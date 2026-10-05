@@ -69,8 +69,9 @@ how many it couldn't read instead of leaving them out.
 
 An iCloud Family Sharing calendar has no secret address, but Home Assistant can
 read it (CalDAV integration). Home Assistant pushes a small copy here: title, start
-and end of each event from midnight today to the end of tomorrow, every 30 minutes
-and at start. Nothing else about the event leaves Home Assistant. The harness only
+and end of each event from midnight today to the end of tomorrow: every hour, once
+shortly before the morning digest, and at start. (Home Assistant itself re-reads an
+iCloud calendar only about every 15 minutes, so pushing more often gains nothing.) Nothing else about the event leaves Home Assistant. The harness only
 lists it. Until a push has arrived, and whenever the last one is older than two
 hours, the digest says so instead of calling the day Clear.
 
@@ -107,7 +108,9 @@ alias: Harness – push Family calendar
 mode: single
 triggers:
   - trigger: time_pattern
-    minutes: /30
+    minutes: "5"
+  - trigger: time
+    at: "06:50:00"        # just before the 07:00 digest
   - trigger: homeassistant
     event: start
 actions:
