@@ -44,13 +44,28 @@ PAIR_RE = re.compile(r"/start(?:@\w+)?\s+([A-Za-z0-9_-]{16,64})")
 SETTINGS_TTL_S = 15 * 60
 
 
+def family_line(st: dict, tz: ZoneInfo) -> str:
+    """One status line about Family pushes. Counts and times only."""
+    if st.get("received_at"):
+        at = datetime.fromisoformat(st["received_at"]).astimezone(tz)
+        line = f"last push {at:%a %-I:%M %p}, {st['events']} event(s)"
+        if not st.get("ok"):
+            line += ", Home Assistant couldn't read it"
+    else:
+        line = "no push from Home Assistant yet"
+    if st.get("rejected_at") and (not st.get("received_at")
+                                  or st["rejected_at"] > st["received_at"]):
+        line += f" (last push refused: {st['rejected']})"
+    return line
+
+
 class Controller:
     def __init__(self, *, ledger: Ledger, vault: Vault, api, engines: dict[str, Engine],
                  executor: Executor, base_config: Config,
                  sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
-                 poll_timeout: int = 25, calendar=None):
+                 poll_timeout: int = 25, calendar=None, family=None):
         self.ledger = ledger
         self.vault = vault
         self.api = api
@@ -63,6 +78,7 @@ class Controller:
         self.requests = requests or queue.Queue()
         self.poll_timeout = poll_timeout
         self.calendar = calendar           # S1: read-only calendar feeds, or None
+        self.family = family               # Family pushes from Home Assistant, or None
         self.outbox = Outbox(ledger, api, sleep=sleep, tz=base_config.timezone)
         self.config: Config | None = None
         self.runner: Runner | None = None
@@ -361,6 +377,8 @@ class Controller:
                     f"{render.escape(by)}. It no longer listens to this chat."), db=db)
             self.outbox.flush()
         self.vault.reset()
+        if self.family is not None:
+            self.family.forget()           # the pinned Home Assistant key goes too
         self.ledger.event("reset", {"by": by})
         self.config = None
         self.runner = None
@@ -385,7 +403,7 @@ class Controller:
                     return      # a fresh read is on its way; give it up to 5 minutes
             self.ledger.set_meta("digest_date", daily.local_date(now, cfg.timezone))
             d = daily.gather(self.ledger, cfg, paused=paused, notes=list(self.notes.values()),
-                             calendar=self.calendar)
+                             calendar=self.calendar, family=self.family)
             daily.deliver(self.ledger, cfg, d)
 
     # -- status ------------------------------------------------------------------------------
@@ -423,6 +441,8 @@ class Controller:
                 when = f"read {ok_at.astimezone(tz):%a %-I:%M %p}" if ok_at else "not read yet"
                 lines.append(f"Calendar {render.escape(label)}: {when}" +
                              (f" (last problem: {render.escape(err)})" if err else ""))
+        if self.family is not None and cfg.family_entity:
+            lines.append("Family calendar: " + render.escape(family_line(self.family.status(), tz)))
         start = cfg.proactive_from
         lines.append(f"Digest: {cfg.digest_time} daily" +
                      ("" if self._proactive_ok() else f", from {start:%b %-d}"))
@@ -449,6 +469,8 @@ class Controller:
             "calendar": ([{"label": label, "ok_at": ok_at.isoformat() if ok_at else None,
                            "error": err} for label, ok_at, err in self.calendar.coverage()]
                          if self.calendar is not None and self.calendar.configured else []),
+            "family": (self.family.status() if self.family is not None
+                       and self.base_config.family_entity else None),
             "last_digest": {"at": self.ledger.get_meta("last_digest_at"),
                             "sent": self.ledger.get_meta("last_digest_sent") == "yes",
                             "text": self.ledger.get_meta("last_digest_text") or ""},

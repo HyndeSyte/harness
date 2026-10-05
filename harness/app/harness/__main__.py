@@ -16,7 +16,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import policy
+from . import family, policy
 from .calendar_feed import CalendarFeeds
 from .config import Config
 from .controller import Controller
@@ -45,7 +45,7 @@ def configure_logging() -> None:
     root.setLevel(logging.INFO)
 
 
-def build(data_dir: str, *, port: int = 8099):
+def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_PORT):
     vault = Vault(os.path.join(data_dir, "secrets.json"))
     ledger = Ledger(os.path.join(data_dir, "harness.sqlite"))
     transport = UrllibTransport()
@@ -59,16 +59,21 @@ def build(data_dir: str, *, port: int = 8099):
     }
     status: dict = {}
     requests: queue.Queue = queue.Queue()
-    web = serve(SetupApp(vault, status, requests), port=port)
     # owner_user_id is a placeholder until pairing binds the real one.
     base = Config(owner_user_id=1, stage=STAGE)
+    inbox = family.FamilyInbox(os.path.join(data_dir, "family.json"), ledger.now,
+                               entity=base.family_entity or "calendar.family")
+    web = serve(SetupApp(vault, status, requests,
+                         family=inbox if base.family_entity else None), port=port)
     executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="worker")
     calendar = CalendarFeeds(ledger, transport, executor,
                              lambda: vault.get("calendar_feeds"), base.timezone)
+    listener = family.serve(inbox, port=family_port) if base.family_entity else None
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
                             executor=executor, base_config=base, status_box=status,
-                            requests=requests, calendar=calendar)
-    return controller, web
+                            requests=requests, calendar=calendar,
+                            family=inbox if base.family_entity else None)
+    return controller, web, listener
 
 
 class Stop(Exception):
@@ -84,7 +89,7 @@ def main() -> int:
     log = logging.getLogger("harness")
     data_dir = os.environ.get("HARNESS_DATA", "/data")
     port = int(os.environ.get("HARNESS_PORT", "8099"))
-    controller, web = build(data_dir, port=port)
+    controller, web, listener = build(data_dir, port=port)
 
     def stop(*_):
         raise Stop()
@@ -112,6 +117,8 @@ def main() -> int:
         pass
     log.info("harness stopping")
     web.shutdown()
+    if listener is not None:
+        listener.shutdown()
     controller.executor.shutdown(wait=False, cancel_futures=True)
     # Home Assistant's cold backup stops the add-on before copying /data;
     # closing here leaves a single consistent database file behind.

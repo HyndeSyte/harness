@@ -36,6 +36,7 @@ check is broken on purpose, one at a time, and the suite must fail.
 | 18 | Calendars are read, never written: a GET of a Google secret iCal address, and nothing else is accepted as an address. The address is a secret like a key. | `calendar_feed`, `vault` |
 | 19 | An unread calendar is never an empty day. Each calendar is its own input; one that wasn't read today is named, and events whose repeat pattern isn't understood are counted, not dropped. | `calendar_feed`, `ical`, `digest` |
 | 20 | A link from an instrument card opens a conversation and nothing else. Its title is decoded strictly, cleaned and escaped; it never starts an action or reaches a model by itself. | `deeplink`, `commands` |
+| 21 | The Family calendar arrives only as a push from Home Assistant, on its own internal port, never by asking Home Assistant. A push must come from Home Assistant's address, carry the pinned key, match schema 1 exactly, be recent and newer than the last. It is stored and listed, nothing more: Family events never mark an overlap, and the digest is never Clear while Family is missing. | `family`, `daily` |
 
 ## Run the tests
 
@@ -43,5 +44,6 @@ check is broken on purpose, one at a time, and the suite must fail.
 
 ## Status
 
-Stage S1: zero effects; a read-only calendar in the morning digest. See
+Stage S1: zero effects; read-only calendars (Google, and iCloud Family pushed in by
+Home Assistant) in the morning digest. See
 `harness/CHANGELOG.md`.

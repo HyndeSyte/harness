@@ -33,6 +33,9 @@ class Config:
     # the sender, never in a prompt.
     proactive_from: date = date(2026, 10, 20)
     digest_time: str = "07:00"
+    # The Home Assistant calendar whose pushes the harness expects (family.py).
+    # Empty: none expected. Set: the digest is never Clear while it is missing.
+    family_entity: str = "calendar.family"
     approval_ttl_s: int = 12 * 3600
     work_domains: tuple[str, ...] = ()
     work_markers: tuple[str, ...] = DEFAULT_WORK_MARKERS

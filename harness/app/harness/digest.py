@@ -139,7 +139,9 @@ def _t(dt: datetime, local: ZoneInfo) -> str:
 
 
 def _short(label: str) -> str:
-    name = label.split("@", 1)[0] if "@" in label else label
+    # An address's local part, dots as spaces: "first.last" would otherwise
+    # be defanged into "first[.]last" as if it were a link.
+    name = label.split("@", 1)[0].replace(".", " ") if "@" in label else label
     return name[:20]
 
 

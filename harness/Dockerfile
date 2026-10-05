@@ -14,6 +14,6 @@ RUN chmod a+x /etc/services.d/harness/run /etc/services.d/harness/finish \
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.2.0" \
+    io.hass.version="0.3.0" \
     org.opencontainers.image.title="Harness" \
     org.opencontainers.image.description="Deterministic controller for a private Telegram thread"

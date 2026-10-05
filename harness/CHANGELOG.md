@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+- The iCloud Family calendar in the morning digest. Home Assistant pushes a
+  minimized copy (title, start, end) every 30 minutes to a listener on the add-on's
+  internal network; the harness stores it and lists it as Family context. It never
+  counts a Family event as an overlap or acts on it.
+- The digest is never Clear while the Family calendar is missing: nothing received
+  yet, not updated for two hours, not about today, or Home Assistant can't read it,
+  each said plainly. A refused push is named; wrong-key pushes are counted in the
+  next digest even when good pushes keep arriving.
+- The listener takes a key only in a 30-minute window (at first start, or from a
+  button on the add-on page), checks the sender's address before starting a
+  thread, and handles at most two connections at once.
+- Several calendars are listed in time order.
+- A calendar named by its address shows the name with spaces, not "first[.]last".
+
 ## 0.2.0
 
 - Today's calendar in the morning digest, read-only, from your calendars' secret

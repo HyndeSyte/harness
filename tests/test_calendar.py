@@ -556,5 +556,5 @@ def test_each_digest_leaves_one_log_line_for_the_watchdog(ledger, tmp_path, cloc
     with caplog.at_level(logging.INFO, logger="harness.daily"):
         r.c.tick()
     lines = [m for m in caplog.messages if m.startswith("DIGEST ")]
-    assert lines == ["DIGEST 2026-10-15 state=clear sent=no problems=0 waiting=0 events=0"]
+    assert lines == ["DIGEST 2026-10-15 state=clear sent=no problems=0 waiting=0 events=0 family=-"]
     assert "Vet" not in caplog.text

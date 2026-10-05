@@ -1,8 +1,10 @@
 # https://developers.home-assistant.io/docs/apps/configuration
 # Deliberately narrow: no Home Assistant API, no Supervisor API, no mapped
-# folders, no ports. Its only state is /data. Its only page is Ingress.
+# folders, no host ports. Its only state is /data. Its only page is Ingress.
+# It also listens on 8100 for Family calendar pushes from Home Assistant, on
+# the internal add-on network only (no host port is mapped; see family.py).
 name: Harness
-version: "0.2.0"
+version: "0.3.0"
 slug: harness
 description: >-
   One private Telegram thread with Claude and GPT as engines. A small

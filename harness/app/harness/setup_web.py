@@ -44,8 +44,9 @@ class SetupApp:
     """Everything the handler needs, shared across request threads."""
 
     def __init__(self, vault: Vault, status_box: dict, requests: queue.Queue, *,
-                 allowed_peers: tuple[str, ...] = (INGRESS_PROXY,)):
+                 allowed_peers: tuple[str, ...] = (INGRESS_PROXY,), family=None):
         self.vault = vault
+        self.family = family          # FamilyInbox, for the "accept a new key" button
         self.status = status_box
         self.requests = requests
         self.allowed_peers = allowed_peers
@@ -104,6 +105,33 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
             err = (f' <span class="muted">(last problem: {_e(c["error"])})</span>'
                    if c.get("error") else "")
             parts.append(f"<div>{_e(c['label'])}: {when}{err}</div>")
+        parts.append("</div>")
+    fam = st.get("family")
+    if fam is not None:
+        parts.append("<h2>Family calendar (from Home Assistant)</h2><div class='card'>")
+        if fam.get("received_at"):
+            ok = fam.get("ok")
+            parts.append(f'<div class="{"ok" if ok else "no"}">last push '
+                         f'{_e(fam["received_at"][:16].replace("T", " "))} UTC · '
+                         f'{_e(fam.get("events", 0))} event(s)'
+                         f'{"" if ok else " · Home Assistant could not read it"}</div>')
+        else:
+            parts.append('<div class="no">no push from Home Assistant yet</div>')
+        if fam.get("rejected_at"):
+            parts.append(f'<div class="muted">last refused push '
+                         f'{_e(fam["rejected_at"][:16].replace("T", " "))} UTC: '
+                         f'{_e(fam.get("rejected") or "")}</div>')
+        if fam.get("key_pinned_at"):
+            parts.append(f'<div class="muted">key pinned '
+                         f'{_e(fam["key_pinned_at"][:10])} (Reset forgets it)</div>')
+        elif fam.get("armed"):
+            parts.append('<div class="muted">no key yet; the next push from Home Assistant '
+                         'sets it</div>')
+        elif may_edit:
+            parts.append('<div class="muted">no key yet, and not accepting one.</div>'
+                         '<form method="post" action="arm">'
+                         f'<input type="hidden" name="csrf" value="{_e(app.csrf)}">'
+                         '<button>Accept a key from Home Assistant (30 minutes)</button></form>')
         parts.append("</div>")
     last = st.get("last_digest") or {}
     if last.get("text"):
@@ -284,6 +312,15 @@ def make_handler(app: SetupApp):
             with app.lock:
                 app.pair_code = v.new_pairing_code()
             return "New pairing code below."
+
+        def _post_arm(self, form, name):
+            if app.family is None:
+                return "There is no Family calendar listener."
+            if app.family.status().get("key_pinned_at"):
+                return "A key is already set. Reset forgets it."
+            app.family.arm()
+            log.info("family: accepting a new key for 30 minutes (from the add-on page)")
+            return "The next push from Home Assistant in the next 30 minutes sets the key."
 
         def _post_reset(self, form, name):
             if form.get("confirm", "").strip() != "RESET":

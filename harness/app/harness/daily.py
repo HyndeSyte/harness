@@ -144,20 +144,63 @@ def _since(ledger: Ledger) -> datetime:
     return last or (ledger.now() - timedelta(days=1))
 
 
+def _order(o):
+    """All-day first, then by start. Several calendars arrive unsorted."""
+    if o.all_day:
+        return (0, o.start.isoformat(), o.summary)
+    return (1, o.start.timestamp(), o.summary)
+
+
+def family_problem(view, tz: str) -> str:
+    """The one line the digest says about Family, or "" when it was read."""
+    local = ZoneInfo(tz)
+    refused = f" (last push refused: {view.rejected})" if view.rejected else ""
+    if view.status == "never":
+        return f"Family calendar: nothing from Home Assistant yet{refused}"
+    when = view.received_at.astimezone(local).strftime("%a %-I:%M %p")
+    if view.status == "stale":
+        return f"Family calendar: not updated since {when}{refused}"
+    if view.status == "unavailable":
+        return f"Family calendar: Home Assistant couldn't read it (as of {when})"
+    if view.status == "window":
+        return ("Family calendar: the last push isn't about today "
+                "(check Home Assistant's time zone)")
+    return ""
+
+
 def gather(ledger: Ledger, config: Config, *, paused: bool,
-           notes: list[str] = (), calendar=None) -> digest.Digest:
+           notes: list[str] = (), calendar=None, family=None) -> digest.Digest:
     now = ledger.now()
     since = _since(ledger)
     inputs = [digest.InputCoverage("Telegram", ledger.last_poll_success(), TELEGRAM_MAX_AGE)]
     agenda = None
+    notes = list(notes)
+    day_start, day_end, day = calendar_feed.today_bounds(now, config.timezone)
+    occ: list = []
+    unreadable = read = configured = 0
     if calendar is not None and calendar.configured:
         cov = calendar.coverage()
         for label, ok_at, err in cov:
             inputs.append(digest.InputCoverage(f"Calendar {label}", ok_at,
                                                calendar_feed.MAX_AGE, err))
-        _, _, day = calendar_feed.today_bounds(now, config.timezone)
         occ, unreadable, read, configured = calendar.agenda(day)
-        occ = [_screened(o, config) for o in occ]
+        occ = list(occ)
+    fam_status = None
+    if family is not None and config.family_entity:
+        view = family.view(now, config.timezone, day_start, day_end, since=since)
+        fam_status = view.status
+        configured += 1
+        problem = family_problem(view, config.timezone)
+        if problem:
+            notes.append(problem)
+        else:
+            read += 1
+            occ += view.occurrences
+        if view.wrong_keys:
+            # Loud even while good pushes keep arriving: someone else is trying.
+            notes.append(f"Family calendar: {view.wrong_keys} push(es) with the wrong key")
+    if configured:
+        occ = sorted((_screened(o, config) for o in occ), key=_order)
         agenda = digest.Agenda(occ, unreadable, read, configured, labels=configured > 1)
     rows = ledger.inputs()
     canary_ok: bool | None = True
@@ -211,15 +254,17 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
             low.append(f"{PROVIDER_NAME.get(provider, provider)} ${max(left, 0):.2f} of "
                        f"${budget} left this month")
 
-    notes = list(notes)
     if paused:
         at = ledger.meta_time("paused_at")
         when = f" since {at.astimezone(ZoneInfo(config.timezone)):%a %-I:%M %p}" if at else ""
         notes.append(f"stopped{when} (/resume)")
-    return digest.compose(now=now, tz=config.timezone, inputs=inputs, waiting=waiting,
-                          failures=failures, low_balance=low, canary_ok=canary_ok,
-                          config_unchanged_since=ledger.meta_time("integrity_since"),
-                          canary_notes=canary_notes, notes=notes, agenda=agenda)
+    d = digest.compose(now=now, tz=config.timezone, inputs=inputs, waiting=waiting,
+                       failures=failures, low_balance=low, canary_ok=canary_ok,
+                       config_unchanged_since=ledger.meta_time("integrity_since"),
+                       canary_notes=canary_notes, notes=notes, agenda=agenda)
+    if fam_status is not None:
+        d.facts["family"] = fam_status
+    return d
 
 
 def deliver(ledger: Ledger, config: Config, d: digest.Digest) -> bool:
@@ -239,7 +284,8 @@ def deliver(ledger: Ledger, config: Config, d: digest.Digest) -> bool:
     # The external watchdog reads this line from the add-on log (Supervisor),
     # so a missing digest is noticed without giving the add-on any API.
     # Counts only: no titles, no text.
-    log.info("DIGEST %s state=%s sent=%s problems=%s waiting=%s events=%s",
+    log.info("DIGEST %s state=%s sent=%s problems=%s waiting=%s events=%s family=%s",
              local_date(now, config.timezone), d.state, "yes" if allowed else "no",
-             d.facts.get("problems", 0), d.facts.get("waiting", 0), d.facts.get("events", "-"))
+             d.facts.get("problems", 0), d.facts.get("waiting", 0), d.facts.get("events", "-"),
+             d.facts.get("family", "-"))
     return allowed
