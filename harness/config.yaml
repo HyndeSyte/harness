@@ -1,0 +1,27 @@
+# https://developers.home-assistant.io/docs/apps/configuration
+# Deliberately narrow: no Home Assistant API, no Supervisor API, no mapped
+# folders, no ports. Its only state is /data. Its only page is Ingress.
+name: Harness
+version: "0.2.0"
+slug: harness
+description: >-
+  One private Telegram thread with Claude and GPT as engines. A small
+  deterministic controller decides everything; nothing changes without your tap.
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:message-lock-outline
+panel_title: Harness
+panel_admin: true
+homeassistant_api: false
+hassio_api: false
+auth_api: false
+backup: cold
+# Seconds Supervisor waits for a clean stop (default 10). The controller
+# interrupts its long poll on SIGTERM; this is margin for closing the ledger.
+timeout: 30

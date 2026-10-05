@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Start the harness controller. Everything it needs is in /data.
+# ==============================================================================
+bashio::log.info "Starting the harness controller"
+cd /opt/harness || exit 1
+export PYTHONPATH=/opt/harness PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+exec python3 -m harness
