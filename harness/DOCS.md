@@ -184,6 +184,7 @@ continuity is unknown.
 - Talk to any host but Telegram, Anthropic, OpenAI and calendar.google.com.
 - Listen to anyone but the paired account, in its private chat. Messages from
   anyone else are dropped and their text is never stored.
-- Keep messages that look like work content (rights-protected documents, configured
-  work domains).
+- Keep messages that carry rights-protected document markers. (Screening by work
+  domain is built, but this release ships with no domains set, so it is not on
+  yet. A later release turns it on.)
 - Put a key in a log line or a URL it shows you.
