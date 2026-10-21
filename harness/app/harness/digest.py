@@ -77,7 +77,9 @@ def compose(*, now: datetime, tz: str, inputs: list[InputCoverage],
             low_balance: list[str], canary_ok: bool | None,
             config_unchanged_since: datetime | None,
             canary_notes: list[str] = (), notes: list[str] = (),
-            agenda: Agenda | None = None) -> Digest:
+            agenda: Agenda | None = None, extra: list[str] = ()) -> Digest:
+    """`extra`: informational lines appended after the agenda. They never
+    count as a problem and never change the state (the mirror's shadow line)."""
     local = ZoneInfo(tz)
     problems: list[str] = []
     for c in sorted(inputs, key=lambda c: c.name):
@@ -120,6 +122,9 @@ def compose(*, now: datetime, tz: str, inputs: list[InputCoverage],
         facts["calendars_read"] = agenda.read
     since = (config_unchanged_since.astimezone(local).strftime("%b %-d")
              if config_unchanged_since else "unverified")
+    info = [escape(x) for x in extra if x]
+    if info:
+        tail += [""] + info
 
     if problems:
         body = ["<b>Attention needed</b>"] + [f"• {escape(p)}" for p in problems]

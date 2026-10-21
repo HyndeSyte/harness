@@ -222,21 +222,21 @@ def test_digest_is_deterministic():
 # -- work-content filter ---------------------------------------------------------------
 
 @pytest.mark.parametrize("text", [
-    "fw from jane.doe@salesforce.com about the QBR",
-    "see https://acme.my.salesforce.com/lightning/r/Account",
+    "fw from jane.doe@example-corp.test about the QBR",
+    "see https://acme.my.example-corp.test/r/Account",
     "attachment: DRMEncryptedDataSpace",
     "MSIP_Label_1234_Enabled=true",
 ])
 def test_work_content_is_stopped(text):
-    assert ingress_filter.check(text, work_domains=("salesforce.com",),
+    assert ingress_filter.check(text, work_domains=("example-corp.test",),
                                 markers=Config(owner_user_id=1).work_markers)
 
 
 @pytest.mark.parametrize("text", [
     "is the feed store open saturday?",
-    "notsalesforce.com.example is a different domain",
-    "my salesforcecareer notes",
+    "notexample-corp.test.example is a different domain",
+    "my example-corpcareer notes",
 ])
 def test_personal_content_passes(text):
-    assert ingress_filter.check(text, work_domains=("salesforce.com",),
+    assert ingress_filter.check(text, work_domains=("example-corp.test",),
                                 markers=Config(owner_user_id=1).work_markers) is None

@@ -65,7 +65,7 @@ class Controller:
                  sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
-                 poll_timeout: int = 25, calendar=None, family=None):
+                 poll_timeout: int = 25, calendar=None, family=None, mirror=None):
         self.ledger = ledger
         self.vault = vault
         self.api = api
@@ -79,6 +79,7 @@ class Controller:
         self.poll_timeout = poll_timeout
         self.calendar = calendar           # S1: read-only calendar feeds, or None
         self.family = family               # Family pushes from Home Assistant, or None
+        self.mirror = mirror               # MirrorShadow (computes, never writes), or None
         self.outbox = Outbox(ledger, api, sleep=sleep, tz=base_config.timezone)
         self.config: Config | None = None
         self.runner: Runner | None = None
@@ -216,6 +217,8 @@ class Controller:
         if self.calendar is not None:
             self.calendar.maybe_start()
             self.calendar.collect()
+        if self.mirror is not None and self.mirror.due():
+            self.mirror.run()              # shadow only; its own failures are its record
         self._daily(paused)
         self.outbox.flush()
         self._publish()
@@ -403,7 +406,8 @@ class Controller:
                     return      # a fresh read is on its way; give it up to 5 minutes
             self.ledger.set_meta("digest_date", daily.local_date(now, cfg.timezone))
             d = daily.gather(self.ledger, cfg, paused=paused, notes=list(self.notes.values()),
-                             calendar=self.calendar, family=self.family)
+                             calendar=self.calendar, family=self.family,
+                             mirror_line=self.mirror.digest_line() if self.mirror else "")
             daily.deliver(self.ledger, cfg, d)
 
     # -- status ------------------------------------------------------------------------------

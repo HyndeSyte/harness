@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+- Work-hours mirror, shadow only. When mirror settings are entered on the add-on
+  page, plain code works out which personal blocks would be copied to the work
+  calendar, records that in its own table, and adds one line to the morning
+  digest. It writes nothing to any calendar. With no mirror settings, nothing
+  changes: no table rows, no digest line.
+- The planner behind it (work days, hours, look-ahead, quiet hours, which
+  calendars count, titles to skip, Family rules, "Busy" titles) ships with it.
+  The calendar write it would feed is registered for S2 only and nothing calls
+  it in this release.
+
 ## 0.3.0
 
 - The iCloud Family calendar in the morning digest. Home Assistant pushes a

@@ -48,6 +48,14 @@ class Occurrence:
     summary: str
     calendar: str
     transparent: bool = False
+    # Identity and guests, for the work-hours mirror (shadow mode, 2026-10-18).
+    # `uid` is the VEVENT's UID; `instance` is the original start key of a
+    # recurring instance (the RRULE start, or RECURRENCE-ID for an override)
+    # and "" for a single event, so a moved instance keeps its identity.
+    # `attendees` are the ATTENDEE addresses, lower-cased, without "mailto:".
+    uid: str = ""
+    instance: str = ""
+    attendees: tuple[str, ...] = ()
 
 
 @dataclass
@@ -527,8 +535,17 @@ def window(text: str, *, start: datetime, end: datetime, tz: str,
         summary = unescape(ev.first("SUMMARY").value).strip() if ev.first("SUMMARY") else ""
         summary = " ".join(summary.split())[:MAX_SUMMARY] or "(no title)"
         transp = ev.first("TRANSP")
+        rid = ev.first("RECURRENCE-ID")
+        try:
+            instance = (_key(parse_when(rid, default)) if rid is not None
+                        else _key(s) if ev.first("RRULE") is not None else "")
+        except Unreadable:
+            instance = _key(s)
+        attendees = tuple(a.value.strip().lower().removeprefix("mailto:")
+                          for a in ev.all("ATTENDEE"))
         out.occurrences.append(Occurrence(s, e, not isinstance(s, datetime), summary, name,
-                                          bool(transp and transp.value.upper() == "TRANSPARENT")))
+                                          bool(transp and transp.value.upper() == "TRANSPARENT"),
+                                          ev.uid, instance, attendees))
 
     for ev in loose:
         try:

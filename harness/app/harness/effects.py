@@ -77,6 +77,11 @@ class EffectDef:
     undo: str = ""
     idempotency: str = ""
     preconditions: tuple[Callable[[dict], str | None], ...] = ()
+    # "model": a model may propose it (schema/runner path). "controller":
+    # only plain controller code may build it; a model naming it is refused.
+    origin: str = "model"
+    # Cross-field check on validated params (None when fine).
+    shape: Callable[[dict], str | None] | None = None
 
     def validate(self, params: Any) -> dict:
         if not isinstance(params, dict):
@@ -94,7 +99,24 @@ class EffectDef:
                     raise ParamError(f"{name}: required")
                 continue
             out[name] = spec.check(name, params[name])
+        if self.shape is not None:
+            why = self.shape(out)
+            if why:
+                raise ParamError(why)
         return out
+
+
+def _mirror_shape(p: dict) -> str | None:
+    if p["op"] == "delete":
+        extra = set(p) - {"op", "event_id"}
+        return f"delete takes only event_id, not {sorted(extra)}" if extra else None
+    missing = {"start", "end", "title"} - set(p)
+    if missing:
+        return f"{p['op']} needs {sorted(missing)}"
+    from datetime import datetime as _dt
+    if _dt.fromisoformat(p["end"]) <= _dt.fromisoformat(p["start"]):
+        return "end must be after start"
+    return None
 
 
 def _future(params: dict) -> str | None:
@@ -123,12 +145,57 @@ REGISTRY: dict[str, EffectDef] = {
                      "look the event up by id; a re-create after an undo gets "
                      "a new id because deleted ids leave a tombstone"),
     ),
+    # Work-hours mirror (workmirror.py, decided 2026-10-08). Built only by
+    # the controller from his configured rules, from a reconcile of the plan
+    # against the live copies; each card's tap approves its exact operations.
+    # A model can't propose it. His own events are never edited.
+    "work_mirror_copy": EffectDef(
+        name="work_mirror_copy",
+        min_stage="S2",
+        reversible=True,
+        ttl_s=72 * 3600,
+        reviewer_required=False,
+        params={
+            "op": Param("str", pattern=r"add|update|delete"),
+            "event_id": Param("str", pattern=r"m1[0-9a-v]{20,120}"),
+            "start": Param("datetime", required=False),
+            "end": Param("datetime", required=False),
+            "title": Param("str", required=False, max_len=200),
+        },
+        # The attendee is his configured work address, filled in by the
+        # executor from config at execution time, never from params.
+        fixed={"calendar": "harness-created", "visibility": "private",
+               "attendees": ("config:work_mirror.work_address",), "recurrence": (),
+               # Notifications stay on their own side (his rule, 2026-10-08):
+               # no email to a Google work guest (externalOnly still emails a
+               # non-Google calendar, which needs it to get the event at all),
+               # and no reminders on the copy, so his personal devices don't
+               # buzz twice. The work side stays quiet by his work calendar's
+               # "notify only if I responded Yes or Maybe" with the invite left
+               # unanswered; the organizer can't set a guest's reminders.
+               "conference": None, "send_updates": "externalOnly", "transparency": "opaque",
+               "description": "", "location": "", "reminders": (),
+               "reminders_use_default": False,
+               "guests_can_invite_others": False, "guests_can_see_other_guests": False},
+        undo="delete the copy by its id; a Google work calendar drops it without an email",
+        idempotency=("event id comes from the plan (hash of source and occurrence id); "
+                     "insert with that id. On a conflict, GET it: confirmed and matching "
+                     "means done; cancelled (a tombstone left by an earlier undo) means "
+                     "patch it back to confirmed with these fields, never 'already done'"),
+        origin="controller",
+        shape=_mirror_shape,
+    ),
 }
 
 
-def lookup(effect_type: str, stage_at_least: Callable[[str], bool]) -> EffectDef:
+def lookup(effect_type: str, stage_at_least: Callable[[str], bool], *,
+           origin: str = "model") -> EffectDef:
     d = REGISTRY.get(effect_type)
     if d is None:
+        raise ParamError(f"unknown effect type {effect_type!r}")
+    if d.origin != origin:
+        # A model that names a controller-only effect gets the same answer
+        # as one that names an effect that doesn't exist.
         raise ParamError(f"unknown effect type {effect_type!r}")
     if not stage_at_least(d.min_stage):
         raise ParamError(f"{effect_type} is not enabled before {d.min_stage}")

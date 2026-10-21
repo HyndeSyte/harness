@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 from .net import REDACT
-from .vault import FIELDS, LABELS, Vault, VaultError
+from .vault import FIELDS, LABELS, TEXT_FIELDS, Vault, VaultError
 
 log = logging.getLogger("harness.web")
 
@@ -62,8 +62,8 @@ body{{font:15px/1.5 system-ui,sans-serif;max-width:640px;margin:24px auto;paddin
 color:#1b1b1b;background:#fff}}
 h1{{font-size:20px}} h2{{font-size:16px;margin-top:28px}}
 .ok{{color:#1a7f37}} .no{{color:#b42318}} .muted{{color:#666}}
-input[type=password],input[type=text]{{width:100%;padding:8px;box-sizing:border-box;
-margin:4px 0 12px}}
+input[type=password],input[type=text],textarea{{width:100%;padding:8px;box-sizing:border-box;
+margin:4px 0 12px;font:inherit}}
 button{{padding:8px 14px}} code{{background:#f2f2f2;padding:2px 4px}}
 .card{{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:12px 0}}
 @media (prefers-color-scheme: dark){{body{{background:#111;color:#eee}}
@@ -166,8 +166,12 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
                  f'<form method="post" action="save" autocomplete="off">'
                  f'<input type="hidden" name="csrf" value="{_e(app.csrf)}">')
     for f in FIELDS:
-        parts.append(f'<label>{_e(LABELS[f])}<input type="password" name="{f}" '
-                     f'autocomplete="off" spellcheck="false"></label>')
+        if f in TEXT_FIELDS:
+            parts.append(f'<label>{_e(LABELS[f])}<textarea name="{f}" rows="6" '
+                         f'autocomplete="off" spellcheck="false"></textarea></label>')
+        else:
+            parts.append(f'<label>{_e(LABELS[f])}<input type="password" name="{f}" '
+                         f'autocomplete="off" spellcheck="false"></label>')
     parts.append("<button>Save</button></form>")
 
     if keys.get("telegram_bot_token") and not owner:

@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 
+from .workmirror import MirrorConfig
+
 STAGES = ("S0", "S1", "S2", "S3")
 
 # Corporate-content markers seen in the wild. "DRMEncryptedDataSpace" is
@@ -45,6 +47,16 @@ class Config:
     # Telegram keeps undelivered updates for at most 24 hours. After a
     # longer silence the thread is told continuity is unknown.
     continuity_window_s: int = 24 * 3600
+    # Work-hours mirror (workmirror.py). Off and empty by default: his
+    # address and rules are entered at install, never committed here.
+    # Not read at runtime: the mirror's live settings are the vault field
+    # work_mirror, parsed on each use (mirror_shadow.MirrorShadow.config).
+    # Kept because tests/test_workmirror.py (test_off_and_empty_by_default)
+    # pins this default and effects.py names config:work_mirror.work_address
+    # as the future executor's attendee source. It is a constant default, so
+    # its share of the integrity hash never moves; removing it would reset
+    # "config unchanged since" once but would not break startup.
+    work_mirror: MirrorConfig = field(default_factory=MirrorConfig)
     monthly_budget_usd: dict = field(default_factory=lambda: {
         "anthropic": 40, "openai": 10})
     low_balance_usd: dict = field(default_factory=lambda: {

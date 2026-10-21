@@ -173,6 +173,16 @@ CREATE TABLE IF NOT EXISTS events(
   kind TEXT NOT NULL,
   detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mirror_shadow(
+  event_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  start TEXT NOT NULL,
+  end TEXT NOT NULL,
+  title TEXT NOT NULL,
+  label TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 # Job states and the only transitions allowed between them. Anything else

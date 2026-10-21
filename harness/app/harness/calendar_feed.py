@@ -70,6 +70,9 @@ class FeedResult:
     window: ical.Window | None = None
     error: str = ""
     day: str = ""              # the local day the window describes
+    # The same feed over the mirror's horizon (shadow mode), when asked for.
+    ahead: ical.Window | None = None
+    ahead_error: str = ""      # why the ahead parse failed; today's window is unaffected
 
 
 @dataclass
@@ -80,7 +83,7 @@ class Snapshot:
 
 
 def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
-              tz: str) -> FeedResult:
+              tz: str, ahead_until: datetime | None = None) -> FeedResult:
     fid = feed_id(url)
     REDACT.register(url, url.rsplit("/", 2)[-2])          # the address and its private part
     try:
@@ -106,8 +109,18 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
         w = ical.window(text, start=start, end=end, tz=tz, fallback_name=f"Calendar {fid[:4]}")
     except Exception as e:                       # a parser bug must not kill the loop
         return FeedResult(fid, False, error=f"couldn't read the calendar ({type(e).__name__})")
+    # The mirror's longer window is parsed on its own: whatever goes wrong
+    # there leaves it unread for the shadow and never touches today's agenda.
+    ahead, ahead_error = None, ""
+    if ahead_until is not None and ahead_until > end:
+        try:
+            ahead = ical.window(text, start=start, end=ahead_until, tz=tz,
+                                fallback_name=f"Calendar {fid[:4]}")
+        except Exception as e:
+            ahead_error = type(e).__name__
     return FeedResult(fid, True, window=w,
-                      day=start.astimezone(ZoneInfo(tz)).date().isoformat())
+                      day=start.astimezone(ZoneInfo(tz)).date().isoformat(), ahead=ahead,
+                      ahead_error=ahead_error)
 
 
 def today_bounds(now: datetime, tz: str) -> tuple[datetime, datetime, str]:
@@ -122,8 +135,12 @@ class CalendarFeeds:
     """Owned by the controller thread; fetches happen in workers."""
 
     def __init__(self, ledger: Ledger, transport: Transport, executor: Executor,
-                 urls_fn, tz: str):
+                 urls_fn, tz: str, *, ahead_days: int = 0, ahead_when=None):
         self.ledger = ledger
+        self.ahead_days = ahead_days       # > 0: each read also parses this far ahead
+        # Called at each read: False skips the ahead parse (no mirror settings
+        # entered). None: always parse ahead when ahead_days > 0.
+        self.ahead_when = ahead_when
         self.transport = transport
         self.executor = executor
         self.urls_fn = urls_fn
@@ -133,6 +150,7 @@ class CalendarFeeds:
         self._started_at: dict[str, datetime] = {}
         self._last_start: datetime | None = None
         self._pre_digest_day: str | None = None
+        self.generation = 0            # bumps whenever a read lands (ok or not)
 
     # -- what the controller calls -------------------------------------------------
     def urls(self) -> list[str]:
@@ -164,12 +182,15 @@ class CalendarFeeds:
         now = self.ledger.now()
         self._last_start = now
         start, end, _ = today_bounds(now, self.tz)
+        ahead_until = (start + timedelta(days=self.ahead_days + 1)
+                       if self.ahead_days and self._want_ahead() else None)
         for url in self.urls():
             fid = feed_id(url)
             if fid in self._futures:
                 continue
             self._futures[fid] = self.executor.submit(fetch_one, self.transport, url,
-                                                      start=start, end=end, tz=self.tz)
+                                                      start=start, end=end, tz=self.tz,
+                                                      ahead_until=ahead_until)
             self._started_at[fid] = now
 
     def collect(self) -> None:
@@ -192,6 +213,7 @@ class CalendarFeeds:
                         self.ledger.input_failed(f"calendar:{fid}", "the read took too long")
                 continue
             del self._futures[fid]
+            self.generation += 1
             try:
                 res: FeedResult = fut.result()
             except Exception as e:
@@ -200,11 +222,29 @@ class CalendarFeeds:
                 continue
             if res.ok:
                 self.ledger.input_ok(f"calendar:{fid}")
+                if res.ahead_error:
+                    with self.ledger.tx() as db:
+                        self.ledger.event("calendar_ahead_failed",
+                                          {"feed": fid, "error": res.ahead_error}, db=db)
                 if res.window is not None and res.day == day:
                     # A read that started yesterday describes yesterday.
                     self.snapshot.feeds[fid] = res
             else:
                 self.ledger.input_failed(f"calendar:{fid}", res.error)
+                prev = self.snapshot.feeds.get(fid)
+                if prev is not None:
+                    # Today's agenda keeps the last good read; the mirror's
+                    # ahead window does not: a feed whose latest read failed
+                    # is unread for the shadow (no delete from stale data).
+                    prev.ahead = None
+
+    def _want_ahead(self) -> bool:
+        if self.ahead_when is None:
+            return True
+        try:
+            return bool(self.ahead_when())
+        except Exception:                       # unknown: today's read is what matters
+            return False
 
     def _fresh(self, now: datetime, within: timedelta) -> bool:
         rows = self.ledger.inputs()
@@ -243,3 +283,20 @@ class CalendarFeeds:
             occ += res.window.occurrences
             unreadable += res.window.unreadable
         return occ, unreadable, len(self.snapshot.feeds), len(self.urls())
+
+    # -- for the mirror's shadow run ----------------------------------------------------
+    def ahead(self, day: str) -> tuple[list[ical.Occurrence], int, int, int]:
+        """(occurrences over the ahead window from every feed read today,
+        unreadable count, feeds read today with an ahead window, feeds
+        configured). Only feeds read today count: an older read is unread."""
+        if self.snapshot.day != day or not self.ahead_days:
+            return [], 0, 0, len(self.urls())
+        occ: list[ical.Occurrence] = []
+        unreadable = read = 0
+        for res in self.snapshot.feeds.values():
+            if res.ahead is None:
+                continue
+            read += 1
+            occ += res.ahead.occurrences
+            unreadable += res.ahead.unreadable
+        return occ, unreadable, read, len(self.urls())

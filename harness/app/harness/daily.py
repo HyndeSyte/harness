@@ -169,7 +169,11 @@ def family_problem(view, tz: str) -> str:
 
 
 def gather(ledger: Ledger, config: Config, *, paused: bool,
-           notes: list[str] = (), calendar=None, family=None) -> digest.Digest:
+           notes: list[str] = (), calendar=None, family=None,
+           mirror_line: str = "") -> digest.Digest:
+    """`mirror_line`: the work-hours mirror's one line (shadow mode), counts
+    only. It is appended as information and can never make the digest
+    anything but what the inputs, waits and failures say it is."""
     now = ledger.now()
     since = _since(ledger)
     inputs = [digest.InputCoverage("Telegram", ledger.last_poll_success(), TELEGRAM_MAX_AGE)]
@@ -261,7 +265,8 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     d = digest.compose(now=now, tz=config.timezone, inputs=inputs, waiting=waiting,
                        failures=failures, low_balance=low, canary_ok=canary_ok,
                        config_unchanged_since=ledger.meta_time("integrity_since"),
-                       canary_notes=canary_notes, notes=notes, agenda=agenda)
+                       canary_notes=canary_notes, notes=notes, agenda=agenda,
+                       extra=[mirror_line] if mirror_line else [])
     if fam_status is not None:
         d.facts["family"] = fam_status
     return d

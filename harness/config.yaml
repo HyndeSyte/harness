@@ -4,7 +4,7 @@
 # It also listens on 8100 for Family calendar pushes from Home Assistant, on
 # the internal add-on network only (no host port is mapped; see family.py).
 name: Harness
-version: "0.3.0"
+version: "0.4.0"
 slug: harness
 description: >-
   One private Telegram thread with Claude and GPT as engines. A small

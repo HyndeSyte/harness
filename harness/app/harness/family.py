@@ -316,6 +316,24 @@ class FamilyInbox:
                 "rejected_at": rej.get("at"), "rejected": rej.get("reason"),
                 "key_pinned_at": pinned, "armed": armed}
 
+    def recent(self, now: datetime) -> tuple[str, datetime | None, list]:
+        """For the mirror's shadow run: (status as in view(), the last push's
+        window_end, every event of the last fresh push as (title, start, end)).
+        Events only when the status is "fresh"; nothing is interpreted here."""
+        with self._lock:
+            last = self._d.get("last")
+        if not last:
+            return "never", None, []
+        received = datetime.fromisoformat(last["received_at"])
+        we = datetime.fromisoformat(last["window_end"])
+        if now - received > MAX_AGE:
+            return "stale", we, []
+        if not last["ok"] or last["state"] in ("unavailable", "unknown"):
+            return "unavailable", we, []
+        out = [(" ".join(str(t).split())[:ical.MAX_SUMMARY] or "(no title)",
+                _when(s, "start"), _when(e, "end")) for t, s, e in last["events"]]
+        return "fresh", we, out
+
     def view(self, now: datetime, tz: str, day_start: datetime, day_end: datetime,
              since: datetime | None = None):
         """What the digest may say about Family today: FamilyView.

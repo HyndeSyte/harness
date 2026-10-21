@@ -22,6 +22,7 @@ from .config import Config
 from .controller import Controller
 from .engines import AnthropicEngine, OpenAIEngine
 from .ledger import Ledger
+from .mirror_shadow import MirrorShadow, read_days
 from .net import RedactingFilter, UrllibTransport
 from .setup_web import SetupApp, serve
 from .telegram_api import TelegramBotAPI
@@ -66,13 +67,19 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     web = serve(SetupApp(vault, status, requests,
                          family=inbox if base.family_entity else None), port=port)
     executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="worker")
+    # The mirror's shadow needs the feeds read as far as its horizon; the
+    # settings text is read from the vault on every run (never from Config).
     calendar = CalendarFeeds(ledger, transport, executor,
-                             lambda: vault.get("calendar_feeds"), base.timezone)
+                             lambda: vault.get("calendar_feeds"), base.timezone,
+                             ahead_days=read_days(None),
+                             ahead_when=lambda: bool((vault.get("work_mirror") or "").strip()))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
+    mirror = MirrorShadow(ledger, lambda: vault.get("work_mirror"), calendar=calendar,
+                          family=inbox if base.family_entity else None, tz=base.timezone)
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,
-                            family=inbox if base.family_entity else None)
+                            family=inbox if base.family_entity else None, mirror=mirror)
     return controller, web, listener
 
 

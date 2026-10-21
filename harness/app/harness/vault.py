@@ -31,13 +31,20 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import calendar_feed
+from . import calendar_feed, workmirror
 
-FIELDS = ("telegram_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds")
+# work_mirror: his work address, hours and rules for the work-hours mirror
+# (workmirror.parse_settings). Not a key, but it names his employer's address
+# and his family's events, so it is kept, shown and changed like one: entered
+# once here, never in the repository or in add-on options.
+FIELDS = ("telegram_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
+          "work_mirror")
+TEXT_FIELDS = ("work_mirror",)          # several lines; a textarea on the page
 LABELS = {"telegram_bot_token": "Telegram bot token",
           "anthropic_api_key": "Anthropic API key",
           "openai_api_key": "OpenAI API key",
-          "calendar_feeds": "calendar addresses (secret iCal, space between several)"}
+          "calendar_feeds": "calendar addresses (secret iCal, space between several)",
+          "work_mirror": "work mirror settings (work: address, days:, hours:, family: ...)"}
 # Formats are checked loosely: enough to catch a paste of the wrong thing
 # (a URL, a sentence, a key in the wrong box), not a claim about validity.
 PATTERNS = {
@@ -124,6 +131,11 @@ class Vault:
                 return calendar_feed.check_urls(v)
             except ValueError as e:
                 raise VaultError(str(e)) from None
+        if field == "work_mirror":
+            try:
+                return workmirror.settings_text(workmirror.parse_settings(v))
+            except workmirror.MirrorConfigError as e:
+                raise VaultError(f"work mirror settings: {e}") from None
         if not PATTERNS[field].fullmatch(v):
             raise VaultError(f"that doesn't look like a {LABELS[field]}")
         return v
