@@ -16,14 +16,15 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import family, policy
+from . import caldav, family, policy
 from .calendar_feed import CalendarFeeds
 from .config import Config
 from .controller import Controller
 from .engines import AnthropicEngine, OpenAIEngine
+from .family_add import FamilyAdd
 from .ledger import Ledger
 from .mirror_shadow import MirrorShadow, read_days
-from .net import RedactingFilter, UrllibTransport
+from .net import CalDavTransport, RedactingFilter, UrllibTransport
 from .setup_web import SetupApp, serve
 from .telegram_api import TelegramBotAPI
 from .vault import Vault
@@ -76,10 +77,19 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
     mirror = MirrorShadow(ledger, lambda: vault.get("work_mirror"), calendar=calendar,
                           family=inbox if base.family_entity else None, tz=base.timezone)
+    client = caldav.FamilyCalDav(
+        CalDavTransport(lambda: caldav.host_of(vault.get("family_calendar_url"))),
+        lambda: (vault.get("family_apple_id"), vault.get("family_app_password"),
+                 vault.get("family_calendar_url")))
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,
-                            family=inbox if base.family_entity else None, mirror=mirror)
+                            family=inbox if base.family_entity else None, mirror=mirror,
+                            family_add=FamilyAdd(
+                                ledger, client, tz=base.timezone,
+                                policy_version=base.policy_version,
+                                model=policy.MODELS[policy.engine_for("message")].model,
+                                creds_stamp=vault.family_stamp))
     return controller, web, listener
 
 

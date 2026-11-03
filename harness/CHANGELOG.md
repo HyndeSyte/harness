@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0
+
+- The app can now write to one calendar. It can add one event to iCloud Family
+  from a message, and undo that add. This is the first change to the world the app
+  can make at this stage. It is off until you turn it on with a tap. The stage stays
+  S1, and calendar holds and the work mirror stay locked.
+- Say "add dentist Tuesday 3pm". A card shows the exact event in your local time.
+  One tap creates one event, with no invitees, alarm or repeat. The reply carries
+  iCloud's answer and an Undo button.
+- Undo deletes only that event, once, and refuses if someone changed it.
+- If iCloud's answer is lost the app says it doesn't know, tells you to check the
+  calendar, and never retries. A failed write, rejected password or wrong calendar
+  name stays in `/status` and the digest until a write succeeds. `/stop` blocks adds
+  and undos.
+- Apple ID, app-specific password and calendar address go on the add-on page. The
+  app talks to one more host: the iCloud host in that address.
+- Plain code checks every proposal. An event over 24 hours or over a year ahead, or a
+  title or location with a link in it, is refused in words. A time written with an
+  offset your zone doesn't have at that moment, or a suspected duplicate, puts a warning
+  on the card.
+- After 10 adds and 14 days, whichever is later, with no undo and no failed or unknown
+  write, the app asks you, with the whole record, whether to stop checking each add. The
+  card lasts 3 days and asks again at most once a week. Your tap re-reads the record first,
+  and nothing changes if it moved. Only your tap changes that. Any warning, more than 5 such
+  adds in a day, another add at the same start, or a long or several-line message still gets
+  a card.
+- `/checkadds` brings the Approve tap back at once. So does an undo, a failed or unknown
+  write, an add with no Undo, or a change to the credentials, the policy or the model. The app says why, and
+  only a fresh full count can ask again. `/status` and the digest say when adds skip the tap.
+
 ## 0.4.0
 
 - Work-hours mirror, shadow only. When mirror settings are entered on the add-on

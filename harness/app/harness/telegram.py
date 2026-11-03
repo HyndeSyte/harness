@@ -23,7 +23,7 @@ from typing import Any, Callable, Protocol
 ALLOWED_UPDATES = ("message", "callback_query")
 
 COMMANDS = frozenset({"/stop", "/resume", "/cancel", "/status", "/rule", "/undo",
-                      "/start"})
+                      "/start", "/checkadds"})
 
 
 @dataclass(frozen=True)

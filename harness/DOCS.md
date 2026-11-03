@@ -2,7 +2,8 @@
 
 A small deterministic controller that owns one private Telegram thread. You write;
 Claude (and, later, GPT) answer through it. The models never hold a credential and
-can't change anything: at this stage the harness has **zero effects**.
+can't change anything themselves. At this stage the harness has **one effect**, off
+until you turn it on: adding an event to the iCloud Family calendar.
 
 ## Set up (about 20 minutes, once)
 
@@ -41,8 +42,9 @@ can't change anything: at this stage the harness has **zero effects**.
   calendar.
 - Runs a daily canary through Claude and GPT and reports if either fails.
 
-It can't send email, book, buy, delete or schedule anything. Effects arrive one at a
-time in later stages, each with a card you approve by tapping.
+Apart from adding an event to the Family calendar (below), it can't send email, book,
+buy, delete or schedule anything. Effects arrive one at a time in later stages, each
+with a card you approve by tapping.
 
 ## Commands
 
@@ -54,12 +56,13 @@ time in later stages, each with a card you approve by tapping.
 | `/status` | What it's doing, spend this month, canary results. |
 | `/rule` | Your standing rules. |
 | `/undo` | Retire the newest rule (`/undo R1a2b3c` for a specific one). |
+| `/checkadds` | Family calendar adds need your Approve tap again, at once. |
 
 ## Calendar
 
 The harness reads each calendar through its secret iCal address, every 30 minutes
 and again just before the digest. That address can only read; nothing here can
-change your calendar. Treat it like a password: if it leaks, use *Reset* next to it
+change your Google calendars. Treat it like a password: if it leaks, use *Reset* next to it
 in Google Calendar and paste the new one here.
 
 If an event uses a repeat pattern the harness doesn't understand, the digest says
@@ -140,6 +143,75 @@ actions:
 
 To stop it, turn the automation off; the digest will then say Family isn't updated.
 
+## Adding to the Family calendar
+
+**The app can write to this one calendar.** It can add one event at a time to iCloud
+Family and undo that add. It can't edit or delete anything else, and it can't touch
+any other calendar. It is off until you turn it on.
+
+Set up, on the add-on page:
+
+1. Make an app-specific password for your Apple ID (account.apple.com, *Sign-In and
+   Security*, *App-Specific Passwords*). It looks like `abcd-efgh-ijkl-mnop`.
+2. Enter the Apple ID, that password and the calendar address, the URL of the Family
+   collection, which must be `https://p<digits>-caldav.icloud.com/.../`. They are kept
+   like the other keys and never shown again. After pairing, enter one at a time and
+   approve each on its card in Telegram.
+
+Then send something like "add dentist Tuesday 3pm":
+
+- **While it's off,** it says so and adds nothing, with a *Turn on* button if the three
+  settings are entered. Your tap is the only thing that turns it on. Send the event again.
+- **Once it's on,** a card shows the exact event in your local time, with the weekday and
+  date. *Approve* creates one event, with no invitees, alarm or repeat. The offer ends
+  after 12 hours, and an event whose start has already passed is refused.
+- **Checks on every proposal.** An event over 24 hours or over a year ahead is refused, and
+  so is a title or location with a recognized link or an invisible character, because the
+  card must show exactly what is written. The reply says which. A link is a scheme, an IP
+  address, `www.`, a mailbox, a host with a path, port or query, or a bare word.word with a
+  suffix on a list of real web suffixes, so a name ending in one (`Dr.Me`) is refused too.
+  Say it with a space. The list can't catch every address, so any other word.word
+  (`Dr.Smith`) gets a warning on the card and never skips the tap. A time written with a UTC
+  offset your zone doesn't have at that moment, or the same title and start as another add,
+  also puts a warning on the card. Read it before you approve.
+- **The reply** gives iCloud's answer and an *Undo* button, good for 7 days. Undo deletes
+  only that event, once. If someone changed the event since, Undo refuses and leaves it.
+
+If iCloud's answer is lost, or it has a server error, the event may or may not be there.
+The reply says so and asks you to check the calendar, and it doesn't retry. A failed write,
+a rejected password or a calendar whose name isn't Family is said in the thread, and stays
+in `/status` and the digest until a write succeeds. `/stop` blocks adds and undos; after
+`/resume`, send the event again.
+
+**Checking each add.** The app counts events added and days since the first. At 10 adds
+and 14 days, whichever is later, with no undo and no failed or unknown write, it reads the
+calendar and sends one card with the record: approved, declined, expired, cancelled, refused,
+undone, failed and unknown, how many were shown with a warning, and how many of those events
+are no longer on the calendar. It asks whether any were wrong and whether the family got
+alerts. If it can't complete that read, it says so and offers nothing until it can. An undo,
+a failed write, or a change of policy or model restarts the count; declines and missing
+events don't.
+
+The card lasts 3 days. If you ignore it, it asks again at most once a week. When you tap
+it, the app reads the record again first. If anything changed, or the read can't complete,
+nothing changes: you get a fresh card, or a message saying why.
+
+If you tap the button to stop checking, adds go straight in without the Approve tap, up to
+5 a day. Anything with a warning still gets a card, and so does any add at a start time
+another add already has, or from a message over 200 characters or with several lines, since
+that may be pasted text. You still get the receipt and the Undo,
+`/stop` still works, and `/status` and every digest say adds are skipping the tap. Nothing
+else changes.
+
+**Going back.** `/checkadds` brings the tap back at once. It also comes back by itself, and
+the thread says why, after an undo, a failed or unknown write, an add iCloud gave no version
+tag for (so no Undo), a change to the calendar address, Apple ID or password, or a change of
+policy or model. An add already queued when the tap comes back isn't written, and the thread
+says so. Going without it again takes a fresh full count. *Reset* on the add-on page ends all of this, along with the keys and
+the pairing.
+
+Whether an added event alerts other family members isn't known yet.
+
 ## Links from instrument cards
 
 A card can carry a link that opens this chat with the card's title, so you can say
@@ -169,8 +241,8 @@ and deletes the ledger.
 
 ## Backups
 
-Backups include `/data` (the ledger, the keys, the calendar addresses and the
-last Family push). The add-on stops briefly during a
+Backups include `/data` (the ledger, the keys, the app-specific password, the calendar
+addresses and the last Family push). The add-on stops briefly during a
 backup so the database is copied whole. After a restore, anything sent after the
 backup was taken is gone; if the gap is longer than a day, the thread says
 continuity is unknown.
@@ -180,8 +252,10 @@ continuity is unknown.
 - Read or change anything in Home Assistant (no Home Assistant or Supervisor API).
   The Family calendar comes the other way: Home Assistant pushes it in, and the
   listener answers with a status code only.
-- Change your calendar. It reads calendars only, by GET, from calendar.google.com.
-- Talk to any host but Telegram, Anthropic, OpenAI and calendar.google.com.
+- Change a calendar, with one exception: adding an event to iCloud Family, and undoing
+  that add, as above. Google calendars are read only, by GET, from calendar.google.com.
+- Talk to any host but Telegram, Anthropic, OpenAI, calendar.google.com and the iCloud
+  host in the Family calendar address you entered.
 - Listen to anyone but the paired account, in its private chat. Messages from
   anyone else are dropped and their text is never stored.
 - Keep messages that carry rights-protected document markers. (Screening by work

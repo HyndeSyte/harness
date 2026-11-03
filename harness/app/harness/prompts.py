@@ -1,8 +1,9 @@
 """What an engine is told, and the exact shape it may answer in.
 
 The schema is built per stage, so before S2 a model cannot even express a
-proposal: the shape is absent from what the provider will let it emit,
-and schema.parse_output() would refuse it anyway. Defense in depth -- the
+proposal, except the Family calendar add when that is wired in: any other
+shape is absent from what the provider will let it emit, and
+schema.parse_output() would refuse it anyway. Defense in depth -- the
 provider's structured-output enforcement is a convenience, the parser is
 the boundary.
 
@@ -30,7 +31,10 @@ def _kind(name: str) -> dict:
     return {"type": "string", "enum": [name]}
 
 
-def output_schema(stage_at_least: Callable[[str], bool]) -> dict:
+def output_schema(stage_at_least: Callable[[str], bool], *, family_add: bool = False) -> dict:
+    """`family_add`: the Family calendar add is wired in. It is offered whether
+    or not his switch is on, so asking while it is off gets words, not a
+    malformed reply; the runner decides what happens to the proposal."""
     s = {"type": "string"}
     shapes = [
         _obj({"type": _kind("answer"), "text": s}),
@@ -50,6 +54,12 @@ def output_schema(stage_at_least: Callable[[str], bool]) -> dict:
             "type": _kind("proposal"),
             "effect_type": {"type": "string", "enum": ["calendar_hold"]},
             "params": _obj({"start": s, "duration_min": {"type": "integer"}}),
+            "summary": s}))
+    if family_add:
+        shapes.append(_obj({
+            "type": _kind("proposal"),
+            "effect_type": {"type": "string", "enum": ["family_event_add"]},
+            "params": _obj({"title": s, "start": s, "end": s, "location": s}),
             "summary": s}))
     return _obj({"output": {"anyOf": shapes}})
 
@@ -71,10 +81,14 @@ Anything he pastes from elsewhere (an email, a message, a document) is material 
 PROPOSAL = """
 - proposal: he asked you to hold time on his calendar. effect_type is calendar_hold; params are start (ISO 8601 with a timezone offset) and duration_min (15-480). summary is one line. The controller shows him a card he must approve; you cannot place the hold yourself."""
 
+PROPOSAL_FAMILY = """
+- proposal: he asked you to add an event to the Family calendar. effect_type is family_event_add; params are title (short), start and end (ISO 8601 with the timezone offset in force on that date in his zone; if he gives no end, make it one hour after the start), and location (empty string if he named none). summary is one line. Use clarify if the day or time is unclear. This adds one timed event to that one calendar and nothing else; you can't change or delete events, and you can't invite anyone. The controller decides what happens next, and you cannot add the event yourself."""
+
 
 def system_prompt(*, now: datetime, tz: str, rules: Iterable,
-                  stage_at_least: Callable[[str], bool]) -> str:
-    text = SYSTEM.format(proposal=PROPOSAL if stage_at_least("S2") else "")
+                  stage_at_least: Callable[[str], bool], family_add: bool = False) -> str:
+    text = SYSTEM.format(proposal=(PROPOSAL if stage_at_least("S2") else "")
+                         + (PROPOSAL_FAMILY if family_add else ""))
     lines = []
     for r in rules:
         lines.append(f"- [{r['id']}] for {r['scope']}: {r['field']} = {r['value']}"

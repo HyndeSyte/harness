@@ -30,6 +30,10 @@ TELEGRAM_LIMIT = 4096
 _SCHEME = re.compile(r"(?i)\b(?:https?|ftp|tg)://([^\s/<>\"'?#]+)([^\s<>\"']*)")
 _BARE = re.compile(r"(?<![\w.\[])((?:[^\W_][\w-]*\.)+[^\W\d_]{2,})\b(/[^\s<>\"']*)?")
 _IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_WIDE_DOTS = re.compile("[。．｡]")
+_HOST_SHAPED = re.compile(r"(?i)\bmailto:|\bwww\.\S|\bxn--"
+                          r"|[\w.+-]+@[^\W_][\w-]*\.[^\W\d_]{2,}"
+                          r"|(?:[^\W_][\w-]*\.)+[^\W\d_]{2,}(?::\d|\?\S)")
 _COMMAND = re.compile(r"(?<![\w/])/([A-Za-z0-9_]{1,32})")
 _MENTION = re.compile(r"(?<![\w@])@([A-Za-z0-9_]{3,32})")
 WORD_JOINER = "\u2060"     # invisible; breaks Telegram's command and mention detection
@@ -161,10 +165,90 @@ def _when(start_iso: str, minutes: int, tz: str) -> str:
     return f"{day}, {begin}–{endt} {zone} ({minutes} min)"
 
 
+def _clock(dt: datetime) -> str:
+    return f"{dt.hour % 12 or 12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+
+
+def _day(dt: datetime) -> str:
+    return f"{dt:%a %b} {dt.day}, {dt.year}"
+
+
+def family_when(start_iso: str, end_iso: str, tz: str) -> str:
+    """In his local zone, with the weekday and the date, however the model
+    wrote the offset: a wrong offset shows as a wrong time, in time to decline."""
+    local = ZoneInfo(tz)
+    s = datetime.fromisoformat(start_iso).astimezone(local)
+    e = datetime.fromisoformat(end_iso).astimezone(local)
+    if s.date() != e.date():
+        return f"{_day(s)}, {_clock(s)} {s:%Z} to {_day(e)}, {_clock(e)} {e:%Z}"
+    zone = f"{e:%Z}" if s.utcoffset() == e.utcoffset() else f"{s:%Z} to {e:%Z}"
+    return f"{_day(s)}, {_clock(s)} to {_clock(e)} {zone}"
+
+
+# A bare word.word is a link only with a suffix like these: Dr.Smith is a name.
+LINK_SUFFIXES = frozenset("""
+    com net org edu gov mil int info biz name pro mobi app dev ai io co me tv cc ws fm am gg ly gl
+    to sh so xyz online site website shop store link click top club live life world news blog
+    cloud page zip mov tech art fun icu vip win work bid loan
+    uk us ca au nz ie de fr es it nl be at ch se no dk fi pl pt cz gr hu ro ru ua tr il in cn jp
+    kr tw hk sg id my th vn ph br mx ar cl eu su рф
+    example test
+""".split())
+
+
+def _plain_dots(text: str) -> str:
+    return _WIDE_DOTS.sub(".", text)
+
+
+def has_link(text: str) -> bool:
+    """A scheme URL, an IP address, a host with a path, port, query or mailbox, www.,
+    or a known suffix."""
+    text = _plain_dots(text)
+    if _SCHEME.search(text) or _IPV4.search(text) or _HOST_SHAPED.search(text):
+        return True
+    return any(m.group(2) or m.group(1).rsplit(".", 1)[-1].casefold() in LINK_SUFFIXES
+               for m in _BARE.finditer(text))
+
+
+def maybe_host(text: str) -> bool:
+    """Any bare word.word. Dr.Smith is a name and evil.lol is not, and the suffix list
+    can't tell them all apart, so his eyes do: this always gets a card."""
+    return _BARE.search(_plain_dots(text)) is not None
+
+
+def family_text(text: str) -> str:
+    """Exact text, escaped, with /commands and @mentions made inert by a joiner he
+    can't see. Text with a link never gets here: family_add refuses it first."""
+    text = _COMMAND.sub(lambda m: "/" + WORD_JOINER + m.group(1), text)
+    return escape(_MENTION.sub(lambda m: "@" + WORD_JOINER + m.group(1), text))
+
+
+def family_event_text(params: dict, tz: str) -> str:
+    """The event, from canonical params. Title and location are model text."""
+    lines = [family_text(params["title"]), escape(family_when(params["start"], params["end"], tz))]
+    if params.get("location"):
+        lines.append("Where: " + family_text(params["location"]))
+    return "\n".join(lines)
+
+
+def family_card(params: dict, *, tz: str, expires: datetime, job_id: str,
+                warnings=()) -> str:
+    exp = expires.astimezone(ZoneInfo(tz))
+    check = [f"\u26a0 <b>Check before approving:</b> {escape(w)}" for w in warnings]
+    return fit("\n".join([
+        "<b>Add to the Family calendar?</b>",
+        family_event_text(params, tz),
+        *check,
+        "Family calendar only. No invitees, no alarm, no repeat.",
+        f"<i>Offer ends {_day(exp)}, {_clock(exp)} · job {short(job_id)}</i>"]))
+
+
 def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime,
-                  job_id: str) -> str:
+                  job_id: str, warnings=()) -> str:
     """Rendered from canonical params and the definition. The model's own
     summary is not used here on purpose."""
+    if effect.name == "family_event_add":
+        return family_card(params, tz=tz, expires=expires, job_id=job_id, warnings=warnings)
     if effect.name == "calendar_hold":
         lines = [
             "<b>Hold on your harness calendar</b>",

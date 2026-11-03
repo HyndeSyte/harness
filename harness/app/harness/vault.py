@@ -31,26 +31,34 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import calendar_feed, workmirror
+from . import caldav, calendar_feed, workmirror
 
 # work_mirror: his work address, hours and rules for the work-hours mirror
 # (workmirror.parse_settings). Not a key, but it names his employer's address
 # and his family's events, so it is kept, shown and changed like one: entered
 # once here, never in the repository or in add-on options.
+# family_*: what the one calendar write needs (caldav.py). The address is
+# checked strictly, because the password is sent wherever it points.
 FIELDS = ("telegram_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
-          "work_mirror")
+          "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url")
+FAMILY_FIELDS = ("family_apple_id", "family_app_password", "family_calendar_url")
 TEXT_FIELDS = ("work_mirror",)          # several lines; a textarea on the page
 LABELS = {"telegram_bot_token": "Telegram bot token",
           "anthropic_api_key": "Anthropic API key",
           "openai_api_key": "OpenAI API key",
           "calendar_feeds": "calendar addresses (secret iCal, space between several)",
-          "work_mirror": "work mirror settings (work: address, days:, hours:, family: ...)"}
+          "work_mirror": "work mirror settings (work: address, days:, hours:, family: ...)",
+          "family_apple_id": "Family calendar: Apple ID",
+          "family_app_password": "Family calendar: app-specific password",
+          "family_calendar_url": "Family calendar: iCloud calendar address"}
 # Formats are checked loosely: enough to catch a paste of the wrong thing
 # (a URL, a sentence, a key in the wrong box), not a claim about validity.
 PATTERNS = {
     "telegram_bot_token": re.compile(r"\d{5,15}:[A-Za-z0-9_-]{30,64}"),
     "anthropic_api_key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,200}"),
     "openai_api_key": re.compile(r"sk-[A-Za-z0-9_-]{20,250}"),
+    "family_apple_id": re.compile(r"[^\s@:]{1,100}@[^\s@:]{1,100}\.[^\s@:]{2,30}"),
+    "family_app_password": re.compile(r"[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}"),
 }
 PAIRING_TTL_S = 15 * 60
 PAIRING_MAX_FAILURES = 10
@@ -119,6 +127,12 @@ class Vault:
             keys = self._load().get("keys", {})
         return {f: (keys.get(f) or {}).get("set_at") for f in FIELDS}
 
+    def family_stamp(self) -> str:
+        """When the Family calendar credentials were last set. No secret in it:
+        it changes when they change, which ends any authority earned on them."""
+        status = self.key_status()
+        return json.dumps([status[f] for f in FAMILY_FIELDS])
+
     @staticmethod
     def check_format(field: str, value: str) -> str:
         if field not in FIELDS:
@@ -136,6 +150,11 @@ class Vault:
                 return workmirror.settings_text(workmirror.parse_settings(v))
             except workmirror.MirrorConfigError as e:
                 raise VaultError(f"work mirror settings: {e}") from None
+        if field == "family_calendar_url":
+            try:
+                return caldav.check_url(v)
+            except ValueError as e:
+                raise VaultError(str(e)) from None
         if not PATTERNS[field].fullmatch(v):
             raise VaultError(f"that doesn't look like a {LABELS[field]}")
         return v

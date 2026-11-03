@@ -1,7 +1,7 @@
 """Button taps. Two kinds, two prefixes, two tables -- never confused.
 
   a:/d:<nonce>  approve or decline a proposed effect (approvals.py)
-  c:<nonce>     a choice that changes nothing in the world (choices.py)
+  c:<nonce>     a choice (choices.py); only a Family calendar Undo reaches the world
 
 Every tap is answered (his client shows a spinner until it is). A tap
 that fails a binding check gets a short reason and changes nothing. A tap
@@ -33,12 +33,13 @@ REFUSALS = {
 
 class Callbacks:
     def __init__(self, ledger: Ledger, api, *, owner_user_id: int, policy_version: str,
-                 settings_fn: Callable[[str, str], str] | None = None):
+                 settings_fn: Callable[[str, str], str] | None = None, family_add=None):
         self.ledger = ledger
         self.api = api
         self.owner = owner_user_id
         self.policy_version = policy_version
         self.settings_fn = settings_fn     # (change_id, "approve"|"decline") -> message
+        self.family_add = family_add       # family_add.FamilyAdd, or None
 
     def handle(self, inc) -> str:
         """Returns what happened, for tests and the event log."""
@@ -78,6 +79,8 @@ class Callbacks:
         if kind in ("settings_approve", "settings_decline") and self.settings_fn:
             return render.escape(self.settings_fn(
                 target, "approve" if kind == "settings_approve" else "decline"))
+        if kind.startswith("family_add_") and self.family_add is not None:
+            return self.family_add.on_choice(kind, target)   # plain text, no model words
         return "Nothing changed."
 
     def _answer(self, inc, text: str | None) -> None:

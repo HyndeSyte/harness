@@ -8,19 +8,28 @@ touch, whether a second model must review it, how to undo it, and what
 happens if the remote call succeeded but the Pi died before recording
 it -- is fixed here, in code, and versioned with the policy.
 
-v1.4 staging: S0 and S1 have no live effects. The first, a private hold
-on the calendar the harness itself created, unlocks at S2.
+v1.4 staging: S0 has no live effects. A private hold on the calendar the
+harness itself created unlocks at S2. The one exception is family_event_add,
+registered at S1 behind a switch of its own (family_add.py): it stays off
+until his tap, and it does not move the stage.
 """
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
+FAMILY_ADD = "family_event_add"
+
 
 class ParamError(ValueError):
     pass
+
+
+class PlainRefusal(ParamError):
+    """A refusal he should hear in plain words, not as a malformed reply."""
 
 
 @dataclass(frozen=True)
@@ -119,6 +128,65 @@ def _mirror_shape(p: dict) -> str | None:
     return None
 
 
+# Letters by category but drawn as nothing, and the object placeholder.
+_BLANK_LOOKING = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0,
+                            0x1D159, 0xFFFC})
+_ZWJ, _ZWNJ, _VS16 = "\u200d", "\u200c", "\ufe0f"
+_YEARS = (2000, 2100)    # far enough for any real event, and safe to convert between zones
+
+
+def _joiner_fits(value: str, i: int) -> bool:
+    """The two joiners real text uses: U+200D between emoji, U+200C between
+    letters of Arabic script (Persian needs it). Anywhere else they are hidden."""
+    before = value[:i].rstrip(_VS16)[-1:]
+    after = value[i + 1:i + 2]
+    if not before or not after:
+        return False
+    if value[i] == _ZWJ:
+        return unicodedata.category(before) in ("So", "Sk") and unicodedata.category(after) == "So"
+    return 0x0600 <= ord(before) <= 0x06FF and 0x0600 <= ord(after) <= 0x06FF
+
+
+def _plain_text(value: str) -> bool:
+    """No control, format, line-separator, private-use or unassigned characters,
+    nothing unpaired and nothing invisible: nothing that could start a new calendar
+    property, fake a line on a card, or make a card read differently from what is
+    written."""
+    for i, c in enumerate(value):
+        if c in (_ZWJ, _ZWNJ):
+            if not _joiner_fits(value, i):
+                return False
+        elif unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp", "Cn", "Co") \
+                or ord(c) in _BLANK_LOOKING:
+            return False
+    return True
+
+
+def _visible(value: str) -> bool:
+    """At least one letter, digit or symbol. _plain_text has refused the blank-looking ones."""
+    return any(unicodedata.category(c)[0] in "LNS" for c in value)
+
+
+def _family_shape(p: dict) -> str | None:
+    title, location = p["title"], p.get("location", "")
+    if not _plain_text(title) or not _plain_text(location):
+        raise PlainRefusal("the title or location has an invisible or special character "
+                           "I can't show you exactly on a card")
+    if not _visible(title):
+        raise PlainRefusal("the title is blank")
+    if location.strip() and not _visible(location):
+        raise PlainRefusal("the location is blank")
+    start, end = datetime.fromisoformat(p["start"]), datetime.fromisoformat(p["end"])
+    for dt in (start, end):
+        if not _YEARS[0] <= dt.year <= _YEARS[1]:
+            raise PlainRefusal(f"the year has to be between {_YEARS[0]} and {_YEARS[1]}")
+        if dt.second or dt.microsecond:
+            raise PlainRefusal("the times have to be whole minutes")  # the card shows no seconds
+    if end <= start:
+        raise PlainRefusal("the end has to be after the start")
+    return None
+
+
 def _future(params: dict) -> str | None:
     # Evaluated by the executor against its own clock at execution time.
     return None
@@ -184,6 +252,30 @@ REGISTRY: dict[str, EffectDef] = {
                      "patch it back to confirmed with these fields, never 'already done'"),
         origin="controller",
         shape=_mirror_shape,
+    ),
+    # One event on iCloud Family (family_add.py, caldav.py). A model may propose
+    # it; the title, times and location are all it can say. Being registered
+    # at S1 lets it be proposed, not done: it also needs his own switch on, and
+    # a tap on its card until he has said otherwise after the bake-in.
+    FAMILY_ADD: EffectDef(
+        name=FAMILY_ADD,
+        min_stage="S1",
+        reversible=True,
+        ttl_s=12 * 3600,
+        reviewer_required=False,
+        params={
+            "title": Param("str", max_len=200),
+            "start": Param("datetime"),
+            "end": Param("datetime"),
+            "location": Param("str", required=False, max_len=200),
+        },
+        fixed={"calendar": "Family", "marker": "X-HARNESS-OWNED", "attendees": (),
+               "organizer": None, "alarms": (), "recurrence": ()},
+        undo="delete that event, once, if its ETag is still the one the harness wrote",
+        idempotency=("uid derived from the effect id and PUT with If-None-Match: *, so a "
+                     "repeat is refused by the server and can't be a second event; "
+                     "a lost response is reported as unknown and never retried"),
+        shape=_family_shape,
     ),
 }
 

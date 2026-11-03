@@ -11,8 +11,10 @@ standard library.
 
 ## Invariants
 
-Each invariant has tests. The security checks are also mutation-tested: every
-check is broken on purpose, one at a time, and the suite must fail.
+Each invariant has tests. Security checks are also mutation-tested when they are
+written: a check is broken on purpose in a scratch copy and a test must fail. That is
+done by hand, not on every run, and the script is not in this repository, so it is
+evidence about the release it was run on, not a standing guarantee. For the Family calendar add in 0.5.0, the last full pass ran 248 breaks: 236 were caught and 2 more were caught by a failing test fixture. 7 survived, got tests, and were caught on a rerun. The other 3 survivors changed nothing a test could see: 1 was redundant code, now removed, and 2 are noted as equivalent. A run that fails to import counts as not applied, never as caught.
 
 | # | Invariant | Where |
 |---|---|---|
@@ -20,7 +22,7 @@ check is broken on purpose, one at a time, and the suite must fail.
 | 2 | The Telegram offset advances only in the same transaction that records the updates it confirms. Ids are scoped by the bot's id: a new token starts a new offset instead of confirming the new bot's updates away. After six quiet days the poll asks for the earliest update, because Telegram re-randomizes ids after a week. | `ledger.ingest`, `telegram.poll_once`, `controller` |
 | 3 | A tap approves exactly one card, once. It must come from his account and chat, on that exact message, unexpired, with the same parameter hash and policy version. The approval is consumed before any remote call. | `approvals` |
 | 4 | Choices (undo a rule, pick a side in a conflict, confirm a settings change) are bound the same way, in their own table and with their own prefix. One tap per card. | `choices` |
-| 5 | Effects are default-deny and staged. Before S2 the model can't even express a proposal, because the shape is not in its schema. | `effects`, `prompts`, `schema` |
+| 5 | Effects are default-deny and staged. Before S2 the model can't even express a proposal, because the shape is not in its schema. The one exception is `family_event_add`, which has its own switch (invariant 24). | `effects`, `prompts`, `schema` |
 | 6 | Model output has a closed set of shapes, and anything else fails closed. The provider's structured output is a convenience; the parser is the boundary. | `schema.parse_output` |
 | 7 | The controller decides every character he can tap. Model text is escaped. Its links (any host, IP or `tg://`), bare domains and IPs are defanged, and its `/commands` and `@mentions` are made inert. Messages never exceed Telegram's limit or break its markup. | `render` |
 | 8 | Every job ends in a receipt, and the reply that reports it is written in the same transaction. A Telegram outage delays a reply but never loses it, and a late reply says when it was written. | `ledger`, `runner`, `outbox` |
@@ -33,11 +35,22 @@ check is broken on purpose, one at a time, and the suite must fail.
 | 15 | The settings page answers only Home Assistant's Ingress proxy, for a logged-in user. The first user to save becomes its only editor. It never shows a key back. | `setup_web` |
 | 16 | Secrets never reach a log line, an error message or a URL he sees. The Supervisor token is removed from the process environment at start. | `net`, `__main__` |
 | 17 | Work content is stopped at the door, before it is stored or sent to a model. This is defense in depth, not a guarantee. | `ingress_filter` |
-| 18 | Calendars are read, never written: a GET of a Google secret iCal address, and nothing else is accepted as an address. The address is a secret like a key. | `calendar_feed`, `vault` |
+| 18 | Google calendars are read, never written: a GET of a Google secret iCal address, and nothing else is accepted as an address. The address is a secret like a key. The app writes to one calendar only, iCloud Family, and only as invariants 23 to 33 say. | `calendar_feed`, `vault` |
 | 19 | An unread calendar is never an empty day. Each calendar is its own input; one that wasn't read today is named, and events whose repeat pattern isn't understood are counted, not dropped. | `calendar_feed`, `ical`, `digest` |
 | 20 | A link from an instrument card opens a conversation and nothing else. Its title is decoded strictly, cleaned and escaped; it never starts an action or reaches a model by itself. | `deeplink`, `commands` |
 | 21 | The Family calendar arrives only as a push from Home Assistant, on its own internal port, never by asking Home Assistant. A push must come from Home Assistant's address, carry the pinned key, match schema 1 exactly, be recent and newer than the last. It is stored and listed, nothing more: Family events never mark an overlap, and the digest is never Clear while Family is missing. | `family`, `daily` |
 | 22 | The work-hours mirror is decided by plain code from his settings, never by a model; a model naming its write gets "unknown effect". A tap approves one exact manifest (recipient, visibility, destination, hours and every block). The write is a private copy on the harness's own calendar, titled "Busy" unless he opts in to titles, with only his work address as guest; his own events are never edited. Only his primary calendar counts unless he names others. A partial read never deletes a copy or adds a Family block. A card is bound to its exact operations, not the time it was read. | `workmirror`, `effects` |
+| 23 | `family_event_add` is the only write to a family calendar. A model supplies a title, a start, an end and an optional location, and nothing else. Calendar, marker, and the absence of attendees, organizer, alarm and repeat are fixed in code. Times need a zone and are whole minutes in a bounded range, the end is after the start, and title and location are capped and refuse control, format, line-separator, private-use, unassigned and invisible characters, except a joiner inside emoji or Arabic script. A title needs a visible letter, digit or symbol. These are refused in plain words. | `effects`, `caldav` |
+| 24 | It has its own setting, off by default, turned on only by his tap on a bound card. It doesn't move the stage, and `calendar_hold` and `work_mirror_copy` stay locked. A proposal while it is off fails closed, in words, and no proposal is recorded. A reset turns it off, consumes every open button and Approve card for it, and starts a record that doesn't reach back across the reset. | `family_add`, `runner` |
+| 25 | An add goes through `approvals`: bound to its exact parameters, expiring, consumed before the remote call, and checked again just before it. The card is plain code, in his local zone with the weekday and date, and it shows exactly what is written: a link is refused, where a bare word.word is a link only with a known web suffix, and any other word.word gets a warning. An event over 24 hours or over a year ahead is refused in words, here and at execution. A UTC offset that isn't his zone's at that instant, or a suspected duplicate, puts a warning on the card. An event now in the past is refused at execution. The proposal and its card are written in one transaction. | `approvals`, `render`, `family_add` |
+| 26 | Before every write the server's display name for the saved address must be exactly Family. A create is a PUT with If-None-Match, on a uid derived from the effect id, so a repeat can't be a second event. Events are read by GET on their path; no REPORT is ever sent, because real iCloud answers 412 to a UID filter. | `caldav` |
+| 27 | Outcomes come only from the server's response. A lost response or a 5xx to a write is unknown, and the thread says so and says to check the calendar. Nothing is retried. A write is recorded as sending before the request, so a restart in between fails loudly as unknown. | `caldav`, `family_add` |
+| 28 | Undo deletes only that event, once, with If-Match, and refuses if its ETag changed since the harness wrote it or it now has attendees or a repeat. A lost answer to the delete is unknown. | `caldav`, `family_add` |
+| 29 | The Apple ID, app-specific password and calendar address are entered on the settings page, kept in the vault, never shown again, and changed only by his tap after pairing. They never reach a log, an error, the ledger, the thread or a model. The address must be https on `p<digits>-caldav.icloud.com`. | `vault`, `caldav` |
+| 30 | The CalDAV transport reaches only the host in the saved address, by https, with four methods. It refuses redirects and ignores proxies. | `net` |
+| 31 | Plain code counts receipted adds and the days since the first. At 10 adds and 14 days, whichever is later, with no undo and no failed or unknown write, one bound card brings him the whole record: approved, declined, expired, cancelled, refused, undone, failed, unknown and warned, and how many counted events a read finds missing. If that read can't complete, the card isn't offered. An undo or a failed write restarts the count, and the count's id is random so no old card can match it. The card lasts 3 days and asks again at most once a week. His tap re-reads the record, and if it differs or can't be read, nothing loosens. Only his tap loosens: adds then skip the Approve tap and keep the receipt, the Undo and `/stop`. Any warning, more than 5 tapless adds in a local day, another add at the same start, or a message over 200 characters or with several lines goes back to a card. Nothing else loosens. |
+| 33 | The count and skipping the tap hold only for the policy, the model and the credentials they were earned on. `/checkadds`, an undo, a failed or unknown write, a tapless add with no Undo, a change to any of those, or a reset brings the tap back at once, says why, and needs a fresh full count to ask again. A tapless add is checked again just before its write and refused in words if the tap has come back. `/status` and every digest, Clear included, say when adds skip the tap. | `family_add`, `commands`, `daily` | `family_add` |
+| 32 | A failed write, a rejected password or a name mismatch shows in the thread, and in `/status` and the digest until a write succeeds. `/stop` blocks adds and undos, including one approved in the same batch. No write waits behind a `/stop`. | `family_add`, `controller` |
 
 ## Run the tests
 
@@ -45,6 +58,7 @@ check is broken on purpose, one at a time, and the suite must fail.
 
 ## Status
 
-Stage S1: zero effects; read-only calendars (Google, and iCloud Family pushed in by
-Home Assistant) in the morning digest. See
-`harness/CHANGELOG.md`.
+Stage S1: read-only calendars (Google, and iCloud Family pushed in by Home Assistant)
+in the morning digest. From 0.5.0 the app can write to one calendar: it can add an
+event to iCloud Family, and undo that add. That is off until he turns it on with a tap,
+and every other effect stays locked. See `harness/CHANGELOG.md`.

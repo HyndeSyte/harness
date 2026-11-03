@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .canonical import canonical_hash, canonical_json
-from .ledger import Ledger, iso
+from .ledger import Ledger, _null, iso
 
 ACTIONS = {"a": "approve", "d": "decline"}
 _PREFIX = {v: k for k, v in ACTIONS.items()}
@@ -68,18 +68,19 @@ def create_proposal(ledger: Ledger, *, job_id: str, effect_type: str, params: di
     return pid
 
 
-def mint(ledger: Ledger, *, proposal_id: str, owner_user_id: int, ttl_s: int) -> str:
+def mint(ledger: Ledger, *, proposal_id: str, owner_user_id: int, ttl_s: int, db=None) -> str:
     """A fresh nonce bound to one proposal. Its message id is bound after
     the card is sent (bind_message); until then no tap can match it."""
-    row = ledger.db.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+    row = (db or ledger.db).execute("SELECT * FROM proposals WHERE id=?",
+                                    (proposal_id,)).fetchone()
     if row is None or row["state"] != "proposed":
         raise ValueError("no open proposal to approve")
     nonce = secrets.token_urlsafe(18)                     # 24 chars
     now = ledger.now()
     expires = min(now + timedelta(seconds=ttl_s),
                   datetime.fromisoformat(row["expires_at"]))
-    with ledger.tx() as db:
-        db.execute(
+    with (ledger.tx() if db is None else _null(db)) as d:
+        d.execute(
             "INSERT INTO approvals(nonce, proposal_id, owner_user_id, chat_id, message_id,"
             " params_hash, policy_version, created_at, expires_at)"
             " VALUES(?,?,?,?,?,?,?,?,?)",

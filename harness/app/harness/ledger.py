@@ -183,6 +183,17 @@ CREATE TABLE IF NOT EXISTS mirror_shadow(
   label TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS family_adds(
+  proposal_id TEXT PRIMARY KEY REFERENCES proposals(id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  uid TEXT NOT NULL,
+  state TEXT NOT NULL,
+  http_status INTEGER,
+  etag TEXT,
+  undo_state TEXT NOT NULL DEFAULT 'none',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 # Job states and the only transitions allowed between them. Anything else

@@ -1,9 +1,12 @@
 """HTTPS for the controller: one small transport, secrets kept out of logs.
 
-The controller talks to exactly four hosts -- Telegram, Anthropic,
-OpenAI and (S1, read-only) calendar.google.com -- with the standard
+The controller talks to exactly four fixed hosts -- Telegram, Anthropic,
+OpenAI and (S1, read-only) calendar.google.com -- and one configured host,
+the iCloud calendar host in the Family calendar address, with the standard
 library only, so the add-on has no
-third-party dependencies to pin, audit or break on update.
+third-party dependencies to pin, audit or break on update. The iCloud host
+is enforced here, request by request, by CalDavTransport, which also refuses
+redirects: it is the only transport that carries a family password.
 
 The Telegram bot token travels in the URL path, which is where secrets
 leak: an exception message, a traceback, a log line. So nothing here ever
@@ -21,7 +24,8 @@ import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+from urllib.parse import urlsplit
 
 
 class Redactor:
@@ -91,17 +95,25 @@ class Transport(Protocol):
                 json_body: Any = None, timeout: float = 30) -> HttpResponse: ...
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None                     # the 3xx comes back as an answer, not a new request
+
+
 class UrllibTransport:
-    def __init__(self, *, use_env_proxy: bool = True, cafile: str | None = None):
+    def __init__(self, *, use_env_proxy: bool = True, cafile: str | None = None,
+                 follow_redirects: bool = True):
         handlers: list = []
         if not use_env_proxy:
             handlers.append(urllib.request.ProxyHandler({}))
+        if not follow_redirects:
+            handlers.append(_NoRedirect())
         ctx = ssl.create_default_context(cafile=cafile)
         handlers.append(urllib.request.HTTPSHandler(context=ctx))
         self._opener = urllib.request.build_opener(*handlers)
 
-    def request(self, method, url, *, headers=None, json_body=None, timeout=30):
-        data = None
+    def request(self, method, url, *, headers=None, json_body=None, body=None, timeout=30):
+        data = body
         hdrs = dict(headers or {})
         if json_body is not None:
             data = json.dumps(json_body).encode("utf-8")
@@ -133,3 +145,26 @@ class UrllibTransport:
                                  if not isinstance(reason, str) else "unreachable") from None
         except (ConnectionError, OSError) as e:
             raise TransportError("network", type(e).__name__) from None
+
+
+class CalDavTransport(UrllibTransport):
+    """Https to the one configured iCloud host, four methods, no redirects and
+    no proxy. Anything else never leaves: kind "blocked" means nothing was sent."""
+
+    METHODS = frozenset({"PROPFIND", "GET", "PUT", "DELETE"})
+
+    def __init__(self, allowed_host: Callable[[], str], *, cafile: str | None = None):
+        super().__init__(use_env_proxy=False, cafile=cafile, follow_redirects=False)
+        self.allowed_host = allowed_host
+
+    def request(self, method, url, *, headers=None, json_body=None, body=None, timeout=20):
+        try:
+            parts = urlsplit(url)
+            plain_host = parts.username is None and parts.port is None
+        except ValueError:
+            raise TransportError("blocked") from None
+        host = self.allowed_host()
+        if (method not in self.METHODS or parts.scheme != "https" or not plain_host
+                or not host or parts.hostname != host or json_body is not None):
+            raise TransportError("blocked")
+        return super().request(method, url, headers=headers, body=body, timeout=timeout)

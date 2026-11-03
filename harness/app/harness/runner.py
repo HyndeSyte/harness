@@ -24,7 +24,7 @@ from concurrent.futures import Executor, Future
 from datetime import datetime, timedelta
 from typing import Callable
 
-from . import approvals, choices, policy, prompts, render, rules, schema
+from . import approvals, choices, effects, policy, prompts, render, rules, schema
 from .config import Config
 from .engines import CallOutcome, Engine, EngineError, EngineResult, call_with_retries
 from .ledger import Ledger, iso
@@ -68,7 +68,8 @@ class Runner:
     def __init__(self, ledger: Ledger, config: Config, engines: dict[str, Engine],
                  executor: Executor, *, sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
-                 budgets_ok: Callable[[str], bool] | None = None):
+                 budgets_ok: Callable[[str], bool] | None = None, family_add=None):
+        self.family_add = family_add       # family_add.FamilyAdd, or None
         self.ledger = ledger
         self.config = config
         self.engines = engines
@@ -126,10 +127,12 @@ class Runner:
             return False
         now = self.ledger.now()
         fired = rules.active_for_message(self.ledger, policy.MAX_RULES_PER_CALL)
+        family = self.family_add is not None
         system = prompts.system_prompt(now=now, tz=self.config.timezone, rules=fired,
-                                       stage_at_least=self.config.stage_at_least)
+                                       stage_at_least=self.config.stage_at_least,
+                                       family_add=family)
         user = prompts.user_content(text, earlier=self._earlier(job))
-        out_schema = prompts.output_schema(self.config.stage_at_least)
+        out_schema = prompts.output_schema(self.config.stage_at_least, family_add=family)
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "running", db=db)
             self.ledger.job_set(job["id"], db=db, engine=engine_name, started_at=now)
@@ -207,6 +210,10 @@ class Runner:
         try:
             out = schema.parse_output(res.output, stage_at_least=self.config.stage_at_least)
         except schema.OutputError as e:
+            if self.family_add is not None and isinstance(e.__cause__, effects.PlainRefusal):
+                self.family_add.refuse_in_words(job, {"engine": engine, "model": res.model,
+                                                      "usd": round(res.usd, 5)}, str(e))
+                return
             self._fail(job, "bad_output", engine, result=res, detail=str(e)[:120])
             return
         receipt = {"engine": engine, "model": res.model, "usd": round(res.usd, 5),
@@ -271,11 +278,22 @@ class Runner:
                         binds=[{"type": "choice", "nonce": undo_n}])
 
     def _on_proposal(self, job, body, receipt, fired):
-        # Reachable only from S2: before that the schema has no proposal
-        # shape and effects.lookup refuses calendar_hold.
-        from . import effects
+        # From S2 for calendar_hold: before that the schema has no such shape
+        # and effects.lookup refuses it. family_event_add has its own switch.
         d = effects.lookup(body["effect_type"], self.config.stage_at_least)
         params = body["params"]
+        family = d.name == effects.FAMILY_ADD
+        if family:
+            if self.family_add is None:
+                self._fail(job, "family_add_not_wired", job["engine"])
+                return
+            if self.family_add.refuse(job, receipt, params):
+                return
+            warnings = self.family_add.warnings(params, message=self.ledger.job_text(job["id"]))
+        else:
+            warnings = []
+        # One transaction: the proposal and the card that tells him about it
+        # are written together, so a crash can't leave a job with no words.
         with self.ledger.tx() as db:
             pid = approvals.create_proposal(self.ledger, job_id=job["id"],
                                             effect_type=d.name, params=params,
@@ -283,15 +301,20 @@ class Runner:
                                             ttl_s=min(d.ttl_s, self.config.approval_ttl_s),
                                             db=db)
             self.ledger.transition(job["id"], "proposed", db=db)
-        nonce = approvals.mint(self.ledger, proposal_id=pid,
-                               owner_user_id=self.config.owner_user_id,
-                               ttl_s=self.config.approval_ttl_s)
-        row = self.ledger.db.execute("SELECT expires_at FROM approvals WHERE nonce=?",
-                                     (nonce,)).fetchone()
-        card = render.proposal_card(d, params, tz=self.config.timezone,
-                                    expires=datetime.fromisoformat(row["expires_at"]),
-                                    job_id=job["id"])
-        with self.ledger.tx() as db:
+            if warnings:
+                self.family_add.note_warned(pid, db)
+            if family and not warnings and self.family_add.auto_approve(pid, job["id"], db):
+                self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
+                                               "receipt": receipt}, db=db)
+                return                      # the controller writes it this tick
+            nonce = approvals.mint(self.ledger, proposal_id=pid,
+                                   owner_user_id=self.config.owner_user_id,
+                                   ttl_s=self.config.approval_ttl_s, db=db)
+            row = db.execute("SELECT expires_at FROM approvals WHERE nonce=?",
+                             (nonce,)).fetchone()
+            card = render.proposal_card(d, params, tz=self.config.timezone,
+                                        expires=datetime.fromisoformat(row["expires_at"]),
+                                        job_id=job["id"], warnings=warnings)
             self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
                                            "receipt": receipt}, db=db)
             self.ledger.enqueue(chat_id=job["chat_id"], kind="card", text=card,

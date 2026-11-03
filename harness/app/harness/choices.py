@@ -9,6 +9,10 @@ callback prefix, so a choice can never be confused with an approval.
 
 One tap per card: consuming any button on a message consumes all of its
 siblings, so "keep new" and "keep old" cannot both happen.
+
+The family_add_* kinds carry the same binding. One of them does reach the
+world: family_add_undo deletes the one event its target names, under
+family_add.py's checks, and only after the tap is consumed.
 """
 from __future__ import annotations
 
@@ -19,7 +23,8 @@ from datetime import datetime, timedelta
 from .ledger import Ledger, iso
 
 KINDS = frozenset({"rule_undo", "rule_keep_new", "rule_keep_old",
-                   "settings_approve", "settings_decline"})
+                   "settings_approve", "settings_decline", "family_add_enable",
+                   "family_add_undo", "family_add_loosen", "family_add_keep"})
 PREFIX = "c"
 
 

@@ -12,8 +12,9 @@ Each tick:
   8. send what is due from the outbox;
   9. publish a status snapshot for the settings page.
 
-Nothing in here calls a model directly and nothing in here can act on the
-world: S1 has no effects at all.
+Nothing in here calls a model directly. The only thing it can do to the world
+at S1 is the Family calendar add, which is off until his tap (family_add.py):
+it runs after the commands, so a /stop in the same batch wins.
 """
 from __future__ import annotations
 
@@ -65,7 +66,9 @@ class Controller:
                  sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
-                 poll_timeout: int = 25, calendar=None, family=None, mirror=None):
+                 poll_timeout: int = 25, calendar=None, family=None, mirror=None,
+                 family_add=None):
+        self.family_add = family_add       # the one calendar write (family_add.py), or None
         self.ledger = ledger
         self.vault = vault
         self.api = api
@@ -96,18 +99,31 @@ class Controller:
         if self.config is not None and self.config.owner_user_id == owner:
             return
         self.config = replace(self.base_config, owner_user_id=owner)
+        if self.family_add is not None:
+            self.family_add.bind(owner)
         self.runner = Runner(self.ledger, self.config, self.engines, self.executor,
                              sleep=self.sleep, monotonic=self.monotonic,
-                             budgets_ok=self._budget_ok)
+                             budgets_ok=self._budget_ok, family_add=self.family_add)
         self.canary = daily.Canary(self.ledger, self.config, self.engines, self.executor,
                                    sleep=self.sleep, monotonic=self.monotonic,
                                    budget_ok=self._budget_ok)
         self.commands = commands.Commands(self.ledger, status_fn=self.status_text,
                                           cancel_fn=self.runner.cancel_in_flight,
-                                          screen_fn=self._screen_text)
+                                          screen_fn=self._screen_text,
+                                          checkadds_fn=(self.family_add.check_adds
+                                                        if self.family_add else None))
         self.callbacks = callbacks.Callbacks(self.ledger, self.api, owner_user_id=owner,
                                              policy_version=self.config.policy_version,
-                                             settings_fn=self._settings_decision)
+                                             settings_fn=self._settings_decision,
+                                             family_add=self.family_add)
+
+    def _family_note(self) -> None:
+        """A failed write stays in /status and the digest until a write succeeds."""
+        problem = self.family_add.problem() if self.family_add is not None else ""
+        if problem:
+            self.notes["family_add"] = problem
+        else:
+            self.notes.pop("family_add", None)
 
     def _budget_ok(self, provider: str) -> bool:
         budget = self.base_config.monthly_budget_usd.get(provider)
@@ -123,6 +139,9 @@ class Controller:
         if owner is not None:
             self._bind_owner(owner)
             self.runner.reconcile_after_restart()
+            if self.family_add is not None:
+                self.family_add.reconcile_after_restart()
+        self._family_note()
         if self.vault.get("telegram_bot_token"):
             if self._telegram_health() and owner is not None:
                 self._set_commands()
@@ -213,6 +232,10 @@ class Controller:
         self.runner.start_pending(paused=commands.is_paused(self.ledger))
         self.runner.collect()
         self.runner.check_timers()
+        if self.family_add is not None:
+            self.family_add.run_pending(paused=commands.is_paused(self.ledger),
+                                        held=not self._proactive_ok())
+            self._family_note()
         self._announce_settings()
         if self.calendar is not None:
             self.calendar.maybe_start()
@@ -382,6 +405,9 @@ class Controller:
         self.vault.reset()
         if self.family is not None:
             self.family.forget()           # the pinned Home Assistant key goes too
+        if self.family_add is not None:
+            self.family_add.forget()       # off again, and the bake-in starts over
+            self._family_note()
         self.ledger.event("reset", {"by": by})
         self.config = None
         self.runner = None
@@ -407,7 +433,9 @@ class Controller:
             self.ledger.set_meta("digest_date", daily.local_date(now, cfg.timezone))
             d = daily.gather(self.ledger, cfg, paused=paused, notes=list(self.notes.values()),
                              calendar=self.calendar, family=self.family,
-                             mirror_line=self.mirror.digest_line() if self.mirror else "")
+                             mirror_line=self.mirror.digest_line() if self.mirror else "",
+                             family_add_line=(self.family_add.digest_line()
+                                              if self.family_add else ""))
             daily.deliver(self.ledger, cfg, d)
 
     # -- status ------------------------------------------------------------------------------
@@ -416,9 +444,13 @@ class Controller:
         tz = ZoneInfo(cfg.timezone)
         now = self.ledger.now()
         last = self.ledger.last_poll_success()
+        fa_on = self.family_add is not None and self.family_add.enabled()
         lines = [f"<b>Status</b> · stage {cfg.stage} · " +
-                 ("zero effects" if not cfg.stage_at_least("S2") else "calendar holds on"),
+                 ("calendar holds on" if cfg.stage_at_least("S2")
+                  else "one effect: Family calendar adds" if fa_on else "zero effects"),
                  "Stopped (/resume)" if commands.is_paused(self.ledger) else "Running"]
+        if self.family_add is not None:
+            lines.append(self.family_add.status_line())
         if last:
             lines.append(f"Telegram: last contact {int((now - last).total_seconds())}s ago")
         lines.append(f"Jobs: {len(self.ledger.jobs_in('running'))} running · "

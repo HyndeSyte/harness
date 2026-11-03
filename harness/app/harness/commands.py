@@ -9,6 +9,7 @@
   /status  what it is doing, in one screen.
   /rule    the standing rules, and any waiting for him to pick a side.
   /undo    retire the newest rule (or /undo R1a2b3c for a specific one).
+  /checkadds  every Family calendar add needs his Approve tap again, at once.
   /start   hello; a link on an instrument card opens here with the card's
            title (deeplink.py). It opens a conversation, nothing more.
 
@@ -24,7 +25,8 @@ from .ledger import Ledger, iso
 
 HELP = [("stop", "Stop: start nothing new"), ("resume", "Resume after /stop"),
         ("cancel", "Cancel everything pending"), ("status", "What it's doing"),
-        ("rule", "Your standing rules"), ("undo", "Undo the newest rule")]
+        ("rule", "Your standing rules"), ("undo", "Undo the newest rule"),
+        ("checkadds", "Family calendar adds need your tap again")]
 
 
 def is_paused(ledger: Ledger) -> bool:
@@ -40,7 +42,9 @@ def _args(text: str) -> tuple[str, str]:
 class Commands:
     def __init__(self, ledger: Ledger, *, status_fn: Callable[[], str],
                  cancel_fn: Callable[[str], None],
-                 screen_fn: Callable[[str], str | None] = lambda text: None):
+                 screen_fn: Callable[[str], str | None] = lambda text: None,
+                 checkadds_fn: Callable[[], str] | None = None):
+        self.checkadds_fn = checkadds_fn  # family_add.FamilyAdd.check_adds, or None
         self.ledger = ledger
         self.screen_fn = screen_fn        # the work-content filter, for decoded text
         self.status_fn = status_fn
@@ -114,6 +118,9 @@ class Commands:
 
     def _status(self, arg: str) -> str:
         return self.status_fn()
+
+    def _checkadds(self, arg: str) -> str:
+        return self.checkadds_fn() if self.checkadds_fn else "Nothing changed: no adds here."
 
     def _rule(self, arg: str) -> str:
         active, quarantined = rules.listing(self.ledger)
