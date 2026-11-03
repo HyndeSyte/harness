@@ -311,7 +311,7 @@ def test_the_configured_host_is_allowed():
     ("GET", "https://x@p99-caldav.icloud.com/1/a/"),
     ("GET", "https://p99-caldav.icloud.com:444/1/a/"),
     ("GET", "https://p99-caldav.icloud.com:bad/1/a/"),
-    ("REPORT", FAMILY_URL),
+    ("PATCH", FAMILY_URL),
     ("POST", FAMILY_URL),
 ])
 def test_anything_else_never_leaves(method, url):

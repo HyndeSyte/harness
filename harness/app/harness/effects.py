@@ -277,6 +277,23 @@ REGISTRY: dict[str, EffectDef] = {
                      "a lost response is reported as unknown and never retried"),
         shape=_family_shape,
     ),
+    # Keeping Family true to the Gmail calendar (family_copy.py). Built only by plain
+    # code, with no tap, after he turned it on by entering his name. A model can't
+    # propose it. It carries fixed words and times, never text from Gmail, and it
+    # changes only its own copies and plain one-offs of his it took over.
+    "family_copy_sync": EffectDef(
+        name="family_copy_sync",
+        min_stage="S1",
+        reversible=True,
+        ttl_s=0,
+        reviewer_required=False,
+        params={},
+        fixed={"calendar": "Family", "marker": "X-HARNESS-OWNED", "attendees": (),
+               "organizer": None, "alarms": (), "recurrence": ()},
+        undo="delete it on the calendar; a copy removed by anyone is not put back",
+        idempotency="uid fixed per copy, PUT with If-None-Match: * or If-Match, so no doubles",
+        origin="controller",
+    ),
 }
 
 

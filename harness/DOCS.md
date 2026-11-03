@@ -219,6 +219,29 @@ the pairing.
 **Alerts.** Tested on a real phone: an add alerts family phones that have notifications on
 for the Family calendar. The app can't turn that off. Each phone's own Calendar settings can.
 
+## Copies from your Gmail calendar
+
+To turn this on, enter your Gmail calendar's secret iCal address with the other calendar
+addresses, and your first name in its own box. Adds must be on. There is no tap: after each read
+of your calendars, plain code keeps Family true to Gmail for the next 60 days. `/stop` stops it,
+and `/status` says if the Gmail calendar isn't being read.
+
+- **Appointments** go on as "Name - PT", "Name - Doctor" and so on: fixed words and times, no
+  text from Gmail. It picks by words in the title, so it will sometimes guess wrong. A wrong guess
+  blocks an hour on Family and says nothing private.
+- **Trips** are one block, from a "Stay at" event: "Name - Springfield (out Tue 3:15 PM ZZ 101, back
+  Fri 1:40 PM ZZ 101)", or "Name - away".
+- **Moved or cancelled** on Gmail, the copy follows.
+- **Yours by hand:** a matching event with your first name in it is taken over, not doubled. It's
+  replaced only when the event changes on Gmail. Events with other people, repeating ones and
+  anyone else's are never touched.
+- **Removed or edited on Family:** a copy someone edits is left alone. A copy someone removes
+  isn't put back, and two removed of a kind stops that kind.
+- **One Gmail calendar:** with two Gmail addresses entered it does nothing, because it can't tell
+  which is yours.
+
+Each add, move and removal alerts family phones that have notifications on for this calendar.
+
 ## Links from instrument cards
 
 A card can carry a link that opens this chat with the card's title, so you can say

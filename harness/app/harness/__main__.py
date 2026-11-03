@@ -22,6 +22,7 @@ from .config import Config
 from .controller import Controller
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
+from .family_copy import AHEAD_DAYS, FamilyCopy
 from .ledger import Ledger
 from .mirror_shadow import MirrorShadow, read_days
 from .net import CalDavTransport, RedactingFilter, UrllibTransport
@@ -72,8 +73,9 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     # settings text is read from the vault on every run (never from Config).
     calendar = CalendarFeeds(ledger, transport, executor,
                              lambda: vault.get("calendar_feeds"), base.timezone,
-                             ahead_days=read_days(None),
-                             ahead_when=lambda: bool((vault.get("work_mirror") or "").strip()))
+                             ahead_days=max(read_days(None), AHEAD_DAYS),
+                             ahead_when=lambda: bool((vault.get("work_mirror") or "").strip()
+                                                     or vault.get("family_copy_name")))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
     mirror = MirrorShadow(ledger, lambda: vault.get("work_mirror"), calendar=calendar,
                           family=inbox if base.family_entity else None, tz=base.timezone)
@@ -81,15 +83,16 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
         CalDavTransport(lambda: caldav.host_of(vault.get("family_calendar_url"))),
         lambda: (vault.get("family_apple_id"), vault.get("family_app_password"),
                  vault.get("family_calendar_url")))
+    adds = FamilyAdd(ledger, client, tz=base.timezone, policy_version=base.policy_version,
+                     model=policy.MODELS[policy.engine_for("message")].model,
+                     creds_stamp=vault.family_stamp)
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,
                             family=inbox if base.family_entity else None, mirror=mirror,
-                            family_add=FamilyAdd(
-                                ledger, client, tz=base.timezone,
-                                policy_version=base.policy_version,
-                                model=policy.MODELS[policy.engine_for("message")].model,
-                                creds_stamp=vault.family_stamp))
+                            family_add=adds,
+                            family_copy=FamilyCopy(ledger, adds, calendar, tz=base.timezone,
+                                                   name_fn=lambda: vault.get("family_copy_name")))
     return controller, web, listener
 
 

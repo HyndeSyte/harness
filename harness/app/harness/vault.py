@@ -40,7 +40,8 @@ from . import caldav, calendar_feed, workmirror
 # family_*: what the one calendar write needs (caldav.py). The address is
 # checked strictly, because the password is sent wherever it points.
 FIELDS = ("telegram_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
-          "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url")
+          "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url",
+          "family_copy_name")
 FAMILY_FIELDS = ("family_apple_id", "family_app_password", "family_calendar_url")
 TEXT_FIELDS = ("work_mirror",)          # several lines; a textarea on the page
 LABELS = {"telegram_bot_token": "Telegram bot token",
@@ -50,7 +51,9 @@ LABELS = {"telegram_bot_token": "Telegram bot token",
           "work_mirror": "work mirror settings (work: address, days:, hours:, family: ...)",
           "family_apple_id": "Family calendar: Apple ID",
           "family_app_password": "Family calendar: app-specific password",
-          "family_calendar_url": "Family calendar: iCloud calendar address"}
+          "family_calendar_url": "Family calendar: iCloud calendar address",
+          "family_copy_name": ("Family calendar: your first name. This turns on keeping Family "
+                               "up to date from your Gmail calendar, with no tap")}
 # Formats are checked loosely: enough to catch a paste of the wrong thing
 # (a URL, a sentence, a key in the wrong box), not a claim about validity.
 PATTERNS = {
@@ -59,6 +62,7 @@ PATTERNS = {
     "openai_api_key": re.compile(r"sk-[A-Za-z0-9_-]{20,250}"),
     "family_apple_id": re.compile(r"[^\s@:]{1,100}@[^\s@:]{1,100}\.[^\s@:]{2,30}"),
     "family_app_password": re.compile(r"[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}"),
+    "family_copy_name": re.compile(r"[^\W\d_][^\W\d_ .'-]*(?:[ .'-][^\W\d_]+){0,3}"),
 }
 PAIRING_TTL_S = 15 * 60
 PAIRING_MAX_FAILURES = 10

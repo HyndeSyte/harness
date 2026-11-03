@@ -194,6 +194,21 @@ CREATE TABLE IF NOT EXISTS family_adds(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS family_copies(
+  key TEXT PRIMARY KEY,
+  uid TEXT NOT NULL,
+  href TEXT NOT NULL,
+  hand INTEGER NOT NULL,
+  seen TEXT NOT NULL,
+  word TEXT NOT NULL,
+  title TEXT NOT NULL,
+  start TEXT NOT NULL,
+  end TEXT NOT NULL,
+  state TEXT NOT NULL,
+  missing INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 # Job states and the only transitions allowed between them. Anything else

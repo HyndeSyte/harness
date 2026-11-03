@@ -1,14 +1,16 @@
 """The one client that can write to a calendar: iCloud Family, by CalDAV.
 
-Adapted from the tested capability, keeping only what one effect needs:
-add one event, and delete that same event again. Nothing here can name
-another calendar, change an event, or add an attendee, an organizer, an
-alarm or a repeat: the event text is built here from four fields.
+Adapted from the tested capability: add one event and delete that same event
+again, and for copies from Gmail (family_copy.py) change its own copy or remove
+one plain event he made by hand. Nothing here can name another calendar, or add
+an attendee, an organizer, an alarm or a repeat: the event text is built here
+from a few fields.
 
   * Before every write, the server's own display name for the saved address
     must be exactly "Family". A mislabeled address is refused.
-  * An event is read by GET on its path. There is no REPORT here at all:
-    real iCloud answers 412 to a UID prop-filter.
+  * An event is read by GET on its path. The one REPORT is a time-range read,
+    to see what is already on Family: real iCloud answers 412 to a UID
+    prop-filter, so that form is never sent.
   * A create is a PUT with If-None-Match: *, on a path derived from the
     effect id, so a repeat lands on the same path and is refused.
   * A delete is sent only if the event still has the ETag the harness saw
@@ -32,12 +34,14 @@ from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import urlsplit
 
+from . import ical
 from .net import REDACT, HttpResponse, TransportError
 
 CALENDAR_NAME = "Family"       # fixed in code; nothing can name another calendar
 MARKER = "X-HARNESS-OWNED"
 TIMEOUT_S = 20
 _DAV = "{DAV:}displayname"
+_CALENDAR_DATA = "{urn:ietf:params:xml:ns:caldav}calendar-data"
 _ICS_HEADERS = {"Content-Type": "text/calendar; charset=utf-8"}
 _PROPFIND = ('<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop>'
              "<D:displayname/></D:prop></D:propfind>")
@@ -117,17 +121,41 @@ def build_ics(uid: str, params: dict, now: datetime) -> str:
     return "\r\n".join(_fold(x) for x in lines) + "\r\n"
 
 
-def _is_ours(ics: str, uid: str) -> bool:
-    """Still one plain event of ours: right uid, marker kept, and no attendee,
-    organizer or repeat that could turn a delete into a message to someone."""
+def build_copy_ics(uid: str, title: str, start, end, now: datetime) -> str:
+    """A copy from Gmail: the same fixed shape, and a trip can be whole days."""
+    def when(name: str, value) -> str:
+        if isinstance(value, datetime):
+            return f"{name}:{_utc(value.isoformat())}"
+        return f"{name};VALUE=DATE:{value:%Y%m%d}"
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//harness//family_copy//EN",
+             "BEGIN:VEVENT", f"UID:{uid}",
+             f"DTSTAMP:{now.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+             when("DTSTART", start), when("DTEND", end), f"SUMMARY:{_esc(title)}",
+             f"{MARKER}:1", "END:VEVENT", "END:VCALENDAR"]
+    return "\r\n".join(_fold(x) for x in lines) + "\r\n"
+
+
+def _lines(ics: str) -> tuple[list[str], list[str]]:
     text = re.sub(r"\r?\n[ \t]", "", ics.replace("\r\n", "\n"))
     lines = [x for x in text.split("\n") if x]
-    names = [re.split(r"[;:]", x, maxsplit=1)[0].upper() for x in lines]
-    if names.count("UID") != 1 or f"UID:{uid}" not in lines or f"{MARKER}:1" not in lines:
-        return False
+    return lines, [re.split(r"[;:]", x, maxsplit=1)[0].upper() for x in lines]
+
+
+def _is_plain(ics: str) -> bool:
+    """One event, with no attendee, organizer or repeat that could turn a delete
+    into a message to someone."""
+    lines, names = _lines(ics)
     if sum(x.upper() == "BEGIN:VEVENT" for x in lines) != 1:
         return False
     return not {"ATTENDEE", "ORGANIZER", "RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"} & set(names)
+
+
+def _is_ours(ics: str, uid: str) -> bool:
+    """Still one plain event of ours: right uid, marker kept."""
+    lines, names = _lines(ics)
+    if names.count("UID") != 1 or f"UID:{uid}" not in lines or f"{MARKER}:1" not in lines:
+        return False
+    return _is_plain(ics)
 
 
 # -- the client -----------------------------------------------------------------
@@ -138,6 +166,20 @@ class Outcome:
     kind: str
     status: int | None = None
     etag: str | None = None
+
+
+@dataclass(frozen=True)
+class Item:
+    """One occurrence read from Family, and where it lives."""
+    occ: ical.Occurrence
+    href: str
+    etag: str
+
+
+@dataclass(frozen=True)
+class Read:
+    items: list[Item]
+    unreadable: int
 
 
 class FamilyCalDav:
@@ -235,6 +277,114 @@ class FamilyCalDav:
             elif r.status != 200:
                 return None
         return gone
+
+    def items_between(self, start: datetime, end: datetime, tz: str) -> Read | None:
+        """What is on Family in this window. Reads only. None when that can't be said."""
+        ready = self._auth()
+        if ready is None:
+            return None
+        auth, url = ready
+        if self._name_problem(auth, url) is not None:
+            return None
+        body = ('<?xml version="1.0" encoding="utf-8"?>'
+                '<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+                "<D:prop><D:getetag/><C:calendar-data/></D:prop>"
+                '<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">'
+                f'<C:time-range start="{_utc(start.isoformat())}" end="{_utc(end.isoformat())}"/>'
+                "</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>")
+        try:
+            r = self._call(auth, "REPORT", url,
+                           {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}, body)
+            if r.status != 207:
+                return None
+            out: list[Item] = []
+            unreadable = 0
+            for resp in ET.fromstring(r.body).iter("{DAV:}response"):
+                href = resp.findtext("{DAV:}href") or ""
+                etag = resp.findtext(".//{DAV:}getetag") or ""
+                data = resp.findtext(f".//{_CALENDAR_DATA}") or ""
+                if "BEGIN:VCALENDAR" not in data:
+                    return None                  # an answer with no event in it is no answer
+                w = ical.window(data, start=start, end=end, tz=tz, fallback_name=CALENDAR_NAME)
+                unreadable += w.unreadable
+                out += [Item(occ, href, etag) for occ in w.occurrences]
+            return Read(out, unreadable)
+        except (TransportError, ET.ParseError, ValueError):
+            return None
+
+    def put_copy(self, uid: str, title: str, start, end, now: datetime,
+                 etag: str | None = None) -> Outcome:
+        """A copy from Gmail: new, or a change to our own. The uid is fixed per copy, so a
+        write whose answer was lost finds itself on the next try instead of doubling."""
+        ready = self._auth()
+        if ready is None:
+            return Outcome("no_credentials")
+        auth, url = ready
+        problem = self._name_problem(auth, url)
+        if problem is not None:
+            return problem
+        href = f"{url}{uid}.ics"
+        guard = {"If-Match": etag} if etag else {"If-None-Match": "*"}
+        try:
+            r = self._call(auth, "PUT", href, {**_ICS_HEADERS, **guard},
+                           build_copy_ics(uid, title, start, end, now))
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        if r.status in (200, 201, 204):
+            return Outcome("ok", r.status, r.headers.get("etag"))
+        if r.status == 412:
+            if etag:
+                return Outcome("changed", r.status)
+            return self._ours_already(auth, href, uid)
+        if r.status == 401:
+            return Outcome("auth", r.status)
+        return Outcome("unknown" if r.status >= 500 else "failed", r.status)
+
+    def _ours_already(self, auth: dict, href: str, uid: str) -> Outcome:
+        try:
+            r = self._call(auth, "GET", href)
+        except TransportError:
+            return Outcome("unknown")
+        if r.status == 200 and _is_ours(r.body.decode("utf-8", "replace"), uid):
+            return Outcome("ok", r.status, r.headers.get("etag"))
+        return Outcome("exists", r.status)
+
+    def remove_hand_copy(self, href: str, etag: str) -> Outcome:
+        """Delete one event he made by hand, taken over from Gmail. Only a plain one-off
+        in this calendar, only as it was just read."""
+        ready = self._auth()
+        if ready is None:
+            return Outcome("no_credentials")
+        auth, url = ready
+        problem = self._name_problem(auth, url)
+        if problem is not None:
+            return problem
+        collection = urlsplit(url)
+        if not href.startswith(collection.path) or not href.endswith(".ics") or ".." in href:
+            return Outcome("failed")
+        target = f"{collection.scheme}://{collection.netloc}{href}"
+        try:
+            r = self._call(auth, "GET", target)
+        except TransportError:
+            return Outcome("failed")
+        if r.status == 404:
+            return Outcome("gone", r.status)
+        if r.status != 200:
+            return Outcome("failed", r.status)
+        if not etag or r.headers.get("etag") != etag \
+                or not _is_plain(r.body.decode("utf-8", "replace")):
+            return Outcome("changed", r.status)
+        try:
+            r = self._call(auth, "DELETE", target, {"If-Match": etag})
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        if r.status in (200, 204):
+            return Outcome("ok", r.status)
+        if r.status == 404:
+            return Outcome("gone", r.status)
+        if r.status == 412:
+            return Outcome("changed", r.status)
+        return Outcome("unknown" if r.status >= 500 else "failed", r.status)
 
     def undo(self, uid: str, etag: str | None) -> Outcome:
         """Delete this one event, if it is still exactly what the harness wrote."""

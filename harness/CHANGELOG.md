@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0
+
+- Family stays true to your Gmail calendar, with no tap. Enter your first name on the add-on
+  page to turn it on; adds must be on, and your Gmail calendar's secret iCal address entered.
+  Plain code does it after each read. No model sees any of it, and /stop stops it.
+- Appointments go on as "Name - PT", "Name - Doctor", "Name - Dentist" and the like: fixed words
+  and times, never text from Gmail. Calls, meetings, "Busy" and someone else's invite stay off.
+- A hotel stay becomes one block for the whole trip, with the city, flight times and numbers when
+  the flights match a strict pattern, and "Name - away" when they don't.
+- A copy follows its event. If it moves, the copy moves. If it's cancelled, the copy comes off
+  after two good reads in a row. Many gone at once is held back as a bad read.
+- Events you copied by hand are taken over rather than doubled, if they carry your first name.
+  They stay as they are until the event changes on Gmail. An event with other people on it, a
+  repeating one, or anyone else's stays as it is.
+- A copy someone edits on Family is left alone for good. A copy gone from two good reads in a row
+  isn't put back, and after two of a kind it stops copying that kind.
+- At most 12 changes a day. If Gmail or Family can't be read, or too much looks gone at once,
+  nothing changes. With more than one Gmail calendar entered, it does nothing. The morning digest
+  says what changed, in counts, and any problem.
+- None of this counts toward adds skipping the tap, and adds you ask for work as before.
+
 ## 0.5.1
 
 - A standing rule now needs your tap. A correction, or anything pasted that looks like one,

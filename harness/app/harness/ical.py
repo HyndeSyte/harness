@@ -56,6 +56,9 @@ class Occurrence:
     uid: str = ""
     instance: str = ""
     attendees: tuple[str, ...] = ()
+    # For offers to Family (family_copy.py). `organizer` is the address, lower-cased.
+    location: str = ""
+    organizer: str = ""
 
 
 @dataclass
@@ -543,9 +546,12 @@ def window(text: str, *, start: datetime, end: datetime, tz: str,
             instance = _key(s)
         attendees = tuple(a.value.strip().lower().removeprefix("mailto:")
                           for a in ev.all("ATTENDEE"))
+        where = unescape(ev.first("LOCATION").value).strip() if ev.first("LOCATION") else ""
+        org = ev.first("ORGANIZER")
+        organizer = org.value.strip().lower().removeprefix("mailto:") if org else ""
         out.occurrences.append(Occurrence(s, e, not isinstance(s, datetime), summary, name,
                                           bool(transp and transp.value.upper() == "TRANSPARENT"),
-                                          ev.uid, instance, attendees))
+                                          ev.uid, instance, attendees, where, organizer))
 
     for ev in loose:
         try:

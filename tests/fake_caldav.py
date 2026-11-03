@@ -14,6 +14,7 @@ import hashlib
 import re
 import socket
 from urllib.parse import unquote, urlsplit
+from xml.sax.saxutils import escape
 
 import pytest
 
@@ -75,8 +76,8 @@ def valid_ics(body: bytes | None) -> str | None:
         return None
     if any(len(p.get(k, [])) != 1 for k in ("UID", "DTSTAMP", "DTSTART", "DTEND", "SUMMARY")):
         return None
-    if not re.fullmatch(r"DTSTART:\d{8}T\d{6}Z", p["DTSTART"][0]) \
-            or not re.fullmatch(r"DTEND:\d{8}T\d{6}Z", p["DTEND"][0]):
+    if not re.fullmatch(r"DTSTART(:\d{8}T\d{6}Z|;VALUE=DATE:\d{8})", p["DTSTART"][0]) \
+            or not re.fullmatch(r"DTEND(:\d{8}T\d{6}Z|;VALUE=DATE:\d{8})", p["DTEND"][0]):
         return None
     return p["UID"][0].split(":", 1)[1]
 
@@ -138,7 +139,14 @@ class FakeICloud:
         if method == "REPORT":
             if b"prop-filter" in (body or b""):      # as real iCloud did
                 return HttpResponse(412)
-            return HttpResponse(207, {}, b'<D:multistatus xmlns:D="DAV:"/>')
+            items = "".join(
+                f"<D:response><D:href>{p}</D:href><D:propstat><D:prop>"
+                f"<D:getetag>{escape(etag)}</D:getetag>"
+                f"<C:calendar-data>{escape(ics)}</C:calendar-data></D:prop>"
+                "<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+                for p, (etag, ics) in self.events.items() if p.startswith(cal))
+            return HttpResponse(207, {}, ('<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:'
+                                          f'xml:ns:caldav">{items}</D:multistatus>').encode())
         if method == "GET":
             cur = self.events.get(path)
             if cur is None:
@@ -155,6 +163,8 @@ class FakeICloud:
         cur = self.events.get(path)
         if method == "PUT":
             if headers.get("If-None-Match") == "*" and cur is not None:
+                return HttpResponse(412)
+            if "If-Match" in headers and (cur is None or cur[0] != headers["If-Match"]):
                 return HttpResponse(412)
             if valid_ics(body) is None:
                 return HttpResponse(403, {}, b"valid-calendar-data")

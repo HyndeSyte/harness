@@ -148,10 +148,10 @@ class UrllibTransport:
 
 
 class CalDavTransport(UrllibTransport):
-    """Https to the one configured iCloud host, four methods, no redirects and
+    """Https to the one configured iCloud host, five methods, no redirects and
     no proxy. Anything else never leaves: kind "blocked" means nothing was sent."""
 
-    METHODS = frozenset({"PROPFIND", "GET", "PUT", "DELETE"})
+    METHODS = frozenset({"PROPFIND", "REPORT", "GET", "PUT", "DELETE"})
 
     def __init__(self, allowed_host: Callable[[], str], *, cafile: str | None = None):
         super().__init__(use_env_proxy=False, cafile=cafile, follow_redirects=False)
