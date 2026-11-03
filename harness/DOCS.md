@@ -31,8 +31,9 @@ until you turn it on: adding an event to the iCloud Family calendar.
 
 - Answers and drafts when you write. Each reply ends with a short job id; every job
   ends in a receipt in its ledger.
-- Keeps corrections as typed rules ("keep drafts short") with an *Undo* button.
-  `/rule` lists them.
+- Keeps corrections as typed rules ("keep drafts short"). A rule does nothing until you tap
+  *Keep rule* on a card showing its exact text; it then has an *Undo* button. `/rule` lists
+  them, including any still waiting.
 - Sends a short digest every morning (from the configured start date): *Clear*,
   *Decision needed*, or *Attention needed*, with what failed and since when, then
   today's calendar. If a calendar couldn't be read, the digest says so; it never
@@ -163,8 +164,8 @@ Then send something like "add dentist Tuesday 3pm":
 - **While it's off,** it says so and adds nothing, with a *Turn on* button if the three
   settings are entered. Your tap is the only thing that turns it on. Send the event again.
 - **Once it's on,** a card shows the exact event in your local time, with the weekday and
-  date. *Approve* creates one event, with no invitees, alarm or repeat. The offer ends
-  after 12 hours, and an event whose start has already passed is refused.
+  date. *Approve* creates one event, with no invitees or repeat. It alerts family phones
+  that have notifications on for the Family calendar. The offer ends after 12 hours, and an event whose start has already passed is refused.
 - **Checks on every proposal.** An event over 24 hours or over a year ahead is refused, and
   so is a title or location with a recognized link or an invisible character, because the
   card must show exactly what is written. The reply says which. A link is a scheme, an IP
@@ -187,30 +188,36 @@ in `/status` and the digest until a write succeeds. `/stop` blocks adds and undo
 and 14 days, whichever is later, with no undo and no failed or unknown write, it reads the
 calendar and sends one card with the record: approved, declined, expired, cancelled, refused,
 undone, failed and unknown, how many were shown with a warning, and how many of those events
-are no longer on the calendar. It asks whether any were wrong and whether the family got
-alerts. If it can't complete that read, it says so and offers nothing until it can. An undo,
+are no longer on the calendar. It says that adds alert family phones with notifications on
+for this calendar, and that without the tap an alert can arrive with nothing approved
+first, and it asks whether any adds were wrong. If it can't complete that read, it says so and offers nothing until it can. An undo,
 a failed write, or a change of policy or model restarts the count; declines and missing
 events don't.
 
 The card lasts 3 days. If you ignore it, it asks again at most once a week. When you tap
 it, the app reads the record again first. If anything changed, or the read can't complete,
-nothing changes: you get a fresh card, or a message saying why.
+nothing changes: you get a fresh card, or a message saying why. While `/stop` is on, a tap
+changes nothing, reads nothing, and the same card works after `/resume`. `/checkadds` closes
+an open card the same way *keep checking* does, and the count starts over.
+
+It won't offer this while any standing rule is still waiting for your tap, and says so.
 
 If you tap the button to stop checking, adds go straight in without the Approve tap, up to
 5 a day. Anything with a warning still gets a card, and so does any add at a start time
-another add already has, or from a message over 200 characters or with several lines, since
-that may be pasted text. You still get the receipt and the Undo,
+another add already has, or from a message over 200 characters or with several lines, any
+message in the 30 minutes after one, or a message sent as a reply, since that may be pasted text. You still get the receipt and the Undo,
 `/stop` still works, and `/status` and every digest say adds are skipping the tap. Nothing
 else changes.
 
 **Going back.** `/checkadds` brings the tap back at once. It also comes back by itself, and
 the thread says why, after an undo, a failed or unknown write, an add iCloud gave no version
-tag for (so no Undo), a change to the calendar address, Apple ID or password, or a change of
-policy or model. An add already queued when the tap comes back isn't written, and the thread
+tag for (so no Undo), a change to the calendar address, Apple ID or password, a change of
+policy or model, or a stored rule that never had your tap. An add already queued when the tap comes back isn't written, and the thread
 says so. Going without it again takes a fresh full count. *Reset* on the add-on page ends all of this, along with the keys and
 the pairing.
 
-Whether an added event alerts other family members isn't known yet.
+**Alerts.** Tested on a real phone: an add alerts family phones that have notifications on
+for the Family calendar. The app can't turn that off. Each phone's own Calendar settings can.
 
 ## Links from instrument cards
 
@@ -227,6 +234,13 @@ Home Assistant template, with the card title in `title`:
 {%- endfor -%}
 https://t.me/YOUR_BOT?start=c1{{ ns.t | base64_encode | replace('+','-') | replace('/','_') | replace('=','') }}
 ```
+
+## Standing rules from before 0.5.1
+
+Rules saved by an earlier version were never confirmed, because that step didn't exist. From
+0.5.1 they stop being used until you decide. Each gets a card with its exact text, again each
+week until you tap *Keep rule* or *Drop rule*. If adds were already skipping the tap, the tap
+comes back.
 
 ## Changing a key later
 

@@ -24,14 +24,12 @@ from concurrent.futures import Executor, Future
 from datetime import datetime, timedelta
 from typing import Callable
 
-from . import approvals, choices, effects, policy, prompts, render, rules, schema
+from . import approvals, effects, policy, prompts, render, rules, schema
 from .config import Config
 from .engines import CallOutcome, Engine, EngineError, EngineResult, call_with_retries
 from .ledger import Ledger, iso
 
 log = logging.getLogger("harness.runner")
-
-CHOICE_TTL_S = 7 * 24 * 3600
 
 PROVIDER_NAME = {"anthropic": "Claude", "openai": "GPT"}
 
@@ -131,6 +129,8 @@ class Runner:
         system = prompts.system_prompt(now=now, tz=self.config.timezone, rules=fired,
                                        stage_at_least=self.config.stage_at_least,
                                        family_add=family)
+        if self.family_add is not None:
+            self.family_add.note_message(text)
         user = prompts.user_content(text, earlier=self._earlier(job))
         out_schema = prompts.output_schema(self.config.stage_at_least, family_add=family)
         with self.ledger.tx() as db:
@@ -248,34 +248,17 @@ class Runner:
     def _on_rule(self, job, body, receipt, fired):
         with self.ledger.tx() as db:
             try:
-                outcome = rules.propose(self.ledger, body["rule"], job_id=job["id"], db=db)
+                rule_id = rules.hold(self.ledger, body["rule"], job_id=job["id"], db=db)
             except rules.RuleError as e:
                 receipt["rule"] = {"refused": str(e)[:120]}
                 self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
                 self._reply(db, job, f"I can't keep that as a rule: {e}.")
                 return
-            receipt["rule"] = {"id": outcome.rule_id, "status": outcome.status}
+            receipt["rule"] = {"id": rule_id, "status": "pending"}
             self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
-            if outcome.status == "quarantined":
-                old = outcome.conflicts_with[0]
-                new_n = choices.mint(self.ledger, kind="rule_keep_new", target=outcome.rule_id,
-                                     chat_id=job["chat_id"], ttl_s=CHOICE_TTL_S, db=db)
-                old_n = choices.mint(self.ledger, kind="rule_keep_old", target=outcome.rule_id,
-                                     chat_id=job["chat_id"], ttl_s=CHOICE_TTL_S, db=db)
-                text = (f"That clashes with rule {render.escape(old)}. "
-                        f"Use the new one ({render.escape(outcome.rule_id)}) or keep the old?")
-                self._reply(db, job, text, raw=True,
-                            buttons=[[("Use new", choices.callback_data(new_n)),
-                                      ("Keep old", choices.callback_data(old_n))]],
-                            binds=[{"type": "choice", "nonce": new_n},
-                                   {"type": "choice", "nonce": old_n}])
-                return
-            undo_n = choices.mint(self.ledger, kind="rule_undo", target=outcome.rule_id,
-                                  chat_id=job["chat_id"], ttl_s=CHOICE_TTL_S, db=db)
-            self._reply(db, job, render.escape(outcome.message) +
-                        f" <i>({render.escape(outcome.rule_id)})</i>", raw=True,
-                        buttons=[[("Undo", choices.callback_data(undo_n))]],
-                        binds=[{"type": "choice", "nonce": undo_n}])
+            row = db.execute("SELECT * FROM rules WHERE id=?", (rule_id,)).fetchone()
+            buttons, binds = rules.card_buttons(self.ledger, rule_id, job["chat_id"], db)
+            self._reply(db, job, rules.card_text(row), raw=True, buttons=buttons, binds=binds)
 
     def _on_proposal(self, job, body, receipt, fired):
         # From S2 for calendar_hold: before that the schema has no such shape
@@ -289,7 +272,8 @@ class Runner:
                 return
             if self.family_add.refuse(job, receipt, params):
                 return
-            warnings = self.family_add.warnings(params, message=self.ledger.job_text(job["id"]))
+            warnings = self.family_add.warnings(params, message=self.ledger.job_text(job["id"]),
+                                                replied=bool(job["reply_to_message_id"]))
         else:
             warnings = []
         # One transaction: the proposal and the card that tells him about it

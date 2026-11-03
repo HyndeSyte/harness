@@ -120,6 +120,9 @@ def make_undo_card(w, config):
         "literal": "keep drafts short"}})]
     w.say("keep drafts short")
     w.step()
+    _, _, buttons, mid = w.bot.sent[-1]
+    assert w.tap(buttons[0][0][1], message_id=mid) == "ok"      # his tap keeps the rule
+    w.outbox.flush()
     _, text, buttons, mid = w.bot.sent[-1]
     return buttons[0][0][1], mid
 
@@ -155,6 +158,9 @@ def test_one_tap_per_card_for_conflict_choices(ledger, config):
         "literal": "long drafts"}})]
     w.say("long drafts")
     w.step()
+    _, _, buttons, mid = w.bot.sent[-1]
+    assert w.tap(buttons[0][0][1], message_id=mid) == "ok"      # his tap keeps the rule
+    w.outbox.flush()
     _, _, buttons, mid = w.bot.sent[-1]
     use_new, keep_old = buttons[0][0][1], buttons[0][1][1]
     assert w.tap(use_new, message_id=mid) == "ok"

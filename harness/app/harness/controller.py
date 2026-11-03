@@ -30,7 +30,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import (callbacks, choices, commands, daily, ingress_filter, integrity, policy,
-               render, telegram)
+               render, rules, telegram)
 from .config import Config
 from .engines import Engine
 from .ledger import Ledger
@@ -232,6 +232,8 @@ class Controller:
         self.runner.start_pending(paused=commands.is_paused(self.ledger))
         self.runner.collect()
         self.runner.check_timers()
+        if not commands.is_paused(self.ledger):
+            rules.sweep(self.ledger, self.config.owner_user_id, held=not self._proactive_ok())
         if self.family_add is not None:
             self.family_add.run_pending(paused=commands.is_paused(self.ledger),
                                         held=not self._proactive_ok())

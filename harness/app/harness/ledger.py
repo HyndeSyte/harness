@@ -238,6 +238,19 @@ class Ledger:
             self.set_meta("schema_version", str(SCHEMA_VERSION))
         elif int(cur) != SCHEMA_VERSION:
             raise LedgerError(f"ledger schema {cur}, code expects {SCHEMA_VERSION}")
+        self._rules_need_a_tap()
+
+    def _rules_need_a_tap(self) -> None:
+        """Once, on the first open by 0.5.1 or later: rules stored before his tap existed
+        stop being active, so their text can't reach a prompt until he keeps them. No
+        table changes, and no version bump: 0.5.0 opening this file just ignores them."""
+        if self.get_meta("rules_need_tap") is not None:
+            return
+        with self.tx() as db:
+            db.execute("UPDATE rules SET state='legacy_pending'"
+                       " WHERE state IN ('active','quarantined')")
+            db.execute("UPDATE rules SET state='legacy_superseded' WHERE state='superseded'")
+            self.set_meta("rules_need_tap", "1", db)
 
     # -- plumbing ------------------------------------------------------
     @contextmanager

@@ -38,12 +38,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import caldav, choices, commands, effects, render
+from . import caldav, choices, commands, effects, policy, render, rules
 from .canonical import canonical_hash
 from .ledger import Ledger, iso
 
 ENABLED = "family_add_enabled"
 LOOSENED = "family_add_loosened"
+PASTED_UNTIL = "family_add_pasted_until"
 BAKE = "family_add_bake"
 PROBLEM = "family_add_problem"
 CREDS = "family_add_creds"
@@ -96,6 +97,11 @@ def _one_year_after(dt: datetime) -> datetime:
         return dt.replace(year=dt.year + 1)
     except ValueError:                  # Feb 29
         return dt.replace(year=dt.year + 1, day=28)
+
+
+def _looks_pasted(text: str) -> bool:
+    text = text.strip()
+    return len(text) > MAX_TAPLESS_MESSAGE or len(text.splitlines()) > 1
 
 
 class FamilyAdd:
@@ -175,7 +181,15 @@ class FamilyAdd:
     def check_adds(self) -> str:
         """/checkadds: plain code, at once, and only a fresh count can undo it."""
         if not self.ledger.get_meta(LOOSENED):
-            return "Every Family calendar add already needs your Approve tap. Nothing changed."
+            if not self._bake()["asked_at"]:
+                return "Every Family calendar add already needs your Approve tap. Nothing changed."
+            with self.ledger.tx() as db:      # same as answering the card "keep checking"
+                self._restart_count(db)
+                self.ledger.event("family_add_kept", {"why": "/checkadds"}, db=db)
+            return ("Every Family calendar add already needs your Approve tap, and it still does. "
+                    "I've closed the question about stopping that, so that card no longer works "
+                    f"and won't come back. The count starts over: {BAKE_ADDS} adds and "
+                    f"{BAKE_DAYS} days before I'd ask again.")
         with self.ledger.tx() as db:
             db.execute("DELETE FROM meta WHERE key=?", (LOOSENED,))
             self._restart_count(db)
@@ -207,6 +221,9 @@ class FamilyAdd:
                 or (earned_on and earned_on != self._earning()):
             with self.ledger.tx() as db:
                 self._setback(db, "the policy or the model changed since this was earned")
+        if self.ledger.get_meta(LOOSENED) and rules.legacy_waiting(self.ledger):
+            with self.ledger.tx() as db:
+                self._setback(db, "a standing rule saved before this update never had your tap")
 
     # -- the bake-in count -----------------------------------------------------------
     def _bake(self) -> dict:
@@ -296,6 +313,17 @@ class FamilyAdd:
         days = (now - first).days
         if days < BAKE_DAYS:
             return
+        if rules.blocking(self.ledger):
+            if not b.get("rules_told"):
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(BAKE, json.dumps({**b, "rules_told": True}), db)
+                    self.ledger.enqueue(
+                        chat_id=self.chat_id, kind="notice", held=held, db=db,
+                        text=("<b>Stop checking each Family calendar add?</b> That's due, but I "
+                              "won't offer it yet: a standing rule is still waiting for your tap. "
+                              "/rule lists them. Keep or drop each one on its card, and I'll "
+                              "send this with the record."))
+            return
         if b["asked_at"] and now - datetime.fromisoformat(b["asked_at"]) < ASK_AGAIN_AFTER:
             return
         tried = b.get("tried")
@@ -331,13 +359,18 @@ class FamilyAdd:
             self.ledger.enqueue(
                 chat_id=self.chat_id, kind="card", held=held,
                 text=(f"<b>Stop checking each Family calendar add?</b>\n{record}\n"
-                      "<b>Were any of these wrong? Did the family get alerts from them?</b>\n"
-                      "If neither, you can say yes: an add then goes straight to the Family "
+                      "Every standing rule in use has your tap.\n"
+                      "Adds alert family phones that have notifications on for the Family "
+                      "calendar. Without the Approve tap, that alert can arrive with nothing "
+                      "approved first.\n"
+                      "<b>Were any of these adds wrong?</b>\n"
+                      "If none were, you can say yes: an add then goes straight to the Family "
                       "calendar without the Approve tap, unless a check finds something off. You "
-                      "still get the receipt, the Undo button and /stop. Nothing else changes: "
+                      "still get the receipt, the Undo button and /stop, though Undo can't recall "
+                      "an alert already delivered. Nothing else changes: "
                       "edits, deletes and messages to people still need your go. Only your tap "
                       "changes this."),
-                buttons=[[("None wrong, no alerts: stop checking", choices.callback_data(yes))],
+                buttons=[[("None wrong: stop checking", choices.callback_data(yes))],
                          [("Something was off: keep checking", choices.callback_data(no))]],
                 binds=[{"type": "choice", "nonce": yes}, {"type": "choice", "nonce": no}],
                 db=db)
@@ -356,7 +389,7 @@ class FamilyAdd:
                         "put those on the family calendar. Say it again without that")
         return None
 
-    def warnings(self, params: dict, *, message: str = "") -> list[str]:
+    def warnings(self, params: dict, *, message: str = "", replied: bool = False) -> list[str]:
         """What goes on the card. With any of these, an add never skips the tap."""
         out = []
         local = ZoneInfo(self.tz)
@@ -366,18 +399,30 @@ class FamilyAdd:
                 out.append(f"the {key} was written with a different UTC offset than your zone "
                            "has at that moment, so the time shown may not be what you meant.")
         if any(render.maybe_host(params.get(key, "")) for key in ("title", "location")):
-            out.append("the title or location has a word.word in it. If that's a web address, "
-                       "it may show as a link on family phones.")
+            out.append("the title or location has a word.word, a word:word or a phone number in "
+                       "it. If that's an address, it may show as a link on family phones.")
         loose = self.loosened()
         if self._is_duplicate(params, any_title=loose):
             out.append("this looks like a duplicate: another add has the same start"
                        + ("." if loose else " and title."))
         if loose and self._tapless_today() >= MAX_TAPLESS_PER_DAY:
             out.append(f"{MAX_TAPLESS_PER_DAY} adds have already gone in without a tap today.")
-        message = message.strip()
-        if loose and (len(message) > MAX_TAPLESS_MESSAGE or "\n" in message):
-            out.append("your message was long or had several lines, so it may be pasted text.")
+        if loose and (_looks_pasted(message) or replied or self._pasted_recently()):
+            out.append("your message, a recent one or the one you replied to may have been long "
+                       "or had several lines, so it may be pasted text.")
         return out
+
+    def note_message(self, text: str) -> None:
+        """Each message, before the model reads it. A paste stays in the conversation
+        through the model's own replies, so every message in its window extends it. In
+        the ledger, so a restart can't lose it."""
+        if _looks_pasted(text) or self._pasted_recently():
+            until = self.ledger.now() + timedelta(seconds=policy.CONTEXT_WINDOW_S)
+            self.ledger.set_meta(PASTED_UNTIL, iso(until))
+
+    def _pasted_recently(self) -> bool:
+        until = self.ledger.get_meta(PASTED_UNTIL)
+        return bool(until) and datetime.fromisoformat(until) > self.ledger.now()
 
     def note_warned(self, proposal_id: str, db) -> None:
         self.ledger.event("family_add_warned", {"proposal": proposal_id}, db=db)
@@ -431,7 +476,8 @@ class FamilyAdd:
                                      chat_id=job["chat_id"], ttl_s=ENABLE_TTL_S, db=db)
                 self._say(db, job["chat_id"], job["id"],
                           "Adding to the Family calendar is off, so nothing was added. Turn it "
-                          "on? Each add will still show you a card to approve.",
+                          "on? Each add will still show you a card to approve, and each add "
+                          "alerts family phones that have notifications on for this calendar.",
                           buttons=[[("Turn on", choices.callback_data(nonce))]],
                           binds=[{"type": "choice", "nonce": nonce}])
             else:
@@ -462,6 +508,13 @@ class FamilyAdd:
         self.ledger.event("family_add_auto", {"proposal": proposal_id}, db=db)
         return True
 
+    def stopped(self) -> bool:
+        """Stopped, or a /stop already in from this same poll: taps run before commands."""
+        return commands.is_paused(self.ledger) or self.ledger.db.execute(
+            "SELECT 1 FROM jobs j JOIN job_text t ON t.job_id=j.id WHERE j.kind='command'"
+            " AND j.state='received' AND LOWER(TRIM(t.text)) LIKE '/stop%' LIMIT 1"
+        ).fetchone() is not None
+
     # -- his taps ---------------------------------------------------------------------
     def on_choice(self, kind: str, target: str) -> str:
         if kind == "family_add_enable":
@@ -475,6 +528,13 @@ class FamilyAdd:
             b = self._bake()
             if not self.enabled() or target != b["epoch"]:
                 return "The record changed after that card was sent, so nothing changed."
+            if rules.blocking(self.ledger):
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(BAKE, json.dumps({**b, "asked_at": None,
+                                                           "rules_told": False}), db)
+                return ("A standing rule is waiting for your tap, so nothing changed and I didn't "
+                        "check the calendar. Keep or drop it on its card, and I'll send a fresh "
+                        "card.")
             missing = self.client.missing(self._counted_uids(b))
             if missing is None:
                 with self.ledger.tx() as db:

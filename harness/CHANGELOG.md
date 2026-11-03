@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.1
+
+- A standing rule now needs your tap. A correction, or anything pasted that looks like one,
+  stays unused until you tap *Keep rule* on a card showing its exact text, and only a kept
+  rule reaches a prompt. An unanswered card drops the rule after 7 days.
+- Rules saved by earlier versions were never tapped, so they stop being used until you decide.
+  Each gets a card, again each week. Adds can't start skipping the tap while any rule waits,
+  and if they already skip it, the tap comes back and the thread says why.
+- The cards are honest about alerts: a real test showed adds alert family phones with
+  notifications on for the Family calendar. The card asking to stop checking says so, and
+  says an alert can arrive with nothing approved first. It asks only whether adds were wrong.
+- A tap on that card during `/stop` changes nothing, reads nothing, and the card still works
+  after `/resume`.
+- `/checkadds` with that card open closes it like *keep checking*, and says so.
+- While adds skip the tap, a long or several-line message gets a card, and so does any message
+  in the 30 minutes after one, or sent as a reply.
+- More address shapes are stopped: any URL scheme, `[evil.com/x]`, `.evil.com`, and wide or
+  look-alike dots. A word:word or a phone number gets a card.
+- A saved rule a card can't show exactly is retired with a notice. Every other saved rule,
+  including one waiting on a clash, gets a card. A clash nobody answers is dropped after 7 days.
+
 ## 0.5.0
 
 - The app can now write to one calendar. It can add one event to iCloud Family

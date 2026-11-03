@@ -18,7 +18,7 @@ from harness.config import Config
 from harness.controller import Controller
 from harness.ledger import Ledger
 from harness.vault import Vault
-from conftest import OWNER, msg
+from conftest import OWNER, cb, msg
 from fakes import FakeBot, FakeEngine, ManualExecutor, SyncExecutor, result, tg_error
 
 TOKEN = "123456789:AAEhBP0av28aH3sT9_" + "x" * 18
@@ -58,9 +58,13 @@ def test_restore_drill(tmp_path, clock):
     bot.batches.append([msg(1, "keep drafts short")])
     c.tick()
     ex.run_all()
-    c.tick()                                         # rule saved, reply sent
+    c.tick()                                         # the rule's card is sent
     assert len(bot.sent) == 1
-    bot.batches.append([msg(2, "a slow question")])
+    _, _, buttons, mid = bot.sent[0]
+    bot.batches.append([cb(2, buttons[0][0][1], message_id=mid)])
+    c.tick()                                         # his tap keeps it, reply sent
+    assert len(bot.sent) == 2
+    bot.batches.append([msg(3, "a slow question")])
     c.tick()                                         # running, worker held
     in_flight = ledger.jobs_in("running")[0]["id"]
     bot.fail_sends = [tg_error(502, "Bad Gateway")]
@@ -76,7 +80,7 @@ def test_restore_drill(tmp_path, clock):
     assert sorted(p.name for p in backup.iterdir()) == ["harness.sqlite", "secrets.json"]
 
     # --- life goes on after the backup (this work will be lost)
-    c, ledger, _, _ = boot(data, clock, SyncExecutor(), FakeBot([[msg(3, "after backup")]]),
+    c, ledger, _, _ = boot(data, clock, SyncExecutor(), FakeBot([[msg(4, "after backup")]]),
                            script=[result()])
     c.tick()
     assert ledger.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 3

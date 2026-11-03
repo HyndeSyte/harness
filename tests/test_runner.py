@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from harness import policy, telegram
+from harness import policy, rules, telegram
 from harness.config import Config
 from harness.engines import EngineError
 from harness.runner import Runner
@@ -154,16 +154,23 @@ def test_rule_becomes_a_typed_rule_with_an_undo_button(ledger, config):
     run(r)
     assert ledger.job(job)["state"] == "answered"
     [row] = ledger.db.execute("SELECT * FROM rules").fetchall()
-    assert row["state"] == "active" and row["provenance_job_id"] == job
+    assert row["state"] == "pending" and row["provenance_job_id"] == job
     [out] = queued(ledger)
-    assert "Saved for draft jobs: length = short." in out["text"]
+    assert "length = short" in out["text"]
     buttons = json.loads(out["buttons_json"])
-    assert buttons[0][0][0] == "Undo" and buttons[0][0][1].startswith("c:")
+    assert buttons[0][0][0] == "Keep rule" and buttons[0][0][1].startswith("c:")
     binds = json.loads(out["binds_json"])
     assert binds[0]["type"] == "choice"
-    # the next job carries the rule, and its receipt says so
+    # not used yet
     r.engines["claude"].script = [result()]
-    job2 = send(ledger, "draft a note", uid=2)
+    before = send(ledger, "draft something", uid=3)
+    run(r)
+    assert receipt(ledger, before)["rules"] == []
+    assert "length = short" not in r.engines["claude"].calls[-1]["system"]
+    # his tap; the next job carries the rule, and its receipt says so
+    rules.confirm(ledger, row["id"])
+    r.engines["claude"].script = [result()]
+    job2 = send(ledger, "draft a note", uid=4)
     run(r)
     assert receipt(ledger, job2)["rules"] == [row["id"]]
     assert "length = short" in r.engines["claude"].calls[-1]["system"]
@@ -177,14 +184,13 @@ def test_conflicting_rule_is_quarantined_and_asked(ledger, config):
     r, _ = make(ledger, config, [rule("all", "short"), rule("draft", "long")])
     send(ledger, "always short", uid=1)
     run(r)
+    rules.confirm(ledger, ledger.db.execute("SELECT id FROM rules").fetchone()["id"])
     send(ledger, "drafts long", uid=2)
     run(r)
     states = sorted(x["state"] for x in ledger.db.execute("SELECT state FROM rules"))
-    assert states == ["active", "quarantined"]
-    last = queued(ledger)[-1]
-    assert "clashes" in last["text"]
-    labels = [b[0] for b in json.loads(last["buttons_json"])[0]]
-    assert labels == ["Use new", "Keep old"]
+    assert states == ["active", "pending"]
+    pending = ledger.db.execute("SELECT id FROM rules WHERE state='pending'").fetchone()["id"]
+    assert rules.confirm(ledger, pending).status == "quarantined"
 
 
 def test_a_forbidden_rule_is_refused_in_words(ledger, config):

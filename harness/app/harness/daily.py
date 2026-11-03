@@ -237,6 +237,9 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     for r in ledger.db.execute("SELECT * FROM rules WHERE state='quarantined'"):
         waiting.append(digest.Waiting(f"rule {r['id']} clashes with another; pick one",
                                       datetime.fromisoformat(r["created_at"])))
+    for r in ledger.db.execute("SELECT * FROM rules WHERE state IN ('pending','legacy_pending')"):
+        waiting.append(digest.Waiting(f"rule {r['id']} isn't used until you tap its card",
+                                      datetime.fromisoformat(r["created_at"])))
 
     failures: list[str] = []
     for job in ledger.jobs_since(since, "failed"):

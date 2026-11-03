@@ -124,19 +124,25 @@ class Commands:
 
     def _rule(self, arg: str) -> str:
         active, quarantined = rules.listing(self.ledger)
-        if not active and not quarantined:
+        waiting = rules.awaiting(self.ledger)
+        if not active and not quarantined and not waiting:
             return ("No standing rules yet. Correct me in plain words "
                     "(\"keep drafts shorter\") and I'll offer to keep it.")
         lines = ["<b>Standing rules</b>"] if active else []
         for r in active:
             where = "everything" if r["scope"] == "all" else r["scope"]
             lines.append(f"{render.escape(r['id'])} · {render.escape(where)}: "
-                         f"{render.escape(r['field'])} = {render.escape(r['value'])}")
+                         f"{render.escape(r['field'])} = {render.family_text(r['value'])}")
         if quarantined:
             lines.append("<b>Waiting for you to pick a side</b>")
             for r in quarantined:
                 lines.append(f"{render.escape(r['id'])} · {render.escape(r['scope'])}: "
-                             f"{render.escape(r['field'])} = {render.escape(r['value'])}")
+                             f"{render.escape(r['field'])} = {render.family_text(r['value'])}")
+        if waiting:
+            lines.append("<b>Not in use, waiting for your tap on its card</b>")
+            for r in waiting:
+                lines.append(f"{render.escape(r['id'])} · {render.escape(r['scope'])}: "
+                             f"{render.escape(r['field'])} = {render.family_text(r['value'])}")
         lines.append("<i>/undo retires the newest; /undo R1a2b3c a specific one.</i>")
         return "\n".join(lines)
 

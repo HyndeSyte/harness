@@ -43,7 +43,18 @@ class Callbacks:
 
     def handle(self, inc) -> str:
         """Returns what happened, for tests and the event log."""
-        if choices.parse(inc.callback_data) is not None:
+        nonce = choices.parse(inc.callback_data)
+        if nonce is not None and self.family_add is not None \
+                and choices.kind_of(self.ledger, nonce) == "family_add_loosen" \
+                and self.family_add.stopped():
+            # Nothing is consumed, so this same card still works after /resume.
+            self._answer(inc, "Stopped. Nothing changed.")
+            with self.ledger.tx() as db:
+                self.ledger.enqueue(chat_id=inc.chat_id, kind="reply", db=db, text=(
+                    "I'm stopped, so nothing changed and I didn't check the calendar. After "
+                    "/resume, tap that card again."))
+            return "stopped"
+        if nonce is not None:
             v = choices.verify_and_consume(self.ledger, inc, owner_user_id=self.owner)
             if not v.ok:
                 self._answer(inc, REFUSALS.get(v.reason, "Not valid."))
@@ -60,13 +71,18 @@ class Callbacks:
         self._answer(inc, None)
         self._strip_buttons(inc)
         with self.ledger.tx() as db:
-            self.ledger.enqueue(chat_id=inc.chat_id, kind="reply", text=render.fit(message),
-                                db=db)
+            if message:                    # a rule's own card has already said it
+                self.ledger.enqueue(chat_id=inc.chat_id, kind="reply", text=render.fit(message),
+                                    db=db)
             self.ledger.release_held(db=db)
         return "ok"
 
     def _apply_choice(self, kind: str, target: str) -> str:
         try:
+            if kind == "rule_approve":
+                return self._keep_rule(target)
+            if kind == "rule_decline":
+                return render.escape(rules.decline(self.ledger, target))
             if kind == "rule_undo":
                 return render.escape(rules.undo(self.ledger, target)) + \
                     f" <i>({render.escape(target)} retired)</i>"
@@ -82,6 +98,35 @@ class Callbacks:
         if kind.startswith("family_add_") and self.family_add is not None:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
         return "Nothing changed."
+
+    def _keep_rule(self, target: str) -> str:
+        """His tap on a rule's card. It now behaves as a correction always has: an
+        Undo button, or a question if it clashes."""
+        with self.ledger.tx() as db:
+            out = rules.confirm(self.ledger, target, db=db)
+            if out.status == "quarantined":
+                old = out.conflicts_with[0]
+                new_n = choices.mint(self.ledger, kind="rule_keep_new", target=out.rule_id,
+                                     chat_id=self.owner, ttl_s=rules.CARD_TTL_S, db=db)
+                old_n = choices.mint(self.ledger, kind="rule_keep_old", target=out.rule_id,
+                                     chat_id=self.owner, ttl_s=rules.CARD_TTL_S, db=db)
+                self.ledger.enqueue(
+                    chat_id=self.owner, kind="reply", db=db,
+                    text=(f"That clashes with rule {render.escape(old)}. "
+                          f"Use the new one ({render.escape(out.rule_id)}) or keep the old?"),
+                    buttons=[[("Use new", choices.callback_data(new_n)),
+                              ("Keep old", choices.callback_data(old_n))]],
+                    binds=[{"type": "choice", "nonce": new_n}, {"type": "choice", "nonce": old_n}])
+                return ""
+            undo_n = choices.mint(self.ledger, kind="rule_undo", target=out.rule_id,
+                                  chat_id=self.owner, ttl_s=rules.CARD_TTL_S, db=db)
+            self.ledger.enqueue(
+                chat_id=self.owner, kind="reply", db=db,
+                text=render.fit(render.family_text(out.message)
+                                + f" <i>({render.escape(out.rule_id)})</i>"),
+                buttons=[[("Undo", choices.callback_data(undo_n))]],
+                binds=[{"type": "choice", "nonce": undo_n}])
+        return ""
 
     def _answer(self, inc, text: str | None) -> None:
         try:

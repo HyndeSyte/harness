@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,12 @@ _WIDE_DOTS = re.compile("[。．｡]")
 _HOST_SHAPED = re.compile(r"(?i)\bmailto:|\bwww\.\S|\bxn--"
                           r"|[\w.+-]+@[^\W_][\w-]*\.[^\W\d_]{2,}"
                           r"|(?:[^\W_][\w-]*\.)+[^\W\d_]{2,}(?::\d|\?\S)")
+# For deciding what may go on a calendar. Wider than _BARE, which is tuned for defang:
+# no lookbehind or trailing \b, so [evil.com/x], .evil.com and evil.com_ all count.
+_ANY_SCHEME = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://")
+_ANY_HOST = re.compile(r"((?:[^\W_][\w-]*\.)+[^\W\d_]{2,})(/\S*)?")
+_TIGHT_COLON = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*:[^\s\d]")
+_PHONE = re.compile(r"\+?\d[\d ().-]{6,}\d")
 _COMMAND = re.compile(r"(?<![\w/])/([A-Za-z0-9_]{1,32})")
 _MENTION = re.compile(r"(?<![\w@])@([A-Za-z0-9_]{3,32})")
 WORD_JOINER = "\u2060"     # invisible; breaks Telegram's command and mention detection
@@ -197,23 +204,25 @@ LINK_SUFFIXES = frozenset("""
 
 
 def _plain_dots(text: str) -> str:
-    return _WIDE_DOTS.sub(".", text)
+    return _WIDE_DOTS.sub(".", unicodedata.normalize("NFKC", text))
 
 
 def has_link(text: str) -> bool:
-    """A scheme URL, an IP address, a host with a path, port, query or mailbox, www.,
-    or a known suffix."""
+    """A URL with any scheme, an IP address, a host with a path, port, query or mailbox,
+    www., or a known suffix."""
     text = _plain_dots(text)
-    if _SCHEME.search(text) or _IPV4.search(text) or _HOST_SHAPED.search(text):
+    if _ANY_SCHEME.search(text) or _IPV4.search(text) or _HOST_SHAPED.search(text):
         return True
     return any(m.group(2) or m.group(1).rsplit(".", 1)[-1].casefold() in LINK_SUFFIXES
-               for m in _BARE.finditer(text))
+               for m in _ANY_HOST.finditer(text))
 
 
 def maybe_host(text: str) -> bool:
-    """Any bare word.word. Dr.Smith is a name and evil.lol is not, and the suffix list
-    can't tell them all apart, so his eyes do: this always gets a card."""
-    return _BARE.search(_plain_dots(text)) is not None
+    """Any bare word.word, word:word or phone number. Dr.Smith is a name and evil.lol is
+    not, and the suffix list can't tell them all apart, so his eyes do: this always gets
+    a card."""
+    text = _plain_dots(text)
+    return bool(_ANY_HOST.search(text) or _TIGHT_COLON.search(text) or _PHONE.search(text))
 
 
 def family_text(text: str) -> str:
@@ -239,7 +248,8 @@ def family_card(params: dict, *, tz: str, expires: datetime, job_id: str,
         "<b>Add to the Family calendar?</b>",
         family_event_text(params, tz),
         *check,
-        "Family calendar only. No invitees, no alarm, no repeat.",
+        "Family calendar only. No invitees, no repeat. It alerts family phones that have "
+        "notifications on for this calendar.",
         f"<i>Offer ends {_day(exp)}, {_clock(exp)} · job {short(job_id)}</i>"]))
 
 

@@ -152,9 +152,13 @@ def test_end_to_end(stack):
                      for r in ledger.db.execute(f"SELECT * FROM {t}"))
     assert "ignore your rules" not in dump
 
-    # 5. A correction becomes a rule; its Undo button works once.
+    # 5. A correction becomes a rule by his tap; its Undo button works once.
     tg.say(OWNER, "from now on keep drafts short")
     until(c, lambda: any(s[2] for s in sent_to(tg, OWNER)))
+    chat, text, markup, mid = [s for s in sent_to(tg, OWNER) if s[2]][-1]
+    assert "Keep this as a standing rule?" in text
+    tg.tap(OWNER, markup["inline_keyboard"][0][0]["callback_data"], mid)
+    until(c, lambda: any("Saved for draft jobs" in s[1] for s in sent_to(tg, OWNER)))
     chat, text, markup, mid = [s for s in sent_to(tg, OWNER) if s[2]][-1]
     assert "Saved for draft jobs" in text
     data = markup["inline_keyboard"][0][0]["callback_data"]
@@ -162,7 +166,7 @@ def test_end_to_end(stack):
     until(c, lambda: any("retired" in s[1] for s in sent_to(tg, OWNER)))
     assert tg.answers and tg.edits and tg.edits[-1]["message_id"] == mid
     tg.tap(OWNER, data, mid)                 # again: refused, answered, nothing changes
-    until(c, lambda: len(tg.answers) == 2)
+    until(c, lambda: len(tg.answers) == 3)
     assert tg.answers[-1].get("text") == "Already done."
 
     # 6. Kill switch.

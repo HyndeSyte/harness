@@ -355,7 +355,7 @@ def test_the_card_is_plain_code_in_local_time_with_weekday_and_date(on):
     assert "Tue Oct 27, 2026, 3:00 PM to 4:00 PM EDT" in text
     assert "Where: Main St" in text
     assert "ignored by the card" not in text
-    assert "No invitees, no alarm, no repeat" in text
+    assert "No invitees, no repeat" in text
 
 
 def test_the_card_handles_a_day_change_and_a_clock_change():
@@ -812,7 +812,7 @@ def test_keep_checking_changes_nothing(on):
 
 def test_after_his_tap_adds_skip_approve_and_keep_receipt_undo_and_stop(on):
     days_and_adds(on, 10, 14)
-    on.press(ask_cards(on)[0], "None wrong, no alerts: stop checking")
+    on.press(ask_cards(on)[0], "None wrong: stop checking")
     assert on.fa.loosened()
     on.icloud.log.clear()
     on.bot.sent.clear()
@@ -886,11 +886,11 @@ def test_a_new_count_can_earn_a_new_card_and_the_old_card_is_void(on):
     on.ask(start="2027-01-05T15:00:00-05:00", end="2027-01-05T16:00:00-05:00")
     on.icloud.force_status = 403
     on.press(on.with_button("Approve"), "Approve")
-    on.press(old, "None wrong, no alerts: stop checking")
+    on.press(old, "None wrong: stop checking")
     assert not on.fa.loosened() and "record changed" in on.texts()[-1]
     days_and_adds(on, 10, 14)
     assert len(ask_cards(on)) == 2
-    on.press(ask_cards(on)[-1], "None wrong, no alerts: stop checking")
+    on.press(ask_cards(on)[-1], "None wrong: stop checking")
     assert on.fa.loosened()
 
 
@@ -1060,7 +1060,7 @@ def test_event_text_is_exactly_what_was_approved(on):
 
 # -- review round: the way back ---------------------------------------------------------------
 
-STOP = "None wrong, no alerts: stop checking"
+STOP = "None wrong: stop checking"
 KEEP = "Something was off: keep checking"
 day = iter(range(1, 100000))
 
@@ -1375,7 +1375,7 @@ def test_the_card_shows_every_count_and_asks_plainly(on):
     assert ("10 approved and added, 2 declined, 1 expired, 0 cancelled, 0 refused, 0 undone, "
             "0 failed, 0 unknown, 0 shown with a warning") in text
     assert "0 of those 10 added are no longer on the calendar" in text
-    assert "Were any of these wrong? Did the family get alerts from them?" in text
+    assert "Were any of these adds wrong?" in text
     assert [row[0][0] for row in card[2]] == [STOP, KEEP]
 
 

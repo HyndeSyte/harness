@@ -24,7 +24,8 @@ from .ledger import Ledger, iso
 
 KINDS = frozenset({"rule_undo", "rule_keep_new", "rule_keep_old",
                    "settings_approve", "settings_decline", "family_add_enable",
-                   "family_add_undo", "family_add_loosen", "family_add_keep"})
+                   "family_add_undo", "family_add_loosen", "family_add_keep",
+                   "rule_approve", "rule_decline"})
 PREFIX = "c"
 
 
@@ -73,6 +74,12 @@ def bind(ledger: Ledger, nonce: str, message_id: int) -> None:
                          (message_id, nonce))
         if cur.rowcount != 1:
             raise ValueError("choice already bound or missing")
+
+
+def kind_of(ledger: Ledger, nonce: str) -> str | None:
+    """Looks, consumes nothing: for a card that must stay usable."""
+    row = ledger.db.execute("SELECT kind FROM choices WHERE nonce=?", (nonce,)).fetchone()
+    return row["kind"] if row else None
 
 
 def verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int) -> ChoiceVerdict:
