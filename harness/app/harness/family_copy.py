@@ -55,8 +55,8 @@ SLOP = timedelta(minutes=30)   # travel time makes the two calendars differ a li
 PROBLEM = "family_copy_problem"
 READ_SIZE = "family_copy_read_size"
 THIN_READS = "family_copy_thin_reads"
-REVIVED = "family_copy_revived_073"      # a new name gives them one more try after this update
-REVIVE_TRIES = "family_copy_revive_tries_073"
+REVIVED = "family_copy_revived_074"      # a new name gives them one more try after this update
+REVIVE_TRIES = "family_copy_revive_tries_074"
 TRIP = "trip"
 CAPPED = ("Copies from Gmail: today's limit of changes is reached, so some wait for tomorrow and "
           "may be wrong until then.")

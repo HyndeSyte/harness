@@ -148,13 +148,25 @@ def _lines(ics: str) -> tuple[list[str], list[str]]:
     return lines, [re.split(r"[;:]", x, maxsplit=1)[0].upper() for x in lines]
 
 
+def _not_plain(lines: list[str], names: list[str]) -> list[str]:
+    """What stops this being a plain one-off. Only the event's own lines count: a time zone
+    block alongside it has repeat lines of its own, for its clock changes."""
+    out, inside = [], False
+    for line, name in zip(lines, names):
+        if line.upper() in ("BEGIN:VEVENT", "END:VEVENT"):
+            inside = line.upper() == "BEGIN:VEVENT"
+        elif inside and name in _NOT_PLAIN:
+            out.append(line)
+    return out
+
+
 def _is_plain(ics: str) -> bool:
     """One event, with no attendee, organizer or repeat that could turn a delete
     into a message to someone."""
     lines, names = _lines(ics)
     if sum(x.upper() == "BEGIN:VEVENT" for x in lines) != 1:
         return False
-    return not _NOT_PLAIN & set(names)
+    return not _not_plain(lines, names)
 
 
 def _content(ics: str) -> list[str]:
@@ -184,7 +196,7 @@ def _names(lines) -> list[str]:
 
 def _why_refused(body: str, same_etag: bool, read: str) -> str:
     lines, names = _lines(body)
-    odd = _names(x for x, name in zip(lines, names) if name in _NOT_PLAIN)
+    odd = _names(_not_plain(lines, names))
     events = sum(x.upper() == "BEGIN:VEVENT" for x in lines)
     differ = set(_content(body)) ^ set(_content(read))
     return (f"events={events} not_plain={odd} same_etag={same_etag} "

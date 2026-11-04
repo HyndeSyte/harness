@@ -774,6 +774,31 @@ def test_his_copy_moves_when_a_get_writes_the_same_event_differently(copy):
     assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
 
 
+def test_his_copy_with_repeat_lines_in_its_time_zone_block_moves(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    zone = ("BEGIN:VTIMEZONE\r\nTZID:America/New_York\r\nBEGIN:DAYLIGHT\r\nDTSTART:20070311T020000\r\n"
+            "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU\r\nRDATE:20070311T020000\r\nTZOFFSETFROM:-0500\r\n"
+            "TZOFFSETTO:-0400\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n")
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("BEGIN:VEVENT", zone + "BEGIN:VEVENT"))
+    read(copy, occ(uid="u1", start=start))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
+    assert not events(copy, "family_copy_left_alone")
+
+
+@pytest.mark.parametrize("line", ["RRULE:FREQ=WEEKLY", "RDATE:20270101T100000Z", "ORGANIZER:mailto:a@example.invalid",
+                                  "ATTENDEE:", "RRULE:", "RDATE:"])
+def test_a_real_repeat_or_guest_still_stops_the_removal(copy, line):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    item = copy.fa.client.items_between(when(copy, 4), when(copy, 6), TZ).items[0]
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("END:VEVENT", f"{line}\r\nEND:VEVENT"))
+    assert copy.fa.client.remove_hand_copy(item.href, item.etag, item.data).kind == "changed"
+    assert path in on_family(copy)
+
+
 def test_a_refused_copy_logs_the_reason_in_names_only(copy, caplog):
     start = when(copy, 5)
     path = seed(copy, "Sam - PT", start)

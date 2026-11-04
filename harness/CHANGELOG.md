@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.4
+
+- The reason moved hand copies stayed put: the repeat lines in an event's time zone block, there for its clock changes, counted as the event repeating. Now only the event's own lines count. A real repeat or a guest still means it's left alone.
+- Copies given up on, still exactly as they were, get one more try after this update.
+
 ## 0.7.3
 
 - 0.7.2 didn't get moved hand copies going: iCloud's copy still failed a safety check. Comparing an event with what was just read now ignores line order and the server's own X- lines.
