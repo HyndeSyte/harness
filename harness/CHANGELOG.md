@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2
+
+- Copies now follow a move on Gmail when iCloud reports an event's version differently in a list than it does when asked directly. They could stop following with no word.
+- The digest names any copy it stops following, by word and date, and says why, so a stale copy doesn't go unnoticed. It also says when the daily limit holds changes back, part of Family can't be read, or a read goes wrong.
+- A note or place added to a copy on Family now means it's left alone, rather than rebuilt without them.
+- A hand copy already off from Gmail when taken over now moves to match, only if it has the copy's exact title and length and no note. Anything else is left alone and named.
+- Copies it gave up on by mistake, still exactly as they were, are followed again once after this update.
+
 ## 0.7.1
 
 - Several appointments cancelled together now come off Family, after about three hours. They could

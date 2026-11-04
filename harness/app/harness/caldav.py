@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from . import ical
 from .net import REDACT, HttpResponse, TransportError
@@ -135,6 +135,9 @@ def build_copy_ics(uid: str, title: str, start, end, now: datetime) -> str:
     return "\r\n".join(_fold(x) for x in lines) + "\r\n"
 
 
+_STAMPS = frozenset({"DTSTAMP", "LAST-MODIFIED", "CREATED", "SEQUENCE", "PRODID"})
+
+
 def _lines(ics: str) -> tuple[list[str], list[str]]:
     text = re.sub(r"\r?\n[ \t]", "", ics.replace("\r\n", "\n"))
     lines = [x for x in text.split("\n") if x]
@@ -148,6 +151,29 @@ def _is_plain(ics: str) -> bool:
     if sum(x.upper() == "BEGIN:VEVENT" for x in lines) != 1:
         return False
     return not {"ATTENDEE", "ORGANIZER", "RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"} & set(names)
+
+
+def _unchanged(ics: str, read: str) -> bool:
+    """The same event as was just read, whatever the server's stamps and line endings. A
+    calendar's list and a GET can answer with different ETags for one version."""
+    def content(text: str) -> list[str]:
+        lines, names = _lines(text)
+        return [x for x, name in zip(lines, names) if name not in _STAMPS]
+    return bool(read) and content(ics) == content(read)
+
+
+def href_path(href: str) -> str:
+    """One event's address however the server wrote it, to compare two reads."""
+    try:
+        return unquote(urlsplit(href).path)
+    except ValueError:
+        return href
+
+
+def details(ics: str) -> tuple[str, ...]:
+    """What someone can add that the reader's title and times don't show."""
+    lines, names = _lines(ics)
+    return tuple(x for x, name in zip(lines, names) if name in ("DESCRIPTION", "LOCATION"))
 
 
 def _is_ours(ics: str, uid: str) -> bool:
@@ -174,6 +200,7 @@ class Item:
     occ: ical.Occurrence
     href: str
     etag: str
+    data: str = ""
 
 
 @dataclass(frozen=True)
@@ -307,13 +334,13 @@ class FamilyCalDav:
                     return None                  # an answer with no event in it is no answer
                 w = ical.window(data, start=start, end=end, tz=tz, fallback_name=CALENDAR_NAME)
                 unreadable += w.unreadable
-                out += [Item(occ, href, etag) for occ in w.occurrences]
+                out += [Item(occ, href, etag, data) for occ in w.occurrences]
             return Read(out, unreadable)
         except (TransportError, ET.ParseError, ValueError):
             return None
 
     def put_copy(self, uid: str, title: str, start, end, now: datetime,
-                 etag: str | None = None) -> Outcome:
+                 etag: str | None = None, data: str = "") -> Outcome:
         """A copy from Gmail: new, or a change to our own. The uid is fixed per copy, so a
         write whose answer was lost finds itself on the next try instead of doubling."""
         ready = self._auth()
@@ -324,6 +351,8 @@ class FamilyCalDav:
         if problem is not None:
             return problem
         href = f"{url}{uid}.ics"
+        if etag == "":
+            return Outcome("failed")           # a change to one with no version isn't a new one
         guard = {"If-Match": etag} if etag else {"If-None-Match": "*"}
         try:
             r = self._call(auth, "PUT", href, {**_ICS_HEADERS, **guard},
@@ -334,8 +363,44 @@ class FamilyCalDav:
             return Outcome("ok", r.status, r.headers.get("etag"))
         if r.status == 412:
             if etag:
-                return Outcome("changed", r.status)
+                current = self._current_etag(auth, href, uid, data)
+                if current.kind != "ok":
+                    return current
+                return self._put_again(auth, href, uid, title, start, end, now, current.etag)
             return self._ours_already(auth, href, uid)
+        if r.status == 401:
+            return Outcome("auth", r.status)
+        return Outcome("unknown" if r.status >= 500 else "failed", r.status)
+
+    def _current_etag(self, auth: dict, href: str, uid: str, data: str) -> Outcome:
+        """The ETag of our copy, if it's unchanged from what was just read. Only an answer
+        that shows a difference is "changed": not getting an answer says nothing."""
+        try:
+            r = self._call(auth, "GET", href)
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        if r.status == 401:
+            return Outcome("auth", r.status)
+        if r.status != 200:
+            return Outcome("unknown" if r.status >= 500 else "failed", r.status)
+        body = r.body.decode("utf-8", "replace")
+        if not (_is_ours(body, uid) and _unchanged(body, data)):
+            return Outcome("changed", r.status)
+        etag = r.headers.get("etag")
+        return Outcome("ok", r.status, etag) if etag else Outcome("failed", r.status)
+
+    def _put_again(self, auth: dict, href: str, uid: str, title: str, start, end, now: datetime,
+                   etag: str) -> Outcome:
+        """Once, with the ETag a GET gave. A second refusal is a real change."""
+        try:
+            r = self._call(auth, "PUT", href, {**_ICS_HEADERS, "If-Match": etag},
+                           build_copy_ics(uid, title, start, end, now))
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        if r.status in (200, 201, 204):
+            return Outcome("ok", r.status, r.headers.get("etag"))
+        if r.status == 412:
+            return Outcome("changed", r.status)
         if r.status == 401:
             return Outcome("auth", r.status)
         return Outcome("unknown" if r.status >= 500 else "failed", r.status)
@@ -349,7 +414,7 @@ class FamilyCalDav:
             return Outcome("ok", r.status, r.headers.get("etag"))
         return Outcome("exists", r.status)
 
-    def remove_hand_copy(self, href: str, etag: str) -> Outcome:
+    def remove_hand_copy(self, href: str, etag: str, data: str = "") -> Outcome:
         """Delete one event he made by hand, taken over from Gmail. Only a plain one-off
         in this calendar, only as it was just read."""
         ready = self._auth()
@@ -360,9 +425,14 @@ class FamilyCalDav:
         if problem is not None:
             return problem
         collection = urlsplit(url)
-        if not href.startswith(collection.path) or not href.endswith(".ics") or ".." in href:
+        try:
+            path = urlsplit(href).path     # a server may answer with a whole address, or escape it
+        except ValueError:
             return Outcome("failed")
-        target = f"{collection.scheme}://{collection.netloc}{href}"
+        if not unquote(path).startswith(unquote(collection.path)) or not path.endswith(".ics") \
+                or ".." in unquote(path) or re.search(r"%(25|2f|5c)", path, re.I):
+            return Outcome("failed")
+        target = f"{collection.scheme}://{collection.netloc}{path}"
         try:
             r = self._call(auth, "GET", target)
         except TransportError:
@@ -371,11 +441,13 @@ class FamilyCalDav:
             return Outcome("gone", r.status)
         if r.status != 200:
             return Outcome("failed", r.status)
-        if not etag or r.headers.get("etag") != etag \
-                or not _is_plain(r.body.decode("utf-8", "replace")):
+        body, current = r.body.decode("utf-8", "replace"), r.headers.get("etag")
+        if not _is_plain(body) or (current != etag and not _unchanged(body, data)):
             return Outcome("changed", r.status)
+        if not (current or etag):
+            return Outcome("failed", r.status)   # nothing to guard the delete with
         try:
-            r = self._call(auth, "DELETE", target, {"If-Match": etag})
+            r = self._call(auth, "DELETE", target, {"If-Match": current or etag})
         except TransportError as e:
             return Outcome("failed" if e.kind == "blocked" else "unknown")
         if r.status in (200, 204):
@@ -386,7 +458,7 @@ class FamilyCalDav:
             return Outcome("changed", r.status)
         return Outcome("unknown" if r.status >= 500 else "failed", r.status)
 
-    def undo(self, uid: str, etag: str | None) -> Outcome:
+    def undo(self, uid: str, etag: str | None, data: str = "") -> Outcome:
         """Delete this one event, if it is still exactly what the harness wrote."""
         ready = self._auth()
         if ready is None:
@@ -406,11 +478,13 @@ class FamilyCalDav:
             return Outcome("auth", r.status)
         if r.status != 200:
             return Outcome("failed", r.status)
-        current = r.headers.get("etag")
-        if not etag or current != etag or not _is_ours(r.body.decode("utf-8", "replace"), uid):
+        body, current = r.body.decode("utf-8", "replace"), r.headers.get("etag")
+        if not _is_ours(body, uid) or (current != etag and not _unchanged(body, data)):
             return Outcome("changed", r.status)
+        if not (current or etag):
+            return Outcome("failed", r.status)   # nothing to guard the delete with
         try:
-            r = self._call(auth, "DELETE", href, {"If-Match": etag})
+            r = self._call(auth, "DELETE", href, {"If-Match": current or etag})
         except TransportError as e:
             return Outcome("failed" if e.kind == "blocked" else "unknown")
         if r.status in (200, 204):

@@ -32,7 +32,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,8 @@ AHEAD_DAYS = 60                # read this far, so a move is followed, not taken
 MAX_HOURS = 8                  # longer than this isn't an appointment
 MAX_WRITES_PER_DAY = 12
 MAX_REMOVALS_AT_ONCE = 3
+MAX_FAILED_WRITES = 3          # in one read, before it stops trying until the next
+MAX_NAMED = 10                 # in the digest, which has a length limit of its own
 READS_BEFORE_REMOVING = 2
 STOP_AFTER_REMOVED = 2
 HOLD_READS = 6                 # three hours: long enough for a bad read to pass, then it's real
@@ -53,7 +55,14 @@ SLOP = timedelta(minutes=30)   # travel time makes the two calendars differ a li
 PROBLEM = "family_copy_problem"
 READ_SIZE = "family_copy_read_size"
 THIN_READS = "family_copy_thin_reads"
+REVIVED = "family_copy_revived"
+REVIVE_TRIES = "family_copy_revive_tries"
 TRIP = "trip"
+CAPPED = ("Copies from Gmail: today's limit of changes is reached, so some wait for tomorrow and "
+          "may be wrong until then.")
+_WHY = {"edited": "changed on Family", "changed": "changed on Family",
+        "not listed": "Family's list leaves it out", "gone": "no longer on Family",
+        "off": "its time doesn't match Gmail", "earlier": "stopped following earlier"}
 
 # The word on Family, by what the title says. Checked in order.
 _WORDS = (("PT", r"pt|physical therapy|physio"),
@@ -247,7 +256,7 @@ class FamilyCopy:
         return line + (f". Stopped for {', '.join(stopped)}, after two were removed" if stopped else "")
 
     def digest_line(self) -> str:
-        """Counts only. Silent when nothing changed and nothing is wrong."""
+        """Counts, and which were left alone. Silent when nothing changed and nothing is wrong."""
         since = self.ledger.meta_time("last_digest_at")
         parts = []
         for kind, label in (("family_copy_added", "added"), ("family_copy_moved", "moved"),
@@ -259,7 +268,8 @@ class FamilyCopy:
                 parts.append(f"{n} {label}")
         line = "Copies from Gmail to Family: " + ", ".join(parts) + "." if parts else ""
         problem = self.ledger.get_meta(PROBLEM)
-        return " ".join(x for x in (line, problem) if x)
+        left = self._left_alone(iso(since) if since else "")
+        return " ".join(x for x in (line, left, problem) if x)
 
     # -- each tick -------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
@@ -269,11 +279,17 @@ class FamilyCopy:
             return
         self._seen = gen
         try:
-            if not paused and self.fa.enabled() and self.name():
+            if paused:
+                return
+            if self.fa.enabled() and self.name():
                 self._sync()
+            else:
+                self._problem("")          # off: an old problem isn't one any more
         except Exception as e:
             log.warning("family copy failed: %s", type(e).__name__)
             self.ledger.event("family_copy_failed", {"error": type(e).__name__})
+            self._problem("Copies from Gmail: something went wrong on the last read, so Family may "
+                          "be out of date.")
 
     def _gmail_feeds(self) -> list:
         return [res for res in self.calendar.snapshot.feeds.values() if res.window is not None
@@ -303,6 +319,9 @@ class FamilyCopy:
             self._problem("Copies from Gmail: couldn't read the Family calendar, so nothing "
                           "changed.")
             return
+        self.deleted: set[str] = set()     # his copies removed this read: not there to match
+        self._revive(family, now, until)
+        self._tell_once(family)
         occ = feed.ahead.occurrences
         planned = plan(occ, name, self.tz)
         wants = {k: w for k, w in planned.items() if self._ends(w) > now}
@@ -355,10 +374,11 @@ class FamilyCopy:
     # -- what's already there ------------------------------------------------------------
     def _follow(self, wants: dict, family: caldav.Read, now: datetime, gmail_clean: bool,
                 until: datetime, odd: bool) -> str:
-        items = {i.href: i for i in family.items}
+        items = {caldav.href_path(i.href): i for i in family.items}
         by_uid = {i.occ.uid: i for i in family.items}
         gone, absent = [], []
         problem = ""
+        waiting = tries = 0
         for row in self._live():
             start, end = self._when(row["start"]), self._when(row["end"])
             if self._moment(end) <= now:
@@ -367,15 +387,17 @@ class FamilyCopy:
             begins = self._moment(start)
             if begins >= until:
                 continue                   # past what was read: unread, not gone
-            item = items.get(row["href"]) if row["hand"] else by_uid.get(row["uid"])
+            item = items.get(caldav.href_path(row["href"])) if row["hand"] else by_uid.get(row["uid"])
             want = wants.get(row["key"])
             if item is None:
                 absent.append((row, want))
                 continue
             if row["hand"]:
-                if row["seen"] != _seen(item.occ):
-                    self._set(row, "hands_off")    # not what was taken over any more
+                if not _still_seen(row, item):
+                    self._leave(row, "edited")     # not what was taken over any more
                     continue
+                if row["seen"] == _seen(item.occ):
+                    self._update(row, seen=_seen_now(item))    # from before notes were seen
             elif want is not None and self._landed(item.occ, want):
                 # Already as it should be: a write whose answer was lost.
                 if not (_same(want.start, start) and _same(want.end, end)):
@@ -383,8 +405,8 @@ class FamilyCopy:
                 elif row["missing"]:
                     self._update(row, missing=0)
                 continue
-            elif not self._as_written(item.occ, row, start, end):
-                self._set(row, "hands_off")        # someone edited it: theirs now
+            elif not self._as_written(item.occ, row, start, end) or caldav.details(item.data):
+                self._leave(row, "edited")         # someone edited it: theirs now
                 continue
             if want is None:
                 if gmail_clean:
@@ -394,16 +416,23 @@ class FamilyCopy:
                 self._update(row, missing=0)
             # Once begun, a trip's flights have left the read: that's not a change.
             retitled = not row["hand"] and want.title != row["title"] and begins > now
-            if retitled or not (_same(want.start, start) and _same(want.end, end)):
+            # Taken over when Gmail had already moved on: the row can't show that, the event can.
+            behind = row["hand"] and _off_time(item, want) and _clearly_same(item, want)
+            if retitled or behind or not (_same(want.start, start) and _same(want.end, end)):
                 if not self._room():
+                    waiting += 1
                     continue
-                problem = self._move(row, item, want)
-                if problem:
-                    break
-        else:
+                failed = self._move(row, item, want)
+                if failed:
+                    # One copy's trouble shouldn't hold up the rest, but don't hammer iCloud.
+                    problem = problem or failed
+                    tries += 1
+                    if tries >= MAX_FAILED_WRITES:
+                        break
+        if not problem:
             problem = self._absent(absent, family.unreadable == 0)
             problem = self._cancel(gone, wants, odd) or problem
-        return problem
+        return problem or (CAPPED if waiting else "")
 
     def _moment(self, value) -> datetime:
         if isinstance(value, datetime):
@@ -423,8 +452,11 @@ class FamilyCopy:
 
     def _absent(self, absent: list, family_clean: bool) -> str:
         """Gone from Family. One read can be wrong, and so can many gone at once for a while."""
-        if not family_clean or not absent:
+        if not absent:
             return ""
+        if not family_clean:
+            return (f"Copies from Gmail: {len(absent)} events aren't in Family's list, but part of "
+                    "Family couldn't be read, so I changed nothing.")
         if len(absent) > MAX_REMOVALS_AT_ONCE and min(r["missing"] for r, _ in absent) + 1 < HOLD_READS:
             for row, _ in absent:
                 self._update(row, missing=row["missing"] + 1)
@@ -438,7 +470,7 @@ class FamilyCopy:
                 # The read left it out but it's there, or iCloud won't say. In time, if it's
                 # there, someone moved it out of what's read: theirs now.
                 if there == 0 and row["missing"] + 1 >= GIVE_UP_READS:
-                    self._set(row, "hands_off")
+                    self._leave(row, "not listed")
                     continue
                 self._update(row, missing=row["missing"] + 1)
                 problem = ("Copies from Gmail: what Family listed doesn't match what's on it, so "
@@ -466,15 +498,17 @@ class FamilyCopy:
                 kept += 1      # his own copy can't be rebuilt from a bad read's mistake
                 continue
             if not self._room():
+                problem = CAPPED
                 break
-            out = (self.client.remove_hand_copy(item.href, item.etag) if row["hand"]
-                   else self.client.undo(row["uid"], item.etag))
+            out = (self.client.remove_hand_copy(item.href, item.etag, item.data) if row["hand"]
+                   else self.client.undo(row["uid"], item.etag, item.data))
             if out.kind in ("ok", "gone"):
+                self.deleted.add(item.href)
                 self._set(row, "cancelled")
                 self._log("family_copy_cancelled", row["key"])
                 self.writes += 1
             elif out.kind == "changed":
-                self._set(row, "hands_off")
+                self._leave(row, "changed")
             else:
                 problem = self._write_problem(out)
                 break
@@ -487,6 +521,7 @@ class FamilyCopy:
         """Gone from Family with no help from here: taken as his answer, and not put back."""
         if row["hand"]:
             self._set(row, "done")
+            self._note(row, "gone")
             return
         self._set(row, "removed")
         self._log("family_copy_removed", row["key"])
@@ -495,19 +530,20 @@ class FamilyCopy:
         now = self.ledger.now()
         if row["hand"]:
             # Takes over his copy: removed, and ours written in its place.
-            out = self.client.remove_hand_copy(item.href, item.etag)
+            out = self.client.remove_hand_copy(item.href, item.etag, item.data)
             if out.kind == "changed":
-                self._set(row, "hands_off")
+                self._leave(row, "changed")
                 return ""
             if out.kind not in ("ok", "gone"):
                 return self._write_problem(out)
-            etag = None
+            self.deleted.add(item.href)
+            etag, data = None, ""
         else:
-            etag = item.etag
+            etag, data = item.etag, item.data
         uid = _uid(row["key"]) if row["hand"] else row["uid"]
-        out = self.client.put_copy(uid, want.title, want.start, want.end, now, etag=etag)
+        out = self.client.put_copy(uid, want.title, want.start, want.end, now, etag=etag, data=data)
         if out.kind == "changed":
-            self._set(row, "hands_off")
+            self._leave(row, "changed")
             return ""
         if out.kind != "ok":
             if row["hand"]:
@@ -527,8 +563,9 @@ class FamilyCopy:
         now = self.ledger.now()
         stopped = self._stopped_words()
         live = self._live()
-        claimed = {r["href"] for r in live if r["hand"]} | {r["uid"] for r in live}
-        free = [i for i in family if i.href not in claimed and i.occ.uid not in claimed]
+        claimed = {caldav.href_path(r["href"]) for r in live if r["hand"]} | {r["uid"] for r in live}
+        free = [i for i in family if caldav.href_path(i.href) not in claimed
+                and i.occ.uid not in claimed and i.href not in self.deleted]
         for key, want in sorted(wants.items(), key=lambda kv: _text(kv[1].start)):
             row = self.ledger.db.execute("SELECT state, start FROM family_copies WHERE key=?",
                                          (key,)).fetchone()
@@ -539,12 +576,20 @@ class FamilyCopy:
             match = match_on_family(want, sources.get(key, ""), free, name)
             if match is not None:
                 if _takeable(match.occ):
-                    self._insert(key, want, match.occ.uid, match.href, hand=1,
-                                 seen=_seen(match.occ))
+                    # Past the drive time, Gmail has already moved on: record where it really
+                    # is, so the next read moves it.
+                    off = _off_time(match, want)
+                    held = replace(want, start=match.occ.start, end=match.occ.end) if off else want
+                    self._insert(key, held, match.occ.uid, match.href, hand=1,
+                                 seen=_seen_now(match))
                     free = [i for i in free if i.href != match.href]
+                    if off and not _clearly_same(match, want):
+                        row = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?",
+                                                     (key,)).fetchone()
+                        self._leave(row, "off")    # may be another thing that looks like it
                 continue
             if not self._room():
-                break
+                return CAPPED
             # A finished copy is still on Family, so its event needs a new one.
             uid = _uid(f"{key}:{_text(want.start)}") if again else _uid(key)
             out = self.client.put_copy(uid, want.title, want.start, want.end, now)
@@ -556,6 +601,7 @@ class FamilyCopy:
         return ""
 
     def _write_problem(self, out: caldav.Outcome) -> str:
+        log.warning("family copy: a write answered %s (%s)", out.kind, out.status)
         return ("Copies from Gmail: the last change to Family didn't go through ("
                 f"{out.kind}). I'll try again at the next read.")
 
@@ -578,6 +624,91 @@ class FamilyCopy:
     def _set(self, row, state: str) -> None:
         self._update(row, state=state)
 
+    def _leave(self, row, why: str) -> None:
+        """No longer followed. Never silently: a copy left behind is a wrong calendar."""
+        self._set(row, "hands_off")
+        self._note(row, why)
+
+    def _note(self, row, why: str) -> None:
+        log.warning("family copy: %s copy of %s not followed (%s)", row["word"], row["start"][:10], why)
+        with self.ledger.tx() as db:
+            self.ledger.event("family_copy_left_alone", {
+                "key": row["key"], "word": row["word"], "start": row["start"], "why": why}, db=db)
+
+    def _left_alone(self, since: str) -> str:
+        """Which ones, so he can look, in fixed words."""
+        said = []
+        more = 0
+        for r in self.ledger.db.execute("SELECT detail FROM events WHERE kind='family_copy_left_alone'"
+                                        " AND at>=?", (since,)):
+            try:
+                d = json.loads(r["detail"])
+                day = _first_day(self._when(d["start"]), ZoneInfo(self.tz))
+                text = f"{d['word']} {day:%b} {day.day} ({_WHY[d['why']]})"
+            except (ValueError, KeyError, TypeError, AttributeError):
+                more += 1                  # an odd record mustn't cost the morning's digest
+                continue
+            if len(said) < MAX_NAMED:
+                said.append(text)
+            else:
+                more += 1
+        if more:
+            said.append(f"and {more} more")
+        return "Left alone, check by hand: " + ", ".join(said) + "." if said else ""
+
+    def _revive(self, family: caldav.Read, now: datetime, until: datetime) -> None:
+        """Once, on the update that stopped leaving copies behind by mistake: any it gave up
+        on that's still exactly as it left it goes back to being followed. Needs a whole read,
+        since it only gets the one try. One whose day has passed is finished, so if its event
+        moved on, that gets a new copy. One the list leaves out gets a few reads to turn up, and
+        any it can't follow after that is named once, so none stays stale unsaid."""
+        if self.ledger.get_meta(REVIVED) or not family.items or family.unreadable:
+            return
+        unseen = False
+        items = {caldav.href_path(i.href): i for i in family.items}
+        by_uid = {i.occ.uid: i for i in family.items}
+        live = self._live()
+        held = {caldav.href_path(r["href"]) for r in live if r["hand"]} | {r["uid"] for r in live}
+        for row in self.ledger.db.execute(
+                "SELECT * FROM family_copies WHERE state='hands_off'").fetchall():
+            start, end = self._when(row["start"]), self._when(row["end"])
+            if self._moment(end) <= now:
+                self._set(row, "done")
+                continue
+            path = caldav.href_path(row["href"])
+            item = items.get(path) if row["hand"] else by_uid.get(row["uid"])
+            if item is None:
+                unseen = unseen or self._moment(start) < until
+                continue
+            claim = path if row["hand"] else row["uid"]
+            if claim in held:
+                continue
+            if _still_seen(row, item) if row["hand"] else (
+                    self._as_written(item.occ, row, start, end) and not caldav.details(item.data)):
+                self._update(row, state="live", missing=0)
+                held.add(claim)
+                log.info("family copy: following a %s copy again", row["word"])
+        tries = int(self.ledger.get_meta(REVIVE_TRIES) or 0) + 1
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(REVIVE_TRIES, str(tries), db)
+        if unseen and tries < HOLD_READS:
+            return
+        for row in self.ledger.db.execute(
+                "SELECT * FROM family_copies WHERE state='hands_off'").fetchall():
+            self._note(row, "earlier")
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(REVIVED, "1", db)
+
+    def _tell_once(self, family: caldav.Read) -> None:
+        """Once per start: where his own copies stand. Words and dates only."""
+        if getattr(self, "_told", False):
+            return
+        self._told = True
+        for r in self.ledger.db.execute("SELECT word, state, start, missing FROM family_copies"
+                                        " WHERE hand=1 OR state='hands_off'").fetchall():
+            log.info("family copy: %s %s %s missing=%s", r["word"], r["start"][:10], r["state"], r["missing"])
+        log.info("family copy: read %d events, %d unreadable", len(family.items), family.unreadable)
+
     def _update(self, row, **fields) -> None:
         cols = ", ".join(f"{name}=?" for name in fields)
         with self.ledger.tx() as db:
@@ -598,6 +729,30 @@ def _takeable(occ: ical.Occurrence) -> bool:
 def _seen(occ: ical.Occurrence) -> str:
     """His event as it was taken over. If it changes, it isn't ours to touch."""
     return f"{occ.summary}|{occ.start.isoformat()}|{occ.end.isoformat()}"
+
+
+def _seen_now(item: caldav.Item) -> str:
+    """With a note or place, which the reader's title and times don't show."""
+    extra = hashlib.sha256("\n".join(caldav.details(item.data)).encode()).hexdigest()[:16]
+    return f"{_seen(item.occ)}|{extra}"
+
+
+def _off_time(item: caldav.Item, want: Want) -> bool:
+    return isinstance(want.start, datetime) and isinstance(item.occ.start, datetime) \
+        and abs(item.occ.start - want.start) > SLOP
+
+
+def _clearly_same(item: caldav.Item, want: Want) -> bool:
+    """Close in time and a word in common isn't enough to rewrite someone's event: the very
+    title a copy has, the same length, and no note. A place is his PT's usual."""
+    return (item.occ.summary.strip() == want.title
+            and item.occ.end - item.occ.start == want.end - want.start
+            and not any(x.upper().startswith("DESCRIPTION") for x in caldav.details(item.data)))
+
+
+def _still_seen(row, item: caldav.Item) -> bool:
+    """A row from before that was added holds only the title and times."""
+    return row["seen"] in (_seen_now(item), _seen(item.occ))
 
 
 def _text(value) -> str:

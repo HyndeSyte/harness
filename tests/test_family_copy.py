@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from harness import caldav, effects, ical
-from harness.family_copy import (GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE, MAX_WRITES_PER_DAY, PROBLEM, FamilyCopy,
+from harness.family_copy import (GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE, MAX_WRITES_PER_DAY, PROBLEM, REVIVED, FamilyCopy,
                                  name_from_options, plan, word_for)
 from harness.net import TransportError
 from harness.vault import FIELDS
@@ -699,6 +699,392 @@ def test_his_copy_moves_when_gmail_moves(copy):
     read(copy, occ(uid="u1", start=start))
     read(copy, occ(uid="u1", start=when(copy, 7)))
     assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
+
+
+def different_etags(rig):
+    """Real iCloud isn't known to give a list and a GET the same ETag for one version."""
+    original = rig.icloud.request
+
+    def request(method, url, **kw):
+        out = original(method, url, **kw)
+        if method == "REPORT":
+            return type(out)(out.status, out.headers, out.body.replace(b"<D:getetag>", b"<D:getetag>L"))
+        return out
+    rig.icloud.request = request
+
+
+def test_his_copy_moves_when_the_list_and_a_get_disagree_on_its_etag(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    different_etags(copy)
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
+    assert not events(copy, "family_copy_left_alone")
+
+
+def test_our_copy_moves_when_the_list_and_a_get_disagree_on_its_etag(copy):
+    read(copy, occ(uid="u1", start=when(copy, 5)))
+    first = starts(copy)
+    different_etags(copy)
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert starts(copy) != first and len(copy.icloud.family()) == 1
+    assert not events(copy, "family_copy_left_alone")
+
+
+def test_a_real_edit_is_still_left_alone_and_it_says_so(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("Sam - PT", "Sam - PT moved"))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path in on_family(copy) and events(copy, "family_copy_left_alone") == 1
+    assert "Left alone" in copy.copy.digest_line()
+
+
+def test_a_note_added_after_the_read_stops_the_removal(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    different_etags(copy)
+    item = copy.fa.client.items_between(when(copy, 4), when(copy, 6), TZ).items[0]
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("END:VEVENT", "DESCRIPTION:note\r\nEND:VEVENT"))
+    assert copy.fa.client.remove_hand_copy(item.href, item.etag, item.data).kind == "changed"
+    assert path in on_family(copy)
+
+
+def test_a_copy_given_up_by_mistake_is_followed_again_once(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off'")
+        copy.ledger.set_meta(REVIVED, "", db)     # as it stands the first time the update runs
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
+    assert copy.ledger.get_meta(REVIVED)
+
+
+def test_a_copy_left_alone_after_that_stays_left_alone(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off'")
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path in on_family(copy)
+
+
+def test_a_copy_he_really_edited_is_not_followed_again(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off'")
+        copy.ledger.set_meta(REVIVED, "", db)
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("Sam - PT", "Sam - PT moved"))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path in on_family(copy)
+
+
+def test_no_answer_on_the_second_look_does_not_give_up_on_a_copy(copy):
+    read(copy, occ(uid="u1", start=when(copy, 5)))
+    different_etags(copy)
+    listed = copy.icloud.request
+    gets = []
+
+    def flaky(method, url, **kw):
+        if method == "GET" and not gets:
+            gets.append(url)
+            raise TransportError("timeout", "timeout")
+        return listed(method, url, **kw)
+    copy.icloud.request = flaky
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert gets and not events(copy, "family_copy_left_alone")
+    first = starts(copy)
+    read(copy, occ(uid="u1", start=when(copy, 9)))
+    assert starts(copy) != first
+
+
+def test_a_copy_whose_day_passed_while_given_up_gets_a_new_one(copy):
+    start = when(copy, 5)
+    seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    past = (copy.clock() - timedelta(days=5)).isoformat()
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off', start=?, end=?", (past, past))
+        copy.ledger.set_meta(REVIVED, "", db)
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert copy.ledger.db.execute("SELECT state FROM family_copies").fetchone()[0] == "live"
+    assert titles(copy) == ["Sam - PT", "Sam - PT"]
+
+
+def test_a_read_with_nothing_in_it_does_not_use_up_the_one_try(copy):
+    start = when(copy, 5)
+    seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off'")
+        copy.ledger.set_meta(REVIVED, "", db)
+    saved = dict(copy.icloud.events)
+    copy.icloud.events.clear()
+    read(copy, occ(uid="u1", start=start))
+    assert not copy.ledger.get_meta(REVIVED)
+    copy.icloud.events.update(saved)
+
+
+def test_two_rows_never_come_to_hold_one_event(copy):
+    start = when(copy, 5)
+    seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off'")
+    read(copy, occ(uid="u2", start=start))
+    with copy.ledger.tx() as db:
+        copy.ledger.set_meta(REVIVED, "", db)
+    read(copy, occ(uid="u2", start=start))
+    states = [r[0] for r in copy.ledger.db.execute("SELECT state FROM family_copies ORDER BY key")]
+    assert sorted(states) == ["hands_off", "live"]
+
+
+def test_a_revived_copy_still_takes_two_reads_to_come_off(copy):
+    start = when(copy, 5)
+    seed(copy, "Sam - PT", start)
+    other = occ("Lunch", start=when(copy, 2))
+    read(copy, other, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off', missing=2")
+        copy.ledger.set_meta(REVIVED, "", db)
+    read(copy, other)
+    assert titles(copy) == ["Sam - PT"]
+
+
+def test_a_note_on_his_copy_stops_it_being_rebuilt_bare(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("END:VEVENT", "DESCRIPTION:note\r\nEND:VEVENT"))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path in on_family(copy) and events(copy, "family_copy_left_alone") == 1
+
+
+def test_a_note_on_our_copy_is_not_overwritten(copy):
+    read(copy, occ(uid="u1", start=when(copy, 5)))
+    path = next(iter(on_family(copy)))
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("END:VEVENT", "LOCATION:Main St\r\nEND:VEVENT"))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert "LOCATION:Main St" in on_family(copy)[path] and events(copy, "family_copy_left_alone") == 1
+
+
+def test_his_copy_already_behind_gmail_moves_on_the_next_read(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    event = occ(uid="u1", start=start + timedelta(minutes=75))
+    read(copy, event)
+    assert path in on_family(copy)
+    read(copy, event)
+    assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
+
+
+@pytest.mark.parametrize("title, hours", [("Sam drives Kim to PT", 1), ("Sam - PT", 3)])
+def test_something_only_like_his_copy_is_not_rewritten(copy, title, hours):
+    start = when(copy, 5)
+    path = seed(copy, title, start, hours=hours)
+    event = occ(uid="u1", start=start + timedelta(minutes=75))
+    read(copy, event)
+    read(copy, event)
+    assert path in on_family(copy) and events(copy, "family_copy_left_alone") == 1
+    assert "doesn't match Gmail" in copy.copy.digest_line()
+
+
+def test_a_row_from_before_catches_up_when_his_copy_is_behind(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    event = occ(uid="u1", start=start + timedelta(minutes=75))
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET start=?, end=?",
+                   (event.start.isoformat(), event.end.isoformat()))
+    read(copy, event)
+    assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
+
+
+def test_a_row_from_before_also_sees_a_note_added_later(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    event = occ(uid="u1", start=start)
+    read(copy, event)
+    current = next(iter(copy.icloud.family()))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET seen=seen||''")
+        row = db.execute("SELECT seen FROM family_copies").fetchone()[0]
+        db.execute("UPDATE family_copies SET seen=?", (row.rsplit("|", 1)[0],))
+    read(copy, event)
+    copy.icloud.seed(current, copy.icloud.events[current][1].replace("END:VEVENT", "DESCRIPTION:note\r\nEND:VEVENT"))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path in on_family(copy)
+
+
+def test_a_given_up_copy_left_out_of_the_list_gets_more_reads_then_is_named(copy):
+    start = when(copy, 5)
+    keep_family_readable(copy)
+    path = seed(copy, "Sam - PT", start)
+    event = occ(uid="u1", start=start)
+    read(copy, event)
+    saved = copy.icloud.events.pop(path)
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off'")
+        copy.ledger.set_meta(REVIVED, "", db)
+    read(copy, event)
+    assert not copy.ledger.get_meta(REVIVED)
+    copy.icloud.events[path] = saved
+    read(copy, event)
+    assert copy.ledger.db.execute("SELECT state FROM family_copies").fetchone()[0] == "live"
+
+
+def test_a_copy_really_given_up_is_named_once_after_the_update(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET state='hands_off'")
+        copy.ledger.set_meta(REVIVED, "", db)
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("Sam - PT", "Sam - PT moved"))
+    read(copy, occ(uid="u1", start=start))
+    read(copy, occ(uid="u1", start=start))
+    assert events(copy, "family_copy_left_alone") == 1
+    assert "stopped following earlier" in copy.copy.digest_line()
+
+
+def test_two_given_up_rows_on_one_event_only_one_comes_back(copy):
+    start = when(copy, 5)
+    seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    with copy.ledger.tx() as db:
+        db.execute("INSERT INTO family_copies(key, uid, href, hand, seen, word, title, start, end, state,"
+                   " missing, created_at, updated_at) SELECT 'other', uid, href, hand, seen, word, title,"
+                   " start, end, state, missing, created_at, updated_at FROM family_copies")
+        db.execute("UPDATE family_copies SET state='hands_off'")
+        copy.ledger.set_meta(REVIVED, "", db)
+    read(copy, occ(uid="u1", start=start))
+    states = sorted(r[0] for r in copy.ledger.db.execute("SELECT state FROM family_copies"))
+    assert states == ["hands_off", "live"]
+
+
+@pytest.mark.parametrize("detail", ["not json", '{"word": "PT"}', '{"word":"PT","start":"junk","why":"edited"}',
+                                    '{"word":"PT","start":"2026-11-09","why":"unheard of"}'])
+def test_an_odd_record_cannot_cost_the_digest(copy, detail):
+    with copy.ledger.tx() as db:
+        copy.ledger.event("family_copy_left_alone", detail, db=db)
+    assert "and 1 more" in copy.copy.digest_line()
+
+
+def test_the_digest_names_ten_then_counts(copy):
+    with copy.ledger.tx() as db:
+        for _ in range(25):
+            copy.ledger.event("family_copy_left_alone", {"key": "k", "word": "PT", "start": "2026-11-09",
+                                                         "why": "edited"}, db=db)
+    line = copy.copy.digest_line()
+    assert line.count("PT Nov 9") == 10 and "and 15 more" in line
+
+
+def test_a_problem_clears_when_copying_is_off(copy):
+    with copy.ledger.tx() as db:
+        copy.ledger.set_meta(PROBLEM, "old", db)
+    copy.name = ""
+    read(copy)
+    assert not copy.ledger.get_meta(PROBLEM)
+
+
+def test_one_copy_that_will_not_come_off_does_not_hold_up_the_rest(copy):
+    first, second = when(copy, 5), when(copy, 6)
+    bad = seed(copy, "Sam - PT", first)
+    good = seed(copy, "Sam - PT", second)
+    read(copy, occ(uid="u1", start=first), occ(uid="u2", start=second))
+    original = copy.icloud.request
+
+    def refused(method, url, **kw):
+        if method == "DELETE" and url.endswith(bad):
+            return original("GET", url)._replace(status=403) if hasattr(original("GET", url), "_replace") \
+                else type(original("GET", url))(403, {}, b"")
+        return original(method, url, **kw)
+    copy.icloud.request = refused
+    read(copy, occ(uid="u1", start=when(copy, 7)), occ(uid="u2", start=when(copy, 8)))
+    assert bad in on_family(copy) and good not in on_family(copy)
+    assert "didn't go through" in copy.ledger.get_meta(PROBLEM)
+
+
+def test_his_deleted_copy_is_not_taken_over_again_in_the_same_read(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    original = copy.icloud.request
+
+    def refused(method, url, **kw):
+        out = original(method, url, **kw)
+        return type(out)(403, {}, b"") if method == "PUT" else out
+    copy.icloud.request = refused
+    read(copy, occ(uid="u1", start=start + timedelta(minutes=45)))
+    assert path not in on_family(copy)
+    copy.icloud.request = original
+    read(copy, occ(uid="u1", start=start + timedelta(minutes=45)))
+    assert titles(copy) == ["Sam - PT"]
+
+
+def test_a_part_of_family_unread_says_so_when_a_copy_is_missing(copy):
+    start = when(copy, 5)
+    keep_family_readable(copy)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    del copy.icloud.events[path]
+    seed(copy, "Bad", when(copy, 6), extra=["RRULE:FREQ=WEEKLY;BYSETPOS=1;BYDAY=MO"])
+    read(copy, occ(uid="u1", start=start))
+    assert copy.ledger.db.execute("SELECT state FROM family_copies").fetchone()[0] == "live"
+    assert "couldn't be read" in copy.ledger.get_meta(PROBLEM)
+
+
+def test_the_daily_limit_says_so(copy):
+    read(copy, occ(uid="u1", start=when(copy, 5)))
+    with copy.ledger.tx() as db:
+        for _ in range(MAX_WRITES_PER_DAY):
+            copy.ledger.event("family_copy_added", {"key": "x"}, db=db)
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert "limit" in copy.ledger.get_meta(PROBLEM)
+
+
+def test_a_crash_in_the_sync_says_so(copy, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("x")
+    monkeypatch.setattr(copy.copy, "_sync", boom)
+    read(copy, occ(uid="u1", start=when(copy, 5)))
+    assert "went wrong" in copy.ledger.get_meta(PROBLEM)
+
+
+def test_the_digest_names_which_was_left_alone(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("Sam - PT", "Sam - PT moved"))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    line = copy.copy.digest_line()
+    assert f"PT {start:%b} {start.day} (changed on Family)" in line
+
+
+@pytest.mark.parametrize("href", [f"{FAMILY_PATH}%252e%252e/x.ics", f"{FAMILY_PATH}a%2Fb.ics", "//[bad/x.ics"])
+def test_a_strange_address_is_refused_not_a_crash(copy, href):
+    assert copy.fa.client.remove_hand_copy(href, '"e"').kind == "failed"
+
+
+def test_a_copy_with_no_version_in_the_list_is_not_counted_as_moved(copy):
+    assert copy.fa.client.put_copy("hx-1", "Sam - PT", when(copy, 5), when(copy, 6), copy.clock(), etag="").kind == "failed"
+
+
+def test_an_escaped_or_whole_address_stays_inside_the_calendar(copy):
+    icloud = copy.icloud
+    path = seed(copy, "Sam - PT", when(copy, 5))
+    etag = icloud.events[path][0]
+    assert copy.fa.client.remove_hand_copy(f"https://p1.example{path}", etag).kind == "ok"
+    assert copy.fa.client.remove_hand_copy(f"{FAMILY_PATH}%2e%2e/x.ics", '"e"').kind == "failed"
 
 
 def test_his_copy_comes_off_when_gmail_cancels(copy):
