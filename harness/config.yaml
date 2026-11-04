@@ -27,3 +27,8 @@ backup: cold
 # Seconds Supervisor waits for a clean stop (default 10). The controller
 # interrupts its long poll on SIGTERM; this is margin for closing the ledger.
 timeout: 30
+# The first name on copies from Gmail (family_copy.py). Empty leaves copying off.
+options:
+  family_copy_name: ""
+schema:
+  family_copy_name: str?

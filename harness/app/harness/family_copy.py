@@ -1,8 +1,8 @@
 """Keeping Family true to his Gmail calendar, with no tap and no model.
 
 After each read of his calendars, plain code works out which Gmail events belong on
-Family, then adds, moves and removes its own copies to match. He turned this on by
-entering his first name on the add-on page; adds must also be on, and /stop stops it.
+Family, then adds, moves and removes its own copies to match. His first name in the
+add-on's settings turns this on; adds must also be on, and /stop stops it.
 
 What keeps that safe without a tap:
 
@@ -26,7 +26,9 @@ asks for, and nothing here counts toward them or changes them.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -65,7 +67,20 @@ _STAY = re.compile(r"stay at\b(?! home\b)", re.I)
 _FLIGHT = re.compile(r"flight to ((?:[A-Za-z'-]+ ){0,2}[A-Za-z'-]+) \(([A-Z0-9]{2} ?[0-9]{1,4})\)",
                      re.I)
 MAX_CITY = 24
+_NAME = re.compile(r"[^\W\d_]+(?:[ '-][^\W\d_]+){0,3}")
 _STOP = frozenset({"with", "and", "the", "at", "to", "for", "from", "of", "in", "on", "my"})
+
+
+def name_from_options(data_dir: str) -> str:
+    """The setting, read each time. Anything but a plain name leaves copying off, since
+    it goes in every title."""
+    try:
+        with open(os.path.join(data_dir, "options.json"), encoding="utf-8") as f:
+            value = json.load(f).get("family_copy_name", "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    value = value.strip() if isinstance(value, str) else ""
+    return value if _NAME.fullmatch(value) else ""
 
 
 def is_gmail(occ: ical.Occurrence) -> bool:
@@ -203,7 +218,7 @@ class FamilyCopy:
         self.fa = family_add
         self.client = family_add.client
         self.calendar = calendar
-        self.name_fn = name_fn             # the vault's first name; none means this is off
+        self.name_fn = name_fn             # the setting's first name; none means this is off
         self.tz = tz
         self._seen: int | None = None      # the calendar read last looked at
 
@@ -213,7 +228,7 @@ class FamilyCopy:
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
         if not self.name():
-            return "Copies from Gmail: off. Your first name on the add-on page turns them on."
+            return "Copies from Gmail: off, no first name in the add-on's settings."
         feeds = self.calendar.snapshot.feeds.values()
         if not self.calendar.configured or (feeds and not self._gmail_feeds()):
             return ("Copies from Gmail: waiting. Enter your Gmail calendar's secret iCal address "

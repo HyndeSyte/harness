@@ -2,8 +2,8 @@
 
 ## 0.6.0
 
-- Family stays true to your Gmail calendar, with no tap. Enter your first name on the add-on
-  page to turn it on; adds must be on, and your Gmail calendar's secret iCal address entered.
+- Family stays true to your Gmail calendar, with no tap. Your first name in the add-on's settings
+  turns it on; adds must be on, and your Gmail calendar's secret iCal address entered.
   Plain code does it after each read. No model sees any of it, and /stop stops it.
 - Appointments go on as "Name - PT", "Name - Doctor", "Name - Dentist" and the like: fixed words
   and times, never text from Gmail. Calls, meetings, "Busy" and someone else's invite stay off.

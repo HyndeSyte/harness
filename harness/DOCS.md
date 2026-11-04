@@ -222,7 +222,8 @@ for the Family calendar. The app can't turn that off. Each phone's own Calendar 
 ## Copies from your Gmail calendar
 
 To turn this on, enter your Gmail calendar's secret iCal address with the other calendar
-addresses, and your first name in its own box. Adds must be on. There is no tap: after each read
+addresses, and put your first name in the add-on's settings (Configuration tab). Clearing the name
+turns it off. Adds must be on. There is no tap: after each read
 of your calendars, plain code keeps Family true to Gmail for the next 60 days. `/stop` stops it,
 and `/status` says if the Gmail calendar isn't being read.
 

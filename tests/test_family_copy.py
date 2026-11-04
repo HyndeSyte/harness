@@ -3,15 +3,17 @@
 All names and addresses are invented.
 """
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from harness import caldav, effects, ical
-from harness.family_copy import (MAX_REMOVALS_AT_ONCE, MAX_WRITES_PER_DAY, PROBLEM, FamilyCopy, plan,
-                                 word_for)
+from harness.family_copy import (MAX_REMOVALS_AT_ONCE, MAX_WRITES_PER_DAY, PROBLEM, FamilyCopy,
+                                 name_from_options, plan, word_for)
 from harness.net import TransportError
+from harness.vault import FIELDS
 from fake_caldav import (APP_PASSWORD, APPLE_ID, FAMILY_PATH, FAMILY_URL, FakeICloud,  # noqa: F401
                          no_network, props)
 from test_family_add import Rig, on, plain_prompt, rig  # noqa: F401
@@ -1002,6 +1004,33 @@ def test_status_says_how_it_is(copy):
     assert "secret iCal address" in copy.copy.status_line()
     copy.name = ""
     assert "first name" in copy.copy.status_line()
+
+
+# -- the setting ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("body, name", [
+    ('{"family_copy_name": "Sam"}', "Sam"), ('{"family_copy_name": " Sam "}', "Sam"),
+    ('{"family_copy_name": "Mary Jo"}', "Mary Jo"), ('{"family_copy_name": "Ren\u00e9e"}', "Ren\u00e9e"),
+    ('{"family_copy_name": ""}', ""), ('{}', ""), ('not json', ""), ('[1]', ""),
+    ('{"family_copy_name": 5}', ""), ('{"family_copy_name": "evil.example"}', ""),
+    ('{"family_copy_name": "Sam https://evil.example"}', ""), ('{"family_copy_name": "/resume"}', ""),
+    ('{"family_copy_name": "Sam\\nX-THING:1"}', "")])
+def test_only_a_plain_name_turns_it_on(tmp_path, body, name):
+    (tmp_path / "options.json").write_text(body, encoding="utf-8")
+    assert name_from_options(str(tmp_path)) == name
+
+
+def test_no_settings_file_leaves_it_off(tmp_path):
+    assert name_from_options(str(tmp_path)) == ""
+
+
+def test_the_setting_is_declared_empty():
+    text = (Path(__file__).resolve().parents[1] / "harness" / "config.yaml").read_text(encoding="utf-8")
+    assert 'family_copy_name: ""' in text and "family_copy_name: str?" in text
+
+
+def test_the_name_is_not_kept_with_the_keys():
+    assert "family_copy_name" not in FIELDS
 
 
 # -- the client ----------------------------------------------------------------------------------

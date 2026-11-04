@@ -4,6 +4,8 @@ Secrets never live here. The three keys (Telegram bot token, Anthropic
 key, OpenAI key) are entered once on the add-on's own page and stored in
 /data, never in add-on options: the Supervisor API exposes options, and
 his Home Assistant connector can read and rewrite them (round-4 finding).
+The one option is a first name for copies from Gmail (family_copy.py). It isn't a
+secret, but the connector can set it, and setting it turns those copies on.
 """
 from __future__ import annotations
 

@@ -22,7 +22,7 @@ from .config import Config
 from .controller import Controller
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
-from .family_copy import AHEAD_DAYS, FamilyCopy
+from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
 from .ledger import Ledger
 from .mirror_shadow import MirrorShadow, read_days
 from .net import CalDavTransport, RedactingFilter, UrllibTransport
@@ -75,7 +75,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                              lambda: vault.get("calendar_feeds"), base.timezone,
                              ahead_days=max(read_days(None), AHEAD_DAYS),
                              ahead_when=lambda: bool((vault.get("work_mirror") or "").strip()
-                                                     or vault.get("family_copy_name")))
+                                                     or name_from_options(data_dir)))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
     mirror = MirrorShadow(ledger, lambda: vault.get("work_mirror"), calendar=calendar,
                           family=inbox if base.family_entity else None, tz=base.timezone)
@@ -92,7 +92,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                             family=inbox if base.family_entity else None, mirror=mirror,
                             family_add=adds,
                             family_copy=FamilyCopy(ledger, adds, calendar, tz=base.timezone,
-                                                   name_fn=lambda: vault.get("family_copy_name")))
+                                                   name_fn=lambda: name_from_options(data_dir)))
     return controller, web, listener
 
 
