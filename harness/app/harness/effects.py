@@ -294,6 +294,22 @@ REGISTRY: dict[str, EffectDef] = {
         idempotency="uid fixed per copy, PUT with If-None-Match: * or If-Match, so no doubles",
         origin="controller",
     ),
+    # Keeping his Gmail calendar true to Family, for the events he named in the add-on's
+    # settings (family_gmail.py). Built only by plain code, with no tap. A model can't
+    # propose it. It carries the title he set and times, and changes only its own blocks.
+    "family_gmail_sync": EffectDef(
+        name="family_gmail_sync",
+        min_stage="S1",
+        reversible=True,
+        ttl_s=0,
+        reviewer_required=False,
+        params={},
+        fixed={"calendar": "his Gmail calendar", "marker": "harness=family_gmail", "attendees": (),
+               "reminders": (), "recurrence": (), "send_updates": "none", "visibility": "private"},
+        undo="delete it on the calendar; a block removed by anyone is not put back",
+        idempotency="event id fixed per block, with If-Match on a change, so no doubles",
+        origin="controller",
+    ),
 }
 
 

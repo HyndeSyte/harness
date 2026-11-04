@@ -243,6 +243,42 @@ and `/status` says if the Gmail calendar isn't being read.
 
 Each add, move and removal alerts family phones that have notifications on for this calendar.
 
+## Blocks on your Gmail calendar from Family
+
+Some Family events tie you up without being yours, like watching the kids during someone's
+appointment. Name them and your Gmail calendar stays true to them, for the next 60 days, with no tap.
+
+To turn this on, once, about 10 minutes:
+
+1. In [Google Cloud console](https://console.cloud.google.com), make a project, turn on the
+   **Google Calendar API**, make a **service account**, and add a **JSON key** to it. It downloads a
+   file. This is free.
+2. In Google Calendar, open your calendar's settings, **Share with specific people**, add the service
+   account's address, and pick **Make changes to events**.
+3. On this add-on's page, paste the whole file into the Gmail calendar key box. Tap to approve it in
+   Telegram, as with any key.
+4. In the add-on's settings (Configuration tab), set `family_to_gmail`, then restart:
+   `Family title => Gmail title`, with `;` between several. The Family title must match in full, not
+   counting capitals. The Gmail title must include a word that doesn't copy back to Family, like Busy.
+   Clearing it turns this off, and leaves the blocks already there. Taking out one of several
+   removes that one's blocks.
+
+Adds must be on, and your Gmail calendar's secret iCal address entered, which is how it knows your
+address. Before its first block it puts one test event on Gmail, 45 days out, and takes it off again.
+If Google refuses, the digest says so and nothing else happens. `/stop` stops it, and `/status` says
+how many blocks are on Gmail.
+
+- **What Gmail gets:** your title and the times, marked private. No text from Family, guests,
+  reminders or emails.
+- **Moved or cancelled** on Family, the block follows.
+- **Edited or removed on Gmail:** a block you edit in any way (the time, a note, a guest) is left
+  alone from then on. A block you remove isn't put back.
+- **Part of Family unreadable:** if it can't read an event on Family, it won't remove blocks, and the
+  digest says so. Delete any that are wrong.
+- **Limit:** 30 changes a day. Past that, the digest says so and the rest go the next day.
+- **What it can touch:** only blocks it wrote. Your share lets it do more than that, so to end it for
+  good, remove the service account from the calendar's sharing.
+
 ## Links from instrument cards
 
 A card can carry a link that opens this chat with the card's title, so you can say
@@ -290,10 +326,12 @@ continuity is unknown.
 - Read or change anything in Home Assistant (no Home Assistant or Supervisor API).
   The Family calendar comes the other way: Home Assistant pushes it in, and the
   listener answers with a status code only.
-- Change a calendar, with one exception: adding an event to iCloud Family, and undoing
-  that add, as above. Google calendars are read only, by GET, from calendar.google.com.
-- Talk to any host but Telegram, Anthropic, OpenAI, calendar.google.com and the iCloud
-  host in the Family calendar address you entered.
+- Change a calendar, with two exceptions, both as above: iCloud Family, and its own blocks
+  on your Gmail calendar once you've entered a key. Otherwise Google calendars are read
+  only, by GET, from calendar.google.com.
+- Talk to any host but Telegram, Anthropic, OpenAI, calendar.google.com, the iCloud
+  host in the Family calendar address you entered, and, for those blocks,
+  oauth2.googleapis.com and www.googleapis.com.
 - Listen to anyone but the paired account, in its private chat. Messages from
   anyone else are dropped and their text is never stored.
 - Keep messages that carry rights-protected document markers. (Screening by work

@@ -7,6 +7,8 @@ library only, so the add-on has no
 third-party dependencies to pin, audit or break on update. The iCloud host
 is enforced here, request by request, by CalDavTransport, which also refuses
 redirects: it is the only transport that carries a family password.
+GoogleTransport does the same for the two Google hosts that write to his Gmail
+calendar (google_cal.py), when he has entered a key for that.
 
 The Telegram bot token travels in the URL path, which is where secrets
 leak: an exception message, a traceback, a log line. So nothing here ever
@@ -166,5 +168,27 @@ class CalDavTransport(UrllibTransport):
         host = self.allowed_host()
         if (method not in self.METHODS or parts.scheme != "https" or not plain_host
                 or not host or parts.hostname != host or json_body is not None):
+            raise TransportError("blocked")
+        return super().request(method, url, headers=headers, body=body, timeout=timeout)
+
+
+class GoogleTransport(UrllibTransport):
+    """Https to Google's token and calendar hosts, no redirects and no proxy. It is the only
+    transport that carries the service account's sign-in. Anything else never leaves."""
+
+    METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+
+    def __init__(self, hosts: frozenset[str], *, cafile: str | None = None):
+        super().__init__(use_env_proxy=False, cafile=cafile, follow_redirects=False)
+        self.hosts = hosts
+
+    def request(self, method, url, *, headers=None, json_body=None, body=None, timeout=20):
+        try:
+            parts = urlsplit(url)
+            plain_host = parts.username is None and parts.port is None
+        except ValueError:
+            raise TransportError("blocked") from None
+        if (method not in self.METHODS or parts.scheme != "https" or not plain_host
+                or parts.hostname not in self.hosts or json_body is not None):
             raise TransportError("blocked")
         return super().request(method, url, headers=headers, body=body, timeout=timeout)

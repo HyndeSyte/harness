@@ -209,6 +209,19 @@ CREATE TABLE IF NOT EXISTS family_copies(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS family_gmail(
+  key TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  intent TEXT NOT NULL,
+  title TEXT NOT NULL,
+  start TEXT NOT NULL,
+  end TEXT NOT NULL,
+  state TEXT NOT NULL,
+  missing INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 # Job states and the only transitions allowed between them. Anything else

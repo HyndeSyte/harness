@@ -16,16 +16,17 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import caldav, family, policy
+from . import caldav, family, google_cal, policy
 from .calendar_feed import CalendarFeeds
 from .config import Config
 from .controller import Controller
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
+from .family_gmail import FamilyGmail, rules_from_options
 from .ledger import Ledger
 from .mirror_shadow import MirrorShadow, read_days
-from .net import CalDavTransport, RedactingFilter, UrllibTransport
+from .net import CalDavTransport, GoogleTransport, RedactingFilter, UrllibTransport
 from .setup_web import SetupApp, serve
 from .telegram_api import TelegramBotAPI
 from .vault import Vault
@@ -92,7 +93,13 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                             family=inbox if base.family_entity else None, mirror=mirror,
                             family_add=adds,
                             family_copy=FamilyCopy(ledger, adds, calendar, tz=base.timezone,
-                                                   name_fn=lambda: name_from_options(data_dir)))
+                                                   name_fn=lambda: name_from_options(data_dir)),
+                            family_gmail=FamilyGmail(
+                                ledger, adds, calendar,
+                                google_cal.GoogleCalendar(GoogleTransport(google_cal.HOSTS),
+                                                          lambda: vault.get("google_service_key"),
+                                                          ledger.now),
+                                rules_fn=lambda: rules_from_options(data_dir), tz=base.timezone))
     return controller, web, listener
 
 

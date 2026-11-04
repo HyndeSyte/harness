@@ -31,7 +31,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import caldav, calendar_feed, workmirror
+from . import caldav, calendar_feed, google_cal, workmirror
 
 # work_mirror: his work address, hours and rules for the work-hours mirror
 # (workmirror.parse_settings). Not a key, but it names his employer's address
@@ -39,8 +39,10 @@ from . import caldav, calendar_feed, workmirror
 # once here, never in the repository or in add-on options.
 # family_*: what the one calendar write needs (caldav.py). The address is
 # checked strictly, because the password is sent wherever it points.
+# google_service_key: what lets blocks reach his Gmail calendar (google_cal.py).
 FIELDS = ("telegram_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
-          "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url")
+          "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url",
+          "google_service_key")
 FAMILY_FIELDS = ("family_apple_id", "family_app_password", "family_calendar_url")
 TEXT_FIELDS = ("work_mirror",)          # several lines; a textarea on the page
 LABELS = {"telegram_bot_token": "Telegram bot token",
@@ -50,7 +52,8 @@ LABELS = {"telegram_bot_token": "Telegram bot token",
           "work_mirror": "work mirror settings (work: address, days:, hours:, family: ...)",
           "family_apple_id": "Family calendar: Apple ID",
           "family_app_password": "Family calendar: app-specific password",
-          "family_calendar_url": "Family calendar: iCloud calendar address"}
+          "family_calendar_url": "Family calendar: iCloud calendar address",
+          "google_service_key": "Gmail calendar: Google service account key (the whole file)"}
 # Formats are checked loosely: enough to catch a paste of the wrong thing
 # (a URL, a sentence, a key in the wrong box), not a claim about validity.
 PATTERNS = {
@@ -153,6 +156,11 @@ class Vault:
         if field == "family_calendar_url":
             try:
                 return caldav.check_url(v)
+            except ValueError as e:
+                raise VaultError(str(e)) from None
+        if field == "google_service_key":
+            try:
+                return google_cal.check_key(v)
             except ValueError as e:
                 raise VaultError(str(e)) from None
         if not PATTERNS[field].fullmatch(v):

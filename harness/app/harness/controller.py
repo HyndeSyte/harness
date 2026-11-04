@@ -67,9 +67,10 @@ class Controller:
                  monotonic: Callable[[], float] = time.monotonic,
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
                  poll_timeout: int = 25, calendar=None, family=None, mirror=None,
-                 family_add=None, family_copy=None):
+                 family_add=None, family_copy=None, family_gmail=None):
         self.family_add = family_add       # the one calendar write (family_add.py), or None
         self.family_copy = family_copy     # Family kept true to Gmail (family_copy.py), or None
+        self.family_gmail = family_gmail   # Gmail kept true to Family (family_gmail.py), or None
         self.ledger = ledger
         self.vault = vault
         self.api = api
@@ -245,6 +246,8 @@ class Controller:
             self.calendar.collect()
         if self.family_copy is not None:
             self.family_copy.run(paused=commands.is_paused(self.ledger))
+        if self.family_gmail is not None:
+            self.family_gmail.run(paused=commands.is_paused(self.ledger))
         if self.mirror is not None and self.mirror.due():
             self.mirror.run()              # shadow only; its own failures are its record
         self._daily(paused)
@@ -441,7 +444,9 @@ class Controller:
                              mirror_line=self.mirror.digest_line() if self.mirror else "",
                              family_add_line=" ".join(x for x in (
                                  self.family_add.digest_line() if self.family_add else "",
-                                 self.family_copy.digest_line() if self.family_copy else "") if x))
+                                 self.family_copy.digest_line() if self.family_copy else "",
+                                 self.family_gmail.digest_line() if self.family_gmail else "")
+                                 if x))
             daily.deliver(self.ledger, cfg, d)
 
     # -- status ------------------------------------------------------------------------------
@@ -459,6 +464,8 @@ class Controller:
             lines.append(self.family_add.status_line())
             if fa_on and self.family_copy is not None:
                 lines.append(self.family_copy.status_line())
+            if fa_on and self.family_gmail is not None:
+                lines.append(self.family_gmail.status_line())
         if last:
             lines.append(f"Telegram: last contact {int((now - last).total_seconds())}s ago")
         lines.append(f"Jobs: {len(self.ledger.jobs_in('running'))} running · "

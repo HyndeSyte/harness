@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- The Family events you name in the add-on's settings put a block on your Gmail calendar, with no
+  tap. It moves when they move and goes when they go. Your title and the times only, marked private,
+  with no guests, reminders or emails.
+- It needs a Google service account key, entered like any other, and your Gmail calendar shared with
+  that account. A test event goes on Gmail and comes off before the first block.
+- It changes only blocks it wrote. One you edit is left alone, and one you remove isn't put back.
+
 ## 0.6.1
 
 - A computer lab class on your Gmail calendar now goes on Family as "Name - Computer Lab".

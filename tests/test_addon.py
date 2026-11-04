@@ -35,8 +35,8 @@ def test_config_denies_every_api_and_mapping():
         assert risky not in cfg, risky
     # One setting that isn't secret, and no key ever: Home Assistant can read and rewrite these.
     text = (ADDON / "config.yaml").read_text()
-    assert text.split("options:\n")[1] == ('  family_copy_name: ""\nschema:\n'
-                                           "  family_copy_name: str?\n")
+    assert text.split("options:\n")[1] == ('  family_copy_name: ""\n  family_to_gmail: ""\nschema:\n'
+                                           "  family_copy_name: str?\n  family_to_gmail: str?\n")
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099"
     assert cfg["panel_admin"] == "true"
     assert cfg["backup"] == "cold"                 # SQLite is copied with the add-on stopped
