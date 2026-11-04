@@ -5,8 +5,9 @@ sign-in to go stale, and it reaches only what he shared. Its key is kept like an
 (vault.py). The standard library has no RSA, so signing the sign-in token is done here:
 it is one modular exponent, and the only thing it signs is that token.
 
-Nothing here can add an attendee, a reminder, a repeat, a place or a description: the
-event is built here from a title and two times, and no update ever goes out. Every event
+Nothing here can add an attendee, a repeat, a place or a description: the event is built
+here from a title and two times, and no update ever goes out. It asks for no reminder, but
+Google still applies his defaults, which a service account can't change. Every event
 carries a mark, and an id of a form only this code makes, so nothing here can change or
 delete an event it didn't write: list_ours returns only marked ones, and the writes
 refuse any other id.

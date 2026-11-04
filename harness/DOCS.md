@@ -238,6 +238,9 @@ and `/status` says if the Gmail calendar isn't being read.
   anyone else's are never touched.
 - **Removed or edited on Family:** a copy someone edits is left alone. A copy someone removes
   isn't put back, and two removed of a kind stops that kind.
+- **Many at once:** up to three cancelled together come off after two reads. More than that looks
+  like it could be a bad read, so the digest says so and it waits about three hours. Events of yours
+  that it took over stay on Family while your Gmail calendar reads as empty or much shorter than usual.
 - **One Gmail calendar:** with two Gmail addresses entered it does nothing, because it can't tell
   which is yours.
 
@@ -254,7 +257,8 @@ To turn this on, once, about 10 minutes:
    **Google Calendar API**, make a **service account**, and add a **JSON key** to it. It downloads a
    file. This is free.
 2. In Google Calendar, open your calendar's settings, **Share with specific people**, add the service
-   account's address, and pick **Make changes to events**.
+   account's address, and pick **Make changes and see all event details**. The blocks are marked
+   private, and the option above it may hide them from the account that wrote them.
 3. On this add-on's page, paste the whole file into the Gmail calendar key box. Tap to approve it in
    Telegram, as with any key.
 4. In the add-on's settings (Configuration tab), set `family_to_gmail`, then restart:
@@ -268,8 +272,8 @@ address. Before its first block it puts one test event on Gmail, 45 days out, an
 If Google refuses, the digest says so and nothing else happens. `/stop` stops it, and `/status` says
 how many blocks are on Gmail.
 
-- **What Gmail gets:** your title and the times, marked private. No text from Family, guests,
-  reminders or emails.
+- **What Gmail gets:** your title and the times, marked private. No text from Family, guests or
+  invitation emails. Your calendar's default reminders still apply to it.
 - **Moved or cancelled** on Family, the block follows.
 - **Edited or removed on Gmail:** a block you edit in any way (the time, a note, a guest) is left
   alone from then on. A block you remove isn't put back.

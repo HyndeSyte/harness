@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+
+- Several appointments cancelled together now come off Family, after about three hours. They could
+  stay there for good, held as a bad read. Your own events stay while your Gmail calendar reads oddly.
+- `/status` says when copying has stopped for a kind of event.
+- Corrected: blocks on your Gmail calendar do carry your default reminders. Google applies them,
+  and a service account can't turn them off. The sharing option's name is corrected too.
+
 ## 0.7.0
 
 - The Family events you name in the add-on's settings put a block on your Gmail calendar, with no

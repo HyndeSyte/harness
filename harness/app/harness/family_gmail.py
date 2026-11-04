@@ -8,7 +8,8 @@ Gmail, which moves when it moves and goes when it goes, with no tap and no model
 The mirror image of family_copy.py, and it keeps the same safety:
 
   * Gmail gets the fixed title he set and the times, never text from Family, and no
-    guest, reminder, place or update (google_cal.py).
+    guest, place or update (google_cal.py). His own default reminders apply: they're
+    his, and a service account can't turn them off.
   * It changes only blocks it wrote. A block someone has since edited is left alone for
     good, and one someone removed, with its Family event still there, stays removed.
   * Nothing is removed, or taken as removed, on one read. It takes two good reads in a
@@ -32,7 +33,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from . import caldav, calendar_feed, google_cal, ical
-from .family_copy import _SKIP, _STAY, AHEAD_DAYS, MAX_REMOVALS_AT_ONCE, READS_BEFORE_REMOVING, _same
+from .family_copy import (_SKIP, _STAY, AHEAD_DAYS, GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE,
+                          READS_BEFORE_REMOVING, _same)
 from .ledger import Ledger, iso
 
 log = logging.getLogger("harness.family_gmail")
@@ -40,7 +42,6 @@ log = logging.getLogger("harness.family_gmail")
 MAX_WRITES_PER_DAY = 30        # a weekly event that changes time is 18 writes, and no one's alerted
 MAX_RULES = 5
 MAX_TITLE = 60
-HOLD_READS = 6                 # three hours: long enough for a bad read to pass, then it's real
 PROBLEM = "family_gmail_problem"
 PROVEN = "family_gmail_proven"
 TEST_TRY = "family_gmail_test_try"
@@ -265,7 +266,8 @@ class FamilyGmail:
                     "nothing changed.")
         if kind == "denied":
             return ("Blocks on Gmail from Family: Google refused. Check your Gmail calendar is "
-                    f"shared with {self.google.account()} on \"Make changes to events\". "
+                    f"shared with {self.google.account()} on \"Make changes and see all event "
+                    "details\". "
                     "Nothing changed.")
         return (f"Blocks on Gmail from Family: the last change to Gmail didn't go through ({kind}). "
                 "I'll try again at the next read.")
@@ -376,7 +378,7 @@ class FamilyGmail:
             for row, _ in absent:
                 self._update(row, missing=0)
             return ""
-        if len(absent) > MAX_REMOVALS_AT_ONCE and max(r["missing"] for r, _ in absent) + 1 < HOLD_READS:
+        if len(absent) > MAX_REMOVALS_AT_ONCE and min(r["missing"] for r, _ in absent) + 1 < HOLD_READS:
             for row, _ in absent:
                 self._update(row, missing=row["missing"] + 1)
             return (f"Blocks on Gmail from Family: {len(absent)} blocks look gone from Gmail at "
@@ -386,8 +388,12 @@ class FamilyGmail:
             if row["missing"] + 1 < READS_BEFORE_REMOVING:
                 self._update(row, missing=row["missing"] + 1)
             elif not self.google.really_gone(address, row["event_id"]):
-                # The list left it out but it's there, or Google won't say. Keep it ours.
-                self._update(row, missing=0)
+                # The list left it out but it's there, or Google won't say. In time, it's been
+                # moved out of what's read: his now.
+                if row["missing"] + 1 >= GIVE_UP_READS:
+                    self._set(row, "hands_off")
+                    continue
+                self._update(row, missing=row["missing"] + 1)
                 problem = ("Blocks on Gmail from Family: Google's list of blocks doesn't match "
                            "what's on Gmail, so I changed nothing. I'll try again.")
             elif want is None:

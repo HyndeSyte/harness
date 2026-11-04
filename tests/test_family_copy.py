@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from harness import caldav, effects, ical
-from harness.family_copy import (MAX_REMOVALS_AT_ONCE, MAX_WRITES_PER_DAY, PROBLEM, FamilyCopy,
+from harness.family_copy import (GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE, MAX_WRITES_PER_DAY, PROBLEM, FamilyCopy,
                                  name_from_options, plan, word_for)
 from harness.net import TransportError
 from harness.vault import FIELDS
@@ -267,6 +267,154 @@ def test_many_gone_at_once_is_held_as_a_bad_read(copy):
     assert len(copy.icloud.family()) == len(events_)
     assert "bad read" in copy.ledger.get_meta(PROBLEM)
     assert "bad read" in copy.copy.digest_line()
+
+
+def test_a_read_that_stays_empty_is_believed_after_a_while(copy):
+    events_ = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(MAX_REMOVALS_AT_ONCE + 1)]
+    read(copy, *events_)
+    for _ in range(HOLD_READS - 1):
+        read(copy)
+    assert len(copy.icloud.family()) == len(events_)
+    read(copy)
+    read(copy)
+    assert not copy.icloud.family() and not copy.ledger.get_meta(PROBLEM)
+
+
+def test_many_visits_cancelled_with_the_rest_of_gmail_intact_all_come_off(copy):
+    """What a discharge looks like. It used to be held for good as a bad read."""
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    visits = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(MAX_REMOVALS_AT_ONCE + 2)]
+    read(copy, *others, *visits)
+    assert len(copy.icloud.family()) == len(visits)
+    read(copy, *others)
+    assert len(copy.icloud.family()) == len(visits)    # one read can be wrong
+    read(copy, *others)
+    assert len(copy.icloud.family()) == len(visits)    # many at once waits, and says so
+    assert "bad read" in copy.ledger.get_meta(PROBLEM)
+    for _ in range(HOLD_READS):
+        read(copy, *others)
+    assert not copy.icloud.family() and not copy.ledger.get_meta(PROBLEM)
+
+
+def his_copies(rig, n):
+    return [seed(rig, "Sam - PT", when(rig, 3 + i)) for i in range(n)]
+
+
+def test_his_own_copies_come_off_when_visits_really_end(copy):
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    visits = [occ("PT", uid=f"v{i}", start=when(copy, 3 + i)) for i in range(5)]
+    his_copies(copy, 5)
+    read(copy, *others, *visits)
+    assert titles(copy) == ["Sam - PT"] * 5 and not copy.bot.sent
+    for _ in range(HOLD_READS + 1):
+        read(copy, *others)
+    assert not copy.icloud.family()
+
+
+def test_his_own_copy_stays_through_an_empty_gmail_read_for_good(copy):
+    visit = occ("PT", uid="v", start=when(copy, 3))
+    his_copies(copy, 1)
+    read(copy, visit)
+    for _ in range(HOLD_READS + 3):
+        read(copy)
+    assert titles(copy) == ["Sam - PT"]
+    assert "read oddly" in copy.ledger.get_meta(PROBLEM)
+    read(copy, visit)
+    assert not copy.ledger.get_meta(PROBLEM)
+
+
+def test_his_own_copies_stay_while_the_rest_of_gmail_has_halved(copy):
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    visit = occ("PT", uid="v", start=when(copy, 3))
+    his_copies(copy, 1)
+    read(copy, *others, visit)
+    read(copy, others[0])
+    read(copy, others[0])
+    read(copy, others[0])
+    assert titles(copy) == ["Sam - PT"] and "read oddly" in copy.ledger.get_meta(PROBLEM)
+
+
+def test_if_gmail_stays_shorter_his_cancelled_copy_comes_off_in_time(copy):
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    visit = occ("PT", uid="v", start=when(copy, 3))
+    his_copies(copy, 1)
+    read(copy, *others, visit)
+    for _ in range(HOLD_READS + 1):
+        read(copy, others[0])
+    assert not copy.icloud.family() and not copy.ledger.get_meta(PROBLEM)
+
+
+def test_many_swapped_for_as_many_with_the_rest_of_gmail_halved_is_held(copy):
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    n = MAX_REMOVALS_AT_ONCE + 1
+    old = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(n)]
+    new = [occ(f"Dentist {i}", start=when(copy, 20 + i)) for i in range(n)]
+    read(copy, *others, *old)
+    read(copy, others[0], *new)
+    read(copy, others[0], *new)
+    assert titles(copy).count("Sam - PT") == n and "bad read" in copy.ledger.get_meta(PROBLEM)
+
+
+def test_each_bad_read_gets_its_own_full_hold(copy):
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    visit = occ("PT", uid="v", start=when(copy, 3))
+    his_copies(copy, 1)
+    read(copy, *others, visit)
+    for _ in range(HOLD_READS - 2):
+        read(copy, others[0])
+    read(copy, *others, visit)                 # that one passed
+    for _ in range(HOLD_READS - 2):
+        read(copy, others[0])
+    assert titles(copy) == ["Sam - PT"]        # the second starts its own count
+
+
+def test_a_copy_of_ours_dragged_out_of_what_is_read_becomes_theirs(copy):
+    keep_family_readable(copy)
+    event = occ(uid="u1", start=when(copy, 5))
+    read(copy, event)
+    path = next(p for p, ics in on_family(copy).items() if "Sam - PT" in ics)
+    real = copy.fa.client.items_between
+    copy.fa.client.items_between = lambda *a: caldav.Read(
+        [i for i in real(*a).items if i.href != path], 0)
+    for _ in range(GIVE_UP_READS + 1):
+        read(copy, event)
+    copy.fa.client.items_between = real
+    assert copy.ledger.db.execute("SELECT state FROM family_copies").fetchone()[0] == "hands_off"
+    assert not copy.ledger.get_meta(PROBLEM)
+
+
+def test_status_says_when_a_kind_has_stopped(copy):
+    keep_family_readable(copy)
+    events_ = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(2)]
+    read(copy, *events_)
+    remove_copies(copy, "Sam - PT")
+    read(copy, *events_)
+    read(copy, *events_)
+    assert "Stopped for PT" in copy.copy.status_line()
+
+
+def test_many_gone_with_the_rest_of_gmail_halved_is_held(copy):
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    visits = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(MAX_REMOVALS_AT_ONCE + 2)]
+    read(copy, *others, *visits)
+    read(copy, others[0])
+    read(copy, others[0])
+    assert len(copy.icloud.family()) == len(visits)
+    assert "bad read" in copy.ledger.get_meta(PROBLEM)
+    read(copy, *others, *visits)                       # it was a bad read
+    read(copy, *others, *visits)
+    assert len(copy.icloud.family()) == len(visits) and not copy.ledger.get_meta(PROBLEM)
+
+
+def test_a_hold_doesnt_stop_new_copies(copy):
+    others = [occ(f"Lunch {i}", start=when(copy, 2 + i)) for i in range(6)]
+    visits = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(MAX_REMOVALS_AT_ONCE + 1)]
+    read(copy, *others, *visits)
+    new = occ("Dentist", start=when(copy, 20))
+    read(copy, others[0], new)
+    read(copy, others[0], new)
+    assert "bad read" in copy.ledger.get_meta(PROBLEM) and "Sam - Dentist" in titles(copy)
+    assert len(titles(copy)) == len(visits) + 1
 
 
 def test_a_few_gone_at_once_are_removed(copy):
@@ -556,9 +704,10 @@ def test_his_copy_moves_when_gmail_moves(copy):
 def test_his_copy_comes_off_when_gmail_cancels(copy):
     start = when(copy, 5)
     seed(copy, "Sam - PT", start)
-    read(copy, occ(uid="u1", start=start))
-    read(copy)
-    read(copy)
+    other = occ("Lunch", start=when(copy, 2))     # a real Gmail calendar is never empty
+    read(copy, other, occ(uid="u1", start=start))
+    read(copy, other)
+    read(copy, other)
     assert not copy.icloud.family()
 
 
@@ -784,6 +933,35 @@ def test_many_missing_from_family_at_once_is_a_bad_read(copy):
     read(copy, *events_)
     assert "bad read" in copy.ledger.get_meta(PROBLEM)
     assert {r[0] for r in copy.ledger.db.execute("SELECT state FROM family_copies")} == {"live"}
+
+
+def test_many_really_gone_from_family_are_believed_after_a_while(copy):
+    events_ = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(MAX_REMOVALS_AT_ONCE + 1)]
+    keep_family_readable(copy)
+    read(copy, *events_)
+    remove_copies(copy, "Sam - PT")
+    for _ in range(HOLD_READS + 1):
+        read(copy, *events_)
+    assert {r[0] for r in copy.ledger.db.execute("SELECT state FROM family_copies")} == {"removed"}
+    assert not copy.ledger.get_meta(PROBLEM) and titles(copy) == ["School day"]
+
+
+def test_a_list_leaving_copies_out_for_hours_doesnt_lose_them(copy):
+    events_ = [occ(f"PT {i}", start=when(copy, 3 + i)) for i in range(MAX_REMOVALS_AT_ONCE + 1)]
+    keep_family_readable(copy)
+    read(copy, *events_)
+    real = copy.fa.client.items_between
+    school = [i for i in real(copy.clock(), copy.clock() + timedelta(days=60), TZ).items
+              if i.occ.summary == "School day"]
+    copy.fa.client.items_between = lambda *a: caldav.Read(school, 0)
+    for _ in range(HOLD_READS + 2):
+        read(copy, *events_)
+    assert copy.ledger.get_meta(PROBLEM)
+    assert {r[0] for r in copy.ledger.db.execute("SELECT state FROM family_copies")} == {"live"}
+    copy.fa.client.items_between = real
+    read(copy, *events_)
+    assert {r[0] for r in copy.ledger.db.execute("SELECT state FROM family_copies")} == {"live"}
+    assert len(titles(copy)) == len(events_) + 1 and not copy.ledger.get_meta(PROBLEM)
 
 
 def test_an_answer_with_no_event_in_it_is_none():

@@ -14,7 +14,9 @@ What keeps that safe without a tap:
     must carry his name, since Family holds everyone's events. A copy someone has since
     edited is left alone for good.
   * Nothing is removed, or taken as removed, on one read. It takes two good reads in a
-    row, and more than a few at once is held back as a sign the read is wrong.
+    row. Many going at once is held back for a while as a sign the read is wrong, and the
+    hold ends, since visits that really ended have to come off. His own copies stay while
+    the Gmail read looks odd: a harness copy comes back by itself, and his can't.
   * If Gmail or Family can't be read, nothing happens.
 
 A copy removed from Family, with its source still on Gmail, stays removed. Two removed
@@ -45,8 +47,12 @@ MAX_WRITES_PER_DAY = 12
 MAX_REMOVALS_AT_ONCE = 3
 READS_BEFORE_REMOVING = 2
 STOP_AFTER_REMOVED = 2
+HOLD_READS = 6                 # three hours: long enough for a bad read to pass, then it's real
+GIVE_UP_READS = 12             # six hours of a copy being there but not listed
 SLOP = timedelta(minutes=30)   # travel time makes the two calendars differ a little
 PROBLEM = "family_copy_problem"
+READ_SIZE = "family_copy_read_size"
+THIN_READS = "family_copy_thin_reads"
 TRIP = "trip"
 
 # The word on Family, by what the title says. Checked in order.
@@ -236,7 +242,9 @@ class FamilyCopy:
                     "on the add-on page.")
         n = self.ledger.db.execute("SELECT COUNT(*) FROM family_copies WHERE state='live'"
                                    ).fetchone()[0]
-        return f"Copies from Gmail: on, {n} on Family now"
+        line = f"Copies from Gmail: on, {n} on Family now"
+        stopped = sorted(self._stopped_words())
+        return line + (f". Stopped for {', '.join(stopped)}, after two were removed" if stopped else "")
 
     def digest_line(self) -> str:
         """Counts only. Silent when nothing changed and nothing is wrong."""
@@ -296,12 +304,27 @@ class FamilyCopy:
                           "changed.")
             return
         occ = feed.ahead.occurrences
-        wants = {k: w for k, w in plan(occ, name, self.tz).items() if self._ends(w) > now}
+        planned = plan(occ, name, self.tz)
+        wants = {k: w for k, w in planned.items() if self._ends(w) > now}
         sources = {_key(o): o.summary for o in occ}
         self.writes = self._writes_today()
-        problems = [self._follow(wants, family, now, feed.ahead.unreadable == 0, until)]
+        odd = self._thin(len(occ), len(occ) - len(planned)) or not occ
+        problems = [self._follow(wants, family, now, feed.ahead.unreadable == 0, until, odd)]
         problems.append(self._add_new(wants, sources, family.items, name))
         self._problem(next((p for p in problems if p), ""))
+
+    def _thin(self, total: int, rest: int) -> bool:
+        """Gmail holds more than what copies, so the rest of it doesn't suddenly halve, and it's
+        never empty. That tells a bad read from visits that really ended, which can take many
+        copies at once. If it stays that way, that's just what Gmail looks like now."""
+        size = int(self.ledger.get_meta(READ_SIZE) or 0)
+        reads = int(self.ledger.get_meta(THIN_READS) or 0) + 1
+        thin = (total == 0 or rest * 2 < size) and reads < HOLD_READS
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(THIN_READS, str(reads if thin else 0), db)
+            if not thin:
+                self.ledger.set_meta(READ_SIZE, str(rest), db)
+        return thin
 
     def _live(self) -> list:
         return self.ledger.db.execute("SELECT * FROM family_copies WHERE state='live'").fetchall()
@@ -331,7 +354,7 @@ class FamilyCopy:
 
     # -- what's already there ------------------------------------------------------------
     def _follow(self, wants: dict, family: caldav.Read, now: datetime, gmail_clean: bool,
-                until: datetime) -> str:
+                until: datetime, odd: bool) -> str:
         items = {i.href: i for i in family.items}
         by_uid = {i.occ.uid: i for i in family.items}
         gone, absent = [], []
@@ -379,7 +402,7 @@ class FamilyCopy:
                     break
         else:
             problem = self._absent(absent, family.unreadable == 0)
-            problem = self._cancel(gone, wants) or problem
+            problem = self._cancel(gone, wants, odd) or problem
         return problem
 
     def _moment(self, value) -> datetime:
@@ -399,32 +422,49 @@ class FamilyCopy:
                 and _same(occ.end, end))
 
     def _absent(self, absent: list, family_clean: bool) -> str:
-        """Gone from Family. One read can be wrong, and so can many gone at once."""
+        """Gone from Family. One read can be wrong, and so can many gone at once for a while."""
         if not family_clean or not absent:
             return ""
-        if len(absent) > MAX_REMOVALS_AT_ONCE:
+        if len(absent) > MAX_REMOVALS_AT_ONCE and min(r["missing"] for r, _ in absent) + 1 < HOLD_READS:
+            for row, _ in absent:
+                self._update(row, missing=row["missing"] + 1)
             return (f"Copies from Gmail: {len(absent)} events look gone from Family at once. That "
                     "looks like a bad read, so I changed nothing.")
+        problem = ""
         for row, want in absent:
             if row["missing"] + 1 < READS_BEFORE_REMOVING:
                 self._update(row, missing=row["missing"] + 1)
+            elif not row["hand"] and (there := self.client.missing([row["uid"]])) != 1:
+                # The read left it out but it's there, or iCloud won't say. In time, if it's
+                # there, someone moved it out of what's read: theirs now.
+                if there == 0 and row["missing"] + 1 >= GIVE_UP_READS:
+                    self._set(row, "hands_off")
+                    continue
+                self._update(row, missing=row["missing"] + 1)
+                problem = ("Copies from Gmail: what Family listed doesn't match what's on it, so "
+                           "I changed nothing. I'll try again.")
             elif want is None:
                 self._set(row, "cancelled")        # gone on both sides: nothing to learn
             else:
                 self._removed(row)
-        return ""
+        return problem
 
-    def _cancel(self, gone: list, wants: dict) -> str:
+    def _cancel(self, gone: list, wants: dict, odd: bool) -> str:
         ready = [(row, item) for row, item in gone if row["missing"] + 1 >= READS_BEFORE_REMOVING]
         for row, _ in gone:
             self._update(row, missing=row["missing"] + 1)
-        # A series changed: Gmail still has as many as went. Many gone from a read that
-        # came back thin is a bad read.
-        if len(ready) > MAX_REMOVALS_AT_ONCE and len(wants) < len(ready):
+        # A series changed: Gmail still has as many as went. Otherwise many going at once may
+        # be a bad read, so wait, and tell him. Visits that really ended stay gone after that.
+        if len(ready) > MAX_REMOVALS_AT_ONCE and (odd or len(wants) < len(ready)) \
+                and min(row["missing"] for row, _ in ready) + 1 < HOLD_READS:
             return (f"Copies from Gmail: {len(ready)} events look cancelled at once. That looks "
                     "like a bad read, so I left them on Family.")
         problem = ""
+        kept = 0
         for row, item in ready:
+            if row["hand"] and odd:
+                kept += 1      # his own copy can't be rebuilt from a bad read's mistake
+                continue
             if not self._room():
                 break
             out = (self.client.remove_hand_copy(item.href, item.etag) if row["hand"]
@@ -438,6 +478,9 @@ class FamilyCopy:
             else:
                 problem = self._write_problem(out)
                 break
+        if kept and not problem:
+            problem = (f"Copies from Gmail: {kept} of your own events on Family look cancelled, but "
+                       "your Gmail calendar read oddly, so I left them.")
         return problem
 
     def _removed(self, row) -> None:

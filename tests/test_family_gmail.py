@@ -17,7 +17,7 @@ import pytest
 
 from harness import effects, google_cal
 from harness.family_copy import FamilyCopy, plan as copy_plan
-from harness.family_gmail import (HOLD_READS, MAX_WRITES_PER_DAY, PROBLEM, PROVEN, TEST_TITLE, FamilyGmail, Rule,
+from harness.family_gmail import (GIVE_UP_READS, HOLD_READS, MAX_WRITES_PER_DAY, PROBLEM, PROVEN, TEST_TITLE, FamilyGmail, Rule,
                                   parse_rules, rules_from_options)
 from harness.net import REDACT, GoogleTransport, HttpResponse, TransportError
 from harness.vault import FIELDS, Vault, VaultError
@@ -418,7 +418,7 @@ def test_if_google_refuses_nothing_else_happens_and_it_says_who_to_share_with(g)
     g.google.shared = False
     go(g)
     assert g.google.live() == {} and g.ledger.get_meta(PROVEN) is None
-    assert ACCOUNT in problem(g) and "Make changes to events" in problem(g)
+    assert ACCOUNT in problem(g) and "Make changes and see all event details" in problem(g)
     assert ACCOUNT in g.gm.digest_line()
 
 
@@ -442,7 +442,7 @@ def test_a_share_thats_read_only_says_so(g):
     sit(g)
     g.google.fail["POST"] = 403
     go(g)
-    assert "Make changes to events" in problem(g) and g.ledger.get_meta(PROVEN) is None
+    assert "Make changes and see all event details" in problem(g) and g.ledger.get_meta(PROVEN) is None
 
 
 def test_a_test_event_that_wont_come_off_says_what_it_is_and_nothing_else_is_written(g):
@@ -940,6 +940,19 @@ def test_a_short_list_with_one_block_missing_doesnt_lose_it(g):
         go(g)
     g.google.request = real
     assert g.ledger.db.execute("SELECT state FROM family_gmail").fetchone()["state"] == "live"
+
+
+def test_a_block_he_dragged_out_of_what_is_read_becomes_his_and_the_message_stops(g):
+    sit(g)
+    go(g)
+    uid = only(g)["id"]
+    far = datetime(2030, 1, 1, 9, tzinfo=NY)
+    g.google.hand_edit(uid, start={"dateTime": far.isoformat()},
+                       end={"dateTime": (far + timedelta(hours=1)).isoformat()})
+    for _ in range(GIVE_UP_READS + 1):
+        go(g)
+    assert g.ledger.db.execute("SELECT state FROM family_gmail").fetchone()["state"] == "hands_off"
+    assert not problem(g)
 
 
 def test_google_not_answering_about_one_block_keeps_it(g):
