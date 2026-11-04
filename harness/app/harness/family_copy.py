@@ -57,6 +57,7 @@ _WORDS = (("PT", r"pt|physical therapy|physio"),
           ("Vet", r"vet|veterinar\w*"),
           ("Haircut", r"haircut|barber"),
           ("Coffee", r"coffee"),
+          ("Computer Lab", r"computer lab"),
           ("Appointment", r"appt|appointment"))
 _WORD_RES = tuple((word, re.compile(rf"\b(?:{pattern})\b", re.I)) for word, pattern in _WORDS)
 _SKIP = re.compile(r"\b(busy|call|session|meeting|flight|stay|reservation|drive|transit|uber|lyft"

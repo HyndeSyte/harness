@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+- A computer lab class on your Gmail calendar now goes on Family as "Name - Computer Lab".
+
 ## 0.6.0
 
 - Family stays true to your Gmail calendar, with no tap. Your first name in the add-on's settings

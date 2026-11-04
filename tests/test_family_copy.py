@@ -104,6 +104,7 @@ def events(rig, kind):
     ("PT at the clinic", "PT"), ("Physical therapy", "PT"), ("Dentist (Main St)", "Dentist"),
     ("Doctor - Lee, PA", "Doctor"), ("Consultation with Jan Roe, MD", "Doctor"),
     ("Echo (cardiology)", "Doctor"), ("Coffee with Pat", "Coffee"), ("Pat + Sam ☕", "Coffee"),
+    ("Computer Lab elective (Main St)", "Computer Lab"),
     ("Appointment with the spa", "Appointment")])
 def test_the_word_is_fixed_by_what_the_title_says(title, word):
     assert word_for(occ(title)) == word
