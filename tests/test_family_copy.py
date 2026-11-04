@@ -753,6 +753,53 @@ def test_a_note_added_after_the_read_stops_the_removal(copy):
     assert path in on_family(copy)
 
 
+def test_his_copy_moves_when_a_get_writes_the_same_event_differently(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    different_etags(copy)
+    original = copy.icloud.request
+
+    def request(method, url, **kw):
+        out = original(method, url, **kw)
+        if method == "GET" and b"BEGIN:VEVENT" in out.body:
+            lines = out.body.split(b"\r\n")
+            top, bottom = lines.index(b"BEGIN:VEVENT") + 1, lines.index(b"END:VEVENT")
+            event = lines[top:bottom][::-1] + [b"X-APPLE-SOMETHING:1"]
+            body = b"\r\n".join(lines[:top] + event + lines[bottom:])
+            return type(out)(out.status, out.headers, body)
+        return out
+    copy.icloud.request = request
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    assert path not in on_family(copy) and titles(copy) == ["Sam - PT"]
+
+
+def test_a_refused_copy_logs_the_reason_in_names_only(copy, caplog):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    different_etags(copy)
+    item = copy.fa.client.items_between(when(copy, 4), when(copy, 6), TZ).items[0]
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace(
+        "END:VEVENT", "ORGANIZER:mailto:secret@example.invalid\r\nDESCRIPTION:private note\r\nEND:VEVENT"))
+    with caplog.at_level("WARNING"):
+        assert copy.fa.client.remove_hand_copy(item.href, item.etag, item.data).kind == "changed"
+    assert "ORGANIZER" in caplog.text and "DESCRIPTION" in caplog.text
+    assert "secret" not in caplog.text and "private note" not in caplog.text
+
+
+def test_a_copy_given_up_twice_is_named_once(copy):
+    start = when(copy, 5)
+    path = seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    copy.icloud.seed(path, copy.icloud.events[path][1].replace("Sam - PT", "Sam - PT moved"))
+    read(copy, occ(uid="u1", start=when(copy, 7)))
+    row = copy.ledger.db.execute("SELECT * FROM family_copies").fetchone()
+    copy.copy._note(row, "edited")
+    assert events(copy, "family_copy_left_alone") == 2
+    assert copy.copy.digest_line().count("PT ") == 1
+
+
 def test_a_copy_given_up_by_mistake_is_followed_again_once(copy):
     start = when(copy, 5)
     path = seed(copy, "Sam - PT", start)
@@ -981,8 +1028,8 @@ def test_an_odd_record_cannot_cost_the_digest(copy, detail):
 
 def test_the_digest_names_ten_then_counts(copy):
     with copy.ledger.tx() as db:
-        for _ in range(25):
-            copy.ledger.event("family_copy_left_alone", {"key": "k", "word": "PT", "start": "2026-11-09",
+        for n in range(25):
+            copy.ledger.event("family_copy_left_alone", {"key": f"k{n}", "word": "PT", "start": "2026-11-09",
                                                          "why": "edited"}, db=db)
     line = copy.copy.digest_line()
     assert line.count("PT Nov 9") == 10 and "and 15 more" in line

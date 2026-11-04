@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.3
+
+- 0.7.2 didn't get moved hand copies going: iCloud's copy still failed a safety check. Comparing an event with what was just read now ignores line order and the server's own X- lines.
+- When a hand copy is refused, the log gives the reason in property names only, never what they say.
+- Copies given up on, still exactly as they were, get one more try after this update.
+- The digest names a copy once a day, even if it's given up on twice.
+
 ## 0.7.2
 
 - Copies now follow a move on Gmail when iCloud reports an event's version differently in a list than it does when asked directly. They could stop following with no word.

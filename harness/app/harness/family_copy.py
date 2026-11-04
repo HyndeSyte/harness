@@ -55,8 +55,8 @@ SLOP = timedelta(minutes=30)   # travel time makes the two calendars differ a li
 PROBLEM = "family_copy_problem"
 READ_SIZE = "family_copy_read_size"
 THIN_READS = "family_copy_thin_reads"
-REVIVED = "family_copy_revived"
-REVIVE_TRIES = "family_copy_revive_tries"
+REVIVED = "family_copy_revived_073"      # a new name gives them one more try after this update
+REVIVE_TRIES = "family_copy_revive_tries_073"
 TRIP = "trip"
 CAPPED = ("Copies from Gmail: today's limit of changes is reached, so some wait for tomorrow and "
           "may be wrong until then.")
@@ -638,6 +638,7 @@ class FamilyCopy:
     def _left_alone(self, since: str) -> str:
         """Which ones, so he can look, in fixed words."""
         said = []
+        named = set()
         more = 0
         for r in self.ledger.db.execute("SELECT detail FROM events WHERE kind='family_copy_left_alone'"
                                         " AND at>=?", (since,)):
@@ -645,6 +646,9 @@ class FamilyCopy:
                 d = json.loads(r["detail"])
                 day = _first_day(self._when(d["start"]), ZoneInfo(self.tz))
                 text = f"{d['word']} {day:%b} {day.day} ({_WHY[d['why']]})"
+                if d["key"] in named:
+                    continue               # given up on again after a retry: once is enough
+                named.add(d["key"])
             except (ValueError, KeyError, TypeError, AttributeError):
                 more += 1                  # an odd record mustn't cost the morning's digest
                 continue

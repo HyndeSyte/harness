@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ from urllib.parse import unquote, urlsplit
 
 from . import ical
 from .net import REDACT, HttpResponse, TransportError
+
+log = logging.getLogger(__name__)
 
 CALENDAR_NAME = "Family"       # fixed in code; nothing can name another calendar
 MARKER = "X-HARNESS-OWNED"
@@ -136,6 +139,7 @@ def build_copy_ics(uid: str, title: str, start, end, now: datetime) -> str:
 
 
 _STAMPS = frozenset({"DTSTAMP", "LAST-MODIFIED", "CREATED", "SEQUENCE", "PRODID"})
+_NOT_PLAIN = frozenset({"ATTENDEE", "ORGANIZER", "RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"})
 
 
 def _lines(ics: str) -> tuple[list[str], list[str]]:
@@ -150,16 +154,41 @@ def _is_plain(ics: str) -> bool:
     lines, names = _lines(ics)
     if sum(x.upper() == "BEGIN:VEVENT" for x in lines) != 1:
         return False
-    return not {"ATTENDEE", "ORGANIZER", "RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"} & set(names)
+    return not _NOT_PLAIN & set(names)
+
+
+def _content(ics: str) -> list[str]:
+    """What the event says: not its stamps, the server's own X- lines, or their order."""
+    lines, names = _lines(ics)
+    out, inside = [], False
+    for line, name in zip(lines, names):
+        if line.upper() in ("BEGIN:VEVENT", "END:VEVENT"):
+            inside = line.upper() == "BEGIN:VEVENT"
+        elif inside and name not in _STAMPS and not name.startswith("X-"):
+            out.append(line)
+    return sorted(out)
 
 
 def _unchanged(ics: str, read: str) -> bool:
-    """The same event as was just read, whatever the server's stamps and line endings. A
-    calendar's list and a GET can answer with different ETags for one version."""
-    def content(text: str) -> list[str]:
-        lines, names = _lines(text)
-        return [x for x, name in zip(lines, names) if name not in _STAMPS]
-    return bool(read) and content(ics) == content(read)
+    """The same event as was just read, however the server wrote it. A calendar's list and a
+    GET can answer with different ETags for one version."""
+    now, then = _content(ics), _content(read)
+    return bool(then) and now == then
+
+
+def _names(lines) -> list[str]:
+    """Property names only, for the log. Never what they say."""
+    names = {re.split(r"[;:]", x, maxsplit=1)[0].upper() for x in lines}
+    return sorted(x for x in names if re.fullmatch(r"[A-Z0-9-]{1,40}", x))
+
+
+def _why_refused(body: str, same_etag: bool, read: str) -> str:
+    lines, names = _lines(body)
+    odd = _names(x for x, name in zip(lines, names) if name in _NOT_PLAIN)
+    events = sum(x.upper() == "BEGIN:VEVENT" for x in lines)
+    differ = set(_content(body)) ^ set(_content(read))
+    return (f"events={events} not_plain={odd} same_etag={same_etag} "
+            f"had_read={bool(read)} differ={_names(differ)}")
 
 
 def href_path(href: str) -> str:
@@ -443,6 +472,7 @@ class FamilyCalDav:
             return Outcome("failed", r.status)
         body, current = r.body.decode("utf-8", "replace"), r.headers.get("etag")
         if not _is_plain(body) or (current != etag and not _unchanged(body, data)):
+            log.warning("family copy: hand copy refused: %s", _why_refused(body, current == etag, data))
             return Outcome("changed", r.status)
         if not (current or etag):
             return Outcome("failed", r.status)   # nothing to guard the delete with
@@ -455,6 +485,7 @@ class FamilyCalDav:
         if r.status == 404:
             return Outcome("gone", r.status)
         if r.status == 412:
+            log.warning("family copy: hand copy delete refused: same_etag=%s", current == etag)
             return Outcome("changed", r.status)
         return Outcome("unknown" if r.status >= 500 else "failed", r.status)
 
