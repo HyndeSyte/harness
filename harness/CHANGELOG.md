@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- Say what should change on the Family or Gmail calendar and it's done, with no tap: take days
+  off, end a series, move one day or event, add an event or a series. One receipt and one Undo.
+  Off until the new `calendar_changes` option is on.
+- It finds the event on a fresh read, keeps every other line of it, guards against someone's edit
+  in between, and reads each write back. Nothing that may be pasted goes without a tap.
+- A day taken off that comes back, from any app, gets a line in the digest.
+
 ## 0.8.2
 
 - A school run now comes off only for what really stops it. An event during the trip to school does. An event after drop-off doesn't, so going on to an appointment keeps the run.

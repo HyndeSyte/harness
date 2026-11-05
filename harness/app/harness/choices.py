@@ -25,7 +25,7 @@ from .ledger import Ledger, iso
 KINDS = frozenset({"rule_undo", "rule_keep_new", "rule_keep_old",
                    "settings_approve", "settings_decline", "family_add_enable",
                    "family_add_undo", "family_add_loosen", "family_add_keep",
-                   "rule_approve", "rule_decline"})
+                   "rule_approve", "rule_decline", "calendar_change_undo"})
 PREFIX = "c"
 
 

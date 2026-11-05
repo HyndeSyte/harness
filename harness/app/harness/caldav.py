@@ -501,6 +501,84 @@ class FamilyCalDav:
             return Outcome("changed", r.status)
         return Outcome("unknown" if r.status >= 500 else "failed", r.status)
 
+    # -- what he asks for (calendar_change.py): any event on Family, guarded the same way --
+    def _at(self, url: str, href: str) -> str | None:
+        """The event's whole address, only if it's in this calendar."""
+        collection = urlsplit(url)
+        try:
+            path = urlsplit(href).path     # a server may answer with a whole address, or escape it
+        except ValueError:
+            return None
+        if not unquote(path).startswith(unquote(collection.path)) or not path.endswith(".ics") \
+                or ".." in unquote(path) or re.search(r"%(25|2f|5c)", path, re.I):
+            return None
+        return f"{collection.scheme}://{collection.netloc}{path}"
+
+    def _ready(self) -> tuple[dict, str] | Outcome:
+        ready = self._auth()
+        if ready is None:
+            return Outcome("no_credentials")
+        return self._name_problem(*ready) or ready
+
+    def fetch(self, href: str) -> tuple[Outcome, str]:
+        """One event as it is now, with the version to guard a change with."""
+        ready = self._ready()
+        if isinstance(ready, Outcome):
+            return ready, ""
+        auth, url = ready
+        target = self._at(url, href)
+        if target is None:
+            return Outcome("failed"), ""
+        try:
+            r = self._call(auth, "GET", target)
+        except TransportError:
+            return Outcome("failed"), ""
+        if r.status == 404:
+            return Outcome("gone", r.status), ""
+        if r.status == 401:
+            return Outcome("auth", r.status), ""
+        if r.status != 200:
+            return Outcome("failed", r.status), ""
+        return Outcome("ok", r.status, r.headers.get("etag")), r.body.decode("utf-8", "replace")
+
+    def _write(self, method: str, href: str, guard: dict, body: str | None = None) -> Outcome:
+        ready = self._ready()
+        if isinstance(ready, Outcome):
+            return ready
+        auth, url = ready
+        target = self._at(url, href)
+        if target is None:
+            return Outcome("failed")
+        try:
+            r = self._call(auth, method, target,
+                           {**(_ICS_HEADERS if body else {}), **guard}, body)
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        if r.status in (200, 201, 204):
+            return Outcome("ok", r.status, r.headers.get("etag"))
+        if r.status == 412:
+            return Outcome("changed", r.status)
+        if r.status == 404:
+            return Outcome("gone", r.status)
+        if r.status == 401:
+            return Outcome("auth", r.status)
+        return Outcome("unknown" if r.status >= 500 else "failed", r.status)
+
+    def replace(self, href: str, etag: str, ics: str) -> Outcome:
+        """Only over the version just read."""
+        return self._write("PUT", href, {"If-Match": etag}, ics) if etag else Outcome("failed")
+
+    def remove_at(self, href: str, etag: str) -> Outcome:
+        """Only the version just read."""
+        return self._write("DELETE", href, {"If-Match": etag}) if etag else Outcome("failed")
+
+    def put_new(self, href: str, ics: str) -> Outcome:
+        """Never over anything."""
+        return self._write("PUT", href, {"If-None-Match": "*"}, ics)
+
+    def href_for(self, uid: str) -> str:
+        return f"{self.credentials()[2]}{uid}.ics"
+
     def undo(self, uid: str, etag: str | None, data: str = "") -> Outcome:
         """Delete this one event, if it is still exactly what the harness wrote."""
         ready = self._auth()

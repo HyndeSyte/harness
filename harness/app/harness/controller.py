@@ -67,7 +67,8 @@ class Controller:
                  monotonic: Callable[[], float] = time.monotonic,
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
                  poll_timeout: int = 25, calendar=None, family=None, mirror=None,
-                 family_add=None, family_copy=None, family_gmail=None):
+                 family_add=None, family_copy=None, family_gmail=None, calendar_change=None):
+        self.calendar_change = calendar_change   # changes he asks for (calendar_change.py), or None
         self.family_add = family_add       # the one calendar write (family_add.py), or None
         self.family_copy = family_copy     # Family kept true to Gmail (family_copy.py), or None
         self.family_gmail = family_gmail   # Gmail kept true to Family (family_gmail.py), or None
@@ -103,21 +104,31 @@ class Controller:
         self.config = replace(self.base_config, owner_user_id=owner)
         if self.family_add is not None:
             self.family_add.bind(owner)
+        if self.calendar_change is not None:
+            self.calendar_change.bind(owner)
         self.runner = Runner(self.ledger, self.config, self.engines, self.executor,
                              sleep=self.sleep, monotonic=self.monotonic,
-                             budgets_ok=self._budget_ok, family_add=self.family_add)
+                             budgets_ok=self._budget_ok, family_add=self.family_add,
+                             calendar_change=self.calendar_change)
         self.canary = daily.Canary(self.ledger, self.config, self.engines, self.executor,
                                    sleep=self.sleep, monotonic=self.monotonic,
                                    budget_ok=self._budget_ok)
         self.commands = commands.Commands(self.ledger, status_fn=self.status_text,
                                           cancel_fn=self.runner.cancel_in_flight,
                                           screen_fn=self._screen_text,
-                                          checkadds_fn=(self.family_add.check_adds
+                                          checkadds_fn=(self._check_adds
                                                         if self.family_add else None))
         self.callbacks = callbacks.Callbacks(self.ledger, self.api, owner_user_id=owner,
                                              policy_version=self.config.policy_version,
                                              settings_fn=self._settings_decision,
-                                             family_add=self.family_add)
+                                             family_add=self.family_add,
+                                             calendar_change=self.calendar_change)
+
+    def _check_adds(self) -> str:
+        words = self.family_add.check_adds()
+        if self.calendar_change is not None and self.calendar_change.on():
+            words += self.calendar_change.check_changes()
+        return words
 
     def _family_note(self) -> None:
         """A failed write stays in /status and the digest until a write succeeds."""
@@ -143,6 +154,8 @@ class Controller:
             self.runner.reconcile_after_restart()
             if self.family_add is not None:
                 self.family_add.reconcile_after_restart()
+            if self.calendar_change is not None:
+                self.calendar_change.reconcile_after_restart()
         self._family_note()
         if self.vault.get("telegram_bot_token"):
             if self._telegram_health() and owner is not None:
@@ -240,6 +253,8 @@ class Controller:
             self.family_add.run_pending(paused=commands.is_paused(self.ledger),
                                         held=not self._proactive_ok())
             self._family_note()
+        if self.calendar_change is not None:
+            self.calendar_change.run_pending(paused=commands.is_paused(self.ledger))
         self._announce_settings()
         if self.calendar is not None:
             self.calendar.maybe_start()
@@ -416,6 +431,8 @@ class Controller:
         if self.family_add is not None:
             self.family_add.forget()       # off again, and the bake-in starts over
             self._family_note()
+        if self.calendar_change is not None:
+            self.calendar_change.forget()
         self.ledger.event("reset", {"by": by})
         self.config = None
         self.runner = None
@@ -445,7 +462,8 @@ class Controller:
                              family_add_line=" ".join(x for x in (
                                  self.family_add.digest_line() if self.family_add else "",
                                  self.family_copy.digest_line() if self.family_copy else "",
-                                 self.family_gmail.digest_line() if self.family_gmail else "")
+                                 self.family_gmail.digest_line() if self.family_gmail else "",
+                                 self.calendar_change.digest_line() if self.calendar_change else "")
                                  if x))
             daily.deliver(self.ledger, cfg, d)
 
@@ -456,8 +474,10 @@ class Controller:
         now = self.ledger.now()
         last = self.ledger.last_poll_success()
         fa_on = self.family_add is not None and self.family_add.enabled()
+        changes_on = self.calendar_change is not None and self.calendar_change.on()
         lines = [f"<b>Status</b> · stage {cfg.stage} · " +
                  ("calendar holds on" if cfg.stage_at_least("S2")
+                  else "calendar changes on" if changes_on
                   else "one effect: Family calendar adds" if fa_on else "zero effects"),
                  "Stopped (/resume)" if commands.is_paused(self.ledger) else "Running"]
         if self.family_add is not None:
@@ -466,6 +486,8 @@ class Controller:
                 lines.append(self.family_copy.status_line())
             if fa_on and self.family_gmail is not None:
                 lines.append(self.family_gmail.status_line())
+        if self.calendar_change is not None:
+            lines.append(self.calendar_change.status_line())
         if last:
             lines.append(f"Telegram: last contact {int((now - last).total_seconds())}s ago")
         lines.append(f"Jobs: {len(self.ledger.jobs_in('running'))} running · "

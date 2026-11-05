@@ -1,4 +1,4 @@
-"""The one client that can write to Google: blocks on his Gmail calendar.
+"""The one client that can write to Google: blocks on his Gmail calendar, and what he asks for.
 
 He makes a Google service account and shares his calendar with it, so there is no
 sign-in to go stale, and it reaches only what he shared. Its key is kept like any other
@@ -8,9 +8,10 @@ it is one modular exponent, and the only thing it signs is that token.
 Nothing here can add an attendee, a repeat, a place or a description: the event is built
 here from a title and two times, and no update ever goes out. It asks for no reminder, but
 Google still applies his defaults, which a service account can't change. Every event
-carries a mark, and an id of a form only this code makes, so nothing here can change or
-delete an event it didn't write: list_ours returns only marked ones, and the writes
-refuse any other id.
+carries a mark, and an id of a form only this code makes, so the sync can't change or
+delete an event it didn't write: list_ours returns only marked ones, and its writes
+refuse any other id. Only the methods marked for calendar_change.py reach other events, and
+only for a change he asked for. No update goes out from those either.
 
 An Outcome says what Google answered and nothing more. No answer, or a 5xx, is "unknown":
 the id is fixed per block, so the next read's try finds it instead of doubling.
@@ -38,6 +39,7 @@ MARK = {"harness": "family_gmail"}
 TIMEOUT_S = 20
 MAX_PAGES = 20
 _ID_RE = re.compile(r"hb[0-9a-f]{32}")      # Google allows a-v and 0-9 in an id it's given
+_ANY_ID_RE = re.compile(r"[a-zA-Z0-9_-]{1,1024}")     # one day of a series is its id, _, a time
 _EMAIL_RE = re.compile(r"[a-z0-9-]{1,64}@[a-z0-9-]{1,64}\.iam\.gserviceaccount\.com")
 _ADDRESS_RE = re.compile(r"[^\s@/?#]{1,100}@[^\s@/?#]{1,100}")
 # 1.2.840.113549.1.1.1, rsaEncryption, as it sits in a PKCS#8 key.
@@ -360,6 +362,81 @@ class GoogleCalendar:
         if r.status == 412:
             return Outcome("unknown", r.status)
         return Outcome("ok", r.status) if r.status == 200 else self._answer(r)
+
+    # -- what he asks for (calendar_change.py): the one way to touch an event not ours -------
+    def events_between(self, address: str, start: datetime, end: datetime) -> list[dict] | None:
+        """Everything in this window, each day of a series on its own. None when that can't
+        be said."""
+        url = self._events(address)
+        token, _ = self._access()
+        if url is None or token is None:
+            return None
+        out: list[dict] = []
+        query = {"singleEvents": "true", "showDeleted": "false", "maxResults": "250",
+                 "timeMin": start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                 "timeMax": end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
+        for _ in range(MAX_PAGES):
+            try:
+                r = self._call(token, "GET", f"{url}?{urlencode(query)}")
+                if r.status != 200:
+                    return None
+                page = r.json()
+                out += [e for e in page.get("items", []) if isinstance(e, dict)]
+                following = page.get("nextPageToken")
+            except (TransportError, ValueError, TypeError, AttributeError):
+                return None
+            if not following:
+                return out
+            query["pageToken"] = following
+        return None
+
+    def look(self, address: str, uid: str) -> tuple[str, dict | None]:
+        """One event: "ok" and it, "gone", or "unknown". No answer says nothing about whether
+        it's there."""
+        url = self._events(address)
+        token, _ = self._access()
+        if url is None or token is None or not _ANY_ID_RE.fullmatch(uid):
+            return "unknown", None
+        try:
+            r = self._call(token, "GET", f"{url}/{uid}")
+            if r.status in (404, 410):
+                return "gone", None
+            found = r.json() if r.status == 200 else None
+        except (TransportError, ValueError):
+            return "unknown", None
+        return ("ok", found) if isinstance(found, dict) else ("unknown", None)
+
+    def _ask(self, address: str, method: str, uid: str, body: dict | None, etag: str | None) -> Outcome:
+        url = self._events(address)
+        if url is None or (uid and not _ANY_ID_RE.fullmatch(uid)):
+            return Outcome("failed")
+        token, problem = self._access()
+        if token is None:
+            return problem
+        where = f"{url}/{uid}?sendUpdates=none" if uid else f"{url}?sendUpdates=none"
+        try:
+            r = self._call(token, method, where, body=body, etag=etag)
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        if r.status in (200, 204):
+            return Outcome("ok", r.status)
+        if r.status == 412:
+            return Outcome("changed", r.status)
+        if r.status == 410:
+            return Outcome("gone", r.status)
+        if r.status == 409:
+            return Outcome("exists", r.status)
+        return self._answer(r)
+
+    def change(self, address: str, uid: str, fields: dict, etag: str | None) -> Outcome:
+        return self._ask(address, "PATCH", uid, fields, etag)
+
+    def drop(self, address: str, uid: str, etag: str | None) -> Outcome:
+        return self._ask(address, "DELETE", uid, None, etag)
+
+    def insert(self, address: str, event: dict) -> Outcome:
+        """Its id is fixed per request, so a lost answer can't become a second one."""
+        return self._ask(address, "POST", "", event, None)
 
     def really_gone(self, address: str, uid: str) -> bool:
         """Asked by id, because a list can come back short. Only a clear yes is a yes."""

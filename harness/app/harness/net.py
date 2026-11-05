@@ -197,7 +197,7 @@ class GoogleTransport(UrllibTransport):
     """Https to Google's token and calendar hosts, no redirects and no proxy. It is the only
     transport that carries the service account's sign-in. Anything else never leaves."""
 
-    METHODS = frozenset({"GET", "POST", "PUT", "DELETE"})
+    METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 
     def __init__(self, hosts: frozenset[str], *, cafile: str | None = None):
         super().__init__(use_env_proxy=False, cafile=cafile, follow_redirects=False)

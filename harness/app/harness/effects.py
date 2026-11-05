@@ -18,10 +18,15 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 FAMILY_ADD = "family_event_add"
+CALENDAR_CHANGE = "calendar_change"
+MAX_CHANGES = 12
+MAX_DATES = 60
+MAX_DAYS_AHEAD = 2 * 366
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 class ParamError(ValueError):
@@ -30,6 +35,10 @@ class ParamError(ValueError):
 
 class PlainRefusal(ParamError):
     """A refusal he should hear in plain words, not as a malformed reply."""
+
+
+class ChangeRefusal(PlainRefusal):
+    """The same, about a calendar change."""
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,12 @@ class Param:
                 # A time without a zone is two different times on a
                 # travel week. Refused rather than guessed.
                 raise ParamError(f"{name}: timezone required")
+            return value
+        if self.kind == "list":
+            if not isinstance(value, list):
+                raise ParamError(f"{name}: list required")
+            if self.maximum is not None and len(value) > self.maximum:
+                raise ChangeRefusal("that's too many changes for one message. Send them in parts")
             return value
         raise ParamError(f"{name}: unknown param kind {self.kind}")
 
@@ -187,6 +202,90 @@ def _family_shape(p: dict) -> str | None:
     return None
 
 
+_CHANGE_KEYS = frozenset({"calendar", "op", "title", "dates", "start", "end", "days", "until", "location"})
+_DAY_NAMES = re.compile(r"(?:MO|TU|WE|TH|FR|SA|SU)(?:,(?:MO|TU|WE|TH|FR|SA|SU)){0,6}")
+
+
+def _change_date(text: str) -> bool:
+    if not DATE_RE.fullmatch(text):
+        return False
+    try:
+        return _YEARS[0] <= datetime.fromisoformat(text).year <= _YEARS[1]
+    except ValueError:
+        return False
+
+
+def _change_time(text: str, *, day_ok: bool = False) -> bool:
+    if day_ok and _change_date(text):
+        return True
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return when.tzinfo is not None and not when.second and not when.microsecond \
+        and _YEARS[0] <= when.year <= _YEARS[1]
+
+
+def _one_change(c: Any) -> None:
+    if not isinstance(c, dict) or set(c) != _CHANGE_KEYS or not all(isinstance(v, str) for v in c.values()):
+        raise ParamError("a change has the wrong shape")
+    if c["calendar"] not in ("family", "gmail"):
+        raise ParamError("a change names an unknown calendar")
+    op = c["op"]
+    if op not in ("remove", "end_series", "move", "add", "add_series"):
+        raise ParamError("a change has an unknown op")
+    for text in (c["title"], c["location"]):
+        if len(text) > 200 or not _plain_text(text):
+            raise ChangeRefusal("the title or location has an invisible or special character, or "
+                                "is too long")
+    if not _visible(c["title"]):
+        raise ChangeRefusal("which event isn't clear")
+    days =[x for x in c["dates"].split(",") if x]
+    if len(days) > MAX_DATES or not all(_change_date(x) for x in days):
+        raise ChangeRefusal("I couldn't read those dates")
+    if op in ("remove", "end_series", "move") and not days:
+        raise ChangeRefusal("which days isn't clear")
+    need = {"remove": ("dates",), "end_series": ("dates",), "move": ("dates", "start", "end"),
+            "add": ("start", "end"), "add_series": ("start", "end", "days", "until")}[op]
+    for key in _CHANGE_KEYS - {"calendar", "op", "title", "location"}:
+        if key == "days" and op == "end_series":      # only those days of the week, if named
+            continue
+        if bool(c[key]) != (key in need):
+            raise ParamError(f"{op} doesn't fit {key}")
+    if op in ("end_series", "move") and len(days) != 1:
+        raise ChangeRefusal("that takes exactly one date")
+    if op == "end_series" and c["days"] and not _DAY_NAMES.fullmatch(c["days"]):
+        raise ChangeRefusal("I couldn't read those days of the week")
+    if "start" in need:
+        day_ok = op in ("add", "move")
+        if not (_change_time(c["start"], day_ok=day_ok) and _change_time(c["end"], day_ok=day_ok)):
+            raise ChangeRefusal("I couldn't read those times; they need a time zone and whole minutes")
+        if _change_date(c["start"]) != _change_date(c["end"]):
+            raise ChangeRefusal("the start and end have to be both days or both times")
+        start, end = datetime.fromisoformat(c["start"]), datetime.fromisoformat(c["end"])
+        if end < start or (end == start and "T" in c["start"]):
+            raise ChangeRefusal("the end has to be after the start")
+    if op == "add_series":
+        if not _DAY_NAMES.fullmatch(c["days"]) or not _change_date(c["until"]):
+            raise ChangeRefusal("I couldn't read the days or the last date of that series")
+        if "T" not in c["start"]:
+            raise ChangeRefusal("a series needs a start and end time")
+        if ("MO", "TU", "WE", "TH", "FR", "SA", "SU")[start.weekday()] not in c["days"]:
+            raise ChangeRefusal("the first day of that series isn't one of its days of the week")
+        if datetime.fromisoformat(c["until"]).date() < datetime.fromisoformat(c["start"]).date():
+            raise ChangeRefusal("that series would end before it starts")
+        if datetime.fromisoformat(c["end"]) - datetime.fromisoformat(c["start"]) > timedelta(hours=24):
+            raise ChangeRefusal("one day of a series can't run longer than 24 hours")
+
+
+def _changes_shape(p: dict) -> str | None:
+    if not p["changes"]:
+        raise ChangeRefusal("I couldn't tell what to change")
+    for c in p["changes"]:
+        _one_change(c)
+    return None
+
+
 def _future(params: dict) -> str | None:
     # Evaluated by the executor against its own clock at execution time.
     return None
@@ -276,6 +375,24 @@ REGISTRY: dict[str, EffectDef] = {
                      "repeat is refused by the server and can't be a second event; "
                      "a lost response is reported as unknown and never retried"),
         shape=_family_shape,
+    ),
+    # What he asks to change on Family or Gmail (calendar_change.py). A model says what he
+    # said: which calendar, which days, what it's called. Plain code finds the event on a
+    # fresh read. Off until the add-on's option is on; then no tap, by his word on Nov 5, 2026,
+    # except for text that may be pasted. Fixed in code: no attendee, no alarm.
+    CALENDAR_CHANGE: EffectDef(
+        name=CALENDAR_CHANGE,
+        min_stage="S1",
+        reversible=True,
+        ttl_s=12 * 3600,
+        reviewer_required=False,
+        params={"changes": Param("list", maximum=MAX_CHANGES)},
+        fixed={"calendars": ("Family", "his Gmail calendar"), "attendees": (), "organizer": None,
+               "alarms": "his own defaults", "send_updates": "none"},
+        undo="put each event back as it was read, unless someone has changed it since",
+        idempotency=("a change to an event carries the version just read; a new event's id is "
+                     "fixed per request; a lost answer is reported as unknown and never retried"),
+        shape=_changes_shape,
     ),
     # Keeping Family true to the Gmail calendar (family_copy.py). Built only by plain
     # code, with no tap, after he turned it on by entering his name. A model can't

@@ -17,6 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import caldav, drive, family, google_cal, policy
+from .calendar_change import CalendarChange, changes_from_options
 from .calendar_feed import CalendarFeeds
 from .config import Config
 from .controller import Controller
@@ -88,6 +89,14 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     adds = FamilyAdd(ledger, client, tz=base.timezone, policy_version=base.policy_version,
                      model=policy.MODELS[policy.engine_for("message")].model,
                      creds_stamp=vault.family_stamp)
+    google = google_cal.GoogleCalendar(GoogleTransport(google_cal.HOSTS),
+                                       lambda: vault.get("google_service_key"), ledger.now)
+    family_gmail = FamilyGmail(ledger, adds, calendar, google,
+                               rules_fn=lambda: rules_from_options(data_dir),
+                               school_fn=lambda: school_from_options(data_dir),
+                               drives=drive.Drives(ledger, MapTransport(drive.HOSTS),
+                                                   lambda: school_address_from_options(data_dir)),
+                               tz=base.timezone)
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,
@@ -95,16 +104,11 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                             family_add=adds,
                             family_copy=FamilyCopy(ledger, adds, calendar, tz=base.timezone,
                                                    name_fn=lambda: name_from_options(data_dir)),
-                            family_gmail=FamilyGmail(
-                                ledger, adds, calendar,
-                                google_cal.GoogleCalendar(GoogleTransport(google_cal.HOSTS),
-                                                          lambda: vault.get("google_service_key"),
-                                                          ledger.now),
-                                rules_fn=lambda: rules_from_options(data_dir),
-                                school_fn=lambda: school_from_options(data_dir),
-                                drives=drive.Drives(ledger, MapTransport(drive.HOSTS),
-                                                    lambda: school_address_from_options(data_dir)),
-                                tz=base.timezone))
+                            family_gmail=family_gmail,
+                            calendar_change=CalendarChange(
+                                ledger, client, google,
+                                enabled=lambda: changes_from_options(data_dir),
+                                address=family_gmail._address, tz=base.timezone))
     return controller, web, listener
 
 

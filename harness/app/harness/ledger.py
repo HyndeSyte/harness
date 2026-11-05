@@ -194,6 +194,25 @@ CREATE TABLE IF NOT EXISTS family_adds(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS calendar_changes(
+  proposal_id TEXT PRIMARY KEY REFERENCES proposals(id),
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  state TEXT NOT NULL,
+  undo_state TEXT NOT NULL,
+  undo_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS calendar_removed(
+  calendar TEXT NOT NULL,
+  uid TEXT NOT NULL,
+  instance TEXT NOT NULL,
+  title TEXT NOT NULL,
+  day TEXT NOT NULL,
+  removed_at TEXT NOT NULL,
+  told_at TEXT,
+  PRIMARY KEY(calendar, uid, instance)
+);
 CREATE TABLE IF NOT EXISTS family_copies(
   key TEXT PRIMARY KEY,
   uid TEXT NOT NULL,

@@ -389,7 +389,7 @@ def test_the_key_and_token_are_kept_out_of_logs(g):
 @pytest.mark.parametrize("method, url", [
     ("GET", "https://evil.example/x"), ("GET", "http://www.googleapis.com/x"),
     ("GET", "https://www.googleapis.com:444/x"), ("GET", "https://a@www.googleapis.com/x"),
-    ("PATCH", "https://www.googleapis.com/x"), ("GET", "https://calendar.google.com/x")])
+    ("TRACE", "https://www.googleapis.com/x"), ("GET", "https://calendar.google.com/x")])
 def test_the_transport_goes_nowhere_else(method, url):
     with pytest.raises(TransportError) as e:
         GoogleTransport(google_cal.HOSTS).request(method, url)

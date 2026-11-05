@@ -259,6 +259,17 @@ def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime
     summary is not used here on purpose."""
     if effect.name == "family_event_add":
         return family_card(params, tz=tz, expires=expires, job_id=job_id, warnings=warnings)
+    if effect.name == "calendar_change":
+        exp = expires.astimezone(ZoneInfo(tz))
+        verbs = {"remove": "take off", "end_series": "end, from", "move": "move",
+                 "add": "add", "add_series": "add, repeating"}
+        return fit("\n".join([
+            "<b>Change the calendar?</b>",
+            *[f"⚠ <b>Check before approving:</b> {escape(w)}" for w in warnings],
+            *[f"{escape(c['calendar'].title())}: {verbs[c['op']]} {family_text(c['title'])}"
+              + "".join(f" {escape(c[k])}" for k in ("dates", "start", "end", "days", "until") if c[k])
+              for c in params["changes"]],
+            f"<i>Offer ends {_day(exp)}, {_clock(exp)} · job {short(job_id)}</i>"]))
     if effect.name == "calendar_hold":
         lines = [
             "<b>Hold on your harness calendar</b>",

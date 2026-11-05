@@ -66,8 +66,10 @@ class Runner:
     def __init__(self, ledger: Ledger, config: Config, engines: dict[str, Engine],
                  executor: Executor, *, sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
-                 budgets_ok: Callable[[str], bool] | None = None, family_add=None):
+                 budgets_ok: Callable[[str], bool] | None = None, family_add=None,
+                 calendar_change=None):
         self.family_add = family_add       # family_add.FamilyAdd, or None
+        self.calendar_change = calendar_change   # calendar_change.CalendarChange, or None
         self.ledger = ledger
         self.config = config
         self.engines = engines
@@ -126,13 +128,15 @@ class Runner:
         now = self.ledger.now()
         fired = rules.active_for_message(self.ledger, policy.MAX_RULES_PER_CALL)
         family = self.family_add is not None
+        change = self.calendar_change is not None and self.calendar_change.on()
         system = prompts.system_prompt(now=now, tz=self.config.timezone, rules=fired,
                                        stage_at_least=self.config.stage_at_least,
-                                       family_add=family)
+                                       family_add=family, calendar_change=change)
         if self.family_add is not None:
             self.family_add.note_message(text)
         user = prompts.user_content(text, earlier=self._earlier(job))
-        out_schema = prompts.output_schema(self.config.stage_at_least, family_add=family)
+        out_schema = prompts.output_schema(self.config.stage_at_least, family_add=family,
+                                           calendar_change=change)
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "running", db=db)
             self.ledger.job_set(job["id"], db=db, engine=engine_name, started_at=now)
@@ -210,6 +214,10 @@ class Runner:
         try:
             out = schema.parse_output(res.output, stage_at_least=self.config.stage_at_least)
         except schema.OutputError as e:
+            if self.calendar_change is not None and isinstance(e.__cause__, effects.ChangeRefusal):
+                self.calendar_change.refuse_in_words(job, {"engine": engine, "model": res.model,
+                                                           "usd": round(res.usd, 5)}, str(e))
+                return
             if self.family_add is not None and isinstance(e.__cause__, effects.PlainRefusal):
                 self.family_add.refuse_in_words(job, {"engine": engine, "model": res.model,
                                                       "usd": round(res.usd, 5)}, str(e))
@@ -266,7 +274,16 @@ class Runner:
         d = effects.lookup(body["effect_type"], self.config.stage_at_least)
         params = body["params"]
         family = d.name == effects.FAMILY_ADD
-        if family:
+        change = d.name == effects.CALENDAR_CHANGE
+        if change:
+            if self.calendar_change is None:
+                self._fail(job, "calendar_change_not_wired", job["engine"])
+                return
+            if self.calendar_change.refuse(job, receipt, params):
+                return
+            warnings = self.calendar_change.warnings(
+                job, params, pasted_recently=self.family_add is not None and self.family_add._pasted_recently())
+        elif family:
             if self.family_add is None:
                 self._fail(job, "family_add_not_wired", job["engine"])
                 return
@@ -285,8 +302,13 @@ class Runner:
                                             ttl_s=min(d.ttl_s, self.config.approval_ttl_s),
                                             db=db)
             self.ledger.transition(job["id"], "proposed", db=db)
-            if warnings:
+            if warnings and family:
                 self.family_add.note_warned(pid, db)
+            if change and not warnings:
+                self.calendar_change.auto_approve(pid, job["id"], db)
+                self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
+                                               "receipt": receipt}, db=db)
+                return                      # the controller does it this tick
             if family and not warnings and self.family_add.auto_approve(pid, job["id"], db):
                 self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
                                                "receipt": receipt}, db=db)

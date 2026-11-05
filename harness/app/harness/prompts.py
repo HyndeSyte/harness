@@ -31,10 +31,12 @@ def _kind(name: str) -> dict:
     return {"type": "string", "enum": [name]}
 
 
-def output_schema(stage_at_least: Callable[[str], bool], *, family_add: bool = False) -> dict:
+def output_schema(stage_at_least: Callable[[str], bool], *, family_add: bool = False,
+                  calendar_change: bool = False) -> dict:
     """`family_add`: the Family calendar add is wired in. It is offered whether
     or not his switch is on, so asking while it is off gets words, not a
-    malformed reply; the runner decides what happens to the proposal."""
+    malformed reply; the runner decides what happens to the proposal.
+    `calendar_change`: changes he asks for are on, which takes in adds too."""
     s = {"type": "string"}
     shapes = [
         _obj({"type": _kind("answer"), "text": s}),
@@ -55,7 +57,18 @@ def output_schema(stage_at_least: Callable[[str], bool], *, family_add: bool = F
             "effect_type": {"type": "string", "enum": ["calendar_hold"]},
             "params": _obj({"start": s, "duration_min": {"type": "integer"}}),
             "summary": s}))
-    if family_add:
+    if calendar_change:
+        one = _obj({"calendar": {"type": "string", "enum": ["family", "gmail"]},
+                    "op": {"type": "string",
+                           "enum": ["remove", "end_series", "move", "add", "add_series"]},
+                    "title": s, "dates": s, "start": s, "end": s, "days": s, "until": s,
+                    "location": s})
+        shapes.append(_obj({
+            "type": _kind("proposal"),
+            "effect_type": {"type": "string", "enum": ["calendar_change"]},
+            "params": _obj({"changes": {"type": "array", "items": one}}),
+            "summary": s}))
+    elif family_add:
         shapes.append(_obj({
             "type": _kind("proposal"),
             "effect_type": {"type": "string", "enum": ["family_event_add"]},
@@ -85,10 +98,22 @@ PROPOSAL_FAMILY = """
 - proposal: he asked you to add an event to the Family calendar. effect_type is family_event_add; params are title (short), start and end (ISO 8601 with the timezone offset in force on that date in his zone; if he gives no end, make it one hour after the start), and location (empty string if he named none). summary is one line. Use clarify if the day or time is unclear. This adds one timed event to that one calendar and nothing else; you can't change or delete events, and you can't invite anyone. The controller decides what happens next, and you cannot add the event yourself."""
 
 
+PROPOSAL_CHANGE = """
+- proposal: he asked you to add, move or take off events on a calendar. effect_type is calendar_change; params.changes is a list, one item per event he named. Each has: calendar (family is the shared Family calendar, gmail is his own; if he doesn't say and it's about the kids or the household, use family; otherwise clarify); op; title (the words he uses for the event; for a new event, its short title); location (empty unless he named one for a new event); and the fields below, with every field that op doesn't use an empty string.
+  remove: dates, the days it comes off, as YYYY-MM-DD with commas, in one go however many there are. Works for one-off events and days of a repeating one.
+  end_series: dates, one YYYY-MM-DD, the first day it no longer happens. days is empty, or two-letter days with commas if he's ending only those days of the week.
+  move: dates, the one YYYY-MM-DD it's on now, plus its new start and end (ISO 8601 with the timezone offset in force on that date in his zone; for an all-day event, YYYY-MM-DD for both, end being the last day).
+  add: start and end, as ISO 8601 with offset; for an all-day event, YYYY-MM-DD for both, end being the last day.
+  add_series: start and end of its first day (ISO 8601 with offset), days (two-letter days with commas, like MO,WE), until (YYYY-MM-DD, last day).
+A program changing days from a date on is end_series plus add_series. Work out real dates from what he said and today's date. Use clarify if the days or the event are unclear. Never propose a change he didn't ask for, and never add an event that only says something isn't happening: to close a day, take the real event off it. You can't see his calendars, so don't say what's on them. No invitees, ever. The controller finds the event and does the rest; you can't change anything yourself."""
+
+
 def system_prompt(*, now: datetime, tz: str, rules: Iterable,
-                  stage_at_least: Callable[[str], bool], family_add: bool = False) -> str:
+                  stage_at_least: Callable[[str], bool], family_add: bool = False,
+                  calendar_change: bool = False) -> str:
     text = SYSTEM.format(proposal=(PROPOSAL if stage_at_least("S2") else "")
-                         + (PROPOSAL_FAMILY if family_add else ""))
+                         + (PROPOSAL_CHANGE if calendar_change
+                            else PROPOSAL_FAMILY if family_add else ""))
     lines = []
     for r in rules:
         lines.append(f"- [{r['id']}] for {r['scope']}: {r['field']} = {r['value']}"

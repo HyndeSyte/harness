@@ -74,6 +74,20 @@ def valid_ics(body: bytes | None) -> str | None:
         return None
     if ["BEGIN:VCALENDAR"] != p.get("BEGIN", [""])[:1] or p.get("VERSION") != ["VERSION:2.0"]:
         return None
+    # A series and its moved days share a uid across events, in the zone of the event.
+    if "RRULE" in p or "RECURRENCE-ID" in p or "EXDATE" in p or any("TZID=" in x for x in p.get("DTSTART", [])):
+        uids = {x.split(":", 1)[1] for x in p.get("UID", [])}
+        form = r"(;TZID=[^:;]+:\d{8}T\d{6}|:\d{8}T\d{6}Z?|;VALUE=DATE:\d{8})"
+        for name in ("DTEND", "EXDATE", "RECURRENCE-ID"):
+            if not all(re.fullmatch(name + form + r"(,[\dTZ]+)*", x) for x in p.get(name, [])):
+                return None
+        # A zone's own start lines sit in with the event's.
+        if not all(re.fullmatch("DTSTART" + form, x) for x in p.get("DTSTART", [])):
+            return None
+        for rule in p.get("RRULE", []):
+            if not re.search(r"FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)", rule):
+                return None
+        return uids.pop() if len(uids) == 1 and p.get("DTSTART") else None
     if any(len(p.get(k, [])) != 1 for k in ("UID", "DTSTAMP", "DTSTART", "DTEND", "SUMMARY")):
         return None
     if not re.fullmatch(r"DTSTART(:\d{8}T\d{6}Z|;VALUE=DATE:\d{8})", p["DTSTART"][0]) \
