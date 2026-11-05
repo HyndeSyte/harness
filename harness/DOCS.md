@@ -281,8 +281,8 @@ how many blocks are on Gmail.
   digest says so. Delete any that are wrong.
 - **School days:** set `family_school` to the Family titles that mean a school day, with `;` between
   several. Each gets a drop-off block, from 30 minutes before the start to 15 after, and a pickup block, from 15 minutes before the end to 30 after.
-  A real event of yours in the way removes that block, and it comes back if the event goes. A "Busy"
-  hold, or an all-day event other than a stay, doesn't count. If your Gmail calendar can't be read,
+  A real event of yours during the trip to school (the first 15 minutes of a block) removes that block, and it comes back if the event goes. A "Busy"
+  hold, or an all-day event other than a stay, doesn't count. Enter the school's street address in `family_school_address`, and an event within three hours of a run counts too if you can't drive between it and the school in time. An event with no street address is taken as nearby, and the digest says so. If a drive time can't be looked up, the run stays and the digest says so. If your Gmail calendar can't be read,
   school runs don't change and the digest says so. If one event on it can't be read, blocks already
   there stay.
 - **Limit:** 100 changes a day. Past that, the digest says so and the rest go the next day.
@@ -341,7 +341,9 @@ continuity is unknown.
   only, by GET, from calendar.google.com.
 - Talk to any host but Telegram, Anthropic, OpenAI, calendar.google.com, the iCloud
   host in the Family calendar address you entered, and, for those blocks,
-  oauth2.googleapis.com and www.googleapis.com.
+  oauth2.googleapis.com and www.googleapis.com. With the school's address entered, drive times
+  also use nominatim.openstreetmap.org and router.project-osrm.org, by GET, and they get street
+  addresses and map points only: never a title, name or time.
 - Listen to anyone but the paired account, in its private chat. Messages from
   anyone else are dropped and their text is never stored.
 - Keep messages that carry rights-protected document markers. (Screening by work

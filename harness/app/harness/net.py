@@ -8,7 +8,8 @@ third-party dependencies to pin, audit or break on update. The iCloud host
 is enforced here, request by request, by CalDavTransport, which also refuses
 redirects: it is the only transport that carries a family password.
 GoogleTransport does the same for the two Google hosts that write to his Gmail
-calendar (google_cal.py), when he has entered a key for that.
+calendar (google_cal.py), when he has entered a key for that. MapTransport does the same
+for the two map hosts, when he has entered the school's address (drive.py).
 
 The Telegram bot token travels in the URL path, which is where secrets
 leak: an exception message, a traceback, a log line. So nothing here ever
@@ -170,6 +171,26 @@ class CalDavTransport(UrllibTransport):
                 or not host or parts.hostname != host or json_body is not None):
             raise TransportError("blocked")
         return super().request(method, url, headers=headers, body=body, timeout=timeout)
+
+
+class MapTransport(UrllibTransport):
+    """Https GET to the two map hosts (drive.py), no redirects and no proxy. It carries no
+    sign-in of any kind. Anything else never leaves."""
+
+    def __init__(self, hosts: frozenset[str], *, cafile: str | None = None):
+        super().__init__(use_env_proxy=False, cafile=cafile, follow_redirects=False)
+        self.hosts = hosts
+
+    def request(self, method, url, *, headers=None, json_body=None, body=None, timeout=10):
+        try:
+            parts = urlsplit(url)
+            plain_host = parts.username is None and parts.port is None
+        except ValueError:
+            raise TransportError("blocked") from None
+        if (method != "GET" or parts.scheme != "https" or not plain_host
+                or parts.hostname not in self.hosts or json_body is not None or body is not None):
+            raise TransportError("blocked")
+        return super().request(method, url, headers=headers, timeout=timeout)
 
 
 class GoogleTransport(UrllibTransport):

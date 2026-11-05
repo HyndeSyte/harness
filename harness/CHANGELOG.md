@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2
+
+- A school run now comes off only for what really stops it. An event during the trip to school does. An event after drop-off doesn't, so going on to an appointment keeps the run.
+- With the school's address in `family_school_address`, an event within three hours of a run counts if you can't drive between it and the school in time. Drive times come from OpenStreetMap's free services, which get the street address and nothing else from the event.
+- An event with no street address is taken as nearby, and the digest says so. If a drive time can't be looked up, the run stays and the digest says so.
+
 ## 0.8.1
 
 - School runs are 45 minutes: 15 each way and 15 to spare. Drop-off starts 30 minutes before the start and ends 15 after. Pickup starts 15 minutes before the end and ends 30 after. Blocks already on Gmail move to match.

@@ -15,10 +15,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness import effects, google_cal
+from harness import drive, effects, google_cal
 from harness.family_copy import FamilyCopy, plan as copy_plan
 from harness.family_gmail import (DROP_TITLE, GIVE_UP_READS, HOLD_READS, MAX_WRITES_PER_DAY, PICK_TITLE, PROBLEM, PROVEN, TEST_TITLE,
-                                  FamilyGmail, Rule, parse_rules, parse_school, rules_from_options, school_from_options)
+                                  FamilyGmail, Rule, parse_rules, parse_school, rules_from_options, school_address_from_options, school_from_options)
 from harness.net import REDACT, GoogleTransport, HttpResponse, TransportError
 from harness.vault import FIELDS, Vault, VaultError
 from fake_caldav import FAMILY_PATH, FakeICloud, no_network, props  # noqa: F401
@@ -1539,3 +1539,180 @@ def test_the_school_setting_is_read_from_the_options(tmp_path):
     for bad in ('{"family_school": 5}', "not json", "[1]"):
         (tmp_path / "options.json").write_text(bad)
         assert school_from_options(str(tmp_path)) == ()
+
+# -- how far an event is from a school run ------------------------------------------
+
+class FakeDrives:
+    """Minutes by place, and what was asked."""
+
+    def __init__(self, places):
+        self.places = places
+        self.asked = []
+
+    def begin(self):
+        pass
+
+    def on(self):
+        return True
+
+    def misread(self):
+        return False
+
+    def minutes(self, place):
+        self.asked.append(place)
+        return self.places.get(place, drive.NO_ADDRESS)
+
+
+def at_place(rig, title, place, hour, minute=0, hours=1):
+    event = occ(title, start=when(rig, days=3, hour=hour, minute=minute), hours=hours, location=place)
+    rig.feeds.window.occurrences.append(event)
+    return event
+
+
+def runs(rig):
+    return [r[0] for r in local(rig)]
+
+
+def test_going_straight_on_to_a_nearby_appointment_keeps_the_run(school):
+    school.gm.drives = FakeDrives({"Near": 11})
+    school_day(school)
+    at_place(school, "Eye doctor", "Near", 8, 30)      # off at 8:15, there by 8:26
+    go(school)
+    assert len(runs(school)) == 2
+    assert not problem(school)
+
+
+def test_an_appointment_too_far_to_reach_after_drop_off_takes_the_run(school):
+    school.gm.drives = FakeDrives({"Far": 60})
+    school_day(school)
+    at_place(school, "Specialist", "Far", 8, 30)
+    go(school)
+    assert runs(school) == ["Busy (school pickup)"]
+
+
+def test_an_appointment_too_far_to_get_back_from_takes_the_pickup(school):
+    school.gm.drives = FakeDrives({"Far": 60})
+    school_day(school)
+    at_place(school, "Specialist", "Far", 13, 30)      # over at 2:30, school by 3:15 needs 45 minutes
+    go(school)
+    assert runs(school) == ["Busy (school drop-off)"]
+
+
+def test_an_appointment_ending_at_three_nearby_keeps_the_pickup(school):
+    school.gm.drives = FakeDrives({"Near": 11})
+    school_day(school)
+    at_place(school, "PT at the clinic", "Near", 14)
+    go(school)
+    assert len(runs(school)) == 2
+
+
+def test_exactly_enough_time_is_enough(school):
+    school.gm.drives = FakeDrives({"Exact": 15})
+    school_day(school)
+    at_place(school, "Eye doctor", "Exact", 8, 30)
+    go(school)
+    assert len(runs(school)) == 2
+
+
+def test_during_the_trip_to_school_takes_the_run_whatever_the_address(school):
+    school.gm.drives = FakeDrives({"Near": 1})
+    school_day(school)
+    at_place(school, "Quick one", "Near", 8, 10)
+    go(school)
+    assert runs(school) == ["Busy (school pickup)"]
+
+
+def test_with_no_address_the_run_stays_and_the_digest_gives_only_the_time(school):
+    school.gm.drives = FakeDrives({})
+    school_day(school)
+    event = at_place(school, "Secret visit", "", 8, 30)
+    go(school)
+    assert len(runs(school)) == 2
+    assert "no address" in problem(school)
+    assert f"{event.start.day}, 8:30" in problem(school)
+    assert "Secret" not in problem(school)
+
+
+def test_a_failed_lookup_keeps_the_run_and_says_so(school):
+    school.gm.drives = FakeDrives({"Somewhere": drive.FAILED})
+    school_day(school)
+    at_place(school, "Specialist", "Somewhere", 8, 30)
+    go(school)
+    assert len(runs(school)) == 2
+    assert "couldn't look up a drive time" in problem(school)
+
+
+def test_an_event_far_from_any_run_is_never_looked_up(school):
+    drives = FakeDrives({"Far": 60})
+    school.gm.drives = drives
+    school_day(school)
+    at_place(school, "Lunch", "Far", 11, 30, hours=0.5)  # more than three hours from both
+    go(school)
+    assert drives.asked == []
+    assert len(runs(school)) == 2
+
+
+@pytest.mark.parametrize("title,free", [("Busy (interim)", False), ("Webinar", True)])
+def test_holds_and_free_events_are_never_looked_up(school, title, free):
+    drives = FakeDrives({"Far": 60})
+    school.gm.drives = drives
+    school_day(school)
+    school.feeds.window.occurrences.append(occ(title, start=when(school, days=3, hour=8, minute=30),
+                                               location="Far", transparent=free))
+    go(school)
+    assert drives.asked == []
+    assert len(runs(school)) == 2
+
+
+def test_with_no_school_address_nothing_is_looked_up(school):
+    drives = FakeDrives({"Far": 60})
+    drives.on = lambda: False
+    school.gm.drives = drives
+    school_day(school)
+    at_place(school, "Specialist", "Far", 8, 30)
+    go(school)
+    assert drives.asked == []
+    assert len(runs(school)) == 2
+    assert not problem(school)
+
+
+def test_the_school_address_is_read_from_the_options(tmp_path):
+    assert school_address_from_options(str(tmp_path)) == ""
+    (tmp_path / "options.json").write_text('{"family_school_address": " 1 Main St, Town "}')
+    assert school_address_from_options(str(tmp_path)) == "1 Main St, Town"
+    (tmp_path / "options.json").write_text('{"family_school_address": 5}')
+    assert school_address_from_options(str(tmp_path)) == ""
+
+
+def test_a_school_address_it_cant_use_says_so(school):
+    drives = FakeDrives({})
+    drives.on = lambda: False
+    drives.misread = lambda: True
+    school.gm.drives = drives
+    school_day(school)
+    go(school)
+    assert "doesn't look like a street address" in problem(school)
+
+
+def test_a_finished_event_is_not_named_as_missing_an_address(school):
+    school.gm.drives = FakeDrives({})
+    school_day(school, days=0)
+    school.feeds.window.occurrences.append(occ("Done", start=school.clock() - timedelta(hours=1), location=""))
+    go(school)
+    assert "no address" not in problem(school)
+
+
+def test_real_lookups_reach_the_decision(school, tmp_path):
+    from harness.net import HttpResponse as Answer
+
+    class Maps:
+        def request(self, method, url, *, headers=None, timeout=30):
+            if "/route/" in url:
+                return Answer(200, {}, b'{"routes": [{"duration": 3600}]}')
+            return Answer(200, {}, b'[{"lat": "1.0", "lon": "2.0"}]')
+
+    school.gm.drives = drive.Drives(school.ledger, Maps(), lambda: "1 School St, Town, VA", sleep=lambda s: None)
+    school_day(school)
+    at_place(school, "Specialist", "The Clinic, 2 Clinic Rd, Town, VA 12345", 8, 30)
+    go(school)
+    assert runs(school) == ["Busy (school pickup)"]

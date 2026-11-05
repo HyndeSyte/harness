@@ -16,17 +16,17 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import caldav, family, google_cal, policy
+from . import caldav, drive, family, google_cal, policy
 from .calendar_feed import CalendarFeeds
 from .config import Config
 from .controller import Controller
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
-from .family_gmail import FamilyGmail, rules_from_options, school_from_options
+from .family_gmail import FamilyGmail, rules_from_options, school_address_from_options, school_from_options
 from .ledger import Ledger
 from .mirror_shadow import MirrorShadow, read_days
-from .net import CalDavTransport, GoogleTransport, RedactingFilter, UrllibTransport
+from .net import CalDavTransport, GoogleTransport, MapTransport, RedactingFilter, UrllibTransport
 from .setup_web import SetupApp, serve
 from .telegram_api import TelegramBotAPI
 from .vault import Vault
@@ -101,7 +101,10 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                                           lambda: vault.get("google_service_key"),
                                                           ledger.now),
                                 rules_fn=lambda: rules_from_options(data_dir),
-                                school_fn=lambda: school_from_options(data_dir), tz=base.timezone))
+                                school_fn=lambda: school_from_options(data_dir),
+                                drives=drive.Drives(ledger, MapTransport(drive.HOSTS),
+                                                    lambda: school_address_from_options(data_dir)),
+                                tz=base.timezone))
     return controller, web, listener
 
 

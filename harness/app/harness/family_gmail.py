@@ -18,8 +18,9 @@ The mirror image of family_copy.py, and it keeps the same safety:
 
 School days work the same way, from the `family_school` option, which names the Family
 events that mean a school day. Each gets two blocks, drop-off and pickup, unless a real event
-on his own calendar is in the way, in which case the other parent has that run. If the event
-goes, the block comes back.
+on his own calendar is in the way, in which case the other parent has that run: one during the
+trip to school, or, with the school's address entered, one he can't drive to or from in time
+(drive.py). If the event goes, the block comes back.
 
 The two can't chase each other: a title here must carry a word family_copy.py skips, so
 a block never copies to Family, and a copy on Family (hx- uid) never gets a block.
@@ -38,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from . import caldav, calendar_feed, google_cal, ical
+from . import caldav, calendar_feed, drive, google_cal, ical
 from .family_copy import (_SKIP, _STAY, AHEAD_DAYS, GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE,
                           READS_BEFORE_REMOVING, _same)
 from .ledger import Ledger, iso
@@ -53,6 +54,9 @@ PICK_TITLE = "Busy (school pickup)"
 # morning bell and after the afternoon one.
 DROP_BEFORE, DROP_AFTER = timedelta(minutes=30), timedelta(minutes=15)
 PICK_BEFORE, PICK_AFTER = timedelta(minutes=15), timedelta(minutes=30)
+TO_SCHOOL = timedelta(minutes=15)   # a run starts when he leaves, so he's there this much later
+NEAR_RUN = timedelta(hours=3)       # an event further from a run than this can't get in its way
+NOTE_AHEAD = timedelta(days=14)     # how far ahead a missing address is worth a word
 MAX_TITLE = 60
 PROBLEM = "family_gmail_problem"
 PROVEN = "family_gmail_proven"
@@ -115,6 +119,15 @@ def school_from_options(data_dir: str) -> tuple[str, ...]:
     return parse_school(value) if isinstance(value, str) else ()
 
 
+def school_address_from_options(data_dir: str) -> str:
+    try:
+        with open(os.path.join(data_dir, "options.json"), encoding="utf-8") as f:
+            value = json.load(f).get("family_school_address", "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
 @dataclass(frozen=True)
 class Want:
     key: str
@@ -146,15 +159,21 @@ def school_plan(items: list[caldav.Item], titles: tuple[str, ...]) -> dict[str, 
     return out
 
 
+def _is_real(occ: ical.Occurrence) -> bool:
+    """Not a block from here, and not a "Busy" hold, which may only be drive time."""
+    return not (google_cal.is_ours(occ.uid.removesuffix("@google.com"))
+                or occ.summary.strip().casefold().startswith("busy"))
+
+
 def _ties_him_up(occ: ical.Occurrence, want: Want, tz: str) -> bool:
-    """A real event of his over this run, which means the other parent has it. Not a block
-    from here, not a "Busy" hold, which may only be drive time, and not an all-day event
-    unless it's a trip: a birthday doesn't stop a school run."""
-    if google_cal.is_ours(occ.uid.removesuffix("@google.com")) or occ.summary.strip().casefold().startswith("busy"):
+    """A real event of his during the trip to school, which means the other parent has the run.
+    The way back doesn't count: he can go straight on from there. Not an all-day event unless
+    it's a trip: a birthday doesn't stop a school run."""
+    if not _is_real(occ):
         return False
     if occ.all_day:
         return bool(_STAY.match(occ.summary)) and occ.start <= want.start.astimezone(ZoneInfo(tz)).date() < occ.end
-    return not occ.transparent and occ.start < want.end and occ.end > want.start
+    return not occ.transparent and occ.start < want.start + TO_SCHOOL and occ.end > want.start
 
 
 def plan(items: list[caldav.Item], rules: tuple[Rule, ...]) -> dict[str, Want]:
@@ -187,8 +206,9 @@ def _was_sent(intent: str, block: google_cal.Block) -> bool:
 
 class FamilyGmail:
     def __init__(self, ledger: Ledger, family_add, calendar, google: google_cal.GoogleCalendar,
-                 *, rules_fn=lambda: (), school_fn=lambda: (), tz: str):
+                 *, rules_fn=lambda: (), school_fn=lambda: (), drives=None, tz: str):
         self.school_fn = school_fn         # the Family titles that mean a school day
+        self.drives = drives               # drive times, once the school's address is entered
         self.ledger = ledger
         self.fa = family_add
         self.client = family_add.client
@@ -294,11 +314,56 @@ class FamilyGmail:
             self.school_note = ("Blocks on Gmail from Family: couldn't read your Gmail calendar, so "
                                 "school runs didn't change.")
             return {k: w for k, w in runs.items() if k in live}
-        free = {k: w for k, w in runs.items()
-                if not any(_ties_him_up(o, w, self.tz) for o in ahead.occurrences)}
+        self._no_address: set[datetime] = set()
+        self._no_lookup = False
+        self._use_drives = self.drives is not None and self.drives.on()
+        if self.drives is not None:
+            self.drives.begin()
+        now = self.ledger.now()
+        # Soonest first, so a limit on lookups leaves the far-off days for the next read.
+        free = {k: w for k, w in sorted(runs.items(), key=lambda kv: kv[1].start) if w.end > now
+                and not any(_ties_him_up(o, w, self.tz) or self._too_far(o, w) for o in ahead.occurrences)}
+        self.school_note = self._drive_note()
         if ahead.unreadable:
             return {**free, **{k: w for k, w in runs.items() if k in live}}
         return free
+
+    def _too_far(self, occ: ical.Occurrence, want: Want) -> bool:
+        """An event before or after a run that he can't get to or from in time. With no answer
+        the run stays: a block too many only shows him busy, and the digest says why."""
+        if not self._use_drives or occ.all_day or occ.transparent or not _is_real(occ):
+            return False
+        arrive = want.start + TO_SCHOOL
+        gap = arrive - occ.end if occ.end <= want.start else occ.start - arrive
+        if gap > NEAR_RUN:
+            return False
+        minutes = self.drives.minutes(occ.location)
+        if minutes == drive.NO_ADDRESS:
+            now = self.ledger.now()
+            if now < occ.start < now + NOTE_AHEAD:
+                self._no_address.add(occ.start)
+            return False
+        if minutes == drive.FAILED:
+            self._no_lookup = True
+            return False
+        return timedelta(minutes=minutes) > gap
+
+    def _drive_note(self) -> str:
+        """Times only: nothing from the event itself goes in a note."""
+        notes = []
+        if self.drives is not None and self.drives.misread():
+            notes.append("Blocks on Gmail from Family: the school's address in the add-on's settings doesn't "
+                         "look like a street address, so drive times are off.")
+        if self._no_lookup:
+            notes.append("Blocks on Gmail from Family: couldn't look up a drive time, so I kept the school "
+                         "runs it was for. I'll try again at the next read.")
+        if self._no_address:
+            first = min(self._no_address).astimezone(ZoneInfo(self.tz))
+            when = f"{first:%b} {first.day}, {first.hour % 12 or 12}:{first:%M}"
+            more = f", and {len(self._no_address) - 1} more," if len(self._no_address) > 1 else ""
+            notes.append(f"Blocks on Gmail from Family: the event at {when}{more} is near a school run with "
+                         "no address I can use, so I kept the run. Add an address if it's far.")
+        return " ".join(notes)
 
     def _thin(self, rest: int) -> bool:
         """Family holds everyone's events, so the rest of it doesn't suddenly halve. That tells
