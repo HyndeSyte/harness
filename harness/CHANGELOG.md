@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.1
+
+- Undo checks every calendar before it writes anything, so it no longer undoes one calendar and
+  stops on the other.
+- Undoing a change after a later change to the same event offers one button that undoes both,
+  newest first, instead of calling the later change someone else's.
+- A day of a Gmail series isn't put back once its series is gone, and an event already back
+  doesn't block the rest of an undo.
+
 ## 0.9.0
 
 - Say what should change on the Family or Gmail calendar and it's done, with no tap: take days

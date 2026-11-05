@@ -62,6 +62,8 @@ _WORD = re.compile(r"[^\W_]+")
 WORDS = {"unknown": "the answer was lost or the server had an error, so it may or may not have "
                     "gone through. Check the calendar. I won't retry",
          "changed": "someone changed that event since, so I left it alone",
+         "series_gone": "the series that day belongs to isn't on the calendar any more, so there's "
+                        "nothing to put it back into",
          "gone": "that event isn't there any more",
          "auth": "the calendar refused the password or key on the add-on page",
          "mismatch": "the saved address isn't the Family calendar",
@@ -277,8 +279,10 @@ class CalendarChange:
         self._fail_orphans()
         for p in self._approved():
             self._execute(p, paused)
-        for row in self.ledger.db.execute(
-                "SELECT * FROM calendar_changes WHERE undo_state='requested'").fetchall():
+        for (pid,) in self.ledger.db.execute(           # newest first, read fresh: an undo before
+                "SELECT proposal_id FROM calendar_changes WHERE undo_state='requested' ORDER BY rowid DESC"
+                ).fetchall():                            # it can hand this one new versions
+            row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()
             self._undo(row, paused)
         if not paused and self.on():
             self._check_returned()
@@ -727,6 +731,7 @@ class CalendarChange:
             raise Stopped("unknown", back.status, "it was written, but reading it back failed. Check "
                                                   "the calendar", undo=entry)
         entry["etag"] = back.etag or entry["etag"]
+        entry["after"] = body or new        # as the server keeps it, so a later undo can match it
         if not shows(body):
             raise Stopped("failed", words="the calendar doesn't show the change when I read it back. "
                                           "Check the calendar", undo=entry)
@@ -818,6 +823,7 @@ class CalendarChange:
                 raise Stopped("unknown", back.status, "it was added, but reading it back failed. Check "
                                                       "the calendar", undo=entry)
             entry["etag"] = back.etag or entry["etag"]
+            entry["after"] = body or ics
             if not ical.parse_calendar(body)[1]:
                 raise Stopped("failed", words="the calendar doesn't show it when I read it back", undo=entry)
             return entry
@@ -855,6 +861,8 @@ class CalendarChange:
         self._gmail_stop(self.google.drop(address, e["id"], e.get("etag")))
         entry = {"cal": "gmail", "how": "restore", "id": e["id"],
                  "fields": {**{k: e[k] for k in _RESTORED if k in e}, "status": "confirmed"}}
+        if e.get("recurringEventId"):
+            entry["series"] = e["recurringEventId"]
         if not self.google.really_gone(address, e["id"]):
             raise Stopped("unknown", words="it was removed, but reading it back didn't show that. Check "
                                            "the calendar", undo=entry)
@@ -940,19 +948,21 @@ class CalendarChange:
         return Step(f"Gmail: {_safe(c['title'])} added{self._new_words(c, start, end)}.", run)
 
     # -- undo ----------------------------------------------------------------------------------
-    def _undo_button(self, db, proposal_id: str) -> tuple[list, list]:
+    def _undo_button(self, db, proposal_id: str, label: str = "Undo") -> tuple[list, list]:
         nonce = choices.mint(self.ledger, kind="calendar_change_undo", target=proposal_id,
                              chat_id=self.chat_id, ttl_s=UNDO_TTL_S, db=db)
-        return [[("Undo", choices.callback_data(nonce))]], [{"type": "choice", "nonce": nonce}]
+        return [[(label, choices.callback_data(nonce))]], [{"type": "choice", "nonce": nonce}]
 
     def on_choice(self, kind: str, target: str) -> str:
         if kind != "calendar_change_undo":
             return "Nothing changed."
         with self.ledger.tx() as db:
-            cur = db.execute("UPDATE calendar_changes SET undo_state='requested', updated_at=?"
-                             " WHERE proposal_id=? AND undo_state='open'",
-                             (iso(self.ledger.now()), target))
-            if cur.rowcount != 1:
+            done = 0
+            for pid in target.split():               # "Undo both" names the later changes too
+                done += db.execute("UPDATE calendar_changes SET undo_state='requested', updated_at=?"
+                                   " WHERE proposal_id=? AND undo_state='open'",
+                                   (iso(self.ledger.now()), pid)).rowcount
+            if not done:
                 return "There's nothing to undo there."
         return "Undoing it now."
 
@@ -970,8 +980,20 @@ class CalendarChange:
         with self.ledger.tx() as db:
             db.execute("UPDATE calendar_changes SET undo_state='undoing', updated_at=? WHERE proposal_id=?",
                        (iso(self.ledger.now()), row["proposal_id"]))
-        problem = None
         steps = json.loads(row["undo_json"])
+        # Nothing is written unless every part checks out first. Only an edit in the seconds
+        # between the check and the writes can still stop it partway.
+        later = self._later_changes(row, steps)
+        if later:
+            self._offer_both(row, later)
+            return
+        problem = self._undo_ready(steps)
+        if problem is not None:
+            again = (" Undo here won't work while it stays that way." if problem == "changed"
+                     else " Undo tries again.")
+            self._reopen(row, f"<b>Not undone:</b> {_safe(WORDS.get(problem, 'the calendar refused it'))}. "
+                              "Nothing changed. Check the calendar." + again)
+            return
         left = list(steps)
         latest: dict[str, str] = {}          # an event undone a step ago has a new version
         for step in reversed(steps):
@@ -990,6 +1012,7 @@ class CalendarChange:
             with self.ledger.tx() as db:
                 db.execute("UPDATE calendar_changes SET undo_state='undone', updated_at=? WHERE proposal_id=?",
                            (iso(self.ledger.now()), row["proposal_id"]))
+                self._carry_versions(db, row, latest)
                 self._say(db, self.chat_id, row["job_id"], "<b>Undone.</b> It's back the way it was.")
             return
         with self.ledger.tx() as db:
@@ -997,12 +1020,123 @@ class CalendarChange:
         self._reopen(row, f"<b>Not fully undone:</b> {_safe(WORDS.get(problem, 'the calendar refused it'))}. "
                           "Check the calendar. Undo tries what's left again.")
 
+    @staticmethod
+    def _event_key(step: dict) -> str:
+        """One event however a step names it: one day of a Gmail series is part of the series."""
+        if step["cal"] == "family":
+            return "family:" + caldav.href_path(step["href"])
+        return "gmail:" + (step.get("series") or _gmail_series(step["id"]) or step["id"])
+
+    def _later_changes(self, row, steps: list) -> list[str]:
+        """Later changes still standing on the same events, which have to go first, and any
+        later ones on the events those touch."""
+        keys = {self._event_key(s) for s in steps}
+        found: list[str] = []
+        rows = self.ledger.db.execute(            # rows go in as changes run, so rowid is their order
+            "SELECT proposal_id, undo_json FROM calendar_changes WHERE rowid>(SELECT rowid FROM"
+            " calendar_changes WHERE proposal_id=?) AND undo_state IN ('open','requested','undoing')"
+            " ORDER BY rowid", (row["proposal_id"],)).fetchall()
+        for other in rows:
+            theirs = {self._event_key(s) for s in json.loads(other["undo_json"])}
+            if keys & theirs:
+                found.append(other["proposal_id"])
+                keys |= theirs
+        return found
+
+    def _offer_both(self, row, later: list[str]) -> None:
+        """One button for all of them, newest undone first, so no old receipt's expired button
+        can leave this stuck."""
+        with self.ledger.tx() as db:
+            db.execute("UPDATE calendar_changes SET undo_state='open', updated_at=? WHERE proposal_id=?",
+                       (iso(self.ledger.now()), row["proposal_id"]))
+            label = "Undo both" if len(later) == 1 else f"Undo all {len(later) + 1}"
+            buttons, binds = self._undo_button(db, " ".join([row["proposal_id"], *later]), label)
+            self._say(db, self.chat_id, row["job_id"],
+                      "<b>Not undone:</b> you asked for another change to that event after this one, "
+                      "so that has to be undone too. Nothing changed.", buttons=buttons, binds=binds)
+
+    def _carry_versions(self, db, row, latest: dict[str, str]) -> None:
+        """This undo put an event back as an earlier change left it, under a new version. That
+        earlier change's own undo should know the event as its own, however the server rewrote it."""
+        if not latest:
+            return
+        latest = {**latest, **{caldav.href_path(k): v for k, v in latest.items()}}   # an href in either form
+        for other in db.execute(
+                "SELECT proposal_id, undo_json FROM calendar_changes WHERE rowid<(SELECT rowid FROM"
+                " calendar_changes WHERE proposal_id=?) AND undo_state IN ('open','requested')",
+                (row["proposal_id"],)).fetchall():
+            steps, moved = json.loads(other["undo_json"]), False
+            for step in steps:
+                key = caldav.href_path(step["href"]) if step["cal"] == "family" else step.get("id")
+                if key in latest and latest[key]:
+                    step["etag"], moved = latest[key], True
+            if moved:
+                db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
+                           (json.dumps(steps), other["proposal_id"]))
+
+    def _undo_ready(self, steps: list) -> str | None:
+        """Each event as the last step of this change left it, read before anything is written."""
+        seen: set[str] = set()
+        for step in reversed(steps):
+            # A Gmail series and its days are separate objects here, each with its own version.
+            key = caldav.href_path(step["href"]) if step["cal"] == "family" else step["id"]
+            if key in seen:
+                continue                     # an earlier step on it is checked once the later one runs
+            seen.add(key)
+            problem = (self._gmail_ready if step["cal"] == "gmail" else self._family_ready)(step)
+            if problem != "ok":
+                return problem
+        return None
+
+    def _family_ready(self, step: dict) -> str:
+        out, body = self.client.fetch(step["href"])
+        if step["how"] == "restore":
+            if out.kind == "ok":
+                return "ok" if caldav._unchanged(body, step["before"]) else "changed"
+            return "ok" if out.kind == "gone" else out.kind
+        if out.kind == "gone" and step["how"] == "delete":
+            return "ok"
+        if out.kind != "ok":
+            return out.kind
+        if out.etag != step.get("etag") and not caldav._unchanged(body, step.get("after", "")):
+            return "changed"
+        return "ok"
+
+    def _gmail_ready(self, step: dict) -> str:
+        address = self.address()
+        if not address or self.google is None:
+            return "failed"
+        kind, cur = self.google.look(address, step["id"])
+        if kind == "unknown":
+            return "unknown"
+        cancelled = kind == "gone" or (cur or {}).get("status") == "cancelled"
+        if step["how"] == "restore":
+            return self._series_there(address, step) if cancelled else "ok"
+        if cancelled:
+            return "ok" if step["how"] == "drop" else "gone"
+        if cur.get("etag") != step.get("etag") and not self._as_written(cur, step.get("wrote") or {}):
+            return "changed"
+        return "ok"
+
+    def _series_there(self, address: str, step: dict) -> str:
+        """Google will put one day back under a series that's gone, as an event on its own."""
+        series = step.get("series") or _gmail_series(step["id"])
+        if not series:
+            return "ok"
+        kind, cur = self.google.look(address, series)
+        if kind == "unknown":
+            return "unknown"
+        return "series_gone" if kind == "gone" or (cur or {}).get("status") == "cancelled" else "ok"
+
     def _undo_step(self, step: dict, latest: dict[str, str]) -> str:
         return (self._undo_gmail if step["cal"] == "gmail" else self._undo_family)(step, latest)
 
     def _undo_family(self, step: dict, latest: dict[str, str]) -> str:
         href = step["href"]
         if step["how"] == "restore":
+            out, body = self.client.fetch(href)
+            if out.kind == "ok" and caldav._unchanged(body, step["before"]):
+                return "ok"                  # something already put it back
             return self._after_undo(self.client.put_new(href, step["before"]), href, latest)
         out, body = self.client.fetch(href)
         if out.kind == "gone" and step["how"] == "delete":
@@ -1047,6 +1181,9 @@ class CalendarChange:
         if step["how"] == "restore":
             if not cancelled:
                 return "ok"                  # someone already put it back
+            there = self._series_there(address, step)
+            if there != "ok":
+                return there
             out = self.google.change(address, uid, step["fields"], None)
         else:
             if cancelled:
@@ -1139,3 +1276,9 @@ def _same_start(a, b) -> bool:
     if isinstance(a, datetime) and isinstance(b, datetime):
         return a.astimezone(timezone.utc) == b.astimezone(timezone.utc)
     return a == b
+
+
+def _gmail_series(event_id: str) -> str:
+    """The series one day of it belongs to, from its id, or "" if it isn't one day of a series."""
+    m = re.fullmatch(r"(.+)_\d{8}(T\d{6}Z)?", event_id)
+    return m.group(1) if m else ""

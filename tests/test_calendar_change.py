@@ -310,7 +310,7 @@ def test_undo_leaves_alone_an_event_someone_changed_since(r):
     r.tell(change(dates="2026-11-23"))
     r.icloud.human_edit(PATH, "School Day", "School Days")
     r.press(r.with_button("Undo"), "Undo")
-    assert "School Days" in r.body() and "Not fully undone" in r.texts()[-1]
+    assert "School Days" in r.body() and "Not undone" in r.texts()[-1] and "Nothing changed" in r.texts()[-1]
 
 
 def test_a_one_off_goes_and_undo_brings_it_back(r):
@@ -454,6 +454,9 @@ def test_a_crash_while_planning_never_runs_it_twice(r, monkeypatch):
 def gmail_day(r, uid="base_1", series="base", title="Piano", day="2026-11-09T08:00:00-05:00"):
     r.gmail.events[uid] = {"id": uid, "etag": '"1"', "summary": title, "recurringEventId": series,
                            "start": {"dateTime": day}, "end": {"dateTime": day}, "location": "Clinic"}
+    r.gmail.events.setdefault(series, {"id": series, "etag": '"0"', "summary": title, "status": "confirmed",
+                                       "start": {"dateTime": "2026-10-05T08:00:00-04:00"},
+                                       "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"]})
 
 
 def test_a_gmail_day_comes_off_and_comes_back(r):
@@ -724,7 +727,7 @@ def test_gmail_undo_leaves_alone_what_he_changed_since(r):
                   start="2026-11-09T10:00:00-05:00", end="2026-11-09T11:00:00-05:00"))
     r.gmail.events["base_1"].update(etag='"his"', start={"dateTime": "2026-11-09T12:00:00-05:00"})
     r.press(r.with_button("Undo"), "Undo")
-    assert "Not fully undone" in r.texts()[-1] and "12:00" in r.gmail.events["base_1"]["start"]["dateTime"]
+    assert "Not undone" in r.texts()[-1] and "12:00" in r.gmail.events["base_1"]["start"]["dateTime"]
 
 
 def test_gmail_undo_of_a_removal_puts_its_details_back(r):
@@ -849,7 +852,7 @@ def test_a_failed_read_isnt_called_already_gone(r):
                   end="2026-11-20T10:00:00-05:00"))
     r.gmail.down = True
     r.press(r.with_button("Undo"), "Undo")
-    assert "Not fully undone" in r.texts()[-1]
+    assert "Not undone" in r.texts()[-1]
     assert next(iter(r.gmail.events.values())).get("status") != "cancelled"
     r.gmail.down = False
     r.press(r.with_button("Undo"), "Undo")
@@ -950,3 +953,107 @@ def test_an_event_with_a_link_in_its_title_can_still_come_off(r):
     r.icloud.seed(path, event_on("bad", "Meet at school.org", "20261124T150000Z", "20261124T160000Z"))
     r.tell(change(title="meet at school.org", dates="2026-11-24"))
     assert path not in r.icloud.events
+
+
+# -- what the live test found -----------------------------------------------------------------------
+
+def gmail_series(r, title="Harness Test"):
+    """A Gmail series and its days as Google keeps them: one id for the series, one per day."""
+    r.gmail.events["cmS"] = {"id": "cmS", "etag": '"5"', "summary": title, "status": "confirmed",
+                             "start": {"dateTime": "2026-12-01T19:00:00-05:00"},
+                             "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TU;UNTIL=20261230T045959Z"]}
+    for d in (1, 8, 15):
+        uid = f"cmS_202612{d + 1:02d}T000000Z"
+        r.gmail.events[uid] = {"id": uid, "etag": f'"{d}"', "summary": title, "recurringEventId": "cmS",
+                               "start": {"dateTime": f"2026-12-{d:02d}T19:00:00-05:00"},
+                               "end": {"dateTime": f"2026-12-{d:02d}T20:00:00-05:00"}}
+
+
+def undo_of(r, n):
+    """The Undo on the nth receipt, counting from the first."""
+    return [s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)][n]
+
+
+def test_undo_of_an_earlier_change_waits_for_the_later_one(r):
+    r.tell(change(dates="2026-11-23"))
+    r.tell(change(dates="2026-11-25"))
+    before = r.body()
+    r.advance(days=6)
+    r.press(undo_of(r, 0), "Undo")
+    assert r.body() == before and "undone too" in r.texts()[-1]
+    r.advance(days=2)                          # the later receipt's own button is gone now
+    r.press(r.with_button("Undo both"), "Undo both")
+    assert [t for t in r.texts()[-2:] if "Undone" in t] == r.texts()[-2:]
+    assert {"2026-11-23", "2026-11-25"} <= days_of(r.body())
+    assert ical.unfold(r.body()) == ical.unfold(SERIES)
+
+
+def test_a_gmail_series_and_one_of_its_days_are_each_checked(r):
+    gmail_series(r)
+    r.tell(change(calendar="gmail", op="move", title="harness test", dates="2026-12-08",
+                  start="2026-12-08T21:00:00-05:00", end="2026-12-08T22:00:00-05:00"),
+           change(calendar="gmail", op="end_series", title="harness test", dates="2026-12-15"))
+    ended = list(r.gmail.events["cmS"]["recurrence"])
+    day = r.gmail.events["cmS_20261209T000000Z"]
+    day.update(etag='"his"', start={"dateTime": "2026-12-08T18:00:00-05:00"})    # he moved it again
+    r.press(r.with_button("Undo"), "Undo")
+    assert "Not undone" in r.texts()[-1] and r.gmail.events["cmS"]["recurrence"] == ended
+
+
+def test_an_event_already_back_doesnt_block_the_rest_of_the_undo(r):
+    path = FAMILY_PATH + "one-off.ics"
+    r.icloud.seed(path, ONE)
+    gmail_day(r, uid="oil_1", series="oil", title="Oil change", day="2026-12-01T10:00:00-05:00")
+    r.tell(change(title="oil change", dates="2026-12-01"),
+           change(calendar="gmail", title="oil change", dates="2026-12-01"))
+    r.icloud.seed(path, ONE)                    # a phone put it back
+    r.press(r.with_button("Undo"), "Undo")
+    assert "Undone" in r.texts()[-1] and r.gmail.events["oil_1"]["status"] == "confirmed"
+
+
+def test_undo_of_an_add_on_both_calendars_never_stops_halfway(r):
+    """Nov 5: Gmail went, Family stayed, a later day's change still standing."""
+    r.tell(change(op="add_series", title="Harness Test", start="2026-12-01T19:00:00-05:00",
+                  end="2026-12-01T20:00:00-05:00", days="TU", until="2026-12-29"),
+           change(calendar="gmail", op="add_series", title="Harness Test", start="2026-12-01T19:00:00-05:00",
+                  end="2026-12-01T20:00:00-05:00", days="TU", until="2026-12-29"))
+    added = [p for p in r.icloud.events if "/hm-" in p][0]
+    r.icloud.human_edit(added, "SUMMARY:Harness Test", "SUMMARY:Harness Test2")
+    gid = next(k for k in r.gmail.events if k.startswith("cm"))
+    r.press(r.with_button("Undo"), "Undo")
+    assert "Not undone" in r.texts()[-1] and "Nothing changed" in r.texts()[-1]
+    assert r.gmail.events[gid].get("status") != "cancelled" and added in r.icloud.events
+
+
+def test_a_gmail_day_isnt_put_back_under_a_series_thats_gone(r):
+    gmail_series(r)
+    r.tell(change(calendar="gmail", title="harness test", dates="2026-12-08"))
+    r.gmail.events["cmS"]["status"] = "cancelled"          # the series went another way
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.gmail.events["cmS_20261209T000000Z"]["status"] == "cancelled"
+    assert "isn't on the calendar any more" in r.texts()[-1]
+
+
+def test_a_gmail_day_comes_back_when_its_series_is_there(r):
+    gmail_series(r)
+    r.tell(change(calendar="gmail", title="harness test", dates="2026-12-08"))
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.gmail.events["cmS_20261209T000000Z"]["status"] == "confirmed" and "Undone" in r.texts()[-1]
+
+
+def test_undo_matches_what_the_server_kept_not_what_was_sent(r):
+    """A later change undone leaves the event as the server kept it after the first."""
+    real = r.icloud.request
+
+    def rewrites(method, url, **kw):
+        if method == "PUT" and kw.get("body"):
+            kw["body"] = kw["body"].replace(b"SUMMARY:", b"CATEGORIES:x\r\nSUMMARY:", 1)
+        return real(method, url, **kw)
+    r.icloud.request = rewrites
+    r.tell(change(op="add_series", title="Harness Test", start="2026-12-01T19:00:00-05:00",
+                  end="2026-12-01T20:00:00-05:00", days="TU", until="2026-12-29"))
+    r.tell(change(title="harness test", dates="2026-12-08"))
+    r.press(undo_of(r, 1), "Undo")
+    assert "Undone" in r.texts()[-1]
+    r.press(undo_of(r, 0), "Undo")
+    assert "Undone" in r.texts()[-1] and not [p for p in r.icloud.events if "/hm-" in p]
