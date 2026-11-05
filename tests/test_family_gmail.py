@@ -17,13 +17,13 @@ import pytest
 
 from harness import effects, google_cal
 from harness.family_copy import FamilyCopy, plan as copy_plan
-from harness.family_gmail import (GIVE_UP_READS, HOLD_READS, MAX_WRITES_PER_DAY, PROBLEM, PROVEN, TEST_TITLE, FamilyGmail, Rule,
-                                  parse_rules, rules_from_options)
+from harness.family_gmail import (DROP_TITLE, GIVE_UP_READS, HOLD_READS, MAX_WRITES_PER_DAY, PICK_TITLE, PROBLEM, PROVEN, TEST_TITLE,
+                                  FamilyGmail, Rule, parse_rules, parse_school, rules_from_options, school_from_options)
 from harness.net import REDACT, GoogleTransport, HttpResponse, TransportError
 from harness.vault import FIELDS, Vault, VaultError
 from fake_caldav import FAMILY_PATH, FakeICloud, no_network, props  # noqa: F401
 from test_family_add import Rig, on, rig  # noqa: F401
-from test_family_copy import Feeds, GMAIL, NY, TZ, occ, on_family, seed, titles, when
+from test_family_copy import Feeds, GMAIL, NY, TZ, day_occ, occ, on_family, seed, titles, when
 
 ACCOUNT = "harness@pi-project-1.iam.gserviceaccount.com"
 RULES = (Rule("kid sitting", "Busy (watching kids)"),)
@@ -1316,3 +1316,226 @@ def test_both_directions_run_together_without_chasing(g):
         go(g)
     assert sorted(titles(g)) == ["Kid sitting", "Sam - PT"]
     assert g.google.titles() == ["Busy (watching kids)"]
+
+
+# -- school runs ----------------------------------------------------------------------
+
+@pytest.fixture
+def school(g):
+    g.rules = ()
+    g.gm.school_fn = lambda: ("school day",)
+    g.feeds.window.occurrences.append(occ("Filler", start=when(g, days=40, hour=20)))
+    return g
+
+
+def school_day(rig, days=3):
+    return seed(rig, "School Day", when(rig, days=days, hour=8, minute=30), hours=6.75)
+
+
+def mine(rig, title, days=3, hour=8, minute=0, hours=1):
+    event = occ(title, start=when(rig, days=days, hour=hour, minute=minute), hours=hours)
+    rig.feeds.window.occurrences.append(event)
+    return event
+
+
+def local(rig):
+    """Times as the fake hands them back may carry any offset, so compare moments."""
+    out = []
+    for v in rig.google.live().values():
+        out.append((v["summary"], datetime.fromisoformat(v["start"]["dateTime"]).astimezone(NY).strftime("%H:%M"),
+                    datetime.fromisoformat(v["end"]["dateTime"]).astimezone(NY).strftime("%H:%M")))
+    return sorted(out)
+
+
+def test_a_school_day_gets_a_drop_off_and_a_pickup(school):
+    school_day(school)
+    go(school)
+    assert local(school) == [("Busy (school drop-off)", "08:15", "08:45"), ("Busy (school pickup)", "15:00", "15:30")]
+
+
+def test_a_closed_day_has_no_blocks(school):
+    seed(school, "No School", when(school, days=3, hour=8, minute=30), hours=6.75)
+    go(school)
+    assert school.google.live() == {}
+
+
+def test_blocks_follow_a_school_day_that_moves(school):
+    path = school_day(school)
+    go(school)
+    del school.icloud.events[path]
+    seed(school, "School Day", when(school, days=3, hour=9, minute=30), hours=6.75)
+    go(school)
+    go(school)
+    assert ("Busy (school drop-off)", "09:15", "09:45") in local(school)
+    assert len(local(school)) == 2
+
+
+def test_blocks_come_off_when_the_school_day_is_cancelled(school):
+    path = school_day(school)
+    seed(school, "Someone else's event", when(school, days=5))
+    go(school)
+    del school.icloud.events[path]
+    go(school)
+    assert len(school.google.live()) == 2      # one read is never enough
+    go(school)
+    assert school.google.live() == {}
+
+
+def test_an_event_of_his_over_drop_off_leaves_pickup(school):
+    school_day(school)
+    mine(school, "PT at the clinic", hour=8)
+    go(school)
+    assert [r[0] for r in local(school)] == ["Busy (school pickup)"]
+
+
+def test_an_event_of_his_over_pickup_leaves_drop_off(school):
+    school_day(school)
+    mine(school, "Eye doctor", hour=15, hours=2)
+    go(school)
+    assert [r[0] for r in local(school)] == ["Busy (school drop-off)"]
+
+
+def test_an_event_ending_as_the_run_starts_is_no_conflict(school):
+    school_day(school)
+    mine(school, "PT at the clinic", hour=14)      # over at 3:00, and pickup starts at 3:00
+    go(school)
+    assert len(local(school)) == 2
+
+
+@pytest.mark.parametrize("title", ["Busy (interim)", "Busy", "busy (watching kids)"])
+def test_a_busy_hold_is_no_conflict(school, title):
+    school_day(school)
+    mine(school, title, hour=14, hours=2)
+    go(school)
+    assert len(local(school)) == 2
+
+
+def test_an_event_marked_free_is_no_conflict(school):
+    school_day(school)
+    school.feeds.window.occurrences.append(occ("Webinar", start=when(school, hour=8), transparent=True))
+    go(school)
+    assert len(local(school)) == 2
+
+
+def test_its_own_blocks_never_count_as_a_conflict(school):
+    school_day(school)
+    go(school)
+    for v in list(school.google.live().values()):
+        start = datetime.fromisoformat(v["start"]["dateTime"])
+        school.feeds.window.occurrences.append(occ(v["summary"], start=start, uid=v["id"] + "@google.com"))
+    go(school)
+    go(school)
+    assert len(local(school)) == 2
+
+
+def test_a_birthday_is_no_conflict_but_a_trip_is(school):
+    school_day(school)
+    day = when(school).date()
+    school.feeds.window.occurrences.append(day_occ("Cousin's birthday", day, day))
+    go(school)
+    assert len(local(school)) == 2
+    school.feeds.window.occurrences.append(day_occ("Stay at Hotel", day - timedelta(days=1), day))
+    go(school)
+    go(school)
+    assert school.google.live() == {}
+
+
+def test_a_trip_ending_the_day_before_is_no_conflict(school):
+    school_day(school)
+    day = when(school).date()
+    school.feeds.window.occurrences.append(day_occ("Stay at Hotel", day - timedelta(days=2), day - timedelta(days=1)))
+    go(school)
+    assert len(local(school)) == 2
+
+
+def test_a_block_comes_off_for_a_new_conflict_and_returns_when_it_goes(school):
+    school_day(school)
+    go(school)
+    event = mine(school, "PT at the clinic", hour=8)
+    go(school)
+    go(school)
+    assert [r[0] for r in local(school)] == ["Busy (school pickup)"]
+    school.feeds.window.occurrences.remove(event)
+    go(school)
+    assert len(local(school)) == 2
+
+
+def test_one_unreadable_event_keeps_what_is_there_and_still_adds(school):
+    school_day(school)
+    school.feeds.window.unreadable = 1
+    go(school)
+    assert len(local(school)) == 2             # or one odd old event stops new blocks for good
+    mine(school, "PT at the clinic", hour=8)
+    go(school)
+    go(school)
+    assert len(local(school)) == 2             # kept while part of it can't be read
+    school.feeds.window.unreadable = 0
+    go(school)
+    go(school)
+    assert [r[0] for r in local(school)] == ["Busy (school pickup)"]
+
+
+def test_with_no_read_of_gmail_it_adds_nothing_and_says_so(school):
+    school_day(school)
+    school.feeds.snapshot.feeds["a"].ahead = None
+    go(school)
+    assert school.google.live() == {}
+    assert "couldn't read your Gmail" in problem(school)
+
+
+def test_a_real_event_whose_id_starts_like_a_block_still_counts(school):
+    school_day(school)
+    school.feeds.window.occurrences.append(occ("PT at the clinic", start=when(school, hour=8), uid="hbreal123@google.com"))
+    go(school)
+    assert [r[0] for r in local(school)] == ["Busy (school pickup)"]
+
+
+def test_two_school_events_on_one_day_are_one_pair_of_blocks(school):
+    school_day(school)
+    seed(school, "school day", when(school, days=3, hour=8, minute=30), hours=6.75)
+    go(school)
+    go(school)
+    assert len(local(school)) == 2
+
+
+def test_an_empty_gmail_read_removes_nothing(school):
+    school_day(school)
+    go(school)
+    school.feeds.window.occurrences.clear()
+    go(school)
+    go(school)
+    assert len(local(school)) == 2
+
+
+def test_a_block_he_removed_stays_removed(school):
+    school_day(school)
+    go(school)
+    uid = next(iter(school.google.live()))
+    school.google.events[uid]["status"] = "cancelled"
+    for _ in range(3):
+        go(school)
+    assert len(school.google.live()) == 1
+
+
+def test_a_school_run_can_never_copy_back_to_family():
+    assert copy_plan([occ(DROP_TITLE), occ(PICK_TITLE)], "Sam", TZ) == {}
+
+
+def test_a_school_setting_alone_turns_it_on(school):
+    assert "on, 0" in school.gm.status_line()
+
+
+@pytest.mark.parametrize("text, want", [
+    ("School Day", ("school day",)), (" A ; B ;", ("a", "b")), ("", ()), ("  ", ()),
+    (";".join(f"K{i}" for i in range(6)), ()), ("x" * 101, ())])
+def test_the_school_setting(text, want):
+    assert parse_school(text) == want
+
+
+def test_the_school_setting_is_read_from_the_options(tmp_path):
+    assert school_from_options(str(tmp_path)) == ()
+    (tmp_path / "options.json").write_text('{"family_school": "School Day"}')
+    assert school_from_options(str(tmp_path)) == ("school day",)
+    for bad in ('{"family_school": 5}', "not json", "[1]"):
+        (tmp_path / "options.json").write_text(bad)
+        assert school_from_options(str(tmp_path)) == ()

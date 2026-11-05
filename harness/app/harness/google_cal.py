@@ -46,6 +46,11 @@ _RSA_OID = bytes.fromhex("2a864886f70d010101")
 _DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
 
 
+def is_ours(uid: str) -> bool:
+    """An id of the form only this code makes."""
+    return bool(_ID_RE.fullmatch(uid))
+
+
 def event_id(key: str) -> str:
     return "hb" + hashlib.sha256(f"family_gmail:{key}".encode()).hexdigest()[:32]
 

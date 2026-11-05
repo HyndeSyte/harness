@@ -279,7 +279,13 @@ how many blocks are on Gmail.
   alone from then on. A block you remove isn't put back.
 - **Part of Family unreadable:** if it can't read an event on Family, it won't remove blocks, and the
   digest says so. Delete any that are wrong.
-- **Limit:** 30 changes a day. Past that, the digest says so and the rest go the next day.
+- **School days:** set `family_school` to the Family titles that mean a school day, with `;` between
+  several. Each gets a drop-off and a pickup block, 15 minutes either side of the start and of the end.
+  A real event of yours in the way removes that block, and it comes back if the event goes. A "Busy"
+  hold, or an all-day event other than a stay, doesn't count. If your Gmail calendar can't be read,
+  school runs don't change and the digest says so. If one event on it can't be read, blocks already
+  there stay.
+- **Limit:** 100 changes a day. Past that, the digest says so and the rest go the next day.
 - **What it can touch:** only blocks it wrote. Your share lets it do more than that, so to end it for
   good, remove the service account from the calendar's sharing.
 

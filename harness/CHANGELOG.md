@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0
+
+- School runs on your Gmail calendar. Name the Family events that mean a school day in `family_school`, and each gets a drop-off and a pickup block, 15 minutes either side of the start and of the end, with no tap. They follow Family: a closed day has no blocks and a moved start moves them.
+- A real event of yours in the way means no block for that run, and it comes back if the event goes. A "Busy" hold, a block from here, or an all-day event other than a stay doesn't count. If your Gmail calendar can't be read, school runs don't change and the digest says so.
+- Up to 100 changes a day to Gmail, up from 30, so the first school runs go on in one go.
+
 ## 0.7.4
 
 - The reason moved hand copies stayed put: the repeat lines in an event's time zone block, there for its clock changes, counted as the event repeating. Now only the event's own lines count. A real repeat or a guest still means it's left alone.

@@ -85,7 +85,7 @@ def starts(rig):
 
 def seed(rig, title, start, hours=1, extra=()):
     utc, fmt = start.astimezone(ZoneInfo("UTC")), "%Y%m%dT%H%M%SZ"
-    uid = f"his-{abs(hash((title, start))) % 99999}"
+    uid = f"his-{abs(hash((title, start)))}"
     path = f"{FAMILY_PATH}{uid}.ics"
     rig.icloud.seed(path, "\r\n".join([
         "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{utc:{fmt}}",

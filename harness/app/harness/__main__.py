@@ -23,7 +23,7 @@ from .controller import Controller
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
-from .family_gmail import FamilyGmail, rules_from_options
+from .family_gmail import FamilyGmail, rules_from_options, school_from_options
 from .ledger import Ledger
 from .mirror_shadow import MirrorShadow, read_days
 from .net import CalDavTransport, GoogleTransport, RedactingFilter, UrllibTransport
@@ -76,7 +76,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                              lambda: vault.get("calendar_feeds"), base.timezone,
                              ahead_days=max(read_days(None), AHEAD_DAYS),
                              ahead_when=lambda: bool((vault.get("work_mirror") or "").strip()
-                                                     or name_from_options(data_dir)))
+                                                     or name_from_options(data_dir)
+                                                     or school_from_options(data_dir)))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
     mirror = MirrorShadow(ledger, lambda: vault.get("work_mirror"), calendar=calendar,
                           family=inbox if base.family_entity else None, tz=base.timezone)
@@ -99,7 +100,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 google_cal.GoogleCalendar(GoogleTransport(google_cal.HOSTS),
                                                           lambda: vault.get("google_service_key"),
                                                           ledger.now),
-                                rules_fn=lambda: rules_from_options(data_dir), tz=base.timezone))
+                                rules_fn=lambda: rules_from_options(data_dir),
+                                school_fn=lambda: school_from_options(data_dir), tz=base.timezone))
     return controller, web, listener
 
 

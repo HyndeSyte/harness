@@ -16,6 +16,11 @@ The mirror image of family_copy.py, and it keeps the same safety:
     row, and more than a few at once is held back for a while as a sign the read is wrong.
   * If Family or Google can't be read, nothing happens.
 
+School days work the same way, from the `family_school` option, which names the Family
+events that mean a school day. Each gets two blocks, drop-off and pickup, unless a real event
+on his own calendar is in the way, in which case the other parent has that run. If the event
+goes, the block comes back.
+
 The two can't chase each other: a title here must carry a word family_copy.py skips, so
 a block never copies to Family, and a copy on Family (hx- uid) never gets a block.
 
@@ -30,7 +35,8 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from . import caldav, calendar_feed, google_cal, ical
 from .family_copy import (_SKIP, _STAY, AHEAD_DAYS, GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE,
@@ -39,8 +45,11 @@ from .ledger import Ledger, iso
 
 log = logging.getLogger("harness.family_gmail")
 
-MAX_WRITES_PER_DAY = 30        # a weekly event that changes time is 18 writes, and no one's alerted
+MAX_WRITES_PER_DAY = 100       # two runs a school day for 60 days fit, and no one's alerted
 MAX_RULES = 5
+DROP_TITLE = "Busy (school drop-off)"
+PICK_TITLE = "Busy (school pickup)"
+DRIVE = timedelta(minutes=15)  # each way, so a run is half an hour around the bell
 MAX_TITLE = 60
 PROBLEM = "family_gmail_problem"
 PROVEN = "family_gmail_proven"
@@ -86,12 +95,62 @@ def rules_from_options(data_dir: str) -> tuple[Rule, ...]:
     return parse_rules(value) if isinstance(value, str) else ()
 
 
+def parse_school(text: str) -> tuple[str, ...]:
+    """The Family titles that mean a school day: plain words, ";" between several."""
+    titles = [t.strip().casefold() for t in (text or "").split(";") if t.strip()]
+    if len(titles) > MAX_RULES or any(len(t) > 100 for t in titles):
+        return ()
+    return tuple(titles)
+
+
+def school_from_options(data_dir: str) -> tuple[str, ...]:
+    try:
+        with open(os.path.join(data_dir, "options.json"), encoding="utf-8") as f:
+            value = json.load(f).get("family_school", "")
+    except (OSError, ValueError, AttributeError):
+        return ()
+    return parse_school(value) if isinstance(value, str) else ()
+
+
 @dataclass(frozen=True)
 class Want:
     key: str
     title: str
     start: datetime
     end: datetime
+
+
+def school_plan(items: list[caldav.Item], titles: tuple[str, ...]) -> dict[str, Want]:
+    """Each school day's two runs: there and back around the start, and around the end.
+    Family says which days, so a closed day or a moved start needs nothing here."""
+    wants = []
+    for item in items:
+        occ: ical.Occurrence = item.occ
+        if occ.summary.strip().casefold() not in titles or occ.all_day or occ.end <= occ.start \
+                or occ.uid.startswith("hx-"):
+            continue
+        for run, title, at in (("drop", DROP_TITLE, occ.start), ("pick", PICK_TITLE, occ.end)):
+            key = hashlib.sha256(f"{occ.uid}|{occ.instance}|{run}".encode()).hexdigest()[:32]
+            wants.append(Want(key, title, at - DRIVE, at + DRIVE))
+    out: dict[str, Want] = {}
+    seen = set()
+    for want in sorted(wants, key=lambda w: w.key):    # two events for one day are one run
+        moment = (want.title, want.start.astimezone(timezone.utc))
+        if moment not in seen:
+            seen.add(moment)
+            out[want.key] = want
+    return out
+
+
+def _ties_him_up(occ: ical.Occurrence, want: Want, tz: str) -> bool:
+    """A real event of his over this run, which means the other parent has it. Not a block
+    from here, not a "Busy" hold, which may only be drive time, and not an all-day event
+    unless it's a trip: a birthday doesn't stop a school run."""
+    if google_cal.is_ours(occ.uid.removesuffix("@google.com")) or occ.summary.strip().casefold().startswith("busy"):
+        return False
+    if occ.all_day:
+        return bool(_STAY.match(occ.summary)) and occ.start <= want.start.astimezone(ZoneInfo(tz)).date() < occ.end
+    return not occ.transparent and occ.start < want.end and occ.end > want.start
 
 
 def plan(items: list[caldav.Item], rules: tuple[Rule, ...]) -> dict[str, Want]:
@@ -124,7 +183,8 @@ def _was_sent(intent: str, block: google_cal.Block) -> bool:
 
 class FamilyGmail:
     def __init__(self, ledger: Ledger, family_add, calendar, google: google_cal.GoogleCalendar,
-                 *, rules_fn=lambda: (), tz: str):
+                 *, rules_fn=lambda: (), school_fn=lambda: (), tz: str):
+        self.school_fn = school_fn         # the Family titles that mean a school day
         self.ledger = ledger
         self.fa = family_add
         self.client = family_add.client
@@ -136,7 +196,7 @@ class FamilyGmail:
 
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
-        if not self.rules_fn():
+        if not (self.rules_fn() or self.school_fn()):
             return ("Blocks on Gmail from Family: off. Nothing is named in the add-on's settings, "
                     "or what's there can't be read.")
         if not self.google.configured():
@@ -172,7 +232,8 @@ class FamilyGmail:
             return
         self._seen = gen
         try:
-            if not paused and self.fa.enabled() and self.rules_fn() and self.google.configured():
+            if not paused and self.fa.enabled() and (self.rules_fn() or self.school_fn()) \
+                    and self.google.configured():
                 self._sync()
         except Exception as e:
             log.warning("family to gmail failed: %s", type(e).__name__)
@@ -206,12 +267,34 @@ class FamilyGmail:
             self._problem(self._said(why))
             return
         named = plan(family.items, rules)
-        wants = {k: w for k, w in named.items() if w.end > now}
+        wants = {k: w for k, w in {**named, **self._school_runs(family.items)}.items() if w.end > now}
         self.writes = self._writes_today()
         problem = self._follow(address, wants, {b.id: b for b in blocks}, now, until,
                                family.unreadable == 0, self._thin(len(family.items) - len(named)))
         added = self._add_new(address, wants)
-        self._problem(problem or added)
+        self._problem(problem or added or self.school_note)
+
+    def _school_runs(self, items: list[caldav.Item]) -> dict[str, Want]:
+        """The runs that are his. With no read of his calendar, what's there stays and nothing
+        is added: that says nothing about whether he's free. With one event in it unreadable,
+        the rest still counts, or one odd old event would stop new blocks for good: what's there
+        stays, and a block too many only shows him busy."""
+        self.school_note = ""
+        runs = school_plan(items, self.school_fn())
+        if not runs:
+            return {}
+        ahead = next((res.ahead for res in self.calendar.snapshot.feeds.values() if res.window is not None
+                      and res.window.calendar.casefold().endswith("@gmail.com")), None)
+        live = {r["key"] for r in self._live()}
+        if ahead is None or not ahead.occurrences:
+            self.school_note = ("Blocks on Gmail from Family: couldn't read your Gmail calendar, so "
+                                "school runs didn't change.")
+            return {k: w for k, w in runs.items() if k in live}
+        free = {k: w for k, w in runs.items()
+                if not any(_ties_him_up(o, w, self.tz) for o in ahead.occurrences)}
+        if ahead.unreadable:
+            return {**free, **{k: w for k, w in runs.items() if k in live}}
+        return free
 
     def _thin(self, rest: int) -> bool:
         """Family holds everyone's events, so the rest of it doesn't suddenly halve. That tells
