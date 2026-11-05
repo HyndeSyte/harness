@@ -280,7 +280,7 @@ how many blocks are on Gmail.
 - **Part of Family unreadable:** if it can't read an event on Family, it won't remove blocks, and the
   digest says so. Delete any that are wrong.
 - **School days:** set `family_school` to the Family titles that mean a school day, with `;` between
-  several. Each gets a drop-off and a pickup block, 15 minutes either side of the start and of the end.
+  several. Each gets a drop-off block, from 30 minutes before the start to 15 after, and a pickup block, from 15 minutes before the end to 30 after.
   A real event of yours in the way removes that block, and it comes back if the event goes. A "Busy"
   hold, or an all-day event other than a stay, doesn't count. If your Gmail calendar can't be read,
   school runs don't change and the digest says so. If one event on it can't be read, blocks already

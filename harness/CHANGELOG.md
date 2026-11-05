@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1
+
+- School runs are 45 minutes: 15 each way and 15 to spare. Drop-off starts 30 minutes before the start and ends 15 after. Pickup starts 15 minutes before the end and ends 30 after. Blocks already on Gmail move to match.
+
 ## 0.8.0
 
 - School runs on your Gmail calendar. Name the Family events that mean a school day in `family_school`, and each gets a drop-off and a pickup block, 15 minutes either side of the start and of the end, with no tap. They follow Family: a closed day has no blocks and a moved start moves them.

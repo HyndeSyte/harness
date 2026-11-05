@@ -1350,7 +1350,7 @@ def local(rig):
 def test_a_school_day_gets_a_drop_off_and_a_pickup(school):
     school_day(school)
     go(school)
-    assert local(school) == [("Busy (school drop-off)", "08:15", "08:45"), ("Busy (school pickup)", "15:00", "15:30")]
+    assert local(school) == [("Busy (school drop-off)", "08:00", "08:45"), ("Busy (school pickup)", "15:00", "15:45")]
 
 
 def test_a_closed_day_has_no_blocks(school):
@@ -1366,7 +1366,7 @@ def test_blocks_follow_a_school_day_that_moves(school):
     seed(school, "School Day", when(school, days=3, hour=9, minute=30), hours=6.75)
     go(school)
     go(school)
-    assert ("Busy (school drop-off)", "09:15", "09:45") in local(school)
+    assert ("Busy (school drop-off)", "09:00", "09:45") in local(school)
     assert len(local(school)) == 2
 
 

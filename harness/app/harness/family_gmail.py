@@ -49,7 +49,10 @@ MAX_WRITES_PER_DAY = 100       # two runs a school day for 60 days fit, and no o
 MAX_RULES = 5
 DROP_TITLE = "Busy (school drop-off)"
 PICK_TITLE = "Busy (school pickup)"
-DRIVE = timedelta(minutes=15)  # each way, so a run is half an hour around the bell
+# 15 minutes each way and 15 to spare, so a run is 45 minutes. The spare is before the
+# morning bell and after the afternoon one.
+DROP_BEFORE, DROP_AFTER = timedelta(minutes=30), timedelta(minutes=15)
+PICK_BEFORE, PICK_AFTER = timedelta(minutes=15), timedelta(minutes=30)
 MAX_TITLE = 60
 PROBLEM = "family_gmail_problem"
 PROVEN = "family_gmail_proven"
@@ -129,9 +132,10 @@ def school_plan(items: list[caldav.Item], titles: tuple[str, ...]) -> dict[str, 
         if occ.summary.strip().casefold() not in titles or occ.all_day or occ.end <= occ.start \
                 or occ.uid.startswith("hx-"):
             continue
-        for run, title, at in (("drop", DROP_TITLE, occ.start), ("pick", PICK_TITLE, occ.end)):
+        for run, title, start, end in (("drop", DROP_TITLE, occ.start - DROP_BEFORE, occ.start + DROP_AFTER),
+                                       ("pick", PICK_TITLE, occ.end - PICK_BEFORE, occ.end + PICK_AFTER)):
             key = hashlib.sha256(f"{occ.uid}|{occ.instance}|{run}".encode()).hexdigest()[:32]
-            wants.append(Want(key, title, at - DRIVE, at + DRIVE))
+            wants.append(Want(key, title, start, end))
     out: dict[str, Want] = {}
     seen = set()
     for want in sorted(wants, key=lambda w: w.key):    # two events for one day are one run
