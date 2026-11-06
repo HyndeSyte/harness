@@ -304,6 +304,7 @@ class MailDates:
         self.monotonic = monotonic or time.monotonic
         self.chat_id: int | None = None
         self._future: Future | None = None
+        self._listed = False
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -314,6 +315,7 @@ class MailDates:
     # -- each tick ------------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
         try:
+            self._list_found()
             self._collect()
             self._undo_requested()
             if not paused and self.configured() and self._future is None and self._due():
@@ -445,6 +447,18 @@ class MailDates:
             return
         self.ledger.input_ok("mail")
         log.info("mail dates: %d looked at, %d dates", r.sent_to_engine, len(r.found))
+        for _, m, f in r.found:                    # the log stays on the Pi: it's how a batch is checked
+            log.info("mail date: %s %s (from %s)", f.day.isoformat(), title(f), clean(m.subject))
+
+    def _list_found(self) -> None:
+        """Once a start: what's found and waiting, so a check after a restart sees it all."""
+        if self._listed:
+            return
+        self._listed = True
+        for r in self.ledger.db.execute("SELECT what, day, kind FROM mail_dates WHERE state='found'"
+                                        " ORDER BY day").fetchall():
+            log.info("mail date waiting: %s %s", r["day"],
+                     title(Found(r["what"], date.fromisoformat(r["day"]), r["kind"])))
 
     # -- writing ----------------------------------------------------------------------------
     def _writes_today(self) -> int:

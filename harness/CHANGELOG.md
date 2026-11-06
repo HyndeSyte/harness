@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.2
+
+- Each date found in mail is named in the add-on log, with the subject it came from, and what's
+  found but not yet written is listed again at each start. The log stays on the Pi.
+
 ## 0.12.1
 
 - Mail is checked every 5 minutes, not every 30, so a date from new mail lands within minutes.

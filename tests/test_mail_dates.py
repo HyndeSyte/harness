@@ -123,6 +123,19 @@ def test_with_writes_off_it_finds_and_writes_nothing(g):
     assert "Last day: Amazon return: PC parts" in g.md.digest_line()
 
 
+def test_each_date_found_is_named_in_the_log_and_again_after_a_start(g, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="harness.mail_dates")
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN}, writes=False)
+    read(g)
+    assert "mail date: 2026-11-26 Last day: Amazon return: PC parts (from Your order of PC parts)" \
+        in caplog.text
+    caplog.clear()
+    rig_mail(g, [], writes=False)                 # a restart: a fresh reader over the same ledger
+    g.md.run(paused=False)
+    assert "mail date waiting: 2026-11-26 Last day: Amazon return: PC parts" in caplog.text
+
+
 def test_mail_that_isnt_picked_never_reaches_the_engine(g):
     rig_mail(g, [msg(1, "Photos from the weekend", "see you soon", sender="Friend <f@x.example>")])
     read(g)
