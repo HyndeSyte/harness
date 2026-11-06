@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.3
+
+- Fixes from checking the first month against the inbox. One thing in several emails (two notes
+  about one service appointment, three about one insurance renewal) is one entry. Payments that
+  happen on their own, monthly subscription renewals and expiring promo credits are left out.
+  School and group updates and loan servicing mail are now read, so registration deadlines and
+  loan dates aren't missed.
+- When these rules change, what was found but not written is let go and the last 30 days are
+  read again under the new rules. Nothing already on the calendar is touched.
+
 ## 0.12.2
 
 - Each date found in mail is named in the add-on log, with the subject it came from, and what's

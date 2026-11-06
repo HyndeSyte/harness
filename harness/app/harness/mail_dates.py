@@ -65,14 +65,21 @@ _PICK = re.compile(
     r"\b(order|ordered|return|returns|refund|renew\w*|due|deadline|appointment|appt|reminder|"
     r"expir\w*|invoice|bill|statement|payment|registration|register|reservation|booking|"
     r"booked|scheduled|confirm\w*|policy|trial|subscription|filing|tax|rsvp|tickets?|"
-    r"enrollment|enrol\w*|warranty|recall|delivery|deliver\w*|pickup|pick up|class|session)\b",
+    r"enrollment|enrol\w*|warranty|recall|delivery|deliver\w*|pickup|pick up|class|session|"
+    r"update|servicing|notice|account|action|important|upcoming|invit\w*|loan|mortgage|"
+    r"insurance|escrow|school|trimester|semester|camp)\b",
     re.I)
 _SCRIPT_FAILED = re.compile(r"summary of failures for google apps script", re.I)
 _TAG = re.compile(r"<[^>]+>")
 _COMMAND = re.compile(r"(^|\s)[/@]+")
 _WORD_RE = re.compile(r"\w+")
 _STOP = frozenset({"a", "an", "the", "for", "of", "to", "your", "my", "on", "by", "and", "from"})
-SCRIPT_SENDER = "apps-scripts-notifications@google.com"
+_GENERIC = frozenset({"pay", "bill", "due", "payment", "renews", "renewal", "renew", "expires", "expire",
+                      "appointment", "appt", "last", "day", "return", "returns", "order", "deadline",
+                      "date", "service", "plan", "policy", "account", "online", "form", "session",
+                      "before", "with", "drop", "off", "at", "in", "is", "be", "auto"})
+RULES = "2"                           # what's found under older rules is found again under these
+SCRIPT_SENDER ="apps-scripts-notifications@google.com"
 _SPACE = re.compile(r"\s+")
 
 
@@ -96,7 +103,10 @@ last day to return, cancel, claim or correct something), appointment (he has to 
 renewal (something renews or expires), event (something he signed up for).
 
 Only dates on or after today. Only what needs him: not delivery estimates, sales, marketing, \
-newsletters, or dates already past. If a date is "within 30 days of delivery" and the delivery \
+offers, promotional credits or points that expire, or dates already past. Leave out payments \
+that happen on their own (autopay, autodraft) unless he must do something first, and monthly \
+subscription renewals; keep yearly renewals. A school or group update can carry real dates \
+(registration closes, no class, an event): list those. If a date is "within 30 days of delivery" and the delivery \
 date is in the email, work it out; if it can't be worked out, leave it out. Most emails have \
 none: then items is empty.
 
@@ -264,6 +274,11 @@ def _words(text: str) -> frozenset[str]:
     return frozenset(w for w in _WORD_RE.findall(text.casefold()) if w not in _STOP)
 
 
+def _names(text: str) -> frozenset[str]:
+    """The words that say which thing: not the kind of thing, not numbers."""
+    return frozenset(w for w in _words(text) if w not in _GENERIC and not w.isdigit() and len(w) > 2)
+
+
 def note_id(key: str) -> str:
     return google_cal.event_id(f"mail:{key}")
 
@@ -315,6 +330,8 @@ class MailDates:
     # -- each tick ------------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
         try:
+            if not paused and self.configured():
+                self._rules()
             self._list_found()
             self._collect()
             self._undo_requested()
@@ -447,8 +464,27 @@ class MailDates:
             return
         self.ledger.input_ok("mail")
         log.info("mail dates: %d looked at, %d dates", r.sent_to_engine, len(r.found))
-        for _, m, f in r.found:                    # the log stays on the Pi: it's how a batch is checked
+        for key_src, m, f in r.found:              # the log stays on the Pi: it's how a batch is checked
+            key = _key(key_src or f"uid:{m.uid}", f)
+            row = self.ledger.db.execute("SELECT * FROM mail_dates WHERE key=?", (key,)).fetchone()
+            if row is not None and row["state"] == "found" and self._already(row):
+                self._set(key, "skipped")
+                log.info("mail date: %s %s (from %s), already found", f.day.isoformat(), title(f),
+                         clean(m.subject))
+                continue
             log.info("mail date: %s %s (from %s)", f.day.isoformat(), title(f), clean(m.subject))
+
+    def _rules(self) -> None:
+        """Rules changed since these were found: find them again, from the start of the window.
+        What's on his calendar stays; what's only found is let go and read afresh."""
+        if self.ledger.get_meta("mail_rules") == RULES or self._future is not None:
+            return
+        with self.ledger.tx() as db:
+            db.execute("DELETE FROM mail_dates WHERE state IN ('found','skipped')")
+            for k in ("mail_last_uid", "mail_more", "mail_stuck_uid", "mail_stuck_tries", "mail_read_at"):
+                self.ledger.set_meta(k, "", db)
+            self.ledger.set_meta("mail_rules", RULES, db)
+        log.info("mail dates: rules changed, reading the last %d days again", FIRST_DAYS)
 
     def _list_found(self) -> None:
         """Once a start: what's found and waiting, so a check after a restart sees it all."""
@@ -501,13 +537,15 @@ class MailDates:
             self._tell(batch, landed)
 
     def _already(self, row) -> bool:
-        """The same thing from two emails (an order and its shipping notice): once. Same day, and
-        one's words all in the other's: "Pay water bill" and "Pay electric bill" are two."""
-        mine = _words(row["what"])
-        for other in self.ledger.db.execute("SELECT what FROM mail_dates WHERE day=? AND key<>?"
-                                            " AND state='live'", (row["day"], row["key"])):
-            small, big = sorted((mine, _words(other["what"])), key=len)
-            if len(small) >= 2 and small <= big:
+        """The same thing from two emails (an order and its shipping notice, two insurers' notes
+        on one renewal): once. Same day and kind, and a name in common: "Pay water bill" and
+        "Pay electric bill" are two. Compared with what's live or found before it."""
+        mine = _names(row["what"])
+        for other in self.ledger.db.execute(
+                "SELECT what FROM mail_dates WHERE day=? AND kind=? AND key<>? AND (state='live'"
+                " OR (state='found' AND rowid<(SELECT rowid FROM mail_dates WHERE key=?)))",
+                (row["day"], row["kind"], row["key"], row["key"])):
+            if mine & _names(other["what"]):
                 return True
         return False
 

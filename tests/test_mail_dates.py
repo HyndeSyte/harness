@@ -343,6 +343,45 @@ def test_different_bills_on_one_day_are_two(g):
     assert len(g.google.live()) == 2
 
 
+def test_one_thing_from_several_emails_is_one_entry(g):
+    rig_mail(g, [msg(1, "Your service appointment"), msg(2, "Appointment confirmed"),
+                 msg(3, "Your policy renewal"), msg(4, "Insurance notice"), msg(5, "Your session")],
+             {"Your service appointment": [{"what": "Service appointment at Valley Motors",
+                                            "date": "2026-11-13", "kind": "appointment"}],
+              "Appointment confirmed": [{"what": "Service appointment: minivan at Valley Motors",
+                                         "date": "2026-11-13", "kind": "appointment"}],
+              "Your policy renewal": [{"what": "Home insurance policy renews", "date": "2026-11-29",
+                                       "kind": "renewal"}],
+              "Insurance notice": [{"what": "Hazard insurance expires; send renewal to lender",
+                                    "date": "2026-11-29", "kind": "renewal"}],
+              "Your session": [{"what": "Fill out intake form before session", "date": "2026-11-13",
+                                "kind": "deadline"}]}, writes=False)
+    read(g)
+    found = [r["what"] for r in g.ledger.db.execute("SELECT what FROM mail_dates WHERE state='found'")]
+    assert sorted(found) == ["Fill out intake form before session", "Home insurance policy renews",
+                             "Service appointment at Valley Motors"]
+
+
+def test_school_and_loan_mail_is_read():
+    assert picked("A parent <p@x.example>", "Learning Center Update - October 31")
+    assert picked("Bank <b@x.example>", "A servicing message from your bank")
+
+
+def test_new_rules_find_it_all_again_and_leave_his_calendar_alone(g):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    read(g)
+    live = dict(g.google.live())
+    g.ledger.db.execute("INSERT INTO mail_dates(key, message_id, what, day, kind, state, event_id,"
+                        " batch, created_at) VALUES('k','<9@x>','Old noise','2026-11-20','deadline',"
+                        "'found','e',NULL,'2026-11-06T00:00:00+00:00')")
+    g.ledger.set_meta("mail_rules", "1")
+    g.engine.asked.clear()
+    read(g)
+    states = dict(g.ledger.db.execute("SELECT what, state FROM mail_dates").fetchall())
+    assert "Old noise" not in states and g.google.live() == live
+    assert g.engine.asked == []      # its one message is on his calendar already: not asked again
+
+
 def test_a_title_cant_carry_a_command_or_too_many_dates():
     assert clean("/pause everything") == "pause everything" and clean("ask @somebot now") == "ask somebot now"
     many = {"items": [{"what": f"Thing {i}", "date": "2026-11-20", "kind": "deadline"} for i in range(40)]}
