@@ -106,7 +106,9 @@ Only dates on or after today. Only what needs him: not delivery estimates, sales
 offers, promotional credits or points that expire, or dates already past. Leave out payments \
 that happen on their own (autopay, autodraft) unless he must do something first, and monthly \
 subscription renewals; keep yearly renewals. A school or group update can carry real dates \
-(registration closes, no class, an event): list those. If a date is "within 30 days of delivery" and the delivery \
+(registration closes, an event): list those. A day something doesn't happen (no class, a \
+break, closed) is not a date: leave it out. If a date is "within 30 days of delivery" and the \
+delivery \
 date is in the email, work it out; if it can't be worked out, leave it out. Most emails have \
 none: then items is empty.
 
@@ -161,7 +163,7 @@ def parse_items(output: dict | None, today: date) -> list[Found]:
         except ValueError:
             continue
         what = clean(str(it.get("what", "")))
-        if not what or not today <= day <= today + AHEAD:
+        if not what or non_event(what) or not today <= day <= today + AHEAD:
             continue
         out.append(Found(what, day, it["kind"]))
     return out[:MAX_ITEMS]
@@ -272,6 +274,14 @@ def _key(message_id: str, f: Found) -> str:
 
 def _words(text: str) -> frozenset[str]:
     return frozenset(w for w in _WORD_RE.findall(text.casefold()) if w not in _STOP)
+
+
+_NON_EVENT = re.compile(r"^(no |closed\b)|\b(no (class|school|classes)|closed|cancell?ed|break begins)\b", re.I)
+
+
+def non_event(what: str) -> bool:
+    """A day something doesn't happen is not a date to carry: he wants the day empty."""
+    return bool(_NON_EVENT.search(what))
 
 
 def _names(text: str) -> frozenset[str]:
@@ -491,6 +501,9 @@ class MailDates:
         if self._listed:
             return
         self._listed = True
+        for r in self.ledger.db.execute("SELECT key, what FROM mail_dates WHERE state='found'").fetchall():
+            if non_event(r["what"]):               # found before that rule: let go
+                self._set(r["key"], "skipped")
         for r in self.ledger.db.execute("SELECT what, day, kind FROM mail_dates WHERE state='found'"
                                         " ORDER BY day").fetchall():
             log.info("mail date waiting: %s %s", r["day"],
@@ -514,13 +527,21 @@ class MailDates:
         room = MAX_WRITES_PER_DAY - self._writes_today()
         batch = hashlib.sha256(f"{iso(self.ledger.now())}".encode()).hexdigest()[:16]
         landed = []
+        days: dict[date, list[dict] | None] = {}
         for row in rows:
             day = date.fromisoformat(row["day"])
-            if day < today or self._already(row):
+            if day < today or self._already(row) or non_event(row["what"]):
                 self._set(row["key"], "skipped")
                 continue
             if room <= 0:
                 break
+            if day not in days:
+                days[day] = self._on_day(address, day)
+            if days[day] is None:
+                break                              # his calendar can't be read: next tick
+            if any(_names(row["what"]) & _names(e.get("summary") or "") for e in days[day]):
+                self._set(row["key"], "skipped")   # already on his calendar, from him or a copy
+                continue
             f = Found(row["what"], day, row["kind"])
             out = self.google.add_note(address, row["event_id"], title(f), day)
             if out.kind == "ok":
@@ -535,6 +556,13 @@ class MailDates:
                 break                              # Google is having trouble: next tick
         if landed:
             self._tell(batch, landed)
+
+    def _on_day(self, address: str, day: date) -> list[dict] | None:
+        start = datetime.combine(day, datetime.min.time(), ZoneInfo(self.tz))
+        events = self.google.events_between(address, start, start + timedelta(days=1))
+        return None if events is None else [e for e in events
+                                            if e.get("extendedProperties", {}).get("private")
+                                            != google_cal.NOTE_MARK]
 
     def _already(self, row) -> bool:
         """The same thing from two emails (an order and its shipping notice, two insurers' notes

@@ -362,6 +362,28 @@ def test_one_thing_from_several_emails_is_one_entry(g):
                              "Service appointment at Valley Motors"]
 
 
+def test_a_day_something_doesnt_happen_isnt_carried(g):
+    rig_mail(g, [msg(1, "Learning Center Update")],
+             {"Learning Center Update": [
+                 {"what": "No class: fall break begins", "date": "2026-11-23", "kind": "event"},
+                 {"what": "Celebration of Learning, 2-3pm", "date": "2026-11-19", "kind": "event"}]})
+    read(g)
+    assert [e["summary"] for e in g.google.live().values()] == ["On: Celebration of Learning, 2-3pm"]
+
+
+def test_what_is_on_his_calendar_already_isnt_added_again(g):
+    rig_mail(g, [msg(1, "Your service appointment")],
+             {"Your service appointment": [{"what": "Service appointment at Valley Motors",
+                                            "date": "2026-11-13", "kind": "appointment"}]})
+    g.google.events["his1"] = {"id": "his1", "iCalUID": "his1@google.com", "status": "confirmed",
+                               "etag": g.google._etag(), "eventType": "default",
+                               "summary": "Valley Motors service",
+                               "start": {"dateTime": "2026-11-13T08:00:00-05:00"},
+                               "end": {"dateTime": "2026-11-13T09:00:00-05:00"}}
+    read(g)
+    assert [e["summary"] for e in g.google.live().values()] == ["Valley Motors service"]
+
+
 def test_school_and_loan_mail_is_read():
     assert picked("A parent <p@x.example>", "Learning Center Update - October 31")
     assert picked("Bank <b@x.example>", "A servicing message from your bank")

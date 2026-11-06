@@ -164,11 +164,17 @@ class FakeGoogle:
 
     def _list(self, query):
         assert query["singleEvents"] == "true" and query["showDeleted"] == "false"
-        assert query["privateExtendedProperty"] == "harness=family_gmail"
+        assert query.get("privateExtendedProperty", "harness=family_gmail") == "harness=family_gmail"
         low = datetime.fromisoformat(query["timeMin"])
         high = datetime.fromisoformat(query["timeMax"])
         items = []
         for e in self.live().values():
+            if "privateExtendedProperty" not in query:          # everything in the window
+                if "dateTime" not in e["start"]:
+                    if e["start"]["date"] < high.date().isoformat() \
+                            and e["end"]["date"] > low.date().isoformat():
+                        items.append(e)
+                    continue
             if "dateTime" not in e["start"]:
                 items.append(e)
             elif datetime.fromisoformat(e["end"]["dateTime"]) > low \

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.4
+
+- A day something doesn't happen (no class, a break, closed) isn't carried from mail.
+- A date already on your Gmail calendar that day, entered by you or copied from Family, isn't
+  added again from mail.
+
 ## 0.12.3
 
 - Fixes from checking the first month against the inbox. One thing in several emails (two notes
