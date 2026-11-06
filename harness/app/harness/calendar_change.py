@@ -169,6 +169,7 @@ class CalendarChange:
         self.address = address             # his Gmail address, as its feed names itself
         self.tz = tz
         self.chat_id: int | None = None
+        self.touched = False               # something landed this tick: read Family again now
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -418,6 +419,7 @@ class CalendarChange:
                     self._note_removed(db, step)
             if stopped is not None:
                 break
+        self.touched = self.touched or bool(undo)
         self._finish(p, done, undo, notes, stopped)
 
     def _note_removed(self, db, step: Step) -> None:
@@ -1026,6 +1028,7 @@ class CalendarChange:
                 break
             problem = None
             left.remove(step)
+            self.touched = True
             with self.ledger.tx() as db:
                 db.execute("UPDATE calendar_changes SET undo_json=?, updated_at=? WHERE proposal_id=?",
                            (json.dumps(left), iso(self.ledger.now()), row["proposal_id"]))

@@ -151,6 +151,7 @@ class CalendarFeeds:
         self._last_start: datetime | None = None
         self._pre_digest_day: str | None = None
         self.generation = 0            # bumps whenever a read lands (ok or not)
+        self._soon: datetime | None = None   # a read asked for before the usual time
 
     # -- what the controller calls -------------------------------------------------
     def urls(self) -> list[str]:
@@ -174,13 +175,24 @@ class CalendarFeeds:
             if self._pre_digest_day == day or self._fresh(now, FRESH_FOR):
                 return
             self._pre_digest_day = day
+        elif self._soon is not None and now >= self._soon:
+            pass
         elif self._last_start and now - self._last_start < FETCH_EVERY:
             return
         self.start()
 
+    def read_soon(self, after: timedelta = timedelta(0)) -> None:
+        """He changed something, or a removal waits on a second look: read then, not at the usual
+        time. A read already going started before this, so another follows it."""
+        at = self.ledger.now() + after
+        if self._soon is None or at < self._soon:
+            self._soon = at
+
     def start(self) -> None:
         now = self.ledger.now()
         self._last_start = now
+        if self._soon is not None and self._soon <= now:
+            self._soon = None
         start, end, _ = today_bounds(now, self.tz)
         ahead_until = (start + timedelta(days=self.ahead_days + 1)
                        if self.ahead_days and self._want_ahead() else None)

@@ -51,6 +51,15 @@ READS_BEFORE_REMOVING = 2
 STOP_AFTER_REMOVED = 2
 HOLD_READS = 6                 # three hours: long enough for a bad read to pass, then it's real
 GIVE_UP_READS = 12             # six hours of a copy being there but not listed
+CONFIRM_AFTER = timedelta(minutes=2)   # the second look before a removal, not the next usual read
+
+
+def confirm_soon(ledger: Ledger, table: str, calendar) -> None:
+    """A few removals waiting on their second look get it in minutes. Many at once wait for the
+    usual reads: that's the guard against a bad read, and it's meant to take hours."""
+    n = ledger.db.execute(f"SELECT COUNT(*) FROM {table} WHERE state='live' AND missing=1").fetchone()[0]
+    if 0 < n <= MAX_REMOVALS_AT_ONCE:
+        calendar.read_soon(CONFIRM_AFTER)
 SLOP = timedelta(minutes=30)   # travel time makes the two calendars differ a little
 PROBLEM = "family_copy_problem"
 READ_SIZE = "family_copy_read_size"

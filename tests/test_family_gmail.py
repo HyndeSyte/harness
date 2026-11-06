@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness import drive, effects, google_cal
+from harness import drive, effects, family_rules, google_cal
 from harness.family_copy import FamilyCopy, plan as copy_plan
 from harness.family_gmail import (DROP_TITLE, GIVE_UP_READS, HOLD_READS, MAX_WRITES_PER_DAY, PICK_TITLE, PROBLEM, PROVEN, TEST_TITLE,
                                   FamilyGmail, Rule, parse_rules, parse_school, rules_from_options, school_address_from_options, school_from_options)
@@ -1716,3 +1716,47 @@ def test_real_lookups_reach_the_decision(school, tmp_path):
     at_place(school, "Specialist", "The Clinic, 2 Clinic Rd, Town, VA 12345", 8, 30)
     go(school)
     assert runs(school) == ["Busy (school pickup)"]
+
+
+# -- 0.10.1: no hour's wait -------------------------------------------------------------------
+
+def test_a_cancelled_event_gets_its_second_look_in_minutes(g):
+    seed(g, "Mom at work", when(g, days=5))
+    path = sit(g)
+    go(g)
+    assert g.feeds.soon == []                  # nothing waiting: the usual reads
+    del g.icloud.events[path]
+    go(g)
+    assert g.google.titles() == ["Busy (watching kids)"] and g.feeds.soon == [timedelta(minutes=2)]
+    go(g)
+    assert g.google.live() == {}
+
+
+def test_many_cancelled_at_once_wait_for_the_usual_reads(g):
+    paths = [sit(g, days=d) for d in (2, 3, 4, 5)]
+    seed(g, "Mom at work", when(g, days=6))
+    go(g)
+    for path in paths:
+        del g.icloud.events[path]
+    go(g)
+    assert g.feeds.soon == []                  # that's the guard against a bad read
+
+
+def test_a_block_no_rule_wants_comes_off_on_the_first_read(g):
+    said = [family_rules.Rule("kid sitting", "kids")]
+    g.gm.said_fn = lambda: tuple(said)
+    sit(g)
+    go(g)
+    said[0] = family_rules.Rule("kid sitting", "none")      # he says it means nothing; the event stays on Family
+    go(g)
+    assert g.google.live() == {} and count(g, "family_gmail_cancelled") == 1
+
+
+def test_a_setting_that_reads_empty_takes_nothing_off_at_once(g):
+    g.gm.said_fn = lambda: (family_rules.Rule("Book club", "none"),)    # so it still runs
+    seed(g, "Mom at work", when(g, days=5))
+    sit(g)
+    go(g)
+    g.rules = ()                               # the add-on's options failed to read
+    go(g)
+    assert g.google.titles() == ["Busy (watching kids)"]

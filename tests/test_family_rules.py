@@ -162,3 +162,40 @@ def test_a_rule_with_dates_or_on_gmail_is_refused():
             schema.parse_output({"type": "proposal", "effect_type": "calendar_change",
                                  "params": {"changes": [bad]}, "summary": "x"}, stage_at_least=at_least("S1"))
     assert effects  # imported for the registry
+
+
+class Soon:
+    """A calendar reader that only notes when it's asked to read early."""
+    pending = False
+    configured = False
+    generation = 0
+
+    def __init__(self):
+        self.asked = 0
+
+    def read_soon(self, after=timedelta(0)):
+        self.asked += 1
+
+    def maybe_start(self, **kw):
+        pass
+
+    def collect(self):
+        pass
+
+
+def test_a_rule_and_its_undo_each_get_a_read_at_once(r):
+    r.tell(rule(), words="Pat dentist means I have the kids")
+    r.c.calendar = Soon()
+    r.tell(rule(kind="none"), words="Pat dentist means nothing")
+    assert r.c.calendar.asked == 1
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.c.calendar.asked == 2
+    r.tick()
+    assert r.c.calendar.asked == 2             # once per change, not every tick
+
+
+def test_one_rule_can_cover_a_person():
+    rules = (Rule("Pat", "kids"), Rule("Pat + kids", "none"))
+    assert pick("Pat dentist", rules).kind == "kids" and pick("Pat doctor", rules).kind == "kids"
+    assert pick("Pat + kids at the zoo", rules).kind == "none"       # more words win
+    assert pick("Patio day", rules) is None

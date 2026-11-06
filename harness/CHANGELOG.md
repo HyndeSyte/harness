@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.1
+
+- After a change, a rule or an Undo, Family is read again at once, so Gmail and work follow
+  in a minute or two instead of up to half an hour.
+- A block that's no longer needed because of something you said, with its event still on
+  Family, comes off on that read.
+- An event taken off Family gets its second look two minutes later, not at the next usual read.
+  Many gone at once still wait for the usual reads: that's the guard against a bad read.
+- The digest's question about new Family events says to ignore the ones that don't affect you,
+  so the list of rules stays short. One rule can cover a person: "Anything with Pat means I
+  have the kids".
+
 ## 0.10.0
 
 - Say what a Family event means for you, by its name: "Pat dentist means I have the kids",

@@ -51,6 +51,10 @@ class Feeds:
         self.window = ical.Window(GMAIL)
         res = SimpleNamespace(window=self.window, ahead=self.window)
         self.snapshot = SimpleNamespace(feeds={"a": res})
+        self.soon: list[timedelta] = []    # early reads asked for
+
+    def read_soon(self, after=timedelta(0)):
+        self.soon.append(after)
 
 
 @pytest.fixture

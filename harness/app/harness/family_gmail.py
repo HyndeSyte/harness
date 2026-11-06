@@ -42,7 +42,7 @@ from zoneinfo import ZoneInfo
 
 from . import caldav, calendar_feed, drive, family_rules, google_cal, ical, render
 from .family_copy import (_SKIP, _STAY, AHEAD_DAYS, GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE,
-                          READS_BEFORE_REMOVING, _same)
+                          READS_BEFORE_REMOVING, _same, confirm_soon)
 from .ledger import Ledger, iso
 
 log = logging.getLogger("harness.family_gmail")
@@ -153,6 +153,10 @@ def _said_kind(occ: ical.Occurrence, said: tuple) -> str | None:
     return rule.kind if rule else None
 
 
+def _key(occ: ical.Occurrence, run: str = "") -> str:
+    return hashlib.sha256((f"{occ.uid}|{occ.instance}" + (f"|{run}" if run else "")).encode()).hexdigest()[:32]
+
+
 def school_plan(items: list[caldav.Item], titles: tuple[str, ...], said: tuple = ()) -> dict[str, Want]:
     """Each school day's two runs: there and back around the start, and around the end.
     Family says which days, so a closed day or a moved start needs nothing here."""
@@ -165,8 +169,7 @@ def school_plan(items: list[caldav.Item], titles: tuple[str, ...], said: tuple =
             continue
         for run, title, start, end in (("drop", DROP_TITLE, occ.start - DROP_BEFORE, occ.start + DROP_AFTER),
                                        ("pick", PICK_TITLE, occ.end - PICK_BEFORE, occ.end + PICK_AFTER)):
-            key = hashlib.sha256(f"{occ.uid}|{occ.instance}|{run}".encode()).hexdigest()[:32]
-            wants.append(Want(key, title, start, end))
+            wants.append(Want(_key(occ, run), title, start, end))
     out: dict[str, Want] = {}
     seen = set()
     for want in sorted(wants, key=lambda w: w.key):    # two events for one day are one run
@@ -206,7 +209,7 @@ def plan(items: list[caldav.Item], rules: tuple[Rule, ...], said: tuple = ()) ->
         if title is None or occ.all_day or occ.uid.startswith("hx-") or occ.end <= occ.start:
             continue
         # A moved day keeps its series and its place in it, so it keeps its block.
-        key = hashlib.sha256(f"{occ.uid}|{occ.instance}".encode()).hexdigest()[:32]
+        key = _key(occ)
         out[key] = Want(key, title, occ.start, occ.end, kind or "")
     return out
 
@@ -258,6 +261,8 @@ class FamilyGmail:
         self.rules_fn = rules_fn
         self.tz = tz
         self._seen: int | None = None      # the calendar read last looked at
+        self.dropped: set[str] = set()     # no longer wanted only because of what he said
+        self._last: tuple | None = None    # (settings, what he'd said) at the last read
 
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
@@ -303,8 +308,8 @@ class FamilyGmail:
                  for t, w in shown]
         more = f", and {len(new) - MAX_ASKED} more another day" if len(new) > MAX_ASKED else ""
         return ("On Family with no rule yet: " + ", ".join(named) + more + ". If one ties you up, "
-                "tell me, like \"Pat dentist means I have the kids\". If not, say it means nothing "
-                "and I'll stop asking.")
+                "tell me, like \"Anything with Pat means I have the kids\". Ignore any that don't: "
+                "I won't ask again.")
 
     # -- each tick -------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
@@ -349,7 +354,15 @@ class FamilyGmail:
             self._problem(self._said(why))
             return
         said = self.said_fn()
-        named = self._not_busy(plan(family.items, rules, said))
+        planned = plan(family.items, rules, said)
+        # Wanted under what he'd said at the last read, not under what he says now, with the same
+        # events and the same settings: that's his word, not a bad read. A setting that read empty
+        # or an event that changed still takes two reads.
+        self.dropped = set()
+        if self._last is not None and self._last[0] == rules and self._last[1] != said:
+            self.dropped = plan(family.items, rules, self._last[1]).keys() - planned.keys()
+        self._last = (rules, said)
+        named = self._not_busy(planned)
         wants = {k: w for k, w in {**named, **self._school_runs(family.items)}.items() if w.end > now}
         self.asking = unruled(family.items, rules, self.school_fn(), said, now, now + ASK_AHEAD)
         self.writes = self._writes_today()
@@ -357,6 +370,7 @@ class FamilyGmail:
                                family.unreadable == 0, self._thin(len(family.items) - len(named)))
         added = self._add_new(address, wants)
         self._problem(problem or added or self.school_note or self.me_note)
+        confirm_soon(self.ledger, "family_gmail", self.calendar)
 
     def _school_runs(self, items: list[caldav.Item]) -> dict[str, Want]:
         """The runs that are his. With no read of his calendar, what's there stays and nothing
@@ -635,7 +649,8 @@ class FamilyGmail:
         return problem
 
     def _cancel(self, address: str, gone: list, thin: bool) -> str:
-        ready = [(row, block) for row, block in gone if row["missing"] + 1 >= READS_BEFORE_REMOVING]
+        ready = [(row, block) for row, block in gone
+                 if row["missing"] + 1 >= READS_BEFORE_REMOVING or row["key"] in self.dropped]
         for row, _ in gone:
             self._update(row, missing=row["missing"] + 1)
         if len(ready) > MAX_REMOVALS_AT_ONCE and thin:

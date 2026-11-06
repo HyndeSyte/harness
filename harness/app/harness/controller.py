@@ -255,6 +255,9 @@ class Controller:
             self._family_note()
         if self.calendar_change is not None:
             self.calendar_change.run_pending(paused=commands.is_paused(self.ledger))
+            if self.calendar_change.touched and self.calendar is not None:
+                self.calendar.read_soon()  # so Gmail and work follow in a minute, not half an hour
+            self.calendar_change.touched = False
         self._announce_settings()
         if self.calendar is not None:
             self.calendar.maybe_start()

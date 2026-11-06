@@ -558,3 +558,22 @@ def test_each_digest_leaves_one_log_line_for_the_watchdog(ledger, tmp_path, cloc
     lines = [m for m in caplog.messages if m.startswith("DIGEST ")]
     assert lines == ["DIGEST 2026-10-15 state=clear sent=no problems=0 waiting=0 events=0 family=-"]
     assert "Vet" not in caplog.text
+
+
+def test_an_early_read_when_asked_and_after_one_in_flight(ledger, clock):
+    x = Feeds(ledger, [(200, TODAY)] * 5, executor=ManualExecutor())
+    x.f.maybe_start()                          # a read goes out
+    x.f.read_soon()                            # he changes something while it's out
+    x.f.maybe_start()
+    assert len(x.f.executor.pending) == 1      # one at a time
+    x.f.executor.run_all(); x.f.collect()
+    x.f.maybe_start()                          # and another follows, minutes before the usual
+    assert x.f.pending
+    x.f.executor.run_all(); x.f.collect()
+    clock.advance(minutes=1); x.f.maybe_start()
+    assert not x.f.pending                     # then back to the usual half hour
+    x.f.read_soon(timedelta(minutes=2))
+    clock.advance(minutes=1); x.f.maybe_start()
+    assert not x.f.pending
+    clock.advance(minutes=1); x.f.maybe_start()
+    assert x.f.pending
