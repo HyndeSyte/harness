@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.1
+
+- A date that moves follows the email: when a new email says an appointment or deadline was
+  rescheduled, the entry from mail moves to the new day instead of a second one being added.
+- An entry you moved yourself (in your calendar, or by telling the harness) isn't added again
+  when the new confirmation arrives. A second, separate appointment with the same place is
+  still its own entry.
+
 ## 0.13.0
 
 - "Again" reads your calendar instead of asking. When you name something that's on your Gmail

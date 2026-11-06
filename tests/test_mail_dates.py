@@ -425,3 +425,46 @@ def test_a_failure_email_from_anyone_else_is_ignored(g):
     rig_mail(g, [msg(1, "Summary of failures for Google Apps Script: Work holds", sender="x@spoof.example")])
     read(g)
     assert "work holds script failed" not in g.md.digest_line()
+
+
+# -- a date that moves ---------------------------------------------------------------------------
+
+APPT = [{"what": "Service appointment at Valley Motors", "date": "2026-11-13", "kind": "appointment"}]
+
+
+def test_a_rescheduled_email_moves_the_note_instead_of_adding_one(g):
+    rig_mail(g, [msg(1, "Your service appointment")], {"Your service appointment": APPT})
+    read(g)
+    [(uid, ev)] = g.google.live().items()
+    g.box.messages.append(msg(2, "Appointment rescheduled"))
+    g.engine.answers["Appointment rescheduled"] = [{"what": "Service appointment at Valley Motors",
+                                                   "date": "2026-11-20", "kind": "appointment",
+                                                   "rescheduled": True}]
+    read(g)
+    [(uid2, ev2)] = g.google.live().items()
+    assert uid2 == uid and ev2["start"] == {"date": "2026-11-20"} and ev2["end"] == {"date": "2026-11-21"}
+    g.c.outbox.flush()
+    assert "moved there, as the email says" in g.bot.sent[-1][1]
+
+
+def test_a_second_appointment_that_isnt_a_reschedule_is_its_own(g):
+    rig_mail(g, [msg(1, "Your service appointment")], {"Your service appointment": APPT})
+    read(g)
+    g.box.messages.append(msg(2, "Your next service appointment"))
+    g.engine.answers["Your next service appointment"] = [{"what": "Service appointment at Valley Motors",
+                                                         "date": "2027-01-15", "kind": "appointment"}]
+    read(g)
+    assert sorted(e["start"]["date"] for e in g.google.live().values()) == ["2026-11-13", "2027-01-15"]
+
+
+def test_a_note_he_moved_himself_isnt_added_again_when_the_email_comes(g):
+    rig_mail(g, [msg(1, "Your service appointment")], {"Your service appointment": APPT})
+    read(g)
+    [uid] = g.google.live()
+    g.google.hand_edit(uid, start={"date": "2026-11-20"}, end={"date": "2026-11-21"})   # he said so in chat
+    g.box.messages.append(msg(2, "Appointment rescheduled"))
+    g.engine.answers["Appointment rescheduled"] = [{"what": "Service appointment at Valley Motors",
+                                                   "date": "2026-11-20", "kind": "appointment",
+                                                   "rescheduled": True}]
+    read(g)
+    assert [e["start"]["date"] for e in g.google.live().values()] == ["2026-11-20"]

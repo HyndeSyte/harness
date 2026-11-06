@@ -233,7 +233,8 @@ class FakeGoogle:
             e["status"] = "cancelled"
             e["etag"] = self._etag()
             return HttpResponse(204, {}, b"")
-        self.events[uid] = {**self._local(json.loads(body)), "etag": self._etag()}
+        base = e if method == "PATCH" else {}          # PATCH keeps what it doesn't name, as Google does
+        self.events[uid] = {**base, **self._local(json.loads(body)), "etag": self._etag()}
         return self._maybe_lost(HttpResponse(200, {}, json.dumps(self.events[uid]).encode()))
 
 
