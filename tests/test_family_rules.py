@@ -199,3 +199,11 @@ def test_one_rule_can_cover_a_person():
     assert pick("Pat dentist", rules).kind == "kids" and pick("Pat doctor", rules).kind == "kids"
     assert pick("Pat + kids at the zoo", rules).kind == "none"       # more words win
     assert pick("Patio day", rules) is None
+
+
+def test_the_receipt_says_how_many_events_it_covers(r):
+    r.tell(rule(title="School", kind="school"), words="School is a school day")
+    said = r.texts()[-1]
+    assert "with School in the name" in said and "events on Family in the next two months" in said
+    r.tell(rule(title="Book club", kind="none"), words="Book club means nothing")
+    assert "Nothing on Family has those words" in r.texts()[-1]

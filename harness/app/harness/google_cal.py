@@ -25,10 +25,11 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import quote, urlencode
 
+from . import ical
 from .net import REDACT, TransportError
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -184,6 +185,37 @@ def _body(uid: str, title: str, start: datetime, end: datetime) -> dict:
             "reminders": {"useDefault": False},
             "guestsCanInviteOthers": False, "guestsCanSeeOtherGuests": False,
             "extendedProperties": {"private": dict(MARK)}}
+
+
+KEPT_TYPES = frozenset({"default", "outOfOffice", "focusTime", "fromGmail"})   # what the feed has too
+
+
+def _when(part: dict) -> datetime | date:
+    if "dateTime" in part:
+        t = datetime.fromisoformat(part["dateTime"].replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            raise ValueError("no offset")
+        return t
+    return date.fromisoformat(part["date"])
+
+
+def _occurrence(e: dict, address: str, me: str) -> "ical.Occurrence | None":
+    """One event as ical.py makes it from the feed: the UID and the instance's original start
+    are what copies are keyed on."""
+    people = [a for a in e.get("attendees") or [] if isinstance(a, dict)]
+    if any(a.get("self") and a.get("responseStatus") == "declined" for a in people):
+        return None
+    start, end = _when(e["start"]), _when(e["end"])
+    if isinstance(start, datetime) != isinstance(end, datetime):
+        raise ValueError("mixed times")
+    original = e.get("originalStartTime")
+    instance = ical._key(_when(original)) if e.get("recurringEventId") and original else ""
+    summary = " ".join(str(e.get("summary") or "").split())[:ical.MAX_SUMMARY] or "(no title)"
+    return ical.Occurrence(
+        start, end, not isinstance(start, datetime), summary, address,
+        e.get("transparency") == "transparent", str(e["iCalUID"]), instance,
+        tuple(str(a.get("email", "")).lower() for a in people),
+        str(e.get("location") or "").strip(), str((e.get("organizer") or {}).get("email", "")).lower())
 
 
 def _ours(event: dict) -> bool:
@@ -389,6 +421,30 @@ class GoogleCalendar:
                 return out
             query["pageToken"] = following
         return None
+
+    def window(self, address: str, start: datetime, end: datetime) -> "ical.Window | None":
+        """His calendar as the secret-address feed would give it, read now: that feed is Google's
+        cache and can be an hour behind. The same identities as the feed, so nothing built on
+        it moves. None when it can't be read."""
+        events = self.events_between(address, start, end)
+        if events is None:
+            return None
+        out = ical.Window(address)
+        me = address.casefold()
+        if any(not e.get("iCalUID") for e in events if e.get("status") != "cancelled"):
+            return None                    # can't name it as the feed does: the feed's copy stands
+        for e in events:
+            if e.get("status") == "cancelled" or e.get("eventType", "default") not in KEPT_TYPES:
+                continue
+            try:
+                occ = _occurrence(e, address, me)
+            except (KeyError, ValueError, TypeError, AttributeError):
+                out.unreadable += 1
+                continue
+            if occ is not None:
+                out.occurrences.append(occ)
+        out.occurrences.sort(key=lambda o: (not o.all_day, ical._sort_key(o.start, timezone.utc), o.summary))
+        return out
 
     def look(self, address: str, uid: str) -> tuple[str, dict | None]:
         """One event: "ok" and it, "gone", or "unknown". No answer says nothing about whether

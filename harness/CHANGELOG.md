@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0
+
+- Your Gmail calendar is read straight from Google for the days ahead, not from the secret
+  address's copy, which Google can serve an hour late. Copies to Family and blocks on Gmail
+  follow what's really there. If Google can't be reached, the old copy is used.
+- The digest says what wasn't done in plain words: what you asked, when, and why, in place of
+  a job number.
+- A rule's receipt says how many events on Family it covers in the next two months.
+- A reply to the digest is taken as your own words, with no Approve tap: the digest's text
+  never reaches the engine.
+- The work-hours shadow mirror is retired. The work holds script does that job.
+
 ## 0.10.1
 
 - After a change, a rule or an Undo, Family is read again at once, so Gmail and work follow

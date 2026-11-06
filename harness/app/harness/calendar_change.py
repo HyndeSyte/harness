@@ -247,6 +247,8 @@ class CalendarChange:
             if not replied:
                 return False
             prev = self.ledger.outbound(job["chat_id"], replied)
+            if prev is not None and prev["kind"] == "digest" and not prev["job_id"]:
+                return False    # the engine is never shown a digest (runner._earlier): only his words
             if prev is None or prev["kind"] != "answer" or not prev["job_id"]:
                 return True
             if _looks_pasted(self.ledger.job_text(prev["job_id"])):
@@ -730,8 +732,25 @@ class CalendarChange:
                 family_rules.put(self.ledger, said, kind, db)
             return {"cal": "rule", "how": "rule", "said": said,
                     "before": [before.said, before.kind] if before else None}
-        return Step(f"From now on, Family events called {_safe(said)} {RULE_WORDS[kind]}. It takes "
-                    "effect at the next read of Family, within half an hour.", run)
+        n = self._rule_reach(said)
+        reach = ("" if n is None else " Nothing on Family has those words in the next two months." if n == 0
+                 else f" That's {n} event{'' if n == 1 else 's'} on Family in the next two months.")
+        return Step(f"From now on, Family events with {_safe(said)} in the name {RULE_WORDS[kind]}.{reach} "
+                    "Gmail and work follow within a few minutes.", run)
+
+    def _rule_reach(self, said: str) -> int | None:
+        """How much one sentence moves, so he isn't surprised. None when Family can't be read."""
+        now = self.ledger.now()
+        try:
+            read = self.client.items_between(now, now + timedelta(days=60), self.tz)
+            if read is None:
+                return None
+            want = family_rules.words(said)
+            return len({(i.occ.uid, i.occ.instance) for i in read.items if not i.occ.all_day
+                        and not i.occ.uid.startswith("hx-") and want <= family_rules.words(i.occ.summary)})
+        except Exception as e:                 # only the count is lost
+            log.warning("rule count failed: %s", type(e).__name__)
+            return None
 
     # -- Family --------------------------------------------------------------------------------
     def _family_fetch(self, href: str) -> tuple[str, str]:

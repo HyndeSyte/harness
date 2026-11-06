@@ -1057,3 +1057,39 @@ def test_undo_matches_what_the_server_kept_not_what_was_sent(r):
     assert "Undone" in r.texts()[-1]
     r.press(undo_of(r, 0), "Undo")
     assert "Undone" in r.texts()[-1] and not [p for p in r.icloud.events if "/hm-" in p]
+
+
+def test_the_digest_says_what_wasnt_done_in_plain_words(r):
+    from harness import daily
+    from harness.config import Config
+    from conftest import OWNER
+    r.tell(change(title="Book club", dates="2026-12-01"))       # nothing called that on Family
+    r.ledger.db.execute("DELETE FROM meta WHERE key='integrity_since'")
+    d = daily.gather(r.ledger, Config(owner_user_id=OWNER, stage="S1"), paused=False)
+    assert "\u201cBook club\u201d" in d.text and "couldn't find that event" in d.text
+    assert "Nothing changed" in d.text and "job " not in d.text
+
+
+def test_a_reply_to_the_digest_needs_no_tap(r):
+    from harness import daily
+    from harness.config import Config
+    from conftest import OWNER
+    r.ledger.db.execute("DELETE FROM meta WHERE key='integrity_since'")
+    r.tick()                                  # the controller builds its parts
+    r.ledger.set_meta("digest_date", "2000-01-01")
+    r.c._daily(False)
+    r.c.outbox.flush()
+    digest_msg = r.bot.sent[-1]
+    r.tell(change(dates="2026-11-23"), words="take school off the 23rd", reply_to=digest_msg[3])
+    assert "2026-11-23" not in days_of(r.body())
+    assert not any(s[2] and any(t == "Approve" for row in s[2] for t, _ in row) for s in r.bot.sent)
+    assert daily and Config and OWNER  # imported for the digest
+
+
+def test_a_change_that_stopped_partway_isnt_called_nothing_changed(r):
+    from harness import daily
+    job = {"id": "j", "created_at": "2026-11-05T15:00:00+00:00"}
+    line = daily._failed(r.ledger, job, {"effect": "calendar_change", "steps": 1, "outcome": "failed"}, TZ)
+    assert "Nothing changed" not in line and "check the calendar" in line
+    line = daily._failed(r.ledger, job, {"reason": "not_found"}, TZ)
+    assert "Nothing changed" in line and "a request (Thu 10:00 AM)" in line

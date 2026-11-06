@@ -15,6 +15,7 @@ dead feed is named in the digest instead of quietly shrinking the agenda.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
@@ -24,6 +25,8 @@ from zoneinfo import ZoneInfo
 from . import ical
 from .ledger import Ledger
 from .net import REDACT, Transport, TransportError
+
+log = logging.getLogger(__name__)
 
 # Google's secret address, and nothing else: the controller only ever
 # fetches from calendar.google.com.
@@ -135,8 +138,11 @@ class CalendarFeeds:
     """Owned by the controller thread; fetches happen in workers."""
 
     def __init__(self, ledger: Ledger, transport: Transport, executor: Executor,
-                 urls_fn, tz: str, *, ahead_days: int = 0, ahead_when=None):
+                 urls_fn, tz: str, *, ahead_days: int = 0, ahead_when=None, ahead_from=None):
         self.ledger = ledger
+        # (address, start, until) -> Window or None: his Gmail calendar read now, in place of the
+        # feed's cached copy for the days ahead. None, or no answer, keeps the feed's.
+        self.ahead_from = ahead_from
         self.ahead_days = ahead_days       # > 0: each read also parses this far ahead
         # Called at each read: False skips the ahead parse (no mirror settings
         # entered). None: always parse ahead when ahead_days > 0.
@@ -181,6 +187,24 @@ class CalendarFeeds:
             return
         self.start()
 
+    def _read(self, url: str, start: datetime, end: datetime, ahead_until: datetime | None) -> FeedResult:
+        """In a worker: a slow answer from Google never holds up Telegram."""
+        res = fetch_one(self.transport, url, start=start, end=end, tz=self.tz, ahead_until=ahead_until)
+        if ahead_until is not None:
+            self._fresh_ahead(res, (start, ahead_until))
+        return res
+
+    def _fresh_ahead(self, res: FeedResult, span: tuple[datetime, datetime]) -> None:
+        if self.ahead_from is None or not res.ok or res.ahead is None or res.window is None                 or not res.window.calendar.casefold().endswith("@gmail.com"):
+            return
+        try:
+            fresh = self.ahead_from(res.window.calendar, *span)
+        except Exception as e:                     # the feed's copy stands
+            log.warning("gmail read failed: %s", type(e).__name__)
+            fresh = None
+        if fresh is not None:
+            res.ahead = fresh
+
     def read_soon(self, after: timedelta = timedelta(0)) -> None:
         """He changed something, or a removal waits on a second look: read then, not at the usual
         time. A read already going started before this, so another follows it."""
@@ -200,9 +224,7 @@ class CalendarFeeds:
             fid = feed_id(url)
             if fid in self._futures:
                 continue
-            self._futures[fid] = self.executor.submit(fetch_one, self.transport, url,
-                                                      start=start, end=end, tz=self.tz,
-                                                      ahead_until=ahead_until)
+            self._futures[fid] = self.executor.submit(self._read, url, start, end, ahead_until)
             self._started_at[fid] = now
 
     def collect(self) -> None:

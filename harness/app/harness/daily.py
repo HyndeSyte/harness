@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import calendar_feed, digest, ingress_filter, policy, prompts, schema
+from . import calendar_feed, digest, ingress_filter, policy, prompts, render, schema
 from .config import Config
 from .engines import CallOutcome, Engine, call_with_retries
 from .ledger import Ledger, iso
@@ -244,13 +244,13 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     failures: list[str] = []
     for job in ledger.jobs_since(since, "failed"):
         rec = ledger.receipts(job["id"])
-        reason = ""
+        detail: dict = {}
         if rec:
             try:
-                reason = json.loads(rec[-1]["detail"]).get("reason", "")
-            except (ValueError, AttributeError):
-                reason = ""
-        failures.append(f"job {job['id'][:8]}: {reason or 'failed'}")
+                detail = json.loads(rec[-1]["detail"])
+            except (ValueError, TypeError):
+                detail = {}
+        failures.append(_failed(ledger, job, detail if isinstance(detail, dict) else {}, config.timezone))
     dead = ledger.db.execute("SELECT COUNT(*) AS n FROM outbox WHERE state='dead'"
                              " AND created_at>=?", (iso(since),)).fetchone()["n"]
     if dead:
@@ -299,3 +299,47 @@ def deliver(ledger: Ledger, config: Config, d: digest.Digest) -> bool:
              d.facts.get("problems", 0), d.facts.get("waiting", 0), d.facts.get("events", "-"),
              d.facts.get("family", "-"))
     return allowed
+
+
+# Why a request didn't happen, in his words, not the ledger's.
+WHY = {
+    "not_found": "I couldn't find that event",
+    "changed": "it changed after you saw it",
+    "stopped": "I was stopped",
+    "off": "changing calendars was off",
+    "interrupted": "the harness restarted first",
+    "expired": "it waited too long for a tap",
+    "calendar_unknown": "it stopped partway, so check the calendar",
+    "calendar_change_impossible": "the calendar refused it",
+    "family_add_off": "adding to Family was off",
+    "family_add_impossible": "Family refused it",
+    "family_unknown": "it stopped partway, so check Family",
+    "unknown": "I don't know if it went through, so check the calendar",
+    "failed": "the calendar refused it",
+}
+
+
+def _failed(ledger: Ledger, job, detail: dict, tz: str) -> str:
+    """What he asked for and when, so the line means something without a job number."""
+    p = ledger.db.execute("SELECT effect_type, params_json FROM proposals WHERE job_id=?"
+                          " ORDER BY created_at DESC LIMIT 1", (job["id"],)).fetchone()
+    what = "a request"
+    if p is not None:
+        try:
+            params = json.loads(p["params_json"])
+            titles = [c["title"] for c in params.get("changes", [])] or [params.get("title", "")]
+            titles = [render.defang(t.strip()[:40]) for t in titles if t and t.strip()]
+            if titles:
+                what = "your change to " + ", ".join(chr(0x201c) + t + chr(0x201d) for t in titles[:3])
+        except (ValueError, AttributeError, KeyError, TypeError):
+            pass
+    t = datetime.fromisoformat(job["created_at"]).astimezone(ZoneInfo(tz))
+    when = f"{t:%a} {t.hour % 12 or 12}:{t:%M} {'AM' if t.hour < 12 else 'PM'}"
+    reason = str(detail.get("reason") or detail.get("outcome") or "")
+    partway = detail.get("steps") or reason in ("calendar_unknown", "family_unknown", "unknown")
+    if partway and reason not in ("calendar_unknown", "family_unknown", "unknown"):
+        reason = "calendar_unknown"            # some of it landed, then it stopped
+    why = WHY.get(reason) or (reason.replace("_", " ") if reason else "it didn't finish")
+    tail = "" if partway else " Nothing changed."
+    done = "only partly went through" if partway else "wasn't done"
+    return f"{what} ({when}) {done}: {why}.{tail}"

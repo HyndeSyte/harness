@@ -26,7 +26,7 @@ from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
 from .family_gmail import FamilyGmail, rules_from_options, school_address_from_options, school_from_options
 from .ledger import Ledger
-from .mirror_shadow import MirrorShadow, read_days
+from .mirror_shadow import read_days
 from .net import CalDavTransport, GoogleTransport, MapTransport, RedactingFilter, UrllibTransport
 from .setup_web import SetupApp, serve
 from .telegram_api import TelegramBotAPI
@@ -71,18 +71,17 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     web = serve(SetupApp(vault, status, requests,
                          family=inbox if base.family_entity else None), port=port)
     executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="worker")
-    # The mirror's shadow needs the feeds read as far as its horizon; the
-    # settings text is read from the vault on every run (never from Config).
+    # Copies to Family and blocks on Gmail need the feeds read well ahead; the
+    # settings that decide it are read on every run.
     calendar = CalendarFeeds(ledger, transport, executor,
                              lambda: vault.get("calendar_feeds"), base.timezone,
                              ahead_days=max(read_days(None), AHEAD_DAYS),
-                             ahead_when=lambda: bool((vault.get("work_mirror") or "").strip()
-                                                     or name_from_options(data_dir)
+                             ahead_when=lambda: bool(name_from_options(data_dir)
                                                      or school_from_options(data_dir)
-                                                     or family_rules.load(ledger)))
+                                                     or family_rules.load(ledger)),
+                             ahead_from=lambda address, start, until: (
+                                 google.window(address, start, until) if google.configured() else None))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
-    mirror = MirrorShadow(ledger, lambda: vault.get("work_mirror"), calendar=calendar,
-                          family=inbox if base.family_entity else None, tz=base.timezone)
     client = caldav.FamilyCalDav(
         CalDavTransport(lambda: caldav.host_of(vault.get("family_calendar_url"))),
         lambda: (vault.get("family_apple_id"), vault.get("family_app_password"),
@@ -102,7 +101,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,
-                            family=inbox if base.family_entity else None, mirror=mirror,
+                            family=inbox if base.family_entity else None, mirror=None,   # retired: the work holds script does it
                             family_add=adds,
                             family_copy=FamilyCopy(ledger, adds, calendar, tz=base.timezone,
                                                    name_fn=lambda: name_from_options(data_dir)),
