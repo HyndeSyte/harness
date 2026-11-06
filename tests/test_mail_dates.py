@@ -185,10 +185,22 @@ def test_the_sync_never_treats_a_note_as_its_block(g):
 def test_a_long_backlog_carries_on_where_it_stopped(g):
     many = [msg(i, f"Order {i} confirmed") for i in range(1, MAX_TO_ENGINE + 6)]
     rig_mail(g, many)
-    read(g)
+    g.md.run(paused=False)                # one read sends at most its cap
     assert len(g.engine.asked) == MAX_TO_ENGINE
     read(g)
     assert len(g.engine.asked) == MAX_TO_ENGINE + 5 and len(set(g.engine.asked)) == MAX_TO_ENGINE + 5
+
+
+def test_a_backlog_reads_on_at_once_then_waits_for_the_clock(g):
+    many = [msg(i, f"Order {i} confirmed") for i in range(1, 2 * MAX_TO_ENGINE + 3)]
+    rig_mail(g, many)
+    for _ in range(6):                 # no clock moves: each read starts as the last one ends
+        g.md.run(paused=False)
+    assert len(g.engine.asked) == 2 * MAX_TO_ENGINE + 2
+    g.box.messages.append(msg(99, "Order 99 confirmed"))
+    g.md.run(paused=False)
+    g.md.run(paused=False)
+    assert "Order 99 confirmed" not in g.engine.asked    # caught up: new mail waits READ_EVERY
 
 
 def test_a_failed_call_is_tried_again_next_read(g):

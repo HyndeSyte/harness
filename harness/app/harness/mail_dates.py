@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 
 HOST = "imap.gmail.com"
 PORT = 993
-READ_EVERY = timedelta(minutes=30)
+READ_EVERY = timedelta(minutes=5)     # a check with no new mail costs nothing
 FIRST_DAYS = 30                       # how far back the first read looks
 MAX_HEADERS = 400                     # message headers looked at per read
 MAX_TO_ENGINE = 10                    # messages sent to the engine per read
@@ -279,6 +279,7 @@ class Read:
     error: str = ""
     stuck_uid: int = 0                     # the message it stopped on, to count its tries
     passed: list | None = None             # messages given up on after MAX_TRIES
+    more: bool = False                     # stopped at a cap with mail left: read again at once
 
 
 class MailDates:
@@ -324,6 +325,8 @@ class MailDates:
             self.ledger.event("mail_dates_failed", {"error": type(e).__name__})
 
     def _due(self) -> bool:
+        if self.ledger.get_meta("mail_more"):
+            return True                            # a backlog waits on no clock
         last = self.ledger.meta_time("mail_read_at")
         return last is None or self.ledger.now() - last >= READ_EVERY
 
@@ -361,6 +364,7 @@ class MailDates:
                     r.script_failed.append(m.sent)
                 elif m.message_id not in seen and picked(m.sender, m.subject):
                     if r.sent_to_engine >= MAX_TO_ENGINE:
+                        r.more = True
                         break
                     try:
                         m.text = box.text_for(m)
@@ -387,6 +391,8 @@ class MailDates:
                     else:
                         r.found += [(m.message_id, m, f) for f in parse_items(out.result.output, today)]
                 r.last_uid = m.uid
+            else:
+                r.more = len(messages) >= MAX_HEADERS
             return r
         except (OSError, imaplib.IMAP4.error, EOFError) as e:
             r.error = "refused" if isinstance(e, imaplib.IMAP4.error) else "unreachable"
@@ -430,6 +436,7 @@ class MailDates:
             self.ledger.set_meta("mail_stuck_tries", str(tries if r.stuck_uid else 0), db)
             for subject in r.passed or []:
                 self.ledger.event("mail_passed", {"subject": subject}, db=db)
+            self.ledger.set_meta("mail_more", "1" if r.more and not r.error else "", db)
             self.ledger.event("mail_read", {"sent": r.sent_to_engine, "found": len(r.found)}, db=db)
         if r.error:
             self.ledger.input_failed("mail", {"refused": "Gmail refused the app password",

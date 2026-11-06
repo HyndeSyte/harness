@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1
+
+- Mail is checked every 5 minutes, not every 30, so a date from new mail lands within minutes.
+- A backlog reads straight through: when a read stops at its cap with mail left, the next one
+  starts at once. The spend per email and the daily caps are unchanged.
+
 ## 0.12.0
 
 - Dates from your mail: with a Gmail app password on the add-on page, the harness reads your
