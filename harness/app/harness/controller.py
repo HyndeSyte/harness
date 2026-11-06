@@ -67,11 +67,13 @@ class Controller:
                  monotonic: Callable[[], float] = time.monotonic,
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
                  poll_timeout: int = 25, calendar=None, family=None, mirror=None,
-                 family_add=None, family_copy=None, family_gmail=None, calendar_change=None):
+                 family_add=None, family_copy=None, family_gmail=None, calendar_change=None,
+                 mail_dates=None):
         self.calendar_change = calendar_change   # changes he asks for (calendar_change.py), or None
         self.family_add = family_add       # the one calendar write (family_add.py), or None
         self.family_copy = family_copy     # Family kept true to Gmail (family_copy.py), or None
         self.family_gmail = family_gmail   # Gmail kept true to Family (family_gmail.py), or None
+        self.mail_dates = mail_dates       # dates from his mail onto Gmail (mail_dates.py), or None
         self.ledger = ledger
         self.vault = vault
         self.api = api
@@ -106,6 +108,8 @@ class Controller:
             self.family_add.bind(owner)
         if self.calendar_change is not None:
             self.calendar_change.bind(owner)
+        if self.mail_dates is not None:
+            self.mail_dates.bind(owner)
         self.runner = Runner(self.ledger, self.config, self.engines, self.executor,
                              sleep=self.sleep, monotonic=self.monotonic,
                              budgets_ok=self._budget_ok, family_add=self.family_add,
@@ -122,7 +126,8 @@ class Controller:
                                              policy_version=self.config.policy_version,
                                              settings_fn=self._settings_decision,
                                              family_add=self.family_add,
-                                             calendar_change=self.calendar_change)
+                                             calendar_change=self.calendar_change,
+                                             mail_dates=self.mail_dates)
 
     def _check_adds(self) -> str:
         words = self.family_add.check_adds()
@@ -266,6 +271,8 @@ class Controller:
             self.family_copy.run(paused=commands.is_paused(self.ledger))
         if self.family_gmail is not None:
             self.family_gmail.run(paused=commands.is_paused(self.ledger))
+        if self.mail_dates is not None:
+            self.mail_dates.run(paused=commands.is_paused(self.ledger))
         if self.mirror is not None and self.mirror.due():
             self.mirror.run()              # shadow only; its own failures are its record
         self._daily(paused)
@@ -466,7 +473,8 @@ class Controller:
                                  self.family_add.digest_line() if self.family_add else "",
                                  self.family_copy.digest_line() if self.family_copy else "",
                                  self.family_gmail.digest_line() if self.family_gmail else "",
-                                 self.calendar_change.digest_line() if self.calendar_change else "")
+                                 self.calendar_change.digest_line() if self.calendar_change else "",
+                                 self.mail_dates.digest_line() if self.mail_dates else "")
                                  if x))
             daily.deliver(self.ledger, cfg, d)
 

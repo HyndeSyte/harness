@@ -26,6 +26,7 @@ from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
 from .family_gmail import FamilyGmail, rules_from_options, school_address_from_options, school_from_options
 from .ledger import Ledger
+from .mail_dates import MailDates, option_on as mail_option_on
 from .mirror_shadow import read_days
 from .net import CalDavTransport, GoogleTransport, MapTransport, RedactingFilter, UrllibTransport
 from .setup_web import SetupApp, serve
@@ -109,7 +110,13 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                             calendar_change=CalendarChange(
                                 ledger, client, google,
                                 enabled=lambda: changes_from_options(data_dir),
-                                address=family_gmail._address, tz=base.timezone))
+                                address=family_gmail._address, tz=base.timezone),
+                            mail_dates=MailDates(
+                                ledger, google, executor, address=family_gmail._address,
+                                password=lambda: "".join((vault.get("gmail_app_password") or "").split()),
+                                engine_fn=lambda: engines.get(policy.engine_for("message")),
+                                writes_on=lambda: mail_option_on(data_dir), tz=base.timezone,
+                                budget_ok=lambda provider: controller._budget_ok(provider)))
     return controller, web, listener
 
 

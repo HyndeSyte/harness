@@ -203,6 +203,17 @@ CREATE TABLE IF NOT EXISTS calendar_changes(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mail_dates(
+  key TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  what TEXT NOT NULL,
+  day TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  batch TEXT,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS family_rules(
   said TEXT PRIMARY KEY,
   kind TEXT NOT NULL,

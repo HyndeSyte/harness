@@ -42,7 +42,7 @@ from . import caldav, calendar_feed, google_cal, workmirror
 # google_service_key: what lets blocks reach his Gmail calendar (google_cal.py).
 FIELDS = ("telegram_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
           "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url",
-          "google_service_key")
+          "google_service_key", "gmail_app_password")
 FAMILY_FIELDS = ("family_apple_id", "family_app_password", "family_calendar_url")
 TEXT_FIELDS = ("work_mirror",)          # several lines; a textarea on the page
 LABELS = {"telegram_bot_token": "Telegram bot token",
@@ -53,7 +53,8 @@ LABELS = {"telegram_bot_token": "Telegram bot token",
           "family_apple_id": "Family calendar: Apple ID",
           "family_app_password": "Family calendar: app-specific password",
           "family_calendar_url": "Family calendar: iCloud calendar address",
-          "google_service_key": "Gmail calendar: Google service account key (the whole file)"}
+          "google_service_key": "Gmail calendar: Google service account key (the whole file)",
+          "gmail_app_password": "Gmail mail: app password (read-only, for dates from your mail)"}
 # Formats are checked loosely: enough to catch a paste of the wrong thing
 # (a URL, a sentence, a key in the wrong box), not a claim about validity.
 PATTERNS = {
@@ -62,6 +63,7 @@ PATTERNS = {
     "openai_api_key": re.compile(r"sk-[A-Za-z0-9_-]{20,250}"),
     "family_apple_id": re.compile(r"[^\s@:]{1,100}@[^\s@:]{1,100}\.[^\s@:]{2,30}"),
     "family_app_password": re.compile(r"[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}"),
+    "gmail_app_password": re.compile(r"[a-z]{4}\s?[a-z]{4}\s?[a-z]{4}\s?[a-z]{4}"),
 }
 PAIRING_TTL_S = 15 * 60
 PAIRING_MAX_FAILURES = 10

@@ -4,7 +4,7 @@
 # It also listens on 8100 for Family calendar pushes from Home Assistant, on
 # the internal add-on network only (no host port is mapped; see family.py).
 name: Harness
-version: "0.11.0"
+version: "0.12.0"
 slug: harness
 description: >-
   One private Telegram thread with Claude and GPT as engines. A small
@@ -34,15 +34,18 @@ timeout: 30
 # The Family events that mean a school day, with ";" between several, for
 # drop-off and pickup blocks (family_gmail.py). Empty leaves that off.
 # Changing events he asks for on Family and Gmail, with no tap (calendar_change.py).
+# Writing dates from his mail onto his Gmail calendar (mail_dates.py). Off: found, not written.
 options:
   family_copy_name: ""
   family_to_gmail: ""
   family_school: ""
   family_school_address: ""
   calendar_changes: false
+  mail_dates: false
 schema:
   family_copy_name: str?
   family_to_gmail: str?
   family_school: str?
   family_school_address: str?
   calendar_changes: bool?
+  mail_dates: bool?

@@ -195,7 +195,8 @@ class CalendarFeeds:
         return res
 
     def _fresh_ahead(self, res: FeedResult, span: tuple[datetime, datetime]) -> None:
-        if self.ahead_from is None or not res.ok or res.ahead is None or res.window is None                 or not res.window.calendar.casefold().endswith("@gmail.com"):
+        if self.ahead_from is None or not res.ok or res.ahead is None or res.window is None \
+                or not res.window.calendar.casefold().endswith("@gmail.com"):
             return
         try:
             fresh = self.ahead_from(res.window.calendar, *span)
@@ -204,6 +205,10 @@ class CalendarFeeds:
             fresh = None
         if fresh is not None:
             res.ahead = fresh
+            log.info("gmail read through google: %d events, %d unreadable", len(fresh.occurrences),
+                     fresh.unreadable)
+        else:
+            log.info("gmail read through google: none, the feed stands")
 
     def read_soon(self, after: timedelta = timedelta(0)) -> None:
         """He changed something, or a removal waits on a second look: read then, not at the usual

@@ -34,8 +34,9 @@ REFUSALS = {
 class Callbacks:
     def __init__(self, ledger: Ledger, api, *, owner_user_id: int, policy_version: str,
                  settings_fn: Callable[[str, str], str] | None = None, family_add=None,
-                 calendar_change=None):
+                 calendar_change=None, mail_dates=None):
         self.calendar_change = calendar_change   # calendar_change.CalendarChange, or None
+        self.mail_dates = mail_dates             # mail_dates.MailDates, or None
         self.ledger = ledger
         self.api = api
         self.owner = owner_user_id
@@ -101,6 +102,8 @@ class Callbacks:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
         if kind == "calendar_change_undo" and self.calendar_change is not None:
             return self.calendar_change.on_choice(kind, target)
+        if kind == "mail_dates_undo" and self.mail_dates is not None:
+            return self.mail_dates.on_choice(kind, target)
         return "Nothing changed."
 
     def _keep_rule(self, target: str) -> str:

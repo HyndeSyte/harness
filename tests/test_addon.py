@@ -36,9 +36,11 @@ def test_config_denies_every_api_and_mapping():
     # One setting that isn't secret, and no key ever: Home Assistant can read and rewrite these.
     text = (ADDON / "config.yaml").read_text()
     assert text.split("options:\n")[1] == ('  family_copy_name: ""\n  family_to_gmail: ""\n  family_school: ""\n'
-                                           '  family_school_address: ""\n  calendar_changes: false\nschema:\n'
+                                           '  family_school_address: ""\n  calendar_changes: false\n'
+                                           '  mail_dates: false\nschema:\n'
                                            "  family_copy_name: str?\n  family_to_gmail: str?\n  family_school: str?\n"
-                                           "  family_school_address: str?\n  calendar_changes: bool?\n")
+                                           "  family_school_address: str?\n  calendar_changes: bool?\n"
+                                           "  mail_dates: bool?\n")
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099"
     assert cfg["panel_admin"] == "true"
     assert cfg["backup"] == "cold"                 # SQLite is copied with the add-on stopped

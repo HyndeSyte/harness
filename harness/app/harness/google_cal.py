@@ -187,6 +187,24 @@ def _body(uid: str, title: str, start: datetime, end: datetime) -> dict:
             "extendedProperties": {"private": dict(MARK)}}
 
 
+NOTE_MARK = {"harness": "mail_dates"}    # a date from his mail (mail_dates.py): never a block
+
+
+def _note_body(uid: str, title: str, day: date) -> dict:
+    """Free, all day, no reminder: it shows the date and holds no time, so nothing reaches work."""
+    return {"id": uid, "summary": title, "status": "confirmed",
+            "start": {"date": day.isoformat()}, "end": {"date": (day + timedelta(days=1)).isoformat()},
+            "visibility": "private", "transparency": "transparent",
+            "reminders": {"useDefault": False},
+            "guestsCanInviteOthers": False, "guestsCanSeeOtherGuests": False,
+            "extendedProperties": {"private": dict(NOTE_MARK)}}
+
+
+def _a_note(event: dict) -> bool:
+    private = (event.get("extendedProperties") or {}).get("private") or {}
+    return bool(_ID_RE.fullmatch(str(event.get("id", "")))) and private.get("harness") == NOTE_MARK["harness"]
+
+
 KEPT_TYPES = frozenset({"default", "outOfOffice", "focusTime", "fromGmail"})   # what the feed has too
 
 
@@ -529,6 +547,67 @@ class GoogleCalendar:
             return Outcome("changed", r.status)
         if r.status == 410:
             return Outcome("gone", r.status)
+        return self._answer(r)
+
+    # -- dates from his mail (mail_dates.py): their own mark, so the sync never sees them -----
+    def add_note(self, address: str, uid: str, title: str, day: date) -> Outcome:
+        """A fixed id, so a lost answer finds itself. "exists": that id can't be used."""
+        url = self._events(address)
+        if url is None or not _ID_RE.fullmatch(uid):
+            return Outcome("failed")
+        token, problem = self._access()
+        if token is None:
+            return problem
+        try:
+            r = self._call(token, "POST", f"{url}?sendUpdates=none", body=_note_body(uid, title, day))
+            if r.status == 200:
+                return Outcome("ok", r.status)
+            if r.status != 409:
+                return self._answer(r)
+            r = self._call(token, "GET", f"{url}/{uid}")
+            found = r.json() if r.status == 200 else None
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        except ValueError:
+            return Outcome("exists")
+        if isinstance(found, dict) and _a_note(found) and found.get("status") != "cancelled":
+            return Outcome("ok", 200)              # the earlier try landed
+        return Outcome("exists")
+
+    def remove_note(self, address: str, uid: str, title: str, day: date) -> Outcome:
+        """Only a note of ours that he hasn't changed: a title or time he edited makes it his."""
+        url = self._events(address)
+        if url is None or not _ID_RE.fullmatch(uid):
+            return Outcome("failed")
+        token, problem = self._access()
+        if token is None:
+            return problem
+        try:
+            r = self._call(token, "GET", f"{url}/{uid}")
+            if r.status in (404, 410):
+                return Outcome("gone", r.status)
+            if r.status != 200:
+                return self._answer(r)
+            found = r.json()
+            if not isinstance(found, dict) or not _a_note(found):
+                return Outcome("changed", r.status)
+            if found.get("status") == "cancelled":
+                return Outcome("gone", r.status)
+            if any(found.get(k) for k in ("description", "location", "attendees")) \
+                    or found.get("transparency") != "transparent" or found.get("summary") != title \
+                    or (found.get("start") or {}).get("date") != day.isoformat():
+                return Outcome("changed", r.status)
+            r = self._call(token, "DELETE", f"{url}/{uid}?sendUpdates=none", etag=found.get("etag"))
+        except TransportError as e:
+            return Outcome("failed" if e.kind == "blocked" else "unknown")
+        except ValueError:
+            return Outcome("unknown")
+        if r.status in (200, 204):
+            return Outcome("ok", r.status)
+        if r.status == 410:
+            return Outcome("gone", r.status)
+        if r.status == 412:
+            return Outcome("changed", r.status)
         return self._answer(r)
 
     def remove(self, address: str, block: Block) -> Outcome:

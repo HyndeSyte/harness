@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.12.0
+
+- Dates from your mail: with a Gmail app password on the add-on page, the harness reads your
+  inbox read-only (nothing marked read, moved or deleted) and finds the dates you have to act
+  on: return windows, deadlines, renewals, appointments. Each one goes on your Gmail calendar
+  as a free all-day entry with no reminder, so it shows in Outlook and never reaches work. One
+  message per batch, with one Undo.
+- Only mail that looks like an order, bill, renewal, appointment or deadline is read past its
+  subject. What the engine pulls out is checked and cleaned here; no link reaches a calendar.
+- Until the mail_dates option is on, dates are found and named in the digest, not written.
+- Google's email about a failed run of the work holds script becomes a digest line.
+- The log says whether each read of your Gmail calendar came straight from Google.
+
 ## 0.11.0
 
 - Your Gmail calendar is read straight from Google for the days ahead, not from the secret
