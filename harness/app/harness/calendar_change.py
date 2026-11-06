@@ -46,6 +46,11 @@ from .ledger import Ledger, iso
 log = logging.getLogger("harness.calendar_change")
 
 UNDO_TTL_S = 7 * 24 * 3600
+CONTEXT_BACK, CONTEXT_AHEAD, CONTEXT_MAX = timedelta(days=90), timedelta(days=60), 6
+_CONTEXT_SKIP = frozenset({"the", "and", "for", "are", "again", "next", "week", "weeks", "every", "with",
+                           "then", "after", "that", "going", "forward", "this", "today", "tomorrow",
+                           "two", "add", "put", "move", "take", "off", "calendar", "recurring", "on",
+                           "from", "until", "each", "our", "his", "her", "him", "she", "you", "your"})
 CHECK_EVERY = timedelta(minutes=30)
 END_AHEAD = timedelta(days=366)        # how far on a series's next day is looked for
 RETURN_AHEAD = timedelta(days=366)     # how far on a day that came back is looked for
@@ -109,6 +114,10 @@ def _safe(text: str) -> str:
     """Text from a calendar, for Telegram. Anyone can put a title on his calendar by invite,
     so it can't be a link or a command."""
     return render.family_text(render.defang(text))
+
+
+_WEEKDAY_WORDS = {"MO": "Monday", "TU": "Tuesday", "WE": "Wednesday", "TH": "Thursday", "FR": "Friday",
+                  "SA": "Saturday", "SU": "Sunday"}
 
 
 def _day_words(day: date) -> str:
@@ -511,6 +520,32 @@ class CalendarChange:
                              *self._span(first, last), bool(e.get("recurringEventId")), first, e, invited))
         return out, 0
 
+    def context_for(self, text: str, now: datetime) -> list[str]:
+        """His Gmail events whose names share a word with his message, so "again" reads as the
+        last one's day, time and place, not as a question. In a worker; nothing raised."""
+        words = {w for w in re.findall(r"[a-z']{3,}", text.casefold())} - _CONTEXT_SKIP
+        if not words or self.google is None or not self.google.configured() or not self.address():
+            return []
+        try:
+            events = self.google.events_between(self.address(), now - CONTEXT_BACK, now + CONTEXT_AHEAD)
+        except Exception as e:                     # a lookup is a help, never a stop
+            log.warning("calendar context failed: %s", type(e).__name__)
+            return []
+        hits = []
+        for e in events or []:
+            title = e.get("summary") or ""
+            if e.get("status") == "cancelled" or not words & set(re.findall(r"[a-z']{3,}", title.casefold())):
+                continue
+            when = self._gmail_when(e.get("start"))
+            end = self._gmail_when(e.get("end"))
+            if not isinstance(when, datetime) or not isinstance(end, datetime):
+                continue
+            place = f" at {e['location'].split(',')[0]}" if e.get("location") else ""
+            series = ", repeats" if e.get("recurringEventId") else ""
+            hits.append((when, f"{render.family_when(when.isoformat(), end.isoformat(), self.tz)}: "
+                               f"{_safe(title)}{place}{series}"))
+        return [line for _, line in sorted(hits)[-CONTEXT_MAX:]]
+
     def _gmail_address(self) -> str:
         if self.google is None or not self.google.configured():
             raise Refuse("the Google key isn't set on the add-on page")
@@ -699,10 +734,14 @@ class CalendarChange:
         self._check_days([start.astimezone(ZoneInfo(self.tz)).date()])
         if c["op"] != "add_series":
             return start, end, ""
+        every = int(c.get("every") or 1)
+        rule = f"FREQ=WEEKLY;BYDAY={c['days']}" + (f";INTERVAL={every}" if every > 1 else "")
+        if not c["until"]:
+            return start, end, rule                # it goes on until he ends it
         until = date.fromisoformat(c["until"])
         self._check_days([until])
         cut = datetime(until.year, until.month, until.day, 23, 59, 59, tzinfo=ZoneInfo(self.tz))
-        return start, end, f"FREQ=WEEKLY;BYDAY={c['days']};UNTIL={cut.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
+        return start, end, f"{rule};UNTIL={cut.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
 
     def _when_words(self, start, end) -> str:
         if not isinstance(start, datetime):
@@ -712,9 +751,14 @@ class CalendarChange:
 
     def _new_words(self, c: dict, start, end) -> str:
         if c["op"] == "add_series":
+            n = int(c.get("every") or 1)
+            every = f"{'other' if n == 2 else str(n) + ' weeks on'} " if n > 1 else ""
+            days = ", ".join(_WEEKDAY_WORDS[d] for d in c["days"].split(","))
+            head = f" every {every}{days}, starting {self._when_words(start, end)}"
+            if not c["until"]:
+                return head + ", going on until you end it"
             until = date.fromisoformat(c["until"])
-            return (f" every {c['days']}, starting {self._when_words(start, end)}, through "
-                    f"{_day_words(until)}, {until.year}")
+            return f"{head}, through {_day_words(until)}, {until.year}"
         return ", " + self._when_words(start, end)
 
     # -- what an event means for him -------------------------------------------------------------

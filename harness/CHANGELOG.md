@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.0
+
+- "Again" reads your calendar instead of asking. When you name something that's on your Gmail
+  calendar, the events with those words are given with your message, so "coffee with Sam
+  again next week" takes the day, time and place from the last one.
+- Your own plans go on your Gmail calendar without a question; the kids and the household go on
+  Family.
+- A series can repeat every two, three or four weeks, and can go on with no end date when you
+  say "going forward".
+
 ## 0.12.4
 
 - A day something doesn't happen (no class, a break, closed) isn't carried from mail.

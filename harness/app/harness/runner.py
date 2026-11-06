@@ -141,9 +141,17 @@ class Runner:
             self.ledger.transition(job["id"], "running", db=db)
             self.ledger.job_set(job["id"], db=db, engine=engine_name, started_at=now)
         self._fired[job["id"]] = [r["id"] for r in fired]
-        self._futures[job["id"]] = self.executor.submit(
-            call_with_retries, engine, system=system, user=user, schema=out_schema,
-            budget_s=policy.JOB_DEADLINE_S - 30, sleep=self.sleep, monotonic=self.monotonic)
+        cc = self.calendar_change if change else None
+        earlier = self._earlier(job)
+
+        def call():
+            # In the worker: what his calendar says about the events he names is a Google read.
+            with_calendar = prompts.user_content(text, earlier=earlier,
+                                                 calendar=cc.context_for(text, now)) if cc else user
+            return call_with_retries(engine, system=system, user=with_calendar, schema=out_schema,
+                                     budget_s=policy.JOB_DEADLINE_S - 30, sleep=self.sleep,
+                                     monotonic=self.monotonic)
+        self._futures[job["id"]] = self.executor.submit(call)
         return True
 
     def _refuse(self, job, reason: str, engine_name: str) -> None:

@@ -227,8 +227,8 @@ def _change_time(text: str, *, day_ok: bool = False) -> bool:
 
 
 def _one_change(c: Any) -> None:
-    # "kind" came with rules; a change written before then has none.
-    if not isinstance(c, dict) or set(c) not in (_CHANGE_KEYS, _CHANGE_KEYS | {"kind"}) \
+    # "kind" came with rules and "every" with repeats; a change written before them has neither.
+    if not isinstance(c, dict) or not _CHANGE_KEYS <= set(c) <= _CHANGE_KEYS | {"kind", "every"} \
             or not all(isinstance(v, str) for v in c.values()):
         raise ParamError("a change has the wrong shape")
     if c["calendar"] not in ("family", "gmail"):
@@ -251,15 +251,19 @@ def _one_change(c: Any) -> None:
         return
     if c.get("kind"):
         raise ParamError(f"{op} doesn't fit kind")
+    if c.get("every", "") not in ("", "1", "2", "3", "4") or (c.get("every") and op != "add_series"):
+        raise ChangeRefusal("I couldn't read how often that repeats")
     days =[x for x in c["dates"].split(",") if x]
     if len(days) > MAX_DATES or not all(_change_date(x) for x in days):
         raise ChangeRefusal("I couldn't read those dates")
     if op in ("remove", "end_series", "move") and not days:
         raise ChangeRefusal("which days isn't clear")
     need = {"remove": ("dates",), "end_series": ("dates",), "move": ("dates", "start", "end"),
-            "add": ("start", "end"), "add_series": ("start", "end", "days", "until")}[op]
+            "add": ("start", "end"), "add_series": ("start", "end", "days")}[op]
     for key in _CHANGE_KEYS - {"calendar", "op", "title", "location"}:
         if key == "days" and op == "end_series":      # only those days of the week, if named
+            continue
+        if key == "until" and op == "add_series":     # empty: it goes on, as he said "going forward"
             continue
         if bool(c[key]) != (key in need):
             raise ParamError(f"{op} doesn't fit {key}")
@@ -277,13 +281,13 @@ def _one_change(c: Any) -> None:
         if end < start or (end == start and "T" in c["start"]):
             raise ChangeRefusal("the end has to be after the start")
     if op == "add_series":
-        if not _DAY_NAMES.fullmatch(c["days"]) or not _change_date(c["until"]):
+        if not _DAY_NAMES.fullmatch(c["days"]) or (c["until"] and not _change_date(c["until"])):
             raise ChangeRefusal("I couldn't read the days or the last date of that series")
         if "T" not in c["start"]:
             raise ChangeRefusal("a series needs a start and end time")
         if ("MO", "TU", "WE", "TH", "FR", "SA", "SU")[start.weekday()] not in c["days"]:
             raise ChangeRefusal("the first day of that series isn't one of its days of the week")
-        if datetime.fromisoformat(c["until"]).date() < datetime.fromisoformat(c["start"]).date():
+        if c["until"] and datetime.fromisoformat(c["until"]).date() < datetime.fromisoformat(c["start"]).date():
             raise ChangeRefusal("that series would end before it starts")
         if datetime.fromisoformat(c["end"]) - datetime.fromisoformat(c["start"]) > timedelta(hours=24):
             raise ChangeRefusal("one day of a series can't run longer than 24 hours")

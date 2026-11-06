@@ -1093,3 +1093,41 @@ def test_a_change_that_stopped_partway_isnt_called_nothing_changed(r):
     assert "Nothing changed" not in line and "check the calendar" in line
     line = daily._failed(r.ledger, job, {"reason": "not_found"}, TZ)
     assert "Nothing changed" in line and "a request (Thu 10:00 AM)" in line
+
+
+# -- "again": what his calendar already says, not a question ------------------------------------
+
+def test_his_calendar_is_given_for_the_events_he_names(r):
+    r.gmail.events["cof1"] = {"id": "cof1", "status": "confirmed", "summary": "Coffee with Sam",
+                              "location": "Corner Cafe, 1 Main St",
+                              "start": {"dateTime": "2026-10-16T08:30:00-04:00"},
+                              "end": {"dateTime": "2026-10-16T10:00:00-04:00"}}
+    r.gmail.events["den1"] = {"id": "den1", "status": "confirmed", "summary": "Dentist",
+                              "start": {"dateTime": "2026-10-20T08:30:00-04:00"},
+                              "end": {"dateTime": "2026-10-20T09:00:00-04:00"}}
+    r.tell(change(calendar="gmail", op="add_series", title="Coffee with Sam",
+                  start="2026-11-13T08:30:00-05:00", end="2026-11-13T10:00:00-05:00", days="FR",
+                  until="", location="Corner Cafe") | {"every": "2"},
+           words="Sam and I are on for coffee again next week, then every two weeks going forward")
+    user = r.claude.calls[-1]["user"]
+    assert "<calendar>" in user and "Coffee with Sam at Corner Cafe" in user and "Dentist" not in user
+    [new] = [e for k, e in r.gmail.events.items() if k.startswith("cm")]
+    assert new["recurrence"] == ["RRULE:FREQ=WEEKLY;BYDAY=FR;INTERVAL=2"]
+    assert "every other Friday" in r.texts()[-1] and "until you end it" in r.texts()[-1]
+
+
+def test_nothing_named_on_his_calendar_gives_no_calendar(r):
+    r.tell(change(op="add", title="Recital", start="2026-12-01T18:00:00-05:00",
+                  end="2026-12-01T19:00:00-05:00"), words="add the recital Dec 1 at 6")
+    assert "<calendar>" not in r.claude.calls[-1]["user"]
+
+
+def test_a_series_repeat_is_only_one_to_four_weeks():
+    from harness.effects import ChangeRefusal, _one_change
+    bad = change(calendar="gmail", op="add_series", title="Coffee", start="2026-11-13T08:30:00-05:00",
+                 end="2026-11-13T10:00:00-05:00", days="FR") | {"every": "9"}
+    with pytest.raises(ChangeRefusal):
+        _one_change(bad)
+    with pytest.raises(ChangeRefusal):
+        _one_change(change(calendar="gmail", op="add", title="Coffee", start="2026-11-13T08:30:00-05:00",
+                           end="2026-11-13T10:00:00-05:00") | {"every": "2"})
