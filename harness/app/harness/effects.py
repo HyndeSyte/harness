@@ -227,12 +227,14 @@ def _change_time(text: str, *, day_ok: bool = False) -> bool:
 
 
 def _one_change(c: Any) -> None:
-    if not isinstance(c, dict) or set(c) != _CHANGE_KEYS or not all(isinstance(v, str) for v in c.values()):
+    # "kind" came with rules; a change written before then has none.
+    if not isinstance(c, dict) or set(c) not in (_CHANGE_KEYS, _CHANGE_KEYS | {"kind"}) \
+            or not all(isinstance(v, str) for v in c.values()):
         raise ParamError("a change has the wrong shape")
     if c["calendar"] not in ("family", "gmail"):
         raise ParamError("a change names an unknown calendar")
     op = c["op"]
-    if op not in ("remove", "end_series", "move", "add", "add_series"):
+    if op not in ("remove", "end_series", "move", "add", "add_series", "rule"):
         raise ParamError("a change has an unknown op")
     for text in (c["title"], c["location"]):
         if len(text) > 200 or not _plain_text(text):
@@ -240,6 +242,15 @@ def _one_change(c: Any) -> None:
                                 "is too long")
     if not _visible(c["title"]):
         raise ChangeRefusal("which event isn't clear")
+    if op == "rule":
+        # What a Family event's name means for him (family_rules.py). No dates, no calendar write.
+        if c["calendar"] != "family" or c.get("kind") not in ("me", "kids", "school", "none"):
+            raise ChangeRefusal("what that event means for you isn't clear")
+        if any(c[k] for k in _CHANGE_KEYS - {"calendar", "op", "title"}):
+            raise ParamError("rule doesn't fit dates or times")
+        return
+    if c.get("kind"):
+        raise ParamError(f"{op} doesn't fit kind")
     days =[x for x in c["dates"].split(",") if x]
     if len(days) > MAX_DATES or not all(_change_date(x) for x in days):
         raise ChangeRefusal("I couldn't read those dates")

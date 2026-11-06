@@ -16,7 +16,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import caldav, drive, family, google_cal, policy
+from . import caldav, drive, family, family_rules, google_cal, policy
 from .calendar_change import CalendarChange, changes_from_options
 from .calendar_feed import CalendarFeeds
 from .config import Config
@@ -78,7 +78,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                              ahead_days=max(read_days(None), AHEAD_DAYS),
                              ahead_when=lambda: bool((vault.get("work_mirror") or "").strip()
                                                      or name_from_options(data_dir)
-                                                     or school_from_options(data_dir)))
+                                                     or school_from_options(data_dir)
+                                                     or family_rules.load(ledger)))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
     mirror = MirrorShadow(ledger, lambda: vault.get("work_mirror"), calendar=calendar,
                           family=inbox if base.family_entity else None, tz=base.timezone)
@@ -94,6 +95,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     family_gmail = FamilyGmail(ledger, adds, calendar, google,
                                rules_fn=lambda: rules_from_options(data_dir),
                                school_fn=lambda: school_from_options(data_dir),
+                               said_fn=lambda: family_rules.load(ledger),
                                drives=drive.Drives(ledger, MapTransport(drive.HOSTS),
                                                    lambda: school_address_from_options(data_dir)),
                                tz=base.timezone)

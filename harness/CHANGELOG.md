@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.0
+
+- Say what a Family event means for you, by its name: "Pat dentist means I have the kids",
+  "Lee - Doctor is mine", "School Day is a school day", or that one means nothing. Gmail, and
+  work from there, follow it from the next read. One receipt and one Undo, like any change.
+- A rule goes by words, so emoji and names in front don't matter. The most words win.
+- Your own Family events get "Busy (family)" on Gmail, unless Gmail already has you busy then.
+- The digest names Family events coming up in the next two weeks with no rule yet, five at
+  most, until you say what they mean.
+- The add-on's title settings still work. A rule you say comes first.
+
 ## 0.9.1
 
 - Undo checks every calendar before it writes anything, so it no longer undoes one calendar and

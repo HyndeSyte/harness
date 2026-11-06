@@ -203,6 +203,11 @@ CREATE TABLE IF NOT EXISTS calendar_changes(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS family_rules(
+  said TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS calendar_removed(
   calendar TEXT NOT NULL,
   uid TEXT NOT NULL,

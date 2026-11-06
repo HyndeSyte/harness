@@ -38,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from . import caldav, choices, commands, effects, google_cal, ical, ics_edit, render
+from . import caldav, choices, commands, effects, family_rules, google_cal, ical, ics_edit, render
 from .canonical import canonical_hash
 from .family_add import _looks_pasted
 from .ledger import Ledger, iso
@@ -71,6 +71,10 @@ WORDS = {"unknown": "the answer was lost or the server had an error, so it may o
          "no_key": "the Google key isn't set on the add-on page",
          "denied": "Google says this calendar isn't shared for changes",
          "exists": "that one is already there"}
+RULE_WORDS = {"me": "are yours: Busy on Gmail and at work, unless you're already busy then",
+              "kids": "mean you have the kids: Busy (watching kids) on Gmail and at work",
+              "school": "are school days: drop-off and pickup runs on Gmail and at work",
+              "none": "don't tie you up: nothing on Gmail, and I won't ask about them"}
 
 
 def changes_from_options(data_dir: str) -> bool | None:
@@ -569,6 +573,8 @@ class CalendarChange:
     # -- working out what to write -------------------------------------------------------------
     def _plan(self, c: dict, key: str) -> tuple[list[Step], list[str]]:
         calendar, op = c["calendar"], c["op"]
+        if op == "rule":
+            return [self._rule(c)], []
         if calendar == "gmail":
             self._gmail_address()
         if op in ("add", "add_series"):
@@ -706,6 +712,24 @@ class CalendarChange:
             return (f" every {c['days']}, starting {self._when_words(start, end)}, through "
                     f"{_day_words(until)}, {until.year}")
         return ", " + self._when_words(start, end)
+
+    # -- what an event means for him -------------------------------------------------------------
+    def _rule(self, c: dict) -> Step:
+        said, kind = c["title"].strip(), c["kind"]
+        if not family_rules.words(said):
+            raise Refuse("which event isn't clear")
+        if not family_rules.room(self.ledger, said, kind):
+            raise Refuse(f"there are already {family_rules.MAX_RULES} of these. Say one of them means "
+                         "nothing to make room")
+
+        def run() -> dict:
+            before = family_rules.find(self.ledger, said)
+            with self.ledger.tx() as db:
+                family_rules.put(self.ledger, said, kind, db)
+            return {"cal": "rule", "how": "rule", "said": said,
+                    "before": [before.said, before.kind] if before else None}
+        return Step(f"From now on, Family events called {_safe(said)} {RULE_WORDS[kind]}. It takes "
+                    "effect at the next read of Family, within half an hour.", run)
 
     # -- Family --------------------------------------------------------------------------------
     def _family_fetch(self, href: str) -> tuple[str, str]:
@@ -1025,7 +1049,16 @@ class CalendarChange:
         """One event however a step names it: one day of a Gmail series is part of the series."""
         if step["cal"] == "family":
             return "family:" + caldav.href_path(step["href"])
+        if step["cal"] == "rule":
+            return "rule:" + " ".join(sorted(family_rules.words(step["said"])))
         return "gmail:" + (step.get("series") or _gmail_series(step["id"]) or step["id"])
+
+    @staticmethod
+    def _object_key(step: dict) -> str:
+        """One thing with its own version: a Gmail series and its days are separate here."""
+        if step["cal"] == "family":
+            return caldav.href_path(step["href"])
+        return step["id"] if step["cal"] == "gmail" else CalendarChange._event_key(step)
 
     def _later_changes(self, row, steps: list) -> list[str]:
         """Later changes still standing on the same events, which have to go first, and any
@@ -1067,8 +1100,8 @@ class CalendarChange:
                 (row["proposal_id"],)).fetchall():
             steps, moved = json.loads(other["undo_json"]), False
             for step in steps:
-                key = caldav.href_path(step["href"]) if step["cal"] == "family" else step.get("id")
-                if key in latest and latest[key]:
+                key = self._object_key(step)
+                if step["cal"] != "rule" and key in latest and latest[key]:
                     step["etag"], moved = latest[key], True
             if moved:
                 db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
@@ -1078,9 +1111,8 @@ class CalendarChange:
         """Each event as the last step of this change left it, read before anything is written."""
         seen: set[str] = set()
         for step in reversed(steps):
-            # A Gmail series and its days are separate objects here, each with its own version.
-            key = caldav.href_path(step["href"]) if step["cal"] == "family" else step["id"]
-            if key in seen:
+            key = self._object_key(step)
+            if step["cal"] == "rule" or key in seen:
                 continue                     # an earlier step on it is checked once the later one runs
             seen.add(key)
             problem = (self._gmail_ready if step["cal"] == "gmail" else self._family_ready)(step)
@@ -1129,6 +1161,12 @@ class CalendarChange:
         return "series_gone" if kind == "gone" or (cur or {}).get("status") == "cancelled" else "ok"
 
     def _undo_step(self, step: dict, latest: dict[str, str]) -> str:
+        if step["cal"] == "rule":
+            with self.ledger.tx() as db:     # put back what it said before, or nothing
+                family_rules.put(self.ledger, step["said"], None, db)
+                if step["before"]:
+                    family_rules.put(self.ledger, step["before"][0], step["before"][1], db)
+            return "ok"
         return (self._undo_gmail if step["cal"] == "gmail" else self._undo_family)(step, latest)
 
     def _undo_family(self, step: dict, latest: dict[str, str]) -> str:

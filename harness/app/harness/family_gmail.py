@@ -35,11 +35,12 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from . import caldav, calendar_feed, drive, google_cal, ical
+from . import caldav, calendar_feed, drive, family_rules, google_cal, ical, render
 from .family_copy import (_SKIP, _STAY, AHEAD_DAYS, GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE,
                           READS_BEFORE_REMOVING, _same)
 from .ledger import Ledger, iso
@@ -57,6 +58,9 @@ PICK_BEFORE, PICK_AFTER = timedelta(minutes=15), timedelta(minutes=30)
 TO_SCHOOL = timedelta(minutes=15)   # a run starts when he leaves, so he's there this much later
 NEAR_RUN = timedelta(hours=3)       # an event further from a run than this can't get in its way
 NOTE_AHEAD = timedelta(days=14)     # how far ahead a missing address is worth a word
+ASK_AHEAD = timedelta(days=14)      # how far ahead an event with no rule is worth asking about
+MAX_ASKED = 5
+MAX_ASKED_TITLE = 40
 MAX_TITLE = 60
 PROBLEM = "family_gmail_problem"
 PROVEN = "family_gmail_proven"
@@ -134,16 +138,30 @@ class Want:
     title: str
     start: datetime
     end: datetime
+    kind: str = ""                 # "me": only if Gmail doesn't already have him busy
 
 
-def school_plan(items: list[caldav.Item], titles: tuple[str, ...]) -> dict[str, Want]:
+def _short(title: str) -> str:
+    """A title for the digest: no invisible characters, and not long enough to crowd it out."""
+    text = "".join(ch for ch in title if unicodedata.category(ch) != "Cf").strip()
+    return text if len(text) <= MAX_ASKED_TITLE else text[:MAX_ASKED_TITLE - 1].rstrip() + "\u2026"
+
+
+def _said_kind(occ: ical.Occurrence, said: tuple) -> str | None:
+    """What he said this event means, if he did. That comes before the add-on's settings."""
+    rule = family_rules.pick(occ.summary, said)
+    return rule.kind if rule else None
+
+
+def school_plan(items: list[caldav.Item], titles: tuple[str, ...], said: tuple = ()) -> dict[str, Want]:
     """Each school day's two runs: there and back around the start, and around the end.
     Family says which days, so a closed day or a moved start needs nothing here."""
     wants = []
     for item in items:
         occ: ical.Occurrence = item.occ
-        if occ.summary.strip().casefold() not in titles or occ.all_day or occ.end <= occ.start \
-                or occ.uid.startswith("hx-"):
+        kind = _said_kind(occ, said)
+        school = kind == "school" if kind else occ.summary.strip().casefold() in titles
+        if not school or occ.all_day or occ.end <= occ.start or occ.uid.startswith("hx-"):
             continue
         for run, title, start, end in (("drop", DROP_TITLE, occ.start - DROP_BEFORE, occ.start + DROP_AFTER),
                                        ("pick", PICK_TITLE, occ.end - PICK_BEFORE, occ.end + PICK_AFTER)):
@@ -176,19 +194,40 @@ def _ties_him_up(occ: ical.Occurrence, want: Want, tz: str) -> bool:
     return not occ.transparent and occ.start < want.start + TO_SCHOOL and occ.end > want.start
 
 
-def plan(items: list[caldav.Item], rules: tuple[Rule, ...]) -> dict[str, Want]:
-    """What Gmail should hold, from Family alone. A title comes only from a rule."""
+def plan(items: list[caldav.Item], rules: tuple[Rule, ...], said: tuple = ()) -> dict[str, Want]:
+    """What Gmail should hold, from Family alone. A title comes only from a rule: fixed words
+    for what he said, or the one in the add-on's settings."""
     titles = {r.family: r.title for r in rules}
     out: dict[str, Want] = {}
     for item in items:
         occ: ical.Occurrence = item.occ
-        title = titles.get(occ.summary.strip().casefold())
+        kind = _said_kind(occ, said)
+        title = family_rules.TITLES.get(kind) if kind else titles.get(occ.summary.strip().casefold())
         if title is None or occ.all_day or occ.uid.startswith("hx-") or occ.end <= occ.start:
             continue
         # A moved day keeps its series and its place in it, so it keeps its block.
         key = hashlib.sha256(f"{occ.uid}|{occ.instance}".encode()).hexdigest()[:32]
-        out[key] = Want(key, title, occ.start, occ.end)
+        out[key] = Want(key, title, occ.start, occ.end, kind or "")
     return out
+
+
+def unruled(items: list[caldav.Item], rules: tuple[Rule, ...], school: tuple[str, ...], said: tuple,
+            now: datetime, until: datetime) -> list[tuple[str, datetime]]:
+    """Family events coming up that no rule covers, soonest first, each title once. Timed only:
+    a birthday doesn't tie him up. Not a copy of his own, and not a hold or block."""
+    covered = {r.family for r in rules} | set(school)
+    first: dict[frozenset, tuple[str, datetime]] = {}
+    for item in items:
+        occ: ical.Occurrence = item.occ
+        if occ.all_day or occ.uid.startswith("hx-") or not now <= occ.start < until or occ.transparent \
+                or not _is_real(occ) or not family_rules.words(occ.summary):
+            continue
+        if _said_kind(occ, said) or occ.summary.strip().casefold() in covered:
+            continue
+        key = family_rules.words(occ.summary)
+        if key not in first or occ.start < first[key][1]:
+            first[key] = (occ.summary.strip(), occ.start)
+    return sorted(first.values(), key=lambda x: x[1])
 
 
 def _intent(title: str, start: datetime, end: datetime) -> str:
@@ -206,8 +245,10 @@ def _was_sent(intent: str, block: google_cal.Block) -> bool:
 
 class FamilyGmail:
     def __init__(self, ledger: Ledger, family_add, calendar, google: google_cal.GoogleCalendar,
-                 *, rules_fn=lambda: (), school_fn=lambda: (), drives=None, tz: str):
+                 *, rules_fn=lambda: (), school_fn=lambda: (), said_fn=lambda: (), drives=None, tz: str):
         self.school_fn = school_fn         # the Family titles that mean a school day
+        self.said_fn = said_fn             # what he's said Family events mean (family_rules.py)
+        self.asking: list[tuple[str, datetime]] = []
         self.drives = drives               # drive times, once the school's address is entered
         self.ledger = ledger
         self.fa = family_add
@@ -220,7 +261,7 @@ class FamilyGmail:
 
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
-        if not (self.rules_fn() or self.school_fn()):
+        if not (self.rules_fn() or self.school_fn() or self.said_fn()):
             return ("Blocks on Gmail from Family: off. Nothing is named in the add-on's settings, "
                     "or what's there can't be read.")
         if not self.google.configured():
@@ -246,7 +287,24 @@ class FamilyGmail:
                 parts.append(f"{n} {label}")
         line = "Blocks on Gmail from Family: " + ", ".join(parts) + "." if parts else ""
         problem = self.ledger.get_meta(PROBLEM)
-        return " ".join(x for x in (line, problem) if x)
+        return " ".join(x for x in (line, problem, self._ask_line()) if x)
+
+    def _ask_line(self) -> str:
+        """Titles come from Family, which anyone with it can write, so they're defanged. The digest
+        escapes them."""
+        before = family_rules.asked(self.ledger)
+        new = [(t, w) for t, w in self.asking if " ".join(sorted(family_rules.words(t))) not in before]
+        if not new:
+            return ""
+        zone = ZoneInfo(self.tz)
+        shown = new[:MAX_ASKED]
+        family_rules.mark_asked(self.ledger, [t for t, _ in shown])
+        named = [f"{render.defang(_short(t))} ({w.astimezone(zone):%b} {w.astimezone(zone).day})"
+                 for t, w in shown]
+        more = f", and {len(new) - MAX_ASKED} more another day" if len(new) > MAX_ASKED else ""
+        return ("On Family with no rule yet: " + ", ".join(named) + more + ". If one ties you up, "
+                "tell me, like \"Pat dentist means I have the kids\". If not, say it means nothing "
+                "and I'll stop asking.")
 
     # -- each tick -------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
@@ -256,7 +314,7 @@ class FamilyGmail:
             return
         self._seen = gen
         try:
-            if not paused and self.fa.enabled() and (self.rules_fn() or self.school_fn()) \
+            if not paused and self.fa.enabled() and (self.rules_fn() or self.school_fn() or self.said_fn()) \
                     and self.google.configured():
                 self._sync()
         except Exception as e:
@@ -290,13 +348,15 @@ class FamilyGmail:
         if blocks is None:
             self._problem(self._said(why))
             return
-        named = plan(family.items, rules)
+        said = self.said_fn()
+        named = self._not_busy(plan(family.items, rules, said))
         wants = {k: w for k, w in {**named, **self._school_runs(family.items)}.items() if w.end > now}
+        self.asking = unruled(family.items, rules, self.school_fn(), said, now, now + ASK_AHEAD)
         self.writes = self._writes_today()
         problem = self._follow(address, wants, {b.id: b for b in blocks}, now, until,
                                family.unreadable == 0, self._thin(len(family.items) - len(named)))
         added = self._add_new(address, wants)
-        self._problem(problem or added or self.school_note)
+        self._problem(problem or added or self.school_note or self.me_note)
 
     def _school_runs(self, items: list[caldav.Item]) -> dict[str, Want]:
         """The runs that are his. With no read of his calendar, what's there stays and nothing
@@ -304,7 +364,7 @@ class FamilyGmail:
         the rest still counts, or one odd old event would stop new blocks for good: what's there
         stays, and a block too many only shows him busy."""
         self.school_note = ""
-        runs = school_plan(items, self.school_fn())
+        runs = school_plan(items, self.school_fn(), self.said_fn())
         if not runs:
             return {}
         ahead = next((res.ahead for res in self.calendar.snapshot.feeds.values() if res.window is not None
@@ -327,6 +387,25 @@ class FamilyGmail:
         if ahead.unreadable:
             return {**free, **{k: w for k, w in runs.items() if k in live}}
         return free
+
+    def _not_busy(self, wants: dict[str, Want]) -> dict[str, Want]:
+        """His own Family events, less those Gmail already has him busy for: he often puts them
+        on both. With no read of Gmail, the ones already there stay and nothing is added."""
+        self.me_note = ""
+        mine = {k for k, w in wants.items() if w.kind == "me"}
+        if not mine:
+            return wants
+        ahead = next((res.ahead for res in self.calendar.snapshot.feeds.values() if res.window is not None
+                      and res.window.calendar.casefold().endswith("@gmail.com")), None)
+        live = {r["key"] for r in self._live()}
+        if ahead is None or not ahead.occurrences or ahead.unreadable:
+            # Not knowing whether he's busy isn't knowing he's free, so nothing is added or taken.
+            self.me_note = ("Blocks on Gmail from Family: couldn't read all of your Gmail calendar, so "
+                            "your own Family events didn't change.")
+            return {k: w for k, w in wants.items() if k not in mine or k in live}
+        return {k: w for k, w in wants.items() if k not in mine or not any(
+            _is_real(o) and not o.all_day and not o.transparent and o.start <= w.start and o.end >= w.end
+            for o in ahead.occurrences)}
 
     def _too_far(self, occ: ical.Occurrence, want: Want) -> bool:
         """An event before or after a run that he can't get to or from in time. With no answer
