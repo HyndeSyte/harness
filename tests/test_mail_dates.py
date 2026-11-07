@@ -68,7 +68,8 @@ def rig_mail(g, messages, answers=None, writes=True):
     g.writes = writes
     g.md = MailDates(g.ledger, g.client, SyncExecutor(), address=lambda: GMAIL,
                      password=lambda: "abcdefghijklmnop", engine_fn=lambda: g.engine,
-                     writes_on=lambda: g.writes, tz=TZ, mailbox=g.box, sleep=lambda s: None)
+                     writes_on=lambda: g.writes, tz=TZ, mailbox=g.box, sleep=lambda s: None,
+                     family=g.fa.client)
     g.md.bind(1)
     return g
 
@@ -468,3 +469,46 @@ def test_a_note_he_moved_himself_isnt_added_again_when_the_email_comes(g):
                                                    "rescheduled": True}]
     read(g)
     assert [e["start"]["date"] for e in g.google.live().values()] == ["2026-11-20"]
+
+
+# -- already on his calendar, whatever it's called -------------------------------------------------
+
+def test_a_booking_at_the_time_of_his_own_event_isnt_added(g):
+    rig_mail(g, [msg(1, "Thanks for Booking")],
+             {"Thanks for Booking": [{"what": "Counseling session, 8:00am", "date": "2026-11-09",
+                                      "kind": "appointment", "time": "08:00"}]})
+    g.google.events["his1"] = {"id": "his1", "iCalUID": "his1@google.com", "status": "confirmed",
+                               "etag": g.google._etag(), "eventType": "default", "summary": "Therapy",
+                               "start": {"dateTime": "2026-11-09T08:00:00-05:00"},
+                               "end": {"dateTime": "2026-11-09T09:00:00-05:00"}}
+    read(g)
+    assert [e["summary"] for e in g.google.live().values()] == ["Therapy"]
+
+
+def test_a_school_event_on_family_isnt_added(g):
+    from fake_caldav import FAMILY_PATH
+    g.icloud.seed(FAMILY_PATH + "skate.ics", "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:skate", "DTSTAMP:20261101T120000Z",
+        "DTSTART:20261120T180000Z", "DTEND:20261120T200000Z", "SUMMARY:Skating trip",
+        "END:VEVENT", "END:VCALENDAR", ""]))
+    rig_mail(g, [msg(1, "Learning Center Update")],
+             {"Learning Center Update": [{"what": "Field trip: roller skating at the rink",
+                                          "date": "2026-11-20", "kind": "event", "time": ""}]})
+    read(g)
+    assert g.google.live() == {}
+
+
+def test_a_time_that_isnt_a_time_is_dropped():
+    [f] = parse_items({"items": [{"what": "Thing", "date": "2026-11-20", "kind": "event",
+                                  "time": "8am", "rescheduled": False}]}, date(2026, 11, 6))
+    assert f.at == ""
+
+
+def test_a_ledger_from_before_gets_the_time_column(tmp_path):
+    from harness.ledger import Ledger
+    path = str(tmp_path / "old.db")
+    old = Ledger(path)
+    old.db.execute("ALTER TABLE mail_dates DROP COLUMN at")
+    old.db.close()
+    again = Ledger(path)
+    assert "at" in {r[1] for r in again.db.execute("PRAGMA table_info(mail_dates)")}

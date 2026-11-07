@@ -212,7 +212,8 @@ CREATE TABLE IF NOT EXISTS mail_dates(
   state TEXT NOT NULL,
   event_id TEXT NOT NULL,
   batch TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  at TEXT
 );
 CREATE TABLE IF NOT EXISTS family_rules(
   said TEXT PRIMARY KEY,
@@ -302,6 +303,10 @@ class Ledger:
         elif int(cur) != SCHEMA_VERSION:
             raise LedgerError(f"ledger schema {cur}, code expects {SCHEMA_VERSION}")
         self._rules_need_a_tap()
+        # 0.13.2: the time a date from mail is at, if it has one. Added, never required, so an
+        # older add-on opening this file just doesn't read it.
+        if "at" not in {r[1] for r in self.db.execute("PRAGMA table_info(mail_dates)")}:
+            self.db.execute("ALTER TABLE mail_dates ADD COLUMN at TEXT")
 
     def _rules_need_a_tap(self) -> None:
         """Once, on the first open by 0.5.1 or later: rules stored before his tap existed

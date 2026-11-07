@@ -116,6 +116,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 password=lambda: "".join((vault.get("gmail_app_password") or "").split()),
                                 engine_fn=lambda: engines.get(policy.engine_for("message")),
                                 writes_on=lambda: mail_option_on(data_dir), tz=base.timezone,
+                                family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)))
     return controller, web, listener
 

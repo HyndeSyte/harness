@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.2
+
+- What's already on your calendar is checked on Family as well as Gmail, and a date with a time
+  counts as there when anything starts at that time, whatever it's called: a booking for a
+  session you have as "Therapy", or a school event copied to Gmail as "Busy (family)".
+- Bills, statements and loan or card payments are left out (they're on autopay), unless the
+  email says a payment failed, is past due or must be made by hand. Renewals that happen on
+  their own are left out; a yearly subscription you could cancel stays. The routine "fill out
+  your forms" in a booking is left out.
+- The last 30 days are read again under these rules.
+
 ## 0.13.1
 
 - A date that moves follows the email: when a new email says an appointment or deadline was
