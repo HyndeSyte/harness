@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.4
+
+- A date from mail counts as already on your calendar when a word matches in another form:
+  a "Skate Center" trip is the "Skating" outing you already have.
+
 ## 0.13.3
 
 - Left out of dates from mail: offers and memberships to claim (even marked "action

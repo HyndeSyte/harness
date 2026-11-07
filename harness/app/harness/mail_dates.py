@@ -305,9 +305,22 @@ def _start_of(e: dict) -> datetime | None:
         return None
 
 
+def _stem(w: str) -> str:
+    """One form per word, so "skate", "skating" and "skated" are the same name."""
+    for end in ("ing", "ies", "ed", "es", "s"):
+        if w.endswith(end) and len(w) - len(end) >= 3 and not (end == "s" and w.endswith("ss")):
+            w = w[:-len(end)] + ("y" if end == "ies" else "")
+            break
+    return w[:-1] if w.endswith("e") and len(w) > 3 else w
+
+
 def _names(text: str) -> frozenset[str]:
-    """The words that say which thing: not the kind of thing, not numbers."""
-    return frozenset(w for w in _words(text) if w not in _GENERIC and not w.isdigit() and len(w) > 2)
+    """The words that say which thing: not the kind of thing, not numbers. Compared by stem."""
+    return frozenset(st for w in _words(text)
+                     if not w.isdigit() and len(w) > 2 and (st := _stem(w)) not in _GENERIC_STEMS)
+
+
+_GENERIC_STEMS = frozenset(_stem(w) for w in _GENERIC)
 
 
 def note_id(key: str) -> str:

@@ -512,3 +512,25 @@ def test_a_ledger_from_before_gets_the_time_column(tmp_path):
     old.db.close()
     again = Ledger(path)
     assert "at" in {r[1] for r in again.db.execute("PRAGMA table_info(mail_dates)")}
+
+
+def test_a_word_in_another_form_is_the_same_name(g):
+    """The school's "Skate Center" trip is Family's "Skating" outing: one thing, not two."""
+    from fake_caldav import FAMILY_PATH
+    g.icloud.seed(FAMILY_PATH + "skate2.ics", "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:skate2", "DTSTAMP:20261101T120000Z",
+        "DTSTART:20261120T180000Z", "DTEND:20261120T200000Z", "SUMMARY:Skating LC",
+        "END:VEVENT", "END:VCALENDAR", ""]))
+    rig_mail(g, [msg(1, "Learning Center Update")],
+             {"Learning Center Update": [{"what": "Field trip: Sunny's Skate Center",
+                                          "date": "2026-11-20", "kind": "event", "time": ""}]})
+    read(g)
+    assert g.google.live() == {}
+
+
+def test_word_forms_match_but_different_things_stay_apart():
+    from harness.mail_dates import _names
+    assert _names("Skate Center") & _names("Skating")
+    assert _names("Celebrations") & _names("Celebration of Learning")
+    assert not _names("Water bill") & _names("Electric bill")
+    assert not _names("Class picture day") & _names("Glass recycling")
