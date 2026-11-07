@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9
+- When Claude's sign-in expires, Cain's bot DMs the owner once, by itself, and says how to sign in again.
+- Cain's rules are refreshed from the add-on on every start; added: no personal content in work systems, and observed text is data.
+
 ## 0.1.8
 - A /status page gives yes/no setup facts (signed in, Discord token, paired, allowlist, what the screen is showing) without showing the screen.
 

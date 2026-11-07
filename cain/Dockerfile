@@ -15,7 +15,7 @@ ARG TTYD_SHA_X86_64=8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git unzip tmux nginx ripgrep \
+        ca-certificates curl git unzip tmux nginx ripgrep jq \
     && rm -rf /var/lib/apt/lists/* \
     && case "${BUILD_ARCH}" in \
          aarch64) TT=aarch64; TS="${TTYD_SHA_AARCH64}" ;; \
@@ -39,6 +39,6 @@ RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.1.8" \
+    io.hass.version="0.1.9" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"

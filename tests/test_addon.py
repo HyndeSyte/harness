@@ -198,6 +198,19 @@ def test_cain_status_gives_facts_not_the_screen():
     assert "$screen" not in status and "$last" not in status
     assert status.count("$(flag ") == 4 and '"$state"' in status
     states = {line.split("state=")[1].split(";")[0].strip() for line in run.splitlines() if "state=" in line and "then state=" in line}
-    assert states == {"waiting_for_code", "trust_prompt", "first_run_menu", "ready"}
+    assert states == {"login_needed", "waiting_for_code", "trust_prompt", "first_run_menu", "ready"}
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     assert "location = /status {" in nginx and "alias /tmp/status.json;" in nginx
+
+
+def test_cain_tells_the_owner_once_when_its_signin_expires():
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    assert 'state" = login_needed ] && [ ! -f /data/alerted-login ]' in run
+    assert "touch /data/alerted-login" in run and "rm -f /data/alerted-login" in run
+    alert = (CAIN / "rootfs/opt/cain/alert.sh").read_text()
+    code = "\n".join(l for l in alert.splitlines() if not l.strip().startswith("#"))
+    # The token is only written to a private header file, then dropped.
+    assert code.count("$token") == 2 and "umask 077" in code and "unset token" in code
+    assert code.index("unset token") < code.index("curl ")
+    assert '-H "@$hdr"' in code and "set -x" not in code
+    assert " jq " in (CAIN / "Dockerfile").read_text()

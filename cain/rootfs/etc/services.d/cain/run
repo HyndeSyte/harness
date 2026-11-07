@@ -6,9 +6,8 @@
 # ==============================================================================
 export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
 mkdir -p /data/work
-if [ ! -f /data/work/CLAUDE.md ]; then
-  cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
-fi
+# Cain's standing rules ship with the add-on, so an update always brings them.
+cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
 if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
   bashio::log.info "Installing the Discord channel plugin"
   claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"
@@ -47,7 +46,9 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     paired() { tr -d ' \n' < /data/.claude/channels/discord/access.json | grep -q '"allowFrom":\["'; }
     last=$(printf '%s\n' "$screen" | tail -n 30)
     state=unknown
-    if printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
+    # Only the bottom lines: Cain may talk about sign-in in its own replies.
+    if printf '%s\n' "$last" | tail -n 12 | grep -Eqi 'run /login|token has expired|authentication_error|invalid api key|not logged in'; then state=login_needed
+    elif printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
     elif printf '%s' "$last" | grep -Eqi 'do you trust|trust the files'; then state=trust_prompt
     elif printf '%s' "$last" | grep -Eqi 'select login|login method|choose the text style|dark mode'; then state=first_run_menu
     elif printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode'; then state=ready
@@ -58,6 +59,18 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
       "$(flag paired)" \
       "$(flag grep -Eq '"dmPolicy": *"allowlist"' /data/.claude/channels/discord/access.json)" \
       "$state" > /tmp/status.tmp && mv /tmp/status.tmp /tmp/status.json || true
+    # When Claude's sign-in runs out, Cain can't answer, so the bot says so
+    # itself, once, until Cain is ready again.
+    if [ "$state" = login_needed ] && [ ! -f /data/alerted-login ]; then
+      if /opt/cain/alert.sh "Cain can't answer: its Claude sign-in has expired. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code in the box."; then
+        touch /data/alerted-login
+        bashio::log.warning "Sign-in expired; told the owner in Discord"
+      else
+        bashio::log.error "Sign-in expired, and the Discord alert failed"
+      fi
+    elif [ "$state" = ready ]; then
+      rm -f /data/alerted-login
+    fi
     if [ -n "$url" ]; then
       safe=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/"/%22/g; s/</%3C/g')
       printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /tmp/signin.tmp && mv /tmp/signin.tmp /tmp/signin.html || true
