@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.3
+
+- Left out of dates from mail: offers and memberships to claim (even marked "action
+  required"), the standard "report damage within N days" in a delivery email, and a lender
+  asking for proof of insurance. The last 30 days are read again.
+
 ## 0.13.2
 
 - What's already on your calendar is checked on Family as well as Gmail, and a date with a time

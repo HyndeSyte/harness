@@ -79,7 +79,7 @@ _GENERIC = frozenset({"pay", "bill", "due", "payment", "renews", "renewal", "ren
                       "date", "service", "plan", "policy", "account", "online", "form", "session",
                       "before", "with", "drop", "off", "at", "in", "is", "be", "auto"})
 MOVED = "moved"                       # a found row's batch while it waits: the email reschedules it
-RULES = "3"                           # what's found under older rules is found again under these
+RULES = "4"                           # what's found under older rules is found again under these
 SCRIPT_SENDER = "apps-scripts-notifications@google.com"
 _SPACE = re.compile(r"\s+")
 
@@ -109,7 +109,10 @@ statements and loan or card payments: he pays those on autopay. List one only wh
 says a payment failed, is past due, or must be made by hand (a check, or a link to pay). Leave \
 out renewals that happen on their own, like insurance; keep a yearly subscription he could \
 cancel before it charges. Leave out the routine "fill out your forms before your visit" in a \
-booking. A school or group update can carry real dates \
+booking. Leave out an offer, membership, reward or deal to claim, even when the subject says \
+"action required". Leave out the standard "report damage or a missing item within N days" in \
+a delivery or order email. Leave out a lender or mortgage servicer asking for an insurance \
+policy or proof of coverage: his insurer sends it. A school or group update can carry real dates \
 (registration closes, an event): list those. A day something doesn't happen (no class, a \
 break, closed) is not a date: leave it out. If a date is "within 30 days of delivery" and the \
 delivery \
