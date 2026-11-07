@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.5
+- Fix: the Cain page gave 500 (nginx looked for the page under the wrong name).
+
 ## 0.1.4
 - The sign-in button is on the Cain page itself, above the terminal, while a sign-in waits for its code. A direct /signin address is refused by Home Assistant (401) outside the page.
 
