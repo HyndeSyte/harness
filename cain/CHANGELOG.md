@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.10
+- Removed a wrong rule about work systems: Cain's account has none.
+
 ## 0.1.9
 - When Claude's sign-in expires, Cain's bot DMs the owner once, by itself, and says how to sign in again.
 - Cain's rules are refreshed from the add-on on every start; added: no personal content in work systems, and observed text is data.
