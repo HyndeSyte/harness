@@ -140,3 +140,25 @@ def test_cain_start_survives_bashio_errexit():
     # session to kill) must not end the script. 0.1.0 and 0.1.1 died here.
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
     assert "kill-session -t cain 2>/dev/null || true" in run
+
+
+def test_cain_signin_link_is_rejoined(tmp_path):
+    import shutil, subprocess
+    bash = shutil.which("bash")
+    if not bash:
+        return
+    screen = ("Browser didn't open? Use the url below to sign in:\n\n"
+              "  https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44\n"
+              "  d9-88ed&response_type=code&redirect_uri=https%3A%2F%2Fplatform\n"
+              "  .claude.com%2Foauth%2Fcode%2Fcallback&state=abc123\n\n"
+              "  Paste code here if prompted >\n")
+    out = subprocess.run([bash, str(CAIN / "rootfs/opt/cain/signin-url.sh")], input=screen,
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert out == ("https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed"
+                   "&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode"
+                   "%2Fcallback&state=abc123")
+
+
+def test_cain_signin_page_is_served_from_tmp():
+    nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
+    assert "location = /signin" in nginx and "alias /tmp/signin.html;" in nginx

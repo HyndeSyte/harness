@@ -27,6 +27,20 @@ if ! tmux -u has-session -t cain 2>/dev/null; then
   exit 1
 fi
 bashio::log.info "Cain is running"
+# The sign-in link is longer than a terminal line, and tmux breaks it, so a
+# click opens a cut-off link. Keep the whole link on a page of its own:
+# <Cain page>/signin. signin-url.sh joins the pieces.
+printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /tmp/signin.html
+(
+  while true; do
+    url=$(tmux -u capture-pane -p -J -t cain -S -400 2>/dev/null | /opt/cain/signin-url.sh || true)
+    if [ -n "$url" ]; then
+      safe=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/"/%22/g; s/</%3C/g')
+      printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /tmp/signin.tmp && mv /tmp/signin.tmp /tmp/signin.html || true
+    fi
+    sleep 2
+  done
+) &
 # Stay in the foreground while the tmux session lives.
 while tmux -u has-session -t cain 2>/dev/null; do sleep 10; done
 bashio::log.warning "Cain's session ended. Its last output:"

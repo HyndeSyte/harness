@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.3
+- A sign-in page at <Cain page>/signin shows the whole Claude sign-in link: the terminal cuts it across lines.
+
 ## 0.1.2
 - Fix: the session no longer stops at start when there is no old session to close.
 
