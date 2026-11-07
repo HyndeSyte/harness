@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.11
+- Cain reads and writes the organization's record (a private repo) through the GitHub connector.
+
 ## 0.1.10
 - Removed a wrong rule about work systems: Cain's account has none.
 
