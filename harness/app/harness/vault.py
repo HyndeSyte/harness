@@ -40,12 +40,13 @@ from . import caldav, calendar_feed, google_cal, workmirror
 # family_*: what the one calendar write needs (caldav.py). The address is
 # checked strictly, because the password is sent wherever it points.
 # google_service_key: what lets blocks reach his Gmail calendar (google_cal.py).
-FIELDS = ("telegram_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
+FIELDS = ("telegram_bot_token", "discord_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
           "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url",
           "google_service_key", "gmail_app_password")
 FAMILY_FIELDS = ("family_apple_id", "family_app_password", "family_calendar_url")
 TEXT_FIELDS = ("work_mirror",)          # several lines; a textarea on the page
 LABELS = {"telegram_bot_token": "Telegram bot token",
+          "discord_bot_token": "Discord bot token (Cain's bot)",
           "anthropic_api_key": "Anthropic API key",
           "openai_api_key": "OpenAI API key",
           "calendar_feeds": "calendar addresses (secret iCal, space between several)",
@@ -59,6 +60,7 @@ LABELS = {"telegram_bot_token": "Telegram bot token",
 # (a URL, a sentence, a key in the wrong box), not a claim about validity.
 PATTERNS = {
     "telegram_bot_token": re.compile(r"\d{5,15}:[A-Za-z0-9_-]{30,64}"),
+    "discord_bot_token": re.compile(r"[A-Za-z0-9_-]{20,40}\.[A-Za-z0-9_-]{5,10}\.[A-Za-z0-9_-]{25,60}"),
     "anthropic_api_key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,200}"),
     "openai_api_key": re.compile(r"sk-[A-Za-z0-9_-]{20,250}"),
     "family_apple_id": re.compile(r"[^\s@:]{1,100}@[^\s@:]{1,100}\.[^\s@:]{2,30}"),

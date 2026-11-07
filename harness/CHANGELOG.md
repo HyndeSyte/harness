@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.0
+
+- First step to Discord: the keeper connects to Discord with Cain's bot (a "Discord bot token" field on this page) and hears presses on its own buttons only. It posts one test card to your DM; a tap on it proves the link. Every press is checked: you, in your DM, on the card exactly as posted (a card changed after posting is refused), once, before it expires. Telegram is unchanged until the move is done.
+
 ## 0.13.4
 
 - A date from mail counts as already on your calendar when a word matches in another form:

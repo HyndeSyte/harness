@@ -21,6 +21,9 @@ from .calendar_change import CalendarChange, changes_from_options
 from .calendar_feed import CalendarFeeds
 from .config import Config
 from .controller import Controller
+from .discord_api import DiscordAPI, DiscordTransport
+from .discord_gateway import Gateway
+from .discord_keeper import DiscordKeeper
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
@@ -118,6 +121,12 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 writes_on=lambda: mail_option_on(data_dir), tz=base.timezone,
                                 family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)))
+    # Discord: the keeper posts as Cain's bot in his DM and hears its own buttons.
+    keeper = DiscordKeeper(DiscordAPI(lambda: vault.get("discord_bot_token"), DiscordTransport()),
+                           ledger.get_meta, ledger.set_meta)
+    controller.discord = keeper
+    controller.gateway = Gateway(lambda: vault.get("discord_bot_token"), keeper.on_interaction,
+                                 on_state=keeper.on_state)
     return controller, web, listener
 
 
@@ -142,6 +151,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
 
     log.info("harness starting (stage %s, policy %s)", STAGE, policy.POLICY_VERSION)
+    controller.gateway.start()
     started = False
     failures = 0
     try:
