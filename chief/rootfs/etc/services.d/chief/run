@@ -1,0 +1,23 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Prepare /data on first start, then run the session inside tmux so the
+# terminal page can attach to it. Everything that must survive lives in /data:
+# the Claude sign-in, the Discord token and allowlist, the plugin, the work folder.
+# ==============================================================================
+export HOME=/data TERM=xterm-256color
+mkdir -p /data/work
+if [ ! -f /data/work/CLAUDE.md ]; then
+  cp /opt/chief/CLAUDE.md /data/work/CLAUDE.md
+fi
+if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
+  bashio::log.info "Installing the Discord channel plugin"
+  claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"
+  claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
+fi
+bashio::log.info "Starting the chief session"
+tmux kill-session -t chief 2>/dev/null
+tmux new-session -d -s chief -x 120 -y 40 /opt/chief/session.sh
+# Stay in the foreground while the tmux session lives.
+while tmux has-session -t chief 2>/dev/null; do sleep 10; done
+bashio::log.warning "The chief session ended"
+exit 1
