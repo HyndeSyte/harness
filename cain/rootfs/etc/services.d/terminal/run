@@ -5,5 +5,5 @@
 # ==============================================================================
 export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
 nginx || bashio::log.error "nginx did not start"
-exec ttyd --interface 127.0.0.1 --port 7681 --writable \
+exec ttyd --interface 127.0.0.1 --port 7681 --base-path /tty --writable \
   bash -c 'until tmux -u has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux -u attach -t cain'

@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.4
+- The sign-in button is on the Cain page itself, above the terminal, while a sign-in waits for its code. A direct /signin address is refused by Home Assistant (401) outside the page.
+
 ## 0.1.3
 - A sign-in page at <Cain page>/signin shows the whole Claude sign-in link: the terminal cuts it across lines.
 

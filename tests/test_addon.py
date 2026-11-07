@@ -162,3 +162,12 @@ def test_cain_signin_link_is_rejoined(tmp_path):
 def test_cain_signin_page_is_served_from_tmp():
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     assert "location = /signin" in nginx and "alias /tmp/signin.html;" in nginx
+
+
+def test_cain_page_shows_signin_over_the_terminal_with_relative_paths():
+    page = (CAIN / "rootfs/opt/cain/index.html").read_text()
+    assert 'src="tty/"' in page and 'fetch("signin"' in page
+    assert "/api/" not in page and 'src="/' not in page     # must work under the Ingress prefix
+    nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
+    assert "location = /" in nginx and "location /tty/" in nginx
+    assert "--base-path /tty" in (CAIN / "rootfs/etc/services.d/terminal/run").read_text()

@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cain</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee; font: 15px system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: none; padding: 10px 14px; background: #2a2a2a; }
+  #bar a { color: #fff; background: #5865f2; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-weight: 600; }
+  #bar span { margin-left: 10px; color: #bbb; }
+  iframe { flex: 1; border: 0; width: 100%; }
+</style></head>
+<body>
+<div id="bar"><a id="go" href="#" target="_blank" rel="noopener">Sign in to Claude</a><span>Then paste the code it gives you below.</span></div>
+<iframe src="tty/" title="Cain session"></iframe>
+<script>
+  // The terminal breaks the long sign-in link across lines; the add-on rejoins it
+  // into ./signin. Show it as one button while a sign-in is on screen.
+  async function check() {
+    try {
+      const r = await fetch("signin", { cache: "no-store" });
+      const doc = new DOMParser().parseFromString(await r.text(), "text/html");
+      const a = doc.querySelector("a[href^='https://']");
+      const bar = document.getElementById("bar");
+      if (a) { document.getElementById("go").href = a.getAttribute("href"); bar.style.display = "block"; }
+      else { bar.style.display = "none"; }
+    } catch (e) {}
+  }
+  check(); setInterval(check, 2000);
+</script>
+</body></html>
