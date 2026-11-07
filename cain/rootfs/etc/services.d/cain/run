@@ -7,17 +7,17 @@
 export HOME=/data TERM=xterm-256color
 mkdir -p /data/work
 if [ ! -f /data/work/CLAUDE.md ]; then
-  cp /opt/chief/CLAUDE.md /data/work/CLAUDE.md
+  cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
 fi
 if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
   bashio::log.info "Installing the Discord channel plugin"
   claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"
   claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
 fi
-bashio::log.info "Starting the chief session"
-tmux kill-session -t chief 2>/dev/null
-tmux new-session -d -s chief -x 120 -y 40 /opt/chief/session.sh
+bashio::log.info "Starting Cain"
+tmux kill-session -t cain 2>/dev/null
+tmux new-session -d -s cain -x 120 -y 40 /opt/cain/session.sh
 # Stay in the foreground while the tmux session lives.
-while tmux has-session -t chief 2>/dev/null; do sleep 10; done
-bashio::log.warning "The chief session ended"
+while tmux has-session -t cain 2>/dev/null; do sleep 10; done
+bashio::log.warning "Cain's session ended"
 exit 1

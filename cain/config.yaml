@@ -3,9 +3,9 @@
 # bot (Anthropic's Discord channel plugin). Its only state is /data. Its only
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
-name: Chief
+name: Cain
 version: "0.1.0"
-slug: chief
+slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
   Discord bot, with your Claude connectors.
@@ -18,7 +18,7 @@ boot: auto
 ingress: true
 ingress_port: 8099
 panel_icon: mdi:account-tie
-panel_title: Chief
+panel_title: Cain
 panel_admin: true
 homeassistant_api: false
 hassio_api: false

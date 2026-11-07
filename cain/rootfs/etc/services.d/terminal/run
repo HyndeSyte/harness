@@ -6,4 +6,4 @@
 export HOME=/data TERM=xterm-256color
 nginx
 exec ttyd --interface 127.0.0.1 --port 7681 --writable \
-  bash -c 'until tmux has-session -t chief 2>/dev/null; do sleep 1; done; exec tmux attach -t chief'
+  bash -c 'until tmux has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux attach -t cain'

@@ -7,7 +7,7 @@ a credential.
 
 This repository is also a Home Assistant add-on repository. The harness add-on lives in
 `harness/`, and its Python package in `harness/app/harness`. It uses only the
-standard library. A second add-on, `chief/`, runs a Claude Code session that
+standard library. A second add-on, `cain/`, runs Cain: a Claude Code session that
 answers a private Discord bot (Anthropic's Discord channel plugin); it holds no harness keys.
 
 ## Invariants

@@ -94,17 +94,17 @@ def test_service_runs_the_package_and_scrubs_nothing_by_shell():
 def test_repository_layout():
     repo = flat_yaml(ROOT / "repository.yaml")
     assert repo["name"] and (ADDON / "config.yaml").exists()
-    # exactly two add-ons: the harness, and the chief (which holds no harness keys)
+    # exactly two add-ons: the harness, and Cain (which holds no harness keys)
     addons = sorted(p.name for p in ROOT.iterdir() if p.is_dir() and (p / "config.yaml").exists())
-    assert addons == ["chief", "harness"]
+    assert addons == ["cain", "harness"]
 
 
-CHIEF = ROOT / "chief"
+CAIN = ROOT / "cain"
 
 
-def test_chief_config_denies_every_api_and_mapping():
-    cfg = flat_yaml(CHIEF / "config.yaml")
-    assert cfg["slug"] == "chief"
+def test_cain_config_denies_every_api_and_mapping():
+    cfg = flat_yaml(CAIN / "config.yaml")
+    assert cfg["slug"] == "cain"
     for api in ("homeassistant_api", "hassio_api", "auth_api"):
         assert cfg[api] == "false", api
     for risky in ("map", "ports", "host_network", "privileged", "full_access", "docker_api",
@@ -114,22 +114,22 @@ def test_chief_config_denies_every_api_and_mapping():
     assert cfg["init"] == "false"
 
 
-def test_chief_versions_agree_and_everything_is_pinned():
-    cfg = flat_yaml(CHIEF / "config.yaml")
-    docker = (CHIEF / "Dockerfile").read_text()
+def test_cain_versions_agree_and_everything_is_pinned():
+    cfg = flat_yaml(CAIN / "config.yaml")
+    docker = (CAIN / "Dockerfile").read_text()
     assert f'io.hass.version="{cfg["version"]}"' in docker
-    assert f"## {cfg['version']}" in (CHIEF / "CHANGELOG.md").read_text()
+    assert f"## {cfg['version']}" in (CAIN / "CHANGELOG.md").read_text()
     base = re.search(r"ARG BUILD_FROM=(\S+)", docker).group(1)
     assert re.fullmatch(r"ghcr\.io/home-assistant/base-debian:trixie-\d{4}\.\d{2}\.\d+", base)
-    assert (CHIEF / "build.yaml").read_text().count(base) == 2
+    assert (CAIN / "build.yaml").read_text().count(base) == 2
     assert re.search(r"ARG CLAUDE_VERSION=\d+\.\d+\.\d+$", docker, re.M)
     assert re.search(r"ARG BUN_VERSION=\d+\.\d+\.\d+$", docker, re.M)
     assert "sha256sum -c" in docker and "ENV DISABLE_AUTOUPDATER=1" in docker
 
 
-def test_chief_terminal_is_reachable_only_through_ingress():
-    nginx = (CHIEF / "rootfs/etc/nginx/nginx.conf").read_text()
+def test_cain_terminal_is_reachable_only_through_ingress():
+    nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     assert "allow 172.30.32.2;" in nginx and "deny all;" in nginx
     assert nginx.count("listen ") == 1 and "listen 8099 " in nginx
-    term = (CHIEF / "rootfs/etc/services.d/terminal/run").read_text()
+    term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
     assert "--interface 127.0.0.1" in term
