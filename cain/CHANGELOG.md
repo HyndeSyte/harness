@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.2
+- Fix: the session no longer stops at start when there is no old session to close.
+
 ## 0.1.1
 - The session starts with a UTF-8 locale, and if it stops at start the reason is in the log.
 

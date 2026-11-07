@@ -15,7 +15,7 @@ if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official";
   claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
 fi
 bashio::log.info "Starting Cain"
-tmux -u kill-session -t cain 2>/dev/null
+tmux -u kill-session -t cain 2>/dev/null || true   # bashio runs with errexit
 if ! tmux -u new-session -d -s cain -x 120 -y 40 /opt/cain/session.sh 2>/tmp/tmux.err; then
   bashio::log.error "tmux could not start: $(cat /tmp/tmux.err)"
   exit 1

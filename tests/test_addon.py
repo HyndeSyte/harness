@@ -133,3 +133,10 @@ def test_cain_terminal_is_reachable_only_through_ingress():
     assert nginx.count("listen ") == 1 and "listen 8099 " in nginx
     term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
     assert "--interface 127.0.0.1" in term
+
+
+def test_cain_start_survives_bashio_errexit():
+    # bashio runs with errexit: a command that fails on a clean start (no old
+    # session to kill) must not end the script. 0.1.0 and 0.1.1 died here.
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    assert "kill-session -t cain 2>/dev/null || true" in run
