@@ -177,4 +177,5 @@ def test_cain_page_root_is_not_an_alias():
     # alias on "location = /" makes nginx look for "index.htmlindex.html" (0.1.4 gave 500).
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     block = nginx.split("location = / {")[1].split("}")[0]
-    assert "alias" not in block.replace("Not alias", "") and "try_files /index.html =404;" in block
+    code = " ".join(l for l in block.splitlines() if not l.strip().startswith("#"))
+    assert "alias" not in code and "try_files /index.html =404;" in code
