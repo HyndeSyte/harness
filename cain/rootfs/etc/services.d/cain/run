@@ -4,7 +4,7 @@
 # terminal page can attach to it. Everything that must survive lives in /data:
 # the Claude sign-in, the Discord token and allowlist, the plugin, the work folder.
 # ==============================================================================
-export HOME=/data TERM=xterm-256color
+export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
 mkdir -p /data/work
 if [ ! -f /data/work/CLAUDE.md ]; then
   cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
@@ -15,9 +15,20 @@ if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official";
   claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
 fi
 bashio::log.info "Starting Cain"
-tmux kill-session -t cain 2>/dev/null
-tmux new-session -d -s cain -x 120 -y 40 /opt/cain/session.sh
+tmux -u kill-session -t cain 2>/dev/null
+if ! tmux -u new-session -d -s cain -x 120 -y 40 /opt/cain/session.sh 2>/tmp/tmux.err; then
+  bashio::log.error "tmux could not start: $(cat /tmp/tmux.err)"
+  exit 1
+fi
+sleep 3
+if ! tmux -u has-session -t cain 2>/dev/null; then
+  bashio::log.error "Cain's session ended at once. Its last output:"
+  tail -n 20 /data/session.log 2>/dev/null
+  exit 1
+fi
+bashio::log.info "Cain is running"
 # Stay in the foreground while the tmux session lives.
-while tmux has-session -t cain 2>/dev/null; do sleep 10; done
-bashio::log.warning "Cain's session ended"
+while tmux -u has-session -t cain 2>/dev/null; do sleep 10; done
+bashio::log.warning "Cain's session ended. Its last output:"
+tail -n 20 /data/session.log 2>/dev/null
 exit 1

@@ -3,7 +3,7 @@
 # The terminal page: ttyd on localhost only, behind nginx, which admits only
 # Home Assistant's Ingress proxy. It attaches to the running session.
 # ==============================================================================
-export HOME=/data TERM=xterm-256color
+export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
 nginx
 exec ttyd --interface 127.0.0.1 --port 7681 --writable \
-  bash -c 'until tmux has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux attach -t cain'
+  bash -c 'until tmux -u has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux -u attach -t cain'
