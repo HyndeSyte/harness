@@ -40,6 +40,24 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
       url=''
       printf '%s' '<!doctype html><p>No sign-in waiting.</p>' > /tmp/signin.html
     fi
+    # Yes/no facts for checking setup from outside, without showing the screen
+    # (a token may be typed there): <Cain page>/status.
+    flag() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
+    # access.json spreads allowFrom over several lines.
+    paired() { tr -d ' \n' < /data/.claude/channels/discord/access.json | grep -q '"allowFrom":\["'; }
+    last=$(printf '%s\n' "$screen" | tail -n 30)
+    state=unknown
+    if printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
+    elif printf '%s' "$last" | grep -Eqi 'do you trust|trust the files'; then state=trust_prompt
+    elif printf '%s' "$last" | grep -Eqi 'select login|login method|choose the text style|dark mode'; then state=first_run_menu
+    elif printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode'; then state=ready
+    fi
+    printf '{"signed_in": %s, "discord_token": %s, "paired": %s, "allowlist": %s, "screen": "%s"}\n' \
+      "$(flag test -s /data/.claude/.credentials.json)" \
+      "$(flag grep -q '^DISCORD_BOT_TOKEN=.' /data/.claude/channels/discord/.env)" \
+      "$(flag paired)" \
+      "$(flag grep -Eq '"dmPolicy": *"allowlist"' /data/.claude/channels/discord/access.json)" \
+      "$state" > /tmp/status.tmp && mv /tmp/status.tmp /tmp/status.json || true
     if [ -n "$url" ]; then
       safe=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/"/%22/g; s/</%3C/g')
       printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /tmp/signin.tmp && mv /tmp/signin.tmp /tmp/signin.html || true

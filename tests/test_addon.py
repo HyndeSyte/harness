@@ -188,3 +188,16 @@ def test_cain_page_has_a_paste_box_that_types_into_the_terminal():
     assert r'type("\r")' in page                           # Enter is sent after the code
     bar = page.split('<div id="bar">')[1].split("</div>")[0]
     assert '<form id="send">' not in bar                     # the box shows even with no sign-in waiting
+
+
+def test_cain_status_gives_facts_not_the_screen():
+    # /status lets setup be checked from outside; the screen may hold a token, so
+    # only yes/no facts and a fixed state word leave the add-on.
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    status = run.split("printf '{\"signed_in\"")[1].split("> /tmp/status.tmp")[0]
+    assert "$screen" not in status and "$last" not in status
+    assert status.count("$(flag ") == 4 and '"$state"' in status
+    states = {line.split("state=")[1].split(";")[0].strip() for line in run.splitlines() if "state=" in line and "then state=" in line}
+    assert states == {"waiting_for_code", "trust_prompt", "first_run_menu", "ready"}
+    nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
+    assert "location = /status {" in nginx and "alias /tmp/status.json;" in nginx

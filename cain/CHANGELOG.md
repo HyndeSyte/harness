@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.8
+- A /status page gives yes/no setup facts (signed in, Discord token, paired, allowlist, what the screen is showing) without showing the screen.
+
 ## 0.1.7
 - The type box is always on the page, for any command, not just the sign-in code.
 
