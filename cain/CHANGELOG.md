@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.7
+- The type box is always on the page, for any command, not just the sign-in code.
+
 ## 0.1.6
 - A paste box under the sign-in button sends the code into the terminal (a phone gives no way to paste into it).
 

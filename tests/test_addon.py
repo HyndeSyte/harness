@@ -186,3 +186,5 @@ def test_cain_page_has_a_paste_box_that_types_into_the_terminal():
     page = (CAIN / "rootfs/opt/cain/index.html").read_text()
     assert '<input id="code"' in page and "contentWindow.term" in page
     assert r'type("\r")' in page                           # Enter is sent after the code
+    bar = page.split('<div id="bar">')[1].split("</div>")[0]
+    assert '<form id="send">' not in bar                     # the box shows even with no sign-in waiting

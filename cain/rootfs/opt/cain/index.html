@@ -7,17 +7,17 @@
   #bar { display: none; padding: 10px 14px; background: #2a2a2a; }
   #bar a { color: #fff; background: #5865f2; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-weight: 600; }
   #bar span { margin-left: 10px; color: #bbb; }
-  #send { display: flex; gap: 8px; margin-top: 10px; }
+  #send { display: flex; gap: 8px; padding: 8px 14px; background: #1c1c1c; }
   #send input { flex: 1; min-width: 0; padding: 8px; font-size: 16px; border-radius: 6px; border: 1px solid #555; background: #111; color: #eee; }
   #send button { padding: 8px 14px; border: 0; border-radius: 6px; background: #3ba55d; color: #fff; font-weight: 600; }
   iframe { flex: 1; border: 0; width: 100%; }
 </style></head>
 <body>
-<div id="bar"><a id="go" href="#" target="_blank" rel="noopener">Sign in to Claude</a><span>Then paste the code here:</span>
-  <form id="send"><input id="code" autocomplete="off" placeholder="Paste code"><button>Send</button></form></div>
+<div id="bar"><a id="go" href="#" target="_blank" rel="noopener">Sign in to Claude</a><span>Then paste the code in the box below.</span></div>
+<form id="send"><input id="code" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Type or paste here, then Send"><button>Send</button></form>
 <iframe src="tty/" title="Cain session"></iframe>
 <script>
-  // Typing into the terminal is hard on a phone, so the code goes in through the box.
+  // Typing into the terminal is hard on a phone, so anything can go in through the box.
   // ttyd exposes its terminal as window.term; sending data is the same as typing it.
   document.getElementById("send").addEventListener("submit", (e) => {
     e.preventDefault();
