@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.6
+- A paste box under the sign-in button sends the code into the terminal (a phone gives no way to paste into it).
+
 ## 0.1.5
 - Fix: the Cain page gave 500 (nginx looked for the page under the wrong name).
 

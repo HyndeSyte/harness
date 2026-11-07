@@ -179,3 +179,10 @@ def test_cain_page_root_is_not_an_alias():
     block = nginx.split("location = / {")[1].split("}")[0]
     code = " ".join(l for l in block.splitlines() if not l.strip().startswith("#"))
     assert "alias" not in code and "try_files /index.html =404;" in code
+
+
+def test_cain_page_has_a_paste_box_that_types_into_the_terminal():
+    # On a phone there is no way to paste into the terminal itself (0.1.5).
+    page = (CAIN / "rootfs/opt/cain/index.html").read_text()
+    assert '<input id="code"' in page and "contentWindow.term" in page
+    assert r'type("\r")' in page                           # Enter is sent after the code
