@@ -513,7 +513,7 @@ def test_no_etag_at_all_means_no_undo_button_and_says_so(on, monkeypatch):
     assert "can't offer Undo" in text and buttons is None
 
 
-class Crash(Exception):
+class Crash(BaseException):
     """The process dies mid-request (as the stop signal does)."""
 
 
