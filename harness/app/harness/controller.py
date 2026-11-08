@@ -453,6 +453,7 @@ class Controller:
             age = (self.ledger.now() - datetime.fromisoformat(m["timestamp"])).total_seconds()
         except (KeyError, ValueError, TypeError):
             age = FRESH_S + 1
+        h.age = max(0.0, age)
         if age > FRESH_S:
             h.finish("stale", "His newest message is over 2 minutes old, so the keeper didn't act "
                               "on it. Nothing changed.")

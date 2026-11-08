@@ -27,6 +27,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
@@ -50,10 +51,16 @@ class Handover:
     paired: str = ""                     # the Discord user Cain is paired with
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
+    arrived: float = field(default_factory=time.monotonic)
+    age: float | None = None             # how old his message was when Cain handed it over
 
     def finish(self, status: str, said: str = "", **extra) -> None:
         if not self.done.is_set():
             self.result = {"status": status, "said": said, **extra}
+            took = time.monotonic() - self.arrived
+            # Outcome and timing only: never his words. The target is 20 s from his message.
+            log.info("handover: %s, %.1fs here%s", status, took,
+                     f", {self.age + took:.0f}s after his message" if self.age is not None else "")
             self.done.set()
 
 

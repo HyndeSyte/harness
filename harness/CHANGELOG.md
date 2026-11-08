@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1
+
+- The log notes each handover from Cain: what happened and how long it took, so the 20-second target can be measured. Never your words.
+
 ## 0.15.0
 
 - The calendar keeper moves to Discord. With a Discord bot token set, it talks only in your DM with Cain, under Cain's name, and Telegram goes quiet.
