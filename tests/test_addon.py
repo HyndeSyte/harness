@@ -254,3 +254,53 @@ def test_cain_cannot_write_calendars_send_messages_or_change_home_assistant():
             "mcp__claude_ai_Slack__slack_schedule_message"} <= deny
     assert "mcp__claude_ai_HASS_MCP" in deny          # the whole read-write connector
     assert not any("read-only" in d for d in deny)    # reading stays
+
+
+def _checkin(tmp_path, now, screen):
+    import os
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if not bash:
+        import pytest
+        pytest.skip("no bash")
+    stub = tmp_path / "bin"
+    stub.mkdir(exist_ok=True)
+    (stub / "tmux").write_text(
+        "#!/bin/bash\n"
+        'if [ "$2" = capture-pane ]; then printf "%s\n" "$STUB_SCREEN"; exit 0; fi\n'
+        'printf "%s\n" "$*" >> "$STUB_SENT"\n', newline="\n")
+    (stub / "tmux").chmod(0o755)
+    sent = tmp_path / "sent.txt"
+    env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
+               CHECKIN_DIR=str(tmp_path / "done"), CHECKIN_NOW=now, CHECKIN_DAY="2026-11-08",
+               STUB_SCREEN=screen, STUB_SENT=str(sent))
+    script = (CAIN / "rootfs/opt/cain/checkin.sh").read_text().replace("\r\n", "\n")
+    subprocess.run([bash, "-c", script], env=env, check=True, timeout=20)
+    return sent.read_text() if sent.exists() else ""
+
+
+IDLE = "> \n  ? for shortcuts            auto mode on"
+
+
+def test_checkin_fires_once_in_its_hour_and_only_when_cain_is_idle(tmp_path):
+    out = _checkin(tmp_path, "0712", IDLE)
+    assert "morning" in out and "Not a message from Dane" in out and "Enter" in out
+    assert _checkin(tmp_path, "0730", IDLE) == out                 # once a day per slot
+    assert "1230" in _checkin(tmp_path, "1240", IDLE).splitlines()[-2]
+
+
+def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
+    assert _checkin(tmp_path, "0712", IDLE + "\n  esc to interrupt") == ""
+    assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed
+    assert _checkin(tmp_path, "0300", IDLE) == ""
+    assert _checkin(tmp_path, "0712", "Do you trust the files in this folder?") == ""
+
+
+def test_cain_checks_in_on_his_own_record():
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    assert "/opt/cain/checkin.sh" in run
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text()
+    assert "## Check-ins" in rules and "state/PENDING.md" in rules
+    assert "never his go on anything" in rules
+    assert " tzdata " in (CAIN / "Dockerfile").read_text()
