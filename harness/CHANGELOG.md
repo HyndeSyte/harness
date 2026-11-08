@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.0
+
+- Cain is the gatekeeper. This add-on no longer has its own Discord connection and never posts to you itself: every card goes to Cain's link, which holds it until Cain shows it, unchanged. Taps on its cards come back from the link. Only Stop's notices and the 7:40 digest fallback go straight out.
+
 ## 0.16.0
 
 - Cain posts through the keeper: questions with buttons, and one morning update with the calendar digest folded in (with Stop). If Cain hasn't posted it by 7:40, the digest goes out on its own.

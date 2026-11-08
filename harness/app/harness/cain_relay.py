@@ -1,14 +1,12 @@
-"""Passing his taps and reactions to Cain.
+"""The calendar specialist's line to Cain's link (the Cain add-on, link/main.ts).
 
-Cain's Discord plugin only hears his messages: not presses on buttons, not
-reactions. The keeper's connection hears both and checks them (it's him, in the
-DM, on the message as posted). This passes what he did to the Cain add-on,
-which types it into Cain's session once Cain is idle (cain: relay.ts, checkin.sh).
+Cain is the gatekeeper: this add-on never posts to Dane itself. Every card it
+makes goes to Cain's link, which holds it until Cain shows it unchanged (only
+Stop notices and the 7:40 digest fallback go straight out). Taps on its cards
+come back to handover.py /press, already checked by the link.
 
-Local only: the add-ons' own network on the Pi. Keyed like the handover, with
-HMAC-SHA256(bot token, "harness-relay-v1"), so nothing else can speak for him.
-Short words only: what he chose or the emoji, and a short excerpt of the
-message it was on. Never anything from a calendar or mail.
+Local only: the add-ons' own network on the Pi. Keyed with
+HMAC-SHA256(bot token, "harness-relay-v1"); both add-ons hold the token.
 """
 from __future__ import annotations
 
@@ -17,31 +15,75 @@ import hmac
 import http.client
 import json
 import logging
+from typing import Callable
+from urllib.parse import quote
 
-log = logging.getLogger("harness.relay")
+log = logging.getLogger("harness.link")
 
 HOST, PORT = "0fcc2575-cain", 8097
 KEY_CONTEXT = b"harness-relay-v1"
-MAX_TEXT = 600
 
 
 def key_for(token: str) -> str:
     return hmac.new(token.encode(), KEY_CONTEXT, hashlib.sha256).hexdigest()
 
 
-def send(token: str, text: str, *, host: str = HOST, port: int = PORT, timeout: float = 10) -> bool:
-    if not token:
-        return False
-    body = json.dumps({"text": text[:MAX_TEXT]})
-    try:
-        c = http.client.HTTPConnection(host, port, timeout=timeout)
-        c.request("POST", "/relay", body=body,
-                  headers={"content-type": "application/json", "x-harness-key": key_for(token)})
-        status = c.getresponse().status
-        c.close()
-    except OSError as e:
-        log.warning("relay to Cain failed: %s", type(e).__name__)
-        return False
-    if status != 200:
-        log.warning("relay to Cain refused: %s", status)
-    return status == 200
+class LinkError(Exception):
+    def __init__(self, code: int, description: str):
+        self.code = code
+        self.description = description
+        super().__init__(f"link {code}: {description}")
+
+
+class CainLink:
+    def __init__(self, token_fn: Callable[[], str], *, host: str = HOST, port: int = PORT,
+                 timeout: float = 8):
+        self._token_fn = token_fn
+        self.host, self.port, self.timeout = host, port, timeout
+
+    def _call(self, method: str, path: str, body: dict | None = None):
+        token = self._token_fn()
+        if not token:
+            raise LinkError(0, "no bot token set")
+        try:
+            c = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+            c.request(method, path, body=json.dumps(body) if body is not None else None,
+                      headers={"content-type": "application/json",
+                               "x-harness-key": key_for(token)})
+            r = c.getresponse()
+            raw = r.read()
+            c.close()
+        except OSError as e:
+            raise LinkError(0, type(e).__name__) from None
+        try:
+            data = json.loads(raw or b"{}")
+        except ValueError:
+            data = {}
+        if r.status >= 400:
+            raise LinkError(r.status, str(data.get("said") or data.get("status") or ""))
+        return data
+
+    def card(self, text: str, rows: list, kind: str) -> int:
+        out = self._call("POST", "/card", {"text": text, "rows": rows, "kind": kind})
+        if not isinstance(out.get("id"), int):
+            raise LinkError(0, "no card id")
+        return out["id"]
+
+    def buttons(self, card: int, rows: list) -> None:
+        self._call("POST", "/buttons", {"card": card, "rows": rows})
+
+    def answer(self, callback: str, text: str) -> None:
+        self._call("POST", "/answer", {"callback": callback, "text": text})
+
+    def card_of(self, message_id: str) -> int | None:
+        try:
+            out = self._call("GET", f"/card-of?m={quote(str(message_id))}")
+        except LinkError:
+            return None
+        return out.get("card") if isinstance(out.get("card"), int) else None
+
+    def health(self) -> bool:
+        try:
+            return self._call("GET", "/health").get("status") == "ok"
+        except LinkError:
+            return False

@@ -1,17 +1,9 @@
-"""The keeper on Discord: REST payloads, the gateway connection, and the press check."""
-import base64
-import hashlib
-import json
-import socket
-import struct
-import threading
+"""Cain's bot over REST, as the calendar specialist uses it: payloads, owner, limits, vault."""
 
 import pytest
 
 from harness.discord_api import (LIMIT, SUPPRESS_EMBEDS, DiscordAPI, DiscordError,
                                  DiscordTransport, card_digest, check_token, components)
-from harness.discord_gateway import GUID, Closed, Gateway, WebSocket
-from harness.discord_keeper import ACK, DiscordKeeper, KeeperStore
 from harness.net import TransportError
 from harness.vault import Vault, VaultError
 from fakes import FakeTransport
@@ -76,91 +68,3 @@ def test_vault_takes_a_discord_token_and_refuses_junk(tmp_path):
         v.check_format("discord_bot_token", "https://discord.com/not-a-token")
 
 
-# -- the WebSocket and the gateway ---------------------------------------------
-
-class FakeServer:
-    """One end of a socketpair speaking the server side of RFC 6455."""
-
-    def __init__(self):
-        self.client, self.server = socket.socketpair()
-        self.received = []
-
-    def connect(self, host):
-        return self.client
-
-    def handshake(self):
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            buf += self.server.recv(4096)
-        key = next(l.split(":", 1)[1].strip() for l in buf.decode().split("\r\n")
-                   if l.lower().startswith("sec-websocket-key"))
-        accept = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
-        self.server.sendall(f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                            f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode())
-
-    def send(self, obj):
-        data = json.dumps(obj).encode()
-        head = bytes([0x81]) + (bytes([len(data)]) if len(data) < 126 else
-                                bytes([126]) + struct.pack("!H", len(data)))
-        self.server.sendall(head + data)
-
-    def close(self, code):
-        self.server.sendall(bytes([0x88, 2]) + struct.pack("!H", code))
-
-    def recv(self):
-        def read(n):
-            out = b""
-            while len(out) < n:
-                out += self.server.recv(n - len(out))
-            return out
-        b1, b2 = read(2)
-        assert b2 & 0x80, "client frames must be masked"
-        n = b2 & 0x7F
-        if n == 126:
-            n = struct.unpack("!H", read(2))[0]
-        mask, data = read(4), read(n)
-        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-        if b1 & 0x0F == 0x8:
-            return None
-        return json.loads(data)
-
-
-def test_gateway_identifies_with_no_intents_and_hands_presses_over():
-    srv = FakeServer()
-    presses, states = [], []
-    gw = Gateway(lambda: TOKEN, presses.append, on_state=states.append, connect=srv.connect)
-    done = threading.Event()
-
-    def server():
-        srv.handshake()
-        srv.send({"op": 10, "d": {"heartbeat_interval": 60000}})
-        ident = srv.recv()
-        srv.received.append(ident)
-        srv.send({"op": 0, "s": 1, "t": "READY", "d": {"session_id": "s",
-                  "resume_gateway_url": "wss://gateway-x.discord.gg"}})
-        srv.send({"op": 0, "s": 2, "t": "INTERACTION_CREATE", "d": {"type": 3, "id": "i"}})
-        srv.close(4004)
-        done.set()
-
-    threading.Thread(target=server, daemon=True).start()
-    with pytest.raises(Closed) as e:
-        gw._session(TOKEN)
-    assert e.value.code == 4004
-    ident = srv.received[0]
-    # Reactions in DMs only: never DIRECT_MESSAGES (1<<12) or MESSAGE_CONTENT (1<<15).
-    assert ident["op"] == 2 and ident["d"]["intents"] == 1 << 13
-    assert presses == [{"type": 3, "id": "i"}]
-    assert "ready" in states and gw.session_id == "s" and gw.seq == 2
-
-
-def test_websocket_refuses_hosts_other_than_discords_gateway():
-    with pytest.raises(Closed):
-        WebSocket("wss://evil.example/?v=10")
-
-
-def test_a_failing_state_listener_does_not_drop_the_connection():
-    def boom(state):
-        raise RuntimeError("listener broke")
-    gw = Gateway(lambda: TOKEN, lambda it: None, on_state=boom)
-    gw._set("ready")
-    assert gw.state == "ready"

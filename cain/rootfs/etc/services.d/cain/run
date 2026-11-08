@@ -34,8 +34,9 @@ bashio::log.info "Cain is running"
   timeout 120 claude mcp list 2>&1 | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 \
     | while IFS= read -r line; do echo "[cain] connector: $line"; done
 ) &
-# His taps and reactions, passed on by the calendar specialist, wait here for Cain.
-( while true; do bun /opt/cain/relay.ts 2>&1; sleep 5; done ) &
+# Cain's link (link/main.ts): taps, reactions and specialists' cards. What Cain must
+# hear is queued for him; checkin.sh types it in when he is idle.
+( while true; do bun /opt/cain/link/main.ts 2>&1; sleep 5; done ) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM so open work moves
 # without Dane. checkin.sh decides when, and only types into an idle session.
 (

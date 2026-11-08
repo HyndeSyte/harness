@@ -223,13 +223,15 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     script = (CAIN / "rootfs/opt/cain/keeper.sh").read_text()
     code = "\n".join(l for l in script.splitlines() if not l.strip().startswith("#"))
     # The same key the harness checks, made from the token inside bun, never on a command line.
-    assert handover.KEY_CONTEXT.decode() in code and 'createHmac("sha256"' in code
+    assert f"ctx={handover.KEY_CONTEXT.decode()}" in code and 'createHmac("sha256"' in code
     assert "process.env.ENV_FILE" in code and "$token" not in code
     assert "umask 077" in code and '-H "@$hdr"' in code and "unset key" in code
     assert code.index("unset key") < code.index("curl ")
-    assert f'"http://0fcc2575-harness:{handover.PORT}/$cmd"' in code
-    assert "case \"$cmd\" in handover|ask|digest|morning)" in code
-    for route in ("handover", "ask", "digest", "morning"):
+    # To the specialist: requests and the digest. To Cain's own link, on this machine only:
+    # showing a card, asking with buttons, the morning message.
+    assert f'url="http://0fcc2575-harness:{handover.PORT}/$cmd"' in code
+    assert 'url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1' in code
+    for route in ("handover", "digest"):
         assert f"/{route}" in handover.ROUTES
     # Nothing of his is passed: only Cain's own suggestion and who Cain is paired with.
     assert "{suggestion: $s, paired: $p}" in code
@@ -314,12 +316,17 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     import sys
     sys.path.insert(0, str(ADDON / "app"))
     from harness import cain_relay
-    relay = (CAIN / "rootfs/opt/cain/relay.ts").read_text()
-    assert cain_relay.KEY_CONTEXT.decode() in relay and "timingSafeEqual" in relay
-    assert f"?? {cain_relay.PORT})" in relay and '"/relay"' in relay
-    assert cain_relay.HOST == "0fcc2575-cain"
+    link = (CAIN / "rootfs/opt/cain/link/main.ts").read_text(encoding="utf-8")
+    assert f'key("{cain_relay.KEY_CONTEXT.decode()}")' in link and "timingSafeEqual" in link
+    assert f"?? {cain_relay.PORT})" in link and cain_relay.HOST == "0fcc2575-cain"
+    # Cain's scripts only, from this machine: the specialist can't show its own cards.
+    assert 'LOCAL_ONLY = new Set(["/show", "/ask", "/morning"])' in link
+    from harness import handover
+    assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
+    assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")
+    assert "http://0fcc2575-harness:8098" in link
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    assert "bun /opt/cain/relay.ts" in run
+    assert "bun /opt/cain/link/main.ts" in run
     assert not re.search(r"^ports", (CAIN / "config.yaml").read_text(), re.M)
 
 

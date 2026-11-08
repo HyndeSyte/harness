@@ -25,7 +25,7 @@ if [ -s "$queue" ]; then
   text=$(printf '%s' "$line" | jq -r '.text // empty' 2>/dev/null | tr -d '\r\n')
   tail -n +2 "$queue" > "$queue.tmp" && mv "$queue.tmp" "$queue"
   if [ -n "$text" ]; then
-    type_in "Relayed by the add-on, checked by your calendar specialist as Dane's own: $text" || exit 1
+    type_in "Relayed by the add-on: $text" || exit 1
     echo "[cain] relayed a tap or reaction"
   fi
   exit 0

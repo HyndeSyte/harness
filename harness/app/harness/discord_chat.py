@@ -1,11 +1,13 @@
-"""The harness's chat on Discord, in the shape its outbox and buttons already use.
+"""The harness's chat, handed to Cain: the shape its outbox and buttons already use.
 
 Everything the harness says goes through the outbox, and every button tap
 through callbacks. Both were written against a small chat interface:
-send_message, edit_reply_markup and answer_callback. This is that interface
-on Discord, posting as Cain's bot in his DM.
+send_message, edit_reply_markup and answer_callback. This is that interface,
+but nothing goes to Dane directly: each message becomes a card handed to Cain's
+link (cain_relay.py), which holds it until Cain shows it, unchanged.
 
-- "chat id" keeps meaning "his chat": the owner's id. Here it maps to the DM.
+- "chat id" keeps meaning "his chat": the owner's id. The message id it
+  returns is the card's id; taps come back with it (controller._press).
 - Text is written as Telegram-style HTML (<b>, <i>, escaped entities); it is
   turned into Discord markdown, with everything that was text escaped so an
   event title can't format, link or ping.
@@ -13,9 +15,8 @@ on Discord, posting as Cain's bot in his DM.
   Cain's plugin, which only answers its own "perm:" buttons, leaves them alone.
 - A Stop button rides along with every set of buttons and on the digest. When
   stopped, a Turn back on button takes its place.
-- Every message it posts is remembered with a digest of what it shows, so a
-  tap on a message someone changed afterwards (Cain can edit the bot's
-  messages) is refused before it reaches anything (discord_keeper.py).
+- Stop's notices and the 7:40 digest fallback are "direct": the link posts them
+  at once, because they exist for when Cain can't be relied on.
 """
 from __future__ import annotations
 
@@ -23,14 +24,13 @@ import html
 import re
 from typing import Callable
 
-from .discord_api import PRIMARY, DiscordAPI, DiscordError, components, escape
+from .cain_relay import CainLink, LinkError
+from .discord_api import PRIMARY, components, escape
 from .telegram_api import TelegramError
 
 PREFIX = "k:"
-# Cain's own posts through the keeper: his markdown kept (mentions and previews
-# are still off). "morning" also carries the Stop button, like the digest.
-RAW_KINDS = ("cain", "morning")
 STOP, RESUME = "k:stop", "k:resume"
+TOGGLE_KINDS = ("digest", "stopped", "resumed", "alert")   # carry Stop / Turn back on
 
 # The words a few older messages use for commands that don't exist here.
 WORDS = (
@@ -62,53 +62,42 @@ def to_markdown(text: str) -> str:
     return "".join(out)
 
 
-def _err(e: DiscordError) -> TelegramError:
-    # The outbox and callbacks know one error shape: code, words, retry_after.
-    return TelegramError(e.code, e.description, e.retry_after)
+def _err(e: LinkError) -> TelegramError:
+    # The outbox and callbacks know one error shape: code, words. Unreachable is retried.
+    return TelegramError(e.code if e.code else 503, e.description)
 
 
-class DiscordChat:
-    def __init__(self, api: DiscordAPI, keeper, *, paused: Callable[[], bool] = lambda: False):
-        self.api = api
-        self.keeper = keeper          # where the DM is, and what each message showed
+class LinkChat:
+    def __init__(self, link: CainLink, *, paused: Callable[[], bool] = lambda: False):
+        self.link = link
         self.paused = paused
 
     def _rows(self, buttons, kind: str | None) -> list[dict]:
         rows = [[(label, PREFIX + data) for label, data in row] for row in (buttons or [])]
-        if rows or kind in ("digest", "stopped", "morning"):
+        if rows or kind in TOGGLE_KINDS:
             rows.append([("Turn back on", RESUME)] if self.paused() else [("Stop", STOP)])
         return components(rows, styles={"k:a:": PRIMARY})
 
     def send_message(self, chat_id: int, text: str, buttons=None, *, html: bool = True,
                      kind: str | None = None) -> int:
-        content = text if kind in RAW_KINDS else to_markdown(text) if html else escape(text)
+        content = to_markdown(text) if html else escape(text)
         try:
-            msg = self.api.send(self.keeper.dm(), content, self._rows(buttons, kind))
-        except DiscordError as e:
+            return self.link.card(content, self._rows(buttons, kind), kind or "reply")
+        except LinkError as e:
             raise _err(e) from None
-        self.keeper.remember(msg)
-        return int(msg["id"])
-
-    def post(self, text: str, buttons=None) -> int:
-        """Something the keeper itself says (stopped, turned back on)."""
-        return self.send_message(0, text, buttons, kind="notice")
 
     def edit_reply_markup(self, chat_id: int, message_id: int, buttons) -> None:
         try:
-            msg = self.api.edit(self.keeper.dm(), str(message_id),
-                                rows=self._rows(buttons, None) if buttons else [])
-        except DiscordError as e:
+            self.link.buttons(int(message_id), self._rows(buttons, None) if buttons else [])
+        except LinkError as e:
             raise _err(e) from None
-        if isinstance(msg, dict):
-            self.keeper.remember(msg)
 
     def answer_callback(self, callback_id: str, text: str | None = None) -> None:
-        """The press was already acknowledged on the gateway thread, within Discord's
-        3 seconds. A refusal is shown to him alone."""
+        """The link already acknowledged the tap within Discord's 3 seconds. A refusal
+        is shown to him alone."""
         if not text or not callback_id or ":" not in callback_id:
             return
-        app, token = callback_id.split(":", 1)
         try:
-            self.api.followup(app, token, text)
-        except DiscordError as e:
+            self.link.answer(callback_id, text)
+        except LinkError as e:
             raise _err(e) from None

@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import (cain_relay, callbacks, choices, commands, daily, ingress_filter, integrity,
+from . import (callbacks, choices, commands, daily, ingress_filter, integrity,
                policy, render, rules, telegram)
 from .config import Config
 from .discord_api import DiscordError
@@ -47,9 +47,7 @@ log = logging.getLogger("harness.controller")
 PAIR_RE = re.compile(r"/start(?:@\w+)?\s+([A-Za-z0-9_-]{16,64})")
 SETTINGS_TTL_S = 15 * 60
 FRESH_S = 120              # a handed-over message must be this new
-UNDO_KINDS = ("calendar_change_undo", "mail_dates_undo", "family_add_undo")
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
-QUESTION_TTL_S = 7 * 86400
 
 
 def family_line(st: dict, tz: ZoneInfo) -> str:
@@ -109,7 +107,6 @@ class Controller:
         self.discord = None
         self.discord_chat = None
         self.handovers = None
-        self.gateway = None
         self._discord_seen: str | None = None    # fingerprint of the token it identified with
         self._reconciled = False
         self._handover_jobs: dict[str, list] = {}
@@ -307,7 +304,12 @@ class Controller:
         self.outbox.flush()
         self._publish()
 
-    # -- Discord ---------------------------------------------------------------------
+    # -- Discord, through Cain ---------------------------------------------------------
+    # The harness has no Discord connection of its own. It hands every card to Cain's
+    # link (discord_chat.LinkChat), which holds it until Cain shows it; taps on its cards
+    # come back from the link (handover.py /press). It still reads his DM itself (REST,
+    # with the bot token) when Cain hands a request over, so it never relies on Cain's
+    # account of what he said.
     def _discord_mode(self) -> bool:
         return self.discord is not None and bool(self.vault.get("discord_bot_token"))
 
@@ -316,20 +318,11 @@ class Controller:
             self._publish()
             self._wait(10)
             return
-        for p in self.discord.take_presses():
-            self._press(p)
         for h in (self.handovers.take() if self.handovers is not None else []):
-            {"ask": self._cain_ask, "morning": self._cain_morning,
-             "digest": self._cain_digest}.get(h.kind, self._handover)(h)
-        for r in self.discord.take_reactions():
-            self._reaction(r)
+            {"press": self._press, "digest": self._cain_digest,
+             "morning-posted": self._morning_posted}.get(h.kind, self._handover)(h)
         self._release_digest()
-        if self.discord.status.get("gateway") == "ready":
-            self.ledger.ingest([], None)       # proves the link for the digest, once a minute
-            self.notes.pop("discord_link", None)
-        elif str(self.discord.status.get("gateway", "")).startswith("stopped"):
-            self.notes["discord_link"] = ("Discord refused the bot token, so taps can't reach "
-                                          "the keeper. Put the current token on the Harness page.")
+        self._link_health()
         self._work()
         self._finish_handovers()
         self._wait(0.3 if (self._busy() or self._handover_jobs) else 3)
@@ -341,6 +334,19 @@ class Controller:
         # poll_timeout 0 (tests) means never block, as with the Telegram long poll.
         self.discord.wake.wait(seconds if self.poll_timeout else 0)
         self.discord.wake.clear()
+
+    def _link_health(self) -> None:
+        """Once a minute: is Cain's link there to take cards? It is how he hears us."""
+        now = self.monotonic()
+        if now - getattr(self, "_link_checked", -1e9) < 60:
+            return
+        self._link_checked = now
+        if self.discord_chat.link.health():
+            self.ledger.ingest([], None)          # proves the path to him, for the digest
+            self.notes.pop("cain_link", None)
+        else:
+            self.notes["cain_link"] = ("Cain's add-on isn't answering, so cards wait. Calendar "
+                                       "work goes on; you'll see them when Cain is back.")
 
     def _discord_ready(self) -> bool:
         """Identify the bot and its owner once per token; on a new bot, move over."""
@@ -360,79 +366,41 @@ class Controller:
             return False
         owner_i, bot_i = int(owner), int(bot)
         if self.ledger.bot_id() != bot_i:
-            undoable, waiting = self._cutover_read()
             self.ledger.set_bot(bot_i)
             self.ledger.set_meta("chat_name", "Discord")
-        else:
-            undoable, waiting = [], 0
         self.api = self.discord_chat
         self.outbox.api = self.discord_chat
         self._bind_owner(owner_i)
         self.runner.answers_to_cain = True
-        self.callbacks.cain_answer = self._cain_answer
         self._reconcile()
-        if undoable or waiting:
-            self._cutover_post(owner_i, undoable, waiting)
         self._discord_seen = print_
         self.notes.pop("discord", None)
-        log.info("discord: talking to the bot's owner in the DM")
+        log.info("discord: cards go to Cain for the bot's owner")
         return True
 
-    def _cutover_read(self) -> tuple[list, int]:
-        """Before the bot changes: what is still undoable, and how many questions are open,
-        on the old chat. Read with the old bot's id, since messages are keyed by it."""
-        now = self.ledger.now().isoformat()
-        marks = ",".join("?" * len(UNDO_KINDS))
-        rows = self.ledger.db.execute(
-            f"SELECT * FROM choices WHERE kind IN ({marks}) AND consumed_at IS NULL"
-            " AND expires_at > ? AND message_id IS NOT NULL ORDER BY created_at DESC LIMIT 10",
-            (*UNDO_KINDS, now)).fetchall()
-        undoable = []
-        for c in rows:
-            said = self.ledger.outbound(c["chat_id"], c["message_id"])
-            if said is not None:
-                undoable.append((c["kind"], c["target"], c["expires_at"], said["text"]))
-        waiting = self.ledger.db.execute(
-            "SELECT COUNT(*) FROM approvals WHERE consumed_at IS NULL AND expires_at > ?",
-            (now,)).fetchone()[0]
-        return undoable, int(waiting)
-
-    def _cutover_post(self, owner: int, undoable: list, waiting: int) -> None:
-        now = self.ledger.now()
-        with self.ledger.tx() as db:
-            if waiting:
-                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=(
-                    f"The calendar keeper moved here from Telegram. {waiting} question(s) waiting "
-                    "there were closed and nothing was done for them. Ask again if you still "
-                    "want it."))
-            for kind, target, expires, text in reversed(undoable):
-                ttl = int((datetime.fromisoformat(expires) - now).total_seconds())
-                if ttl < 60:
-                    continue
-                n = choices.mint(self.ledger, kind=kind, target=target, chat_id=owner,
-                                 ttl_s=ttl, db=db)
-                self.ledger.enqueue(chat_id=owner, kind="reply", db=db,
-                                    text=render.fit("<i>From before the move, still undoable:</i>\n"
-                                                    + text),
-                                    buttons=[[("Undo", choices.callback_data(n))]],
-                                    binds=[{"type": "choice", "nonce": n}])
-            self.ledger.event("discord_cutover", {"undoable": len(undoable), "closed": waiting},
-                              db=db)
-
-    def _press(self, p: dict) -> None:
+    def _press(self, h) -> None:
+        """A tap on one of our cards, checked by Cain's link and passed back here. The
+        card's own checks (that card, once, before it expires) are the ledger's."""
+        p = h.press
+        h.finish("ok")
         owner = self.config.owner_user_id
-        cid = p["custom_id"]
+        cid = str(p.get("custom_id", ""))
+        if not cid.startswith(DISCORD_PREFIX):
+            return
         if cid in (STOP, RESUME):
             text = self.commands._stop("") if cid == STOP else self.commands._resume("")
             with self.ledger.tx() as db:
-                self.ledger.enqueue(chat_id=owner, kind="stopped" if cid == STOP else "notice",
+                self.ledger.enqueue(chat_id=owner, kind="stopped" if cid == STOP else "resumed",
                                     text=text, db=db)
             return
-        inc = telegram.Incoming(update_id=int(p["id"]), kind="callback", user_id=owner,
-                                chat_id=owner, chat_type="private",
-                                message_id=int(p["message_id"]),
-                                callback_id=f"{p['app']}:{p['token']}",
-                                callback_data=cid[len(DISCORD_PREFIX):])
+        try:
+            inc = telegram.Incoming(update_id=int(p["id"]), kind="callback", user_id=owner,
+                                    chat_id=owner, chat_type="private",
+                                    message_id=int(p["message_id"]),
+                                    callback_id=f"{p.get('app', '')}:{p.get('token', '')}",
+                                    callback_data=cid[len(DISCORD_PREFIX):])
+        except (KeyError, ValueError, TypeError):
+            return
         self.ledger.ingest([telegram.Decision(inc, True, None, None)], None)
         self.callbacks.handle(inc)
 
@@ -443,17 +411,17 @@ class Controller:
         if h.paired and h.paired != str(owner):
             self.notes["discord_owner"] = ("Cain is paired with a different Discord account than "
                                            "the bot's owner, so the keeper won't act for Cain")
-            h.finish("refused", "The keeper won't act: you're paired with a different Discord "
-                                "account than the bot's owner.")
+            h.finish("refused", "The specialist won't act: you're paired with a different "
+                                "Discord account than the bot's owner.")
             return
         try:
             msgs = self.discord.api.history(self.discord.dm(), 20)
         except DiscordError as e:
-            h.finish("error", f"The keeper couldn't read the DM ({e.code}). Nothing changed.")
+            h.finish("error", f"The specialist couldn't read the DM ({e.code}). Nothing changed.")
             return
         mine = [m for m in msgs if str((m.get("author") or {}).get("id")) == str(owner)]
         if not mine:
-            h.finish("nothing", "There's no message from him for the keeper to act on.")
+            h.finish("nothing", "There's no message from him to act on.")
             return
         m = mine[0]                                          # Discord lists newest first
         try:
@@ -462,8 +430,8 @@ class Controller:
             age = FRESH_S + 1
         h.age = max(0.0, age)
         if age > FRESH_S:
-            h.finish("stale", "His newest message is over 2 minutes old, so the keeper didn't act "
-                              "on it. Nothing changed.")
+            h.finish("stale", "His newest message is over 2 minutes old, so nothing was done "
+                              "with it. Nothing changed.")
             return
         text, flags, reply_to = self._discord_words(m, msgs, owner)
         if h.suggestion:
@@ -471,11 +439,11 @@ class Controller:
             text += ("\n\n[A suggestion from Cain, his assistant. These are not his words: "
                      + h.suggestion + "]")
         if not text.strip():
-            h.finish("nothing", "His message has no words for the keeper to act on.")
+            h.finish("nothing", "His message has no words to act on.")
             return
         hit = self._screen_text(text)
         if hit:
-            h.finish("refused", f"The keeper didn't keep that message: it looks like {hit}. "
+            h.finish("refused", f"That message wasn't kept: it looks like {hit}. "
                                 "Nothing was stored.")
             return
         inc = telegram.Incoming(update_id=int(m["id"]), kind="message", user_id=owner,
@@ -491,13 +459,13 @@ class Controller:
                 "SELECT id FROM jobs WHERE bot_id=? AND chat_id=? AND message_id=?",
                 (self.ledger.bot_id(), owner, int(m["id"]))).fetchone()
             if row is None:
-                h.finish("error", "The keeper couldn't record that. Nothing changed.")
+                h.finish("error", "That couldn't be recorded. Nothing changed.")
                 return
             job_id = row["id"]
         self._handover_jobs.setdefault(job_id, []).append(h)
 
     def _discord_words(self, m: dict, msgs: list[dict], owner: int):
-        """His words, the signs they may not be his own, and the keeper message he replied to."""
+        """His words, the signs they may not be his own, and our card he replied to."""
         flags: list[str] = []
         text = m.get("content") or ""
         ref = m.get("message_reference") or {}
@@ -513,8 +481,9 @@ class Controller:
         reply_to = None
         if ref.get("message_id") and ref.get("type", 0) == 0:
             rid = str(ref["message_id"])
-            if self.discord.posted(rid):
-                reply_to = int(rid)                          # a reply to the keeper: still him
+            card = self.discord_chat.link.card_of(rid)
+            if card:
+                reply_to = int(card)                         # a reply to our card: still him
             else:
                 target = m.get("referenced_message") or next(
                     (x for x in msgs if str(x.get("id")) == rid), None)
@@ -522,51 +491,7 @@ class Controller:
                     flags.append("foreign_reply")
         return text, flags, reply_to
 
-    # -- Cain posting through the keeper, and his taps and reactions back to Cain ----------
-    def _relay(self, text: str) -> None:
-        """To Cain's session, off this thread: a slow Cain never holds up the loop."""
-        token = self.vault.get("discord_bot_token")
-        self.executor.submit(cain_relay.send, token, text)
-        self.ledger.event("relayed_to_cain", {"chars": len(text)})
-
-    def _cain_post(self, h, kind: str) -> bool:
-        """Cain's words, posted by the keeper so his buttons can be heard."""
-        if not h.text:
-            h.finish("refused", "Nothing to post.")
-            return False
-        owner = self.config.owner_user_id
-        excerpt = h.text if len(h.text) <= 150 else h.text[:147] + "..."
-        with self.ledger.tx() as db:
-            row, binds = [], []
-            for label in h.options:
-                n = choices.mint(self.ledger, kind="cain_question", chat_id=owner,
-                                 target=json.dumps({"q": excerpt, "a": label}),
-                                 ttl_s=QUESTION_TTL_S, db=db)
-                row.append((label, choices.callback_data(n)))
-                binds.append({"type": "choice", "nonce": n})
-            self.ledger.enqueue(chat_id=owner, kind=kind, text=h.text, db=db,
-                                buttons=[row] if row else None, binds=binds or None)
-        self.outbox.flush()
-        return True
-
-    def _cain_ask(self, h) -> None:
-        if self._cain_post(h, "cain"):
-            h.finish("posted", "Posted. His tap will reach you as a relayed message."
-                     if h.options else "Posted.")
-
-    def _cain_answer(self, target: str) -> str:
-        try:
-            t = json.loads(target)
-        except ValueError:
-            return "Nothing changed."
-        self._relay(f'Dane tapped "{t.get("a", "")}" on your question: "{t.get("q", "")}"')
-        return f"You chose: {render.escape(t.get('a', ''))}."
-
-    def _cain_morning(self, h) -> None:
-        if self._cain_post(h, "morning"):
-            self.ledger.set_meta("digest_held_at", "")      # the digest is in it now
-            h.finish("posted", "Posted your morning update.")
-
+    # -- the morning: Cain folds the digest into his one message ----------------------------
     def _cain_digest(self, h) -> None:
         held = self.ledger.get_meta("digest_held_at")
         if not held:
@@ -575,9 +500,13 @@ class Controller:
             return
         h.finish("ok", render.plain(self.ledger.get_meta("last_digest_text") or ""))
 
+    def _morning_posted(self, h) -> None:
+        self.ledger.set_meta("digest_held_at", "")          # the digest is in it now
+        h.finish("ok")
+
     def _release_digest(self) -> None:
-        """If Cain didn't post his morning update in time, the digest goes out on its own,
-        so a silent morning always means something is wrong."""
+        """If Cain didn't post his morning message in time, the digest goes out on its own
+        (one of the two things that bypass him), so a silent morning means something is wrong."""
         held = self.ledger.get_meta("digest_held_at")
         if not held:
             return
@@ -585,40 +514,30 @@ class Controller:
             return
         with self.ledger.tx() as db:
             self.ledger.set_meta("digest_held_at", "", db)
-            self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="digest", db=db,
-                                text=("<i>Cain didn't post his morning update, so here is the "
+            self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="alert", db=db,
+                                text=("<i>Cain didn't post his morning message, so here is the "
                                       "calendar digest on its own.</i>\n"
                                       + (self.ledger.get_meta("last_digest_text") or "")))
-        log.warning("digest posted without Cain's morning update")
-
-    def _reaction(self, r: dict) -> None:
-        try:
-            msg = self.discord.api.message(self.discord.dm(), r["message_id"])
-        except DiscordError:
-            return
-        if str((msg.get("author") or {}).get("id")) != str(self.discord.bot()):
-            return                                       # his own message: nothing to pass on
-        text = (msg.get("content") or "").strip().replace("\n", " ")
-        excerpt = text if len(text) <= 150 else text[:147] + "..."
-        self._relay(f'Dane reacted {r["emoji"]} to your message: "{excerpt}"')
+        log.warning("digest posted without Cain's morning message")
 
     def _finish_handovers(self) -> None:
-        """Answer Cain once the request has settled and what he was told has gone out."""
+        """Answer Cain once the request has settled and its cards are with him."""
         for job_id, waiting in list(self._handover_jobs.items()):
             job = self.ledger.job(job_id)
             if job is None:
                 for h in waiting:
-                    h.finish("error", "The keeper lost track of that. Nothing changed.")
+                    h.finish("error", "Lost track of that. Nothing changed.")
                 del self._handover_jobs[job_id]
                 continue
             if job["state"] in ("received", "running", "approved"):
                 continue
             rows = self.ledger.db.execute(
-                "SELECT kind, text, state FROM outbox WHERE job_id=? AND kind!='notice' ORDER BY id",
-                (job_id,)).fetchall()
+                "SELECT kind, text, state, message_id FROM outbox WHERE job_id=? AND kind!='notice'"
+                " ORDER BY id", (job_id,)).fetchall()
             if any(r["state"] not in ("sent", "dead") for r in rows):
-                continue                                      # not delivered yet
-            said = [render.plain(r["text"]) for r in rows if r["state"] == "sent"]
+                continue                                      # not with Cain yet
+            sent = [r for r in rows if r["state"] == "sent"]
+            said = [render.plain(r["text"]) for r in sent]
             receipts = self.ledger.receipts(job_id)
             to_cain = ""
             if receipts:
@@ -626,12 +545,13 @@ class Controller:
                     to_cain = json.loads(receipts[-1]["detail"] or "{}").get("said_to_cain", "")
                 except ValueError:
                     to_cain = ""
-            status = {"answered": "not a change" if to_cain else "posted",
+            status = {"answered": "not a change" if to_cain else "card",
                       "no_action": "not a change",
                       "proposed": "waiting for his tap"}.get(job["state"], job["state"])
             words = to_cain or "\n\n".join(said) or "Done."
+            cards = [int(r["message_id"]) for r in sent if r["message_id"]]
             for h in waiting:
-                h.finish(status, words, posted_in_dm=bool(said))
+                h.finish(status, words, cards=cards)
             del self._handover_jobs[job_id]
 
     def _busy(self) -> bool:

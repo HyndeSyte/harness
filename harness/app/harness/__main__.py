@@ -22,8 +22,8 @@ from .calendar_feed import CalendarFeeds
 from .config import Config
 from .controller import Controller
 from .discord_api import DiscordAPI, DiscordTransport
-from .discord_gateway import Gateway
-from .discord_chat import DiscordChat
+from .cain_relay import CainLink
+from .discord_chat import LinkChat
 from .discord_keeper import DiscordKeeper, KeeperStore
 from . import commands, handover
 from .engines import AnthropicEngine, OpenAIEngine
@@ -123,17 +123,14 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 writes_on=lambda: mail_option_on(data_dir), tz=base.timezone,
                                 family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)))
-    # Discord: the keeper posts as Cain's bot in his DM and hears its own buttons.
-    # Its record is its own file: presses arrive on the gateway thread, and the
-    # ledger's connection belongs to this one.
+    # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;
+    # taps come back to /press. The bot token reads his DM when Cain hands a request over.
     store = KeeperStore(os.path.join(data_dir, "discord.json"))
     discord_token = lambda: vault.get("discord_bot_token")          # noqa: E731
     keeper = DiscordKeeper(DiscordAPI(discord_token, DiscordTransport()), store.get, store.set)
     controller.discord = keeper
-    controller.discord_chat = DiscordChat(keeper.api, keeper,
-                                          paused=lambda: commands.is_paused(ledger))
-    controller.gateway = Gateway(discord_token, keeper.on_interaction, on_state=keeper.on_state,
-                                 on_reaction=keeper.on_reaction)
+    controller.discord_chat = LinkChat(CainLink(discord_token),
+                                       paused=lambda: commands.is_paused(ledger))
     # Cain hands calendar requests over here, keyed by the bot token both hold.
     controller.handovers = handover.Inbox(discord_token, wake=keeper.wake)
     try:
@@ -167,7 +164,6 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
 
     log.info("harness starting (stage %s, policy %s)", STAGE, policy.POLICY_VERSION)
-    controller.gateway.start()
     started = False
     failures = 0
     try:
