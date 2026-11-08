@@ -233,7 +233,7 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
         assert f"/{route}" in handover.ROUTES
     # Nothing of his is passed: only Cain's own suggestion and who Cain is paired with.
     assert "{suggestion: $s, paired: $p}" in code
-    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text()
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "/opt/cain/keeper.sh handover" in rules and "never change a calendar yourself" in rules
     assert "exec /opt/cain/keeper.sh handover" in (CAIN / "rootfs/opt/cain/handover.sh").read_text()
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
@@ -304,7 +304,7 @@ def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
 def test_cain_checks_in_on_his_own_record():
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
     assert "/opt/cain/checkin.sh" in run
-    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text()
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "## Check-ins" in rules and "state/PENDING.md" in rules
     assert "never his go on anything" in rules
     assert " tzdata " in (CAIN / "Dockerfile").read_text()
@@ -342,7 +342,7 @@ def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):
 
 
 def test_cains_morning_update_folds_in_the_digest():
-    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text()
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "/opt/cain/keeper.sh digest" in rules and '/opt/cain/keeper.sh morning "text"' in rules
     assert "ONE message" in rules and "Relayed by the add-on" in rules
     import json
