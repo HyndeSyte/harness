@@ -16,6 +16,11 @@ tap: Cain's words never change a calendar by themselves.
 - The answer waits for the result, up to WAIT_S, so Cain never says "done"
   before it is.
 
+Cain also posts through the keeper here, because only the keeper's connection
+hears taps: /ask (a question with buttons; his tap goes back to Cain),
+/morning (Cain's one morning update, digest folded in, with Stop), and /digest
+(takes today's calendar digest for that update).
+
 The HTTP thread never touches the ledger: it queues the request for the
 controller and waits on an event.
 """
@@ -39,6 +44,9 @@ KEY_CONTEXT = b"harness-handover-v1"
 WAIT_S = 25
 MAX_BODY = 4096
 MAX_SUGGESTION = 1500
+MAX_TEXT = 1900
+MAX_OPTIONS = 5
+ROUTES = ("/handover", "/ask", "/morning", "/digest")
 
 
 def key_for(token: str) -> str:
@@ -47,6 +55,9 @@ def key_for(token: str) -> str:
 
 @dataclass
 class Handover:
+    kind: str = "handover"               # or ask, morning, digest
+    text: str = ""                       # ask, morning: what Cain posts
+    options: list = field(default_factory=list)
     suggestion: str = ""
     paired: str = ""                     # the Discord user Cain is paired with
     done: threading.Event = field(default_factory=threading.Event)
@@ -104,7 +115,7 @@ def _handler(inbox: Inbox, wait_s: float):
             self.wfile.write(data)
 
         def do_POST(self):
-            if self.path != "/handover":
+            if self.path not in ROUTES:
                 return self._reply(404, {"status": "not found"})
             if not inbox.key_ok(self.headers.get("x-harness-key", "")):
                 log.warning("handover refused: wrong key")
@@ -121,7 +132,11 @@ def _handler(inbox: Inbox, wait_s: float):
                 return self._reply(400, {"status": "not JSON"})
             if not isinstance(body, dict):
                 return self._reply(400, {"status": "not JSON"})
-            h = Handover(suggestion=str(body.get("suggestion") or "")[:MAX_SUGGESTION].strip(),
+            opts = body.get("options") if isinstance(body.get("options"), list) else []
+            h = Handover(kind=self.path.strip("/"),
+                         text=str(body.get("text") or "")[:MAX_TEXT].strip(),
+                         options=[str(o)[:80].strip() for o in opts if str(o).strip()][:MAX_OPTIONS],
+                         suggestion=str(body.get("suggestion") or "")[:MAX_SUGGESTION].strip(),
                          paired=str(body.get("paired") or "").strip())
             inbox.submit(h)
             if not h.done.wait(wait_s):

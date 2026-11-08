@@ -27,6 +27,9 @@ from .discord_api import PRIMARY, DiscordAPI, DiscordError, components, escape
 from .telegram_api import TelegramError
 
 PREFIX = "k:"
+# Cain's own posts through the keeper: his markdown kept (mentions and previews
+# are still off). "morning" also carries the Stop button, like the digest.
+RAW_KINDS = ("cain", "morning")
 STOP, RESUME = "k:stop", "k:resume"
 
 # The words a few older messages use for commands that don't exist here.
@@ -72,13 +75,13 @@ class DiscordChat:
 
     def _rows(self, buttons, kind: str | None) -> list[dict]:
         rows = [[(label, PREFIX + data) for label, data in row] for row in (buttons or [])]
-        if rows or kind in ("digest", "stopped"):
+        if rows or kind in ("digest", "stopped", "morning"):
             rows.append([("Turn back on", RESUME)] if self.paused() else [("Stop", STOP)])
         return components(rows, styles={"k:a:": PRIMARY})
 
     def send_message(self, chat_id: int, text: str, buttons=None, *, html: bool = True,
                      kind: str | None = None) -> int:
-        content = to_markdown(text) if html else escape(text)
+        content = text if kind in RAW_KINDS else to_markdown(text) if html else escape(text)
         try:
             msg = self.api.send(self.keeper.dm(), content, self._rows(buttons, kind))
         except DiscordError as e:

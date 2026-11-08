@@ -132,7 +132,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     controller.discord = keeper
     controller.discord_chat = DiscordChat(keeper.api, keeper,
                                           paused=lambda: commands.is_paused(ledger))
-    controller.gateway = Gateway(discord_token, keeper.on_interaction, on_state=keeper.on_state)
+    controller.gateway = Gateway(discord_token, keeper.on_interaction, on_state=keeper.on_state,
+                                 on_reaction=keeper.on_reaction)
     # Cain hands calendar requests over here, keyed by the bot token both hold.
     controller.handovers = handover.Inbox(discord_token, wake=keeper.wake)
     try:

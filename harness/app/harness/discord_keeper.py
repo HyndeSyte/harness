@@ -34,6 +34,15 @@ UPDATE, ACK = 7, 6       # answer kinds
 REMEMBER_S = 35 * 86400  # longer than any card lives (Undo: 7 days, rules: 30)
 
 
+def _drain(q: "queue.Queue") -> list:
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except queue.Empty:
+            return out
+
+
 class KeeperStore:
     """The keeper's own small record (/data/discord.json): owner, DM, cards.
 
@@ -88,6 +97,7 @@ class DiscordKeeper:
         self._clock = clock
         self._lock = threading.Lock()
         self.presses: "queue.Queue[dict]" = queue.Queue()
+        self.reactions: "queue.Queue[dict]" = queue.Queue()
         self.wake = threading.Event()        # set when there's something for the controller
         self.status: dict = {"gateway": "off"}
 
@@ -197,12 +207,23 @@ class DiscordKeeper:
             log.error("discord: could not answer the press in time: %s", e.code)
 
     def take_presses(self) -> list[dict]:
-        out = []
-        while True:
-            try:
-                out.append(self.presses.get_nowait())
-            except queue.Empty:
-                return out
+        return _drain(self.presses)
+
+    def on_reaction(self, d: dict) -> None:
+        """Gateway thread. His reaction in the DM: kept for the controller to pass to
+        Cain. Anyone else's, or anywhere else, is dropped."""
+        try:
+            if d.get("guild_id") or str(d.get("user_id")) != self.owner() \
+                    or str(d.get("channel_id")) != self.dm():
+                return
+        except DiscordError:
+            return
+        emoji = (d.get("emoji") or {}).get("name") or "?"
+        self.reactions.put({"message_id": str(d.get("message_id")), "emoji": str(emoji)[:32]})
+        self.wake.set()
+
+    def take_reactions(self) -> list[dict]:
+        return _drain(self.reactions)
 
     def on_state(self, state: str) -> None:
         self.status["gateway"] = state

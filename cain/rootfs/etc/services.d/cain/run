@@ -34,10 +34,12 @@ bashio::log.info "Cain is running"
   timeout 120 claude mcp list 2>&1 | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 \
     | while IFS= read -r line; do echo "[cain] connector: $line"; done
 ) &
-# Check-ins: Cain moves open work at 7:10 AM, 12:30 PM and 5:30 PM without waiting
-# for Dane. checkin.sh decides when, and only types into an idle session.
+# His taps and reactions, passed on by the calendar specialist, wait here for Cain.
+( while true; do bun /opt/cain/relay.ts 2>&1; sleep 5; done ) &
+# Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM so open work moves
+# without Dane. checkin.sh decides when, and only types into an idle session.
 (
-  while true; do /opt/cain/checkin.sh || true; sleep 30; done
+  while true; do /opt/cain/checkin.sh || true; sleep 5; done
 ) &
 # The sign-in link is longer than a terminal line, and tmux breaks it, so a
 # click opens a cut-off link. Keep the whole link on a page of its own:

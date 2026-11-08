@@ -30,8 +30,8 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import (callbacks, choices, commands, daily, ingress_filter, integrity, policy,
-               render, rules, telegram)
+from . import (cain_relay, callbacks, choices, commands, daily, ingress_filter, integrity,
+               policy, render, rules, telegram)
 from .config import Config
 from .discord_api import DiscordError
 from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
@@ -48,6 +48,8 @@ PAIR_RE = re.compile(r"/start(?:@\w+)?\s+([A-Za-z0-9_-]{16,64})")
 SETTINGS_TTL_S = 15 * 60
 FRESH_S = 120              # a handed-over message must be this new
 UNDO_KINDS = ("calendar_change_undo", "mail_dates_undo", "family_add_undo")
+DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
+QUESTION_TTL_S = 7 * 86400
 
 
 def family_line(st: dict, tz: ZoneInfo) -> str:
@@ -317,7 +319,11 @@ class Controller:
         for p in self.discord.take_presses():
             self._press(p)
         for h in (self.handovers.take() if self.handovers is not None else []):
-            self._handover(h)
+            {"ask": self._cain_ask, "morning": self._cain_morning,
+             "digest": self._cain_digest}.get(h.kind, self._handover)(h)
+        for r in self.discord.take_reactions():
+            self._reaction(r)
+        self._release_digest()
         if self.discord.status.get("gateway") == "ready":
             self.ledger.ingest([], None)       # proves the link for the digest, once a minute
             self.notes.pop("discord_link", None)
@@ -363,6 +369,7 @@ class Controller:
         self.outbox.api = self.discord_chat
         self._bind_owner(owner_i)
         self.runner.answers_to_cain = True
+        self.callbacks.cain_answer = self._cain_answer
         self._reconcile()
         if undoable or waiting:
             self._cutover_post(owner_i, undoable, waiting)
@@ -514,6 +521,86 @@ class Controller:
                 if not target or str((target.get("author") or {}).get("id")) != str(owner):
                     flags.append("foreign_reply")
         return text, flags, reply_to
+
+    # -- Cain posting through the keeper, and his taps and reactions back to Cain ----------
+    def _relay(self, text: str) -> None:
+        """To Cain's session, off this thread: a slow Cain never holds up the loop."""
+        token = self.vault.get("discord_bot_token")
+        self.executor.submit(cain_relay.send, token, text)
+        self.ledger.event("relayed_to_cain", {"chars": len(text)})
+
+    def _cain_post(self, h, kind: str) -> bool:
+        """Cain's words, posted by the keeper so his buttons can be heard."""
+        if not h.text:
+            h.finish("refused", "Nothing to post.")
+            return False
+        owner = self.config.owner_user_id
+        excerpt = h.text if len(h.text) <= 150 else h.text[:147] + "..."
+        with self.ledger.tx() as db:
+            row, binds = [], []
+            for label in h.options:
+                n = choices.mint(self.ledger, kind="cain_question", chat_id=owner,
+                                 target=json.dumps({"q": excerpt, "a": label}),
+                                 ttl_s=QUESTION_TTL_S, db=db)
+                row.append((label, choices.callback_data(n)))
+                binds.append({"type": "choice", "nonce": n})
+            self.ledger.enqueue(chat_id=owner, kind=kind, text=h.text, db=db,
+                                buttons=[row] if row else None, binds=binds or None)
+        self.outbox.flush()
+        return True
+
+    def _cain_ask(self, h) -> None:
+        if self._cain_post(h, "cain"):
+            h.finish("posted", "Posted. His tap will reach you as a relayed message."
+                     if h.options else "Posted.")
+
+    def _cain_answer(self, target: str) -> str:
+        try:
+            t = json.loads(target)
+        except ValueError:
+            return "Nothing changed."
+        self._relay(f'Dane tapped "{t.get("a", "")}" on your question: "{t.get("q", "")}"')
+        return f"You chose: {render.escape(t.get('a', ''))}."
+
+    def _cain_morning(self, h) -> None:
+        if self._cain_post(h, "morning"):
+            self.ledger.set_meta("digest_held_at", "")      # the digest is in it now
+            h.finish("posted", "Posted your morning update.")
+
+    def _cain_digest(self, h) -> None:
+        held = self.ledger.get_meta("digest_held_at")
+        if not held:
+            h.finish("none", "No calendar digest is waiting. Today's was already posted, "
+                             "or it isn't 7:00 AM yet.")
+            return
+        h.finish("ok", render.plain(self.ledger.get_meta("last_digest_text") or ""))
+
+    def _release_digest(self) -> None:
+        """If Cain didn't post his morning update in time, the digest goes out on its own,
+        so a silent morning always means something is wrong."""
+        held = self.ledger.get_meta("digest_held_at")
+        if not held:
+            return
+        if (self.ledger.now() - datetime.fromisoformat(held)).total_seconds() < DIGEST_WAIT_S:
+            return
+        with self.ledger.tx() as db:
+            self.ledger.set_meta("digest_held_at", "", db)
+            self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="digest", db=db,
+                                text=("<i>Cain didn't post his morning update, so here is the "
+                                      "calendar digest on its own.</i>\n"
+                                      + (self.ledger.get_meta("last_digest_text") or "")))
+        log.warning("digest posted without Cain's morning update")
+
+    def _reaction(self, r: dict) -> None:
+        try:
+            msg = self.discord.api.message(self.discord.dm(), r["message_id"])
+        except DiscordError:
+            return
+        if str((msg.get("author") or {}).get("id")) != str(self.discord.bot()):
+            return                                       # his own message: nothing to pass on
+        text = (msg.get("content") or "").strip().replace("\n", " ")
+        excerpt = text if len(text) <= 150 else text[:147] + "..."
+        self._relay(f'Dane reacted {r["emoji"]} to your message: "{excerpt}"')
 
     def _finish_handovers(self) -> None:
         """Answer Cain once the request has settled and what he was told has gone out."""
@@ -744,7 +831,7 @@ class Controller:
                                  self.calendar_change.digest_line() if self.calendar_change else "",
                                  self.mail_dates.digest_line() if self.mail_dates else "")
                                  if x))
-            daily.deliver(self.ledger, cfg, d)
+            daily.deliver(self.ledger, cfg, d, hold=self._discord_mode())
 
     # -- status ------------------------------------------------------------------------------
     def status_text(self) -> str:

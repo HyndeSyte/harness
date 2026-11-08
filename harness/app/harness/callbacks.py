@@ -102,6 +102,8 @@ class Callbacks:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
         if kind == "calendar_change_undo" and self.calendar_change is not None:
             return self.calendar_change.on_choice(kind, target)
+        if kind == "cain_question" and getattr(self, "cain_answer", None) is not None:
+            return self.cain_answer(target)          # passed to Cain; says what he chose
         if kind == "mail_dates_undo" and self.mail_dates is not None:
             return self.mail_dates.on_choice(kind, target)
         return "Nothing changed."

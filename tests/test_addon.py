@@ -220,18 +220,22 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     import sys
     sys.path.insert(0, str(ADDON / "app"))
     from harness import handover
-    script = (CAIN / "rootfs/opt/cain/handover.sh").read_text()
+    script = (CAIN / "rootfs/opt/cain/keeper.sh").read_text()
     code = "\n".join(l for l in script.splitlines() if not l.strip().startswith("#"))
     # The same key the harness checks, made from the token inside bun, never on a command line.
     assert handover.KEY_CONTEXT.decode() in code and 'createHmac("sha256"' in code
     assert "process.env.ENV_FILE" in code and "$token" not in code
     assert "umask 077" in code and '-H "@$hdr"' in code and "unset key" in code
     assert code.index("unset key") < code.index("curl ")
-    assert f"http://0fcc2575-harness:{handover.PORT}/handover" in code
+    assert f'"http://0fcc2575-harness:{handover.PORT}/$cmd"' in code
+    assert "case \"$cmd\" in handover|ask|digest|morning)" in code
+    for route in ("handover", "ask", "digest", "morning"):
+        assert f"/{route}" in handover.ROUTES
     # Nothing of his is passed: only Cain's own suggestion and who Cain is paired with.
     assert "{suggestion: $s, paired: $p}" in code
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text()
-    assert "/opt/cain/handover.sh" in rules and "never change a calendar yourself" in rules
+    assert "/opt/cain/keeper.sh handover" in rules and "never change a calendar yourself" in rules
+    assert "exec /opt/cain/keeper.sh handover" in (CAIN / "rootfs/opt/cain/handover.sh").read_text()
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
     assert "cp /opt/cain/settings.json /data/work/.claude/settings.json" in run
 
@@ -304,3 +308,43 @@ def test_cain_checks_in_on_his_own_record():
     assert "## Check-ins" in rules and "state/PENDING.md" in rules
     assert "never his go on anything" in rules
     assert " tzdata " in (CAIN / "Dockerfile").read_text()
+
+
+def test_taps_and_reactions_reach_cain_with_the_relay_key():
+    import sys
+    sys.path.insert(0, str(ADDON / "app"))
+    from harness import cain_relay
+    relay = (CAIN / "rootfs/opt/cain/relay.ts").read_text()
+    assert cain_relay.KEY_CONTEXT.decode() in relay and "timingSafeEqual" in relay
+    assert f"?? {cain_relay.PORT})" in relay and '"/relay"' in relay
+    assert cain_relay.HOST == "0fcc2575-cain"
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    assert "bun /opt/cain/relay.ts" in run
+    assert not re.search(r"^ports", (CAIN / "config.yaml").read_text(), re.M)
+
+
+def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):
+    import shutil
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    q = tmp_path / "relay.queue"
+    q.write_text('{"text": "Dane tapped \\"Yes\\" on your question: \\"Book it?\\""}\n'
+                 '{"text": "second"}\n', newline="\n")
+    import os
+    os.environ["RELAY_QUEUE"] = str(q)
+    try:
+        out = _checkin(tmp_path, "0712", IDLE)
+    finally:
+        del os.environ["RELAY_QUEUE"]
+    assert "Relayed by the add-on" in out and 'tapped "Yes"' in out and "morning" not in out
+    assert q.read_text().strip() == '{"text": "second"}'
+
+
+def test_cains_morning_update_folds_in_the_digest():
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text()
+    assert "/opt/cain/keeper.sh digest" in rules and '/opt/cain/keeper.sh morning "text"' in rules
+    assert "ONE message" in rules and "Relayed by the add-on" in rules
+    import json
+    allow = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]["allow"]
+    assert "Bash(/opt/cain/keeper.sh:*)" in allow

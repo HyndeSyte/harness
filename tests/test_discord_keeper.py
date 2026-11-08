@@ -341,3 +341,66 @@ def test_while_stopped_a_handover_changes_nothing(rig):
     rig.he_says("move the dentist to thursday")
     out = rig.handover()
     assert rig.claude.calls == [] and "stopped" in out["said"].lower()
+
+
+# -- Cain posting through the keeper; his taps and reactions back to Cain ---------------------
+
+@pytest.fixture
+def relayed(monkeypatch):
+    from harness import cain_relay
+    sent = []
+    monkeypatch.setattr(cain_relay, "send", lambda token, text, **kw: sent.append(text) or True)
+    return sent
+
+
+def test_cains_question_has_buttons_and_his_tap_goes_back_to_cain(rig, relayed):
+    out = rig.handover(kind="ask", text="Book the plumber for Tuesday?", options=["Yes", "No"])
+    assert out["status"] == "posted"
+    card = json.loads(json.dumps(rig.d.sent[-1]))                     # as he saw it
+    assert card["content"] == "Book the plumber for Tuesday?"          # his words, as written
+    assert len(ids(card)) == 3 and ids(card)[-1] == STOP
+    rig.keeper.on_interaction(press_on(card, ids(card)[0]))
+    rig.c.tick()
+    assert relayed == ['Dane tapped "Yes" on your question: "Book the plumber for Tuesday?"']
+    assert "You chose: Yes" in rig.d.sent[-1]["content"]
+    rig.keeper.on_interaction(press_on(card, ids(card)[1]))            # a second tap: used
+    rig.c.tick()
+    assert len(relayed) == 1
+
+
+def test_his_reaction_to_a_cain_message_goes_to_cain(rig, relayed):
+    rig.c.discord_chat.send_message(1, "Want me to draft it?", kind="cain")
+    mid = rig.d.sent[-1]["id"]
+    rig.d.message = lambda ch, m: {"id": m, "content": "Want me to draft it?", "author": {"id": BOT}}
+    rig.keeper.on_reaction({"user_id": OWNER, "channel_id": DM, "message_id": mid,
+                            "emoji": {"name": "👍"}})
+    rig.keeper.on_reaction({"user_id": "333", "channel_id": DM, "message_id": mid,
+                            "emoji": {"name": "👎"}})                    # not his: dropped
+    rig.c.tick()
+    assert relayed == ['Dane reacted 👍 to your message: "Want me to draft it?"']
+
+
+def test_one_morning_message_with_the_digest_folded_in(rig, relayed):
+    with rig.ledger.tx() as db:
+        rig.ledger.set_meta("last_digest_text", "<b>Today</b>: dentist 2 PM", db)
+        rig.ledger.set_meta("digest_held_at", rig.clock().isoformat(), db)
+    out = rig.handover(kind="digest")
+    assert out["status"] == "ok" and out["said"] == "Today: dentist 2 PM"
+    rig.handover(kind="morning", text="Morning. Dentist at 2. Nothing needs you.")
+    assert rig.d.sent[-1]["content"].startswith("Morning.") and ids(rig.d.sent[-1]) == [STOP]
+    rig.clock.advance(minutes=50)
+    rig.c.tick()
+    assert sum("dentist" in m["content"].lower() for m in rig.d.sent) == 1   # not posted again
+
+
+def test_without_cains_morning_update_the_digest_goes_out_on_its_own(rig):
+    with rig.ledger.tx() as db:
+        rig.ledger.set_meta("last_digest_text", "Today: dentist 2 PM", db)
+        rig.ledger.set_meta("digest_held_at", rig.clock().isoformat(), db)
+    rig.clock.advance(minutes=39)
+    rig.c.tick()
+    assert rig.d.sent == []
+    rig.clock.advance(minutes=2)
+    rig.c.tick()
+    assert "didn't post his morning update" in rig.d.sent[-1]["content"]
+    assert ids(rig.d.sent[-1]) == [STOP]

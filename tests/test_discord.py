@@ -147,7 +147,8 @@ def test_gateway_identifies_with_no_intents_and_hands_presses_over():
         gw._session(TOKEN)
     assert e.value.code == 4004
     ident = srv.received[0]
-    assert ident["op"] == 2 and ident["d"]["intents"] == 0
+    # Reactions in DMs only: never DIRECT_MESSAGES (1<<12) or MESSAGE_CONTENT (1<<15).
+    assert ident["op"] == 2 and ident["d"]["intents"] == 1 << 13
     assert presses == [{"type": 3, "id": "i"}]
     assert "ready" in states and gw.session_id == "s" and gw.seq == 2
 

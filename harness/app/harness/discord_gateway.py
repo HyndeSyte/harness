@@ -1,9 +1,10 @@
 """The keeper's own Discord connection: it hears presses on its buttons, nothing else.
 
-It identifies with intents 0, so Discord sends it no messages at all, only the
-events every connection gets: READY, and INTERACTION_CREATE for button presses
-on this bot's messages. Cain's connection on the same bot hears his messages;
-this one never does.
+It identifies with one intent, DIRECT_MESSAGE_REACTIONS, so Discord sends it no
+messages at all: only READY, INTERACTION_CREATE for button presses on this bot's
+messages, and reactions in DMs (which carry an emoji and ids, never text). Cain's
+connection on the same bot hears his messages; this one never does. Cain's plugin
+doesn't ask for reactions, so this connection hears them for him.
 
 Plain stdlib: a TLS socket, a minimal WebSocket client (RFC 6455: masked
 client frames, ping/pong, close, fragments), and the gateway protocol
@@ -40,6 +41,7 @@ HOSTS_SUFFIX = ".discord.gg"
 OP_DISPATCH, OP_HEARTBEAT, OP_IDENTIFY, OP_RESUME, OP_RECONNECT = 0, 1, 2, 6, 7
 OP_INVALID, OP_HELLO, OP_ACK = 9, 10, 11
 # Close codes after which retrying with the same token can't work.
+INTENTS = 1 << 13          # DIRECT_MESSAGE_REACTIONS
 FATAL = {4004: "token refused", 4010: "invalid shard", 4011: "sharding required",
          4012: "invalid version", 4013: "invalid intents", 4014: "intents not allowed"}
 
@@ -171,11 +173,13 @@ class Gateway:
     """Keeps one connection up, forever, in its own thread."""
 
     def __init__(self, token_fn: Callable[[], str], on_interaction: Callable[[dict], None], *,
-                 on_state: Callable[[str], None] | None = None, connect=None,
+                 on_state: Callable[[str], None] | None = None,
+                 on_reaction: Callable[[dict], None] | None = None, connect=None,
                  sleep=time.sleep, url: str = GATEWAY):
         self._token_fn = token_fn
         self._on_interaction = on_interaction
         self._on_state = on_state or (lambda s: None)
+        self._on_reaction = on_reaction or (lambda d: None)
         self._connect = connect
         self._sleep = sleep
         self._url = url
@@ -259,7 +263,7 @@ class Gateway:
                     "token": token, "session_id": self.session_id, "seq": self.seq}}))
             else:
                 ws.send_text(json.dumps({"op": OP_IDENTIFY, "d": {
-                    "token": token, "intents": 0,
+                    "token": token, "intents": INTENTS,
                     "properties": {"os": "linux", "browser": "harness", "device": "harness"}}}))
             while not self._stop.is_set():
                 msg = json.loads(ws.recv_text())
@@ -308,6 +312,11 @@ class Gateway:
             self._set("ready")
         elif kind == "RESUMED":
             self._set("ready")
+        elif kind == "MESSAGE_REACTION_ADD":
+            try:
+                self._on_reaction(data)
+            except Exception as e:
+                log.error("gateway: reaction handler failed: %s", type(e).__name__)
         elif kind == "INTERACTION_CREATE":
             try:
                 self._on_interaction(data)

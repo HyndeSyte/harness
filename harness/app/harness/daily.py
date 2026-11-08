@@ -278,7 +278,7 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     return d
 
 
-def deliver(ledger: Ledger, config: Config, d: digest.Digest) -> bool:
+def deliver(ledger: Ledger, config: Config, d: digest.Digest, *, hold: bool = False) -> bool:
     """Send the digest if proactive messages are allowed today; otherwise
     record it silently. Returns whether it was queued for sending."""
     now = ledger.now()
@@ -290,7 +290,11 @@ def deliver(ledger: Ledger, config: Config, d: digest.Digest) -> bool:
         ledger.set_meta("last_digest_text", d.text, db)
         ledger.set_meta("last_digest_sent", "yes" if allowed else "no", db)
         ledger.event("digest", {"state": d.state, "sent": allowed, **d.facts}, db=db)
-        if allowed:
+        if allowed and hold:
+            # On Discord, Cain folds it into his one morning update; if he doesn't
+            # take it, the controller posts it on its own (controller._release_digest).
+            ledger.set_meta("digest_held_at", iso(now), db)
+        elif allowed:
             ledger.enqueue(chat_id=config.owner_user_id, kind="digest", text=d.text, db=db)
     # The external watchdog reads this line from the add-on log (Supervisor),
     # so a missing digest is noticed without giving the add-on any API.

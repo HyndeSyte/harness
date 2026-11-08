@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.16.0
+
+- Cain posts through the keeper: questions with buttons, and one morning update with the calendar digest folded in (with Stop). If Cain hasn't posted it by 7:40, the digest goes out on its own.
+- Your taps on Cain's questions and your reactions to his messages reach Cain. The keeper's connection now also hears reactions in your DM (only reactions: still never your messages).
+
 ## 0.15.1
 
 - The log notes each handover from Cain: what happened and how long it took, so the 20-second target can be measured. Never your words.

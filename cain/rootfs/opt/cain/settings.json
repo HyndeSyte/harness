@@ -1,6 +1,8 @@
 {
   "permissions": {
     "allow": [
+      "Bash(/opt/cain/keeper.sh)",
+      "Bash(/opt/cain/keeper.sh:*)",
       "Bash(/opt/cain/handover.sh)",
       "Bash(/opt/cain/handover.sh:*)"
     ],
