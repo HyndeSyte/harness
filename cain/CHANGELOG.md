@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.17
+
+- The morning message has one fixed shape: the date, then Needs you, Today, Moving, short bullets, bold times, at most a few lines each, with the rest on request.
+
 ## 0.1.16
 
 - Cain can ask with buttons and hears your taps and reactions, passed on by the calendar specialist. One morning message with the digest folded in. keeper.sh replaces handover.sh (which still works).
