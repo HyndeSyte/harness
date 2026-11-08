@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13
+
+- The log lists Cain's connectors by name at start, so the tools Cain must not use can be blocked by name.
+
 ## 0.1.12
 
 - Calendar changes go to the calendar keeper: Cain runs handover.sh, the keeper reads your message itself, makes the change and posts the receipt here under Cain's name. Cain never writes a calendar.

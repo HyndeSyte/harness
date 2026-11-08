@@ -27,6 +27,13 @@ if ! tmux -u has-session -t cain 2>/dev/null; then
   exit 1
 fi
 bashio::log.info "Cain is running"
+# Which connectors Cain has, by name only (addresses removed), so the tools it
+# must not use can be blocked by their exact names (/opt/cain/settings.json).
+(
+  sleep 30
+  timeout 120 claude mcp list 2>&1 | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 \
+    | while IFS= read -r line; do echo "[cain] connector: $line"; done
+) &
 # The sign-in link is longer than a terminal line, and tmux breaks it, so a
 # click opens a cut-off link. Keep the whole link on a page of its own:
 # <Cain page>/signin. signin-url.sh joins the pieces.
