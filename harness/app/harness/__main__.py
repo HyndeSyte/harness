@@ -135,7 +135,13 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     controller.gateway = Gateway(discord_token, keeper.on_interaction, on_state=keeper.on_state)
     # Cain hands calendar requests over here, keyed by the bot token both hold.
     controller.handovers = handover.Inbox(discord_token, wake=keeper.wake)
-    handover.serve(controller.handovers)
+    try:
+        handover.serve(controller.handovers,
+                       port=int(os.environ.get("HARNESS_HANDOVER_PORT", handover.PORT)))
+    except OSError as e:
+        # Everything else still works; he hears about it in the digest and on the page.
+        logging.getLogger("harness").error("handover: can't listen: %s", e)
+        controller.notes["handover"] = "Cain can't hand requests to the keeper: its port is taken"
     return controller, web, listener
 
 
