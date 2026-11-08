@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.1
+
+- Shadow scoring: school runs use the same fixed drive windows as today (the first pass showed 86 timing-only differences), and the difference list shows misses first, one line per event with a count, so a series can't crowd out what matters.
+
 ## 0.18.0
 
 - New, off by default: `meaning_shadow`. Claude judges what each Family event (last and next 60 days) means for you as typed obligations (you're there, you drive, you have the kids, farm coverage, she's away, can't do anything), and plain code turns those into the blocks today's code would write. Shadow only: nothing is written to any calendar. The blocks it would give are scored against today's title rules, in one log line with up to 20 differences, and on the add-on page. At most 10 calls a run, 60 a day, and $3 a month on its own spend line. Your rules and the two title settings are its first examples.

@@ -48,7 +48,7 @@ from zoneinfo import ZoneInfo
 
 from . import caldav, family_rules, google_cal, ical, policy, render
 from .engines import call_with_retries
-from .family_gmail import DROP_TITLE, PICK_TITLE, _is_real, _short, plan as old_plan, school_plan
+from .family_gmail import DROP_AFTER, DROP_BEFORE, DROP_TITLE, PICK_AFTER, PICK_BEFORE, PICK_TITLE, _is_real, _short, plan as old_plan, school_plan
 from .ledger import Ledger, iso
 from .mail_dates import clean as _clean
 
@@ -336,12 +336,17 @@ def blocks_for(j: Judgment, span: Span, now: datetime, *, supported: bool) -> li
     for ob in j.obligations:
         sure = supported and not j.unsure and ob.certainty == "high"
         legs: list[tuple[str, int, int]] = []
-        if ob.type == "transport":
-            school = ob.place == "school"
+        if ob.type == "transport" and ob.place == "school" and span.minutes > 0:
+            # A school run's times are fixed by the drive logic, not judged: the same windows
+            # family_gmail writes today, around the school day's own start and end.
+            m = span.minutes
+            legs.append((DROP_TITLE, -int(DROP_BEFORE.total_seconds() // 60), int(DROP_AFTER.total_seconds() // 60)))
+            legs.append((PICK_TITLE, m - int(PICK_BEFORE.total_seconds() // 60), m + int(PICK_AFTER.total_seconds() // 60)))
+        elif ob.type == "transport":
             if ob.e > ob.s:
-                legs.append((DROP_TITLE if school else TITLE["drive_there"], ob.s, ob.e))
+                legs.append((TITLE["drive_there"], ob.s, ob.e))
             if ob.rs is not None and ob.re is not None:
-                legs.append((PICK_TITLE if school else TITLE["drive_back"], ob.rs, ob.re))
+                legs.append((TITLE["drive_back"], ob.rs, ob.re))
         elif ob.type == "partner_away":
             continue                       # context: what it means for him is its own obligation
         else:
@@ -779,10 +784,18 @@ class Score:
 
     def diff_lines(self, tz: str) -> list[str]:
         zone = ZoneInfo(tz)
+        # Misses first (they decide the switch), then new blocks, then timing; one line per
+        # event and kind, with how many occurrences it covers, so a series can't crowd out the rest.
+        rank = {"missing": 0, "new": 1, "window": 2}
+        groups: dict[tuple, list] = {}
+        for start, kind, title, event in self.diffs:
+            groups.setdefault((kind, title, event), []).append(start)
+        ordered = sorted(groups.items(), key=lambda kv: (rank.get(kv[0][0], 3), min(kv[1])))
         out = []
-        for start, kind, title, event in sorted(self.diffs, key=lambda d: d[0])[:MAX_DIFF_LINES]:
-            s = start.astimezone(zone)
-            out.append(f"meaning shadow diff: {kind} {title} {_day(s)} {_clock(s)}, for {shown(event)}")
+        for (kind, title, event), starts in ordered[:MAX_DIFF_LINES]:
+            s = min(starts).astimezone(zone)
+            more = f" (+{len(starts) - 1} more)" if len(starts) > 1 else ""
+            out.append(f"meaning shadow diff: {kind} {title} {_day(s)} {_clock(s)}{more}, for {shown(event)}")
         return out
 
 

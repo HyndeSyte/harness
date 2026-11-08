@@ -141,7 +141,9 @@ def test_transport_is_two_short_legs_with_fixed_titles():
     school = blocks(ob("transport", at(T0, minutes=-30), at(T0), at(T0, hours=1), at(T0, hours=1, minutes=30),
                        place="school"))
     assert [b.title for b in school] == [DROP_TITLE, PICK_TITLE]
-    assert all(b.hours == 0.5 for b in school)
+    # School runs take the drive logic's fixed windows (Nov 8 shadow: 86 timing differences
+    # came from the model's own windows), around the school day's start and end.
+    assert all(b.hours == 0.75 for b in school)
     other = blocks(ob("transport", at(T0, minutes=-30), at(T0), place="event_location"))
     assert [b.title for b in other] == ["Busy (drive there)"]
     back = blocks(ob("transport", rstart=at(T0, hours=1), rend=at(T0, hours=1, minutes=20)))
@@ -483,3 +485,17 @@ def test_the_pinned_sonnet_judges_at_low_effort():
     assert policy.engine_for("meaning") == "claude"
     assert policy.MODELS[policy.engine_for(meaning.PURPOSE)].model == "claude-sonnet-5-5"
     assert policy.MEANING_EFFORT == "low" and policy.MEANING_MONTHLY_USD > 0
+
+
+def test_misses_come_first_and_a_series_is_one_line():
+    from datetime import datetime, timedelta, timezone
+    from harness.meaning import Score
+    s = Score()
+    t = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    for i in range(30):
+        s.diffs.append((t + timedelta(days=i), "window", "Busy (school pickup)", "School Day"))
+    s.diffs.append((t + timedelta(days=40), "missing", "Busy (watching kids)", "Her trip"))
+    lines = s.diff_lines("America/New_York")
+    assert len(lines) == 2
+    assert "missing Busy (watching kids)" in lines[0]
+    assert "(+29 more)" in lines[1]
