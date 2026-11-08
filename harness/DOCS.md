@@ -288,6 +288,11 @@ how many blocks are on Gmail.
 - **Limit:** 100 changes a day. Past that, the digest says so and the rest go the next day.
 - **What it can touch:** only blocks it wrote. Your share lets it do more than that, so to end it for
   good, remove the service account from the calendar's sharing.
+- **Judging instead of title words (shadow):** `meaning_shadow` (off by default) has Claude judge what
+  each Family event in the last and next 60 days means for you, a few at a time (at most 10 calls a
+  run, 60 a day, $3 a month), and compares the blocks that would give with the blocks the title rules
+  give. It writes nothing to any calendar. The score is one line in the add-on log, with up to 20
+  differences, and the same on this page.
 
 ## Links from instrument cards
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## unreleased
+
+- New, off by default: `meaning_shadow`. Claude judges what each Family event (last and next 60 days) means for you as typed obligations (you're there, you drive, you have the kids, farm coverage, she's away, can't do anything), and plain code turns those into the blocks today's code would write. Shadow only: nothing is written to any calendar. The blocks it would give are scored against today's title rules, in one log line with up to 20 differences, and on the add-on page. At most 10 calls a run, 60 a day, and $3 a month on its own spend line. Your rules and the two title settings are its first examples.
+
 ## 0.17.1
 
 - Fixed: "this ties me up" (a rule about what a Family event means) crashed the card and left the request hanging for 10 minutes. A crash while finishing a request now ends it at once.

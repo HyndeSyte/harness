@@ -245,6 +245,37 @@ CREATE TABLE IF NOT EXISTS family_copies(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meaning_examples(
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  said TEXT NOT NULL,
+  words TEXT NOT NULL,
+  who TEXT NOT NULL,
+  series TEXT NOT NULL,
+  types TEXT NOT NULL,
+  place TEXT NOT NULL,
+  month INTEGER,
+  confirmed INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meaning_judgments(
+  key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  anchor TEXT NOT NULL,
+  obligations TEXT NOT NULL,
+  cites TEXT NOT NULL,
+  unsure INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  failure TEXT NOT NULL,
+  tries INTEGER NOT NULL,
+  policy_version TEXT NOT NULL,
+  examples_version TEXT NOT NULL,
+  model TEXT NOT NULL,
+  judged_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS family_gmail(
   key TEXT PRIMARY KEY,
   event_id TEXT NOT NULL,

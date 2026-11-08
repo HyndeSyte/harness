@@ -141,6 +141,15 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
                      f"<pre style='white-space:pre-wrap;font:inherit'>"
                      f"{_e(html.unescape(re.sub(r'</?[bi]>', '', last['text'])))}</pre>"
                      "</div>")
+    shadow = st.get("meaning_shadow")
+    if shadow:
+        # Template lines with cleaned titles (meaning.py), escaped again here.
+        lines = [shadow.get("summary") or ""] + list(shadow.get("diffs") or [])
+        parts.append(f"<h2>Family meaning (shadow)</h2><div class='card'><div class='muted'>"
+                     f"{_e((shadow.get('at') or '')[:16].replace('T', ' '))} UTC · writes no calendar"
+                     f" · ${_e(shadow.get('spent_month_usd', 0))} of ${_e(shadow.get('limit_usd', 0))}"
+                     f" this month</div><pre style='white-space:pre-wrap;font:inherit'>"
+                     f"{_e(chr(10).join(lines))}</pre></div>")
 
     parts.append("<h2>Keys</h2><div class='card'>")
     for f in FIELDS:

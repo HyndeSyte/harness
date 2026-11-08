@@ -73,12 +73,13 @@ class Controller:
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
                  poll_timeout: int = 25, calendar=None, family=None, mirror=None,
                  family_add=None, family_copy=None, family_gmail=None, calendar_change=None,
-                 mail_dates=None):
+                 mail_dates=None, meaning=None):
         self.calendar_change = calendar_change   # changes he asks for (calendar_change.py), or None
         self.family_add = family_add       # the one calendar write (family_add.py), or None
         self.family_copy = family_copy     # Family kept true to Gmail (family_copy.py), or None
         self.family_gmail = family_gmail   # Gmail kept true to Family (family_gmail.py), or None
         self.mail_dates = mail_dates       # dates from his mail onto Gmail (mail_dates.py), or None
+        self.meaning = meaning             # the shadow judging of Family events (meaning.py), or None
         self.ledger = ledger
         self.vault = vault
         self.api = api
@@ -298,6 +299,8 @@ class Controller:
             self.family_gmail.run(paused=commands.is_paused(self.ledger))
         if self.mail_dates is not None:
             self.mail_dates.run(paused=commands.is_paused(self.ledger))
+        if self.meaning is not None:
+            self.meaning.run(paused=commands.is_paused(self.ledger))   # shadow: writes no calendar
         if self.mirror is not None and self.mirror.due():
             self.mirror.run()              # shadow only; its own failures are its record
         self._daily(paused)
@@ -836,4 +839,5 @@ class Controller:
             "last_digest": {"at": self.ledger.get_meta("last_digest_at"),
                             "sent": self.ledger.get_meta("last_digest_sent") == "yes",
                             "text": self.ledger.get_meta("last_digest_text") or ""},
+            "meaning_shadow": self.meaning.status() if self.meaning is not None else None,
         })

@@ -16,7 +16,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import caldav, drive, family, family_rules, google_cal, policy
+from . import caldav, drive, family, family_rules, google_cal, meaning, policy
 from .calendar_change import CalendarChange, changes_from_options
 from .calendar_feed import CalendarFeeds
 from .config import Config
@@ -68,6 +68,10 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
         "gpt": OpenAIEngine(policy.MODELS["gpt"], lambda: vault.get("openai_api_key"),
                             transport, effort=policy.EFFORT["gpt"]),
     }
+    # The same pinned Sonnet for judging Family events (meaning.py), at its own effort.
+    judge_engine = AnthropicEngine(policy.MODELS[policy.engine_for(meaning.PURPOSE)],
+                                   lambda: vault.get("anthropic_api_key"), transport,
+                                   effort=policy.MEANING_EFFORT)
     status: dict = {}
     requests: queue.Queue = queue.Queue()
     # owner_user_id is a placeholder until pairing binds the real one.
@@ -84,7 +88,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                              ahead_days=max(read_days(None), AHEAD_DAYS),
                              ahead_when=lambda: bool(name_from_options(data_dir)
                                                      or school_from_options(data_dir)
-                                                     or family_rules.load(ledger)),
+                                                     or family_rules.load(ledger)
+                                                     or meaning.option_on(data_dir)),
                              ahead_from=lambda address, start, until: (
                                  google.window(address, start, until) if google.configured() else None))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
@@ -122,6 +127,16 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 engine_fn=lambda: engines.get(policy.engine_for("message")),
                                 writes_on=lambda: mail_option_on(data_dir), tz=base.timezone,
                                 family=client,
+                                budget_ok=lambda provider: controller._budget_ok(provider)),
+                            # Shadow only: judges Family events and scores them; writes no calendar.
+                            meaning=meaning.MeaningShadow(
+                                ledger, client, calendar,
+                                ThreadPoolExecutor(max_workers=1, thread_name_prefix="meaning"),
+                                engine_fn=lambda: judge_engine, on_fn=lambda: meaning.option_on(data_dir),
+                                tz=base.timezone, rules_fn=lambda: rules_from_options(data_dir),
+                                school_fn=lambda: school_from_options(data_dir),
+                                said_fn=lambda: family_rules.load(ledger),
+                                name_fn=lambda: name_from_options(data_dir),
                                 budget_ok=lambda provider: controller._budget_ok(provider)))
     # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;
     # taps come back to /press. The bot token reads his DM when Cain hands a request over.
@@ -187,6 +202,8 @@ def main() -> int:
     if listener is not None:
         listener.shutdown()
     controller.executor.shutdown(wait=False, cancel_futures=True)
+    if controller.meaning is not None:
+        controller.meaning.executor.shutdown(wait=False, cancel_futures=True)
     # Home Assistant's cold backup stops the add-on before copying /data;
     # closing here leaves a single consistent database file behind.
     controller.ledger.close()

@@ -43,8 +43,16 @@ EFFORT = {"claude": "high", "gpt": "low"}
 # be routed to later by measured trial -- never as a silent fallback.
 ROUTING: dict[str, str] = {
     "message": "claude",
+    # What a Family event means for him (meaning.py): the same pinned Sonnet, no
+    # second model to pin and test.
+    "meaning": "claude",
 }
 CANARY_ENGINES = ("claude", "gpt")
+
+# Judging a Family event is a small structured call: Sonnet at its floor, with its
+# own spend line ("meaning") and its own monthly ceiling, under the provider budget.
+MEANING_EFFORT = "low"
+MEANING_MONTHLY_USD = 3.0
 
 # Time limits (seconds).
 HTTP_TIMEOUT_S = 120            # one model call

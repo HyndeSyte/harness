@@ -35,6 +35,7 @@ timeout: 30
 # drop-off and pickup blocks (family_gmail.py). Empty leaves that off.
 # Changing events he asks for on Family and Gmail, with no tap (calendar_change.py).
 # Writing dates from his mail onto his Gmail calendar (mail_dates.py). Off: found, not written.
+# Judging what Family events mean for him, in shadow (meaning.py): scored in the log, writes no calendar.
 options:
   family_copy_name: ""
   family_to_gmail: ""
@@ -42,6 +43,7 @@ options:
   family_school_address: ""
   calendar_changes: false
   mail_dates: false
+  meaning_shadow: false
 schema:
   family_copy_name: str?
   family_to_gmail: str?
@@ -49,3 +51,4 @@ schema:
   family_school_address: str?
   calendar_changes: bool?
   mail_dates: bool?
+  meaning_shadow: bool?
