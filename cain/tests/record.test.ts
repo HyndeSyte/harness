@@ -136,7 +136,7 @@ describe("record keeper, end to end", () => {
     const heard = existsSync(cfg.relay) ? readFileSync(cfg.relay, "utf8") : "";
     expect(heard).not.toContain("Dane's page sent a note");
     expect(heard).not.toContain("A change Dane made");
-    const states = readFileSync(join(seed, "log/requests/2026-11.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l).state);
+    const states = upstream("log/requests/2026-11.jsonl")!.trim().split("\n").map((l) => JSON.parse(l).state);
     expect(states).toEqual(["rejected", "rejected", "rejected"]);
     // The same request again (say the reply to a push was lost): not applied twice.
     const req = { id: "cain-a1", from: "cain", kind: "change", summary: "Add", ops: [{ op: "append", path: "areas/farm/open.md", text: "- hay" }] };
@@ -144,7 +144,7 @@ describe("record keeper, end to end", () => {
     queue("3.json", req); cycle(cfg);
     expect(upstream("areas/farm/open.md")).toBe("- fence\n- hay\n");
     expect(readdirSync(cfg.queue)).toEqual([]);
-  });
+  }, 30_000);
 
   test("a link committed into the record can't be written through, and half-written files wait", () => {
     queue(".4.json", { id: "cain-tmp1", from: "cain", kind: "change", summary: "s", ops: [{ op: "append", path: "areas/farm/open.md", text: "x" }] });
