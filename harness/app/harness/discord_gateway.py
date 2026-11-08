@@ -191,7 +191,10 @@ class Gateway:
     def _set(self, state: str) -> None:
         if state != self.state:
             self.state = state
-            self._on_state(state)
+            try:
+                self._on_state(state)
+            except Exception as e:            # a bad listener never drops the link
+                log.error("gateway: state handler failed: %s", type(e).__name__)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -229,7 +232,7 @@ class Gateway:
                     self.session_id = self.seq = None
                 failures += 1
                 log.warning("gateway: %s", REDACT(str(e)))
-            except (OSError, ValueError) as e:
+            except Exception as e:             # anything else: never let the thread die
                 failures += 1
                 log.warning("gateway: %s", type(e).__name__)
             self._set("reconnecting")

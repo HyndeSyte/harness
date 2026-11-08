@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.1
+
+- Fix: the Discord connection stopped right after connecting, because it reached the main record from its own thread. The keeper now keeps its own small record, and the connection keeps going if anything else goes wrong.
+
 ## 0.14.0
 
 - First step to Discord: the keeper connects to Discord with Cain's bot (a "Discord bot token" field on this page) and hears presses on its own buttons only. It posts one test card to your DM; a tap on it proves the link. Every press is checked: you, in your DM, on the card exactly as posted (a card changed after posting is refused), once, before it expires. Telegram is unchanged until the move is done.

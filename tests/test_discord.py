@@ -247,3 +247,33 @@ def test_gateway_identifies_with_no_intents_and_hands_presses_over():
 def test_websocket_refuses_hosts_other_than_discords_gateway():
     with pytest.raises(Closed):
         WebSocket("wss://evil.example/?v=10")
+
+
+def test_the_keepers_record_works_from_the_gateway_thread(tmp_path):
+    # Presses and the probe run on the gateway thread; the keeper's record must not be
+    # tied to the thread that opened it (the ledger's SQLite connection is).
+    from harness.discord_keeper import KeeperStore
+    store = KeeperStore(str(tmp_path / "discord.json"))
+    k = DiscordKeeper(FakeAPI(), store.get, store.set, clock=lambda: 1000.0)
+    errors = []
+
+    def other():
+        try:
+            k.on_state("ready")
+            msg = card(k)
+            press(k, msg)
+        except Exception as e:                     # pragma: no cover - the failure we guard
+            errors.append(e)
+    t = threading.Thread(target=other)
+    t.start()
+    t.join(5)
+    assert not errors and store.get("discord_owner") == OWNER
+    assert KeeperStore(str(tmp_path / "discord.json")).get("discord_dm") == DM
+
+
+def test_a_failing_state_listener_does_not_drop_the_connection():
+    def boom(state):
+        raise RuntimeError("listener broke")
+    gw = Gateway(lambda: TOKEN, lambda it: None, on_state=boom)
+    gw._set("ready")
+    assert gw.state == "ready"

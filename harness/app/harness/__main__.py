@@ -23,7 +23,7 @@ from .config import Config
 from .controller import Controller
 from .discord_api import DiscordAPI, DiscordTransport
 from .discord_gateway import Gateway
-from .discord_keeper import DiscordKeeper
+from .discord_keeper import DiscordKeeper, KeeperStore
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
@@ -122,8 +122,11 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)))
     # Discord: the keeper posts as Cain's bot in his DM and hears its own buttons.
+    # Its record is its own file: presses arrive on the gateway thread, and the
+    # ledger's connection belongs to this one.
+    store = KeeperStore(os.path.join(data_dir, "discord.json"))
     keeper = DiscordKeeper(DiscordAPI(lambda: vault.get("discord_bot_token"), DiscordTransport()),
-                           ledger.get_meta, ledger.set_meta)
+                           store.get, store.set)
     controller.discord = keeper
     controller.gateway = Gateway(lambda: vault.get("discord_bot_token"), keeper.on_interaction,
                                  on_state=keeper.on_state)

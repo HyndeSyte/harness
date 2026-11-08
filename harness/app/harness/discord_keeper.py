@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
+import tempfile
 import threading
 import time
 from typing import Callable
@@ -31,6 +33,49 @@ log = logging.getLogger("harness.discord")
 PREFIX = "k:"
 COMPONENT = 3            # interaction type: a button press
 UPDATE, ACK = 7, 6       # answer kinds
+
+
+class KeeperStore:
+    """The keeper's own small record (/data/discord.json): owner, DM, cards.
+
+    Not the ledger: the ledger's SQLite connection belongs to the main thread,
+    and presses arrive on the gateway thread. Locked, written atomically, 0600.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def get(self, key: str) -> str | None:
+        with self._lock:
+            return self._load().get(key)
+
+    def set(self, key: str, value: str) -> None:
+        with self._lock:
+            data = self._load()
+            data[key] = value
+            d = os.path.dirname(os.path.abspath(self.path))
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".discord.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, sort_keys=True)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+                raise
 
 
 class DiscordKeeper:
