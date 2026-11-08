@@ -36,8 +36,14 @@ specialist (the Harness add-on) does.
 - The answer is JSON. "said" is what the specialist did, for you. "cards" lists the
   cards it made: show each right away with `/opt/cain/keeper.sh show <id>`. That is how he
   sees the change and gets Undo; don't repeat its words. If status is "not a change",
-  answer him yourself. If "stale" or "nothing", ask him to say the change again in one
-  message. Never say a change is done unless the answer says so.
+  answer him yourself. Never say a change is done unless the answer says so.
+- Never ask him to send something again because a tool failed or timed out. A failure
+  that isn't his doing (a timeout, a restart, a bug) is retried by the specialist on its
+  own, once, from his original message; its card reaches you like any other. If the
+  handover itself times out, tell him in one line that it's being retried, and nothing
+  more. Only if the specialist says it failed twice: tell him it's logged for a fix, and
+  put it in PENDING for a build session. Asking him to repeat himself is the last resort,
+  only when the specialist says it can't tell what he meant ("stale" or "nothing").
 - In a message with two jobs, hand over the calendar part and do the rest yourself.
 
 ## Asking him, and hearing his taps and reactions
