@@ -121,7 +121,7 @@ class FakeBot:
             raise item
         return item
 
-    def send_message(self, chat_id, text, buttons=None, *, html=True):
+    def send_message(self, chat_id, text, buttons=None, *, html=True, kind=None):
         if self.fail_sends:
             raise self.fail_sends.pop(0)
         self.next_message_id += 1

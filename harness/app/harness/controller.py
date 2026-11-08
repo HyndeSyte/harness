@@ -19,6 +19,7 @@ it runs after the commands, so a /stop in the same batch wins.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import queue
 import re
@@ -32,6 +33,8 @@ from zoneinfo import ZoneInfo
 from . import (callbacks, choices, commands, daily, ingress_filter, integrity, policy,
                render, rules, telegram)
 from .config import Config
+from .discord_api import DiscordError
+from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
 from .engines import Engine
 from .ledger import Ledger
 from .outbox import Outbox
@@ -43,6 +46,8 @@ log = logging.getLogger("harness.controller")
 
 PAIR_RE = re.compile(r"/start(?:@\w+)?\s+([A-Za-z0-9_-]{16,64})")
 SETTINGS_TTL_S = 15 * 60
+FRESH_S = 120              # a handed-over message must be this new
+UNDO_KINDS = ("calendar_change_undo", "mail_dates_undo", "family_add_undo")
 
 
 def family_line(st: dict, tz: ZoneInfo) -> str:
@@ -98,6 +103,14 @@ class Controller:
         self.notes: dict[str, str] = {}           # standing problems for the digest
         self._poll_failures = 0
         self._token_seen: str | None = None      # fingerprint of the token getMe confirmed
+        # Discord (set by __main__): the keeper, its chat, Cain's handovers.
+        self.discord = None
+        self.discord_chat = None
+        self.handovers = None
+        self.gateway = None
+        self._discord_seen: str | None = None    # fingerprint of the token it identified with
+        self._reconciled = False
+        self._handover_jobs: dict[str, list] = {}
 
     # -- set-up --------------------------------------------------------------
     def _bind_owner(self, owner: int) -> None:
@@ -153,16 +166,12 @@ class Controller:
         if not self.ledger.integrity_ok():
             self.notes["ledger"] = "the ledger failed its integrity check; restore a backup"
         integrity.check(self.ledger, self.base_config)
-        owner = self.vault.owner_id()
+        owner = None if self._discord_mode() else self.vault.owner_id()
         if owner is not None:
             self._bind_owner(owner)
-            self.runner.reconcile_after_restart()
-            if self.family_add is not None:
-                self.family_add.reconcile_after_restart()
-            if self.calendar_change is not None:
-                self.calendar_change.reconcile_after_restart()
+            self._reconcile()
         self._family_note()
-        if self.vault.get("telegram_bot_token"):
+        if self.vault.get("telegram_bot_token") and not self._discord_mode():
             if self._telegram_health() and owner is not None:
                 self._set_commands()
         for name, engine in self.engines.items():
@@ -179,6 +188,16 @@ class Controller:
                 self.notes[f"model:{name}"] = (f"{policy.MODELS[name].model} isn't available "
                                                "from the provider")
         self._publish()
+
+    def _reconcile(self) -> None:
+        if self._reconciled:
+            return
+        self._reconciled = True
+        self.runner.reconcile_after_restart()
+        if self.family_add is not None:
+            self.family_add.reconcile_after_restart()
+        if self.calendar_change is not None:
+            self.calendar_change.reconcile_after_restart()
 
     def _token_print(self) -> str:
         return hashlib.sha256(self.vault.get("telegram_bot_token").encode()).hexdigest()[:16]
@@ -226,6 +245,9 @@ class Controller:
     # -- the loop --------------------------------------------------------------
     def tick(self) -> None:
         self._drain_requests()
+        if self._discord_mode():
+            self._discord_tick()
+            return
         if not self.vault.get("telegram_bot_token"):
             self._publish()
             self.sleep(2)
@@ -247,6 +269,10 @@ class Controller:
         if decisions is not None:
             self._continuity(prev_poll)
             self._after_poll(decisions)
+        self._work()
+
+    def _work(self) -> None:
+        """Everything after his input is recorded: the same on either chat."""
         paused = commands.is_paused(self.ledger)
         self.commands.handle_pending()
         self.runner.start_pending(paused=commands.is_paused(self.ledger))
@@ -278,6 +304,247 @@ class Controller:
         self._daily(paused)
         self.outbox.flush()
         self._publish()
+
+    # -- Discord ---------------------------------------------------------------------
+    def _discord_mode(self) -> bool:
+        return self.discord is not None and bool(self.vault.get("discord_bot_token"))
+
+    def _discord_tick(self) -> None:
+        if not self._discord_ready():
+            self._publish()
+            self._wait(10)
+            return
+        for p in self.discord.take_presses():
+            self._press(p)
+        for h in (self.handovers.take() if self.handovers is not None else []):
+            self._handover(h)
+        if self.discord.status.get("gateway") == "ready":
+            self.ledger.ingest([], None)       # proves the link for the digest, once a minute
+            self.notes.pop("discord_link", None)
+        elif str(self.discord.status.get("gateway", "")).startswith("stopped"):
+            self.notes["discord_link"] = ("Discord refused the bot token, so taps can't reach "
+                                          "the keeper. Put the current token on the Harness page.")
+        self._work()
+        self._finish_handovers()
+        self._wait(0.3 if (self._busy() or self._handover_jobs) else 3)
+
+    def _wait(self, seconds: float) -> None:
+        if self.discord is None:
+            self.sleep(seconds)
+            return
+        # poll_timeout 0 (tests) means never block, as with the Telegram long poll.
+        self.discord.wake.wait(seconds if self.poll_timeout else 0)
+        self.discord.wake.clear()
+
+    def _discord_ready(self) -> bool:
+        """Identify the bot and its owner once per token; on a new bot, move over."""
+        print_ = hashlib.sha256(self.vault.get("discord_bot_token").encode()).hexdigest()[:16]
+        if self._discord_seen == print_ and self.config is not None:
+            return True
+        try:
+            if self._discord_seen is not None:
+                self.discord.forget_identity()
+            owner, bot = self.discord.owner(), self.discord.bot()
+            self.discord.dm()
+        except DiscordError as e:
+            self.notes["discord"] = f"Discord check failed: {e.description or e.code}"
+            return False
+        if not owner or not bot:
+            self.notes["discord"] = "Discord didn't say which bot this token belongs to, or whose"
+            return False
+        owner_i, bot_i = int(owner), int(bot)
+        if self.ledger.bot_id() != bot_i:
+            undoable, waiting = self._cutover_read()
+            self.ledger.set_bot(bot_i)
+            self.ledger.set_meta("chat_name", "Discord")
+        else:
+            undoable, waiting = [], 0
+        self.api = self.discord_chat
+        self.outbox.api = self.discord_chat
+        self._bind_owner(owner_i)
+        self.runner.answers_to_cain = True
+        self._reconcile()
+        if undoable or waiting:
+            self._cutover_post(owner_i, undoable, waiting)
+        self._discord_seen = print_
+        self.notes.pop("discord", None)
+        log.info("discord: talking to the bot's owner in the DM")
+        return True
+
+    def _cutover_read(self) -> tuple[list, int]:
+        """Before the bot changes: what is still undoable, and how many questions are open,
+        on the old chat. Read with the old bot's id, since messages are keyed by it."""
+        now = self.ledger.now().isoformat()
+        marks = ",".join("?" * len(UNDO_KINDS))
+        rows = self.ledger.db.execute(
+            f"SELECT * FROM choices WHERE kind IN ({marks}) AND consumed_at IS NULL"
+            " AND expires_at > ? AND message_id IS NOT NULL ORDER BY created_at DESC LIMIT 10",
+            (*UNDO_KINDS, now)).fetchall()
+        undoable = []
+        for c in rows:
+            said = self.ledger.outbound(c["chat_id"], c["message_id"])
+            if said is not None:
+                undoable.append((c["kind"], c["target"], c["expires_at"], said["text"]))
+        waiting = self.ledger.db.execute(
+            "SELECT COUNT(*) FROM approvals WHERE consumed_at IS NULL AND expires_at > ?",
+            (now,)).fetchone()[0]
+        return undoable, int(waiting)
+
+    def _cutover_post(self, owner: int, undoable: list, waiting: int) -> None:
+        now = self.ledger.now()
+        with self.ledger.tx() as db:
+            if waiting:
+                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=(
+                    f"The calendar keeper moved here from Telegram. {waiting} question(s) waiting "
+                    "there were closed and nothing was done for them. Ask again if you still "
+                    "want it."))
+            for kind, target, expires, text in reversed(undoable):
+                ttl = int((datetime.fromisoformat(expires) - now).total_seconds())
+                if ttl < 60:
+                    continue
+                n = choices.mint(self.ledger, kind=kind, target=target, chat_id=owner,
+                                 ttl_s=ttl, db=db)
+                self.ledger.enqueue(chat_id=owner, kind="reply", db=db,
+                                    text=render.fit("<i>From before the move, still undoable:</i>\n"
+                                                    + text),
+                                    buttons=[[("Undo", choices.callback_data(n))]],
+                                    binds=[{"type": "choice", "nonce": n}])
+            self.ledger.event("discord_cutover", {"undoable": len(undoable), "closed": waiting},
+                              db=db)
+
+    def _press(self, p: dict) -> None:
+        owner = self.config.owner_user_id
+        cid = p["custom_id"]
+        if cid in (STOP, RESUME):
+            text = self.commands._stop("") if cid == STOP else self.commands._resume("")
+            with self.ledger.tx() as db:
+                self.ledger.enqueue(chat_id=owner, kind="stopped" if cid == STOP else "notice",
+                                    text=text, db=db)
+            return
+        inc = telegram.Incoming(update_id=int(p["id"]), kind="callback", user_id=owner,
+                                chat_id=owner, chat_type="private",
+                                message_id=int(p["message_id"]),
+                                callback_id=f"{p['app']}:{p['token']}",
+                                callback_data=cid[len(DISCORD_PREFIX):])
+        self.ledger.ingest([telegram.Decision(inc, True, None, None)], None)
+        self.callbacks.handle(inc)
+
+    def _handover(self, h) -> None:
+        """Cain says he asked for a calendar change. Read the DM and act on his newest
+        message, if it is fresh. Never on Cain's words."""
+        owner = self.config.owner_user_id
+        if h.paired and h.paired != str(owner):
+            self.notes["discord_owner"] = ("Cain is paired with a different Discord account than "
+                                           "the bot's owner, so the keeper won't act for Cain")
+            h.finish("refused", "The keeper won't act: you're paired with a different Discord "
+                                "account than the bot's owner.")
+            return
+        try:
+            msgs = self.discord.api.history(self.discord.dm(), 20)
+        except DiscordError as e:
+            h.finish("error", f"The keeper couldn't read the DM ({e.code}). Nothing changed.")
+            return
+        mine = [m for m in msgs if str((m.get("author") or {}).get("id")) == str(owner)]
+        if not mine:
+            h.finish("nothing", "There's no message from him for the keeper to act on.")
+            return
+        m = mine[0]                                          # Discord lists newest first
+        try:
+            age = (self.ledger.now() - datetime.fromisoformat(m["timestamp"])).total_seconds()
+        except (KeyError, ValueError, TypeError):
+            age = FRESH_S + 1
+        if age > FRESH_S:
+            h.finish("stale", "His newest message is over 2 minutes old, so the keeper didn't act "
+                              "on it. Nothing changed.")
+            return
+        text, flags, reply_to = self._discord_words(m, msgs, owner)
+        if h.suggestion:
+            flags.append("suggestion")
+            text += ("\n\n[A suggestion from Cain, his assistant. These are not his words: "
+                     + h.suggestion + "]")
+        if not text.strip():
+            h.finish("nothing", "His message has no words for the keeper to act on.")
+            return
+        hit = self._screen_text(text)
+        if hit:
+            h.finish("refused", f"The keeper didn't keep that message: it looks like {hit}. "
+                                "Nothing was stored.")
+            return
+        inc = telegram.Incoming(update_id=int(m["id"]), kind="message", user_id=owner,
+                                chat_id=owner, chat_type="private", message_id=int(m["id"]),
+                                text=text, reply_to_message_id=reply_to)
+        jobs = self.ledger.ingest([telegram.Decision(inc, True, None, "message")], None)
+        if jobs:
+            job_id = jobs[0]
+            if flags:
+                self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flags))))
+        else:
+            row = self.ledger.db.execute(
+                "SELECT id FROM jobs WHERE bot_id=? AND chat_id=? AND message_id=?",
+                (self.ledger.bot_id(), owner, int(m["id"]))).fetchone()
+            if row is None:
+                h.finish("error", "The keeper couldn't record that. Nothing changed.")
+                return
+            job_id = row["id"]
+        self._handover_jobs.setdefault(job_id, []).append(h)
+
+    def _discord_words(self, m: dict, msgs: list[dict], owner: int):
+        """His words, the signs they may not be his own, and the keeper message he replied to."""
+        flags: list[str] = []
+        text = m.get("content") or ""
+        ref = m.get("message_reference") or {}
+        if m.get("edited_timestamp"):
+            flags.append("edited")
+        if ref.get("type") == 1 or m.get("message_snapshots"):
+            flags.append("forwarded")
+            snaps = m.get("message_snapshots") or []
+            if not text and snaps:
+                text = ((snaps[0] or {}).get("message") or {}).get("content") or ""
+        if m.get("attachments"):
+            flags.append("attachment")
+        reply_to = None
+        if ref.get("message_id") and ref.get("type", 0) == 0:
+            rid = str(ref["message_id"])
+            if self.discord.posted(rid):
+                reply_to = int(rid)                          # a reply to the keeper: still him
+            else:
+                target = m.get("referenced_message") or next(
+                    (x for x in msgs if str(x.get("id")) == rid), None)
+                if not target or str((target.get("author") or {}).get("id")) != str(owner):
+                    flags.append("foreign_reply")
+        return text, flags, reply_to
+
+    def _finish_handovers(self) -> None:
+        """Answer Cain once the request has settled and what he was told has gone out."""
+        for job_id, waiting in list(self._handover_jobs.items()):
+            job = self.ledger.job(job_id)
+            if job is None:
+                for h in waiting:
+                    h.finish("error", "The keeper lost track of that. Nothing changed.")
+                del self._handover_jobs[job_id]
+                continue
+            if job["state"] in ("received", "running", "approved"):
+                continue
+            rows = self.ledger.db.execute(
+                "SELECT kind, text, state FROM outbox WHERE job_id=? AND kind!='notice' ORDER BY id",
+                (job_id,)).fetchall()
+            if any(r["state"] not in ("sent", "dead") for r in rows):
+                continue                                      # not delivered yet
+            said = [render.plain(r["text"]) for r in rows if r["state"] == "sent"]
+            receipts = self.ledger.receipts(job_id)
+            to_cain = ""
+            if receipts:
+                try:
+                    to_cain = json.loads(receipts[-1]["detail"] or "{}").get("said_to_cain", "")
+                except ValueError:
+                    to_cain = ""
+            status = {"answered": "not a change" if to_cain else "posted",
+                      "no_action": "not a change",
+                      "proposed": "waiting for his tap"}.get(job["state"], job["state"])
+            words = to_cain or "\n\n".join(said) or "Done."
+            for h in waiting:
+                h.finish(status, words, posted_in_dm=bool(said))
+            del self._handover_jobs[job_id]
 
     def _busy(self) -> bool:
         return bool(self.runner and self.runner.in_flight) or bool(

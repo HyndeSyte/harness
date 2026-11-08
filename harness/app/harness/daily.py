@@ -178,7 +178,8 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     calendar adds skip his tap."""
     now = ledger.now()
     since = _since(ledger)
-    inputs = [digest.InputCoverage("Telegram", ledger.last_poll_success(), TELEGRAM_MAX_AGE)]
+    inputs = [digest.InputCoverage(ledger.get_meta("chat_name") or "Telegram", ledger.last_poll_success(),
+                                   TELEGRAM_MAX_AGE)]
     agenda = None
     notes = list(notes)
     day_start, day_end, day = calendar_feed.today_bounds(now, config.timezone)

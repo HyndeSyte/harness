@@ -1,0 +1,5 @@
+{
+  "permissions": {
+    "allow": ["Bash(/opt/cain/handover.sh)", "Bash(/opt/cain/handover.sh:*)"]
+  }
+}

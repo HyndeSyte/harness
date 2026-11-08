@@ -23,7 +23,9 @@ from .config import Config
 from .controller import Controller
 from .discord_api import DiscordAPI, DiscordTransport
 from .discord_gateway import Gateway
+from .discord_chat import DiscordChat
 from .discord_keeper import DiscordKeeper, KeeperStore
+from . import commands, handover
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
@@ -125,11 +127,15 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     # Its record is its own file: presses arrive on the gateway thread, and the
     # ledger's connection belongs to this one.
     store = KeeperStore(os.path.join(data_dir, "discord.json"))
-    keeper = DiscordKeeper(DiscordAPI(lambda: vault.get("discord_bot_token"), DiscordTransport()),
-                           store.get, store.set)
+    discord_token = lambda: vault.get("discord_bot_token")          # noqa: E731
+    keeper = DiscordKeeper(DiscordAPI(discord_token, DiscordTransport()), store.get, store.set)
     controller.discord = keeper
-    controller.gateway = Gateway(lambda: vault.get("discord_bot_token"), keeper.on_interaction,
-                                 on_state=keeper.on_state)
+    controller.discord_chat = DiscordChat(keeper.api, keeper,
+                                          paused=lambda: commands.is_paused(ledger))
+    controller.gateway = Gateway(discord_token, keeper.on_interaction, on_state=keeper.on_state)
+    # Cain hands calendar requests over here, keyed by the bot token both hold.
+    controller.handovers = handover.Inbox(discord_token, wake=keeper.wake)
+    handover.serve(controller.handovers)
     return controller, web, listener
 
 

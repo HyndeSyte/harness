@@ -77,7 +77,7 @@ class TelegramBotAPI:
 
     def send_message(self, chat_id: int, text: str,
                      buttons: list[list[tuple[str, str]]] | None = None, *,
-                     html: bool = True) -> int:
+                     html: bool = True, kind: str | None = None) -> int:
         payload: dict = {"chat_id": chat_id, "text": text,
                          "link_preview_options": {"is_disabled": True}}
         if html:

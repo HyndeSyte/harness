@@ -1,38 +1,37 @@
 """The calendar keeper's place in his Discord DM, as Cain.
 
-It posts under Cain's bot in the owner's DM and hears presses on its own
-buttons over its own gateway connection (discord_gateway.py). Every press is
-checked here, in code:
+It posts under Cain's bot in the owner's DM (discord_chat.py) and hears presses
+on its own buttons over its own gateway connection (discord_gateway.py). Here,
+on the gateway thread and within Discord's 3 seconds, every press is checked:
 - it's the owner (the bot's owner), in the DM with him, not a server;
-- the button is one of the keeper's ("k:" ids) and the card is one it posted;
-- the card still shows exactly what it posted (Cain can edit the bot's
-  messages, so a rewritten card is refused);
-- the card hasn't been used, and hasn't expired.
+- the button is one of the keeper's ("k:" ids) on a message it posted;
+- the message still shows exactly what it posted (Cain can edit the bot's
+  messages, so a rewritten card is refused).
+A press that passes is acknowledged at once and queued for the controller,
+which owns the ledger and applies it: a card's own checks (that tap, on that
+card, once, before it expires) are the ledger's, as they always were.
 Presses on buttons that aren't the keeper's (Cain's own "perm:" buttons) are
 left alone: Cain's plugin answers those.
-
-Stage 1 (this file today): the probe. On first connection it posts one test
-card; a press on it proves two connections on one bot, the owner check, the
-card check and the 3-second answer, on the Pi.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-import secrets
+import queue
 import tempfile
 import threading
 import time
 from typing import Callable
 
-from .discord_api import PRIMARY, DiscordAPI, DiscordError, card_digest, components
+from .discord_api import DiscordAPI, DiscordError, card_digest
 
 log = logging.getLogger("harness.discord")
 
 PREFIX = "k:"
 COMPONENT = 3            # interaction type: a button press
 UPDATE, ACK = 7, 6       # answer kinds
+REMEMBER_S = 35 * 86400  # longer than any card lives (Undo: 7 days, rules: 30)
 
 
 class KeeperStore:
@@ -78,14 +77,18 @@ class KeeperStore:
                 raise
 
 
+
+
 class DiscordKeeper:
-    def __init__(self, api: DiscordAPI, get_meta: Callable[[str], str | None],
-                 set_meta: Callable[[str, str], None], *, clock=time.time):
+    def __init__(self, api: DiscordAPI, get: Callable[[str], str | None],
+                 set_: Callable[[str, str], None], *, clock=time.time):
         self.api = api
-        self._get = get_meta
-        self._set = set_meta
+        self._get = get
+        self._set = set_
         self._clock = clock
         self._lock = threading.Lock()
+        self.presses: "queue.Queue[dict]" = queue.Queue()
+        self.wake = threading.Event()        # set when there's something for the controller
         self.status: dict = {"gateway": "off"}
 
     # -- identity ------------------------------------------------------------
@@ -98,6 +101,15 @@ class DiscordKeeper:
             self._set("discord_owner", oid)
         return oid
 
+    def bot(self) -> str | None:
+        cached = self._get("discord_bot")
+        if cached:
+            return cached
+        bid = self.api.bot_id()
+        if bid:
+            self._set("discord_bot", bid)
+        return bid
+
     def dm(self) -> str:
         cached = self._get("discord_dm")
         if cached:
@@ -109,46 +121,50 @@ class DiscordKeeper:
         self._set("discord_dm", ch)
         return ch
 
-    # -- cards ---------------------------------------------------------------
-    def post_card(self, kind: str, text: str, buttons: list[tuple[str, str]], *,
-                  ttl_s: int, data: dict | None = None) -> str:
-        """Post a card; buttons are (label, action). Returns the message id."""
-        nonce = secrets.token_urlsafe(9)
-        rows = components([[(label, f"{PREFIX}{nonce}:{action}") for label, action in buttons]],
-                          styles={f"{PREFIX}{nonce}:approve": PRIMARY})
-        msg = self.api.send(self.dm(), text, rows)
-        card = {"kind": kind, "nonce": nonce, "message_id": str(msg["id"]),
-                "digest": card_digest(msg.get("content", ""), msg.get("components")),
-                "expires": self._clock() + ttl_s, "used": False, "data": data or {}}
-        self._set(f"discord_card:{nonce}", json.dumps(card))
-        return str(msg["id"])
+    def forget_identity(self) -> None:
+        """A new token may be a new bot: look everything up again."""
+        for k in ("discord_owner", "discord_bot", "discord_dm"):
+            self._set(k, "")
 
-    def _check(self, it: dict) -> tuple[dict | None, str, str]:
-        """(card, action, refusal). card is None when refused."""
-        data = it.get("data") or {}
-        cid = str(data.get("custom_id", ""))
-        _, nonce, action = (cid.split(":", 2) + ["", ""])[:3]
+    # -- what each message showed ------------------------------------------------
+    def remember(self, msg: dict) -> None:
+        """Called after each post or edit, with the message Discord returned."""
+        now = self._clock()
+        with self._lock:
+            raw = self._get("discord_messages")
+            shown = json.loads(raw) if raw else {}
+            shown = {k: v for k, v in shown.items() if v.get("until", 0) > now}
+            shown[str(msg["id"])] = {"digest": card_digest(msg.get("content", ""),
+                                                           msg.get("components")),
+                                     "until": now + REMEMBER_S}
+            self._set("discord_messages", json.dumps(shown))
+
+    def posted(self, message_id: str) -> bool:
+        raw = self._get("discord_messages")
+        return bool(raw) and str(message_id) in json.loads(raw)
+
+    def _shown(self, message_id: str) -> str | None:
+        raw = self._get("discord_messages")
+        entry = (json.loads(raw) if raw else {}).get(str(message_id))
+        return entry["digest"] if entry and entry.get("until", 0) > self._clock() else None
+
+    # -- presses -------------------------------------------------------------
+    def _check(self, it: dict) -> str:
+        """Why a press is refused, or "" when it may go on."""
         user = (it.get("user") or (it.get("member") or {}).get("user") or {}).get("id")
         if it.get("guild_id") or it.get("member"):
-            return None, action, "not in the DM"
+            return "not in the DM"
         if not user or str(user) != self.owner():
-            return None, action, "not the owner"
+            return "not the owner"
         if str(it.get("channel_id", "")) != self.dm():
-            return None, action, "not the DM"
-        raw = self._get(f"discord_card:{nonce}")
-        if not raw:
-            return None, action, "unknown card"
-        card = json.loads(raw)
+            return "not the DM"
         msg = it.get("message") or {}
-        if str(msg.get("id")) != card["message_id"]:
-            return None, action, "wrong message"
-        if card_digest(msg.get("content", ""), msg.get("components")) != card["digest"]:
-            return None, action, "card was changed after it was posted"
-        if card["used"]:
-            return None, action, "already used"
-        if self._clock() > card["expires"]:
-            return None, action, "expired"
-        return card, action, ""
+        digest = self._shown(str(msg.get("id")))
+        if digest is None:
+            return "not a message the keeper posted"
+        if card_digest(msg.get("content", ""), msg.get("components")) != digest:
+            return "card was changed after it was posted"
+        return ""
 
     def on_interaction(self, it: dict) -> None:
         """Called on the gateway thread. Answers within 3 seconds."""
@@ -157,27 +173,22 @@ class DiscordKeeper:
         cid = str((it.get("data") or {}).get("custom_id", ""))
         if not cid.startswith(PREFIX):
             return                                    # not ours: Cain's plugin answers it
-        with self._lock:
-            try:
-                card, action, refusal = self._check(it)
-            except DiscordError as e:
-                card, action, refusal = None, "", f"check failed: {e.code}"
-            if card is None:
-                log.warning("discord: press refused: %s", refusal)
-                self.status["last_press"] = f"refused: {refusal}"
-                self._answer(it, ACK)
-                return
-            card["used"] = True
-            self._set(f"discord_card:{card['nonce']}", json.dumps(card))
-        content = (it.get("message") or {}).get("content", "")
-        self._answer(it, UPDATE, {"content": f"{content}\n\nDone: {self._label(action)}.",
-                                  "components": [], "allowed_mentions": {"parse": []}})
-        self.status["last_press"] = f"{card['kind']}: {action}"
-        log.info("discord: press accepted (%s, %s)", card["kind"], action)
-
-    @staticmethod
-    def _label(action: str) -> str:
-        return {"approve": "approved", "decline": "declined", "ok": "heard"}.get(action, action)
+        try:
+            refusal = self._check(it)
+        except DiscordError as e:
+            refusal = f"check failed: {e.code}"
+        self._answer(it, ACK)
+        if refusal:
+            log.warning("discord: press refused: %s", refusal)
+            self.status["last_press"] = f"refused: {refusal}"
+            return
+        self.status["last_press"] = "accepted"
+        log.info("discord: press accepted")
+        self.presses.put({"id": str(it.get("id")), "token": str(it.get("token")),
+                          "app": str(it.get("application_id", "")),
+                          "custom_id": cid, "message_id": str((it.get("message") or {}).get("id")),
+                          "user": str(self.owner())})
+        self.wake.set()
 
     def _answer(self, it: dict, kind: int, data: dict | None = None) -> None:
         try:
@@ -185,20 +196,15 @@ class DiscordKeeper:
         except DiscordError as e:
             log.error("discord: could not answer the press in time: %s", e.code)
 
-    # -- stage 1 probe -------------------------------------------------------
+    def take_presses(self) -> list[dict]:
+        out = []
+        while True:
+            try:
+                out.append(self.presses.get_nowait())
+            except queue.Empty:
+                return out
+
     def on_state(self, state: str) -> None:
         self.status["gateway"] = state
         log.info("discord: connection %s", state)
-        if state == "ready" and not self._get("discord_probe"):
-            threading.Thread(target=self._probe, name="discord-probe", daemon=True).start()
-
-    def _probe(self) -> None:
-        try:
-            mid = self.post_card(
-                "probe", "Calendar keeper: connected to Discord. Tap the button so I can check "
-                "that your taps reach me. Nothing else happens.",
-                [("Tap to test", "ok")], ttl_s=7 * 86400)
-            self._set("discord_probe", mid)
-            log.info("discord: probe card posted")
-        except DiscordError as e:
-            log.error("discord: probe card failed: %s", e.code)
+        self.wake.set()

@@ -8,6 +8,7 @@ export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
 mkdir -p /data/work
 # Cain's standing rules ship with the add-on, so an update always brings them.
 cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
+mkdir -p /data/work/.claude && cp /opt/cain/settings.json /data/work/.claude/settings.json
 if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
   bashio::log.info "Installing the Discord channel plugin"
   claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"

@@ -67,7 +67,7 @@ class Outbox:
             when = written.astimezone(self.tz).strftime("%a %-I:%M %p")
             text = render.fit(f"<i>Delayed: written {when}.</i>\n" + text)
         try:
-            mid = self._deliver(row["chat_id"], text, buttons)
+            mid = self._deliver(row["chat_id"], text, buttons, row["kind"])
         except TelegramError as e:
             self._failed(row, e)
             return False
@@ -95,15 +95,15 @@ class Outbox:
                 self.ledger.event("bind_failed", {"outbox": row["id"], "error": str(e)[:100]})
         return True
 
-    def _deliver(self, chat_id: int, text: str, buttons) -> int:
+    def _deliver(self, chat_id: int, text: str, buttons, kind: str | None = None) -> int:
         try:
-            return self.api.send_message(chat_id, text, buttons)
+            return self.api.send_message(chat_id, text, buttons, kind=kind)
         except TelegramError as e:
             # Every character is escaped by render, so a markup error means
             # a bug there. Deliver it plainly rather than not at all.
             if e.code == 400 and "parse" in e.description.lower():
                 self.ledger.event("html_fallback", {"error": e.description[:100]})
-                return self.api.send_message(chat_id, _plain(text), buttons, html=False)
+                return self.api.send_message(chat_id, _plain(text), buttons, html=False, kind=kind)
             raise
 
     def _failed(self, row, e: TelegramError) -> None:

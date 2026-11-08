@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.12
+
+- Calendar changes go to the calendar keeper: Cain runs handover.sh, the keeper reads your message itself, makes the change and posts the receipt here under Cain's name. Cain never writes a calendar.
+
 ## 0.1.11
 - Cain reads and writes the organization's record (a private repo) through the GitHub connector.
 

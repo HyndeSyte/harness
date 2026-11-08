@@ -56,6 +56,16 @@ REASONS = {
 }
 
 
+# Why a change from a handed-over message waits for a tap.
+PROVENANCE = {
+    "edited": "your message was edited after you sent it.",
+    "forwarded": "it was a forwarded message, so the words may be someone else's.",
+    "attachment": "your message had an attachment.",
+    "foreign_reply": "it replied to a message that isn't yours or mine.",
+    "suggestion": "it rests on something Cain suggested, not only your own words.",
+}
+
+
 def reason_text(reason: str, engine: str | None) -> str:
     spec = policy.MODELS.get(engine or "claude")
     name = PROVIDER_NAME.get(spec.provider, engine) if spec else "the model"
@@ -77,6 +87,9 @@ class Runner:
         self.sleep = sleep
         self.monotonic = monotonic
         self._futures: dict[str, Future] = {}
+        # On Discord, Cain is the conversation: an answer or "nothing to do" goes
+        # back to Cain in the handover's reply, not into his DM.
+        self.answers_to_cain = False
         self._fired: dict[str, list[str]] = {}
         self._budgets_ok = budgets_ok or self._budget_ok
 
@@ -242,6 +255,9 @@ class Runner:
         return dict(rules_fired=tuple(fired), allowlist=self.config.link_allowlist)
 
     def _on_answer(self, job, body, receipt, fired):
+        if self.answers_to_cain:
+            self._to_cain(job, "answered", receipt, body["text"])
+            return
         text = render.answer(job["id"], body["text"], **self._footer_args(fired))
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
@@ -255,11 +271,25 @@ class Runner:
             self._reply(db, job, text, kind="answer", raw=True)
 
     def _on_no_action(self, job, body, receipt, fired):
+        if self.answers_to_cain:
+            self._to_cain(job, "no_action", receipt, "Not a calendar change: " + body["reason"])
+            return
         text = render.answer(job["id"], "Nothing to do: " + body["reason"],
                              **self._footer_args(fired))
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "no_action", receipt=json.dumps(receipt), db=db)
             self._reply(db, job, text, kind="answer", raw=True)
+
+    def _to_cain(self, job, state: str, receipt: dict, words: str) -> None:
+        receipt["said_to_cain"] = words[:1500]
+        with self.ledger.tx() as db:
+            self.ledger.transition(job["id"], state, receipt=json.dumps(receipt), db=db)
+
+    def _provenance(self, job) -> list[str]:
+        """Discord's own signs that the words may not be his own, fresh ones
+        (controller._handover). Any of them puts the change on a card to tap."""
+        raw = self.ledger.get_meta(f"job_flags:{job['id']}")
+        return [PROVENANCE[f] for f in (json.loads(raw) if raw else []) if f in PROVENANCE]
 
     def _on_rule(self, job, body, receipt, fired):
         with self.ledger.tx() as db:
@@ -301,6 +331,7 @@ class Runner:
                                                 replied=bool(job["reply_to_message_id"]))
         else:
             warnings = []
+        warnings = list(warnings) + self._provenance(job)
         # One transaction: the proposal and the card that tells him about it
         # are written together, so a crash can't leave a job with no words.
         with self.ledger.tx() as db:

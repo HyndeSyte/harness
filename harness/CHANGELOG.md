@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.0
+
+- The calendar keeper moves to Discord. With a Discord bot token set, it talks only in your DM with Cain, under Cain's name, and Telegram goes quiet.
+- You ask Cain in plain words. Cain hands the request over without passing your words; the keeper reads your newest message (from the last 2 minutes) itself, makes the change, and posts the receipt with Undo. Questions go back to Cain to answer.
+- A card to tap comes up when the words may not be yours: an edited or forwarded message, an attachment, a reply to something that isn't yours, or anything resting on Cain's suggestion.
+- A Stop button sits on every set of buttons and on the morning digest; Turn back on replaces it while stopped. Both work even if Cain is down.
+- At the move, changes still undoable are posted again with Undo, and open Telegram questions are closed with a note.
+
 ## 0.14.1
 
 - Fix: the Discord connection stopped right after connecting, because it reached the main record from its own thread. The keeper now keeps its own small record, and the connection keeps going if anything else goes wrong.

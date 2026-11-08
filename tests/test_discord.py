@@ -11,7 +11,7 @@ import pytest
 from harness.discord_api import (LIMIT, SUPPRESS_EMBEDS, DiscordAPI, DiscordError,
                                  DiscordTransport, card_digest, check_token, components)
 from harness.discord_gateway import GUID, Closed, Gateway, WebSocket
-from harness.discord_keeper import ACK, UPDATE, DiscordKeeper
+from harness.discord_keeper import ACK, DiscordKeeper, KeeperStore
 from harness.net import TransportError
 from harness.vault import Vault, VaultError
 from fakes import FakeTransport
@@ -74,98 +74,6 @@ def test_vault_takes_a_discord_token_and_refuses_junk(tmp_path):
     assert v.check_format("discord_bot_token", TOKEN) == TOKEN
     with pytest.raises(VaultError):
         v.check_format("discord_bot_token", "https://discord.com/not-a-token")
-
-
-# -- the press check ------------------------------------------------------------
-
-class FakeAPI:
-    def __init__(self):
-        self.sent, self.answers = [], []
-
-    def owner_id(self):
-        return OWNER
-
-    def dm_channel(self, user):
-        return DM
-
-    def send(self, channel, text, rows=None):
-        msg = {"id": str(100 + len(self.sent)), "content": text, "components": rows or []}
-        self.sent.append(msg)
-        return msg
-
-    def answer(self, iid, token, kind, data=None):
-        self.answers.append((kind, data))
-
-
-def keeper(now=[1000.0]):
-    meta = {}
-    k = DiscordKeeper(FakeAPI(), meta.get, meta.__setitem__, clock=lambda: now[0])
-    return k, meta
-
-
-def press(k, msg, action="approve", **over):
-    cid = next(c["custom_id"] for r in msg["components"] for c in r["components"]
-               if c["custom_id"].endswith(":" + action))
-    it = {"type": 3, "id": "i1", "token": "t1", "channel_id": DM, "user": {"id": OWNER},
-          "data": {"custom_id": cid}, "message": json.loads(json.dumps(msg))}
-    it.update(over)
-    k.on_interaction(it)
-    return k.api.answers[-1] if k.api.answers else None
-
-
-def card(k):
-    k.post_card("change", "Calendar: move the dentist to Thu 2 PM?",
-                [("Approve", "approve"), ("Decline", "decline")], ttl_s=600)
-    return k.api.sent[-1]
-
-
-def test_a_press_by_him_on_the_card_as_posted_is_accepted_once():
-    k, _ = keeper()
-    msg = card(k)
-    kind, data = press(k, msg)
-    assert kind == UPDATE and data["components"] == [] and "approved" in data["content"]
-    assert press(k, msg)[0] == ACK and "already used" in k.status["last_press"]
-
-
-def test_a_card_rewritten_after_posting_is_refused():
-    k, _ = keeper()
-    msg = card(k)
-    msg["content"] = "Calendar: add lunch Friday?"          # what Cain could do
-    assert press(k, msg)[0] == ACK
-    assert "changed" in k.status["last_press"]
-
-
-@pytest.mark.parametrize("over,why", [
-    ({"user": {"id": "333"}}, "not the owner"),
-    ({"guild_id": "5", "member": {"user": {"id": OWNER}}}, "not in the DM"),
-    ({"channel_id": "444"}, "not the DM"),
-])
-def test_presses_from_anyone_or_anywhere_else_are_refused(over, why):
-    k, _ = keeper()
-    msg = card(k)
-    assert press(k, msg, **over)[0] == ACK
-    assert why in k.status["last_press"]
-
-
-def test_an_expired_card_is_refused():
-    now = [1000.0]
-    k, _ = keeper(now)
-    msg = card(k)
-    now[0] += 601
-    assert press(k, msg)[0] == ACK and "expired" in k.status["last_press"]
-
-
-def test_buttons_that_are_not_the_keepers_are_left_to_cain():
-    k, _ = keeper()
-    k.on_interaction({"type": 3, "id": "i", "token": "t", "channel_id": DM, "user": {"id": OWNER},
-                      "data": {"custom_id": "perm:allow:abcde"}, "message": {}})
-    assert k.api.answers == []
-
-
-def test_digest_covers_text_and_buttons():
-    rows = components([[("Approve", "k:a:approve")]])
-    assert card_digest("x", rows) != card_digest("y", rows)
-    assert card_digest("x", rows) != card_digest("x", components([[("Approve", "k:a:decline")]]))
 
 
 # -- the WebSocket and the gateway ---------------------------------------------
@@ -247,28 +155,6 @@ def test_gateway_identifies_with_no_intents_and_hands_presses_over():
 def test_websocket_refuses_hosts_other_than_discords_gateway():
     with pytest.raises(Closed):
         WebSocket("wss://evil.example/?v=10")
-
-
-def test_the_keepers_record_works_from_the_gateway_thread(tmp_path):
-    # Presses and the probe run on the gateway thread; the keeper's record must not be
-    # tied to the thread that opened it (the ledger's SQLite connection is).
-    from harness.discord_keeper import KeeperStore
-    store = KeeperStore(str(tmp_path / "discord.json"))
-    k = DiscordKeeper(FakeAPI(), store.get, store.set, clock=lambda: 1000.0)
-    errors = []
-
-    def other():
-        try:
-            k.on_state("ready")
-            msg = card(k)
-            press(k, msg)
-        except Exception as e:                     # pragma: no cover - the failure we guard
-            errors.append(e)
-    t = threading.Thread(target=other)
-    t.start()
-    t.join(5)
-    assert not errors and store.get("discord_owner") == OWNER
-    assert KeeperStore(str(tmp_path / "discord.json")).get("discord_dm") == DM
 
 
 def test_a_failing_state_listener_does_not_drop_the_connection():

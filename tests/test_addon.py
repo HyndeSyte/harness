@@ -214,3 +214,28 @@ def test_cain_tells_the_owner_once_when_its_signin_expires():
     assert code.index("unset token") < code.index("curl ")
     assert '-H "@$hdr"' in code and "set -x" not in code
     assert " jq " in (CAIN / "Dockerfile").read_text()
+
+
+def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
+    import sys
+    sys.path.insert(0, str(ADDON / "app"))
+    from harness import handover
+    script = (CAIN / "rootfs/opt/cain/handover.sh").read_text()
+    code = "\n".join(l for l in script.splitlines() if not l.strip().startswith("#"))
+    # The same key the harness checks, made from the token inside bun, never on a command line.
+    assert handover.KEY_CONTEXT.decode() in code and 'createHmac("sha256"' in code
+    assert "process.env.ENV_FILE" in code and "$token" not in code
+    assert "umask 077" in code and '-H "@$hdr"' in code and "unset key" in code
+    assert code.index("unset key") < code.index("curl ")
+    assert f"http://0fcc2575-harness:{handover.PORT}/handover" in code
+    # Nothing of his is passed: only Cain's own suggestion and who Cain is paired with.
+    assert "{suggestion: $s, paired: $p}" in code
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text()
+    assert "/opt/cain/handover.sh" in rules and "never change a calendar yourself" in rules
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    assert "cp /opt/cain/settings.json /data/work/.claude/settings.json" in run
+
+
+def test_the_handover_port_is_never_published():
+    cfg = (ADDON / "config.yaml").read_text()
+    assert not re.search(r"^ports", cfg, re.M) and "8098" not in cfg

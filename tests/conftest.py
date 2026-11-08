@@ -63,7 +63,7 @@ class FakeAPI:
         assert tuple(allowed_updates) == ("message", "callback_query")
         return self.batches.pop(0) if self.batches else []
 
-    def send_message(self, chat_id, text, buttons=None, *, html=True):
+    def send_message(self, chat_id, text, buttons=None, *, html=True, kind=None):
         self.next_message_id += 1
         self.sent.append((chat_id, text, buttons, self.next_message_id))
         return self.next_message_id

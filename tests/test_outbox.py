@@ -86,7 +86,7 @@ def test_markup_error_falls_back_to_plain_text(ledger):
 
 def test_message_id_zero_is_never_bound(ledger):
     class ZeroBot(FakeBot):
-        def send_message(self, chat_id, text, buttons=None):
+        def send_message(self, chat_id, text, buttons=None, **kw):
             self.sent.append((chat_id, text, buttons, 0))
             return 0
     with ledger.tx() as db:

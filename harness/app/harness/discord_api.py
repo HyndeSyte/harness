@@ -192,6 +192,14 @@ class DiscordAPI:
         self._call("POST", f"/interactions/{interaction_id}/{interaction_token}/callback", body,
                    auth=False, timeout=3)
 
+    def followup(self, application_id: str, interaction_token: str, text: str) -> None:
+        """A short note after a press, shown only to him (ephemeral, flag 64). The
+        interaction's token is good for 15 minutes."""
+        REDACT.register(interaction_token)
+        self._call("POST", f"/webhooks/{application_id}/{interaction_token}",
+                   {"content": fit(text), "flags": 64, "allowed_mentions": {"parse": []}},
+                   auth=False, timeout=10)
+
 
 def check_token(value: str) -> bool:
     return bool(TOKEN_FORMAT.fullmatch(value.strip()))
