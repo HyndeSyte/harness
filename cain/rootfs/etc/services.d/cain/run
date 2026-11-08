@@ -37,6 +37,16 @@ bashio::log.info "Cain is running"
 # Cain's link (link/main.ts): taps, reactions and specialists' cards. What Cain must
 # hear is queued for him; checkin.sh types it in when he is idle.
 ( while true; do bun /opt/cain/link/main.ts 2>&1; sleep 5; done ) &
+# The record keeper (record/main.ts): the one writer of Cain's record. Keeps a
+# copy in /data/record (so Home Assistant's backups carry it off the box),
+# applies requests in order, and runs the nightly check. Its key comes from the
+# add-on's options and goes only into its environment.
+(
+  RECORD_TOKEN="$(bashio::config 'github_token' 2>/dev/null || true)"
+  [ "$RECORD_TOKEN" = "null" ] && RECORD_TOKEN=""
+  export RECORD_TOKEN
+  while true; do bun /opt/cain/record/main.ts 2>&1; sleep 10; done
+) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM so open work moves
 # without Dane. checkin.sh decides when, and only types into an idle session.
 (

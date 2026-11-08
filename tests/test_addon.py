@@ -108,10 +108,47 @@ def test_cain_config_denies_every_api_and_mapping():
     for api in ("homeassistant_api", "hassio_api", "auth_api"):
         assert cfg[api] == "false", api
     for risky in ("map", "ports", "host_network", "privileged", "full_access", "docker_api",
-                  "devices", "hassio_role", "image", "options", "schema"):
+                  "devices", "hassio_role", "image"):
         assert risky not in cfg, risky
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099" and cfg["panel_admin"] == "true"
     assert cfg["init"] == "false"
+    # One option only: the record keeper's GitHub token, as a password field.
+    text = (CAIN / "config.yaml").read_text()
+    assert re.search(r"^options:\n  github_token: \"\"\nschema:\n  github_token: password\?\n", text, re.M)
+
+
+def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
+    import json, shutil, subprocess
+    s = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]
+    for tool in ("create_or_update_file", "push_files", "delete_file", "create_branch", "merge_pull_request"):
+        assert f"mcp__claude_ai_GitHub__{tool}" in s["deny"]
+    assert "Bash(/opt/cain/record.sh:*)" in s["allow"]
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    assert "/opt/cain/record.sh submit" in rules and "only through the record keeper" in rules
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    assert "bun /opt/cain/record/main.ts" in run and "bashio::config 'github_token'" in run
+    printed = [l for l in run.splitlines() if "RECORD_TOKEN" in l and re.search(r"echo|printf|log\.", l)]
+    assert not printed   # the token is never printed
+    bash, jq = shutil.which("bash"), shutil.which("jq")
+    if not bash or not jq:
+        import pytest
+        pytest.skip("no bash or jq")
+    env = {"PATH": __import__("os").environ["PATH"], "RECORD_DIR": str(tmp_path / "rec"),
+           "RECORD_QUEUE": str(tmp_path / "q"), "RECORD_OUTCOMES": str(tmp_path / "o")}
+    (tmp_path / "rec").mkdir()
+    sh = str(CAIN / "rootfs/opt/cain/record.sh")
+    run_ = lambda *a: subprocess.run([bash, sh, *a], env=env, capture_output=True, text=True, timeout=20)
+    assert run_("sha", "areas/x.md").stdout.strip() == "new"
+    req = tmp_path / "r.json"
+    req.write_text(json.dumps({"id": "cain-test-1", "from": "cain", "kind": "change", "summary": "s", "ops": []}))
+    assert run_("submit", str(req)).stdout.strip() == "cain-test-1"
+    assert len(list((tmp_path / "q").glob("*.json"))) == 1
+    assert run_("status", "cain-test-1").stdout.strip() == "waiting"
+    (tmp_path / "o").mkdir()
+    (tmp_path / "o" / "cain-test-1.json").write_text(json.dumps({"state": "conflict", "reason": "changed"}))
+    assert run_("status", "cain-test-1").stdout.strip() == "conflict: changed"
+    req.write_text("{}")
+    assert run_("submit", str(req)).returncode == 2
 
 
 def test_cain_versions_agree_and_everything_is_pinned():

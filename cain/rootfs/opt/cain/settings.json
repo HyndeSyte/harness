@@ -4,7 +4,9 @@
       "Bash(/opt/cain/keeper.sh)",
       "Bash(/opt/cain/keeper.sh:*)",
       "Bash(/opt/cain/handover.sh)",
-      "Bash(/opt/cain/handover.sh:*)"
+      "Bash(/opt/cain/handover.sh:*)",
+      "Bash(/opt/cain/record.sh)",
+      "Bash(/opt/cain/record.sh:*)"
     ],
     "deny": [
       "mcp__claude_ai_Google_Calendar__create_event",
@@ -19,7 +21,12 @@
       "mcp__claude_ai_Gmail__forward",
       "mcp__claude_ai_Slack__slack_send_message",
       "mcp__claude_ai_Slack__slack_schedule_message",
-      "mcp__claude_ai_HASS_MCP"
+      "mcp__claude_ai_HASS_MCP",
+      "mcp__claude_ai_GitHub__create_or_update_file",
+      "mcp__claude_ai_GitHub__push_files",
+      "mcp__claude_ai_GitHub__delete_file",
+      "mcp__claude_ai_GitHub__create_branch",
+      "mcp__claude_ai_GitHub__merge_pull_request"
     ]
   }
 }

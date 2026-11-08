@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.2.0"
+version: "0.3.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -25,3 +25,9 @@ hassio_api: false
 auth_api: false
 backup: cold
 timeout: 30
+# The record keeper's key: a GitHub fine-grained token for the org repo only,
+# with Contents read and write. Entered by Dane here, never shown or logged.
+options:
+  github_token: ""
+schema:
+  github_token: password?

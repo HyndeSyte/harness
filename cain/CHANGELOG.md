@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- The record keeper: one writer for Cain's record. Changes arrive as small requests (from Cain, your page, or laptop sessions), are checked against the record's rules, applied one at a time and committed, so no two writers can clash. Stale or rule-breaking changes go back to Cain instead of overwriting anything.
+- A copy of the record lives on the Pi, so Home Assistant's daily backups carry it off the box.
+- A nightly check (state/record-check.md) finds incomplete notes, broken links and likely duplicates for Cain to fix.
+- Cain's GitHub write tools are switched off; he writes through the keeper. Needs a GitHub token for the org repo in the add-on's options.
+
 ## 0.2.0
 
 - Cain's link: the one Discord connection for taps and reactions now lives here, with the checks on every tap. Specialists hand their cards to Cain, who shows them unchanged when he decides. keeper.sh show posts a card; ask and morning post Cain's own questions with buttons.
