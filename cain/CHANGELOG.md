@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.14
+
+- Cain can't change calendars, send or reply to email, send Slack messages, or change Home Assistant: those tools are switched off. Calendar changes go through the calendar specialist; reading still works.
+
 ## 0.1.13
 
 - The log lists Cain's connectors by name at start, so the tools Cain must not use can be blocked by name.

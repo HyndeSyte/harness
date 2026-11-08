@@ -239,3 +239,18 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
 def test_the_handover_port_is_never_published():
     cfg = (ADDON / "config.yaml").read_text()
     assert not re.search(r"^ports", cfg, re.M) and "8098" not in cfg
+
+
+def test_cain_cannot_write_calendars_send_messages_or_change_home_assistant():
+    import json
+    deny = set(json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]["deny"])
+    for tool in ("create_event", "update_event", "delete_event", "respond_to_event"):
+        assert f"mcp__claude_ai_Google_Calendar__{tool}" in deny
+    for tool in ("create-events", "update-events", "cancel-events"):
+        assert f"mcp__claude_ai_Notion__notion-calendar-{tool}" in deny
+    for tool in ("send_message", "reply", "forward"):
+        assert f"mcp__claude_ai_Gmail__{tool}" in deny
+    assert {"mcp__claude_ai_Slack__slack_send_message",
+            "mcp__claude_ai_Slack__slack_schedule_message"} <= deny
+    assert "mcp__claude_ai_HASS_MCP" in deny          # the whole read-write connector
+    assert not any("read-only" in d for d in deny)    # reading stays

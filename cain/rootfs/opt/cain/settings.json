@@ -1,5 +1,23 @@
 {
   "permissions": {
-    "allow": ["Bash(/opt/cain/handover.sh)", "Bash(/opt/cain/handover.sh:*)"]
+    "allow": [
+      "Bash(/opt/cain/handover.sh)",
+      "Bash(/opt/cain/handover.sh:*)"
+    ],
+    "deny": [
+      "mcp__claude_ai_Google_Calendar__create_event",
+      "mcp__claude_ai_Google_Calendar__update_event",
+      "mcp__claude_ai_Google_Calendar__delete_event",
+      "mcp__claude_ai_Google_Calendar__respond_to_event",
+      "mcp__claude_ai_Notion__notion-calendar-create-events",
+      "mcp__claude_ai_Notion__notion-calendar-update-events",
+      "mcp__claude_ai_Notion__notion-calendar-cancel-events",
+      "mcp__claude_ai_Gmail__send_message",
+      "mcp__claude_ai_Gmail__reply",
+      "mcp__claude_ai_Gmail__forward",
+      "mcp__claude_ai_Slack__slack_send_message",
+      "mcp__claude_ai_Slack__slack_schedule_message",
+      "mcp__claude_ai_HASS_MCP"
+    ]
   }
 }
