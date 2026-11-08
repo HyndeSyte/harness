@@ -263,12 +263,21 @@ def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime
         exp = expires.astimezone(ZoneInfo(tz))
         verbs = {"remove": "take off", "end_series": "end, from", "move": "move",
                  "add": "add", "add_series": "add, repeating"}
+
+        def line(c):
+            if c["op"] == "rule":
+                # What a Family event's name means for him: no dates, no calendar write.
+                from .calendar_change import RULE_WORDS
+                meaning = RULE_WORDS.get(c.get("kind", ""), "mean what you said")
+                return f"Family: from now on, events with {family_text(c['title'])} in the name {escape(meaning)}"
+            return (f"{escape(c['calendar'].title())}: {verbs.get(c['op'], escape(c['op']))} "
+                    f"{family_text(c['title'])}"
+                    + "".join(f" {escape(c[k])}" for k in ("dates", "start", "end", "days", "until")
+                              if c.get(k)))
         return fit("\n".join([
             "<b>Change the calendar?</b>",
             *[f"⚠ <b>Check before approving:</b> {escape(w)}" for w in warnings],
-            *[f"{escape(c['calendar'].title())}: {verbs[c['op']]} {family_text(c['title'])}"
-              + "".join(f" {escape(c[k])}" for k in ("dates", "start", "end", "days", "until") if c[k])
-              for c in params["changes"]],
+            *[line(c) for c in params["changes"]],
             f"<i>Offer ends {_day(exp)}, {_clock(exp)} · job {short(job_id)}</i>"]))
     if effect.name == "calendar_hold":
         lines = [

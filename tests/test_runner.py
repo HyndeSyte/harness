@@ -251,3 +251,76 @@ def test_a_reply_carries_the_exchange_it_answers(ledger, config):
     user = eng.calls[-1]["user"]
     assert "draft a note to the coop" in user and "Draft one." in user
     assert user.index("Earlier in this conversation") < user.index("<message>\nshorter")
+
+
+# -- Nov 8: "Turkey harvest ties me up" crashed the receipt card and hung for 10 minutes ----
+
+def test_a_rule_change_renders_on_the_card():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from harness import render
+    card = render.proposal_card(
+        SimpleNamespace(name="calendar_change"),
+        {"changes": [{"calendar": "family", "op": "rule", "title": "Turkey harvest", "kind": "me",
+                      "dates": "", "start": "", "end": "", "days": "", "until": "",
+                      "location": "", "every": ""}]},
+        tz="America/New_York", expires=datetime(2026, 11, 8, 18, tzinfo=timezone.utc),
+        job_id="abcd-1", warnings=["it rests on something Cain suggested"])
+    assert "Turkey harvest" in card and "from now on" in card and "Busy on Gmail" in card
+
+
+def _cain_runner(ledger, config, script):
+    r, eng = make(ledger, config, script)
+    r.answers_to_cain = True
+    return r, eng
+
+
+def test_a_bug_after_the_answer_ends_the_job_at_once_and_retries_it_once(ledger, config, monkeypatch):
+    r, _ = _cain_runner(ledger, config, [result(text="a"), result(text="b")])
+    job = send(ledger, "Turkey harvest ties me up")
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise KeyError("rule")
+    monkeypatch.setattr(r, "_on_answer", boom)
+    run(r)
+    # not left running: failed, then put back for one retry, with a notice (no "send it again")
+    assert ledger.job(job)["state"] == "received"
+    texts = [o["text"] for o in queued(ledger)]
+    assert any("running it once more" in t for t in texts)
+    assert not any("Send it again" in t for t in texts)
+    run(r)                                              # the retry hits the same bug
+    assert ledger.job(job)["state"] == "failed"
+    assert receipt(ledger, job)["reason"] == "internal_error"
+    last = queued(ledger)[-1]["text"]
+    assert "failed twice" in last and "Send it again" not in last
+    assert len(calls) == 2
+
+
+def test_after_a_restart_a_recent_failure_runs_once_more(ledger, config, clock):
+    r, _ = _cain_runner(ledger, config, [result(text="done now")])
+    job = send(ledger, "Turkey harvest ties me up")
+    r.start_pending(paused=False)
+    r._futures.clear()                                  # the old process is gone
+    r._fail(ledger.job(job), "deadline", "claude")      # Cain's run already used its retry? no:
+    assert ledger.job(job)["state"] == "received"       # first failure retries at once
+    # simulate the retry also failing before the update, then the fixed version starting
+    r.start_pending(paused=False)
+    r._futures.clear()
+    r._fail(ledger.job(job), "internal_error", "claude")
+    assert ledger.job(job)["state"] == "failed"
+    assert r.retry_recent_failures() == 0               # already retried once: not again
+
+
+def test_restart_retry_picks_up_an_old_unretried_failure(ledger, config):
+    r, _ = make(ledger, config, [result(text="ok")])    # failed while not yet answering Cain
+    job = send(ledger, "Turkey harvest ties me up")
+    r.start_pending(paused=False)
+    r._futures.clear()
+    r._fail(ledger.job(job), "deadline", "claude")
+    assert ledger.job(job)["state"] == "failed"
+    r.answers_to_cain = True                            # the restarted, fixed harness
+    assert r.retry_recent_failures() == 1
+    run(r)
+    assert ledger.job(job)["state"] == "answered"

@@ -373,6 +373,9 @@ class Controller:
         self._bind_owner(owner_i)
         self.runner.answers_to_cain = True
         self._reconcile()
+        retried = self.runner.retry_recent_failures()     # often an update that fixed the cause
+        if retried:
+            log.info("retrying %d recent failure(s) after the restart", retried)
         self._discord_seen = print_
         self.notes.pop("discord", None)
         log.info("discord: cards go to Cain for the bot's owner")

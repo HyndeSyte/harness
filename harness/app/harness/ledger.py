@@ -271,6 +271,7 @@ TRANSITIONS = {
                 "failed", "cancelled"},
     "proposed": {"approved", "declined", "expired", "cancelled"},
     "approved": {"executed", "failed"},
+    "failed": {"received"},          # a retry of a failure that wasn't his doing (runner)
 }
 
 

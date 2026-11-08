@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.17.1
+
+- Fixed: "this ties me up" (a rule about what a Family event means) crashed the card and left the request hanging for 10 minutes. A crash while finishing a request now ends it at once.
+- With Cain in front, a request that fails for a reason that isn't yours (a timeout, a restart, a bug, a model hiccup) runs once more on its own, from the same message; after an update, recent failures get that one retry too. You are never asked to send it again. A change from a retry still waits for your tap.
+
 ## 0.17.0
 
 - Cain is the gatekeeper. This add-on no longer has its own Discord connection and never posts to you itself: every card goes to Cain's link, which holds it until Cain shows it, unchanged. Taps on its cards come back from the link. Only Stop's notices and the 7:40 digest fallback go straight out.

@@ -52,6 +52,7 @@ REASONS = {
     "bad_output": "{name}'s reply didn't fit the allowed shapes",
     "deadline": "it took longer than 10 minutes",
     "interrupted": "the harness restarted while working on it",
+    "internal_error": "a bug in the calendar specialist stopped it (it's logged)",
     "too_long": "the message is longer than I accept (12,000 characters)",
 }
 
@@ -64,6 +65,13 @@ PROVENANCE = {
     "foreign_reply": "it replied to a message that isn't yours or mine.",
     "suggestion": "it rests on something Cain suggested, not only your own words.",
 }
+
+
+# With Cain in front, a failure he didn't cause is never handed back to him as
+# "send it again": these are retried once, from the same message, on their own.
+RETRYABLE = frozenset({"deadline", "interrupted", "internal_error", "rate_limited", "overloaded",
+                       "server_error", "timeout", "network", "tls", "incomplete", "bad_output"})
+RETRY_WINDOW_S = 24 * 3600
 
 
 def reason_text(reason: str, engine: str | None) -> str:
@@ -206,7 +214,14 @@ class Runner:
             except Exception as e:          # a bug in a worker, not a provider answer
                 log.error("worker crashed on %s: %s", job_id, type(e).__name__)
                 outcome = CallOutcome(error=EngineError("fatal", "bad_output", type(e).__name__))
-            self._finish(job_id, outcome)
+            try:
+                self._finish(job_id, outcome)
+            except Exception as e:          # a bug after the answer: end the job now, never hang
+                log.exception("finishing %s failed", job_id)
+                job = self.ledger.job(job_id)
+                if job is not None and job["state"] == "running":
+                    self._fail(job, "internal_error", job["engine"],
+                               detail=f"{type(e).__name__}: {e}"[:120])
             done += 1
         return done
 
@@ -377,10 +392,54 @@ class Runner:
             receipt["detail"] = detail
         if attempts:
             receipt["attempts"] = attempts
+        retry = self._may_retry(job, reason)
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "failed", receipt=json.dumps(receipt), db=db)
-            self._reply(db, job, f"I couldn't finish that: {reason_text(reason, engine)}. "
-                                 "Nothing was done. Send it again to retry.")
+            if retry:
+                self.ledger.set_meta(f"job_retried:{job['id']}", self.ledger.now().isoformat(), db)
+                self.ledger.transition(job["id"], "received", db=db)
+                self.ledger.event("job_retry", {"job": job["id"], "reason": reason}, db=db)
+                self._reply(db, job, f"That didn't finish ({reason_text(reason, engine)}), "
+                                     "so I'm running it once more.", kind="notice")
+            elif self.answers_to_cain:
+                again = " It failed twice, so it's logged for a fix." \
+                    if self.ledger.get_meta(f"job_retried:{job['id']}") else ""
+                self._reply(db, job, f"I couldn't finish that: {reason_text(reason, engine)}. "
+                                     f"Nothing was done.{again}")
+            else:
+                self._reply(db, job, f"I couldn't finish that: {reason_text(reason, engine)}. "
+                                     "Nothing was done. Send it again to retry.")
+
+    def _may_retry(self, job, reason: str) -> bool:
+        """Once per message, only for failures that aren't his doing, only with Cain in
+        front (who would otherwise hand the retry back to Dane)."""
+        if not self.answers_to_cain or reason not in RETRYABLE or job["kind"] != "message":
+            return False
+        if self.ledger.get_meta(f"job_retried:{job['id']}"):
+            return False
+        age = (self.ledger.now() - datetime.fromisoformat(job["created_at"])).total_seconds()
+        return age <= RETRY_WINDOW_S
+
+    def retry_recent_failures(self) -> int:
+        """After a restart (often an update with a fix): a message that failed for a
+        reason that wasn't his, in the last day and never retried, runs once more.
+        A change from it still waits for his tap."""
+        if not self.answers_to_cain:
+            return 0
+        n = 0
+        for job in self.ledger.jobs_in("failed"):
+            try:
+                reason = json.loads(self.ledger.receipts(job["id"])[-1]["detail"] or "{}").get("reason")
+            except (IndexError, ValueError):
+                continue
+            if self._may_retry(job, reason or ""):
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(f"job_retried:{job['id']}", self.ledger.now().isoformat(), db)
+                    self.ledger.transition(job["id"], "received", db=db)
+                    self.ledger.event("job_retry", {"job": job["id"], "reason": reason,
+                                                    "after": "restart"}, db=db)
+                n += 1
+        return n
 
     def check_timers(self) -> None:
         now = self.ledger.now()
