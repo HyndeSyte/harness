@@ -763,3 +763,16 @@ def test_an_answer_a_newer_answer_overruled_stays_overruled(lv):
     assert meaning.revive_answers(lv.ledger) == []
     states = dict(lv.ledger.db.execute("SELECT id, state FROM meaning_examples").fetchall())
     assert states == {a: "overruled", b: "active"}
+
+
+def test_a_judgment_from_before_features_were_kept_is_made_again_for_his_answer(lv):
+    got, _ = meaning_live.validate_rows({"rows": [ROW]})
+    lv.live.import_rows(got)
+    lv.ledger.db.execute(
+        "INSERT INTO meaning_judgments(key, kind, fingerprint, anchor, obligations, cites, unsure, status,"
+        " failure, tries, policy_version, examples_version, model, judged_at)"
+        " VALUES('e:old','single','fp','2026-12-15','[]','[]',1,'ok','',1,'p','v','m','2026-11-08')")
+    lv.ledger.set_meta("meaning_revived", "")
+    lv.live.tick(paused=True)
+    row = lv.ledger.db.execute("SELECT stale FROM meaning_judgments WHERE key='e:old'").fetchone()
+    assert row["stale"] == 1

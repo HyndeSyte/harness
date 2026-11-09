@@ -419,18 +419,20 @@ class MeaningLive:
             self.ledger.event("meaning_live_failed", {"error": type(e).__name__})
 
     def _revive(self) -> None:
-        """Once: his answers wrongly overruled by a seeded example (meaning.revive_answers)."""
-        if self.ledger.get_meta("meaning_revived") == "1":
+        """Once: his answers wrongly overruled by a seeded example (meaning.revive_answers) come
+        back, and every judgment any answer of his could touch is made again, so none still
+        rests on what was judged before his answer counted."""
+        if self.ledger.get_meta("meaning_revived") == "2":
             return
         ids = meaning.revive_answers(self.ledger)
-        if ids:
-            meaning.rejudge_for(self.ledger, ids)
-            if self.shadow is not None:
-                self.shadow.poke()
-            self.ledger.event("meaning_revived", {"n": len(ids)})
-            log.info("meaning: %d answers of his back in use", len(ids))
+        mine = [e.id for e in meaning.active_examples(self.ledger) if e.source not in meaning.SEEDED]
+        n = meaning.rejudge_for(self.ledger, mine, only_unseen=True)   # judged without it
+        if n and self.shadow is not None:
+            self.shadow.poke()
+        self.ledger.event("meaning_revived", {"n": len(ids), "rejudge": n})
+        log.info("meaning: %d answers of his back in use; %d judgments to make again", len(ids), n)
         with self.ledger.tx() as db:
-            self.ledger.set_meta("meaning_revived", "1", db)
+            self.ledger.set_meta("meaning_revived", "2", db)
 
     def _expire(self) -> None:
         now = iso(self.ledger.now())

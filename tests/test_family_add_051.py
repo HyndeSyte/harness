@@ -255,7 +255,7 @@ def test_the_docs_do_not_imply_no_alerts():
 def test_the_version_agrees_everywhere():
     from harness import __version__
     assert f'version: "{__version__}"' in (ADDON / "config.yaml").read_text(encoding="utf-8")
-    assert __version__ == "0.19.3"
+    assert __version__ == "0.19.4"
 
 
 # -- 5. a new rule needs his tap ------------------------------------------------------------------

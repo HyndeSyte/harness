@@ -527,7 +527,7 @@ def add_example(ledger: Ledger, *, source: str, said: str, words: frozenset[str]
     return eid, True
 
 
-def rejudge_for(ledger: Ledger, example_ids: Iterable[str]) -> int:
+def rejudge_for(ledger: Ledger, example_ids: Iterable[str], *, only_unseen: bool = False) -> int:
     """Mark for judging again every stored judgment whose candidates include one of these
     examples, now or when it was judged. The judging itself runs under the usual limits."""
     ids = set(example_ids)
@@ -543,11 +543,16 @@ def rejudge_for(ledger: Ledger, example_ids: Iterable[str]) -> int:
             except ValueError:
                 continue
             if not f:
+                # Judged before features were kept: whether a new answer touches it can't be
+                # told, so it is judged again (and keeps its features from then on).
+                db.execute("UPDATE meaning_judgments SET stale=1 WHERE key=?", (row["key"],))
+                n += 1
                 continue
             feats = Features(f.get("series", ""), frozenset(f.get("words", [])), f.get("who", ""),
                              int(f.get("month") or 1), frozenset(f.get("types", [])))
             now_ids = {e.id for e in candidates(examples, feats)}
-            if (now_ids & ids) or (before & ids):
+            hit = ((now_ids & ids) - before) if only_unseen else ((now_ids & ids) or (before & ids))
+            if hit:
                 db.execute("UPDATE meaning_judgments SET stale=1 WHERE key=?", (row["key"],))
                 n += 1
     return n

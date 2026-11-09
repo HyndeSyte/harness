@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.4
+
+- Events judged before your answers counted are judged again, once, with your answers in view (the Dec 15 dentist was one). A few cents of Claude calls.
+
 ## 0.19.3
 
 - Your answers about Family events are used again. One you gave Cain could be set aside by an old setting that was only loaded after the day you said it, as with the Dec 15 dentist. Your answer now always wins over an old setting, and answers set aside that way are back in use.
