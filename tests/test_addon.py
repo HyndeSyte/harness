@@ -392,3 +392,28 @@ def test_cains_morning_update_folds_in_the_digest():
     import json
     allow = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]["allow"]
     assert "Bash(/opt/cain/keeper.sh:*)" in allow
+
+
+def test_cains_addon_sends_calendar_meanings_when_the_file_changes(tmp_path):
+    import os, shutil, subprocess
+    bash = shutil.which("bash")
+    if not bash:
+        import pytest
+        pytest.skip("no bash")
+    f = tmp_path / "calendar-meanings.md"
+    f.write_text("| Date | Kind | Meaning |\n|---|---|---|\n| 2026-11-08 | dentist | kids |\n")
+    calls = tmp_path / "calls"
+    keeper = tmp_path / "keeper.sh"
+    keeper.write_text(f"#!/bin/bash\necho \"$@\" >> {calls.as_posix()}\n")
+    keeper.chmod(0o755)
+    env = {**os.environ, "MEANINGS_FILE": str(f), "MEANINGS_SENT": str(tmp_path / "sent"),
+           "MEANINGS_TRIED": str(tmp_path / "tried"), "KEEPER": str(keeper),
+           "CHECKIN_DIR": str(tmp_path / "c"), "RELAY_QUEUE": str(tmp_path / "q"),
+           "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}
+    script = str(CAIN / "rootfs/opt/cain/checkin.sh")
+    for _ in range(2):          # unchanged file: sent once
+        subprocess.run([bash, script], env=env, timeout=20)
+    assert len(calls.read_text().splitlines()) == 1
+    f.write_text(f.read_text() + "| 2026-11-09 | harvest | me |\n")
+    subprocess.run([bash, script], env=env, timeout=20)
+    assert len(calls.read_text().splitlines()) == 2

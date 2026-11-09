@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3
+
+- Your calendar answers in Cain's record reach the calendar specialist on their own whenever they change, instead of waiting for Cain to remember.
+
 ## 0.3.2
 
 - When you tell Cain what a kind of Family event means for you, he keeps it in your record (areas/family/calendar-meanings.md) and sends the table to the calendar specialist, so it shapes your Gmail blocks. New: keeper.sh meanings.

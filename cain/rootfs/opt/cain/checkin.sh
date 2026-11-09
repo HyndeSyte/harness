@@ -10,6 +10,26 @@ dir="${CHECKIN_DIR:-/data/checkins}"
 queue="${RELAY_QUEUE:-/data/relay.queue}"
 mkdir -p "$dir"
 
+# 0. What Dane has said Family events mean, from Cain's record, goes to the calendar
+#    specialist whenever the file changes: by the add-on, not by Cain remembering to.
+#    A failed send is retried at most every 10 minutes.
+meanings="${MEANINGS_FILE:-/data/record/areas/family/calendar-meanings.md}"
+sent="${MEANINGS_SENT:-/data/meanings.sent}"
+tried="${MEANINGS_TRIED:-/data/meanings.tried}"
+if [ -s "$meanings" ]; then
+  sum=$(sha256sum "$meanings" | cut -d' ' -f1)
+  if [ "$sum" != "$(cat "$sent" 2>/dev/null)" ] \
+     && [ -z "$(find "$tried" -mmin -10 2>/dev/null)" ]; then
+    if "${KEEPER:-/opt/cain/keeper.sh}" meanings "$meanings" >/dev/null 2>&1; then
+      printf '%s' "$sum" > "$sent"
+      echo "[cain] sent Dane's calendar meanings to the specialist"
+    else
+      touch "$tried"
+      echo "[cain] couldn't send Dane's calendar meanings; will retry"
+    fi
+  fi
+fi
+
 screen=$(tmux -u capture-pane -p -J -t cain 2>/dev/null) || exit 0
 last=$(printf '%s\n' "$screen" | tail -n 12)
 printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode' || exit 0     # at his prompt
