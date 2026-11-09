@@ -73,13 +73,14 @@ class Controller:
                  status_box: dict | None = None, requests: "queue.Queue | None" = None,
                  poll_timeout: int = 25, calendar=None, family=None, mirror=None,
                  family_add=None, family_copy=None, family_gmail=None, calendar_change=None,
-                 mail_dates=None, meaning=None):
+                 mail_dates=None, meaning=None, meaning_live=None):
         self.calendar_change = calendar_change   # changes he asks for (calendar_change.py), or None
         self.family_add = family_add       # the one calendar write (family_add.py), or None
         self.family_copy = family_copy     # Family kept true to Gmail (family_copy.py), or None
         self.family_gmail = family_gmail   # Gmail kept true to Family (family_gmail.py), or None
         self.mail_dates = mail_dates       # dates from his mail onto Gmail (mail_dates.py), or None
         self.meaning = meaning             # the shadow judging of Family events (meaning.py), or None
+        self.meaning_live = meaning_live   # his answers, receipts and Undo (meaning_live.py), or None
         self.ledger = ledger
         self.vault = vault
         self.api = api
@@ -123,6 +124,8 @@ class Controller:
             self.calendar_change.bind(owner)
         if self.mail_dates is not None:
             self.mail_dates.bind(owner)
+        if self.meaning_live is not None:
+            self.meaning_live.bind(owner)
         self.runner = Runner(self.ledger, self.config, self.engines, self.executor,
                              sleep=self.sleep, monotonic=self.monotonic,
                              budgets_ok=self._budget_ok, family_add=self.family_add,
@@ -140,7 +143,8 @@ class Controller:
                                              settings_fn=self._settings_decision,
                                              family_add=self.family_add,
                                              calendar_change=self.calendar_change,
-                                             mail_dates=self.mail_dates)
+                                             mail_dates=self.mail_dates,
+                                             meaning_live=self.meaning_live)
 
     def _check_adds(self) -> str:
         words = self.family_add.check_adds()
@@ -300,7 +304,9 @@ class Controller:
         if self.mail_dates is not None:
             self.mail_dates.run(paused=commands.is_paused(self.ledger))
         if self.meaning is not None:
-            self.meaning.run(paused=commands.is_paused(self.ledger))   # shadow: writes no calendar
+            self.meaning.run(paused=commands.is_paused(self.ledger))   # judges; writes no calendar
+        if self.meaning_live is not None:
+            self.meaning_live.tick(paused=commands.is_paused(self.ledger))   # questions, no model
         if self.mirror is not None and self.mirror.due():
             self.mirror.run()              # shadow only; its own failures are its record
         self._daily(paused)
@@ -323,7 +329,8 @@ class Controller:
             return
         for h in (self.handovers.take() if self.handovers is not None else []):
             {"press": self._press, "digest": self._cain_digest,
-             "morning-posted": self._morning_posted}.get(h.kind, self._handover)(h)
+             "morning-posted": self._morning_posted,
+             "meanings": self._meanings}.get(h.kind, self._handover)(h)
         self._release_digest()
         self._link_health()
         self._work()
@@ -505,6 +512,15 @@ class Controller:
                              "or it isn't 7:00 AM yet.")
             return
         h.finish("ok", render.plain(self.ledger.get_meta("last_digest_text") or ""))
+
+    def _meanings(self, h) -> None:
+        """What he told Cain kinds of Family events mean, from his record, already checked
+        (handover.py). Stored as his confirmed examples; the same table again stores nothing."""
+        if self.meaning_live is None:
+            h.finish("off", "Event meanings aren't set up in the calendar specialist.")
+            return
+        added, known = self.meaning_live.import_rows(h.rows)
+        h.finish("ok", f"Stored {added} new; {known} already known.", new=added, known=known)
 
     def _morning_posted(self, h) -> None:
         self.ledger.set_meta("digest_held_at", "")          # the digest is in it now
@@ -755,9 +771,11 @@ class Controller:
                                  self.family_copy.digest_line() if self.family_copy else "",
                                  self.family_gmail.digest_line() if self.family_gmail else "",
                                  self.calendar_change.digest_line() if self.calendar_change else "",
-                                 self.mail_dates.digest_line() if self.mail_dates else "")
+                                 self.mail_dates.digest_line() if self.mail_dates else "",
+                                 self.meaning_live.digest_line() if self.meaning_live else "")
                                  if x))
-            daily.deliver(self.ledger, cfg, d, hold=self._discord_mode())
+            if daily.deliver(self.ledger, cfg, d, hold=self._discord_mode()) and self.meaning_live:
+                self.meaning_live.send_receipts()      # each new block's card, with Undo
 
     # -- status ------------------------------------------------------------------------------
     def status_text(self) -> str:

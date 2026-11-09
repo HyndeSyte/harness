@@ -4,7 +4,7 @@
 # It also listens on 8100 for Family calendar pushes from Home Assistant, on
 # the internal add-on network only (no host port is mapped; see family.py).
 name: Harness
-version: "0.18.1"
+version: "0.19.0"
 slug: harness
 description: >-
   One private Telegram thread with Claude and GPT as engines. A small
@@ -44,6 +44,7 @@ options:
   calendar_changes: false
   mail_dates: false
   meaning_shadow: false
+  meaning_live: false
 schema:
   family_copy_name: str?
   family_to_gmail: str?
@@ -52,3 +53,4 @@ schema:
   calendar_changes: bool?
   mail_dates: bool?
   meaning_shadow: bool?
+  meaning_live: bool?

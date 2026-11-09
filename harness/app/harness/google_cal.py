@@ -168,20 +168,30 @@ class Block:
     plain: bool = True     # still only what this code wrote
 
 
+FREE_PREFIX = "Maybe busy"                  # a provisional block (meaning.py): shown free
+FREE_TITLES = frozenset({"Busy for travel (farm)"})   # stops travel, not a meeting
+
+
+def shown_free(title: str) -> bool:
+    """A block written free ("transparent"), so the work holds script, which skips free
+    events, never copies it to work. Every other block is busy, as it always was."""
+    return title.startswith(FREE_PREFIX) or title in FREE_TITLES
+
+
 def _plain(event: dict) -> bool:
     """A note, a place, a guest, a color, a reminder or a shown-as change makes it his."""
     if any(event.get(k) for k in ("description", "location", "attendees", "colorId")):
         return False
     if (event.get("reminders") or {}).get("overrides"):
         return False
-    return event.get("visibility") in (None, "private") \
-        and event.get("transparency") in (None, "opaque")
+    shown_as = ("transparent",) if shown_free(str(event.get("summary") or "")) else (None, "opaque")
+    return event.get("visibility") in (None, "private") and event.get("transparency") in shown_as
 
 
 def _body(uid: str, title: str, start: datetime, end: datetime) -> dict:
     return {"id": uid, "summary": title, "status": "confirmed",
             "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
-            "visibility": "private", "transparency": "opaque",
+            "visibility": "private", "transparency": "transparent" if shown_free(title) else "opaque",
             "reminders": {"useDefault": False},
             "guestsCanInviteOthers": False, "guestsCanSeeOtherGuests": False,
             "extendedProperties": {"private": dict(MARK)}}

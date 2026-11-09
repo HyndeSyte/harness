@@ -32,6 +32,11 @@ How a judgment is made, and kept honest:
 
 Before any judging, the same skips as today: copies of his own events (hx- uids), "Busy"
 holds, and anything carrying his own name.
+
+Phase 2 (meaning_live.py) adds examples from his own answers, taps on receipts and what he
+told Cain (add_example: the newest word for a kind wins, older ones are overruled, never
+deleted), re-judging exactly the judgments whose candidates include a new one (rejudge_for),
+and a last good judgment kept through a failed one (last_good), which live mode acts on.
 """
 from __future__ import annotations
 
@@ -365,6 +370,7 @@ def blocks_for(j: Judgment, span: Span, now: datetime, *, supported: bool) -> li
 # -- examples: what he already said ----------------------------------------------------------
 
 KIND_TYPES = {"me": ["presence"], "kids": ["supervision"], "school": ["transport"], "none": []}
+SEEDED = ("said", "family_to_gmail", "family_school")   # sources read again on every Family read
 
 
 def who_for(title: str) -> str:
@@ -388,6 +394,8 @@ class Example:
     place: str
     month: int | None
     confirmed: bool
+    trusted: bool = True                # False: "Wrong time" said its window can't be relied on
+    scope: str = ""                     # "part": it ties him up for part of the event
 
 
 def _example_id(source: str, words: frozenset[str], types: list[str]) -> str:
@@ -433,9 +441,10 @@ def sync_examples(ledger: Ledger, rows: list[dict]) -> None:
                        " place, month, confirmed, state, created_at, updated_at)"
                        " VALUES(?,?,?,?,?,'',?,?,NULL,1,'active',?,?)"
                        " ON CONFLICT(id) DO UPDATE SET state='active', updated_at=excluded.updated_at"
-                       " WHERE meaning_examples.state!='active'",
+                       " WHERE meaning_examples.state='retired'",
                        (r["id"], r["source"], r["said"][:MAX_FIELD], " ".join(sorted(r["words"])),
                         r["who"], json.dumps(r["types"]), r["place"], now, now))
+        # One his answer overruled stays overruled: his newer word wins over an old setting.
         for row in db.execute("SELECT id FROM meaning_examples WHERE state='active' AND source IN"
                               " ('said','family_to_gmail','family_school')").fetchall():
             if row["id"] not in ids:
@@ -448,8 +457,70 @@ def active_examples(ledger: Ledger) -> list[Example]:
     for r in ledger.db.execute("SELECT * FROM meaning_examples WHERE state='active' ORDER BY id"):
         out.append(Example(r["id"], r["source"], r["said"], frozenset(r["words"].split()),
                            r["who"], r["series"], tuple(json.loads(r["types"])), r["place"],
-                           r["month"], bool(r["confirmed"])))
+                           r["month"], bool(r["confirmed"]), bool(r["trusted"]), r["scope"]))
     return out
+
+
+def _same_kind(a_words: frozenset, a_series: str, b_words: frozenset, b_series: str) -> bool:
+    return (bool(a_words) and a_words == b_words) or (bool(a_series) and a_series == b_series)
+
+
+def add_example(ledger: Ledger, *, source: str, said: str, words: frozenset[str], who: str = "",
+                series: str = "", types: list[str], place: str = "none", month: int | None = None,
+                trusted: bool = True, scope: str = "", said_on: str = "") -> tuple[str, bool]:
+    """A confirmed example from his own answer (a tap, an Undo, or what he told Cain). The
+    newest word for a kind of event wins: any other active example for the same kind (same
+    words, or the same series) is overruled, never deleted. One he said before something newer
+    that's already here comes in overruled. Returns (id, whether it is new)."""
+    eid = _example_id(f"{source}|{series}|{int(trusted)}|{scope}", words, types)
+    now = iso(ledger.now())
+    with ledger.tx() as db:
+        if db.execute("SELECT 1 FROM meaning_examples WHERE id=?", (eid,)).fetchone():
+            return eid, False
+        state = "active"
+        others = [r for r in db.execute("SELECT id, words, series, created_at FROM meaning_examples"
+                                        " WHERE state='active'").fetchall()
+                  if _same_kind(frozenset(r["words"].split()), r["series"], words, series)]
+        if said_on and any(r["created_at"][:10] > said_on for r in others):
+            state = "overruled"            # something newer for this kind is already here
+        else:
+            for r in others:
+                db.execute("UPDATE meaning_examples SET state='overruled', updated_at=? WHERE id=?",
+                           (now, r["id"]))
+        db.execute("INSERT INTO meaning_examples(id, source, said, words, who, series, types,"
+                   " place, month, confirmed, state, created_at, updated_at, trusted, scope)"
+                   " VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)",
+                   (eid, source, said[:MAX_FIELD], " ".join(sorted(words)), who, series,
+                    json.dumps(list(types)), place, month, state,
+                    f"{said_on}T00:00:00+00:00" if said_on else now,   # when he said it
+                    now, int(trusted), scope))
+    return eid, True
+
+
+def rejudge_for(ledger: Ledger, example_ids: Iterable[str]) -> int:
+    """Mark for judging again every stored judgment whose candidates include one of these
+    examples, now or when it was judged. The judging itself runs under the usual limits."""
+    ids = set(example_ids)
+    if not ids:
+        return 0
+    examples = active_examples(ledger)
+    n = 0
+    with ledger.tx() as db:
+        for row in db.execute("SELECT key, features, candidates FROM meaning_judgments").fetchall():
+            try:
+                f = json.loads(row["features"] or "{}")
+                before = set(json.loads(row["candidates"] or "[]"))
+            except ValueError:
+                continue
+            if not f:
+                continue
+            feats = Features(f.get("series", ""), frozenset(f.get("words", [])), f.get("who", ""),
+                             int(f.get("month") or 1), frozenset(f.get("types", [])))
+            now_ids = {e.id for e in candidates(examples, feats)}
+            if (now_ids & ids) or (before & ids):
+                db.execute("UPDATE meaning_judgments SET stale=1 WHERE key=?", (row["key"],))
+                n += 1
+    return n
 
 
 def examples_version(examples: list[Example]) -> str:
@@ -492,7 +563,7 @@ def supported(j: Judgment, examples: dict[str, Example]) -> bool:
     have = {ob.type for ob in j.obligations if ob.type != "partner_away"}
     for c in j.cites:
         ex = examples.get(c)
-        if ex is None or not ex.confirmed:
+        if ex is None or not ex.confirmed or not ex.trusted:
             continue
         theirs = set(ex.types)
         if (not have and not theirs) or (have & theirs):
@@ -695,6 +766,7 @@ def user_content(ev: Ev, item: caldav.Item, *, now: datetime, tz: str, calendar,
     for ex in cands:
         meaning = ", ".join(ex.types) or "nothing: it doesn't tie him up"
         place = " (at school)" if ex.place == "school" else ""
+        place += " (part of it only)" if ex.scope == "part" else ""
         parts.append(f"- [{ex.id}] events with the words \"{_u(ex.said, 80)}\": {meaning}{place}")
     return "\n".join(parts)
 
@@ -708,35 +780,65 @@ def stored(ledger: Ledger, key: str):
 def needs_judging(row, ev: Ev, active_ids: set[str]) -> bool:
     if row is None or row["fingerprint"] != ev.fingerprint or row["policy_version"] != VERSION:
         return True
+    if row["stale"]:
+        return True                        # a new answer of his may change it
     if row["status"] == "failed":
         return row["tries"] < MAX_TRIES
     return any(c not in active_ids for c in json.loads(row["cites"]))
 
 
+def _features_json(f: Features | None) -> str:
+    if f is None:
+        return "{}"
+    return json.dumps({"series": f.series, "words": sorted(f.words), "who": f.who,
+                       "month": f.month, "types": sorted(f.types)})
+
+
 def store(ledger: Ledger, ev: Ev, item: caldav.Item, tz: str, j: Judgment | None, *,
-          examples_ver: str, model: str, failure: str = "") -> None:
+          examples_ver: str, model: str, failure: str = "", features: Features | None = None,
+          cands: Iterable[str] = ()) -> None:
+    """A failed judgment keeps the last good one it had (an outage never takes a block away);
+    `good` says the obligations hold a real judgment."""
     now = iso(ledger.now())
     prev = stored(ledger, ev.key)
     tries = (prev["tries"] + 1 if prev is not None and prev["fingerprint"] == ev.fingerprint
              and prev["status"] == "failed" else 1) if j is None else 0
+    if j is not None:
+        obligations = json.dumps([o.as_dict() for o in j.obligations])
+        cites, unsure, good = json.dumps(list(j.cites)), int(j.unsure), 1
+    elif prev is not None and (prev["status"] == "ok" or prev["good"]):
+        obligations, cites, unsure, good = prev["obligations"], prev["cites"], prev["unsure"], 1
+    else:
+        obligations, cites, unsure, good = "[]", "[]", 1, 0
     with ledger.tx() as db:
         db.execute(
             "INSERT INTO meaning_judgments(key, kind, fingerprint, anchor, obligations, cites,"
-            " unsure, status, failure, tries, policy_version, examples_version, model, judged_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET"
+            " unsure, status, failure, tries, policy_version, examples_version, model, judged_at,"
+            " candidates, features, stale, good)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?) ON CONFLICT(key) DO UPDATE SET"
             " kind=excluded.kind, fingerprint=excluded.fingerprint, anchor=excluded.anchor,"
             " obligations=excluded.obligations, cites=excluded.cites, unsure=excluded.unsure,"
             " status=excluded.status, failure=excluded.failure, tries=excluded.tries,"
             " policy_version=excluded.policy_version, examples_version=excluded.examples_version,"
-            " model=excluded.model, judged_at=excluded.judged_at",
-            (ev.key, ev.kind, ev.fingerprint, iso(span_of(item.occ, tz).anchor),
-             json.dumps([o.as_dict() for o in j.obligations]) if j else "[]",
-             json.dumps(list(j.cites)) if j else "[]", int(j.unsure) if j else 1,
-             "ok" if j else "failed", failure[:60], tries, VERSION, examples_ver, model[:60], now))
+            " model=excluded.model, judged_at=excluded.judged_at, candidates=excluded.candidates,"
+            " features=excluded.features, stale=0, good=excluded.good",
+            (ev.key, ev.kind, ev.fingerprint, iso(span_of(item.occ, tz).anchor), obligations,
+             cites, unsure, "ok" if j else "failed", failure[:60], tries, VERSION, examples_ver,
+             model[:60], now, json.dumps(list(cands)), _features_json(features), good))
 
 
 def judgment_of(row) -> Judgment | None:
     if row is None or row["status"] != "ok":
+        return None
+    return Judgment(tuple(Rel.from_dict(d) for d in json.loads(row["obligations"])),
+                    tuple(json.loads(row["cites"])), bool(row["unsure"]))
+
+
+def last_good(row) -> Judgment | None:
+    """The judgment to act on: the current one, or the last good one kept through a failure
+    or through a change still waiting to be judged (it is relative to the occurrence, so it
+    follows a move)."""
+    if row is None or row["policy_version"] != VERSION or not (row["status"] == "ok" or row["good"]):
         return None
     return Judgment(tuple(Rel.from_dict(d) for d in json.loads(row["obligations"])),
                     tuple(json.loads(row["cites"])), bool(row["unsure"]))
@@ -865,6 +967,15 @@ class MeaningShadow:
     def status(self) -> dict | None:
         return self.last
 
+    def poke(self) -> None:
+        """A new answer of his marked judgments to redo: go on at the next tick."""
+        self._backlog = True
+
+    @property
+    def items(self) -> list[caldav.Item] | None:
+        """Family as last read, for the questions (meaning_live.py)."""
+        return self._items
+
     # -- each tick ----------------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
         """A bug here is a record, never a stopped loop."""
@@ -941,7 +1052,7 @@ class MeaningShadow:
             user = user_content(ev, item, now=now, tz=self.tz, calendar=self.calendar, cands=cands,
                                 facts=self.facts_fn())
             jobs.append((ev.key, user))
-            self._batch[ev.key] = (ev, item, [c.id for c in cands], ver)
+            self._batch[ev.key] = (ev, item, [c.id for c in cands], ver, feats)
         self._evs = evs
         self._future = self.executor.submit(self._judge, engine, jobs, allowance)
 
@@ -982,7 +1093,7 @@ class MeaningShadow:
             self.ledger.set_meta("meaning_calls", f"{day}:{used + len(results)}", db)
         ok = bad = 0
         for key, res, err in results:
-            ev, item, cand_ids, ver = self._batch[key]
+            ev, item, cand_ids, ver, feats = self._batch[key]
             if res is not None:
                 self.ledger.add_spend(provider=spec.provider, model=res.model, purpose=PURPOSE,
                                       input_tokens=res.input_tokens, output_tokens=res.output_tokens,
@@ -996,7 +1107,8 @@ class MeaningShadow:
             elif res is not None:
                 why = res.status
             store(self.ledger, ev, item, self.tz, j, examples_ver=ver,
-                  model=res.model if res is not None else "", failure="" if j else why)
+                  model=res.model if res is not None else "", failure="" if j else why,
+                  features=feats, cands=cand_ids)
             ok, bad = ok + (j is not None), bad + (j is None)
         if any(err == "budget" or (res is None and err in ("billing", "spend_limit", "auth", "no_key"))
                for _, res, err in results):

@@ -276,6 +276,40 @@ CREATE TABLE IF NOT EXISTS meaning_judgments(
   model TEXT NOT NULL,
   judged_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meaning_questions(
+  id TEXT PRIMARY KEY,
+  kind_key TEXT NOT NULL,
+  event_key TEXT NOT NULL,
+  occurrence TEXT NOT NULL,
+  ask TEXT NOT NULL,
+  each INTEGER NOT NULL,
+  said TEXT NOT NULL,
+  features TEXT NOT NULL,
+  starts TEXT NOT NULL,
+  expires TEXT NOT NULL,
+  state TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meaning_kinds(
+  kind_key TEXT PRIMARY KEY,
+  ask_each_time INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meaning_receipts(
+  id TEXT PRIMARY KEY,
+  gmail_key TEXT NOT NULL,
+  title TEXT NOT NULL,
+  said TEXT NOT NULL,
+  start TEXT NOT NULL,
+  end TEXT NOT NULL,
+  features TEXT NOT NULL,
+  state TEXT NOT NULL,
+  action TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS family_gmail(
   key TEXT PRIMARY KEY,
   event_id TEXT NOT NULL,
@@ -339,6 +373,20 @@ class Ledger:
         # older add-on opening this file just doesn't read it.
         if "at" not in {r[1] for r in self.db.execute("PRAGMA table_info(mail_dates)")}:
             self.db.execute("ALTER TABLE mail_dates ADD COLUMN at TEXT")
+        # 0.19.0: what event meaning needs for his answers and Undo (meaning.py). Added with
+        # defaults, never required, so 0.18 opening this file just doesn't read them.
+        added = {
+            "meaning_examples": (("trusted", "INTEGER NOT NULL DEFAULT 1"),
+                                 ("scope", "TEXT NOT NULL DEFAULT ''")),
+            "meaning_judgments": (("candidates", "TEXT NOT NULL DEFAULT '[]'"),
+                                  ("features", "TEXT NOT NULL DEFAULT '{}'"),
+                                  ("stale", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("good", "INTEGER NOT NULL DEFAULT 0"))}
+        for table, cols in added.items():
+            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def _rules_need_a_tap(self) -> None:
         """Once, on the first open by 0.5.1 or later: rules stored before his tap existed

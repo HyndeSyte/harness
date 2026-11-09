@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.0
+
+- New, off by default: `meaning_live`. When on, the blocks on your Gmail come from what each Family event was judged to mean, not from title words. Switch it off and the old title rules are back exactly as they were.
+- Blocks it's sure of (backed by your own answers) are "Busy (...)". Kids or driving in the next 48 hours that it isn't sure of get "Maybe busy (...)", shown free, so work never sees it.
+- When it can't tell and it changes your next two weeks, Cain shows you one question with buttons ("are you watching the kids?", "does it tie you up?"). At most three open, one per kind of event, never the same one twice. Your tap is remembered for that kind of event; "Depends" means it asks each time.
+- Each new block gets a card with Not mine, Wrong time and Just this once. Removing a block by hand on Google still just removes it.
+- What you tell Cain a kind of Family event means is kept in your record and sent here, so it counts too.
+- Questions and Undo cost no model calls.
+
 ## 0.18.1
 
 - Shadow scoring: school runs use the same fixed drive windows as today (the first pass showed 86 timing-only differences), and the difference list shows misses first, one line per event with a count, so a series can't crowd out what matters.

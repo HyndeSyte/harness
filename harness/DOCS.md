@@ -293,6 +293,13 @@ how many blocks are on Gmail.
   run, 60 a day, $3 a month), and compares the blocks that would give with the blocks the title rules
   give. It writes nothing to any calendar. The score is one line in the add-on log, with up to 20
   differences, and the same on this page.
+- **Judging instead of title words (live):** `meaning_live` (off by default, separate from
+  `meaning_shadow`) makes those judgments decide the blocks on Gmail instead of the title rules and
+  the two title settings. A block backed by your own answer is "Busy (...)"; kids or driving in the
+  next 48 hours that it isn't sure of is "Maybe busy (...)", shown free so it never reaches work.
+  When it can't tell and it matters in the next two weeks, Cain shows you one question with buttons.
+  Each new block gets a card with Not mine, Wrong time and Just this once. Turn it off to go straight
+  back to the title rules. All the limits and safety above still apply.
 
 ## Links from instrument cards
 

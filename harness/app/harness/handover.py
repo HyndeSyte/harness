@@ -17,8 +17,10 @@ tap: Cain's words never change a calendar by themselves.
   before it is.
 
 Also here: /digest (Cain takes today's calendar digest for his one morning
-message), /morning-posted (Cain's link says that message is out), and /press
-(a tap on one of this add-on's cards, checked by Cain's link and passed back).
+message), /morning-posted (Cain's link says that message is out), /press
+(a tap on one of this add-on's cards, checked by Cain's link and passed back),
+and /meanings (what Dane told Cain kinds of Family events mean, from his record:
+short rows, checked strictly here before anything is queued; meaning_live.py).
 
 The HTTP thread never touches the ledger: it queues the request for the
 controller and waits on an event.
@@ -43,7 +45,8 @@ KEY_CONTEXT = b"harness-handover-v1"
 WAIT_S = 25
 MAX_BODY = 4096
 MAX_SUGGESTION = 1500
-ROUTES = ("/handover", "/digest", "/press", "/morning-posted")
+MAX_MEANINGS_BODY = 16384             # up to 60 short rows
+ROUTES = ("/handover", "/digest", "/press", "/morning-posted", "/meanings")
 
 
 def key_for(token: str) -> str:
@@ -52,8 +55,9 @@ def key_for(token: str) -> str:
 
 @dataclass
 class Handover:
-    kind: str = "handover"               # or digest, press, morning-posted
+    kind: str = "handover"               # or digest, press, morning-posted, meanings
     suggestion: str = ""
+    rows: list = field(default_factory=list)   # /meanings: already checked
     press: dict = field(default_factory=dict)
     paired: str = ""                     # the Discord user Cain is paired with
     done: threading.Event = field(default_factory=threading.Event)
@@ -120,7 +124,7 @@ def _handler(inbox: Inbox, wait_s: float):
                 n = int(self.headers.get("content-length") or 0)
             except ValueError:
                 n = -1
-            if n < 0 or n > MAX_BODY:
+            if n < 0 or n > (MAX_MEANINGS_BODY if self.path == "/meanings" else MAX_BODY):
                 return self._reply(413, {"status": "too large"})
             try:
                 body = json.loads(self.rfile.read(n) or b"{}") if n else {}
@@ -128,7 +132,14 @@ def _handler(inbox: Inbox, wait_s: float):
                 return self._reply(400, {"status": "not JSON"})
             if not isinstance(body, dict):
                 return self._reply(400, {"status": "not JSON"})
-            h = Handover(kind=self.path.strip("/"),
+            rows: list = []
+            if self.path == "/meanings":
+                from .meaning_live import validate_rows
+                checked, why = validate_rows(body)
+                if checked is None:
+                    return self._reply(400, {"status": "refused", "said": why})
+                rows = checked
+            h = Handover(kind=self.path.strip("/"), rows=rows,
                          suggestion=str(body.get("suggestion") or "")[:MAX_SUGGESTION].strip(),
                          paired=str(body.get("paired") or "").strip(),
                          press={k: str(body.get(k, "")) for k in

@@ -45,6 +45,14 @@ specialist (the Harness add-on) does.
   put it in PENDING for a build session. Asking him to repeat himself is the last resort,
   only when the specialist says it can't tell what he meant ("stale" or "nothing").
 - In a message with two jobs, hand over the calendar part and do the rest yourself.
+- When he tells you what a kind of Family event means for him ("Pat's dentist means I have
+  the kids"), record it in areas/family/calendar-meanings.md through the record keeper:
+  one table row `| kind words | meaning | YYYY-MM-DD |`, meaning one of kids, me, school,
+  drive, none, dated the day he said it. Then run
+  `/opt/cain/keeper.sh meanings /data/record/areas/family/calendar-meanings.md` once the
+  change is applied. At startup and at each morning check-in, send the whole table once
+  the same way; the specialist stores only what's new. Never put his words in it beyond
+  the kind's few words.
 
 ## Asking him, and hearing his taps and reactions
 - When a decision has a few clear answers, ask with buttons:

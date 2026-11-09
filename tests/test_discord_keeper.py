@@ -353,3 +353,32 @@ def test_without_cains_morning_message_the_digest_goes_out_on_its_own(rig):
     card = rig.link.last()
     assert card["kind"] == "alert" and "didn't post his morning message" in card["text"]
     assert ids(card) == [STOP]
+
+
+# -- what Dane told Cain kinds of Family events mean (meaning_live.py) --------------------
+
+MEANING_ROW = {"kind": "Pat dentist", "meaning": "kids", "said_on": "2026-10-01"}
+
+
+def test_the_meanings_route_needs_the_key_and_good_rows():
+    from harness import handover
+    token = "tok-" + "a" * 30
+    inbox = handover.Inbox(lambda: token)
+    srv = handover.serve(inbox, port=0, host="127.0.0.1", wait_s=2)
+    port = srv.server_address[1]
+    try:
+        assert post(port, "/meanings", {"rows": [MEANING_ROW]}, "wrong")[0] == 403
+        code, out = post(port, "/meanings", {"rows": [{**MEANING_ROW, "meaning": "<script>"}]},
+                         handover.key_for(token))
+        assert code == 400 and "script" not in json.dumps(out) and inbox.queue.empty()
+
+        def answer():
+            h = inbox.queue.get(timeout=3)
+            assert h.kind == "meanings" and h.rows == [{"words": ["dentist", "pat"], "meaning": "kids",
+                                                        "said_on": "2026-10-01"}]
+            h.finish("ok", "Stored 1 new; 0 already known.")
+        threading.Thread(target=answer, daemon=True).start()
+        code, out = post(port, "/meanings", {"rows": [MEANING_ROW]}, handover.key_for(token))
+        assert code == 200 and out["said"] == "Stored 1 new; 0 already known."
+    finally:
+        srv.shutdown()

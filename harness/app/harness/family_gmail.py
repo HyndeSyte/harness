@@ -27,6 +27,10 @@ a block never copies to Family, and a copy on Family (hx- uid) never gets a bloc
 
 Before its first block, one test event goes on Gmail and comes off again, so a key or
 share that doesn't work costs nothing and says so.
+
+With the `meaning_live` option on (meaning_live.py), the wants come from what each Family event
+was judged to mean instead of the title rules and the two options; everything below that
+decides how and whether to write stays as it is. Off, nothing here changes.
 """
 from __future__ import annotations
 
@@ -68,6 +72,8 @@ TEST_TRY = "family_gmail_test_try"
 READ_SIZE = "family_gmail_read_size"
 THIN_READS = "family_gmail_thin_reads"
 TEST_TITLE = "Busy (harness test, safe to delete)"
+# The school runs, sure or maybe: the drive logic decides whether the run is his.
+_RUN_TITLES = frozenset({DROP_TITLE, PICK_TITLE, "Maybe busy (school drop-off)", "Maybe busy (school pickup)"})
 _TITLE_RE = re.compile(r"[^\W_]+(?:[ '&()+,.-]+[^\W_]+)*[ )]*")
 
 
@@ -139,6 +145,7 @@ class Want:
     start: datetime
     end: datetime
     kind: str = ""                 # "me": only if Gmail doesn't already have him busy
+    state: str = ""                # live meaning (meaning_live.py): "confirmed" | "provisional"
 
 
 def _short(title: str) -> str:
@@ -248,7 +255,10 @@ def _was_sent(intent: str, block: google_cal.Block) -> bool:
 
 class FamilyGmail:
     def __init__(self, ledger: Ledger, family_add, calendar, google: google_cal.GoogleCalendar,
-                 *, rules_fn=lambda: (), school_fn=lambda: (), said_fn=lambda: (), drives=None, tz: str):
+                 *, rules_fn=lambda: (), school_fn=lambda: (), said_fn=lambda: (), drives=None, tz: str,
+                 live=None, live_fn=lambda: False):
+        self.live = live                   # meaning_live.MeaningLive, or None
+        self.live_fn = live_fn             # the meaning_live option: the judgments decide
         self.school_fn = school_fn         # the Family titles that mean a school day
         self.said_fn = said_fn             # what he's said Family events mean (family_rules.py)
         self.asking: list[tuple[str, datetime]] = []
@@ -264,9 +274,15 @@ class FamilyGmail:
         self.dropped: set[str] = set()     # no longer wanted only because of what he said
         self._last: tuple | None = None    # (settings, what he'd said) at the last read
 
+    def _live_on(self) -> bool:
+        return self.live is not None and bool(self.live_fn())
+
+    def _named(self) -> bool:
+        return bool(self.rules_fn() or self.school_fn() or self.said_fn()) or self._live_on()
+
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
-        if not (self.rules_fn() or self.school_fn() or self.said_fn()):
+        if not self._named():
             return ("Blocks on Gmail from Family: off. Nothing is named in the add-on's settings, "
                     "or what's there can't be read.")
         if not self.google.configured():
@@ -314,13 +330,18 @@ class FamilyGmail:
     # -- each tick -------------------------------------------------------------------
     def run(self, *, paused: bool) -> None:
         """Only after a new read. A bug here is a record, never a stopped loop."""
+        if not paused and self._live_on():
+            try:
+                self._undo_requested()
+            except Exception as e:
+                log.warning("family to gmail undo failed: %s", type(e).__name__)
+                self.ledger.event("family_gmail_failed", {"error": type(e).__name__})
         gen = self.calendar.generation
         if gen == self._seen:
             return
         self._seen = gen
         try:
-            if not paused and self.fa.enabled() and (self.rules_fn() or self.school_fn() or self.said_fn()) \
-                    and self.google.configured():
+            if not paused and self.fa.enabled() and self._named() and self.google.configured():
                 self._sync()
         except Exception as e:
             log.warning("family to gmail failed: %s", type(e).__name__)
@@ -353,18 +374,29 @@ class FamilyGmail:
         if blocks is None:
             self._problem(self._said(why))
             return
-        said = self.said_fn()
-        planned = plan(family.items, rules, said)
-        # Wanted under what he'd said at the last read, not under what he says now, with the same
-        # events and the same settings: that's his word, not a bad read. A setting that read empty
-        # or an event that changed still takes two reads.
-        self.dropped = set()
-        if self._last is not None and self._last[0] == rules and self._last[1] != said:
-            self.dropped = plan(family.items, rules, self._last[1]).keys() - planned.keys()
-        self._last = (rules, said)
-        named = self._not_busy(planned)
-        wants = {k: w for k, w in {**named, **self._school_runs(family.items)}.items() if w.end > now}
-        self.asking = unruled(family.items, rules, self.school_fn(), said, now, now + ASK_AHEAD)
+        if self._live_on():
+            # What each event was judged to mean, model-free here: the judgments are stored.
+            judged = self.live.wants(family.items, now)
+            self.dropped = set()
+            self._last = None
+            runs = {k: w for k, w in judged.items() if w.title in _RUN_TITLES}
+            named = self._not_busy({k: w for k, w in judged.items() if k not in runs})
+            wants = {k: w for k, w in {**named, **self._school_runs(family.items, runs)}.items()
+                     if w.end > now}
+            self.asking = []               # questions go on their own cards (meaning_live.py)
+        else:
+            said = self.said_fn()
+            planned = plan(family.items, rules, said)
+            # Wanted under what he'd said at the last read, not under what he says now, with the
+            # same events and the same settings: that's his word, not a bad read. A setting that
+            # read empty or an event that changed still takes two reads.
+            self.dropped = set()
+            if self._last is not None and self._last[0] == rules and self._last[1] != said:
+                self.dropped = plan(family.items, rules, self._last[1]).keys() - planned.keys()
+            self._last = (rules, said)
+            named = self._not_busy(planned)
+            wants = {k: w for k, w in {**named, **self._school_runs(family.items)}.items() if w.end > now}
+            self.asking = unruled(family.items, rules, self.school_fn(), said, now, now + ASK_AHEAD)
         self.writes = self._writes_today()
         problem = self._follow(address, wants, {b.id: b for b in blocks}, now, until,
                                family.unreadable == 0, self._thin(len(family.items) - len(named)))
@@ -372,13 +404,14 @@ class FamilyGmail:
         self._problem(problem or added or self.school_note or self.me_note)
         confirm_soon(self.ledger, "family_gmail", self.calendar)
 
-    def _school_runs(self, items: list[caldav.Item]) -> dict[str, Want]:
+    def _school_runs(self, items: list[caldav.Item], runs: dict[str, Want] | None = None) -> dict[str, Want]:
         """The runs that are his. With no read of his calendar, what's there stays and nothing
         is added: that says nothing about whether he's free. With one event in it unreadable,
         the rest still counts, or one odd old event would stop new blocks for good: what's there
         stays, and a block too many only shows him busy."""
         self.school_note = ""
-        runs = school_plan(items, self.school_fn(), self.said_fn())
+        if runs is None:
+            runs = school_plan(items, self.school_fn(), self.said_fn())
         if not runs:
             return {}
         ahead = next((res.ahead for res in self.calendar.snapshot.feeds.values() if res.window is not None
@@ -675,6 +708,9 @@ class FamilyGmail:
                      missing=0, intent="")
         self._log("family_gmail_moved", row["key"])
         self.writes += 1
+        if self.live is not None and want.state == "confirmed" \
+                and row["title"].startswith(google_cal.FREE_PREFIX):
+            self.live.applied(want, row["generation"])     # a maybe he now has for sure
 
     # -- what's new ----------------------------------------------------------------------
     def _add_new(self, address: str, wants: dict) -> str:
@@ -710,7 +746,53 @@ class FamilyGmail:
                 self._insert(want, uid, generation)
                 self._log("family_gmail_added", want.key)
                 self.writes += 1
+                if self.live is not None and want.state == "confirmed":
+                    self.live.applied(want, generation)    # its receipt, with Undo
         return failed
+
+    # -- his Undo (meaning_live.py) ------------------------------------------------------
+    def _undo_requested(self) -> None:
+        """Take off the blocks he tapped Undo on, only as they were written. "Wrong time" may
+        come back once it's judged again; the others stay off. Not under the day's cap: it's
+        his tap."""
+        waiting = self.live.removals()
+        if not waiting:
+            return
+        address = self._address()
+        if address is None or not self.google.configured():
+            return
+        for rid, key, action in waiting:
+            row = self.ledger.db.execute("SELECT * FROM family_gmail WHERE key=?", (key,)).fetchone()
+            after = "cancelled" if action == "wrong_time" else "undone"
+            if row is None or row["state"] != "live":
+                self.live.removed(rid)
+                continue
+            start, end = self._when(row["start"]), self._when(row["end"])
+            blocks, why = self.google.list_ours(address, start - timedelta(minutes=1),
+                                                end + timedelta(minutes=1))
+            if blocks is None:
+                self._problem(self._said(why))
+                return
+            block = next((b for b in blocks if b.id == row["event_id"]), None)
+            if block is None:
+                self._set(row, after)
+                self.live.removed(rid)
+                continue
+            if not block.plain or not (block.title == row["title"] and _same(block.start, start)
+                                       and _same(block.end, end)):
+                self._set(row, "hands_off")    # someone changed it: theirs now
+                self.live.removed(rid)
+                continue
+            out = self.google.remove(address, block)
+            if out.kind in ("ok", "gone"):
+                self._set(row, after)
+                self._log("family_gmail_undone", row["key"])
+                self.live.removed(rid)
+            elif out.kind == "changed":
+                self._set(row, "hands_off")
+                self.live.removed(rid)
+            else:
+                return                         # tried again next tick
 
     # -- the record ----------------------------------------------------------------------
     def _insert(self, want: Want, uid: str, generation: int, state: str = "live") -> None:

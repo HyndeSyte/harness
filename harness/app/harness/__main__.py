@@ -16,7 +16,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from . import caldav, drive, family, family_rules, google_cal, meaning, policy
+from . import caldav, drive, family, family_rules, google_cal, meaning, meaning_live, policy
 from .calendar_change import CalendarChange, changes_from_options
 from .calendar_feed import CalendarFeeds
 from .config import Config
@@ -89,7 +89,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                              ahead_when=lambda: bool(name_from_options(data_dir)
                                                      or school_from_options(data_dir)
                                                      or family_rules.load(ledger)
-                                                     or meaning.option_on(data_dir)),
+                                                     or meaning.option_on(data_dir)
+                                                     or meaning_live.live_on(data_dir)),
                              ahead_from=lambda address, start, until: (
                                  google.window(address, start, until) if google.configured() else None))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
@@ -102,13 +103,28 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                      creds_stamp=vault.family_stamp)
     google = google_cal.GoogleCalendar(GoogleTransport(google_cal.HOSTS),
                                        lambda: vault.get("google_service_key"), ledger.now)
+    # Judges Family events (meaning.py): in shadow it only scores; with meaning_live on, its
+    # judgments decide the Gmail blocks (meaning_live.py) and the old title rules stand aside.
+    judging = meaning.MeaningShadow(
+        ledger, client, calendar, ThreadPoolExecutor(max_workers=1, thread_name_prefix="meaning"),
+        engine_fn=lambda: judge_engine,
+        on_fn=lambda: meaning.option_on(data_dir) or meaning_live.live_on(data_dir),
+        tz=base.timezone, rules_fn=lambda: rules_from_options(data_dir),
+        school_fn=lambda: school_from_options(data_dir),
+        said_fn=lambda: family_rules.load(ledger),
+        name_fn=lambda: name_from_options(data_dir),
+        budget_ok=lambda provider: controller._budget_ok(provider))
+    live = meaning_live.MeaningLive(ledger, judging, calendar, tz=base.timezone,
+                                    on_fn=lambda: meaning_live.live_on(data_dir),
+                                    name_fn=lambda: name_from_options(data_dir))
     family_gmail = FamilyGmail(ledger, adds, calendar, google,
                                rules_fn=lambda: rules_from_options(data_dir),
                                school_fn=lambda: school_from_options(data_dir),
                                said_fn=lambda: family_rules.load(ledger),
                                drives=drive.Drives(ledger, MapTransport(drive.HOSTS),
                                                    lambda: school_address_from_options(data_dir)),
-                               tz=base.timezone)
+                               tz=base.timezone, live=live,
+                               live_fn=lambda: meaning_live.live_on(data_dir))
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,
@@ -128,16 +144,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 writes_on=lambda: mail_option_on(data_dir), tz=base.timezone,
                                 family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)),
-                            # Shadow only: judges Family events and scores them; writes no calendar.
-                            meaning=meaning.MeaningShadow(
-                                ledger, client, calendar,
-                                ThreadPoolExecutor(max_workers=1, thread_name_prefix="meaning"),
-                                engine_fn=lambda: judge_engine, on_fn=lambda: meaning.option_on(data_dir),
-                                tz=base.timezone, rules_fn=lambda: rules_from_options(data_dir),
-                                school_fn=lambda: school_from_options(data_dir),
-                                said_fn=lambda: family_rules.load(ledger),
-                                name_fn=lambda: name_from_options(data_dir),
-                                budget_ok=lambda provider: controller._budget_ok(provider)))
+                            meaning=judging, meaning_live=live)
     # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;
     # taps come back to /press. The bot token reads his DM when Cain hands a request over.
     store = KeeperStore(os.path.join(data_dir, "discord.json"))
