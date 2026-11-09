@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- Build work no longer needs your laptop. When a fix or feature is ready, Cain asks with a Start button. Your tap starts a cloud session on your Claude plan, and Cain sends you its link.
+- When it finishes, Cain gets an outside review of the change and asks you with a Ship button, saying what changed and that tests passed.
+- While a job runs, the add-on nudges Cain every 15 minutes to check on it, so the result reaches you without you asking.
+
 ## 0.4.0
 
 - Outside reviews from the Pi: Cain sends a brief to other models and gets their verdicts back, without your laptop or a browser. OpenAI's Codex runs on your ChatGPT plan; Gemini and Perplexity use small prepaid keys; a fresh Claude uses your plan's API credit.

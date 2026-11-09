@@ -498,3 +498,31 @@ def test_cain_knows_when_and_how_to_use_reviews():
     assert "reviews/" in rules.split("Rules the keeper enforces")[1].split(";")[0]
     keeper = (CAIN / "rootfs/opt/cain/record/core.ts").read_text(encoding="utf-8")
     assert "projects|reviews)" in keeper
+
+
+def test_open_cloud_jobs_get_a_nudge_every_15_minutes(tmp_path):
+    import os
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    os.environ.update(JOBS_DIR=str(jobs), JOBS_NUDGED=str(tmp_path / "nudged"))
+    try:
+        assert _checkin(tmp_path, "0300", IDLE) == ""                 # no open job: quiet
+        (jobs / "cse_01ABC").write_text("build | Fix the turkey card\n")
+        out = _checkin(tmp_path, "0300", IDLE)
+        assert "cloud job check" in out and "Not a message from Dane" in out
+        assert _checkin(tmp_path, "0301", IDLE) == out                 # not again within 15 min
+        (tmp_path / "sent.txt").unlink()
+        assert _checkin(tmp_path, "0300", IDLE + "\n  esc to interrupt") == ""   # never mid-task
+    finally:
+        del os.environ["JOBS_DIR"], os.environ["JOBS_NUDGED"]
+
+
+def test_build_work_runs_as_cloud_jobs_with_his_go():
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    assert "## Cloud jobs" in rules and "trig_015FTxexzFDZyjYjzw39bPv8" in rules
+    assert '"Start" "Not now"' in rules and '"Ship" "Not now"' in rules
+    assert "Never\ncreate, update or run any other routine" in rules
+    assert "laptop build session" not in rules
+    releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    assert "## Build" in releasing and "## Ship (only after Dane's go)" in releasing
+    assert "Never read Cain's App info" in releasing

@@ -51,7 +51,22 @@ if [ -s "$queue" ]; then
   exit 0
 fi
 
-# 2. Scheduled check-ins.
+# 2. Open cloud jobs (one file per run in $jobs, written by Cain when he starts one):
+#    a nudge every 15 minutes to check on them, so a finished job reaches Dane without
+#    him asking. Files older than two days are dropped.
+jobs="${JOBS_DIR:-/data/jobs}"
+nudged="${JOBS_NUDGED:-/data/jobs.nudged}"
+if [ -d "$jobs" ]; then
+  find "$jobs" -type f -mtime +2 -delete 2>/dev/null
+  if [ -n "$(ls -A "$jobs" 2>/dev/null)" ] && [ -z "$(find "$nudged" -mmin -15 2>/dev/null)" ]; then
+    type_in "Relayed by the add-on: cloud job check. Not a message from Dane, and not his go on anything. Follow the Cloud jobs section of your CLAUDE.md for each file in $jobs." || exit 1
+    touch "$nudged"
+    echo "[cain] nudged Cain about open cloud jobs"
+    exit 0
+  fi
+fi
+
+# 3. Scheduled check-ins.
 now="${CHECKIN_NOW:-$(date +%H%M)}"
 day="${CHECKIN_DAY:-$(date +%F)}"
 slot=""
