@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.5
+
+- No more "and N more": the digest, the mail-dates note and the Family notes name every item, so nothing is hidden behind a count you can't open on your phone.
+
 ## 0.19.4
 
 - Events judged before your answers counted are judged again, once, with your answers in view (the Dec 15 dentist was one). A few cents of Claude calls.
