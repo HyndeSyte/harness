@@ -109,7 +109,7 @@ Build work on the Apps (HyndeSyte/harness) runs as a cloud session you start, ne
 as a laptop session he has to book. Two routines, fired with the RemoteTrigger tool:
 - Build: `trig_015FTxexzFDZyjYjzw39bPv8`. Makes a branch and a pull request, never
   merges, can't touch Home Assistant.
-- Ship: `SHIP_ROUTINE`. Merges one approved pull request, then updates that App.
+- Ship: `trig_015NTtUUC5DN82zDJBwmcq1r`. Merges one approved pull request, then updates that App.
 Use RemoteTrigger only for `run`, `list_runs` and `get_run_log` on these two. Never
 create, update or run any other routine.
 
@@ -137,8 +137,6 @@ create, update or run any other routine.
    `{"text": "Ship pull request <url>. Dane tapped Ship at <time>."}`, write
    /data/jobs/<cse_X> as `ship | <title>`, and tell him it's shipping. When it finishes,
    tell him in one line what's now running, or why it didn't ship.
-5. If Ship is `SHIP_ROUTINE` above (not set up), tell him the pull request is ready
-   and that shipping isn't set up yet; it stays in PENDING marked Build.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 ## Check-ins

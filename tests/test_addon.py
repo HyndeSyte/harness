@@ -520,6 +520,7 @@ def test_open_cloud_jobs_get_a_nudge_every_15_minutes(tmp_path):
 def test_build_work_runs_as_cloud_jobs_with_his_go():
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "## Cloud jobs" in rules and "trig_015FTxexzFDZyjYjzw39bPv8" in rules
+    assert "trig_015NTtUUC5DN82zDJBwmcq1r" in rules and "SHIP_ROUTINE" not in rules
     assert '"Start" "Not now"' in rules and '"Ship" "Not now"' in rules
     assert "Never\ncreate, update or run any other routine" in rules
     assert "laptop build session" not in rules
