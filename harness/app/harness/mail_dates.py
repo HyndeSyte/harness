@@ -30,7 +30,7 @@ import os
 import re
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -58,6 +58,7 @@ UNDO_TTL_S = 7 * 86400
 KINDS = ("deadline", "window_closes", "appointment", "renewal", "event")
 PREFIX = {"deadline": "Due", "window_closes": "Last day", "appointment": "Appt",
           "renewal": "Renews", "event": "On"}
+TIMED = ("appointment", "event")      # he has to be there: at its time, when the email gives one
 OPTION = "mail_dates"
 
 # What may carry a date he has to act on. Anything else never leaves the Pi.
@@ -297,6 +298,19 @@ def non_event(what: str) -> bool:
     return bool(_NON_EVENT.search(what))
 
 
+def _clock(at: str) -> str:
+    """Like " at 8:00 AM", or nothing."""
+    if not at:
+        return ""
+    h, m = (int(x) for x in at.split(":"))
+    return f" at {(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def _at(row) -> str:
+    at = row["at"] if "at" in row.keys() else None
+    return at if at and re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", at) else ""
+
+
 def _start_of(e: dict) -> datetime | None:
     v = (e.get("start") or {}).get("dateTime")
     try:
@@ -383,6 +397,7 @@ class MailDates:
             if not paused and self.configured() and self._future is None and self._due():
                 self._start()
             if not paused and self.writes_on():
+                self._retime()
                 self._write_found()
         except Exception as e:                     # a bug here is a record, never a stopped loop
             log.warning("mail dates failed: %s", type(e).__name__)
@@ -587,8 +602,9 @@ class MailDates:
             if self._there(row, days[day]):
                 self._set(row["key"], "skipped")   # already on his calendar, from him or a copy
                 continue
-            f = Found(row["what"], day, row["kind"])
-            out = self.google.add_note(address, row["event_id"], title(f), day)
+            start = self._start_at(row, day)
+            f = Found(row["what"], day, row["kind"], at=f"{start:%H:%M}" if start else "")
+            out = self.google.add_note(address, row["event_id"], title(f), day, start)
             if out.kind == "ok":
                 with self.ledger.tx() as db:
                     db.execute("UPDATE mail_dates SET state='live', batch=? WHERE key=?", (batch, row["key"]))
@@ -649,17 +665,19 @@ class MailDates:
             if state == "unknown":
                 return None
             was = Found(old["what"], date.fromisoformat(old["day"]), old["kind"])
-            if state != "ok" or e.get("status") == "cancelled" or e.get("summary") != title(was)                     or (e.get("start") or {}).get("date") != old["day"]:
+            if state != "ok" or e.get("status") == "cancelled" or e.get("summary") != title(was) \
+                    or not google_cal.note_placed(e, was.day, self._start_at(old, was.day)):
                 continue                           # gone, or his now: leave it be
+            start = self._start_at(row, day)
             out = self.google.change(address, old["event_id"], {
                 "summary": title(Found(row["what"], day, row["kind"])),
-                "start": {"date": day.isoformat()},
-                "end": {"date": (day + timedelta(days=1)).isoformat()}}, e.get("etag"))
+                **google_cal.note_span(day, start),
+                "reminders": {"useDefault": start is not None}}, e.get("etag"))
             if out.kind != "ok":
                 return None if out.kind == "unknown" else False
             with self.ledger.tx() as db:
-                db.execute("UPDATE mail_dates SET day=?, what=? WHERE key=?",
-                           (day.isoformat(), row["what"], old["key"]))
+                db.execute("UPDATE mail_dates SET day=?, what=?, at=? WHERE key=?",
+                           (day.isoformat(), row["what"], _at(row), old["key"]))
                 db.execute("UPDATE mail_dates SET state='skipped' WHERE key=?", (row["key"],))
                 self.ledger.event("mail_date_moved", {"from": old["day"], "to": row["day"]}, db=db)
             return True
@@ -678,6 +696,47 @@ class MailDates:
                 return True
         return False
 
+    def _start_at(self, row, day: date) -> datetime | None:
+        """When he has to be there, if the email said: an appointment or event with a time."""
+        at = _at(row)
+        if row["kind"] not in TIMED or not at:
+            return None
+        h, m = (int(x) for x in at.split(":"))
+        return datetime.combine(day, time(h, m), ZoneInfo(self.tz))
+
+    def _retime(self) -> None:
+        """Notes written before times were kept: an appointment the email gave a time for sat on
+        his calendar all day. Each moves to its time once, unless he has changed it (then it's his)."""
+        if self.ledger.get_meta("mail_retimed") == "1":
+            return
+        address = self.address()
+        if not address or not self.google.configured():
+            return
+        today = self.ledger.now().astimezone(ZoneInfo(self.tz)).date()
+        for row in self.ledger.db.execute(
+                "SELECT * FROM mail_dates WHERE state='live' AND day>=? AND at IS NOT NULL AND at<>''",
+                (today.isoformat(),)).fetchall():
+            day = date.fromisoformat(row["day"])
+            start = self._start_at(row, day)
+            if start is None:
+                continue
+            state, e = self.google.look(address, row["event_id"])
+            if state == "unknown":
+                return                             # next tick
+            f = Found(row["what"], day, row["kind"])
+            if state != "ok" or e.get("status") == "cancelled" or e.get("summary") != title(f) \
+                    or any(e.get(k) for k in ("description", "location", "attendees")) \
+                    or not google_cal.note_placed(e, day):
+                continue                           # gone, or his now
+            out = self.google.change(address, row["event_id"], {
+                **google_cal.note_span(day, start), "reminders": {"useDefault": True}}, e.get("etag"))
+            if out.kind == "unknown":
+                return
+            if out.kind == "ok":
+                self.ledger.event("mail_date_retimed", {"day": row["day"]})
+        with self.ledger.tx() as db:
+            self.ledger.set_meta("mail_retimed", "1", db)
+
     def _set(self, key: str, state: str) -> None:
         with self.ledger.tx() as db:
             db.execute("UPDATE mail_dates SET state=? WHERE key=?", (state, key))
@@ -685,12 +744,12 @@ class MailDates:
     def _tell(self, batch: str, landed: list[Found], moved: list[Found] = ()) -> None:
         if self.chat_id is None:
             return
-        lines = [f"{f.day:%a %b} {f.day.day}: {render.escape(title(f))}" for f in landed[:12]]
+        lines = [f"{f.day:%a %b} {f.day.day}{_clock(f.at)}: {render.escape(title(f))}" for f in landed[:12]]
         lines += [f"{f.day:%a %b} {f.day.day}: {render.escape(title(f))} (moved there, as the email says)"
                   for f in moved]
         more = f"\n...and {len(landed) - 12} more" if len(landed) > 12 else ""
         text = ("<b>From your mail, on your calendar:</b>\n" + "\n".join(lines) + more +
-                "\nFree, no reminder, nothing at work.")
+                "\nFree, nothing at work. One with a time has your usual reminder; the rest have none.")
         with self.ledger.tx() as db:
             nonce = choices.mint(self.ledger, kind="mail_dates_undo", target=batch, chat_id=self.chat_id,
                                  ttl_s=UNDO_TTL_S, db=db)
@@ -714,7 +773,8 @@ class MailDates:
             return
         for row in rows:
             f = Found(row["what"], date.fromisoformat(row["day"]), row["kind"])
-            out = self.google.remove_note(address, row["event_id"], title(f), f.day)
+            out = self.google.remove_note(address, row["event_id"], title(f), f.day,
+                                          self._start_at(row, f.day))
             if out.kind in ("ok", "gone"):
                 self._set(row["key"], "undone")
             elif out.kind == "changed":

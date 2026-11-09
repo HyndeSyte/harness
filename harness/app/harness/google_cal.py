@@ -200,12 +200,37 @@ def _body(uid: str, title: str, start: datetime, end: datetime) -> dict:
 NOTE_MARK = {"harness": "mail_dates"}    # a date from his mail (mail_dates.py): never a block
 
 
-def _note_body(uid: str, title: str, day: date) -> dict:
-    """Free, all day, no reminder: it shows the date and holds no time, so nothing reaches work."""
-    return {"id": uid, "summary": title, "status": "confirmed",
-            "start": {"date": day.isoformat()}, "end": {"date": (day + timedelta(days=1)).isoformat()},
+NOTE_HOURS = timedelta(hours=1)
+
+
+def note_span(day: date, start: datetime | None = None) -> dict:
+    """All day, or at the time the email gives, for an hour."""
+    if start is None:
+        return {"start": {"date": day.isoformat()}, "end": {"date": (day + timedelta(days=1)).isoformat()}}
+    span = {"start": {"dateTime": start.isoformat()}, "end": {"dateTime": (start + NOTE_HOURS).isoformat()}}
+    zone = getattr(start.tzinfo, "key", None)
+    if zone:
+        span["start"]["timeZone"] = span["end"]["timeZone"] = zone
+    return span
+
+
+def note_placed(event: dict, day: date, start: datetime | None = None) -> bool:
+    """Still where we put it: the same day, or the same start."""
+    s = event.get("start") or {}
+    if start is None:
+        return "dateTime" not in s and s.get("date") == day.isoformat()
+    try:
+        return datetime.fromisoformat(str(s["dateTime"]).replace("Z", "+00:00")) == start
+    except (KeyError, ValueError):
+        return False
+
+
+def _note_body(uid: str, title: str, day: date, start: datetime | None = None) -> dict:
+    """Free, so nothing reaches work. All day with no reminder, or, when the email gives the time
+    he has to be there, at that time with his usual reminder."""
+    return {"id": uid, "summary": title, "status": "confirmed", **note_span(day, start),
             "visibility": "private", "transparency": "transparent",
-            "reminders": {"useDefault": False},
+            "reminders": {"useDefault": start is not None},
             "guestsCanInviteOthers": False, "guestsCanSeeOtherGuests": False,
             "extendedProperties": {"private": dict(NOTE_MARK)}}
 
@@ -560,7 +585,8 @@ class GoogleCalendar:
         return self._answer(r)
 
     # -- dates from his mail (mail_dates.py): their own mark, so the sync never sees them -----
-    def add_note(self, address: str, uid: str, title: str, day: date) -> Outcome:
+    def add_note(self, address: str, uid: str, title: str, day: date,
+                 start: datetime | None = None) -> Outcome:
         """A fixed id, so a lost answer finds itself. "exists": that id can't be used."""
         url = self._events(address)
         if url is None or not _ID_RE.fullmatch(uid):
@@ -569,7 +595,7 @@ class GoogleCalendar:
         if token is None:
             return problem
         try:
-            r = self._call(token, "POST", f"{url}?sendUpdates=none", body=_note_body(uid, title, day))
+            r = self._call(token, "POST", f"{url}?sendUpdates=none", body=_note_body(uid, title, day, start))
             if r.status == 200:
                 return Outcome("ok", r.status)
             if r.status != 409:
@@ -584,7 +610,8 @@ class GoogleCalendar:
             return Outcome("ok", 200)              # the earlier try landed
         return Outcome("exists")
 
-    def remove_note(self, address: str, uid: str, title: str, day: date) -> Outcome:
+    def remove_note(self, address: str, uid: str, title: str, day: date,
+                    start: datetime | None = None) -> Outcome:
         """Only a note of ours that he hasn't changed: a title or time he edited makes it his."""
         url = self._events(address)
         if url is None or not _ID_RE.fullmatch(uid):
@@ -605,7 +632,7 @@ class GoogleCalendar:
                 return Outcome("gone", r.status)
             if any(found.get(k) for k in ("description", "location", "attendees")) \
                     or found.get("transparency") != "transparent" or found.get("summary") != title \
-                    or (found.get("start") or {}).get("date") != day.isoformat():
+                    or not note_placed(found, day, start):
                 return Outcome("changed", r.status)
             r = self._call(token, "DELETE", f"{url}/{uid}?sendUpdates=none", etag=found.get("etag"))
         except TransportError as e:

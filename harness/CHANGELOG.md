@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.2
+
+- An appointment or event from your mail now lands at its time, for an hour, with your usual reminder, instead of as an all-day note. It stays free, so nothing reaches work. Deadlines and last days stay all-day, with no reminder.
+- Ones already on your calendar move to their time once, unless you've changed them.
+
 ## 0.19.1
 
 - Cheaper Claude calls: the fixed instructions sent with every call are now marked for Anthropic's prompt cache, so a run of calls (judging your Family events, reading dates from mail) pays full price for them once, then a tenth. Nothing you see changes.

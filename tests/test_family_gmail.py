@@ -195,7 +195,9 @@ class FakeGoogle:
         if uid in self.events:
             return HttpResponse(409, {}, b"{}")   # Google keeps a deleted id too
         assert not {"attendees", "location", "description", "recurrence"} & set(event)
-        assert event["reminders"] == {"useDefault": False} and event["visibility"] == "private"
+        timed_note = "dateTime" in event["start"] and (event.get("extendedProperties") or {}).get(
+            "private") == google_cal.NOTE_MARK                  # a mail date he has to be at, at its time
+        assert event["reminders"] == {"useDefault": timed_note} and event["visibility"] == "private"
         self.events[uid] = {**self._local(event), "etag": self._etag()}
         return self._maybe_lost(HttpResponse(200, {}, json.dumps(self.events[uid]).encode()))
 

@@ -1,5 +1,6 @@
 """Follow-through: dates from his mail onto his Gmail calendar. All names are invented."""
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from harness import choices, google_cal
 from harness.engines import EngineResult
@@ -534,3 +535,55 @@ def test_word_forms_match_but_different_things_stay_apart():
     assert _names("Celebrations") & _names("Celebration of Learning")
     assert not _names("Water bill") & _names("Electric bill")
     assert not _names("Class picture day") & _names("Glass recycling")
+
+
+# -- at its time ---------------------------------------------------------------------------------
+
+TIMED_APPT = [{"what": "Service appointment at Valley Motors", "date": "2026-11-13", "kind": "appointment",
+               "time": "08:00"}]
+
+
+def test_an_appointment_with_a_time_lands_at_that_time_with_his_usual_reminder(g):
+    rig_mail(g, [msg(1, "Your service appointment")], {"Your service appointment": TIMED_APPT})
+    read(g)
+    [(uid, ev)] = g.google.live().items()
+    start = datetime.fromisoformat(ev["start"]["dateTime"])
+    assert start == datetime(2026, 11, 13, 8, tzinfo=ZoneInfo(TZ))
+    assert datetime.fromisoformat(ev["end"]["dateTime"]) - start == timedelta(hours=1)
+    assert ev["transparency"] == "transparent" and ev["reminders"] == {"useDefault": True}
+    g.c.outbox.flush()
+    assert "Fri Nov 13 at 8:00 AM: Appt: Service appointment at Valley Motors" in g.bot.sent[-1][1]
+    batch = g.ledger.db.execute("SELECT batch FROM mail_dates").fetchone()[0]
+    g.md.on_choice("mail_dates_undo", batch)
+    g.md.run(paused=False)
+    assert g.google.live() == {}                   # undo still finds it, at its time
+
+
+def test_a_deadline_with_a_time_stays_all_day(g):
+    rig_mail(g, [msg(1, "Your bill")], {"Your bill": [
+        {"what": "Pay by check", "date": "2026-11-20", "kind": "deadline", "time": "17:00"}]})
+    read(g)
+    [(uid, ev)] = g.google.live().items()
+    assert ev["start"] == {"date": "2026-11-20"} and ev["reminders"] == {"useDefault": False}
+
+
+def test_an_appointment_written_all_day_before_moves_to_its_time_once(g):
+    rig_mail(g, [msg(1, "Your service appointment"), msg(2, "Your class")],
+             {"Your service appointment": TIMED_APPT,
+              "Your class": [{"what": "Pottery class", "date": "2026-11-14", "kind": "event", "time": "10:00"}]})
+    g.ledger.set_meta("mail_retimed", "1")         # as on the Pi: already "run" under the old code
+    read(g)
+    for uid, ev in list(g.google.events.items()):  # what the old code wrote: all day
+        g.google.events[uid].update(google_cal.note_span(date.fromisoformat(ev["start"]["dateTime"][:10])),
+                                    reminders={"useDefault": False})
+    appt, pottery = sorted(g.google.live(), key=lambda u: g.google.events[u]["summary"])
+    g.google.hand_edit(pottery, description="bring an apron")          # his now
+    g.ledger.set_meta("mail_retimed", "")
+    g.md.run(paused=False)
+    ev = g.google.events[appt]
+    assert datetime.fromisoformat(ev["start"]["dateTime"]) == datetime(2026, 11, 13, 8, tzinfo=ZoneInfo(TZ))
+    assert ev["reminders"] == {"useDefault": True}
+    assert g.google.events[pottery]["start"] == {"date": "2026-11-14"}
+    writes = len(g.google.writes())
+    g.md.run(paused=False)
+    assert len(g.google.writes()) == writes        # once
