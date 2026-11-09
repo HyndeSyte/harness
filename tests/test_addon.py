@@ -112,9 +112,17 @@ def test_cain_config_denies_every_api_and_mapping():
         assert risky not in cfg, risky
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099" and cfg["panel_admin"] == "true"
     assert cfg["init"] == "false"
-    # One option only: the record keeper's GitHub token, as a password field.
+    # Keys (the record keeper's GitHub token, the review runner's three API keys) as
+    # password fields, and the review caps as bounded numbers. Nothing else.
     text = (CAIN / "config.yaml").read_text()
-    assert re.search(r"^options:\n  github_token: \"\"\nschema:\n  github_token: password\?\n", text, re.M)
+    assert text.split("options:\n")[1] == (
+        '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
+        "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
+        "  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\nschema:\n"
+        "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
+        "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
+        "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
+        "  codex_monthly_runs: int(0,5000)\n")
 
 
 def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
@@ -417,3 +425,76 @@ def test_cains_addon_sends_calendar_meanings_when_the_file_changes(tmp_path):
     f.write_text(f.read_text() + "| 2026-11-09 | harvest | me |\n")
     subprocess.run([bash, script], env=env, timeout=20)
     assert len(calls.read_text().splitlines()) == 2
+
+
+def test_cain_installs_codex_pinned_and_checked():
+    docker = (CAIN / "Dockerfile").read_text()
+    assert re.search(r"^ARG CODEX_VERSION=\d+\.\d+\.\d+$", docker, re.M)
+    for arch in ("AARCH64", "X86_64"):
+        assert re.search(rf"^ARG CODEX_SHA_{arch}=[0-9a-f]{{64}}$", docker, re.M), arch
+    assert "releases/download/rust-v${CODEX_VERSION}/codex-${TT}-unknown-linux-musl.tar.gz" in docker
+    check = docker.index('echo "${CS}  /tmp/codex.tgz" | sha256sum -c -')
+    assert check < docker.index("tar -xzf /tmp/codex.tgz")                    # checked before unpacking
+    assert "codex --version" in docker and " bubblewrap" in docker
+    assert "npm" not in docker                                                # the release binary, not a registry
+
+
+def test_cain_runs_the_review_runner_with_keys_only_in_its_environment():
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    assert "bun /opt/cain/review/main.ts" in run
+    block = run.split("# The review runner")[1].split(") &")[0]
+    for opt in ("gemini_api_key", "perplexity_api_key", "anthropic_api_key", "review_limit_usd",
+                "gemini_monthly_usd", "perplexity_monthly_usd", "anthropic_monthly_usd", "codex_monthly_runs"):
+        assert f"opt {opt}" in block, opt
+    # Names no other tool reads: Claude Code would switch to an ANTHROPIC_API_KEY.
+    assert "ANTHROPIC_API_KEY=" not in run and "export ANTHROPIC_API_KEY" not in run
+    assert "GEMINI_API_KEY=" not in run and "PERPLEXITY_API_KEY=" not in run
+    for line in run.splitlines():
+        if "_KEY" in line:
+            assert not re.search(r"\becho\b|\bprintf\b|log\.|set -x", line), line
+    assert "set -x" not in run
+    main = (CAIN / "rootfs/opt/cain/review/main.ts").read_text(encoding="utf-8")
+    assert "delete env[k]" in main and '"REVIEW_ANTHROPIC_KEY"' in main
+    codex = (CAIN / "rootfs/opt/cain/review/seats/openai.ts").read_text(encoding="utf-8")
+    # Codex gets a fresh environment: no keys, no record, no home of Cain's.
+    assert "const env = { PATH:" in codex and "...process.env" not in codex
+    assert '"--sandbox", "read-only"' in codex and '"--ephemeral"' in codex and '"--output-schema"' in codex
+
+
+def test_cain_review_keys_never_reach_logs_or_cain():
+    import json
+    for name in ("main.ts", "runner.ts", "cli.ts", "seats/common.ts", "seats/gemini.ts",
+                 "seats/perplexity.ts", "seats/claude.ts"):
+        src = (CAIN / "rootfs/opt/cain/review" / name).read_text(encoding="utf-8")
+        for line in src.splitlines():
+            if "console.log" in line or "log(" in line:
+                assert not re.search(r"keys\.|o\.key|_KEY", line), f"{name}: {line}"
+    settings = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]
+    assert "Read(//data/options.json)" in settings["deny"] and "Read(//data/codex/**)" in settings["deny"]
+    assert "Bash(/opt/cain/review.sh:*)" in settings["allow"]
+    assert "exec bun /opt/cain/review/cli.ts" in (CAIN / "rootfs/opt/cain/review.sh").read_text()
+
+
+def test_cain_chatgpt_signin_is_on_the_ingress_page():
+    nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
+    block = nginx.split("location /codex {")[1].split("}")[0]
+    assert "proxy_pass http://127.0.0.1:8096;" in block
+    assert nginx.count("listen ") == 1 and "allow 172.30.32.2;" in nginx      # still Ingress only
+    page = (CAIN / "rootfs/opt/cain/index.html").read_text()
+    assert 'href="codex"' in page and 'href="/codex' not in page
+    main = (CAIN / "rootfs/opt/cain/review/main.ts").read_text(encoding="utf-8")
+    assert 'hostname: "127.0.0.1"' in main and "8096" in main
+    signin = (CAIN / "rootfs/opt/cain/review/signin.ts").read_text(encoding="utf-8")
+    assert '"login", "--device-auth"' in signin and 'cli_auth_credentials_store = "file"' in signin
+
+
+def test_cain_knows_when_and_how_to_use_reviews():
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    section = rules.split("## Outside reviews")[1].split("\n## ")[0]
+    for must in ("/opt/cain/review.sh submit", "/data/review-private-terms.txt", "blocked: privacy",
+                 "building, planning, research", "Reviewed: ", "Never ask him to run or check a review",
+                 "substituted", "consequential", "needs_facts"):
+        assert must in section, must
+    assert "reviews/" in rules.split("Rules the keeper enforces")[1].split(";")[0]
+    keeper = (CAIN / "rootfs/opt/cain/record/core.ts").read_text(encoding="utf-8")
+    assert "projects|reviews)" in keeper

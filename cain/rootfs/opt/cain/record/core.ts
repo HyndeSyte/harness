@@ -25,7 +25,8 @@ export type Outcome = {
 
 // Where requests may write. log/ and inbox/ belong to the keeper itself; code,
 // workflows and the repo's own settings are never written through requests.
-const WRITABLE = /^(areas|state|archive|rules|projects)\/[A-Za-z0-9._ \/&()-]+$/;
+// reviews/ holds outside-model reviews (written by the review runner, as Cain).
+const WRITABLE = /^(areas|state|archive|rules|projects|reviews)\/[A-Za-z0-9._ \/&()-]+$/;
 const APPEND_ONLY = /(^|\/)decisions\.md$/i;
 
 // Text that ends up in Cain's terminal: one line, no control characters, short.

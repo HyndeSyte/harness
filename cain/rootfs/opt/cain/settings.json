@@ -6,7 +6,9 @@
       "Bash(/opt/cain/handover.sh)",
       "Bash(/opt/cain/handover.sh:*)",
       "Bash(/opt/cain/record.sh)",
-      "Bash(/opt/cain/record.sh:*)"
+      "Bash(/opt/cain/record.sh:*)",
+      "Bash(/opt/cain/review.sh)",
+      "Bash(/opt/cain/review.sh:*)"
     ],
     "deny": [
       "mcp__claude_ai_Google_Calendar__create_event",
@@ -26,7 +28,12 @@
       "mcp__claude_ai_GitHub__push_files",
       "mcp__claude_ai_GitHub__delete_file",
       "mcp__claude_ai_GitHub__create_branch",
-      "mcp__claude_ai_GitHub__merge_pull_request"
+      "mcp__claude_ai_GitHub__merge_pull_request",
+      "Read(//data/options.json)",
+      "Read(//data/codex/**)",
+      "Edit(//data/codex/**)",
+      "Edit(//data/review-queue/**)",
+      "Edit(//data/review-spend.json)"
     ]
   }
 }

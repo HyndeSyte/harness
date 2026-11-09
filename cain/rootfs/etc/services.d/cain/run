@@ -47,6 +47,26 @@ bashio::log.info "Cain is running"
   export RECORD_TOKEN
   while true; do bun /opt/cain/record/main.ts 2>&1; sleep 10; done
 ) &
+# The review runner (review/main.ts): outside-model reviews (Codex on his ChatGPT
+# plan, Gemini, Perplexity, Claude on the plan's API credit), and the ChatGPT
+# sign-in page (<Cain page>/codex). Its keys come from the add-on's options and go
+# only into its environment, under names no other tool reads (an ANTHROPIC_API_KEY
+# in Cain's own session would move Claude Code off his plan). Never printed.
+(
+  opt() { v="$(bashio::config "$1" 2>/dev/null || true)"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
+  REVIEW_GEMINI_KEY="$(opt gemini_api_key)"
+  REVIEW_PERPLEXITY_KEY="$(opt perplexity_api_key)"
+  REVIEW_ANTHROPIC_KEY="$(opt anthropic_api_key)"
+  REVIEW_LIMIT_USD="$(opt review_limit_usd)"
+  REVIEW_CAP_GEMINI_USD="$(opt gemini_monthly_usd)"
+  REVIEW_CAP_PERPLEXITY_USD="$(opt perplexity_monthly_usd)"
+  REVIEW_CAP_ANTHROPIC_USD="$(opt anthropic_monthly_usd)"
+  REVIEW_CAP_CODEX_RUNS="$(opt codex_monthly_runs)"
+  export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
+    REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS
+  mkdir -p -m 700 /data/codex
+  while true; do bun /opt/cain/review/main.ts 2>&1; sleep 10; done
+) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM so open work moves
 # without Dane. checkin.sh decides when, and only types into an idle session.
 (

@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.3.3"
+version: "0.4.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -25,9 +25,28 @@ hassio_api: false
 auth_api: false
 backup: cold
 timeout: 30
-# The record keeper's key: a GitHub fine-grained token for the org repo only,
-# with Contents read and write. Entered by Dane here, never shown or logged.
+# Keys, entered by Dane here, never shown or logged. github_token: the record
+# keeper's GitHub fine-grained token for the org repo only (Contents read and write).
+# The three API keys go only to the review runner: Gemini and Perplexity on small
+# prepaid balances (auto-reload off), Anthropic from his linked Console org (his
+# plan's monthly API credit). Caps: per review, and per seat per month.
 options:
   github_token: ""
+  gemini_api_key: ""
+  perplexity_api_key: ""
+  anthropic_api_key: ""
+  review_limit_usd: 1.5
+  gemini_monthly_usd: 8
+  perplexity_monthly_usd: 4
+  anthropic_monthly_usd: 30
+  codex_monthly_runs: 200
 schema:
   github_token: password?
+  gemini_api_key: password?
+  perplexity_api_key: password?
+  anthropic_api_key: password?
+  review_limit_usd: float(0,20)
+  gemini_monthly_usd: float(0,200)
+  perplexity_monthly_usd: float(0,200)
+  anthropic_monthly_usd: float(0,200)
+  codex_monthly_runs: int(0,5000)

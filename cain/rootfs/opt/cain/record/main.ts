@@ -173,7 +173,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
               o = { ...base, state: "done" };
             } catch (e) {
               // Undo this request's partial writes; the others stand.
-              git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects"]);
+              git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects", "reviews"]);
               o = { ...base, state: "rejected", reason: clean(`couldn't write: ${(e as Error).message}`) };
             }
           }
