@@ -499,3 +499,16 @@ def test_misses_come_first_and_a_series_is_one_line():
     assert len(lines) == 2
     assert "missing Busy (watching kids)" in lines[0]
     assert "(+29 more)" in lines[1]
+
+
+def test_a_difference_says_why_in_fixed_words_only():
+    from datetime import datetime, timezone
+    from harness.meaning import Judgment, Rel, Score, judged_why
+    j = Judgment((Rel("supervision", 0, 60, certainty="medium"),), ("ex1",), True)
+    why = judged_why(j, False, {})
+    assert why == ("judged unsure; obligations: supervision medium; cites 1, 0 his answers;"
+                   " not backed by an example")
+    s = Score()
+    s.diffs.append((datetime(2026, 12, 15, 15, tzinfo=timezone.utc), "missing", "Busy (watching kids)",
+                    "Alyssa dentist", why))
+    assert f"({why}), for Alyssa dentist" in s.diff_lines("America/New_York")[0]

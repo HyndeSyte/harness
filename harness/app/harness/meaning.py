@@ -873,7 +873,7 @@ class Score:
     missed_critical: int = 0
     false_busy_h: float = 0.0
     unsure: int = 0
-    diffs: list = field(default_factory=list)   # (start, kind, title, event title)
+    diffs: list = field(default_factory=list)   # (start, kind, title, event title, why)
 
     def line(self) -> str:
         share = round(100 * self.unsure / self.judged) if self.judged else 0
@@ -890,18 +890,31 @@ class Score:
         # event and kind, with how many occurrences it covers, so a series can't crowd out the rest.
         rank = {"missing": 0, "new": 1, "window": 2}
         groups: dict[tuple, list] = {}
-        for start, kind, title, event in self.diffs:
+        whys: dict[tuple, str] = {}
+        for start, kind, title, event, *why in self.diffs:
             groups.setdefault((kind, title, event), []).append(start)
+            whys.setdefault((kind, title, event), why[0] if why else "")
         ordered = sorted(groups.items(), key=lambda kv: (rank.get(kv[0][0], 3), min(kv[1])))
         out = []
         for (kind, title, event), starts in ordered[:MAX_DIFF_LINES]:
             s = min(starts).astimezone(zone)
             more = f" (+{len(starts) - 1} more)" if len(starts) > 1 else ""
-            out.append(f"meaning shadow diff: {kind} {title} {_day(s)} {_clock(s)}{more}, for {shown(event)}")
+            why = whys[(kind, title, event)]
+            reason = f" ({why})" if why else ""
+            out.append(f"meaning shadow diff: {kind} {title} {_day(s)} {_clock(s)}{more}{reason}, for {shown(event)}")
         return out
 
 
-def compare(old: list[Block], new: list[Block], score: Score, event_title: str) -> None:
+def judged_why(j: Judgment, backed: bool, examples: dict[str, Example]) -> str:
+    """Why the judge's blocks are what they are, in fixed words and counts only: no text of the
+    model's or of the event's."""
+    obs = ", ".join(f"{ob.type} {ob.certainty}" for ob in j.obligations) or "none"
+    mine = sum(1 for c in j.cites if c in examples and examples[c].source not in SEEDED)
+    return (f"judged {'unsure' if j.unsure else 'sure'}; obligations: {obs}; cites {len(j.cites)}"
+            f", {mine} his answers; {'backed' if backed else 'not backed'} by an example")
+
+
+def compare(old: list[Block], new: list[Block], score: Score, event_title: str, why: str = "") -> None:
     used: set[int] = set()
     same = True
     for o in sorted(old, key=lambda b: b.start):
@@ -912,14 +925,14 @@ def compare(old: list[Block], new: list[Block], score: Score, event_title: str) 
             score.missing += 1
             if o.type in CRITICAL:
                 score.missed_critical += 1
-            score.diffs.append((o.start, "missing", o.title, event_title))
+            score.diffs.append((o.start, "missing", o.title, event_title, why))
             continue
         used.add(match)
         n = new[match]
         if abs(n.start - o.start) > EXACT or abs(n.end - o.end) > EXACT:
             same = False
             score.window += 1
-            score.diffs.append((n.start, "window", n.title, event_title))
+            score.diffs.append((n.start, "window", n.title, event_title, why))
     for i, n in enumerate(new):
         if i in used:
             continue
@@ -927,7 +940,7 @@ def compare(old: list[Block], new: list[Block], score: Score, event_title: str) 
         score.new += 1
         if n.blocks == "meetings":
             score.false_busy_h += n.hours
-        score.diffs.append((n.start, "new", n.title, event_title))
+        score.diffs.append((n.start, "new", n.title, event_title, why))
     score.compared += 1
     if same:
         score.agree += 1
@@ -1138,9 +1151,10 @@ class MeaningShadow:
             s.judged += 1
             s.unsure += int(j.unsure)
             backed = supported(j, examples)
+            why = judged_why(j, backed, examples)
             for item in ev.occurrences:
                 new = blocks_for(j, span_of(item.occ, self.tz), now, supported=backed)
-                compare(old_blocks(item, rules, school, said), new, s, item.occ.summary)
+                compare(old_blocks(item, rules, school, said), new, s, item.occ.summary, why)
         line, diffs = s.line(), s.diff_lines(self.tz)
         log.info("%s", line)
         for d in diffs:
