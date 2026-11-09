@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3
+
+- Cain keeps a place book in your record (areas/home/places.md): where each place named on Family is, so those events get drive blocks and an address that opens in Maps.
+- When the calendar specialist asks where a place is, just reply with the address (or say skip). Cain writes it down and the add-on passes it on by itself.
+
 ## 0.4.2
 
 - The morning message is easier to read on your phone: clear section headers, and the top line says how many things need you.

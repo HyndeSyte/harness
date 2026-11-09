@@ -105,7 +105,7 @@ class Callbacks:
             return self.calendar_change.on_choice(kind, target)
         if kind == "mail_dates_undo" and self.mail_dates is not None:
             return self.mail_dates.on_choice(kind, target)
-        if kind in ("meaning_answer", "meaning_undo") and self.meaning_live is not None:
+        if kind in ("meaning_answer", "meaning_undo", "place_skip") and self.meaning_live is not None:
             return self.meaning_live.on_choice(kind, target)   # templates only, no model words
         return "Nothing changed."
 

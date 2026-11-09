@@ -4,10 +4,17 @@ and his events' addresses, for his drive blocks.
 OpenStreetMap's free services turn an address into a place and two places into a drive time,
 with no account and no key. They get a street address and map points only. The address is
 built from what's recognized as a house number, a street, and a town and state, so a name
-or note beside it stays behind, and a place with no street in it isn't sent at all. Each
+or note beside it stays behind, and a place with no street in it isn't sent this way. Each
 answer is kept, so an address goes out once. Home, from the add-on's settings, can be map
 coordinates ("lat, lon"), which are used as they are and never looked up. Nothing here decides
 anything (family_gmail.py).
+
+A Family event's place is often only a name ("Funky's Skate Center"). When neither a street
+address nor his place book (places.py) places it, find_place asks the map for that name, and
+only that: the location's text, cut short, never the title or notes, and only within a box
+around home. A result counts only if every meaningful word of the text is in its name;
+otherwise it is not found, and he's asked. Found and not found are both kept, so a name goes
+out once. The block then carries the place's name and street address, so Maps opens it.
 """
 from __future__ import annotations
 
@@ -32,6 +39,11 @@ MAX_REQUESTS_PER_READ = 10
 MAX_SECONDS_PER_READ = 20         # the app waits on this, so a slow service can't hold it up
 MAX_MINUTES = 240                 # longer means the wrong town was found: no answer, not far away
 AROUND_SCHOOL = 1.0               # degrees: prefer a match this close, for an address with no town
+AROUND_HOME = 1.0                 # degrees: a place found by name must be this close to home
+MAX_NAME_TEXT = 100               # a place's name as sent: longer is a note, not a name
+NAME_RESULTS = 5
+MAX_LABEL = 60
+_NOT_NAME_WORDS = frozenset({"the", "a", "an", "of", "at", "and", "in", "on"})
 
 NO_ADDRESS = "no address"
 FAILED = "failed"
@@ -63,6 +75,43 @@ def coordinates(text: str) -> str:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return ""
     return f"{lon},{lat}"
+
+
+def point_text(text: str) -> str:
+    """Map coordinates as a place is written: "lat, lon". Empty when it isn't that."""
+    point = coordinates(text)
+    if not point:
+        return ""
+    lon, lat = point.split(",")
+    return f"{lat}, {lon}"
+
+
+def name_words(text: str) -> frozenset[str]:
+    """What a name says, for matching: its words, lower case, apostrophes and "the" left out,
+    so "Funky's Skate Center" and "Funkys skate center" are the same."""
+    t = re.sub(r"['\u2019`]", "", (text or "").casefold())
+    return frozenset(w for w in re.findall(r"[^\W_]+", t) if w not in _NOT_NAME_WORDS)
+
+
+def label(name: str) -> str:
+    """A found place's name as a block may carry it, before its address: plain characters, no
+    comma (the address follows one), cut short. Empty when nothing's left."""
+    text = " ".join(re.sub(r"[^\w '&.\-]", " ", name or "").replace("_", " ").split())
+    return text[:MAX_LABEL].strip()
+
+
+def sound_place(location: str) -> bool:
+    """What a block may carry as its place: a recognized street address, map coordinates
+    ("lat, lon"), or a found place's name and then its street address. Never a note."""
+    if not location:
+        return True
+    street = street_address(location)
+    if location in (street, point_text(location)):
+        return True
+    if street and location.endswith(", " + street):
+        name = location[:-len(street) - 2]
+        return bool(name) and label(name) == name
+    return False
 
 
 def street_address(place: str) -> str:
@@ -154,6 +203,56 @@ class Drives:
         with self.ledger.tx() as db:
             self.ledger.set_meta(key, found, db)
         return self._read(found)
+
+    def find_place(self, text: str) -> str:
+        """A place named on Family, by its name on the map near home: "Name, street address",
+        or "lat, lon" when the map has no street for it, or NO_ADDRESS, or FAILED (ask again at
+        the next read). Only the text goes out, cleaned and cut short."""
+        query = " ".join((text or "").split())
+        want = name_words(query)
+        if not query or len(query) > MAX_NAME_TEXT or is_online(query) or not want:
+            return NO_ADDRESS
+        home = self._spot(HOME)
+        if home is None:
+            return NO_ADDRESS              # no home to look near: never a search of the world
+        near = home[1] or self._locate(home[2])
+        if near in (NO_ADDRESS, FAILED):
+            return FAILED
+        key = "drive_name:" + _hash(" ".join(sorted(want)) + "|" + near)
+        kept = self.ledger.get_meta(key)
+        if kept is not None:
+            return NO_ADDRESS if kept == "none" else kept
+        lon, lat = (float(x) for x in near.split(","))
+        fields = {"format": "jsonv2", "limit": str(NAME_RESULTS), "q": query, "bounded": "1",
+                  "addressdetails": "1",
+                  "viewbox": f"{lon - AROUND_HOME},{lat + AROUND_HOME},{lon + AROUND_HOME},{lat - AROUND_HOME}"}
+        answer = self._get(f"https://{GEOCODE_HOST}/search?{urlencode(fields)}")
+        if not isinstance(answer, list):
+            return FAILED
+        found, point = "none", ""
+        for r in answer:
+            try:
+                name = str(r.get("name") or "")
+                r_lat, r_lon = float(r["lat"]), float(r["lon"])
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            if not name or not want <= name_words(name):
+                continue                   # a near miss is not found: he's asked instead
+            street = _street_of(r.get("address"))
+            point = f"{r_lon},{r_lat}"
+            if street:
+                found = f"{label(name)}, {street}" if label(name) else street
+                if not sound_place(found):
+                    found = street         # a name that reads as part of the address: the address alone
+            else:
+                found = point_text(f"{r_lat}, {r_lon}")
+            break
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(key, found or "none", db)
+            if found != "none" and street_address(found):
+                # Its point too, so the drive to it isn't a second lookup.
+                self.ledger.set_meta("drive_place:" + _hash(street_address(found).casefold()), point, db)
+        return NO_ADDRESS if found in ("none", "") else found
 
     def _near(self) -> str:
         """Where an address with no town is most likely to be: near home, else near the school."""
@@ -249,6 +348,23 @@ class Drives:
             log.warning("drive lookup failed: %s", type(e).__name__)   # never the address
             self._down = True
             return None
+
+
+def _street_of(address) -> str:
+    """A map result's address parts as a street address drive.py recognizes, or empty."""
+    if not isinstance(address, dict):
+        return ""
+    parts = {k: str(v) for k, v in address.items() if isinstance(v, (str, int))}
+    number, road = parts.get("house_number", ""), parts.get("road", "")
+    town = next((parts[k] for k in ("city", "town", "village", "hamlet", "municipality") if parts.get(k)), "")
+    region = parts.get("ISO3166-2-lvl4", "")
+    state = region.split("-")[1] if re.fullmatch(r"US-[A-Z]{2}", region) else ""
+    code = (re.match(r"\d{5}", parts.get("postcode", "")) or [""])[0]
+    if not (number and road and town and state):
+        return ""
+    text = f"{number} {road}, {town}, {state}" + (f" {code}" if code else "")
+    street = street_address(text)
+    return street if street == text else ""
 
 
 def _hash(text: str) -> str:

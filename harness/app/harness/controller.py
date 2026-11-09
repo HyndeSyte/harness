@@ -330,7 +330,7 @@ class Controller:
         for h in (self.handovers.take() if self.handovers is not None else []):
             {"press": self._press, "digest": self._cain_digest,
              "morning-posted": self._morning_posted,
-             "meanings": self._meanings}.get(h.kind, self._handover)(h)
+             "meanings": self._meanings, "places": self._places}.get(h.kind, self._handover)(h)
         self._release_digest()
         self._link_health()
         self._work()
@@ -521,6 +521,16 @@ class Controller:
             return
         added, known = self.meaning_live.import_rows(h.rows)
         h.finish("ok", f"Stored {added} new; {known} already known.", new=added, known=known)
+
+    def _places(self, h) -> None:
+        """His place book, from his record, already checked (handover.py): the whole book,
+        replacing what was here. Events at those places get their address and drives on the
+        next read of Family."""
+        if self.meaning_live is None:
+            h.finish("off", "Places aren't set up in the calendar specialist.")
+            return
+        n, skipped = self.meaning_live.places.import_rows(h.rows)
+        h.finish("ok", f"Stored {n} place{'s' * (n != 1)}; {skipped} skipped.", places=n, skipped=skipped)
 
     def _morning_posted(self, h) -> None:
         self.ledger.set_meta("digest_held_at", "")          # the digest is in it now

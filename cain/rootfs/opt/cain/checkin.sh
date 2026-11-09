@@ -10,25 +10,28 @@ dir="${CHECKIN_DIR:-/data/checkins}"
 queue="${RELAY_QUEUE:-/data/relay.queue}"
 mkdir -p "$dir"
 
-# 0. What Dane has said Family events mean, from Cain's record, goes to the calendar
-#    specialist whenever the file changes: by the add-on, not by Cain remembering to.
-#    A failed send is retried at most every 10 minutes.
-meanings="${MEANINGS_FILE:-/data/record/areas/family/calendar-meanings.md}"
-sent="${MEANINGS_SENT:-/data/meanings.sent}"
-tried="${MEANINGS_TRIED:-/data/meanings.tried}"
-if [ -s "$meanings" ]; then
-  sum=$(sha256sum "$meanings" | cut -d' ' -f1)
+# 0. What Dane has said Family events mean, and his place book, from Cain's record, go to
+#    the calendar specialist whenever the file changes: by the add-on, not by Cain
+#    remembering to. A failed send is retried at most every 10 minutes.
+send_table() {   # what (keeper command), file, sent marker, tried marker, words for the log
+  local what="$1" file="$2" sent="$3" tried="$4" words="$5" sum
+  [ -s "$file" ] || return 0
+  sum=$(sha256sum "$file" | cut -d' ' -f1)
   if [ "$sum" != "$(cat "$sent" 2>/dev/null)" ] \
      && [ -z "$(find "$tried" -mmin -10 2>/dev/null)" ]; then
-    if "${KEEPER:-/opt/cain/keeper.sh}" meanings "$meanings" >/dev/null 2>&1; then
+    if "${KEEPER:-/opt/cain/keeper.sh}" "$what" "$file" >/dev/null 2>&1; then
       printf '%s' "$sum" > "$sent"
-      echo "[cain] sent Dane's calendar meanings to the specialist"
+      echo "[cain] sent Dane's $words to the specialist"
     else
       touch "$tried"
-      echo "[cain] couldn't send Dane's calendar meanings; will retry"
+      echo "[cain] couldn't send Dane's $words; will retry"
     fi
   fi
-fi
+}
+send_table meanings "${MEANINGS_FILE:-/data/record/areas/family/calendar-meanings.md}" \
+  "${MEANINGS_SENT:-/data/meanings.sent}" "${MEANINGS_TRIED:-/data/meanings.tried}" "calendar meanings"
+send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
+  "${PLACES_SENT:-/data/places.sent}" "${PLACES_TRIED:-/data/places.tried}" "place book"
 
 screen=$(tmux -u capture-pane -p -J -t cain 2>/dev/null) || exit 0
 last=$(printf '%s\n' "$screen" | tail -n 12)

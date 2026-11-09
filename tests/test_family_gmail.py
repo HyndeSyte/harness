@@ -195,8 +195,9 @@ class FakeGoogle:
         if uid in self.events:
             return HttpResponse(409, {}, b"{}")   # Google keeps a deleted id too
         assert not {"attendees", "description", "recurrence"} & set(event)
-        # A place only on an event he goes to, and only its street address (meaning_live.py).
-        assert "location" not in event or drive.street_address(event["location"]) == event["location"] != ""
+        # A place only on an event he goes to, and only its street address or map points
+        # (meaning_live.py, places.py).
+        assert "location" not in event or event["location"] != "" and drive.sound_place(event["location"])
         timed_note = "dateTime" in event["start"] and (event.get("extendedProperties") or {}).get(
             "private") == google_cal.NOTE_MARK                  # a mail date he has to be at, at its time
         assert event["reminders"] == {"useDefault": timed_note} and event["visibility"] == "private"

@@ -310,6 +310,22 @@ CREATE TABLE IF NOT EXISTS meaning_receipts(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS places(
+  key TEXT PRIMARY KEY,
+  address TEXT NOT NULL,
+  skip INTEGER NOT NULL,
+  said_on TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS place_asks(
+  key TEXT PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE,
+  said TEXT NOT NULL,
+  starts TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS family_gmail(
   key TEXT PRIMARY KEY,
   event_id TEXT NOT NULL,

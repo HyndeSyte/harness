@@ -431,6 +431,31 @@ def test_cains_addon_sends_calendar_meanings_when_the_file_changes(tmp_path):
     assert len(calls.read_text().splitlines()) == 2
 
 
+def test_cains_addon_sends_the_place_book_when_it_changes(tmp_path):
+    import os, shutil, subprocess
+    bash = shutil.which("bash")
+    if not bash:
+        import pytest
+        pytest.skip("no bash")
+    f = tmp_path / "places.md"
+    f.write_text("| Place | Address | Said on |\n|---|---|---|\n| HMLC | 12 Rink Rd, Leesburg, VA | 2026-11-08 |\n")
+    calls = tmp_path / "calls"
+    keeper = tmp_path / "keeper.sh"
+    keeper.write_text(f"#!/bin/bash\necho \"$@\" >> {calls.as_posix()}\n")
+    keeper.chmod(0o755)
+    env = {**os.environ, "PLACES_FILE": str(f), "PLACES_SENT": str(tmp_path / "sent"),
+           "PLACES_TRIED": str(tmp_path / "tried"), "MEANINGS_FILE": str(tmp_path / "none.md"),
+           "KEEPER": str(keeper), "CHECKIN_DIR": str(tmp_path / "c"), "RELAY_QUEUE": str(tmp_path / "q"),
+           "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}
+    script = str(CAIN / "rootfs/opt/cain/checkin.sh")
+    for _ in range(2):          # unchanged file: sent once
+        subprocess.run([bash, script], env=env, timeout=20)
+    assert [l.split()[0] for l in calls.read_text().splitlines()] == ["places"]
+    f.write_text(f.read_text() + "| Gym | skip | 2026-11-09 |\n")
+    subprocess.run([bash, script], env=env, timeout=20)
+    assert [l.split()[0] for l in calls.read_text().splitlines()] == ["places", "places"]
+
+
 def test_cain_installs_codex_pinned_and_checked():
     docker = (CAIN / "Dockerfile").read_text()
     assert re.search(r"^ARG CODEX_VERSION=\d+\.\d+\.\d+$", docker, re.M)

@@ -195,8 +195,9 @@ def _plain(event: dict, location: str | None = None) -> bool:
 
 
 def _sound_place(location: str) -> bool:
-    """Only a recognized street address, exactly as drive.py cuts it: never a name or a note."""
-    return not location or drive.street_address(location) == location
+    """Only a recognized street address, exactly as drive.py cuts it, map coordinates, or a
+    place found by name and its street address (drive.sound_place): never a note."""
+    return drive.sound_place(location)
 
 
 def _body(uid: str, title: str, start: datetime, end: datetime, location: str = "") -> dict:

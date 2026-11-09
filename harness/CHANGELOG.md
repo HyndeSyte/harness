@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.7
+
+- Family events that only name a place ("Funky's Skate Center") now get their drive blocks and address too. The place is looked up by its name on the map, only near home, and only if the map's name really matches. Your block then shows the place's name and street address, so it opens in Google Maps.
+- Cain also keeps a place book for you: each place name once, with its street address. Your word wins over the map, so nicknames, typos and private places ("HMLC", "Grandma's") work too.
+- When an event you go to is at a place neither your book nor the map knows, Cain asks you once: "Where is HMLC? (for Skating HMLC, Fri Nov 20)". Reply with the address, or tap Skip. Each place is asked once; a place you skip is never asked again unless you bring it up.
+- Only the event's place goes to the map, never its title or notes, and each name goes out once. A place in your book, or one you skipped, isn't looked up at all.
+- Events you go to now get their drive and address even when the judgment didn't say where the event is, as long as Family has its street address. Events judged to be at home or school still don't.
+- Events at a place you add later get their drives on the next read, with no restart.
+
 ## 0.19.6
 
 - Family events you go to yourself now get their drive time on your Gmail, as separate blocks: "Busy (drive there)" ending when the event starts, and "Busy (drive back)" starting when it ends. The event's own block keeps its real start and end, so you can still see when it begins.

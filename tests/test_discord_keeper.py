@@ -382,3 +382,33 @@ def test_the_meanings_route_needs_the_key_and_good_rows():
         assert code == 200 and out["said"] == "Stored 1 new; 0 already known."
     finally:
         srv.shutdown()
+
+
+# -- his place book (places.py) -------------------------------------------------------------
+
+PLACE_ROW = {"place": "HMLC", "address": "Front desk, 12 Rink Rd, Leesburg, VA 20175", "said_on": "2026-10-01"}
+
+
+def test_the_places_route_needs_the_key_and_a_real_address():
+    from harness import handover
+    token = "tok-" + "b" * 30
+    inbox = handover.Inbox(lambda: token)
+    srv = handover.serve(inbox, port=0, host="127.0.0.1", wait_s=2)
+    port = srv.server_address[1]
+    try:
+        assert post(port, "/places", {"rows": [PLACE_ROW]}, "wrong")[0] == 403
+        code, out = post(port, "/places", {"rows": [{**PLACE_ROW, "address": "behind Pat's barn"}]},
+                         handover.key_for(token))
+        assert code == 400 and out["said"].startswith("row 1: address must be")
+        assert "Pat" not in json.dumps(out) and inbox.queue.empty()
+
+        def answer():
+            h = inbox.queue.get(timeout=3)
+            assert h.kind == "places" and h.rows == [{"key": "hmlc", "address": "12 Rink Rd, Leesburg, VA 20175",
+                                                      "skip": False, "said_on": "2026-10-01"}]
+            h.finish("ok", "Stored 1 place; 0 skipped.")
+        threading.Thread(target=answer, daemon=True).start()
+        code, out = post(port, "/places", {"rows": [PLACE_ROW]}, handover.key_for(token))
+        assert code == 200 and out["said"] == "Stored 1 place; 0 skipped."
+    finally:
+        srv.shutdown()

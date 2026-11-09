@@ -53,6 +53,21 @@ specialist (the Harness add-on) does.
   change is applied. At startup and at each morning check-in, send the whole table once
   the same way; the specialist stores only what's new. Never put his words in it beyond
   the kind's few words.
+- His place book is areas/home/places.md: a table `| Place | Address | Said on |`, one row
+  per place as Family names it, so his events there get their address and drive blocks.
+  The calendar specialist looks a new place up by name on the map near home first; when
+  that finds nothing that matches, it asks where it is once, on a card: "Where is HMLC? (for
+  Skating HMLC, Fri Nov 20) Reply with an address, or tap Skip." It has a button: show it
+  right away. When he answers with where it is, write the row through the record keeper:
+  the place name exactly as the card says it, the street address with its town and state
+  ("12 Rink Rd, Leesburg, VA"), or "lat, lon" if that's all there is, dated the day he said
+  it. If he says skip in words, write `skip` as the address. A skipped place is never asked
+  again; if he raises it later and says where it is, write its row then. If he corrects a place later,
+  write a new row for it with the new date; the newest row for a place wins. The add-on
+  sends the book to the specialist whenever the file changes; you can also run
+  `/opt/cain/keeper.sh places /data/record/areas/home/places.md`. A row that isn't a
+  street address or coordinates is refused: fix the row, don't guess. Put nothing else of
+  his in it. Never "and N more": each place is asked on its own card, named.
 
 ## Asking him, and hearing his taps and reactions
 - When a decision has a few clear answers, ask with buttons:

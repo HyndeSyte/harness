@@ -27,6 +27,10 @@ turns them into his calendar and lets him correct it, all model-free:
     /meanings), stored as confirmed examples with source "dane-via-cain". Strictly checked:
     allowed meanings only, bounded lengths, words cleaned. Sending the same table again
     changes nothing.
+  * Where an event he goes to is: a street address in its location, else his place book
+    (places.py), else the map by the location's name near home (drive.find_place), whether
+    or not the judgment named the place, unless it was judged to be at home or school. A
+    place none of them knows gets one card asking him where it is.
 """
 from __future__ import annotations
 
@@ -40,7 +44,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import choices, drive, family_rules, meaning, render
+from . import choices, family_rules, meaning, places, render
 from .family_gmail import DROP_TITLE, PICK_TITLE, Want, _is_real, _key
 from .ledger import Ledger, iso
 
@@ -134,10 +138,9 @@ def _occ_id(occ) -> str:
     return f"{occ.uid}|{occ.instance}"
 
 
-def _street(location: str) -> str:
-    """Where he goes, for its block and its drive: only a recognized street address, since
-    anyone with Family can write its place. Empty for a name, a link or a call."""
-    return "" if drive.is_online(location) else drive.street_address(location)
+# Where a presence block is held, as judged: at home or school, the event's location isn't
+# where he goes. Anything else ("event_location", or no place said) is the event's location.
+NOT_THERE = ("home", "school")
 
 
 def _place(j: meaning.Judgment, kind: str) -> str:
@@ -200,6 +203,7 @@ class MeaningLive:
         self.name_fn = name_fn
         self.chat_id: int | None = None
         self._why: dict[str, dict] = {}    # Gmail key -> what the block is for (receipts)
+        self.places = places.PlaceBook(ledger, tz=tz)   # where a named place is (places.py)
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -216,7 +220,7 @@ class MeaningLive:
             "SELECT occurrence, ask, answer FROM meaning_questions WHERE state='answered'"
             " ORDER BY updated_at")}
 
-    def wants(self, items, now: datetime) -> dict[str, Want]:
+    def wants(self, items, now: datetime, *, find=None) -> dict[str, Want]:
         """From the judgments alone, with no model: the same judgment and the same Family give
         the same wants. The usual skips first (his copies, holds, his own name)."""
         evs = meaning.events_of(items, self.tz, self.name_fn())
@@ -225,6 +229,7 @@ class MeaningLive:
         out: dict[str, Want] = {}
         why: dict[str, dict] = {}
         seen: set = set()
+        self.places.begin()
         for ev in evs.values():
             j = meaning.last_good(meaning.stored(self.ledger, ev.key))
             if j is None:
@@ -253,10 +258,16 @@ class MeaningLive:
                         seen.add(moment)
                     key = _key(occ, run)
                     place = "school" if run in ("drop", "pick") else _place(j, b.type)
+                    where = ""
+                    if b.type == "presence" and place not in NOT_THERE:
+                        # The event's own location, whether or not the judgment named it: a
+                        # street address in it, else his place book, else the map by its name
+                        # (`find`). A place none of them knows is asked about once (places.py).
+                        where, ask = self.places.resolve(occ.location, find)
+                        if ask:
+                            self.places.unresolved(occ.location, occ.summary, b.start)
                     out[key] = Want(key, b.title, b.start, b.end,
-                                    "me" if b.type == "presence" else "", b.state,
-                                    _street(occ.location) if b.type == "presence" and place == "event_location"
-                                    else "",
+                                    "me" if b.type == "presence" else "", b.state, where,
                                     not any(x.type == "transport" for x in blocks))
                     why[key] = {"kind": kind_key(ev), "said": meaning.shown(occ.summary),
                                 "words": sorted(family_rules.words(occ.summary)),
@@ -357,6 +368,8 @@ class MeaningLive:
             return self._answer(rid, code)
         if kind == "meaning_undo" and code in UNDOS:
             return self._undo(rid, code)
+        if kind == "place_skip":
+            return self.places.on_choice(kind, target)
         return "Nothing changed."
 
     def _example(self, f: dict, source: str, types: list[str], **kw) -> str:
@@ -423,6 +436,7 @@ class MeaningLive:
             if paused or self.chat_id is None or not self.on():
                 return
             self._ask()
+            self.places.ask(self.chat_id, self.ledger.now())    # where a named place is, once each
         except Exception as e:
             log.warning("meaning questions failed: %s", type(e).__name__)
             self.ledger.event("meaning_live_failed", {"error": type(e).__name__})

@@ -465,7 +465,7 @@ def test_keeper_sh_posts_the_table(tmp_path):
 def test_keeper_sh_meanings_is_wired_like_the_other_routes():
     script = (ROOT / "cain/rootfs/opt/cain/keeper.sh").read_text()
     code = "\n".join(l for l in script.splitlines() if not l.strip().startswith("#"))
-    assert "handover|digest|meanings)" in code and "ctx=harness-handover-v1" in code
+    assert "handover|digest|meanings|places)" in code and "ctx=harness-handover-v1" in code
     assert "/meanings" in handover.ROUTES
     rules = (ROOT / "cain/rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "areas/family/calendar-meanings.md" in rules and "/opt/cain/keeper.sh meanings" in rules
@@ -977,7 +977,10 @@ def test_a_name_link_or_call_writes_no_place_and_no_drive(drives, place):
     go(drives)
     go(drives)
     assert blocks(drives) == [("Busy (family)", start, start + 60 * M, "")]
-    assert drives.maps.urls == []
+    # A name the map doesn't know near home (places.py, test_places.py) is looked up once, by
+    # itself; a link or a call never is.
+    sent = [parse_qs(urlsplit(u).query)["q"][0] for u in drives.maps.urls]
+    assert sent == ([place] if place.startswith("Dr") else [])
 
 
 def test_no_home_no_drive_but_the_place_still_goes_on(drives):

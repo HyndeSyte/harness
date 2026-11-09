@@ -7,6 +7,10 @@
 #                                        table in areas/family/calendar-meanings.md (rows of
 #                                        | kind words | kids/me/school/drive/none | YYYY-MM-DD |)
 #                                        or a JSON list of {kind, meaning, said_on}
+#   keeper.sh places <file>              send Dane's place book: the table in
+#                                        areas/home/places.md (rows of
+#                                        | place name | street address, "lat, lon" or skip | YYYY-MM-DD |)
+#                                        or a JSON list of {place, address, said_on}
 #   keeper.sh show <card id>             show a specialist's card to Dane, unchanged
 #   keeper.sh ask "question" "opt" ...   ask with up to 5 buttons; his tap comes back relayed
 #   keeper.sh morning "text" ["opt" ...] post the one morning message (with Stop)
@@ -14,11 +18,11 @@ set -u
 dir=/data/.claude/channels/discord
 cmd="${1:-handover}"; shift || true
 case "$cmd" in
-  handover|digest|meanings) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
+  handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|morning) url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
-if [ "$cmd" = meanings ] && [ ! -r "${1:-}" ]; then
+if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
 owner=$(jq -r '.allowFrom[0] // empty' "$dir/access.json" 2>/dev/null)
@@ -48,6 +52,17 @@ case "$cmd" in
           gsub(/^[ \t]+|[ \t]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", m); gsub(/^[ \t]+|[ \t]+$/, "", d)
           if (m ~ /^(kids|me|school|drive|none)$/) print k "\t" m "\t" d
         }' "$1" | jq -Rnc '{rows: [inputs | split("\t") | {kind: .[0], meaning: .[1], said_on: .[2]}]}')
+    fi ;;
+  places)
+    # The whole book each time: it replaces what the specialist had.
+    if jq -e 'type == "array" or type == "object"' "$1" >/dev/null 2>&1; then
+      body=$(jq -c 'if type == "array" then {rows: .} else {rows: (.rows // [])} end' "$1")
+    else
+      body=$(awk -F'|' 'NF >= 5 {
+          p = $2; a = $3; d = $4
+          gsub(/^[ \t]+|[ \t]+$/, "", p); gsub(/^[ \t]+|[ \t]+$/, "", a); gsub(/^[ \t]+|[ \t]+$/, "", d)
+          if (d ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) print p "\t" a "\t" d
+        }' "$1" | jq -Rnc '{rows: [inputs | split("\t") | {place: .[0], address: .[1], said_on: .[2]}]}')
     fi ;;
   show)     body=$(jq -nc --arg i "${1:-}" '{id: ($i | tonumber? // 0)}') ;;
   *)        text="${1:-}"; shift || true

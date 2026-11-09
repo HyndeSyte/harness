@@ -33,12 +33,14 @@ With the `meaning_live` option on (meaning_live.py), the wants come from what ea
 was judged to mean instead of the title rules and the two options; everything below that
 decides how and whether to write stays as it is. Off, nothing here changes.
 
-In live mode, an event he goes to himself, at a street address, also gets its drive: a block
+In live mode, an event he goes to himself, at a place that resolves (a street address in its
+location, his place book, or the map by name near home: places.py), also gets its drive: a block
 "Busy (drive there)" ending as it starts and one "Busy (drive back)" starting as it ends, never
 added to the event's own block, which keeps the event's times. Drives run from home (the
 `home_location` option) unless two events in a day are too close to go home between them, in
-which case it's straight from one to the next. The event's own block carries its street address,
-and only that, so it opens in Maps; that place is ours, and it's compared with what was written,
+which case it's straight from one to the next. The event's own block carries its street address
+(after the place's name, when the map found it by name) or map point, and only that, so it opens
+in Maps; that place is ours, and it's compared with what was written,
 so it never makes the block look edited.
 """
 from __future__ import annotations
@@ -413,7 +415,7 @@ class FamilyGmail:
         self.leg_note = ""
         if self._live_on():
             # What each event was judged to mean, model-free here: the judgments are stored.
-            judged = self.live.wants(family.items, now)
+            judged = self.live.wants(family.items, now, find=getattr(self.drives, "find_place", None))
             self.dropped = set()
             self._last = None
             runs = {k: w for k, w in judged.items() if w.title in _RUN_TITLES}
