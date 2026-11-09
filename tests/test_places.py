@@ -341,6 +341,7 @@ PLACE_ROW = {"place": "HMLC", "address": "12 Rink Rd, Leesburg, VA 20175", "said
     ({"rows": [{**PLACE_ROW, "place": " ".join(f"w{n}" for n in range(9))}]}, "row 1: place must be"),
     ({"rows": [PLACE_ROW, {**PLACE_ROW, "said_on": "soon"}]}, "row 2: said_on"),
     ({"rows": [{**PLACE_ROW, "said_on": "2099-01-01"}]}, "row 1: said_on must not be in the future"),
+    ({"rows": []}, "an empty table would wipe the place book"),
 ])
 def test_the_place_book_is_checked_strictly(body, why):
     rows, reason = places.validate_rows(body)

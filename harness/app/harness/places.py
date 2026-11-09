@@ -71,6 +71,9 @@ def validate_rows(body) -> tuple[list[dict] | None, str]:
         return None, "rows must be a list"
     if len(rows) > MAX_ROWS:
         return None, f"at most {MAX_ROWS} rows"
+    if not rows:
+        # A send replaces the book: an empty one is far likelier a bad read than his word.
+        return None, "an empty table would wipe the place book; nothing changed"
     today = datetime.now().date()
     out = []
     for n, row in enumerate(rows, 1):
