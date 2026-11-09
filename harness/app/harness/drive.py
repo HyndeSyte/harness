@@ -1,10 +1,13 @@
-"""How long the drive is between the school and an event's address, for school runs.
+"""How long a drive is: from the school to an event's address, for school runs, and between home
+and his events' addresses, for his drive blocks.
 
 OpenStreetMap's free services turn an address into a place and two places into a drive time,
 with no account and no key. They get a street address and map points only. The address is
 built from what's recognized as a house number, a street, and a town and state, so a name
 or note beside it stays behind, and a place with no street in it isn't sent at all. Each
-answer is kept, so an address goes out once. Nothing here decides anything (family_gmail.py).
+answer is kept, so an address goes out once. Home, from the add-on's settings, can be map
+coordinates ("lat, lon"), which are used as they are and never looked up. Nothing here decides
+anything (family_gmail.py).
 """
 from __future__ import annotations
 
@@ -32,6 +35,7 @@ AROUND_SCHOOL = 1.0               # degrees: prefer a match this close, for an a
 
 NO_ADDRESS = "no address"
 FAILED = "failed"
+HOME = "home"                     # between(): his home, from the add-on's settings
 
 _ONLINE = re.compile(r"://|\b(?:zoom|teams|webex|google meet|telehealth|virtual|online)\b", re.I)
 _IN_BRACKETS = re.compile(r"\((\d[^()]*)\)")
@@ -45,6 +49,20 @@ _TOWN_STATE = re.compile(r"\s*,\s*(?:([A-Za-z][A-Za-z .'-]{1,40}?)\s*,\s*)?([A-Z
 
 def is_online(place: str) -> bool:
     return bool(_ONLINE.search(place or ""))
+
+
+_COORDS = re.compile(r"\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*")
+
+
+def coordinates(text: str) -> str:
+    """"lat, lon" as the route service wants it, "lon,lat". Empty when it isn't that."""
+    m = _COORDS.fullmatch(text or "")
+    if not m:
+        return ""
+    lat, lon = float(m.group(1)), float(m.group(2))
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return ""
+    return f"{lon},{lat}"
 
 
 def street_address(place: str) -> str:
@@ -66,11 +84,12 @@ def street_address(place: str) -> str:
 
 
 class Drives:
-    def __init__(self, ledger: Ledger, transport: Transport, school_fn, *, sleep=time.sleep,
-                 clock=time.monotonic):
+    def __init__(self, ledger: Ledger, transport: Transport, school_fn, *, home_fn=lambda: "",
+                 sleep=time.sleep, clock=time.monotonic):
         self.ledger = ledger
         self.transport = transport
         self.school_fn = school_fn         # the school's address, from the add-on's settings
+        self.home_fn = home_fn             # his home: "lat, lon" or a street address, the same
         self.sleep = sleep
         self.clock = clock
         self.begin()
@@ -87,6 +106,64 @@ class Drives:
     def misread(self) -> bool:
         """Something's entered for the school, and it can't be used."""
         return bool((self.school_fn() or "").strip()) and not self.on()
+
+    def home_on(self) -> bool:
+        return self._spot(HOME) is not None
+
+    def home_misread(self) -> bool:
+        """Something's entered for home, and it can't be used."""
+        return bool((self.home_fn() or "").strip()) and not self.home_on()
+
+    def _spot(self, where: str) -> tuple[str, str, str] | None:
+        """(what it's kept under, map point, street address): one of the last two. Only the
+        recognized parts ever go out, as with an event's place."""
+        text = (self.home_fn() or "") if where == HOME else where
+        point = coordinates(text)
+        if point:
+            return "@" + point, point, ""
+        address = street_address(text)
+        return (address.casefold(), "", address) if address else None
+
+    def between(self, origin: str, destination: str) -> float | str:
+        """The drive from one place to another, or NO_ADDRESS, or FAILED. Either can be HOME,
+        map coordinates, or an event's place. Home that can't be used is FAILED: that's the
+        setting's trouble, not the event's."""
+        ends = []
+        for where in (origin, destination):
+            spot = self._spot(where)
+            if spot is None:
+                return FAILED if where == HOME else NO_ADDRESS
+            ends.append(spot)
+        (a_id, a_point, a_address), (b_id, b_point, b_address) = ends
+        if a_id == b_id:
+            return 0.0
+        key = "drive_between:" + _hash(a_id + "|" + b_id)
+        kept = self.ledger.get_meta(key)
+        if kept is not None:
+            return self._read(kept)
+        near = self._near()
+        points = []
+        for where, point, address in ((origin, a_point, a_address), (destination, b_point, b_address)):
+            found = point or self._locate(address, near=near)
+            if found == NO_ADDRESS or found == FAILED:
+                return FAILED if where == HOME else found
+            points.append(found)
+        found = self._route(*points)
+        if found == FAILED:
+            return FAILED
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(key, found, db)
+        return self._read(found)
+
+    def _near(self) -> str:
+        """Where an address with no town is most likely to be: near home, else near the school."""
+        for spot in (self._spot(HOME), self._spot(self.school_fn() or "")):
+            if spot is None:
+                continue
+            found = spot[1] or self._locate(spot[2])
+            if found not in (NO_ADDRESS, FAILED):
+                return found
+        return ""
 
     def minutes(self, place: str) -> float | str:
         """The drive from the school to this place, or NO_ADDRESS, or FAILED."""

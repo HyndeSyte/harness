@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.6
+
+- Family events you go to yourself now get their drive time on your Gmail, as separate blocks: "Busy (drive there)" ending when the event starts, and "Busy (drive back)" starting when it ends. The event's own block keeps its real start and end, so you can still see when it begins.
+- Drives start and end at home, unless two events on the same day are too close to go home between them. Then it's one drive straight from the first to the second, and no drive home after the first.
+- The event's block now carries its street address, so tapping it on your phone opens Google Maps. Only the street address goes on it, never a name or note from Family. Calls and links get no address and no drive.
+- New setting `home_location`: your home, as map coordinates ("38.5, -78.5") or a street address. Empty leaves drive blocks off.
+- If a drive time can't be found, that drive block is left off and your digest names the event's day and time.
+
 ## 0.19.5
 
 - No more "and N more": the digest, the mail-dates note and the Family notes name every item, so nothing is hidden behind a count you can't open on your phone.

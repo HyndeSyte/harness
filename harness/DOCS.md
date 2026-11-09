@@ -272,8 +272,8 @@ address. Before its first block it puts one test event on Gmail, 45 days out, an
 If Google refuses, the digest says so and nothing else happens. `/stop` stops it, and `/status` says
 how many blocks are on Gmail.
 
-- **What Gmail gets:** your title and the times, marked private. No text from Family, guests or
-  invitation emails. Your calendar's default reminders still apply to it.
+- **What Gmail gets:** your title and the times, marked private, and in live mode an event's street
+  address (see Drive blocks). No other text from Family, guests or invitation emails. Your calendar's default reminders still apply to it.
 - **Moved or cancelled** on Family, the block follows.
 - **Edited or removed on Gmail:** a block you edit in any way (the time, a note, a guest) is left
   alone from then on. A block you remove isn't put back.
@@ -300,6 +300,13 @@ how many blocks are on Gmail.
   When it can't tell and it matters in the next two weeks, Cain shows you one question with buttons.
   Each new block gets a card with Not mine, Wrong time and Just this once. Turn it off to go straight
   back to the title rules. All the limits and safety above still apply.
+- **Drive blocks (live):** an event you go to yourself, at a street address, gets its street address
+  on its block (only that, never a name or note from Family, so it opens in Maps) and, with
+  `home_location` set ("lat, lon" or a street address), separate "Busy (drive there)" and
+  "Busy (drive back)" blocks around it. The event's block keeps its own times. Two events on the same
+  day too close to go home between them get one drive straight from the first to the second. A drive
+  that can't be found is left off, and the digest names the event's day and time. A place you type
+  on a block makes it yours, like any other edit.
 
 ## Links from instrument cards
 

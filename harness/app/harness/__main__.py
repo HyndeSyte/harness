@@ -29,7 +29,7 @@ from . import commands, handover
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
-from .family_gmail import FamilyGmail, rules_from_options, school_address_from_options, school_from_options
+from .family_gmail import FamilyGmail, home_from_options, rules_from_options, school_address_from_options, school_from_options
 from .ledger import Ledger
 from .mail_dates import MailDates, option_on as mail_option_on
 from .mirror_shadow import read_days
@@ -122,7 +122,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                school_fn=lambda: school_from_options(data_dir),
                                said_fn=lambda: family_rules.load(ledger),
                                drives=drive.Drives(ledger, MapTransport(drive.HOSTS),
-                                                   lambda: school_address_from_options(data_dir)),
+                                                   lambda: school_address_from_options(data_dir),
+                                                   home_fn=lambda: home_from_options(data_dir)),
                                tz=base.timezone, live=live,
                                live_fn=lambda: meaning_live.live_on(data_dir))
     controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,

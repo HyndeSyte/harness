@@ -9,4 +9,4 @@ Design of record: DESIGN-v1.4 (2026-10-05), option A, chosen after four
 adversarial review rounds.
 """
 
-__version__ = "0.19.5"
+__version__ = "0.19.6"

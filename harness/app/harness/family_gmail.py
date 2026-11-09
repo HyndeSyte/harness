@@ -7,8 +7,9 @@ Gmail, which moves when it moves and goes when it goes, with no tap and no model
 
 The mirror image of family_copy.py, and it keeps the same safety:
 
-  * Gmail gets the fixed title he set and the times, never text from Family, and no
-    guest, place or update (google_cal.py). His own default reminders apply: they're
+  * Gmail gets the fixed title he set and the times, never text from Family but an
+    event's recognized street address (live mode, below), and no guest or update
+    (google_cal.py). His own default reminders apply: they're
     his, and a service account can't turn them off.
   * It changes only blocks it wrote. A block someone has since edited is left alone for
     good, and one someone removed, with its Family event still there, stays removed.
@@ -31,12 +32,21 @@ share that doesn't work costs nothing and says so.
 With the `meaning_live` option on (meaning_live.py), the wants come from what each Family event
 was judged to mean instead of the title rules and the two options; everything below that
 decides how and whether to write stays as it is. Off, nothing here changes.
+
+In live mode, an event he goes to himself, at a street address, also gets its drive: a block
+"Busy (drive there)" ending as it starts and one "Busy (drive back)" starting as it ends, never
+added to the event's own block, which keeps the event's times. Drives run from home (the
+`home_location` option) unless two events in a day are too close to go home between them, in
+which case it's straight from one to the next. The event's own block carries its street address,
+and only that, so it opens in Maps; that place is ours, and it's compared with what was written,
+so it never makes the block look edited.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import unicodedata
@@ -72,6 +82,9 @@ TEST_TRY = "family_gmail_test_try"
 READ_SIZE = "family_gmail_read_size"
 THIN_READS = "family_gmail_thin_reads"
 TEST_TITLE = "Busy (harness test, safe to delete)"
+# meaning.TITLE's drive legs (meaning.py imports this module, so they're spelled here too).
+DRIVE_THERE, DRIVE_BACK = "Busy (drive there)", "Busy (drive back)"
+MAYBE_DRIVE = {DRIVE_THERE: "Maybe busy (drive there)", DRIVE_BACK: "Maybe busy (drive back)"}
 # The school runs, sure or maybe: the drive logic decides whether the run is his.
 _RUN_TITLES = frozenset({DROP_TITLE, PICK_TITLE, "Maybe busy (school drop-off)", "Maybe busy (school pickup)"})
 _TITLE_RE = re.compile(r"[^\W_]+(?:[ '&()+,.-]+[^\W_]+)*[ )]*")
@@ -129,13 +142,22 @@ def school_from_options(data_dir: str) -> tuple[str, ...]:
     return parse_school(value) if isinstance(value, str) else ()
 
 
-def school_address_from_options(data_dir: str) -> str:
+def _text_option(data_dir: str, name: str) -> str:
     try:
         with open(os.path.join(data_dir, "options.json"), encoding="utf-8") as f:
-            value = json.load(f).get("family_school_address", "")
+            value = json.load(f).get(name, "")
     except (OSError, ValueError, AttributeError):
         return ""
     return value.strip() if isinstance(value, str) else ""
+
+
+def school_address_from_options(data_dir: str) -> str:
+    return _text_option(data_dir, "family_school_address")
+
+
+def home_from_options(data_dir: str) -> str:
+    """Where his drives start and end: "lat, lon", or a street address."""
+    return _text_option(data_dir, "home_location")
 
 
 @dataclass(frozen=True)
@@ -146,6 +168,7 @@ class Want:
     end: datetime
     kind: str = ""                 # "me": only if Gmail doesn't already have him busy
     state: str = ""                # live meaning (meaning_live.py): "confirmed" | "provisional"
+    place: str = ""                # an event he goes to: its street address (drive.street_address)
 
 
 def _short(title: str) -> str:
@@ -240,17 +263,28 @@ def unruled(items: list[caldav.Item], rules: tuple[Rule, ...], school: tuple[str
     return sorted(first.values(), key=lambda x: x[1])
 
 
-def _intent(title: str, start: datetime, end: datetime) -> str:
-    return json.dumps([title, start.isoformat(), end.isoformat()])
+def _intent(title: str, start: datetime, end: datetime, place: str = "") -> str:
+    return json.dumps([title, start.isoformat(), end.isoformat(), place])
 
 
 def _was_sent(intent: str, block: google_cal.Block) -> bool:
-    """Google hands times back in the calendar's own offset, so compare moments."""
+    """Google hands times back in the calendar's own offset, so compare moments. One written
+    before blocks had places has none."""
     if not intent:
         return False
-    title, start, end = json.loads(intent)
+    title, start, end, *place = json.loads(intent)
     return block.title == title and _same(block.start, datetime.fromisoformat(start)) \
-        and _same(block.end, datetime.fromisoformat(end))
+        and _same(block.end, datetime.fromisoformat(end)) and block.location == (place[0] if place else "")
+
+
+def leg_key(key: str, leg: str) -> str:
+    """A drive's own key, fixed by its event's, and never the same as it."""
+    return hashlib.sha256(f"{key}|{leg}".encode()).hexdigest()[:32]
+
+
+def _leg_title(leg: str, state: str) -> str:
+    title = DRIVE_THERE if leg == "there" else DRIVE_BACK
+    return MAYBE_DRIVE.get(title, title) if state == "provisional" else title
 
 
 class FamilyGmail:
@@ -373,6 +407,9 @@ class FamilyGmail:
         if blocks is None:
             self._problem(self._said(why))
             return
+        if self.drives is not None:
+            self.drives.begin()            # one allowance of lookups for the whole read
+        self.leg_note = ""
         if self._live_on():
             # What each event was judged to mean, model-free here: the judgments are stored.
             judged = self.live.wants(family.items, now)
@@ -380,7 +417,8 @@ class FamilyGmail:
             self._last = None
             runs = {k: w for k, w in judged.items() if w.title in _RUN_TITLES}
             named = self._not_busy({k: w for k, w in judged.items() if k not in runs})
-            wants = {k: w for k, w in {**named, **self._school_runs(family.items, runs)}.items()
+            legs = self._drive_legs(named, now)
+            wants = {k: w for k, w in {**named, **legs, **self._school_runs(family.items, runs)}.items()
                      if w.end > now}
             self.asking = []               # questions go on their own cards (meaning_live.py)
         else:
@@ -400,7 +438,7 @@ class FamilyGmail:
         problem = self._follow(address, wants, {b.id: b for b in blocks}, now, until,
                                family.unreadable == 0, self._thin(len(family.items) - len(named)))
         added = self._add_new(address, wants)
-        self._problem(problem or added or self.school_note or self.me_note)
+        self._problem(problem or added or self.school_note or self.me_note or self.leg_note)
         confirm_soon(self.ledger, "family_gmail", self.calendar)
 
     def _school_runs(self, items: list[caldav.Item], runs: dict[str, Want] | None = None) -> dict[str, Want]:
@@ -423,8 +461,6 @@ class FamilyGmail:
         self._no_address: set[datetime] = set()
         self._no_lookup = False
         self._use_drives = self.drives is not None and self.drives.on()
-        if self.drives is not None:
-            self.drives.begin()
         now = self.ledger.now()
         # Soonest first, so a limit on lookups leaves the far-off days for the next read.
         free = {k: w for k, w in sorted(runs.items(), key=lambda kv: kv[1].start) if w.end > now
@@ -490,6 +526,91 @@ class FamilyGmail:
                 f"the events at {'; '.join(whens)} are"
             notes.append(f"Blocks on Gmail from Family: {which} near a school run with "
                          "no address I can use, so I kept the run. Add an address if it's far.")
+        return " ".join(notes)
+
+    def _drive_legs(self, wants: dict[str, Want], now: datetime) -> dict[str, Want]:
+        """The drives to and from the events he goes to, as their own blocks. In a day, in time
+        order: straight from one event to the next when there isn't time to go home between,
+        else home and out again. A drive that can't be found is left off, and the digest names
+        the event's time (nothing else from it)."""
+        drives = self.drives
+        if drives is None or not hasattr(drives, "between"):
+            return {}
+        if drives.home_misread():
+            self.leg_note = ("Blocks on Gmail from Family: home in the add-on's settings doesn't look like a "
+                             "street address or map coordinates (lat, lon), so drive blocks are off.")
+            return {}
+        if not drives.home_on():
+            return {}
+        zone = ZoneInfo(self.tz)
+        days: dict = {}
+        # Soonest first, so a limit on lookups leaves the far-off days for the next read.
+        for want in sorted((w for w in wants.values() if w.place and w.end > now), key=lambda w: w.start):
+            days.setdefault(want.start.astimezone(zone).date(), []).append(want)
+        out: dict[str, Want] = {}
+        failed: set[datetime] = set()
+        not_found: set[datetime] = set()
+
+        def minutes(origin: str, destination: str, event: Want) -> int | None:
+            found = drives.between(origin, destination)
+            if found == drive.FAILED:
+                failed.add(event.start)
+            elif found == drive.NO_ADDRESS:
+                not_found.add(event.start)
+            else:
+                return math.ceil(found)
+            return None
+
+        def leg(event: Want, which: str, start: datetime, end: datetime) -> None:
+            if end > start:
+                key = leg_key(event.key, which)
+                out[key] = Want(key, _leg_title(which, event.state), start, end, "", event.state)
+
+        for events in days.values():
+            prev: Want | None = None
+            for event in events:
+                there_from: str | None = drive.HOME
+                if prev is not None:
+                    back = minutes(prev.place, drive.HOME, prev)
+                    out_again = minutes(drive.HOME, event.place, event)
+                    if back is None or out_again is None:
+                        there_from = None          # can't tell which way he goes: no drive between
+                    elif event.start - prev.end < timedelta(minutes=back + out_again):
+                        there_from = prev.place    # no time to go home: straight on
+                    else:
+                        leg(prev, "back", prev.end, prev.end + timedelta(minutes=back))
+                if there_from is not None:
+                    there = minutes(there_from, event.place, event)
+                    if there is not None:
+                        start = event.start - timedelta(minutes=there)
+                        if there_from != drive.HOME:
+                            start = max(start, prev.end)   # straight on starts when the last one ends
+                        leg(event, "there", start, event.start)
+                prev = event
+            back = minutes(prev.place, drive.HOME, prev)
+            if back is not None:
+                leg(prev, "back", prev.end, prev.end + timedelta(minutes=back))
+        self.leg_note = self._leg_note(failed, not_found, now)
+        return out
+
+    def _leg_note(self, failed: set[datetime], not_found: set[datetime], now: datetime) -> str:
+        """Times only, each one named: nothing from the event itself goes in a note."""
+        zone = ZoneInfo(self.tz)
+
+        def which(times: set[datetime]) -> str:
+            whens = [f"{t:%b} {t.day}, {t.hour % 12 or 12}:{t:%M}"
+                     for t in (s.astimezone(zone) for s in sorted(times))]
+            return f"the event at {whens[0]}" if len(whens) == 1 else f"the events at {'; '.join(whens)}"
+
+        failed = {t for t in failed if t < now + NOTE_AHEAD}
+        not_found = {t for t in not_found - failed if t < now + NOTE_AHEAD}
+        notes = []
+        if failed:
+            notes.append(f"Blocks on Gmail from Family: couldn't look up the drive for {which(failed)}, "
+                         "so a drive block is missing. I'll try again at the next read.")
+        if not_found:
+            notes.append(f"Blocks on Gmail from Family: couldn't find a drive to {which(not_found)}, "
+                         "so a drive block is missing. Check the address on Family.")
         return " ".join(notes)
 
     def _thin(self, rest: int) -> bool:
@@ -596,14 +717,15 @@ class FamilyGmail:
                 continue
             if want is not None and self._landed(block, want):
                 # Already as it should be: a write whose answer was lost.
-                if not (_same(want.start, start) and _same(want.end, end) and want.title == title):
+                if not (_same(want.start, start) and _same(want.end, end) and want.title == title
+                        and want.place == row["place"]):
                     self._moved(row, want)
                 elif row["missing"]:
                     self._update(row, missing=0)
                 continue
             # A move whose answer was lost, with the event moved again since: still ours.
             if not _was_sent(row["intent"], block) and not (block.title == title and _same(block.start, start)
-                                 and _same(block.end, end)):
+                                 and _same(block.end, end) and block.location == row["place"]):
                 self._set(row, "hands_off")    # someone edited it: theirs now
                 continue
             if want is None:
@@ -618,8 +740,8 @@ class FamilyGmail:
             if not self._room():
                 waiting += 1
                 continue
-            self._update(row, intent=_intent(want.title, want.start, want.end))
-            out = self.google.move(address, block, want.title, want.start, want.end)
+            self._update(row, intent=_intent(want.title, want.start, want.end, want.place))
+            out = self.google.move(address, block, want.title, want.start, want.end, want.place)
             if out.kind == "ok":
                 self._moved(row, want)
             elif out.kind == "changed":
@@ -647,7 +769,7 @@ class FamilyGmail:
     @staticmethod
     def _landed(block: google_cal.Block, want: Want) -> bool:
         return block.title == want.title and _same(block.start, want.start) \
-            and _same(block.end, want.end)
+            and _same(block.end, want.end) and block.location == want.place
 
     def _absent(self, address: str, absent: list, family_clean: bool) -> str:
         """Gone from Gmail. One read can be wrong, and so can many gone at once for a while."""
@@ -706,7 +828,7 @@ class FamilyGmail:
 
     def _moved(self, row, want: Want) -> None:
         self._update(row, title=want.title, start=want.start.isoformat(), end=want.end.isoformat(),
-                     missing=0, intent="")
+                     place=want.place, missing=0, intent="")
         self._log("family_gmail_moved", row["key"])
         self.writes += 1
         if self.live is not None and want.state == "confirmed" \
@@ -734,7 +856,7 @@ class FamilyGmail:
             if not self._room():
                 return self._capped(len(new) - n)
             uid = google_cal.event_id(f"{want.key}:{generation}")
-            out = self.google.add(address, uid, want.title, want.start, want.end)
+            out = self.google.add(address, uid, want.title, want.start, want.end, want.place)
             if out.kind == "exists":
                 self._insert(want, uid, generation, "lost")    # that id's used up: the next one
             elif out.kind == "changed":
@@ -780,7 +902,7 @@ class FamilyGmail:
                 self.live.removed(rid)
                 continue
             if not block.plain or not (block.title == row["title"] and _same(block.start, start)
-                                       and _same(block.end, end)):
+                                       and _same(block.end, end) and block.location == row["place"]):
                 self._set(row, "hands_off")    # someone changed it: theirs now
                 self.live.removed(rid)
                 continue
@@ -801,13 +923,13 @@ class FamilyGmail:
         with self.ledger.tx() as db:
             db.execute(
                 "INSERT INTO family_gmail(key, event_id, generation, intent, title, start, end,"
-                " state, missing, created_at, updated_at) VALUES(?,?,?,'',?,?,?,?,0,?,?)"
+                " state, missing, created_at, updated_at, place) VALUES(?,?,?,'',?,?,?,?,0,?,?,?)"
                 " ON CONFLICT(key) DO UPDATE SET event_id=excluded.event_id,"
                 " generation=excluded.generation, intent='', title=excluded.title,"
                 " start=excluded.start, end=excluded.end, state=excluded.state, missing=0,"
-                " updated_at=excluded.updated_at",
+                " updated_at=excluded.updated_at, place=excluded.place",
                 (want.key, uid, generation, want.title, want.start.isoformat(),
-                 want.end.isoformat(), state, now, now))
+                 want.end.isoformat(), state, now, now, want.place))
 
     def _set(self, row, state: str) -> None:
         self._update(row, state=state)

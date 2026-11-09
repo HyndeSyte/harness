@@ -2,6 +2,7 @@
 
 All names are invented. No network: Family, Google, Cain's link and the model are fakes.
 """
+import hashlib
 import json
 import shutil
 import subprocess
@@ -9,19 +10,21 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness import caldav, choices, family_rules, handover, ical, meaning, meaning_live
-from harness.family_gmail import DROP_TITLE, FamilyGmail
+from harness import caldav, choices, drive, family_rules, handover, ical, meaning, meaning_live
+from harness.family_gmail import DROP_TITLE, FamilyGmail, _leg_title, home_from_options, leg_key
 from harness.ledger import Ledger
+from harness.net import HttpResponse, TransportError
 from conftest import Clock
 from fakes import FakeEngine, SyncExecutor, result
 from fake_caldav import FAMILY_PATH, no_network  # noqa: F401  (autouse)
 from test_family_add import Rig as FamilyRig, on, rig  # noqa: F401
 from test_family_copy import Feeds, GMAIL, NY, TZ, occ, seed, when
-from test_family_gmail import KEY, RULES, FakeGoogle, g  # noqa: F401
+from test_family_gmail import KEY, RULES, FakeGoogle, count, g  # noqa: F401
 from harness import google_cal
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -776,3 +779,288 @@ def test_a_judgment_from_before_features_were_kept_is_made_again_for_his_answer(
     lv.live.tick(paused=True)
     row = lv.ledger.db.execute("SELECT stale FROM meaning_judgments WHERE key='e:old'").fetchone()
     assert row["stale"] == 1
+
+
+# -- 7. drive blocks around an event he goes to (0.19.6) --------------------------------------------------
+
+HOME = "38.5, -78.5"                                          # map points: never looked up
+CLINIC = "2 Clinic Rd, Town, VA"
+PARK = "9 Park Ave, Town, VA"
+POINTS = {"home": "-78.5,38.5", CLINIC: "-78.4,38.4", PARK: "-78.3,38.3"}
+
+
+class Maps:
+    """OpenStreetMap's two services: an address to a point, and minutes between two points."""
+
+    def __init__(self):
+        self.minutes = {frozenset({"home", CLINIC}): 20, frozenset({"home", PARK}): 25,
+                        frozenset({CLINIC, PARK}): 15}
+        self.urls = []
+        self.fail = None
+
+    def request(self, method, url, *, headers=None, timeout=30):
+        self.urls.append(url)
+        if self.fail:
+            raise TransportError(self.fail)
+        parts = urlsplit(url)
+        named = {v: k for k, v in reversed(POINTS.items())}   # "home" names its point
+        if parts.hostname == drive.GEOCODE_HOST:
+            q = parse_qs(parts.query)["q"][0]
+            lon, lat = POINTS[q].split(",") if q in POINTS else (None, None)
+            body = f'[{{"lat": "{lat}", "lon": "{lon}"}}]' if lat else "[]"
+        else:
+            a, b = parts.path.split("/driving/")[1].split(";")
+            body = f'{{"routes": [{{"duration": {self.minutes[frozenset({named[a], named[b]})] * 60}}}]}}'
+        return HttpResponse(200, {}, body.encode())
+
+
+class ByTitle(FakeEngine):
+    """A judgment for each event, by its title, whatever order they're judged in."""
+
+    def __init__(self):
+        super().__init__("claude")
+        self.by = {}
+
+    def complete(self, *, system, user, schema):
+        self.calls.append({"system": system, "user": user, "schema": schema})
+        return next(r for title, r in self.by.items() if f"title: {title}" in user)
+
+
+@pytest.fixture
+def drives(live):
+    live.maps = Maps()
+    live.home = HOME
+    live.judge = ByTitle()
+    live.gm.drives = drive.Drives(live.ledger, live.maps, lambda: "", home_fn=lambda: live.home,
+                                  sleep=lambda s: None)
+    live.feeds.window.occurrences = [occ("Errand", when(live, days=20, hour=15))]   # Gmail is read
+    return live
+
+
+def _ics(uid, title, start, hours, place):
+    utc, fmt = start.astimezone(timezone.utc), "%Y%m%dT%H%M%SZ"
+    where = ["LOCATION:" + place.replace(",", "\\,")] if place else []
+    return "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{utc:{fmt}}",
+                        f"DTSTART:{utc:{fmt}}", f"DTEND:{utc + timedelta(hours=hours):{fmt}}",
+                        f"SUMMARY:{title}", *where, "END:VEVENT", "END:VCALENDAR"]) + "\r\n"
+
+
+def goes(rig, title, start, place, hours=1):
+    """A Family event he goes to himself, judged so, at a place. Seeded again, it moves."""
+    uid = "goes-" + hashlib.sha256(title.encode()).hexdigest()[:12]
+    path = f"{FAMILY_PATH}{uid}.ics"
+    rig.icloud.seed(path, _ics(uid, title, start, hours, place))
+    eid = answer_ex(rig, title, ["presence"])
+    rig.judge.by[title] = judged(ob("presence", start, start + timedelta(hours=hours), place="event_location"),
+                                 cites=[eid])
+    return path
+
+
+def blocks(rig):
+    """(title, start, end, place) on Gmail, by start."""
+    return sorted(((e["summary"], datetime.fromisoformat(e["start"]["dateTime"]),
+                    datetime.fromisoformat(e["end"]["dateTime"]), e.get("location", ""))
+                   for e in rig.google.live().values()), key=lambda b: (b[1], b[0]))
+
+
+def states(rig):
+    return {r["state"] for r in rig.ledger.db.execute("SELECT state FROM family_gmail")}
+
+
+M = timedelta(minutes=1)
+
+
+def test_the_drive_is_its_own_blocks_and_the_event_keeps_its_times(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, "The Eye Clinic, " + CLINIC)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 20 * M, start, ""),
+        ("Busy (family)", start, start + 60 * M, CLINIC),             # the street address only
+        ("Busy (drive back)", start + 60 * M, start + 80 * M, "")]
+    # Home is map points: only the clinic's street address was looked up, never its name.
+    asked = [parse_qs(urlsplit(u).query)["q"][0] for u in drives.maps.urls if drive.GEOCODE_HOST in u]
+    assert asked == [CLINIC]
+
+
+def test_too_close_to_go_home_drives_straight_on(drives):
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    goes(drives, "Eye doctor", a, CLINIC)
+    goes(drives, "Swim lesson", b, PARK)
+    go(drives)
+    go(drives)
+    # Home and out again is 20 + 25 minutes, more than the half hour between: clinic to park.
+    assert blocks(drives) == [
+        ("Busy (drive there)", a - 20 * M, a, ""),
+        ("Busy (family)", a, a + 60 * M, CLINIC),
+        ("Busy (drive there)", b - 15 * M, b, ""),
+        ("Busy (family)", b, b + 60 * M, PARK),
+        ("Busy (drive back)", b + 60 * M, b + 85 * M, "")]
+
+
+def test_time_enough_goes_home_between(drives):
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=14)
+    goes(drives, "Eye doctor", a, CLINIC)
+    goes(drives, "Swim lesson", b, PARK)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", a - 20 * M, a, ""),
+        ("Busy (family)", a, a + 60 * M, CLINIC),
+        ("Busy (drive back)", a + 60 * M, a + 80 * M, ""),
+        ("Busy (drive there)", b - 25 * M, b, ""),
+        ("Busy (family)", b, b + 60 * M, PARK),
+        ("Busy (drive back)", b + 60 * M, b + 85 * M, "")]
+
+
+def test_the_place_is_ours_so_the_block_still_follows_and_goes(drives):
+    start = when(drives, days=3, hour=10)
+    path = goes(drives, "Eye doctor", start, CLINIC)
+    seed(drives, "Book club", when(drives, days=9))           # Family isn't otherwise empty
+    drives.judge.by["Book club"] = judged()
+    go(drives)
+    go(drives)
+    writes = len(drives.google.writes())
+    go(drives)                                               # the place we wrote isn't his edit
+    assert len(drives.google.writes()) == writes and states(drives) == {"live"}
+    later = when(drives, days=4, hour=13)
+    goes(drives, "Eye doctor", later, CLINIC)                 # moved on Family
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", later - 20 * M, later, ""),
+        ("Busy (family)", later, later + 60 * M, CLINIC),
+        ("Busy (drive back)", later + 60 * M, later + 80 * M, "")]
+    assert states(drives) == {"live"} and count(drives, "family_gmail_moved") == 3
+    del drives.icloud.events[path]                            # cancelled on Family
+    go(drives)
+    assert len(blocks(drives)) == 3                           # never on one read
+    go(drives)
+    assert blocks(drives) == [] and states(drives) == {"cancelled"}
+
+
+def test_a_new_address_moves_the_place_with_it(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)
+    goes(drives, "Eye doctor", start, PARK)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 25 * M, start, ""),
+        ("Busy (family)", start, start + 60 * M, PARK),
+        ("Busy (drive back)", start + 60 * M, start + 85 * M, "")]
+    assert states(drives) == {"live"}
+
+
+def test_a_place_he_types_on_the_block_makes_it_his(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)
+    uid = next(k for k, e in drives.google.live().items() if e["summary"] == "Busy (family)")
+    drives.google.hand_edit(uid, location="Back entrance, 2 Clinic Rd")
+    goes(drives, "Eye doctor", start + timedelta(hours=2), CLINIC)
+    go(drives)
+    go(drives)
+    row = drives.ledger.db.execute("SELECT state FROM family_gmail WHERE event_id=?", (uid,)).fetchone()
+    assert row["state"] == "hands_off"
+    assert drives.google.live()[uid]["location"] == "Back entrance, 2 Clinic Rd"
+
+
+@pytest.mark.parametrize("place", ["Dr Patel's office", "https://example.com/visit", "Zoom call, 2 Clinic Rd"])
+def test_a_name_link_or_call_writes_no_place_and_no_drive(drives, place):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, place)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [("Busy (family)", start, start + 60 * M, "")]
+    assert drives.maps.urls == []
+
+
+def test_no_home_no_drive_but_the_place_still_goes_on(drives):
+    drives.home = ""
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [("Busy (family)", start, start + 60 * M, CLINIC)]
+    assert drives.maps.urls == []
+
+
+def test_a_home_it_cant_read_says_so(drives):
+    drives.home = "the farm"
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (family)"]
+    assert "home in the add-on's settings doesn't look like" in drives.ledger.get_meta("family_gmail_problem")
+
+
+def test_home_as_a_street_address_is_looked_up_once(drives):
+    drives.home = "5 Farm Ln, Town, VA"
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    POINTS["5 Farm Ln, Town, VA"] = POINTS["home"]            # the map finds home where it is
+    try:
+        go(drives)
+        go(drives)
+    finally:
+        del POINTS["5 Farm Ln, Town, VA"]
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (family)", "Busy (drive back)"]
+    asked = [parse_qs(urlsplit(u).query)["q"][0] for u in drives.maps.urls if drive.GEOCODE_HOST in u]
+    assert sorted(asked) == sorted({CLINIC, "5 Farm Ln, Town, VA"})
+
+
+def test_a_lookup_that_fails_leaves_the_drive_off_and_says_so(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    drives.maps.fail = "timeout"
+    go(drives)
+    go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (family)"]
+    note = drives.ledger.get_meta("family_gmail_problem")
+    local = start.astimezone(NY)
+    assert note == ("Blocks on Gmail from Family: couldn't look up the drive for the event at "
+                    f"{local:%b} {local.day}, {local.hour % 12 or 12}:{local:%M}, so a drive block is missing. "
+                    "I'll try again at the next read.")
+    assert "Eye" not in note and "Clinic" not in note and "more" not in note
+    drives.maps.fail = None
+    go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (family)", "Busy (drive back)"]
+    assert not drives.ledger.get_meta("family_gmail_problem")
+
+
+def test_a_place_the_map_cant_find_leaves_the_drive_off_and_says_so(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, "40 Nowhere Rd, Town, VA")
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [("Busy (family)", start, start + 60 * M, "40 Nowhere Rd, Town, VA")]
+    assert "couldn't find a drive to the event at" in drives.ledger.get_meta("family_gmail_problem")
+
+
+def test_the_drive_keys_are_fixed_and_not_the_events():
+    k = "a" * 32
+    assert leg_key(k, "there") == leg_key(k, "there") != leg_key(k, "back") != k
+    assert len(leg_key(k, "there")) == 32
+
+
+def test_a_maybe_events_drives_are_maybe_too():
+    assert _leg_title("there", "provisional") == meaning.MAYBE[meaning.TITLE["drive_there"]]
+    assert _leg_title("back", "confirmed") == meaning.TITLE["drive_back"]
+
+
+def test_home_is_read_from_the_options(tmp_path):
+    assert home_from_options(str(tmp_path)) == ""
+    (tmp_path / "options.json").write_text('{"home_location": " 38.5, -78.5 "}')
+    assert home_from_options(str(tmp_path)) == "38.5, -78.5"
+
+
+def test_home_and_places_as_the_drive_service_takes_them():
+    assert drive.coordinates("38.5, -78.5") == "-78.5,38.5"
+    assert drive.coordinates("38.5,-78.5") == "-78.5,38.5"
+    assert drive.coordinates("138.5, -78.5") == "" and drive.coordinates("5 Farm Ln") == ""

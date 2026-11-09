@@ -5,9 +5,10 @@ sign-in to go stale, and it reaches only what he shared. Its key is kept like an
 (vault.py). The standard library has no RSA, so signing the sign-in token is done here:
 it is one modular exponent, and the only thing it signs is that token.
 
-Nothing here can add an attendee, a repeat, a place or a description: the event is built
-here from a title and two times, and no update ever goes out. It asks for no reminder, but
-Google still applies his defaults, which a service account can't change. Every event
+Nothing here can add an attendee, a repeat or a description: the event is built here from a
+title, two times and, for an event he goes to, its street address and nothing else
+(drive.street_address: anything more is refused), and no update ever goes out. It asks for
+no reminder, but Google still applies his defaults, which a service account can't change. Every event
 carries a mark, and an id of a form only this code makes, so the sync can't change or
 delete an event it didn't write: list_ours returns only marked ones, and its writes
 refuse any other id. Only the methods marked for calendar_change.py reach other events, and
@@ -29,7 +30,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import quote, urlencode
 
-from . import ical
+from . import drive, ical
 from .net import REDACT, TransportError
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -165,7 +166,8 @@ class Block:
     title: str
     start: datetime
     end: datetime
-    plain: bool = True     # still only what this code wrote
+    plain: bool = True     # still only what this code wrote, but for its place
+    location: str = ""     # its place as Google has it: the caller knows what it wrote there
 
 
 FREE_PREFIX = "Maybe busy"                  # a provisional block (meaning.py): shown free
@@ -178,9 +180,13 @@ def shown_free(title: str) -> bool:
     return title.startswith(FREE_PREFIX) or title in FREE_TITLES
 
 
-def _plain(event: dict) -> bool:
-    """A note, a place, a guest, a color, a reminder or a shown-as change makes it his."""
-    if any(event.get(k) for k in ("description", "location", "attendees", "colorId")):
+def _plain(event: dict, location: str | None = None) -> bool:
+    """A note, a guest, a color, a reminder or a shown-as change makes it his. So does a place
+    other than the one written, when that's given; when it isn't, the caller compares the
+    place itself (Block.location), since only it knows what it wrote."""
+    if any(event.get(k) for k in ("description", "attendees", "colorId")):
+        return False
+    if location is not None and str(event.get("location") or "").strip() != location:
         return False
     if (event.get("reminders") or {}).get("overrides"):
         return False
@@ -188,8 +194,14 @@ def _plain(event: dict) -> bool:
     return event.get("visibility") in (None, "private") and event.get("transparency") in shown_as
 
 
-def _body(uid: str, title: str, start: datetime, end: datetime) -> dict:
-    return {"id": uid, "summary": title, "status": "confirmed",
+def _sound_place(location: str) -> bool:
+    """Only a recognized street address, exactly as drive.py cuts it: never a name or a note."""
+    return not location or drive.street_address(location) == location
+
+
+def _body(uid: str, title: str, start: datetime, end: datetime, location: str = "") -> dict:
+    place = {"location": location} if location else {}
+    return {"id": uid, "summary": title, "status": "confirmed", **place,
             "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
             "visibility": "private", "transparency": "transparent" if shown_free(title) else "opaque",
             "reminders": {"useDefault": False},
@@ -398,7 +410,8 @@ class GoogleCalendar:
                         out.append(Block(event["id"], event["etag"], event.get("summary", ""),
                                          datetime.fromisoformat(event["start"][side]),
                                          datetime.fromisoformat(event["end"][side]),
-                                         timed and _plain(event)))
+                                         timed and _plain(event),
+                                         str(event.get("location") or "").strip()))
                 following = page.get("nextPageToken")
             except (ValueError, KeyError, TypeError, AttributeError):
                 return None, Outcome("failed", r.status)   # not read is not empty
@@ -407,18 +420,19 @@ class GoogleCalendar:
             query["pageToken"] = following
         return None, Outcome("failed")         # more than it should ever be: don't guess
 
-    def add(self, address: str, uid: str, title: str, start: datetime, end: datetime) -> Outcome:
+    def add(self, address: str, uid: str, title: str, start: datetime, end: datetime,
+            location: str = "") -> Outcome:
         """A new block. Its id is fixed, so a write whose answer was lost finds itself rather
         than doubling, and is put right if the block has moved on since. "exists" is an id
         that can't be used: Google keeps a deleted one, and keeps next to nothing about it,
         so a block that comes back needs a new id (family_gmail.py)."""
         url = self._events(address)
-        if url is None or not _ID_RE.fullmatch(uid):
+        if url is None or not _ID_RE.fullmatch(uid) or not _sound_place(location):
             return Outcome("failed")
         token, problem = self._access()
         if token is None:
             return problem
-        body = _body(uid, title, start, end)
+        body = _body(uid, title, start, end, location)
         try:
             r = self._call(token, "POST", f"{url}?sendUpdates=none", body=body)
         except TransportError as e:
@@ -436,7 +450,7 @@ class GoogleCalendar:
             found = r.json()
             if not isinstance(found, dict) or not _ours(found) or found.get("status") == "cancelled":
                 return Outcome("exists", r.status)
-            if not _plain(found):
+            if not _plain(found, location):
                 return Outcome("changed", r.status)    # he got to it first: his now
             r = self._call(token, "PUT", f"{url}/{uid}?sendUpdates=none", body=body,
                            etag=found.get("etag"))
@@ -563,17 +577,18 @@ class GoogleCalendar:
         except (TransportError, ValueError, AttributeError):
             return False
 
-    def move(self, address: str, block: Block, title: str, start: datetime, end: datetime) -> Outcome:
+    def move(self, address: str, block: Block, title: str, start: datetime, end: datetime,
+             location: str = "") -> Outcome:
         """Only as it was just read."""
         url = self._events(address)
-        if url is None or not _ID_RE.fullmatch(block.id) or not block.etag:
+        if url is None or not _ID_RE.fullmatch(block.id) or not block.etag or not _sound_place(location):
             return Outcome("failed")
         token, problem = self._access()
         if token is None:
             return problem
         try:
             r = self._call(token, "PUT", f"{url}/{block.id}?sendUpdates=none",
-                           body=_body(block.id, title, start, end), etag=block.etag)
+                           body=_body(block.id, title, start, end, location), etag=block.etag)
         except TransportError as e:
             return Outcome("failed" if e.kind == "blocked" else "unknown")
         if r.status == 200:

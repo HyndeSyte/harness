@@ -40,7 +40,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import choices, family_rules, meaning, render
+from . import choices, drive, family_rules, meaning, render
 from .family_gmail import DROP_TITLE, PICK_TITLE, Want, _is_real, _key
 from .ledger import Ledger, iso
 
@@ -132,6 +132,12 @@ def kind_key(ev: meaning.Ev) -> str:
 
 def _occ_id(occ) -> str:
     return f"{occ.uid}|{occ.instance}"
+
+
+def _street(location: str) -> str:
+    """Where he goes, for its block and its drive: only a recognized street address, since
+    anyone with Family can write its place. Empty for a name, a link or a call."""
+    return "" if drive.is_online(location) else drive.street_address(location)
 
 
 def _place(j: meaning.Judgment, kind: str) -> str:
@@ -246,9 +252,11 @@ class MeaningLive:
                             continue       # two Family events for one day are one run
                         seen.add(moment)
                     key = _key(occ, run)
-                    out[key] = Want(key, b.title, b.start, b.end,
-                                    "me" if b.type == "presence" else "", b.state)
                     place = "school" if run in ("drop", "pick") else _place(j, b.type)
+                    out[key] = Want(key, b.title, b.start, b.end,
+                                    "me" if b.type == "presence" else "", b.state,
+                                    _street(occ.location) if b.type == "presence" and place == "event_location"
+                                    else "")
                     why[key] = {"kind": kind_key(ev), "said": meaning.shown(occ.summary),
                                 "words": sorted(family_rules.words(occ.summary)),
                                 "who": meaning.who_for(occ.summary),

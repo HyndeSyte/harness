@@ -225,3 +225,40 @@ def test_the_transport_goes_nowhere_else(method, url):
     with pytest.raises(TransportError) as e:
         MapTransport(drive.HOSTS).request(method, url)
     assert e.value.kind == "blocked"
+
+
+# -- 0.19.6: between any two places, home among them ----------------------------------------
+
+def test_from_home_as_map_points_only_the_event_address_is_looked_up(tmp_path, maps):
+    d = Drives(Ledger(str(tmp_path / "l.db")), maps, lambda: "", home_fn=lambda: "5.0, 6.0", sleep=lambda s: None)
+    assert d.between(drive.HOME, "The Clinic, 2 Clinic Rd, Town, VA") == 11
+    looked_up = [parse_qs(urlsplit(u).query)["q"][0] for u in maps.urls if drive.GEOCODE_HOST in u]
+    assert looked_up == ["2 Clinic Rd, Town, VA"]
+    assert maps.urls[-1].split("/driving/")[1].split("?")[0] == "6.0,5.0;4.0,3.0"
+    n = len(maps.urls)
+    assert d.between(drive.HOME, "2 Clinic Rd, Town, VA") == 11 and len(maps.urls) == n   # kept
+
+
+def test_between_two_addresses_and_back(tmp_path, maps):
+    maps.places["3 Mill Rd, Town, VA"] = (5.0, 6.0)
+    d = Drives(Ledger(str(tmp_path / "l.db")), maps, lambda: SCHOOL, sleep=lambda s: None)
+    assert d.between("2 Clinic Rd, Town, VA", "3 Mill Rd, Town, VA") == 11
+    assert maps.urls[-1].split("/driving/")[1].split("?")[0] == "4.0,3.0;6.0,5.0"
+    assert d.between("2 Clinic Rd, Town, VA", "The Clinic, 2 Clinic Rd, Town, VA") == 0
+
+
+def test_a_home_it_cant_use_is_failed_and_a_place_with_no_street_is_no_address(tmp_path, maps):
+    d = Drives(Ledger(str(tmp_path / "l.db")), maps, lambda: "", home_fn=lambda: "the farm", sleep=lambda s: None)
+    assert not d.home_on() and d.home_misread()
+    assert d.between(drive.HOME, "2 Clinic Rd, Town, VA") == FAILED
+    d.home_fn = lambda: "5.0, 6.0"
+    assert d.home_on() and not d.home_misread()
+    assert d.between(drive.HOME, "Bob's house") == NO_ADDRESS
+    assert maps.urls == []
+
+
+def test_between_logs_no_address(tmp_path, maps, caplog):
+    maps.fail = "timeout"
+    d = Drives(Ledger(str(tmp_path / "l.db")), maps, lambda: "", home_fn=lambda: "5.0, 6.0", sleep=lambda s: None)
+    assert d.between(drive.HOME, "2 Clinic Rd, Town, VA") == FAILED
+    assert "Clinic" not in caplog.text and "5.0" not in caplog.text

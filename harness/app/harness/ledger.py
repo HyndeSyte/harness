@@ -381,7 +381,9 @@ class Ledger:
             "meaning_judgments": (("candidates", "TEXT NOT NULL DEFAULT '[]'"),
                                   ("features", "TEXT NOT NULL DEFAULT '{}'"),
                                   ("stale", "INTEGER NOT NULL DEFAULT 0"),
-                                  ("good", "INTEGER NOT NULL DEFAULT 0"))}
+                                  ("good", "INTEGER NOT NULL DEFAULT 0")),
+            # 0.19.6: the street address written on a block, so his own edit to it still shows.
+            "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"),)}
         for table, cols in added.items():
             have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, decl in cols:
