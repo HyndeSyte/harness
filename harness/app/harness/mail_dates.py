@@ -744,10 +744,10 @@ class MailDates:
     def _tell(self, batch: str, landed: list[Found], moved: list[Found] = ()) -> None:
         if self.chat_id is None:
             return
-        lines = [f"{f.day:%a %b} {f.day.day}{_clock(f.at)}: {render.escape(title(f))}" for f in landed[:12]]
+        lines = [f"{f.day:%a %b} {f.day.day}{_clock(f.at)}: {render.escape(title(f))}" for f in landed]
         lines += [f"{f.day:%a %b} {f.day.day}: {render.escape(title(f))} (moved there, as the email says)"
                   for f in moved]
-        more = f"\n...and {len(landed) - 12} more" if len(landed) > 12 else ""
+        more = ""                              # every one, never "and N more"
         text = ("<b>From your mail, on your calendar:</b>\n" + "\n".join(lines) + more +
                 "\nFree, nothing at work. One with a time has your usual reminder; the rest have none.")
         with self.ledger.tx() as db:

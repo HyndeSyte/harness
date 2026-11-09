@@ -207,12 +207,12 @@ def test_unknown_is_never_clear(kw, expect):
     assert d.state == "attention" and expect in d.text and "Clear" not in d.text
 
 
-def test_decision_lists_at_most_three_oldest_first():
+def test_decision_lists_every_one_oldest_first():
     waits = [digest.Waiting(f"item {i}", NOW - timedelta(hours=i)) for i in range(1, 6)]
     d = compose(waiting=waits)
     assert d.state == "decision"
     lines = d.text.splitlines()
-    assert lines[1].startswith("1. item 5") and "…and 2 more" in d.text
+    assert lines[1].startswith("1. item 5") and "5. item 1" in d.text and "more" not in d.text
 
 
 def test_digest_is_deterministic():

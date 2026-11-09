@@ -1052,16 +1052,16 @@ def test_two_given_up_rows_on_one_event_only_one_comes_back(copy):
 def test_an_odd_record_cannot_cost_the_digest(copy, detail):
     with copy.ledger.tx() as db:
         copy.ledger.event("family_copy_left_alone", detail, db=db)
-    assert "and 1 more" in copy.copy.digest_line()
+    assert "1 whose record couldn't be read" in copy.copy.digest_line()
 
 
-def test_the_digest_names_ten_then_counts(copy):
+def test_the_digest_names_every_one(copy):
     with copy.ledger.tx() as db:
         for n in range(25):
             copy.ledger.event("family_copy_left_alone", {"key": f"k{n}", "word": "PT", "start": "2026-11-09",
                                                          "why": "edited"}, db=db)
     line = copy.copy.digest_line()
-    assert line.count("PT Nov 9") == 10 and "and 15 more" in line
+    assert line.count("PT Nov 9") == 25 and "more" not in line
 
 
 def test_a_problem_clears_when_copying_is_off(copy):

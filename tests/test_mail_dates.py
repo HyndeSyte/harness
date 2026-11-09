@@ -587,3 +587,15 @@ def test_an_appointment_written_all_day_before_moves_to_its_time_once(g):
     writes = len(g.google.writes())
     g.md.run(paused=False)
     assert len(g.google.writes()) == writes        # once
+
+
+def test_the_receipt_names_every_date_never_and_n_more(g):
+    subjects = [f"Your order {n}" for n in range(3)]
+    answers = {s: [{"what": f"Return {s} part {i}",
+                    "date": (date(2026, 11, 20) + timedelta(days=5 * n + i)).isoformat(),
+                    "kind": "window_closes"} for i in range(5)] for n, s in enumerate(subjects)}
+    rig_mail(g, [msg(n + 1, s) for n, s in enumerate(subjects)], answers)
+    read(g)
+    g.c.outbox.flush()
+    text = g.bot.sent[-1][1]
+    assert text.count("Last day: Return") == 15 and "more" not in text

@@ -46,7 +46,6 @@ MAX_HOURS = 8                  # longer than this isn't an appointment
 MAX_WRITES_PER_DAY = 12
 MAX_REMOVALS_AT_ONCE = 3
 MAX_FAILED_WRITES = 3          # in one read, before it stops trying until the next
-MAX_NAMED = 10                 # in the digest, which has a length limit of its own
 READS_BEFORE_REMOVING = 2
 STOP_AFTER_REMOVED = 2
 HOLD_READS = 6                 # three hours: long enough for a bad read to pass, then it's real
@@ -661,12 +660,9 @@ class FamilyCopy:
             except (ValueError, KeyError, TypeError, AttributeError):
                 more += 1                  # an odd record mustn't cost the morning's digest
                 continue
-            if len(said) < MAX_NAMED:
-                said.append(text)
-            else:
-                more += 1
+            said.append(text)              # every one by name, never "and N more"
         if more:
-            said.append(f"and {more} more")
+            said.append(f"{more} whose record couldn't be read")
         return "Left alone, check by hand: " + ", ".join(said) + "." if said else ""
 
     def _revive(self, family: caldav.Read, now: datetime, until: datetime) -> None:

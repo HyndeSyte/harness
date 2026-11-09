@@ -27,8 +27,6 @@ from zoneinfo import ZoneInfo
 
 from .render import escape, model_text
 
-MAX_ITEMS = 3
-MAX_AGENDA = 12
 
 
 @dataclass(frozen=True)
@@ -106,12 +104,9 @@ def compose(*, now: datetime, tz: str, inputs: list[InputCoverage],
         problems.append("config: changed or unverified")
 
     waits = sorted(waiting, key=lambda w: w.since)
-    shown = waits[:MAX_ITEMS]
-    more = len(waits) - len(shown)
+    # Every one, never "and N more": a count he can't open is no use to him.
     wait_lines = [f"{i}. {escape(w.summary)} (waiting {_ago(now, w.since)})"
-                  for i, w in enumerate(shown, 1)]
-    if more > 0:
-        wait_lines.append(f"…and {more} more")
+                  for i, w in enumerate(waits, 1)]
 
     facts = {"problems": len(problems), "waiting": len(waits),
              "failures": len(failures)}
@@ -189,7 +184,4 @@ def agenda_lines(a: Agenda, *, now: datetime, local: ZoneInfo) -> list[str]:
         if i in clash:
             line += " ⚠ overlaps"
         lines.append(line)
-    shown = lines[:MAX_AGENDA]
-    if len(lines) > MAX_AGENDA:
-        shown.append(f"…and {len(lines) - MAX_AGENDA} more")
-    return [head] + shown
+    return [head] + lines                  # all of the day, never "and N more"

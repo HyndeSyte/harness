@@ -283,11 +283,11 @@ def test_anyone_can_invite_him_so_titles_are_defanged_like_model_text():
     assert "x.example.org" not in t
 
 
-def test_long_days_are_cut_with_a_count():
+def test_a_long_day_lists_every_event():
     a = digest.Agenda([occ(6 + i // 2, 30 * (i % 2), 7 + i // 2, 0, f"E{i}")
                        for i in range(15)], 0, 1, 1)
     t = compose(a).text
-    assert "…and 3 more" in t and "E11" in t and "E12" not in t
+    assert "more" not in t and all(f"E{i}" in t for i in range(15))
 
 
 def test_unreadable_events_need_attention():

@@ -318,12 +318,11 @@ class FamilyGmail:
         if not new:
             return ""
         zone = ZoneInfo(self.tz)
-        shown = new[:MAX_ASKED]
+        shown = new[:MAX_ASKED]            # the rest are asked on another day, by name then
         family_rules.mark_asked(self.ledger, [t for t, _ in shown])
         named = [f"{render.defang(_short(t))} ({w.astimezone(zone):%b} {w.astimezone(zone).day})"
                  for t, w in shown]
-        more = f", and {len(new) - MAX_ASKED} more another day" if len(new) > MAX_ASKED else ""
-        return ("On Family with no rule yet: " + ", ".join(named) + more + ". If one ties you up, "
+        return ("On Family with no rule yet: " + ", ".join(named) + ". If one ties you up, "
                 "tell me, like \"Anything with Pat means I have the kids\". Ignore any that don't: "
                 "I won't ask again.")
 
@@ -484,10 +483,12 @@ class FamilyGmail:
             notes.append("Blocks on Gmail from Family: couldn't look up a drive time, so I kept the school "
                          "runs it was for. I'll try again at the next read.")
         if self._no_address:
-            first = min(self._no_address).astimezone(ZoneInfo(self.tz))
-            when = f"{first:%b} {first.day}, {first.hour % 12 or 12}:{first:%M}"
-            more = f", and {len(self._no_address) - 1} more," if len(self._no_address) > 1 else ""
-            notes.append(f"Blocks on Gmail from Family: the event at {when}{more} is near a school run with "
+            zone = ZoneInfo(self.tz)
+            whens = [f"{t:%b} {t.day}, {t.hour % 12 or 12}:{t:%M}"
+                     for t in (s.astimezone(zone) for s in sorted(self._no_address))]
+            which = f"the event at {whens[0]} is" if len(whens) == 1 else \
+                f"the events at {'; '.join(whens)} are"
+            notes.append(f"Blocks on Gmail from Family: {which} near a school run with "
                          "no address I can use, so I kept the run. Add an address if it's far.")
         return " ".join(notes)
 
