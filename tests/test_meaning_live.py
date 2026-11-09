@@ -1064,3 +1064,28 @@ def test_home_and_places_as_the_drive_service_takes_them():
     assert drive.coordinates("38.5, -78.5") == "-78.5,38.5"
     assert drive.coordinates("38.5,-78.5") == "-78.5,38.5"
     assert drive.coordinates("138.5, -78.5") == "" and drive.coordinates("5 Farm Ln") == ""
+
+
+def test_an_event_already_on_gmail_still_gets_its_drives(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    drives.feeds.window.occurrences.append(occ("Eye doctor", start))   # he put it on Gmail himself
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 20 * M, start, ""),
+        ("Busy (drive back)", start + 60 * M, start + 80 * M, "")]
+
+
+def test_an_event_judged_as_his_drive_gets_no_second_drive(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    drives.judge.by["Eye doctor"] = judged(
+        ob("presence", start, start + 60 * M, place="event_location"),
+        ob("transport", start - 30 * M, start, place="event_location",
+           rstart=(start + 60 * M).isoformat(), rend=(start + 90 * M).isoformat()),
+        cites=[answer_ex(drives, "Eye doctor", ["presence"])])
+    go(drives)
+    go(drives)
+    titles = [b[0] for b in blocks(drives)]
+    assert titles.count("Busy (drive there)") == 1 and titles.count("Busy (drive back)") == 1

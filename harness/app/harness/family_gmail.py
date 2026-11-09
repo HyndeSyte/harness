@@ -169,6 +169,7 @@ class Want:
     kind: str = ""                 # "me": only if Gmail doesn't already have him busy
     state: str = ""                # live meaning (meaning_live.py): "confirmed" | "provisional"
     place: str = ""                # an event he goes to: its street address (drive.street_address)
+    legs: bool = True              # False: the judgment already has him driving to it
 
 
 def _short(title: str) -> str:
@@ -416,8 +417,11 @@ class FamilyGmail:
             self.dropped = set()
             self._last = None
             runs = {k: w for k, w in judged.items() if w.title in _RUN_TITLES}
-            named = self._not_busy({k: w for k, w in judged.items() if k not in runs})
-            legs = self._drive_legs(named, now)
+            own = {k: w for k, w in judged.items() if k not in runs}
+            named = self._not_busy(own)
+            # From every event he goes to, even one Gmail already has him busy for: he often
+            # puts it there himself, and the drive is still his.
+            legs = self._drive_legs(own, now)
             wants = {k: w for k, w in {**named, **legs, **self._school_runs(family.items, runs)}.items()
                      if w.end > now}
             self.asking = []               # questions go on their own cards (meaning_live.py)
@@ -545,7 +549,7 @@ class FamilyGmail:
         zone = ZoneInfo(self.tz)
         days: dict = {}
         # Soonest first, so a limit on lookups leaves the far-off days for the next read.
-        for want in sorted((w for w in wants.values() if w.place and w.end > now), key=lambda w: w.start):
+        for want in sorted((w for w in wants.values() if w.place and w.legs and w.end > now), key=lambda w: w.start):
             days.setdefault(want.start.astimezone(zone).date(), []).append(want)
         out: dict[str, Want] = {}
         failed: set[datetime] = set()

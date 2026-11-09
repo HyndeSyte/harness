@@ -256,7 +256,8 @@ class MeaningLive:
                     out[key] = Want(key, b.title, b.start, b.end,
                                     "me" if b.type == "presence" else "", b.state,
                                     _street(occ.location) if b.type == "presence" and place == "event_location"
-                                    else "")
+                                    else "",
+                                    not any(x.type == "transport" for x in blocks))
                     why[key] = {"kind": kind_key(ev), "said": meaning.shown(occ.summary),
                                 "words": sorted(family_rules.words(occ.summary)),
                                 "who": meaning.who_for(occ.summary),
