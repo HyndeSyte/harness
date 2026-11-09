@@ -396,7 +396,9 @@ def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):
 def test_cains_morning_update_folds_in_the_digest():
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "/opt/cain/keeper.sh digest" in rules and '/opt/cain/keeper.sh morning "text"' in rules
-    assert "ONE message" in rules and "Relayed by the add-on" in rules
+    assert "ONE summary message, then one message per decision" in rules and "Relayed by the add-on" in rules
+    assert "section with \"and N more\"" not in rules        # nothing hidden behind a count
+    assert "never in the morning message" in rules and "Never show a card without buttons" in rules
     import json
     allow = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]["allow"]
     assert "Bash(/opt/cain/keeper.sh:*)" in allow

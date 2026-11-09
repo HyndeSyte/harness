@@ -49,6 +49,6 @@ RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.4.1" \
+    io.hass.version="0.4.2" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.2
+
+- The morning message is easier to read on your phone: clear section headers, and the top line says how many things need you.
+- Each decision now comes as its own message with its buttons right under it, so you always know what you're answering.
+- Needs you only has things you can do from your phone with a tap. If Cain or a cloud job could do something, he asks "Want me to do it?" instead. PC-only chores stay off the morning message; ask for the PC list when you're there.
+- Today shows everything on your calendars; no more "and 1 more". All-day items sit on one small line at the end.
+- No more questions pointing at a card that has already expired.
+
 ## 0.4.1
 
 - Build work no longer needs your laptop. When a fix or feature is ready, Cain asks with a Start button. Your tap starts a cloud session on your Claude plan, and Cain sends you its link.
