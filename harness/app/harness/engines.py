@@ -99,6 +99,25 @@ def _unwrap(text: str) -> dict | None:
     return obj["output"]
 
 
+def system_blocks(system: str) -> list[dict]:
+    """The system prompt as cacheable blocks. The fixed instructions are marked
+    for Anthropic's prompt cache (5 minutes, refreshed on every hit; reads cost a
+    tenth of the input price), so a burst of calls (an event-meaning pass, a batch
+    of mail) pays for them once. A trailing "Now: ..." line changes every minute,
+    so it goes in its own block after the marker and never breaks the cache.
+    Prompts shorter than the model's minimum (512 tokens on Sonnet 5.5) simply
+    aren't cached; nothing else changes."""
+    head, sep, tail = system.rpartition("\nNow: ")
+    if sep and head.strip() and "\n" not in tail.strip():
+        stable, volatile = head, "Now: " + tail.strip()
+    else:
+        stable, volatile = system, ""
+    blocks = [{"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}]
+    if volatile:
+        blocks.append({"type": "text", "text": volatile})
+    return blocks
+
+
 class AnthropicEngine:
     VERSION = "2023-06-01"
 
@@ -133,7 +152,7 @@ class AnthropicEngine:
         body = {
             "model": self.spec.model,
             "max_tokens": self.spec.max_output_tokens,
-            "system": system,
+            "system": system_blocks(system),
             "messages": [{"role": "user", "content": user}],
             "output_config": {"effort": self._effort,
                               "format": {"type": "json_schema", "schema": schema}},

@@ -45,7 +45,8 @@ def test_anthropic_request_shape_and_answer():
     assert req["headers"]["x-api-key"] == AKEY
     assert req["headers"]["anthropic-version"] == "2023-06-01"
     body = req["json"]
-    assert body["model"] == "claude-sonnet-5-5" and body["system"] == "S"
+    assert body["model"] == "claude-sonnet-5-5"
+    assert body["system"] == [{"type": "text", "text": "S", "cache_control": {"type": "ephemeral"}}]
     assert body["messages"] == [{"role": "user", "content": "U"}]
     assert body["output_config"]["format"] == {"type": "json_schema", "schema": SCHEMA}
     assert body["output_config"]["effort"] == "high"
@@ -234,3 +235,28 @@ def test_retries_stop_when_the_deadline_cannot_fit_another_call():
 def test_redactor_never_leaks_registered_secrets():
     REDACT.register(AKEY)
     assert AKEY not in REDACT(f"url https://x/{AKEY}/y")
+
+
+def test_fixed_instructions_are_cached_and_the_clock_line_is_not():
+    from harness.engines import system_blocks
+    blocks = system_blocks("Rules here.\nStanding rules he set.\n\nNow: Mon Nov 9, 2026, 6:10 AM EST (America/New_York).")
+    assert blocks == [
+        {"type": "text", "text": "Rules here.\nStanding rules he set.\n",
+         "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "Now: Mon Nov 9, 2026, 6:10 AM EST (America/New_York)."}]
+    # A prompt without a trailing clock line is cached whole.
+    assert system_blocks("Judge each event.") == [
+        {"type": "text", "text": "Judge each event.", "cache_control": {"type": "ephemeral"}}]
+    # "Now:" in the middle isn't a clock line.
+    assert len(system_blocks("A\nNow: do this\nthen that")) == 1
+
+
+def test_the_real_reply_prompt_keeps_its_clock_line_last():
+    from datetime import datetime, timezone
+    from harness import prompts
+    from harness.engines import system_blocks
+    s = prompts.system_prompt(now=datetime(2026, 11, 9, 11, 0, tzinfo=timezone.utc),
+                              tz="America/New_York", rules=[], stage_at_least=lambda _: True)
+    blocks = system_blocks(s)
+    assert len(blocks) == 2 and blocks[1]["text"].startswith("Now: ")
+    assert "Now:" not in blocks[0]["text"]

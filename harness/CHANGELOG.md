@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.1
+
+- Cheaper Claude calls: the fixed instructions sent with every call are now marked for Anthropic's prompt cache, so a run of calls (judging your Family events, reading dates from mail) pays full price for them once, then a tenth. Nothing you see changes.
+
 ## 0.19.0
 
 - New, off by default: `meaning_live`. When on, the blocks on your Gmail come from what each Family event was judged to mean, not from title words. Switch it off and the old title rules are back exactly as they were.
