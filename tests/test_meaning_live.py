@@ -1089,3 +1089,17 @@ def test_an_event_judged_as_his_drive_gets_no_second_drive(drives):
     go(drives)
     titles = [b[0] for b in blocks(drives)]
     assert titles.count("Busy (drive there)") == 1 and titles.count("Busy (drive back)") == 1
+
+
+def test_undo_takes_the_events_drives_off_with_it_at_once(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (family)", "Busy (drive back)"]
+    assert drives.live.send_receipts() == 1
+    drives.tick()
+    card = drives.with_button("Not mine")
+    drives.press(card, "Not mine")
+    drives.tick()                                             # no new read: the tap does it
+    assert drives.google.live() == {}

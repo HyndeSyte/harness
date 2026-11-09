@@ -892,6 +892,8 @@ class FamilyGmail:
             row = self.ledger.db.execute("SELECT * FROM family_gmail WHERE key=?", (key,)).fetchone()
             after = "cancelled" if action == "wrong_time" else "undone"
             if row is None or row["state"] != "live":
+                if not self._drop_legs(address, key):
+                    return                     # tried again next tick
                 self.live.removed(rid)
                 continue
             start, end = self._when(row["start"]), self._when(row["end"])
@@ -903,6 +905,8 @@ class FamilyGmail:
             block = next((b for b in blocks if b.id == row["event_id"]), None)
             if block is None:
                 self._set(row, after)
+                if not self._drop_legs(address, key):
+                    return
                 self.live.removed(rid)
                 continue
             if not block.plain or not (block.title == row["title"] and _same(block.start, start)
@@ -914,12 +918,46 @@ class FamilyGmail:
             if out.kind in ("ok", "gone"):
                 self._set(row, after)
                 self._log("family_gmail_undone", row["key"])
+                if not self._drop_legs(address, key):
+                    return
                 self.live.removed(rid)
             elif out.kind == "changed":
                 self._set(row, "hands_off")
                 self.live.removed(rid)
             else:
                 return                         # tried again next tick
+
+    def _drop_legs(self, address: str, key: str) -> bool:
+        """His Undo takes the event's drives off with it, now, not two reads later: the wait is
+        for a bad read, and a tap isn't one. A drive he changed is his and stays. False: Google
+        couldn't be reached, so the Undo is tried again next tick."""
+        for which in ("there", "back"):
+            row = self.ledger.db.execute("SELECT * FROM family_gmail WHERE key=? AND state='live'",
+                                         (leg_key(key, which),)).fetchone()
+            if row is None:
+                continue
+            start, end = self._when(row["start"]), self._when(row["end"])
+            blocks, why = self.google.list_ours(address, start - timedelta(minutes=1), end + timedelta(minutes=1))
+            if blocks is None:
+                self._problem(self._said(why))
+                return False
+            block = next((b for b in blocks if b.id == row["event_id"]), None)
+            if block is None:
+                self._set(row, "cancelled")
+                continue
+            if not block.plain or not (block.title == row["title"] and _same(block.start, start)
+                                       and _same(block.end, end)):
+                self._set(row, "hands_off")
+                continue
+            out = self.google.remove(address, block)
+            if out.kind in ("ok", "gone"):
+                self._set(row, "cancelled")
+                self._log("family_gmail_undone", row["key"])
+            elif out.kind == "changed":
+                self._set(row, "hands_off")
+            else:
+                return False
+        return True
 
     # -- the record ----------------------------------------------------------------------
     def _insert(self, want: Want, uid: str, generation: int, state: str = "live") -> None:

@@ -7,6 +7,7 @@
 - The event's block now carries its street address, so tapping it on your phone opens Google Maps. Only the street address goes on it, never a name or note from Family. Calls and links get no address and no drive.
 - New setting `home_location`: your home, as map coordinates ("38.5, -78.5") or a street address. Empty leaves drive blocks off.
 - If a drive time can't be found, that drive block is left off and your digest names the event's day and time.
+- Undo on an event takes its drive blocks off with it, right away. Events already on your Gmail still get their drives, and an event you're driving someone to never gets a second set.
 
 ## 0.19.5
 
