@@ -409,6 +409,7 @@ class MeaningLive:
     def tick(self, *, paused: bool) -> None:
         """A bug here is a record, never a stopped loop."""
         try:
+            self._revive()
             self._expire()
             if paused or self.chat_id is None or not self.on():
                 return
@@ -416,6 +417,20 @@ class MeaningLive:
         except Exception as e:
             log.warning("meaning questions failed: %s", type(e).__name__)
             self.ledger.event("meaning_live_failed", {"error": type(e).__name__})
+
+    def _revive(self) -> None:
+        """Once: his answers wrongly overruled by a seeded example (meaning.revive_answers)."""
+        if self.ledger.get_meta("meaning_revived") == "1":
+            return
+        ids = meaning.revive_answers(self.ledger)
+        if ids:
+            meaning.rejudge_for(self.ledger, ids)
+            if self.shadow is not None:
+                self.shadow.poke()
+            self.ledger.event("meaning_revived", {"n": len(ids)})
+            log.info("meaning: %d answers of his back in use", len(ids))
+        with self.ledger.tx() as db:
+            self.ledger.set_meta("meaning_revived", "1", db)
 
     def _expire(self) -> None:
         now = iso(self.ledger.now())

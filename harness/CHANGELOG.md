@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.19.2
+## 0.19.3
+
+- Your answers about Family events are used again. One you gave Cain could be set aside by an old setting that was only loaded after the day you said it, as with the Dec 15 dentist. Your answer now always wins over an old setting, and answers set aside that way are back in use.
 
 - An appointment or event from your mail now lands at its time, for an hour, with your usual reminder, instead of as an all-day note. It stays free, so nothing reaches work. Deadlines and last days stay all-day, with no reminder.
 - Ones already on your calendar move to their time once, unless you've changed them.

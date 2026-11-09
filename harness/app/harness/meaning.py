@@ -465,6 +465,35 @@ def _same_kind(a_words: frozenset, a_series: str, b_words: frozenset, b_series: 
     return (bool(a_words) and a_words == b_words) or (bool(a_series) and a_series == b_series)
 
 
+def revive_answers(ledger: Ledger) -> list[str]:
+    """Once: an answer of his that came in overruled only because a seeded example was read in
+    after the day he said it. For each kind, his newest such answer is active again, unless
+    another answer of his is; the seeded ones for that kind are overruled. Returns the ids."""
+    revived: list[str] = []
+    now = iso(ledger.now())
+    with ledger.tx() as db:
+        rows = db.execute("SELECT id, source, words, series, state, created_at FROM meaning_examples"
+                          " WHERE state IN ('active','overruled') ORDER BY created_at DESC, id").fetchall()
+        mine = [r for r in rows if r["source"] not in SEEDED]
+        for r in mine:
+            if r["state"] != "overruled":
+                continue
+            kind = [o for o in rows if o["id"] != r["id"] and _same_kind(
+                frozenset(o["words"].split()), o["series"], frozenset(r["words"].split()), r["series"])]
+            if any(o["source"] not in SEEDED and (o["state"] == "active" or o["id"] in revived)
+                   for o in kind):
+                continue                       # another answer of his already speaks for it
+            if any(o["source"] not in SEEDED and o["created_at"] > r["created_at"] for o in kind):
+                continue                       # a newer answer of his overruled it
+            db.execute("UPDATE meaning_examples SET state='active', updated_at=? WHERE id=?", (now, r["id"]))
+            for o in kind:
+                if o["source"] in SEEDED and o["state"] == "active":
+                    db.execute("UPDATE meaning_examples SET state='overruled', updated_at=? WHERE id=?",
+                               (now, o["id"]))
+            revived.append(r["id"])
+    return revived
+
+
 def add_example(ledger: Ledger, *, source: str, said: str, words: frozenset[str], who: str = "",
                 series: str = "", types: list[str], place: str = "none", month: int | None = None,
                 trusted: bool = True, scope: str = "", said_on: str = "") -> tuple[str, bool]:
@@ -478,10 +507,11 @@ def add_example(ledger: Ledger, *, source: str, said: str, words: frozenset[str]
         if db.execute("SELECT 1 FROM meaning_examples WHERE id=?", (eid,)).fetchone():
             return eid, False
         state = "active"
-        others = [r for r in db.execute("SELECT id, words, series, created_at FROM meaning_examples"
+        others = [r for r in db.execute("SELECT id, source, words, series, created_at FROM meaning_examples"
                                         " WHERE state='active'").fetchall()
                   if _same_kind(frozenset(r["words"].split()), r["series"], words, series)]
-        if said_on and any(r["created_at"][:10] > said_on for r in others):
+        # A seeded example is dated when it was read in, not when he said it: never newer.
+        if said_on and any(r["created_at"][:10] > said_on and r["source"] not in SEEDED for r in others):
             state = "overruled"            # something newer for this kind is already here
         else:
             for r in others:

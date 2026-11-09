@@ -728,3 +728,38 @@ def test_questions_and_undo_cost_no_model_calls(live):
     live.tick()
     live.live.tick(paused=False)
     assert len(live.judge.calls) == calls
+
+
+def test_a_seeded_rule_read_in_after_he_said_it_doesnt_overrule_his_answer(lv):
+    rows = meaning.seed_rows((family_rules.Rule("Pat dentist", "kids"),), (), ())
+    meaning.sync_examples(lv.ledger, rows)                 # read in today, after 2026-10-01
+    got, _ = meaning_live.validate_rows({"rows": [ROW]})
+    lv.live.import_rows(got)
+    assert [e.source for e in meaning.active_examples(lv.ledger)] == [meaning_live.SOURCE_CAIN]
+
+
+def test_his_answer_wrongly_overruled_before_is_back_in_use_once(lv):
+    rows = meaning.seed_rows((family_rules.Rule("Pat dentist", "kids"),), (), ())
+    meaning.sync_examples(lv.ledger, rows)
+    got, _ = meaning_live.validate_rows({"rows": [ROW]})
+    lv.live.import_rows(got)
+    lv.ledger.db.execute("UPDATE meaning_examples SET state=CASE source WHEN ? THEN 'overruled'"
+                         " ELSE 'active' END", (meaning_live.SOURCE_CAIN,))   # as the old code left it
+    lv.ledger.set_meta("meaning_revived", "")
+    lv.live.tick(paused=True)
+    assert [e.source for e in meaning.active_examples(lv.ledger)] == [meaning_live.SOURCE_CAIN]
+    meaning.sync_examples(lv.ledger, rows)                 # the next Family read keeps it so
+    assert [e.source for e in meaning.active_examples(lv.ledger)] == [meaning_live.SOURCE_CAIN]
+    lv.ledger.db.execute("UPDATE meaning_examples SET state='overruled' WHERE source=?",
+                         (meaning_live.SOURCE_CAIN,))
+    lv.live.tick(paused=True)
+    assert meaning.active_examples(lv.ledger) == []        # once only
+
+
+def test_an_answer_a_newer_answer_overruled_stays_overruled(lv):
+    w = frozenset({"book", "club"})
+    a, _ = meaning.add_example(lv.ledger, source="answer", said="book club", words=w, types=["presence"])
+    b, _ = meaning.add_example(lv.ledger, source="answer", said="book club", words=w, types=[])
+    assert meaning.revive_answers(lv.ledger) == []
+    states = dict(lv.ledger.db.execute("SELECT id, state FROM meaning_examples").fetchall())
+    assert states == {a: "overruled", b: "active"}
