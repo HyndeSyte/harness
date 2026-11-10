@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.10
+
+- The no-block line also counts his own answers for the event's words, by state (active, overruled). That tells a judge that ignored his answer apart from an answer that never arrived or was overruled.
+- Each table of his answers Cain sends is logged: rows, new and already known.
+
 ## 0.19.9
 
 - A Family event in the next 30 days that gets no block now says why in the log, once, and again only when the reason changes. The reasons:
