@@ -74,8 +74,18 @@ export function checkBrief(j: any): { brief?: Brief; error?: string } {
 
 // What a seat is handed: a new object built from the "text" and "flag" fields
 // only, so nothing else on a brief can reach a prompt.
+// It checks the kinds itself and throws rather than coerce.
 export function outbound(b: Brief): Outbound {
-  return { topic: b.topic, question: b.question, body: b.body, needs_facts: b.needs_facts === true, consequential: b.consequential === true };
+  if (!b || typeof b !== "object") throw new Error(STORED_BAD);
+  for (const k of ["topic", "question", "body"] as const) if (typeof b[k] !== "string") throw new Error(STORED_BAD);
+  if (typeof b.needs_facts !== "boolean" || typeof b.consequential !== "boolean") throw new Error(STORED_BAD);
+  return { topic: b.topic, question: b.question, body: b.body, needs_facts: b.needs_facts, consequential: b.consequential };
+}
+
+// An id is a file name and a record folder: only a-z, 0-9 and -, so never a
+// path separator or "..".
+export function safeId(id: unknown): id is string {
+  return typeof id === "string" && ID.test(id) && !/[\\/]|\.\./.test(id);
 }
 
 export function digest(b: Brief): string {
@@ -97,12 +107,19 @@ const BUILT_IN: { what: string; re: RegExp }[] = [
   { what: "an SSN-shaped number", re: /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/ },
 ];
 
+// Text is matched in one canonical form, so a term can't hide behind zero-width
+// characters, soft hyphens, variation selectors, compatibility letters or odd spacing.
+const INVISIBLE = /[\p{Cf}͏ᅟᅠ឴឵᠋-᠏ㅤ︀-️ﾠ\u{E0100}-\u{E01EF}]/gu;
+export function normalizeText(s: string): string {
+  return s.normalize("NFKC").replace(INVISIBLE, "").replace(/\s+/g, " ");
+}
+
 export function loadTerms(text: string | null): { terms?: Terms; error?: string } {
   if (text === null) return { error: "no private-terms list (/data/review-private-terms.txt); Cain writes it before any review goes out" };
   const entries: Terms["entries"] = [];
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
-    const t = lines[i].trim();
+    const t = normalizeText(lines[i]).trim();
     if (!t || t.startsWith("#")) continue;
     if (t.startsWith("re:")) {
       try { entries.push({ line: i + 1, re: new RegExp(t.slice(3), "iu") }); }
@@ -125,11 +142,41 @@ export function privacyCheck(b: Brief, termsText: string | null): { ok: true } |
   if (!checkBrief(b).brief) return { ok: false, why: [STORED_BAD] };
   const loaded = loadTerms(termsText);
   if (!loaded.terms) return { ok: false, why: [loaded.error!] };
-  const text = [b.id, b.topic, b.question, b.body].join("\n");
+  const id = normalizeText(b.id);
+  const text = normalizeText([b.topic, b.question, b.body].join("\n"));
   const why = new Set<string>();
-  for (const p of BUILT_IN) if (p.re.test(text)) why.add(p.what);
-  for (const e of loaded.terms.entries) if (e.re.test(text)) why.add(`private term on line ${e.line} of the list`);
+  for (const p of BUILT_IN) if (p.re.test(text) || p.re.test(id)) why.add(p.what);
+  for (const e of loaded.terms.entries) if (e.re.test(text) || e.re.test(id)) why.add(`private term on line ${e.line} of the list`);
+  if (BUILT_IN.some((p) => p.re.test(id)) || loaded.terms.entries.some((e) => e.re.test(id))) why.add(ID_PRIVATE);
   return why.size ? { ok: false, why: [...why] } : { ok: true };
+}
+
+// The same gate for a whole review read back from the queue: a brief in the
+// allowed shape, a safe id that is the brief's own, and no private term.
+export function reviewCheck(r: Review, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
+  if (!r.brief || !safeId(r.id) || r.brief.id !== r.id) return { ok: false, why: [STORED_BAD] };
+  return privacyCheck(r.brief, termsText);
+}
+
+export const ID_PRIVATE = "the id itself matched";
+export const HIDDEN_ID = "(id withheld)";
+// The id as it may be shown in a log, a relay line or a status: never one that
+// failed the check.
+export function shownId(r: Pick<Review, "id" | "id_private">): string {
+  return r.id_private || !safeId(r.id) ? HIDDEN_ID : r.id;
+}
+// The topic always comes from the brief that passed the gate, never the copy on the review.
+export function topicOf(r: Review): string { return r.brief?.topic ?? ""; }
+
+// Blocked: nothing sent, nothing recorded; the brief and its topic are dropped.
+export function markBlocked(r: Review, why: string[], at: string) {
+  r.status = "blocked: privacy";
+  r.blocked_why = why;
+  r.brief = null;
+  r.topic = "";
+  if (why.includes(ID_PRIVATE) || !safeId(r.id)) r.id_private = true;
+  for (const s of r.seats) if (s.state !== "done") { s.state = "blocked"; delete s.next_at; }
+  r.finished_at = at;
 }
 
 // ---- The one answer shape every seat returns. ----
@@ -322,7 +369,7 @@ export type Review = {
   id: string; brief: Brief | null; digest: string; created_at: string; updated_at: string;
   status: ReviewStatus; consequential: boolean; needs_facts: boolean; topic: string;
   seats: SeatRun[]; cost_usd: number; wait_until?: string; finished_at?: string;
-  blocked_why?: string[]; record_dir?: string; recorded?: boolean; relayed?: boolean;
+  blocked_why?: string[]; record_dir?: string; recorded?: boolean; relayed?: boolean; id_private?: boolean;
 };
 export const FINAL: ReviewStatus[] = ["done", "incomplete", "blocked: privacy"];
 
@@ -372,7 +419,9 @@ export function seatName(s: SeatRun): string {
 }
 
 export function recordDir(r: Review): string {
-  return /^\d{4}-\d\d-\d\d-/.test(r.id) ? r.id : `${r.created_at.slice(0, 10)}-${r.id}`;
+  const day = String(r.created_at ?? "").slice(0, 10);
+  if (!safeId(r.id) || !/^\d{4}-\d\d-\d\d$/.test(day)) throw new Error("not a safe review id");
+  return /^\d{4}-\d\d-\d\d-/.test(r.id) ? r.id : `${day}-${r.id}`;
 }
 
 export function verdictsMd(r: Review): string {
@@ -390,7 +439,7 @@ export function verdictsMd(r: Review): string {
   const reviewed = done.map((s) => `${seatName(s)}, ${human(s.verdict)}`).join("; ") || "no seat answered";
   const ind = independent(r);
   const lines = [
-    `# Review: ${oneLine(r.topic, 120)} (${r.created_at.slice(0, 10)})`, "",
+    `# Review: ${oneLine(topicOf(r), 120)} (${r.created_at.slice(0, 10)})`, "",
     `Brief: brief.txt. Status: ${r.status}. Digest: ${r.digest}.${r.consequential ? ` Consequential: needs two non-Claude families; got ${ind.length ? ind.map((s) => LABEL[s]).join(" and ") : "none"}.` : ""}`, "",
     "| Seat | Model | Verdict | Findings | Cost |", "| --- | --- | --- | --- | --- |", ...rows, "",
     ...sections,
@@ -403,7 +452,7 @@ export function verdictsMd(r: Review): string {
 
 export function resultJson(r: Review): string {
   const out = {
-    id: r.id, topic: r.topic, digest: r.digest, status: r.status, consequential: r.consequential, needs_facts: r.needs_facts,
+    id: shownId(r), topic: topicOf(r), digest: r.digest, status: r.status, consequential: r.consequential, needs_facts: r.needs_facts,
     created_at: r.created_at, finished_at: r.finished_at, cost_usd: Number(r.cost_usd.toFixed(4)),
     independent: independent(r),
     seats: r.seats.map((s) => ({ key: s.key, seat: s.seat, role: s.role, stands_in_for: s.stands_in_for, state: s.state,
@@ -441,7 +490,9 @@ export function recordRequest(r: Review): { id: string; from: "cain"; kind: "cha
 // fixed fix texts only; no model text ever goes into it.
 export function relayLine(r: Review): string {
   if (r.status === "blocked: privacy")
-    return `Review ${r.id} blocked: privacy. Nothing was sent anywhere. Run /opt/cain/review.sh status ${r.id} to see what matched, take it out of the brief (or fix the terms list), and submit again under a new id.`;
+    return r.id_private || !safeId(r.id)
+      ? `Review ${HIDDEN_ID} blocked: privacy. Its id matched the private-terms list or isn't a safe id, so it isn't repeated here. Nothing was sent anywhere. Pick a new id with nothing private in it and submit again.`
+      : `Review ${r.id} blocked: privacy. Nothing was sent anywhere. Run /opt/cain/review.sh status ${r.id} to see what matched, take it out of the brief (or fix the terms list), and submit again under a new id.`;
   const done = r.seats.filter((s) => s.state === "done");
   const tally = VERDICTS.slice().reverse().map((v) => [v, done.filter((s) => s.verdict === v).length] as const)
     .filter(([, n]) => n > 0).map(([v, n]) => `${n} ${human(v)}`).join(", ");
@@ -451,8 +502,8 @@ export function relayLine(r: Review): string {
   const where = `Verdicts in reviews/${recordDir(r)}/verdicts.md.`;
   const head = r.status === "incomplete"
     ? (r.consequential
-      ? `Review ${r.id} incomplete: a consequential review needs two non-Claude families and got ${independent(r).length} within a day, so the decision waits.`
-      : `Review ${r.id} incomplete: no seat answered.`)
-    : `Review ${r.id} done: ${tally || "no verdicts"}${who ? ` (${who})` : ""}.`;
+      ? `Review ${shownId(r)} incomplete: a consequential review needs two non-Claude families and got ${independent(r).length} within a day, so the decision waits.`
+      : `Review ${shownId(r)} incomplete: no seat answered.`)
+    : `Review ${shownId(r)} done: ${tally || "no verdicts"}${who ? ` (${who})` : ""}.`;
   return [head, ...(down.length ? [`${down.join("; ")}.`] : []), where].join(" ");
 }

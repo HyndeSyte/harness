@@ -6,8 +6,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
-  FINAL, JUDGES, LABEL, SEATS, STORED_BAD, SeatError, backoffMs, estimate, fixFor, independent, outbound, privacyCheck, recordRequest,
-  relayLine, retryLimit, seatRun, type Brief, type ErrorKind, type Review, type SeatName, type SeatRun,
+  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, estimate, fixFor, independent, markBlocked, outbound, recordRequest,
+  relayLine, reviewCheck, safeId, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 
@@ -58,8 +58,17 @@ function readJson<T>(path: string, fallback: T): T {
   try { return JSON.parse(readFileSync(path, "utf8")); } catch { return fallback; }
 }
 
-export const reviewFile = (dir: string, id: string) => join(dir, `${id}.json`);
-export function loadReview(dir: string, id: string): Review | null { return readJson<Review | null>(reviewFile(dir, id), null); }
+// Only a safe id names a file, so no id can reach outside the queue folder.
+export const reviewFile = (dir: string, id: string) => {
+  if (!safeId(id)) throw new Error("not a safe review id");
+  return join(dir, `${id}.json`);
+};
+// A file whose review names a different id than its own is not read at all.
+export function loadReview(dir: string, id: string): Review | null {
+  if (!safeId(id)) return null;
+  const r = readJson<Review | null>(reviewFile(dir, id), null);
+  return r && typeof r === "object" && r.id === id ? r : null;
+}
 export function saveReview(dir: string, r: Review) { writeAtomic(reviewFile(dir, r.id), JSON.stringify(r, null, 1)); }
 
 export class Runner {
@@ -96,12 +105,12 @@ export class Runner {
     if (!this.fnFor(seat)) return { kind: "unconfigured", detail: `no ${LABEL[seat]} key in the add-on's options` };
     return this.deps.unavailable?.(seat) ?? null;
   }
-  private estModel(seat: SeatName, b: Brief): string {
+  private estModel(seat: SeatName, b: Outbound): string {
     const m = this.cfg.models;
     return seat === "gemini" ? (b.consequential ? m.geminiBig : m.gemini) : seat === "perplexity" ? m.perplexity : m.claude;
   }
   // Monthly caps per seat, and the per-review limit, checked before every call.
-  capCheck(seat: SeatName, b: Brief, spentThisReview: number, selftest = false): Unavailable {
+  capCheck(seat: SeatName, b: Outbound, spentThisReview: number, selftest = false): Unavailable {
     const row = this.ledger()[this.month()]?.[seat];
     if (seat === "openai") {
       return (row?.runs ?? 0) >= this.cfg.caps.openaiRuns ? { kind: "cap", detail: `the monthly cap of ${this.cfg.caps.openaiRuns} Codex runs is reached` } : null;
@@ -120,7 +129,13 @@ export class Runner {
       const r = loadReview(this.cfg.queueDir, name.slice(0, -5));
       if (!r) continue;
       try {
-        if (FINAL.includes(r.status)) { this.after(r); continue; }
+        if (FINAL.includes(r.status)) {
+          // Saved only when after() changed it (recorded, relayed, or blocked at the record gate).
+          const before = JSON.stringify(r);
+          this.after(r);
+          if (JSON.stringify(r) !== before) { r.updated_at = this.now().toISOString(); saveReview(this.cfg.queueDir, r); }
+          continue;
+        }
         // A tick finishes every call it starts, so "running" here means the add-on
         // restarted mid-call: that try counts, and the seat goes back in line.
         for (const s of r.seats) if (s.state === "running") {
@@ -131,7 +146,7 @@ export class Runner {
         }
         if (r.seats.some((s) => s.state === "failed" && s.error?.detail === "interrupted by a restart")) this.substitute(r);
         await this.advance(r);
-      } catch (e) { this.log(`review ${r.id}: ${(e as Error).message}`); }
+      } catch (e) { this.log(`review ${shownId(r)}: ${(e as Error).message}`); }
       r.updated_at = this.now().toISOString();
       saveReview(this.cfg.queueDir, r);
     }
@@ -140,9 +155,9 @@ export class Runner {
   async advance(r: Review): Promise<void> {
     // A queued brief is read back from disk, so it is checked again in full: the
     // allowlist (an old or edited brief with any other field is refused, not
-    // sent), then the terms. No brief at all on an open review is refused too.
-    if (!r.brief) return this.block(r, [STORED_BAD]);
-    const g = privacyCheck(r.brief, this.terms());
+    // sent), the id (safe, and the brief's own), then the terms. No brief at all
+    // on an open review is refused too.
+    const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
     for (let pass = 0; pass < 4; pass++) {
       const now = this.now().toISOString();
@@ -166,7 +181,8 @@ export class Runner {
     const hourly = s.state !== "queued";
     const fn = this.fnFor(s.seat);
     const b = r.brief!;
-    const down = this.unavailable(s.seat) ?? this.capCheck(s.seat, b, r.cost_usd);
+    const out = outbound(b);   // throws on a wrong kind: nothing is sent
+    const down = this.unavailable(s.seat) ?? this.capCheck(s.seat, out, r.cost_usd);
     if (down || !fn) return this.fail(r, s, down?.kind ?? "unconfigured", down?.detail ?? "not set up", hourly, 0);
     s.started_at = this.now().toISOString();
     s.attempts++;
@@ -178,7 +194,7 @@ export class Runner {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, rej) => { timer = setTimeout(() => { ctl.abort(); rej(new SeatError("timeout", `no answer within ${ms / 1000} s`)); }, ms); });
     try {
-      const a = await Promise.race([fn({ brief: outbound(b), role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day() }), deadline]);
+      const a = await Promise.race([fn({ brief: out, role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day() }), deadline]);
       const cost = this.addSpend(s.seat, a.cost_usd, a.findings.length, a.searches ?? 0);
       Object.assign(s, { state: "done", verdict: a.verdict, findings: a.findings, model: a.model, tokens: a.tokens,
         cost_usd: s.cost_usd + cost, finished_at: this.now().toISOString() });
@@ -218,7 +234,7 @@ export class Runner {
       if (this.unavailable("claude")) continue;
       if (s.state === "failed") s.state = "substituted";
       r.seats.push(seatRun("claude", s.seat === "perplexity" ? "facts-stand-in" : "stand-in", s.seat));
-      this.log(`review ${r.id}: ${LABEL[s.seat]} is down (${s.error?.kind}); Claude stands in, marked substituted`);
+      this.log(`review ${shownId(r)}: ${LABEL[s.seat]} is down (${s.error?.kind}); Claude stands in, marked substituted`);
     }
   }
 
@@ -246,12 +262,16 @@ export class Runner {
     r.finished_at = this.now().toISOString();
     for (const s of r.seats) delete s.next_at;
     this.after(r);
-    this.log(`review ${r.id}: ${status}`);
+    this.log(`review ${shownId(r)}: ${status}`);
   }
 
   // Record first, then Cain's one line. Each happens once, even across restarts.
   private after(r: Review) {
     if (!r.recorded && r.brief && (r.status === "done" || r.status === "incomplete")) {
+      // The same gate again before anything reaches the record: a review read
+      // back as final may never have passed it, or the list may have grown.
+      const g = reviewCheck(r, this.terms());
+      if (!g.ok) return this.block(r, g.why);
       const req = recordRequest(r);
       const stamp = this.now().toISOString().replace(/[-:]/g, "").slice(0, 15);
       writeAtomic(join(this.cfg.recordQueue, `${stamp}-${req.id}.json`), JSON.stringify(req));
@@ -263,12 +283,8 @@ export class Runner {
 
   block(r: Review, why: string[]) {
     // Never sent, never recorded: the brief itself is dropped from the queue too.
-    r.status = "blocked: privacy";
-    r.blocked_why = why;
-    r.brief = null;
-    for (const s of r.seats) if (s.state !== "done") { s.state = "blocked"; delete s.next_at; }
-    r.finished_at = this.now().toISOString();
-    this.log(`review ${r.id}: blocked: privacy (${why.join("; ")})`);
+    markBlocked(r, why, this.now().toISOString());
+    this.log(`review ${shownId(r)}: blocked: privacy (${why.join("; ")})`);
     this.after(r);
   }
 
