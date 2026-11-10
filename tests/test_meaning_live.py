@@ -7,7 +7,7 @@ import json
 import shutil
 import subprocess
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -1191,3 +1191,39 @@ def test_a_judgment_that_never_saw_his_answer_is_made_again_on_its_own(drives):
     go(drives)
     go(drives)
     assert len(drives.judge.calls) == calls                   # seen now: never again
+
+
+def test_his_dated_answer_decides_that_event_whatever_the_judge_says(drives):
+    # Nov 10: the judge had his "ties me up" for the turkey harvest in front of it and stayed
+    # unsure. An answer about that very event (a dated row) now decides it, like a card answer.
+    harvest = when(drives, days=4, hour=9)
+    goes(drives, "Turkey harvest", harvest, CLINIC, hours=7)
+    drives.judge.by["Turkey harvest"] = judged(
+        ob("presence", harvest, harvest + timedelta(hours=7), certainty="medium"), unsure=True)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == []
+
+    def send(meaning_, day):
+        rows, why = meaning_live.validate_rows({"rows": [
+            {"kind": "Turkey harvest", "meaning": meaning_, "said_on": date.today().isoformat(),
+             "for": day.date().isoformat()}]})
+        assert why == ""
+        drives.live.import_rows(rows)
+        for _ in range(3):
+            go(drives)
+        return [b[0] for b in blocks(drives)]
+
+    assert send("me", harvest + timedelta(days=7)) == []      # another day: still the judge's
+    assert "Busy (family)" in send("me", harvest)
+    assert [b for b in blocks(drives) if b[0] == "Busy (family)"][0][1:3] == (
+        harvest, harvest + timedelta(hours=7))
+    assert send("none", harvest) == []                        # his newer word wins
+
+
+def test_a_dated_row_must_be_a_real_date():
+    for bad in ("Nov 21", "2026-13-01", 20261121):
+        rows, why = meaning_live.validate_rows({"rows": [{**ROW, "for": bad}]})
+        assert rows is None and "for must be a date" in why
+    rows, _ = meaning_live.validate_rows({"rows": [{**ROW, "for": "2026-11-21"}]})
+    assert rows[0]["for"] == "2026-11-21"

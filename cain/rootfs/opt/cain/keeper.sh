@@ -47,11 +47,14 @@ case "$cmd" in
     if jq -e 'type == "array" or type == "object"' "$1" >/dev/null 2>&1; then
       body=$(jq -c 'if type == "array" then {rows: .} else {rows: (.rows // [])} end' "$1")
     else
+      # An optional fourth column (For, a date) makes a row his answer about that one event.
       body=$(awk -F'|' 'NF >= 5 {
-          k = $2; m = $3; d = $4
+          k = $2; m = $3; d = $4; f = (NF >= 6 ? $5 : "")
           gsub(/^[ \t]+|[ \t]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", m); gsub(/^[ \t]+|[ \t]+$/, "", d)
-          if (m ~ /^(kids|me|school|drive|none)$/) print k "\t" m "\t" d
-        }' "$1" | jq -Rnc '{rows: [inputs | split("\t") | {kind: .[0], meaning: .[1], said_on: .[2]}]}')
+          gsub(/^[ \t]+|[ \t]+$/, "", f)
+          if (m ~ /^(kids|me|school|drive|none)$/) print k "\t" m "\t" d "\t" f
+        }' "$1" | jq -Rnc '{rows: [inputs | split("\t")
+          | {kind: .[0], meaning: .[1], said_on: .[2]} + (if (.[3] // "") != "" then {for: .[3]} else {} end)]}')
     fi ;;
   places)
     # The whole book each time: it replaces what the specialist had.

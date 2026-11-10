@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.13
+
+- A dated row from Cain's record (`for`: the event's day) is Dane's answer about that one event: the Family event with exactly those words on that day gets what he said, as if he had answered its card, whatever the judge thinks. Other events with those words still go to the judge, with the row as an example. No question is asked about an event he already answered this way.
+
 ## 0.19.12
 
 - **Self-healing judgments.** Each read, any judgment that never had an active answer of his in front of it is made again, if one fits the event now. Once it has seen his answer, it never triggers again. Before this, an answer that arrived "already known", or after the event was judged, never reached the judgment (the Nov 21 turkey harvest).

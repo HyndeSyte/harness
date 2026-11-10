@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.5
+
+- The calendar meanings table takes an optional fourth column, For (a date): that row is Dane's answer about the one event on that day, and is sent as `for`.
+
 ## 0.4.4
 
 - **Outside reviews: an allowlist decides what leaves.** Only a brief's topic, question and body go to the outside models, plus its two flags. The id stays on the Pi, and any other field is refused without echoing it. The terms list stays as a backstop, now on text with invisible characters stripped and Unicode normalized first.
