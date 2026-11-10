@@ -65,6 +65,7 @@ log = logging.getLogger("harness.family_gmail")
 
 MAX_WRITES_PER_DAY = 100       # two runs a school day for 60 days fit, and no one's alerted
 MAX_RULES = 5
+DRIVE_ROUND = 15               # drive blocks are rounded up to whole quarter hours (Dane, Nov 9)
 DROP_TITLE = "Busy (school drop-off)"
 PICK_TITLE = "Busy (school pickup)"
 # 15 minutes each way and 15 to spare, so a run is 45 minutes. The spare is before the
@@ -564,7 +565,7 @@ class FamilyGmail:
             elif found == drive.NO_ADDRESS:
                 not_found.add(event.start)
             else:
-                return math.ceil(found)
+                return math.ceil(found / DRIVE_ROUND) * DRIVE_ROUND
             return None
 
         def leg(event: Want, which: str, start: datetime, end: datetime) -> None:

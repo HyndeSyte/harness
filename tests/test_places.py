@@ -71,9 +71,9 @@ def at(rig, title, start, place, judged_place, hours=1):
 
 
 def drove_to(start, place):
-    return [("Busy (drive there)", start - 20 * M, start, ""),
+    return [("Busy (drive there)", start - 30 * M, start, ""),
             ("Busy (family)", start, start + 60 * M, place),
-            ("Busy (drive back)", start + 60 * M, start + 80 * M, "")]
+            ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
 
 
 # -- what the book gives an event ----------------------------------------------------------------------

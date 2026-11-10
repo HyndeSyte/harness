@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.8
+
+- Drive blocks are rounded up to whole quarter hours (Dane, Nov 9): a 66-minute drive shows as 75, so the drive there starts on the quarter hour and never cuts it fine. Exactly 15, 30 and so on stay as they are. The choice between going home and driving straight on uses the rounded times too.
+
 ## 0.19.7
 
 - Family events that only name a place ("Funky's Skate Center") now get their drive blocks and address too. The place is looked up by its name on the map, only near home, and only if the map's name really matches. Your block then shows the place's name and street address, so it opens in Google Maps.

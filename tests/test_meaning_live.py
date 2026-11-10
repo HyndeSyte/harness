@@ -876,9 +876,9 @@ def test_the_drive_is_its_own_blocks_and_the_event_keeps_its_times(drives):
     go(drives)
     go(drives)
     assert blocks(drives) == [
-        ("Busy (drive there)", start - 20 * M, start, ""),
+        ("Busy (drive there)", start - 30 * M, start, ""),
         ("Busy (family)", start, start + 60 * M, CLINIC),             # the street address only
-        ("Busy (drive back)", start + 60 * M, start + 80 * M, "")]
+        ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
     # Home is map points: only the clinic's street address was looked up, never its name.
     asked = [parse_qs(urlsplit(u).query)["q"][0] for u in drives.maps.urls if drive.GEOCODE_HOST in u]
     assert asked == [CLINIC]
@@ -890,13 +890,14 @@ def test_too_close_to_go_home_drives_straight_on(drives):
     goes(drives, "Swim lesson", b, PARK)
     go(drives)
     go(drives)
-    # Home and out again is 20 + 25 minutes, more than the half hour between: clinic to park.
+    # Home and out again is 30 + 30 minutes (20 and 25 rounded up to quarter hours), more than
+    # the half hour between: clinic to park.
     assert blocks(drives) == [
-        ("Busy (drive there)", a - 20 * M, a, ""),
+        ("Busy (drive there)", a - 30 * M, a, ""),
         ("Busy (family)", a, a + 60 * M, CLINIC),
         ("Busy (drive there)", b - 15 * M, b, ""),
         ("Busy (family)", b, b + 60 * M, PARK),
-        ("Busy (drive back)", b + 60 * M, b + 85 * M, "")]
+        ("Busy (drive back)", b + 60 * M, b + 90 * M, "")]
 
 
 def test_time_enough_goes_home_between(drives):
@@ -906,12 +907,12 @@ def test_time_enough_goes_home_between(drives):
     go(drives)
     go(drives)
     assert blocks(drives) == [
-        ("Busy (drive there)", a - 20 * M, a, ""),
+        ("Busy (drive there)", a - 30 * M, a, ""),
         ("Busy (family)", a, a + 60 * M, CLINIC),
-        ("Busy (drive back)", a + 60 * M, a + 80 * M, ""),
-        ("Busy (drive there)", b - 25 * M, b, ""),
+        ("Busy (drive back)", a + 60 * M, a + 90 * M, ""),
+        ("Busy (drive there)", b - 30 * M, b, ""),
         ("Busy (family)", b, b + 60 * M, PARK),
-        ("Busy (drive back)", b + 60 * M, b + 85 * M, "")]
+        ("Busy (drive back)", b + 60 * M, b + 90 * M, "")]
 
 
 def test_the_place_is_ours_so_the_block_still_follows_and_goes(drives):
@@ -929,9 +930,9 @@ def test_the_place_is_ours_so_the_block_still_follows_and_goes(drives):
     go(drives)
     go(drives)
     assert blocks(drives) == [
-        ("Busy (drive there)", later - 20 * M, later, ""),
+        ("Busy (drive there)", later - 30 * M, later, ""),
         ("Busy (family)", later, later + 60 * M, CLINIC),
-        ("Busy (drive back)", later + 60 * M, later + 80 * M, "")]
+        ("Busy (drive back)", later + 60 * M, later + 90 * M, "")]
     assert states(drives) == {"live"} and count(drives, "family_gmail_moved") == 3
     del drives.icloud.events[path]                            # cancelled on Family
     go(drives)
@@ -949,9 +950,9 @@ def test_a_new_address_moves_the_place_with_it(drives):
     go(drives)
     go(drives)
     assert blocks(drives) == [
-        ("Busy (drive there)", start - 25 * M, start, ""),
+        ("Busy (drive there)", start - 30 * M, start, ""),
         ("Busy (family)", start, start + 60 * M, PARK),
-        ("Busy (drive back)", start + 60 * M, start + 85 * M, "")]
+        ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
     assert states(drives) == {"live"}
 
 
@@ -1076,8 +1077,8 @@ def test_an_event_already_on_gmail_still_gets_its_drives(drives):
     go(drives)
     go(drives)
     assert blocks(drives) == [
-        ("Busy (drive there)", start - 20 * M, start, ""),
-        ("Busy (drive back)", start + 60 * M, start + 80 * M, "")]
+        ("Busy (drive there)", start - 30 * M, start, ""),
+        ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
 
 
 def test_an_event_judged_as_his_drive_gets_no_second_drive(drives):
@@ -1106,3 +1107,18 @@ def test_undo_takes_the_events_drives_off_with_it_at_once(drives):
     drives.press(card, "Not mine")
     drives.tick()                                             # no new read: the tap does it
     assert drives.google.live() == {}
+
+
+
+def test_drive_time_rounds_up_to_the_quarter_hour(drives):
+    # 31 minutes each way shows as 45, so the drive starts on a quarter hour and never cuts it
+    # fine (Dane, Nov 9). Exactly 15 stays 15.
+    drives.maps.minutes[frozenset({"home", CLINIC})] = 31
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 45 * M, start, ""),
+        ("Busy (family)", start, start + 60 * M, CLINIC),
+        ("Busy (drive back)", start + 60 * M, start + 105 * M, "")]
