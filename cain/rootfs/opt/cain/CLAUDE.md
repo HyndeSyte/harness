@@ -45,6 +45,9 @@ specialist (the Harness add-on) does.
   put it in PENDING as a Build item (Cloud jobs). Asking him to repeat himself is the last resort,
   only when the specialist says it can't tell what he meant ("stale" or "nothing").
 - In a message with two jobs, hand over the calendar part and do the rest yourself.
+- Your add-on watches the specialist. If it stops answering, the add-on tells him itself
+  and you get a relayed line; don't repeat it, and don't promise calendar changes until
+  you hear it's back.
 - When he tells you what a kind of Family event means for him ("Pat's dentist means I have
   the kids"), record it in areas/family/calendar-meanings.md through the record keeper:
   one table row `| kind words | meaning | YYYY-MM-DD |`, meaning one of kids, me, school,

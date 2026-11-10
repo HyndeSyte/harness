@@ -2,7 +2,9 @@
 
 Cain is the gatekeeper: this add-on never posts to Dane itself. Every card it
 makes goes to Cain's link, which holds it until Cain shows it unchanged (only
-Stop notices and the 7:40 digest fallback go straight out). Taps on its cards
+Stop notices and the 7:40 digest fallback go straight out). The one exception
+is the mutual watch's "Cain's add-on is down" message (watch.py), which can't
+go through Cain. Taps on its cards
 come back to handover.py /press, already checked by the link.
 
 Local only: the add-ons' own network on the Pi. Keyed with
@@ -82,8 +84,14 @@ class CainLink:
             return None
         return out.get("card") if isinstance(out.get("card"), int) else None
 
-    def health(self) -> bool:
+    def status(self) -> dict | None:
+        """Cain's link's own answer to /health, or None when it doesn't answer. Newer
+        links also say whether their Discord connection is up (link/main.ts)."""
         try:
-            return self._call("GET", "/health").get("status") == "ok"
+            out = self._call("GET", "/health")
         except LinkError:
-            return False
+            return None
+        return out if isinstance(out, dict) and out.get("status") == "ok" else None
+
+    def health(self) -> bool:
+        return self.status() is not None

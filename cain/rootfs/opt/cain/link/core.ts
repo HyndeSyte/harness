@@ -166,6 +166,12 @@ export class Link {
     return this.d.load().messages[messageId]?.card ?? null;
   }
 
+  // -- the mutual watch (watch.ts): a plain notice, straight to his DM ---------------
+  async notice(text: string): Promise<string> {
+    const msg = await this.post(text, []);
+    return String(msg.id);
+  }
+
   // -- Cain's own words with buttons ----------------------------------------------
   async ask(text: string, options: string[], withStop = false): Promise<string> {
     const opts = options.map((o) => o.trim()).filter(Boolean).slice(0, 5);

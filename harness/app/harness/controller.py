@@ -30,10 +30,11 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import (callbacks, choices, commands, daily, ingress_filter, integrity,
-               policy, render, rules)
+               policy, render, rules, watch)
 from .chat import Decision, Incoming
 from .config import Config
-from .discord_api import DiscordError
+from .cain_relay import LinkError
+from .discord_api import DiscordError, escape
 from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
 from .engines import Engine
 from .ledger import Ledger
@@ -107,6 +108,10 @@ class Controller:
         self._discord_seen: str | None = None    # fingerprint of the token it identified with
         self._reconciled = False
         self._handover_jobs: dict[str, list] = {}
+        # The mutual watch on Cain's add-on (watch.py, set by __main__), and the last
+        # thing Cain's link said about itself, for the settings page.
+        self.cain_watch = None
+        self.cain_status: dict | None = None
 
     # -- set-up --------------------------------------------------------------
     def _bind_owner(self, owner: int) -> None:
@@ -193,6 +198,8 @@ class Controller:
 
     # -- the loop --------------------------------------------------------------
     def tick(self) -> None:
+        if self.handovers is not None:
+            self.handovers.beat()          # Cain's watch asks whether this loop turns
         self._drain_requests()
         if self._discord_mode():
             self._discord_tick()
@@ -276,12 +283,37 @@ class Controller:
         if now - getattr(self, "_link_checked", -1e9) < 60:
             return
         self._link_checked = now
-        if self.discord_chat.link.health():
+        status = self.discord_chat.link.status()
+        self.cain_status = status
+        if status is not None:
             self.ledger.ingest([])                # proves the path to him, for the digest
             self.notes.pop("cain_link", None)
         else:
             self.notes["cain_link"] = ("Cain's add-on isn't answering, so cards wait. Calendar "
                                        "work goes on; you'll see them when Cain is back.")
+        if self.cain_watch is not None:
+            self._watch_cain(status is not None)
+
+    def _watch_cain(self, ok: bool) -> None:
+        """The mutual watch (watch.py): Cain down for the grace period is told once,
+        straight to his DM with the bot token, since Cain is the usual path and is the
+        one that's down. Back is told once, through Cain's link. A failed send is
+        tried again at the next check."""
+        due = self.cain_watch.observe(ok)
+        if due is None:
+            return
+        down_s = self.cain_watch.down_for()
+        try:
+            if due == watch.DOWN:
+                self.discord.api.send(self.discord.dm(), escape(watch.down_text(down_s)))
+            else:
+                self.discord_chat.link.card(escape(watch.back_text(down_s)), [], "alert")
+        except (DiscordError, LinkError) as e:
+            log.warning("watch: couldn't tell him Cain is %s: %s", due,
+                        getattr(e, "description", "") or type(e).__name__)
+            return
+        self.cain_watch.sent(due)
+        log.info("watch: told him Cain's add-on is %s (after %.0fs)", due, down_s)
 
     def _discord_ready(self) -> bool:
         """Identify the bot and its owner once per token; on a new bot, move over."""
@@ -697,4 +729,21 @@ class Controller:
                             "sent": self.ledger.get_meta("last_digest_sent") == "yes",
                             "text": self.ledger.get_meta("last_digest_text") or ""},
             "meaning_shadow": self.meaning.status() if self.meaning is not None else None,
+            "discord": self._discord_status(),
         })
+
+    def _discord_status(self) -> dict | None:
+        """The Discord link (it lives in Cain's add-on) and the watch on Cain, for the page.
+        What Cain's link says is checked for shape here; the page escapes it again."""
+        if self.discord_chat is None or not hasattr(self, "_link_checked"):
+            return None                       # not checked yet: nothing to say
+        link = None
+        st = self.cain_status
+        if isinstance(st, dict) and isinstance(st.get("discord"), dict):
+            d = st["discord"]
+            heard = d.get("last_heard")
+            heard_ok = isinstance(heard, (int, float)) and not isinstance(heard, bool) and heard > 0
+            link = {"connected": d.get("connected") is True,
+                    "last_heard": watch.iso(heard / 1000) if heard_ok else None}
+        return {"cain_answering": st is not None, "link": link,
+                "cain": self.cain_watch.status() if self.cain_watch is not None else None}

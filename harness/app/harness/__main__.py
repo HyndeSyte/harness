@@ -25,7 +25,7 @@ from .discord_api import DiscordAPI, DiscordTransport
 from .cain_relay import CainLink
 from .discord_chat import LinkChat
 from .discord_keeper import DiscordKeeper, KeeperStore
-from . import commands, handover
+from . import commands, handover, watch
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
@@ -152,6 +152,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     keeper = DiscordKeeper(DiscordAPI(discord_token, DiscordTransport()), store.get, store.set)
     controller.discord = keeper
     controller.discord_chat = chat
+    # The mutual watch on Cain's add-on: told once if it's down 5 minutes, once when back.
+    controller.cain_watch = watch.PeerWatch(store.get, store.set)
     # Cain hands calendar requests over here, keyed by the bot token both hold.
     controller.handovers = handover.Inbox(discord_token, wake=keeper.wake)
     try:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- **If the calendar specialist stops, you hear about it.** Cain's add-on checks the Harness add-on every minute. If it hasn't answered for 5 minutes (or its main loop has stuck for 10), you get one Discord message saying so, and one more when it's back. Cain is told too, so he won't promise calendar changes meanwhile.
+- **No noise on restarts or updates.** Anything shorter than 5 minutes says nothing, and a message is never repeated. A restart of Cain during an outage doesn't tell you twice.
+- **The Harness page can show the Discord link.** Cain's link now reports whether it's connected to Discord and when it last heard from it. The other half of the watch is in Harness 0.20.0: if Cain's add-on stops, Harness tells you itself.
+
 ## 0.4.4
 
 - **Outside reviews: an allowlist decides what leaves.** Only a brief's topic, question and body go to the outside models, plus its two flags. The id stays on the Pi, and any other field is refused without echoing it. The terms list stays as a backstop, now on text with invisible characters stripped and Unicode normalized first.

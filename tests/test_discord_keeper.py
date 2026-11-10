@@ -72,6 +72,9 @@ class FakeLink:
     def health(self):
         return self.up
 
+    def status(self):
+        return {"status": "ok"} if self.up else None
+
     def last(self):
         return self.cards[max(self.cards)] if self.cards else None
 

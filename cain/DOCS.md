@@ -16,6 +16,13 @@ plugin (research preview) and your Claude plan; no API key.
 Only one place may run the bot at a time. Stop any other session using the same
 token first, or both will answer.
 
+## If the calendar specialist stops
+
+Cain's add-on and the Harness add-on check each other every minute. If Harness hasn't
+answered for 5 minutes, you get one Discord message from Cain's add-on, and one more when
+it's back. If Cain's add-on is the one that stops, Harness tells you itself. Restarts and
+updates are shorter than 5 minutes and say nothing.
+
 ## Outside reviews (once)
 
 1. ChatGPT, for the OpenAI reviewer: in ChatGPT, Settings, Security, turn on device
