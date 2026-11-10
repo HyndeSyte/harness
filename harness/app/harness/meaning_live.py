@@ -74,6 +74,9 @@ UNDOS = frozenset(c for _, c in UNDO_BUTTONS)
 MEANINGS = {"kids": (["supervision"], "none"), "me": (["presence"], "none"),
             "school": (["transport"], "school"), "drive": (["transport"], "event_location"),
             "none": ([], "none")}
+# A dated row is his answer about one event, applied as if he had answered its card.
+EVENT_ANSWER = {"kids": ("supervision", "yes"), "me": ("presence", "yes"),
+                "school": ("transport", "yes"), "drive": ("transport", "yes"), "none": ("*", "no")}
 MAX_ROWS = 60
 MAX_KIND = 80
 MAX_KIND_WORDS = 8
@@ -102,8 +105,9 @@ def validate_rows(body) -> tuple[list[dict] | None, str]:
     today = datetime.now().date()
     out = []
     for n, row in enumerate(rows, 1):
-        if not isinstance(row, dict) or set(row) != {"kind", "meaning", "said_on"}:
-            return None, f"row {n}: needs exactly kind, meaning and said_on"
+        if not isinstance(row, dict) or not ({"kind", "meaning", "said_on"} <= set(row)
+                                              <= {"kind", "meaning", "said_on", "for"}):
+            return None, f"row {n}: needs exactly kind, meaning and said_on (and for, a date)"
         kind, said_meaning, said_on = row["kind"], row["meaning"], row["said_on"]
         if not isinstance(kind, str) or not 0 < len(kind) <= MAX_KIND:
             return None, f"row {n}: kind must be 1 to {MAX_KIND} characters"
@@ -120,7 +124,18 @@ def validate_rows(body) -> tuple[list[dict] | None, str]:
             return None, f"row {n}: said_on must be a date like 2026-11-08"
         if day.year < 2020 or day > today + timedelta(days=1):
             return None, f"row {n}: said_on must not be in the future"
-        out.append({"words": sorted(words), "meaning": said_meaning, "said_on": said_on})
+        clean = {"words": sorted(words), "meaning": said_meaning, "said_on": said_on}
+        on = row.get("for")
+        if on is not None:
+            # His answer about one event: the Family event with these words on that day.
+            if not isinstance(on, str) or not _DATE.fullmatch(on):
+                return None, f"row {n}: for must be a date like 2026-11-21"
+            try:
+                date.fromisoformat(on)
+            except ValueError:
+                return None, f"row {n}: for must be a date like 2026-11-21"
+            clean["for"] = on
+        out.append(clean)
     return out, ""
 
 
@@ -201,8 +216,11 @@ def _forced(j: meaning.Judgment, types: tuple[str, ...], sp: meaning.Span,
     window judged, a timed event's own time; an all-day one has none to give."""
     obs = tuple(meaning.Rel(o.type, o.s, o.e, o.rs, o.re, o.place, "high")
                 for o in j.obligations if o.type in types)
-    if not obs and "presence" in types and sp.minutes > 0 and not all_day:
-        obs = (meaning.Rel("presence", 0, sp.minutes, certainty="high"),)
+    if not obs and sp.minutes > 0 and not all_day:
+        for kind in ("presence", "supervision"):
+            if kind in types:
+                obs = (meaning.Rel(kind, 0, sp.minutes, certainty="high"),)
+                break
     return meaning.Judgment(obs, (), False)
 
 
@@ -239,12 +257,28 @@ class MeaningLive:
             "SELECT occurrence, ask, answer FROM meaning_questions WHERE state='answered'"
             " ORDER BY updated_at")}
 
+    def _event_answers(self) -> dict[tuple[str, str], tuple[str, str]]:
+        """His dated answers from Cain's record: (words, day) -> (ask, code). Exactly that
+        event's words on exactly that day; anything else stays with the judge."""
+        return {(r["words"], r["day"]): EVENT_ANSWER[r["meaning"]] for r in self.ledger.db.execute(
+            "SELECT words, day, meaning FROM meaning_event_answers") if r["meaning"] in EVENT_ANSWER}
+
+    @staticmethod
+    def _answer_for(occ, sp, answers, dated):
+        """His card answer for this occurrence, else his dated answer for it from the record."""
+        got = answers.get(_occ_id(occ))
+        if got is not None:
+            return got
+        words = " ".join(sorted(family_rules.words(occ.summary)))
+        return dated.get((words, sp.anchor.date().isoformat()))
+
     def wants(self, items, now: datetime, *, find=None) -> dict[str, Want]:
         """From the judgments alone, with no model: the same judgment and the same Family give
         the same wants. The usual skips first (his copies, holds, his own name)."""
         evs = meaning.events_of(items, self.tz, self.name_fn())
         examples = {e.id: e for e in meaning.active_examples(self.ledger)}
         answers = self._answers()
+        dated = self._event_answers()
         out: dict[str, Want] = {}
         why: dict[str, dict] = {}
         seen: set = set()
@@ -259,7 +293,7 @@ class MeaningLive:
             for item in ev.occurrences:
                 occ = item.occ
                 sp = meaning.span_of(occ, self.tz)
-                answer = answers.get(_occ_id(occ))
+                answer = self._answer_for(occ, sp, answers, dated)
                 blocks = self._blocks(j, backed, sp, now, answer, occ.all_day)
                 if not blocks:
                     none[_occ_id(occ)] = (sp.anchor, meaning.shown(occ.summary),
@@ -342,6 +376,8 @@ class MeaningLive:
         if answer is None:
             return blocks
         ask, code = answer
+        if ask == "*":
+            return [] if code == "no" else blocks
         asked = _asked_types(ask)
         rest = [b for b in blocks if b.type not in asked]
         if code == "no":
@@ -570,6 +606,7 @@ class MeaningLive:
                                        ).fetchall()
         by_kind = {(r["kind_key"], r["ask"]) for r in asked if not r["each"]}
         by_occ = {(r["occurrence"], r["ask"]) for r in asked}
+        dated = self._event_answers()
         out = []
         for ev in evs.values():
             row = meaning.stored(self.ledger, ev.key)
@@ -594,6 +631,8 @@ class MeaningLive:
                     continue
                 if (_occ_id(occ), ask) in by_occ:
                     continue
+                if self._answer_for(occ, sp, {}, dated) is not None:
+                    continue               # he answered about this very event in his record
                 if not self._matters(j, ask, sp, occ.all_day, now):
                     continue
                 out.append((sp.anchor, ev, item, ask, kk, each, j))
@@ -660,6 +699,16 @@ class MeaningLive:
         wins. The same table again stores nothing new. Returns (new, already known)."""
         added = known = 0
         new_ids = []
+        # His dated answers: the whole set each time, as the record holds them now.
+        dated = {(" ".join(r["words"]), r["for"]): r for r in rows if r.get("for")}
+        with self.ledger.tx() as db:
+            had = {(r["words"], r["day"], r["meaning"]) for r in db.execute(
+                "SELECT words, day, meaning FROM meaning_event_answers")}
+            db.execute("DELETE FROM meaning_event_answers")
+            for (words, day), r in sorted(dated.items(), key=lambda kv: kv[1]["said_on"]):
+                db.execute("INSERT OR REPLACE INTO meaning_event_answers(words, day, meaning, said_on)"
+                           " VALUES(?,?,?,?)", (words, day, r["meaning"], r["said_on"]))
+        changed = had != {(w, d, r["meaning"]) for (w, d), r in dated.items()}
         for row in sorted(rows, key=lambda r: r["said_on"]):
             types, place = MEANINGS[row["meaning"]]
             words = frozenset(row["words"])
@@ -673,7 +722,9 @@ class MeaningLive:
                 known += 1
         if new_ids:
             meaning.rejudge_for(self.ledger, new_ids)
+        if new_ids or changed:
             if self.shadow is not None:
                 self.shadow.poke()
-            self.ledger.event("meaning_imported", {"new": added, "known": known})
+            self.ledger.event("meaning_imported", {"new": added, "known": known,
+                                                   "dated": len(dated)})
         return added, known

@@ -7,6 +7,10 @@
 - **The Harness page can show the Discord link.** Cain's link now reports whether it's connected to Discord and when it last heard from it, only to a caller holding the key (anyone else just gets "ok"). The other half of the watch is in Harness 0.20.0: if Cain's add-on stops, Harness tells you itself.
 - **Review fixes to the watch.** A message to you can't repeat if the line to Cain fails, checks never overlap, and the message gives up after 15 seconds. Only "no answer", a server error or "stuck" counts as Harness down; a refused key shows as "can't check: key refused" and tells you nothing. The 5 minutes are timed on a clock that boot-time clock jumps can't fool, and the watch's file is saved even if its folder went missing.
 
+## 0.4.5
+
+- The calendar meanings table takes an optional fourth column, For (a date): that row is Dane's answer about the one event on that day, and is sent as `for`.
+
 ## 0.4.4
 
 - **Outside reviews: an allowlist decides what leaves.** Only a brief's topic, question and body go to the outside models, plus its two flags. The id stays on the Pi, and any other field is refused without echoing it. The terms list stays as a backstop, now on text with invisible characters stripped and Unicode normalized first.

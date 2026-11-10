@@ -295,6 +295,13 @@ CREATE TABLE IF NOT EXISTS meaning_kinds(
   ask_each_time INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meaning_event_answers(
+  words TEXT NOT NULL,
+  day TEXT NOT NULL,
+  meaning TEXT NOT NULL,
+  said_on TEXT NOT NULL,
+  PRIMARY KEY(words, day)
+);
 CREATE TABLE IF NOT EXISTS meaning_receipts(
   id TEXT PRIMARY KEY,
   gmail_key TEXT NOT NULL,

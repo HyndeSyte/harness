@@ -8,6 +8,10 @@
 - **Cain can now check this add-on too** (Cain 0.5.0): it answers a keyed health check while its main loop is turning.
 - **Review fixes to the watch.** The "Cain is back" message now comes straight from here, so it can't sit unshown. Cain's Discord connection being down for 5 minutes counts as Cain down, and the message says so. A restart during an outage no longer breaks the Harness page, a failed check or send can't stop the main loop, the 5 minutes are timed on a clock that boot-time clock jumps can't fool, and a busy loop isn't mistaken for a stuck one.
 
+## 0.19.13
+
+- A dated row from Cain's record (`for`: the event's day) is Dane's answer about that one event: the Family event with exactly those words on that day gets what he said, as if he had answered its card, whatever the judge thinks. Other events with those words still go to the judge, with the row as an example. No question is asked about an event he already answered this way.
+
 ## 0.19.12
 
 - **Self-healing judgments.** Each read, any judgment that never had an active answer of his in front of it is made again, if one fits the event now. Once it has seen his answer, it never triggers again. Before this, an answer that arrived "already known", or after the event was judged, never reached the judgment (the Nov 21 turkey harvest).
