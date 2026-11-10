@@ -24,13 +24,35 @@ export type Brief = {
   needs_facts: boolean; consequential: boolean; seats?: SeatName[];
 };
 
+// ---- What may leave: an allowlist, not a default. ----
+// Every field a brief may have is listed with what happens to it. "text" goes to
+// the seats and passes the private-terms check first (the backstop); "flag"
+// reaches them only as true or false; "local" never leaves the Pi (the id names
+// the queue file and the record folder; seats picks who is asked). A field not
+// listed is refused, so nothing new leaks by being added to a brief.
+export const BRIEF_FIELDS = {
+  id: "local", topic: "text", question: "text", body: "text",
+  needs_facts: "flag", consequential: "flag", seats: "local",
+} as const;
+export type Outbound = Pick<Brief, "topic" | "question" | "body" | "needs_facts" | "consequential">;
+// Fixed reasons: never a field's name or content, which could be the private part.
+export const UNKNOWN_FIELD = `a field that isn't allowed; a brief has only ${Object.keys(BRIEF_FIELDS).join(", ")}`;
+export const STORED_BAD = "the queued brief isn't in the allowed shape, so nothing was sent";
+
 export const LIMITS = { topic: 120, question: 2_000, body: 60_000 };
 export const ID = /^[a-z0-9][a-z0-9-]{2,63}$/;
 
 export function parseBrief(raw: string): { brief?: Brief; error?: string } {
   let j: any;
   try { j = JSON.parse(raw); } catch { return { error: "not JSON" }; }
+  return checkBrief(j);
+}
+
+// The one check for a brief, whether Cain just wrote it or it was read back from
+// the queue: allowlisted fields only, each of the right kind.
+export function checkBrief(j: any): { brief?: Brief; error?: string } {
   if (!j || typeof j !== "object" || Array.isArray(j)) return { error: "not an object" };
+  if (Object.keys(j).some((k) => !Object.hasOwn(BRIEF_FIELDS, k))) return { error: UNKNOWN_FIELD };
   if (typeof j.id !== "string" || !ID.test(j.id)) return { error: "id: 3 to 64 of a-z, 0-9 and -, starting with a letter or digit" };
   for (const k of ["topic", "question", "body"] as const) {
     if (typeof j[k] !== "string" || !j[k].trim()) return { error: `${k} is missing` };
@@ -41,13 +63,19 @@ export function parseBrief(raw: string): { brief?: Brief; error?: string } {
   let seats: SeatName[] | undefined;
   if (j.seats !== undefined) {
     if (!Array.isArray(j.seats) || j.seats.length === 0) return { error: "seats must be a list of seat names" };
-    for (const s of j.seats) if (!SEATS.includes(s)) return { error: `unknown seat ${String(s).slice(0, 20)}` };
+    for (const s of j.seats) if (!SEATS.includes(s)) return { error: "seats has a name that isn't a seat" };
     seats = [...new Set(j.seats as SeatName[])];
   }
   const brief: Brief = { id: j.id, topic: j.topic.trim(), question: j.question.trim(), body: j.body,
     needs_facts: j.needs_facts, consequential: j.consequential };
   if (seats) brief.seats = seats;
   return { brief };
+}
+
+// What a seat is handed: a new object built from the "text" and "flag" fields
+// only, so nothing else on a brief can reach a prompt.
+export function outbound(b: Brief): Outbound {
+  return { topic: b.topic, question: b.question, body: b.body, needs_facts: b.needs_facts === true, consequential: b.consequential === true };
 }
 
 export function digest(b: Brief): string {
@@ -89,9 +117,12 @@ export function loadTerms(text: string | null): { terms?: Terms; error?: string 
   return { terms: { entries } };
 }
 
+// The allowlist first (the shape), then the backstop: the text that leaves (topic,
+// question, body) and the id, which names the record folder, match no private term.
 // Says what matched by kind and line number only, so the private text itself is
 // never repeated into a log, the record or Discord.
 export function privacyCheck(b: Brief, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
+  if (!checkBrief(b).brief) return { ok: false, why: [STORED_BAD] };
   const loaded = loadTerms(termsText);
   if (!loaded.terms) return { ok: false, why: [loaded.error!] };
   const text = [b.id, b.topic, b.question, b.body].join("\n");
@@ -168,7 +199,7 @@ export function validateAnswer(x: unknown, lenient = false): { answer?: Answer; 
 
 export type Role = "reviewer" | "facts" | "stand-in" | "facts-stand-in";
 
-export function prompt(b: Brief, role: Role): { system: string; user: string } {
+export function prompt(b: Outbound, role: Role): { system: string; user: string } {
   const base = [
     "You are an independent outside reviewer. Be blunt and specific.",
     "Rank the real problems by impact, most important first, each with a concrete fix. Leave out praise and minor style points.",
@@ -269,7 +300,7 @@ export function tokenCost(model: string, day: string, input: number, output: num
   return (input * p.in + output * p.out) / 1e6;
 }
 // Before a call: the most it could cost, from the brief's length and the output cap.
-export function estimate(seat: SeatName, model: string, b: Brief, maxOut: number, day: string): number {
+export function estimate(seat: SeatName, model: string, b: Outbound, maxOut: number, day: string): number {
   if (seat === "openai") return 0;    // the ChatGPT plan; counted in runs, not dollars
   const input = Math.ceil((b.topic.length + b.question.length + b.body.length + 2_000) / 3);
   const searches = seat === "claude" && b.needs_facts ? 5 * CLAUDE_SEARCH_USD : seat === "perplexity" ? 5 * PERPLEXITY_SEARCH_USD : 0;

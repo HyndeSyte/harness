@@ -95,11 +95,17 @@ second view adds value; skip it for small, obvious things.
   question. Never paste his messages, mail or record notes into it as they are; say
   only what a stranger needs. No names of family, his employer, health, accounts,
   emails or phone numbers.
+- Only topic, question and body leave, plus the two true/false flags; the id stays on
+  the Pi. A brief has exactly the fields shown below (and optionally `seats`): any
+  other field is refused ("not a brief: a field that isn't allowed"), so never add
+  context, notes or names as extra fields. Everything you want reviewed goes in body,
+  written for a stranger.
 - Keep /data/review-private-terms.txt current: one term per line (family names,
   employer names, health words, anything of his that must not leave), `re:` for a
-  pattern, `#` for notes. Add a term the day you learn one. A brief that matches is
-  blocked before anything is sent ("blocked: privacy"); fix the brief and send it under
-  a new id. With no list, nothing goes out.
+  pattern, `#` for notes. Add a term the day you learn one. It is the backstop: topic,
+  question, body and id are checked against it, and a brief that matches is blocked
+  before anything is sent ("blocked: privacy"); fix the brief and send it under a new
+  id. With no list, nothing goes out.
 - Submit: write `{"id": "<date>-<slug>", "topic": "...", "question": "...", "body": "...",
   "needs_facts": true|false, "consequential": true|false}` to a temp file and run
   `/opt/cain/review.sh submit <file>`. needs_facts adds Perplexity to check current facts

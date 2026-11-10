@@ -6,7 +6,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
-  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, estimate, fixFor, independent, privacyCheck, recordRequest,
+  FINAL, JUDGES, LABEL, SEATS, STORED_BAD, SeatError, backoffMs, estimate, fixFor, independent, outbound, privacyCheck, recordRequest,
   relayLine, retryLimit, seatRun, type Brief, type ErrorKind, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
@@ -138,10 +138,12 @@ export class Runner {
   }
 
   async advance(r: Review): Promise<void> {
-    if (r.brief) {
-      const g = privacyCheck(r.brief, this.terms());
-      if (!g.ok) return this.block(r, g.why);
-    }
+    // A queued brief is read back from disk, so it is checked again in full: the
+    // allowlist (an old or edited brief with any other field is refused, not
+    // sent), then the terms. No brief at all on an open review is refused too.
+    if (!r.brief) return this.block(r, [STORED_BAD]);
+    const g = privacyCheck(r.brief, this.terms());
+    if (!g.ok) return this.block(r, g.why);
     for (let pass = 0; pass < 4; pass++) {
       const now = this.now().toISOString();
       const due = r.seats.filter((s) => this.isDue(r, s, now));
@@ -176,7 +178,7 @@ export class Runner {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, rej) => { timer = setTimeout(() => { ctl.abort(); rej(new SeatError("timeout", `no answer within ${ms / 1000} s`)); }, ms); });
     try {
-      const a = await Promise.race([fn({ brief: b, role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day() }), deadline]);
+      const a = await Promise.race([fn({ brief: outbound(b), role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day() }), deadline]);
       const cost = this.addSpend(s.seat, a.cost_usd, a.findings.length, a.searches ?? 0);
       Object.assign(s, { state: "done", verdict: a.verdict, findings: a.findings, model: a.model, tokens: a.tokens,
         cost_usd: s.cost_usd + cost, finished_at: this.now().toISOString() });
@@ -293,7 +295,7 @@ export class Runner {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const a = await Promise.race([
-          this.fnFor(seat)!({ brief: SELFTEST, role: "reviewer", signal: ctl.signal, maxOutputTokens: 2_048, day: this.day(), selftest: true }),
+          this.fnFor(seat)!({ brief: outbound(SELFTEST), role: "reviewer", signal: ctl.signal, maxOutputTokens: 2_048, day: this.day(), selftest: true }),
           new Promise<never>((_, rej) => { timer = setTimeout(() => { ctl.abort(); rej(new SeatError("timeout", "no answer in time")); }, ms); }),
         ]);
         this.addSpend(seat, a.cost_usd, 0);

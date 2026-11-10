@@ -1,8 +1,9 @@
 // What every seat shares: the call shape, HTTP with a deadline, and error mapping.
-import { classifyHttp, SeatError, type Answer, type Brief, type Role } from "../core.ts";
+import { classifyHttp, SeatError, type Answer, type Outbound, type Role } from "../core.ts";
 
 export type SeatInput = {
-  brief: Brief; role: Role; signal: AbortSignal; maxOutputTokens: number;
+  brief: Outbound;        // the allowlisted fields only (core.ts outbound), never the whole brief
+  role: Role; signal: AbortSignal; maxOutputTokens: number;
   day: string;            // YYYY-MM-DD, for date-dependent prices
   selftest?: boolean;
 };
