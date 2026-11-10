@@ -520,6 +520,7 @@ class Controller:
             h.finish("off", "Event meanings aren't set up in the calendar specialist.")
             return
         added, known = self.meaning_live.import_rows(h.rows)
+        log.info("meanings from Cain: %d rows, %d new, %d already known", len(h.rows), added, known)
         h.finish("ok", f"Stored {added} new; {known} already known.", new=added, known=known)
 
     def _places(self, h) -> None:

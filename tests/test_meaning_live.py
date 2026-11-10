@@ -1152,3 +1152,18 @@ def test_why_names_each_gate():
     assert meaning_live.no_block_why(j(sure), False, {}, None).startswith("not backed")
     assert meaning_live.no_block_why(j(unsure), True, {}, None).startswith("the judge wasn't sure")
     assert meaning_live.no_block_why(j(sure, u=True), True, {}, None).startswith("the judge wasn't sure")
+
+
+def test_the_why_counts_his_answers_for_the_words(live, caplog):
+    harvest = when(live, days=4, hour=9)
+    seed(live, "Turkey harvest", harvest, hours=7)
+    old = answer_ex(live, "Turkey harvest", ["supervision"])
+    meaning.add_example(live.ledger, source="answer", said="turkey harvest", words=family_rules.words("Turkey harvest"),
+                        types=["presence"])                   # newer: overrules the first
+    live.judge.script = [judged(ob("presence", harvest, harvest + timedelta(hours=7), certainty="medium"))]
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    go(live)
+    go(live)
+    [said] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("no block for")]
+    assert said.endswith("his answers for these words: 1 active, 1 overruled"), said
+    assert old

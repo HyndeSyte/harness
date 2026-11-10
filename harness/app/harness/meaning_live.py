@@ -262,7 +262,8 @@ class MeaningLive:
                 blocks = self._blocks(j, backed, sp, now, answer, occ.all_day)
                 if not blocks:
                     none[_occ_id(occ)] = (sp.anchor, meaning.shown(occ.summary),
-                                          no_block_why(j, backed, examples, answer))
+                                          no_block_why(j, backed, examples, answer)
+                                          + self._his_for(family_rules.words(occ.summary)))
                 plain_used = False
                 for i, b in enumerate(blocks):
                     if b.end <= now:
@@ -301,6 +302,17 @@ class MeaningLive:
         self._why = why
         self._say_none(none, now)
         return out
+
+    def _his_for(self, words: frozenset[str]) -> str:
+        """How many of his own answers (not seeded ones) are for these words, by state: tells a
+        judge that ignored his answer from an answer that never arrived or was overruled."""
+        states: dict[str, int] = {}
+        for r in self.ledger.db.execute("SELECT source, words, state FROM meaning_examples"):
+            ex_words = frozenset((r["words"] or "").split())
+            if r["source"] not in meaning.SEEDED and ex_words and ex_words <= words:
+                states[r["state"]] = states.get(r["state"], 0) + 1
+        said = ", ".join(f"{n} {st}" for st, n in sorted(states.items())) or "none"
+        return f"; his answers for these words: {said}"
 
     def _say_none(self, none: dict[str, tuple[datetime, str, str]], now: datetime) -> None:
         """One log line for each Family event in the next NONE_DAYS that gets no block, with
