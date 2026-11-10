@@ -7,7 +7,7 @@ from harness.engines import EngineResult
 from harness.mail_dates import (MAX_TO_ENGINE, MailDates, Message, clean, parse_items, picked,
                                 text_of, title, Found)
 from fake_caldav import no_network  # noqa: F401  (autouse)
-from fakes import SyncExecutor
+from fakes import own, SyncExecutor
 from test_family_add import on, rig  # noqa: F401
 from test_family_copy import GMAIL, TZ
 from test_family_gmail import g  # noqa: F401

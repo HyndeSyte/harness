@@ -35,7 +35,6 @@ from .mail_dates import MailDates, option_on as mail_option_on
 from .mirror_shadow import read_days
 from .net import CalDavTransport, GoogleTransport, MapTransport, RedactingFilter, UrllibTransport
 from .setup_web import SetupApp, serve
-from .telegram_api import TelegramBotAPI
 from .vault import Vault
 
 SCRUB = ("SUPERVISOR_TOKEN", "HASSIO_TOKEN")
@@ -60,7 +59,10 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     vault = Vault(os.path.join(data_dir, "secrets.json"))
     ledger = Ledger(os.path.join(data_dir, "harness.sqlite"))
     transport = UrllibTransport()
-    api = TelegramBotAPI(lambda: vault.get("telegram_bot_token"), transport)
+    # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;
+    # taps come back to /press. The bot token reads his DM when Cain hands a request over.
+    discord_token = lambda: vault.get("discord_bot_token")          # noqa: E731
+    chat = LinkChat(CainLink(discord_token), paused=lambda: commands.is_paused(ledger))
     engines = {
         "claude": AnthropicEngine(policy.MODELS["claude"],
                                   lambda: vault.get("anthropic_api_key"), transport,
@@ -126,7 +128,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                                    home_fn=lambda: home_from_options(data_dir)),
                                tz=base.timezone, live=live,
                                live_fn=lambda: meaning_live.live_on(data_dir))
-    controller = Controller(ledger=ledger, vault=vault, api=api, engines=engines,
+    controller = Controller(ledger=ledger, vault=vault, api=chat, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,
                             family=inbox if base.family_entity else None, mirror=None,   # retired: the work holds script does it
@@ -146,14 +148,10 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)),
                             meaning=judging, meaning_live=live)
-    # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;
-    # taps come back to /press. The bot token reads his DM when Cain hands a request over.
     store = KeeperStore(os.path.join(data_dir, "discord.json"))
-    discord_token = lambda: vault.get("discord_bot_token")          # noqa: E731
     keeper = DiscordKeeper(DiscordAPI(discord_token, DiscordTransport()), store.get, store.set)
     controller.discord = keeper
-    controller.discord_chat = LinkChat(CainLink(discord_token),
-                                       paused=lambda: commands.is_paused(ledger))
+    controller.discord_chat = chat
     # Cain hands calendar requests over here, keyed by the bot token both hold.
     controller.handovers = handover.Inbox(discord_token, wake=keeper.wake)
     try:
@@ -167,9 +165,9 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
 
 
 class Stop(Exception):
-    """Raised from the signal handler so a blocking long poll is
-    interrupted at once, not after its timeout: Home Assistant gives an
-    add-on a limited time to stop before it kills it."""
+    """Raised from the signal handler so a blocking wait is interrupted at
+    once, not after its timeout: Home Assistant gives an add-on a limited
+    time to stop before it kills it."""
 
 
 def main() -> int:

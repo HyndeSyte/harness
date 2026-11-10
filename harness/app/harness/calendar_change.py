@@ -111,7 +111,7 @@ def pick_titles(asked: str, titles: set[str]) -> list[str]:
 
 
 def _safe(text: str) -> str:
-    """Text from a calendar, for Telegram. Anyone can put a title on his calendar by invite,
+    """Text from a calendar, for his chat. Anyone can put a title on his calendar by invite,
     so it can't be a link or a command."""
     return render.family_text(render.defang(text))
 

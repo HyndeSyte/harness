@@ -13,7 +13,8 @@ import pytest
 from harness import daily, digest, family
 from harness.calendar_feed import CalendarFeeds, today_bounds
 from harness.config import Config
-from harness.controller import Controller, family_line
+from harness.controller import family_line
+from fakes import own, TestController as Controller
 from harness.family import FamilyInbox, Rejected, parse
 from harness.setup_web import SetupApp, render_page
 from harness.vault import Vault

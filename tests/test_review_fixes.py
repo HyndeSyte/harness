@@ -20,25 +20,14 @@ from conftest import OWNER, msg
 from fakes import FakeEngine, SyncExecutor, result
 from test_controller import Rig
 
-NEW_TOKEN = "987654321:BBEhBP0av28aH3sT9_" + "y" * 18
 
-
-# 1 (high): a reset or a new token must not wedge the loop or lose updates
-def test_a_new_bot_starts_its_own_offset_and_message_ids(ledger, tmp_path, clock):
+# 1 (high): a new token must not wedge the loop or lose his messages
+def test_a_new_bot_starts_its_own_message_ids(ledger, tmp_path, clock):
     r = Rig(ledger, tmp_path, clock)
+    ledger.set_bot(1)
     r.updates(msg(41, "first bot, message 10", message_id=10))
     r.c.tick()
-    assert ledger.telegram_offset() == 42
-    # reset, then a different bot's token, and pairing again
-    r.requests.put({"type": "reset", "by": "Owner"})
-    r.c.tick()
-    r.vault.set_key("telegram_bot_token", NEW_TOKEN, by="Owner")
-    r.bot.bot_id = 2
-    code = r.vault.new_pairing_code()
-    r.updates(msg(3, f"/start {code}"))          # the new bot's update ids start low
-    r.c.tick()
-    assert r.bot.offsets[-1] == 0                 # not the old bot's offset
-    assert r.vault.owner_id() == OWNER
+    ledger.set_bot(2)          # a new bot token (controller._discord_ready records it)
     # the new chat reuses message id 10: a new job, not an integrity error
     r.claude.script = [result(text="second bot answer")]
     r.updates(msg(4, "second bot, message 10", message_id=10))

@@ -2,7 +2,7 @@
 
 Everything he receives goes through the outbox: written in the same
 transaction as the job state it reports, then sent here, in order, with
-retries. Cards and choice buttons are bound to the message id Telegram
+retries. Cards and choice buttons are bound to the message id the chat
 returns -- after the send, never before -- so a button can only ever
 match the exact message it was sent on. If the process dies between the
 send and the bind, the buttons simply never work (fail closed) and the
@@ -20,12 +20,12 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import approvals, choices, render
+from .chat import ChatError
 from .ledger import Ledger, LedgerError, iso
-from .telegram_api import TelegramError
 
 log = logging.getLogger("harness.outbox")
 
-SPACING_S = 1.1        # Telegram: about one message per second per chat
+SPACING_S = 1.1        # about one message per second
 DELAYED_AFTER_S = 600  # a reply this late says so
 
 
@@ -68,7 +68,7 @@ class Outbox:
             text = render.fit(f"<i>Delayed: written {when}.</i>\n" + text)
         try:
             mid = self._deliver(row["chat_id"], text, buttons, row["kind"])
-        except TelegramError as e:
+        except ChatError as e:
             self._failed(row, e)
             return False
         now = self.ledger.now()
@@ -98,7 +98,7 @@ class Outbox:
     def _deliver(self, chat_id: int, text: str, buttons, kind: str | None = None) -> int:
         try:
             return self.api.send_message(chat_id, text, buttons, kind=kind)
-        except TelegramError as e:
+        except ChatError as e:
             # Every character is escaped by render, so a markup error means
             # a bug there. Deliver it plainly rather than not at all.
             if e.code == 400 and "parse" in e.description.lower():
@@ -106,7 +106,7 @@ class Outbox:
                 return self.api.send_message(chat_id, _plain(text), buttons, html=False, kind=kind)
             raise
 
-    def _failed(self, row, e: TelegramError) -> None:
+    def _failed(self, row, e: ChatError) -> None:
         attempts = row["attempts"] + 1
         now = self.ledger.now()
         if e.retryable:

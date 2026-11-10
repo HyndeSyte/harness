@@ -14,8 +14,8 @@ import logging
 from typing import Callable
 
 from . import approvals, choices, render, rules
+from .chat import ChatError
 from .ledger import Ledger
-from .telegram_api import TelegramError
 
 log = logging.getLogger("harness.callbacks")
 
@@ -141,11 +141,11 @@ class Callbacks:
     def _answer(self, inc, text: str | None) -> None:
         try:
             self.api.answer_callback(inc.callback_id, text)
-        except TelegramError as e:
-            log.info("answerCallbackQuery failed: %s", e)
+        except ChatError as e:
+            log.info("answering the tap failed: %s", e)
 
     def _strip_buttons(self, inc) -> None:
         try:
             self.api.edit_reply_markup(inc.chat_id, inc.message_id, None)
-        except TelegramError as e:
+        except ChatError as e:
             log.info("removing buttons failed: %s", e)

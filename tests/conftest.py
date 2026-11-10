@@ -49,27 +49,3 @@ def cb(update_id, data, *, message_id, user=OWNER, chat=OWNER, chat_type="privat
         "id": f"cq{update_id}", "data": data,
         "from": {"id": user, "is_bot": False},
         "message": {"message_id": message_id, "chat": {"id": chat, "type": chat_type}}}}
-
-
-class FakeAPI:
-    def __init__(self, batches=None):
-        self.batches = list(batches or [])
-        self.offsets = []
-        self.sent = []
-        self.next_message_id = 9000
-
-    def get_updates(self, offset, timeout, allowed_updates):
-        self.offsets.append(offset)
-        assert tuple(allowed_updates) == ("message", "callback_query")
-        return self.batches.pop(0) if self.batches else []
-
-    def send_message(self, chat_id, text, buttons=None, *, html=True, kind=None):
-        self.next_message_id += 1
-        self.sent.append((chat_id, text, buttons, self.next_message_id))
-        return self.next_message_id
-
-    def edit_reply_markup(self, chat_id, message_id, buttons):
-        self.sent.append(("edit", chat_id, message_id, buttons))
-
-    def answer_callback(self, callback_id, text=None):
-        self.sent.append(("answer", callback_id, text))

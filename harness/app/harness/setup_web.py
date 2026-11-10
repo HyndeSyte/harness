@@ -9,9 +9,9 @@ the sidebar entry, so this page enforces its own rule: the first Home
 Assistant user to save settings becomes the only one who can change them.
 
 What it never does: show a key back (only whether each is set, and when),
-put a key in a URL, log a request body, or change anything after pairing
-without his tap in Telegram -- after pairing, a change becomes a pending
-request the controller announces to him as a card.
+put a key in a URL, log a request body, or change a key without his tap
+while there is an owner (vault.py) -- then a change becomes a pending request
+the controller announces to him as a card.
 """
 from __future__ import annotations
 
@@ -52,7 +52,6 @@ class SetupApp:
         self.allowed_peers = allowed_peers
         self.csrf = secrets.token_urlsafe(24)
         self.lock = threading.Lock()
-        self.pair_code: str | None = None   # shown on the page; only its hash is stored
 
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -85,12 +84,10 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
     parts.append(f"<div>Stage <b>{_e(st.get('stage', '?'))}</b> · "
                  f"{'stopped' if st.get('paused') else 'running'}</div>")
     if owner:
-        parts.append(f'<div class="ok">Paired with your Telegram account since '
-                     f'{_e(owner["paired_at"][:10])}.</div>')
-    else:
-        parts.append('<div class="no">Not paired yet.</div>')
+        parts.append(f'<div class="ok">Key changes need your tap on a card (owner since '
+                     f'{_e(owner["paired_at"][:10])}).</div>')
     if st.get("last_poll"):
-        parts.append(f'<div class="muted">Last contact with Telegram: {_e(st["last_poll"][:19])}'
+        parts.append(f'<div class="muted">Last contact with Cain: {_e(st["last_poll"][:19])}'
                      ' UTC</div>')
     for note in st.get("notes") or []:
         parts.append(f'<div class="no">⚠ {_e(note)}</div>')
@@ -135,7 +132,7 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
         parts.append("</div>")
     last = st.get("last_digest") or {}
     if last.get("text"):
-        how = "sent to Telegram" if last.get("sent") else "not sent: recorded only, before launch"
+        how = "sent" if last.get("sent") else "not sent: recorded only, before launch"
         parts.append(f"<h2>Last digest</h2><div class='card'><div class='muted'>"
                      f"{_e((last.get('at') or '')[:16].replace('T', ' '))} UTC · {how}</div>"
                      f"<pre style='white-space:pre-wrap;font:inherit'>"
@@ -166,9 +163,9 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
 
     pending = v.pending()
     if pending:
-        parts.append(f'<p class="card">Waiting for your tap in Telegram: replace the '
-                     f'{_e(LABELS[pending["field"]])}.</p>')
-    note = ("After pairing, a change here is sent to Telegram and only your tap applies it."
+        parts.append(f'<p class="card">Waiting for your tap on its card: replace the '
+                     f'{_e(LABELS.get(pending["field"], pending["field"]))}.</p>')
+    note = ("A change here is sent to you as a card, and only your tap applies it."
             if owner else "Paste each key once. They are stored only on this Pi.")
     parts.append(f"<h2>{'Replace a key' if owner else 'Enter keys'}</h2>"
                  f'<p class="muted">{note}</p>'
@@ -183,27 +180,10 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
                          f'autocomplete="off" spellcheck="false"></label>')
     parts.append("<button>Save</button></form>")
 
-    if keys.get("telegram_bot_token") and not owner:
-        bot = st.get("bot")
-        with app.lock:
-            code = app.pair_code if v.pairing_active() else None
-        parts.append("<h2>Pair with your Telegram</h2>")
-        if code and bot:
-            link = f"https://t.me/{_e(bot)}?start={_e(code)}"
-            parts.append(f'<div class="card">On your phone, open <a href="{link}" '
-                         f'target="_blank" rel="noopener">{link}</a> and tap Start. '
-                         f'Or send <code>/start {_e(code)}</code> to @{_e(bot)}. '
-                         f'<span class="muted">Good for 15 minutes.</span></div>')
-        elif code:
-            parts.append(f'<div class="card">Send <code>/start {_e(code)}</code> to your bot. '
-                         f'<span class="muted">Good for 15 minutes.</span></div>')
-        parts.append(f'<form method="post" action="pair"><input type="hidden" name="csrf" '
-                     f'value="{_e(app.csrf)}"><button>New pairing code</button></form>')
-
     if owner or any(keys.values()):
         parts.append('<h2>Start over</h2><form method="post" action="reset">'
                      f'<input type="hidden" name="csrf" value="{_e(app.csrf)}">'
-                     '<p class="muted">Forgets the keys and the pairing. Your record (the '
+                     '<p class="muted">Forgets the keys and the owner. Your record (the '
                      'ledger) stays. Type RESET to confirm.</p>'
                      '<input type="text" name="confirm" autocomplete="off">'
                      '<button>Reset</button></form>')
@@ -252,22 +232,10 @@ def make_handler(app: SetupApp):
             path = self.path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
             if path not in ("", "index.html"):
                 return self._send(HTTPStatus.NOT_FOUND, "Not found")
-            self._ensure_code()
             flash = ""
             if "?" in self.path:
                 flash = parse_qs(self.path.split("?", 1)[1]).get("m", [""])[0][:200]
             return self._send(HTTPStatus.OK, render_page(app, who[0], who[1], flash))
-
-        def _ensure_code(self):
-            v = app.vault
-            if v.owner() or not v.get("telegram_bot_token"):
-                return
-            with app.lock:
-                if app.pair_code is None or not v.pairing_active():
-                    try:
-                        app.pair_code = v.new_pairing_code()
-                    except VaultError:
-                        app.pair_code = None
 
         def do_POST(self):
             who = self._who()
@@ -302,29 +270,19 @@ def make_handler(app: SetupApp):
             if not entered:
                 return "Nothing entered."
             if paired and len(entered) > 1:
-                return "After pairing, replace one key at a time. Nothing was changed."
+                return "Replace one key at a time. Nothing was changed."
             done, errors = [], []
             for f in entered:
                 try:
                     if paired:
                         v.request_change(f, form[f], by=name)
-                        done.append(f"{LABELS[f]}: sent to Telegram for your approval")
+                        done.append(f"{LABELS[f]}: sent to you as a card for your approval")
                     else:
                         v.set_key(f, form[f], by=name)
                         done.append(f"{LABELS[f]} saved")
                 except VaultError as e:
                     errors.append(str(e))
             return "; ".join(done + errors)
-
-        def _post_pair(self, form, name):
-            v = app.vault
-            if v.owner():
-                return "Already paired."
-            if not v.get("telegram_bot_token"):
-                return "Enter the bot token first."
-            with app.lock:
-                app.pair_code = v.new_pairing_code()
-            return "New pairing code below."
 
         def _post_arm(self, form, name):
             if app.family is None:
@@ -339,8 +297,6 @@ def make_handler(app: SetupApp):
             if form.get("confirm", "").strip() != "RESET":
                 return "Not reset: type RESET to confirm."
             app.requests.put({"type": "reset", "by": name})
-            with app.lock:
-                app.pair_code = None
             return "Reset requested. Reload in a few seconds."
 
     return Handler

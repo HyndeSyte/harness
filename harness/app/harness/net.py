@@ -1,7 +1,7 @@
 """HTTPS for the controller: one small transport, secrets kept out of logs.
 
-The controller talks to exactly four fixed hosts -- Telegram, Anthropic,
-OpenAI and (S1, read-only) calendar.google.com -- and one configured host,
+The controller talks to fixed hosts -- Anthropic, OpenAI, Discord (discord_api.py)
+and (S1, read-only) calendar.google.com -- and one configured host,
 the iCloud calendar host in the Family calendar address, with the standard
 library only, so the add-on has no
 third-party dependencies to pin, audit or break on update. The iCloud host
@@ -11,8 +11,8 @@ GoogleTransport does the same for the two Google hosts that write to his Gmail
 calendar (google_cal.py), when he has entered a key for that. MapTransport does the same
 for the two map hosts, when he has entered the school's address (drive.py).
 
-The Telegram bot token travels in the URL path, which is where secrets
-leak: an exception message, a traceback, a log line. So nothing here ever
+Secrets can end up in a URL, which is where they leak: an exception
+message, a traceback, a log line. So nothing here ever
 puts a URL into an error, and every string that may be logged passes
 through the redactor, which knows every secret currently loaded.
 """

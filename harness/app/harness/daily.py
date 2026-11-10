@@ -5,7 +5,7 @@ prompt, schema, structured output, the parser -- with a fixed question,
 and records the result as an input the digest depends on. The digest is
 composed by plain code (digest.compose) from the ledger: what is waiting
 on him, what failed since the last digest, budgets, the canary, whether
-Telegram has been reachable, and since when the code and config are
+the chat has been reachable, and since when the code and config are
 unchanged.
 
 Before proactive_from the digest is composed and recorded but not sent.
@@ -30,7 +30,7 @@ from .ledger import Ledger, iso
 log = logging.getLogger("harness.daily")
 
 CANARY_TIME = "06:40"
-TELEGRAM_MAX_AGE = timedelta(minutes=15)
+CHAT_MAX_AGE = timedelta(minutes=15)
 CANARY_MAX_AGE = timedelta(hours=26)
 PROVIDER_NAME = {"anthropic": "Claude", "openai": "GPT"}
 
@@ -178,8 +178,8 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     calendar adds skip his tap."""
     now = ledger.now()
     since = _since(ledger)
-    inputs = [digest.InputCoverage(ledger.get_meta("chat_name") or "Telegram", ledger.last_poll_success(),
-                                   TELEGRAM_MAX_AGE)]
+    inputs = [digest.InputCoverage(ledger.get_meta("chat_name") or "Discord", ledger.last_poll_success(),
+                                   CHAT_MAX_AGE)]
     agenda = None
     notes = list(notes)
     day_start, day_end, day = calendar_feed.today_bounds(now, config.timezone)

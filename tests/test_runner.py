@@ -3,12 +3,12 @@ import json
 
 import pytest
 
-from harness import policy, rules, telegram
+from harness import policy, rules
 from harness.config import Config
 from harness.engines import EngineError
 from harness.runner import Runner
 from conftest import OWNER, msg
-from fakes import FakeBot, FakeEngine, ManualExecutor, SyncExecutor, result
+from fakes import receive, FakeBot, FakeEngine, ManualExecutor, SyncExecutor, result
 
 
 @pytest.fixture
@@ -25,7 +25,7 @@ def make(ledger, config, script=None, executor=None):
 
 def send(ledger, text, uid=1, **kw):
     bot = FakeBot([[msg(uid, text, **kw)]])
-    _, jobs = telegram.poll_once(bot, ledger, OWNER, timeout=0)
+    _, jobs = receive(ledger, bot.take())
     return jobs[0]
 
 

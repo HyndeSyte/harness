@@ -41,7 +41,7 @@ class Verdict:
 
 def callback_data(action: str, nonce: str) -> str:
     data = f"{_PREFIX[action]}:{nonce}"
-    if len(data.encode("utf-8")) > 64:          # Telegram's hard limit
+    if len(data.encode("utf-8")) > 64:          # room for the "k:" prefix in a Discord custom_id
         raise ValueError("callback_data over 64 bytes")
     return data
 
@@ -91,8 +91,7 @@ def mint(ledger: Ledger, *, proposal_id: str, owner_user_id: int, ttl_s: int, db
 
 def bind_message(ledger: Ledger, nonce: str, message_id: int) -> None:
     if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
-        # Telegram returns message_id 0 for ephemeral and scheduled
-        # messages; a card that is not a real message can never be tapped.
+        # A card that is not a real message can never be tapped.
         raise ValueError("not a real message id")
     with ledger.tx() as db:
         cur = db.execute("UPDATE approvals SET message_id=? WHERE nonce=? AND message_id IS NULL",

@@ -1,7 +1,7 @@
 """Configuration. Non-secret, versioned, and part of the integrity hash.
 
-Secrets never live here. The three keys (Telegram bot token, Anthropic
-key, OpenAI key) are entered once on the add-on's own page and stored in
+Secrets never live here. The keys (Discord bot token, Anthropic key,
+OpenAI key and the rest in vault.FIELDS) are entered once on the add-on's own page and stored in
 /data, never in add-on options: the Supervisor API exposes options, and
 his Home Assistant connector can read and rewrite them (round-4 finding).
 The one option is a first name for copies from Gmail (family_copy.py). It isn't a
@@ -46,9 +46,6 @@ class Config:
     # Domains whose links may stay clickable in model text. Everything
     # else is defanged; links he can tap are rendered by the controller.
     link_allowlist: tuple[str, ...] = ()
-    # Telegram keeps undelivered updates for at most 24 hours. After a
-    # longer silence the thread is told continuity is unknown.
-    continuity_window_s: int = 24 * 3600
     # Work-hours mirror (workmirror.py). Off and empty by default: his
     # address and rules are entered at install, never committed here.
     # Not read at runtime: the mirror's live settings are the vault field
@@ -68,7 +65,7 @@ class Config:
         if self.stage not in STAGES:
             raise ValueError(f"unknown stage {self.stage!r}")
         if not isinstance(self.owner_user_id, int) or self.owner_user_id <= 0:
-            raise ValueError("owner_user_id must be his positive Telegram user id")
+            raise ValueError("owner_user_id must be his positive Discord user id")
 
     def stage_at_least(self, stage: str) -> bool:
         return STAGES.index(self.stage) >= STAGES.index(stage)

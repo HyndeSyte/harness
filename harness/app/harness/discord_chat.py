@@ -8,7 +8,7 @@ link (cain_relay.py), which holds it until Cain shows it, unchanged.
 
 - "chat id" keeps meaning "his chat": the owner's id. The message id it
   returns is the card's id; taps come back with it (controller._press).
-- Text is written as Telegram-style HTML (<b>, <i>, escaped entities); it is
+- Text is written as simple HTML (<b>, <i>, escaped entities); it is
   turned into Discord markdown, with everything that was text escaped so an
   event title can't format, link or ping.
 - Each button's id is the harness's callback data with a "k:" prefix, so
@@ -25,8 +25,8 @@ import re
 from typing import Callable
 
 from .cain_relay import CainLink, LinkError
+from .chat import ChatError
 from .discord_api import PRIMARY, components, escape
-from .telegram_api import TelegramError
 
 PREFIX = "k:"
 STOP, RESUME = "k:stop", "k:resume"
@@ -50,7 +50,7 @@ _TAG = re.compile(r"<(/?)(b|i)>")
 
 
 def to_markdown(text: str) -> str:
-    """Telegram HTML (only <b> and <i> are used) to Discord markdown."""
+    """The harness's HTML (only <b> and <i> are used) to Discord markdown."""
     for old, new in WORDS:
         text = text.replace(old, new)
     out, pos = [], 0
@@ -62,9 +62,9 @@ def to_markdown(text: str) -> str:
     return "".join(out)
 
 
-def _err(e: LinkError) -> TelegramError:
+def _err(e: LinkError) -> ChatError:
     # The outbox and callbacks know one error shape: code, words. Unreachable is retried.
-    return TelegramError(e.code if e.code else 503, e.description)
+    return ChatError(e.code if e.code else 503, e.description)
 
 
 class LinkChat:

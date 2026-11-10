@@ -16,4 +16,4 @@ LABEL \
     io.hass.type="addon" \
     io.hass.version="0.19.10" \
     org.opencontainers.image.title="Harness" \
-    org.opencontainers.image.description="Deterministic controller for a private Telegram thread"
+    org.opencontainers.image.description="Deterministic calendar specialist behind Cain on Discord"

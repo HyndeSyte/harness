@@ -4,6 +4,7 @@ import socket
 
 import pytest
 
+from fakes import own
 from harness import workmirror
 from harness.vault import FIELDS, TEXT_FIELDS, Vault, VaultError
 from harness.workmirror import FamilyRule, MirrorConfigError, parse_settings, settings_text
@@ -90,7 +91,7 @@ def test_the_vault_keeps_it_like_a_key_and_the_page_gets_a_textarea(tmp_path):
     with pytest.raises(VaultError, match="work mirror settings"):
         v.set_key("work_mirror", "hours: 08:00-18:00", by="Owner")
     # after pairing, a change is a request for his tap, like any key
-    v.try_pair(v.new_pairing_code(), user_id=7, chat_id=7)
+    own(v, 7)
     v.request_change("work_mirror", "enabled: no", by="Owner")
     assert parse_settings(v.get("work_mirror")).enabled
     assert v.pending()["field"] == "work_mirror"

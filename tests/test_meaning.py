@@ -12,7 +12,7 @@ import pytest
 from harness import caldav, family_rules, ical, meaning, policy
 from harness.engines import EngineError
 from harness.family_gmail import DROP_TITLE, PICK_TITLE
-from fakes import FakeEngine, SyncExecutor, result
+from fakes import own, FakeEngine, SyncExecutor, result
 from fake_caldav import FAMILY_PATH, no_network  # noqa: F401  (autouse)
 from test_family_add import on, rig  # noqa: F401
 from test_family_copy import NY, TZ, seed, when

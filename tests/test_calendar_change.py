@@ -8,7 +8,7 @@ import pytest
 from harness import caldav, effects, ical, ics_edit, prompts, render, schema
 from harness.calendar_change import CalendarChange, matches
 from fake_caldav import FAMILY_PATH, no_network  # noqa: F401  (autouse)
-from fakes import result
+from fakes import own, result
 from test_family_add import Rig, at_least, plain_prompt  # noqa: F401
 
 TZ = "America/New_York"

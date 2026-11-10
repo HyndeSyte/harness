@@ -10,8 +10,6 @@
   /rule    the standing rules, and any waiting for him to pick a side.
   /undo    retire the newest rule (or /undo R1a2b3c for a specific one).
   /checkadds  every Family calendar add needs his Approve tap again, at once.
-  /start   hello; a link on an instrument card opens here with the card's
-           title (deeplink.py). It opens a conversation, nothing more.
 
 Each command is a job of its own, so it gets a receipt like anything else.
 """
@@ -20,14 +18,8 @@ from __future__ import annotations
 import json
 from typing import Callable
 
-from . import deeplink, render, rules
+from . import render, rules
 from .ledger import Ledger, iso
-
-HELP = [("stop", "Stop: start nothing new"), ("resume", "Resume after /stop"),
-        ("cancel", "Cancel everything pending"), ("status", "What it's doing"),
-        ("rule", "Your standing rules"), ("undo", "Undo the newest rule"),
-        ("checkadds", "Family calendar adds need your tap again")]
-
 
 def is_paused(ledger: Ledger) -> bool:
     return ledger.get_meta("paused") == "1"
@@ -159,17 +151,3 @@ class Commands:
                 f" <i>({render.escape(target)} retired)</i>"
         except rules.RuleError as e:
             return render.escape(f"Couldn't undo {target}: {e}.")
-
-    def _start(self, arg: str) -> str:
-        if arg:
-            title = deeplink.decode(arg)
-            if title is None:
-                return "That link doesn't open anything."
-            if self.screen_fn(title):
-                self.ledger.event("deeplink", {"kind": "card", "refused": "work content"})
-                return "That card's title looks like work content, so I didn't keep it."
-            self.ledger.event("deeplink", {"kind": "card"})
-            return (f"From your instrument card: <b>{render.model_text(title)}</b>\n"
-                    "Tell me what happened, or what you want done about it.")
-        return ("This is your harness. Send me anything: a question, a draft to write, "
-                "a decision to think through. /status shows what I'm doing.")
