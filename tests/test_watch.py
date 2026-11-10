@@ -41,7 +41,7 @@ class T:
 
 def pw(mem=None, t=None):
     mem, t = mem or Mem(), t or T()
-    return watch.PeerWatch(mem.get, mem.set, clock=t), mem, t
+    return watch.PeerWatch(mem.get, mem.set, clock=t, mono=t), mem, t
 
 
 # -- the decision, alone ------------------------------------------------------------------
@@ -145,9 +145,10 @@ def test_the_words_name_the_time_and_what_stops_working():
 
 class Sent:
     def __init__(self):
-        self.msgs, self.fail = [], False
+        self.msgs, self.fail, self.timeouts = [], False, []
 
-    def __call__(self, channel, text, rows=None):
+    def __call__(self, channel, text, rows=None, timeout=20):
+        self.timeouts.append(timeout)
         if self.fail:
             raise DiscordError(0, "URLError")
         self.msgs.append((channel, text))
@@ -157,7 +158,8 @@ class Sent:
 def watched(rig, clock, tmp_path):
     store = KeeperStore(str(tmp_path / "discord.json"))
     rig.c.cain_watch = watch.PeerWatch(store.get, store.set,
-                                       clock=lambda: clock().timestamp())
+                                       clock=lambda: clock().timestamp(),
+                                       mono=lambda: clock().timestamp())
     rig.d.send = Sent()
     return rig.d.send
 
@@ -174,7 +176,7 @@ def rig(ledger, tmp_path, clock):
     return Rig(ledger, tmp_path, clock)
 
 
-def test_cain_down_is_told_straight_to_his_dm_once_and_back_through_cain(rig, clock, tmp_path):
+def test_cain_down_is_told_straight_to_his_dm_once_and_back_the_same_way(rig, clock, tmp_path):
     sent = watched(rig, clock, tmp_path)
     minute(rig, clock)
     rig.link.up = False
@@ -189,10 +191,11 @@ def test_cain_down_is_told_straight_to_his_dm_once_and_back_through_cain(rig, cl
     rig.link.up = True
     before = dict(rig.link.cards)
     minute(rig, clock, 3)
-    new = [c for k, c in rig.link.cards.items() if k not in before]
-    assert len(new) == 1 and new[0]["kind"] == "alert" and "answering again" in new[0]["text"]
-    assert new[0]["rows"] == []
-    assert len(sent.msgs) == 1 and rig.c.status_box["discord"]["cain"]["state"] == "up"
+    assert not [c for k, c in rig.link.cards.items()
+                if k not in before and "answering again" in c["text"]]   # not a held card
+    assert len(sent.msgs) == 2 and sent.msgs[1][0] == DM and "answering again" in sent.msgs[1][1]
+    assert rig.c.status_box["discord"]["cain"]["state"] == "up"
+    assert all(t <= 5 for t in sent.timeouts)                # a short send, never a stuck loop
 
 
 def test_a_failed_dm_is_tried_again_next_minute(rig, clock, tmp_path):
@@ -238,8 +241,8 @@ def test_a_stopped_cain_link_over_http_is_told_once_and_back(rig, clock, tmp_pat
     try:
         cards = len(st.cards)
         minute(rig, clock, 2)
-        backs = [c for c in list(st.cards.values())[cards:] if "answering again" in c["text"]]
-        assert len(backs) == 1 and backs[0]["kind"] == "alert" and len(sent.msgs) == 1
+        assert not [c for c in list(st.cards.values())[cards:] if "answering again" in c["text"]]
+        assert len(sent.msgs) == 2 and "answering again" in sent.msgs[1][1]
     finally:
         srv2.shutdown()
         srv2.server_close()
@@ -264,7 +267,10 @@ def test_health_needs_the_key_and_says_whether_the_loop_turns(monkeypatch):
         assert get(port, "/health", "wrong")[0] == 403
         assert get(port, "/nothing", handover.key_for(TOKEN))[0] == 404
         code, body = get(port, "/health", handover.key_for(TOKEN))
-        assert code == 200 and body["status"] == "ok"
+        assert code == 200 and body["status"] == "starting"     # the loop hasn't turned yet
+        inbox.beat()
+        assert get(port, "/health", handover.key_for(TOKEN))[1]["status"] == "ok"
+        inbox.beat()
         inbox.beat_at -= handover.STUCK_S + 1
         assert get(port, "/health", handover.key_for(TOKEN))[1]["status"] == "stuck"
         inbox.beat()
@@ -317,3 +323,184 @@ def test_odd_answers_from_cain_are_not_trusted(rig):
     assert rig.c._discord_status()["link"] == {"connected": False, "last_heard": None}
     rig.c.cain_status = {"status": "ok"}
     assert rig.c._discord_status()["link"] is None
+
+
+# -- review fixes ------------------------------------------------------------------------------
+
+def test_a_restart_mid_outage_with_no_last_ok_still_reports():
+    """Stored by an outage that began before any good check: last_ok is null."""
+    mem = Mem()
+    mem.d["watch_cain"] = json.dumps({"down_since": 999_000.0, "alerted_at": 999_400.0,
+                                      "last_ok": None})
+    w, _, t = pw(mem)
+    assert w.status()["state"] == "unknown"
+    assert w.observe(False) is None
+    assert w.status()["state"] == "down" and w.status()["last_ok"] is None
+    t.t += 60
+    assert w.observe(True) == watch.BACK and w.status()["state"] == "back"
+
+
+def test_stored_times_that_are_not_numbers_are_dropped():
+    mem = Mem()
+    mem.d["watch_cain"] = json.dumps({"down_since": "x", "alerted_at": True, "last_ok": [1]})
+    w, _, _ = pw(mem)
+    w.observe(False)
+    assert w.status()["state"] == "waiting" and w.status()["alerted_at"] is None
+    assert watch.num(float("nan")) is None and watch.num(7) == 7.0
+
+
+def test_a_wall_clock_jump_at_boot_does_not_make_a_short_outage_look_long():
+    mem, wall, mono = Mem(), T(), T()
+    w = watch.PeerWatch(mem.get, mem.set, clock=wall, mono=mono)
+    assert w.observe(False) is None
+    wall.t += 365 * 86400                     # the Pi's clock set from the network
+    mono.t += 60
+    assert w.observe(False) is None           # one real minute, not a year
+    mono.t += watch.GRACE_S
+    assert w.observe(False) == watch.DOWN
+    assert w.down_for() < watch.GRACE_S + 120
+    assert "hours" not in watch.down_text(w.down_for())
+
+
+def test_shown_durations_are_clamped():
+    assert watch.minutes(-500) == "1 minute"
+    assert watch.minutes(10 ** 12) == watch.minutes(watch.MAX_SHOWN_S)
+    assert watch.iso(1e20) is None
+
+
+def test_cain_with_discord_down_counts_as_down_and_says_so(rig, clock, tmp_path):
+    sent = watched(rig, clock, tmp_path)
+    up = {"status": "ok", "discord": {"connected": True, "last_heard": 1_790_000_000_000}}
+    off = {"status": "ok", "discord": {"connected": False, "last_heard": 1_790_000_000_000}}
+    rig.link.status = lambda timeout=None: up
+    minute(rig, clock)
+    rig.link.status = lambda timeout=None: off
+    minute(rig, clock, 4)
+    assert sent.msgs == []                                   # a reconnect: nothing
+    minute(rig, clock, 2)
+    assert len(sent.msgs) == 1 and "Discord connection has been down" in sent.msgs[0][1]
+    rig.link.status = lambda timeout=None: up
+    minute(rig, clock)
+    assert len(sent.msgs) == 2 and "answering again" in sent.msgs[1][1]
+
+
+def test_an_older_link_without_the_discord_field_still_counts_as_up(rig, clock, tmp_path):
+    sent = watched(rig, clock, tmp_path)
+    rig.link.status = lambda timeout=None: {"status": "ok"}
+    minute(rig, clock, 10)
+    assert sent.msgs == [] and rig.c.cain_watch.state() == "up"
+
+
+@pytest.mark.parametrize("boom", [OSError("socket"), TimeoutError(), ValueError("store"),
+                                  DiscordError(0, "the bot's owner is unknown")])
+def test_nothing_in_the_watch_escapes_the_tick_and_a_due_message_stays_due(rig, clock, tmp_path, boom):
+    sent = watched(rig, clock, tmp_path)
+    rig.link.up = False
+    minute(rig, clock, 5)
+
+    def fail(*a, **k):
+        raise boom
+    real = rig.d.send
+    rig.d.send = fail
+    minute(rig, clock, 2)                                    # tick() didn't raise
+    assert rig.c.cain_watch.state() == "waiting"             # still due
+    rig.d.send = real
+    minute(rig, clock)
+    assert len(sent.msgs) == 1 and rig.c.cain_watch.state() == "down"
+
+
+def test_a_failing_store_does_not_escape_the_tick(rig, clock):
+    def broken(*a):
+        raise OSError("disk full")
+    rig.c.cain_watch = watch.PeerWatch(lambda k: None, broken,
+                                       clock=lambda: clock().timestamp(),
+                                       mono=lambda: clock().timestamp())
+    rig.link.up = False
+    minute(rig, clock, 3)                                    # no exception
+
+
+def test_nothing_is_sent_before_discord_is_ready_here(rig, clock, tmp_path):
+    sent = watched(rig, clock, tmp_path)
+    rig.c._discord_seen = None
+    rig.link.up = False
+    rig.c._link_checked = -1e9
+    for _ in range(7):
+        clock.advance(seconds=60)
+        rig.c._link_checked = -1e9
+        rig.c._link_health()
+    assert sent.msgs == [] and rig.c.cain_watch.state() == "waiting"
+
+
+def test_last_heard_out_of_range_is_dropped(rig):
+    for bad in (5, 10 ** 30, float("inf"), -1, True):
+        rig.c.cain_status = {"status": "ok", "discord": {"connected": True, "last_heard": bad}}
+        assert rig.c._discord_status()["link"]["last_heard"] is None
+    rig.c.cain_status = {"status": "ok", "discord": {"connected": True,
+                                                     "last_heard": 1_790_000_000_000}}
+    assert rig.c._discord_status()["link"]["last_heard"].startswith("2026")
+
+
+def test_the_probe_of_cain_is_short(rig, clock, tmp_path):
+    seen = []
+    rig.link.status = lambda timeout=None: seen.append(timeout) or {"status": "ok"}
+    minute(rig, clock)
+    assert seen and all(t is not None and t <= 5 for t in seen)
+
+
+def test_the_probe_sends_the_key_and_gets_the_detail():
+    srv, st = fake_servers.cain_link(TOKEN)
+    st.discord = {"connected": True, "last_heard": 1}
+    try:
+        link = CainLink(lambda: TOKEN, host="127.0.0.1", port=srv.server_address[1], timeout=2)
+        assert link.status(timeout=2)["discord"]["connected"] is True and st.bad_keys == 0
+    finally:
+        srv.shutdown()
+
+
+def test_the_stuck_clock_starts_at_the_first_turn():
+    inbox = handover.Inbox(lambda: TOKEN)
+    assert inbox.health()["status"] == "starting"
+    inbox.beat()
+    assert inbox.health()["status"] == "ok"
+
+
+def test_the_loop_never_idles_near_the_stuck_limit(rig, clock):
+    waits = []
+    rig.c.sleep = lambda s: waits.append(s)
+    real_wait = rig.c._wait
+    rig.c._wait = lambda s: (waits.append(s), real_wait(s))
+    for _ in range(5):
+        rig.c.tick()
+    rig.c._discord_ready = lambda: False                     # Discord not checked yet
+    rig.c.tick()
+    rig.c._discord_mode = lambda: False                      # no bot token
+    rig.c.tick()
+    assert waits and max(waits) <= handover.STUCK_S / 20
+
+
+def test_the_loop_beats_between_its_phases(rig):
+    beats = []
+    rig.c.handovers.beat = lambda: beats.append(1)
+    rig.c.tick()
+    assert len(beats) >= 5
+
+
+def test_a_new_bot_keeps_the_watch(rig, clock, tmp_path):
+    store = KeeperStore(str(tmp_path / "discord.json"))
+    w = watch.PeerWatch(store.get, store.set, clock=lambda: 1000.0, mono=lambda: 1000.0)
+    w.observe(False)
+    w.s["alerted_at"] = 1000.0
+    w._save()
+    from harness.discord_keeper import DiscordKeeper
+    DiscordKeeper(None, store.get, store.set).forget_identity()   # the "new bot, move over" path
+    assert json.loads(store.get("watch_cain"))["alerted_at"] == 1000.0
+
+
+# The same key on both sides: Cain's Bun link must compute exactly this (cain/tests/watch.test.ts).
+VECTOR_TOKEN = "not-a-real-token.cross-language-vector"
+VECTOR_KEY = "d8bd045641e8485f5f91e19bbcabc8dd05ae3b3b5d98dd30609c58119229450a"
+
+
+def test_the_handover_key_matches_the_bun_side():
+    assert handover.key_for(VECTOR_TOKEN) == VECTOR_KEY
+    assert handover.Inbox(lambda: VECTOR_TOKEN).key_ok(VECTOR_KEY)

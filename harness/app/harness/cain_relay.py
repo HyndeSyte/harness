@@ -2,9 +2,9 @@
 
 Cain is the gatekeeper: this add-on never posts to Dane itself. Every card it
 makes goes to Cain's link, which holds it until Cain shows it unchanged (only
-Stop notices and the 7:40 digest fallback go straight out). The one exception
-is the mutual watch's "Cain's add-on is down" message (watch.py), which can't
-go through Cain. Taps on its cards
+Stop notices and the 7:40 digest fallback go straight out). The other exception
+is the mutual watch's "Cain's add-on is down" and "back" messages (watch.py),
+which can't count on Cain. Taps on its cards
 come back to handover.py /press, already checked by the link.
 
 Local only: the add-ons' own network on the Pi. Keyed with
@@ -43,12 +43,14 @@ class CainLink:
         self._token_fn = token_fn
         self.host, self.port, self.timeout = host, port, timeout
 
-    def _call(self, method: str, path: str, body: dict | None = None):
+    def _call(self, method: str, path: str, body: dict | None = None, *,
+              timeout: float | None = None):
         token = self._token_fn()
         if not token:
             raise LinkError(0, "no bot token set")
         try:
-            c = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+            c = http.client.HTTPConnection(self.host, self.port,
+                                           timeout=timeout or self.timeout)
             c.request(method, path, body=json.dumps(body) if body is not None else None,
                       headers={"content-type": "application/json",
                                "x-harness-key": key_for(token)})
@@ -84,11 +86,12 @@ class CainLink:
             return None
         return out.get("card") if isinstance(out.get("card"), int) else None
 
-    def status(self) -> dict | None:
-        """Cain's link's own answer to /health, or None when it doesn't answer. Newer
-        links also say whether their Discord connection is up (link/main.ts)."""
+    def status(self, timeout: float | None = None) -> dict | None:
+        """Cain's link's own answer to /health, or None when it doesn't answer. Sent with
+        the key: newer links then also say whether their Discord connection is up
+        (link/main.ts); without it they say only "ok"."""
         try:
-            out = self._call("GET", "/health")
+            out = self._call("GET", "/health", timeout=timeout)
         except LinkError:
             return None
         return out if isinstance(out, dict) and out.get("status") == "ok" else None

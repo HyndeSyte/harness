@@ -72,7 +72,7 @@ class FakeLink:
     def health(self):
         return self.up
 
-    def status(self):
+    def status(self, timeout=None):
         return {"status": "ok"} if self.up else None
 
     def last(self):

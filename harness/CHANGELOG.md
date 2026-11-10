@@ -2,10 +2,11 @@
 
 ## 0.20.0
 
-- **If Cain's add-on stops, you hear about it.** This add-on checks Cain's every minute. If Cain hasn't answered for 5 minutes, you get one Discord message saying so, sent straight from here since Cain is the one that's down. It tells you Stop and the buttons won't work until Cain is back. When Cain answers again you get one more message, through Cain.
+- **If Cain's add-on stops, you hear about it.** This add-on checks Cain's every minute. If Cain hasn't answered for 5 minutes, you get one Discord message saying so, sent straight from here since Cain is the one that's down. It tells you Stop and the buttons won't work until Cain is back. When Cain answers again you get one more message, also straight from here.
 - **No noise on restarts or updates.** Anything shorter than 5 minutes says nothing, and a message is never repeated. If Discord can't take it, it's tried again a minute later. A restart of this add-on during an outage doesn't tell you twice.
 - **Discord on the Harness page.** A new Discord section shows whether the Discord link (held by Cain's add-on) is connected, when it last heard from Discord, and whether Cain is answering, with when you were told.
 - **Cain can now check this add-on too** (Cain 0.5.0): it answers a keyed health check while its main loop is turning.
+- **Review fixes to the watch.** The "Cain is back" message now comes straight from here, so it can't sit unshown. Cain's Discord connection being down for 5 minutes counts as Cain down, and the message says so. A restart during an outage no longer breaks the Harness page, a failed check or send can't stop the main loop, the 5 minutes are timed on a clock that boot-time clock jumps can't fool, and a busy loop isn't mistaken for a stuck one.
 
 ## 0.19.12
 

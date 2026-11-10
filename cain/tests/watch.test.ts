@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { BACK, backText, check, DOWN, downText, GRACE_MS, minutes, PeerWatch } from "../rootfs/opt/cain/link/watch";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { BACK, backText, check, classify, DOWN, downText, every, fileStore, GRACE_MS, healthBody, hmacKey,
+  MAX_SHOWN_MS, minutes, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "../rootfs/opt/cain/link/watch";
 import { emptyState, Link, State } from "../rootfs/opt/cain/link/core";
 
 function rig(saved: any = null, start = 1_000_000) {
   const clock = { t: start };
   let file: any = saved;
-  const w = new PeerWatch({ load: () => file, save: (s) => { file = s; }, now: () => clock.t });
+  const w = new PeerWatch({ load: () => file, save: (s) => { file = s; }, now: () => clock.t, mono: () => clock.t });
   return { w, clock, file: () => file };
 }
 
@@ -118,5 +122,127 @@ describe("the link's notice", () => {
     expect(post.body.content).toContain("calendar specialist");
     expect(post.body.components).toBeUndefined();
     expect(post.body.allowed_mentions).toEqual({ parse: [] });
+  });
+});
+
+describe("review fixes", () => {
+  test("once the DM is out it's sent, even if the line to Cain fails", async () => {
+    const { w, clock } = rig();
+    const told: string[] = [];
+    const logs: string[] = [];
+    const tell = async (text: string) => { told.push(text); };
+    const relay = () => { throw new Error("EACCES: relay.queue"); };
+    await check(w, async () => false, tell, (l) => logs.push(l), relay);
+    clock.t += GRACE_MS;
+    expect(await check(w, async () => false, tell, (l) => logs.push(l), relay)).toBe(DOWN);
+    for (let i = 0; i < 5; i++) {
+      clock.t += 60_000;
+      expect(await check(w, async () => false, tell, (l) => logs.push(l), relay)).toBeNull();
+    }
+    expect(told.length).toBe(1);
+    expect(logs.some((l) => l.includes("couldn't pass the down line to Cain"))).toBe(true);
+  });
+
+  test("checks never overlap, and a failure is logged", async () => {
+    const timers: (() => void)[] = [];
+    const logs: string[] = [];
+    let release!: () => void;
+    let runs = 0;
+    every(60_000, async () => {
+      runs++;
+      if (runs === 1) await new Promise<void>((r) => { release = r; });
+      if (runs === 2) throw new Error("boom");
+    }, (l) => logs.push(l), (cb) => { timers.push(cb); });
+    expect(timers.length).toBe(1);
+    timers.shift()!();                    // the first check starts, and hangs
+    await Promise.resolve();
+    expect(timers.length).toBe(0);        // nothing else is scheduled while it runs
+    release();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(timers.length).toBe(1);
+    timers.shift()!();                    // the second fails
+    await new Promise((r) => setTimeout(r, 0));
+    expect(logs.some((l) => l.includes("check failed: Error: boom"))).toBe(true);
+    expect(timers.length).toBe(1);        // and the loop goes on
+    expect(runs).toBe(2);
+  });
+
+  test("the notice has a timeout of about 15 s", async () => {
+    expect(NOTICE_TIMEOUT_MS).toBe(15_000);
+    const timeouts: (number | undefined)[] = [];
+    let state: State = emptyState();
+    Object.assign(state, { owner: "4242", dm: "5151", bot: "999" });
+    const rest = async (_m: string, _p: string, body?: any, _a?: boolean, t?: number) => { timeouts.push(t); return { id: "1", content: body?.content }; };
+    const link = new Link({ rest, load: () => JSON.parse(JSON.stringify(state)), save: (s) => { state = s; },
+      now: () => 1, relay: () => {}, toHarness: async () => true, paired: () => "4242", log: () => {} });
+    await link.notice("x", NOTICE_TIMEOUT_MS);
+    expect(timeouts).toEqual([15_000]);
+  });
+
+  test("only 404 counts as alive without a body; 5xx and no answer are down; 403 is refused", async () => {
+    expect(classify(404, null)).toBe("up");
+    expect(classify(200, { status: "ok" })).toBe("up");
+    expect(classify(200, { status: "starting" })).toBe("up");
+    expect(classify(200, { status: "stuck" })).toBe("down");
+    expect(classify(500, null)).toBe("down");
+    expect(classify(503, null)).toBe("down");
+    expect(classify(403, null)).toBe("refused");
+    expect(await probeHarness(async () => { throw new Error("ECONNREFUSED"); })).toBe("down");
+    expect(await probeHarness(async () => new Response("{}", { status: 502 }))).toBe("down");
+    expect(await probeHarness(async () => new Response(JSON.stringify({ status: "ok" }), { status: 200 }))).toBe("up");
+  });
+
+  test("a refused key tells him nothing, is logged once, and shows as can't check", async () => {
+    const { w, clock } = rig();
+    const logs: string[] = [];
+    const told: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      expect(await check(w, async () => "refused", async (t) => { told.push(t); }, (l) => logs.push(l))).toBeNull();
+      clock.t += 60_000;
+    }
+    expect(told).toEqual([]);
+    expect(logs.filter((l) => l.includes("refused our key")).length).toBe(1);
+    expect(w.state()).toBe("refused");
+    expect(w.status().note).toBe("can't check: key refused");
+  });
+
+  test("the handover key matches the Python side (tests/test_watch.py)", () => {
+    expect(hmacKey("not-a-real-token.cross-language-vector", "harness-handover-v1"))
+      .toBe("d8bd045641e8485f5f91e19bbcabc8dd05ae3b3b5d98dd30609c58119229450a");
+    expect(hmacKey("", "harness-handover-v1")).toBe("");
+  });
+
+  test("a wall-clock jump at boot doesn't make a short outage look long", () => {
+    const wall = { t: 1_000_000 }, mono = { t: 5 };
+    const w = new PeerWatch({ load: () => null, save: () => {}, now: () => wall.t, mono: () => mono.t });
+    expect(w.observe(false)).toBeNull();
+    wall.t += 365 * 86_400_000;
+    mono.t += 60_000;
+    expect(w.observe(false)).toBeNull();
+    mono.t += GRACE_MS;
+    expect(w.observe(false)).toBe(DOWN);
+    expect(w.downFor()).toBeLessThan(GRACE_MS + 120_000);
+    expect(minutes(-5)).toBe("1 minute");
+    expect(minutes(1e15)).toBe(minutes(MAX_SHOWN_MS));
+  });
+
+  test("health: bare ok without the key, the detail only with it", () => {
+    const detail = () => ({ discord: { connected: true, last_heard: 5 }, watch: { state: "up" } });
+    expect(healthBody(false, detail)).toEqual({ status: "ok" });
+    expect(healthBody(true, detail)).toEqual({ status: "ok", ...detail() });
+  });
+
+  test("the watch file: the folder is made first, and a failed save is logged", () => {
+    const root = mkdtempSync(join(tmpdir(), "watch-"));
+    const logs: string[] = [];
+    const path = join(root, "gone", "link", "watch.json");
+    const st = fileStore(path, (l) => logs.push(l));
+    st.save({ down_since: 1, alerted_at: 2, last_ok: null });
+    expect(JSON.parse(readFileSync(path, "utf8")).alerted_at).toBe(2);
+    expect(st.load()?.alerted_at).toBe(2);
+    writeFileSync(join(root, "file"), "x");
+    const bad = fileStore(join(root, "file", "watch.json"), (l) => logs.push(l));
+    expect(() => bad.save({ down_since: null, alerted_at: null, last_ok: null })).not.toThrow();
+    expect(logs.some((l) => l.includes("couldn't save"))).toBe(true);
   });
 });

@@ -24,7 +24,8 @@ short rows, checked strictly here before anything is queued; meaning_live.py), a
 /places (his place book, where the places named on Family are; checked the same way;
 places.py). GET /health is for Cain's half of the mutual watch (watch.py): it
 answers "ok" while the controller loop is turning, and "stuck" when it hasn't
-for STUCK_S, so a hung loop counts as down.
+for STUCK_S, so a hung loop counts as down. The clock starts at the loop's first
+turn ("starting" until then), and the loop beats between its phases.
 
 The HTTP thread never touches the ledger: it queues the request for the
 controller and waits on an event.
@@ -86,12 +87,14 @@ class Inbox:
         self._token_fn = token_fn
         self.queue: "queue.Queue[Handover]" = queue.Queue()
         self.wake = wake
-        self.beat_at = time.monotonic()      # the controller loop's last turn
+        self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
 
     def beat(self) -> None:
         self.beat_at = time.monotonic()
 
     def health(self) -> dict:
+        if self.beat_at is None:
+            return {"status": "starting", "loop_age_s": None}
         age = time.monotonic() - self.beat_at
         return {"status": "ok" if age < STUCK_S else "stuck", "loop_age_s": int(age)}
 

@@ -22,7 +22,7 @@ const LIMIT = 2000;
 const SUPPRESS_EMBEDS = 1 << 2;
 const DIRECT_KINDS = new Set(["stopped", "resumed", "alert"]);
 
-export type Rest = (method: string, path: string, body?: unknown, auth?: boolean) => Promise<any>;
+export type Rest = (method: string, path: string, body?: unknown, auth?: boolean, timeoutMs?: number) => Promise<any>;
 
 export interface Card { text: string; rows: any[]; kind: string; created: number; shown: string | null }
 export interface Shown { digest: string; until: number; card?: number; q?: { q: string; options: string[]; used: boolean } }
@@ -107,11 +107,12 @@ export class Link {
       digest: digest(msg.content ?? "", msg.components), until: now + REMEMBER_MS };
   }
 
-  private async post(text: string, comps: any[]): Promise<any> {
+  private async post(text: string, comps: any[], timeoutMs?: number): Promise<any> {
     const { dm } = await this.identity();
     const body: any = { content: fit(text), allowed_mentions: { parse: [] }, flags: SUPPRESS_EMBEDS };
     if (comps.length) body.components = comps;
-    const msg = await this.d.rest("POST", `/channels/${dm}/messages`, body);
+    const msg = timeoutMs === undefined ? await this.d.rest("POST", `/channels/${dm}/messages`, body)
+      : await this.d.rest("POST", `/channels/${dm}/messages`, body, true, timeoutMs);
     if (!msg?.id) throw new Error("no message returned");
     return msg;
   }
@@ -167,8 +168,8 @@ export class Link {
   }
 
   // -- the mutual watch (watch.ts): a plain notice, straight to his DM ---------------
-  async notice(text: string): Promise<string> {
-    const msg = await this.post(text, []);
+  async notice(text: string, timeoutMs?: number): Promise<string> {
+    const msg = await this.post(text, [], timeoutMs);
     return String(msg.id);
   }
 

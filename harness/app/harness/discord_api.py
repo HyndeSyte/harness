@@ -155,12 +155,13 @@ class DiscordAPI:
         return str(ch["id"])
 
     # -- messages ------------------------------------------------------------
-    def send(self, channel_id: str, text: str, rows: list[dict] | None = None) -> dict:
+    def send(self, channel_id: str, text: str, rows: list[dict] | None = None, *,
+             timeout: float = 20) -> dict:
         payload = {"content": fit(text), "allowed_mentions": {"parse": []},
                    "flags": SUPPRESS_EMBEDS}
         if rows:
             payload["components"] = rows
-        msg = self._call("POST", f"/channels/{channel_id}/messages", payload)
+        msg = self._call("POST", f"/channels/{channel_id}/messages", payload, timeout=timeout)
         if not isinstance(msg, dict) or not msg.get("id"):
             raise DiscordError(0, "no message returned")
         return msg

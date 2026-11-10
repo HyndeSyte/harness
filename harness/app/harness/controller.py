@@ -33,7 +33,6 @@ from . import (callbacks, choices, commands, daily, ingress_filter, integrity,
                policy, render, rules, watch)
 from .chat import Decision, Incoming
 from .config import Config
-from .cain_relay import LinkError
 from .discord_api import DiscordError, escape
 from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
 from .engines import Engine
@@ -47,6 +46,8 @@ log = logging.getLogger("harness.controller")
 SETTINGS_TTL_S = 15 * 60
 FRESH_S = 120              # a handed-over message must be this new
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
+PROBE_S = 5                # the watch's check of Cain and its message: short, never a stuck loop
+HEARD_FLOOR_S = 1_420_070_400   # 2015-01-01: an older "last heard from Discord" is nonsense
 
 
 def family_line(st: dict, tz: ZoneInfo) -> str:
@@ -197,9 +198,14 @@ class Controller:
             self.calendar_change.reconcile_after_restart()
 
     # -- the loop --------------------------------------------------------------
-    def tick(self) -> None:
+    def _beat(self) -> None:
+        """Cain's watch asks whether this loop turns (handover /health). Beaten at the
+        start of each tick, between its phases and around the long calls."""
         if self.handovers is not None:
-            self.handovers.beat()          # Cain's watch asks whether this loop turns
+            self.handovers.beat()
+
+    def tick(self) -> None:
+        self._beat()
         self._drain_requests()
         if self._discord_mode():
             self._discord_tick()
@@ -214,6 +220,7 @@ class Controller:
         self.runner.start_pending(paused=commands.is_paused(self.ledger))
         self.runner.collect()
         self.runner.check_timers()
+        self._beat()
         if not commands.is_paused(self.ledger):
             rules.sweep(self.ledger, self.config.owner_user_id, held=not self._proactive_ok())
         if self.family_add is not None:
@@ -226,21 +233,28 @@ class Controller:
                 self.calendar.read_soon()  # so Gmail and work follow in a minute, not half an hour
             self.calendar_change.touched = False
         self._announce_settings()
+        self._beat()
         if self.calendar is not None:
             self.calendar.maybe_start()
             self.calendar.collect()
+        self._beat()
         if self.family_copy is not None:
             self.family_copy.run(paused=commands.is_paused(self.ledger))
+            self._beat()
         if self.family_gmail is not None:
             self.family_gmail.run(paused=commands.is_paused(self.ledger))
+            self._beat()
         if self.mail_dates is not None:
             self.mail_dates.run(paused=commands.is_paused(self.ledger))
+            self._beat()
         if self.meaning is not None:
             self.meaning.run(paused=commands.is_paused(self.ledger))   # judges; writes no calendar
+            self._beat()
         if self.meaning_live is not None:
             self.meaning_live.tick(paused=commands.is_paused(self.ledger))   # questions, no model
         if self.mirror is not None and self.mirror.due():
             self.mirror.run()              # shadow only; its own failures are its record
+            self._beat()
         self._daily(paused)
         self.outbox.flush()
         self._publish()
@@ -263,9 +277,12 @@ class Controller:
             {"press": self._press, "digest": self._cain_digest,
              "morning-posted": self._morning_posted,
              "meanings": self._meanings, "places": self._places}.get(h.kind, self._handover)(h)
+        self._beat()
         self._release_digest()
         self._link_health()
+        self._beat()
         self._work()
+        self._beat()
         self._finish_handovers()
         self._wait(0.3 if (self._busy() or self._handover_jobs) else 3)
 
@@ -283,7 +300,7 @@ class Controller:
         if now - getattr(self, "_link_checked", -1e9) < 60:
             return
         self._link_checked = now
-        status = self.discord_chat.link.status()
+        status = self.discord_chat.link.status(timeout=PROBE_S)
         self.cain_status = status
         if status is not None:
             self.ledger.ingest([])                # proves the path to him, for the digest
@@ -292,28 +309,33 @@ class Controller:
             self.notes["cain_link"] = ("Cain's add-on isn't answering, so cards wait. Calendar "
                                        "work goes on; you'll see them when Cain is back.")
         if self.cain_watch is not None:
-            self._watch_cain(status is not None)
+            self._watch_cain(status)
 
-    def _watch_cain(self, ok: bool) -> None:
+    def _watch_cain(self, status: dict | None) -> None:
         """The mutual watch (watch.py): Cain down for the grace period is told once,
         straight to his DM with the bot token, since Cain is the usual path and is the
-        one that's down. Back is told once, through Cain's link. A failed send is
-        tried again at the next check."""
-        due = self.cain_watch.observe(ok)
-        if due is None:
-            return
-        down_s = self.cain_watch.down_for()
+        one that's down; back is told once, the same way (a card held by Cain might
+        never be shown). Cain counts as down when its link doesn't answer, or when it
+        says its Discord connection is down (newer links only say). A failed send is
+        tried again at the next check. Nothing here may stop the loop."""
         try:
-            if due == watch.DOWN:
-                self.discord.api.send(self.discord.dm(), escape(watch.down_text(down_s)))
-            else:
-                self.discord_chat.link.card(escape(watch.back_text(down_s)), [], "alert")
-        except (DiscordError, LinkError) as e:
-            log.warning("watch: couldn't tell him Cain is %s: %s", due,
-                        getattr(e, "description", "") or type(e).__name__)
-            return
-        self.cain_watch.sent(due)
-        log.info("watch: told him Cain's add-on is %s (after %.0fs)", due, down_s)
+            discord_down = (isinstance(status, dict) and isinstance(status.get("discord"), dict)
+                            and status["discord"].get("connected") is False)
+            why = watch.DISCORD if discord_down else watch.LINK
+            due = self.cain_watch.observe(status is not None and not discord_down)
+            if due is None:
+                return
+            if self._discord_seen is None or self.config is None:
+                log.info("watch: Cain is %s, but Discord isn't ready here yet; next check", due)
+                return
+            down_s = self.cain_watch.down_for()
+            text = watch.down_text(down_s, why) if due == watch.DOWN else watch.back_text(down_s)
+            self.discord.api.send(self.discord.dm(), escape(text), timeout=PROBE_S)
+            self.cain_watch.sent(due)
+            log.info("watch: told him Cain's add-on is %s (%s, after %.0fs)", due, why, down_s)
+        except Exception as e:                 # a due message stays due for the next check
+            log.warning("watch: couldn't check or tell him about Cain: %s: %s", type(e).__name__,
+                        str(getattr(e, "description", "") or "")[:80])
 
     def _discord_ready(self) -> bool:
         """Identify the bot and its owner once per token; on a new bot, move over."""
@@ -741,9 +763,13 @@ class Controller:
         st = self.cain_status
         if isinstance(st, dict) and isinstance(st.get("discord"), dict):
             d = st["discord"]
-            heard = d.get("last_heard")
-            heard_ok = isinstance(heard, (int, float)) and not isinstance(heard, bool) and heard > 0
-            link = {"connected": d.get("connected") is True,
-                    "last_heard": watch.iso(heard / 1000) if heard_ok else None}
+            heard = watch.num(d.get("last_heard"))
+            ceiling = (self.cain_watch.clock() if self.cain_watch is not None else time.time()) + 86400
+            try:
+                ok = heard is not None and HEARD_FLOOR_S <= heard / 1000 <= ceiling
+                last_heard = watch.iso(heard / 1000) if ok else None
+            except (OverflowError, ValueError, TypeError):
+                last_heard = None
+            link = {"connected": d.get("connected") is True, "last_heard": last_heard}
         return {"cain_answering": st is not None, "link": link,
                 "cain": self.cain_watch.status() if self.cain_watch is not None else None}

@@ -20,7 +20,8 @@ token first, or both will answer.
 
 Cain's add-on and the Harness add-on check each other every minute. If Harness hasn't
 answered for 5 minutes, you get one Discord message from Cain's add-on, and one more when
-it's back. If Cain's add-on is the one that stops, Harness tells you itself. Restarts and
+it's back. If Cain's add-on is the one that stops, or its Discord connection stays down,
+Harness tells you itself, both when it goes and when it's back. Restarts and
 updates are shorter than 5 minutes and say nothing.
 
 ## Outside reviews (once)
