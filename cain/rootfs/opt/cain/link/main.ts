@@ -93,8 +93,10 @@ async function harnessAlive(): Promise<boolean> {
   try {
     const r = await fetch(`${HARNESS}/health`, { headers: { "x-harness-key": key("harness-handover-v1") },
       signal: AbortSignal.timeout(10000) });
-    if (!r.ok) return false;
-    return (await r.json().catch(() => null))?.status === "ok";
+    // Any answer means it's running: an older Harness has no /health (404). Only its own
+    // "stuck" (its loop hasn't turned in 10 minutes) or no answer at all counts as down.
+    if (!r.ok) return true;
+    return (await r.json().catch(() => null))?.status !== "stuck";
   } catch { return false; }
 }
 
