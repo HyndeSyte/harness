@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  SeatError, classifyHttp, independent, newReview, parseBrief, privacyCheck, recordRequest, relayLine, seatsFor,
-  validateAnswer, type Brief, type SeatName,
+  BRIEF_FIELDS, STORED_BAD, SeatError, UNKNOWN_FIELD, classifyHttp, independent, newReview, outbound, parseBrief, privacyCheck,
+  recordRequest, relayLine, seatsFor, validateAnswer, type Brief, type SeatName,
 } from "../rootfs/opt/cain/review/core.ts";
 import { DEFAULTS, Runner, loadReview, saveReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
 import type { SeatAnswer, SeatFn, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
@@ -56,8 +56,24 @@ describe("briefs", () => {
     expect(parseBrief(JSON.stringify({ ...brief(), id: "Bad Id" })).error).toContain("id");
     expect(parseBrief(JSON.stringify({ ...brief(), body: "" })).error).toContain("body");
     expect(parseBrief(JSON.stringify({ ...brief(), needs_facts: "yes" })).error).toContain("needs_facts");
-    expect(parseBrief(JSON.stringify({ ...brief(), seats: ["grok"] })).error).toContain("unknown seat");
+    expect(parseBrief(JSON.stringify({ ...brief(), seats: ["grok"] })).error).toContain("isn't a seat");
     expect(parseBrief(JSON.stringify(brief())).brief?.id).toBe("2026-11-08-desk-plan");
+  });
+
+  test("allowlist: any field not listed is refused, with a fixed reason that never echoes it", () => {
+    const extra = parseBrief(JSON.stringify({ ...brief(), notes: "Acme Corp" }));
+    expect(extra.error).toBe(UNKNOWN_FIELD);
+    expect(parseBrief(JSON.stringify({ ...brief(), "Pat diabetes": 1 })).error).toBe(UNKNOWN_FIELD);
+    expect(parseBrief('{"__proto__": {"x": 1}, "id": "abc-def", "topic": "t", "question": "q", "body": "b", "needs_facts": false, "consequential": false}').error).toBe(UNKNOWN_FIELD);
+    expect(UNKNOWN_FIELD).not.toContain("notes");
+    expect(parseBrief(JSON.stringify({ ...brief(), seats: ["Acme Corp"] })).error).not.toContain("Acme");
+    expect(Object.keys(BRIEF_FIELDS).sort()).toEqual(["body", "consequential", "id", "needs_facts", "question", "seats", "topic"]);
+  });
+
+  test("a seat is handed only the allowlisted fields, never the id or seats", () => {
+    const o = outbound({ ...brief({ seats: ["openai"] }), extra: "Acme Corp" } as any);
+    expect(Object.keys(o).sort()).toEqual(["body", "consequential", "needs_facts", "question", "topic"]);
+    expect(JSON.stringify(o)).not.toContain("Acme");
   });
 
   test("seats: Sonar only for facts; consequential always has both outside judges", () => {
@@ -129,6 +145,34 @@ describe("privacy gate", () => {
     expect(t.get("2026-11-08-desk-plan").status).toBe("blocked: privacy");
     expect(gemini.calls.length).toBe(1);
     expect(t.records()).toEqual([]);
+  });
+
+  test("an old-shape queued brief still runs; one with an extra field, or none, is refused unsent", async () => {
+    const seats = { openai: spy(), gemini: spy(), claude: spy() };
+    const t = rig(seats);
+    // Written as the earlier version saved it: the same six fields.
+    const old = newReview(brief(), new Date("2026-11-08T15:00:00Z"));
+    saveReview(t.cfg.queueDir, JSON.parse(JSON.stringify(old)));
+    const bad = newReview(brief({ id: "2026-11-08-edited" }), new Date("2026-11-08T15:00:00Z"));
+    (bad.brief as any).context = "Acme Corp offsite";
+    saveReview(t.cfg.queueDir, bad);
+    const gone = newReview(brief({ id: "2026-11-08-no-brief" }), new Date("2026-11-08T15:00:00Z"));
+    gone.brief = null;
+    saveReview(t.cfg.queueDir, gone);
+    await t.runner.tick();
+    expect(t.get("2026-11-08-desk-plan").status).toBe("done");
+    for (const s of Object.values(seats)) {
+      expect(s.calls).toHaveLength(1);
+      expect(Object.keys(s.calls[0].brief).sort()).toEqual(["body", "consequential", "needs_facts", "question", "topic"]);
+    }
+    for (const id of ["2026-11-08-edited", "2026-11-08-no-brief"]) {
+      const r = t.get(id);
+      expect(r.status).toBe("blocked: privacy");
+      expect(r.blocked_why).toEqual([STORED_BAD]);
+      expect(r.brief).toBeNull();
+    }
+    expect(JSON.stringify(t.get("2026-11-08-edited"))).not.toContain("Acme");
+    expect(t.records()).toHaveLength(1);
   });
 
   test("no list file: nothing goes out", async () => {
