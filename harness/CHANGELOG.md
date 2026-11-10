@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.19.9
+
+- A Family event in the next 30 days that gets no block now says why in the log, once, and again only when the reason changes. The reasons:
+  - he answered no;
+  - judged as nothing for him;
+  - not backed by one of his answers;
+  - the judge wasn't sure.
+
+  Each comes with the judgment's counts. Prompted by the Nov 21 turkey harvest, which had his answer and no block, with nothing saying why.
+
 ## 0.19.8
 
 - Drive blocks are rounded up to whole quarter hours (Dane, Nov 9): a 66-minute drive shows as 75, so the drive there starts on the quarter hour and never cuts it fine. Exactly 15, 30 and so on stay as they are. The choice between going home and driving straight on uses the rounded times too.

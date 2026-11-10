@@ -1122,3 +1122,33 @@ def test_drive_time_rounds_up_to_the_quarter_hour(drives):
         ("Busy (drive there)", start - 45 * M, start, ""),
         ("Busy (family)", start, start + 60 * M, CLINIC),
         ("Busy (drive back)", start + 60 * M, start + 105 * M, "")]
+
+
+def test_an_event_with_no_block_says_why_once(live, caplog):
+    # Nov 10: the turkey harvest had his answer yet no block, and nothing said why.
+    harvest = when(live, days=4, hour=9)
+    seed(live, "Turkey harvest", harvest, hours=7)
+    answer_ex(live, "Turkey harvest", ["presence"])
+    live.judge.script = [judged(ob("presence", harvest, harvest + timedelta(hours=7), certainty="medium"))]
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    go(live)
+    go(live)
+    assert live.google.titles() == []
+    said = [r.getMessage() for r in caplog.records if r.getMessage().startswith("no block for")]
+    assert len(said) == 1, said                                # once, not every read
+    assert "Turkey harvest" in said[0] and "not backed by one of his answers" in said[0]
+    assert "presence medium" in said[0]
+    go(live)
+    assert sum(r.getMessage().startswith("no block for") for r in caplog.records) == 1
+
+
+def test_why_names_each_gate():
+    from harness.meaning import Judgment, Rel
+    sure = Rel("presence", 0, 60, certainty="high")
+    unsure = Rel("presence", 0, 60, certainty="medium")
+    j = lambda *obs, u=False: Judgment(tuple(obs), (), u)
+    assert meaning_live.no_block_why(j(sure), True, {}, ("presence", "no")).startswith("he answered no")
+    assert meaning_live.no_block_why(j(), True, {}, None).startswith("judged as nothing")
+    assert meaning_live.no_block_why(j(sure), False, {}, None).startswith("not backed")
+    assert meaning_live.no_block_why(j(unsure), True, {}, None).startswith("the judge wasn't sure")
+    assert meaning_live.no_block_why(j(sure, u=True), True, {}, None).startswith("the judge wasn't sure")

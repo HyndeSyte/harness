@@ -134,6 +134,24 @@ def kind_key(ev: meaning.Ev) -> str:
     return "w:" + " ".join(sorted(w)) if w else "e:" + ev.key
 
 
+NONE_DAYS = 30                      # how far ahead a missing block explains itself in the log
+
+
+def no_block_why(j: meaning.Judgment, backed: bool, examples: dict, answer) -> str:
+    """Why a judged event gave no block, in fixed words and counts (meaning.judged_why)."""
+    if answer is not None and answer[1] == "no":
+        reason = "he answered no"
+    elif not j.obligations:
+        reason = "judged as nothing for him"
+    elif not backed:
+        reason = "not backed by one of his answers, and a non-urgent block needs that"
+    elif j.unsure or any(ob.certainty != "high" for ob in j.obligations):
+        reason = "the judge wasn't sure, and a non-urgent block needs a sure judgment"
+    else:
+        reason = "its blocks had all ended"
+    return f"{reason} ({meaning.judged_why(j, backed, examples)})"
+
+
 def _occ_id(occ) -> str:
     return f"{occ.uid}|{occ.instance}"
 
@@ -203,6 +221,7 @@ class MeaningLive:
         self.name_fn = name_fn
         self.chat_id: int | None = None
         self._why: dict[str, dict] = {}    # Gmail key -> what the block is for (receipts)
+        self._none_said: dict[str, str] = {}   # occurrence -> why it got no block, as last logged
         self.places = places.PlaceBook(ledger, tz=tz)   # where a named place is (places.py)
 
     def bind(self, owner: int) -> None:
@@ -230,15 +249,20 @@ class MeaningLive:
         why: dict[str, dict] = {}
         seen: set = set()
         self.places.begin()
+        none: dict[str, tuple[datetime, str, str]] = {}
         for ev in evs.values():
             j = meaning.last_good(meaning.stored(self.ledger, ev.key))
             if j is None:
-                continue                   # not judged yet: nothing, and no guess
+                continue                   # not judged yet: nothing, and no guess (judged next read)
             backed = meaning.supported(j, examples)
             for item in ev.occurrences:
                 occ = item.occ
                 sp = meaning.span_of(occ, self.tz)
-                blocks = self._blocks(j, backed, sp, now, answers.get(_occ_id(occ)), occ.all_day)
+                answer = answers.get(_occ_id(occ))
+                blocks = self._blocks(j, backed, sp, now, answer, occ.all_day)
+                if not blocks:
+                    none[_occ_id(occ)] = (sp.anchor, meaning.shown(occ.summary),
+                                          no_block_why(j, backed, examples, answer))
                 plain_used = False
                 for i, b in enumerate(blocks):
                     if b.end <= now:
@@ -275,7 +299,18 @@ class MeaningLive:
                                 "series": occ.uid if ev.kind == "series" else "",
                                 "month": sp.anchor.month, "type": b.type, "place": place}
         self._why = why
+        self._say_none(none, now)
         return out
+
+    def _say_none(self, none: dict[str, tuple[datetime, str, str]], now: datetime) -> None:
+        """One log line for each Family event in the next NONE_DAYS that gets no block, with
+        why, written again only when the why changes. So a missing block explains itself."""
+        soon = {k: v for k, v in none.items() if now <= v[0] <= now + timedelta(days=NONE_DAYS)}
+        for k, (at, said, why) in sorted(soon.items(), key=lambda kv: kv[1][0]):
+            if self._none_said.get(k) != why:
+                log.info("no block for %s on %s: %s", said,
+                         at.astimezone(ZoneInfo(self.tz)).strftime("%a %b %d %I:%M %p"), why)
+        self._none_said = {k: v[2] for k, v in soon.items()}
 
     @staticmethod
     def _blocks(j, backed, sp, now, answer, all_day: bool) -> list[meaning.Block]:
