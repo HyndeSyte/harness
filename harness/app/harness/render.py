@@ -7,7 +7,8 @@ just approved) are built here from canonical fields. Cards for proposals
 are rendered from the canonical parameters and the effect definition,
 never from the model's own description of what it wants to do.
 
-Messages use Telegram's HTML parse mode; only &, < and > need escaping.
+Messages are written in simple HTML (<b>, <i>); only &, < and > need escaping.
+discord_chat.to_markdown turns them into Discord markdown.
 """
 from __future__ import annotations
 
@@ -20,9 +21,9 @@ from zoneinfo import ZoneInfo
 from . import approvals
 from .effects import EffectDef
 
-TELEGRAM_LIMIT = 4096
+MESSAGE_LIMIT = 4096
 
-# Anything Telegram may turn into something he can tap, in model text:
+# Anything a chat client may turn into something he can tap, in model text:
 #   scheme URLs with any host -- names, IP literals, internationalized
 #   names -- including tg:// links;
 #   bare domains, with Unicode-aware labels and letter-only TLDs;
@@ -43,7 +44,7 @@ _TIGHT_COLON = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*:[^\s\d]")
 _PHONE = re.compile(r"\+?\d[\d ().-]{6,}\d")
 _COMMAND = re.compile(r"(?<![\w/])/([A-Za-z0-9_]{1,32})")
 _MENTION = re.compile(r"(?<![\w@])@([A-Za-z0-9_]{3,32})")
-WORD_JOINER = "\u2060"     # invisible; breaks Telegram's command and mention detection
+WORD_JOINER = "\u2060"     # invisible; breaks command and mention detection
 
 
 def escape(text: str) -> str:
@@ -84,15 +85,15 @@ def model_text(text: str, allowlist: tuple[str, ...] = ()) -> str:
 
 
 def units(text: str) -> int:
-    """Length as Telegram may count it: UTF-16 code units. Measuring the
+    """Length in UTF-16 code units. Measuring the
     HTML source this way over-counts, never under-counts."""
     return len(text.encode("utf-16-le")) // 2
 
 
 def fit(text: str, footer: str = "") -> str:
-    """Never exceed Telegram's limit; say so when cut. Never cuts inside
+    """Never exceed the message limit; say so when cut. Never cuts inside
     an HTML entity or tag."""
-    room = TELEGRAM_LIMIT - units(footer)
+    room = MESSAGE_LIMIT - units(footer)
     if units(text) <= room:
         return text + footer
     marker = "\n… (cut to fit)"
@@ -130,7 +131,7 @@ _TAG = re.compile(r"<(/?)([a-z]+)[^>]*>")
 
 
 def _close_tags(text: str) -> str:
-    """Close any tag the cut left open, so Telegram can still parse it."""
+    """Close any tag the cut left open, so it still parses."""
     stack: list[str] = []
     for m in _TAG.finditer(text):
         closing, name = m.group(1), m.group(2)

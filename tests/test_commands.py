@@ -3,14 +3,14 @@ import json
 
 import pytest
 
-from harness import choices, rules, telegram
+from harness import choices, rules
 from harness.callbacks import Callbacks
 from harness.commands import Commands, is_paused
 from harness.config import Config
 from harness.outbox import Outbox
 from harness.runner import Runner
 from conftest import OWNER, cb, msg
-from fakes import FakeBot, FakeEngine, ManualExecutor, SyncExecutor, result
+from fakes import FakeBot, FakeEngine, ManualExecutor, SyncExecutor, receive, result
 
 
 @pytest.fixture
@@ -34,13 +34,13 @@ class World:
     def say(self, text, **kw):
         self.uid += 1
         self.bot.batches.append([msg(self.uid, text, **kw)])
-        decisions, jobs = telegram.poll_once(self.bot, self.ledger, OWNER, timeout=0)
+        decisions, jobs = receive(self.ledger, self.bot.take())
         return decisions, jobs
 
     def tap(self, data, message_id, **kw):
         self.uid += 1
         self.bot.batches.append([cb(self.uid, data, message_id=message_id, **kw)])
-        decisions, _ = telegram.poll_once(self.bot, self.ledger, OWNER, timeout=0)
+        decisions, _ = receive(self.ledger, self.bot.take())
         d = decisions[0]
         return self.cbs.handle(d.incoming) if d.accepted else d.reason
 
@@ -73,7 +73,7 @@ def test_stop_cancels_new_work_and_resume_restores_it(ledger, config):
 
 def test_every_command_is_a_job_with_a_receipt(ledger, config):
     w = World(ledger, config)
-    for c in ("/status", "/rule", "/undo", "/start", "/resume"):
+    for c in ("/status", "/rule", "/undo", "/resume"):
         _, [job] = w.say(c)
         w.step()
         assert ledger.job(job)["state"] == "answered"
@@ -131,7 +131,6 @@ def test_undo_button_works_once_on_its_own_card(ledger, config):
     w = World(ledger, config)
     data, mid = make_undo_card(w, config)
     assert w.tap(data, message_id=mid + 1) == "tap is not on the card it belongs to"
-    assert w.tap(data, message_id=mid, user=999) == "not the owner"
     assert w.tap(data, message_id=mid) == "ok"
     assert rules.listing(ledger) == ([], [])
     assert w.bot.edits[-1] == (OWNER, mid, None)            # buttons removed

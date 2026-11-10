@@ -6,11 +6,11 @@ from datetime import timedelta
 
 import pytest
 
-from harness import approvals, choices, daily, render, telegram
+from harness import approvals, choices, daily, render
 from harness.config import Config
-from harness.telegram import Incoming
-from conftest import OWNER, msg
-from fakes import FakeBot
+from harness.chat import Incoming
+from conftest import OWNER
+from fakes import receive
 
 
 def inc(**kw):
@@ -45,7 +45,7 @@ def test_choices_and_approvals_refuse_message_id_zero(ledger):
         choices.bind(ledger, n, 0)
     # a real, unbound approval: id 0 (or a bool) must not bind it
     from conftest import msg as _msg
-    _, [job] = telegram.poll_once(FakeBot([[_msg(1, "hold")]]), ledger, OWNER, timeout=0)
+    _, [job] = receive(ledger, [_msg(1, "hold")])
     with ledger.tx() as db:
         ledger.transition(job, "running", db=db)
         pid = approvals.create_proposal(ledger, job_id=job, effect_type="calendar_hold",
@@ -81,41 +81,29 @@ def test_an_expired_change_cannot_be_approved_even_unread(tmp_path):
 
 
 def test_empty_polls_are_recorded_at_most_once_a_minute(ledger, clock):
-    ledger.ingest([], None)
+    ledger.ingest([])
     first = ledger.get_meta("last_poll_success")
     clock.advance(seconds=30)
-    ledger.ingest([], None)
+    ledger.ingest([])
     assert ledger.get_meta("last_poll_success") == first
     clock.advance(seconds=31)
-    ledger.ingest([], None)
+    ledger.ingest([])
     assert ledger.get_meta("last_poll_success") != first
-
-
-def test_a_pairing_code_from_a_group_does_not_pair(ledger, tmp_path, clock):
-    from test_controller import Rig
-    r = Rig(ledger, tmp_path, clock, paired=False)
-    code = r.vault.new_pairing_code()
-    r.updates(msg(1, f"/start {code}", chat=-100555, chat_type="group"))
-    r.c.tick()
-    assert r.vault.owner() is None
-    r.updates(msg(2, f"/start {code}", is_bot=True))
-    r.c.tick()
-    assert r.vault.owner() is None
 
 
 def test_digest_says_what_it_does_not_know(ledger, clock):
     cfg = Config(owner_user_id=OWNER, stage="S1")
-    ledger.ingest([], None)
+    ledger.ingest([])
     with ledger.tx() as db:
         ledger.set_meta("integrity_since", ledger.get_meta("last_poll_success"), db)
         ledger.set_meta("paused_at", ledger.get_meta("last_poll_success"), db)
     ledger.add_spend(provider="anthropic", model="m", purpose="job", input_tokens=0,
                      output_tokens=0, usd=35.0)
-    d = daily.gather(ledger, cfg, paused=True, notes=["a webhook is set on the bot"])
+    d = daily.gather(ledger, cfg, paused=True, notes=["a standing problem the digest must show"])
     assert d.state == "attention"
     assert "canary: did not run" in d.text
     assert "stopped since" in d.text and "/resume" in d.text
-    assert "a webhook is set on the bot" in d.text
+    assert "a standing problem the digest must show" in d.text
     assert "Claude $5.00 of $40 left this month" in d.text
 
 
@@ -129,30 +117,20 @@ def test_environment_scrub():
 def test_fit_closes_tags_and_never_splits_an_entity():
     long = "<b>" + "a &amp; b " * 900 + "</b>"
     out = render.fit(long, "\n\n<i>job abc</i>")
-    assert render.units(out) <= render.TELEGRAM_LIMIT
+    assert render.units(out) <= render.MESSAGE_LIMIT
     body = out.split("\n… (cut to fit)")[0]
     assert body.endswith("</b>")
     assert not __import__("re").search(r"&[a-z]*$", body.removesuffix("</b>"))
 
 
-def test_fit_counts_what_telegram_counts():
+def test_fit_counts_utf16_units():
     emoji = "🙂" * 2100            # 2 UTF-16 units each: 4200 units, 2100 characters
     out = render.fit(emoji)
-    assert render.units(out) <= render.TELEGRAM_LIMIT and "(cut to fit)" in out
-
-
-def test_idle_reset_only_after_six_quiet_days(ledger, clock):
-    from harness.ledger import iso
-    with ledger.tx() as db:
-        ledger.set_meta("telegram_offset", "50", db)
-        ledger.set_meta("last_update_received", iso(clock() - timedelta(days=5)), db)
-    bot = FakeBot()
-    telegram.poll_once(bot, ledger, OWNER, timeout=0)
-    assert bot.offsets[-1] == 50
+    assert render.units(out) <= render.MESSAGE_LIMIT and "(cut to fit)" in out
 
 
 def test_a_cut_never_lands_inside_an_entity():
     # 4096 - 15 (the cut marker) = 4081 = 5 * 816 + 1: a naive cut ends on "&"
     out = render.fit("&amp;" * 2000)
     body = out.split("\n… (cut to fit)")[0]
-    assert body.endswith("&amp;") and render.units(out) <= render.TELEGRAM_LIMIT
+    assert body.endswith("&amp;") and render.units(out) <= render.MESSAGE_LIMIT

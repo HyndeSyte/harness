@@ -324,7 +324,7 @@ def test_an_answer_overrules_a_seeded_rule_and_the_next_read_doesnt_bring_it_bac
 
 # -- 3. through the real tap paths --------------------------------------------------------------------
 
-def test_a_tap_on_telegram_goes_through_the_choice_binding(on):
+def test_a_tap_goes_through_the_choice_binding(on):
     on.shadow = Shadow()
     on.live = meaning_live.MeaningLive(on.ledger, on.shadow, Feeds(), tz=TZ, on_fn=lambda: True)
     on.c.meaning_live = on.live

@@ -13,7 +13,7 @@ import pytest
 from harness import daily, digest, effects, mirror_shadow
 from harness.calendar_feed import CalendarFeeds
 from harness.config import Config
-from harness.controller import Controller
+from fakes import own, TestController as Controller
 from harness.family import FamilyInbox
 from harness.ledger import Ledger
 from harness.mirror_shadow import MirrorShadow
@@ -335,7 +335,7 @@ def test_no_mirror_settings_means_no_ahead_parse(ledger, tmp_path, clock, monkey
 
 def compose(extra, **kw):
     base = dict(now=datetime(2026, 10, 22, 11, tzinfo=timezone.utc), tz="America/New_York",
-                inputs=[digest.InputCoverage("Telegram", datetime(2026, 10, 22, 10, 59, tzinfo=timezone.utc),
+                inputs=[digest.InputCoverage("Discord", datetime(2026, 10, 22, 10, 59, tzinfo=timezone.utc),
                                              timedelta(minutes=15))],
                 waiting=[], failures=[], low_balance=[], canary_ok=True,
                 config_unchanged_since=datetime(2026, 10, 20, tzinfo=timezone.utc))
@@ -366,7 +366,7 @@ def test_shadow_outcomes_never_alter_the_digest_state_in_either_direction(line):
 
 def test_gather_passes_the_line_and_nothing_else_changes(ledger, clock):
     cfg = Config(owner_user_id=OWNER, stage="S1")
-    ledger.input_ok("telegram")
+    ledger.input_ok("discord")
     with ledger.tx() as db:
         ledger.set_meta("last_poll_success", clock().isoformat(), db)
     with_line = daily.gather(ledger, cfg, paused=False, mirror_line=LINES[1])
@@ -378,7 +378,7 @@ def test_gather_passes_the_line_and_nothing_else_changes(ledger, clock):
 # -- through the controller, with every write-capable client replaced by one that raises ---------
 
 class RaisingBot(FakeBot):
-    """Reads work; anything that would reach Telegram's write side raises."""
+    """Reads work; anything that would reach the chat's write side raises."""
 
     def send_message(self, *a, **k):
         raise AssertionError("send_message called")
@@ -401,12 +401,11 @@ class Stack:
     def __init__(self, ledger, tmp_path, clock, replies, *, settings=SETTINGS, urls=U1,
                  wired=True):
         self.vault = Vault(str(tmp_path / "secrets.json"), clock=clock)
-        self.vault.set_key("telegram_bot_token", TOKEN, by="Owner")
         self.vault.set_key("openai_api_key", OKEY, by="Owner")
         self.vault.set_key("calendar_feeds", urls, by="Owner")
         if settings:
             self.vault.set_key("work_mirror", settings, by="Owner")
-        self.vault.try_pair(self.vault.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
+        own(self.vault, OWNER)
         self.bot = RaisingBot()
         self.transport = ReadOnlyTransport(replies)
         self.status = {}
@@ -516,7 +515,7 @@ def test_with_no_settings_the_digest_is_byte_identical_with_or_without_the_shado
 
 def test_shadow_module_imports_no_client_and_no_effect():
     src = Path(mirror_shadow.__file__).read_text()
-    for name in ("net", "telegram_api", "engines", "effects", "outbox", "approvals", "urllib",
+    for name in ("net", "cain_relay", "discord_api", "engines", "effects", "outbox", "approvals", "urllib",
                  "http", "socket"):
         assert not re.search(rf"^\s*(from \.?{name}\b|import {name}\b|from \. import .*\b{name}\b)",
                              src, re.M), name

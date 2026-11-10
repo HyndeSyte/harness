@@ -12,7 +12,7 @@ import pytest
 from harness import calendar_feed, digest
 from harness.calendar_feed import CalendarFeeds, check_urls, feed_id, fetch_one
 from harness.config import Config
-from harness.controller import Controller
+from fakes import own, TestController as Controller
 from harness.ical import Occurrence
 from harness.net import REDACT, RedactingFilter, TransportError
 from harness.vault import Vault, VaultError
@@ -78,8 +78,8 @@ def test_the_vault_keeps_them_like_a_key(tmp_path):
     assert v.key_status()["calendar_feeds"]
     with pytest.raises(VaultError, match="secret iCal"):
         v.set_key("calendar_feeds", "https://example.com/cal.ics", by="Owner")
-    # after pairing, a change is a request for his tap, like any key
-    v.try_pair(v.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
+    # with an owner, a change is a request for his tap, like any key
+    own(v, OWNER)
     v.request_change("calendar_feeds", U2, by="Owner")
     assert v.get("calendar_feeds") == f"{U1} {U2}"
     assert v.pending()["field"] == "calendar_feeds"
@@ -227,7 +227,7 @@ def occ(h1, m1, h2, m2, title, cal="owner@example.com", transparent=False):
 
 def compose(agenda, **kw):
     base = dict(now=NOW, tz="America/New_York",
-                inputs=[digest.InputCoverage("Telegram", NOW, timedelta(minutes=15))],
+                inputs=[digest.InputCoverage("Discord", NOW, timedelta(minutes=15))],
                 waiting=[], failures=[], low_balance=[], canary_ok=True,
                 config_unchanged_since=NOW - timedelta(days=3))
     base.update(kw)
@@ -298,7 +298,7 @@ def test_unreadable_events_need_attention():
 
 def test_a_stale_calendar_is_named_with_why():
     d = compose(digest.Agenda([], 0, 0, 1), inputs=[
-        digest.InputCoverage("Telegram", NOW, timedelta(minutes=15)),
+        digest.InputCoverage("Discord", NOW, timedelta(minutes=15)),
         digest.InputCoverage("Calendar owner", NOW - timedelta(hours=5), timedelta(hours=2),
                              "Google says this address doesn't exist (was it reset?)")])
     assert d.state == "attention"
@@ -357,11 +357,10 @@ class Rig:
     def __init__(self, ledger, tmp_path, clock, replies, *, urls=U1,
                  proactive_from=date(2026, 10, 20)):
         self.vault = Vault(str(tmp_path / "secrets.json"), clock=clock)
-        self.vault.set_key("telegram_bot_token", TOKEN, by="Owner")
         self.vault.set_key("openai_api_key", OKEY, by="Owner")
         if urls:
             self.vault.set_key("calendar_feeds", urls, by="Owner")
-        self.vault.try_pair(self.vault.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
+        own(self.vault, OWNER)
         self.bot = FakeBot()
         self.claude = FakeEngine("claude", [canary_ok()])
         self.gpt = FakeEngine("gpt", [canary_ok("gpt")])

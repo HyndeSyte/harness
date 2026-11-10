@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from fakes import own
 from harness import caldav, effects, ical
 from harness.family_copy import (GIVE_UP_READS, HOLD_READS, MAX_REMOVALS_AT_ONCE, MAX_WRITES_PER_DAY, PROBLEM, REVIVED, FamilyCopy,
                                  name_from_options, plan, word_for)

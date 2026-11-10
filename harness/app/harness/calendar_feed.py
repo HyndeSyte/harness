@@ -188,7 +188,7 @@ class CalendarFeeds:
         self.start()
 
     def _read(self, url: str, start: datetime, end: datetime, ahead_until: datetime | None) -> FeedResult:
-        """In a worker: a slow answer from Google never holds up Telegram."""
+        """In a worker: a slow answer from Google never holds up his chat."""
         res = fetch_one(self.transport, url, start=start, end=end, tz=self.tz, ahead_until=ahead_until)
         if ahead_until is not None:
             self._fresh_ahead(res, (start, ahead_until))

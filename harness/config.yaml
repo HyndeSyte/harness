@@ -7,7 +7,7 @@ name: Harness
 version: "0.19.10"
 slug: harness
 description: >-
-  One private Telegram thread with Claude and GPT as engines. A small
+  The calendar specialist behind Cain on Discord, with Claude and GPT as engines. A small
   deterministic controller decides everything. Calendar changes you ask for go
   through with no tap once you turn them on; anything that may be pasted gets one.
 arch:

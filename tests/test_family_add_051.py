@@ -10,7 +10,7 @@ from harness.family_add import LOOSENED, MAX_TAPLESS_MESSAGE
 from harness.ledger import Ledger, iso
 from conftest import OWNER, cb, msg
 from fake_caldav import no_network  # noqa: F401  (autouse)
-from fakes import result
+from fakes import own, result
 from test_family_add import (KEEP, STOP, ask_cards, count_up, fresh, loose, on,  # noqa: F401
                              plain_prompt, proposal, rig, titles)
 

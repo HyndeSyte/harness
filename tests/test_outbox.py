@@ -3,9 +3,9 @@ import json
 
 from harness import approvals, choices
 from harness.outbox import Outbox
-from harness.telegram_api import TelegramError
+from harness.chat import ChatError
 from conftest import OWNER
-from fakes import FakeBot, tg_error
+from fakes import receive, FakeBot, chat_error
 
 
 def enqueue(ledger, text, **kw):
@@ -41,7 +41,7 @@ def test_buttons_are_bound_only_after_the_send(ledger):
 
 def test_rate_limit_waits_for_retry_after(ledger, clock):
     bot = FakeBot()
-    bot.fail_sends = [tg_error(429, "Too Many Requests", retry_after=30)]
+    bot.fail_sends = [chat_error(429, "Too Many Requests", retry_after=30)]
     rid = enqueue(ledger, "hello")
     ob = Outbox(ledger, bot, sleep=lambda s: None)
     assert ob.flush() == 0
@@ -55,7 +55,7 @@ def test_rate_limit_waits_for_retry_after(ledger, clock):
 
 def test_an_outage_delays_a_reply_but_never_drops_it(ledger, clock):
     bot = FakeBot()
-    bot.fail_sends = [tg_error(0, "network: timeout")] * 15 + [tg_error(502, "Bad Gateway")] * 5
+    bot.fail_sends = [chat_error(0, "network: timeout")] * 15 + [chat_error(502, "Bad Gateway")] * 5
     rid = enqueue(ledger, "your answer")
     ob = Outbox(ledger, bot, sleep=lambda s: None)
     for _ in range(21):                    # about three hours of failures, then it's back
@@ -70,7 +70,7 @@ def test_an_outage_delays_a_reply_but_never_drops_it(ledger, clock):
 
 def test_permanent_errors_are_not_retried(ledger):
     bot = FakeBot()
-    bot.fail_sends = [tg_error(403, "Forbidden: bot was blocked by the user")]
+    bot.fail_sends = [chat_error(403, "Forbidden: bot was blocked by the user")]
     rid = enqueue(ledger, "hello")
     Outbox(ledger, bot, sleep=lambda s: None).flush()
     assert ledger.outbox_row(rid)["state"] == "dead"
@@ -78,7 +78,7 @@ def test_permanent_errors_are_not_retried(ledger):
 
 def test_markup_error_falls_back_to_plain_text(ledger):
     bot = FakeBot()
-    bot.fail_sends = [tg_error(400, "Bad Request: can't parse entities")]
+    bot.fail_sends = [chat_error(400, "Bad Request: can't parse entities")]
     enqueue(ledger, "<b>Stopped.</b> a &amp; b")
     Outbox(ledger, bot, sleep=lambda s: None).flush()
     assert bot.texts() == ["Stopped. a & b"] and bot.modes == ["plain"]
@@ -118,8 +118,7 @@ def test_held_notices_wait_for_the_next_reply_and_go_first(ledger):
 def test_approval_cards_bind_like_choices(ledger, clock):
     # A minimal proposal path, as S2 will use it.
     from conftest import msg
-    from harness import telegram
-    _, [job] = telegram.poll_once(FakeBot([[msg(1, "hold")]]), ledger, OWNER, timeout=0)
+    _, [job] = receive(ledger, [msg(1, "hold")])
     with ledger.tx() as db:
         ledger.transition(job, "running", db=db)
         pid = approvals.create_proposal(ledger, job_id=job, effect_type="calendar_hold",

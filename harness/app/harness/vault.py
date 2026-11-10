@@ -1,4 +1,4 @@
-"""/data/secrets.json: the keys, the paired owner, and nothing else.
+"""/data/secrets.json: the keys, the owner, and nothing else.
 
 The keys are the three API keys and, from S1, his calendars' secret iCal
 addresses: each grants read access to something of his, so each is kept,
@@ -13,15 +13,14 @@ Rules this file keeps:
   * written atomically (temp file, fsync, rename), mode 0600;
   * keys are never returned to the settings page -- only whether each is
     set, and when;
-  * the owner is write-once. Re-pairing needs a reset, and a reset is
-    announced to the old owner first;
-  * after pairing, changing any key is a pending request that only his
-    tap in Telegram can apply.
+  * the owner is write-once, and a reset (which forgets it) is announced
+    to him first. The owner was set by pairing over Telegram, now retired;
+    an install paired then keeps its owner;
+  * while there is an owner, changing any key is a pending request that
+    only his tap on a card (on Discord, through Cain) can apply.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -40,13 +39,12 @@ from . import caldav, calendar_feed, google_cal, workmirror
 # family_*: what the one calendar write needs (caldav.py). The address is
 # checked strictly, because the password is sent wherever it points.
 # google_service_key: what lets blocks reach his Gmail calendar (google_cal.py).
-FIELDS = ("telegram_bot_token", "discord_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
+FIELDS = ("discord_bot_token", "anthropic_api_key", "openai_api_key", "calendar_feeds",
           "work_mirror", "family_apple_id", "family_app_password", "family_calendar_url",
           "google_service_key", "gmail_app_password")
 FAMILY_FIELDS = ("family_apple_id", "family_app_password", "family_calendar_url")
 TEXT_FIELDS = ("work_mirror",)          # several lines; a textarea on the page
-LABELS = {"telegram_bot_token": "Telegram bot token",
-          "discord_bot_token": "Discord bot token (Cain's bot)",
+LABELS = {"discord_bot_token": "Discord bot token (Cain's bot)",
           "anthropic_api_key": "Anthropic API key",
           "openai_api_key": "OpenAI API key",
           "calendar_feeds": "calendar addresses (secret iCal, space between several)",
@@ -59,7 +57,6 @@ LABELS = {"telegram_bot_token": "Telegram bot token",
 # Formats are checked loosely: enough to catch a paste of the wrong thing
 # (a URL, a sentence, a key in the wrong box), not a claim about validity.
 PATTERNS = {
-    "telegram_bot_token": re.compile(r"\d{5,15}:[A-Za-z0-9_-]{30,64}"),
     "discord_bot_token": re.compile(r"[A-Za-z0-9_-]{20,40}\.[A-Za-z0-9_-]{5,10}\.[A-Za-z0-9_-]{25,60}"),
     "anthropic_api_key": re.compile(r"sk-ant-[A-Za-z0-9_-]{20,200}"),
     "openai_api_key": re.compile(r"sk-[A-Za-z0-9_-]{20,250}"),
@@ -67,8 +64,8 @@ PATTERNS = {
     "family_app_password": re.compile(r"[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}-[A-Za-z]{4}"),
     "gmail_app_password": re.compile(r"[a-z]{4}\s?[a-z]{4}\s?[a-z]{4}\s?[a-z]{4}"),
 }
-PAIRING_TTL_S = 15 * 60
-PAIRING_MAX_FAILURES = 10
+# Keys for things that are gone. A copy left in secrets.json is dropped on the next write.
+RETIRED = ("telegram_bot_token",)
 CHANGE_TTL_S = 15 * 60
 
 
@@ -78,10 +75,6 @@ class VaultError(ValueError):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _hash(code: str) -> str:
-    return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
 class Vault:
@@ -121,6 +114,8 @@ class Vault:
         with self._lock:
             data = self._load()
             result = fn(data)
+            for f in RETIRED:
+                (data.get("keys") or {}).pop(f, None)
             self._save(data)
             return result
 
@@ -196,7 +191,7 @@ class Vault:
             return cur.get("id") == user_id
         return self._update(fn)
 
-    # -- owner (his Telegram account) ---------------------------------------------
+    # -- owner ----------------------------------------------------------------------
     def owner(self) -> dict | None:
         with self._lock:
             return self._load().get("owner")
@@ -205,48 +200,7 @@ class Vault:
         o = self.owner()
         return int(o["user_id"]) if o else None
 
-    # -- pairing --------------------------------------------------------------------
-    def new_pairing_code(self) -> str:
-        code = secrets.token_urlsafe(16)          # 22 chars, [A-Za-z0-9_-]
-
-        def fn(data):
-            if data.get("owner"):
-                raise VaultError("already paired")
-            data["pairing"] = {"hash": _hash(code), "failures": 0,
-                               "expires_at": (self.clock() + timedelta(seconds=PAIRING_TTL_S))
-                               .isoformat()}
-            return code
-        return self._update(fn)
-
-    def pairing_active(self) -> bool:
-        with self._lock:
-            p = self._load().get("pairing")
-        return bool(p) and datetime.fromisoformat(p["expires_at"]) > self.clock()
-
-    def try_pair(self, code: str, *, user_id: int, chat_id: int) -> str:
-        """Returns "paired", or why not. Write-once: an owner, once set,
-        is never replaced here."""
-        def fn(data):
-            if data.get("owner"):
-                return "already paired"
-            p = data.get("pairing")
-            if not p:
-                return "no pairing code"
-            if datetime.fromisoformat(p["expires_at"]) <= self.clock():
-                data.pop("pairing", None)
-                return "pairing code expired"
-            if not hmac.compare_digest(p["hash"], _hash(code)):
-                p["failures"] = int(p.get("failures", 0)) + 1
-                if p["failures"] >= PAIRING_MAX_FAILURES:
-                    data.pop("pairing", None)
-                return "wrong code"
-            data["owner"] = {"user_id": int(user_id), "chat_id": int(chat_id),
-                             "paired_at": self.clock().isoformat()}
-            data.pop("pairing", None)
-            return "paired"
-        return self._update(fn)
-
-    # -- changes after pairing: only his tap applies them -------------------------
+    # -- changes while there is an owner: only his tap applies them ----------------
     def request_change(self, field: str, value: str, *, by: str) -> str:
         v = self.check_format(field, value)
         change_id = secrets.token_hex(4)
@@ -283,16 +237,17 @@ class Vault:
                 data.pop("pending", None)
                 return "That request expired. Nothing changed."
             data.pop("pending", None)
+            label = LABELS.get(p["field"], p["field"])
             if decision != "approve":
-                return f"Declined. The {LABELS[p['field']]} was not changed."
+                return f"Declined. The {label} was not changed."
             data.setdefault("keys", {})[p["field"]] = {
                 "value": p["value"], "set_at": self.clock().isoformat(), "set_by": p["by"]}
-            return f"Done. The {LABELS[p['field']]} was replaced."
+            return f"Done. The {label} was replaced."
         return self._update(fn)
 
     # -- reset ------------------------------------------------------------------------
     def reset(self) -> None:
-        """Forget the keys, the owner and any pairing. The ledger -- his
+        """Forget the keys, the owner and anything pending. The ledger -- his
         record -- is not touched."""
         def fn(data):
             for k in ("keys", "owner", "pairing", "pending"):

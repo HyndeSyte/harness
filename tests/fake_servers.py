@@ -1,8 +1,8 @@
-"""Local stand-ins for Telegram, Anthropic and OpenAI, spoken to over real HTTP.
+"""Local stand-ins for Cain's link, Anthropic and OpenAI, spoken to over real HTTP.
 
 They implement only what the controller uses, with the semantics that
-matter: getUpdates long-polls and confirms by offset; sendMessage returns
-increasing message ids; the model endpoints return structured output in
+matter: the link checks the key made from the bot token and returns
+increasing card ids; the model endpoints return structured output in
 each provider's own response shape, with usage.
 """
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import re
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -39,91 +38,61 @@ def _serve(handler_cls, state):
     return httpd
 
 
-class TelegramState:
-    def __init__(self, token, username="example_harness_bot"):
-        self.token = token
-        self.username = username
-        self.lock = threading.Condition()
-        self.queue = []                  # pending updates (dicts)
-        self.next_update = 1
-        self.next_message = 1000
-        self.sent = []                   # (chat_id, text, markup, message_id)
-        self.edits = []
-        self.answers = []
-        self.bad_paths = 0
+class LinkState:
+    """Cain's link (cain/rootfs/opt/cain/link/main.ts): holds the cards Cain shows."""
 
-    def push(self, kind, payload):
-        with self.lock:
-            u = {"update_id": self.next_update, kind: payload}
-            self.next_update += 1
-            self.queue.append(u)
-            self.lock.notify_all()
-            return u["update_id"]
+    def __init__(self, token):
+        from harness.cain_relay import key_for
+        self.key = key_for(token)
+        self.lock = threading.Lock()
+        self.next_card = 1
+        self.cards = {}                  # id -> {"text", "rows", "kind"}
+        self.answers = []                # (callback, text)
+        self.edits = []                  # card ids whose buttons changed
+        self.bad_keys = 0
 
-    def say(self, user, text, *, chat=None, reply_to=None):
-        with self.lock:
-            mid = self.next_message
-            self.next_message += 1
-        m = {"message_id": mid, "from": {"id": user, "is_bot": False},
-             "chat": {"id": chat or user, "type": "private"}, "date": int(time.time()),
-             "text": text}
-        if reply_to:
-            m["reply_to_message"] = {"message_id": reply_to}
-        self.push("message", m)
-        return mid
-
-    def tap(self, user, data, message_id, chat=None):
-        self.push("callback_query", {"id": f"cq{self.next_update}", "data": data,
-                                     "from": {"id": user, "is_bot": False},
-                                     "chat_instance": "x",
-                                     "message": {"message_id": message_id,
-                                                 "chat": {"id": chat or user,
-                                                          "type": "private"}}})
+    def with_buttons(self):
+        return [(cid, c) for cid, c in sorted(self.cards.items()) if c["rows"]]
 
 
-class TelegramHandler(_Base):
+class LinkHandler(_Base):
+    def _ok(self):
+        st: LinkState = self.server.state
+        if self.headers.get("x-harness-key") != st.key:
+            st.bad_keys += 1
+            self._json(403, {"status": "refused"})
+            return False
+        return True
+
+    def do_GET(self):
+        if not self._ok():
+            return
+        if self.path == "/health":
+            return self._json(200, {"status": "ok"})
+        if self.path.startswith("/card-of"):
+            return self._json(200, {"card": None})
+        return self._json(404, {"status": "not found"})
+
     def do_POST(self):
-        st: TelegramState = self.server.state
-        m = re.fullmatch(r"/bot([^/]+)/(\w+)", self.path)
-        if not m or m.group(1) != st.token:
-            st.bad_paths += 1
-            return self._json(401, {"ok": False, "error_code": 401,
-                                    "description": "Unauthorized"})
-        method, body = m.group(2), self._body()
-        if method == "getUpdates":
-            offset = body.get("offset", 0)
-            deadline = time.time() + min(float(body.get("timeout", 0)), 5)
-            with st.lock:
-                if offset:
-                    st.queue = [u for u in st.queue if u["update_id"] >= offset]
-                while not st.queue and time.time() < deadline:
-                    st.lock.wait(timeout=max(0.0, deadline - time.time()))
-                out = list(st.queue[:100])
-            return self._json(200, {"ok": True, "result": out})
-        if method == "sendMessage":
-            text = body.get("text", "")
-            if not 1 <= len(text) <= 4096:
-                return self._json(400, {"ok": False, "error_code": 400,
-                                        "description": "Bad Request: message is too long"})
-            with st.lock:
-                mid = st.next_message
-                st.next_message += 1
-                st.sent.append((body["chat_id"], text, body.get("reply_markup"), mid))
-            return self._json(200, {"ok": True, "result": {"message_id": mid}})
-        if method == "editMessageReplyMarkup":
-            st.edits.append(body)
-            return self._json(200, {"ok": True, "result": True})
-        if method == "answerCallbackQuery":
-            st.answers.append(body)
-            return self._json(200, {"ok": True, "result": True})
-        if method == "getMe":
-            return self._json(200, {"ok": True, "result": {"id": 1, "is_bot": True,
-                                                           "username": st.username}})
-        if method == "getWebhookInfo":
-            return self._json(200, {"ok": True, "result": {"url": ""}})
-        if method == "setMyCommands":
-            return self._json(200, {"ok": True, "result": True})
-        return self._json(404, {"ok": False, "error_code": 404, "description": "Not Found"})
+        if not self._ok():
+            return
+        st: LinkState = self.server.state
+        body = self._body()
+        with st.lock:
+            if self.path == "/card":
+                cid = st.next_card
+                st.next_card += 1
+                st.cards[cid] = {"text": body.get("text", ""), "rows": body.get("rows") or [],
+                                 "kind": body.get("kind")}
+                return self._json(200, {"id": cid})
+            if self.path == "/buttons":
+                st.cards[int(body["card"])]["rows"] = body.get("rows") or []
+                st.edits.append(int(body["card"]))
+                return self._json(200, {"status": "ok"})
+            if self.path == "/answer":
+                st.answers.append((body.get("callback"), body.get("text")))
+                return self._json(200, {"status": "ok"})
+        return self._json(404, {"status": "not found"})
 
 
 def _reply_for(user_text: str) -> dict:
@@ -190,9 +159,9 @@ class OpenAIHandler(_Base):
                                 "usage": {"input_tokens": 900, "output_tokens": 200}})
 
 
-def telegram(token):
-    st = TelegramState(token)
-    return _serve(TelegramHandler, st), st
+def cain_link(token):
+    st = LinkState(token)
+    return _serve(LinkHandler, st), st
 
 
 def anthropic(key):

@@ -1,12 +1,13 @@
-"""Test doubles: engines, executors, an HTTP transport, a Telegram API."""
+"""Test doubles: engines, executors, an HTTP transport, a chat, a controller fed by it."""
 from __future__ import annotations
 
 import json
 from concurrent.futures import Future
 
+from harness import controller as _controller
+from harness.chat import ChatError, Decision, Incoming
 from harness.engines import EngineError, EngineResult
 from harness.net import HttpResponse
-from harness.telegram_api import TelegramError
 
 
 def result(output=None, *, status="ok", engine="claude", usd=0.001, text=None):
@@ -94,28 +95,21 @@ class FakeTransport:
 
 
 class FakeBot:
-    """A Telegram Bot API double with real send semantics: message ids,
-    scripted failures, update batches."""
+    """The chat the controller talks to (send, edit buttons, answer taps), with real
+    send semantics: message ids, scripted failures. `batches` holds his input as
+    update dicts (conftest.msg / conftest.cb); TestController reads one batch a tick,
+    as Cain's handovers bring his words and taps."""
 
-    def __init__(self, batches=None, username="example_harness_bot"):
+    def __init__(self, batches=None):
         self.batches = list(batches or [])
-        self.offsets = []
         self.sent = []          # (chat_id, text, buttons, message_id)
         self.edits = []
         self.answers = []
-        self.commands = []
         self.next_message_id = 500
-        self.fail_sends = []    # TelegramErrors to raise on the next sends
-        self.username = username
-        self.webhook_url = ""
-        self.timeouts = []
+        self.fail_sends = []    # ChatErrors to raise on the next sends
         self.modes = []
-        self.bot_id = 1
 
-    def get_updates(self, offset, timeout, allowed_updates):
-        self.offsets.append(offset)
-        self.timeouts.append(timeout)
-        assert tuple(allowed_updates) == ("message", "callback_query")
+    def take(self):
         item = self.batches.pop(0) if self.batches else []
         if isinstance(item, Exception):
             raise item
@@ -135,18 +129,108 @@ class FakeBot:
     def answer_callback(self, callback_id, text=None):
         self.answers.append((callback_id, text))
 
-    def get_me(self):
-        return {"id": self.bot_id, "is_bot": True, "username": self.username}
-
-    def get_webhook_info(self):
-        return {"url": self.webhook_url}
-
-    def set_my_commands(self, commands, chat_id):
-        self.commands.append((chat_id, commands))
-
     def texts(self):
         return [t for _, t, _, _ in self.sent]
 
 
-def tg_error(code=429, desc="Too Many Requests", retry_after=None):
-    return TelegramError(code, desc, retry_after)
+def chat_error(code=429, desc="Too Many Requests", retry_after=None):
+    return ChatError(code, desc, retry_after)
+
+
+# -- his input, as the controller records it ---------------------------------------------
+COMMANDS = frozenset({"/stop", "/resume", "/cancel", "/status", "/rule", "/undo", "/checkadds"})
+
+
+def parse(update: dict) -> Incoming:
+    uid = int(update["update_id"])
+    if "message" in update:
+        m = update["message"] or {}
+        frm, chat = m.get("from") or {}, m.get("chat") or {}
+        reply = m.get("reply_to_message") or {}
+        return Incoming(update_id=uid, kind="message", user_id=frm.get("id"),
+                        is_bot=bool(frm.get("is_bot")), chat_id=chat.get("id"),
+                        chat_type=chat.get("type"), message_id=m.get("message_id"),
+                        text=m.get("text"), reply_to_message_id=reply.get("message_id"))
+    if "callback_query" in update:
+        q = update["callback_query"] or {}
+        frm, msg = q.get("from") or {}, q.get("message") or {}
+        chat = msg.get("chat") or {}
+        return Incoming(update_id=uid, kind="callback", user_id=frm.get("id"),
+                        is_bot=bool(frm.get("is_bot")), chat_id=chat.get("id"),
+                        chat_type=chat.get("type"), message_id=msg.get("message_id"),
+                        callback_id=q.get("id"), callback_data=q.get("data"))
+    return Incoming(update_id=uid, kind="other")
+
+
+def decide(inc: Incoming, owner: int, screen=None) -> Decision:
+    """Only his own words and taps count (on Discord: the bot owner's DM, and taps
+    Cain's link checked). A command word is a command job; work content is refused."""
+    if inc.kind == "other" or inc.user_id != owner or inc.chat_id != owner:
+        return Decision(inc, False, "not his", None)
+    if inc.kind == "callback":
+        return Decision(inc, True, None, None)
+    text = (inc.text or "").strip()
+    if not text:
+        return Decision(inc, False, "no text", None)
+    first = text.split(maxsplit=1)[0].lower().split("@", 1)[0]
+    if first in COMMANDS:
+        return Decision(inc, True, None, "command")
+    why = screen(text) if screen else None
+    if why:
+        return Decision(inc, False, why, None)
+    return Decision(inc, True, None, "message")
+
+
+def own(vault, user_id, *, at="2026-10-21T13:00:00+00:00"):
+    """Give the vault an owner, as an install paired before has (vault.py)."""
+    vault._update(lambda d: d.__setitem__("owner", {"user_id": int(user_id),
+                                                    "chat_id": int(user_id),
+                                                    "paired_at": at}))
+
+
+class TestController(_controller.Controller):
+    """The controller with a chat handed in directly, no Discord keeper: the owner is
+    the vault's, and his words and taps come from the chat double's batches."""
+    __test__ = False
+
+    def _bind_from_vault(self) -> bool:
+        if self.config is None and self.vault.owner_id() is not None:
+            self._bind_owner(self.vault.owner_id())
+            self._reconcile()
+        return self.config is not None
+
+    def startup(self):
+        if self.discord is None:
+            self._bind_from_vault()
+        super().startup()
+
+    def tick(self):
+        if self.discord is not None:
+            return super().tick()
+        self._drain_requests()
+        if not self._bind_from_vault():
+            self._publish()
+            self.sleep(2)
+            return
+        take = getattr(self.api, "take", None)
+        updates = take() if take else []
+        decisions = [decide(parse(u), self.config.owner_user_id, self._screen_text)
+                     for u in updates]
+        self.ledger.ingest(decisions)
+        for d in decisions:
+            inc = d.incoming
+            if d.accepted and inc.kind == "callback":
+                self.callbacks.handle(inc)
+            elif not d.accepted and d.reason and d.reason.startswith("work content"):
+                with self.ledger.tx() as db:
+                    self.ledger.enqueue(chat_id=inc.chat_id, kind="reply", db=db,
+                                        text="I didn't keep that message: it looks like "
+                                             f"{d.reason}. Nothing was stored or sent to a model.")
+        self._work()
+
+
+def receive(ledger, updates, owner=424242, screen=None):
+    """Record his input straight into the ledger, as the controller does. Returns
+    (decisions, new job ids)."""
+    decisions = [decide(parse(u), owner, screen) for u in updates]
+    return decisions, ledger.ingest(decisions)

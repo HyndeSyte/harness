@@ -12,7 +12,7 @@ import pytest
 
 from harness import caldav, commands, daily, effects, family_add, prompts, render, schema
 from harness.config import Config
-from harness.controller import Controller
+from fakes import receive, own, TestController as Controller
 from harness.family_add import FamilyAdd
 from harness.ledger import iso
 from harness.runner import Runner
@@ -48,12 +48,11 @@ class Rig:
         self.clock = clock
         self.tmp_path = tmp_path
         self.vault = Vault(str(tmp_path / "secrets.json"), clock=clock)
-        self.vault.set_key("telegram_bot_token", TOKEN, by="Owner")
         if credentials:
             self.vault.set_key("family_apple_id", APPLE_ID, by="Owner")
             self.vault.set_key("family_app_password", APP_PASSWORD, by="Owner")
             self.vault.set_key("family_calendar_url", FAMILY_URL, by="Owner")
-        self.vault.try_pair(self.vault.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
+        own(self.vault, OWNER)
         self.bot = FakeBot()
         self.claude = FakeEngine("claude")
         self.icloud = FakeICloud()
@@ -256,11 +255,10 @@ def test_the_real_prompt_describes_it_only_when_wired(monkeypatch):
 
 
 def test_a_runner_without_it_wired_fails_closed(ledger):
-    from harness import telegram
     r = Runner(ledger, Config(owner_user_id=OWNER, stage="S1"),
                {"claude": FakeEngine(script=[proposal()])}, SyncExecutor(),
                sleep=lambda s: None, monotonic=lambda: 0.0)
-    _, [job] = telegram.poll_once(FakeBot([[msg(1, "add it")]]), ledger, OWNER, timeout=0)
+    _, [job] = receive(ledger, [msg(1, "add it")])
     r.start_pending(paused=False)
     r.collect()
     assert ledger.job(job)["state"] == "failed"
@@ -648,7 +646,7 @@ def test_the_vault_keeps_them_like_keys(tmp_path):
     v.set_key("family_calendar_url", FAMILY_URL, by="Owner")
     v.set_key("family_app_password", APP_PASSWORD, by="Owner")
     assert v.key_status()["family_calendar_url"] and v.get("family_app_password") == APP_PASSWORD
-    v.try_pair(v.new_pairing_code(), user_id=7, chat_id=7)
+    own(v, 7)
     cid = v.request_change("family_calendar_url", OTHER_URL, by="Owner")
     assert v.get("family_calendar_url") == FAMILY_URL      # only his tap applies it
     v.resolve_change(cid, "approve")
@@ -1107,8 +1105,7 @@ def test_checkadds_restores_the_tap_at_once_and_says_so(loose):
     assert loose.icloud.log == [] and "Add to the Family calendar?" in loose.last()[1]
 
 
-def test_checkadds_is_in_his_command_list_and_only_his(loose):
-    assert "checkadds" in [name for name, _ in commands.HELP]
+def test_checkadds_is_only_his(loose):
     loose.uid += 1
     loose.bot.batches.append([msg(loose.uid, "/checkadds", user=999, chat=999)])
     loose.tick()
@@ -1467,8 +1464,7 @@ def test_an_old_card_replayed_after_a_reset_does_nothing(on):
     on.tick()
     assert not on.fa.enabled() and not on.fa.loosened()
     # paired again, same account, same bot, and turned on again
-    on.vault.set_key("telegram_bot_token", TOKEN, by="Owner")
-    on.vault.try_pair(on.vault.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
+    own(on.vault, OWNER)
     on.vault.set_key("family_apple_id", APPLE_ID, by="Owner")
     on.vault.set_key("family_app_password", APP_PASSWORD, by="Owner")
     on.vault.set_key("family_calendar_url", FAMILY_URL, by="Owner")
@@ -1975,11 +1971,10 @@ def test_an_ignored_card_asks_again_at_most_once_a_week(on):
 def do_reset(rig):
     rig.requests.put({"type": "reset", "by": "Owner"})
     rig.tick()
-    rig.vault.set_key("telegram_bot_token", TOKEN, by="Owner")
     rig.vault.set_key("family_apple_id", APPLE_ID, by="Owner")
     rig.vault.set_key("family_app_password", APP_PASSWORD, by="Owner")
     rig.vault.set_key("family_calendar_url", FAMILY_URL, by="Owner")
-    rig.vault.try_pair(rig.vault.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
+    own(rig.vault, OWNER)
     rig.tick()
 
 

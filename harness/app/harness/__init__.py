@@ -1,6 +1,6 @@
 """The harness controller.
 
-A small deterministic program that owns his Telegram thread, keeps the
+A small deterministic program behind Cain on Discord that keeps the
 ledger, and holds the only keys that can change anything. Models are
 engines: they read what the controller hands them and return an answer
 or a typed proposal. They never hold a credential.

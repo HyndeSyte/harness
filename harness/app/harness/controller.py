@@ -2,15 +2,15 @@
 
 Each tick:
   1. take requests from the settings page (a reset, mostly);
-  2. without a bot token, wait; without an owner, run pairing only;
-  3. long-poll Telegram, screen, record (offset atomic with the records);
-  4. tell him if continuity is unknown (a gap longer than Telegram keeps);
-  5. commands, then button taps, then message jobs (started in workers,
-     collected here), then their timers;
-  6. announce any settings change waiting for his tap;
-  7. the daily canary and digest;
-  8. send what is due from the outbox;
-  9. publish a status snapshot for the settings page.
+  2. without the Discord bot token, wait; identify the bot and its owner once;
+  3. what Cain handed over: his taps on our cards, his requests (read from his
+     own DM), the morning digest;
+  4. commands, then message jobs (started in workers, collected here), then
+     their timers;
+  5. announce any settings change waiting for his tap;
+  6. the daily canary and digest;
+  7. send what is due from the outbox (cards go to Cain's link);
+  8. publish a status snapshot for the settings page.
 
 Nothing in here calls a model directly. The only thing it can do to the world
 at S1 is the Family calendar add, which is off until his tap (family_add.py):
@@ -22,16 +22,16 @@ import hashlib
 import json
 import logging
 import queue
-import re
 import time
 from concurrent.futures import Executor
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import (callbacks, choices, commands, daily, ingress_filter, integrity,
-               policy, render, rules, telegram)
+               policy, render, rules)
+from .chat import Decision, Incoming
 from .config import Config
 from .discord_api import DiscordError
 from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
@@ -39,12 +39,10 @@ from .engines import Engine
 from .ledger import Ledger
 from .outbox import Outbox
 from .runner import Runner
-from .telegram_api import TelegramError
 from .vault import LABELS, Vault
 
 log = logging.getLogger("harness.controller")
 
-PAIR_RE = re.compile(r"/start(?:@\w+)?\s+([A-Za-z0-9_-]{16,64})")
 SETTINGS_TTL_S = 15 * 60
 FRESH_S = 120              # a handed-over message must be this new
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
@@ -101,10 +99,7 @@ class Controller:
         self.canary: daily.Canary | None = None
         self.commands: commands.Commands | None = None
         self.callbacks: callbacks.Callbacks | None = None
-        self.bot_username: str | None = None
         self.notes: dict[str, str] = {}           # standing problems for the digest
-        self._poll_failures = 0
-        self._token_seen: str | None = None      # fingerprint of the token getMe confirmed
         # Discord (set by __main__): the keeper, its chat, Cain's handovers.
         self.discord = None
         self.discord_chat = None
@@ -170,14 +165,7 @@ class Controller:
         if not self.ledger.integrity_ok():
             self.notes["ledger"] = "the ledger failed its integrity check; restore a backup"
         integrity.check(self.ledger, self.base_config)
-        owner = None if self._discord_mode() else self.vault.owner_id()
-        if owner is not None:
-            self._bind_owner(owner)
-            self._reconcile()
         self._family_note()
-        if self.vault.get("telegram_bot_token") and not self._discord_mode():
-            if self._telegram_health() and owner is not None:
-                self._set_commands()
         for name, engine in self.engines.items():
             try:
                 state = engine.check_model()
@@ -203,80 +191,17 @@ class Controller:
         if self.calendar_change is not None:
             self.calendar_change.reconcile_after_restart()
 
-    def _token_print(self) -> str:
-        return hashlib.sha256(self.vault.get("telegram_bot_token").encode()).hexdigest()[:16]
-
-    def _telegram_ready(self) -> bool:
-        """Poll only a bot we have identified. A new token means a new bot,
-        whose update and message ids start over: the ledger is told, so it
-        resets the offset rather than confirming the new bot's updates away."""
-        if self._token_seen == self._token_print() and self.ledger.bot_id():
-            return True
-        return self._telegram_health()
-
-    def _telegram_health(self) -> bool:
-        try:
-            me = self.api.get_me()
-            bot_id = me.get("id")
-            if not isinstance(bot_id, int) or bot_id <= 0:
-                self.notes["telegram"] = "Telegram didn't say which bot this token belongs to"
-                return False
-            if self.ledger.set_bot(bot_id):
-                log.info("now talking to bot %s", bot_id)
-            self._token_seen = self._token_print()
-            self._poll_failures = 0
-            self.bot_username = me.get("username")
-            self.notes.pop("telegram", None)
-            hook = self.api.get_webhook_info()
-            if hook.get("url"):
-                # Something else is receiving this bot's updates. Don't
-                # delete it -- that would break whatever set it -- say so.
-                self.notes["webhook"] = ("a webhook is set on the bot, so polling is "
-                                         "blocked; the token is in use elsewhere")
-            else:
-                self.notes.pop("webhook", None)
-            return True
-        except TelegramError as e:
-            self.notes["telegram"] = f"Telegram check failed: {e.description or e.code}"
-            return False
-
-    def _set_commands(self) -> None:
-        try:
-            self.api.set_my_commands(commands.HELP, chat_id=self.config.owner_user_id)
-        except TelegramError as e:
-            log.info("setMyCommands failed: %s", e)
-
     # -- the loop --------------------------------------------------------------
     def tick(self) -> None:
         self._drain_requests()
         if self._discord_mode():
             self._discord_tick()
             return
-        if not self.vault.get("telegram_bot_token"):
-            self._publish()
-            self.sleep(2)
-            return
-        if not self._telegram_ready():
-            self._publish()
-            self.sleep(min(60.0, 5.0 * (1 + self._poll_failures)))
-            self._poll_failures += 1
-            return
-        owner = self.vault.owner_id()
-        if owner is None:
-            self._pairing_tick()
-            self.outbox.flush()
-            self._publish()
-            return
-        self._bind_owner(owner)
-        prev_poll = self.ledger.last_poll_success()
-        decisions = self._poll()
-        if decisions is not None:
-            self._continuity(prev_poll)
-            self._after_poll(decisions)
-        self._work()
+        self._publish()
+        self.sleep(2)
 
     def _work(self) -> None:
-        """Everything after his input is recorded: the same on either chat."""
+        """Everything after his input is recorded."""
         paused = commands.is_paused(self.ledger)
         self.commands.handle_pending()
         self.runner.start_pending(paused=commands.is_paused(self.ledger))
@@ -341,7 +266,7 @@ class Controller:
         if self.discord is None:
             self.sleep(seconds)
             return
-        # poll_timeout 0 (tests) means never block, as with the Telegram long poll.
+        # poll_timeout 0 (tests) means never block.
         self.discord.wake.wait(seconds if self.poll_timeout else 0)
         self.discord.wake.clear()
 
@@ -352,7 +277,7 @@ class Controller:
             return
         self._link_checked = now
         if self.discord_chat.link.health():
-            self.ledger.ingest([], None)          # proves the path to him, for the digest
+            self.ledger.ingest([])                # proves the path to him, for the digest
             self.notes.pop("cain_link", None)
         else:
             self.notes["cain_link"] = ("Cain's add-on isn't answering, so cards wait. Calendar "
@@ -407,14 +332,14 @@ class Controller:
                                     text=text, db=db)
             return
         try:
-            inc = telegram.Incoming(update_id=int(p["id"]), kind="callback", user_id=owner,
-                                    chat_id=owner, chat_type="private",
-                                    message_id=int(p["message_id"]),
-                                    callback_id=f"{p.get('app', '')}:{p.get('token', '')}",
-                                    callback_data=cid[len(DISCORD_PREFIX):])
+            inc = Incoming(update_id=int(p["id"]), kind="callback", user_id=owner,
+                           chat_id=owner, chat_type="private",
+                           message_id=int(p["message_id"]),
+                           callback_id=f"{p.get('app', '')}:{p.get('token', '')}",
+                           callback_data=cid[len(DISCORD_PREFIX):])
         except (KeyError, ValueError, TypeError):
             return
-        self.ledger.ingest([telegram.Decision(inc, True, None, None)], None)
+        self.ledger.ingest([Decision(inc, True, None, None)])
         self.callbacks.handle(inc)
 
     def _handover(self, h) -> None:
@@ -459,10 +384,10 @@ class Controller:
             h.finish("refused", f"That message wasn't kept: it looks like {hit}. "
                                 "Nothing was stored.")
             return
-        inc = telegram.Incoming(update_id=int(m["id"]), kind="message", user_id=owner,
-                                chat_id=owner, chat_type="private", message_id=int(m["id"]),
-                                text=text, reply_to_message_id=reply_to)
-        jobs = self.ledger.ingest([telegram.Decision(inc, True, None, "message")], None)
+        inc = Incoming(update_id=int(m["id"]), kind="message", user_id=owner,
+                       chat_id=owner, chat_type="private", message_id=int(m["id"]),
+                       text=text, reply_to_message_id=reply_to)
+        jobs = self.ledger.ingest([Decision(inc, True, None, "message")])
         if jobs:
             job_id = jobs[0]
             if flags:
@@ -592,112 +517,15 @@ class Controller:
             self.canary and self.canary.pending) or bool(
             self.calendar and self.calendar.pending) or bool(self.ledger.due_outbox())
 
-    def _poll(self):
-        timeout = 1 if self._busy() else self.poll_timeout
-        owner = self.config.owner_user_id
-        screen = self._screen
-        try:
-            decisions, _ = telegram.poll_once(self.api, self.ledger, owner, timeout=timeout,
-                                              screen=screen)
-        except TelegramError as e:
-            self._poll_failed(e)
-            return None
-        self._poll_failures = 0
-        self.notes.pop("telegram", None)
-        return decisions
-
-    def _poll_failed(self, e: TelegramError) -> None:
-        self._poll_failures += 1
-        self.ledger.input_failed("telegram", str(e))
-        if e.code == 409:
-            self.notes["telegram"] = "another program is reading this bot's updates"
-        elif e.code == 401:
-            self.notes["telegram"] = "Telegram refused the bot token"
-        wait = min(60.0, max(e.retry_after or 0, 2.0 * self._poll_failures))
-        self.sleep(wait)
-
-    def _screen(self, inc) -> str | None:
-        return self._screen_text(inc.text or "")
-
     def _screen_text(self, text: str) -> str | None:
         cfg = self.config or self.base_config
         hit = ingress_filter.check(text, work_domains=cfg.work_domains,
                                    markers=cfg.work_markers)
         return f"work content ({hit.kind})" if hit else None
 
-    def _after_poll(self, decisions) -> None:
-        for d in decisions:
-            inc = d.incoming
-            if d.accepted and inc.kind == "callback":
-                self.callbacks.handle(inc)
-            elif not d.accepted and d.reason and d.reason.startswith("work content") \
-                    and inc.chat_id == self.config.owner_user_id:
-                with self.ledger.tx() as db:
-                    self.ledger.enqueue(
-                        chat_id=inc.chat_id, kind="reply",
-                        text=("I didn't keep that message: it looks like work content "
-                              f"({render.escape(d.reason[14:-1])}). Nothing was stored or "
-                              "sent to a model."), db=db)
-
-    # -- continuity --------------------------------------------------------------
     def _proactive_ok(self) -> bool:
         local = self.ledger.now().astimezone(ZoneInfo(self.config.timezone)).date()
         return local >= self.config.proactive_from
-
-    def _continuity(self, prev: datetime | None) -> None:
-        now = self.ledger.now()
-        if prev is None:
-            return
-        gap = (now - prev).total_seconds()
-        if gap <= self.config.continuity_window_s:
-            return
-        tz = ZoneInfo(self.config.timezone)
-        lost_before = now - timedelta(seconds=self.config.continuity_window_s)
-        text = (f"<b>Continuity unknown.</b> I couldn't reach Telegram from "
-                f"{prev.astimezone(tz):%a %b %-d %-I:%M %p} until now. Telegram keeps "
-                f"messages for 24 hours, so anything you sent before "
-                f"{lost_before.astimezone(tz):%a %-I:%M %p} may be lost. Resend anything "
-                "that matters.")
-        with self.ledger.tx() as db:
-            self.ledger.event("continuity_unknown", {"gap_s": int(gap)}, db=db)
-            # Held until he next writes if proactive messages aren't allowed yet.
-            self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", text=text,
-                                held=not self._proactive_ok(), db=db)
-
-    # -- pairing -------------------------------------------------------------------
-    def _pairing_tick(self) -> None:
-        paired = None
-
-        def decide_pairing(inc):
-            nonlocal paired
-            result = "not paired"
-            if (inc.kind == "message" and not inc.is_bot and inc.chat_type == "private"
-                    and inc.user_id is not None and inc.chat_id == inc.user_id and inc.text):
-                m = PAIR_RE.fullmatch(inc.text.strip())
-                if m:
-                    result = self.vault.try_pair(m.group(1), user_id=inc.user_id,
-                                                 chat_id=inc.chat_id)
-                    if result == "paired":
-                        paired = inc
-            # Nothing said to the bot before pairing is kept, including the
-            # code itself: every update is recorded as a refusal, by id.
-            return telegram.Decision(inc, False, f"pairing: {result}", None)
-
-        try:
-            telegram.poll_once(self.api, self.ledger, 0, timeout=self.poll_timeout,
-                               decide_fn=decide_pairing)
-        except TelegramError as e:
-            self._poll_failed(e)
-            return
-        if paired is not None:
-            self._bind_owner(paired.user_id)
-            with self.ledger.tx() as db:
-                self.ledger.event("paired", {"user": paired.user_id}, db=db)
-                self.ledger.enqueue(chat_id=paired.chat_id, kind="notice", text=(
-                    "<b>Paired.</b> This chat is now the only place the harness listens. "
-                    "It answers when you write; it can't change anything in the world yet. "
-                    "/status shows what it's doing; /stop stops it."), db=db)
-            self._set_commands()
 
     # -- settings changes from the add-on page -------------------------------------------
     def _announce_settings(self) -> None:
@@ -712,7 +540,7 @@ class Controller:
             self.ledger.enqueue(
                 chat_id=self.config.owner_user_id, kind="card",
                 text=(f"<b>Settings change requested</b> on the add-on page by "
-                      f"{render.escape(p['by'])}: replace the {LABELS[p['field']]}. "
+                      f"{render.escape(p['by'])}: replace the {LABELS.get(p['field'], p['field'])}. "
                       "Only your tap applies it. <i>Expires in 15 min.</i>"),
                 buttons=[[("Approve", choices.callback_data(ok)),
                           ("Decline", choices.callback_data(no))]],
@@ -735,9 +563,9 @@ class Controller:
                 self._reset(req.get("by", "someone"))
 
     def _reset(self, by: str) -> None:
-        owner = self.vault.owner_id()
-        if owner is not None and self.vault.get("telegram_bot_token"):
-            # Tell the old owner first, while the token still works.
+        owner = self.config.owner_user_id if self.config is not None else None
+        if owner is not None:
+            # Tell him first, while the token still works.
             with self.ledger.tx() as db:
                 self.ledger.enqueue(chat_id=owner, kind="notice", text=(
                     f"<b>The harness was reset</b> from the add-on page by "
@@ -810,7 +638,8 @@ class Controller:
         if self.calendar_change is not None:
             lines.append(self.calendar_change.status_line())
         if last:
-            lines.append(f"Telegram: last contact {int((now - last).total_seconds())}s ago")
+            lines.append(f"{render.escape(self.ledger.get_meta('chat_name') or 'Chat')}: "
+                         f"last contact {int((now - last).total_seconds())}s ago")
         lines.append(f"Jobs: {len(self.ledger.jobs_in('running'))} running · "
                      f"{len(self.ledger.jobs_in('proposed'))} waiting on you")
         spend = []
@@ -853,7 +682,6 @@ class Controller:
         self.status_box.update({
             "paired": owner is not None,
             "owner_since": owner.get("paired_at") if owner else None,
-            "bot": self.bot_username,
             "stage": self.base_config.stage,
             "proactive_from": self.base_config.proactive_from.isoformat(),
             "last_poll": last.isoformat() if last else None,

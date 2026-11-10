@@ -7,12 +7,10 @@ and nothing has to be reconstructed from a conversation.
 
 Two rules carry most of the weight:
 
-  * INGRESS IS ATOMIC WITH THE TELEGRAM OFFSET. Telegram confirms updates
-    when the next getUpdates call passes a higher offset. So the offset
-    may only advance in the same transaction that durably records the
-    updates it confirms. Crash before commit: Telegram re-delivers and
-    the update_id primary key absorbs the duplicate. Crash after commit:
-    nothing is lost because it is already here.
+  * EVERY INBOUND TAP OR MESSAGE IS RECORDED ONCE. Its id (scoped by the
+    bot's id) is the primary key, so a second delivery of the same tap or
+    message is absorbed, and an accepted message becomes its job in the
+    same transaction that records it.
   * EVERY JOB ENDS IN A RECEIPT. A job with no terminal receipt is, by
     definition, something the digest must surface.
 """
@@ -461,17 +459,16 @@ class Ledger:
             "INSERT INTO events(at, kind, detail) VALUES(?, ?, ?)",
             (iso(self.now()), kind, text))
 
-    # -- Telegram ingress ---------------------------------------------
-    # Update ids, message ids and the offset all belong to ONE bot. A new
-    # bot token (after a reset, or a replaced token) starts every counter
-    # again, so they are scoped by the bot's id, and switching bots resets
-    # the offset instead of confirming -- dropping -- the new bot's updates.
+    # -- ingress ------------------------------------------------------
+    # Inbound ids and message ids all belong to ONE bot. A new bot token
+    # (after a reset, or a replaced token) means new ids, so they are
+    # scoped by the bot's id.
     def bot_id(self) -> int:
         return int(self.get_meta("bot_id") or 0)
 
     def set_bot(self, bot_id: int) -> bool:
         """Record which bot this ledger is talking to. Returns True if it
-        changed (and the offset was reset)."""
+        changed."""
         if not isinstance(bot_id, int) or bot_id <= 0:
             raise LedgerError(f"not a bot id: {bot_id!r}")
         old = self.bot_id()
@@ -479,35 +476,22 @@ class Ledger:
             return False
         with self.tx() as db:
             self.set_meta("bot_id", str(bot_id), db)
-            self.set_meta("telegram_offset", "0", db)
-            db.execute("DELETE FROM meta WHERE key='last_update_received'")
             self.event("bot_changed", {"from": old, "to": bot_id}, db=db)
         return True
 
-    def telegram_offset(self) -> int:
-        return int(self.get_meta("telegram_offset") or 0)
+    def ingest(self, batch: Iterable) -> list[str]:
+        """Record a batch of chat.Decision in ONE transaction. Returns new
+        job ids.
 
-    def ingest(self, batch: Iterable, next_offset: int | None, *,
-               reset: bool = False) -> list[str]:
-        """Record a batch of parsed updates and advance the offset in ONE
-        transaction. `batch` items are (Incoming, accepted, reason, kind)
-        decisions from telegram.decide(). Returns new job ids.
-
-        Rejected updates are recorded minimally -- ids and the reason --
-        and their text is never stored. Accepted messages become jobs.
-
-        `reset` is the one sanctioned way for the offset to move backwards:
-        Telegram picks the next update id at random after a week with no
-        updates, so after a long quiet spell the new ids may be lower than
-        the stored offset. Anything else moving it backwards is a bug."""
+        Rejected input is recorded minimally -- ids and the reason -- and
+        its text is never stored. Accepted messages become jobs. An empty
+        batch proves the path to him is up (last_poll_success)."""
         batch = list(batch)
         now = iso(self.now())
         new_jobs: list[str] = []
-        received_any = False
-        if not batch and next_offset is None:
-            # An empty long-poll. Recording every one of them would be
-            # thousands of writes a day to the Pi's storage for nothing;
-            # once a minute is enough to prove Telegram is reachable.
+        if not batch:
+            # Recording every check would be thousands of writes a day to
+            # the Pi's storage for nothing; once a minute is enough.
             last = self.last_poll_success()
             if last is not None and (self.now() - last).total_seconds() < 60:
                 return []
@@ -516,7 +500,6 @@ class Ledger:
             return []
         bot = self.bot_id()
         with self.tx() as db:
-            current = self.telegram_offset()
             for d in batch:
                 inc = d.incoming
                 cur = db.execute(
@@ -526,8 +509,7 @@ class Ledger:
                     (bot, inc.update_id, inc.kind, inc.user_id, inc.chat_id,
                      inc.message_id, int(d.accepted), d.reason, now))
                 if cur.rowcount == 0:
-                    continue        # a re-delivery after a crash: already here
-                received_any = True
+                    continue        # delivered twice: already here
                 if d.accepted and d.job_kind is not None:
                     job_id = str(uuid.uuid4())
                     db.execute(
@@ -540,25 +522,11 @@ class Ledger:
                     db.execute("INSERT INTO job_text(job_id, text) VALUES(?, ?)",
                                (job_id, inc.text or ""))
                     new_jobs.append(job_id)
-            if next_offset is not None:
-                if next_offset < current:
-                    if not reset:
-                        raise LedgerError(
-                            f"offset would move backwards ({current} -> {next_offset})")
-                    self.event("update_ids_reset",
-                               {"from": current, "to": next_offset}, db=db)
-                self.set_meta("telegram_offset", str(next_offset), db)
-            if received_any:
-                self.set_meta("last_update_received", now, db)
             self.set_meta("last_poll_success", now, db)
         return new_jobs
 
     def last_poll_success(self) -> datetime | None:
         v = self.get_meta("last_poll_success")
-        return datetime.fromisoformat(v) if v else None
-
-    def last_update_received(self) -> datetime | None:
-        v = self.get_meta("last_update_received")
         return datetime.fromisoformat(v) if v else None
 
     def meta_time(self, key: str) -> datetime | None:
@@ -635,8 +603,7 @@ class Ledger:
     def record_outbound(self, *, chat_id: int, message_id: int, kind: str,
                         text: str, job_id: str | None = None, db=None) -> None:
         if not isinstance(message_id, int) or message_id <= 0:
-            # Telegram returns 0 for ephemeral or scheduled messages. A card
-            # that is not a real message can never be tapped, so never bound.
+            # A card that is not a real message can never be tapped, so never bound.
             raise LedgerError(f"not a real message id: {message_id!r}")
         (db or self.db).execute(
             "INSERT OR REPLACE INTO outbound(bot_id, message_id, chat_id, job_id, kind, text,"
@@ -651,7 +618,7 @@ class Ledger:
     # -- the outbox: replies are committed with the job, sent after ----------
     # A job's terminal state and the message that tells him about it are
     # written in ONE transaction. Sending happens afterwards and is retried,
-    # so a Telegram outage delays a reply but never loses one, and a crash
+    # so a chat outage delays a reply but never loses one, and a crash
     # between the two leaves a queued message, not a silent job.
     def enqueue(self, *, chat_id: int, kind: str, text: str, job_id: str | None = None,
                 buttons: list | None = None, binds: list | None = None,

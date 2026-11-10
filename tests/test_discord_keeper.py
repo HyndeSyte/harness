@@ -17,7 +17,7 @@ from harness.discord_chat import RESUME, STOP, LinkChat, to_markdown
 from harness.discord_keeper import DiscordKeeper, KeeperStore
 from harness.handover import Handover, Inbox, key_for, serve
 from harness.vault import Vault
-from fakes import FakeBot, FakeEngine, SyncExecutor, result
+from fakes import own, FakeBot, FakeEngine, SyncExecutor, result
 
 # Made up, and assembled at run time so secret scanners don't mistake it for a real one.
 TOKEN = ".".join(["x" * 26, "y" * 6, "z" * 38])

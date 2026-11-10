@@ -1,20 +1,21 @@
-"""The controller loop, end to end with doubles: pairing, jobs, continuity,
-settings changes, reset, and the daily canary and digest."""
+"""The controller loop, end to end with doubles: jobs, settings changes, reset,
+and the daily canary and digest; and the same through Cain on Discord."""
 import json
 import queue
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from harness import approvals, commands
 from harness.config import Config
-from harness.controller import Controller
-from harness.ledger import iso
+from harness.discord_chat import STOP
 from harness.vault import Vault
 from conftest import OWNER, Clock, cb, msg
-from fakes import FakeBot, FakeEngine, SyncExecutor, result, tg_error
+from fakes import FakeBot, FakeEngine, SyncExecutor, own, receive, result
+from fakes import TestController as Controller
+from test_discord_keeper import OWNER as DISCORD_OWNER, Rig as CainRig, ids
 
-TOKEN = "123456789:AAEhBP0av28aH3sT9_" + "x" * 18
 OKEY = "sk-proj-" + "B" * 40
 
 
@@ -24,10 +25,9 @@ class Rig:
         self.ledger = ledger
         self.clock = clock
         self.vault = Vault(str(tmp_path / "secrets.json"), clock=clock)
-        self.vault.set_key("telegram_bot_token", TOKEN, by="Owner")
         self.vault.set_key("openai_api_key", OKEY, by="Owner")
         if paired:
-            self.vault.try_pair(self.vault.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
+            own(self.vault, OWNER)
         self.bot = FakeBot()
         self.claude = FakeEngine("claude")
         self.gpt = FakeEngine("gpt")
@@ -71,31 +71,6 @@ def rig(ledger, tmp_path, clock):
     return Rig(ledger, tmp_path, clock)
 
 
-def test_pairing_binds_only_the_sender_of_the_code(ledger, tmp_path, clock):
-    r = Rig(ledger, tmp_path, clock, paired=False)
-    code = r.vault.new_pairing_code()
-    r.updates(msg(1, "hi bot", user=999, chat=999), msg(2, f"/start {code}"))
-    r.c.tick()
-    assert r.vault.owner_id() == OWNER
-    assert r.bot.sent[0][0] == OWNER and "Paired." in r.bot.sent[0][1]
-    assert r.bot.commands and r.bot.commands[0][0] == OWNER
-    # nothing said before pairing is kept, not even the code
-    assert ledger.db.execute("SELECT COUNT(*) FROM job_text").fetchone()[0] == 0
-    reasons = [x["reason"] for x in ledger.db.execute("SELECT reason FROM updates")]
-    assert reasons == ["pairing: not paired", "pairing: paired"]
-    # and from now on he is the owner: a message becomes a job
-    r.say("what's on Thursday?")
-    assert ledger.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
-
-
-def test_wrong_codes_do_not_pair(ledger, tmp_path, clock):
-    r = Rig(ledger, tmp_path, clock, paired=False)
-    r.vault.new_pairing_code()
-    r.updates(msg(1, "/start AAAAAAAAAAAAAAAAAAAAAA", user=999, chat=999))
-    r.c.tick()
-    assert r.vault.owner() is None and r.bot.sent == []
-
-
 def test_a_message_is_answered_in_one_tick(rig):
     rig.claude.script = [result(text="Thursday is clear.")]
     rig.say("what's on Thursday?")
@@ -107,42 +82,6 @@ def test_work_content_is_refused_before_it_is_stored(rig, ledger):
     assert ledger.db.execute("SELECT COUNT(*) FROM job_text").fetchone()[0] == 0
     assert "looks like work content (marker)" in rig.texts()[-1]
     assert rig.claude.calls == []
-
-
-def test_a_long_outage_says_continuity_is_unknown(rig, ledger, clock):
-    rig.c.tick()
-    with ledger.tx() as db:
-        ledger.set_meta("last_poll_success", iso(clock() - timedelta(hours=30)), db)
-    rig.c.tick()
-    assert "Continuity unknown" in rig.texts()[-1]
-
-
-def test_before_proactive_messages_are_allowed_the_notice_waits_for_him(ledger, tmp_path):
-    clock = Clock(datetime(2026, 10, 12, 15, 0, tzinfo=timezone.utc))
-    ledger.clock = clock
-    r = Rig(ledger, tmp_path, clock)
-    r.c.tick()
-    with ledger.tx() as db:
-        ledger.set_meta("last_poll_success", iso(clock() - timedelta(hours=30)), db)
-    r.c.tick()
-    assert r.bot.sent == []                       # held: nothing proactive before Oct 20
-    r.claude.script = [result(text="answer")]
-    r.say("hello")
-    assert "Continuity unknown" in r.texts()[0] and "answer" in r.texts()[1]
-
-
-def test_after_a_quiet_week_it_asks_for_the_earliest_update(rig, ledger, clock):
-    with ledger.tx() as db:
-        ledger.set_meta("telegram_offset", "1000", db)
-        ledger.set_meta("last_update_received", iso(clock() - timedelta(days=7)), db)
-    rig.updates(msg(5, "back from vacation"))     # ids restarted below the offset
-    rig.c.tick()
-    assert rig.bot.offsets[-1] == 0
-    assert ledger.telegram_offset() == 6
-    assert ledger.db.execute("SELECT COUNT(*) FROM events WHERE kind='update_ids_reset'"
-                             ).fetchone()[0] == 1
-    rig.c.tick()
-    assert rig.bot.offsets[-1] == 6               # back to normal
 
 
 def test_a_settings_change_applies_only_on_his_tap(rig):
@@ -163,7 +102,7 @@ def test_reset_tells_the_old_owner_first(rig):
     rig.requests.put({"type": "reset", "by": "Kid"})
     rig.c.tick()
     assert "The harness was reset" in rig.texts()[-1] and "Kid" in rig.texts()[-1]
-    assert rig.vault.owner() is None and rig.vault.get("telegram_bot_token") == ""
+    assert rig.vault.owner() is None and rig.vault.get("openai_api_key") == ""
 
 
 def at_local(clock, hh, mm, day=21):
@@ -219,20 +158,6 @@ def test_no_digest_reaches_him_before_proactive_from(ledger, tmp_path):
     assert json.loads(ev["detail"])["sent"] is False
 
 
-def test_a_webhook_on_the_bot_is_reported_not_deleted(ledger, tmp_path, clock):
-    r = Rig.__new__(Rig)
-    bot = FakeBot()
-    bot.webhook_url = "https://elsewhere.example/hook"
-    vault = Vault(str(tmp_path / "secrets.json"), clock=clock)
-    vault.set_key("telegram_bot_token", TOKEN, by="Owner")
-    vault.try_pair(vault.new_pairing_code(), user_id=OWNER, chat_id=OWNER)
-    c = Controller(ledger=ledger, vault=vault, api=bot, engines={}, executor=SyncExecutor(),
-                   base_config=Config(owner_user_id=1, stage="S1"), sleep=lambda s: None,
-                   poll_timeout=0)
-    c.startup()
-    assert "webhook is set" in " ".join(c.notes.values())
-
-
 def test_a_missing_model_is_reported(ledger, tmp_path, clock):
     r = Rig(ledger, tmp_path, clock)
     r.gpt.model_state = "missing"
@@ -240,14 +165,77 @@ def test_a_missing_model_is_reported(ledger, tmp_path, clock):
     assert "gpt-6.1-sol isn't available" in r.c.status_text()
 
 
-def test_telegram_conflict_is_noted_and_backs_off(rig):
-    rig.bot.batches.append(tg_error(409, "Conflict: terminated by other getUpdates request"))
-    rig.c.tick()
-    assert "another program" in rig.c.status_text()
-    rig.c.tick()                                   # recovers on the next good poll
-    assert "another program" not in rig.c.status_text()
-
-
 def test_status_command_reads_the_controller(rig):
     rig.say("/status")
     assert rig.texts()[-1].startswith("<b>Status</b> · stage S1 · zero effects")
+
+
+# -- the same, through Cain on Discord: cards to his link, taps back from it --------------
+
+@pytest.fixture
+def cain(ledger, tmp_path, clock):
+    return CainRig(ledger, tmp_path, clock)
+
+
+def test_through_cain_a_settings_change_applies_only_on_his_tap(cain):
+    new = "sk-proj-" + "Z" * 40
+    cain.vault.request_change("openai_api_key", new, by="Kid")
+    cain.c.tick()
+    card = cain.link.last()
+    assert "Settings change requested" in card["text"] and "Kid" in card["text"]
+    approve, decline, stop = ids(card)
+    assert stop == STOP and cain.vault.get("openai_api_key") == ""
+    cain.tap(max(cain.link.cards), approve)
+    assert cain.vault.get("openai_api_key") == new
+    assert "Done. The OpenAI API key was replaced." in cain.link.last()["text"]
+
+
+def test_through_cain_reset_tells_him_first(cain):
+    cain.c.requests.put({"type": "reset", "by": "Kid"})
+    cain.c.tick()
+    assert "The harness was reset" in cain.link.last()["text"]
+    assert cain.vault.get("discord_bot_token") == "" and cain.c.config is None
+
+
+def proposed_card(cain):
+    """A proposed effect on a card, with Approve and Decline, shown through Cain."""
+    ledger, owner = cain.ledger, int(DISCORD_OWNER)
+    _, [jid] = receive(ledger, [msg(1, "hold Friday 2pm", user=owner, chat=owner)], owner=owner)
+    ledger.transition(jid, "running")
+    with ledger.tx() as db:
+        pid = approvals.create_proposal(ledger, job_id=jid, effect_type="calendar_hold",
+                                        params={"start": "2026-10-23T14:00:00-04:00",
+                                                "duration_min": 60},
+                                        policy_version=cain.c.config.policy_version,
+                                        ttl_s=3600, db=db)
+        ledger.transition(jid, "proposed", db=db)
+        nonce = approvals.mint(ledger, proposal_id=pid, owner_user_id=owner, ttl_s=3600, db=db)
+        ledger.enqueue(chat_id=owner, kind="card", text="Hold Friday 2 PM?", job_id=jid, db=db,
+                       buttons=[[("Approve", approvals.callback_data("approve", nonce)),
+                                 ("Decline", approvals.callback_data("decline", nonce))]],
+                       binds=[{"type": "approval", "nonce": nonce}])
+    cain.c.tick()
+    return jid, max(cain.link.cards)
+
+
+def test_through_cain_a_tap_on_a_proposal_card_decides_it_once(cain):
+    jid, cid = proposed_card(cain)
+    approve, decline, stop = ids(cain.link.cards[cid])
+    assert approve.startswith("k:a:") and decline.startswith("k:d:") and stop == STOP
+    cain.tap(cid, decline)
+    assert cain.ledger.job(jid)["state"] == "declined"
+    assert ids(cain.link.cards[cid]) == []                        # buttons taken off
+    cain.tap(cid, approve)                                         # the card is spent
+    assert cain.ledger.job(jid)["state"] == "declined"
+    assert cain.link.answers[-1][1] == "Already done."
+
+
+def test_through_cain_approve_runs_and_stop_still_wins(cain):
+    jid, cid = proposed_card(cain)
+    approve = ids(cain.link.cards[cid])[0]
+    cain.tap(0, STOP)
+    assert commands.is_paused(cain.ledger)
+    cain.tap(cid, approve)
+    assert cain.ledger.db.execute("SELECT COUNT(*) FROM approvals WHERE consumed_at IS NOT NULL"
+                                  ).fetchone()[0] == 1
+    assert cain.ledger.job(jid)["state"] != "proposed"

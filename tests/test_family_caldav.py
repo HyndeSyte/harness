@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from fakes import own
 from harness import caldav
 from harness.net import REDACT, CalDavTransport, RedactingFilter, TransportError
 from fake_caldav import (APP_PASSWORD, APPLE_ID, FAMILY_PATH, FAMILY_URL, OTHER_URL, FakeICloud,

@@ -1,7 +1,8 @@
 # Harness
 
-A small deterministic controller that owns one private Telegram thread. You write;
-Claude (and, later, GPT) answer through it. The models never hold a credential and
+A small deterministic controller behind Cain, your assistant on Discord. You ask Cain;
+calendar requests come here, and Claude (and, later, GPT) work through it. Its messages
+and buttons reach you as cards Cain shows. The models never hold a credential and
 can't change anything themselves. At this stage the harness has **one effect**, off
 until you turn it on: adding an event to the iCloud Family calendar.
 
@@ -12,7 +13,7 @@ until you turn it on: adding an event to the iCloud Family calendar.
 2. **Open the Harness panel** (sidebar, or *Open web UI* here). The first Home
    Assistant user to save settings becomes the only one who can change them.
 3. **Paste the keys**, each into its own box, then *Save*:
-   - the Telegram bot token from @BotFather;
+   - the Discord bot token (Cain's bot, the same one Cain's add-on uses);
    - an Anthropic API key, with prepaid credit and auto-reload off;
    - an OpenAI API key, with prepaid credit;
    - optional: your calendars' **secret iCal addresses**. In Google Calendar on a
@@ -22,10 +23,8 @@ until you turn it on: adding an event to the iCloud Family calendar.
 
    Keys are stored only in this add-on's private storage (`/data`), never in add-on
    options, and are never shown again.
-4. **Pair:** the panel shows a link. Open it on your phone and tap *Start*, or send
-   the `/start` code it shows to your bot. Only the account that sends the code
-   becomes the owner; the code works once and expires in 15 minutes.
-5. Make sure Telegram **two-step verification** is on for your account.
+4. The harness acts only for the Discord account that owns the bot, and only on that
+   account's own messages in its DM with the bot.
 
 ## What it does now
 
@@ -47,17 +46,11 @@ Apart from adding an event to the Family calendar (below), it can't send email, 
 buy, delete or schedule anything. Effects arrive one at a time in later stages, each
 with a card you approve by tapping.
 
-## Commands
+## Stop
 
-| | |
-|---|---|
-| `/stop` | Kill switch: start nothing new until `/resume`. |
-| `/resume` | Undo `/stop`. |
-| `/cancel` | Cancel everything pending. |
-| `/status` | What it's doing, spend this month, canary results. |
-| `/rule` | Your standing rules. |
-| `/undo` | Retire the newest rule (`/undo R1a2b3c` for a specific one). |
-| `/checkadds` | Family calendar adds need your Approve tap again, at once. |
+Every card with buttons, and the digest, carries a **Stop** button: start nothing new
+until you tap **Turn back on**, which takes its place while stopped. What it's doing,
+spend this month and canary results are on the Harness page.
 
 ## Calendar
 
@@ -156,8 +149,8 @@ Set up, on the add-on page:
    Security*, *App-Specific Passwords*). It looks like `abcd-efgh-ijkl-mnop`.
 2. Enter the Apple ID, that password and the calendar address, the URL of the Family
    collection, which must be `https://p<digits>-caldav.icloud.com/.../`. They are kept
-   like the other keys and never shown again. After pairing, enter one at a time and
-   approve each on its card in Telegram.
+   like the other keys and never shown again. Once there is an owner, enter one at a
+   time and approve each on its card.
 
 Then send something like "add dentist Tuesday 3pm":
 
@@ -214,7 +207,7 @@ the thread says why, after an undo, a failed or unknown write, an add iCloud gav
 tag for (so no Undo), a change to the calendar address, Apple ID or password, a change of
 policy or model, or a stored rule that never had your tap. An add already queued when the tap comes back isn't written, and the thread
 says so. Going without it again takes a fresh full count. *Reset* on the add-on page ends all of this, along with the keys and
-the pairing.
+the owner.
 
 **Alerts.** Tested on a real phone: an add alerts family phones that have notifications on
 for the Family calendar. The app can't turn that off. Each phone's own Calendar settings can.
@@ -259,8 +252,8 @@ To turn this on, once, about 10 minutes:
 2. In Google Calendar, open your calendar's settings, **Share with specific people**, add the service
    account's address, and pick **Make changes and see all event details**. The blocks are marked
    private, and the option above it may hide them from the account that wrote them.
-3. On this add-on's page, paste the whole file into the Gmail calendar key box. Tap to approve it in
-   Telegram, as with any key.
+3. On this add-on's page, paste the whole file into the Gmail calendar key box. Tap to approve it on
+   its card, as with any key.
 4. In the add-on's settings (Configuration tab), set `family_to_gmail`, then restart:
    `Family title => Gmail title`, with `;` between several. The Family title must match in full, not
    counting capitals. The Gmail title must include a word that doesn't copy back to Family, like Busy.
@@ -308,22 +301,6 @@ how many blocks are on Gmail.
   that can't be found is left off, and the digest names the event's day and time. A place you type
   on a block makes it yours, like any other edit.
 
-## Links from instrument cards
-
-A card can carry a link that opens this chat with the card's title, so you can say
-what happened or what you want done. The link only opens the conversation. In a
-Home Assistant template, with the card title in `title`:
-
-```
-{%- set ns = namespace(t=title[:46]) -%}
-{%- for i in range(46) -%}
-  {%- if (ns.t | base64_encode | replace('=','') | length) > 62 -%}
-    {%- set ns.t = ns.t[:-1] -%}
-  {%- endif -%}
-{%- endfor -%}
-https://t.me/YOUR_BOT?start=c1{{ ns.t | base64_encode | replace('+','-') | replace('/','_') | replace('=','') }}
-```
-
 ## Standing rules from before 0.5.1
 
 Rules saved by an earlier version were never confirmed, because that step didn't exist. From
@@ -333,22 +310,20 @@ comes back.
 
 ## Changing a key later
 
-Paste the new key (or the new set of calendar addresses) in the panel. After pairing, the change is **not** applied until
-you approve it on a card in Telegram (15 minutes to tap).
+Paste the new key (or the new set of calendar addresses) in the panel. Once there is an owner, the change is **not**
+applied until you approve it on its card (15 minutes to tap). An install paired before Discord keeps its owner.
 
 ## Starting over
 
-*Reset* in the panel (type `RESET`) forgets the keys and the pairing; the ledger
-stays. If Telegram itself is unreachable, uninstalling the add-on also starts over,
-and deletes the ledger.
+*Reset* in the panel (type `RESET`) forgets the keys and the owner; the ledger
+stays. Uninstalling the add-on also starts over, and deletes the ledger.
 
 ## Backups
 
 Backups include `/data` (the ledger, the keys, the app-specific password, the calendar
 addresses and the last Family push). The add-on stops briefly during a
-backup so the database is copied whole. After a restore, anything sent after the
-backup was taken is gone; if the gap is longer than a day, the thread says
-continuity is unknown.
+backup so the database is copied whole. After a restore, anything done after the
+backup was taken is gone.
 
 ## What it never does
 
@@ -358,13 +333,13 @@ continuity is unknown.
 - Change a calendar, with two exceptions, both as above: iCloud Family, and its own blocks
   on your Gmail calendar once you've entered a key. Otherwise Google calendars are read
   only, by GET, from calendar.google.com.
-- Talk to any host but Telegram, Anthropic, OpenAI, calendar.google.com, the iCloud
+- Talk to any host but Discord, Cain's add-on, Anthropic, OpenAI, calendar.google.com, the iCloud
   host in the Family calendar address you entered, and, for those blocks,
   oauth2.googleapis.com and www.googleapis.com. With the school's address entered, drive times
   also use nominatim.openstreetmap.org and router.project-osrm.org, by GET, and they get street
   addresses and map points only: never a title, name or time.
-- Listen to anyone but the paired account, in its private chat. Messages from
-  anyone else are dropped and their text is never stored.
+- Act for anyone but the bot's owner, on his own fresh words in his DM with the bot. Messages
+  from anyone else are never acted on and their text is never stored.
 - Keep messages that carry rights-protected document markers. (Screening by work
   domain is built, but this release ships with no domains set, so it is not on
   yet. A later release turns it on.)
