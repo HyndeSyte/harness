@@ -165,12 +165,20 @@ class Runner:
         cc = self.calendar_change if change else None
         earlier = self._earlier(job)
 
+        t0 = self.monotonic()
+        job_id = job["id"]
+
         def call():
             # In the worker: what his calendar says about the events he names is a Google read.
+            # It counts against the job's own deadline, so retries never outlive the job
+            # (Nov 8: a message with Cain's context ran past 10 minutes and was cut off).
             with_calendar = prompts.user_content(text, earlier=earlier,
                                                  calendar=cc.context_for(text, now)) if cc else user
+            spent = self.monotonic() - t0
+            if spent > 20:
+                log.info("job %s: reading his calendar for context took %d s", job_id, spent)
             return call_with_retries(engine, system=system, user=with_calendar, schema=out_schema,
-                                     budget_s=policy.JOB_DEADLINE_S - 30, sleep=self.sleep,
+                                     budget_s=policy.JOB_DEADLINE_S - 30 - spent, sleep=self.sleep,
                                      monotonic=self.monotonic)
         self._futures[job["id"]] = self.executor.submit(call)
         return True
@@ -392,6 +400,15 @@ class Runner:
             receipt["detail"] = detail
         if attempts:
             receipt["attempts"] = attempts
+        started = job["started_at"] if "started_at" in job.keys() else None
+        ran = ""
+        if started:
+            try:
+                ran = f", {int((self.ledger.now() - datetime.fromisoformat(started)).total_seconds())} s after it started"
+            except (TypeError, ValueError):
+                ran = ""
+        log.warning("job %s failed: %s (engine %s, %d attempts%s)", job["id"], reason, engine,
+                    attempts, ran)
         retry = self._may_retry(job, reason)
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "failed", receipt=json.dumps(receipt), db=db)

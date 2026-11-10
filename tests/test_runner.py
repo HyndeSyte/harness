@@ -324,3 +324,28 @@ def test_restart_retry_picks_up_an_old_unretried_failure(ledger, config):
     assert r.retry_recent_failures() == 1
     run(r)
     assert ledger.job(job)["state"] == "answered"
+
+
+def test_reading_his_calendar_counts_against_the_jobs_deadline(ledger, config, monkeypatch):
+    # The context read runs before the model call; the model's retries get only what's left,
+    # so a slow read can never push the job past its deadline mid-retry.
+    from types import SimpleNamespace
+    from harness import runner as runner_mod
+    clock = [0.0]
+    eng_r, _ = make(ledger, config, [result(text="ok")])
+    eng_r.monotonic = lambda: clock[0]
+
+    def slow_context(text, now):
+        clock[0] += 100.0
+        return ""
+    eng_r.calendar_change = SimpleNamespace(on=lambda: True, context_for=slow_context)
+    seen = {}
+    real = runner_mod.call_with_retries
+
+    def spy(engine, **kw):
+        seen["budget"] = kw["budget_s"]
+        return real(engine, **kw)
+    monkeypatch.setattr(runner_mod, "call_with_retries", spy)
+    send(ledger, "Turkey harvest ties me up")
+    run(eng_r)
+    assert seen["budget"] == policy.JOB_DEADLINE_S - 30 - 100
