@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.6
+
+- Cain reads every rule in rules/ at the start of each conversation and check-in, and when Dane corrects him he writes the general lesson to rules/ that same turn (R-005), with a Build item for the cause. Before this, corrections lived only in the session.
+
 ## 0.4.5
 
 - The calendar meanings table takes an optional fourth column, For (a date): that row is Dane's answer about the one event on that day, and is sent as `for`.

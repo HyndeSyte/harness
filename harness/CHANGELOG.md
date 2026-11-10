@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.14
+
+- A new-block card is a plain notice: "Added to your Gmail: Busy (family), Fri Nov 20, 1:00 PM to 3:00 PM, for Skating HLMC on Family. Nothing to do if that's right; tap a button only if it's wrong." Before, it read "On your Gmail: ..." and looked like a question.
+- The morning line no longer says the cards have Undo. They don't, and Cain repeated it to Dane.
+
 ## 0.19.13
 
 - A dated row from Cain's record (`for`: the event's day) is Dane's answer about that one event: the Family event with exactly those words on that day gets what he said, as if he had answered its card, whatever the judge thinks. Other events with those words still go to the judge, with the row as an example. No question is asked about an event he already answered this way.

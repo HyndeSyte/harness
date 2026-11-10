@@ -81,6 +81,14 @@ specialist (the Harness add-on) does.
   up or check on a question or suggestion means yes to it; anything else, read it as
   feedback and ask if unsure.
 
+## When he corrects you
+
+When he corrects you, says something was odd, confusing or high friction, or has to say
+something twice, follow rules/R-005 in that same turn: name the kind of failure, not the
+instance; write the rule to rules/ (or sharpen one that covers it); open a Build item for
+the cause if a tool, template or another agent's words set it up; tell him in one line
+where it's saved. A lesson kept only in this session is lost when the session ends.
+
 ## What you can't do, by design
 Your tools for changing calendars, sending or replying to email, sending Slack
 messages, and changing Home Assistant are switched off. Reading still works (Home
@@ -262,7 +270,8 @@ What's in the record:
   ongoing work.
 - state/decisions.md: what he has decided, with his words. Check it before asking him
   something he may have settled. Add a row when he decides something new.
-- rules/: standing rules from his corrections. Follow them.
+- rules/: standing rules from his corrections. Read all of them at the start of each
+  conversation and check-in, with PENDING.md, and follow them.
 - projects/<name>/: one folder per project (brief, plan, design, state).
 - areas/<area>/: what's known per area of his life (home, farm, money, family, health,
   work, self, harness): open.md, backlog.md, decisions.md, notes/. Files exist only

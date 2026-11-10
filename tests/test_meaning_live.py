@@ -639,7 +639,8 @@ def test_a_new_confirmed_block_gets_one_receipt_with_three_buttons(live):
     card = confirmed(live)
     _, text, buttons, _ = card
     assert labels(buttons) == ["Not mine", "Wrong time", "Just this once"]
-    assert text.startswith("On your Gmail: Busy (watching kids), ") and text.endswith(", for Turkey harvest.")
+    assert text.startswith("Added to your Gmail: Busy (watching kids), ")
+    assert " to " in text and "for Turkey harvest on Family." in text and "only if it's wrong" in text
     go(live)                                                  # a refresh is not a new receipt
     assert live.live.send_receipts() == 0
     assert "each on its own card with Undo" not in live.live.digest_line()
@@ -1227,3 +1228,17 @@ def test_a_dated_row_must_be_a_real_date():
         assert rows is None and "for must be a date" in why
     rows, _ = meaning_live.validate_rows({"rows": [{**ROW, "for": "2026-11-21"}]})
     assert rows[0]["for"] == "2026-11-21"
+
+
+def test_the_morning_line_names_no_button_the_cards_lack(live):
+    # Nov 10: the line said "with Undo"; the cards have no Undo, and Cain told him to tap it.
+    start = when(live, days=3)
+    seed(live, "Turkey harvest", start)
+    eid = answer_ex(live, "Turkey harvest", ["supervision"])
+    live.judge.script = [judged(ob("supervision", start, start + timedelta(hours=1)), cites=[eid])]
+    go(live)
+    go(live)
+    line = live.live.digest_line()
+    assert line.startswith("New on Gmail") and "Undo" not in line
+    names = {label for label, _ in meaning_live.UNDO_BUTTONS}
+    assert not any(word in line for word in ("Undo", "Remove", "Delete")) and names

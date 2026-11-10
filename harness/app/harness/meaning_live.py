@@ -407,8 +407,9 @@ class MeaningLive:
             return ""
         shown = min(n, MAX_RECEIPTS)
         more = f" ({n - shown} more tomorrow)" if n > shown else ""
+        # Says only what the cards really have (UNDO_BUTTONS): Cain repeats this line to him.
         return (f"New on Gmail from what Family events mean: {shown} block{'s' * (shown != 1)}, "
-                f"each on its own card with Undo{more}.")
+                f"each on its own card. Nothing to do unless one is wrong{more}.")
 
     def send_receipts(self) -> int:
         """With the morning digest: one card per new confirmed block, three buttons each. One
@@ -424,8 +425,12 @@ class MeaningLive:
             if datetime.fromisoformat(r["end"]) <= now:
                 self._receipt(r["id"], "past")
                 continue
-            text = (f"On your Gmail: {render.escape(r['title'])}, {_when(start, False)}, "
-                    f"for {render.escape(r['said'])}.")
+            end = datetime.fromisoformat(r["end"]).astimezone(zone)
+            # A notice, not a question: what was done, when, and why, in plain words.
+            text = (f"Added to your Gmail: {render.escape(r['title'])}, {_day(start)}, "
+                    f"{meaning._clock(start)} to {meaning._clock(end)}, for "
+                    f"{render.escape(r['said'])} on Family. Nothing to do if that's right; "
+                    f"tap a button only if it's wrong.")
             with self.ledger.tx() as db:
                 nonces = [(label, choices.mint(self.ledger, kind="meaning_undo",
                                                target=f"{r['id']}:{code}", chat_id=self.chat_id,
