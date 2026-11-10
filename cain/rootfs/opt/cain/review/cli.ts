@@ -7,7 +7,7 @@
 //   health                 the last nightly seat check
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, type SeatName } from "./core.ts";
+import { FINAL, LABEL, SEATS, markBlocked, newReview, parseBrief, privacyCheck, resultJson, shownId, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
 import { existsReview, loadReview, saveReview, type Ledger, type Health } from "./runner.ts";
 
@@ -33,8 +33,8 @@ switch (cmd) {
     // The gate runs here first, so Cain hears at once; the runner runs it again before every call.
     const g = privacyCheck(b, terms());
     if (!g.ok) {
-      Object.assign(r, { status: "blocked: privacy", blocked_why: g.why, brief: null, relayed: true, finished_at: r.created_at });
-      for (const s of r.seats) s.state = "blocked";
+      markBlocked(r, g.why, r.created_at);
+      r.relayed = true;
       saveReview(cfg.queueDir, r);
       fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
     }
@@ -45,7 +45,7 @@ switch (cmd) {
   case "status": {
     const r = a1 ? loadReview(cfg.queueDir, a1) : null;
     if (!r) fail(`no review ${a1 ?? ""}`.trim(), 1);
-    out(`${r!.id}: ${r!.status}${r!.blocked_why ? ` (${r!.blocked_why.join("; ")})` : ""}${r!.record_dir ? `, record ${r!.record_dir}` : ""}, $${r!.cost_usd.toFixed(3)}`);
+    out(`${shownId(r!)}: ${r!.status}${r!.blocked_why ? ` (${r!.blocked_why.join("; ")})` : ""}${r!.record_dir ? `, record ${r!.record_dir}` : ""}, $${r!.cost_usd.toFixed(3)}`);
     for (const s of r!.seats) {
       const who = s.stands_in_for ? `claude for ${s.stands_in_for} (substituted)` : s.seat;
       const what = s.state === "done" ? `${s.verdict}, ${s.findings?.length ?? 0} finding(s), ${s.model}` : s.error ? `${s.error.kind}: ${s.error.detail}. Fix: ${s.error.fix}` : "";

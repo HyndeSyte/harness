@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  BRIEF_FIELDS, STORED_BAD, SeatError, UNKNOWN_FIELD, classifyHttp, independent, newReview, outbound, parseBrief, privacyCheck,
-  recordRequest, relayLine, seatsFor, validateAnswer, type Brief, type SeatName,
+  BRIEF_FIELDS, HIDDEN_ID, ID_PRIVATE, STORED_BAD, SeatError, UNKNOWN_FIELD, classifyHttp, independent, newReview, outbound, parseBrief,
+  privacyCheck, recordRequest, relayLine, resultJson, safeId, seatsFor, shownId, validateAnswer, type Brief, type SeatName,
 } from "../rootfs/opt/cain/review/core.ts";
 import { DEFAULTS, Runner, loadReview, saveReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
 import type { SeatAnswer, SeatFn, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
@@ -173,6 +173,73 @@ describe("privacy gate", () => {
     }
     expect(JSON.stringify(t.get("2026-11-08-edited"))).not.toContain("Acme");
     expect(t.records()).toHaveLength(1);
+  });
+
+  test("a review read back as final is checked before anything reaches the record", async () => {
+    const t = rig({});
+    const r = newReview(brief({ body: "Plan for the Acme Corp offsite" }), new Date("2026-11-08T15:00:00Z"));
+    r.status = "done";
+    saveReview(t.cfg.queueDir, r);
+    await t.runner.tick();
+    expect(t.records()).toEqual([]);
+    const after = t.get("2026-11-08-desk-plan");
+    expect(after.status).toBe("blocked: privacy");
+    expect(JSON.stringify(after)).not.toContain("Acme");
+    expect(t.relays()[0]).toContain("blocked: privacy");
+  });
+
+  test("the review's own id and topic are never trusted: mismatch, unsafe id, topic from the brief", async () => {
+    const t = rig({ openai: spy(), gemini: spy(), claude: spy() });
+    const r = newReview(brief(), new Date("2026-11-08T15:00:00Z"));
+    r.brief!.id = "2026-11-08-other";
+    saveReview(t.cfg.queueDir, r);
+    await t.runner.tick();
+    expect(t.get("2026-11-08-desk-plan").blocked_why).toEqual([STORED_BAD]);
+    expect(t.records()).toEqual([]);
+    // A file whose review names another id isn't read, and an unsafe id names no file.
+    const q = t.cfg.queueDir;
+    writeFileSync(join(q, "2026-11-08-mismatch.json"), JSON.stringify({ ...newReview(brief(), new Date()), id: "../escape" }));
+    expect(loadReview(q, "2026-11-08-mismatch")).toBeNull();
+    expect(loadReview(q, "../escape")).toBeNull();
+    expect(() => saveReview(q, { ...r, id: "../../etc/x" })).toThrow();
+    for (const bad of ["a/b-c", "a\\bc", "ab..c", "AB-C"]) expect(safeId(bad)).toBe(false);
+    // The topic in the record comes from the brief, never the review's copy.
+    const clean = newReview(brief(), new Date("2026-11-08T15:00:00Z"));
+    clean.topic = "Acme Corp";
+    clean.status = "done";
+    const req = recordRequest(clean);
+    expect(JSON.stringify(req)).not.toContain("Acme");
+    expect(req.ops[1].content).toContain("# Review: Desk plan");
+  });
+
+  test("an id that matches a term is never echoed in the log, the relay or the status", async () => {
+    const logs: string[] = [];
+    const t = rig({ openai: spy() });
+    (t.runner as any).log = (m: string) => logs.push(m);
+    t.submit(brief({ id: "2026-11-08-pat-school-run" }));
+    await t.runner.tick();
+    const r = t.get("2026-11-08-pat-school-run");
+    expect(r.status).toBe("blocked: privacy");
+    expect(r.blocked_why).toContain(ID_PRIVATE);
+    expect(shownId(r)).toBe(HIDDEN_ID);
+    expect(t.relays()[0]).toStartWith(`Review ${HIDDEN_ID} blocked: privacy.`);
+    for (const out of [t.relays().join("\n"), logs.join("\n"), resultJson(r)]) expect(out).not.toContain("pat-school");
+  });
+
+  test("the terms check sees through invisible characters and compatibility forms", () => {
+    const hit = (body: string) => privacyCheck(brief({ body }), TERMS).ok;
+    expect(hit("Ac​me Corp offsite")).toBe(false);          // zero-width space
+    expect(hit("Ac­me⁠ Corp")).toBe(false);             // soft hyphen, word joiner
+    expect(hit("Acme  Corp")).toBe(false);              // odd spaces
+    expect(hit("Ａｃｍｅ Corp")).toBe(false);     // fullwidth letters
+    expect(hit("dia️betes")).toBe(false);                    // variation selector
+    expect(hit("A plain plan")).toBe(true);
+  });
+
+  test("outbound checks kinds itself and throws rather than coerce", () => {
+    expect(() => outbound({ ...brief(), body: 5 } as any)).toThrow();
+    expect(() => outbound({ ...brief(), needs_facts: "yes" } as any)).toThrow();
+    expect(() => outbound(null as any)).toThrow();
   });
 
   test("no list file: nothing goes out", async () => {
@@ -609,5 +676,31 @@ describe("ChatGPT sign-in page", () => {
     f.emit("Starting local login server on http://localhost:1455.\n");
     expect(login.state()).toMatchObject({ phase: "needs_setting" });
     expect(login.state().message).toContain("Settings, Security");
+  });
+});
+
+describe("what reaches a real seat", () => {
+  test("the Gemini request body and the Codex argv carry the allowlisted text, never the id", async () => {
+    reply = () => Response.json({ candidates: [{ content: { parts: [{ text: ok }] }, finishReason: "STOP" }], usageMetadata: {} });
+    const home = mkdtempSync(join(tmpdir(), "codex-home-"));
+    writeFileSync(join(home, "auth.json"), "{}");
+    let cmd: string[] = [];
+    const exec: Exec = async (c) => { cmd = c; writeFileSync(c[c.indexOf("-o") + 1], ok); return { code: 0, stderr: "", stdout: "" }; };
+    const t = rig({ gemini: geminiSeat({ key: KEY, base }), openai: codexSeat({ home, exec }) });
+    t.submit(brief({ id: "2026-11-08-zz-local-only-id" }));
+    await t.runner.tick();
+    expect(seen).toHaveLength(1);
+    const body = JSON.stringify(seen[0].body);
+    expect(body).toContain("monitor arms");
+    expect(body).not.toContain("zz-local-only-id");
+    expect(cmd.join(" ")).toContain("monitor arms");
+    expect(cmd.join(" ")).not.toContain("zz-local-only-id");
+  });
+
+  test("a provider's error text is not kept: only the status and a fixed reason", async () => {
+    reply = () => new Response(JSON.stringify({ error: { message: "echo: Acme Corp offsite plan" } }), { status: 400 });
+    const e = await geminiSeat({ key: KEY, base })(input()).catch((x) => x as SeatError);
+    expect(e.kind).toBe("refused");
+    expect(e.message).toBe("HTTP 400: the service refused the request");
   });
 });
