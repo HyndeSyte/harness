@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.11
+
+- **The Telegram code is gone.** Telegram was replaced by Discord on Nov 7, and the bot is deleted. Removed: the long poll, the Telegram API client, /start pairing and deeplinks, and the Telegram token field on the setup page. Shared message shapes moved to chat.py. The ledger is unchanged, and a leftover token in the vault is ignored and dropped on the next write. Stop, Turn back on, cards and Undo all run through Discord as before.
+- **A request's calendar read counts against its 10-minute deadline** (P9). The model's retries get only the time left, so a slow read can't push a request past its deadline mid-retry. A failed request logs its reason, attempts and run time, and a read over 20 seconds is logged.
+
 ## 0.19.10
 
 - The no-block line also counts his own answers for the event's words, by state (active, overruled). That tells a judge that ignored his answer apart from an answer that never arrived or was overruled.

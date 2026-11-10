@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.4
+
+- **Outside reviews: an allowlist decides what leaves.** Only a brief's topic, question and body go to the outside models, plus its two flags. The id stays on the Pi, and any other field is refused without echoing it. The terms list stays as a backstop, now on text with invisible characters stripped and Unicode normalized first.
+- **The rest of the guard:**
+  - The record is gated the same way as the outside models.
+  - A review-level id or topic is never trusted.
+  - An id that matches a private term is withheld from logs and relay lines.
+  - Provider error text is no longer stored.
+
+  Reviewed by Fable twice.
+
 ## 0.4.3
 
 - Cain keeps a place book in your record (areas/home/places.md): where each place named on Family is, so those events get drive blocks and an address that opens in Maps.
