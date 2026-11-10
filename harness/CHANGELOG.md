@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.12
+
+- **Self-healing judgments.** Each read, any judgment that never had an active answer of his in front of it is made again, if one fits the event now. Once it has seen his answer, it never triggers again. Before this, an answer that arrived "already known", or after the event was judged, never reached the judgment (the Nov 21 turkey harvest).
+- **The no-block line says whether the judge saw his answer or never saw it.**
+
 ## 0.19.11
 
 - **The Telegram code is gone.** Telegram was replaced by Discord on Nov 7, and the bot is deleted. Removed: the long poll, the Telegram API client, /start pairing and deeplinks, and the Telegram token field on the setup page. Shared message shapes moved to chat.py. The ledger is unchanged, and a leftover token in the vault is ignored and dropped on the next write. Stop, Turn back on, cards and Undo all run through Discord as before.

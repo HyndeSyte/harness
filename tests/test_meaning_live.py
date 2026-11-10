@@ -1165,5 +1165,29 @@ def test_the_why_counts_his_answers_for_the_words(live, caplog):
     go(live)
     go(live)
     [said] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("no block for")]
-    assert said.endswith("his answers for these words: 1 active, 1 overruled"), said
+    assert said.endswith("his answers for these words: 1 active, 1 overruled; the judge saw it"), said
     assert old
+
+
+
+
+def test_a_judgment_that_never_saw_his_answer_is_made_again_on_its_own(drives):
+    # Nov 10: judged before his answer was in use; Cain's re-send was "already known", so
+    # nothing re-judged it. Each read now re-judges what never saw a fitting answer of his.
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    sure = drives.judge.by["Eye doctor"]
+    drives.judge.by["Eye doctor"] = judged(ob("presence", start, start + 60 * M, certainty="medium"), unsure=True)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == []
+    drives.ledger.db.execute("UPDATE meaning_judgments SET candidates='[]'")   # judged without it
+    drives.ledger.db.commit()
+    drives.judge.by["Eye doctor"] = sure
+    for _ in range(4):
+        go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (family)", "Busy (drive back)"]
+    calls = len(drives.judge.calls)
+    go(drives)
+    go(drives)
+    assert len(drives.judge.calls) == calls                   # seen now: never again

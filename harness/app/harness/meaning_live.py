@@ -251,7 +251,8 @@ class MeaningLive:
         self.places.begin()
         none: dict[str, tuple[datetime, str, str]] = {}
         for ev in evs.values():
-            j = meaning.last_good(meaning.stored(self.ledger, ev.key))
+            row = meaning.stored(self.ledger, ev.key)
+            j = meaning.last_good(row)
             if j is None:
                 continue                   # not judged yet: nothing, and no guess (judged next read)
             backed = meaning.supported(j, examples)
@@ -263,7 +264,7 @@ class MeaningLive:
                 if not blocks:
                     none[_occ_id(occ)] = (sp.anchor, meaning.shown(occ.summary),
                                           no_block_why(j, backed, examples, answer)
-                                          + self._his_for(family_rules.words(occ.summary)))
+                                          + self._his_for(family_rules.words(occ.summary), row))
                 plain_used = False
                 for i, b in enumerate(blocks):
                     if b.end <= now:
@@ -303,16 +304,27 @@ class MeaningLive:
         self._say_none(none, now)
         return out
 
-    def _his_for(self, words: frozenset[str]) -> str:
-        """How many of his own answers (not seeded ones) are for these words, by state: tells a
-        judge that ignored his answer from an answer that never arrived or was overruled."""
+    def _his_for(self, words: frozenset[str], row=None) -> str:
+        """How many of his own answers (not seeded ones) are for these words, by state, and
+        whether an active one was in front of the judge: tells a judge that ignored his answer
+        from one that never saw it, never got it, or had it overruled."""
         states: dict[str, int] = {}
-        for r in self.ledger.db.execute("SELECT source, words, state FROM meaning_examples"):
+        active: set[str] = set()
+        for r in self.ledger.db.execute("SELECT id, source, words, state FROM meaning_examples"):
             ex_words = frozenset((r["words"] or "").split())
             if r["source"] not in meaning.SEEDED and ex_words and ex_words <= words:
                 states[r["state"]] = states.get(r["state"], 0) + 1
+                if r["state"] == "active":
+                    active.add(r["id"])
         said = ", ".join(f"{n} {st}" for st, n in sorted(states.items())) or "none"
-        return f"; his answers for these words: {said}"
+        seen = ""
+        if active and row is not None:
+            try:
+                shown = set(json.loads(row["candidates"] or "[]"))
+            except ValueError:
+                shown = set()
+            seen = f"; the judge {'saw' if active & shown else 'never saw'} it"
+        return f"; his answers for these words: {said}{seen}"
 
     def _say_none(self, none: dict[str, tuple[datetime, str, str]], now: datetime) -> None:
         """One log line for each Family event in the next NONE_DAYS that gets no block, with
@@ -479,6 +491,7 @@ class MeaningLive:
         """A bug here is a record, never a stopped loop."""
         try:
             self._revive()
+            self._unseen()
             self._expire()
             if paused or self.chat_id is None or not self.on():
                 return
@@ -503,6 +516,18 @@ class MeaningLive:
         log.info("meaning: %d answers of his back in use; %d judgments to make again", len(ids), n)
         with self.ledger.tx() as db:
             self.ledger.set_meta("meaning_revived", "2", db)
+
+    def _unseen(self) -> None:
+        """Each read: a judgment that never had an active answer of his in front of it, though
+        one fits the event now, is made again with it. Self-healing for answers that arrived
+        "already known" (no new answer, so nothing re-judged), or after the event was judged
+        (Nov 10: the turkey harvest). Once seen, an answer never triggers this again."""
+        mine = [e.id for e in meaning.active_examples(self.ledger) if e.source not in meaning.SEEDED]
+        n = meaning.rejudge_for(self.ledger, mine, only_unseen=True)
+        if n:
+            log.info("meaning: %d judgments made again with an answer of his they hadn't seen", n)
+            if self.shadow is not None:
+                self.shadow.poke()
 
     def _expire(self) -> None:
         now = iso(self.ledger.now())
