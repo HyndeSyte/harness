@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.1
+
+- Cain's panel opens only for the Home Assistant user set as its owner (`owner_user_id` in Configuration). Anyone else who opens it gets Forbidden, and until the owner is set it's closed to everyone, you included.
+- At each start, the App's log says whether the panel is locked to its owner or closed to everyone. The Documentation tab says where to find your user id.
+
 ## 0.7.0
 
 - **One question at a time.** Cain's questions come one by one: the next shows up when you answer the one before. Asking the same thing again replaces the old card instead of adding another.

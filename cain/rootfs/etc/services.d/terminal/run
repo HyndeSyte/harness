@@ -4,6 +4,13 @@
 # Home Assistant's Ingress proxy. It attaches to the running session.
 # ==============================================================================
 export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
+# And of Ingress's requests, only the owner's: the Home Assistant user set as
+# owner_user_id. nginx.conf includes the map written here; with no valid id,
+# nobody gets in.
+owner="$(bashio::config 'owner_user_id' 2>/dev/null || true)"
+[ "$owner" = "null" ] && owner=""
+said="$(/opt/cain/owner-gate.sh "$owner" /etc/nginx/owner.conf)" && bashio::log.info "$said" \
+  || bashio::log.error "Could not write /etc/nginx/owner.conf, so Cain's panel stays closed"
 nginx || bashio::log.error "nginx did not start"
 exec ttyd --interface 127.0.0.1 --port 7681 --base-path /tty --writable \
   bash -c 'until tmux -u has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux -u attach -t cain'
