@@ -11,20 +11,51 @@
 #                                        areas/home/places.md (rows of
 #                                        | place name | street address, "lat, lon" or skip | YYYY-MM-DD |)
 #                                        or a JSON list of {place, address, said_on}
-#   keeper.sh show <card id>             show a specialist's card to Dane, unchanged
-#   keeper.sh ask "question" "opt" ...   ask with up to 5 buttons; his tap comes back relayed
-#   keeper.sh morning "text" ["opt" ...] post the one morning message (with Stop)
+#   Cards and asks name their item: --item <PENDING id, or none>, with --question <id>
+#   when the item has more than one; --reply-to <message id> makes it a Discord reply.
+#   keeper.sh show <card id> --item P08 [--question Q2] [--reply-to <id>]
+#                                        show a specialist's card to Dane, unchanged
+#   keeper.sh ask --item P08 [--question Q2] [--reply-to <id>] "question" "opt" ...
+#                                        ask with up to 5 buttons, one ask open at a time
+#                                        ("held" means it goes out when the open one closes);
+#                                        his tap comes back relayed
+#   keeper.sh ship --item P41 --pr <pull request url> --head <full sha> "text"
+#                                        the Ship card (Ship / Not now) for that one head
+#   keeper.sh answered --item P08 [--question Q2]
+#                                        he answered that open ask in words: buttons off
+#   keeper.sh replied <message id>       what a message of his replied to, if anything
+#   keeper.sh morning "text"             post the one morning message (with Stop)
 set -u
 dir=/data/.claude/channels/discord
 cmd="${1:-handover}"; shift || true
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|morning) url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning) url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
+item="" question="" reply_to="" pr="" head=""
+case "$cmd" in
+  show|ask|ship|answered)
+    rest=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --item|--question|--reply-to|--pr|--head)
+          [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
+          case "$1" in
+            --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
+            --pr) pr="$2" ;; --head) head="$2" ;;
+          esac
+          shift 2 ;;
+        *) rest+=("$1"); shift ;;
+      esac
+    done
+    set -- ${rest[@]+"${rest[@]}"} ;;
+esac
+# The card's item, question and thread, as the link takes them.
+meta='def opt($k; $v): if $v == "" then {} else {($k): $v} end; ({item: $it} + opt("question"; $q) + opt("reply_to"; $r))'
 owner=$(jq -r '.allowFrom[0] // empty' "$dir/access.json" 2>/dev/null)
 # The key is HMAC-SHA256(bot token, context); the token stays in its file.
 key=$(ENV_FILE="$dir/.env" CTX="$ctx" bun -e '
@@ -67,8 +98,16 @@ case "$cmd" in
           if (d ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) print p "\t" a "\t" d
         }' "$1" | jq -Rnc '{rows: [inputs | split("\t") | {place: .[0], address: .[1], said_on: .[2]}]}')
     fi ;;
-  show)     body=$(jq -nc --arg i "${1:-}" '{id: ($i | tonumber? // 0)}') ;;
-  *)        text="${1:-}"; shift || true
+  show)     body=$(jq -nc --arg i "${1:-}" --arg it "$item" --arg q "$question" --arg r "$reply_to" \
+              "$meta"' + {id: ($i | tonumber? // 0)}') ;;
+  ask)      text="${1:-}"; shift || true
+            body=$(jq -nc --arg t "$text" --arg it "$item" --arg q "$question" --arg r "$reply_to" \
+              "$meta"' + {text: $t, options: $ARGS.positional}' --args "$@") ;;
+  ship)     body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg q "" --arg r "$reply_to" --arg p "$pr" --arg h "$head" \
+              "$meta"' + {text: $t, pr: $p, head: $h}') ;;
+  answered) body=$(jq -nc --arg it "$item" --arg q "$question" --arg r "" "$meta") ;;
+  replied)  body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
+  morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac
 out=$(curl -sS -m 45 -H "@$hdr" -d "$body" "$url" 2>&1) \

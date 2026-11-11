@@ -35,5 +35,15 @@
       "Edit(//data/review-queue/**)",
       "Edit(//data/review-spend.json)"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "RemoteTrigger",
+        "hooks": [
+          { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts", "timeout": 15 }
+        ]
+      }
+    ]
   }
 }

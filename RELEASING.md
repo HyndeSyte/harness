@@ -67,11 +67,16 @@ changes what its own `pytest` and `bun` run; read workflow diffs before Ship.
 
 ## Ship (only after Dane's go)
 
-Dane's go is his tap on Cain's Ship card for that one pull request.
+Dane's go is his tap on Cain's Ship card for that one pull request, at the one head
+commit the card was for. The job's text carries that commit's full head sha.
 
-1. The pull request is open, its head commit passed CI, and the diff matches its
-   description. If `main` moved and it no longer merges cleanly, stop and report.
-2. Squash-merge it into `main`.
+1. The pull request is open, its head commit is the full head sha in the job's text and
+   passed CI, and the diff matches its description. If `main` moved and it no longer
+   merges cleanly, or the head isn't that sha, stop and report.
+2. Squash-merge it into `main`, pinned to that head with GitHub's head match:
+   `gh pr merge <number> --squash --match-head-commit <full head sha>`. If GitHub refuses
+   because the head moved, nothing is merged: stop and report, and Cain asks again with a
+   new Ship card.
 3. Wait for CI on `main` to pass.
 4. In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed. Nothing else in Home Assistant: no options, no other Apps, no

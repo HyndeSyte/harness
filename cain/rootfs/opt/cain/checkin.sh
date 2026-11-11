@@ -78,10 +78,20 @@ for s in 0710 1230 1730; do
 done
 [ -n "$slot" ] || exit 0
 [ -f "$dir/$day-$slot" ] && exit 0
+# Items someone other than Cain holds (a laptop session), from the holds the record
+# keeper publishes into Cain's copy of the record: first in the check-in, to skip.
+holds="${HOLDS_FILE:-/data/record/state/holds.json}"
+lead=""
+if [ -f "$holds" ]; then
+  held=$(jq -r 'to_entries | map(select((.value.holder // "") != "cain") | .key | gsub("[^A-Za-z0-9._-]"; ""))
+                | map(select(. != "")) | sort | join(", ")' "$holds" 2>/dev/null) \
+    && { [ -z "$held" ] || lead="Held by others, skip these: $held. "; } \
+    || lead="The holds file can't be read right now: before working an item, check it isn't held by others. "
+fi
 if [ "$slot" = 0710 ]; then
-  msg="Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
+  msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else
-  msg="Scheduled check-in from the Cain add-on ($slot). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md. Post to Dane only if something finished or needs his decision."
+  msg="${lead}Scheduled check-in from the Cain add-on ($slot). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md. Post to Dane only if something finished or needs his decision."
 fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"

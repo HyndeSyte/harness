@@ -333,6 +333,86 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     assert "cp /opt/cain/settings.json /data/work/.claude/settings.json" in run
 
 
+def test_keeper_sends_cards_with_their_item_question_and_thread(tmp_path):
+    import json, os, shutil, subprocess
+    bash, jq = shutil.which("bash"), shutil.which("jq")
+    if not bash or not jq:
+        import pytest
+        pytest.skip("no bash or jq")
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "bun").write_text("#!/bin/bash\nprintf deadbeef\n", newline="\n")     # the key, made from no token
+    (stub / "curl").write_text('#!/bin/bash\nfor a in "$@"; do printf "%s\\n" "$a"; done > "$CURL_ARGS"\n'
+                               "echo '{\"status\":\"posted\"}'\n", newline="\n")
+    for f in ("bun", "curl"):
+        (stub / f).chmod(0o755)
+    env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}", CURL_ARGS=str(tmp_path / "args"))
+    keeper = str(CAIN / "rootfs/opt/cain/keeper.sh")
+
+    def call(*a):
+        out = subprocess.run([bash, keeper, *a], env=env, capture_output=True, text=True, timeout=20)
+        args = (tmp_path / "args").read_text().splitlines()
+        return out, json.loads(args[args.index("-d") + 1]), args[-1]
+
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    out, body, url = call("ask", "--item", "P08", "--question", "Q2", "--reply-to", "1234567890123456789",
+                          "P08 Q2: Is the packet filed?", "Filed", "Not filed", "Not sure")
+    assert url == "http://127.0.0.1:8097/ask" and json.loads(out.stdout) == {"status": "posted"}
+    assert body == {"item": "P08", "question": "Q2", "reply_to": "1234567890123456789",
+                    "text": "P08 Q2: Is the packet filed?", "options": ["Filed", "Not filed", "Not sure"]}
+    assert call("ask", "Filed?", "Yes", "--item", "none")[1] == {"item": "none", "text": "Filed?", "options": ["Yes"]}
+    assert call("ask", "Filed?", "Yes")[1]["item"] == ""                             # the link refuses it
+    assert call("show", "1794112807413", "--item", "none", "--reply-to", "99999999999999999")[1] == {
+        "item": "none", "reply_to": "99999999999999999", "id": 1794112807413}
+    _, body, url = call("ship", "--item", "P41", "--pr", "https://github.com/HyndeSyte/harness/pull/5",
+                        "--head", sha, "Cain 0.7.0 ready.")
+    assert url.endswith("/ship") and body == {"item": "P41", "text": "Cain 0.7.0 ready.",
+                                              "pr": "https://github.com/HyndeSyte/harness/pull/5", "head": sha}
+    assert call("answered", "--item", "P08", "--question", "Q2")[1] == {"item": "P08", "question": "Q2"}
+    assert call("replied", "1234567890123456789")[1] == {"m": "1234567890123456789"}
+    assert call("morning", "## Wed")[1] == {"text": "## Wed", "options": []}
+    missing = subprocess.run([bash, keeper, "ask", "--item"], env=env, capture_output=True, text=True, timeout=20)
+    assert missing.returncode == 2 and "--item needs a value" in missing.stdout
+
+
+def test_cains_remote_trigger_hook_is_wired_and_shipped():
+    import json
+    hooks = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["hooks"]["PreToolUse"]
+    pre = [h for h in hooks if h["matcher"] == "RemoteTrigger"]
+    assert len(pre) == 1 and pre[0]["hooks"][0]["command"] == "bun /opt/cain/hooks/remote-trigger.ts"
+    hook = (CAIN / "rootfs/opt/cain/hooks/remote-trigger.ts").read_text(encoding="utf-8")
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    for trig in re.findall(r"trig_[A-Za-z0-9]+", hook):
+        assert trig in rules, trig
+    assert 'permissionDecision: "deny"' in hook and "/data/record/state/holds.json" in hook
+    assert "COPY rootfs /" in (CAIN / "Dockerfile").read_text()                       # ships with the add-on
+
+
+def test_cloud_jobs_in_this_repo_cannot_notify_him():
+    import json
+    deny = json.loads((ROOT / ".claude/settings.json").read_text())["permissions"]["deny"]
+    assert "PushNotification" in deny
+
+
+def test_cains_cards_are_exact_and_his_words_true():
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    asking = rules.split("## Asking him")[1].split("\n## ")[0]
+    for must in ("--item", "--question", '"Filed", "Not filed", "Not sure"', 'never "Not', "One ask is open at a time",
+                 '"held"', "keeper.sh answered", "Record what he tapped exactly", "Never record a fact you",
+                 "reply_to", "overrides your plugin's note", "keeper.sh replied"):
+        assert must in asking, must
+    holds = rules.split("## Who holds what")[1].split("\n## ")[0]
+    for must in ("state/holds.json", "Ask him only about items you hold", "Never tell him who holds what",
+                 "never pass his Discord work to a laptop session", "(P43)", '"Got it"', "as a note"):
+        assert must in holds, must
+    timing = rules.split("## Timing and truth")[1].split("\n## ")[0]
+    for must in ("happens before it", '"asked", "sent", "started" or "done" only once', "ISO timestamps",
+                 "job, session, card, request or commit ids"):
+        assert must in timing, must
+    assert "starting with\n  its item and question id" in rules
+    assert "—" not in rules
+
+
 def test_the_handover_port_is_never_published():
     cfg = (ADDON / "config.yaml").read_text()
     assert not re.search(r"^ports", cfg, re.M) and "8098" not in cfg
@@ -387,6 +467,41 @@ def test_checkin_fires_once_in_its_hour_and_only_when_cain_is_idle(tmp_path):
     assert "1230" in _checkin(tmp_path, "1240", IDLE).splitlines()[-2]
 
 
+def test_checkin_lists_items_held_by_others_first(tmp_path):
+    import json
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    holds = tmp_path / "holds.json"
+    holds.write_text(json.dumps({
+        "P33": {"holder": "laptop:9f2c", "for": "his chat", "branches": ["claude/x"],
+                "taken": "2026-11-11T13:00:00Z", "renewed": "2026-11-11T13:00:00Z"},
+        "P12": {"holder": "laptop:a1;rm -rf", "for": "his chat", "branches": []},
+        "P41": {"holder": "cain", "for": "Build job", "branches": ["claude/y"]},
+        "P4$(x)5": {"holder": "laptop:b2", "for": "his chat", "branches": []},
+    }))
+    os.environ["HOLDS_FILE"] = str(holds)
+    try:
+        out = _checkin(tmp_path, "0712", IDLE)
+        line = out.splitlines()[-2]
+        assert line.split(" -l ", 1)[1].startswith("Held by others, skip these: P12, P33, P4x5. Scheduled check-in")
+        assert "P41" not in line and "laptop" not in line and "$(" not in line
+        (tmp_path / "sent.txt").unlink()
+        holds.write_text("{}")
+        assert "Held by others" not in _checkin(tmp_path, "1240", IDLE)
+        (tmp_path / "sent.txt").unlink()
+        holds.write_text("{broken")
+        assert "holds file can't be read" in _checkin(tmp_path, "1740", IDLE)
+    finally:
+        del os.environ["HOLDS_FILE"]
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    out = _checkin(fresh, "0712", IDLE)                         # no holds file yet: nothing said
+    assert "Scheduled check-in" in out and "Held by others" not in out and "can't be read" not in out
+
+
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
     assert _checkin(tmp_path, "0712", IDLE + "\n  esc to interrupt") == ""
     assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed
@@ -410,8 +525,10 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     link = (CAIN / "rootfs/opt/cain/link/main.ts").read_text(encoding="utf-8")
     assert f'key("{cain_relay.KEY_CONTEXT.decode()}")' in link and "timingSafeEqual" in link
     assert f"?? {cain_relay.PORT})" in link and cain_relay.HOST == "0fcc2575-cain"
-    # Cain's scripts only, from this machine: the specialist can't show its own cards.
-    assert 'LOCAL_ONLY = new Set(["/show", "/ask", "/morning"])' in link
+    # Cain's scripts only, from this machine: the specialist can't show its own cards,
+    # ask, put up a Ship card, or close Cain's questions.
+    assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied"])'
+            in link)
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")
@@ -600,3 +717,11 @@ def test_build_work_runs_as_cloud_jobs_with_his_go():
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
     assert "## Build" in releasing and "## Ship (only after Dane's go)" in releasing
     assert "Never read Cain's App info" in releasing
+    # A Build job names its branch; a Ship card and job carry the full head sha, and the
+    # merge is pinned to it with GitHub's head match.
+    jobs = rules.split("## Cloud jobs")[1].split("\n## ")[0]
+    assert "`Branch: claude/<slug>`" in jobs and "Never name a pull\n   request in place of its branch" in jobs
+    assert "/opt/cain/keeper.sh ship --item" in jobs and "--head <full head sha>" in jobs
+    assert "gh pr merge --squash --match-head-commit <that sha>" in jobs
+    ship = releasing.split("## Ship (only after Dane's go)")[1].split("\n## ")[0]
+    assert "--match-head-commit" in ship and "full head sha" in ship
