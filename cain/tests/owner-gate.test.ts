@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Subprocess } from "bun";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,9 +20,13 @@ const ADMITS_NO_ONE = "map $http_x_remote_user_id $cain_owner { default 0; }\n";
 const LOCKED = "Cain's panel is locked to its owner";
 const UNSET = "No owner_user_id set in Configuration, so Cain's panel answers Forbidden to everyone";
 const NOT_AN_ID = "owner_user_id in Configuration isn't a Home Assistant user id, so Cain's panel answers Forbidden to everyone";
+// What nginx answers everyone but the owner.
+const FORBIDDEN = "Cain's panel opens only for its owner (owner_user_id in this App's Configuration).\n";
 
 const BASH = Bun.which("bash");
 const NGINX = Bun.which("nginx") ?? ["/usr/sbin/nginx", "/usr/local/sbin/nginx"].find((p) => existsSync(p)) ?? null;
+// CI runs all of these: a real-nginx test skipped there would hide a broken gate.
+if (process.env.CI && (!NGINX || !BASH)) throw new Error("owner-gate.test.ts: CI needs bash and nginx for these tests");
 if (!BASH) console.warn("owner-gate.test.ts: no bash here, so owner-gate.sh is not run");
 if (!NGINX) console.warn("owner-gate.test.ts: nginx not found, so the tests against real nginx are skipped");
 
@@ -71,7 +76,7 @@ describe("the gate is wired in", () => {
   test("nginx.conf reads the map, and answers 403 before any location", () => {
     const conf = shipped("etc/nginx/nginx.conf");
     const at = (s: string) => conf.indexOf(s);
-    const gateLine = "if ($cain_owner = 0) { return 403; }";
+    const gateLine = `if ($cain_owner != 1) { return 403 ${JSON.stringify(FORBIDDEN)}; }`;
     expect(at("http {")).toBeGreaterThan(-1);
     expect(at("http {")).toBeLessThan(at("include /etc/nginx/owner.conf;"));
     expect(at("include /etc/nginx/owner.conf;")).toBeLessThan(at("server {"));
@@ -87,6 +92,58 @@ describe("the gate is wired in", () => {
     const write = run.indexOf(`/opt/cain/owner-gate.sh "$owner" /etc/nginx/owner.conf`);
     expect(write).toBeGreaterThan(-1);
     expect(write).toBeLessThan(run.search(/^nginx /m));
+  });
+});
+
+// terminal/run's gate step as shipped, from reading the options to writing the map,
+// run under bash with bashio stubbed and the map in a temp dir.
+const BASHIO_STUBS = [
+  'bashio::app.config() { [ -z "${SUPERVISOR_DOWN-}" ]; }',
+  'bashio::config() { if [ -n "${SUPERVISOR_DOWN-}" ]; then echo null; else printf "%s" "${OPTION-}"; fi; }',
+  'bashio::log.info() { echo "INFO $*"; }',
+  'bashio::log.error() { echo "ERROR $*"; }',
+].join("\n");
+
+function gateStep(map: string, env: Record<string, string>) {
+  const run = shipped("etc/services.d/terminal/run");
+  const from = run.indexOf("bashio::app.config");
+  const to = run.indexOf("\nfi\n", from);
+  if (from < 0 || to < 0) throw new Error("terminal/run no longer has its gate step: update this test");
+  const step = run.slice(from, to + 4)
+    .replaceAll("/opt/cain/owner-gate.sh", posix(GATE))
+    .replaceAll("/etc/nginx/owner.conf", posix(map));
+  const p = Bun.spawnSync([BASH!, "-c", `${BASHIO_STUBS}\n${step}`],
+                          { env: { ...process.env, OPTION: "", SUPERVISOR_DOWN: "", ...env }, stdout: "pipe", stderr: "pipe" });
+  return { log: p.stdout.toString().trim().split("\n"), map: existsSync(map) ? readFileSync(map, "utf8") : null };
+}
+
+describe.skipIf(!BASH)("terminal/run's gate step", () => {
+  let dir = "";
+  beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "gate-step-")); });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("writes the owner's map and says so", () => {
+    expect(gateStep(join(dir, "a.conf"), { OPTION: OWNER })).toEqual({ log: [`INFO ${LOCKED}`], map: ADMITS_OWNER });
+  });
+
+  test("when Supervisor can't be read, it says so and admits no one", () => {
+    const map = join(dir, "b.conf");
+    writeFileSync(map, ADMITS_OWNER);
+    expect(gateStep(map, { OPTION: OWNER, SUPERVISOR_DOWN: "1" })).toEqual({
+      log: ["ERROR Couldn't read this App's options from Supervisor; the panel stays closed until the next start",
+            `INFO ${UNSET}`],
+      map: ADMITS_NO_ONE,
+    });
+  });
+
+  test("when the map can't be written, the old one goes too, so nginx can't start on it", () => {
+    const map = join(dir, "c.conf");
+    writeFileSync(map, ADMITS_OWNER);
+    mkdirSync(`${map}.tmp`);                                // owner-gate.sh can't write its temp file
+    expect(gateStep(map, { OPTION: OWNER })).toEqual({
+      log: [`ERROR Could not write ${posix(map)}, so Cain's panel stays closed`],
+      map: null,
+    });
   });
 });
 
@@ -123,6 +180,25 @@ async function freePort(): Promise<number> {
   await s.stop(true);
   return port;
 }
+
+// A request written by hand, for what fetch won't send: two copies of a header, or
+// a WebSocket upgrade. Resolves with the status code nginx answers.
+function raw(port: number, target: string, headers: string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const sock = connect(port, "127.0.0.1");
+    let got = "";
+    sock.setEncoding("utf8");
+    sock.setTimeout(5000, () => { sock.destroy(); reject(new Error(`no answer from nginx: ${JSON.stringify(got)}`)); });
+    sock.on("connect", () => sock.write([`GET ${target} HTTP/1.1`, "Host: 127.0.0.1", ...headers, "", ""].join("\r\n")));
+    sock.on("data", (d) => {
+      got += d;
+      if (got.includes("\r\n")) { sock.destroy(); resolve(Number(got.split(" ")[1])); }
+    });
+    sock.on("error", reject);
+  });
+}
+const UPGRADE = ["Upgrade: websocket", "Connection: Upgrade", "Sec-WebSocket-Version: 13",
+                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="];
 
 describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : " (skipped: nginx not found)"}`, () => {
   // What the owner gets from each location. /codex and /tty/ are proxied to a stand-in
@@ -175,11 +251,16 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
 
   beforeAll(async () => {
     try {
-      upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => {
-        const path = new URL(req.url).pathname;
-        reached.push(path);
-        return new Response(`upstream ${path}`);
-      } });
+      upstream = Bun.serve({
+        hostname: "127.0.0.1", port: 0,
+        fetch(req, server) {
+          const path = new URL(req.url).pathname;
+          reached.push(path);
+          if (req.headers.get("upgrade") === "websocket" && server.upgrade(req)) return;  // ttyd's terminal
+          return new Response(`upstream ${path}`);
+        },
+        websocket: { message() {} },
+      });
       owned = await start(OWNER);
       unowned = await start("");
     } catch (e) {
@@ -202,19 +283,36 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
 
   test("another Home Assistant user gets 403 everywhere, and nothing reaches the terminal", async () => {
     reached.length = 0;
-    for (const [path] of PAGES) expect(await get(owned, path, OTHER)).toMatchObject({ path, status: 403 });
+    for (const [path] of PAGES) expect(await get(owned, path, OTHER)).toEqual({ path, status: 403, body: FORBIDDEN });
     expect(reached).toEqual([]);
   });
 
   test("a request with no user at all gets 403 everywhere", async () => {
     reached.length = 0;
-    for (const [path] of PAGES) expect(await get(owned, path)).toMatchObject({ path, status: 403 });
+    for (const [path] of PAGES) expect(await get(owned, path)).toEqual({ path, status: 403, body: FORBIDDEN });
     expect(reached).toEqual([]);
   });
 
   test("with no owner set, the owner's id gets 403 everywhere too", async () => {
     reached.length = 0;
-    for (const [path] of PAGES) expect(await get(unowned, path, OWNER)).toMatchObject({ path, status: 403 });
+    for (const [path] of PAGES) expect(await get(unowned, path, OWNER)).toEqual({ path, status: 403, body: FORBIDDEN });
     expect(reached).toEqual([]);
+  });
+
+  test("a second, lowercase copy of the user header gets 403, whichever id comes first", async () => {
+    reached.length = 0;
+    for (const [first, second] of [[OTHER, OWNER], [OWNER, OTHER]]) {
+      expect(await raw(owned, "/tty/", [`X-Remote-User-Id: ${first}`, `x-remote-user-id: ${second}`])).toBe(403);
+    }
+    expect(reached).toEqual([]);
+  });
+
+  test("the terminal's WebSocket opens for its owner, and for no one else", async () => {
+    reached.length = 0;
+    expect(await raw(owned, "/tty/ws", [`X-Remote-User-Id: ${OTHER}`, ...UPGRADE])).toBe(403);
+    expect(await raw(owned, "/tty/ws", UPGRADE)).toBe(403);
+    expect(reached).toEqual([]);
+    expect(await raw(owned, "/tty/ws", [`X-Remote-User-Id: ${OWNER}`, ...UPGRADE])).toBe(101);
+    expect(reached).toEqual(["/tty/ws"]);
   });
 });

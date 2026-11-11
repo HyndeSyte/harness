@@ -4,13 +4,25 @@
 # Home Assistant's Ingress proxy. It attaches to the running session.
 # ==============================================================================
 export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
+# Supervisor's token stays out of what starts here, as in cain/run. bashio keeps its
+# own unexported copy, so the option read below still works.
+unset SUPERVISOR_TOKEN HASSIO_TOKEN
 # And of Ingress's requests, only the owner's: the Home Assistant user set as
 # owner_user_id. nginx.conf includes the map written here; with no valid id,
-# nobody gets in.
+# nobody gets in. If it can't be written, the old one goes too, so nginx won't start.
+bashio::app.config >/dev/null 2>&1 \
+  || bashio::log.error "Couldn't read this App's options from Supervisor; the panel stays closed until the next start"
 owner="$(bashio::config 'owner_user_id' 2>/dev/null || true)"
 [ "$owner" = "null" ] && owner=""
-said="$(/opt/cain/owner-gate.sh "$owner" /etc/nginx/owner.conf)" && bashio::log.info "$said" \
-  || bashio::log.error "Could not write /etc/nginx/owner.conf, so Cain's panel stays closed"
+if said="$(/opt/cain/owner-gate.sh "$owner" /etc/nginx/owner.conf)"; then
+  bashio::log.info "$said"
+else
+  rm -f /etc/nginx/owner.conf
+  bashio::log.error "Could not write /etc/nginx/owner.conf, so Cain's panel stays closed"
+fi
+# Hygiene: s6's copy of the container's environment, the token included, root only.
+# That keeps it from nginx's workers, which don't run as root; not from the session.
+chmod 0700 /run/s6/container_environment 2>/dev/null || true
 nginx || bashio::log.error "nginx did not start"
 exec ttyd --interface 127.0.0.1 --port 7681 --base-path /tty --writable \
   bash -c 'until tmux -u has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux -u attach -t cain'

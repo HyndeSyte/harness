@@ -125,7 +125,19 @@ def test_cain_config_denies_every_api_and_mapping():
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: str?\n")
+        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n")
+
+
+def test_cain_owner_user_id_takes_a_user_id_or_nothing():
+    # Configuration checks owner_user_id when it's saved. Supervisor runs match() on any
+    # value that's there, optional or not, so the pattern takes the default "" too.
+    text = (CAIN / "config.yaml").read_text()
+    pattern = re.search(r"^  owner_user_id: match\((.*)\)\?$", text, re.M).group(1)
+    owner = "0123456789abcdef0123456789abcdef"
+    for ok in ("", owner):
+        assert re.match(pattern, ok), ok                      # voluptuous' Match is re.match
+    for bad in (owner[1:], owner + "0", owner.upper(), owner[:31] + "g", owner + '";}', " " + owner):
+        assert not re.match(pattern, bad), bad
 
 
 def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
@@ -234,37 +246,40 @@ def test_cain_start_survives_bashio_errexit():
     assert "kill-session -t cain 2>/dev/null || true" in run
 
 
-def test_cain_session_starts_without_the_supervisor_token(tmp_path):
+def test_cain_scripts_unset_the_supervisor_token_before_starting_anything():
     # Supervisor's token reaches /addons/self: this App's own options, owner_user_id
-    # included. Cain's session, and the plugins and MCP servers it configures, start
-    # without it. The root shell keeps it for bashio, which reads the options with it.
+    # included. Both service scripts unset it before they start anything, so nothing
+    # they start (Cain's session, nginx, ttyd, the helpers) has it in its environment.
+    # bashio keeps its own unexported copy (bashio.sh declares __BASHIO_SUPERVISOR_TOKEN
+    # when it loads), so their option reads, in subshells too, still work.
     import os, shutil, subprocess
-    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    scrub = 'scrubbed() { env -u SUPERVISOR_TOKEN -u HASSIO_TOKEN "$@"; }'
-    assert scrub in run
-    code = [l.strip() for l in run.splitlines() if not l.strip().startswith("#")]
-    starts = [l for l in code if "new-session" in l or re.search(r"\bclaude (plugin|mcp) ", l)]
-    assert len(starts) == 5 and all(re.match(r"(if ! )?scrubbed ", l) for l in starts), starts
-    session = next(l for l in starts if "new-session" in l)
-    assert session.startswith("if ! scrubbed tmux -u new-session ")
-    assert "chmod 0700 /run/s6/container_environment" in run     # where with-contenv reads it
+    unset = "unset SUPERVISOR_TOKEN HASSIO_TOKEN"
+    prefixes = {}
+    for name in ("cain", "terminal"):
+        lines = (CAIN / f"rootfs/etc/services.d/{name}/run").read_text().splitlines()
+        assert unset in lines, name
+        at = lines.index(unset)
+        ran = [l for l in lines[1:at] if l.strip() and not l.lstrip().startswith("#")]
+        assert all(l.startswith("export ") for l in ran), (name, ran)       # nothing starts before it
+        after = [l for l in lines[at + 1:] if not l.lstrip().startswith("#")]
+        assert not any(re.search(r"SUPERVISOR_TOKEN|HASSIO_TOKEN", l) for l in after), name  # nor puts it back
+        prefixes[name] = "\n".join(lines[1:at + 1])
     bash = shutil.which("bash")
     if not bash:
         import pytest
         pytest.skip("no bash")
-    # The session's command line as shipped, run with a stand-in tmux that keeps its environment.
-    (tmp_path / "bin").mkdir()
-    fake = tmp_path / "bin" / "tmux"
-    fake.write_text('#!/bin/bash\nenv > "$SEEN"\n', newline="\n")
-    fake.chmod(0o755)
-    seen = tmp_path / "seen"
-    env = dict(os.environ, PATH=f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}", SEEN=seen.as_posix(),
-               SUPERVISOR_TOKEN="supervisor-secret", HASSIO_TOKEN="hassio-secret")
-    command = session[len("if ! "):].split(" 2>/tmp/tmux.err")[0]
-    subprocess.run([bash, "-c", f"{scrub}\n{command}"], env=env, check=True, timeout=20)
-    got = seen.read_text()
-    assert "SEEN=" in got                                         # the stand-in ran, with the rest kept
-    assert "SUPERVISOR_TOKEN" not in got and "HASSIO_TOKEN" not in got and "-secret" not in got
+    env = dict(os.environ, SUPERVISOR_TOKEN="supervisor-secret", HASSIO_TOKEN="hassio-secret")
+    for name, prefix in prefixes.items():
+        script = ("declare __BASHIO_SUPERVISOR_TOKEN=${SUPERVISOR_TOKEN:-}\n"   # as bashio.sh does at load
+                  f"{prefix}\n"
+                  'echo "shell:$__BASHIO_SUPERVISOR_TOKEN"; ( echo "subshell:$__BASHIO_SUPERVISOR_TOKEN" )\n'
+                  "env\n")
+        out = subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True,
+                             timeout=20, check=True).stdout
+        assert "shell:supervisor-secret\nsubshell:supervisor-secret\n" in out, name
+        started = out.split("subshell:supervisor-secret\n", 1)[1]           # what a started program gets
+        assert not re.search(r"^(SUPERVISOR_TOKEN|HASSIO_TOKEN|__BASHIO_SUPERVISOR_TOKEN)=", started, re.M), name
+        assert "-secret" not in started, name
 
 
 def test_cain_signin_link_is_rejoined(tmp_path):

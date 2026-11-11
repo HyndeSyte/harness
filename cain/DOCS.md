@@ -22,9 +22,12 @@ token first, or both will answer.
 
 The panel is a live terminal into Cain's session, so it opens for one Home Assistant
 user only: the one whose user id is in `owner_user_id`. Home Assistant tells the App
-who is signed in, and anyone else gets Forbidden. While `owner_user_id` is empty, or
-isn't a user id, the panel answers Forbidden to everyone, you included. The App's log
-says which at each start.
+who is signed in, and anyone else gets Forbidden. While `owner_user_id` is empty, the
+panel answers Forbidden to everyone, you included. The App's log says which at each
+start. This needs Supervisor 2026.10.3 or later (Settings, About).
+
+It keeps other users out, not other Home Assistant admins: an admin can change
+`owner_user_id`.
 
 To find your user id, turn on **Advanced mode** in your user profile. Then go to
 Settings, People, **Users** and open your user: the id is the 32 letters and digits
