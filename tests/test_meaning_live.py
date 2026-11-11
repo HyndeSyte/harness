@@ -20,7 +20,7 @@ from harness.family_gmail import DROP_TITLE, FamilyGmail, _leg_title, home_from_
 from harness.ledger import Ledger
 from harness.net import HttpResponse, TransportError
 from conftest import Clock
-from fakes import FakeEngine, SyncExecutor, result
+from fakes import FakeEngine, ManualExecutor, SyncExecutor, result
 from fake_caldav import FAMILY_PATH, no_network  # noqa: F401  (autouse)
 from test_family_add import Rig as FamilyRig, on, rig  # noqa: F401
 from test_family_copy import Feeds, GMAIL, NY, TZ, occ, seed, when
@@ -1227,3 +1227,117 @@ def test_a_dated_row_must_be_a_real_date():
         assert rows is None and "for must be a date" in why
     rows, _ = meaning_live.validate_rows({"rows": [{**ROW, "for": "2026-11-21"}]})
     assert rows[0]["for"] == "2026-11-21"
+
+
+# -- 8. a judgment already waiting is flagged once, not on every pass (0.21.2) ---------------------------
+
+ONCE = "meaning: 1 judgments made again with an answer of his they hadn't seen"
+
+
+def made_again(caplog):
+    return [r.getMessage() for r in caplog.records if "made again with an answer" in r.getMessage()]
+
+
+def revive_done(ledger):
+    with ledger.tx() as db:
+        ledger.set_meta("meaning_revived", "2", db)            # long done, as on the Pi
+
+
+class Family:
+    """Family as the judge reads it: the events in the window it asks for."""
+
+    def __init__(self, *items):
+        self.items = list(items)
+
+    def items_between(self, start, end, tz):
+        return caldav.Read([i for i in self.items if i.occ.end > start and i.occ.start < end], 0)
+
+
+@pytest.fixture
+def judging(lv):
+    """The judge itself over Family, with a fake engine. Its work is held until released, as a
+    model call takes a while and passes go on meanwhile."""
+    lv.judge = FakeEngine("claude")
+    lv.work = ManualExecutor()
+    lv.family = Family()
+    lv.m = meaning.MeaningShadow(lv.ledger, lv.family, lv.feeds, lv.work, engine_fn=lambda: lv.judge,
+                                 on_fn=lambda: True, tz=TZ)
+    lv.live = meaning_live.MeaningLive(lv.ledger, lv.m, lv.feeds, tz=TZ, on_fn=lambda: True)
+    lv.live.bind(OWNER_ID)
+    return lv
+
+
+def turn(lv):
+    """One controller pass, in its order: the judge, then the questions."""
+    lv.m.run(paused=False)
+    lv.live.tick(paused=False)
+
+
+def test_a_judgment_the_judge_doesnt_reach_is_flagged_once_not_every_pass(lv, caplog):
+    # Nov 11: a judgment the judge doesn't reach stays waiting (its event is outside the read or
+    # gone, or a limit is hit), and every pass, about every 3 seconds, flagged it again: a log
+    # line, a poke and a database write each time.
+    far = item("Book club", local(lv, meaning.AHEAD_DAYS + 30))     # past what the judge reads
+    key = judge(lv.ledger, far, rel("presence")).key                 # judged before his answer
+    answer_ex(lv, "Book club", ["presence"])                         # in use; it never saw it
+    revive_done(lv.ledger)
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    lv.live.tick(paused=False)
+    assert made_again(caplog) == [ONCE] and lv.shadow.pokes == 1
+    assert meaning.stored(lv.ledger, key)["stale"] == 1
+    writes = lv.ledger.db.total_changes
+    lv.live.tick(paused=False)
+    lv.live.tick(paused=False)
+    assert made_again(caplog) == [ONCE] and lv.shadow.pokes == 1     # no line and no poke
+    assert lv.ledger.db.total_changes == writes                      # and nothing written
+    assert meaning.stored(lv.ledger, key)["stale"] == 1              # still waiting for the judge
+
+
+def test_a_judgment_in_the_read_is_flagged_once_and_made_again_with_his_answer(judging, caplog):
+    start = local(judging, 5)
+    it = item("Book club", start)
+    judging.family.items.append(it)
+    key = judge(judging.ledger, it, rel("presence")).key            # judged before his answer
+    eid = answer_ex(judging, "Book club", ["presence"])             # in use; it never saw it
+    judging.judge.script = [judged(ob("presence", start, start + timedelta(hours=1)), cites=[eid])]
+    revive_done(judging.ledger)
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    turn(judging)                                                   # flagged
+    turn(judging)                                                   # the judge is at it
+    turn(judging)                                                   # and still is
+    assert made_again(caplog) == [ONCE]
+    judging.work.run_all()                                          # its answer comes back
+    turn(judging)
+    row = meaning.stored(judging.ledger, key)
+    assert row["stale"] == 0 and json.loads(row["cites"]) == [eid]
+    assert eid in json.loads(row["candidates"])                     # made again with it in front
+    assert len(judging.judge.calls) == 1 and f"[{eid}]" in judging.judge.calls[0]["user"]
+    turn(judging)
+    assert made_again(caplog) == [ONCE]                             # seen now: never again
+    assert meaning.rejudge_for(judging.ledger, [eid], only_unseen=True) == 0
+
+
+def test_a_new_answer_still_marks_each_judgment_it_fits_but_not_one_already_waiting(lv):
+    # Kept: a new answer of his marks each judgment it fits, when it comes in (a tap, an Undo,
+    # Cain's table) and when a pass finds judgments that never saw it. Only what it newly marks
+    # is counted: one already waiting, with features or from before they were kept, is left.
+    swims = [item("Swim meet", local(lv, days)) for days in (3, 10, 17)]
+    keys = [judge(lv.ledger, it, rel()).key for it in swims]
+    judge(lv.ledger, item("Book club", local(lv, 4)), rel())        # one it doesn't fit
+    lv.ledger.db.execute("UPDATE meaning_judgments SET stale=1 WHERE key=?", (keys[2],))   # waiting
+    lv.ledger.db.execute(                                           # waiting, from before features
+        "INSERT INTO meaning_judgments(key, kind, fingerprint, anchor, obligations, cites, unsure, status,"
+        " failure, tries, policy_version, examples_version, model, judged_at, stale)"
+        " VALUES('e:old','single','fp','2026-08-15','[]','[]',1,'ok','',1,'p','v','m','2026-08-01',1)")
+
+    def waiting():
+        return {r["key"] for r in lv.ledger.db.execute("SELECT key FROM meaning_judgments WHERE stale=1")}
+
+    first = answer_ex(lv, "Swim meet", ["transport"])               # in use; none of them saw it
+    assert meaning.rejudge_for(lv.ledger, [first], only_unseen=True) == 2
+    assert waiting() == {*keys, "e:old"}
+    for it in swims[:2]:
+        judge(lv.ledger, it, rel())                                 # made again, with it in front
+    newer = answer_ex(lv, "Swim meet", [])                          # his newer word, just in
+    assert meaning.rejudge_for(lv.ledger, [newer]) == 2
+    assert waiting() == {*keys, "e:old"}

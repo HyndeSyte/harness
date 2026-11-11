@@ -529,14 +529,18 @@ def add_example(ledger: Ledger, *, source: str, said: str, words: frozenset[str]
 
 def rejudge_for(ledger: Ledger, example_ids: Iterable[str], *, only_unseen: bool = False) -> int:
     """Mark for judging again every stored judgment whose candidates include one of these
-    examples, now or when it was judged. The judging itself runs under the usual limits."""
+    examples, now or when it was judged. The judging itself runs under the usual limits.
+    A judgment already waiting to be judged again is flagged once, not on every pass: it is
+    left as it is and not counted, and is judged when the judge reaches it (its event may be
+    outside the read, or a limit hit). Returns how many were newly marked."""
     ids = set(example_ids)
     if not ids:
         return 0
     examples = active_examples(ledger)
     n = 0
     with ledger.tx() as db:
-        for row in db.execute("SELECT key, features, candidates FROM meaning_judgments").fetchall():
+        for row in db.execute("SELECT key, features, candidates FROM meaning_judgments"
+                              " WHERE stale=0").fetchall():
             try:
                 f = json.loads(row["features"] or "{}")
                 before = set(json.loads(row["candidates"] or "[]"))

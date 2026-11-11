@@ -559,10 +559,13 @@ class MeaningLive:
             self.ledger.set_meta("meaning_revived", "2", db)
 
     def _unseen(self) -> None:
-        """Each read: a judgment that never had an active answer of his in front of it, though
+        """Each pass: a judgment that never had an active answer of his in front of it, though
         one fits the event now, is made again with it. Self-healing for answers that arrived
         "already known" (no new answer, so nothing re-judged), or after the event was judged
-        (Nov 10: the turkey harvest). Once seen, an answer never triggers this again."""
+        (Nov 10: the turkey harvest). Once seen, an answer never triggers this again. One
+        already waiting to be made again is flagged once, not on every pass (Nov 11): until
+        the judge reaches it (its event may be outside the read, or a limit hit), it gets no
+        log line and no poke."""
         mine = [e.id for e in meaning.active_examples(self.ledger) if e.source not in meaning.SEEDED]
         n = meaning.rejudge_for(self.ledger, mine, only_unseen=True)
         if n:
