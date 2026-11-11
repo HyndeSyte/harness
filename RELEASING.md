@@ -10,6 +10,19 @@ Home Assistant offers an update when `version` in an App's `config.yaml` changes
 `main`. So `main` is what gets installed: nothing reaches it without passing CI and
 without Dane's go.
 
+`main` changes only through pull requests (a GitHub ruleset): no direct pushes from
+anyone, laptop sessions included, and a pull request merges only when its branch is up
+to date with `main` and these checks pass on it:
+
+- `pytest`: the Python tests.
+- `bun`: Cain's tests.
+- `pr` (`.github/scripts/check_pr.py`): the description follows
+  `.github/pull_request_template.md`, and each App whose shipped files changed (anything
+  in its folder but `tests/` and `tools/`) goes up exactly one version step from `main`,
+  with a matching section at the top of its `CHANGELOG.md`. An App that didn't change
+  keeps `main`'s version. Run it before pushing:
+  `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.
+
 ## Build (a branch and a pull request)
 
 1. One branch per job: `claude/<short-slug>`. Never commit to `main`.
@@ -23,10 +36,11 @@ without Dane's go.
    - Cain: `bun test cain/tests` (install Bun if missing).
 5. Commit as `HyndeSyte <HyndeSyte@users.noreply.github.com>` (GitHub rejects pushes
    that expose a private email). Message: `<App> <version>: <what, in a line>`.
-6. Push the branch and open a pull request into `main`. The description says what
-   changed, how it was tested, what is not verified, and anything Dane must do (for
-   example a new option to switch on).
-7. Wait for the `tests` workflow on the branch to pass. Fix until it does.
+6. Push the branch and open a pull request into `main`. The description follows the
+   template's four sections: what changed, how it was tested, what is not verified, and
+   anything Dane must do (for example a new option to switch on).
+7. Wait for the `pytest`, `bun` and `pr` checks on the pull request to pass. Fix until
+   they do.
 8. Never merge, never push `main`, never force-push. Shipping is a separate step.
 
 ## Ship (only after Dane's go)

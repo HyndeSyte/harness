@@ -1,0 +1,24 @@
+name: pr
+
+# The pull request's own check (RELEASING.md): its description follows the
+# template, and each App whose shipped files changed goes up exactly one version
+# step from main, with a CHANGELOG section for it. Runs again when the
+# description is edited, so fixing the text fixes the check.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python .github/scripts/check_pr.py
