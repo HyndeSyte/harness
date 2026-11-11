@@ -170,26 +170,38 @@ def family_problem(view, tz: str) -> str:
 
 def gather(ledger: Ledger, config: Config, *, paused: bool,
            notes: list[str] = (), calendar=None, family=None,
-           mirror_line: str = "", family_add_line: str = "") -> digest.Digest:
+           mirror_line: str = "", family_add_line: str = "", watch=None) -> digest.Digest:
     """`mirror_line`: the work-hours mirror's one line (shadow mode), counts
     only. It is appended as information and can never make the digest
     anything but what the inputs, waits and failures say it is.
     `family_add_line`: said on every digest, Clear included, while Family
-    calendar adds skip his tap."""
+    calendar adds skip his tap.
+    `watch` (inputs.Watch): each input with no success since its last error,
+    mail included, and one line for those that came back since the last digest."""
     now = ledger.now()
     since = _since(ledger)
     inputs = [digest.InputCoverage(ledger.get_meta("chat_name") or "Discord", ledger.last_poll_success(),
                                    CHAT_MAX_AGE)]
     agenda = None
     notes = list(notes)
+    watched: list[str] = []
+    back = ""
+    if watch is not None:
+        try:                          # the inputs' lines never cost him the day's digest
+            lines, watched = watch.digest_lines()
+            notes += lines
+            back = watch.back_line()
+        except Exception as e:
+            log.warning("digest: couldn't check the inputs: %s", type(e).__name__)
+            notes.append("Couldn't check this morning whether email, Family and Google are working")
     day_start, day_end, day = calendar_feed.today_bounds(now, config.timezone)
     occ: list = []
     unreadable = read = configured = 0
     if calendar is not None and calendar.configured:
         cov = calendar.coverage()
-        for label, ok_at, err in cov:
-            inputs.append(digest.InputCoverage(f"Calendar {label}", ok_at,
-                                               calendar_feed.MAX_AGE, err))
+        for c in cov:
+            inputs.append(digest.InputCoverage(f"Calendar {c.label}" if c.label else "One of your calendars",
+                                               c.ok_at, calendar_feed.MAX_AGE, c.error, c.failing, c.name))
         occ, unreadable, read, configured = calendar.agenda(day)
         occ = list(occ)
     fam_status = None
@@ -275,10 +287,10 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
                        failures=failures, low_balance=low, canary_ok=canary_ok,
                        config_unchanged_since=ledger.meta_time("integrity_since"),
                        canary_notes=canary_notes, notes=notes, agenda=agenda,
-                       extra=[x for x in (family_add_line, mirror_line) if x])
+                       extra=[x for x in (family_add_line, mirror_line, back) if x])
     if fam_status is not None:
         d.facts["family"] = fam_status
-    return d
+    return replace(d, named=d.named + tuple(watched))
 
 
 def deliver(ledger: Ledger, config: Config, d: digest.Digest, *, hold: bool = False) -> bool:

@@ -41,6 +41,7 @@ from .net import REDACT, HttpResponse, TransportError
 log = logging.getLogger(__name__)
 
 CALENDAR_NAME = "Family"       # fixed in code; nothing can name another calendar
+INPUT = "family"               # its name among the inputs (inputs.FAMILY)
 MARKER = "X-HARNESS-OWNED"
 TIMEOUT_S = 20
 _DAV = "{DAV:}displayname"
@@ -251,9 +252,12 @@ class Read:
 
 
 class FamilyCalDav:
-    def __init__(self, transport, credentials: Callable[[], tuple[str, str, str]]):
+    def __init__(self, transport, credentials: Callable[[], tuple[str, str, str]],
+                 seen: Callable[..., None] | None = None):
         self.transport = transport
         self.credentials = credentials     # (Apple ID, app password, calendar address)
+        # inputs.Seen: what iCloud answered, so a turned-down password is told at once.
+        self.seen = seen or (lambda *a: None)
 
     def configured(self) -> bool:
         user, password, url = self.credentials()
@@ -281,16 +285,31 @@ class FamilyCalDav:
                            {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
                            _PROPFIND)
         except TransportError:
+            self.seen(INPUT, "unreachable", "couldn't reach iCloud")
             return Outcome("failed")             # no write has been sent
         if r.status == 401:
+            self.seen(INPUT, "refused", "iCloud refused the app-specific password")
             return Outcome("auth", r.status)
         if r.status != 207:
+            self._answered(r.status)
             return Outcome("failed", r.status)
         try:
             name = ET.fromstring(r.body).findtext(f".//{_DAV}")
         except ET.ParseError:
+            self.seen(INPUT, "error", "iCloud's answer couldn't be read")
             return Outcome("failed", r.status)
-        return None if name == CALENDAR_NAME else Outcome("mismatch", r.status)
+        if name != CALENDAR_NAME:
+            self.seen(INPUT, "error", "the saved address isn't the Family calendar")
+            return Outcome("mismatch", r.status)
+        self.seen(INPUT)
+        return None
+
+    def _answered(self, status: int) -> None:
+        """An answer that isn't the one asked for: none yet, or an error. Said without its code."""
+        if status >= 500:
+            self.seen(INPUT, "unreachable", "iCloud isn't answering right now")
+        else:
+            self.seen(INPUT, "error", "iCloud answered with an error")
 
     def create(self, uid: str, params: dict, now: datetime) -> Outcome:
         ready = self._auth()
@@ -364,6 +383,7 @@ class FamilyCalDav:
             r = self._call(auth, "REPORT", url,
                            {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}, body)
             if r.status != 207:
+                self._answered(r.status)
                 return None
             out: list[Item] = []
             unreadable = 0
@@ -372,12 +392,17 @@ class FamilyCalDav:
                 etag = resp.findtext(".//{DAV:}getetag") or ""
                 data = resp.findtext(f".//{_CALENDAR_DATA}") or ""
                 if "BEGIN:VCALENDAR" not in data:
+                    self.seen(INPUT, "error", "iCloud's answer couldn't be read")
                     return None                  # an answer with no event in it is no answer
                 w = ical.window(data, start=start, end=end, tz=tz, fallback_name=CALENDAR_NAME)
                 unreadable += w.unreadable
                 out += [Item(occ, href, etag, data) for occ in w.occurrences]
             return Read(out, unreadable)
-        except (TransportError, ET.ParseError, ValueError):
+        except TransportError:
+            self.seen(INPUT, "unreachable", "couldn't reach iCloud")
+            return None
+        except (ET.ParseError, ValueError):
+            self.seen(INPUT, "error", "iCloud's answer couldn't be read")
             return None
 
     def put_copy(self, uid: str, title: str, start, end, now: datetime,

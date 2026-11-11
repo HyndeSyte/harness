@@ -221,6 +221,13 @@ class Vault:
             return None
         return p
 
+    def pending_field(self, change_id: str) -> str:
+        """The key a pending change is for, read without letting an expired one go: the tap that
+        resolves it says it expired (resolve_change)."""
+        with self._lock:
+            p = self._load().get("pending")
+        return p["field"] if p and p.get("id") == change_id else ""
+
     def mark_announced(self, change_id: str) -> None:
         def fn(data):
             p = data.get("pending")

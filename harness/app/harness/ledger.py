@@ -366,6 +366,16 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Failures only he can fix (a key turned down, Gmail wanting a sign-in on the web first, a calendar
+# not shared): counted apart (inputs.py).
+NEEDS_HIM = ("refused", "web", "denied")
+
+
+def told(row) -> bool:
+    """He was told about this input's open outage: not about one that ended since."""
+    return bool(row["told_at"]) and (not row["last_success_at"] or row["told_at"] > row["last_success_at"])
+
+
 def iso(dt: datetime) -> str:
     if dt.tzinfo is None:
         raise ValueError("naive datetime in the ledger")
@@ -409,12 +419,24 @@ class Ledger:
             # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
             # who sent it, the address found, the one written, and whether it was written busy.
             "mail_dates": (("sender", "TEXT NOT NULL DEFAULT ''"), ("place", "TEXT NOT NULL DEFAULT ''"),
-                           ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0"))}
-        for table, cols in added.items():
-            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
-            for name, decl in cols:
-                if name not in have:
-                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                           ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0")),
+            # 0.21.1: an input that stops is told (inputs.py). Its outage: the last failure's
+            # kind, the first failure, how many failures and refusals were seen, what he was told
+            # and by which message, whether a digest named it, when one he knew about came back,
+            # and the name it was last read under. An input already failing when this version
+            # first opens the file starts its outage over at its next failure.
+            "inputs": (("kind", "TEXT NOT NULL DEFAULT ''"), ("failing_since", "TEXT"),
+                       ("failures", "INTEGER NOT NULL DEFAULT 0"),
+                       ("refusals", "INTEGER NOT NULL DEFAULT 0"),
+                       ("told_at", "TEXT"), ("told_kind", "TEXT NOT NULL DEFAULT ''"),
+                       ("told_outbox", "INTEGER"), ("named", "INTEGER NOT NULL DEFAULT 0"),
+                       ("back_at", "TEXT"), ("label", "TEXT NOT NULL DEFAULT ''"))}
+        with self.tx() as db:              # all or nothing: a stop halfway leaves the file as it was
+            for table, cols in added.items():
+                have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+                for name, decl in cols:
+                    if name not in have:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def _rules_need_a_tap(self) -> None:
         """Once, on the first open by 0.5.1 or later: rules stored before his tap existed
@@ -685,19 +707,65 @@ class Ledger:
                               " WHERE provider=? AND month=?", (provider, month)).fetchone()
         return float(row["s"])
 
-    # -- inputs (for the digest's coverage) --------------------------------
-    def input_ok(self, name: str) -> None:
+    # -- inputs (for the digest's coverage, and the alerts in inputs.py) ------
+    # An outage runs from a failure to the next success: failing_since is its first failure,
+    # failures and refusals how many of each were seen in it, told_at, told_kind and told_outbox
+    # what he was told and by which message, named whether a digest named it. A success ends it,
+    # and when he knew about it, back_at says when, for the next digest.
+    def input_ok(self, name: str, label: str = "") -> None:
+        """`label`: the name it was read under (a calendar's own name), kept for his messages."""
         with self.tx() as db:
-            db.execute("INSERT INTO inputs(name, last_success_at) VALUES(?, ?)"
-                       " ON CONFLICT(name) DO UPDATE SET last_success_at=excluded.last_success_at",
-                       (name, iso(self.now())))
+            row = db.execute("SELECT * FROM inputs WHERE name=?", (name,)).fetchone()
+            knew = False
+            if row is not None and row["failing_since"] is not None:
+                reached = told(row) and self._reached(db, row)      # always looked at: it may be dropped
+                knew = reached or bool(row["named"])
+            db.execute("INSERT INTO inputs(name, last_success_at, label) VALUES(?, ?, ?)"
+                       " ON CONFLICT(name) DO UPDATE SET last_success_at=excluded.last_success_at,"
+                       " label=CASE WHEN excluded.label<>'' THEN excluded.label ELSE label END,"
+                       " back_at=CASE WHEN ? THEN excluded.last_success_at ELSE back_at END,"
+                       " failing_since=NULL, failures=0, refusals=0, told_at=NULL, told_kind='',"
+                       " told_outbox=NULL, named=0",
+                       (name, iso(self.now()), label, 1 if knew else 0))
 
-    def input_failed(self, name: str, error: str) -> None:
+    def _reached(self, db, row) -> bool:
+        """Did the message that told him about this outage go out? One tried already may have, so it
+        counts and is never dropped. One still waiting and never tried, that tells of nothing else
+        still down, is dropped: the outage it's about is over (Nov 11 review). One that tells of more
+        is said again without this one (inputs.Watch.refresh)."""
+        box = row["told_outbox"]
+        if not box:
+            return True
+        out = db.execute("SELECT state, attempts FROM outbox WHERE id=?", (box,)).fetchone()
+        if out is None or out["state"] == "sent" or (out["state"] == "queued" and out["attempts"]):
+            return True
+        if out["state"] == "queued" and db.execute(
+                "SELECT 1 FROM inputs WHERE told_outbox=? AND name<>? AND failing_since IS NOT NULL",
+                (box, row["name"])).fetchone() is None:
+            db.execute("UPDATE outbox SET state='dropped' WHERE id=?", (box,))
+            self.event("input_message_dropped", {"input": row["name"], "outbox": box}, db=db)
+        return False
+
+    def input_failed(self, name: str, error: str, kind: str = "") -> None:
+        """`error`: what went wrong, in his words. `kind`: "refused" or "denied" for what only he
+        can fix, told from its second (inputs.py); anything else waits six hours. An outage opens
+        at the first failure, or again when the open one began before the last success (a file
+        an older version wrote to in between): counts and what he was told start over."""
+        now = iso(self.now())
+        new = "(failing_since IS NULL OR (last_success_at IS NOT NULL AND failing_since<last_success_at))"
         with self.tx() as db:
-            db.execute("INSERT INTO inputs(name, last_error_at, last_error) VALUES(?, ?, ?)"
+            db.execute("INSERT INTO inputs(name, last_error_at, last_error, kind, failing_since, failures,"
+                       " refusals) VALUES(?, ?, ?, ?, ?, 1, ?)"
                        " ON CONFLICT(name) DO UPDATE SET last_error_at=excluded.last_error_at,"
-                       " last_error=excluded.last_error",
-                       (name, iso(self.now()), error[:300]))
+                       " last_error=excluded.last_error, kind=excluded.kind,"
+                       f" failing_since=CASE WHEN {new} THEN excluded.failing_since ELSE failing_since END,"
+                       f" failures=CASE WHEN {new} THEN 1 ELSE failures+1 END,"
+                       f" refusals=CASE WHEN {new} THEN excluded.refusals ELSE refusals+excluded.refusals END,"
+                       f" told_at=CASE WHEN {new} THEN NULL ELSE told_at END,"
+                       f" told_kind=CASE WHEN {new} THEN '' ELSE told_kind END,"
+                       f" told_outbox=CASE WHEN {new} THEN NULL ELSE told_outbox END,"
+                       f" named=CASE WHEN {new} THEN 0 ELSE named END",
+                       (name, now, error[:300], kind, now, 1 if kind in NEEDS_HIM else 0))
 
     def inputs(self) -> dict[str, sqlite3.Row]:
         return {r["name"]: r for r in self.db.execute("SELECT * FROM inputs")}

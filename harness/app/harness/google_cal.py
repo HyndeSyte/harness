@@ -40,6 +40,9 @@ SCOPE = "https://www.googleapis.com/auth/calendar.events"    # events only, no c
 MARK = {"harness": "family_gmail"}
 TIMEOUT_S = 20
 MAX_PAGES = 20
+INPUT = "google"                            # its name among the inputs (inputs.GOOGLE)
+DENIED = "Google says your calendar isn't shared with Harness"
+REFUSALS = ("invalid_grant", "invalid_client", "unauthorized_client")   # Google turning the key itself down
 _ID_RE = re.compile(r"hb[0-9a-f]{32}")      # Google allows a-v and 0-9 in an id it's given
 _ANY_ID_RE = re.compile(r"[a-zA-Z0-9_-]{1,1024}")     # one day of a series is its id, _, a time
 _EMAIL_RE = re.compile(r"[a-z0-9-]{1,64}@[a-z0-9-]{1,64}\.iam\.gserviceaccount\.com")
@@ -315,18 +318,44 @@ def _too_many(r) -> bool:
     """Google's 403 can mean slow down rather than no access. The reason is read, not shown."""
     try:
         errors = r.json()["error"]["errors"]
-        return any(str(e.get("reason", "")).endswith(("ateLimitExceeded", "quotaExceeded"))
-                   for e in errors)
+        return any(str(e.get("reason", "")).endswith(("LimitExceeded", "quotaExceeded"))
+                   for e in errors)                  # rateLimitExceeded, dailyLimitExceeded, ...
     except (ValueError, KeyError, TypeError, AttributeError):
         return False
 
 
+def _turned_down(r) -> tuple[str, str]:
+    """What a sign-in Google didn't give was. Refused: a 400, 401 or 403 saying the key itself is
+    no good (REFUSALS), unless Google says the sign-in's times are off, which is the Pi's clock, and
+    no new key would fix. Busy (408, 429): unreachable. Anything else: an error. The reason is read,
+    never shown."""
+    if r.status in (408, 429):
+        return "unreachable", "Google isn't answering right now"
+    try:
+        said = r.json()
+        error, described = str(said.get("error", "")), str(said.get("error_description", "")).casefold()
+    except (ValueError, TypeError, AttributeError):
+        error, described = "", ""
+    if r.status not in (400, 401, 403) or error not in REFUSALS:
+        return "error", "Google answered with an error"
+    if any(w in described for w in ("timeframe", "short-lived", "iat and exp")):
+        return "clock", "Google turned the sign-in down, likely because the Pi's clock is off"
+    return "refused", "Google refused the service account key"
+
+
 class GoogleCalendar:
-    def __init__(self, transport, key: Callable[[], str], clock: Callable[[], datetime]):
+    def __init__(self, transport, key: Callable[[], str], clock: Callable[[], datetime],
+                 seen: Callable[..., None] | None = None):
         self.transport = transport
         self.key = key                     # the stored service account key
         self.clock = clock
         self._token: tuple[str, str, datetime] | None = None   # (key it came from, token, until)
+        # inputs.Seen: what Google answered, so a turned-down key is told at once. Called from
+        # worker threads too (calendar_feed's fresh reads, a job's context), so it only notes.
+        self.seen = seen or (lambda *a: None)
+        # His calendar's address (family_gmail._address), set by __main__: only what Google says
+        # about his calendar counts for it, not about another one read through the same key.
+        self.mine: Callable[[], str | None] = lambda: None
 
     def configured(self) -> bool:
         return bool(self.key())
@@ -357,9 +386,15 @@ class GoogleCalendar:
             r = self.transport.request("POST", TOKEN_URL, body=body, timeout=TIMEOUT_S, headers={
                 "Content-Type": "application/x-www-form-urlencoded"})
         except TransportError:
+            self.seen(INPUT, "unreachable", "couldn't reach Google")
             return None, Outcome("failed")     # no write has been sent
         if r.status != 200:
-            return None, Outcome("unknown" if r.status >= 500 else "auth", r.status)
+            kind, words = ("unreachable", "Google isn't answering right now") if r.status >= 500 \
+                else _turned_down(r)
+            self.seen(INPUT, kind, words)
+            # Only the key itself turned down is "auth": a busy Google, the Pi's clock or another
+            # answer isn't the key's fault, and the blocks' line mustn't say it is (Nov 11 review).
+            return None, Outcome("auth" if kind == "refused" else "unknown", r.status)
         try:
             answer = r.json()
             token = answer["access_token"]
@@ -379,8 +414,36 @@ class GoogleCalendar:
             headers["If-Match"] = etag
         if body is not None:
             headers["Content-Type"] = "application/json"
-        return self.transport.request(method, url, headers=headers, timeout=TIMEOUT_S,
-                                      body=json.dumps(body).encode("utf-8") if body else None)
+        his = self._his(url)
+        try:
+            r = self.transport.request(method, url, headers=headers, timeout=TIMEOUT_S,
+                                       body=json.dumps(body).encode("utf-8") if body else None)
+        except TransportError:
+            if his:
+                self.seen(INPUT, "unreachable", "couldn't reach Google")
+            raise
+        # What one event's answer says (gone, changed, not his) is about that event: only an answer
+        # that worked, or none yet, says anything about the calendar. Its reads say the rest.
+        if his and 200 <= r.status < 300:
+            self.seen(INPUT)
+        elif his and (r.status >= 500 or r.status in (408, 429) or (r.status == 403 and _too_many(r))):
+            self.seen(INPUT, "unreachable", "Google isn't answering right now")
+        return r
+
+    def _his(self, url: str) -> bool:
+        """A request about his calendar. Asked from worker threads too: never a stop."""
+        try:
+            mine = self.mine()
+        except Exception:
+            return False
+        base = self._events(mine) if mine else None
+        return bool(base) and url.startswith(base)
+
+    def _shut_out(self, r, url: str) -> None:
+        """A read of his whole calendar Google won't give: it isn't shared with Harness. Writes Google
+        turns down aren't taken for that: one event can be turned down on its own."""
+        if self._his(url) and r.status in (403, 404) and not _too_many(r):
+            self.seen(INPUT, "denied", DENIED)
 
     @staticmethod
     def _events(address: str) -> str | None:
@@ -420,6 +483,7 @@ class GoogleCalendar:
             except TransportError:
                 return None, Outcome("failed")
             if r.status != 200:
+                self._shut_out(r, url)
                 return None, self._answer(r)
             try:
                 page = r.json()
@@ -501,6 +565,7 @@ class GoogleCalendar:
             try:
                 r = self._call(token, "GET", f"{url}?{urlencode(query)}")
                 if r.status != 200:
+                    self._shut_out(r, url)
                     return None
                 page = r.json()
                 out += [e for e in page.get("items", []) if isinstance(e, dict)]

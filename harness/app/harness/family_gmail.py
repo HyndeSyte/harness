@@ -674,7 +674,7 @@ class FamilyGmail:
                     "nothing changed.")
         if kind == "denied":
             return ("Blocks on Gmail from Family: Google refused. Check your Gmail calendar is "
-                    f"shared with {self.google.account()} on \"Make changes and see all event "
+                    f"shared with {self.google.account()} on \"Make changes and see event "
                     "details\". "
                     "Nothing changed.")
         return (f"Blocks on Gmail from Family: the last change to Gmail didn't go through ({kind}). "

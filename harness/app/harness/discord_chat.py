@@ -16,13 +16,15 @@ link (cain_relay.py), which holds it until Cain shows it, unchanged.
 - A Stop button rides along with every set of buttons and on the digest. When
   stopped, a Turn back on button takes its place.
 - Stop's notices and the 7:40 digest fallback are "direct": the link posts them
-  at once, because they exist for when Cain can't be relied on.
+  at once, because they exist for when Cain can't be relied on. So is word that
+  an input stopped (inputs.py), with no buttons: there's nothing to decide.
 """
 from __future__ import annotations
 
 import html
 import re
 from typing import Callable
+from urllib.parse import urlsplit
 
 from .cain_relay import CainLink, LinkError
 from .chat import ChatError
@@ -31,6 +33,9 @@ from .discord_api import PRIMARY, components, escape
 PREFIX = "k:"
 STOP, RESUME = "k:stop", "k:resume"
 TOGGLE_KINDS = ("digest", "stopped", "resumed", "alert")   # carry Stop / Turn back on
+# Out at once, as the link's "alert", with no buttons: an input that stopped (inputs.py), where
+# there's nothing to decide.
+PLAIN_ALERTS = ("input",)
 
 # The words a few older messages use for commands that don't exist here.
 WORDS = (
@@ -47,6 +52,26 @@ WORDS = (
 )
 
 _TAG = re.compile(r"<(/?)(b|i)>")
+# The hosts of the links in the steps he follows (inputs.py): those are kept whole, so their - and
+# _ survive. Any other link, a calendar's own name say, is escaped like the rest of the text, and
+# no ( ) [ ] can be part of one, so nothing becomes a masked link.
+OWN_HOSTS = frozenset({"myaccount.google.com", "account.apple.com", "calendar.google.com",
+                       "console.cloud.google.com", "platform.claude.com", "mail.google.com"})
+_URL = re.compile(r"https?://[A-Za-z0-9._~:/?#@!$&+,;=%-]+")
+
+
+def _text(text: str) -> str:
+    """Plain text, escaped so it can't format, but for the steps' own links in it."""
+    out, pos = [], 0
+    for m in _URL.finditer(text):
+        url = m.group(0).rstrip(".,;:!?")
+        if (urlsplit(url).hostname or "").lower() not in OWN_HOSTS:
+            continue
+        out.append(escape(text[pos:m.start()]))
+        out.append(url)
+        pos = m.start() + len(url)
+    out.append(escape(text[pos:]))
+    return "".join(out)
 
 
 def to_markdown(text: str) -> str:
@@ -55,10 +80,10 @@ def to_markdown(text: str) -> str:
         text = text.replace(old, new)
     out, pos = [], 0
     for m in _TAG.finditer(text):
-        out.append(escape(html.unescape(re.sub(r"<[^>]+>", "", text[pos:m.start()]))))
+        out.append(_text(html.unescape(re.sub(r"<[^>]+>", "", text[pos:m.start()]))))
         out.append("**" if m.group(2) == "b" else "*")
         pos = m.end()
-    out.append(escape(html.unescape(re.sub(r"<[^>]+>", "", text[pos:]))))
+    out.append(_text(html.unescape(re.sub(r"<[^>]+>", "", text[pos:]))))
     return "".join(out)
 
 
@@ -82,7 +107,8 @@ class LinkChat:
                      kind: str | None = None, expires: str | None = None) -> int:
         content = to_markdown(text) if html else escape(text)
         try:
-            return self.link.card(content, self._rows(buttons, kind), kind or "reply", expires=expires)
+            return self.link.card(content, self._rows(buttons, kind),
+                                  "alert" if kind in PLAIN_ALERTS else kind or "reply", expires=expires)
         except LinkError as e:
             raise _err(e) from None
 

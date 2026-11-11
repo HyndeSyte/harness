@@ -104,9 +104,9 @@ def test_a_good_read():
 @pytest.mark.parametrize("reply,needle", [
     ((404, b"Not Found"), "reset"),
     ((403, b""), "refused"),
-    ((500, b""), "answered 500"),
+    ((500, b""), "Google isn't answering right now"),
     ((200, b"<html>sign in</html>"), "wasn't a calendar"),
-    (TransportError("timeout"), "couldn't reach Google (timeout)"),
+    (TransportError("timeout"), "couldn't reach Google"),
 ])
 def test_failures_are_named(reply, needle):
     r = fetch_one(FakeTransport([reply]), U1, **bounds())
@@ -119,12 +119,14 @@ def test_too_big_is_refused(monkeypatch):
     assert not r.ok and "larger" in r.error
 
 
-def test_a_parser_crash_is_a_failed_read_not_a_dead_loop(monkeypatch):
+def test_a_parser_crash_is_a_failed_read_not_a_dead_loop(monkeypatch, caplog):
     def boom(*a, **k):
         raise RuntimeError("bug")
     monkeypatch.setattr(calendar_feed.ical, "window", boom)
-    r = fetch_one(FakeTransport([(200, TODAY)]), U1, **bounds())
-    assert not r.ok and "RuntimeError" in r.error
+    with caplog.at_level(logging.INFO, logger="harness.calendar_feed"):
+        r = fetch_one(FakeTransport([(200, TODAY)]), U1, **bounds())
+    # His words, with the kind of bug in the log only (Nov 11 review: no class names to him).
+    assert not r.ok and r.error == "couldn't read the calendar" and "RuntimeError" in caplog.text
 
 
 def test_the_address_never_reaches_a_log_line():
@@ -302,7 +304,7 @@ def test_a_stale_calendar_is_named_with_why():
         digest.InputCoverage("Calendar owner", NOW - timedelta(hours=5), timedelta(hours=2),
                              "Google says this address doesn't exist (was it reset?)")])
     assert d.state == "attention"
-    assert "Calendar owner: stale since Wed 2:00 AM (Google says" in d.text
+    assert "Calendar owner: not working since 2:00 AM today; Google says" in d.text
 
 
 def test_an_event_from_last_night_shows_when_it_ends():
@@ -414,7 +416,7 @@ def test_a_dead_feed_makes_the_digest_say_so(ledger, tmp_path, clock):
     r.c.tick()
     d = r.bot.texts()[-1]
     assert d.startswith("<b>Attention needed</b>")
-    assert "Calendar calendar " in d and "no successful read yet" in d and "reset" in d
+    assert "One of your calendars: not read yet; Google says" in d and "reset" in d
     assert "can't say what's on it" in d
 
 
@@ -447,7 +449,7 @@ def test_a_feed_that_stopped_reading_goes_stale_after_two_hours(ledger, tmp_path
     r.c.tick()
     d = r.bot.texts()[-1]
     assert d.startswith("<b>Attention needed</b>")
-    assert "Calendar owner@example.com: stale since Wed 4:30 AM (Google answered 500)" in d
+    assert "Calendar owner@example.com: not working since 4:30 AM today; Google isn't answering right now" in d
 
 
 def test_a_dead_feed_is_tried_once_before_the_digest_not_hammered(ledger, tmp_path, clock):

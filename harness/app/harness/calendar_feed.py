@@ -20,9 +20,10 @@ import re
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
-from . import ical
+from . import ical, inputs
 from .ledger import Ledger
 from .net import REDACT, Transport, TransportError
 
@@ -66,12 +67,22 @@ def feed_id(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:8]
 
 
+class FeedCoverage(NamedTuple):
+    """One calendar address, for the digest and the Harness page."""
+    label: str                 # the calendar's own name, the last it was read under; "" before any
+    ok_at: datetime | None     # its last good read
+    error: str                 # its last failure, in his words
+    failing: bool              # down, and not a single blip (inputs.worth_naming)
+    name: str                  # its input: calendar:<feed id>
+
+
 @dataclass
 class FeedResult:
     feed: str
     ok: bool
     window: ical.Window | None = None
     error: str = ""
+    kind: str = "error"        # a failure's kind for the watch: "unreachable" for no answer (inputs.py)
     day: str = ""              # the local day the window describes
     # The same feed over the mirror's horizon (shadow mode), when asked for.
     ahead: ical.Window | None = None
@@ -93,14 +104,19 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
         resp = transport.request("GET", url, headers={"accept": "text/calendar"},
                                  timeout=TIMEOUT_S)
     except TransportError as e:
-        return FeedResult(fid, False, error=f"couldn't reach Google ({e.kind})")
+        log.info("calendar %s: no answer (%s)", fid[:4], e.kind)
+        return FeedResult(fid, False, error="couldn't reach Google", kind="unreachable")
+    if resp.status != 200:
+        log.info("calendar %s: Google answered %s", fid[:4], resp.status)
+    if resp.status >= 500 or resp.status in (408, 429):
+        return FeedResult(fid, False, error="Google isn't answering right now", kind="unreachable")
     if resp.status == 404:
         return FeedResult(fid, False, error="Google says this address doesn't exist "
                                            "(was it reset?)")
     if resp.status in (401, 403):
-        return FeedResult(fid, False, error=f"Google refused this address ({resp.status})")
+        return FeedResult(fid, False, error="Google refused this address")
     if resp.status != 200:
-        return FeedResult(fid, False, error=f"Google answered {resp.status}")
+        return FeedResult(fid, False, error="Google answered with an error")
     if len(resp.body) > MAX_BYTES:
         return FeedResult(fid, False, error="the calendar is larger than this reads")
     text = resp.body.decode("utf-8", "replace").lstrip("\ufeff")
@@ -111,7 +127,8 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
     try:
         w = ical.window(text, start=start, end=end, tz=tz, fallback_name=f"Calendar {fid[:4]}")
     except Exception as e:                       # a parser bug must not kill the loop
-        return FeedResult(fid, False, error=f"couldn't read the calendar ({type(e).__name__})")
+        log.info("calendar %s: couldn't read it (%s)", fid[:4], type(e).__name__)
+        return FeedResult(fid, False, error="couldn't read the calendar")
     # The mirror's longer window is parsed on its own: whatever goes wrong
     # there leaves it unread for the shadow and never touches today's agenda.
     ahead, ahead_error = None, ""
@@ -249,18 +266,20 @@ class CalendarFeeds:
                     fut.cancel()
                     del self._futures[fid]
                     if fid in live:
-                        self.ledger.input_failed(f"calendar:{fid}", "the read took too long")
+                        self.ledger.input_failed(f"calendar:{fid}", "the read took too long", "unreachable")
                 continue
             del self._futures[fid]
             self.generation += 1
             try:
                 res: FeedResult = fut.result()
             except Exception as e:
-                res = FeedResult(fid, False, error=type(e).__name__)
+                log.info("calendar %s: the read stopped (%s)", fid[:4], type(e).__name__)
+                res = FeedResult(fid, False, error="the read stopped on an unexpected problem")
             if fid not in live:
                 continue
             if res.ok:
-                self.ledger.input_ok(f"calendar:{fid}")
+                # Its own name kept too, for his messages after midnight or a restart.
+                self.ledger.input_ok(f"calendar:{fid}", label=res.window.calendar if res.window else "")
                 if res.ahead_error:
                     with self.ledger.tx() as db:
                         self.ledger.event("calendar_ahead_failed",
@@ -269,7 +288,7 @@ class CalendarFeeds:
                     # A read that started yesterday describes yesterday.
                     self.snapshot.feeds[fid] = res
             else:
-                self.ledger.input_failed(f"calendar:{fid}", res.error)
+                self.ledger.input_failed(f"calendar:{fid}", res.error, res.kind)
                 prev = self.snapshot.feeds.get(fid)
                 if prev is not None:
                     # Today's agenda keeps the last good read; the mirror's
@@ -296,19 +315,29 @@ class CalendarFeeds:
         return True
 
     # -- for the digest -----------------------------------------------------------------
-    def coverage(self) -> list[tuple[str, datetime | None, str]]:
-        """(label, last success, last error) per configured feed."""
+    def coverage(self) -> list[FeedCoverage]:
+        """Each configured feed: its name, last good read, last failure, and whether it's failing."""
         rows = self.ledger.inputs()
         out = []
-        for url in self.urls():
-            fid = feed_id(url)
-            row = rows.get(f"calendar:{fid}")
-            res = self.snapshot.feeds.get(fid)
-            label = res.window.calendar if res and res.window else f"calendar {fid[:4]}"
+        for name, label in self.inputs(rows):
+            row = rows.get(name)
             ok_at = (datetime.fromisoformat(row["last_success_at"])
                      if row is not None and row["last_success_at"] else None)
             err = row["last_error"] if row is not None and row["last_error"] else ""
-            out.append((label, ok_at, err))
+            out.append(FeedCoverage(label, ok_at, err, row is not None and inputs.worth_naming(row), name))
+        return out
+
+    def inputs(self, rows: dict | None = None) -> list[tuple[str, str]]:
+        """(input name, label) per configured feed: its own name from today's read, else the last
+        one it was read under, else "" (his messages say "one of your calendars")."""
+        rows = self.ledger.inputs() if rows is None else rows
+        out = []
+        for url in self.urls():
+            fid = feed_id(url)
+            res = self.snapshot.feeds.get(fid)
+            row = rows.get(f"calendar:{fid}")
+            out.append((f"calendar:{fid}", res.window.calendar if res and res.window
+                        else row["label"] if row is not None else ""))
         return out
 
     def agenda(self, day: str) -> tuple[list[ical.Occurrence], int, int, int]:

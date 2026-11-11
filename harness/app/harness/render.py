@@ -15,7 +15,7 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from . import approvals
@@ -183,6 +183,19 @@ def clock_words(t: datetime, *, suffix: bool | None = None) -> str:
     if suffix is None:
         suffix = not _daytime(t)
     return words + (f" {'AM' if t.hour < 12 else 'PM'}" if suffix else "")
+
+
+def since_words(t: datetime, now: datetime, tz: str) -> str:
+    """When something last worked, as he reads it: 4:53 PM today, 4:53 PM yesterday, Sun Nov 8
+    at 4:53 PM. Always with AM or PM: "since 4:53" alone could be either."""
+    zone = ZoneInfo(tz)
+    local, today = t.astimezone(zone), now.astimezone(zone).date()
+    clock = clock_words(local, suffix=True)
+    if local.date() == today:
+        return f"{clock} today"
+    if local.date() == today - timedelta(days=1):
+        return f"{clock} yesterday"
+    return f"{date_words(local.date(), today)} at {clock}"
 
 
 def span_words(start: datetime, end: datetime) -> str:

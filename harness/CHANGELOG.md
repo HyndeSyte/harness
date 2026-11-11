@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.1
+
+- **You hear right away when only you can fix something.** If Gmail turns down Harness's app password or wants you to sign in on the web, iCloud turns down its app-specific password, Google turns down its service account key, or your Gmail calendar isn't shared with Harness any more, you get one message as soon as a second try confirms it. It says what stopped, since when, what it costs you, and how to fix it from your phone, down to tapping Approve on the Discord message that follows. You get it once per outage. If a new key is turned down too, you hear again.
+- **If something else stops, you hear once it has kept failing for six hours.** That's Gmail, iCloud or Google not answering, Claude turning Harness's requests down, or the Pi's clock being off. Messages go out on the quarter hour, with everything that's down then in one, so a home internet outage is one message. A message that hasn't gone out yet only says what's still down, and is dropped if everything in it works again.
+- **The morning digest names everything that's down,** your email included, once it has failed twice or for an hour: "Email from Gmail: not working since Sun Nov 8 at 4:53 PM; Gmail refused the app password". When one you knew about works again, the next digest says so in one line. There's no separate "it's back" message.
+- **Plain words:** no error codes, and "Claude" where messages used to say "the engine".
+- **The Harness log notes a failed email read,** once an hour at most unless the reason changes, and never with what Gmail said.
+
 ## 0.21.0
 
 - **Your plain calendar commands just work.** Say "move PT to 11:30" or "no drop-off today" and it's done straight away, with one receipt and an Undo button: "Moved PT to 11:30 to 12:30 today (Gmail and Family)", "Took off today's 8:00 drop-off". No Approve tap.
