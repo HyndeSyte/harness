@@ -22,7 +22,10 @@ message), /morning-posted (Cain's link says that message is out), /press
 /meanings (what Dane told Cain kinds of Family events mean, from his record:
 short rows, checked strictly here before anything is queued; meaning_live.py), and
 /places (his place book, where the places named on Family are; checked the same way;
-places.py).
+places.py). GET /health is for Cain's half of the mutual watch (watch.py): it
+answers "ok" while the controller loop is turning, and "stuck" when it hasn't
+for STUCK_S, so a hung loop counts as down. The clock starts at the loop's first
+turn ("starting" until then), and the loop beats between its phases.
 
 The HTTP thread never touches the ledger: it queues the request for the
 controller and waits on an event.
@@ -50,6 +53,7 @@ MAX_SUGGESTION = 1500
 MAX_MEANINGS_BODY = 16384             # up to 60 short rows, or the place book
 ROUTES = ("/handover", "/digest", "/press", "/morning-posted", "/meanings", "/places")
 BIG = ("/meanings", "/places")
+STUCK_S = 10 * 60
 
 
 def key_for(token: str) -> str:
@@ -83,6 +87,16 @@ class Inbox:
         self._token_fn = token_fn
         self.queue: "queue.Queue[Handover]" = queue.Queue()
         self.wake = wake
+        self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
+
+    def beat(self) -> None:
+        self.beat_at = time.monotonic()
+
+    def health(self) -> dict:
+        if self.beat_at is None:
+            return {"status": "starting", "loop_age_s": None}
+        age = time.monotonic() - self.beat_at
+        return {"status": "ok" if age < STUCK_S else "stuck", "loop_age_s": int(age)}
 
     def key_ok(self, presented: str) -> bool:
         token = self._token_fn()
@@ -160,7 +174,11 @@ def _handler(inbox: Inbox, wait_s: float):
             self._reply(200, h.result)
 
         def do_GET(self):
-            self._reply(404, {"status": "not found"})
+            if self.path != "/health":
+                return self._reply(404, {"status": "not found"})
+            if not inbox.key_ok(self.headers.get("x-harness-key", "")):
+                return self._reply(403, {"status": "refused"})
+            self._reply(200, inbox.health())
     return H
 
 

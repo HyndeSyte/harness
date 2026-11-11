@@ -8,18 +8,20 @@
 //     POST /answer {callback, text}     a short note only Dane sees, after a tap
 //     POST /relay {text}                a line for Cain
 //     GET  /card-of?m=<message id>      which card a Discord message is
-//     GET  /health
+//     GET  /health                      "ok"; with the key, also the Discord connection and the watch
 //   from Cain's own scripts, on this machine only (127.0.0.1):
 //     POST /show {id}  POST /ask {text, options}  POST /morning {text, options}
 // Nothing is published to the LAN: the add-on has no "ports:".
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { emptyState, Link, Protocol, State } from "./core";
+import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
 const ACCESS = "/data/.claude/channels/discord/access.json";
 const DIR = process.env.LINK_DIR ?? "/data/link";
 const STATE = `${DIR}/state.json`;
+const WATCH = `${DIR}/watch.json`;
 const QUEUE = process.env.RELAY_QUEUE ?? "/data/relay.queue";
 const PORT = Number(process.env.RELAY_PORT ?? 8097);
 const HARNESS = "http://0fcc2575-harness:8098";
@@ -31,8 +33,7 @@ function token(): string {
   try { return readFileSync(ENV, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? ""; } catch { return ""; }
 }
 function key(context: string): string {
-  const t = token();
-  return t ? createHmac("sha256", t).update(context).digest("hex") : "";
+  return hmacKey(token(), context);
 }
 function same(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);
@@ -49,12 +50,12 @@ function save(s: State): void {
   renameSync(`${STATE}.tmp`, STATE);
 }
 
-async function rest(method: string, path: string, body?: unknown, auth = true): Promise<any> {
+async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
   if (auth) headers.authorization = `Bot ${token()}`;
   if (body !== undefined) headers["content-type"] = "application/json";
   const r = await fetch(`${API}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body),
-    redirect: "error", signal: AbortSignal.timeout(path.startsWith("/interactions/") ? 3000 : 20000) });
+    redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? (path.startsWith("/interactions/") ? 3000 : 20000)) });
   if (r.status === 204) return null;
   const data = await r.json().catch(() => null);
   if (r.status >= 400) throw new Error(`discord ${r.status}: ${String(data?.message ?? "").slice(0, 100)}`);
@@ -75,6 +76,29 @@ const link = new Link({
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 600) }) + "\n"),
 });
 
+// -- the gateway's health, for the Harness page ------------------------------------
+let connected = false;
+let lastHeard = 0;                       // ms: the last thing Discord's gateway sent
+
+// -- the mutual watch on the calendar specialist (watch.ts) -------------------------
+const watchLog = (line: string) => console.log(`[cain] link: ${line}`);
+const watch = new PeerWatch({ ...fileStore(WATCH, watchLog), now: Date.now, mono: () => performance.now() });
+
+async function harnessAlive(): Promise<boolean | "refused"> {
+  if (!token()) return true;             // no key yet: nothing to check with, and nothing to say
+  // 404 (an older Harness without /health) is alive; 403 is "refused"; 5xx, its own
+  // "stuck" (its loop hasn't turned in 10 minutes) or no answer at all is down.
+  return probeHarness((signal) => fetch(`${HARNESS}/health`,
+    { headers: { "x-harness-key": key("harness-handover-v1") }, signal }));
+}
+
+every(CHECK_MS, () => check(watch, harnessAlive,
+  async (text) => { await link.notice(text, NOTICE_TIMEOUT_MS); },
+  watchLog,
+  (what) => link.relayLine(what === "down"
+    ? "The add-on told Dane the calendar specialist hasn't answered for 5 minutes. Calendar handovers will fail until it's back; don't promise calendar changes."
+    : "The add-on told Dane the calendar specialist is answering again.")), watchLog);
+
 // -- HTTP -------------------------------------------------------------------------
 const LOCAL_ONLY = new Set(["/show", "/ask", "/morning"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
@@ -83,11 +107,13 @@ Bun.serve({
   port: PORT, hostname: "0.0.0.0",
   async fetch(req, server) {
     const url = new URL(req.url);
-    if (!same(req.headers.get("x-harness-key") ?? "", key("harness-relay-v1"))) return json({ status: "refused" }, 403);
+    const keyOk = same(req.headers.get("x-harness-key") ?? "", key("harness-relay-v1"));
+    if (req.method === "GET" && url.pathname === "/health")
+      return json(healthBody(keyOk, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
+    if (!keyOk) return json({ status: "refused" }, 403);
     const ip = server.requestIP(req)?.address ?? "";
     if (LOCAL_ONLY.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
       return json({ status: "refused" }, 403);
-    if (req.method === "GET" && url.pathname === "/health") return json({ status: "ok" });
     if (req.method === "GET" && url.pathname === "/card-of") return json({ card: link.cardOf(url.searchParams.get("m") ?? "") });
     if (req.method !== "POST") return json({ status: "not found" }, 404);
     const raw = await req.text();
@@ -125,9 +151,9 @@ let fatalToken = "";
 let lastToken = token();
 
 const proto = new Protocol((o) => ws?.send(JSON.stringify(o)), token, {
-  ready: () => { failures = 0; console.log("[cain] link: connection ready"); },
+  ready: () => { failures = 0; connected = true; console.log("[cain] link: connection ready"); },
   interaction: (d) => { link.onInteraction(d).catch((e) => console.log(`[cain] link: tap failed: ${String(e).slice(0, 80)}`)); },
-  reaction: (d) => { link.onReaction(d).catch(() => {}); },
+  reaction: (d) => { link.onReaction(d).catch((e) => console.log(`[cain] link: reaction failed: ${String(e).slice(0, 80)}`)); },
 });
 
 function connect(): void {
@@ -141,6 +167,7 @@ function connect(): void {
   if (host !== "gateway.discord.gg" && !host.endsWith(".discord.gg")) { proto.session = null; setTimeout(connect, 5000); return; }
   ws = new WebSocket(`wss://${host}/?v=10&encoding=json`);
   ws.onmessage = (ev) => {
+    lastHeard = Date.now();
     let m: any;
     try { m = JSON.parse(String(ev.data)); } catch { return; }
     if (proto.handle(m) === "reconnect") { ws?.close(4000); return; }
@@ -151,6 +178,7 @@ function connect(): void {
     }
   };
   ws.onclose = (ev) => {
+    connected = false;
     if (beat) clearInterval(beat);
     proto.interval = 0;
     const what = proto.closed(ev.code);

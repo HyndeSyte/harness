@@ -50,6 +50,7 @@ class LinkState:
         self.answers = []                # (callback, text)
         self.edits = []                  # card ids whose buttons changed
         self.bad_keys = 0
+        self.discord = None              # what /health says about its Discord connection
 
     def with_buttons(self):
         return [(cid, c) for cid, c in sorted(self.cards.items()) if c["rows"]]
@@ -68,7 +69,9 @@ class LinkHandler(_Base):
         if not self._ok():
             return
         if self.path == "/health":
-            return self._json(200, {"status": "ok"})
+            st: LinkState = self.server.state
+            return self._json(200, {"status": "ok", **({"discord": st.discord}
+                                                       if st.discord is not None else {})})
         if self.path.startswith("/card-of"):
             return self._json(200, {"card": None})
         return self._json(404, {"status": "not found"})

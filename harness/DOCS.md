@@ -52,6 +52,16 @@ Every card with buttons, and the digest, carries a **Stop** button: start nothin
 until you tap **Turn back on**, which takes its place while stopped. What it's doing,
 spend this month and canary results are on the Harness page.
 
+## If Cain's add-on stops
+
+This add-on and Cain's check each other every minute. If Cain's add-on hasn't answered for
+5 minutes, or says its Discord connection has been down that long, you get one Discord
+message from here (Cain is the usual path, and it's the one that's down), and one more
+from here when it's back. Until then Stop and the buttons
+don't work; calendar work goes on and cards wait. Restarts and updates are shorter than
+5 minutes and say nothing. The Discord section of the Harness page shows whether the
+Discord link is connected, when it last heard from Discord, and this watch.
+
 ## Calendar
 
 The harness reads each calendar through its secret iCal address, every 30 minutes

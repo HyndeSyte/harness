@@ -70,6 +70,52 @@ button{{padding:8px 14px}} code{{background:#f2f2f2;padding:2px 4px}}
 </style></head><body><h1>Harness</h1>{body}</body></html>"""
 
 
+def _utc(at: str | None) -> str:
+    return _e((at or "")[:16].replace("T", " ")) + " UTC"
+
+
+def _discord_section(d: dict | None) -> list[str]:
+    """The Discord link (held by Cain's add-on) and the mutual watch on Cain (watch.py)."""
+    if not d:
+        return []
+    out = ["<h2>Discord</h2><div class='card'>"]
+    link = d.get("link")
+    if not d.get("cain_answering"):
+        out.append('<div class="no">Discord link: unknown, because Cain\'s add-on isn\'t '
+                   "answering (it holds the link)</div>")
+    elif link is None:
+        out.append('<div class="muted">Discord link: Cain\'s add-on doesn\'t report it yet '
+                   "(update Cain)</div>")
+    else:
+        state = ('<span class="ok">connected</span>' if link.get("connected")
+                 else '<span class="no">not connected</span>')
+        heard = (f"last heard from Discord {_utc(link['last_heard'])}" if link.get("last_heard")
+                 else "nothing heard from Discord since Cain started")
+        out.append(f"<div>Discord link: {state} · <span class='muted'>{heard}</span></div>")
+    w = d.get("cain")
+    if w:
+        state = w.get("state")
+        checked = f" · checked {_utc(w['checked_at'])}" if w.get("checked_at") else ""
+        if state == "up":
+            line = f'<span class="ok">answering</span><span class="muted">{checked}</span>'
+        elif state == "waiting":
+            line = (f'<span class="no">not answering since {_utc(w.get("down_since"))}</span>'
+                    f'<span class="muted"> · you\'ll be told in Discord if it lasts '
+                    f'{_e(w.get("grace_minutes"))} minutes{checked}</span>')
+        elif state == "down":
+            line = (f'<span class="no">not answering since {_utc(w.get("down_since"))}</span>'
+                    f'<span class="muted"> · you were told {_utc(w.get("alerted_at"))}'
+                    f'{checked}</span>')
+        elif state == "back":
+            line = ('<span class="ok">answering again</span><span class="muted"> · telling '
+                    f'you it\'s back{checked}</span>')
+        else:
+            line = '<span class="muted">not checked yet</span>'
+        out.append(f"<div>Watch on Cain's add-on: {line}</div>")
+    out.append("</div>")
+    return out
+
+
 def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") -> str:
     v = app.vault
     st = app.status
@@ -92,6 +138,8 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
     for note in st.get("notes") or []:
         parts.append(f'<div class="no">⚠ {_e(note)}</div>')
     parts.append("</div>")
+
+    parts.extend(_discord_section(st.get("discord")))
 
     cals = st.get("calendar") or []
     if cals:
