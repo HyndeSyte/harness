@@ -366,8 +366,9 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# Failures only he can fix (a key turned down, a calendar not shared): counted apart (inputs.py).
-NEEDS_HIM = ("refused", "denied")
+# Failures only he can fix (a key turned down, Gmail wanting a sign-in on the web first, a calendar
+# not shared): counted apart (inputs.py).
+NEEDS_HIM = ("refused", "web", "denied")
 
 
 def told(row) -> bool:
@@ -715,8 +716,10 @@ class Ledger:
         """`label`: the name it was read under (a calendar's own name), kept for his messages."""
         with self.tx() as db:
             row = db.execute("SELECT * FROM inputs WHERE name=?", (name,)).fetchone()
-            knew = row is not None and row["failing_since"] is not None and (
-                bool(row["named"]) or (told(row) and self._reached(db, row)))
+            knew = False
+            if row is not None and row["failing_since"] is not None:
+                reached = told(row) and self._reached(db, row)      # always looked at: it may be dropped
+                knew = reached or bool(row["named"])
             db.execute("INSERT INTO inputs(name, last_success_at, label) VALUES(?, ?, ?)"
                        " ON CONFLICT(name) DO UPDATE SET last_success_at=excluded.last_success_at,"
                        " label=CASE WHEN excluded.label<>'' THEN excluded.label ELSE label END,"
@@ -726,13 +729,15 @@ class Ledger:
                        (name, iso(self.now()), label, 1 if knew else 0))
 
     def _reached(self, db, row) -> bool:
-        """Did the message that told him about this outage go out? One still waiting, that tells of
-        nothing else still down, is dropped: the outage it's about is over (Nov 11 review)."""
+        """Did the message that told him about this outage go out? One tried already may have, so it
+        counts and is never dropped. One still waiting and never tried, that tells of nothing else
+        still down, is dropped: the outage it's about is over (Nov 11 review). One that tells of more
+        is said again without this one (inputs.Watch.refresh)."""
         box = row["told_outbox"]
         if not box:
             return True
-        out = db.execute("SELECT state FROM outbox WHERE id=?", (box,)).fetchone()
-        if out is None or out["state"] == "sent":
+        out = db.execute("SELECT state, attempts FROM outbox WHERE id=?", (box,)).fetchone()
+        if out is None or out["state"] == "sent" or (out["state"] == "queued" and out["attempts"]):
             return True
         if out["state"] == "queued" and db.execute(
                 "SELECT 1 FROM inputs WHERE told_outbox=? AND name<>? AND failing_since IS NOT NULL",

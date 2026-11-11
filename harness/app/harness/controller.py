@@ -657,13 +657,12 @@ class Controller:
         self.vault.mark_announced(p["id"])
 
     def _settings_decision(self, change_id: str, decision: str) -> str:
-        pending = self.vault.pending() or {}
+        field = self.vault.pending_field(change_id)
         msg = self.vault.resolve_change(change_id, decision)
         self.ledger.event("settings_change", {"id": change_id, "decision": decision})
-        if (decision == "approve" and msg.startswith("Done.") and pending.get("id") == change_id
-                and self.inputs is not None):
+        if decision == "approve" and msg.startswith("Done.") and field and self.inputs is not None:
             try:                       # a new key: a refusal of it is told again (inputs.py)
-                self.inputs.key_changed(pending.get("field", ""))
+                self.inputs.key_changed(field)
             except Exception as e:
                 log.warning("input watch: after a new key: %s", type(e).__name__)
         return msg

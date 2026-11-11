@@ -17,11 +17,12 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from harness import caldav, controller, daily, digest, discord_chat, google_cal, inputs, mail_dates, setup_web
-from harness.calendar_feed import CalendarFeeds, Snapshot, feed_id
+from harness import (caldav, calendar_feed, controller, daily, digest, discord_chat, google_cal, inputs,
+                     mail_dates, setup_web)
+from harness.calendar_feed import CalendarFeeds, Snapshot, feed_id, fetch_one
 from harness.config import Config
 from harness.ledger import Ledger, iso
-from harness.net import HttpResponse
+from harness.net import HttpResponse, TransportError
 from harness.vault import LABELS
 from conftest import OWNER
 from fake_caldav import APP_PASSWORD, APPLE_ID, FAMILY_URL, FakeICloud, no_network  # noqa: F401
@@ -66,6 +67,17 @@ def refused(ledger, clock, n=2, name="mail", words=REFUSED, kind="refused"):
 def last_good(ledger, clock, name="mail"):
     clock.t = LAST_GOOD
     ledger.input_ok(name)
+
+
+def quarter(clock):
+    """On to the next quarter hour, when anything else is looked at."""
+    clock.advance(minutes=15 - clock().minute % 15)
+    clock.t = clock.t.replace(second=0, microsecond=0)
+
+
+def flushed(ledger):
+    """As if the outbox delivered everything waiting."""
+    ledger.db.execute("UPDATE outbox SET state='sent', attempts=1 WHERE state='queued'")
 
 
 # -- 1. what only he can fix: at once, from its second, once an outage ---------------------------
@@ -128,8 +140,7 @@ def test_icloud_turning_the_app_specific_password_down_is_told_from_its_second(l
         assert w.tell(OWNER) == told
     text = sent(ledger)[0]["text"]
     assert text.startswith("<b>Harness can't reach the Family calendar</b>")
-    assert (": iCloud refused the app-specific password. Changing your Apple Account password turns these "
-            "off.") in text
+    assert ": iCloud refused the app-specific password. Changing your Apple Account password turns it off." in text
     assert ("at https://account.apple.com open Sign-In and Security, then App-Specific Passwords, make one "
             'named Harness and copy it.') in text and '"Family calendar: app-specific password"' in text
     assert "wxyz" not in text and APP_PASSWORD not in text
@@ -179,7 +190,7 @@ def test_approving_a_new_key_on_its_card_starts_what_he_was_told_over(on):
     (403, b'{"error": "unauthorized_client"}', "refused"),
     (400, b'{"error": "invalid_grant", "error_description": "Invalid JWT: Token must be a short-lived '
           b'token (60 minutes) and in a reasonable timeframe. Check your iat and exp values in the JWT '
-          b'claim."}', "error"),                          # the Pi's clock: no new key would fix it
+          b'claim."}', "clock"),                          # the Pi's clock: no new key would fix it
     (400, b'{"error": "invalid_request"}', "error"),
     (404, b'{"error": "invalid_grant"}', "error"),
     (429, b'{"error": "rate_limit_exceeded", "error_description": "Rate Limit Exceeded"}', "unreachable"),
@@ -303,6 +314,8 @@ def test_any_other_failure_is_told_once_a_failure_is_seen_six_hours_after_the_fi
         assert w.tell(OWNER) == 0
     clock.advance(minutes=5)                           # a failure seen six hours after the first
     ledger.input_failed("mail", UNREACHABLE, "unreachable")
+    assert w.tell(OWNER) == 0                          # it waits for the quarter hour
+    quarter(clock)
     assert w.tell(OWNER) == 1
     text = sent(ledger)[0]["text"]
     assert "No email has been read since 4:53 PM today: couldn't reach Gmail." in text
@@ -322,6 +335,7 @@ def test_probe_a_pause_or_a_clock_jump_alone_never_tells(ledger, clock):
     w = watch(ledger)
     assert w.tell(OWNER) == 0
     ledger.input_failed("mail", UNREACHABLE, "unreachable")     # still failing when tried again
+    quarter(clock)
     assert w.tell(OWNER) == 1
 
 
@@ -350,7 +364,7 @@ def test_a_refusal_later_in_the_same_outage_is_still_told(ledger, clock):
     assert "Harness keeps trying" in first and "Create new key" in second
 
 
-def test_what_is_unreachable_together_is_one_message(ledger, clock):
+def test_what_is_unreachable_together_is_one_message_each_on_its_line(ledger, clock):
     w = watch(ledger)
     said = {"mail": UNREACHABLE, "family": "couldn't reach iCloud", "google": "couldn't reach Google"}
     claude = "Claude turned the request down (key or billing)"
@@ -362,16 +376,18 @@ def test_what_is_unreachable_together_is_one_message(ledger, clock):
         ledger.input_failed(name, words, "unreachable")
     assert w.tell(OWNER) == 1
     [row] = sent(ledger)
-    assert row["text"].startswith("<b>Harness can't reach a few things it uses</b>\n")
-    for words in said.values():
-        assert words in row["text"]
+    lines = row["text"].split("\n")
+    assert lines[0] == "<b>Harness can't reach a few things it uses</b>"
+    assert [line.split(" since ")[0] for line in lines[1:4]] == [
+        "• No email has been read", "• The Family calendar hasn't been read or changed",
+        "• Harness hasn't been able to change your Gmail calendar"]
+    assert lines[-1] == inputs.KEEPS_TRYING and lines.count(inputs.KEEPS_TRYING) == 1
     assert {r["told_outbox"] for r in ledger.inputs().values() if r["name"] != "meaning"} == {row["id"]}
-    ledger.input_ok("mail")                            # one back, the others still down: it still goes
-    assert ledger.outbox_row(row["id"])["state"] == "queued"
+    readable(row["text"])
     clock.advance(minutes=5)
     ledger.input_failed("meaning", claude, "engine")   # due now, five minutes after that message
     assert w.tell(OWNER) == 0                          # anything else waits for the quarter hour
-    clock.advance(minutes=10)
+    quarter(clock)
     assert w.tell(OWNER) == 1
 
 
@@ -387,8 +403,8 @@ def test_a_message_still_waiting_when_it_works_again_is_dropped(ledger, clock):
 
 @pytest.mark.parametrize("name, words, kind, says", [
     ("meaning", "Claude turned the request down (key or billing)", "engine",
-     "If it goes on, check Claude's billing at https://platform.claude.com/settings/billing and the "
-     "Anthropic API key on the Harness page."),
+     "Harness keeps trying. If it goes on, check Claude's billing at https://platform.claude.com/settings/billing . "
+     "If that's fine, paste a new Anthropic API key on the Harness page (Settings > Apps > Harness > Open Web UI)."),
     ("meaning", "this month's limit for sorting Family events is used up", "limit",
      "It picks up again when the monthly limit resets."),
 ])
@@ -415,11 +431,11 @@ def test_a_calendar_address_is_told_by_its_name_or_as_one_of_his(ledger, clock):
     for name in ("calendar:abcd", "calendar:ef01"):
         ledger.input_failed(name, "Google answered with an error")
     w = inputs.Watch(ledger, tz=TZ, feeds=lambda: [("calendar:abcd", "owner@example.com"), ("calendar:ef01", "")])
-    assert w.tell(OWNER) == 2
-    first, second = (r["text"] for r in sent(ledger))
-    assert first.startswith("<b>Harness can't read one of your calendars</b>\nThe calendar owner@example[.]com "
-                            "hasn't been read since 9:00 AM today: Google answered with an error.")
-    assert "\nOne of your calendars hasn't been read since 9:00 AM today" in second
+    assert w.tell(OWNER) == 1                          # due together: one message
+    text = sent(ledger)[0]["text"]
+    assert text.startswith("<b>A few things Harness uses have stopped working</b>\n• The calendar "
+                           "owner@example[.]com hasn't been read since 9:00 AM today: Google answered with an error.")
+    assert "\n• One of your calendars hasn't been read since 9:00 AM today" in text
 
 
 def test_probe_a_calendar_keeps_its_name_after_midnight_and_a_restart(ledger, clock):
@@ -640,7 +656,11 @@ def test_probe_gmail_wanting_a_sign_in_on_the_web_is_told_like_a_refusal(g):
         g.clock.advance(minutes=5)
     text = sent(g.ledger)[-1]["text"]
     assert ": Gmail asked for a sign-in on the web first." in text and "Changing your Google" not in text
-    assert "https://myaccount.google.com/apppasswords" in text
+    assert ("To fix it from your phone: sign in to Gmail in your browser once at https://mail.google.com . If "
+            "it's still not working in an hour, make a new app password named Harness at "
+            "https://myaccount.google.com/apppasswords and copy it. In Home Assistant open Settings > Apps > "
+            "Harness > Open Web UI.") in text
+    assert g.ledger.inputs()["mail"]["kind"] == "web"
 
 
 # -- the way it reaches him ----------------------------------------------------------------------------
@@ -703,13 +723,13 @@ class Link:
 def test_on_discord_it_goes_out_at_once_with_no_buttons_and_its_links_whole():
     link = Link()
     discord_chat.LinkChat(link).send_message(
-        OWNER, "<b>Harness can't read your email</b>\nOpen https://example.com/app-pass_words/x_y-z and "
-               "make one-named_thing. Then https://example.com/a-b.", kind=inputs.KIND)
+        OWNER, "<b>Harness can't read your email</b>\nOpen https://myaccount.google.com/app-pass_words/x_y-z "
+               "and make one-named_thing. Then https://calendar.google.com/a-b.", kind=inputs.KIND)
     [(text, rows, kind)] = link.cards
     assert kind == "alert" and rows == []              # the link posts an alert at once; no Stop
     assert text.startswith("**Harness can't read your email**")
-    assert "https://example.com/app-pass_words/x_y-z and" in text          # the link whole
-    assert "one\\-named\\_thing" in text and "https://example.com/a-b." in text
+    assert "https://myaccount.google.com/app-pass_words/x_y-z and" in text          # the link whole
+    assert "one\\-named\\_thing" in text and "https://calendar.google.com/a-b." in text
 
 
 def test_the_built_app_watches_mail_once_its_password_is_in(tmp_path, monkeypatch):
@@ -765,3 +785,233 @@ def test_what_he_was_told_before_it_last_worked_doesnt_count(ledger, clock):
     ledger.db.execute("UPDATE inputs SET last_success_at=? WHERE name='mail'", (iso(clock()),))   # 0.21.0's
     refused(ledger, clock)
     assert w.tell(OWNER) == 1 and len(sent(ledger)) == 2
+
+
+# -- the second review (Nov 11): its probes, each a test ----------------------------------------------
+
+def test_probe_working_again_follows_a_new_key_approved_on_its_card(on):
+    """Probe N1: approving a new key cleared what he'd been told, so the digest never said it worked."""
+    w = on.c.inputs = inputs.Watch(on.ledger, inputs.Seen(), tz=TZ, active={inputs.MAIL: lambda: True})
+    last_good(on.ledger, on.clock)
+    refused(on.ledger, on.clock)
+    on.ledger.set_meta("digest_date", daily.local_date(on.clock(), TZ))     # today's digest already went
+    on.ledger.set_meta("canary_date", daily.local_date(on.clock(), TZ))
+    on.tick()
+    assert on.ledger.db.execute("SELECT state FROM outbox WHERE kind='input'").fetchone()["state"] == "sent"
+    change = on.vault.request_change("gmail_app_password", "abcd efgh ijkl mnop", by="Owner")
+    assert on.c._settings_decision(change, "approve").startswith("Done.")
+    on.clock.advance(minutes=5)
+    on.ledger.input_ok("mail")                         # the new password works
+    on.clock.advance(hours=14)                         # the next morning's digest
+    d = daily.gather(on.ledger, Config(owner_user_id=OWNER), paused=False, watch=w)
+    assert "Working again: Email from Gmail since 5:08 PM yesterday." in d.text
+
+
+def test_probe_a_home_internet_outage_is_one_message(ledger, clock):
+    """Probe N2: seven hours of an outage at real cadences made four messages, one per address."""
+    clock.t = datetime(2026, 11, 10, 15, 0, tzinfo=timezone.utc)
+    for n in ("mail", "google", "family", "calendar:f1", "calendar:f2"):
+        ledger.input_ok(n)
+    w = inputs.Watch(ledger, tz=TZ, active={n: (lambda: True) for n in ("mail", "google", "family")},
+                     feeds=lambda: [("calendar:f1", "Work"), ("calendar:f2", "School")])
+    start, told = clock(), 0
+    for m in range(1, 8 * 60 + 1):
+        clock.t = start + timedelta(minutes=m)
+        if m % 5 == 0:
+            ledger.input_failed("mail", UNREACHABLE, "unreachable")
+        if m % 30 == 3:
+            ledger.input_failed("google", "couldn't reach Google", "unreachable")
+        if m % 30 == 7:
+            ledger.input_failed("family", "couldn't reach iCloud", "unreachable")
+        for feed, at in (("calendar:f1", 10), ("calendar:f2", 12)):
+            if m % 30 == at:                           # as calendar_feed now says it: no answer
+                ledger.input_failed(feed, "couldn't reach Google", "unreachable")
+        told += w.tell(OWNER)
+    assert told == 1
+    text = sent(ledger)[0]["text"]
+    assert text.count("\n• ") == 5 and "The calendar Work hasn't been read" in text
+
+
+@pytest.mark.parametrize("reply, kind", [
+    (TransportError("timeout"), "unreachable"), ((503, b""), "unreachable"), ((429, b""), "unreachable"),
+    ((404, b"Not Found"), "error"), ((200, b"<html>sign in</html>"), "error")])
+def test_a_calendar_address_says_what_kind_of_failure_it_was(reply, kind):
+    day = datetime(2026, 10, 21, 4, 0, tzinfo=timezone.utc)
+    r = fetch_one(FakeTransport([reply]), U1, start=day, end=day + DAY, tz=TZ)
+    assert not r.ok and r.kind == kind
+
+
+def test_probe_a_refusal_never_waits_for_the_quarter_hour(ledger, clock):
+    """Probe N3."""
+    w = watch(ledger)
+    ledger.input_failed("family", "couldn't reach iCloud", "unreachable")
+    clock.advance(hours=6)
+    ledger.input_failed("family", "couldn't reach iCloud", "unreachable")
+    assert w.tell(OWNER) == 1
+    refused(ledger, clock)                             # two refusals, inside the same quarter hour
+    assert w.tell(OWNER) == 1
+
+
+def test_probe_a_named_outage_still_drops_its_waiting_message(ledger, clock):
+    """Probe N4: the drop was skipped when a digest had named the outage; it went out after it worked."""
+    config = Config(owner_user_id=OWNER)
+    last_good(ledger, clock)
+    refused(ledger, clock)
+    w = watch(ledger)
+    w.tell(OWNER)                                      # waiting: say Cain's link is down
+    d = daily.gather(ledger, config, paused=False, watch=w)
+    daily.deliver(ledger, config, d)
+    w.digest_sent(d.named)
+    ledger.input_ok("mail")
+    assert [r["state"] for r in sent(ledger) if r["kind"] == "input"] == ["dropped"]
+    clock.advance(days=1)
+    assert "Working again: Email from Gmail" in daily.gather(ledger, config, paused=False, watch=w).text
+
+
+def test_probe_a_waiting_message_is_said_again_without_what_came_back(ledger, clock):
+    """Probe N5: mail came back while one message for two waited; it went out saying mail was down."""
+    w = watch(ledger)
+    for n in ("mail", "google"):
+        ledger.input_failed(n, "couldn't reach it", "unreachable")
+    clock.advance(hours=6)
+    for n in ("mail", "google"):
+        ledger.input_failed(n, "couldn't reach it", "unreachable")
+    assert w.tell(OWNER) == 1                          # one message, waiting
+    ledger.input_ok("mail")                            # mail back while it waits
+    w.tell(OWNER)                                      # the next tick says it again
+    [row] = sent(ledger)
+    assert row["state"] == "queued" and "No email" not in row["text"]
+    assert row["text"].startswith("<b>Harness can't change your Gmail calendar</b>\n")
+    flushed(ledger)
+    clock.advance(hours=1)
+    ledger.input_ok("google")
+    assert w.back_line() == "Working again: Gmail calendar through Google since 4:00 PM today."
+
+
+def test_a_message_already_tried_is_never_dropped_and_working_again_follows(ledger, clock):
+    w = watch(ledger)
+    refused(ledger, clock)
+    w.tell(OWNER)
+    ledger.db.execute("UPDATE outbox SET attempts=1")  # tried: it may have reached him
+    ledger.input_ok("mail")
+    assert sent(ledger)[0]["state"] == "queued"
+    assert w.back_line().startswith("Working again: Email from Gmail since")
+
+
+def test_probe_a_blip_after_a_new_key_isnt_told_at_once(ledger, clock):
+    """Probe N6: the outage's clock stayed old after a new key, so one blip was told at once."""
+    last_good(ledger, clock)
+    refused(ledger, clock)
+    w = watch(ledger)
+    w.tell(OWNER)
+    clock.advance(days=2)
+    refused(ledger, clock, 1)                          # still refused two days on
+    w.key_changed("gmail_app_password")
+    row = ledger.inputs()["mail"]
+    assert (row["failures"], row["refusals"], row["failing_since"]) == (0, 0, iso(clock()))
+    clock.advance(minutes=5)
+    ledger.input_failed("mail", "Gmail answered with an error", "error")    # one blip on the new key
+    quarter(clock)
+    assert w.tell(OWNER) == 0 and len(sent(ledger)) == 1
+    assert "Email from Gmail" not in "\n".join(w.digest_lines()[0])
+
+
+def test_several_refusals_in_one_look_count_as_one(ledger):
+    """Review N7, kept on purpose: a run's calls are one look, and a second look confirms it."""
+    seen = inputs.Seen()
+    w = inputs.Watch(ledger, seen, tz=TZ, active={"family": lambda: True})
+    for _ in range(4):
+        seen("family", "refused", "iCloud refused the app-specific password")
+    w.drain()
+    assert ledger.inputs()["family"]["refusals"] == 1 and w.tell(OWNER) == 0
+
+
+def test_the_migration_is_all_or_nothing(tmp_path, clock, monkeypatch):
+    """Review N8: confirmed."""
+    path = str(tmp_path / "harness.sqlite")
+    Ledger(path, clock=clock).close()
+    db = sqlite3.connect(path)
+    db.execute("ALTER TABLE inputs RENAME TO inputs_new")
+    db.execute("CREATE TABLE inputs(name TEXT PRIMARY KEY, last_success_at TEXT, last_error_at TEXT,"
+               " last_error TEXT)")
+    db.execute("DROP TABLE inputs_new")
+    db.commit()
+    db.close()
+
+    class Flaky(sqlite3.Connection):
+        def execute(self, sql, *a):
+            if sql.startswith("ALTER TABLE inputs ADD COLUMN told_at"):
+                raise sqlite3.OperationalError("boom")
+            return super().execute(sql, *a)
+    real = sqlite3.connect
+    monkeypatch.setattr(sqlite3, "connect", lambda p, **k: real(p, factory=Flaky, **k))
+    with pytest.raises(sqlite3.OperationalError):
+        Ledger(path, clock=clock)
+    monkeypatch.setattr(sqlite3, "connect", real)
+    cols = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(inputs)")}
+    assert cols == {"name", "last_success_at", "last_error_at", "last_error"}
+
+
+def test_probe_a_calendar_named_with_a_link_stays_escaped():
+    """Probe N9: only the steps' own links are kept whole; a calendar's own name never makes one."""
+    now = datetime(2026, 10, 21, 11, 0, tzinfo=timezone.utc)
+    feed = digest.InputCoverage("Calendar Pay at https://evil.example/pay_now-x", now - timedelta(hours=3),
+                                timedelta(hours=2), "couldn't reach Google")
+    d = digest.compose(now=now, tz=TZ, inputs=[feed], waiting=[], failures=[], low_balance=[],
+                       canary_ok=True, config_unchanged_since=now)
+    md = discord_chat.to_markdown(d.text)
+    assert "https://evil.example/pay\\_now\\-x" in md and "https://evil.example/pay_now-x" not in md
+    for url in ("https://myaccount.google.com/apppasswords", "https://mail.google.com",
+                "https://platform.claude.com/settings/billing", "https://console.cloud.google.com",
+                "https://account.apple.com", "https://calendar.google.com/x_y-z"):
+        assert url in discord_chat.to_markdown(f"at {url} now")
+    assert "evil" not in discord_chat.to_markdown("https://myaccount.google.com@evil.example/a_b").split("\\")[0][-5:]
+
+
+def test_probe_a_late_tap_on_an_expired_key_change_says_it_expired(on):
+    """Probe N10."""
+    change = on.vault.request_change("gmail_app_password", "abcd efgh ijkl mnop", by="Owner")
+    on.clock.advance(minutes=16)
+    assert on.c._settings_decision(change, "approve") == "That request expired. Nothing changed."
+
+
+class Limits(FakeGoogle):
+    """Google, out of today's quota: a 403 that only means slow down."""
+
+    def request(self, method, url, **kw):
+        if url == google_cal.TOKEN_URL:
+            return super().request(method, url, **kw)
+        return HttpResponse(403, {}, b'{"error": {"errors": [{"reason": "dailyLimitExceeded"}]}}')
+
+
+def test_a_403_over_a_limit_is_busy_not_a_calendar_not_shared(clock):
+    seen = inputs.Seen()
+    client = google_cal.GoogleCalendar(Limits(), lambda: KEY, clock, seen=seen)
+    client.mine = lambda: GMAIL
+    assert client.events_between(GMAIL, clock(), clock() + DAY) is None
+    assert seen.take() == {"google": ("unreachable", "Google isn't answering right now")}
+
+
+def test_the_clock_reason_has_its_own_words_and_steps(ledger, clock):
+    words = google_cal._turned_down(HttpResponse(400, {}, b'{"error": "invalid_grant", "error_description": '
+                                                 b'"Token must be a short-lived token (60 minutes) and in a '
+                                                 b'reasonable timeframe"}'))
+    assert words == ("clock", "Google turned the sign-in down, likely because the Pi's clock is off")
+    ledger.input_failed("google", words[1], words[0])
+    clock.advance(hours=6)
+    ledger.input_failed("google", words[1], words[0])
+    assert watch(ledger).tell(OWNER) == 1
+    text = sent(ledger)[0]["text"]
+    assert ": Google turned the sign-in down, likely because the Pi's clock is off. Blocks" in text
+    assert text.endswith("Restarting the Pi usually sets its clock right: in Home Assistant open Settings > "
+                         "System, tap the power button at the top right, then Reboot system.")
+
+
+def test_the_sharing_label_is_the_same_everywhere():
+    import pathlib
+    from harness import family_gmail
+    docs = (pathlib.Path(family_gmail.__file__).parents[2] / "DOCS.md").read_text(encoding="utf-8")
+    code = pathlib.Path(family_gmail.__file__).read_text(encoding="utf-8")
+    assert "Make changes and see event details" in inputs.ADVICE[inputs.DENIED]
+    assert "Make changes and see event details" in docs and "see all event details" not in docs
+    assert "see all event" not in code

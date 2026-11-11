@@ -24,6 +24,7 @@ from __future__ import annotations
 import html
 import re
 from typing import Callable
+from urllib.parse import urlsplit
 
 from .cain_relay import CainLink, LinkError
 from .chat import ChatError
@@ -51,17 +52,21 @@ WORDS = (
 )
 
 _TAG = re.compile(r"<(/?)(b|i)>")
-# A link of the harness's own, kept whole so its - and _ survive (inputs.py: the steps he follows).
-# Text from anyone else reaches here defanged, its links without their scheme (render.defang), and
-# no ( ) [ ] can be part of one, so it can never become a masked link.
+# The hosts of the links in the steps he follows (inputs.py): those are kept whole, so their - and
+# _ survive. Any other link, a calendar's own name say, is escaped like the rest of the text, and
+# no ( ) [ ] can be part of one, so nothing becomes a masked link.
+OWN_HOSTS = frozenset({"myaccount.google.com", "account.apple.com", "calendar.google.com",
+                       "console.cloud.google.com", "platform.claude.com", "mail.google.com"})
 _URL = re.compile(r"https?://[A-Za-z0-9._~:/?#@!$&+,;=%-]+")
 
 
 def _text(text: str) -> str:
-    """Plain text, escaped so it can't format, but for the links in it."""
+    """Plain text, escaped so it can't format, but for the steps' own links in it."""
     out, pos = [], 0
     for m in _URL.finditer(text):
         url = m.group(0).rstrip(".,;:!?")
+        if (urlsplit(url).hostname or "").lower() not in OWN_HOSTS:
+            continue
         out.append(escape(text[pos:m.start()]))
         out.append(url)
         pos = m.start() + len(url)

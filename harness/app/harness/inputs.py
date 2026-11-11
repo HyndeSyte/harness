@@ -8,15 +8,19 @@ unlogged, and the digest named only the calendar feeds. Now:
   kind, and the outage, which runs from a failure to the next success, with how many failures and
   refusals were seen in it.
 - What only he can fix (Gmail's app password, Family's app-specific password or the Google service
-  key turned down, or his calendar not shared with Harness) is told at once from its second in an
-  outage, so a stray refusal with a success after it never makes him replace a working password.
-  He's told once an outage, with the fix he can do from his phone; a new key starts that over.
-- Anything else is told once an outage, when a failure is seen six hours or more after the first:
-  a pause, a stop or a clock jump alone never does it. What's due together goes as one message,
-  and anything else is looked at every 15 minutes, so a home internet outage is one message.
+  key turned down, Gmail wanting a sign-in on the web, or his calendar not shared with Harness) is
+  told at once from its second in an outage, so a stray refusal with a success after it never makes
+  him replace a working password. He's told once an outage, with the fix he can do from his phone;
+  a new key starts that over, its clock and counts too.
+- Anything else is told once a failure is seen six hours or more after the first: a pause, a stop
+  or a clock jump alone never does it. It's looked at on the quarter hour (:00, :15, :30, :45), and
+  everything due then goes in one message, with whatever else can't be reached too: a home internet
+  outage is one message.
+- A message still waiting to go, never tried, says only what's still down: it's said again without
+  what came back, and dropped once nothing it tells of is down.
 - The morning digest names an input that has failed for an hour or twice, or that he was told
   about, and one line says which of the ones he knew about came back since the last digest. No
-  separate "it's back"; a message still waiting to go when its outage ends is dropped.
+  separate "it's back".
 
 A message has no buttons, since there's nothing to decide. It goes out at once through Cain's link,
 like his other alerts (the "input" kind, discord_chat.py), and says times as he reads them, never
@@ -27,9 +31,9 @@ through `Seen`, and the controller writes it down on its own thread (`Watch.drai
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
@@ -41,10 +45,10 @@ log = logging.getLogger("harness.inputs")
 
 MAIL, FAMILY, GOOGLE, MEANING = "mail", "family", "google", "meaning"
 FEED = "calendar:"                    # one per calendar address: calendar:<feed id>
-OK, REFUSED, DENIED, UNREACHABLE = "ok", "refused", "denied", "unreachable"
+OK, REFUSED, WEB, DENIED, UNREACHABLE = "ok", "refused", "web", "denied", "unreachable"
 AFTER = timedelta(hours=6)            # anything else: told once a failure is seen this long after the first
 NAMED_AFTER = timedelta(hours=1)      # the digest names one failing this long, or failed twice
-OTHER_EVERY = timedelta(minutes=15)   # anything else is looked at this often, and what's due goes as one
+QUARTER = 15                          # anything else is looked at on the quarter hour, in minutes
 KIND = "input"                        # its outbox kind: straight out, no buttons (discord_chat.py)
 # The vault's keys and the input each is for: a new one starts what he was told over.
 KEYS = {"gmail_app_password": MAIL, "family_apple_id": FAMILY, "family_app_password": FAMILY,
@@ -54,6 +58,7 @@ KEYS = {"gmail_app_password": MAIL, "family_apple_id": FAMILY, "family_app_passw
 TAIL = (' In Home Assistant open Settings > Apps > Harness > Open Web UI. Under "Replace a key", paste '
         'it into "{field}" and save. Then tap Approve on the Discord message that follows, within 15 '
         'minutes.')
+GMAIL_TAIL = TAIL.format(field="Gmail mail: app password")
 
 
 @dataclass(frozen=True)
@@ -71,8 +76,7 @@ SPECS = {
         "Harness can't read your email", "No email has been read",
         "Dates and addresses from your email aren't being added.", "Email from Gmail",
         fix="To fix it from your phone: make a new app password at "
-            "https://myaccount.google.com/apppasswords and name it Harness, then copy it."
-            + TAIL.format(field="Gmail mail: app password"),
+            "https://myaccount.google.com/apppasswords and name it Harness, then copy it." + GMAIL_TAIL,
         cause="Changing your Google password turns it off."),
     FAMILY: Spec(
         "Harness can't reach the Family calendar", "The Family calendar hasn't been read or changed",
@@ -81,7 +85,7 @@ SPECS = {
         fix="To fix it from your phone: at https://account.apple.com open Sign-In and Security, then "
             "App-Specific Passwords, make one named Harness and copy it."
             + TAIL.format(field="Family calendar: app-specific password"),
-        cause="Changing your Apple Account password turns these off."),
+        cause="Changing your Apple Account password turns it off."),
     GOOGLE: Spec(
         "Harness can't change your Gmail calendar",
         "Harness hasn't been able to change your Gmail calendar",
@@ -100,14 +104,20 @@ FEED_SPEC = Spec("Harness can't read one of your calendars", "The calendar {labe
                  "Its events may be out of date in the digest, and in copies and blocks made from it.",
                  "Calendar {label}")
 UNNAMED = "One of your calendars"     # a calendar address not read under its own name yet
-# What he can do about a failure that isn't a refused key, by its kind.
+# What he can do, by the failure's kind, where it isn't a refused key (Spec.fix).
 ADVICE = {
-    "engine": "Harness keeps trying. If it goes on, check Claude's billing at "
-              "https://platform.claude.com/settings/billing and the Anthropic API key on the Harness page.",
-    "limit": "It picks up again when the monthly limit resets.",
+    WEB: "To fix it from your phone: sign in to Gmail in your browser once at https://mail.google.com . "
+         "If it's still not working in an hour, make a new app password named Harness at "
+         "https://myaccount.google.com/apppasswords and copy it." + GMAIL_TAIL,
     DENIED: "To fix it: open https://calendar.google.com in your phone's browser and switch to the "
             "desktop site. Open Settings, pick your calendar, then Shared with, Add people and groups. "
             "Add {account} and choose Make changes and see event details.",
+    "engine": "Harness keeps trying. If it goes on, check Claude's billing at "
+              "https://platform.claude.com/settings/billing . If that's fine, paste a new Anthropic API "
+              "key on the Harness page (Settings > Apps > Harness > Open Web UI).",
+    "limit": "It picks up again when the monthly limit resets.",
+    "clock": "Restarting the Pi usually sets its clock right: in Home Assistant open Settings > System, "
+             "tap the power button at the top right, then Reboot system.",
 }
 KEEPS_TRYING = "Harness keeps trying, and the morning digest will say when it works again."
 
@@ -124,13 +134,14 @@ def seen_for(row) -> timedelta:
 
 
 def worth_naming(row) -> bool:
-    """For the digest: down, and not a single blip: failed twice or for an hour, or he was told."""
+    """Down, and not a single blip: failed twice or for an hour, or he was told."""
     return down(row) and (told(row) or row["failures"] >= 2 or seen_for(row) >= NAMED_AFTER)
 
 
 class Seen:
     """What the clients saw, from any thread: the last answer for each input, until the
-    controller writes it down on its own (Watch.drain). A client with none says nothing."""
+    controller writes it down on its own (Watch.drain). A client with none says nothing.
+    Several answers between two ticks count as one: a run's calls are one look."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -162,7 +173,7 @@ class Watch:
         self.active = active or {}
         self.feeds = feeds
         self.account = account
-        self._other_at: datetime | None = None    # when anything else was last told
+        self._quarter: datetime | None = None      # the quarter hour anything else was last looked at
 
     def drain(self) -> None:
         for name, (kind, words) in (self.seen.take() if self.seen is not None else {}).items():
@@ -193,57 +204,99 @@ class Watch:
         return [(r, watched[r["name"]]) for r in rows if r["name"] in watched]
 
     def key_changed(self, field: str) -> None:
-        """A new key for an input: what he was told about the old one no longer counts, so a
-        refusal of the new one is told again, from its second. A message about the old one still
-        waiting to go is dropped, unless it tells of something else still down."""
+        """A new key for an input: what he was told about the old one no longer counts, so a refusal
+        of the new one is told again from its second, and the outage's clock and counts start over,
+        so one blip of the new key isn't told at once. That he knew stays known (`named`), so the
+        digest still says when it works again. A message about the old key still waiting to go, never
+        tried, is dropped, unless it tells of something else still down."""
         name = KEYS.get(field)
         if name is None:
             return
+        now = iso(self.ledger.now())
         with self.ledger.tx() as db:
             row = db.execute("SELECT * FROM inputs WHERE name=?", (name,)).fetchone()
-            if row is None:
+            if row is None or row["failing_since"] is None:
                 return
-            if row["told_outbox"] and db.execute(
-                    "SELECT 1 FROM inputs WHERE told_outbox=? AND name<>? AND failing_since IS NOT NULL",
-                    (row["told_outbox"], name)).fetchone() is None:
-                db.execute("UPDATE outbox SET state='dropped' WHERE id=? AND state='queued'",
-                           (row["told_outbox"],))
-            db.execute("UPDATE inputs SET refusals=0, told_at=NULL, told_kind='', told_outbox=NULL"
-                       " WHERE name=?", (name,))
-        log.info("input %s: a new key, so a refusal is told again", name)
+            knew = bool(row["named"])
+            if told(row):
+                box = db.execute("SELECT state, attempts FROM outbox WHERE id=?",
+                                 (row["told_outbox"],)).fetchone() if row["told_outbox"] else None
+                waiting = box is not None and box["state"] == "queued" and not box["attempts"]
+                knew = knew or not waiting
+                if waiting and db.execute(
+                        "SELECT 1 FROM inputs WHERE told_outbox=? AND name<>? AND failing_since IS NOT NULL",
+                        (row["told_outbox"], name)).fetchone() is None:
+                    db.execute("UPDATE outbox SET state='dropped' WHERE id=?", (row["told_outbox"],))
+            db.execute("UPDATE inputs SET failing_since=?, failures=0, refusals=0, told_at=NULL,"
+                       " told_kind='', told_outbox=NULL, named=? WHERE name=?",
+                       (now, 1 if knew else 0, name))
+        log.info("input %s: a new key, so its outage starts over", name)
 
     def tell(self, chat_id: int) -> int:
         """Each outage he hasn't heard about, once. What only he can fix: from its second in the
-        outage. Anything else: once a failure is seen six hours after the first, looked at every
-        15 minutes, with every unreachable one due then in one message. Returns how many went."""
+        outage, at once. Anything else: on the quarter hour, once a failure is seen six hours after
+        the first, all in one message with everything else that can't be reached. Then each message
+        still waiting is said again for what's down now (refresh). Returns how many went."""
         now = self.ledger.now()
         sent = 0
-        other: list[tuple[sqlite3.Row, str]] = []
-        for row, label in self._down():
-            kinds = set(row["told_kind"].split(",")) - {""} if told(row) else set()
+        rows = self._down()
+        due = []
+        for row, label in rows:
+            kinds = self._told(row)
             if row["kind"] in NEEDS_HIM:
                 if row["refusals"] >= 2 and row["kind"] not in kinds:
                     self._send(chat_id, [(row, label)], row["kind"], now)
                     sent += 1
             elif not kinds and seen_for(row) >= AFTER:
-                other.append((row, label))
-        if other and (self._other_at is None or now - self._other_at >= OTHER_EVERY):
-            self._other_at = now
-            gone = [x for x in other if x[0]["kind"] == UNREACHABLE]
-            for group in ([gone] if gone else []) + [[x] for x in other if x[0]["kind"] != UNREACHABLE]:
-                self._send(chat_id, group, "other", now)
+                due.append((row, label))
+        quarter = now.replace(minute=now.minute - now.minute % QUARTER, second=0, microsecond=0)
+        if quarter != self._quarter:
+            self._quarter = quarter
+            if due:
+                names = {r["name"] for r, _ in due}
+                # Whatever else can't be reached, failing a while now too: the same outage, told with it.
+                due += [(r, label) for r, label in rows if r["name"] not in names
+                        and r["kind"] == UNREACHABLE and not self._told(r) and worth_naming(r)]
+                self._send(chat_id, due, "other", now)
                 sent += 1
+        self.refresh(now)                  # after: a message that just took one over lets it go
         return sent
+
+    @staticmethod
+    def _told(row) -> set[str]:
+        return set(row["told_kind"].split(",")) - {""} if told(row) else set()
 
     def _send(self, chat_id: int, group: list[tuple[sqlite3.Row, str]], what: str, now: datetime) -> None:
         with self.ledger.tx() as db:
             box = self.ledger.enqueue(chat_id=chat_id, kind=KIND, text=self.message(group, now), db=db)
             for row, _ in group:
-                kinds = ",".join(sorted((set(row["told_kind"].split(",")) if told(row) else set())
-                                        - {""} | {what}))
+                kinds = ",".join(sorted(self._told(row) | {what}))
                 db.execute("UPDATE inputs SET told_at=?, told_kind=?, told_outbox=? WHERE name=?",
                            (iso(now), kinds, box, row["name"]))
         log.info("input %s: told him it stopped (%s)", ", ".join(r["name"] for r, _ in group), what)
+
+    def refresh(self, now: datetime) -> None:
+        """Each message still waiting to go, never tried, says only what is still down: said again
+        without what came back, and dropped once nothing it tells of is down."""
+        waiting = self.ledger.db.execute("SELECT id, text FROM outbox WHERE kind=? AND state='queued'"
+                                         " AND attempts=0", (KIND,)).fetchall()
+        if not waiting:
+            return
+        rows = self.ledger.inputs()
+        labels = self.watched()
+        for box in waiting:
+            group = [(r, labels.get(r["name"], "")) for r in rows.values()
+                     if r["told_outbox"] == box["id"] and down(r) and told(r)]
+            if not group:
+                with self.ledger.tx() as db:
+                    db.execute("UPDATE outbox SET state='dropped' WHERE id=? AND state='queued'"
+                               " AND attempts=0", (box["id"],))
+                continue
+            text = self.message(group, now)
+            if text != box["text"]:
+                with self.ledger.tx() as db:
+                    db.execute("UPDATE outbox SET text=? WHERE id=? AND state='queued' AND attempts=0",
+                               (text, box["id"]))
 
     # -- what he reads ---------------------------------------------------------------------
     def _spec(self, name: str) -> Spec:
@@ -277,11 +330,13 @@ class Watch:
     def message(self, group: list[tuple[sqlite3.Row, str]], now: datetime) -> str:
         if len(group) == 1:
             row, label = group[0]
-            title, advice = self._spec(row["name"]).title, self._advice(row)
-        else:
-            title, advice = "Harness can't reach a few things it uses", KEEPS_TRYING
-        body = "\n".join(self._line(row, label, now) for row, label in group)
-        return render.no_dashes(f"<b>{title}</b>\n{body}\n\n{advice}")
+            return render.no_dashes(f"<b>{self._spec(row['name']).title}</b>\n{self._line(row, label, now)}"
+                                    f"\n\n{self._advice(row)}")
+        title = ("Harness can't reach a few things it uses" if all(r["kind"] == UNREACHABLE for r, _ in group)
+                 else "A few things Harness uses have stopped working")
+        advice = list(dict.fromkeys(self._advice(row) for row, _ in group))
+        body = "\n".join(f"• {self._line(row, label, now)}" for row, label in group)
+        return render.no_dashes(f"<b>{title}</b>\n{body}\n\n" + "\n".join(advice))
 
     # -- the morning digest ------------------------------------------------------------------
     def digest_lines(self) -> tuple[list[str], list[str]]:

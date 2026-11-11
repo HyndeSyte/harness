@@ -69,15 +69,17 @@ each watched, and the sorting of Family events too while it decides your blocks 
 Something is down from the time it fails until the next time it works.
 
 - **What only you can fix**: Gmail's app password, Family's app-specific password or the Google
-  service account key turned down, or your Gmail calendar no longer shared with Harness. One
-  message as soon as a second try confirms it, saying what stopped, since when, what it costs you,
-  and the steps from your phone. They end on the Harness page (Settings > Apps > Harness > Open Web
-  UI, under "Replace a key") and a tap on Approve on the Discord message that follows, within 15
-  minutes. A new key that's turned down too is told again.
-- **Anything else**: Gmail, iCloud or Google not answering, or Claude turning Harness's requests
-  down. One message once it has kept failing for six hours. Whatever is down then comes in one
-  message, and a message that hasn't gone out when it works again is dropped.
-- Each comes once, until it works again, through Cain's link, with no buttons, and not while stopped.
+  service account key turned down, Gmail wanting you to sign in on the web, or your Gmail calendar
+  no longer shared with Harness. One message as soon as a second try confirms it, saying what
+  stopped, since when, what it costs you, and the steps from your phone. They end on the Harness
+  page (Settings > Apps > Harness > Open Web UI, under "Replace a key") and a tap on Approve on the
+  Discord message that follows, within 15 minutes. If a new key is turned down too, you hear again.
+- **Anything else**: Gmail, iCloud or Google not answering, Claude turning Harness's requests down,
+  or the Pi's clock being off. One message once it has kept failing for six hours, sent on the
+  quarter hour with everything else that's down then, so a home internet outage is one message.
+  A message that hasn't gone out yet only says what's still down, and is dropped if everything in
+  it works again.
+- Each comes once per outage, with no buttons. None are sent while Harness is stopped.
 - **The morning digest** names each one that's down once it has failed twice or for an hour, or
   you were told, and says in one line which came back since the last digest. There's no separate
   "it's back" message.
@@ -320,7 +322,7 @@ To turn this on, once, about 10 minutes:
    **Google Calendar API**, make a **service account**, and add a **JSON key** to it. It downloads a
    file. This is free.
 2. In Google Calendar, open your calendar's settings, **Share with specific people**, add the service
-   account's address, and pick **Make changes and see all event details**. The blocks are marked
+   account's address, and pick **Make changes and see event details**. The blocks are marked
    private, and the option above it may hide them from the account that wrote them.
 3. On this add-on's page, paste the whole file into the Gmail calendar key box. Tap to approve it on
    its card, as with any key.

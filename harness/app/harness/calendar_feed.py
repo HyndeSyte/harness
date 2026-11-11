@@ -82,6 +82,7 @@ class FeedResult:
     ok: bool
     window: ical.Window | None = None
     error: str = ""
+    kind: str = "error"        # a failure's kind for the watch: "unreachable" for no answer (inputs.py)
     day: str = ""              # the local day the window describes
     # The same feed over the mirror's horizon (shadow mode), when asked for.
     ahead: ical.Window | None = None
@@ -104,9 +105,11 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
                                  timeout=TIMEOUT_S)
     except TransportError as e:
         log.info("calendar %s: no answer (%s)", fid[:4], e.kind)
-        return FeedResult(fid, False, error="couldn't reach Google")
+        return FeedResult(fid, False, error="couldn't reach Google", kind="unreachable")
     if resp.status != 200:
         log.info("calendar %s: Google answered %s", fid[:4], resp.status)
+    if resp.status >= 500 or resp.status in (408, 429):
+        return FeedResult(fid, False, error="Google isn't answering right now", kind="unreachable")
     if resp.status == 404:
         return FeedResult(fid, False, error="Google says this address doesn't exist "
                                            "(was it reset?)")
@@ -263,7 +266,7 @@ class CalendarFeeds:
                     fut.cancel()
                     del self._futures[fid]
                     if fid in live:
-                        self.ledger.input_failed(f"calendar:{fid}", "the read took too long")
+                        self.ledger.input_failed(f"calendar:{fid}", "the read took too long", "unreachable")
                 continue
             del self._futures[fid]
             self.generation += 1
@@ -285,7 +288,7 @@ class CalendarFeeds:
                     # A read that started yesterday describes yesterday.
                     self.snapshot.feeds[fid] = res
             else:
-                self.ledger.input_failed(f"calendar:{fid}", res.error)
+                self.ledger.input_failed(f"calendar:{fid}", res.error, res.kind)
                 prev = self.snapshot.feeds.get(fid)
                 if prev is not None:
                     # Today's agenda keeps the last good read; the mirror's

@@ -414,7 +414,7 @@ WORDS = {"refused": "Gmail refused the app password", "web": "Gmail asked for a 
          "unreachable": "couldn't reach Gmail", "error": "Gmail answered with an error",
          "unexpected": "the read stopped on an unexpected problem",
          "engine": "Claude turned the request down (key or billing)"}
-KIND = {"web": "refused", "unexpected": "error"}     # its kind for the watch, where it isn't its own
+KIND = {"unexpected": "error"}                       # its kind for the watch, where it isn't its own
 
 
 def failure(e: BaseException) -> str:

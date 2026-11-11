@@ -318,8 +318,8 @@ def _too_many(r) -> bool:
     """Google's 403 can mean slow down rather than no access. The reason is read, not shown."""
     try:
         errors = r.json()["error"]["errors"]
-        return any(str(e.get("reason", "")).endswith(("ateLimitExceeded", "quotaExceeded"))
-                   for e in errors)
+        return any(str(e.get("reason", "")).endswith(("LimitExceeded", "quotaExceeded"))
+                   for e in errors)                  # rateLimitExceeded, dailyLimitExceeded, ...
     except (ValueError, KeyError, TypeError, AttributeError):
         return False
 
@@ -339,7 +339,7 @@ def _turned_down(r) -> tuple[str, str]:
     if r.status not in (400, 401, 403) or error not in REFUSALS:
         return "error", "Google answered with an error"
     if any(w in described for w in ("timeframe", "short-lived", "iat and exp")):
-        return "error", "Google turned the sign-in down: the Pi's clock may be off"
+        return "clock", "Google turned the sign-in down, likely because the Pi's clock is off"
     return "refused", "Google refused the service account key"
 
 

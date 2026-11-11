@@ -104,7 +104,7 @@ def test_a_good_read():
 @pytest.mark.parametrize("reply,needle", [
     ((404, b"Not Found"), "reset"),
     ((403, b""), "refused"),
-    ((500, b""), "Google answered with an error"),
+    ((500, b""), "Google isn't answering right now"),
     ((200, b"<html>sign in</html>"), "wasn't a calendar"),
     (TransportError("timeout"), "couldn't reach Google"),
 ])
@@ -449,7 +449,7 @@ def test_a_feed_that_stopped_reading_goes_stale_after_two_hours(ledger, tmp_path
     r.c.tick()
     d = r.bot.texts()[-1]
     assert d.startswith("<b>Attention needed</b>")
-    assert "Calendar owner@example.com: not working since 4:30 AM today; Google answered with an error" in d
+    assert "Calendar owner@example.com: not working since 4:30 AM today; Google isn't answering right now" in d
 
 
 def test_a_dead_feed_is_tried_once_before_the_digest_not_hammered(ledger, tmp_path, clock):
