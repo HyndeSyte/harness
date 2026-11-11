@@ -1,24 +1,61 @@
 name: pr
 
-# The pull request's own check (RELEASING.md): its description follows the
-# template, and each App whose shipped files changed goes up exactly one version
-# step from main, with a CHANGELOG section for it. Runs again when the
+# The pull request's own check (RELEASING.md): the branch is up to date with
+# main, its description follows the template, each App whose shipped files
+# changed goes up exactly one version step from main with a CHANGELOG section
+# for it, and the required checks are left intact. Runs again when the
 # description is edited, so fixing the text fixes the check.
+#
+# pull_request_target, so this file and check_pr.py always come from main: a
+# pull request can't change the check it is judged by. The pull request's
+# commits are only fetched and read with git (diff, show, ls-tree); nothing
+# from them is checked out, imported, installed or run. The token is read-only.
+#
+# `pr` is a required check. Keep the job name fixed, and add no paths or
+# branches filters and no job-level `if`: a required check must always report.
+# check_pr.py fails a pull request that changes that.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened]
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   pr:
     runs-on: ubuntu-latest
     steps:
+      # The default ref for pull_request_target: main.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: python .github/scripts/check_pr.py
+      - run: python -m pip install --disable-pip-version-check "PyYAML==6.0.2"
+      # main as it is now (not the event's base.sha) and the pull request's head,
+      # as plain refs. The token goes in through the environment for this one
+      # command and is never written to the git config.
+      - name: Fetch main and the pull request head
+        env:
+          TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git fetch --no-tags origin \
+              "+refs/heads/main:refs/remotes/origin/main" \
+              "+refs/pull/$PR/head:refs/remotes/pr/head"
+      - name: Check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python -I .github/scripts/check_pr.py
+          --base origin/main --head refs/remotes/pr/head
+          --expect-head "$HEAD_SHA" --pr "$PR" --repo "$GITHUB_REPOSITORY"

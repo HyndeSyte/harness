@@ -1,5 +1,9 @@
 name: tests
 
+# `pytest` and `bun` are required checks on main (RELEASING.md). Keep the job
+# names fixed, and add no paths or branches filters and no job-level `if`: a
+# required check must run and report on every pull request. check_pr.py fails a
+# pull request that changes that.
 on:
   push:
   pull_request:
@@ -15,7 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install pytest
+      # PyYAML for tests/test_check_pr.py (the pr check parses YAML); the Apps don't use it.
+      - run: pip install pytest "PyYAML==6.0.2"
       - run: python -m pytest -q -p no:cacheprovider
 
   # Cain's tests. Same Bun as Cain's image (cain/Dockerfile BUN_VERSION).
