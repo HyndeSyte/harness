@@ -234,6 +234,39 @@ def test_cain_start_survives_bashio_errexit():
     assert "kill-session -t cain 2>/dev/null || true" in run
 
 
+def test_cain_session_starts_without_the_supervisor_token(tmp_path):
+    # Supervisor's token reaches /addons/self: this App's own options, owner_user_id
+    # included. Cain's session, and the plugins and MCP servers it configures, start
+    # without it. The root shell keeps it for bashio, which reads the options with it.
+    import os, shutil, subprocess
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    scrub = 'scrubbed() { env -u SUPERVISOR_TOKEN -u HASSIO_TOKEN "$@"; }'
+    assert scrub in run
+    code = [l.strip() for l in run.splitlines() if not l.strip().startswith("#")]
+    starts = [l for l in code if "new-session" in l or re.search(r"\bclaude (plugin|mcp) ", l)]
+    assert len(starts) == 5 and all(re.match(r"(if ! )?scrubbed ", l) for l in starts), starts
+    session = next(l for l in starts if "new-session" in l)
+    assert session.startswith("if ! scrubbed tmux -u new-session ")
+    assert "chmod 0700 /run/s6/container_environment" in run     # where with-contenv reads it
+    bash = shutil.which("bash")
+    if not bash:
+        import pytest
+        pytest.skip("no bash")
+    # The session's command line as shipped, run with a stand-in tmux that keeps its environment.
+    (tmp_path / "bin").mkdir()
+    fake = tmp_path / "bin" / "tmux"
+    fake.write_text('#!/bin/bash\nenv > "$SEEN"\n', newline="\n")
+    fake.chmod(0o755)
+    seen = tmp_path / "seen"
+    env = dict(os.environ, PATH=f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}", SEEN=seen.as_posix(),
+               SUPERVISOR_TOKEN="supervisor-secret", HASSIO_TOKEN="hassio-secret")
+    command = session[len("if ! "):].split(" 2>/tmp/tmux.err")[0]
+    subprocess.run([bash, "-c", f"{scrub}\n{command}"], env=env, check=True, timeout=20)
+    got = seen.read_text()
+    assert "SEEN=" in got                                         # the stand-in ran, with the rest kept
+    assert "SUPERVISOR_TOKEN" not in got and "HASSIO_TOKEN" not in got and "-secret" not in got
+
+
 def test_cain_signin_link_is_rejoined(tmp_path):
     import shutil, subprocess
     bash = shutil.which("bash")

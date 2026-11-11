@@ -5,18 +5,25 @@
 # the Claude sign-in, the Discord token and allowlist, the plugin, the work folder.
 # ==============================================================================
 export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
+# Supervisor gives every App a token (SUPERVISOR_TOKEN, and the older HASSIO_TOKEN)
+# that reaches /addons/self: this App's own options, owner_user_id included. This
+# root shell keeps it, for bashio, which reads the options through Supervisor.
+# Cain's session, and what it configures (Claude Code's plugins and MCP servers),
+# start without it. with-contenv reads it from container_environment: root only.
+scrubbed() { env -u SUPERVISOR_TOKEN -u HASSIO_TOKEN "$@"; }
+chmod 0700 /run/s6/container_environment 2>/dev/null || true
 mkdir -p /data/work
 # Cain's standing rules ship with the add-on, so an update always brings them.
 cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
 mkdir -p /data/work/.claude && cp /opt/cain/settings.json /data/work/.claude/settings.json
-if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
+if ! scrubbed claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
   bashio::log.info "Installing the Discord channel plugin"
-  claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"
-  claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
+  scrubbed claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"
+  scrubbed claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
 fi
 bashio::log.info "Starting Cain"
 tmux -u kill-session -t cain 2>/dev/null || true   # bashio runs with errexit
-if ! tmux -u new-session -d -s cain -x 120 -y 40 /opt/cain/session.sh 2>/tmp/tmux.err; then
+if ! scrubbed tmux -u new-session -d -s cain -x 120 -y 40 /opt/cain/session.sh 2>/tmp/tmux.err; then
   bashio::log.error "tmux could not start: $(cat /tmp/tmux.err)"
   exit 1
 fi
@@ -31,7 +38,7 @@ bashio::log.info "Cain is running"
 # must not use can be blocked by their exact names (/opt/cain/settings.json).
 (
   sleep 30
-  timeout 120 claude mcp list 2>&1 | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 \
+  scrubbed timeout 120 claude mcp list 2>&1 | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 \
     | while IFS= read -r line; do echo "[cain] connector: $line"; done
 ) &
 # Cain's link (link/main.ts): taps, reactions and specialists' cards. What Cain must

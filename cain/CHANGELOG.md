@@ -4,6 +4,7 @@
 
 - Cain's panel opens only for the Home Assistant user set as its owner (`owner_user_id` in Configuration). Anyone else who opens it gets Forbidden, and until the owner is set it's closed to everyone, you included.
 - At each start, the App's log says whether the panel is locked to its owner or closed to everyone. The Documentation tab says where to find your user id.
+- Cain's session no longer starts with Home Assistant's Supervisor token, which can change this App's own settings (who the panel opens for, among them).
 
 ## 0.7.0
 
