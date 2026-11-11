@@ -163,7 +163,7 @@ def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
 
 def test_cain_gets_a_rows_base_and_the_holds_from_record_sh(tmp_path):
     # A row edit's base is sha1 of the open row's line, the same as the keeper's rowHash.
-    import hashlib, shutil, subprocess
+    import hashlib, json, shutil, subprocess
     bash = shutil.which("bash")
     if not bash or not shutil.which("sha1sum"):
         import pytest
@@ -187,9 +187,22 @@ def test_cain_gets_a_rows_base_and_the_holds_from_record_sh(tmp_path):
     (rec / "state" / "notes" / "P33.md").write_bytes(("# Notes on P33\n\nWords about P33.\n\n| When | From | Note |\n|---|---|---|\n"
                                                       + "\n".join(notes) + "\n").replace("\n", "\r\n").encode())
     assert run_("notes", "P33").stdout.splitlines() == notes
+    assert run_("notes", "p33").stdout.splitlines() == notes      # ids are one case
     assert run_("notes", "P33", "2026-11-11T13:00:00.000Z").stdout.splitlines() == notes[1:]
+    assert run_("notes", "P33", "2026-11-11T08:30:00-05:00").stdout.splitlines() == notes[1:]   # any offset
+    assert run_("notes", "P33", "2026-11-11T13:00Z").stdout.splitlines() == notes[1:]           # any ISO form
+    assert run_("notes", "P33", "not a time").returncode == 2
     assert run_("notes", "P44").stdout == ""        # none filed
     assert run_("notes", "../P33").returncode == 2
+    # No item: every item's notes but those someone other than Cain holds, each led by its item.
+    if shutil.which("jq"):
+        (rec / "state" / "notes" / "P44.md").write_text("| When | From | Note |\n|---|---|---|\n| 2026-11-11T15:00:00.000Z | cain | for the laptop |\n")
+        (rec / "state" / "notes" / "P11.md").write_text("| When | From | Note |\n|---|---|---|\n| 2026-11-11T16:00:00.000Z | page | for Cain |\n")
+        (rec / "state" / "holds.json").write_text(json.dumps({
+            "P33": {"holder": "cain", "for": "x", "branches": [], "taken": "2026-11-11T12:00:00.000Z", "renewed": "2026-11-11T12:00:00.000Z"},
+            "P44": {"holder": "laptop:abc", "for": "x", "branches": [], "taken": "2026-11-11T12:00:00.000Z", "renewed": "2026-11-11T12:00:00.000Z"}}))
+        assert run_("notes").stdout.splitlines() == ["P11 | 2026-11-11T16:00:00.000Z | page | for Cain |"] + ["P33 " + n for n in notes]
+        assert run_("notes", "-", "2026-11-11T13:30:00Z").stdout.splitlines() == ["P11 | 2026-11-11T16:00:00.000Z | page | for Cain |", "P33 " + notes[1]]
 
 
 def test_cain_versions_agree_and_everything_is_pinned():

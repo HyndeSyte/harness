@@ -47,16 +47,18 @@ which is included in Home Assistant backups.
 The record keeper (`/opt/cain/record/main.ts`) is the record's only writer. Every
 item in your open list (`state/PENDING.md`, rows like P33) has at most one holder:
 Cain, or one laptop session. Only the holder changes the item's row and pushes its
-branches. An item nobody holds is Cain's.
+branches. An item nobody holds is Cain's: anyone else takes it before changing its
+row.
 
 ### Who holds what: `state/holds.json`
 
 The keeper owns it. Its own copy is `/data/record-holds.json` (in Home Assistant
 backups); the copy in the record is put back to it whenever they differ, and no
 request can write it. A keeper with no copy of its own (a new install) starts from
-the record's. The file does not exist until the first hold. Read it as the keeper
-pushed it: `/opt/cain/record.sh holds` on the Pi, or
-`git show origin/main:state/holds.json` in a clone.
+the record's, and so does one whose copy is older than what the keeper itself last
+published (a `/data` restored from a backup). The file does not exist until the
+first hold. Read it as the keeper pushed it: `/opt/cain/record.sh holds` on the Pi,
+or `git show origin/main:state/holds.json` in a clone.
 
 ```json
 {
@@ -78,7 +80,7 @@ pushed it: `/opt/cain/record.sh holds` on the Pi, or
 }
 ```
 
-- Keys are item IDs, sorted. Fields are always in this order.
+- Keys are item IDs, upper case, sorted. Fields are always in this order.
 - `holder`: `cain` or `laptop:<Claude Code session id>`.
 - `for`: his words, or the chat it came from (one line, at most 300 characters).
 - `branches`: exact branch names only the holder may push. Never `main`. A branch is
@@ -89,33 +91,40 @@ pushed it: `/opt/cain/record.sh holds` on the Pi, or
   refused.
 - `taken`: when this holder got it. `renewed`: the holder's last word on it.
 - A hold ends after 24 hours without a word from its holder on that item. Time the
-  keeper couldn't work (the box off, GitHub down) doesn't count toward the 24 hours.
+  keeper couldn't work doesn't count toward the 24 hours: the box off, or rounds that
+  couldn't push (GitHub down, or refusing pushes).
 
 ### Requests
 
 A change request (`kind: "change"`) holds up to 50 ops, applied in order, all or
-nothing. Besides `put`, `append` and `remove`:
+nothing. Item IDs are read in upper case (`p33` is P33). Besides `put`, `append`
+and `remove`:
 
 | Op | Fields | What it does |
 | --- | --- | --- |
-| `take` | `item`, `for`, `branches?`, `job?` | Granted if the item is free or its hold has ended, or if `for` starts with `dane:` (his word moves a hold, with its branches). Refused otherwise, naming the holder. The holder's own take renews it and adds branches. A branch already in another item's hold is refused. While a hold marked `job` is active, takes wait. `job` is Cain's only. |
+| `take` | `item`, `for`, `branches?`, `job?` | The item must be in the record (add a new one with `row-add` first, in the same request). Granted if the item is free or its hold has ended, or if `for` starts with `dane:` (his word moves a hold, with its branches). Refused otherwise, naming the holder. The holder's own take adds branches. A branch already in another item's hold is refused. While a hold marked `job` is active, takes wait. `job` is Cain's only. |
+| `renew` | `item` | The holder only: renews its hold as it stands. A hold that moved or ended is refused, never taken back. |
 | `pass` | `item`, `to` | The holder only. Moves the hold and its branches to `to` (`cain` or `laptop:<id>`) in one step; a `job` mark stays behind. |
 | `release` | `item` | The holder only. The item is free (Cain's) again. |
 | `row` | `item`, `base`, `set` | Changes cells of one open row. `base` is the row's hash as read: sha1 of the row's line, without the line ending (`record.sh rowsha <item>` on the Pi, `record-send.ts --row <item>` on a laptop). A changed row is a conflict; changes to other rows don't matter. `set` covers `Item`, `Who`, `Next step`, `Waits for`, `Done when`. |
-| `row-add` | `item`, `cells` | Adds a row at the end of the open table, `Since` today. Needs `Item`. Refuses an ID in use, or one used before in Done. |
+| `row-add` | `item`, `cells` | Adds a row at the end of the open table, `Since` today. Needs `Item`. Refuses an ID in use, or one used before in Done. Anyone may add a row. |
 | `row-close` | `item`, `evidence` | Moves the row to the top of Done as `\| <ID> <Item>: <evidence> \| <date> \|`. |
 | `note` | `item`, `text` | Anyone, holder or not, on any item the record knows (held, open, or done). Appended with its time and sender to `state/notes/<item>.md`, so it never conflicts and is never refused for a hold. `text` is one line, 1 to 2,000 characters. |
 
-- Cells never hold `|` or a new line.
+- Cells never hold `|` or a new line. A row that already holds an escaped `\|` is
+  changed only with a `put` of the whole file.
 - Every change to `state/PENDING.md`, `put` included, is checked row by row: a row
-  someone else holds refuses the whole request, naming the holder. The text around
-  the tables and the Done table are anyone's.
+  someone else holds refuses the whole request, naming the holder, and so does an
+  open row nobody holds unless the sender is Cain ("take it first"). New rows, the
+  text around the tables and the Done table are anyone's.
 - A `put` of `state/PENDING.md` made from an older version is laid onto the list as
   it stands when the rows it changed are untouched since (both sides changing one
   row, or the text around the tables, is still a conflict).
-- A request from the holder that changes its row renews its hold. A laptop session
-  renews its holds hourly while you chat with it.
+- A request from the holder that changes its row, or files a note on it, renews its
+  hold.
 - A change that changes nothing is rejected: "changes nothing".
+- Paths are plain names: a `.` or `..` segment, an empty one, or one with a space at
+  either end is refused, as is anything under `state/holds.json` or `state/notes`.
 
 ### Notes: his words always land
 
@@ -135,22 +144,34 @@ Words about P33 for whoever holds it, oldest first, filed by the record keeper f
 
 - `When` is the keeper's ISO time. Past 60 KB the oldest notes roll off (git keeps
   them); a new note is never refused for size.
-- Cain reads them with `/opt/cain/record.sh notes <item> [<ISO time>]`: one table row
-  per note, oldest first, only those after the time if one is given; nothing when
-  there are none. Items nobody holds are Cain's, so their notes are his to read too.
+- Cain reads them with `/opt/cain/record.sh notes [<item>|-] [<since>]`: one table row
+  per note, oldest first; nothing when there are none.
+  - With an item: that item's notes.
+  - With no item (or `-`): every item's notes except those on items someone other
+    than Cain holds, each line led by its item (`P33 | <when> | <from> | <note> |`).
+    Items nobody holds are Cain's, so their notes are his to read.
+  - `<since>`: only notes after that time, in any ISO form or offset
+    (`2026-11-11T08:20:00-05:00` is 13:20 UTC).
 - A laptop session's per-turn hook (`record-holds.ts --hook`) shows each new note on
-  its held items once. `record-send.ts` shows any it hasn't seen on the items a request
-  touches and holds that request back once, so a holder reads a note before its next
-  write.
+  its held items once; on an item it has just come to hold, all of its notes.
+  `record-send.ts` shows any it hasn't seen on the items a request touches and holds
+  that request back once, so a holder reads a note before its next write.
 - This op is not the request kind `note`, which is his page's words relayed to Cain.
 
+### Who a request is from
+
 `from` is `cain` (only through Cain's local queue), `laptop:<session id>` (stamped
-by `record-send.ts`), or `page` (your page). Older requests from plain `laptop` are
-still read, and recorded as such, but can't hold anything.
+by `record-send.ts`), or `page` (your page). Older writers that send plain `laptop`
+or `claude-code` may still write, recorded as such, but can't hold anything.
+
+Who a request says it is from is taken as said. Anything that can push to the
+record's inbox could claim to be any laptop session, though never Cain. Holds stop
+accidents between Cain and laptop sessions, not someone set on pretending.
 
 Outcomes in `log/requests`: `done`, `conflict` (re-read and redo), `rejected` (breaks
-a rule), `refused` (someone else holds the item), `relayed`, and `waiting` (a take
-behind one of Cain's jobs: a second line with the same id says how it ended).
+a rule), `refused` (someone else holds the item, or Cain does by default),
+`relayed`, and `waiting` (a take behind one of Cain's jobs: a second line with the
+same id says how it ended).
 
 The keeper looks at Cain's own queue every 2 seconds and runs as soon as something is
 in it; the record's inbox (your page, laptop sessions) is read every minute.
@@ -170,11 +191,16 @@ nothing is installed by this release.
 - `record-holds.ts`: prints what the session holds, new notes on those items (each
   once), its takes still waiting, and tells it once when a hold has ended. `--hook`
   for Claude Code hooks (prints only when there is something to say, never blocks),
-  `--renew` to renew its holds at most hourly.
-- `record-prepush.ts`, run by `pre-push`: refuses a push to any branch the session
-  doesn't hold, reading `state/holds.json` fresh from the record's main. With no
-  session id (Dane in a terminal), `git push --no-verify` skips it.
+  `--renew` to renew its holds with `renew` ops, at most every 6 hours.
+- `record-prepush.ts`, run by `pre-push`: refuses a push to any branch of
+  HyndeSyte/harness the session doesn't hold, reading `state/holds.json` fresh from
+  the record's main. Pushes to any other repository pass through. With no session id
+  (Dane in a terminal), `git push --no-verify` skips it.
 - `record-preflight.ts <request.json> <clone>`: the keeper's checks only.
+
+The tools refuse a record clone that follows anything but the record's `main`. The
+pre-push hook covers `git push` only: changes pushed through `gh` or the GitHub
+connector don't run git's hooks.
 
 To set a laptop up (the session id comes from Claude Code's
 `CLAUDE_CODE_SESSION_ID`; use forward slashes in paths):
@@ -185,7 +211,7 @@ To set a laptop up (the session id comes from Claude Code's
 
    ```json
    {
-     "env": { "RECORD_CLONE": "C:/path/to/org", "CAIN_TOOLS": "C:/path/to/harness-tools" },
+     "env": { "RECORD_CLONE": "C:/path/to/org" },
      "hooks": {
        "SessionStart": [{ "hooks": [{ "type": "command",
          "command": "bun C:/path/to/harness-tools/cain/tools/record-holds.ts --hook" }] }],
@@ -195,6 +221,9 @@ To set a laptop up (the session id comes from Claude Code's
    }
    ```
 
-3. In each clone of this repo a session builds in, git's pre-push hook: copy
-   `cain/tools/pre-push` to `.git/hooks/pre-push`. It runs the tool from `CAIN_TOOLS`,
-   so it is the same whichever branch is checked out.
+3. git's pre-push hook for every repository on the laptop, pointed at the tools:
+   `git config --global core.hooksPath C:/path/to/harness-tools/cain/tools`. It
+   guards HyndeSyte/harness and lets every other repository through. A global
+   `core.hooksPath` replaces each repository's own `.git/hooks`, and the hook needs
+   `bun` on the PATH of whatever runs git. (To guard one clone only, copy
+   `cain/tools/pre-push` to its `.git/hooks/` and set `CAIN_TOOLS` to the tools clone.)

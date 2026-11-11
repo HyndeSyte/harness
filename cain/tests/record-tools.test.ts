@@ -120,9 +120,13 @@ describe("record-holds", () => {
 
   test("the holder's hook shows a note filed on its item once, and its next write waits until it has read one", () => {
     const l = laptop();
+    // A note from before the session held P33: shown on its first look all the same.
+    l.cain({ id: "cain-old-note", ops: [{ op: "note", item: "P33", text: "Dane, Nov 10: the drill comes first" }] });
+    cycle(l.cfg);
     l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: the collision fix")] }]);
     cycle(l.cfg);
     const hook = () => l.tool("record-holds.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, hook_event_name: "UserPromptSubmit" }) });
+    expect(hook().out).toContain("from cain: Dane, Nov 10: the drill comes first");
     expect(hook().out).not.toContain("New notes");
     // Dane tells another session about P33; its row edit is refused, his words go in as a note.
     l.inbox(["2.json", { id: "lap-b-edit", from: B, ops: [{ op: "row", item: "P33", base: rowHash(openRow(PENDING, "P33")!), set: { "Next step": "x" } }] }],
@@ -150,17 +154,18 @@ describe("record-holds", () => {
     expect(hook().out).not.toContain("New notes");   // already shown by the send
   }, 90_000);
 
-  test("--renew takes its holds again, at most once an hour", () => {
+  test("--renew renews its holds with renew ops, at most every 6 hours", () => {
     const l = laptop();
-    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/a"] })] }]);
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "dane: build it", { branches: ["claude/a"] })] }]);
     cycle(l.cfg);
     expect(l.tool("record-holds.ts", ["--renew"], { session: SA }).code).toBe(0);
-    expect(l.inboxNames()).toHaveLength(1);
+    const [name] = l.inboxNames();
+    expect(JSON.parse(sh(["git", "show", `main:${name}`], l.remote)).ops).toEqual([{ op: "renew", item: "P33" }]);   // never a take
     l.running(hrs(2));
     cycle(l.cfg);
-    expect(l.holds().P33).toMatchObject({ holder: A, for: "chat: x", branches: ["claude/a"], taken: T0.toISOString(), renewed: hrs(2).toISOString() });
+    expect(l.holds().P33).toMatchObject({ holder: A, for: "dane: build it", branches: ["claude/a"], taken: T0.toISOString(), renewed: hrs(2).toISOString() });
     l.tool("record-holds.ts", ["--renew"], { session: SA });
-    expect(l.inboxNames()).toEqual([]);   // renewed within the hour: nothing sent
+    expect(l.inboxNames()).toEqual([]);   // renewed within 6 hours: nothing sent
   }, 60_000);
 });
 
@@ -184,29 +189,58 @@ describe("the pre-push hook", () => {
     const none = hook(undefined, pushLine("claude/record-holds"));
     expect(none.code).toBe(1);
     expect(none.err).toContain("no Claude Code session id");
-    expect(l.tool("record-prepush.ts", [], { session: SA, input: pushLine("claude/record-holds"), env: { RECORD_CLONE: join(l.root, "nowhere") } }).code).toBe(1);
+    const harness = ["origin", "https://github.com/HyndeSyte/harness.git"];
+    expect(l.tool("record-prepush.ts", harness, { session: SA, input: pushLine("claude/record-holds"), env: { RECORD_CLONE: join(l.root, "nowhere") } }).code).toBe(1);
+    // Over ssh it's the same repository, and guarded the same way.
+    expect(l.tool("record-prepush.ts", ["origin", "git@github.com:HyndeSyte/harness.git"], { session: SA, input: pushLine("claude/link-cards") }).code).toBe(1);
+    // Any other repository passes through, session or not: the hook is installed for all of them.
+    for (const url of ["https://github.com/HyndeSyte/org.git", "https://github.com/HyndeSyte/harness-notes.git", join(l.root, "elsewhere.git")])
+      expect(l.tool("record-prepush.ts", ["origin", url], { input: pushLine("main") })).toEqual({ code: 0, out: "", err: "" });
+    // A record clone that follows anything but main is refused.
+    sh(["git", "push", "--quiet", "origin", "HEAD:refs/heads/other"], l.clone);
+    const side = join(l.root, "side");
+    sh(["git", "clone", "--quiet", "--branch", "other", l.remote, side], l.root);
+    const wrong = l.tool("record-prepush.ts", harness, { session: SA, input: pushLine("claude/record-holds"), env: { RECORD_CLONE: side } });
+    expect(wrong.code).toBe(1);
+    expect(wrong.err).toContain("follows origin/other, not the record's main");
   }, 60_000);
 
-  test("installed in a clone, it stops a real git push to a branch the session doesn't hold", () => {
+  test("installed, it stops a real git push to a branch the session doesn't hold, and lets other repositories by", () => {
     const l = laptop();
     l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
     cycle(l.cfg);
-    // A harness repo and a clone of it, with the hook copied in as DOCS.md says.
-    const origin = join(l.root, "harness.git"), work = join(l.root, "harness");
-    sh(["git", "init", "--quiet", "--bare", "-b", "main", origin], l.root);
-    sh(["git", "clone", "--quiet", origin, work], l.root);
-    writeFileSync(join(work, "README.md"), "x\n");
-    sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], work);
-    sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "x"], work);
-    mkdirSync(join(work, ".git/hooks"), { recursive: true });
-    copyFileSync(join(TOOLS, "pre-push"), join(work, ".git/hooks/pre-push"));
-    chmodSync(join(work, ".git/hooks/pre-push"), 0o755);
-    const push = (branch: string) => Bun.spawnSync(["git", "push", "--quiet", "origin", `HEAD:refs/heads/${branch}`], { cwd: work, stdout: "pipe", stderr: "pipe",
-      env: cleanEnv({ CLAUDE_CODE_SESSION_ID: SA, RECORD_CLONE: l.clone, CAIN_TOOLS: REPO }) });
-    const refused = push("claude/link-cards");
+    const repo = (name: string) => {
+      const origin = join(l.root, `${name}.git`), work = join(l.root, name);
+      sh(["git", "init", "--quiet", "--bare", "-b", "main", origin], l.root);
+      sh(["git", "clone", "--quiet", origin, work], l.root);
+      writeFileSync(join(work, "README.md"), "x\n");
+      sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], work);
+      sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "x"], work);
+      return { origin, work };
+    };
+    // Here the harness repository is the one at .../harness.git.
+    const guard = { CLAUDE_CODE_SESSION_ID: SA, RECORD_CLONE: l.clone, RECORD_GUARDED_REMOTE: "harness\\.git$" };
+    const push = (work: string, branch: string, pre: string[], env: Record<string, string>) =>
+      Bun.spawnSync(["git", ...pre, "push", "--quiet", "origin", `HEAD:refs/heads/${branch}`], { cwd: work, stdout: "pipe", stderr: "pipe", env: cleanEnv(env) });
+
+    // As the laptop has it: git's global core.hooksPath pointed at cain/tools (no copy, no CAIN_TOOLS).
+    const harness = repo("harness"), other = repo("notes");
+    const global = ["-c", `core.hooksPath=${TOOLS}`];
+    const refused = push(harness.work, "claude/link-cards", global, guard);
     expect(refused.exitCode).not.toBe(0);
     expect(refused.stderr.toString()).toContain("push refused: claude/link-cards isn't in any hold of this session");
-    expect(push("claude/record-holds").exitCode).toBe(0);
-    expect(sh(["git", "branch", "--list"], origin)).toBe("claude/record-holds");
-  }, 60_000);
+    expect(push(harness.work, "claude/record-holds", global, guard).exitCode).toBe(0);
+    expect(sh(["git", "branch", "--list"], harness.origin)).toBe("claude/record-holds");
+    expect(push(other.work, "anything", global, guard).exitCode).toBe(0);   // not the harness: passes through
+    expect(sh(["git", "branch", "--list"], other.origin)).toBe("anything");
+
+    // Or copied into one clone's .git/hooks, with CAIN_TOOLS naming the tools clone.
+    const copy = repo("harness2");
+    mkdirSync(join(copy.work, ".git/hooks"), { recursive: true });
+    copyFileSync(join(TOOLS, "pre-push"), join(copy.work, ".git/hooks/pre-push"));
+    chmodSync(join(copy.work, ".git/hooks/pre-push"), 0o755);
+    const env2 = { ...guard, RECORD_GUARDED_REMOTE: "harness2\\.git$", CAIN_TOOLS: REPO };
+    expect(push(copy.work, "claude/link-cards", [], env2).stderr.toString()).toContain("push refused: claude/link-cards");
+    expect(push(copy.work, "claude/record-holds", [], env2).exitCode).toBe(0);
+  }, 90_000);
 });

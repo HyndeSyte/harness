@@ -4,7 +4,8 @@
 // waiting behind one of Cain's jobs, and any hold of its that has ended since it
 // last looked (a day without a word from it, or Dane moved it), so it doesn't act on
 // an item that isn't its own any more. With --renew it also renews its holds, at
-// most once an hour, by taking them again.
+// most every 6 hours (a hold ends after a day), with renew ops: only the holder's
+// own renew goes through, so a hold that moved is never taken back.
 //
 //   bun cain/tools/record-holds.ts [--session <id>] [--record <clone>] [--hook] [--renew]
 //
@@ -55,13 +56,13 @@ for (const id of ended)
   out.push(`Your hold on ${id} has ended (a day without a word from this session, or Dane moved it). Don't act on ${id} or push its branches unless Dane asks you to take it again and the take comes back done.`);
 if (!out.length && !hook) out.push(`This session (${me}) holds nothing in the record.`);
 
-// Renewed by taking each again: only the holder's own take renews, and it never takes
-// back an item that has already gone.
-if (a.renew && mine.length && now - was.renewed > 3_600_000) {
+// Renewed with renew ops: the keeper refuses one from anyone but the current holder,
+// so a hold that moved or ended in the meantime is never taken back.
+if (a.renew && mine.length && now - was.renewed > 6 * 3_600_000) {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
   const rand = randomBytes(3).toString("hex");
   const req = { id: `laptop-${stamp}-${session!.slice(0, 8)}-renew-${rand}`, from: me, kind: "change",
-    summary: `Holds renewed: ${mine.map(([k]) => k).join(", ")}`, ops: mine.map(([k, h]) => ({ op: "take", item: k, for: h.for })) };
+    summary: `Holds renewed: ${mine.map(([k]) => k).join(", ")}`, ops: mine.map(([k]) => ({ op: "renew", item: k })) };
   const raw = JSON.stringify(req, null, 1) + "\n";
   if (check(raw, rec).state === "ok" && !("error" in send(rec, `${stamp}-${session}-${rand}.json`, raw, `Inbox: ${req.summary} (${req.id})`)))
     was.renewed = now;

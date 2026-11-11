@@ -3,7 +3,7 @@
 // day's expiry and keeper downtime, the faster local cycle, and this morning's
 // collisions replayed.
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { holdsText, noteRows, openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
 import { blobSha, cycle, keep } from "../rootfs/opt/cain/record/main.ts";
@@ -230,7 +230,7 @@ describe("this morning, replayed", () => {
     const r = rig();
     r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "dane: build the merge lane", { branches: ["claude/wave1-merge-lane"] })] }]);
     cycle(r.cfg);
-    r.cain({ id: "cain-2026-11-11-pr2-fixes", ops: [take("P14", "his Start tap on the PR #2 fixes", { branches: ["claude/wave1-merge-lane"], job: "build cse_04W" })] });
+    r.cain({ id: "cain-2026-11-11-pr2-fixes", ops: [take("P11", "his Start tap on the PR #2 fixes", { branches: ["claude/wave1-merge-lane"], job: "build cse_04W" })] });
     cycle(r.cfg);
     expect(r.outcome("cain-2026-11-11-pr2-fixes")).toMatchObject({ state: "refused", reason: `branch claude/wave1-merge-lane is already held, with P33 (by ${A})` });
   }, 30_000);
@@ -277,13 +277,116 @@ describe("this morning, replayed", () => {
   test("two laptop sessions take one item at once: one wins, the other is refused", () => {
     const r = rig();
     r.inbox(
-      [`20261111T124500Z-${SA}-a1b2c3.json`, { id: "lap-a-take-p45", from: A, ops: [take("P45", "made it: the collision fix (laptop chat)")] }],
-      [`20261111T124500Z-${SB}-d4e5f6.json`, { id: "lap-b-take-p45", from: B, ops: [take("P45", "chat: the collision fix")] }],
+      [`20261111T124500Z-${SA}-a1b2c3.json`, { id: "lap-a-take-p44", from: A, ops: [take("P44", "made it: the collision fix (laptop chat)")] }],
+      [`20261111T124500Z-${SB}-d4e5f6.json`, { id: "lap-b-take-p44", from: B, ops: [take("P44", "chat: the collision fix")] }],
     );
     cycle(r.cfg);
-    expect(r.states("lap-a-take-p45")).toEqual(["done"]);
-    expect(r.states("lap-b-take-p45")).toEqual(["refused"]);
-    expect(r.reason("lap-b-take-p45")).toBe(`P45 is held by ${A}`);
-    expect(r.holds()).toMatchObject({ P45: { holder: A } });
+    expect(r.states("lap-a-take-p44")).toEqual(["done"]);
+    expect(r.states("lap-b-take-p44")).toEqual(["refused"]);
+    expect(r.reason("lap-b-take-p44")).toBe(`P44 is held by ${A}`);
+    expect(r.holds()).toMatchObject({ P44: { holder: A } });
+  }, 30_000);
+});
+
+describe("review fixes (Fable, Nov 11), end to end", () => {
+  test("a folder where state/holds.json goes is replaced by the file, and the rounds go on", () => {
+    const r = rig();
+    // Pushed by hand (no request can write there any more).
+    r.pull();
+    mkdirSync(join(r.seed, "state/holds.json"), { recursive: true });
+    writeFileSync(join(r.seed, "state/holds.json/x.md"), "x\n");
+    r.g("add", "-A"); r.g("commit", "--quiet", "-m", "a folder"); r.g("push", "--quiet", "origin", "HEAD:main");
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    expect(cycle(r.cfg).ok).toBe(true);
+    expect(r.states("lap-take-1")).toEqual(["done"]);
+    expect(r.holds()).toMatchObject({ P33: { holder: A } });
+    r.cain({ id: "cain-after-1", ops: [{ op: "append", path: "areas/farm/backlog.md", text: "- hay" }] });
+    expect(cycle(r.cfg).ok).toBe(true);
+    expect(r.outcome("cain-after-1")).toMatchObject({ state: "done" });
+  }, 30_000);
+
+  test("a holds write that fails turns away its own request only", () => {
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    cycle(r.cfg);
+    // state/ made a file by hand: nothing can be written under it.
+    r.pull();
+    r.g("rm", "-r", "--quiet", "state");
+    writeFileSync(join(r.seed, "state"), "not a folder\n");
+    r.g("add", "-A"); r.g("commit", "--quiet", "-m", "state is a file"); r.g("push", "--quiet", "origin", "HEAD:main");
+    r.inbox(["2.json", { id: "lap-release-1", from: A, ops: [{ op: "release", item: "P33" }] }]);
+    r.cain({ id: "cain-append-1", ops: [{ op: "append", path: "areas/farm/backlog.md", text: "- hay" }] });
+    expect(cycle(r.cfg).ok).toBe(true);
+    expect(r.states("lap-release-1")).toEqual(["rejected"]);
+    expect(r.reason("lap-release-1")).toStartWith("couldn't write");
+    expect(r.outcome("cain-append-1")).toMatchObject({ state: "done" });
+    expect(r.kept().holds).toMatchObject({ P33: { holder: A } });   // the release didn't happen
+  }, 30_000);
+
+  test("a round with nothing to commit for a hold that ended still finishes", () => {
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    cycle(r.cfg);
+    // The keeper's own copy has an old hold the record never showed.
+    const st = r.kept();
+    st.holds.P44 = { holder: B, for: "x", branches: [], taken: hrs(-50).toISOString(), renewed: hrs(-50).toISOString() };
+    writeFileSync(r.cfg.holds!, JSON.stringify(st));
+    const head = r.g("ls-remote", r.remote, "refs/heads/main").split(/\s/)[0];
+    r.running(hrs(1));
+    const said: string[] = [], was = console.log;
+    console.log = (...a: unknown[]) => { said.push(a.join(" ")); };
+    try { expect(cycle(r.cfg).ok).toBe(true); } finally { console.log = was; }
+    expect(said.filter((l) => l.includes("couldn't publish") || l.includes("stopped this round"))).toEqual([]);   // skipped, not failed
+    expect(r.kept().holds).toEqual({ P33: expect.objectContaining({ holder: A }) });
+    expect(r.g("ls-remote", r.remote, "refs/heads/main").split(/\s/)[0]).toBe(head);
+  }, 30_000);
+
+  test("while pushes fail, the keeper isn't counted as working, so holds don't age out", () => {
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    cycle(r.cfg);
+    const hook = join(r.remote, "hooks", "pre-receive");
+    mkdirSync(join(r.remote, "hooks"), { recursive: true });
+    writeFileSync(hook, "#!/bin/sh\necho pushes are off >&2\nexit 1\n");
+    chmodSync(hook, 0o755);
+    r.cain({ id: "cain-during-outage", ops: [{ op: "append", path: "areas/farm/backlog.md", text: "- hay" }] });
+    r.at(hrs(2));
+    expect(cycle(r.cfg).ok).toBe(false);
+    r.at(hrs(26));
+    expect(cycle(r.cfg).ok).toBe(false);
+    rmSync(hook);
+    r.at(hrs(26.5));
+    expect(cycle(r.cfg).ok).toBe(true);
+    expect(r.outcome("cain-during-outage")).toMatchObject({ state: "done" });
+    expect(r.holds()).toMatchObject({ P33: { holder: A } });   // 26.5 hours, all of them an outage
+    expect(r.kept().downtime).toEqual([[T0.toISOString(), hrs(26.5).toISOString()]]);
+  }, 60_000);
+
+  test("a /data restored from an older backup doesn't win over what the keeper published since", () => {
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    cycle(r.cfg);
+    const backup = join(r.root, "backup.json");
+    copyFileSync(r.cfg.holds!, backup);
+    r.inbox(["2.json", { id: "lap-take-2", from: B, ops: [take("P44", "chat: y")] }]);
+    cycle(r.cfg);
+    copyFileSync(backup, r.cfg.holds!);   // the restore
+    expect(cycle(r.cfg).ok).toBe(true);
+    expect(Object.keys(r.holds()).sort()).toEqual(["P33", "P44"]);
+    expect(Object.keys(r.kept().holds).sort()).toEqual(["P33", "P44"]);
+  }, 30_000);
+
+  test("a status file a stopped round never wrote is written from the log", () => {
+    const r = rig();
+    const req = { id: "cain-crash-1", from: "cain", kind: "change", summary: "s", ops: [{ op: "append", path: "areas/farm/backlog.md", text: "- hay" }] };
+    r.cain(req);
+    cycle(r.cfg);
+    // As if it stopped after the push, before letting the request go or writing its status.
+    rmSync(join(r.cfg.outcomes, "cain-crash-1.json"));
+    writeFileSync(join(r.cfg.queue, "9999.json"), JSON.stringify(req));
+    expect(cycle(r.cfg).ok).toBe(true);
+    expect(r.outcome("cain-crash-1")).toMatchObject({ state: "done" });
+    expect(readdirSync(r.cfg.queue)).toEqual([]);
+    expect(r.states("cain-crash-1")).toEqual(["done"]);   // applied once
   }, 30_000);
 });

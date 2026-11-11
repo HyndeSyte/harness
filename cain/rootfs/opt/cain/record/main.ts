@@ -24,6 +24,7 @@ export type Config = {
 const MAX_RAW = 1_000_000;
 const MAX_NOTE = 2_000;
 const DOWN_AFTER_MS = 5 * 60_000;   // this long between good rounds counts as keeper downtime
+const KEEPER = "Cain's record keeper";   // the name on the keeper's own commits
 const log = (m: string) => console.log(`[record] ${m}`);
 
 export function blobSha(content: string): string {
@@ -44,7 +45,7 @@ function git(cfg: Config, args: string[], cwd = cfg.dir): string {
   // Byte-exact files (the shas writers send are of the bytes as committed), links
   // checked out as plain files, and no hooks from the copy's own config.
   const p = Bun.spawnSync(["git", "-c", "core.autocrlf=false", "-c", "core.symlinks=false", "-c", "core.hooksPath=/dev/null",
-    "-c", "user.name=Cain's record keeper", "-c", "user.email=HyndeSyte@users.noreply.github.com", ...args],
+    "-c", `user.name=${KEEPER}`, "-c", "user.email=HyndeSyte@users.noreply.github.com", ...args],
     { cwd, env, stdout: "pipe", stderr: "pipe" });
   let out = (p.stdout.toString() + p.stderr.toString()).trim();
   if (cfg.token) out = out.split(cfg.token).join("<token>");
@@ -128,15 +129,16 @@ export function queued(cfg: Config): boolean {
   return existsSync(cfg.queue) && jsonNames(cfg.queue).length > 0;
 }
 
-function seenIds(cfg: Config): Set<string> {
-  const ids = new Set<string>();
+// Every request id in log/requests, with the last outcome logged for it.
+function logbook(cfg: Config): Map<string, Outcome> {
+  const last = new Map<string, Outcome>();
   const d = join(cfg.dir, "log", "requests");
-  if (!existsSync(d)) return ids;
-  for (const f of readdirSync(d).filter((n) => n.endsWith(".jsonl")))
+  if (!existsSync(d)) return last;
+  for (const f of readdirSync(d).filter((n) => n.endsWith(".jsonl")).sort())
     for (const line of readFileSync(join(d, f), "utf8").split("\n")) {
-      try { const id = JSON.parse(line).id; if (id) ids.add(id); } catch { /* skip */ }
+      try { const o = JSON.parse(line); if (o?.id) last.set(o.id, o); } catch { /* skip */ }
     }
-  return ids;
+  return last;
 }
 
 function relay(cfg: Config, text: string) {
@@ -152,10 +154,11 @@ function logOutcome(cfg: Config, o: Outcome) {
 const outcomeFile = (cfg: Config, id: string) => join(cfg.outcomes, `${id.replace(/[^A-Za-z0-9._:-]/g, "_")}.json`);
 
 // ---- The keeper's own state, in /data: the holds, takes waiting behind Cain's
-// jobs, and when the keeper was last able to work (for its downtime). ----
+// jobs, when the keeper last finished a round (for its downtime), and the last
+// commit it pushed. ----
 
 type Waiting = { req: Request; since: string; local: boolean };
-type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downtime };
+type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downtime; pushed?: string };
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
 
@@ -177,7 +180,8 @@ function revive(j: any): State | null {
   }
   const downtime = (Array.isArray(j.downtime) ? j.downtime : [])
     .filter((d: any) => Array.isArray(d) && d.length === 2 && d.every((x: any) => typeof x === "string" && !Number.isNaN(Date.parse(x))));
-  return { holds, waiting, alive: typeof j.alive === "string" ? j.alive : undefined, downtime };
+  return { holds, waiting, alive: typeof j.alive === "string" ? j.alive : undefined, downtime,
+    ...(typeof j.pushed === "string" && /^[0-9a-f]{40}$/.test(j.pushed) ? { pushed: j.pushed } : {}) };
 }
 
 function publishedHolds(cfg: Config): string | null {
@@ -189,6 +193,8 @@ function publishedHolds(cfg: Config): string | null {
 function publish(cfg: Config, holds: Holds) {
   if (!linkFree(cfg, HOLDS_PATH)) throw new Error(`${HOLDS_PATH} is behind a link`);
   const f = join(cfg.dir, HOLDS_PATH);
+  // A folder can only be there by mistake (nothing may write under it): the file replaces it.
+  if (existsSync(f) && lstatSync(f).isDirectory()) rmSync(f, { recursive: true, force: true });
   mkdirSync(dirname(f), { recursive: true });
   writeFileSync(f, holdsText(holds));
 }
@@ -217,20 +223,38 @@ function loadState(cfg: Config): State {
       if (typeof j.commit !== "string" || !/^[0-9a-f]{40}$/.test(j.commit)) throw new Error("no commit");
       git(cfg, ["merge-base", "--is-ancestor", j.commit, `origin/${cfg.branch}`]);
       const landed = revive(j.state);
-      if (landed) { st = landed; writeAtomic(file, JSON.stringify(st)); }
+      if (landed) { st = { ...landed, pushed: j.commit }; writeAtomic(file, JSON.stringify(st)); }
     } catch { /* never landed */ }
     rmSync(next, { force: true });
+  }
+  // A /data restored from an older backup must not win: when the keeper itself has
+  // published holds since this state's last push, its latest published copy stands.
+  if (st.pushed) {
+    let mine = "";
+    try { mine = git(cfg, ["log", "-1", "--format=%H", `--author=${KEEPER}`, `origin/${cfg.branch}`, "--", HOLDS_PATH]); } catch { /* none */ }
+    if (/^[0-9a-f]{40}$/.test(mine) && mine !== st.pushed) {
+      let older = false;
+      try { git(cfg, ["merge-base", "--is-ancestor", mine, st.pushed]); older = true; } catch { /* published after this state */ }
+      let text: string | null = null;
+      if (!older) try { text = git(cfg, ["show", `${mine}:${HOLDS_PATH}`]); } catch { text = null; }
+      const theirs = parseHolds(text);
+      if (theirs) {
+        log("the keeper's copy of the holds is older than what it last published (restored from a backup?); starting from the published copy");
+        st = { ...st, holds: theirs };
+      }
+    }
   }
   return st;
 }
 
-// The keeper worked just now. A long gap since the last time is downtime: holds
-// don't age through it, since nobody could renew them.
-function beat(cfg: Config, st: State, now: Date) {
+// The round that is starting. A long gap since the last round that finished is
+// downtime: holds don't age through it, since nobody could renew them. Kept in
+// memory; saved only when this round finishes, so a round that can't push (an
+// outage) doesn't count as the keeper working.
+function beat(st: State, now: Date) {
   if (st.alive && now.getTime() - Date.parse(st.alive) > DOWN_AFTER_MS) st.downtime.push([st.alive, now.toISOString()]);
   st.alive = now.toISOString();
   st.downtime = st.downtime.filter(([, b]) => now.getTime() - Date.parse(b) < 30 * 86_400_000).slice(-200);
-  writeAtomic(stateFile(cfg), JSON.stringify(st));
 }
 
 const message = (o: Outcome) => o.state === "done"
@@ -252,7 +276,7 @@ function report(cfg: Config, o: Outcome, local: boolean, req: Request | undefine
     else log(`inbox request ${o.id} from ${o.from} was ${o.state}; recorded in log/requests`);
   } else if (o.state === "refused") {
     if (local) relay(cfg, `Your record change ${o.id} ("${o.summary}") was refused: ${o.reason}. That item has another holder; don't send it again.`);
-    else if (o.from === "page") relay(cfg, `A change Dane made on his page (${o.id}, "${o.summary}") wasn't saved: ${o.reason}. His words still need to reach that item's holder.`);
+    else if (o.from === "page") relay(cfg, `A change Dane made on his page (${o.id}, "${o.summary}") wasn't saved: ${o.reason}. If the item is yours, apply what he meant yourself; if someone else holds it, file his words as a note on it.`);
     else log(`inbox request ${o.id} from ${o.from} was refused; recorded in log/requests`);
   }
 }
@@ -267,23 +291,32 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
     const outcomes: (Outcome | null)[] = [];
     const settled: { o: Outcome; req: Request; local: boolean }[] = [];   // takes that stopped waiting
     let st: State;
+    let book = new Map<string, Outcome>();
     try {
       sync(cfg);
       st = loadState(cfg);
-      beat(cfg, st, clock());
+      beat(st, clock());
       items = pending(cfg);
-      const seen = items.length ? seenIds(cfg) : new Set<string>();
+      if (items.length || st.waiting.length) book = logbook(cfg);
+      // A take that has its final outcome in the log already (a /data restored from
+      // a backup) isn't waiting any more.
+      st.waiting = st.waiting.filter((w) => (book.get(w.req.id)?.state ?? "waiting") === "waiting");
+      const seen = new Set(book.keys());
       const t = tree(cfg);
       let commits = 0;
-      const commit = (msg: string) => {
+      // One commit, when there is something to commit.
+      const commit = (msg: string): string | undefined => {
         git(cfg, ["add", "-A"]);
+        try { git(cfg, ["diff", "--cached", "--quiet"]); return undefined; } catch { /* staged changes */ }
         git(cfg, ["commit", "--quiet", "-m", msg]);
         commits++;
         return git(cfg, ["rev-parse", "--short", "HEAD"]);
       };
+      const undo = () => { git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects", "reviews"]); };
       const ctx = (at: Date) => ({ at, holds: st.holds, downtime: st.downtime, tz: cfg.tz });
       const outcomeOf = (req: Request, at: Date) => ({ id: req.id, from: clean(req.from, 80), kind: req.kind, summary: clean(req.summary, 200), at: at.toISOString() });
-      // A planned change: its files, then its holds. A failed write undoes it.
+      // A planned change: its files, then its holds. A failed write, the holds' included,
+      // undoes this request only; the others stand.
       const apply = (p: Extract<Plan, { state: "ok" }>, base: Omit<Outcome, "state">): Outcome => {
         if ([...p.writes.keys()].some((path) => !linkFree(cfg, path))) return { ...base, state: "rejected", reason: "writes through a link" };
         try {
@@ -292,12 +325,12 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
             if (content === null) rmSync(f, { force: true });
             else { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, content); }
           }
+          if (p.holdsChanged) publish(cfg, p.holds);
         } catch (e) {
-          // Undo this request's partial writes; the others stand.
-          git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects", "reviews"]);
+          undo();
           return { ...base, state: "rejected", reason: clean(`couldn't write: ${(e as Error).message}`) };
         }
-        if (p.holdsChanged) { st.holds = p.holds; publish(cfg, st.holds); }
+        if (p.holdsChanged) st.holds = p.holds;
         return { ...base, state: "done" };
       };
       const decide = (req: Request, local: boolean, base: Omit<Outcome, "state">): Outcome => {
@@ -323,6 +356,12 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
           settled.push({ o, req: w.req, local: w.local });
         }
       };
+      // The keeper's own copy of the holds into the record. If that can't be written
+      // the round goes on: the next round tries again.
+      const republish = (msg: string) => {
+        try { publish(cfg, st.holds); commit(msg); }
+        catch (e) { undo(); log(`couldn't publish the holds (${(e as Error).message}); trying again next round`); }
+      };
 
       // Holds that went a day without a word from their holder end.
       const now = clock();
@@ -330,16 +369,13 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
       if (ended.length) {
         const who = ended.map((k) => `${k} (${st.holds[k].holder})`).join(", ");
         for (const k of ended) delete st.holds[k];
-        publish(cfg, st.holds);
-        commit(`Holds: ${who} ended after a day without a word from the holder`);
+        republish(`Holds: ${who} ended after a day without a word from the holder`);
       }
       if (st.waiting.length) settle();
       // The record's copy is the keeper's: put back if anyone else changed it.
       const published = publishedHolds(cfg);
-      if (published === null ? Object.keys(st.holds).length > 0 : published !== holdsText(st.holds)) {
-        publish(cfg, st.holds);
-        commit(`Holds: ${HOLDS_PATH} put back to the keeper's copy`);
-      }
+      if (published === null ? Object.keys(st.holds).length > 0 : published !== holdsText(st.holds))
+        republish(`Holds: ${HOLDS_PATH} put back to the keeper's copy`);
 
       for (const it of items) {
         const at = clock();
@@ -363,8 +399,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
         if (o.state === "done" && st.waiting.length) settle();
       }
       if (commits === 0) {
-        // Nothing to push: only Cain's requests that were already applied, let go now.
-        for (const it of items) if (it.local) rmSync(it.local, { force: true });
+        // Nothing to push: a good round all the same. Cain's requests that were
+        // already applied are let go, with their status file if it was never written.
+        finish(cfg, st, items, outcomes, book);
         return { applied: items.length, ok: true };
       }
       // What this round pushes, in case it stops before saving it below.
@@ -382,19 +419,29 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
     }
     // GitHub has it: the holds and waiting takes are saved, the requests can go,
     // and Cain hears what needs him.
-    writeAtomic(stateFile(cfg), JSON.stringify(st!));
+    st!.pushed = git(cfg, ["rev-parse", "HEAD"]);
+    finish(cfg, st!, items, outcomes, book);
     rmSync(`${stateFile(cfg)}.next`, { force: true });
-    mkdirSync(cfg.outcomes, { recursive: true });
-    items.forEach((it, i) => {
-      if (it.local) rmSync(it.local, { force: true });
-      const o = outcomes[i];
-      if (o) report(cfg, o, !!it.local, it.req, !!it.error);
-    });
+    items.forEach((it, i) => { const o = outcomes[i]; if (o) report(cfg, o, !!it.local, it.req, !!it.error); });
     for (const s of settled) report(cfg, s.o, s.local, s.req, false);
     return { applied: items.length, ok: true };
   }
   log("gave up this round after three tries; will try again");
   return { applied: 0, ok: false };
+}
+
+// A round that finished: its state saved (so it counts as the keeper working), and
+// Cain's queued requests let go. One that was applied in an earlier round that
+// stopped before writing its status file gets that file from the log.
+function finish(cfg: Config, st: State, items: Pending[], outcomes: (Outcome | null)[], book: Map<string, Outcome>) {
+  writeAtomic(stateFile(cfg), JSON.stringify(st));
+  mkdirSync(cfg.outcomes, { recursive: true });
+  items.forEach((it, i) => {
+    if (!it.local) return;
+    rmSync(it.local, { force: true });
+    const before = !outcomes[i] && it.req ? book.get(it.req.id) : undefined;
+    if (before && !existsSync(outcomeFile(cfg, before.id))) writeFileSync(outcomeFile(cfg, before.id), JSON.stringify(before));
+  });
 }
 
 // Once a day: the deterministic check, written to state/record-check.md.

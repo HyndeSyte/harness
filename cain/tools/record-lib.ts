@@ -25,12 +25,16 @@ export function git(dir: string, args: string[], o: { input?: string; env?: Reco
   } catch { return null; }
 }
 
+// The record's main is the only branch the keeper reads, so a clone tracking any
+// other branch would read the wrong holds and send to the wrong inbox.
 export function clone(dir: string | undefined): Clone | { error: string } {
   if (!dir) return { error: "no clone of the record: set RECORD_CLONE, or pass --record <clone>" };
   const up = git(dir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])?.trim();
   if (!up || !up.includes("/")) return { error: `${dir} isn't a clone of the record on a branch with an upstream (main)` };
   const slash = up.indexOf("/");
-  return { dir, remote: up.slice(0, slash), branch: up.slice(slash + 1), ref: up };
+  const c = { dir, remote: up.slice(0, slash), branch: up.slice(slash + 1), ref: up };
+  if (c.branch !== "main") return { error: `${dir} follows ${up}, not the record's main` };
+  return c;
 }
 
 export const fetch = (c: Clone) => git(c.dir, ["fetch", "-q", c.remote, c.branch]) !== null;
@@ -172,9 +176,9 @@ export function memo(c: Clone, session: string): { read(): Memo; write(m: Memo):
   };
 }
 
-// Notes on the session's own held items that it hasn't been shown yet: any it hasn't
-// seen, and on an item it has just come to hold, those filed since it took it. Marks
-// them seen in the memo given.
+// Notes on the session's own held items that it hasn't been shown yet; on an item it
+// has just come to hold, all of them, older ones included. Marks them seen in the
+// memo given.
 const noteKey = (n: Note) => createHash("sha1").update(`${n.when}\n${n.from}\n${n.text}`).digest("hex").slice(0, 16);
 export function freshNotes(c: Clone, me: string, holds: Holds, items: Iterable<string>, m: Memo): { id: string; notes: Note[] }[] {
   const t = treeAt(c), out: { id: string; notes: Note[] }[] = [];
@@ -182,8 +186,8 @@ export function freshNotes(c: Clone, me: string, holds: Holds, items: Iterable<s
     const h = holds[id];
     if (!h || h.holder !== me) continue;
     const all = noteRows(t.read(notesPath(id)));
-    const shown = m.seen[id] ? new Set(m.seen[id]) : null;
-    const notes = all.filter((n) => (shown ? !shown.has(noteKey(n)) : n.when >= h.taken));
+    const shown = new Set(m.seen[id] ?? []);
+    const notes = all.filter((n) => !shown.has(noteKey(n)));
     m.seen[id] = all.map(noteKey);
     if (notes.length) out.push({ id, notes });
   }
@@ -195,7 +199,7 @@ export function freshNotes(c: Clone, me: string, holds: Holds, items: Iterable<s
 export function itemsOf(req: any, t: Tree): string[] {
   const out = new Set<string>();
   for (const o of Array.isArray(req?.ops) ? req.ops : []) {
-    if (typeof o?.item === "string") out.add(o.item);
+    if (typeof o?.item === "string") out.add(o.item.toUpperCase());   // as the keeper reads ids
     if (o?.op === "put" && o.path === PENDING_PATH && typeof o.content === "string")
       for (const id of changedRows(t.read(PENDING_PATH), o.content)) out.add(id);
   }

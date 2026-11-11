@@ -27,9 +27,11 @@ function world(files: Record<string, string> = { [P]: PENDING }) {
     get holds() { return holds; },
     set holds(h: Holds) { holds = h; },
     // Plans a request at a time; when it's ok, its files and holds become the record.
+    // Read as the keeper reads it first (parseRequest), then planned.
     run(from: string, ops: any[], at: Date = T0): Plan {
-      const req: Request = { id: `req-${++n}-abcd`, from, kind: "change", summary: "s", ops };
-      const p = plan(req, t, { at, holds, tz: "America/New_York" });
+      const parsed = parseRequest(JSON.stringify({ id: `req-${++n}-abcd`, from, kind: "change", summary: "s", ops }));
+      if (parsed.error) return { state: "rejected", reason: parsed.error };
+      const p = plan(parsed.req as Request, t, { at, holds, tz: "America/New_York" });
       if (p.state === "ok") {
         for (const [k, v] of p.writes) { if (v === null) delete files[k]; else { files[k] = v; keep(v); } }
         holds = p.holds;
@@ -236,8 +238,10 @@ describe("row edits", () => {
   test("row: a stale base is a conflict; a different row changing doesn't matter", () => {
     const w = world();
     const read33 = w.base("P33");
+    w.run(A, [take("P33", "chat: x")]);
     expect(w.run("cain", [{ op: "row", item: "P44", base: w.base("P44"), set: { "Next step": "x" } }]).state).toBe("ok");
     expect(w.run(A, [{ op: "row", item: "P33", base: read33, set: { "Next step": "y" } }]).state).toBe("ok");
+    w.run(A, [{ op: "release", item: "P33" }]);
     expect(w.run("cain", [{ op: "row", item: "P33", base: read33, set: { "Next step": "z" } }]))
       .toEqual({ state: "conflict", reason: "P33 changed since it was read" });
     expect(w.run("cain", [{ op: "row", item: "P99", base: read33, set: { "Next step": "z" } }]))
@@ -248,14 +252,14 @@ describe("row edits", () => {
     const w = world();
     expect(w.run(A, [{ op: "row-add", item: "P33", cells: { Item: "x" } }])).toMatchObject({ state: "conflict" });
     expect(w.run(A, [{ op: "row-add", item: "P06", cells: { Item: "x" } }])).toMatchObject({ state: "conflict", reason: expect.stringContaining("in Done") });
-    const p = w.run(A, [take("P45", "made it, building the collision fix"), { op: "row-add", item: "P45", cells: { Item: "Record holds", Who: "Build", "Done when": "PR A merged" } }]);
+    // A new item is anyone's to add; the one who makes it takes it in the same request.
+    expect(w.run(A, [take("P45", "made it")])).toEqual({ state: "rejected", reason: "P45 isn't an item in the record; add its row first (row-add), then take it" });
+    const p = w.run(A, [{ op: "row-add", item: "P45", cells: { Item: "Record holds", Who: "Build", "Done when": "PR A merged" } }, take("P45", "made it, building the collision fix")]);
     expect(p.state).toBe("ok");
     const lines = w.files[P].split("\n");
     expect(lines[lines.indexOf(w.row("P44")!) + 1]).toBe("| P45 | Record holds | Build | | | PR A merged | Nov 11 |");
     expect(w.holds.P45.holder).toBe(A);
-    // Someone else adding a row under an ID that's held is refused too.
-    expect(w.run(B, [take("P46", "x")]).state).toBe("ok");
-    expect(w.run(A, [{ op: "row-add", item: "P46", cells: { Item: "x" } }])).toEqual({ state: "refused", reason: `P46 is held by ${B}` });
+    expect(w.run(B, [{ op: "row", item: "P45", base: w.base("P45"), set: { Who: "Cain" } }])).toEqual({ state: "refused", reason: `P45 is held by ${A}` });
   });
 
   test("row-close moves the row to Done, newest first, in its two-column form", () => {
@@ -326,8 +330,10 @@ describe("row edits", () => {
     expect(merged).toContain("theirs");
     const w = world();
     const readAt = w.sha();
-    w.run("cain", [{ op: "row", item: "P44", base: w.base("P44"), set: { "Next step": "theirs" } }]);
-    expect(w.run(A, [{ op: "put", path: P, content: edit(PENDING, "Hold the Build until P33 lifts", "mine"), base: readAt }]))
+    w.run(A, [take("P44", "chat: x")]);
+    w.run(A, [{ op: "row", item: "P44", base: w.base("P44"), set: { "Next step": "theirs" } }]);
+    w.run(A, [{ op: "release", item: "P44" }]);
+    expect(w.run("cain", [{ op: "put", path: P, content: edit(PENDING, "Hold the Build until P33 lifts", "mine"), base: readAt }]))
       .toEqual({ state: "conflict", reason: "state/PENDING.md: changed since it was read (both changed P44)" });
   });
 });
@@ -374,9 +380,10 @@ describe("notes: his words always land", () => {
     for (const [from, item] of [[A, "P44"], ["page", "P11"], ["laptop", "P06"]] as const)
       expect(w.run(from, [{ op: "note", item, text: "x" }]).state).toBe("ok");
     expect(w.run("cain", [{ op: "note", item: "P333", text: "x" }])).toEqual({ state: "rejected", reason: "P333 isn't an item in the record" });
-    // An item held before its row exists (taken to be made) takes notes as well.
-    w.run(B, [take("P45", "made it")]);
-    expect(w.run(A, [{ op: "note", item: "P45", text: "x" }]).state).toBe("ok");
+    // A new item, just made and taken, takes notes as well; ids are one case.
+    w.run(B, [{ op: "row-add", item: "P45", cells: { Item: "x" } }, take("P45", "made it")]);
+    expect(w.run(A, [{ op: "note", item: "p45", text: "x" }]).state).toBe("ok");
+    expect(noteRows(w.files["state/notes/P45.md"])).toHaveLength(1);
   });
 
   test("the notes are the note op's alone, so they never conflict", () => {
@@ -415,5 +422,79 @@ describe("notes: his words always land", () => {
     w.run(A, [take("P33", "x")]);
     expect(w.run(A, [{ op: "note", item: "P33", text: "for whoever takes this next" }], hrs(3)).state).toBe("ok");
     expect(w.holds.P33.renewed).toBe(hrs(3).toISOString());
+  });
+});
+
+describe("review fixes (Fable, Nov 11)", () => {
+  test("a path with a . or .. segment, or a space at either end of one, never passes", () => {
+    const w = world();
+    w.run(B, [take("P33", "chat: x")]);
+    const forged = edit(PENDING, "The laptop session holds all harness work", "HIJACKED");
+    for (const path of ["state/./PENDING.md", "state/./notes/P33.md", "state/./holds.json", "state/holds.json/x.md", "state/notes",
+      "state/notes/", "state//PENDING.md", "areas/farm/../x.md", "areas/ farm/x.md", "areas/farm/x.md "]) {
+      expect(w.run(A, [{ op: "put", path, content: forged, base: blobSha(PENDING) }])).toMatchObject({ state: "rejected", reason: expect.stringContaining("not a place requests may write") });
+      expect(w.run(A, [{ op: "append", path, text: "x" }])).toMatchObject({ state: "rejected" });
+    }
+    expect(w.files[P]).toBe(PENDING);
+    expect(Object.keys(w.files).sort()).toEqual([P]);
+  });
+
+  test("renew renews the hold as it stands, and never takes back one that moved", () => {
+    const w = world();
+    w.run(A, [take("P33", "dane: build the collision fix", { branches: ["claude/a"] })]);
+    expect(w.run(A, [{ op: "renew", item: "P33" }], hrs(5)).state).toBe("ok");
+    expect(w.holds.P33).toEqual({ holder: A, for: "dane: build the collision fix", branches: ["claude/a"], taken: T0.toISOString(), renewed: hrs(5).toISOString() });
+    // Dane moves it to another session: A's renew is refused, its old "dane:" reason notwithstanding.
+    w.run(B, [take("P33", "dane: take P33 over (laptop chat)")], hrs(6));
+    expect(w.run(A, [{ op: "renew", item: "P33" }], hrs(7))).toEqual({ state: "refused", reason: `P33 is held by ${B}` });
+    expect(w.holds.P33.holder).toBe(B);
+    // ...and to Cain.
+    w.run(B, [{ op: "pass", item: "P33", to: "cain" }], hrs(8));
+    expect(w.run(B, [{ op: "renew", item: "P33" }], hrs(9))).toEqual({ state: "refused", reason: "P33 is held by cain" });
+    expect(w.run(A, [{ op: "renew", item: "P44" }])).toEqual({ state: "rejected", reason: "P44 isn't held; nothing to renew" });
+    expect(w.run("laptop", [{ op: "renew", item: "P33" }])).toMatchObject({ state: "rejected" });
+  });
+
+  test("items are Cain's by default: anyone else takes an open row before changing it, and a new row is anyone's", () => {
+    const w = world();
+    const theirs = "P44 is Cain's (nobody holds it); take it first";
+    for (const from of [A, "laptop", "claude-code", "page"]) {
+      expect(w.run(from, [{ op: "row", item: "P44", base: w.base("P44"), set: { "Next step": "mine now" } }])).toEqual({ state: "refused", reason: theirs });
+      expect(w.run(from, [{ op: "put", path: P, content: edit(PENDING, "Hold the Build until P33 lifts", "mine now"), base: w.sha() }])).toEqual({ state: "refused", reason: theirs });
+      expect(w.run(from, [{ op: "row-close", item: "P44", evidence: "x" }])).toEqual({ state: "refused", reason: theirs });
+    }
+    // The text around the tables and Done are anyone's; so is a new row.
+    expect(w.run(A, [{ op: "put", path: P, content: edit(PENDING, "Cain keeps this current.", "Cain keeps this current, row by row."), base: w.sha() }]).state).toBe("ok");
+    expect(w.run("laptop", [{ op: "append", path: P, text: "| P10 Taps reach Cain: tested | Nov 11 |" }]).state).toBe("ok");
+    expect(w.run(A, [{ op: "row-add", item: "P46", cells: { Item: "New", Who: "Build" } }]).state).toBe("ok");
+    // Cain changes his own; a laptop that takes it first does too.
+    expect(w.run("cain", [{ op: "row", item: "P44", base: w.base("P44"), set: { "Next step": "First in the build queue" } }]).state).toBe("ok");
+    expect(w.run(A, [take("P44", "dane: do P44 here"), { op: "row", item: "P44", base: w.base("P44"), set: { "Next step": "mine now" } }]).state).toBe("ok");
+  });
+
+  test("item ids are one case: p33 and P33 are one item with one hold", () => {
+    const w = world();
+    expect(w.run(A, [take("p33", "chat: x")]).state).toBe("ok");
+    expect(Object.keys(w.holds)).toEqual(["P33"]);
+    expect(w.run(B, [take("P33", "chat: y")])).toEqual({ state: "refused", reason: `P33 is held by ${A}` });
+    expect(w.run(B, [{ op: "row", item: "p33", base: w.base("P33"), set: { Who: "x" } }])).toEqual({ state: "refused", reason: `P33 is held by ${A}` });
+    expect(w.run(A, [{ op: "release", item: "p33" }]).state).toBe("ok");
+  });
+
+  test("claude-code writes like plain laptop, and can't hold", () => {
+    const w = world();
+    expect(w.run("claude-code", [{ op: "append", path: "areas/farm/backlog.md", text: "- hay" }]).state).toBe("ok");
+    expect(w.run("claude-code", [{ op: "note", item: "P33", text: "x" }]).state).toBe("ok");
+    expect(w.run("claude-code", [take("P33", "x")])).toEqual({ state: "rejected", reason: "take needs a sender of cain or laptop:<session id>" });
+  });
+
+  test("a row with an escaped | is changed only with a whole-file put", () => {
+    const text = edit(PENDING, "| P44 | Calendar specialist fails his plain commands |", "| P44 | Calendar a \\| b fails his plain commands |");
+    expect(text).toContain("a \\| b");   // a real backslash before the pipe
+    const w = world({ [P]: text });
+    const why = "P44 has an escaped | in it; change it with a put of the whole file";
+    expect(w.run("cain", [{ op: "row", item: "P44", base: w.base("P44"), set: { Who: "Dane" } }])).toEqual({ state: "rejected", reason: why });
+    expect(w.run("cain", [{ op: "row-close", item: "P44", evidence: "x" }])).toEqual({ state: "rejected", reason: why });
+    expect(w.run("cain", [{ op: "put", path: P, content: edit(text, "after P33", "after P11"), base: w.sha() }]).state).toBe("ok");
   });
 });

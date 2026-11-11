@@ -19,6 +19,7 @@ export type Op =
   | { op: "take"; item: string; for: string; branches?: string[]; job?: string }
   | { op: "pass"; item: string; to: string }
   | { op: "release"; item: string }
+  | { op: "renew"; item: string }                                     // the holder only: never takes back a hold that moved
   | { op: "row"; item: string; base: string; set: Partial<Record<RowField, string>> }  // base: rowHash of the row as read
   | { op: "row-add"; item: string; cells: Partial<Record<RowField, string>> }
   | { op: "row-close"; item: string; evidence: string }
@@ -62,7 +63,7 @@ export const MAX_NOTE_TEXT = 2_000;           // characters in one note
 // release. state/notes/ is the keeper's too: written only by the note op, so a note
 // never conflicts with anything.
 const WRITABLE = /^(areas|state|archive|rules|projects|reviews)\/[A-Za-z0-9._ \/&()-]+$/;
-const KEEPERS = /^state\/(holds\.json$|notes(\/|$))/i;
+const KEEPERS = /^state\/(holds\.json|notes)(\/|$)/i;
 const APPEND_ONLY = /(^|\/)decisions\.md$/i;
 
 // Text that ends up in Cain's terminal: one line, no control characters, short.
@@ -75,15 +76,22 @@ export function clean(s: unknown, max = 160): string {
   t = t.replace(/ {2,}/g, " ").trim();
   return t.length > max ? t.slice(0, max - 1) + "…" : t;
 }
-const okPath = (p: string) => WRITABLE.test(p) && !KEEPERS.test(p) && !p.includes("..") && !p.includes("//") && !p.endsWith("/");
+// Every segment a plain name: no "." or ".." (state/./PENDING.md is PENDING.md on
+// disk, and would slip past every check made on the path as written), no empty
+// segment, no space at either end of one.
+const okSegments = (p: string) => p.split("/").every((s) => s !== "" && s !== "." && s !== ".." && s === s.trim());
+const okPath = (p: string) => WRITABLE.test(p) && okSegments(p) && !KEEPERS.test(p) && !p.includes("..");
 const NOTE = /^areas\/[^/]+\/notes\/.+\.md$/;
 export const MAX_BYTES = 60_000;   // Notion pages died of size; nothing here grows that big
 
 // Who may send what. Only Cain's local queue may speak for cain (main.ts checks
 // where a request came from); a laptop session is laptop:<its Claude Code session id>.
+// Plain "laptop" (older requests) and "claude-code" (an older writer) may write but
+// can't hold. Who a request says it's from is taken as said: holds guard against
+// accidents, not against a writer set on pretending.
 const SESSION = /^laptop:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const isHolder = (s: unknown): s is string => s === "cain" || (typeof s === "string" && SESSION.test(s));
-export const knownSender = (s: unknown): boolean => s === "page" || s === "laptop" || isHolder(s);
+export const knownSender = (s: unknown): boolean => s === "page" || s === "laptop" || s === "claude-code" || isHolder(s);
 export const ITEM = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const NEVER_HELD = new Set(["main", "master", "HEAD"]);
 export function okBranch(b: unknown): b is string {
@@ -131,8 +139,9 @@ export function parseRequest(raw: string): { req?: Request; error?: string } {
   if (!Array.isArray(j.ops) || j.ops.length === 0 || j.ops.length > 50) return { req, error: "change needs 1 to 50 ops" };
   for (const o of j.ops) {
     if (!o || typeof o !== "object") return { req, error: "an op must be an object" };
-    if (["take", "pass", "release", "row", "row-add", "row-close", "note"].includes(o.op)) {
+    if (["take", "pass", "release", "renew", "row", "row-add", "row-close", "note"].includes(o.op)) {
       if (typeof o.item !== "string" || !ITEM.test(o.item)) return { req, error: `${o.op}: needs an item id, like P33` };
+      o.item = o.item.toUpperCase();   // p33 and P33 are one item, with one hold
       const why = itemOpProblem(o);
       if (why) return { req, error: why };
       continue;
@@ -159,6 +168,7 @@ function itemOpProblem(o: any): string | null {
     case "pass":
       return isHolder(o.to) ? null : `pass ${o.item}: to must be cain or laptop:<session id>`;
     case "release":
+    case "renew":
       return null;
     case "row":
       if (typeof o.base !== "string" || !/^[0-9a-f]{40}$/.test(o.base)) return `row ${o.item}: needs base, the row's hash as read`;
@@ -304,6 +314,12 @@ function findRow(d: Doc, id: string): number | Edit {
 
 function columns(d: Doc): string[] { return cells(d.lines[d.open!.head]); }
 
+// A row with an escaped pipe can't be split into its cells safely: it is changed
+// with a put of the whole file instead.
+const ESCAPED_PIPE = "\\|";
+const escaped = (line: string, id: string): Edit | null =>
+  line.includes(ESCAPED_PIPE) ? { rejected: `${id} has an escaped | in it; change it with a put of the whole file` } : null;
+
 // An open row as it stands (its line, without the line ending), when there's exactly one.
 export function openRow(text: string | null, id: string): string | null {
   if (text === null) return null;
@@ -317,6 +333,8 @@ export function editRow(text: string, id: string, base: string, set: Partial<Rec
   const i = findRow(d, id);
   if (typeof i !== "number") return i;
   if (rowHash(d.lines[i]) !== base) return { conflict: `${id} changed since it was read` };
+  const esc = escaped(d.lines[i], id);
+  if (esc) return esc;
   const cols = columns(d);
   const cs = cells(d.lines[i]);
   while (cs.length < cols.length) cs.push("");
@@ -350,6 +368,8 @@ export function closeRow(text: string, id: string, evidence: string, date: strin
   const d = parsePending(text);
   const i = findRow(d, id);
   if (typeof i !== "number") return i;
+  const esc = escaped(d.lines[i], id);
+  if (esc) return esc;
   const cr = d.lines[i].endsWith("\r");
   const item = cells(d.lines[i])[columns(d).indexOf("Item")] ?? "";
   const row = renderRow([`${id} ${item}: ${evidence.trim()}`.replace(/ {2,}/g, " "), date], cr);
@@ -512,31 +532,35 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
   const writes = new Map<string, string | null>();   // null = delete
   const current = (p: string) => writes.has(p) ? writes.get(p)! : tree.read(p);
   const touched = new Set<string>();   // the sender's own held rows it changed: renewed
-  let explicit = false;                // a take, pass or release went through
+  let explicit = false;                // a take, pass, release or renew went through
   let wait: string | null = null;
   const refused = (reason: string): Plan => ({ state: "refused", reason });
   const rejected = (reason: string): Plan => ({ state: "rejected", reason });
   const conflict = (reason: string): Plan => ({ state: "conflict", reason });
   const heldBy = (id: string) => `${id} is held by ${holds[id].holder}${holds[id].job ? ` (a job: ${holds[id].job})` : ""}`;
   // Any change to the open list is checked row by row: a row someone else holds is
-  // theirs. Every such row is named, so a writer can leave them all out at once.
+  // theirs, and an open row nobody holds is Cain's, so anyone else takes it before
+  // changing it (a new row is anyone's to add). Every such row is named, so a writer
+  // can leave them all out at once.
   const rowsOk = (before: string | null, after: string | null): string | null => {
-    const theirs: string[] = [];
+    const theirs: string[] = [], was = openRows(before);
     for (const id of changedRows(before, after)) {
       const h = holds[id];
-      if (!h) continue;
-      if (h.holder !== sender) theirs.push(heldBy(id));
-      else touched.add(id);
+      if (h) {
+        if (h.holder !== sender) theirs.push(heldBy(id));
+        else touched.add(id);
+      } else if (sender !== "cain" && was.has(id)) theirs.push(`${id} is Cain's (nobody holds it); take it first`);
     }
     return theirs.length ? theirs.join("; ") : null;
   };
 
   for (const o of req.ops ?? []) {
-    if (o.op === "take" || o.op === "pass" || o.op === "release") {
+    if (o.op === "take" || o.op === "pass" || o.op === "release" || o.op === "renew") {
       if (!isHolder(sender)) return rejected(`${o.op} needs a sender of cain or laptop:<session id>`);
       const id = o.item, h = holds[id];
       if (o.op === "take") {
         if (o.job !== undefined && sender !== "cain") return rejected("only Cain's own jobs are marked job");
+        if (!h && !itemKnown(current(PENDING_PATH), id)) return rejected(`${id} isn't an item in the record; add its row first (row-add), then take it`);
         const branches = o.branches ?? [];
         let carried: string[] = [];
         if (h && h.holder === sender) {
@@ -561,12 +585,18 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       } else {
         if (!h) return rejected(`${id} isn't held; nothing to ${o.op}`);
         if (h.holder !== sender) return refused(heldBy(id));
-        if (o.op === "pass") {
+        if (o.op === "renew") {
+          // Only the hold as it stands is renewed: one that moved or ended is never taken back.
+          holds[id] = { ...h, renewed: iso };
+        } else if (o.op === "pass") {
           if (o.to === sender) return rejected(`${id} is already yours`);
           // Atomic: the hold and its branches move in one step. A job's mark stays behind.
           holds[id] = { holder: o.to, for: h.for, branches: [...h.branches], taken: iso, renewed: iso };
-        } else delete holds[id];
-        touched.delete(id);
+          touched.delete(id);
+        } else {
+          delete holds[id];
+          touched.delete(id);
+        }
       }
       explicit = true;
       continue;
