@@ -96,7 +96,8 @@ describe("the gate is wired in", () => {
 });
 
 // terminal/run's gate step as shipped, from reading the options to writing the map,
-// run under bash with bashio stubbed and the map in a temp dir.
+// run under bash with bashio stubbed and the map in a temp dir. It runs owner-gate.sh
+// directly, as the image does, so the script must be executable here too.
 const BASHIO_STUBS = [
   'bashio::app.config() { [ -z "${SUPERVISOR_DOWN-}" ]; }',
   'bashio::config() { if [ -n "${SUPERVISOR_DOWN-}" ]; then echo null; else printf "%s" "${OPTION-}"; fi; }',
@@ -114,7 +115,8 @@ function gateStep(map: string, env: Record<string, string>) {
     .replaceAll("/etc/nginx/owner.conf", posix(map));
   const p = Bun.spawnSync([BASH!, "-c", `${BASHIO_STUBS}\n${step}`],
                           { env: { ...process.env, OPTION: "", SUPERVISOR_DOWN: "", ...env }, stdout: "pipe", stderr: "pipe" });
-  return { log: p.stdout.toString().trim().split("\n"), map: existsSync(map) ? readFileSync(map, "utf8") : null };
+  return { log: p.stdout.toString().trim().split("\n"), err: p.stderr.toString().trim(),
+           map: existsSync(map) ? readFileSync(map, "utf8") : null };
 }
 
 describe.skipIf(!BASH)("terminal/run's gate step", () => {
@@ -123,7 +125,8 @@ describe.skipIf(!BASH)("terminal/run's gate step", () => {
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
   test("writes the owner's map and says so", () => {
-    expect(gateStep(join(dir, "a.conf"), { OPTION: OWNER })).toEqual({ log: [`INFO ${LOCKED}`], map: ADMITS_OWNER });
+    expect(gateStep(join(dir, "a.conf"), { OPTION: OWNER }))
+      .toEqual({ log: [`INFO ${LOCKED}`], err: "", map: ADMITS_OWNER });
   });
 
   test("when Supervisor can't be read, it says so and admits no one", () => {
@@ -132,6 +135,7 @@ describe.skipIf(!BASH)("terminal/run's gate step", () => {
     expect(gateStep(map, { OPTION: OWNER, SUPERVISOR_DOWN: "1" })).toEqual({
       log: ["ERROR Couldn't read this App's options from Supervisor; the panel stays closed until the next start",
             `INFO ${UNSET}`],
+      err: "",
       map: ADMITS_NO_ONE,
     });
   });
@@ -140,10 +144,9 @@ describe.skipIf(!BASH)("terminal/run's gate step", () => {
     const map = join(dir, "c.conf");
     writeFileSync(map, ADMITS_OWNER);
     mkdirSync(`${map}.tmp`);                                // owner-gate.sh can't write its temp file
-    expect(gateStep(map, { OPTION: OWNER })).toEqual({
-      log: [`ERROR Could not write ${posix(map)}, so Cain's panel stays closed`],
-      map: null,
-    });
+    const r = gateStep(map, { OPTION: OWNER });
+    expect(r.err).toContain(`owner-gate: could not write ${posix(map)}`);   // the script's own refusal
+    expect(r).toMatchObject({ log: [`ERROR Could not write ${posix(map)}, so Cain's panel stays closed`], map: null });
   });
 });
 
