@@ -55,6 +55,15 @@ def is_ours(uid: str) -> bool:
     return bool(_ID_RE.fullmatch(uid))
 
 
+APPT = "Appt: "                            # how a timed appointment from his mail starts (mail_dates.py)
+
+
+def made_here(uid: str, summary: str = "", transparent: bool = True) -> bool:
+    """Written by this add-on and not an event of his: a block, or a free note from his mail. A
+    timed appointment from his mail is written busy, and is his real appointment (Nov 11)."""
+    return is_ours(uid) and not (summary.startswith(APPT) and not transparent)
+
+
 def event_id(key: str) -> str:
     return "hb" + hashlib.sha256(f"family_gmail:{key}".encode()).hexdigest()[:32]
 
@@ -238,14 +247,27 @@ def note_placed(event: dict, day: date, start: datetime | None = None) -> bool:
         return False
 
 
-def _note_body(uid: str, title: str, day: date, start: datetime | None = None) -> dict:
-    """Free, so nothing reaches work. All day with no reminder, or, when the email gives the time
-    he has to be there, at that time with his usual reminder."""
+def _note_body(uid: str, title: str, day: date, start: datetime | None = None, *,
+               place: str = "", busy: bool = False) -> dict:
+    """Free, so nothing reaches work: all day with no reminder, or, when the email gives the time
+    he has to be there, at that time with his usual reminder. A timed appointment is busy, since
+    he really is (Nov 11), with the street address the email gave, so it opens in Maps."""
     return {"id": uid, "summary": title, "status": "confirmed", **note_span(day, start),
-            "visibility": "private", "transparency": "transparent",
+            **({"location": place} if place else {}),
+            "visibility": "private", "transparency": "opaque" if busy else "transparent",
             "reminders": {"useDefault": start is not None},
             "guestsCanInviteOthers": False, "guestsCanSeeOtherGuests": False,
             "extendedProperties": {"private": dict(NOTE_MARK)}}
+
+
+def note_as_written(event: dict, title: str, day: date, start: datetime | None = None, *,
+                    place: str = "", busy: bool = False) -> bool:
+    """Still exactly what was written: a title, time, place, note, guest or shown-as he changed
+    makes it his."""
+    return (event.get("summary") == title and note_placed(event, day, start)
+            and not any(event.get(k) for k in ("description", "attendees"))
+            and str(event.get("location") or "") == place
+            and (event.get("transparency") != "transparent") == busy)
 
 
 def _a_note(event: dict) -> bool:
@@ -602,16 +624,18 @@ class GoogleCalendar:
 
     # -- dates from his mail (mail_dates.py): their own mark, so the sync never sees them -----
     def add_note(self, address: str, uid: str, title: str, day: date,
-                 start: datetime | None = None) -> Outcome:
-        """A fixed id, so a lost answer finds itself. "exists": that id can't be used."""
+                 start: datetime | None = None, *, place: str = "", busy: bool = False) -> Outcome:
+        """A fixed id, so a lost answer finds itself. "exists": that id can't be used. A place
+        is only ever a street address (drive.street_address)."""
         url = self._events(address)
-        if url is None or not _ID_RE.fullmatch(uid):
+        if url is None or not _ID_RE.fullmatch(uid) or (place and drive.street_address(place) != place):
             return Outcome("failed")
         token, problem = self._access()
         if token is None:
             return problem
         try:
-            r = self._call(token, "POST", f"{url}?sendUpdates=none", body=_note_body(uid, title, day, start))
+            r = self._call(token, "POST", f"{url}?sendUpdates=none",
+                           body=_note_body(uid, title, day, start, place=place, busy=busy))
             if r.status == 200:
                 return Outcome("ok", r.status)
             if r.status != 409:
@@ -627,7 +651,7 @@ class GoogleCalendar:
         return Outcome("exists")
 
     def remove_note(self, address: str, uid: str, title: str, day: date,
-                    start: datetime | None = None) -> Outcome:
+                    start: datetime | None = None, *, place: str = "", busy: bool = False) -> Outcome:
         """Only a note of ours that he hasn't changed: a title or time he edited makes it his."""
         url = self._events(address)
         if url is None or not _ID_RE.fullmatch(uid):
@@ -646,9 +670,7 @@ class GoogleCalendar:
                 return Outcome("changed", r.status)
             if found.get("status") == "cancelled":
                 return Outcome("gone", r.status)
-            if any(found.get(k) for k in ("description", "location", "attendees")) \
-                    or found.get("transparency") != "transparent" or found.get("summary") != title \
-                    or not note_placed(found, day, start):
+            if not note_as_written(found, title, day, start, place=place, busy=busy):
                 return Outcome("changed", r.status)
             r = self._call(token, "DELETE", f"{url}/{uid}?sendUpdates=none", etag=found.get("etag"))
         except TransportError as e:

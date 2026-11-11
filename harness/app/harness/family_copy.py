@@ -53,6 +53,27 @@ GIVE_UP_READS = 12             # six hours of a copy being there but not listed
 CONFIRM_AFTER = timedelta(minutes=2)   # the second look before a removal, not the next usual read
 
 
+HOLD = "family_copy_hold:"     # meta, per copy: a read showing these old times is from before his change
+HOLD_FOR = timedelta(hours=3)
+
+
+def hold(ledger: Ledger, key: str, start: str = "", end: str = "", *, gone: bool = False,
+         db=None) -> None:
+    """A copy moved with its Gmail event, or put back with it, in a change he asked for
+    (calendar_change.py). A read taken before that change still shows the times it had, or no
+    event at all, and mustn't undo it: until a read shows the copy as written, or three hours
+    pass, those times, every one it has had in that while, and "gone" are a read from before."""
+    try:
+        d = json.loads(ledger.get_meta(HOLD + key) or "{}")
+        times = [list(t) for t in d.get("times", []) if isinstance(t, list) and len(t) == 2]
+    except (ValueError, TypeError, AttributeError):
+        d, times = {}, []
+    if start and end and [start, end] not in times:
+        times.append([start, end])
+    ledger.set_meta(HOLD + key, json.dumps({"times": times[-8:], "gone": bool(gone or d.get("gone")),
+                                            "until": iso(ledger.now() + HOLD_FOR)}), db)
+
+
 def confirm_soon(ledger: Ledger, table: str, calendar) -> None:
     """A few removals waiting on their second look get it in minutes. Many at once wait for the
     usual reads: that's the guard against a bad read, and it's meant to take hours."""
@@ -252,11 +273,11 @@ class FamilyCopy:
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
         if not self.name():
-            return "Copies from Gmail: off, no first name in the add-on's settings."
+            return "Copies from Gmail: off, no first name in Harness's settings."
         feeds = self.calendar.snapshot.feeds.values()
         if not self.calendar.configured or (feeds and not self._gmail_feeds()):
             return ("Copies from Gmail: waiting. Enter your Gmail calendar's secret iCal address "
-                    "on the add-on page.")
+                    "on the Harness page.")
         n = self.ledger.db.execute("SELECT COUNT(*) FROM family_copies WHERE state='live'"
                                    ).fetchone()[0]
         line = f"Copies from Gmail: on, {n} on Family now"
@@ -336,6 +357,8 @@ class FamilyCopy:
         sources = {_key(o): o.summary for o in occ}
         self.writes = self._writes_today()
         odd = self._thin(len(occ), len(occ) - len(planned)) or not occ
+        if not odd and feed.ahead.unreadable == 0:
+            self._let_go(planned)
         problems = [self._follow(wants, family, now, feed.ahead.unreadable == 0, until, odd)]
         problems.append(self._add_new(wants, sources, family.items, name))
         self._problem(next((p for p in problems if p), ""))
@@ -384,6 +407,7 @@ class FamilyCopy:
                 until: datetime, odd: bool) -> str:
         items = {caldav.href_path(i.href): i for i in family.items}
         by_uid = {i.occ.uid: i for i in family.items}
+        held = self._holds(now)
         gone, absent = [], []
         problem = ""
         waiting = tries = 0
@@ -407,21 +431,26 @@ class FamilyCopy:
                 if row["seen"] == _seen(item.occ):
                     self._update(row, seen=_seen_now(item))    # from before notes were seen
             elif want is not None and self._landed(item.occ, want):
-                # Already as it should be: a write whose answer was lost.
+                # Already as it should be: a write whose answer was lost, or a change he asked for.
                 if not (_same(want.start, start) and _same(want.end, end)):
                     self._moved(row, row["uid"], want)
                 elif row["missing"]:
                     self._update(row, missing=0)
+                if row["key"] in held:
+                    self._unhold(row["key"])
                 continue
             elif not self._as_written(item.occ, row, start, end) or caldav.details(item.data):
                 self._leave(row, "edited")         # someone edited it: theirs now
                 continue
+            stale_times, stale_gone = held.get(row["key"], ((), False))
             if want is None:
-                if gmail_clean:
+                if gmail_clean and not stale_gone:   # gone in a read from before his Undo: not gone
                     gone.append((row, item))
                 continue
             if row["missing"]:
                 self._update(row, missing=0)
+            if any(_same(want.start, a) and _same(want.end, b) for a, b in stale_times):
+                continue                       # a read from before the change he asked for: the next shows it
             # Once begun, a trip's flights have left the read: that's not a change.
             retitled = not row["hand"] and want.title != row["title"] and begins > now
             # Taken over when Gmail had already moved on: the row can't show that, the event can.
@@ -446,6 +475,35 @@ class FamilyCopy:
         if isinstance(value, datetime):
             return value
         return datetime.combine(value, datetime.min.time(), tzinfo=ZoneInfo(self.tz))
+
+    def _holds(self, now: datetime) -> dict[str, tuple]:
+        """Copies changed with a change he asked for: (the times a read from before may still show,
+        whether such a read may show no event). One past its time is let go."""
+        out = {}
+        for r in self.ledger.db.execute("SELECT key, value FROM meta WHERE substr(key, 1, ?)=?",
+                                        (len(HOLD), HOLD)).fetchall():
+            try:
+                d = json.loads(r["value"])
+                if datetime.fromisoformat(d["until"]) > now:
+                    out[r["key"][len(HOLD):]] = (tuple((self._when(a), self._when(b)) for a, b in d["times"]),
+                                                 bool(d.get("gone")))
+                    continue
+            except (ValueError, KeyError, TypeError):
+                pass
+            self._unhold(r["key"][len(HOLD):])
+        return out
+
+    def _let_go(self, planned: dict) -> None:
+        """A copy taken off with its Gmail event, at his word, waits only while a read may still
+        show that event. Once a whole read doesn't, it's an ordinary cancelled copy, so if the
+        event comes back, by Undo or by his own hand, the copy comes back with it."""
+        for row in self.ledger.db.execute("SELECT * FROM family_copies WHERE state='asked_off'").fetchall():
+            if row["key"] not in planned:
+                self._set(row, "cancelled")
+
+    def _unhold(self, key: str) -> None:
+        with self.ledger.tx() as db:
+            db.execute("DELETE FROM meta WHERE key=?", (HOLD + key,))
 
     @staticmethod
     def _landed(occ: ical.Occurrence, want: Want) -> bool:

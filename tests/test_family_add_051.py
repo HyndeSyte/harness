@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from harness import choices, prompts, render, rules
-from harness.family_add import LOOSENED, MAX_TAPLESS_MESSAGE
+from harness.family_add import LOOSENED
 from harness.ledger import Ledger, iso
 from conftest import OWNER, cb, msg
 from fake_caldav import no_network  # noqa: F401  (autouse)
@@ -170,20 +170,20 @@ def add_it(rig, **params):
     rig.say("add it")
 
 
-def test_add_it_after_long_text_gets_a_card(loose):
-    answered(loose, "x" * (MAX_TAPLESS_MESSAGE + 1))
+def test_add_it_after_pasted_text_gets_a_card(loose):
+    answered(loose, "From: Gala Committee <gala@club.example>\nSubject: You're invited\n\nJoin us Dec 3")
     add_it(loose)
     assert "PUT" not in loose.icloud.methods() and "may be pasted text" in loose.last()[1]
 
 
 def test_add_it_after_several_lines_gets_a_card(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     add_it(loose)
     assert "PUT" not in loose.icloud.methods() and "may be pasted text" in loose.last()[1]
 
 
 def test_add_it_as_a_reply_to_pasted_text_gets_a_card(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     answer_id = loose.last()[3]
     loose.claude.script = [result(text="Noted.")]
     loose.say("thanks")
@@ -199,8 +199,8 @@ def test_a_normal_short_conversation_still_writes_tapless(loose):
     assert loose.icloud.methods().count("PUT") == 1
 
 
-def test_the_same_threshold_applies_to_the_earlier_message(loose):
-    answered(loose, "x" * MAX_TAPLESS_MESSAGE)
+def test_a_long_earlier_message_of_his_is_no_sign_of_a_paste(loose):
+    answered(loose, "x" * 1000)
     add_it(loose)
     assert loose.icloud.methods().count("PUT") == 1
 
@@ -212,7 +212,7 @@ def test_his_earlier_message_counts_but_the_models_many_lines_do_not(loose):
 
 
 def test_old_context_the_model_no_longer_sees_does_not_warn(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     loose.advance(minutes=31)
     add_it(loose)
     assert loose.icloud.methods().count("PUT") == 1
@@ -255,7 +255,7 @@ def test_the_docs_do_not_imply_no_alerts():
 def test_the_version_agrees_everywhere():
     from harness import __version__
     assert f'version: "{__version__}"' in (ADDON / "config.yaml").read_text(encoding="utf-8")
-    assert __version__ == "0.20.0"
+    assert __version__ == "0.21.0"
 
 
 # -- 5. a new rule needs his tap ------------------------------------------------------------------
@@ -520,14 +520,14 @@ def test_normal_titles_stay_clean(title):
 
 
 def test_one_short_message_can_not_launder_a_paste(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     answered(loose, "what does it say?")
     add_it(loose)
     assert "PUT" not in loose.icloud.methods() and "may be pasted text" in loose.last()[1]
 
 
 def test_each_message_in_the_window_extends_it(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     loose.advance(minutes=20)
     answered(loose, "what does it say?")
     loose.advance(minutes=20)
@@ -536,7 +536,7 @@ def test_each_message_in_the_window_extends_it(loose):
 
 
 def test_the_paste_window_survives_a_restart_and_ends_on_its_own(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     assert loose.fa._pasted_recently()
     assert Ledger(loose.ledger.path, clock=loose.clock).get_meta("family_add_pasted_until")
     loose.advance(minutes=31)
@@ -544,8 +544,8 @@ def test_the_paste_window_survives_a_restart_and_ends_on_its_own(loose):
 
 
 @pytest.mark.parametrize("brk", ["\r", " ", " ", "\x0b", "\x0c", "\x85"])
-def test_other_line_breaks_count_as_several_lines(loose, brk):
-    assert loose.fa.warnings(fresh(), message="short" + brk + "paste")
+def test_no_kind_of_line_break_is_a_sign_of_a_paste(loose, brk):
+    assert not loose.fa.warnings(fresh(), message="short" + brk + "dictated")      # Nov 11: he dictates
 
 
 def test_the_bake_in_card_says_undo_cannot_recall_an_alert(on):

@@ -153,17 +153,17 @@ class PeerWatch:
 
 def down_text(down_s: float, why: str = LINK) -> str:
     if why == DISCORD:
-        return (f"Cain's add-on is running, but its Discord connection has been down for "
+        return (f"Cain is running, but his Discord connection has been down for "
                 f"{minutes(down_s)}. Until it's back, Stop and the buttons on cards don't "
                 "work, and Cain can't see your messages. Calendar work goes on and its cards "
                 "wait. If it doesn't come back by itself, restart Cain in Home Assistant. "
                 "(From the calendar specialist; I'll say once when it's back.)")
-    return (f"Cain's add-on hasn't answered for {minutes(down_s)}. Until it's back, "
+    return (f"Cain hasn't answered for {minutes(down_s)}. Until he's back, "
             "Stop and the buttons on cards don't work, and Cain can't reply. Calendar work "
             "goes on and its cards wait. If it doesn't come back by itself, restart Cain "
             "in Home Assistant. (From the calendar specialist; I'll say once when it's back.)")
 
 
 def back_text(down_s: float) -> str:
-    return (f"Cain's add-on is answering again, after about {minutes(down_s)}. Stop and the "
+    return (f"Cain is answering again, after about {minutes(down_s)}. Stop and the "
             "buttons work again. (From the calendar specialist.)")

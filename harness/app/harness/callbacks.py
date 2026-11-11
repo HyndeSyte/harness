@@ -70,7 +70,10 @@ class Callbacks:
             if not v.ok:
                 self._answer(inc, REFUSALS.get(v.reason, "Not valid."))
                 return v.reason
-            message = ("Approved. It will run now." if v.action == "approve"
+            # His tap's reply says what will happen; the receipt says what did, once it's read back.
+            said = (self.calendar_change.tap_words(v.proposal_id)
+                    if v.action == "approve" and self.calendar_change is not None else None)
+            message = (said or "Approved. It will run now." if v.action == "approve"
                        else "Declined. Nothing was done.")
         self._answer(inc, None)
         self._strip_buttons(inc)

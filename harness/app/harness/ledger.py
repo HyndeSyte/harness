@@ -358,6 +358,7 @@ TRANSITIONS = {
     "proposed": {"approved", "declined", "expired", "cancelled"},
     "approved": {"executed", "failed"},
     "failed": {"received"},          # a retry of a failure that wasn't his doing (runner)
+    "needs_clarification": {"received"},   # a note from Cain for the question it asked (controller)
 }
 
 
@@ -404,7 +405,11 @@ class Ledger:
                                   ("stale", "INTEGER NOT NULL DEFAULT 0"),
                                   ("good", "INTEGER NOT NULL DEFAULT 0")),
             # 0.19.6: the street address written on a block, so his own edit to it still shows.
-            "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"),)}
+            "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"),),
+            # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
+            # who sent it, the address found, the one written, and whether it was written busy.
+            "mail_dates": (("sender", "TEXT NOT NULL DEFAULT ''"), ("place", "TEXT NOT NULL DEFAULT ''"),
+                           ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0"))}
         for table, cols in added.items():
             have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, decl in cols:
