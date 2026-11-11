@@ -552,7 +552,12 @@ def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
     (rec / "state" / "holds.json").write_text(json.dumps({"P33": {"holder": "laptop:9f2c", "branches": []}}))
     seen = tmp_path / "notes.seen"
     sent = tmp_path / "sent.txt"
-    os.environ.update(RECORD_SH=str(CAIN / "rootfs/opt/cain/record.sh"), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
+    # The keeper's record.sh, executable as the image makes it (chmod a+x /opt/cain/*.sh).
+    record_sh = tmp_path / "record.sh"
+    record_sh.write_text((CAIN / "rootfs/opt/cain/record.sh").read_text().replace("\r\n", "\n"), newline="\n")
+    record_sh.chmod(0o755)
+    assert "chmod a+x" in (CAIN / "Dockerfile").read_text() and "/opt/cain/*.sh" in (CAIN / "Dockerfile").read_text()
+    os.environ.update(RECORD_SH=str(record_sh), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
     try:
         line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
         # The newest three survive, oldest of them first; the older one is counted, not lost.
