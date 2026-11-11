@@ -5,7 +5,7 @@ import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 
 import { join, resolve } from "node:path";
 import { openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
 import { cycle } from "../rootfs/opt/cain/record/main.ts";
-import { A, PENDING, SA, SB, T0, cleanEnv, hrs, rig, sh } from "./rig.ts";
+import { A, B, PENDING, SA, SB, T0, cleanEnv, hrs, rig, sh } from "./rig.ts";
 
 const TOOLS = resolve(import.meta.dir, "../tools");
 const REPO = resolve(import.meta.dir, "../..");
@@ -19,7 +19,8 @@ function laptop() {
   sh(["git", "config", "user.name", "HyndeSyte"], clone);
   sh(["git", "config", "user.email", "HyndeSyte@users.noreply.github.com"], clone);
   const tool = (name: string, args: string[], o: { session?: string; input?: string; env?: Record<string, string> } = {}) => {
-    const env = cleanEnv({ RECORD_CLONE: clone, RECORD_SEND_POLL_MS: "100", ...(o.session ? { CLAUDE_CODE_SESSION_ID: o.session } : {}), ...o.env });
+    const env = cleanEnv({ RECORD_CLONE: clone, RECORD_SEND_POLL_MS: "100", RECORD_HOLDS_FETCH_S: "0",
+      ...(o.session ? { CLAUDE_CODE_SESSION_ID: o.session } : {}), ...o.env });
     const p = Bun.spawnSync([process.execPath, join(TOOLS, name), ...args], { cwd: r.root, env, stdout: "pipe", stderr: "pipe",
       stdin: o.input === undefined ? "ignore" : Buffer.from(o.input) });
     return { code: p.exitCode, out: p.stdout.toString().trim(), err: p.stderr.toString().trim() };
@@ -116,6 +117,38 @@ describe("record-holds", () => {
     const bare = Bun.spawnSync([process.execPath, join(TOOLS, "record-holds.ts"), "--hook"], { env: cleanEnv(), stdin: Buffer.from(JSON.stringify({ session_id: SA })), stdout: "pipe" });
     expect([bare.exitCode, bare.stdout.toString()]).toEqual([0, ""]);
   }, 60_000);
+
+  test("the holder's hook shows a note filed on its item once, and its next write waits until it has read one", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: the collision fix")] }]);
+    cycle(l.cfg);
+    const hook = () => l.tool("record-holds.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, hook_event_name: "UserPromptSubmit" }) });
+    expect(hook().out).not.toContain("New notes");
+    // Dane tells another session about P33; its row edit is refused, his words go in as a note.
+    l.inbox(["2.json", { id: "lap-b-edit", from: B, ops: [{ op: "row", item: "P33", base: rowHash(openRow(PENDING, "P33")!), set: { "Next step": "x" } }] }],
+      ["3.json", { id: "lap-b-note", from: B, ops: [{ op: "note", item: "P33", text: "Dane, other chat: PR #3 rebases after the collision fix" }] }]);
+    cycle(l.cfg);
+    expect(l.states("lap-b-edit")).toEqual(["refused"]);
+    const next = hook();
+    expect(next.code).toBe(0);
+    expect(next.out).toContain("New notes on P33 since you last looked. Read them before you change P33:");
+    expect(next.out).toMatch(new RegExp(`^- .+, from ${B}: Dane, other chat: PR #3 rebases after the collision fix$`, "m"));
+    expect(hook().out).not.toContain("New notes");   // shown once
+    // A note filed in the middle of a turn: the holder's next write shows it and waits once.
+    l.cain({ id: "cain-p33-note", ops: [{ op: "note", item: "P33", text: "Dane in Discord: hold the ship until the drill" }] });
+    cycle(l.cfg);
+    writeFileSync(join(l.root, "req.json"), JSON.stringify({ kind: "change", summary: "P33 next step",
+      ops: [{ op: "row", item: "P33", base: rowHash(openRow(PENDING, "P33")!), set: { "Next step": "PR A is open" } }] }));
+    const held = l.tool("record-send.ts", [join(l.root, "req.json"), "--wait", "0"], { session: SA });
+    expect(held.code).toBe(1);
+    expect(held.out).toContain("from cain: Dane in Discord: hold the ship until the drill");
+    expect(held.out.split("\n").at(-1)).toBe("not sent: read the notes above first, then send it again if it still stands");
+    expect(l.inboxNames()).toEqual([]);
+    const again = l.tool("record-send.ts", [join(l.root, "req.json"), "--wait", "0"], { session: SA });
+    expect(again.out).toMatch(/^sent laptop-/m);
+    expect(l.inboxNames()).toHaveLength(1);
+    expect(hook().out).not.toContain("New notes");   // already shown by the send
+  }, 90_000);
 
   test("--renew takes its holds again, at most once an hour", () => {
     const l = laptop();

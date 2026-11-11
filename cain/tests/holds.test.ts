@@ -2,7 +2,7 @@
 // and no empty "done". The keeper's rules only (core.ts), no git.
 import { describe, expect, test } from "bun:test";
 import {
-  parseRequest, plan, rowHash, openRow, idleMs, holdsText, parseHolds, mergePending, HOLD_IDLE_MS,
+  parseRequest, plan, rowHash, openRow, idleMs, holdsText, parseHolds, mergePending, addNote, noteRows, HOLD_IDLE_MS, MAX_BYTES,
   type Holds, type Plan, type Request, type Tree,
 } from "../rootfs/opt/cain/record/core.ts";
 import { blobSha } from "../rootfs/opt/cain/record/main.ts";
@@ -350,5 +350,70 @@ describe("no empty done", () => {
     expect(w.run(A, [take("P33", "x")]).state).toBe("ok");
     expect(w.run(A, [take("P33", "x")], hrs(1)).state).toBe("ok");   // renewed
     expect(w.run(A, [{ op: "release", item: "P33" }]).state).toBe("ok");
+  });
+});
+
+describe("notes: his words always land", () => {
+  const N = "state/notes/P33.md";
+
+  test("anyone files a note on any item, held or free, while a non-holder's row edit is refused", () => {
+    const w = world();
+    w.run(A, [take("P33", "chat: the collision fix")]);
+    expect(w.run(B, [{ op: "row", item: "P33", base: w.base("P33"), set: { "Next step": "make the card say P08 Q2" } }]))
+      .toEqual({ state: "refused", reason: `P33 is held by ${A}` });
+    expect(w.run(B, [{ op: "note", item: "P33", text: "Dane, laptop chat 9:12 AM: make the card say P08 Q2" }]).state).toBe("ok");
+    expect(w.run("cain", [{ op: "note", item: "P33", text: "Dane in Discord: ship it after the drill" }], hrs(1)).state).toBe("ok");
+    expect(noteRows(w.files[N])).toEqual([
+      { when: T0.toISOString(), from: B, text: "Dane, laptop chat 9:12 AM: make the card say P08 Q2" },
+      { when: hrs(1).toISOString(), from: "cain", text: "Dane in Discord: ship it after the drill" },
+    ]);
+    expect(w.files[N]).toStartWith("# Notes on P33\n");
+    expect(w.files[N]).toContain(`| When | From | Note |\n|---|---|---|\n| ${T0.toISOString()} | ${B} | Dane, laptop chat 9:12 AM:`);
+    expect(w.row("P33")).toBe(openRow(PENDING, "P33"));   // the row itself is untouched
+    // A free item, a done item and plain senders take notes too; an ID the record doesn't know doesn't.
+    for (const [from, item] of [[A, "P44"], ["page", "P11"], ["laptop", "P06"]] as const)
+      expect(w.run(from, [{ op: "note", item, text: "x" }]).state).toBe("ok");
+    expect(w.run("cain", [{ op: "note", item: "P333", text: "x" }])).toEqual({ state: "rejected", reason: "P333 isn't an item in the record" });
+    // An item held before its row exists (taken to be made) takes notes as well.
+    w.run(B, [take("P45", "made it")]);
+    expect(w.run(A, [{ op: "note", item: "P45", text: "x" }]).state).toBe("ok");
+  });
+
+  test("the notes are the note op's alone, so they never conflict", () => {
+    const w = world();
+    w.run("cain", [{ op: "note", item: "P33", text: "x" }]);
+    const base = blobSha(w.files[N]);
+    for (const op of [{ op: "put", path: N, content: "y", base }, { op: "append", path: N, text: "y" },
+      { op: "put", path: "state/notes/P99.md", content: "y", base: "new" }, { op: "put", path: "state/notes", content: "y", base: "new" }])
+      expect(w.run("cain", [op])).toMatchObject({ state: "rejected", reason: expect.stringContaining("not a place requests may write") });
+    // Two notes on one item in one request, from one writer: both land, in order.
+    expect(w.run(B, [{ op: "note", item: "P33", text: "one" }, { op: "note", item: "P33", text: "two" }]).state).toBe("ok");
+    expect(noteRows(w.files[N]).map((n) => n.text)).toEqual(["x", "one", "two"]);
+  });
+
+  test("a note is one line of text, up to 2000 characters", () => {
+    const r = (text: unknown) => parseRequest(JSON.stringify({ id: "abc123", from: B, kind: "change", summary: "s", ops: [{ op: "note", item: "P33", text }] })).error;
+    for (const empty of ["", "   ", 5, undefined]) expect(r(empty)).toBe("note P33: needs text");
+    expect(r("x".repeat(2001))).toBe("note P33: over 2000 characters");
+    expect(r("x".repeat(2000))).toBeUndefined();
+    expect(r("a | b")).toBe("note P33: a cell can't hold | or a new line");
+    expect(r("a\nb")).toBe("note P33: a cell can't hold | or a new line");
+  });
+
+  test("past the size limit the oldest notes roll off, never the new one", () => {
+    let text: string | null = null;
+    for (let i = 0; i < 40; i++) text = addNote(text, "P33", hrs(i).toISOString(), "cain", `${i} ${"x".repeat(1900)}`);
+    expect(Buffer.byteLength(text!)).toBeLessThanOrEqual(MAX_BYTES);
+    const rows = noteRows(text);
+    expect(rows.at(-1)!.text).toStartWith("39 ");
+    expect(rows[0].text).not.toStartWith("0 ");
+    expect(text!).toStartWith("# Notes on P33\n");
+  });
+
+  test("the holder's own note renews its hold", () => {
+    const w = world();
+    w.run(A, [take("P33", "x")]);
+    expect(w.run(A, [{ op: "note", item: "P33", text: "for whoever takes this next" }], hrs(3)).state).toBe("ok");
+    expect(w.holds.P33.renewed).toBe(hrs(3).toISOString());
   });
 });

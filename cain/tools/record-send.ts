@@ -3,7 +3,8 @@
 // keeper's own checks first (record-preflight) and sends nothing they'd turn away,
 // puts it in the record's inbox as <UTC>-<session>-<random>.json, then watches
 // log/requests for its outcome, up to 3 minutes, and prints it. Act on a hold only
-// once its take has printed "done".
+// once its take has printed "done". A note on one of the session's items it hasn't
+// seen yet is shown first, and the request held back once so it can be weighed.
 //
 //   bun cain/tools/record-send.ts <request.json> [--record <clone>] [--session <id>] [--wait <seconds>]
 //   bun cain/tools/record-send.ts --row <item> [--record <clone>]
@@ -15,7 +16,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { clean, openRow, rowHash, PENDING_PATH, type Outcome } from "../rootfs/opt/cain/record/core.ts";
-import { args, check, clone, fetch, send, sessionOf, treeAt, waitFor } from "./record-lib.ts";
+import { args, check, clone, fetch, freshNotes, holdsAt, itemsOf, memo, noteLines, send, sessionOf, treeAt, waitFor } from "./record-lib.ts";
 
 const a = args(process.argv.slice(2), ["record", "session", "wait", "row"]);
 const stop = (line: string, code: number): never => { console.log(line); process.exit(code); };
@@ -48,6 +49,15 @@ const raw = JSON.stringify(req, null, 1) + "\n";
 if (!fetch(rec)) stop("not sent: couldn't fetch the record", 1);
 const r = check(raw, rec);
 if (r.state !== "ok" && r.state !== "waiting") stop(`not sent: ${r.line}`, 1);
+// A note filed on one of its items since it last looked is read before it writes:
+// shown here once, and this request held back so it can be weighed first.
+const m = memo(rec, session!);
+const looked = m.read();
+const fresh = freshNotes(rec, `laptop:${session}`, holdsAt(rec), itemsOf(req, treeAt(rec)), looked);
+if (fresh.length) {
+  m.write(looked);
+  stop([...noteLines(fresh), `not sent: read the notes above first, then send it again if it still stands`].join("\n"), 1);
+}
 const name = `${stamp}-${session}-${rand}.json`;
 const s = send(rec, name, raw, `Inbox: ${clean(req.summary, 120)} (${req.id})`);
 if ("error" in s) stop(`not sent: ${s.error}`, 1);

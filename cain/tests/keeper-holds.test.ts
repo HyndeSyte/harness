@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { holdsText, openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
+import { holdsText, noteRows, openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
 import { blobSha, cycle, keep } from "../rootfs/opt/cain/record/main.ts";
 import { A, B, PENDING, SA, SB, T0, hrs, rig } from "./rig.ts";
 
@@ -206,6 +206,25 @@ describe("this morning, replayed", () => {
     expect(r.states("lap-p44-edit")).toEqual(["refused"]);
     expect(r.reason("lap-p44-edit")).toBe("P44 is held by cain (a job: build cse_03Z)");
   }, 60_000);
+
+  test("his words to the one that doesn't hold P33 land as a note, while its row edit is refused", () => {
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "dane: the laptop holds harness work (laptop chat, 7:42 AM)")] }]);
+    cycle(r.cfg);
+    r.cain({ id: "cain-p33-edit", ops: [{ op: "row", item: "P33", base: row("P33"), set: { "Next step": "PR #1 Ship asked again" } }] });
+    r.cain({ id: "cain-p33-note", ops: [{ op: "note", item: "P33", text: "Dane in Discord, 7:16 AM: By laptop session I want you to go do for me" }] });
+    r.inbox(["2.json", { id: "lap-b-note", from: B, ops: [{ op: "note", item: "P33", text: "Dane, other laptop chat: PR #3 rebases after the collision fix" }] }]);
+    cycle(r.cfg);
+    expect(r.outcome("cain-p33-edit")).toMatchObject({ state: "refused", reason: `P33 is held by ${A}` });
+    expect(r.outcome("cain-p33-note")).toMatchObject({ state: "done" });
+    expect(r.states("lap-b-note")).toEqual(["done"]);
+    expect(noteRows(r.upstream("state/notes/P33.md"))).toEqual([
+      { when: T0.toISOString(), from: "cain", text: "Dane in Discord, 7:16 AM: By laptop session I want you to go do for me" },
+      { when: T0.toISOString(), from: B, text: "Dane, other laptop chat: PR #3 rebases after the collision fix" },
+    ]);
+    expect(r.upstream(P)).toBe(PENDING);
+    expect(r.holds()).toMatchObject({ P33: { holder: A } });
+  }, 30_000);
 
   test("Cain's fixes job can't take the branch a laptop holds", () => {
     const r = rig();

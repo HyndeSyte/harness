@@ -1,17 +1,18 @@
 // What a laptop session holds in Cain's record, for it to read at the start of each
-// turn: its holds (item, branches, why), its takes still waiting behind one of
-// Cain's jobs, and any hold of its that has ended since it last looked (a day
-// without a word from it, or Dane moved it), so it doesn't act on an item that
-// isn't its own any more. With --renew it also renews its holds, at most once an
-// hour, by taking them again.
+// turn: its holds (item, branches, why), new notes on them (his words, or anyone's,
+// filed since it last looked: read before changing the item), its takes still
+// waiting behind one of Cain's jobs, and any hold of its that has ended since it
+// last looked (a day without a word from it, or Dane moved it), so it doesn't act on
+// an item that isn't its own any more. With --renew it also renews its holds, at
+// most once an hour, by taking them again.
 //
 //   bun cain/tools/record-holds.ts [--session <id>] [--record <clone>] [--hook] [--renew]
 //
 // As a Claude Code hook (SessionStart, UserPromptSubmit) pass --hook: the session
 // comes from the hook's input, it prints only when there's something to say, looks
-// at GitHub at most every 30 seconds, and never blocks the prompt.
+// at GitHub at most every 30 seconds (RECORD_HOLDS_FETCH_S), and never blocks the prompt.
 import { randomBytes } from "node:crypto";
-import { args, check, clone, fetch, holdsAt, memo, send, sessionOf, waitingFrom, when } from "./record-lib.ts";
+import { args, check, clone, fetch, freshNotes, holdsAt, memo, noteLines, send, sessionOf, waitingFrom, when } from "./record-lib.ts";
 
 const a = args(process.argv.slice(2), ["record", "session"]);
 const hook = a.hook === true;
@@ -32,7 +33,7 @@ const me = `laptop:${session}`;
 const m = memo(rec, session!);
 const was = m.read();
 const now = Date.now();
-if (!hook || now - was.fetched > 30_000) {
+if (!hook || now - was.fetched > Number(process.env.RECORD_HOLDS_FETCH_S ?? 30) * 1000) {
   if (!fetch(rec)) quiet("Record holds not checked: couldn't fetch the record", 1);
   was.fetched = now;
 }
@@ -47,6 +48,8 @@ if (mine.length) {
   for (const [id, h] of mine)
     out.push(`- ${id}, since ${when(h.taken)}${h.branches.length ? `; branches ${h.branches.join(", ")}` : ""}; for: ${h.for}`);
 }
+// Each note is shown once: the memo keeps the newest one shown per item.
+out.push(...noteLines(freshNotes(rec, me, holds, mine.map(([k]) => k), was)));
 for (const o of waiting) out.push(`Waiting: ${o.summary} (${o.id}) waits behind one of Cain's jobs. Don't act on it until it's done.`);
 for (const id of ended)
   out.push(`Your hold on ${id} has ended (a day without a word from this session, or Dane moved it). Don't act on ${id} or push its branches unless Dane asks you to take it again and the take comes back done.`);
@@ -63,5 +66,7 @@ if (a.renew && mine.length && now - was.renewed > 3_600_000) {
   if (check(raw, rec).state === "ok" && !("error" in send(rec, `${stamp}-${session}-${rand}.json`, raw, `Inbox: ${req.summary} (${req.id})`)))
     was.renewed = now;
 }
-m.write({ held: mine.map(([k]) => k), renewed: was.renewed, fetched: was.fetched });
+const held = mine.map(([k]) => k);
+const seen = Object.fromEntries(Object.entries(was.seen).filter(([k]) => held.includes(k)));
+m.write({ held, renewed: was.renewed, fetched: was.fetched, seen });
 quiet(out.join("\n"));

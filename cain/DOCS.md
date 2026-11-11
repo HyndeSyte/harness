@@ -104,6 +104,7 @@ nothing. Besides `put`, `append` and `remove`:
 | `row` | `item`, `base`, `set` | Changes cells of one open row. `base` is the row's hash as read: sha1 of the row's line, without the line ending (`record.sh rowsha <item>` on the Pi, `record-send.ts --row <item>` on a laptop). A changed row is a conflict; changes to other rows don't matter. `set` covers `Item`, `Who`, `Next step`, `Waits for`, `Done when`. |
 | `row-add` | `item`, `cells` | Adds a row at the end of the open table, `Since` today. Needs `Item`. Refuses an ID in use, or one used before in Done. |
 | `row-close` | `item`, `evidence` | Moves the row to the top of Done as `\| <ID> <Item>: <evidence> \| <date> \|`. |
+| `note` | `item`, `text` | Anyone, holder or not, on any item the record knows (held, open, or done). Appended with its time and sender to `state/notes/<item>.md`, so it never conflicts and is never refused for a hold. `text` is one line, 1 to 2,000 characters. |
 
 - Cells never hold `|` or a new line.
 - Every change to `state/PENDING.md`, `put` included, is checked row by row: a row
@@ -115,6 +116,33 @@ nothing. Besides `put`, `append` and `remove`:
 - A request from the holder that changes its row renews its hold. A laptop session
   renews its holds hourly while you chat with it.
 - A change that changes nothing is rejected: "changes nothing".
+
+### Notes: his words always land
+
+When he tells someone other than the holder something about a held item, it says
+"Got it" and files his words with a `note` op. Only that op writes `state/notes/`.
+A notes file reads:
+
+```
+# Notes on P33
+
+Words about P33 for whoever holds it, oldest first, filed by the record keeper from note requests. Its holder reads new ones before changing P33.
+
+| When | From | Note |
+|---|---|---|
+| 2026-11-11T13:20:00.000Z | laptop:9a1b2c3d-0000-4000-8000-000000000002 | Dane, laptop chat 9:12 AM: make the card say P08 Q2 |
+```
+
+- `When` is the keeper's ISO time. Past 60 KB the oldest notes roll off (git keeps
+  them); a new note is never refused for size.
+- Cain reads them with `/opt/cain/record.sh notes <item> [<ISO time>]`: one table row
+  per note, oldest first, only those after the time if one is given; nothing when
+  there are none. Items nobody holds are Cain's, so their notes are his to read too.
+- A laptop session's per-turn hook (`record-holds.ts --hook`) shows each new note on
+  its held items once. `record-send.ts` shows any it hasn't seen on the items a request
+  touches and holds that request back once, so a holder reads a note before its next
+  write.
+- This op is not the request kind `note`, which is his page's words relayed to Cain.
 
 `from` is `cain` (only through Cain's local queue), `laptop:<session id>` (stamped
 by `record-send.ts`), or `page` (your page). Older requests from plain `laptop` are
@@ -137,11 +165,12 @@ nothing is installed by this release.
   record's inbox as `<UTC>-<session>-<random>.json`, then waits up to 3 minutes for
   its outcome in `log/requests` and prints it. Exit 0 done, 1 refused, conflict or
   rejected, 3 still waiting. `--row <item>` prints a row's base. A session acts on a
-  hold only once its take prints `done`.
-- `record-holds.ts`: prints what the session holds, its takes still waiting, and
-  tells it once when a hold has ended. `--hook` for Claude Code hooks (prints only
-  when there is something to say, never blocks), `--renew` to renew its holds at
-  most hourly.
+  hold only once its take prints `done`. New notes on its items are shown first and
+  the request held back once.
+- `record-holds.ts`: prints what the session holds, new notes on those items (each
+  once), its takes still waiting, and tells it once when a hold has ended. `--hook`
+  for Claude Code hooks (prints only when there is something to say, never blocks),
+  `--renew` to renew its holds at most hourly.
 - `record-prepush.ts`, run by `pre-push`: refuses a push to any branch the session
   doesn't hold, reading `state/holds.json` fresh from the record's main. With no
   session id (Dane in a terminal), `git push --no-verify` skips it.

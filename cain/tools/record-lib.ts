@@ -6,10 +6,12 @@
 // - Sending a request into the record's inbox as one commit on top of the upstream,
 //   without touching the clone's working tree or index, and finding its outcome.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import { parseRequest, plan, parseHolds, HOLDS_PATH, type Holds, type Outcome, type Request, type Tree } from "../rootfs/opt/cain/record/core.ts";
+import { parseRequest, plan, parseHolds, changedRows, noteRows, notesPath, HOLDS_PATH, PENDING_PATH,
+  type Holds, type Note, type Outcome, type Request, type Tree } from "../rootfs/opt/cain/record/core.ts";
 
 export type Clone = { dir: string; remote: string; branch: string; ref: string };
 
@@ -150,19 +152,59 @@ export function args(argv: string[], valued: string[]): { _: string[]; [k: strin
   return out;
 }
 
-// A small per-session note kept in the clone's .git folder: what the session held
-// when it last looked, and when it last renewed and fetched.
-export type Memo = { held: string[]; renewed: number; fetched: number };
+// A small per-session memo kept in the clone's .git folder: what the session held
+// when it last looked, when it last renewed and fetched, and per item which notes it
+// has been shown (by a hash of each, so equal times or a clock step can't hide one).
+export type Memo = { held: string[]; renewed: number; fetched: number; seen: Record<string, string[]> };
 export function memo(c: Clone, session: string): { read(): Memo; write(m: Memo): void } {
   const gitDir = git(c.dir, ["rev-parse", "--git-dir"])?.trim() ?? ".git";
   const file = join(isAbsolute(gitDir) ? gitDir : join(c.dir, gitDir), "record-holds", `${session}.json`);
   return {
     read: () => {
-      try { const j = JSON.parse(readFileSync(file, "utf8")); return { held: Array.isArray(j.held) ? j.held : [], renewed: +j.renewed || 0, fetched: +j.fetched || 0 }; }
-      catch { return { held: [], renewed: 0, fetched: 0 }; }
+      try {
+        const j = JSON.parse(readFileSync(file, "utf8"));
+        const seen: Record<string, string[]> = {};
+        if (j.seen && typeof j.seen === "object") for (const [k, v] of Object.entries(j.seen)) if (Array.isArray(v)) seen[k] = v.map(String);
+        return { held: Array.isArray(j.held) ? j.held : [], renewed: +j.renewed || 0, fetched: +j.fetched || 0, seen };
+      } catch { return { held: [], renewed: 0, fetched: 0, seen: {} }; }
     },
     write: (m) => { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify(m)); },
   };
 }
+
+// Notes on the session's own held items that it hasn't been shown yet: any it hasn't
+// seen, and on an item it has just come to hold, those filed since it took it. Marks
+// them seen in the memo given.
+const noteKey = (n: Note) => createHash("sha1").update(`${n.when}\n${n.from}\n${n.text}`).digest("hex").slice(0, 16);
+export function freshNotes(c: Clone, me: string, holds: Holds, items: Iterable<string>, m: Memo): { id: string; notes: Note[] }[] {
+  const t = treeAt(c), out: { id: string; notes: Note[] }[] = [];
+  for (const id of new Set(items)) {
+    const h = holds[id];
+    if (!h || h.holder !== me) continue;
+    const all = noteRows(t.read(notesPath(id)));
+    const shown = m.seen[id] ? new Set(m.seen[id]) : null;
+    const notes = all.filter((n) => (shown ? !shown.has(noteKey(n)) : n.when >= h.taken));
+    m.seen[id] = all.map(noteKey);
+    if (notes.length) out.push({ id, notes });
+  }
+  return out;
+}
+
+// The items a request would touch: those its ops name, and the rows a put of the
+// open list changes.
+export function itemsOf(req: any, t: Tree): string[] {
+  const out = new Set<string>();
+  for (const o of Array.isArray(req?.ops) ? req.ops : []) {
+    if (typeof o?.item === "string") out.add(o.item);
+    if (o?.op === "put" && o.path === PENDING_PATH && typeof o.content === "string")
+      for (const id of changedRows(t.read(PENDING_PATH), o.content)) out.add(id);
+  }
+  return [...out];
+}
+
+export const noteLines = (fresh: { id: string; notes: Note[] }[]): string[] => fresh.flatMap(({ id, notes }) => [
+  `New notes on ${id} since you last looked. Read them before you change ${id}:`,
+  ...notes.map((n) => `- ${when(n.when)}, from ${n.from}: ${n.text}`),
+]);
 
 export const when = (iso: string) => new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });

@@ -180,6 +180,16 @@ def test_cain_gets_a_rows_base_and_the_holds_from_record_sh(tmp_path):
         assert run_("rowsha", line.split("|")[1].strip()).stdout.strip() == hashlib.sha1(line.encode()).hexdigest()
     assert run_("rowsha", "P99").returncode == 1
     assert run_("holds").stdout.strip() == "{}"   # nothing pushed yet: nobody holds anything
+    # Notes on an item, oldest first, one table row each; only those after a time if given.
+    (rec / "state" / "notes").mkdir()
+    notes = ["| 2026-11-11T13:00:00.000Z | laptop:abc | Dane, other chat: rebase PR #3 after the fix |",
+             "| 2026-11-11T14:00:00.000Z | cain | Dane in Discord: hold the ship until the drill |"]
+    (rec / "state" / "notes" / "P33.md").write_bytes(("# Notes on P33\n\nWords about P33.\n\n| When | From | Note |\n|---|---|---|\n"
+                                                      + "\n".join(notes) + "\n").replace("\n", "\r\n").encode())
+    assert run_("notes", "P33").stdout.splitlines() == notes
+    assert run_("notes", "P33", "2026-11-11T13:00:00.000Z").stdout.splitlines() == notes[1:]
+    assert run_("notes", "P44").stdout == ""        # none filed
+    assert run_("notes", "../P33").returncode == 2
 
 
 def test_cain_versions_agree_and_everything_is_pinned():

@@ -6,7 +6,8 @@
 // Each item (a row of state/PENDING.md, like P33) has at most one holder: Cain, or
 // one laptop session. Only the holder changes its row and pushes its branches. The
 // keeper owns the list of holds (state/holds.json); requests change it only through
-// take, pass and release.
+// take, pass and release. Anyone may file a note on any item (state/notes/<item>.md,
+// also the keeper's own), so his words always reach its holder.
 import { createHash } from "node:crypto";
 
 export type RowField = "Item" | "Who" | "Next step" | "Waits for" | "Done when";
@@ -20,7 +21,8 @@ export type Op =
   | { op: "release"; item: string }
   | { op: "row"; item: string; base: string; set: Partial<Record<RowField, string>> }  // base: rowHash of the row as read
   | { op: "row-add"; item: string; cells: Partial<Record<RowField, string>> }
-  | { op: "row-close"; item: string; evidence: string };
+  | { op: "row-close"; item: string; evidence: string }
+  | { op: "note"; item: string; text: string };                       // anyone, any item: kept for its holder
 
 export type Request = {
   id: string;          // unique; the receipt Dane or Cain can look up
@@ -50,13 +52,17 @@ export type Downtime = [string, string][];   // spans the keeper couldn't work (
 export const HOLDS_PATH = "state/holds.json";
 export const PENDING_PATH = "state/PENDING.md";
 export const HOLD_IDLE_MS = 24 * 3_600_000;   // a day without a word from the holder
+export const notesPath = (item: string) => `state/notes/${item}.md`;
+export const MAX_NOTE_TEXT = 2_000;           // characters in one note
 
 // Where requests may write. log/ and inbox/ belong to the keeper itself; code,
 // workflows and the repo's own settings are never written through requests.
 // reviews/ holds outside-model reviews (written by the review runner, as Cain).
-// state/holds.json is the keeper's own; requests change it only with take, pass and release.
+// state/holds.json is the keeper's own; requests change it only with take, pass and
+// release. state/notes/ is the keeper's too: written only by the note op, so a note
+// never conflicts with anything.
 const WRITABLE = /^(areas|state|archive|rules|projects|reviews)\/[A-Za-z0-9._ \/&()-]+$/;
-const KEEPERS = /^state\/holds\.json$/i;
+const KEEPERS = /^state\/(holds\.json$|notes(\/|$))/i;
 const APPEND_ONLY = /(^|\/)decisions\.md$/i;
 
 // Text that ends up in Cain's terminal: one line, no control characters, short.
@@ -125,7 +131,7 @@ export function parseRequest(raw: string): { req?: Request; error?: string } {
   if (!Array.isArray(j.ops) || j.ops.length === 0 || j.ops.length > 50) return { req, error: "change needs 1 to 50 ops" };
   for (const o of j.ops) {
     if (!o || typeof o !== "object") return { req, error: "an op must be an object" };
-    if (["take", "pass", "release", "row", "row-add", "row-close"].includes(o.op)) {
+    if (["take", "pass", "release", "row", "row-add", "row-close", "note"].includes(o.op)) {
       if (typeof o.item !== "string" || !ITEM.test(o.item)) return { req, error: `${o.op}: needs an item id, like P33` };
       const why = itemOpProblem(o);
       if (why) return { req, error: why };
@@ -163,6 +169,12 @@ function itemOpProblem(o: any): string | null {
       if (typeof o.evidence !== "string" || !o.evidence.trim()) return `row-close ${o.item}: needs evidence`;
       const why = cellProblem(o.evidence);
       return why ? `row-close ${o.item} evidence: ${why}` : null;
+    }
+    case "note": {
+      if (typeof o.text !== "string" || !o.text.trim()) return `note ${o.item}: needs text`;
+      if (o.text.length > MAX_NOTE_TEXT) return `note ${o.item}: over ${MAX_NOTE_TEXT} characters`;
+      const why = cellProblem(o.text);
+      return why ? `note ${o.item}: ${why}` : null;
     }
   }
   return "unknown op";
@@ -354,6 +366,49 @@ export function closeRow(text: string, id: string, evidence: string, date: strin
   return { text: lines.join("\n") };
 }
 
+// An item the record knows: an open row, or one that went to Done.
+export function itemKnown(text: string | null, id: string): boolean {
+  if (text === null) return false;
+  if (openRows(text).has(id)) return true;
+  const d = parsePending(text);
+  if (d.done) for (let i = d.done.body; i < d.done.end; i++) {
+    const first = cells(d.lines[i])[0];
+    if (first === id || first.startsWith(`${id} `)) return true;
+  }
+  return false;
+}
+
+// ---- Notes: words about an item for whoever holds it (state/notes/<item>.md) ----
+
+export type Note = { when: string; from: string; text: string };
+const NOTE_ROW = /^\|\s*\d{4}-\d\d-\d\dT[^|]*\|/;
+
+// One more note at the end, with when and who. His words always land: a file past
+// the size limit drops its oldest notes (git keeps them), never the new one.
+export function addNote(before: string | null, item: string, at: string, from: string, text: string): string {
+  let out = before ?? `# Notes on ${item}\n\nWords about ${item} for whoever holds it, oldest first, filed by the record keeper from note requests. Its holder reads new ones before changing ${item}.\n\n| When | From | Note |\n|---|---|---|\n`;
+  if (!out.endsWith("\n")) out += "\n";
+  out += renderRow([at, from, text.trim()], false) + "\n";
+  const lines = out.split("\n");
+  for (let i = 0; Buffer.byteLength(lines.join("\n")) > MAX_BYTES && i < lines.length - 2;) {
+    if (NOTE_ROW.test(lines[i])) lines.splice(i, 1);
+    else i++;
+  }
+  return lines.join("\n");
+}
+
+// The notes in a notes file, oldest first. "when" is the keeper's ISO time, so notes
+// compare as text.
+export function noteRows(text: string | null): Note[] {
+  const out: Note[] = [];
+  for (const line of (text ?? "").split("\n")) {
+    if (!NOTE_ROW.test(line)) continue;
+    const [when, from, ...rest] = cells(line);
+    out.push({ when, from, text: rest.join(" | ") });
+  }
+  return out;
+}
+
 // A whole-file put of PENDING.md made from an older version: its row changes are
 // laid onto the list as it stands now, so edits to different rows never conflict.
 // Returns the merged text, or why it can't (both sides changed the same row, or the
@@ -514,6 +569,17 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
         touched.delete(id);
       }
       explicit = true;
+      continue;
+    }
+
+    if (o.op === "note") {
+      // His words always land: anyone files a note on any item, held or free, and its
+      // holder reads it before changing the item. Only this op writes the file.
+      const id = o.item, p = notesPath(id);
+      if (!holds[id] && !itemKnown(current(PENDING_PATH), id)) return rejected(`${id} isn't an item in the record`);
+      if (tree.isDir?.(p)) return rejected(`${p}: is a folder`);
+      writes.set(p, addNote(current(p), id, iso, sender, o.text));
+      if (holds[id]?.holder === sender) touched.add(id);
       continue;
     }
 
