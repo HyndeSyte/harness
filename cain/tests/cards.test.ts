@@ -10,7 +10,6 @@ const undoRows = [{ type: 1, components: [{ type: 2, style: 2, label: "Undo", cu
 const laptopHolds = (item: string, branches: string[] = []) =>
   JSON.stringify({ [item]: { holder: "laptop:s1", for: "his chat", branches, taken: "x", renewed: "x" } });
 const snap = (m: any) => structuredClone(m);                         // the card as his phone shows it
-const nyTime = (ms: number) => new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York" });
 
 async function ask(r: ReturnType<typeof rig>, item: string, question = "", text = `${item} ${question}: Filed?`,
                    options = ["Filed", "Not filed", "Not sure"], replyTo?: string) {
@@ -20,12 +19,13 @@ async function ask(r: ReturnType<typeof rig>, item: string, question = "", text 
 
 describe("the check-in clock", () => {
   test("an ask lasts until the next morning check-in, 7:10 AM in New York", () => {
-    expect(nyTime(nextCheckin(NOV11_8AM))).toBe("11/12/2026, 7:10:00 AM");
-    expect(nyTime(nextCheckin(Date.UTC(2026, 10, 11, 11, 0)))).toBe("11/11/2026, 7:10:00 AM");   // 6:00 AM
-    expect(nyTime(nextCheckin(Date.UTC(2026, 10, 11, 12, 10)))).toBe("11/12/2026, 7:10:00 AM");  // 7:10 sharp
+    const utc = (ms: number) => new Date(nextCheckin(ms)).toISOString();   // 7:10 AM EST is 12:10 UTC
+    expect(utc(NOV11_8AM)).toBe("2026-11-12T12:10:00.000Z");                 // Wed 8:00 AM: Thu 7:10
+    expect(utc(Date.UTC(2026, 10, 11, 11, 0))).toBe("2026-11-11T12:10:00.000Z");   // 6:00 AM: the same day
+    expect(utc(Date.UTC(2026, 10, 11, 12, 10))).toBe("2026-11-12T12:10:00.000Z");  // 7:10 sharp: the next day
     // across the end of daylight saving time (Nov 1, 2026) and its start (Mar 8, 2026)
-    expect(new Date(nextCheckin(Date.UTC(2026, 10, 1, 0, 0))).toISOString()).toBe("2026-11-01T12:10:00.000Z");
-    expect(new Date(nextCheckin(Date.UTC(2026, 2, 8, 5, 0))).toISOString()).toBe("2026-03-08T11:10:00.000Z");
+    expect(utc(Date.UTC(2026, 10, 1, 0, 0))).toBe("2026-11-01T12:10:00.000Z");
+    expect(utc(Date.UTC(2026, 2, 8, 5, 0))).toBe("2026-03-08T11:10:00.000Z");
   });
 });
 
