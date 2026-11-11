@@ -144,6 +144,12 @@ class CRig(Rig):
         self.claude.script = [ask(*changes)]
         self.say(words, **kw)
 
+    def approve(self):
+        """Tap Approve on the card just sent, if there is one: a request that ends a series."""
+        last = self.bot.sent[-1] if self.bot.sent else None
+        if last and last[2] and any(t == "Approve" for row in last[2] for t, _ in row):
+            self.press(last, "Approve")
+
     def body(self, path=PATH):
         return self.icloud.events[path][1]
 
@@ -409,9 +415,10 @@ def test_off_says_so_and_changes_nothing(r):
 
 def test_several_changes_land_in_one_receipt(r):
     r.tell(change(dates="2026-11-23"), change(op="end_series", dates="2027-03-08"))
+    r.approve()                                # ending a series is tapped
     days = days_of(r.body())
     assert "2026-11-23" not in days and "2027-03-08" not in days and "2027-03-03" in days
-    assert len([s for s in r.bot.sent if s[2]]) == 1
+    assert len([s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)]) == 1
 
 
 def test_an_added_series_is_an_ordinary_event_and_undo_takes_it_off(r):
@@ -462,8 +469,9 @@ def test_a_crash_while_planning_never_runs_it_twice(r, monkeypatch):
 # -- Gmail --------------------------------------------------------------------------------------
 
 def gmail_day(r, uid="base_1", series="base", title="Piano", day="2026-11-09T08:00:00-05:00"):
+    end = (datetime.fromisoformat(day) + timedelta(hours=1)).isoformat()     # an hour, like a lesson
     r.gmail.events[uid] = {"id": uid, "etag": '"1"', "summary": title, "recurringEventId": series,
-                           "start": {"dateTime": day}, "end": {"dateTime": day}, "location": "Clinic"}
+                           "start": {"dateTime": day}, "end": {"dateTime": end}, "location": "Clinic"}
     r.gmail.events.setdefault(series, {"id": series, "etag": '"0"', "summary": title, "status": "confirmed",
                                        "start": {"dateTime": "2026-10-05T08:00:00-04:00"},
                                        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"]})
@@ -483,6 +491,7 @@ def test_a_gmail_series_ends(r):
                               "start": {"dateTime": "2026-10-05T08:00:00-04:00"},
                               "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"]}
     r.tell(change(calendar="gmail", op="end_series", title="piano", dates="2026-11-09"))
+    r.approve()                                # ending a series is tapped
     assert "UNTIL=20261109T045959Z" in r.gmail.events["base"]["recurrence"][0]
     r.press(r.with_button("Undo"), "Undo")
     assert r.gmail.events["base"]["recurrence"] == ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
@@ -613,6 +622,7 @@ def test_undo_of_two_steps_on_one_event_survives_a_server_that_rewrites(r):
         return real(method, url, **kw)
     r.icloud.request = rewrites
     r.tell(change(dates="2026-11-23"), change(op="end_series", dates="2027-03-08"))
+    r.approve()                                # ending a series is tapped
     r.press(r.with_button("Undo"), "Undo")
     assert "Undone" in r.texts()[-1]
     assert "2026-11-23" in days_of(r.body()) and "2027-03-08" in days_of(r.body())
@@ -637,6 +647,7 @@ def test_a_reply_to_a_receipt_gets_a_tap(r):
 
 def test_end_series_finds_the_next_day_it_happens(r):
     r.tell(change(op="end_series", dates="2026-12-05"))         # a Saturday
+    r.approve()                                # ending a series is tapped
     days = days_of(r.body())
     assert "2026-11-30" in days and "2026-12-07" not in days
 
@@ -648,14 +659,17 @@ def test_a_title_under_two_series_ends_both_or_only_the_day_named(r):
     r.icloud.seed(PATH, mon)
     r.icloud.seed(FAMILY_PATH + "WED.ics", wed)
     r.tell(change(op="end_series", dates="2027-03-08", days="MO"))
+    r.approve()                                # ending a series is tapped
     assert "2027-03-15" not in days_of(r.body()) and "2027-03-17" in days_of(r.body(FAMILY_PATH + "WED.ics"))
     r.tell(change(op="end_series", dates="2027-03-08"))
+    r.approve()                                # ending a series is tapped
     assert "2027-03-17" not in days_of(r.body(FAMILY_PATH + "WED.ics"))
 
 
 def test_a_series_with_more_days_than_named_is_refused(r):
     before = r.body()
     r.tell(change(op="end_series", dates="2027-03-08", days="MO"))
+    r.approve()                                # ending a series is tapped
     assert r.body() == before and "more days" in r.texts()[-1]
 
 
@@ -784,6 +798,7 @@ def test_a_night_shift_moves_on_the_day_it_starts(r):
 def test_ending_a_night_shift_isnt_called_a_failed_read_back(r):
     r.icloud.seed(FAMILY_PATH + "NIGHTS.ics", NIGHTS)
     r.tell(change(op="end_series", title="night shift", dates="2026-12-01"))
+    r.approve()                                # ending a series is tapped
     assert "Done" in r.texts()[-1]
 
 
@@ -803,6 +818,7 @@ def test_ending_doesnt_delete_a_series_that_hasnt_started(r):
     r.icloud.seed(FAMILY_PATH + "LATER.ics", later_series())
     before = r.body()
     r.tell(change(op="end_series", dates="2026-12-15"))
+    r.approve()                                # ending a series is tapped
     assert FAMILY_PATH + "LATER.ics" in r.icloud.events and r.body() == before
     assert "only starts on Jan 12" in r.texts()[-1]
 
@@ -812,6 +828,7 @@ def test_the_days_filter_goes_by_the_rule_not_the_weeks_around(r):
     off = ics_edit.remove_days(SERIES, [f"202703{d:02d}T123000Z" for d in (17, 24, 31)], TZ, NOW)
     r.icloud.seed(PATH, off)
     r.tell(change(op="end_series", dates="2027-03-15", days="MO"))
+    r.approve()                                # ending a series is tapped
     assert "more days" in r.texts()[-1] and "2027-03-15" in days_of(r.body())
 
 
@@ -820,6 +837,7 @@ def test_one_day_moved_doesnt_make_a_monday_series_more_than_mondays(r):
     start = datetime(2027, 3, 16, 9, 0, tzinfo=NY)
     r.icloud.seed(PATH, ics_edit.move_day(mon, "20270315T123000Z", start, start + timedelta(hours=1), TZ, NOW))
     r.tell(change(op="end_series", dates="2027-03-08", days="MO"))
+    r.approve()                                # ending a series is tapped
     assert "Done" in r.texts()[-1]
 
 
@@ -847,6 +865,7 @@ def test_a_series_months_off_can_still_be_ended(r):
                   .replace("EXDATE;TZID=America/New_York:20261104T083000\r\n", "").replace("20261102T", "20261012T")
                   .replace("BYDAY=MO;", ""))
     r.tell(change(op="end_series", dates="2026-11-20"))
+    r.approve()                                # ending a series is tapped
     assert "Done" in r.texts()[-1]
 
 
@@ -888,7 +907,7 @@ def test_gmail_undo_works_after_a_read_back_that_failed(r):
     r.gmail.change = then_down
     r.tell(change(calendar="gmail", op="move", title="piano", dates="2026-11-09",
                   start="2026-11-09T10:00:00-05:00", end="2026-11-09T11:00:00-05:00"))
-    assert "Written, not confirmed" in r.texts()[-1]
+    assert "written but not confirmed" in r.texts()[-1]
     r.gmail.change = real
     r.gmail.down = False
     r.press(r.with_button("Undo"), "Undo")
@@ -927,11 +946,12 @@ def test_a_write_that_landed_is_named_in_the_receipt(r):
         return answer
     r.icloud.request = down_after_put
     r.tell(change(dates="2026-11-23"))
-    assert "Written, not confirmed" in r.texts()[-1] and "School Day" in r.texts()[-1]
+    assert "written but not confirmed" in r.texts()[-1] and "School Day" in r.texts()[-1]
 
 
 def test_an_ended_series_that_comes_back_later_is_still_caught(r):
     r.tell(change(op="end_series", dates="2026-12-01"))
+    r.approve()                                # ending a series is tapped
     r.clock.advance(days=30)
     r.mark_daily_done()
     r.icloud.seed(PATH, SERIES)
@@ -962,6 +982,7 @@ def test_an_unreadable_option_clears_nothing(r):
 def test_something_unreadable_is_said_when_ending(r):
     r.icloud.seed(FAMILY_PATH + "odd.ics", SERIES.replace(UID, "ODD").replace("BYDAY=MO,WE", "BYSETPOS=1;BYDAY=TU"))
     r.tell(change(op="end_series", dates="2026-12-01"))
+    r.approve()                                # ending a series is tapped
     assert "can't read" in r.texts()[-1]
 
 
@@ -1010,6 +1031,7 @@ def test_a_gmail_series_and_one_of_its_days_are_each_checked(r):
     r.tell(change(calendar="gmail", op="move", title="harness test", dates="2026-12-08",
                   start="2026-12-08T21:00:00-05:00", end="2026-12-08T22:00:00-05:00"),
            change(calendar="gmail", op="end_series", title="harness test", dates="2026-12-15"))
+    r.approve()                                # ending a series is tapped
     ended = list(r.gmail.events["cmS"]["recurrence"])
     day = r.gmail.events["cmS_20261209T000000Z"]
     day.update(etag='"his"', start={"dateTime": "2026-12-08T18:00:00-05:00"})    # he moved it again
@@ -1080,7 +1102,8 @@ def test_the_digest_says_what_wasnt_done_in_plain_words(r, monkeypatch):
     from harness import daily
     from harness.config import Config
     from conftest import OWNER
-    monkeypatch.setattr(r.cc, "preview", lambda *a: [])         # couldn't look first: the run finds out
+    from harness.calendar_change import Preview
+    monkeypatch.setattr(r.cc, "preview", lambda *a: Preview([]))   # couldn't look first: the run finds out
     r.tell(change(title="Book club", dates="2026-12-01"))       # nothing called that on Family
     r.ledger.db.execute("DELETE FROM meta WHERE key='integrity_since'")
     d = daily.gather(r.ledger, Config(owner_user_id=OWNER, stage="S1"), paused=False)

@@ -120,7 +120,7 @@ _FILLER = frozenset({"the", "a", "an", "my", "our", "his", "her", "their", "its"
 # A clock time in his words ("the 8:00 drop-off", "PT at 11:30am"): which one, not what it's called.
 _CLOCK = re.compile(r"(?i)(?<![\w:+-])(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?\s*m\.?(?![\w])"
                     r"|(?<![\w:+-])(\d{1,2}):([0-5]\d)(?![\w:])|\bnoon\b")
-EXACT, PART = 2, 1                     # how well his words fit a title
+EXACT, HEAD, PART = 3, 2, 1            # his words are the whole name, all before its dash, or in it
 _RUN_WORDS = frozenset({"dropoff", "pickup", "drive", "busy", "run", "kids"})   # a block's own words
 
 
@@ -154,15 +154,37 @@ def said(asked: str) -> tuple[frozenset[str], tuple[tuple[int, int, str], ...]]:
 
 
 def fit(asked: str, title: str) -> int:
-    """EXACT: his words are the title's. PART: his words are all in it, like "PT" in "PT - Clinic"
-    or "drop-off" in "Busy (school drop-off)". 0: it isn't what he named."""
+    """EXACT: his words are the title's. HEAD: they're all of it before its dash, like "PT" for
+    "PT - Clinic". PART: they're in it, like "drop-off" in "Busy (school drop-off)" or "PT" in
+    "PT insurance call". 0: it isn't what he named."""
     want, _ = said(asked)
     have = title_words(title)
     if not want or not have:
         return 0
     if want == have or want == have - _FILLER:
         return EXACT
+    head = title_words(_event_head(title))
+    if head != have and (want == head or want == head - _FILLER):
+        return HEAD
     return PART if want <= have else 0
+
+
+_SHIFT = r"(?!\s*(?:earlier|later|early|late|before|after|sooner|back|forward|ahead))"
+_NUMBER = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}
+
+
+def durations(text: str) -> set[int]:
+    """Lengths he gave in words, in minutes: "45 minutes", "an hour and a half", "half an hour".
+    Not a shift: "30 minutes earlier" says when, not how long."""
+    t = " ".join(text.casefold().split())
+    out = {int(m.group(1)) for m in re.finditer(r"\b(\d{1,3})\s*(?:mins?|minutes?)\b" + _SHIFT, t)}
+    for m in re.finditer(r"(?<!half )\b(an?|one|two|three|\d{1,2}(?:\.5)?)\s*(?:hrs?|hours?)\b(\s+and\s+a\s+half)?"
+                         + _SHIFT, t):
+        hours = _NUMBER.get(m.group(1)) or float(m.group(1))
+        out.add(int(hours * 60) + (30 if m.group(2) else 0))
+    if re.search(r"\bhalf\s+an?\s+hour\b" + _SHIFT, t):
+        out.add(30)
+    return out
 
 
 def matches(asked: str, title: str) -> bool:
@@ -275,6 +297,16 @@ class Part:
     done: str                          # "Moved PT to 11:30 to 12:30 today (Gmail and Family)"
     steps: list[Step]
     key: tuple = ()                    # the event and what happens to it: the same part twice is once
+    removes: int = 0                   # events it takes off, his own and Family's, copies not counted
+    ends: str = ""                     # a series it ends: every day of it from then on goes
+    length: tuple = ()                 # a move that changes its length: (was, now, new end, name)
+
+
+@dataclass
+class Preview:
+    """What a change will do, found on a fresh read, and what to check before it does."""
+    lines: list[str]
+    checks: list[str] = field(default_factory=list)
 
 
 class CalendarChange:
@@ -332,12 +364,14 @@ class CalendarChange:
             self._say(db, job["chat_id"], job["id"], f"Nothing changed: {render.escape(why)}.")
 
     # -- before anything is offered or done: is it clear? ------------------------------------
-    def preview(self, job, receipt: dict, params: dict) -> list[str] | None:
+    def preview(self, job, receipt: dict, params: dict) -> Preview | None:
         """Every event he names, found on a fresh read of both calendars, before anything is
-        offered or done. Clear: what will happen, a line each, for the card or the run. Unclear:
-        one question naming what's unclear, and None: the job waits for his answer, and nothing
-        changes. Not possible: said in words, and None. When the read itself goes wrong here, []:
-        the run reads again and says what it finds."""
+        offered or done. Clear: what will happen, a line each, for the card or the run, and what
+        to check first, which puts it on a card to tap: a length he didn't give, three or more
+        events taken off at once, or a series ended. Unclear: one question naming what's unclear,
+        and None: the job waits for his answer, and nothing changes. Not possible: said in words,
+        and None. When the read itself goes wrong here, no lines: the run reads again and says
+        what it finds."""
         try:
             parts, _ = self._plan_all(params, "preview")
         except Unclear as why:
@@ -354,9 +388,49 @@ class CalendarChange:
         except (ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant) as e:
             log.warning("calendar change job %s: couldn't preview (%s)", render.short(job["id"]),
                         type(e).__name__)
-            return []
-        log.info("calendar change job %s: clear, %d part(s)", render.short(job["id"]), len(parts))
-        return [p.will for p in parts]
+            return Preview([])
+        checks = self._checks(job, parts)
+        log.info("calendar change job %s: clear, %d part(s), %d check(s)", render.short(job["id"]),
+                 len(parts), len(checks))
+        return Preview([p.will for p in parts], checks)
+
+    def _checks(self, job, parts: list[Part]) -> list[str]:
+        """What a request found clear still can't do on its words alone. Not judging what he
+        meant: the shape of the change. A length the model worked out and he never gave; three
+        or more events off at once; a series ended, which takes off days he didn't name. Pasted
+        text can ask for any of those, so each gets his tap."""
+        out = []
+        words = self._his_words(job)
+        _, times = said(words)
+        for part in parts:
+            if not part.length:
+                continue
+            was, now, end, name = part.length
+            local = end.astimezone(ZoneInfo(self.tz))
+            gave_end = any(self._same_clock(local, t) for t in times)
+            if not gave_end and int(now.total_seconds() // 60) not in durations(words):
+                out.append(f"{render.plain(name)} would be {_length(now)} long instead of {_length(was)}, and you "
+                           "didn't give a new end or length.")
+        removes = sum(part.removes for part in parts)
+        if removes >= 3:
+            out.append(f"this takes off {removes} events at once.")
+        out += [f"it ends {render.plain(part.ends)}, taking off every day of it from then on." for part in parts
+                if part.ends]
+        return out
+
+    def _his_words(self, job) -> str:
+        """What he said himself in the last half hour, this message included: never Cain's notes."""
+        since = iso(self.ledger.now() - timedelta(minutes=30))
+        rows = self.ledger.db.execute(
+            "SELECT t.text FROM job_text t JOIN jobs j ON j.id=t.job_id WHERE j.chat_id=?"
+            " AND (j.created_at>=? OR j.id=?) ORDER BY j.created_at", (job["chat_id"], since, job["id"]))
+        return "\n".join(r["text"].split("\n\n[A suggestion from Cain", 1)[0] for r in rows)
+
+    @staticmethod
+    def _same_clock(t: datetime, said_time: tuple) -> bool:
+        hour, minute, half = said_time
+        hours = {hour % 12 + (12 if half == "p" else 0)} if half else {hour % 12, hour % 12 + 12}
+        return t.hour in hours and t.minute == minute
 
     def _ask(self, job, receipt: dict, question: str) -> None:
         """Once, by name. His answer is a new message, with this one before it."""
@@ -429,7 +503,7 @@ class CalendarChange:
         text = self.ledger.job_text(job["id"])
         if _looks_pasted(text) or pasted_recently:
             out.append("your message or a recent one may be pasted text: it has a quoted line, an "
-                       "email's header lines, a forward or a link.")
+                       "email's header lines, a forward, a link, a phone number or words written to you.")
         elif self._reply_may_be_foreign(job):
             out.append("it's a reply to a message whose words may not be yours, so it may be pasted text.")
         local = ZoneInfo(self.tz)
@@ -616,9 +690,7 @@ class CalendarChange:
                     entry = step.run()
                     landed.append(step)
                 except Stopped as s:
-                    stopped, entry, at = s, s.undo, step
-                    if entry is not None:        # it landed, though its read back didn't confirm it
-                        notes.append(f"Written, not confirmed: {render.plain(step.label)}")
+                    stopped, entry, at = s, s.undo, step   # an entry: written, but not confirmed
                 except (ValueError, KeyError, TypeError, ical.Unreadable) as e:
                     stopped, at = Stopped("failed", words=str(e) if isinstance(e, ics_edit.Cant)
                                           else "I couldn't read that event"), step
@@ -716,16 +788,21 @@ class CalendarChange:
             else:
                 self.ledger.set_meta(PROBLEM, "Calendar change: the last one didn't finish", db)
                 head = ("<b>Only part of that went through.</b>" if done
-                        else "<b>That stopped partway.</b>" if undo
+                        else "<b>That stopped partway.</b>" if any(landed for _, landed, _, _ in failed)
                         else "<b>Not sure that went through.</b>"
-                        if any(s.kind == "unknown" for _, _, s, _ in failed)
+                        if any(s.kind == "unknown" or s.undo is not None for _, _, s, _ in failed)
                         else "<b>Nothing changed.</b>")
             lines = [head] + [part.done for part in done]
             for part, landed, s, at in failed:
                 why = _safe(s.words or WORDS.get(s.kind) or "the calendar refused it")
-                if landed:
-                    lines.append(f"Partly done: {part.will}. It went through on "
-                                 f"{' and '.join(x.what for x in landed)}, not on {at.what}, because {why}.")
+                went = " and ".join(x.what for x in landed)
+                if s.undo is not None:           # written, and the read back couldn't confirm it
+                    lines.append(f"Partly done: {part.will}. It went through on {went}; on {at.what} it was "
+                                 f"written but not confirmed: {why}." if landed else
+                                 f"Not sure: {part.will}, written but not confirmed: {why}.")
+                elif landed:
+                    lines.append(f"Partly done: {part.will}. It went through on {went}, not on {at.what}, "
+                                 f"because {why}.")
                 else:
                     lines.append(f"{'Not sure' if s.kind == 'unknown' else 'Not done'}: {part.will}, "
                                  f"because {why}.")
@@ -939,24 +1016,34 @@ class CalendarChange:
                  unreadable: int, unread: list[str], named: str = "") -> tuple[list[Found], int]:
         """The one event he named, on the days he named: a School Board Meeting next month doesn't
         make "school" on Monday unclear. His words in a title, or its usual long form, are how
-        anyone talks about it. The whole name beats part of one ("School Day" isn't "School Day
-        Pictures"), and a real event beats a block of Harness's unless his words name the run
-        ("no school" is the School Day, "no drop-off" is the drop-off). None, or two different
-        ones, or one only on the calendar the model didn't name: he's asked, by name."""
+        anyone talks about it. A real event, on either calendar, comes before a block of Harness's
+        unless his words name the run ("no school" is the School Day, "no drop-off" the drop-off).
+        When different events fit, the whole of a name of two words or more beats part of one
+        ("School Day" isn't "School Day Pictures"); a one-word name is asked, always ("PT" could be
+        the PT at 4:00 or the PT at the clinic). None, two that fit alike, or one only on the
+        calendar the model didn't name: he's asked, by name."""
         want, times = said(asked)
-        for pool in (first, rest):
+
+        def scored(pool: list[Found]) -> list[tuple[int, Found]]:
             on = [f for f in pool if any(f.first <= d <= f.last for d in days)]
-            scored = [(self._fits(asked, f), f) for f in on]
-            scored = [(score, f) for score, f in scored if score and (not times or self._at(f, times))]
-            if not want & _RUN_WORDS and any(not f.block for _, f in scored):
-                scored = [(score, f) for score, f in scored if not f.block]
-            if not scored:
+            out = [(self._fits(asked, f), f) for f in on]
+            return [(score, f) for score, f in out if score and (not times or self._at(f, times))]
+        pools = [scored(first), scored(rest)]
+        if not want & _RUN_WORDS:
+            real = [[x for x in pool if not x[1].block] for pool in pools]
+            if any(real):
+                pools = real
+        for n, found in enumerate(pools):
+            if not found:
                 continue
-            best = max(score for score, _ in scored)
-            chosen = [f for score, f in scored if score == best]
-            if len({title_words(f.title) for f in chosen}) > 1:
-                raise self._several(asked, days, chosen)
-            if pool is rest:
+            best = max(score for score, _ in found)
+            if len({title_words(f.title) for _, f in found}) > 1:
+                top = [f for score, f in found if score == best]
+                if best != EXACT or len(want) < 2 or len({title_words(f.title) for f in top}) > 1:
+                    raise self._several(asked, days, [f for _, f in found])
+                found = [(best, f) for f in top]
+            chosen = [f for _, f in found]
+            if n == 1:
                 where = "Family" if named == "family" else "your Gmail calendar"
                 when = render.day_words(days[0], self._today())
                 raise Unclear(f"{asked} isn't on {where} {when}, and {self._shown(chosen[0])} is",
@@ -977,12 +1064,13 @@ class CalendarChange:
             raise Refuse(f"{f.title} on {_day_words(f.first)} is Harness's copy of a Gmail event I "
                          "can't find that day, so I left it. Change the event on Gmail, and the copy follows")
 
-    def _part_guard(self, asked: str, days: list[date], chosen: list[Found]) -> None:
-        """His words are only part of a one-off's name, and something that repeats under them isn't
-        on that day: "no school Tuesday", when school is Mondays and Wednesdays, isn't School
-        Pictures that Tuesday, and "move PT" isn't the PT insurance call. Asked, not guessed (the
-        Nov 5 lesson), on either calendar, for a move as well as a removal."""
-        if any(f.repeats or f.block for f in chosen):
+    def _part_guard(self, asked: str, days: list[date], chosen: list[Found], best: int) -> None:
+        """His words are only part of a one-off's name, and around that day something fits them
+        better, or repeats under them: "no school Tuesday", when school is Mondays and Wednesdays,
+        isn't School Pictures that Tuesday, and "move PT tomorrow" isn't tomorrow's PT insurance
+        call when the PT is today. Asked, not guessed (the Nov 5 lesson), on either calendar, for
+        a move as well as a removal."""
+        if best >= HEAD or any(f.repeats or f.block for f in chosen):
             return
         around: list[Found] = []
         for calendar in sorted({f.calendar for f in chosen}):
@@ -991,11 +1079,13 @@ class CalendarChange:
             except Refuse:
                 raise Refuse(f"I couldn't read the days around it to tell which {asked} you mean") from None
             around += more
-        for f in around:
-            if f.repeats and fit(asked, f.title) and not any(f.first <= d <= f.last for d in days):
-                when = render.day_words(days[0], self._today())
-                raise Unclear(f"{f.title} isn't on {when.removeprefix('on ')}, and {chosen[0].title} is",
-                              f"Did you mean {chosen[0].title}?")
+        rivals = [f for f in around if not any(f.first <= d <= f.last for d in days)
+                  and ((f.repeats and fit(asked, f.title)) or fit(asked, f.title) >= HEAD)]
+        if rivals:
+            other = min(rivals, key=lambda f: abs((f.first - days[0]).days))
+            today = self._today()
+            raise Unclear(f"{other.title} is {render.day_words(other.first, today)}, and {chosen[0].title} is "
+                          f"{render.day_words(days[0], today)}", "Which did you mean?")
 
     def _shown(self, f: Found) -> str:
         """An event as he'd name it, plain: a block of Harness's by what it's for, the rest by title."""
@@ -1114,7 +1204,7 @@ class CalendarChange:
         first, rest, unreadable, unread = self._pool(calendar, days)
         chosen, best = self._resolve(c["title"], days, first, rest, unreadable, unread, calendar)
         if best == PART:
-            self._part_guard(c["title"], days, chosen)
+            self._part_guard(c["title"], days, chosen, best)
         if op == "remove":
             return self._plan_remove(c["title"], days, chosen, first + rest, unreadable, unread)
         hits = self._hits(chosen, days[0], c["title"])
@@ -1134,10 +1224,14 @@ class CalendarChange:
                                   "was": {"state": "live", "missing": 0}}]
         else:
             steps = [self._family_move(hit, start, end)]
-        will, done = self._move_words(self._name(c["title"], hit), hit, start, end,
-                                      self._where(hit, bool(hit.copies)))
+        name = self._name(c["title"], hit)
+        will, done = self._move_words(name, hit, start, end, self._where(hit, bool(hit.copies)))
         targets = frozenset((f.calendar, f.series, f.instance) for f in [hit, *hit.copies])
-        return [Part(will, done, steps, (targets, ("move", _moment(start), _moment(end))))], []
+        part = Part(will, done, steps, (targets, ("move", _moment(start), _moment(end))))
+        if isinstance(start, datetime) and isinstance(hit.start, datetime) and isinstance(hit.end, datetime) \
+                and end - start != hit.end - hit.start:
+            part.length = (hit.end - hit.start, end - start, end, name)
+        return [part], []
 
     def _plan_remove(self, asked: str, days: list[date], chosen: list[Found], found: list[Found],
                      unreadable: int, unread: list[str]) -> tuple[list[Part], list[str]]:
@@ -1173,13 +1267,14 @@ class CalendarChange:
                 steps = [self._family_remove_one(f)]
             will, done = self._remove_words(self._name(asked, f), [f], [f.first], self._where(f, bool(f.copies)))
             targets = frozenset((x.calendar, x.series, x.instance) for x in [f, *f.copies])
-            parts.append((f.first, Part(will, done, steps, (targets, ("remove",)))))
+            parts.append((f.first, Part(will, done, steps, (targets, ("remove",)), removes=1)))
         for group in series.values():
             will, done = self._remove_words(self._name(asked, group[0]), group, [g.first for g in group],
                                             " (Family)")
             targets = frozenset(("family", g.series, g.instance) for g in group)
             parts.append((min(g.first for g in group),
-                          Part(will, done, [self._family_remove_days(group)], (targets, ("remove",)))))
+                          Part(will, done, [self._family_remove_days(group)], (targets, ("remove",)),
+                               removes=len(group))))
         return [part for _, part in sorted(parts, key=lambda x: x[0])], notes
 
     def _series_facts(self, calendar: str, f: Found) -> tuple[date, set[int]]:
@@ -1237,7 +1332,8 @@ class CalendarChange:
         text = (f"{self._name(asked, first)} from {render.date_words(day, self._today())} on"
                 f"{self._where(first)}")
         targets = frozenset((f.calendar, f.series, "*") for f in series.values())
-        return [Part(f"End {text}", f"Ended {text}", steps, (targets, ("end", day.isoformat())))], notes
+        return [Part(f"End {text}", f"Ended {text}", steps, (targets, ("end", day.isoformat())),
+                     ends=self._name(asked, first))], notes
 
     def _uid(self, key: str, prefix: str) -> str:
         return prefix + hashlib.sha256(f"calendar_change:{key}".encode()).hexdigest()[:32]
@@ -1346,7 +1442,7 @@ class CalendarChange:
                  "etag": out.etag or ""}
         back, body = self.client.fetch(href)
         if back.kind != "ok":
-            raise Stopped("unknown", back.status, "it was written, but reading it back failed. Check "
+            raise Stopped("unknown", back.status, "reading it back failed. Check "
                                                   "the calendar", undo=entry)
         entry["etag"] = back.etag or entry["etag"]
         entry["after"] = body or new        # as the server keeps it, so a later undo can match it
@@ -1381,7 +1477,7 @@ class CalendarChange:
         if back.kind == "ok":
             raise Stopped("failed", words="the calendar still shows it when I read it back", undo=entry)
         if back.kind != "gone":
-            raise Stopped("unknown", back.status, "it was removed, but reading it back failed. Check "
+            raise Stopped("unknown", back.status, "reading it back failed. Check "
                                                   "the calendar", undo=entry)
         return entry
 
@@ -1463,7 +1559,7 @@ class CalendarChange:
             entry = {"cal": "family", "how": "delete", "href": href, "after": ics, "etag": out.etag or ""}
             back, body = self.client.fetch(href)
             if back.kind != "ok":
-                raise Stopped("unknown", back.status, "it was added, but reading it back failed. Check "
+                raise Stopped("unknown", back.status, "reading it back failed. Check "
                                                       "the calendar", undo=entry)
             entry["etag"] = back.etag or entry["etag"]
             entry["after"] = body or ics
@@ -1476,7 +1572,7 @@ class CalendarChange:
     def _gmail_reread(self, address: str, uid: str, entry: dict, shows: Callable[[dict], bool]) -> dict:
         kind, now = self.google.look(address, uid)
         if kind != "ok":
-            raise Stopped("unknown", words="it was written, but reading it back failed. Check the calendar",
+            raise Stopped("unknown", words="reading it back failed. Check the calendar",
                           undo=entry)
         entry["etag"] = now.get("etag")
         if not shows(now):
@@ -1507,7 +1603,7 @@ class CalendarChange:
         if e.get("recurringEventId"):
             entry["series"] = e["recurringEventId"]
         if not self.google.really_gone(address, e["id"]):
-            raise Stopped("unknown", words="it was removed, but reading it back didn't show that. Check "
+            raise Stopped("unknown", words="reading it back didn't show it gone. Check "
                                            "the calendar", undo=entry)
         return entry
 
@@ -1937,6 +2033,15 @@ class CalendarChange:
         self.ledger.enqueue(chat_id=chat_id, kind="reply", job_id=job_id, text=render.fit(text),
                             buttons=buttons, binds=binds, db=db)
         self.ledger.release_held(db=db)
+
+
+def _length(span: timedelta) -> str:
+    """1 hour; 30 minutes; 1 hour 30 minutes."""
+    minutes = int(span.total_seconds() // 60)
+    hours, rest = divmod(minutes, 60)
+    parts = ([f"{hours} hour{'s' * (hours != 1)}"] if hours else []) + \
+        ([f"{rest} minute{'s' * (rest != 1)}"] if rest or not hours else [])
+    return " ".join(parts)
 
 
 def _moment(when) -> str:

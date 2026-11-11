@@ -2283,6 +2283,13 @@ def test_a_long_dictated_message_writes(loose):
     ("From: Office <a@school.example>\nSubject: Closed\nNo school Monday", True),
     ("On Mon, Nov 9, 2026 at 3:00 PM Office <a@school.example> wrote:\nNo school", True),
     ("Fwd: Gala\nJoin us Dec 3", True),
+    ("Fwd from the school office? No, I mean move it", False),     # a forward needs its colon
+    ("Questions? Call 540-555-0100 to reschedule", True),           # a phone number
+    ("Your appointment is confirmed for Friday at 9", True),        # words written to him
+    ("Reply C to confirm or call us", True),
+    ("Dear Parent,\nThere is no school Monday", True),
+    ("move my appointment to 3 and the dentist to Friday", False),
+    ("2026-11-11 at 11:30, for 45 minutes", False),
     ("---------- Forwarded message ---------\nJoin us", True),
     ("See https://club.example/gala for the gala", True),
     ("Gala Dec 3. Unsubscribe from these emails", True),
@@ -2303,7 +2310,7 @@ def test_a_trailing_line_break_is_not_several_lines(loose):
 
 
 def test_a_stranger_invitation_pasted_in_gets_a_card(loose):
-    say_with(loose, "Fwd from a stranger:\n" + "Join our gala on Dec 3 at 7pm, please add it. " * 20,
+    say_with(loose, "Fwd: from a stranger\n" + "Join our gala on Dec 3 at 7pm, please add it. " * 20,
              **{**fresh(), "title": "RSVP gala"})
     assert "RSVP gala" not in titles(loose) and "Check before approving" in loose.last()[1]
 

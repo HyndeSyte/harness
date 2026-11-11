@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from harness import caldav, commands, family_copy, google_cal, render
-from harness.calendar_change import CalendarChange, fit, said
+from harness.calendar_change import EXACT, HEAD, PART, CalendarChange, fit, said
 from harness.config import Config
 from harness.controller import Controller
 from harness.discord_chat import LinkChat
@@ -306,11 +306,12 @@ def test_his_words_for_pt_find_the_one_pt(m, words):
 
 
 @pytest.mark.parametrize("asked, title, expected", [
-    ("PT", PT_TITLE, 1), ("physical therapy", PT_TITLE, 1), ("physical therapy", "PT", 2),
-    ("PT", "Physical Therapy", 2), ("drop-off", DROP_TITLE, 1), ("drop off", DROP_TITLE, 1),
-    ("the 8:00 drop-off", DROP_TITLE, 1), ("school drop-off", DROP_TITLE, 1), ("pickup", PICK_TITLE, 1),
+    ("PT", PT_TITLE, HEAD), ("physical therapy", PT_TITLE, HEAD), ("physical therapy", "PT", EXACT),
+    ("PT", "Physical Therapy", EXACT), ("Appt: PT", "PT", EXACT), ("PT", "Appt: PT", EXACT),
+    ("PT", "PT insurance call", PART), ("drop-off", DROP_TITLE, PART), ("drop off", DROP_TITLE, PART),
+    ("the 8:00 drop-off", DROP_TITLE, PART), ("school drop-off", DROP_TITLE, PART), ("pickup", PICK_TITLE, PART),
     ("drop-off", PICK_TITLE, 0), ("school", "Homeschool co-op", 0), ("school day", "School", 0),
-    ("dentist", "Dental cleaning", 1), ("PT", "Pottery", 0), ("", "School", 0)])
+    ("dentist", "Dental cleaning", PART), ("PT", "Pottery", 0), ("", "School", 0)])
 def test_fit_goes_both_ways_and_never_on_part_of_a_word(asked, title, expected):
     assert fit(asked, title) == expected
 
@@ -453,7 +454,7 @@ def test_no_done_until_the_calendar_reads_back_the_change(m):
     m.tells("PT 11:30", ask(MOVE_PT))
     m.gmail.change, m.gmail.down = real, False
     receipt = m.seen()[-1]
-    assert not receipt.startswith("Done") and "Written, not confirmed" in receipt
+    assert not receipt.startswith("Done") and "written but not confirmed" in receipt
 
 
 # -- c and d. as he reads it ---------------------------------------------------------------------
@@ -547,9 +548,10 @@ def test_his_word_on_the_other_calendar_only_is_asked_not_done(m):
 
 
 def test_a_partial_match_is_named_by_its_own_title(m):
-    gmail_event(m, "ptb", "PT follow-up — Clinic B", at(15, day=13), at(16, day=13))
-    m.tells("no PT Friday", ask(change("gmail", "remove", "PT", dates="2026-11-13")))
-    assert "Took off Friday's 3:00 PT follow-up - Clinic B (Gmail)" in m.seen()[-1]
+    """Weeks from today's PT, so nothing nearby fits better: it's the one, and named as itself."""
+    gmail_event(m, "ptb", "PT follow-up — Clinic B", at(15, day=27), at(16, day=27))
+    m.tells("no PT on the 27th", ask(change("gmail", "remove", "PT", dates="2026-11-27")))
+    assert "Took off the 3:00 PT follow-up - Clinic B on Fri Nov 27 (Gmail)" in m.seen()[-1]
 
 
 def test_no_school_today_is_the_school_day_not_its_runs(m):
@@ -673,3 +675,134 @@ def test_the_link_is_told_only_when_there_is_an_expiry(monkeypatch):
     assert link.card("x", [], "reply") == 7 and "expires" not in sent[-1]
     link.card("x", [], "card", expires="2026-11-12T00:30:00+00:00")
     assert sent[-1]["expires"] == "2026-11-12T00:30:00+00:00"
+
+
+# -- the outside review, before shipping: a clear request never changes the wrong event ----------
+
+def test_one_word_that_fits_two_different_events_is_asked_never_picked(m):
+    """An exact "PT" at 4:00 and "PT - Clinic" at 12:00 both fit "cancel PT today"."""
+    gmail_event(m, "pt4", "PT", at(16), at(17))
+    out = m.tells("cancel PT today", ask(change("gmail", "remove", "PT")))
+    assert out["status"] == "needs_clarification"
+    assert "PT at 4:00" in out["said"] and "PT - Example Clinic at 12:00" in out["said"]
+    assert m.gmail.events["pt4"].get("status", "confirmed") == "confirmed"
+    assert m.gmail.events[PT_ID].get("status", "confirmed") == "confirmed"
+
+
+def test_a_mail_made_appointment_never_beats_the_real_one(m):
+    gmail_event(m, "apptpt", "Appt: PT", at(15), at(16))
+    out = m.tells("move PT to 11:30", ask(MOVE_PT))
+    assert out["status"] == "needs_clarification" and "Appt: PT at 3:00" in out["said"]
+    assert m.gmail_times(PT_ID) == ("12:00", "13:00") and m.gmail_times("apptpt") == ("15:00", "16:00")
+
+
+def test_someone_elses_pt_on_family_is_never_moved_on_one_word(m):
+    family_event(m, "kid-pt", "PT", at(16), at(17))
+    out = m.tells("move PT to 11:30", ask(change("family", "move", "PT", start="2026-11-11T11:30:00-05:00",
+                                                 end="2026-11-11T12:30:00-05:00")))
+    assert out["status"] == "needs_clarification"
+    assert "DTSTART:20261111T210000Z" in m.icloud.events[FAMILY_PATH + "kid-pt.ics"][1]
+    assert m.gmail_times(PT_ID) == ("12:00", "13:00")
+
+
+def test_no_school_named_on_gmail_asks_about_the_school_day_never_its_runs(m):
+    out = m.tells("no school today", ask(change("gmail", "remove", "school")))
+    assert out["status"] == "needs_clarification"
+    assert "School Day at 8:30 (Family)" in out["said"]
+    assert "drop-off" not in out["said"] and "pickup" not in out["said"]
+    assert FAMILY_PATH + "school-1111.ics" in m.icloud.events
+    assert m.block_state("drop") == "confirmed" and m.block_state("pick") == "confirmed"
+
+
+def test_part_of_a_name_with_a_better_fit_on_another_day_is_asked(m):
+    """PT is today; tomorrow has only the PT insurance call. "Move PT tomorrow to 10" isn't the call."""
+    gmail_event(m, "ptcall12", "PT insurance call", at(9, day=12), at(9, 30, day=12))
+    out = m.tells("move PT tomorrow to 10", ask(change("gmail", "move", "PT", dates="2026-11-12",
+                                                       start="2026-11-12T10:00:00-05:00",
+                                                       end="2026-11-12T10:30:00-05:00")))
+    assert out["status"] == "needs_clarification"
+    assert "PT - Example Clinic is today, and PT insurance call is tomorrow" in out["said"]
+    assert m.gmail_times("ptcall12") == ("09:00", "09:30")
+
+
+SHORT_PT = change("gmail", "move", "PT", start="2026-11-11T11:30:00-05:00", end="2026-11-11T12:00:00-05:00")
+
+
+def test_a_length_he_didnt_give_gets_a_tap(m):
+    """The model shortened it. "30 minutes earlier" is a shift, not a length."""
+    out = m.tells("PT today moved 30 minutes earlier, 11:30", ask(SHORT_PT))
+    assert out["status"] == "waiting for his tap" and m.gmail_times(PT_ID) == ("12:00", "13:00")
+    assert "PT would be 30 minutes long instead of 1 hour, and you didn't give a new end or length" in m.seen()[-1]
+
+
+@pytest.mark.parametrize("words", ["PT today is 11:30 to 12:00", "PT moved to 11:30 and it's only 30 minutes",
+                                   "PT is at 11:30 today, half an hour"])
+def test_a_length_he_gave_goes_straight_through(m, words):
+    out = m.tells(words, ask(SHORT_PT))
+    assert out["status"] == "executed" and m.gmail_times(PT_ID) == ("11:30", "12:00")
+
+
+def test_three_or_more_events_off_at_once_get_a_tap(m):
+    for day in (12, 13):
+        gmail_event(m, f"pt{day}", PT_TITLE, at(12, day=day), at(13, day=day))
+    out = m.tells("no PT today, tomorrow or Friday",
+                  ask(change("gmail", "remove", "PT", dates="2026-11-11,2026-11-12,2026-11-13")))
+    assert out["status"] == "waiting for his tap" and "this takes off 3 events at once" in m.seen()[-1]
+    assert all(e.get("status", "confirmed") == "confirmed" for k, e in m.gmail.events.items() if k.startswith("pt"))
+
+
+def test_ending_a_series_gets_a_tap(m):
+    m.gmail.events["piano"] = {"id": "piano", "etag": '"7"', "summary": "Piano", "status": "confirmed",
+                               "start": {"dateTime": at(17, day=2).isoformat()},
+                               "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"]}
+    for day in (16, 23, 30):
+        gmail_event(m, f"piano_202611{day}", "Piano", at(17, day=day), at(18, day=day), series="piano")
+    out = m.tells("no more piano after next week", ask(change("gmail", "end_series", "piano", dates="2026-11-23")))
+    assert out["status"] == "waiting for his tap"
+    assert "it ends Piano, taking off every day of it from then on" in m.seen()[-1]
+    assert m.gmail.events["piano"]["recurrence"] == ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
+
+
+@pytest.mark.parametrize("text", ["Your appointment is now at 11:30. Questions? Call 540-555-0100",
+                                  "This is a reminder that your visit moved to 11:30",
+                                  "PT moved to 11:30, the number is (540) 555-0100"])
+def test_words_written_to_him_or_a_phone_number_get_a_tap(m, text):
+    out = m.tells(text, ask(MOVE_PT))
+    assert out["status"] == "waiting for his tap" and m.gmail_times(PT_ID) == ("12:00", "13:00")
+
+
+def test_a_forward_needs_its_colon(m):
+    out = m.tells("Fwd the PT note to me later. PT moved to 11:30", ask(MOVE_PT))
+    assert out["status"] == "executed"
+
+
+def test_a_write_the_read_back_cant_confirm_is_said_as_what_he_asked(m):
+    real = m.gmail.change
+
+    def lands_but_reads_nothing(address, uid, fields, etag):
+        out = real(address, uid, fields, etag)
+        m.gmail.down = True
+        return out
+    m.gmail.change = lands_but_reads_nothing
+    m.tells("PT 11:30", ask(MOVE_PT))
+    m.gmail.change, m.gmail.down = real, False
+    receipt = m.seen()[-1]
+    assert receipt.startswith("Not sure that went through.")
+    assert ("Not sure: Move PT to 11:30 to 12:30 today (Gmail and Family), written but not confirmed: "
+            "reading it back failed. Check the calendar.") in receipt
+    assert "Gmail: PT" not in receipt and "on Nov 11 moved" not in receipt
+
+
+def test_a_note_rerun_keeps_its_place_in_the_ledger(m):
+    m.claude.script = [result({"type": "clarify", "question": "Which appointment?"})]
+    m.he_says("my appointment today moved to 11:30")
+    m.handover(paired=OWNER)
+    m.claude.script = [ask(MOVE_PT)]
+    m.handover(paired=OWNER, suggestion="He means PT.")
+    job = m.ledger.db.execute("SELECT id FROM jobs ORDER BY created_at DESC").fetchone()[0]
+    assert int(m.ledger.get_meta(f"job_rerun_after:{job}")) > 0
+
+
+def test_the_model_leaves_which_event_questions_to_the_code():
+    from harness import prompts
+    assert "Never use it to ask which event he means" in prompts.PROPOSAL_CHANGE

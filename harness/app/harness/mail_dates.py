@@ -56,6 +56,7 @@ MAX_ITEMS = 5                         # dates from one message
 MAX_BYTES = 60_000                    # of one message, fetched
 MAX_TEXT = 5_000                      # of its text, sent
 MAX_WHAT = 60
+AGAIN_DAYS = 120                      # how far back an email behind a written appointment is looked for
 MAX_WRITES_PER_DAY = 20
 AHEAD = timedelta(days=365)           # a date further out than this is a misread
 UNDO_TTL_S = 7 * 86400
@@ -85,8 +86,9 @@ _GENERIC = frozenset({"pay", "bill", "due", "payment", "renews", "renewal", "ren
                       "before", "with", "drop", "off", "at", "in", "is", "be", "auto"})
 MOVED = "moved"                       # a found row's batch while it waits: the email reschedules it
 BUSY, HIS = 1, 2                      # mail_dates.busy: written busy; changed by him, so left alone
-RULES = "5"                           # what's found under older rules is found again under these
-# 5: an appointment's street address, so ones already on his calendar get theirs (Nov 11).
+RULES = "4"                           # what's found under older rules is found again under these
+AGAIN_EVERY = timedelta(hours=1)      # the look-up of emails behind appointments already written
+_MSGID = re.compile(r"<[!#-\[\]-~]{1,250}>")   # a Message-ID safe to search for: no quote, no backslash
 SCRIPT_SENDER = "apps-scripts-notifications@google.com"
 _SPACE = re.compile(r"\s+")
 
@@ -108,7 +110,7 @@ for. Reply with exactly one JSON object matching the schema.
 Each item: what (a few plain words, like "Amazon return: PC parts" or "Pay water bill"), date \
 (YYYY-MM-DD), kind: deadline (something is due or must be done by then), window_closes (the \
 last day to return, cancel, claim or correct something), appointment (he has to be somewhere), \
-renewal (something renews or expires), event (something he signed up for). time: its start as HH:MM, 24-hour, in his time zone, when the email gives one, else empty. rescheduled: true only when the email says this was moved or rescheduled from another date, else false. address: for an appointment, the street address where he has to be, on one line with commas (street, town, state and ZIP), when the email gives it, often in its footer or signature; else empty. Never a web address, a phone number or a name.
+renewal (something renews or expires), event (something he signed up for). time: its start as HH:MM, 24-hour, in his time zone, when the email gives one, else empty. rescheduled: true only when the email says this was moved or rescheduled from another date, else false. address: for an appointment, the street address where it takes place, on one line with commas (street, town, state and ZIP), when the email gives it; not the sender's mailing, office or unsubscribe address; empty if unsure. Never a web address, a phone number or a name.
 
 Only dates on or after today. Only what needs him: not delivery estimates, sales, marketing, \
 offers, promotional credits or points that expire, or dates already past. Leave out bills, \
@@ -242,14 +244,32 @@ class Mailbox:
         self.password = password
         self.connect = connect or (lambda: imaplib.IMAP4_SSL(HOST, PORT, timeout=30))
 
-    def read(self, last_uid: int, validity: str | None, since: date) -> tuple[str, int, list[Message]]:
-        """(validity, the last uid it starts after, messages after it with their headers, oldest
-        first). A picked message's text is a second fetch, text_for."""
+    def _open(self) -> None:
         self.imap = self.connect()
         self.imap.login(self.address, self.password)
         typ, _ = self.imap.select("INBOX", readonly=True)
         if typ != "OK":
             raise OSError("inbox")
+
+    def find(self, message_ids: list[str], since: date) -> list[Message]:
+        """The emails with these Message-IDs, by header search, read-only, with their headers. Only
+        ids of a safe shape are searched; one not found is just left out."""
+        self._open()
+        uids: set[int] = set()
+        for mid in message_ids:
+            if not _MSGID.fullmatch(mid):
+                continue
+            typ, data = self.imap.uid("SEARCH", None, f'SINCE {since:%d-%b-%Y} HEADER Message-ID "{mid}"')
+            if typ != "OK":
+                raise OSError("search")
+            uids |= {int(x) for x in (data[0] or b"").split()}
+        wanted = set(message_ids)
+        return [m for m in self._headers(sorted(uids)) if m.message_id in wanted]
+
+    def read(self, last_uid: int, validity: str | None, since: date) -> tuple[str, int, list[Message]]:
+        """(validity, the last uid it starts after, messages after it with their headers, oldest
+        first). A picked message's text is a second fetch, text_for."""
+        self._open()
         now_validity = self._validity()
         if validity != now_validity:
             last_uid = 0                   # the mailbox was rebuilt, or this is the first read
@@ -260,6 +280,9 @@ class Mailbox:
         if typ != "OK":
             raise OSError("search")
         uids = sorted(int(x) for x in (data[0] or b"").split() if int(x) > last_uid)[:MAX_HEADERS]
+        return now_validity, last_uid, self._headers(uids)
+
+    def _headers(self, uids: list[int]) -> list[Message]:
         out = []
         for chunk in range(0, len(uids), 50):
             part = uids[chunk:chunk + 50]
@@ -281,7 +304,7 @@ class Mailbox:
                 out.append(Message(int(m.group(1)), str(h.get("Message-ID", "")).strip(),
                                    str(h.get("From", "")), str(h.get("Subject", "")),
                                    sent if sent and sent.tzinfo else datetime.now().astimezone()))
-        return now_validity, last_uid, sorted(out, key=lambda m: m.uid)
+        return sorted(out, key=lambda m: m.uid)
 
     def text_for(self, m: Message) -> str:
         typ, data = self.imap.uid("FETCH", str(m.uid), f"(BODY.PEEK[]<0.{MAX_BYTES}>)")
@@ -375,6 +398,7 @@ class Read:
     stuck_uid: int = 0                     # the message it stopped on, to count its tries
     passed: list | None = None             # messages given up on after MAX_TRIES
     more: bool = False                     # stopped at a cap with mail left: read again at once
+    asked: tuple = ()                      # a look-up of these emails again, for their addresses
 
 
 class MailDates:
@@ -418,6 +442,8 @@ class MailDates:
             self._undo_requested()
             if not paused and self.configured() and self._future is None and self._due():
                 self._start()
+            elif not paused and self.configured() and self._future is None and self.writes_on():
+                self._start_again()
             if not paused and self.writes_on():
                 self._retime()
                 self._write_found()
@@ -447,12 +473,58 @@ class MailDates:
             int(self.ledger.get_meta("mail_stuck_uid") or 0), int(self.ledger.get_meta("mail_stuck_tries") or 0))
 
     def _seen(self) -> frozenset[str]:
-        """Read already. The email behind a timed appointment written before addresses were kept
-        is read once more, for its address (Nov 11): after that it knows who sent it."""
         return frozenset(r["message_id"] for r in self.ledger.db.execute(
-            "SELECT DISTINCT message_id FROM mail_dates WHERE message_id NOT IN (SELECT message_id FROM"
-            " mail_dates WHERE state='live' AND kind='appointment' AND at IS NOT NULL AND at<>''"
-            " AND sender='')"))
+            "SELECT DISTINCT message_id FROM mail_dates"))
+
+    # -- the emails behind appointments already written, once, for their addresses (Nov 11) ----
+    def _again(self) -> list[str]:
+        """Timed appointments on his calendar from before addresses were kept: their emails."""
+        today = self.ledger.now().astimezone(ZoneInfo(self.tz)).date()
+        return [r["message_id"] for r in self.ledger.db.execute(
+            "SELECT DISTINCT message_id FROM mail_dates WHERE state='live' AND kind='appointment'"
+            " AND at IS NOT NULL AND at<>'' AND sender='' AND day>=? ORDER BY day",
+            (today.isoformat(),)) if _MSGID.fullmatch(r["message_id"])][:MAX_TO_ENGINE]
+
+    def _start_again(self) -> None:
+        """Only those emails, by Message-ID: no other mail is read again, nothing found under the
+        rules is let go, and the read position doesn't move. At most once an hour."""
+        wanted = self._again()
+        last = self.ledger.meta_time("mail_again_at")
+        if not wanted or (last is not None and self.ledger.now() - last < AGAIN_EVERY):
+            return
+        engine = self.engine_fn()
+        if engine is None or not self.budget_ok(policy.MODELS[policy.engine_for("message")].provider):
+            return
+        with self.ledger.tx() as db:
+            self.ledger.set_meta("mail_again_at", iso(self.ledger.now()), db)
+        self._future = self.executor.submit(self._read_again, self.address(), self.password(), engine,
+                                            tuple(wanted), self.ledger.now().astimezone(ZoneInfo(self.tz)).date())
+
+    def _read_again(self, address, password, engine, wanted: tuple, today: date) -> Read:
+        """In a worker, like _read: only these emails, for who sent them and where."""
+        box = self.mailbox(address, password)
+        r = Read("", 0, [], [], [], 0, asked=wanted)
+        try:
+            for m in box.find(list(wanted), today - timedelta(days=AGAIN_DAYS)):
+                m.text = box.text_for(m)
+                out = call_with_retries(engine, system=SYSTEM, user=user_content(m, today),
+                                        schema=output_schema(), budget_s=60, sleep=self.sleep,
+                                        monotonic=self.monotonic)
+                r.sent_to_engine += 1
+                if out.result is not None:
+                    r.spend.append(out.result)
+                    if out.result.status == "ok":
+                        r.found += [(m.message_id, m, f) for f in parse_items(out.result.output, today)]
+            return r
+        except (OSError, imaplib.IMAP4.error, EOFError) as e:
+            r.error = "refused" if isinstance(e, imaplib.IMAP4.error) else "unreachable"
+            return r
+        except Exception as e:
+            log.warning("mail look-up failed: %s", type(e).__name__)
+            r.error = "unreachable"
+            return r
+        finally:
+            box.close()
 
     def _read(self, address, password, engine, last_uid, validity, today, seen,
               stuck_uid=0, stuck_tries=0) -> Read:
@@ -524,10 +596,13 @@ class MailDates:
                                   model=res.model, purpose="mail_dates", input_tokens=res.input_tokens,
                                   output_tokens=res.output_tokens, usd=res.usd)
         now = iso(self.ledger.now())
+        if r.asked:
+            self._collect_again(r)
+            return
         with self.ledger.tx() as db:
-            # An email behind something already on his calendar, read again for its address (a new
-            # rule): it only fills in who sent it and where. A date worded differently this time
-            # must not land a second time.
+            # An email behind something already on his calendar, read again (a rebuilt mailbox): it
+            # only fills in who sent it and where. A date worded differently this time must not
+            # land a second time.
             live = {row["message_id"] for row in db.execute(
                 "SELECT DISTINCT message_id FROM mail_dates WHERE state='live'")}
             for key_src, m, f in r.found:
@@ -580,6 +655,25 @@ class MailDates:
                          clean(m.subject))
                 continue
             log.info("mail date: %s %s (from %s)", f.day.isoformat(), title(f), clean(m.subject))
+
+    def _collect_again(self, r: Read) -> None:
+        """Who sent each email looked up again, and the address it gives for the appointment
+        already on his calendar from it. Nothing new is written from it. One that can't be found
+        or read is marked asked, so it isn't looked up again."""
+        if r.error:
+            log.info("mail look-up: %s", r.error)
+            return
+        with self.ledger.tx() as db:
+            for _, m, f in r.found:
+                db.execute("UPDATE mail_dates SET sender=? WHERE message_id=? AND sender=''",
+                           (sender_of(m.sender) or "-", m.message_id))
+                if f.place:
+                    db.execute("UPDATE mail_dates SET place=? WHERE message_id=? AND kind=? AND day=?"
+                               " AND place=''", (f.place, m.message_id, f.kind, f.day.isoformat()))
+            for mid in r.asked:
+                db.execute("UPDATE mail_dates SET sender='-' WHERE message_id=? AND sender=''", (mid,))
+            self.ledger.event("mail_looked_up", {"asked": len(r.asked), "found": len(r.found)}, db=db)
+        log.info("mail look-up: %d asked, %d dates back", len(r.asked), len(r.found))
 
     def _rules(self) -> None:
         """Rules changed since these were found: find them again, from the start of the window.
@@ -717,15 +811,19 @@ class MailDates:
                     or not google_cal.note_placed(e, was.day, self._start_at(old, was.day)):
                 continue                           # gone, or his now: leave it be
             start = self._start_at(row, day)
-            out = self.google.change(address, old["event_id"], {
-                "summary": title(Found(row["what"], day, row["kind"])),
-                **google_cal.note_span(day, start),
-                "reminders": {"useDefault": start is not None}}, e.get("etag"))
+            busy = self._real(row) and start is not None
+            place = (self._place_for(row) or old["shown"]) if busy else ""
+            fields = {"summary": title(Found(row["what"], day, row["kind"])),
+                      **google_cal.note_span(day, start), "reminders": {"useDefault": start is not None}}
+            if busy:                               # the new email's time, and its place when it has one
+                fields.update(transparency="opaque", **({"location": place} if place else {}))
+            out = self.google.change(address, old["event_id"], fields, e.get("etag"))
             if out.kind != "ok":
                 return None if out.kind == "unknown" else False
             with self.ledger.tx() as db:
-                db.execute("UPDATE mail_dates SET day=?, what=?, at=? WHERE key=?",
-                           (day.isoformat(), row["what"], _at(row), old["key"]))
+                db.execute("UPDATE mail_dates SET day=?, what=?, at=?, busy=?, shown=?, place=? WHERE key=?",
+                           (day.isoformat(), row["what"], _at(row), BUSY if busy else old["busy"],
+                            place if busy else old["shown"], row["place"] or old["place"], old["key"]))
                 db.execute("UPDATE mail_dates SET state='skipped' WHERE key=?", (row["key"],))
                 self.ledger.event("mail_date_moved", {"from": old["day"], "to": row["day"]}, db=db)
             return True
@@ -754,7 +852,7 @@ class MailDates:
         same sender, day and time (Nov 11: the dealer's address was in one email's footer)."""
         if row["place"]:
             return row["place"]
-        if not row["sender"] or not _at(row):
+        if row["sender"] in ("", "-") or not _at(row):
             return ""
         other = self.ledger.db.execute(
             "SELECT place FROM mail_dates WHERE sender=? AND day=? AND at=? AND kind='appointment'"
@@ -793,7 +891,9 @@ class MailDates:
                 return
             if out.kind == "ok":
                 self._mark(row["key"], BUSY, place)
-                self.ledger.event("mail_date_real", {"day": row["day"], "place": bool(place)})
+                if row["busy"] == 0:               # written free before: the next digest names it
+                    self.ledger.event("mail_date_real", {"title": title(f), "day": row["day"],
+                                                         "at": _at(row), "place": place})
             elif out.kind == "changed":
                 self._mark(row["key"], HIS, row["shown"])
             else:
@@ -913,4 +1013,16 @@ class MailDates:
                                   f"{title(Found(r['what'], date.fromisoformat(r['day']), r['kind']))}"
                                   for r in rows)
                 parts.append(f"From your mail, found but not on your calendar yet: {named}.")
+        made = []
+        for r in self.ledger.db.execute("SELECT detail FROM events WHERE kind='mail_date_real' AND at>=?"
+                                        " ORDER BY id", (iso(since) if since else "",)):
+            try:
+                d = json.loads(r["detail"])
+                day = date.fromisoformat(d["day"])
+                made.append(f"{day:%a %b} {day.day}{_clock(d.get('at', ''))}: {d['title']}"
+                            + (f", at {d['place']}" if d.get("place") else ""))
+            except (ValueError, KeyError, TypeError):
+                continue
+        if made:                                   # every one by name, never "and N more"
+            parts.append("From your mail, now busy so work and Family see them: " + "; ".join(made) + ".")
         return " ".join(parts)

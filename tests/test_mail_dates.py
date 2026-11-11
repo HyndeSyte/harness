@@ -34,6 +34,11 @@ class Box:
         start = last_uid if validity == self.validity else 0
         return self.validity, start, [m for m in sorted(self.messages, key=lambda m: m.uid) if m.uid > start]
 
+    def find(self, message_ids, since):
+        """A look-up by Message-ID (a header search), the way the real one is asked."""
+        self.looked_up = getattr(self, "looked_up", []) + [list(message_ids)]
+        return [m for m in sorted(self.messages, key=lambda m: m.uid) if m.message_id in message_ids]
+
     def text_for(self, m):
         self.texts_read.append(m.uid)
         return m.text
@@ -73,6 +78,13 @@ def rig_mail(g, messages, answers=None, writes=True):
                      family=g.fa.client)
     g.md.bind(1)
     return g
+
+
+def again(g):
+    """The look-up of emails behind appointments already written: due now, started, then collected."""
+    g.ledger.db.execute("DELETE FROM meta WHERE key='mail_again_at'")
+    g.md.run(paused=False)
+    g.md.run(paused=False)
 
 
 def read(g):
@@ -675,9 +687,8 @@ def test_one_made_free_before_is_made_busy_with_the_address_a_second_read_finds(
     # As it was on his calendar from Nov 7: free, no address, recorded before any of this.
     g.google.events[uid]["transparency"] = "transparent"
     g.ledger.db.execute("UPDATE mail_dates SET busy=0, shown='', sender='', place=''")
-    g.ledger.set_meta("mail_rules", "4")
-    g.engine.answers["Your service appointment"] = VAN    # the same email, read again under the new rules
-    read(g)
+    g.engine.answers["Your service appointment"] = VAN    # the same email, looked up again for its address
+    again(g)
     uid, ev = appt_of(g)
     assert ev["transparency"] == "opaque" and ev["location"] == PLACE
     assert len(g.google.live()) == 1
@@ -727,18 +738,97 @@ def test_only_a_street_address_is_kept():
 
 
 def test_an_email_read_again_for_its_address_never_lands_a_second_entry(g):
-    """Read again under the new rules, the same email may be worded differently: it only fills in
-    who sent it and where, and adds nothing."""
+    """Looked up again, the same email may be worded differently: it only fills in who sent it and
+    where, and adds nothing."""
     rig_mail(g, [msg(1, "Your service appointment", sender=DEALER)],
              {"Your service appointment": [{**VAN[0], "address": ""}]})
     read(g)
     uid, _ = appt_of(g)
     g.google.events[uid]["transparency"] = "transparent"
     g.ledger.db.execute("UPDATE mail_dates SET busy=0, shown='', sender='', place=''")
-    g.ledger.set_meta("mail_rules", "4")
     g.engine.answers["Your service appointment"] = [{**VAN[0], "what": "Example Van service", "time": "08:45"}]
-    read(g)
+    again(g)
     assert len(g.google.live()) == 1
     uid, ev = appt_of(g)
     assert ev["transparency"] == "opaque" and ev["location"] == PLACE
     assert g.ledger.db.execute("SELECT COUNT(*) FROM mail_dates").fetchone()[0] == 1
+
+
+def test_only_the_emails_behind_written_appointments_are_looked_up_again(g):
+    """No full re-read (Nov 11 review): the rules stay, what was skipped stays, the read position
+    stays, and only the email behind a timed appointment written before addresses is asked for."""
+    rig_mail(g, [msg(1, "Your service appointment", sender=DEALER), msg(2, "Your order of PC parts"),
+                 msg(3, "Your order shipped")],
+             {"Your service appointment": [{**VAN[0], "address": ""}], "Your order of PC parts": RETURN,
+              "Your order shipped": RETURN})
+    read(g)
+    skipped = g.ledger.db.execute("SELECT COUNT(*) FROM mail_dates WHERE state='skipped'").fetchone()[0]
+    assert skipped == 1                                   # the shipping note's return date: once
+    g.ledger.db.execute("UPDATE mail_dates SET sender='' WHERE kind='appointment'")   # from before 0.21.0
+    last, asked = g.ledger.get_meta("mail_last_uid"), list(g.engine.asked)
+    g.engine.answers["Your service appointment"] = VAN
+    again(g)
+    assert g.box.looked_up == [["<1@mail.example>"]]
+    assert g.engine.asked == asked + ["Your service appointment"]
+    assert g.ledger.get_meta("mail_last_uid") == last and g.ledger.get_meta("mail_rules") == "4"
+    assert g.ledger.db.execute("SELECT COUNT(*) FROM mail_dates WHERE state='skipped'").fetchone()[0] == skipped
+    uid, ev = appt_of(g)
+    assert ev["location"] == PLACE
+    again(g)
+    assert len(g.box.looked_up) == 1                      # once: it knows who sent it now
+
+
+def test_an_email_that_cant_be_found_is_looked_for_once(g):
+    rig_mail(g, [msg(1, "Your service appointment", sender=DEALER)],
+             {"Your service appointment": [{**VAN[0], "address": ""}]})
+    read(g)
+    g.ledger.db.execute("UPDATE mail_dates SET sender=''")
+    g.box.messages = []                                   # deleted since
+    again(g)
+    again(g)
+    assert len(g.box.looked_up) == 1
+    assert g.ledger.db.execute("SELECT sender FROM mail_dates").fetchone()[0] == "-"
+
+
+def test_the_next_digest_names_the_ones_made_busy(g):
+    rig_mail(g, [msg(1, "Your service appointment", sender=DEALER)], {"Your service appointment": VAN})
+    read(g)
+    uid, _ = appt_of(g)
+    g.google.events[uid]["transparency"] = "transparent"
+    g.google.events[uid].pop("location", None)
+    g.ledger.db.execute("UPDATE mail_dates SET busy=0, shown=''")
+    g.md.run(paused=False)
+    line = g.md.digest_line()
+    assert ("From your mail, now busy so work and Family see them: Fri Nov 13 at 8:00 AM: "
+            f"Appt: Service appointment: 2024 Example Van, at {PLACE}.") in line
+
+
+def test_a_timed_class_or_event_stays_free(g):
+    rig_mail(g, [msg(1, "Your class", sender="Studio <hi@studio.example>")],
+             {"Your class": [{"what": "Pottery class", "date": "2026-11-14", "kind": "event", "time": "10:00",
+                              "address": "1 Clay Ln, Springfield, VA 24401"}]})
+    read(g)
+    [(uid, ev)] = g.google.live().items()
+    assert ev["transparency"] == "transparent" and "location" not in ev
+    assert datetime.fromisoformat(ev["start"]["dateTime"]) == datetime(2026, 11, 14, 10, tzinfo=ZoneInfo(TZ))
+
+
+def test_a_rescheduled_appointment_takes_the_new_emails_place(g):
+    rig_mail(g, [msg(1, "Your service appointment", sender=DEALER)], {"Your service appointment": VAN})
+    read(g)
+    g.box.messages.append(msg(2, "Appointment rescheduled", sender=DEALER))
+    g.engine.answers["Appointment rescheduled"] = [{**VAN[0], "date": "2026-11-20", "time": "09:00",
+                                                     "rescheduled": True,
+                                                     "address": "40 New Rd, Springfield, VA 24401"}]
+    read(g)
+    uid, ev = appt_of(g)
+    assert datetime.fromisoformat(ev["start"]["dateTime"]) == datetime(2026, 11, 20, 9, tzinfo=ZoneInfo(TZ))
+    assert ev["location"] == "40 New Rd, Springfield, VA 24401" and ev["transparency"] == "opaque"
+    assert len(g.google.live()) == 1
+
+
+def test_the_engine_is_told_where_the_address_comes_from():
+    from harness.mail_dates import SYSTEM, output_schema
+    assert "where it takes place" in SYSTEM and "not the sender's mailing, office or unsubscribe address" in SYSTEM
+    assert "empty if unsure" in SYSTEM
+    assert "address" in output_schema()["properties"]["output"]["properties"]["items"]["items"]["required"]

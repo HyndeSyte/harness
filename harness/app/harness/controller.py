@@ -114,7 +114,6 @@ class Controller:
         self._discord_seen: str | None = None    # fingerprint of the token it identified with
         self._reconciled = False
         self._handover_jobs: dict[str, list] = {}
-        self._handover_after: dict[str, int] = {}    # a request run again: its answer starts after this
         # The mutual watch on Cain's add-on (watch.py, set by __main__), and the last
         # thing Cain's link said about itself, for the settings page.
         self.cain_watch = None
@@ -483,7 +482,8 @@ class Controller:
             self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flagged + flags))), db)
             self.ledger.transition(job_id, "received", db=db)
             self.ledger.event("job_note", {"job": job_id}, db=db)
-        self._handover_after[job_id] = last
+            # Kept in the ledger, so every later answer about it, after a restart too, starts here.
+            self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
         log.info("handover: a note for job %s, which was waiting on its question: it runs again",
                  render.short(job_id))
 
@@ -571,14 +571,14 @@ class Controller:
                 for h in waiting:
                     h.finish("error", "Lost track of that. Nothing changed.")
                 del self._handover_jobs[job_id]
-                self._handover_after.pop(job_id, None)
                 continue
             if job["state"] in ("received", "running", "approved"):
                 continue
             # A request that ran again for a note answers with what it said this time.
             rows = self.ledger.db.execute(
                 "SELECT kind, text, state, message_id FROM outbox WHERE job_id=? AND kind!='notice'"
-                " AND id>? ORDER BY id", (job_id, self._handover_after.get(job_id, 0))).fetchall()
+                " AND id>? ORDER BY id",
+                (job_id, int(self.ledger.get_meta(f"job_rerun_after:{job_id}") or 0))).fetchall()
             if any(r["state"] not in ("sent", "dead") for r in rows):
                 continue                                      # not with Cain yet
             sent = [r for r in rows if r["state"] == "sent"]
@@ -598,7 +598,6 @@ class Controller:
             for h in waiting:
                 h.finish(status, words, cards=cards)
             del self._handover_jobs[job_id]
-            self._handover_after.pop(job_id, None)
 
     def _busy(self) -> bool:
         return bool(self.runner and self.runner.in_flight) or bool(

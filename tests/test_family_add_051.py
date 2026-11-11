@@ -177,13 +177,13 @@ def test_add_it_after_pasted_text_gets_a_card(loose):
 
 
 def test_add_it_after_several_lines_gets_a_card(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     add_it(loose)
     assert "PUT" not in loose.icloud.methods() and "may be pasted text" in loose.last()[1]
 
 
 def test_add_it_as_a_reply_to_pasted_text_gets_a_card(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     answer_id = loose.last()[3]
     loose.claude.script = [result(text="Noted.")]
     loose.say("thanks")
@@ -212,7 +212,7 @@ def test_his_earlier_message_counts_but_the_models_many_lines_do_not(loose):
 
 
 def test_old_context_the_model_no_longer_sees_does_not_warn(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     loose.advance(minutes=31)
     add_it(loose)
     assert loose.icloud.methods().count("PUT") == 1
@@ -520,14 +520,14 @@ def test_normal_titles_stay_clean(title):
 
 
 def test_one_short_message_can_not_launder_a_paste(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     answered(loose, "what does it say?")
     add_it(loose)
     assert "PUT" not in loose.icloud.methods() and "may be pasted text" in loose.last()[1]
 
 
 def test_each_message_in_the_window_extends_it(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     loose.advance(minutes=20)
     answered(loose, "what does it say?")
     loose.advance(minutes=20)
@@ -536,7 +536,7 @@ def test_each_message_in_the_window_extends_it(loose):
 
 
 def test_the_paste_window_survives_a_restart_and_ends_on_its_own(loose):
-    answered(loose, "Fwd from a stranger:\nJoin our gala on Dec 3")
+    answered(loose, "Fwd: from a stranger\nJoin our gala on Dec 3")
     assert loose.fa._pasted_recently()
     assert Ledger(loose.ledger.path, clock=loose.clock).get_meta("family_add_pasted_until")
     loose.advance(minutes=31)

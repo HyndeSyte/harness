@@ -233,16 +233,21 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   time is plain. Your words match a title either way round: "PT" finds "PT - Clinic", and
   "physical therapy" finds "PT". A time you give ("the 8:00 drop-off") says which one.
 - **Unclear** is asked once, by name, and nothing changes until you answer: "More than one event
-  today fits PT: PT - Clinic at 12:00, PT follow-up at 4:00. Which one?"
+  today fits PT: PT - Clinic at 12:00, PT follow-up at 4:00. Which one?" One word that fits two
+  different events is always asked; a name of two words or more takes the event with exactly
+  that name. Part of a name is asked when something within a week fits it better, or repeats
+  under it, and a match only on the calendar you didn't name is asked too.
 - **Copies follow.** Moving or taking off a Gmail event moves or takes off the Family copy this
   add-on keeps of it, in the same change, and Undo puts both back.
 - **Its own blocks are found where they are.** A school drop-off or pickup, a drive or a
   "Busy (...)" block is on your Gmail calendar, whichever calendar you name.
 - **Every part, or what failed.** When one part can't be done, the others still are, and the
   receipt names the part that wasn't, and why. "Done" only once the calendar reads back the change.
-- **A tap only when the words may not be yours**: a message that looks pasted (a quoted line,
-  an email's header lines, a forward, a link), a reply to one, an edited or forwarded message, or
-  a note from Cain. The card says what will happen, in plain words; your tap's reply says it again.
+- **A tap only when the words may not be yours, or the change is a big one**: a message that
+  looks pasted (a quoted line, an email's header lines, a forward, a link, a phone number, words
+  written to you), a reply to one, an edited or forwarded message, a note from Cain; a new length
+  you didn't give, three or more events off at once, or ending a series. The card says what will
+  happen, in plain words; your tap's reply says it again.
 
 ## Dates from your mail
 
@@ -250,7 +255,10 @@ With the `mail_dates` option on, dates in your mail go on your Gmail calendar. D
 days, renewals and the like are free all-day entries with no reminder, so nothing reaches work. An
 appointment the email gives a time for is a real appointment: it's busy, so work and Family see it,
 at its time with your usual reminder, and at the street address that email gave, or that another
-email about it gave (the same sender, day and time). An entry you've changed is yours and left alone.
+email about it gave (the same sender, day and time). Timed appointments already written free are
+made busy, their own emails are looked up once for an address, and the next digest names them. A
+rescheduling email moves the entry, with its own address. An entry you've changed is yours and
+left alone.
 
 ## Copies from your Gmail calendar
 

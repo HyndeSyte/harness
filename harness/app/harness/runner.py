@@ -348,11 +348,13 @@ class Runner:
                 return
             # Each event he names, found before anything is offered or done (Nov 11): clear goes
             # straight through, unclear is asked once, by name.
-            lines = self.calendar_change.preview(job, receipt, params)
-            if lines is None:
+            seen = self.calendar_change.preview(job, receipt, params)
+            if seen is None:
                 return
+            lines = seen.lines
             warnings = self.calendar_change.warnings(
                 job, params, pasted_recently=self.family_add is not None and self.family_add._pasted_recently())
+            warnings = list(warnings) + seen.checks   # what it does, not only whose words they are
         elif family:
             if self.family_add is None:
                 self._fail(job, "family_add_not_wired", job["engine"])

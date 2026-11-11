@@ -105,7 +105,15 @@ _PASTE_SIGNS = (
     re.compile(r"(?m)^[ \t]*>"),                                      # a quoted line
     re.compile(r"```"),                                                 # a code block
     re.compile(r"(?im)^[ \t]*-*[ \t]*(?:original message|forwarded message|begin forwarded message)\b"),
-    re.compile(r"(?im)^[ \t]*(?:fwd?|fw)\b"),                           # a forward's subject
+    re.compile(r"(?im)^[ \t]*(?:fwd?|fw)[ \t]*:"),                       # a forward's subject
+    re.compile(r"(?<!\d)(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]\d{3}[-. ]\d{4}(?!\d)"),  # a phone number
+    # Words written to him, not by him: a business's reminder, a booking, a reply prompt.
+    re.compile(r"(?i)\b(?:your (?:appointment|visit|reservation|booking|order|account)\b"
+               r"|you(?: are|'re| have been) scheduled\b|you have an? (?:appointment|visit)\b"
+               r"|please (?:arrive|call us|reply|confirm|let us know)\b|we look forward\b"
+               r"|we(?:'ll| will) see you\b|reply (?:stop|yes|no|y|n|c|confirm)\b"
+               r"|thank you for (?:choosing|booking|scheduling)\b|this is a (?:friendly )?reminder\b)"),
+    re.compile(r"(?im)^[ \t]*dear\b"),                                  # a letter's greeting
     re.compile(r"(?im)^[ \t]*on\b[^\n]{4,160}\bwrote:[ \t]*$"),          # a reply's quote line
     re.compile(r"(?im)^[ \t]*sent from my\b"),                          # a mail app's signature
     re.compile(r"(?i)\b(?:https?://|www\.)\S"),                         # a link
@@ -427,7 +435,7 @@ class FamilyAdd:
             out.append(f"{MAX_TAPLESS_PER_DAY} adds have already gone in without a tap today.")
         if loose and (_looks_pasted(message) or self._pasted_recently()):
             out.append("your message or a recent one may be pasted text: it has a quoted line, an "
-                       "email's header lines, a forward or a link.")
+                       "email's header lines, a forward, a link, a phone number or words written to you.")
         elif loose and replied:
             out.append("it's a reply, and the message you replied to may be pasted text.")
         return out
