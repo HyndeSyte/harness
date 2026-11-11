@@ -16,6 +16,18 @@ plugin (research preview) and your Claude plan; no API key.
 Only one place may run the bot at a time. Stop any other session using the same
 token first, or both will answer.
 
+## Cards and questions
+
+- Cain asks one question at a time. The next one comes when you answer.
+- Each card names what it's about (like "P08 Q2") and its buttons answer exactly that.
+- Once a card stops mattering its buttons come off, and it says why: "You answered:
+  Filed", "Expired" or "Replaced by a newer card". Cain's questions and Ship cards last
+  until the next morning check-in (7:10 AM, at least two hours away); a Ship card also
+  goes when its pull request changes, merges or closes.
+- Tapping an old card does nothing, and says so.
+- The card shows what you tapped. When a tap needs words from Cain, they come as a reply
+  to that card.
+
 ## If the calendar specialist stops
 
 Cain's add-on and the Harness add-on check each other every minute. If Harness hasn't

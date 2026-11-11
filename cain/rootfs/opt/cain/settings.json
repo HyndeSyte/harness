@@ -33,7 +33,19 @@
       "Read(//data/codex/**)",
       "Edit(//data/codex/**)",
       "Edit(//data/review-queue/**)",
-      "Edit(//data/review-spend.json)"
+      "Edit(//data/review-spend.json)",
+      "Edit(//data/record-holds.json)",
+      "Edit(//data/record-holds.json.next)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "RemoteTrigger",
+        "hooks": [
+          { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15 }
+        ]
+      }
     ]
   }
 }
