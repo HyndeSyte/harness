@@ -215,8 +215,9 @@ def school_plan(items: list[caldav.Item], titles: tuple[str, ...], said: tuple =
 
 
 def _is_real(occ: ical.Occurrence) -> bool:
-    """Not a block from here, and not a "Busy" hold, which may only be drive time."""
-    return not (google_cal.is_ours(occ.uid.removesuffix("@google.com"))
+    """Not a block from here, and not a "Busy" hold, which may only be drive time. A timed
+    appointment from his mail, written busy, is a real one of his (mail_dates.py)."""
+    return not (google_cal.made_here(occ.uid.removesuffix("@google.com"), occ.summary, occ.transparent)
                 or occ.summary.strip().casefold().startswith("busy"))
 
 
@@ -321,14 +322,14 @@ class FamilyGmail:
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
         if not self._named():
-            return ("Blocks on Gmail from Family: off. Nothing is named in the add-on's settings, "
+            return ("Blocks on Gmail from Family: off. Nothing is named in Harness's settings, "
                     "or what's there can't be read.")
         if not self.google.configured():
             return ("Blocks on Gmail from Family: waiting. Enter the Google service account key "
-                    "on the add-on page.")
+                    "on the Harness page.")
         if self.calendar.snapshot.feeds and self._address() is None:
             return ("Blocks on Gmail from Family: waiting. It needs exactly one Gmail calendar's "
-                    "secret iCal address on the add-on page.")
+                    "secret iCal address on the Harness page.")
         n = self.ledger.db.execute("SELECT COUNT(*) FROM family_gmail WHERE state='live'"
                                    ).fetchone()[0]
         return f"Blocks on Gmail from Family: on, {n} on Gmail now"
@@ -520,7 +521,7 @@ class FamilyGmail:
         """Times only: nothing from the event itself goes in a note."""
         notes = []
         if self.drives is not None and self.drives.misread():
-            notes.append("Blocks on Gmail from Family: the school's address in the add-on's settings doesn't "
+            notes.append("Blocks on Gmail from Family: the school's address in Harness's settings doesn't "
                          "look like a street address, so drive times are off.")
         if self._no_lookup:
             notes.append("Blocks on Gmail from Family: couldn't look up a drive time, so I kept the school "
@@ -544,7 +545,7 @@ class FamilyGmail:
         if drives is None or not hasattr(drives, "between"):
             return {}
         if drives.home_misread():
-            self.leg_note = ("Blocks on Gmail from Family: home in the add-on's settings doesn't look like a "
+            self.leg_note = ("Blocks on Gmail from Family: home in Harness's settings doesn't look like a "
                              "street address or map coordinates (lat, lon), so drive blocks are off.")
             return {}
         if not drives.home_on():

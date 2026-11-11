@@ -99,7 +99,7 @@ def test_allowlisted_domains_stay_clickable():
 
 def test_long_answers_are_cut_and_say_so():
     t = render.answer("abcdef12-0000", "x" * 10000)
-    assert len(t) <= render.MESSAGE_LIMIT and "(cut to fit)" in t and "job abcdef12" in t
+    assert len(t) <= render.MESSAGE_LIMIT and "(cut to fit)" in t and "abcdef12" not in t
 
 
 def test_card_comes_from_params_not_model_prose():

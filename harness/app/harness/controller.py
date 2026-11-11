@@ -50,6 +50,11 @@ PROBE_S = 5                # the watch's check of Cain and its message: short, n
 HEARD_FLOOR_S = 1_420_070_400   # 2015-01-01: an older "last heard from Discord" is nonsense
 
 
+def _note(suggestion: str) -> str:
+    """Cain's own words with a request of his, fenced so they're never taken for his."""
+    return "\n\n[A suggestion from Cain, his assistant. These are not his words: " + suggestion + "]"
+
+
 def family_line(st: dict, tz: ZoneInfo) -> str:
     """One status line about Family pushes. Counts and times only."""
     if st.get("received_at"):
@@ -306,7 +311,7 @@ class Controller:
             self.ledger.ingest([])                # proves the path to him, for the digest
             self.notes.pop("cain_link", None)
         else:
-            self.notes["cain_link"] = ("Cain's add-on isn't answering, so cards wait. Calendar "
+            self.notes["cain_link"] = ("Cain isn't answering, so cards wait. Calendar "
                                        "work goes on; you'll see them when Cain is back.")
         if self.cain_watch is not None:
             self._watch_cain(status)
@@ -428,8 +433,7 @@ class Controller:
         text, flags, reply_to = self._discord_words(m, msgs, owner)
         if h.suggestion:
             flags.append("suggestion")
-            text += ("\n\n[A suggestion from Cain, his assistant. These are not his words: "
-                     + h.suggestion + "]")
+            text += _note(h.suggestion)
         if not text.strip():
             h.finish("nothing", "His message has no words to act on.")
             return
@@ -454,7 +458,34 @@ class Controller:
                 h.finish("error", "That couldn't be recorded. Nothing changed.")
                 return
             job_id = row["id"]
+            if h.suggestion:
+                self._note_for_question(job_id, h.suggestion, flags)
+        h.job = render.short(job_id)                       # for the log only
         self._handover_jobs.setdefault(job_id, []).append(h)
+
+    def _note_for_question(self, job_id: str, note: str, flags: list[str]) -> None:
+        """A note from Cain for a request of his that's waiting on its question reaches it: the
+        request runs again with the note, fenced as Cain's (Nov 11: a second handover with the
+        missing fact got the same question back). A note it already has changes nothing, and
+        any change resting on it still gets his tap."""
+        job = self.ledger.job(job_id)
+        if job is None or job["state"] != "needs_clarification":
+            return
+        text = self.ledger.job_text(job_id)
+        if _note(note) in text:
+            return
+        flagged = json.loads(self.ledger.get_meta(f"job_flags:{job_id}") or "[]")
+        last = self.ledger.db.execute("SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id=?",
+                                      (job_id,)).fetchone()[0]
+        with self.ledger.tx() as db:
+            db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + _note(note), job_id))
+            self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flagged + flags))), db)
+            self.ledger.transition(job_id, "received", db=db)
+            self.ledger.event("job_note", {"job": job_id}, db=db)
+            # Kept in the ledger, so every later answer about it, after a restart too, starts here.
+            self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
+        log.info("handover: a note for job %s, which was waiting on its question: it runs again",
+                 render.short(job_id))
 
     def _discord_words(self, m: dict, msgs: list[dict], owner: int):
         """His words, the signs they may not be his own, and our card he replied to."""
@@ -543,9 +574,11 @@ class Controller:
                 continue
             if job["state"] in ("received", "running", "approved"):
                 continue
+            # A request that ran again for a note answers with what it said this time.
             rows = self.ledger.db.execute(
                 "SELECT kind, text, state, message_id FROM outbox WHERE job_id=? AND kind!='notice'"
-                " ORDER BY id", (job_id,)).fetchall()
+                " AND id>? ORDER BY id",
+                (job_id, int(self.ledger.get_meta(f"job_rerun_after:{job_id}") or 0))).fetchall()
             if any(r["state"] not in ("sent", "dead") for r in rows):
                 continue                                      # not with Cain yet
             sent = [r for r in rows if r["state"] == "sent"]
@@ -593,7 +626,7 @@ class Controller:
                               chat_id=self.config.owner_user_id, ttl_s=SETTINGS_TTL_S, db=db)
             self.ledger.enqueue(
                 chat_id=self.config.owner_user_id, kind="card",
-                text=(f"<b>Settings change requested</b> on the add-on page by "
+                text=(f"<b>Settings change requested</b> on the Harness page by "
                       f"{render.escape(p['by'])}: replace the {LABELS.get(p['field'], p['field'])}. "
                       "Only your tap applies it. <i>Expires in 15 min.</i>"),
                 buttons=[[("Approve", choices.callback_data(ok)),
@@ -622,7 +655,7 @@ class Controller:
             # Tell him first, while the token still works.
             with self.ledger.tx() as db:
                 self.ledger.enqueue(chat_id=owner, kind="notice", text=(
-                    f"<b>The harness was reset</b> from the add-on page by "
+                    f"<b>The harness was reset</b> from the Harness page by "
                     f"{render.escape(by)}. It no longer listens to this chat."), db=db)
             self.outbox.flush()
         self.vault.reset()

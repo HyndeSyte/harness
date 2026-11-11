@@ -756,7 +756,8 @@ def _ctx_lines(item: caldav.Item, calendar, tz: str) -> list[str]:
             continue
         label = "Gmail" if w.calendar.casefold().endswith("@gmail.com") else "another calendar"
         for o in w.occurrences:
-            if o.transparent or google_cal.is_ours(o.uid.removesuffix("@google.com")):
+            if o.transparent or google_cal.made_here(o.uid.removesuffix("@google.com"), o.summary,
+                                                     o.transparent):
                 continue                   # free time, or a block this add-on wrote
             os_ = span_of(o, tz)
             if os_.end <= lo or os_.anchor >= hi:

@@ -51,7 +51,7 @@ def test_answer_is_committed_with_its_receipt_and_reply(ledger, config):
     assert rec["engine"] == "claude" and rec["type"] == "answer" and rec["usd"] > 0
     [out] = queued(ledger)
     assert out["job_id"] == job and "Thursday is clear." in out["text"]
-    assert f"job {job.split('-')[0]}" in out["text"]           # footer
+    assert "job" not in out["text"]                            # Nov 11: no job id for him
     assert ledger.spend_month("anthropic") > 0
     # the engine saw his words fenced, and no proposal shape before S2
     call = eng.calls[0]
@@ -266,7 +266,7 @@ def test_a_rule_change_renders_on_the_card():
                       "location": "", "every": ""}]},
         tz="America/New_York", expires=datetime(2026, 11, 8, 18, tzinfo=timezone.utc),
         job_id="abcd-1", warnings=["it rests on something Cain suggested"])
-    assert "Turkey harvest" in card and "from now on" in card and "Busy on Gmail" in card
+    assert "Turkey harvest" in card and "from now on" in card.lower() and "Busy on Gmail" in card
 
 
 def _cain_runner(ledger, config, script):
@@ -338,7 +338,7 @@ def test_reading_his_calendar_counts_against_the_jobs_deadline(ledger, config, m
     def slow_context(text, now):
         clock[0] += 100.0
         return ""
-    eng_r.calendar_change = SimpleNamespace(on=lambda: True, context_for=slow_context)
+    eng_r.calendar_change = SimpleNamespace(on=lambda: True, context_for=slow_context, recent=lambda job: [])
     seen = {}
     real = runner_mod.call_with_retries
 

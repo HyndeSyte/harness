@@ -210,8 +210,8 @@ class FakeGoogle:
         """Times come back in the calendar's own offset, not as they were sent."""
         out = dict(event)
         for side in ("start", "end"):
-            if "date" in event[side]:
-                continue                       # an all-day date comes back as it went
+            if side not in event or "date" in event[side]:
+                continue                       # a change that leaves it, or an all-day date, as it was
             when_ = datetime.fromisoformat(event[side]["dateTime"]).astimezone(ZoneInfo("America/Chicago"))
             out[side] = {"dateTime": when_.isoformat()}
         return out

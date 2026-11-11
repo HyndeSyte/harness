@@ -4,12 +4,12 @@
 # It also listens on 8100 for Family calendar pushes from Home Assistant, on
 # the internal add-on network only (no host port is mapped; see family.py).
 name: Harness
-version: "0.20.0"
+version: "0.21.0"
 slug: harness
 description: >-
   The calendar specialist behind Cain on Discord, with Claude and GPT as engines. A small
-  deterministic controller decides everything. Calendar changes you ask for go
-  through with no tap once you turn them on; anything that may be pasted gets one.
+  deterministic controller decides everything. Clear calendar changes you ask for are
+  done at once with a receipt and Undo once you turn them on; anything that looks pasted gets a tap.
 arch:
   - aarch64
   - amd64

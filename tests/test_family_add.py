@@ -281,7 +281,7 @@ def test_off_with_no_credentials_says_what_is_missing_and_offers_no_button(ledge
     r = Rig(ledger, tmp_path, clock, credentials=False)
     r.ask()
     _, text, buttons, _ = r.last()
-    assert "add-on page" in text and buttons is None
+    assert "Harness page" in text and buttons is None
 
 
 def test_only_his_tap_on_the_card_turns_it_on(rig):
@@ -1043,7 +1043,7 @@ def test_stop_blocks_an_undo_and_keeps_it_offered(on):
 def test_the_digest_is_not_clear_while_waiting_on_a_card(on):
     on.ask()
     d = digest_now(on)
-    assert "proposal waiting for your tap" in d.text
+    assert "waiting for your tap" in d.text and "job " not in d.text
 
 
 def test_event_text_is_exactly_what_was_approved(on):
@@ -2258,23 +2258,50 @@ def say_with(rig, text, **params):
     rig.say(text)
 
 
-def test_a_long_message_always_gets_a_card(loose):
-    say_with(loose, "x" * (family_add.MAX_TAPLESS_MESSAGE + 1), **fresh())
-    assert "PUT" not in loose.icloud.methods() and "long or had several lines" in loose.last()[1]
+# Nov 11: he dictates, often at length and over several lines. Only real signs of text from
+# elsewhere count: a quoted line, an email's header lines, a forward, a link.
+PASTED_EMAIL = ("From: Gala Committee <gala@club.example>\nSubject: You're invited\n\n"
+                "Join our gala on Dec 3 at 7pm.")
 
 
-def test_a_message_at_the_limit_writes(loose):
-    say_with(loose, "x" * family_add.MAX_TAPLESS_MESSAGE, **fresh())
+def test_a_pasted_email_always_gets_a_card(loose):
+    say_with(loose, PASTED_EMAIL, **fresh())
+    assert "PUT" not in loose.icloud.methods() and "may be pasted text" in loose.last()[1]
+
+
+def test_a_long_dictated_message_writes(loose):
+    say_with(loose, "Please add the dentist for Tuesday at three, the one I mentioned last week, " * 4,
+             **fresh())
     assert loose.icloud.methods().count("PUT") == 1
 
 
-def test_the_limit_is_200(loose):
-    assert family_add.MAX_TAPLESS_MESSAGE == 200
+@pytest.mark.parametrize("text, pasted", [
+    ("x" * 1000, False),
+    ("PT today moved 30 minutes earlier, 11:30.\nNot doing school drop-off today.\nThanks", False),
+    ("add dentist\nTuesday", False),
+    ("> On Mon, Nov 9, the office wrote:\n> no school", True),
+    ("From: Office <a@school.example>\nSubject: Closed\nNo school Monday", True),
+    ("On Mon, Nov 9, 2026 at 3:00 PM Office <a@school.example> wrote:\nNo school", True),
+    ("Fwd: Gala\nJoin us Dec 3", True),
+    ("Fwd from the school office? No, I mean move it", False),     # a forward needs its colon
+    ("Questions? Call 540-555-0100 to reschedule", True),           # a phone number
+    ("Your appointment is confirmed for Friday at 9", True),        # words written to him
+    ("Reply C to confirm or call us", True),
+    ("Dear Parent,\nThere is no school Monday", True),
+    ("move my appointment to 3 and the dentist to Friday", False),
+    ("2026-11-11 at 11:30, for 45 minutes", False),
+    ("---------- Forwarded message ---------\nJoin us", True),
+    ("See https://club.example/gala for the gala", True),
+    ("Gala Dec 3. Unsubscribe from these emails", True),
+    ("Gala Dec 3\nSent from my iPhone", True),
+])
+def test_only_real_signs_make_a_message_look_pasted(text, pasted):
+    assert family_add._looks_pasted(text) is pasted
 
 
-def test_a_several_line_message_always_gets_a_card(loose):
+def test_a_several_line_message_writes(loose):
     say_with(loose, "add dentist\nTuesday", **fresh())
-    assert "PUT" not in loose.icloud.methods() and "long or had several lines" in loose.last()[1]
+    assert loose.icloud.methods().count("PUT") == 1
 
 
 def test_a_trailing_line_break_is_not_several_lines(loose):
@@ -2283,7 +2310,7 @@ def test_a_trailing_line_break_is_not_several_lines(loose):
 
 
 def test_a_stranger_invitation_pasted_in_gets_a_card(loose):
-    say_with(loose, "Fwd from a stranger:\n" + "Join our gala on Dec 3 at 7pm, please add it. " * 20,
+    say_with(loose, "Fwd: from a stranger\n" + "Join our gala on Dec 3 at 7pm, please add it. " * 20,
              **{**fresh(), "title": "RSVP gala"})
     assert "RSVP gala" not in titles(loose) and "Check before approving" in loose.last()[1]
 

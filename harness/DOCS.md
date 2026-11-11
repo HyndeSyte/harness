@@ -28,8 +28,8 @@ until you turn it on: adding an event to the iCloud Family calendar.
 
 ## What it does now
 
-- Answers and drafts when you write. Each reply ends with a short job id; every job
-  ends in a receipt in its ledger.
+- Answers and drafts when you write. Every job ends in a receipt in its ledger. Its id
+  is in the log, never on your messages.
 - Keeps corrections as typed rules ("keep drafts short"). A rule does nothing until you tap
   *Keep rule* on a card showing its exact text; it then has an *Undo* button. `/rule` lists
   them, including any still waiting.
@@ -207,8 +207,9 @@ It won't offer this while any standing rule is still waiting for your tap, and s
 
 If you tap the button to stop checking, adds go straight in without the Approve tap, up to
 5 a day. Anything with a warning still gets a card, and so does any add at a start time
-another add already has, or from a message over 200 characters or with several lines, any
-message in the 30 minutes after one, or a message sent as a reply, since that may be pasted text. You still get the receipt and the Undo,
+another add already has, or from a message that looks pasted (a quoted line, an email's header
+lines, a forward, a link), any message in the 30 minutes after one, or a message sent as a reply.
+A long or several-line message is no sign of a paste: you dictate. You still get the receipt and the Undo,
 `/stop` still works, and `/status` and every digest say adds are skipping the tap. Nothing
 else changes.
 
@@ -221,6 +222,43 @@ the owner.
 
 **Alerts.** Tested on a real phone: an add alerts family phones that have notifications on
 for the Family calendar. The app can't turn that off. Each phone's own Calendar settings can.
+
+## Changing your calendar when you ask
+
+With the `calendar_changes` option on, a change you ask for (move, take off, add, end) is done
+straight away when it's clear, with one receipt and an *Undo* button: "Moved PT to 11:30 to
+12:30 today (Gmail and Family)", "Took off today's 8:00 drop-off". No Approve tap.
+
+- **Clear** means every event you name is found as exactly one event on that day, and every
+  time is plain. Your words match a title either way round: "PT" finds "PT - Clinic", and
+  "physical therapy" finds "PT". A time you give ("the 8:00 drop-off") says which one.
+- **Unclear** is asked once, by name, and nothing changes until you answer: "More than one event
+  today fits PT: PT - Clinic at 12:00, PT follow-up at 4:00. Which one?" One word that fits two
+  different events is always asked; a name of two words or more takes the event with exactly
+  that name. Part of a name is asked when something within a week fits it better, or repeats
+  under it, and a match only on the calendar you didn't name is asked too.
+- **Copies follow.** Moving or taking off a Gmail event moves or takes off the Family copy this
+  add-on keeps of it, in the same change, and Undo puts both back.
+- **Its own blocks are found where they are.** A school drop-off or pickup, a drive or a
+  "Busy (...)" block is on your Gmail calendar, whichever calendar you name.
+- **Every part, or what failed.** When one part can't be done, the others still are, and the
+  receipt names the part that wasn't, and why. "Done" only once the calendar reads back the change.
+- **A tap only when the words may not be yours, or the change is a big one**: a message that
+  looks pasted (a quoted line, an email's header lines, a forward, a link, a phone number, words
+  written to you), a reply to one, an edited or forwarded message, a note from Cain; a new length
+  you didn't give, three or more events off at once, or ending a series. The card says what will
+  happen, in plain words; your tap's reply says it again.
+
+## Dates from your mail
+
+With the `mail_dates` option on, dates in your mail go on your Gmail calendar. Deadlines, last
+days, renewals and the like are free all-day entries with no reminder, so nothing reaches work. An
+appointment the email gives a time for is a real appointment: it's busy, so work and Family see it,
+at its time with your usual reminder, and at the street address that email gave, or that another
+email about it gave (the same sender, day and time). Timed appointments already written free are
+made busy, their own emails are looked up once for an address, and the next digest names them. A
+rescheduling email moves the entry, with its own address. An entry you've changed is yours and
+left alone.
 
 ## Copies from your Gmail calendar
 

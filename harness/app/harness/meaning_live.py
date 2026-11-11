@@ -406,7 +406,12 @@ class MeaningLive:
         if not n:
             return ""
         shown = min(n, MAX_RECEIPTS)
-        more = f" ({n - shown} more tomorrow)" if n > shown else ""
+        # What's held is named, never just counted (Nov 11): its own block and day.
+        zone = ZoneInfo(self.tz)
+        held = [f"{r['title']} {_day(datetime.fromisoformat(r['start']).astimezone(zone))}"     # escaped in the digest
+                for r in self.ledger.db.execute("SELECT title, start FROM meaning_receipts WHERE state='new'"
+                                                " ORDER BY start LIMIT -1 OFFSET ?", (MAX_RECEIPTS,))]
+        more = f" (tomorrow: {', '.join(held)})" if held else ""
         return (f"New on Gmail from what Family events mean: {shown} block{'s' * (shown != 1)}, "
                 f"each on its own card with Undo{more}.")
 

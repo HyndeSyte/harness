@@ -66,13 +66,13 @@ class Outbox:
             # He should know this isn't fresh: say when it was written.
             when = written.astimezone(self.tz).strftime("%a %-I:%M %p")
             text = render.fit(f"<i>Delayed: written {when}.</i>\n" + text)
+        binds = json.loads(row["binds_json"]) if row["binds_json"] else []
         try:
-            mid = self._deliver(row["chat_id"], text, buttons, row["kind"])
+            mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
         except ChatError as e:
             self._failed(row, e)
             return False
         now = self.ledger.now()
-        binds = json.loads(row["binds_json"]) if row["binds_json"] else []
         with self.ledger.tx() as db:
             db.execute("UPDATE outbox SET state='sent', sent_at=?, message_id=?,"
                        " attempts=attempts+1, last_error=NULL WHERE id=?",
@@ -95,15 +95,31 @@ class Outbox:
                 self.ledger.event("bind_failed", {"outbox": row["id"], "error": str(e)[:100]})
         return True
 
-    def _deliver(self, chat_id: int, text: str, buttons, kind: str | None = None) -> int:
+    def _expires(self, binds: list) -> str | None:
+        """When a card's buttons lapse: the last of its own approvals and choices to expire, so
+        Cain's link can take them off then (Cain 0.7.0; an older link ignores it). None for a
+        card with no buttons of its own, or one whose expiry can't be read."""
+        ends = []
+        for b in binds:
+            table = {"approval": "approvals", "choice": "choices"}.get(b.get("type"))
+            row = self.ledger.db.execute(f"SELECT expires_at FROM {table} WHERE nonce=?",
+                                         (b.get("nonce"),)).fetchone() if table else None
+            if row is None:
+                return None
+            ends.append(datetime.fromisoformat(row["expires_at"]))
+        return max(ends).isoformat() if ends else None
+
+    def _deliver(self, chat_id: int, text: str, buttons, kind: str | None = None,
+                 expires: str | None = None) -> int:
+        lapse = {"expires": expires} if expires else {}
         try:
-            return self.api.send_message(chat_id, text, buttons, kind=kind)
+            return self.api.send_message(chat_id, text, buttons, kind=kind, **lapse)
         except ChatError as e:
             # Every character is escaped by render, so a markup error means
             # a bug there. Deliver it plainly rather than not at all.
             if e.code == 400 and "parse" in e.description.lower():
                 self.ledger.event("html_fallback", {"error": e.description[:100]})
-                return self.api.send_message(chat_id, _plain(text), buttons, html=False, kind=kind)
+                return self.api.send_message(chat_id, _plain(text), buttons, html=False, kind=kind, **lapse)
             raise
 
     def _failed(self, row, e: ChatError) -> None:

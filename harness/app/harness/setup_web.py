@@ -81,10 +81,10 @@ def _discord_section(d: dict | None) -> list[str]:
     out = ["<h2>Discord</h2><div class='card'>"]
     link = d.get("link")
     if not d.get("cain_answering"):
-        out.append('<div class="no">Discord link: unknown, because Cain\'s add-on isn\'t '
-                   "answering (it holds the link)</div>")
+        out.append('<div class="no">Discord link: unknown, because Cain isn\'t '
+                   "answering (he holds the link)</div>")
     elif link is None:
-        out.append('<div class="muted">Discord link: Cain\'s add-on doesn\'t report it yet '
+        out.append('<div class="muted">Discord link: Cain doesn\'t report it yet '
                    "(update Cain)</div>")
     else:
         state = ('<span class="ok">connected</span>' if link.get("connected")
@@ -111,7 +111,7 @@ def _discord_section(d: dict | None) -> list[str]:
                     f'you it\'s back{checked}</span>')
         else:
             line = '<span class="muted">not checked yet</span>'
-        out.append(f"<div>Watch on Cain's add-on: {line}</div>")
+        out.append(f"<div>Watch on Cain: {line}</div>")
     out.append("</div>")
     return out
 

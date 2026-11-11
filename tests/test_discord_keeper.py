@@ -52,11 +52,11 @@ class FakeLink:
         self.up = True
         self._next = 100
 
-    def card(self, text, rows, kind):
+    def card(self, text, rows, kind, expires=None):
         if not self.up:
             raise LinkError(0, "ConnectionRefusedError")
         self._next += 1
-        self.cards[self._next] = {"text": text, "rows": rows, "kind": kind}
+        self.cards[self._next] = {"text": text, "rows": rows, "kind": kind, "expires": expires}
         return self._next
 
     def buttons(self, card, rows):

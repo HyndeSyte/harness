@@ -79,10 +79,10 @@ class LinkChat:
         return components(rows, styles={"k:a:": PRIMARY})
 
     def send_message(self, chat_id: int, text: str, buttons=None, *, html: bool = True,
-                     kind: str | None = None) -> int:
+                     kind: str | None = None, expires: str | None = None) -> int:
         content = to_markdown(text) if html else escape(text)
         try:
-            return self.link.card(content, self._rows(buttons, kind), kind or "reply")
+            return self.link.card(content, self._rows(buttons, kind), kind or "reply", expires=expires)
         except LinkError as e:
             raise _err(e) from None
 

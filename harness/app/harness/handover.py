@@ -71,14 +71,16 @@ class Handover:
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
     age: float | None = None             # how old his message was when Cain handed it over
+    job: str = ""                        # the job's short id: for the log, never for him
 
     def finish(self, status: str, said: str = "", **extra) -> None:
         if not self.done.is_set():
             self.result = {"status": status, "said": said, **extra}
             took = time.monotonic() - self.arrived
             # Outcome and timing only: never his words. The target is 20 s from his message.
-            log.info("%s: %s, %.1fs here%s", self.kind, status, took,
-                     f", {self.age + took:.0f}s after his message" if self.age is not None else "")
+            log.info("%s: %s, %.1fs here%s%s", self.kind, status, took,
+                     f", {self.age + took:.0f}s after his message" if self.age is not None else "",
+                     f", job {self.job}" if self.job else "")
             self.done.set()
 
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.21.0
+
+- **Your plain calendar commands just work.** Say "move PT to 11:30" or "no drop-off today" and it's done straight away, with one receipt and an Undo button: "Moved PT to 11:30 to 12:30 today (Gmail and Family)", "Took off today's 8:00 drop-off". No Approve tap.
+- **Your words find the event.** "PT" finds "PT - Clinic" and "physical therapy" finds "PT", on Gmail or Family. The Family copy of a Gmail event moves or comes off with it, in the same change, and Undo puts both back. The school drop-off and pickup are found on your Gmail calendar, however you name them.
+- **Asked once, by name, only when it's unclear.** When two events fit what you said, or none does, you're asked which, naming them, and nothing changes until you answer. A note from Cain now reaches a question that's waiting for it.
+- **Plain words, nothing else.** Cards and receipts read like "11:30 to 12:30 today": no date stamps, no job numbers, no expiry line. Your tap's reply says what will happen, and "Done" comes only once the calendar reads back the change.
+- **A long or dictated message is just you.** Only real signs of a paste get a tap now: a quoted line, an email's header lines, a forward, a link, a phone number, or words written to you ("your appointment", "please arrive").
+- **A tap for the big ones.** A change still waits for your tap when it would give an event a new length you didn't say, take off three or more events at once, or end a series.
+- **Every part, or exactly what failed.** If one part can't be done, the rest still is, and the receipt says which part wasn't and why. It never says "Nothing changed" when something did.
+- **Only what you named.** When one word fits two different events ("PT" at 4:00 and "PT - Clinic"), when your words are only part of a name and something nearby fits them better, or when what you named is only on the other calendar, you're asked instead of it being changed. A receipt names the event by its own title.
+- **Buttons come off when they lapse.** Each card tells Cain when its buttons stop working, so once Cain 0.7.0 is in, an expired Approve or Undo is taken off instead of sitting there for days.
+- **Appointments from your mail are real appointments.** One the email gives a time for is now busy, so work and Family see it, at the street address that email gave, or another email about it (same sender, day and time). Timed appointments already on your calendar are made busy too, and only their own emails are looked up again for the address. The next digest names each one made busy. A rescheduling email moves it, with the new email's address. Deadlines, last days, classes and other notices stay free. One you've changed stays yours.
+
 ## 0.20.0
 
 - **If Cain's add-on stops, you hear about it.** This add-on checks Cain's every minute. If Cain hasn't answered for 5 minutes, you get one Discord message saying so, sent straight from here since Cain is the one that's down. It tells you Stop and the buttons won't work until Cain is back. When Cain answers again you get one more message, also straight from here.
