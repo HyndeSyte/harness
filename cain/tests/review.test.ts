@@ -275,7 +275,7 @@ describe("runner", () => {
     expect(t.relays()).toEqual(["Review 2026-11-08-desk-plan done: 2 approve with changes, 1 approve (OpenAI, Gemini, Claude). Verdicts in reviews/2026-11-08-desk-plan/verdicts.md."]);
     expect(t.relays().join(" ")).not.toContain("SECRET-MODEL-TEXT");
     // The record keeper takes the request as it stands.
-    const p = plan(req, { read: () => null, sha: () => null });
+    const p = plan(req, { read: () => null, sha: () => null }, { at: new Date() });
     expect(p.state).toBe("ok");
     // Spend per seat per month.
     expect(t.spend()["2026-11"].gemini).toMatchObject({ runs: 1, findings: 0 });

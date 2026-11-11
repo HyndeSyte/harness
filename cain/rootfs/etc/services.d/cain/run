@@ -5,6 +5,14 @@
 # the Claude sign-in, the Discord token and allowlist, the plugin, the work folder.
 # ==============================================================================
 export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
+# Supervisor gives every App a token (SUPERVISOR_TOKEN, and the older HASSIO_TOKEN)
+# that reaches /addons/self: this App's own options, owner_user_id included. Nothing
+# started here gets it in its environment, Cain's session included. bashio keeps its
+# own unexported copy from when it loaded, so the option reads below still work.
+# That isn't a lock: the session runs as root and could still read the token (from
+# another process's /proc/<pid>/environ, or s6's copy of the environment). Keeping
+# it out for good needs the session to run as its own user, which comes later.
+unset SUPERVISOR_TOKEN HASSIO_TOKEN
 mkdir -p /data/work
 # Cain's standing rules ship with the add-on, so an update always brings them.
 cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md

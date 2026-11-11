@@ -115,16 +115,29 @@ def test_cain_config_denies_every_api_and_mapping():
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099" and cfg["panel_admin"] == "true"
     assert cfg["init"] == "false"
     # Keys (the record keeper's GitHub token, the review runner's three API keys) as
-    # password fields, and the review caps as bounded numbers. Nothing else.
+    # password fields, the review caps as bounded numbers, and the panel's owner (a
+    # Home Assistant user id, not a key). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        "  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\nschema:\n"
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n")
+        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n")
+
+
+def test_cain_owner_user_id_takes_a_user_id_or_nothing():
+    # Configuration checks owner_user_id when it's saved. Supervisor runs match() on any
+    # value that's there, optional or not, so the pattern takes the default "" too.
+    text = (CAIN / "config.yaml").read_text()
+    pattern = re.search(r"^  owner_user_id: match\((.*)\)\?$", text, re.M).group(1)
+    owner = "0123456789abcdef0123456789abcdef"
+    for ok in ("", owner):
+        assert re.match(pattern, ok), ok                      # voluptuous' Match is re.match
+    for bad in (owner[1:], owner + "0", owner.upper(), owner[:31] + "g", owner + '";}', " " + owner):
+        assert not re.match(pattern, bad), bad
 
 
 def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
@@ -161,6 +174,50 @@ def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
     assert run_("submit", str(req)).returncode == 2
 
 
+def test_cain_gets_a_rows_base_and_the_holds_from_record_sh(tmp_path):
+    # A row edit's base is sha1 of the open row's line, the same as the keeper's rowHash.
+    import hashlib, json, shutil, subprocess
+    bash = shutil.which("bash")
+    if not bash or not shutil.which("sha1sum"):
+        import pytest
+        pytest.skip("no bash or sha1sum")
+    rec = tmp_path / "rec"
+    (rec / "state").mkdir(parents=True)
+    rows = ["| P11 | Watch | Build | Ship | | Alerts | Nov 7 |", "| P33 | Wave 1 | Build | Laptop holds it |  | Drills | Nov 10 |"]
+    text = "# Pending\n\n## Open\n\n| ID | Item | Who | Next step | Waits for | Done when | Since |\n|---|---|---|---|---|---|---|\n"
+    text += "\n".join(rows) + "\n\n## Done\n\n| Item | Date |\n|---|---|\n| P33 old: a done row that starts with the same id | Nov 1 |\n"
+    (rec / "state" / "PENDING.md").write_bytes(text.replace("\n", "\r\n").encode())
+    env = {"PATH": __import__("os").environ["PATH"], "RECORD_DIR": str(rec)}
+    run_ = lambda *a: subprocess.run([bash, str(CAIN / "rootfs/opt/cain/record.sh"), *a], env=env, capture_output=True, text=True, timeout=20)
+    for line in rows:
+        assert run_("rowsha", line.split("|")[1].strip()).stdout.strip() == hashlib.sha1(line.encode()).hexdigest()
+    assert run_("rowsha", "P99").returncode == 1
+    assert run_("holds").stdout.strip() == "{}"   # nothing pushed yet: nobody holds anything
+    # Notes on an item, oldest first, one table row each; only those after a time if given.
+    (rec / "state" / "notes").mkdir()
+    notes = ["| 2026-11-11T13:00:00.000Z | laptop:abc | Dane, other chat: rebase PR #3 after the fix |",
+             "| 2026-11-11T14:00:00.000Z | cain | Dane in Discord: hold the ship until the drill |"]
+    (rec / "state" / "notes" / "P33.md").write_bytes(("# Notes on P33\n\nWords about P33.\n\n| When | From | Note |\n|---|---|---|\n"
+                                                      + "\n".join(notes) + "\n").replace("\n", "\r\n").encode())
+    assert run_("notes", "P33").stdout.splitlines() == notes
+    assert run_("notes", "p33").stdout.splitlines() == notes      # ids are one case
+    assert run_("notes", "P33", "2026-11-11T13:00:00.000Z").stdout.splitlines() == notes[1:]
+    assert run_("notes", "P33", "2026-11-11T08:30:00-05:00").stdout.splitlines() == notes[1:]   # any offset
+    assert run_("notes", "P33", "2026-11-11T13:00Z").stdout.splitlines() == notes[1:]           # any ISO form
+    assert run_("notes", "P33", "not a time").returncode == 2
+    assert run_("notes", "P44").stdout == ""        # none filed
+    assert run_("notes", "../P33").returncode == 2
+    # No item: every item's notes but those someone other than Cain holds, each led by its item.
+    if shutil.which("jq"):
+        (rec / "state" / "notes" / "P44.md").write_text("| When | From | Note |\n|---|---|---|\n| 2026-11-11T15:00:00.000Z | cain | for the laptop |\n")
+        (rec / "state" / "notes" / "P11.md").write_text("| When | From | Note |\n|---|---|---|\n| 2026-11-11T16:00:00.000Z | page | for Cain |\n")
+        (rec / "state" / "holds.json").write_text(json.dumps({
+            "P33": {"holder": "cain", "for": "x", "branches": [], "taken": "2026-11-11T12:00:00.000Z", "renewed": "2026-11-11T12:00:00.000Z"},
+            "P44": {"holder": "laptop:abc", "for": "x", "branches": [], "taken": "2026-11-11T12:00:00.000Z", "renewed": "2026-11-11T12:00:00.000Z"}}))
+        assert run_("notes").stdout.splitlines() == ["P11 | 2026-11-11T16:00:00.000Z | page | for Cain |"] + ["P33 " + n for n in notes]
+        assert run_("notes", "-", "2026-11-11T13:30:00Z").stdout.splitlines() == ["P11 | 2026-11-11T16:00:00.000Z | page | for Cain |", "P33 " + notes[1]]
+
+
 def test_cain_versions_agree_and_everything_is_pinned():
     cfg = flat_yaml(CAIN / "config.yaml")
     docker = (CAIN / "Dockerfile").read_text()
@@ -187,6 +244,42 @@ def test_cain_start_survives_bashio_errexit():
     # session to kill) must not end the script. 0.1.0 and 0.1.1 died here.
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
     assert "kill-session -t cain 2>/dev/null || true" in run
+
+
+def test_cain_scripts_unset_the_supervisor_token_before_starting_anything():
+    # Supervisor's token reaches /addons/self: this App's own options, owner_user_id
+    # included. Both service scripts unset it before they start anything, so nothing
+    # they start (Cain's session, nginx, ttyd, the helpers) has it in its environment.
+    # bashio keeps its own unexported copy (bashio.sh declares __BASHIO_SUPERVISOR_TOKEN
+    # when it loads), so their option reads, in subshells too, still work.
+    import os, shutil, subprocess
+    unset = "unset SUPERVISOR_TOKEN HASSIO_TOKEN"
+    prefixes = {}
+    for name in ("cain", "terminal"):
+        lines = (CAIN / f"rootfs/etc/services.d/{name}/run").read_text().splitlines()
+        assert unset in lines, name
+        at = lines.index(unset)
+        ran = [l for l in lines[1:at] if l.strip() and not l.lstrip().startswith("#")]
+        assert all(l.startswith("export ") for l in ran), (name, ran)       # nothing starts before it
+        after = [l for l in lines[at + 1:] if not l.lstrip().startswith("#")]
+        assert not any(re.search(r"SUPERVISOR_TOKEN|HASSIO_TOKEN", l) for l in after), name  # nor puts it back
+        prefixes[name] = "\n".join(lines[1:at + 1])
+    bash = shutil.which("bash")
+    if not bash:
+        import pytest
+        pytest.skip("no bash")
+    env = dict(os.environ, SUPERVISOR_TOKEN="supervisor-secret", HASSIO_TOKEN="hassio-secret")
+    for name, prefix in prefixes.items():
+        script = ("declare __BASHIO_SUPERVISOR_TOKEN=${SUPERVISOR_TOKEN:-}\n"   # as bashio.sh does at load
+                  f"{prefix}\n"
+                  'echo "shell:$__BASHIO_SUPERVISOR_TOKEN"; ( echo "subshell:$__BASHIO_SUPERVISOR_TOKEN" )\n'
+                  "env\n")
+        out = subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True,
+                             timeout=20, check=True).stdout
+        assert "shell:supervisor-secret\nsubshell:supervisor-secret\n" in out, name
+        started = out.split("subshell:supervisor-secret\n", 1)[1]           # what a started program gets
+        assert not re.search(r"^(SUPERVISOR_TOKEN|HASSIO_TOKEN|__BASHIO_SUPERVISOR_TOKEN)=", started, re.M), name
+        assert "-secret" not in started, name
 
 
 def test_cain_signin_link_is_rejoined(tmp_path):
@@ -289,6 +382,106 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     assert "cp /opt/cain/settings.json /data/work/.claude/settings.json" in run
 
 
+def test_keeper_sends_cards_with_their_item_question_and_thread(tmp_path):
+    import json, os, shutil, subprocess
+    bash, jq = shutil.which("bash"), shutil.which("jq")
+    if not bash or not jq:
+        import pytest
+        pytest.skip("no bash or jq")
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "bun").write_text("#!/bin/bash\nprintf deadbeef\n", newline="\n")     # the key, made from no token
+    (stub / "curl").write_text('#!/bin/bash\nfor a in "$@"; do printf "%s\\n" "$a"; done > "$CURL_ARGS"\n'
+                               "echo '{\"status\":\"posted\"}'\n", newline="\n")
+    for f in ("bun", "curl"):
+        (stub / f).chmod(0o755)
+    env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}", CURL_ARGS=str(tmp_path / "args"))
+    keeper = str(CAIN / "rootfs/opt/cain/keeper.sh")
+
+    def call(*a):
+        out = subprocess.run([bash, keeper, *a], env=env, capture_output=True, text=True, timeout=20)
+        args = (tmp_path / "args").read_text().splitlines()
+        return out, json.loads(args[args.index("-d") + 1]), args[-1]
+
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    out, body, url = call("ask", "--item", "P08", "--question", "Q2", "--reply-to", "1234567890123456789",
+                          "P08 Q2: Is the packet filed?", "Filed", "Not filed", "Not sure")
+    assert url == "http://127.0.0.1:8097/ask" and json.loads(out.stdout) == {"status": "posted"}
+    assert body == {"item": "P08", "question": "Q2", "reply_to": "1234567890123456789",
+                    "text": "P08 Q2: Is the packet filed?", "options": ["Filed", "Not filed", "Not sure"]}
+    assert call("ask", "Filed?", "Yes", "--item", "none")[1] == {"item": "none", "text": "Filed?", "options": ["Yes"]}
+    assert call("ask", "Filed?", "Yes")[1]["item"] == ""                             # the link refuses it
+    assert call("show", "1794112807413", "--item", "none", "--reply-to", "99999999999999999")[1] == {
+        "item": "none", "reply_to": "99999999999999999", "id": 1794112807413}
+    _, body, url = call("ship", "--item", "P41", "--pr", "https://github.com/HyndeSyte/harness/pull/5",
+                        "--head", sha, "Cain 0.7.0 ready.")
+    assert url.endswith("/ship") and body == {"item": "P41", "text": "Cain 0.7.0 ready.",
+                                              "pr": "https://github.com/HyndeSyte/harness/pull/5", "head": sha}
+    assert call("answered", "--item", "P08", "--question", "Q2")[1] == {"item": "P08", "question": "Q2"}
+    assert call("replied", "1234567890123456789")[1] == {"m": "1234567890123456789"}
+    assert call("morning", "## Wed")[1] == {"text": "## Wed", "options": []}
+    missing = subprocess.run([bash, keeper, "ask", "--item"], env=env, capture_output=True, text=True, timeout=20)
+    assert missing.returncode == 2 and "--item needs a value" in missing.stdout
+
+
+def test_cains_remote_trigger_hook_is_wired_and_shipped():
+    import json
+    hooks = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["hooks"]["PreToolUse"]
+    pre = [h for h in hooks if h["matcher"] == "RemoteTrigger"]
+    # A hook that crashes refuses (exit 2), rather than letting the run through.
+    assert len(pre) == 1 and pre[0]["hooks"][0]["command"] == "bun /opt/cain/hooks/remote-trigger.ts || exit 2"
+    hook = (CAIN / "rootfs/opt/cain/hooks/remote-trigger.ts").read_text(encoding="utf-8")
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    for trig in re.findall(r"trig_[A-Za-z0-9]+", hook):
+        assert trig in rules, trig
+    assert 'permissionDecision: "deny"' in hook and '"/data/record-holds.json"' in hook and '"/data/link/state.json"' in hook
+    assert "COPY rootfs /" in (CAIN / "Dockerfile").read_text()                       # ships with the add-on
+
+
+def test_cloud_jobs_in_this_repo_cannot_notify_him():
+    import json
+    deny = json.loads((ROOT / ".claude/settings.json").read_text())["permissions"]["deny"]
+    assert "PushNotification" in deny
+
+
+def test_cain_cannot_edit_the_keepers_own_holds():
+    import json
+    deny = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]["deny"]
+    assert {"Edit(//data/record-holds.json)", "Edit(//data/record-holds.json.next)"} <= set(deny)
+
+
+def test_cain_knows_the_keepers_item_ops():
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    record = rules.split("## Your record")[1].split("\n## ")[0]
+    for op in ('"op": "row"', '"op": "row-add"', '"op": "row-close"', '"op": "take"', '"op": "pass"',
+               '"op": "release"', '"op": "renew"', '"op": "note"', "record.sh rowsha", "record.sh holds",
+               "record.sh notes <item>", "record.sh notes -", '"for": "dane: <his words>"', '"job": "<title>"',
+               "refused", "upper-cased"):
+        assert op in record, op
+    jobs = rules.split("## Cloud jobs")[1].split("\n## ")[0]
+    assert "`take` it with\n   `\"job\": \"<title>\"`" in jobs and "`release` the job's item" in jobs
+
+
+def test_cains_cards_are_exact_and_his_words_true():
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    asking = rules.split("## Asking him")[1].split("\n## ")[0]
+    for must in ("--item", "--question", '"Filed", "Not filed", "Not sure"', 'never "Not', "One ask is open at a time",
+                 '"held"', "keeper.sh answered", "Record what he tapped exactly", "Never record a fact you",
+                 "reply_to", "overrides your plugin's note", "keeper.sh replied"):
+        assert must in asking, must
+    holds = rules.split("## Who holds what")[1].split("\n## ")[0]
+    for must in ("state/holds.json", "Ask him only about items you hold", "Never tell him who holds what",
+                 "never pass his Discord work to a laptop session", "(P43)", '"Got it"', "in a `note`",
+                 "as a `note` on its item", "read its notes"):
+        assert must in holds, must
+    timing = rules.split("## Timing and truth")[1].split("\n## ")[0]
+    for must in ("happens before it", '"asked", "sent", "started" or "done" only once', "ISO timestamps",
+                 "job, session, card, request or commit ids"):
+        assert must in timing, must
+    assert "starting with\n  its item and question id" in rules
+    assert "—" not in rules
+
+
 def test_the_handover_port_is_never_published():
     cfg = (ADDON / "config.yaml").read_text()
     assert not re.search(r"^ports", cfg, re.M) and "8098" not in cfg
@@ -343,6 +536,99 @@ def test_checkin_fires_once_in_its_hour_and_only_when_cain_is_idle(tmp_path):
     assert "1230" in _checkin(tmp_path, "1240", IDLE).splitlines()[-2]
 
 
+def test_checkin_lists_items_held_by_others_first(tmp_path):
+    import json
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    # The record keeper's own holds file (/data/record-holds.json), holds under "holds".
+    holds = tmp_path / "record-holds.json"
+    holds.write_text(json.dumps({"holds": {
+        "P33": {"holder": "laptop:9f2c", "for": "his chat", "branches": ["claude/x"],
+                "taken": "2026-11-11T13:00:00Z", "renewed": "2026-11-11T13:00:00Z"},
+        "P12": {"holder": "laptop:a1;rm -rf", "for": "his chat", "branches": []},
+        "P41": {"holder": "cain", "for": "Build job", "branches": ["claude/y"]},
+        "P4$(x)5": {"holder": "laptop:b2", "for": "his chat", "branches": []},
+    }, "waiting": [], "downtime": []}))
+    os.environ["HOLDS_FILE"] = str(holds)
+    try:
+        out = _checkin(tmp_path, "0712", IDLE)
+        line = out.splitlines()[-2]
+        assert line.split(" -l ", 1)[1].startswith("Held by others, skip these: P12, P33, P4x5. Scheduled check-in")
+        assert "P41" not in line and "laptop" not in line and "$(" not in line
+        (tmp_path / "sent.txt").unlink()
+        holds.write_text('{"holds": {}, "waiting": [], "downtime": []}')
+        assert "Held by others" not in _checkin(tmp_path, "1240", IDLE)
+        (tmp_path / "sent.txt").unlink()
+        holds.write_text("{broken")
+        assert "holds file can't be read" in _checkin(tmp_path, "1740", IDLE)
+    finally:
+        del os.environ["HOLDS_FILE"]
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    out = _checkin(fresh, "0712", IDLE)                         # no holds file yet: nothing said
+    assert "Scheduled check-in" in out and "Held by others" not in out and "can't be read" not in out
+
+
+def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
+    # Against the record keeper's own `record.sh notes -` and its notes files.
+    import json
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    rec = tmp_path / "record"
+    (rec / "state" / "notes").mkdir(parents=True)
+
+    def notes(item, rows):   # as the keeper's addNote writes them
+        f = rec / "state" / "notes" / f"{item}.md"
+        nl = chr(10)
+        head = nl.join([f"# Notes on {item}", "", f"Words about {item} for whoever holds it, oldest first, filed by "
+                        f"the record keeper from note requests. Its holder reads new ones before changing {item}.", "",
+                        "| When | From | Note |", "|---|---|---|", ""])
+        body = "".join(f"| {w} | {by} | {t} |{nl}" for w, by, t in rows)
+        f.write_text((f.read_text() if f.exists() else head) + body, newline=nl)
+
+    notes("P41", [("2026-11-09T14:02:11.000Z", "laptop:9f2c", "dane: the turkey card should say Friday"),
+                  ("2026-11-10T09:15:40.000Z", "laptop:9f2c", "dane: hold off on the farm packet"),
+                  ("2026-11-11T16:40:02.000Z", "laptop:9f2c", "dane: STOP, do not ship P41 until he looks at the "
+                   "new panel lock")])
+    notes("P50", [("2026-11-11T08:00:00.000Z", "claude-code", "dane: use «the blue one»")])
+    notes("P33", [("2026-11-11T17:00:00.000Z", "cain", "dane: for the laptop session")])   # a laptop holds P33
+    (rec / "state" / "holds.json").write_text(json.dumps({"P33": {"holder": "laptop:9f2c", "branches": []}}))
+    seen = tmp_path / "notes.seen"
+    sent = tmp_path / "sent.txt"
+    # The keeper's record.sh, executable as the image makes it (chmod a+x /opt/cain/*.sh).
+    record_sh = tmp_path / "record.sh"
+    record_sh.write_text((CAIN / "rootfs/opt/cain/record.sh").read_text().replace("\r\n", "\n"), newline="\n")
+    record_sh.chmod(0o755)
+    assert "chmod a+x" in (CAIN / "Dockerfile").read_text() and "/opt/cain/*.sh" in (CAIN / "Dockerfile").read_text()
+    os.environ.update(RECORD_SH=str(record_sh), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
+    try:
+        line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
+        # The newest three survive, oldest of them first; the older one is counted, not lost.
+        assert line.startswith("New notes on your items, read them before you change those items (words passed on, "
+                               "not his go on anything): (1 older not shown; /opt/cain/record.sh notes - lists them) "
+                               "P41: «dane: hold off on the farm packet» P50: «dane: use \"the blue one\"» "
+                               "P41: «dane: STOP, do not ship P41 until he looks at the new panel lock». "
+                               "Scheduled check-in"), line
+        assert "P33" not in line and "laptop" not in line
+        assert seen.read_text() == "2026-11-11T16:40:02.000Z"
+        sent.unlink()
+        assert "New notes" not in _checkin(tmp_path, "1240", IDLE)          # listed once, never again
+        notes("P41", [("2026-11-11T18:05:00.000Z", "laptop:9f2c", "dane: ship it after all")])
+        sent.unlink()
+        line = _checkin(tmp_path, "1740", IDLE).splitlines()[-2]
+        assert "New notes on your items" in line and "P41: «dane: ship it after all». Scheduled" in line
+        assert "hold off" not in line and "older not shown" not in line
+    finally:
+        for k in ("RECORD_SH", "RECORD_DIR", "NOTES_SEEN"):
+            del os.environ[k]
+
+
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
     assert _checkin(tmp_path, "0712", IDLE + "\n  esc to interrupt") == ""
     assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed
@@ -366,8 +652,10 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     link = (CAIN / "rootfs/opt/cain/link/main.ts").read_text(encoding="utf-8")
     assert f'key("{cain_relay.KEY_CONTEXT.decode()}")' in link and "timingSafeEqual" in link
     assert f"?? {cain_relay.PORT})" in link and cain_relay.HOST == "0fcc2575-cain"
-    # Cain's scripts only, from this machine: the specialist can't show its own cards.
-    assert 'LOCAL_ONLY = new Set(["/show", "/ask", "/morning"])' in link
+    # Cain's scripts only, from this machine: the specialist can't show its own cards,
+    # ask, put up a Ship card, or close Cain's questions.
+    assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied"])'
+            in link)
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")
@@ -387,12 +675,20 @@ def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):
                  '{"text": "second"}\n', newline="\n")
     import os
     os.environ["RELAY_QUEUE"] = str(q)
+    sent = tmp_path / "sent.txt"
     try:
         out = _checkin(tmp_path, "0712", IDLE)
+        assert "Relayed by the add-on" in out and 'tapped "Yes"' in out and "morning" not in out
+        # The queue was moved aside whole before reading, so a line the link adds now
+        # starts a fresh queue instead of being lost, and waits its turn.
+        assert not q.exists() and (tmp_path / "relay.queue.work").read_text().strip() == '{"text": "second"}'
+        q.write_text('{"text": "third"}\n', newline="\n")
+        sent.unlink()
+        assert "Relayed by the add-on: second" in _checkin(tmp_path, "0712", IDLE)
+        sent.unlink()
+        assert "Relayed by the add-on: third" in _checkin(tmp_path, "0712", IDLE)
     finally:
         del os.environ["RELAY_QUEUE"]
-    assert "Relayed by the add-on" in out and 'tapped "Yes"' in out and "morning" not in out
-    assert q.read_text().strip() == '{"text": "second"}'
 
 
 def test_cains_morning_update_folds_in_the_digest():
@@ -556,3 +852,11 @@ def test_build_work_runs_as_cloud_jobs_with_his_go():
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
     assert "## Build" in releasing and "## Ship (only after Dane's go)" in releasing
     assert "Never read Cain's App info" in releasing
+    # A Build job names its branch; a Ship card and job carry the full head sha, and the
+    # merge is pinned to it with GitHub's head match.
+    jobs = rules.split("## Cloud jobs")[1].split("\n## ")[0]
+    assert "`Branch: claude/<slug>`" in jobs and "Never name a pull\n   request in place of its branch" in jobs
+    assert "/opt/cain/keeper.sh ship --item" in jobs and "--head <full head sha>" in jobs
+    assert "gh pr merge --squash --match-head-commit <that sha>" in jobs
+    ship = releasing.split("## Ship (only after Dane's go)")[1].split("\n## ")[0]
+    assert "--match-head-commit" in ship and "full head sha" in ship

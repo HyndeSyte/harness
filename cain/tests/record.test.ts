@@ -10,6 +10,7 @@ const fakeTree = (files: Record<string, string>): Tree => ({
   read: (p) => files[p] ?? null,
   sha: (p) => (p in files ? blobSha(files[p]) : null),
 });
+const at = { at: new Date("2026-11-08T12:00:00Z") };
 
 describe("requests", () => {
   test("parse refuses junk and accepts a change", () => {
@@ -23,14 +24,14 @@ describe("requests", () => {
   test("put needs the sha it read; stale writes are conflicts, not overwrites", () => {
     const t = fakeTree({ "areas/farm/open.md": "old\n" });
     const req = (base: string) => ({ id: "r1abcd", from: "cain", kind: "change" as const, summary: "s", ops: [{ op: "put" as const, path: "areas/farm/open.md", content: "new\n", base }] });
-    expect(plan(req(blobSha("old\n")), t).state).toBe("ok");
-    expect(plan(req("deadbeef"), t)).toMatchObject({ state: "conflict" });
-    expect(plan(req("new"), t)).toMatchObject({ state: "conflict" });
+    expect(plan(req(blobSha("old\n")), t, at).state).toBe("ok");
+    expect(plan(req("deadbeef"), t, at)).toMatchObject({ state: "conflict" });
+    expect(plan(req("new"), t, at)).toMatchObject({ state: "conflict" });
   });
 
   test("rules: where, decisions append-only, notes need id and sources, size", () => {
     const t = fakeTree({ "areas/farm/decisions.md": "a\n" });
-    const r = (ops: any[]) => plan({ id: "r1abcd", from: "cain", kind: "change", summary: "s", ops }, t);
+    const r = (ops: any[]) => plan({ id: "r1abcd", from: "cain", kind: "change", summary: "s", ops }, t, at);
     expect(r([{ op: "put", path: ".github/workflows/x.yml", content: "", base: "new" }])).toMatchObject({ state: "rejected" });
     expect(r([{ op: "put", path: "areas/../x", content: "", base: "new" }])).toMatchObject({ state: "rejected" });
     expect(r([{ op: "put", path: "log/requests/x.jsonl", content: "", base: "new" }])).toMatchObject({ state: "rejected" });
@@ -46,10 +47,10 @@ describe("requests", () => {
     const loser = note("soil-2");
     const t = fakeTree({ "areas/farm/notes/soil-2.md": loser, "areas/farm/notes/soil.md": note("soil") });
     const rm = { op: "remove" as const, path: "areas/farm/notes/soil-2.md", base: blobSha(loser), merged_into: "areas/farm/notes/soil.md" };
-    expect(plan({ id: "r1abcd", from: "cain", kind: "change", summary: "s", ops: [rm] }, t)).toMatchObject({ state: "rejected" });
+    expect(plan({ id: "r1abcd", from: "cain", kind: "change", summary: "s", ops: [rm] }, t, at)).toMatchObject({ state: "rejected" });
     const survivor = note("soil", "replaces:\n  - areas/farm/notes/soil-2.md\n");
     const ok = plan({ id: "r1abcd", from: "cain", kind: "change", summary: "s", ops: [
-      { op: "put", path: "areas/farm/notes/soil.md", content: survivor, base: blobSha(note("soil")) }, rm] }, t);
+      { op: "put", path: "areas/farm/notes/soil.md", content: survivor, base: blobSha(note("soil")) }, rm] }, t, at);
     expect(ok.state).toBe("ok");
   });
 

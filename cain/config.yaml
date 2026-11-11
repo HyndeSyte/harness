@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.5.0"
+version: "0.7.1"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -30,6 +30,9 @@ timeout: 30
 # The three API keys go only to the review runner: Gemini and Perplexity on small
 # prepaid balances (auto-reload off), Anthropic from his linked Console org (his
 # plan's monthly API credit). Caps: per review, and per seat per month.
+# owner_user_id: the Home Assistant user id of the one person Cain's panel opens
+# for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
+# pattern takes "" too: Supervisor checks any value that's there, optional or not.
 options:
   github_token: ""
   gemini_api_key: ""
@@ -40,6 +43,7 @@ options:
   perplexity_monthly_usd: 4
   anthropic_monthly_usd: 30
   codex_monthly_runs: 200
+  owner_user_id: ""
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -50,3 +54,4 @@ schema:
   perplexity_monthly_usd: float(0,200)
   anthropic_monthly_usd: float(0,200)
   codex_monthly_runs: int(0,5000)
+  owner_user_id: match(^([0-9a-f]{32})?$)?

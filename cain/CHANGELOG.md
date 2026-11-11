@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.1
+
+- Cain's panel opens only for the Home Assistant user set as its owner (`owner_user_id` in Configuration, which takes only a user id). Any other user who opens it gets Forbidden, and until the owner is set it's closed to everyone, you included. Needs Supervisor 2026.10.3 or later.
+- At each start, the App's log says whether the panel is locked to its owner or closed to everyone. The Documentation tab says where to find your user id.
+- Cain's session starts without Home Assistant's Supervisor token in its environment. That's a first step, not a lock: the session runs as root and could still find the token. Keeping it out for good comes later, with the session running as its own user.
+
+## 0.7.0
+
+- **One question at a time.** Cain's questions come one by one: the next shows up when you answer the one before. Asking the same thing again replaces the old card instead of adding another.
+- **Cards clean up after themselves.** Once a card stops mattering its buttons come off, and it says what happened: "You answered: Filed", "Expired" or "Replaced by a newer card". Cain's questions and Ship cards last until the next morning check-in (at least two hours); a Ship card also goes when its pull request changes, merges or closes. The old cards already in your DM, this morning's included, are tidied once when this version starts.
+- **Old cards say so.** Tapping a card that's done takes its buttons off and tells you "This card expired; nothing was done", instead of quietly doing nothing.
+- **Answers in the thread.** Cain's answer to a tap, and any late answer, shows as a reply to what it answers. When you reply to one of his cards, he can look up which one.
+- **Exact questions.** Each card starts with its item and question ("P08 Q2:"), and its buttons answer that question ("Filed", "Not filed", "Not sure"). What you tap is recorded exactly as you tapped it, never as something read into it. No card ever shows a commit code, a job id or a machine timestamp.
+- **Never twice, never lost.** A card is never posted twice when Discord is slow to answer, and a tap reaches Cain even if his add-on restarts in the middle of it.
+- **Ship is pinned.** A Ship card is for one exact version of the pull request. If it changes before it merges, GitHub refuses the merge and you get a fresh card.
+- **No crossed wires with laptop sessions.** Cain leaves alone what a laptop session is working on: he won't ask you about it or build on its branch, and he never hands your Discord requests to a laptop. Cloud jobs can't send you notifications; only Cain talks to you.
+- **Notes reach Cain.** New notes left on what Cain is working on reach him at his next check-in, each once, the newest first to stay when there are many.
+- **True words.** Cain says something was asked, sent or done only once it's confirmed, checks what matters before an event rather than after, and keeps timestamps and job ids out of what you see.
+
+## 0.6.0
+
+- **One hand on each item.** Each item in your record now has at most one holder: Cain, or one laptop session. Only the holder can change that item's line in your open list or push to its branches, so Cain and a laptop session can't overwrite each other's work the way they did on P33. An item nobody holds is Cain's; a laptop session takes it before changing its line.
+- **Your word moves an item.** When you tell a laptop session or Cain to take an item over, it moves to them, branches and all. While one of Cain's build or ship jobs is running on an item, a take waits until the job is done.
+- **Your words always land.** Tell Cain or any laptop session something about an item someone else is working on, and it's kept as a note on that item. Whoever holds the item sees the note before they change anything.
+- **Changes to different items don't clash.** Two writers changing different lines of your open list are both saved, instead of one being turned away.
+- **No "done" for nothing.** A change that changes nothing is turned away, so the record can't say something was done when nothing happened.
+- **Cain's changes land in seconds.** The record keeper picks up Cain's own changes within 2 seconds instead of up to a minute. An item whose holder goes a day without a word goes back to Cain; time the box is down doesn't count.
+
 ## 0.5.0
 
 - **If the calendar specialist stops, you hear about it.** Cain's add-on checks the Harness add-on every minute. If it hasn't answered for 5 minutes (or its main loop has stuck for 10), you get one Discord message saying so, and one more when it's back. Cain is told too, so he won't promise calendar changes meanwhile.
