@@ -40,6 +40,8 @@ SCOPE = "https://www.googleapis.com/auth/calendar.events"    # events only, no c
 MARK = {"harness": "family_gmail"}
 TIMEOUT_S = 20
 MAX_PAGES = 20
+INPUT = "google"                            # its name among the inputs (inputs.GOOGLE)
+DENIED = "Google says your calendar isn't shared with Harness, or not to make changes"
 _ID_RE = re.compile(r"hb[0-9a-f]{32}")      # Google allows a-v and 0-9 in an id it's given
 _ANY_ID_RE = re.compile(r"[a-zA-Z0-9_-]{1,1024}")     # one day of a series is its id, _, a time
 _EMAIL_RE = re.compile(r"[a-z0-9-]{1,64}@[a-z0-9-]{1,64}\.iam\.gserviceaccount\.com")
@@ -321,12 +323,28 @@ def _too_many(r) -> bool:
         return False
 
 
+def _turned_down(r) -> tuple[str, str]:
+    """A sign-in Google turned down: the key itself, or, when Google says the sign-in's times are
+    off, the Pi's clock, which no new key would fix. The reason is read, not shown."""
+    try:
+        said = str(r.json().get("error_description", "")).casefold()
+    except (ValueError, TypeError, AttributeError):
+        said = ""
+    if any(w in said for w in ("timeframe", "short-lived", "iat and exp")):
+        return "error", "Google turned the sign-in down: the Pi's clock may be off"
+    return "refused", "Google refused the service account key"
+
+
 class GoogleCalendar:
-    def __init__(self, transport, key: Callable[[], str], clock: Callable[[], datetime]):
+    def __init__(self, transport, key: Callable[[], str], clock: Callable[[], datetime],
+                 seen: Callable[..., None] | None = None):
         self.transport = transport
         self.key = key                     # the stored service account key
         self.clock = clock
         self._token: tuple[str, str, datetime] | None = None   # (key it came from, token, until)
+        # inputs.Seen: what Google answered, so a turned-down key is told at once. Called from
+        # worker threads too (calendar_feed's fresh reads, a job's context), so it only notes.
+        self.seen = seen or (lambda *a: None)
 
     def configured(self) -> bool:
         return bool(self.key())
@@ -357,8 +375,11 @@ class GoogleCalendar:
             r = self.transport.request("POST", TOKEN_URL, body=body, timeout=TIMEOUT_S, headers={
                 "Content-Type": "application/x-www-form-urlencoded"})
         except TransportError:
+            self.seen(INPUT, "unreachable", "couldn't reach Google")
             return None, Outcome("failed")     # no write has been sent
         if r.status != 200:
+            self.seen(INPUT, *(("unreachable", f"Google answered {r.status}") if r.status >= 500
+                               else _turned_down(r)))
             return None, Outcome("unknown" if r.status >= 500 else "auth", r.status)
         try:
             answer = r.json()
@@ -379,8 +400,24 @@ class GoogleCalendar:
             headers["If-Match"] = etag
         if body is not None:
             headers["Content-Type"] = "application/json"
-        return self.transport.request(method, url, headers=headers, timeout=TIMEOUT_S,
-                                      body=json.dumps(body).encode("utf-8") if body else None)
+        try:
+            r = self.transport.request(method, url, headers=headers, timeout=TIMEOUT_S,
+                                       body=json.dumps(body).encode("utf-8") if body else None)
+        except TransportError:
+            self.seen(INPUT, "unreachable", "couldn't reach Google")
+            raise
+        # What one event's answer says (gone, changed, not his) is about that event: only an answer
+        # that worked, or none yet, says anything about the calendar. Its reads say the rest.
+        if 200 <= r.status < 300:
+            self.seen(INPUT)
+        elif r.status >= 500 or r.status == 429 or (r.status == 403 and _too_many(r)):
+            self.seen(INPUT, "unreachable", f"Google answered {r.status}")
+        return r
+
+    def _shut_out(self, r) -> None:
+        """A read of the whole calendar Google won't give: not shared, or shared read-only."""
+        if r.status in (403, 404) and not _too_many(r):
+            self.seen(INPUT, "denied", DENIED)
 
     @staticmethod
     def _events(address: str) -> str | None:
@@ -420,6 +457,7 @@ class GoogleCalendar:
             except TransportError:
                 return None, Outcome("failed")
             if r.status != 200:
+                self._shut_out(r)
                 return None, self._answer(r)
             try:
                 page = r.json()
@@ -501,6 +539,7 @@ class GoogleCalendar:
             try:
                 r = self._call(token, "GET", f"{url}?{urlencode(query)}")
                 if r.status != 200:
+                    self._shut_out(r)
                     return None
                 page = r.json()
                 out += [e for e in page.get("items", []) if isinstance(e, dict)]

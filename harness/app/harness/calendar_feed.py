@@ -296,19 +296,27 @@ class CalendarFeeds:
         return True
 
     # -- for the digest -----------------------------------------------------------------
-    def coverage(self) -> list[tuple[str, datetime | None, str]]:
-        """(label, last success, last error) per configured feed."""
+    def coverage(self) -> list[tuple[str, datetime | None, str, bool]]:
+        """(label, last success, last error, failed since that success) per configured feed."""
         rows = self.ledger.inputs()
         out = []
-        for url in self.urls():
-            fid = feed_id(url)
-            row = rows.get(f"calendar:{fid}")
-            res = self.snapshot.feeds.get(fid)
-            label = res.window.calendar if res and res.window else f"calendar {fid[:4]}"
+        for name, label in self.inputs():
+            row = rows.get(name)
             ok_at = (datetime.fromisoformat(row["last_success_at"])
                      if row is not None and row["last_success_at"] else None)
             err = row["last_error"] if row is not None and row["last_error"] else ""
-            out.append((label, ok_at, err))
+            failing = bool(row is not None and row["last_error_at"]
+                           and (not row["last_success_at"] or row["last_error_at"] > row["last_success_at"]))
+            out.append((label, ok_at, err, failing))
+        return out
+
+    def inputs(self) -> list[tuple[str, str]]:
+        """(input name, label) per configured feed: how the ledger and the alerts name it."""
+        out = []
+        for url in self.urls():
+            fid = feed_id(url)
+            res = self.snapshot.feeds.get(fid)
+            out.append((f"calendar:{fid}", res.window.calendar if res and res.window else f"calendar {fid[:4]}"))
         return out
 
     def agenda(self, day: str) -> tuple[list[ical.Occurrence], int, int, int]:

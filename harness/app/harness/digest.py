@@ -35,6 +35,7 @@ class InputCoverage:
     last_success: datetime | None
     max_age: timedelta
     error: str = ""          # the last failure, said alongside "stale"
+    failing: bool = False    # failed since its last success: named even before it's stale
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,9 @@ def compose(*, now: datetime, tz: str, inputs: list[InputCoverage],
         elif now - c.last_success > c.max_age:
             when = c.last_success.astimezone(local).strftime("%a %-I:%M %p")
             problems.append(f"{c.name}: stale since {when}{why}")
+        elif c.failing:
+            when = c.last_success.astimezone(local).strftime("%a %-I:%M %p")
+            problems.append(f"{c.name}: no good read since {when}{why}")
     if agenda is not None and agenda.read < agenda.configured:
         problems.append(f"calendar: {agenda.configured - agenda.read} of {agenda.configured} "
                         "not read today")

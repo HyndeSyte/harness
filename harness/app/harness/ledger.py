@@ -409,12 +409,25 @@ class Ledger:
             # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
             # who sent it, the address found, the one written, and whether it was written busy.
             "mail_dates": (("sender", "TEXT NOT NULL DEFAULT ''"), ("place", "TEXT NOT NULL DEFAULT ''"),
-                           ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0"))}
+                           ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0")),
+            # 0.21.1: an input that stops is told (inputs.py): the last failure's kind, when the
+            # outage began, what he was told about it, whether a digest named it, and when one
+            # he knew about came back.
+            "inputs": (("kind", "TEXT NOT NULL DEFAULT ''"), ("failing_since", "TEXT"),
+                       ("told_at", "TEXT"), ("told_kind", "TEXT NOT NULL DEFAULT ''"),
+                       ("named", "INTEGER NOT NULL DEFAULT 0"), ("back_at", "TEXT"))}
+        fresh = set()
         for table, cols in added.items():
             have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, decl in cols:
                 if name not in have:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    fresh.add((table, name))
+        if ("inputs", "failing_since") in fresh:
+            # An input already failing when this version first opens the file is in an outage
+            # from its last error (Nov 11: mail, refused since Nov 8, and nobody told).
+            self.db.execute("UPDATE inputs SET failing_since=last_error_at WHERE last_error_at IS NOT NULL"
+                            " AND (last_success_at IS NULL OR last_error_at>last_success_at)")
 
     def _rules_need_a_tap(self) -> None:
         """Once, on the first open by 0.5.1 or later: rules stored before his tap existed
@@ -685,19 +698,30 @@ class Ledger:
                               " WHERE provider=? AND month=?", (provider, month)).fetchone()
         return float(row["s"])
 
-    # -- inputs (for the digest's coverage) --------------------------------
+    # -- inputs (for the digest's coverage, and the alerts in inputs.py) ------
+    # An outage runs from a failure to the next success: failing_since is its first failure,
+    # told_at and told_kind what he was told about it, named whether a digest named it. A
+    # success ends it, and when he knew about it, back_at says when, for the next digest.
     def input_ok(self, name: str) -> None:
         with self.tx() as db:
             db.execute("INSERT INTO inputs(name, last_success_at) VALUES(?, ?)"
-                       " ON CONFLICT(name) DO UPDATE SET last_success_at=excluded.last_success_at",
+                       " ON CONFLICT(name) DO UPDATE SET last_success_at=excluded.last_success_at,"
+                       " back_at=CASE WHEN failing_since IS NOT NULL AND (told_at IS NOT NULL OR named=1)"
+                       " THEN excluded.last_success_at ELSE back_at END,"
+                       " failing_since=NULL, told_at=NULL, told_kind='', named=0",
                        (name, iso(self.now())))
 
-    def input_failed(self, name: str, error: str) -> None:
+    def input_failed(self, name: str, error: str, kind: str = "") -> None:
+        """`error`: what went wrong, in his words. `kind`: "refused" for a key or password turned
+        down, which he's told about at once (inputs.py); anything else waits six hours."""
+        now = iso(self.now())
         with self.tx() as db:
-            db.execute("INSERT INTO inputs(name, last_error_at, last_error) VALUES(?, ?, ?)"
+            db.execute("INSERT INTO inputs(name, last_error_at, last_error, kind, failing_since)"
+                       " VALUES(?, ?, ?, ?, ?)"
                        " ON CONFLICT(name) DO UPDATE SET last_error_at=excluded.last_error_at,"
-                       " last_error=excluded.last_error",
-                       (name, iso(self.now()), error[:300]))
+                       " last_error=excluded.last_error, kind=excluded.kind,"
+                       " failing_since=COALESCE(failing_since, excluded.failing_since)",
+                       (name, now, error[:300], kind, now))
 
     def inputs(self) -> dict[str, sqlite3.Row]:
         return {r["name"]: r for r in self.db.execute("SELECT * FROM inputs")}

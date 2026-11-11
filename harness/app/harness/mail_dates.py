@@ -57,6 +57,7 @@ MAX_BYTES = 60_000                    # of one message, fetched
 MAX_TEXT = 5_000                      # of its text, sent
 MAX_WHAT = 60
 AGAIN_DAYS = 120                      # how far back an email behind a written appointment is looked for
+WARN_EVERY = timedelta(hours=1)       # a read failing the same way is logged again after this
 MAX_WRITES_PER_DAY = 20
 AHEAD = timedelta(days=365)           # a date further out than this is a misread
 UNDO_TTL_S = 7 * 86400
@@ -401,6 +402,24 @@ class Read:
     asked: tuple = ()                      # a look-up of these emails again, for their addresses
 
 
+# What Gmail says when it turns the app password down: RFC 5530's codes, and its own words
+# ("Invalid credentials", "Application-specific password required"). Anything else it answers is
+# an error, and no answer, or a dropped line, is unreachable. Only the kind is ever logged.
+_TURNED_DOWN = re.compile(r"AUTHENTICATIONFAILED|AUTHORIZATIONFAILED|\[EXPIRED\]|(?i:credentials|password)")
+# How each kind is said, in the digest and in his message (inputs.py).
+WORDS = {"refused": "Gmail refused the app password", "unreachable": "couldn't reach Gmail",
+         "error": "Gmail answered with an error", "engine": "the engine refused the call (key or billing)"}
+
+
+def failure(e: BaseException) -> str:
+    """What a failed look at the mailbox was: refused (the app password turned down), unreachable
+    (no answer, or the line dropped) or error (any other answer). imaplib's abort, a dropped line,
+    is an IMAP error too, so it's told apart here, never taken for a refusal."""
+    if isinstance(e, imaplib.IMAP4.abort) or not isinstance(e, imaplib.IMAP4.error):
+        return "unreachable"
+    return "refused" if _TURNED_DOWN.search(str(e)) else "error"
+
+
 class MailDates:
     def __init__(self, ledger: Ledger, google: google_cal.GoogleCalendar, executor: Executor, *,
                  address: Callable[[], str | None], password: Callable[[], str],
@@ -425,6 +444,7 @@ class MailDates:
         self.chat_id: int | None = None
         self._future: Future | None = None
         self._listed = False
+        self._warned: tuple[str, datetime] | None = None   # the last failure logged: its kind, when
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -464,7 +484,8 @@ class MailDates:
         with self.ledger.tx() as db:
             self.ledger.set_meta("mail_read_at", iso(self.ledger.now()), db)
         if engine is None or not self.budget_ok(spec.provider):
-            self.ledger.input_failed("mail", "no engine or budget used up")
+            self._failed("read", "engine" if engine is None else "limit",
+                         "no engine is set up" if engine is None else "this month's budget for it is used up")
             return
         self._future = self.executor.submit(
             self._read, self.address(), self.password(), engine,
@@ -517,7 +538,7 @@ class MailDates:
                         r.found += [(m.message_id, m, f) for f in parse_items(out.result.output, today)]
             return r
         except (OSError, imaplib.IMAP4.error, EOFError) as e:
-            r.error = "refused" if isinstance(e, imaplib.IMAP4.error) else "unreachable"
+            r.error = failure(e)
             return r
         except Exception as e:
             log.warning("mail look-up failed: %s", type(e).__name__)
@@ -573,7 +594,7 @@ class MailDates:
                 r.more = len(messages) >= MAX_HEADERS
             return r
         except (OSError, imaplib.IMAP4.error, EOFError) as e:
-            r.error = "refused" if isinstance(e, imaplib.IMAP4.error) else "unreachable"
+            r.error = failure(e)
             return r
         except Exception as e:
             log.warning("mail read failed: %s", type(e).__name__)
@@ -589,7 +610,7 @@ class MailDates:
         try:
             r: Read = fut.result()
         except Exception as e:
-            self.ledger.input_failed("mail", type(e).__name__)
+            self._failed("read", "error", f"the read stopped on an error ({type(e).__name__})")
             return
         for res in r.spend:
             self.ledger.add_spend(provider=policy.MODELS[policy.engine_for("message")].provider,
@@ -640,11 +661,9 @@ class MailDates:
             self.ledger.set_meta("mail_more", "1" if r.more and not r.error else "", db)
             self.ledger.event("mail_read", {"sent": r.sent_to_engine, "found": len(r.found)}, db=db)
         if r.error:
-            self.ledger.input_failed("mail", {"refused": "Gmail refused the app password",
-                                              "engine": "the engine refused the call (key or billing)"}
-                                     .get(r.error, "couldn't reach Gmail"))
+            self._failed("read", r.error, WORDS.get(r.error, WORDS["unreachable"]))
             return
-        self.ledger.input_ok("mail")
+        self._worked()
         log.info("mail dates: %d looked at, %d dates", r.sent_to_engine, len(r.found))
         for key_src, m, f in r.found:              # the log stays on the Pi: it's how a batch is checked
             key = _key(key_src or f"uid:{m.uid}", f)
@@ -656,13 +675,30 @@ class MailDates:
                 continue
             log.info("mail date: %s %s (from %s)", f.day.isoformat(), title(f), clean(m.subject))
 
+    def _failed(self, what: str, kind: str, words: str) -> None:
+        """A read or look-up that failed: kept for the digest and his message (inputs.py), and said
+        in the log as a warning, by its kind only, since what Gmail says can name the account.
+        Reads run every five minutes, so it's logged when the kind changes, or after an hour."""
+        self.ledger.input_failed("mail", words, kind)
+        now = self.ledger.now()
+        if self._warned is None or self._warned[0] != kind or now - self._warned[1] >= WARN_EVERY:
+            log.warning("mail %s failed: %s", what, kind)
+            self._warned = (kind, now)
+
+    def _worked(self) -> None:
+        self.ledger.input_ok("mail")
+        if self._warned is not None:
+            log.info("mail: reading again after %s", self._warned[0])
+            self._warned = None
+
     def _collect_again(self, r: Read) -> None:
         """Who sent each email looked up again, and the address it gives for the appointment
         already on his calendar from it. Nothing new is written from it. One that can't be found
         or read is marked asked, so it isn't looked up again."""
         if r.error:
-            log.info("mail look-up: %s", r.error)
+            self._failed("look-up", r.error, WORDS.get(r.error, WORDS["unreachable"]))
             return
+        self._worked()
         with self.ledger.tx() as db:
             for _, m, f in r.found:
                 db.execute("UPDATE mail_dates SET sender=? WHERE message_id=? AND sender=''",

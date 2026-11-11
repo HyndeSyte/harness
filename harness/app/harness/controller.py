@@ -118,6 +118,9 @@ class Controller:
         # thing Cain's link said about itself, for the settings page.
         self.cain_watch = None
         self.cain_status: dict | None = None
+        # The watch on what the Harness works from (inputs.py, set by __main__): an input that
+        # stops is told, a refused key at once, anything else after six hours.
+        self.inputs = None
 
     # -- set-up --------------------------------------------------------------
     def _bind_owner(self, owner: int) -> None:
@@ -260,9 +263,23 @@ class Controller:
         if self.mirror is not None and self.mirror.due():
             self.mirror.run()              # shadow only; its own failures are its record
             self._beat()
+        self._watch_inputs()
         self._daily(paused)
         self.outbox.flush()
         self._publish()
+
+    def _watch_inputs(self) -> None:
+        """What the clients saw goes into the ledger, and an input that stopped is told, once an
+        outage: a refused key at once, anything else after six hours with no success (inputs.py).
+        Not while stopped or before proactive messages start, and never a stopped loop."""
+        if self.inputs is None:
+            return
+        try:
+            self.inputs.drain()
+            if not commands.is_paused(self.ledger) and self._proactive_ok():
+                self.inputs.tell(self.config.owner_user_id)
+        except Exception as e:
+            log.warning("input watch failed: %s", type(e).__name__)
 
     # -- Discord, through Cain ---------------------------------------------------------
     # The harness has no Discord connection of its own. It hands every card to Cain's
@@ -699,9 +716,12 @@ class Controller:
                                  self.calendar_change.digest_line() if self.calendar_change else "",
                                  self.mail_dates.digest_line() if self.mail_dates else "",
                                  self.meaning_live.digest_line() if self.meaning_live else "")
-                                 if x))
-            if daily.deliver(self.ledger, cfg, d, hold=self._discord_mode()) and self.meaning_live:
-                self.meaning_live.send_receipts()      # each new block's card, with Undo
+                                 if x), watch=self.inputs)
+            if daily.deliver(self.ledger, cfg, d, hold=self._discord_mode()):
+                if self.inputs is not None:
+                    self.inputs.digest_sent()          # what it named is known to him now
+                if self.meaning_live:
+                    self.meaning_live.send_receipts()  # each new block's card, with Undo
 
     # -- status ------------------------------------------------------------------------------
     def status_text(self) -> str:
@@ -747,7 +767,7 @@ class Controller:
                 ok = datetime.fromisoformat(row["last_success_at"]).astimezone(tz)
                 lines.append(f"{label} canary: ok {ok:%a %-I:%M %p}")
         if self.calendar is not None and self.calendar.configured:
-            for label, ok_at, err in self.calendar.coverage():
+            for label, ok_at, err, _ in self.calendar.coverage():
                 when = f"read {ok_at.astimezone(tz):%a %-I:%M %p}" if ok_at else "not read yet"
                 lines.append(f"Calendar {render.escape(label)}: {when}" +
                              (f" (last problem: {render.escape(err)})" if err else ""))
@@ -776,7 +796,7 @@ class Controller:
             "integrity_since": (self.ledger.get_meta("integrity_since") or None),
             "notes": list(self.notes.values()),
             "calendar": ([{"label": label, "ok_at": ok_at.isoformat() if ok_at else None,
-                           "error": err} for label, ok_at, err in self.calendar.coverage()]
+                           "error": err} for label, ok_at, err, _ in self.calendar.coverage()]
                          if self.calendar is not None and self.calendar.configured else []),
             "family": (self.family.status() if self.family is not None
                        and self.base_config.family_entity else None),

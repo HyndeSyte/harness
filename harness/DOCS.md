@@ -62,6 +62,23 @@ don't work; calendar work goes on and cards wait. Restarts and updates are short
 5 minutes and say nothing. The Discord section of the Harness page shows whether the
 Discord link is connected, when it last heard from Discord, and this watch.
 
+## When something it works from stops
+
+Your mail, the Family calendar, your Gmail calendar through Google, your calendar addresses and
+the judging of Family events are each watched. An outage lasts until the next success.
+
+- **A password or key turned down** (Gmail's app password, Family's app-specific password, the
+  Google service account key): one message at once, saying what stopped, since when, what it costs
+  you, and how to fix it from your phone. Paste the new one on the Harness page and approve its
+  card, as with any key.
+- **Anything else** (no answer, or the engine refusing): one message once nothing has worked for
+  six hours.
+- Each comes once an outage, through Cain's link, with no buttons, and not while stopped.
+- **The morning digest** names each one that's down, and says in one line which came back since the
+  last digest. There's no separate "it's back" message.
+- **The log:** a failed mail read or look-up is a warning naming only its kind (refused,
+  unreachable, error, engine or limit), when the kind changes or once an hour.
+
 ## Calendar
 
 The harness reads each calendar through its secret iCal address, every 30 minutes

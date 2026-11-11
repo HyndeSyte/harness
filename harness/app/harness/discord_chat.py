@@ -16,7 +16,8 @@ link (cain_relay.py), which holds it until Cain shows it, unchanged.
 - A Stop button rides along with every set of buttons and on the digest. When
   stopped, a Turn back on button takes its place.
 - Stop's notices and the 7:40 digest fallback are "direct": the link posts them
-  at once, because they exist for when Cain can't be relied on.
+  at once, because they exist for when Cain can't be relied on. So is word that
+  an input stopped (inputs.py), with no buttons: there's nothing to decide.
 """
 from __future__ import annotations
 
@@ -31,6 +32,9 @@ from .discord_api import PRIMARY, components, escape
 PREFIX = "k:"
 STOP, RESUME = "k:stop", "k:resume"
 TOGGLE_KINDS = ("digest", "stopped", "resumed", "alert")   # carry Stop / Turn back on
+# Out at once, as the link's "alert", with no buttons: an input that stopped (inputs.py), where
+# there's nothing to decide.
+PLAIN_ALERTS = ("input",)
 
 # The words a few older messages use for commands that don't exist here.
 WORDS = (
@@ -82,7 +86,8 @@ class LinkChat:
                      kind: str | None = None, expires: str | None = None) -> int:
         content = to_markdown(text) if html else escape(text)
         try:
-            return self.link.card(content, self._rows(buttons, kind), kind or "reply", expires=expires)
+            return self.link.card(content, self._rows(buttons, kind),
+                                  "alert" if kind in PLAIN_ALERTS else kind or "reply", expires=expires)
         except LinkError as e:
             raise _err(e) from None
 

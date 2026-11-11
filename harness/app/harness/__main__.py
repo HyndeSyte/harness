@@ -25,7 +25,7 @@ from .discord_api import DiscordAPI, DiscordTransport
 from .cain_relay import CainLink
 from .discord_chat import LinkChat
 from .discord_keeper import DiscordKeeper, KeeperStore
-from . import commands, handover, watch
+from . import commands, handover, inputs, watch
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
@@ -96,15 +96,17 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                              ahead_from=lambda address, start, until: (
                                  google.window(address, start, until) if google.configured() else None))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
+    # What iCloud and Google answer, from any thread, for the watch on inputs (inputs.py).
+    seen = inputs.Seen()
     client = caldav.FamilyCalDav(
         CalDavTransport(lambda: caldav.host_of(vault.get("family_calendar_url"))),
         lambda: (vault.get("family_apple_id"), vault.get("family_app_password"),
-                 vault.get("family_calendar_url")))
+                 vault.get("family_calendar_url")), seen=seen)
     adds = FamilyAdd(ledger, client, tz=base.timezone, policy_version=base.policy_version,
                      model=policy.MODELS[policy.engine_for("message")].model,
                      creds_stamp=vault.family_stamp)
     google = google_cal.GoogleCalendar(GoogleTransport(google_cal.HOSTS),
-                                       lambda: vault.get("google_service_key"), ledger.now)
+                                       lambda: vault.get("google_service_key"), ledger.now, seen=seen)
     # Judges Family events (meaning.py): in shadow it only scores; with meaning_live on, its
     # judgments decide the Gmail blocks (meaning_live.py) and the old title rules stand aside.
     judging = meaning.MeaningShadow(
@@ -148,6 +150,14 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)),
                             meaning=judging, meaning_live=live)
+    # An input that stops is told: a refused key at once, anything else after six hours, and
+    # the digest names each one down. Only what's set up is watched.
+    controller.inputs = inputs.Watch(ledger, seen, tz=base.timezone, active={
+        inputs.MAIL: controller.mail_dates.configured,
+        inputs.FAMILY: client.configured,
+        inputs.GOOGLE: google.configured,
+        inputs.MEANING: lambda: meaning.option_on(data_dir) or meaning_live.live_on(data_dir),
+    }, feeds=calendar.inputs, account=google.account)
     store = KeeperStore(os.path.join(data_dir, "discord.json"))
     keeper = DiscordKeeper(DiscordAPI(discord_token, DiscordTransport()), store.get, store.set)
     controller.discord = keeper

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.21.1
+
+- **You hear at once when a password or key is turned down.** If Gmail refuses Harness's app password, iCloud its app-specific password, or Google its service account key, you get one message right away: what stopped, since when, what it costs you, and how to fix it from your phone. Once per outage, with no buttons.
+- **Anything else that stops is told after six hours.** If Gmail, iCloud, Google or a calendar address can't be reached, or the engine won't answer, and nothing has worked for six hours, you get one message.
+- **The morning digest names everything that's down,** your email included, in plain words, and says in one line what came back since the last one. There's no separate "it's back" message.
+- **A failed mail read shows in the log** as a warning naming its kind, when the kind changes or once an hour, never with what Gmail said.
+
 ## 0.21.0
 
 - **Your plain calendar commands just work.** Say "move PT to 11:30" or "no drop-off today" and it's done straight away, with one receipt and an Undo button: "Moved PT to 11:30 to 12:30 today (Gmail and Family)", "Took off today's 8:00 drop-off". No Approve tap.
