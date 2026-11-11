@@ -233,7 +233,10 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
 
     waiting: list[digest.Waiting] = []
     for job in ledger.jobs_in("proposed"):
-        waiting.append(digest.Waiting(f"proposal waiting for your tap (job {job['id'][:8]})",
+        # What it is and when he asked, never a job number (Nov 11).
+        asked = datetime.fromisoformat(job["created_at"]).astimezone(ZoneInfo(config.timezone))
+        waiting.append(digest.Waiting(f"a change you asked for at {asked.hour % 12 or 12}:{asked:%M} "
+                                      f"{'AM' if asked.hour < 12 else 'PM'} {asked:%a}, waiting for your tap",
                                       datetime.fromisoformat(job["updated_at"])))
     for r in ledger.db.execute("SELECT * FROM rules WHERE state='quarantined'"):
         waiting.append(digest.Waiting(f"rule {r['id']} clashes with another; pick one",

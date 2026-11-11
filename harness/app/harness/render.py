@@ -150,16 +150,71 @@ def plain(text: str) -> str:
 
 
 def short(job_id: str) -> str:
+    """A job's short id, for the log. Never in what he sees (Nov 11: "gobbledegook")."""
     return job_id.split("-", 1)[0]
 
 
 def answer(job_id: str, text: str, *, rules_fired: tuple[str, ...] = (),
            allowlist: tuple[str, ...] = ()) -> str:
-    footer = f"\n\n<i>job {short(job_id)}"
+    """Model text for him. The job id stays in the ledger and the log, not on the message."""
+    footer = ""
     if rules_fired:
-        footer += " · rules " + ", ".join(escape(r) for r in rules_fired)
-    footer += "</i>"
+        footer = "\n\n<i>rules " + ", ".join(escape(r) for r in rules_fired) + "</i>"
     return fit(model_text(text, allowlist), footer)
+
+
+# -- dates and times as he reads them ------------------------------------------------------
+# Nov 11: cards showed "2026-11-11T11:30:00-05:00". What he wants instead: "Move PT to 11:30
+# to 12:30 today", "Take off today's 8:00 drop-off". A daytime hour needs no AM or PM; an
+# early or late one gets it, so 7:00 PM is never read as the morning.
+
+def no_dashes(text: str) -> str:
+    """An em or en dash in a calendar's title reads as a hyphen in his messages."""
+    return re.sub(r"\s*[—–]\s*", " - ", text)
+
+
+def _daytime(t: datetime) -> bool:
+    return 7 <= t.hour < 19
+
+
+def clock_words(t: datetime, *, suffix: bool | None = None) -> str:
+    """11:30, 8:00, 7:00 PM. A local time."""
+    words = f"{t.hour % 12 or 12}:{t.minute:02d}"
+    if suffix is None:
+        suffix = not _daytime(t)
+    return words + (f" {'AM' if t.hour < 12 else 'PM'}" if suffix else "")
+
+
+def span_words(start: datetime, end: datetime) -> str:
+    """11:30 to 12:30; 6:00 PM to 7:00 PM. Local times on one day."""
+    suffix = not (_daytime(start) and _daytime(end))
+    return f"{clock_words(start, suffix=suffix)} to {clock_words(end, suffix=suffix)}"
+
+
+def date_words(day, today) -> str:
+    """Fri Nov 20, with the year when it isn't this year's."""
+    year = f", {day.year}" if day.year != today.year else ""
+    return f"{day:%a} {day:%b} {day.day}{year}"
+
+
+def day_words(day, today) -> str:
+    """today, tomorrow, Friday (in the next week), or on Fri Nov 20."""
+    gap = (day - today).days
+    if gap == 0:
+        return "today"
+    if gap == 1:
+        return "tomorrow"
+    if gap == -1:
+        return "yesterday"
+    if 1 < gap < 7:
+        return f"{day:%A}"
+    return "on " + date_words(day, today)
+
+
+def day_owner(day, today) -> str | None:
+    """today's, tomorrow's, Friday's; None for a date further off, which reads better after."""
+    words = day_words(day, today)
+    return None if words.startswith("on ") else words + "'s"
 
 
 def _when(start_iso: str, minutes: int, tz: str) -> str:
@@ -243,48 +298,80 @@ def family_event_text(params: dict, tz: str) -> str:
 
 def family_card(params: dict, *, tz: str, expires: datetime, job_id: str,
                 warnings=()) -> str:
-    exp = expires.astimezone(ZoneInfo(tz))
+    """No expiry line and no job id: he reads the event, nothing else (Nov 11)."""
     check = [f"\u26a0 <b>Check before approving:</b> {escape(w)}" for w in warnings]
     return fit("\n".join([
         "<b>Add to the Family calendar?</b>",
         family_event_text(params, tz),
         *check,
         "Family calendar only. No invitees, no repeat. It alerts family phones that have "
-        "notifications on for this calendar.",
-        f"<i>Offer ends {_day(exp)}, {_clock(exp)} · job {short(job_id)}</i>"]))
+        "notifications on for this calendar."]))
+
+
+def change_line(c: dict, tz: str, now: datetime) -> str:
+    """One change he asked for, in plain words, for when his calendar couldn't be read to
+    say it better (calendar_change.py says it from what it found). Never an ISO stamp."""
+    local = ZoneInfo(tz)
+    today = now.astimezone(local).date()
+
+    def when(text: str):
+        value = datetime.fromisoformat(text)
+        return value.astimezone(local) if "T" in text else value.date()
+
+    title = family_text(no_dashes(c["title"]))
+    where = f" ({escape(c['calendar'].title())})"
+    if c["op"] == "rule":
+        # What a Family event's name means for him: no dates, no calendar write.
+        from .calendar_change import RULE_WORDS
+        meaning = RULE_WORDS.get(c.get("kind", ""), "mean what you said")
+        return f"From now on, Family events with {title} in the name {escape(meaning)}"
+    days = [datetime.fromisoformat(x).date() for x in c.get("dates", "").split(",") if x]
+    named = ", ".join(day_words(d, today) for d in days)
+    if c["op"] == "remove":
+        owner = day_owner(days[0], today) if len(days) == 1 else None
+        return f"Take off {owner} {title}{where}" if owner else f"Take {title} off {named}{where}"
+    if c["op"] == "end_series":
+        return f"End {title} from {date_words(days[0], today)} on{where}"
+    start, end = when(c["start"]), when(c["end"])
+    if isinstance(start, datetime):
+        if start.date() == end.date():
+            at = f"{span_words(start, end)} {day_words(start.date(), today)}"
+        else:
+            at = (f"{date_words(start.date(), today)}, {clock_words(start, suffix=True)} to "
+                  f"{date_words(end.date(), today)}, {clock_words(end, suffix=True)}")
+    else:
+        at = day_words(start, today) if start == end else \
+            f"{date_words(start, today)} through {date_words(end, today)}"
+    if c["op"] == "move":
+        moved = start.date() if isinstance(start, datetime) else start
+        if days and moved != days[0]:
+            return f"Move {title} from {named.removeprefix('on ')} to {at}{where}"
+        return f"Move {title} to {at}{where}"
+    if c["op"] == "add_series":
+        return f"Add {title}, repeating, starting {at}{where}"
+    return f"Add {title} {at}{where}"
 
 
 def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime,
-                  job_id: str, warnings=()) -> str:
-    """Rendered from canonical params and the definition. The model's own
-    summary is not used here on purpose."""
+                  job_id: str, warnings=(), lines: list[str] | None = None,
+                  now: datetime | None = None) -> str:
+    """Rendered from canonical params and the definition, or for a calendar change from
+    what plain code found for them (`lines`). The model's own summary is not used here on
+    purpose. No expiry line and no job id (Nov 11)."""
     if effect.name == "family_event_add":
         return family_card(params, tz=tz, expires=expires, job_id=job_id, warnings=warnings)
     if effect.name == "calendar_change":
-        exp = expires.astimezone(ZoneInfo(tz))
-        verbs = {"remove": "take off", "end_series": "end, from", "move": "move",
-                 "add": "add", "add_series": "add, repeating"}
-
-        def line(c):
-            if c["op"] == "rule":
-                # What a Family event's name means for him: no dates, no calendar write.
-                from .calendar_change import RULE_WORDS
-                meaning = RULE_WORDS.get(c.get("kind", ""), "mean what you said")
-                return f"Family: from now on, events with {family_text(c['title'])} in the name {escape(meaning)}"
-            return (f"{escape(c['calendar'].title())}: {verbs.get(c['op'], escape(c['op']))} "
-                    f"{family_text(c['title'])}"
-                    + "".join(f" {escape(c[k])}" for k in ("dates", "start", "end", "days", "until")
-                              if c.get(k)))
+        if lines is None:
+            lines = [change_line(c, tz, now or expires) for c in params["changes"]]
         return fit("\n".join([
-            "<b>Change the calendar?</b>",
-            *[f"⚠ <b>Check before approving:</b> {escape(w)}" for w in warnings],
-            *[line(c) for c in params["changes"]],
-            f"<i>Offer ends {_day(exp)}, {_clock(exp)} · job {short(job_id)}</i>"]))
+            "<b>Change your calendar?</b>",
+            *[f"\u26a0 <b>Check before approving:</b> {escape(w)}" for w in warnings],
+            *lines]))
     if effect.name == "calendar_hold":
         lines = [
             "<b>Hold on your harness calendar</b>",
             escape(_when(params["start"], params["duration_min"], tz)),
-            f"Title: {escape(effect.fixed['title'])} · no attendees · private",
+            f"Title: {escape(effect.fixed['title'])} \u00b7 no attendees \u00b7 private",
             f"Undo: {escape(effect.undo)}",
         ]
     else:
@@ -292,8 +379,6 @@ def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime
             f"{escape(k)}: {escape(str(v))}" for k, v in sorted(params.items())]
     lines.append("Reversible." if effect.reversible
                  else "<b>Not reversible.</b>")
-    exp = expires.astimezone(ZoneInfo(tz)).strftime("%a %-I:%M %p")
-    lines.append(f"<i>Offer ends {escape(exp)} · job {short(job_id)}</i>")
     return fit("\n".join(lines))
 
 

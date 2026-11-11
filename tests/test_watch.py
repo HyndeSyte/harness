@@ -184,7 +184,8 @@ def test_cain_down_is_told_straight_to_his_dm_once_and_back_the_same_way(rig, cl
     assert sent.msgs == []                                   # an update's restart: nothing
     minute(rig, clock, 2)
     assert len(sent.msgs) == 1 and sent.msgs[0][0] == DM
-    assert "Cain's add" in sent.msgs[0][1] and "Stop" in sent.msgs[0][1]
+    assert "Cain hasn't answered" in sent.msgs[0][1] and "Stop" in sent.msgs[0][1]
+    assert "add-on" not in sent.msgs[0][1]                 # Nov 11: Cain, not "Cain's add-on"
     minute(rig, clock, 20)
     assert len(sent.msgs) == 1                               # not again
     assert rig.c.status_box["discord"]["cain"]["state"] == "down"
@@ -300,7 +301,7 @@ def test_the_page_shows_the_link_and_the_watch(tmp_path):
                                    "grace_minutes": 5}})
     assert "<h2>Discord</h2>" in out and ">connected<" in out
     assert "last heard from Discord 2026-11-10 14:02 UTC" in out
-    assert "Watch on Cain's add-on" in out and ">answering<" in out
+    assert "Watch on Cain:" in out and ">answering<" in out and "add-on" not in out
 
 
 def test_the_page_when_cain_is_down(tmp_path):

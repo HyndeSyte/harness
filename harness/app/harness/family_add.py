@@ -33,6 +33,7 @@ first: if it changed, or can't be read, nothing loosens.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -56,7 +57,6 @@ ENABLE_TTL_S = 15 * 60
 UNDO_TTL_S = 7 * 24 * 3600
 ASK_TTL_S = 3 * 24 * 3600
 ASK_AGAIN_AFTER = timedelta(days=7)   # an ignored card, at most this often
-MAX_TAPLESS_MESSAGE = 200             # characters; longer may be pasted, so it gets a card
 MAX_DURATION = timedelta(hours=24)
 MAX_TAPLESS_PER_DAY = 5
 RECHECK_EVERY = timedelta(hours=1)    # a bake-in check that couldn't complete
@@ -69,11 +69,11 @@ FAILED_WORDS = {
     "exists": ("<b>Not added.</b> iCloud says an event with this id is already there, so I "
                "didn't write a second one. Check the Family calendar."),
     "auth": ("<b>Not added: iCloud rejected the password.</b> Make a new app-specific "
-             "password and enter it on the add-on page."),
+             "password and enter it on the Harness page."),
     "mismatch": ("<b>Not added: name mismatch.</b> The saved address isn't the calendar named "
-                 "Family, so I refused to write to it. Check the address on the add-on page."),
+                 "Family, so I refused to write to it. Check the address on the Harness page."),
     "no_credentials": ("<b>Not added.</b> The Apple ID, app-specific password or calendar "
-                       "address isn't set on the add-on page."),
+                       "address isn't set on the Harness page."),
     "failed": "<b>Not added.</b> {detail} Nothing was changed.",
 }
 # The standing line for the digest and /status. Our words only, never a server's.
@@ -99,9 +99,27 @@ def _one_year_after(dt: datetime) -> datetime:
         return dt.replace(year=dt.year + 1, day=28)
 
 
+# What pasted text carries and his own words don't. He dictates, often at length and over
+# several lines (Nov 11), so length and line breaks are no sign at all: only these are.
+_PASTE_SIGNS = (
+    re.compile(r"(?m)^[ \t]*>"),                                      # a quoted line
+    re.compile(r"```"),                                                 # a code block
+    re.compile(r"(?im)^[ \t]*-*[ \t]*(?:original message|forwarded message|begin forwarded message)\b"),
+    re.compile(r"(?im)^[ \t]*(?:fwd?|fw)\b"),                           # a forward's subject
+    re.compile(r"(?im)^[ \t]*on\b[^\n]{4,160}\bwrote:[ \t]*$"),          # a reply's quote line
+    re.compile(r"(?im)^[ \t]*sent from my\b"),                          # a mail app's signature
+    re.compile(r"(?i)\b(?:https?://|www\.)\S"),                         # a link
+    re.compile(r"(?i)\bunsubscribe\b"),                                 # a mailing's footer
+)
+_HEADER = re.compile(r"(?im)^[ \t]*(?:from|to|cc|bcc|sent|date|subject|reply-to)[ \t]*:[ \t]*\S")
+
+
 def _looks_pasted(text: str) -> bool:
-    text = text.strip()
-    return len(text) > MAX_TAPLESS_MESSAGE or len(text.splitlines()) > 1
+    """Real signs of text from elsewhere: a quote, an email's header lines, a forward, a link."""
+    text = text or ""
+    if any(sign.search(text) for sign in _PASTE_SIGNS):
+        return True
+    return len(_HEADER.findall(text)) >= 2
 
 
 class FamilyAdd:
@@ -407,9 +425,11 @@ class FamilyAdd:
                        + ("." if loose else " and title."))
         if loose and self._tapless_today() >= MAX_TAPLESS_PER_DAY:
             out.append(f"{MAX_TAPLESS_PER_DAY} adds have already gone in without a tap today.")
-        if loose and (_looks_pasted(message) or replied or self._pasted_recently()):
-            out.append("your message, a recent one or the one you replied to may have been long "
-                       "or had several lines, so it may be pasted text.")
+        if loose and (_looks_pasted(message) or self._pasted_recently()):
+            out.append("your message or a recent one may be pasted text: it has a quoted line, an "
+                       "email's header lines, a forward or a link.")
+        elif loose and replied:
+            out.append("it's a reply, and the message you replied to may be pasted text.")
         return out
 
     def note_message(self, text: str) -> None:
@@ -484,7 +504,7 @@ class FamilyAdd:
                 self._say(db, job["chat_id"], job["id"],
                           "Adding to the Family calendar is off, so nothing was added. It needs "
                           "the Apple ID, an app-specific password and the calendar address on "
-                          "the add-on page first.")
+                          "the Harness page first.")
         return True
 
     def refuse_in_words(self, job, receipt: dict, why: str) -> None:

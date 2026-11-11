@@ -115,9 +115,10 @@ class FakeBot:
             raise item
         return item
 
-    def send_message(self, chat_id, text, buttons=None, *, html=True, kind=None):
+    def send_message(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None):
         if self.fail_sends:
             raise self.fail_sends.pop(0)
+        self.expires = getattr(self, "expires", []) + [expires]
         self.next_message_id += 1
         self.sent.append((chat_id, text, buttons, self.next_message_id))
         self.modes.append("html" if html else "plain")

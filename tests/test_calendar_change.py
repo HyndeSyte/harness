@@ -34,6 +34,12 @@ INVITE = ONE.replace("SUMMARY:Oil change", "SUMMARY:Oil change\r\nORGANIZER:mail
                                            "ATTENDEE:mailto:b@example.com")
 
 
+# Text from elsewhere, as it really arrives: an email's header lines. Length and line breaks
+# are no sign of a paste (Nov 11: he dictates).
+PASTED = ("From: Front Office <office@school.example>\nSubject: Schedule change\n\n"
+          "There is no school on Monday, November 23.")
+
+
 def change(calendar="family", op="remove", title="School Day", dates="", start="", end="", days="",
            until="", location=""):
     return {"calendar": calendar, "op": op, "title": title, "dates": dates, "start": start, "end": end,
@@ -381,7 +387,7 @@ def test_a_lost_answer_is_unknown_and_not_retried(r):
 
 def test_pasted_words_get_a_tap(r):
     before = r.body()
-    r.tell(change(dates="2026-11-23"), words="x" * 300)
+    r.tell(change(dates="2026-11-23"), words=PASTED)
     assert r.body() == before and r.with_button("Approve")
     r.press(r.with_button("Approve"), "Approve")
     assert "2026-11-23" not in days_of(r.body())
@@ -437,8 +443,12 @@ def test_a_restart_during_a_write_is_said_out_loud(r):
 
 
 def test_a_crash_while_planning_never_runs_it_twice(r, monkeypatch):
-    def boom(*a, **k):
-        raise RuntimeError("bug")
+    real = r.cc._plan
+
+    def boom(c, key):
+        if key.startswith("preview"):
+            return real(c, key)                # found clear before it was offered
+        raise RuntimeError("bug")              # and the run's own plan crashes
     monkeypatch.setattr(r.cc, "_plan", boom)
     r.claude.script = [ask(change(dates="2026-11-23"))]
     with pytest.raises(RuntimeError):
@@ -558,6 +568,7 @@ def test_a_day_with_only_the_longer_title_doesnt_lose_it(r):
                   .replace("Oil change", "School Day Pictures"))
     r.tell(change(dates="2026-11-04"))             # School Day is already off that day
     assert FAMILY_PATH + "pics.ics" in r.icloud.events and "Nothing changed" in r.texts()[-1]
+    assert "School Day Pictures" in r.texts()[-1]                # asked, by name
 
 
 def test_two_titles_that_could_be_it_are_named(r):
@@ -690,14 +701,14 @@ def test_checkadds_brings_the_tap_back(r):
 
 
 def test_a_card_expires(r):
-    r.tell(change(dates="2026-11-23"), words="x" * 300)
+    r.tell(change(dates="2026-11-23"), words=PASTED)
     r.advance(hours=13)
     r.tick()
     assert any("expired" in t for t in r.texts()[-2:])
 
 
 def test_a_reset_leaves_nothing_standing(r):
-    r.tell(change(dates="2026-11-23"), words="x" * 300)
+    r.tell(change(dates="2026-11-23"), words=PASTED)
     r.cc.forget()
     assert not r.cc.on() and "off since the reset" in r.cc.status_line()
     assert r.ledger.db.execute("SELECT state FROM proposals").fetchone()[0] == "cancelled"
@@ -818,11 +829,17 @@ def test_a_title_next_month_doesnt_make_today_unclear(r):
     assert "2026-11-23" not in days_of(r.body())
 
 
-def test_a_one_off_doesnt_go_on_part_of_its_name(r):
+def test_a_one_off_on_part_of_its_name_is_asked_when_the_series_isnt_that_day(r):
+    """"School" on a Tuesday with only School Pictures on it, when School Day is Mondays and
+    Wednesdays: two events fit his word, so he's asked, by name, and nothing comes off."""
     path = FAMILY_PATH + "pics.ics"
     r.icloud.seed(path, event_on("pics", "School Pictures", "20261124T150000Z", "20261124T160000Z"))
     r.tell(change(title="school", dates="2026-11-24"))
-    assert path in r.icloud.events and "School Pictures" in r.texts()[-1] and "whole name" in r.texts()[-1]
+    asked = r.texts()[-1]
+    assert path in r.icloud.events and "School Pictures" in asked and "School Day" in asked
+    assert asked.startswith("Nothing changed") and asked.rstrip().endswith("?")
+    assert r.ledger.db.execute("SELECT state FROM jobs ORDER BY created_at DESC").fetchone()[0] \
+        == "needs_clarification"
 
 
 def test_a_series_months_off_can_still_be_ended(r):
@@ -835,7 +852,7 @@ def test_a_series_months_off_can_still_be_ended(r):
 
 def test_a_reply_chain_doesnt_launder_a_paste(r):
     r.claude.script = [result(text="noted")]
-    r.say("x" * 300, message_id=7001)
+    r.say(PASTED, message_id=7001)
     first = r.bot.sent[-1]
     r.advance(hours=3)
     r.claude.script = [result(text="ok")]
@@ -1059,10 +1076,11 @@ def test_undo_matches_what_the_server_kept_not_what_was_sent(r):
     assert "Undone" in r.texts()[-1] and not [p for p in r.icloud.events if "/hm-" in p]
 
 
-def test_the_digest_says_what_wasnt_done_in_plain_words(r):
+def test_the_digest_says_what_wasnt_done_in_plain_words(r, monkeypatch):
     from harness import daily
     from harness.config import Config
     from conftest import OWNER
+    monkeypatch.setattr(r.cc, "preview", lambda *a: [])         # couldn't look first: the run finds out
     r.tell(change(title="Book club", dates="2026-12-01"))       # nothing called that on Family
     r.ledger.db.execute("DELETE FROM meta WHERE key='integrity_since'")
     d = daily.gather(r.ledger, Config(owner_user_id=OWNER, stage="S1"), paused=False)

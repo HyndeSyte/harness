@@ -1001,7 +1001,7 @@ def test_a_home_it_cant_read_says_so(drives):
     go(drives)
     go(drives)
     assert [b[0] for b in blocks(drives)] == ["Busy (family)"]
-    assert "home in the add-on's settings doesn't look like" in drives.ledger.get_meta("family_gmail_problem")
+    assert "home in Harness's settings doesn't look like" in drives.ledger.get_meta("family_gmail_problem")
 
 
 def test_home_as_a_street_address_is_looked_up_once(drives):

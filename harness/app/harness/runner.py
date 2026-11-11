@@ -164,6 +164,9 @@ class Runner:
         self._fired[job["id"]] = [r["id"] for r in fired]
         cc = self.calendar_change if change else None
         earlier = self._earlier(job)
+        # What became of his last calendar requests, from the record (Nov 11: an answer said no
+        # proposal had been sent when one had been approved). Read here: the worker has no ledger.
+        recent = cc.recent(job["id"]) if cc else []
 
         t0 = self.monotonic()
         job_id = job["id"]
@@ -172,7 +175,7 @@ class Runner:
             # In the worker: what his calendar says about the events he names is a Google read.
             # It counts against the job's own deadline, so retries never outlive the job
             # (Nov 8: a message with Cain's context ran past 10 minutes and was cut off).
-            with_calendar = prompts.user_content(text, earlier=earlier,
+            with_calendar = prompts.user_content(text, earlier=earlier, recent=recent,
                                                  calendar=cc.context_for(text, now)) if cc else user
             spent = self.monotonic() - t0
             if spent > 20:
@@ -336,11 +339,17 @@ class Runner:
         params = body["params"]
         family = d.name == effects.FAMILY_ADD
         change = d.name == effects.CALENDAR_CHANGE
+        lines = None
         if change:
             if self.calendar_change is None:
                 self._fail(job, "calendar_change_not_wired", job["engine"])
                 return
             if self.calendar_change.refuse(job, receipt, params):
+                return
+            # Each event he names, found before anything is offered or done (Nov 11): clear goes
+            # straight through, unclear is asked once, by name.
+            lines = self.calendar_change.preview(job, receipt, params)
+            if lines is None:
                 return
             warnings = self.calendar_change.warnings(
                 job, params, pasted_recently=self.family_add is not None and self.family_add._pasted_recently())
@@ -366,6 +375,10 @@ class Runner:
             self.ledger.transition(job["id"], "proposed", db=db)
             if warnings and family:
                 self.family_add.note_warned(pid, db)
+            if change:                      # what it says it will do, for his tap and the record
+                self.calendar_change.note_lines(
+                    pid, lines or [render.change_line(c, self.config.timezone, self.ledger.now())
+                                   for c in params["changes"]], db)
             if change and not warnings:
                 self.calendar_change.auto_approve(pid, job["id"], db)
                 self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
@@ -382,7 +395,8 @@ class Runner:
                              (nonce,)).fetchone()
             card = render.proposal_card(d, params, tz=self.config.timezone,
                                         expires=datetime.fromisoformat(row["expires_at"]),
-                                        job_id=job["id"], warnings=warnings)
+                                        job_id=job["id"], warnings=warnings, lines=lines or None,
+                                        now=self.ledger.now())
             self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
                                            "receipt": receipt}, db=db)
             self.ledger.enqueue(chat_id=job["chat_id"], kind="card", text=card,

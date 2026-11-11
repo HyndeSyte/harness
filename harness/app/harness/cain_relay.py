@@ -67,8 +67,13 @@ class CainLink:
             raise LinkError(r.status, str(data.get("said") or data.get("status") or ""))
         return data
 
-    def card(self, text: str, rows: list, kind: str) -> int:
-        out = self._call("POST", "/card", {"text": text, "rows": rows, "kind": kind})
+    def card(self, text: str, rows: list, kind: str, *, expires: str | None = None) -> int:
+        """A card for Cain to show. `expires` (ISO time): when its buttons lapse, so the link takes
+        them off then instead of leaving dead buttons for days (Cain 0.7.0; older links ignore it)."""
+        body = {"text": text, "rows": rows, "kind": kind}
+        if expires:
+            body["expires"] = expires
+        out = self._call("POST", "/card", body)
         if not isinstance(out.get("id"), int):
             raise LinkError(0, "no card id")
         return out["id"]
