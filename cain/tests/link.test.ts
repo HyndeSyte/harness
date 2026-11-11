@@ -99,7 +99,7 @@ describe("taps", () => {
     expect(r.answers()).toEqual([7]);
     expect(r.updates()[0]).toEqual({ content: "Book the plumber for Tuesday?\n\nYou answered: Yes", components: [],
       allowed_mentions: { parse: [] } });
-    expect(r.relayed).toEqual([`Dane tapped "Yes" on your question: "Book the plumber for Tuesday?" (Discord message ${q.id}: answer it with reply_to ${q.id})`]);
+    expect(r.relayed).toEqual([`Dane tapped "Yes" on your question: "Book the plumber for Tuesday?" (Discord message ${q.id}; its card shows his answer. If it needs words from you, reply with reply_to ${q.id})`]);
     expect(await r.tap(q, q.components[0].components[1].custom_id)).toBe("dead: answered");
     expect(r.relayed.length).toBe(1);
   });
@@ -121,12 +121,13 @@ describe("taps", () => {
 describe("reactions", () => {
   test("his reaction to the bot's message goes to Cain, with the message; others don't", async () => {
     const r = rig();
-    await r.link.ask({ text: "Want me to draft it?", options: ["Draft it"], item: "P17" });
+    await r.link.ask({ text: "Want me to draft it?", options: ["Draft it"], item: "P17", question: "Q1" });
     const mid = r.last().id;
+    expect(r.last().content).toBe("P17 Q1: Want me to draft it?");            // the link names it
     expect(await r.link.onReaction({ user_id: OWNER, channel_id: DM, message_id: mid, emoji: { name: "👍" } })).toBe("to Cain");
     expect(await r.link.onReaction({ user_id: "333", channel_id: DM, message_id: mid, emoji: { name: "👎" } })).toBe("ignored");
     expect(await r.link.onReaction({ user_id: OWNER, channel_id: DM, message_id: "1", emoji: { name: "👍" } })).toBe("ignored");
-    expect(r.relayed).toEqual([`Dane reacted 👍 to your message (P17): "Want me to draft it?" (Discord message ${mid})`]);
+    expect(r.relayed).toEqual([`Dane reacted 👍 to your message (P17 Q1): "P17 Q1: Want me to draft it?" (Discord message ${mid})`]);
   });
 });
 

@@ -20,7 +20,7 @@
 // Nothing is published to the LAN: the add-on has no "ports:".
 import { timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { emptyState, Link, Protocol, PULL, Refusal, State } from "./core";
+import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
@@ -31,6 +31,7 @@ const WATCH = `${DIR}/watch.json`;
 const QUEUE = process.env.RELAY_QUEUE ?? "/data/relay.queue";
 const PORT = Number(process.env.RELAY_PORT ?? 8097);
 const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper's copy
+const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
 const SWEEP_MS = 60_000;
@@ -79,18 +80,29 @@ async function toHarness(path: string, body: unknown): Promise<boolean> {
   } catch { return false; }
 }
 
-// What the record says: PENDING.md and the holds the keeper publishes. A missing file
-// is null (no holds, nothing closed); one that can't be read is "", which decides nothing.
-function recordFile(path: string): string | null {
-  try { return readFileSync(`${RECORD}/${path}`, "utf8"); }
+// What the record says: PENDING.md from the keeper's copy, and the keeper's own holds
+// file. A missing file is null (no holds, nothing closed); one that can't be read is
+// "", which decides nothing.
+function readOr(path: string): string | null {
+  try { return readFileSync(path, "utf8"); }
   catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
 
-// A pull request's head now, from GitHub's own refs (no API, no key): null when it
-// can't tell, and an unknown head never takes a card off.
-async function prHead(pr: string): Promise<string | null> {
+// A pull request now. GitHub's API says whether it's open and its head; when that
+// can't be read (it allows 60 asks an hour without a key), the head alone comes from
+// GitHub's own refs. Nothing it can't tell takes a card off.
+async function pullNow(pr: string): Promise<Pull | null> {
   const m = PULL.exec(pr);
   if (!m) return null;
+  try {
+    const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}`, { redirect: "error",
+      headers: { accept: "application/vnd.github+json", "user-agent": "cain-link" }, signal: AbortSignal.timeout(15000) });
+    if (r.ok) {
+      const j: any = await r.json();
+      const head = String(j?.head?.sha ?? "");
+      return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null };
+    }
+  } catch { /* fall back to the refs */ }
   try {
     const p = Bun.spawn(["git", "-c", "credential.helper=", "ls-remote", `https://github.com/${m[1]}/${m[2]}.git`, `refs/pull/${m[3]}/head`],
       { stdout: "pipe", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_TERMINAL_PROMPT: "0", HOME: "/tmp" } });
@@ -99,15 +111,15 @@ async function prHead(pr: string): Promise<string | null> {
     await p.exited;
     clearTimeout(timer);
     const sha = out.trim().split(/\s+/)[0] ?? "";
-    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    return { head: /^[0-9a-f]{40}$/.test(sha) ? sha : null, open: null };
   } catch { return null; }
 }
 
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 600) }) + "\n"),
-  record: () => ({ pending: recordFile("state/PENDING.md"), holds: recordFile("state/holds.json") }),
-  head: prHead,
+  record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
+  pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
 });
 

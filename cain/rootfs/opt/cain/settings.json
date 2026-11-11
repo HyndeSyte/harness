@@ -43,7 +43,7 @@
       {
         "matcher": "RemoteTrigger",
         "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts", "timeout": 15 }
+          { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15 }
         ]
       }
     ]

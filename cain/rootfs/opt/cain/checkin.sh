@@ -42,11 +42,15 @@ type_in() {
   tmux -u send-keys -t cain -l "$1" && sleep 1 && tmux -u send-keys -t cain Enter
 }
 
-# 1. A relayed tap or reaction, one at a time, oldest first.
-if [ -s "$queue" ]; then
-  line=$(head -n 1 "$queue")
+# 1. A relayed tap or reaction, one at a time, oldest first. The link and the record
+#    keeper append to the queue at any moment, so the whole queue is first moved aside
+#    to a work file (new lines start a fresh queue), and lines are taken from that.
+work="$queue.work"
+if [ ! -s "$work" ] && [ -s "$queue" ]; then mv "$queue" "$work"; fi
+if [ -s "$work" ]; then
+  line=$(head -n 1 "$work")
   text=$(printf '%s' "$line" | jq -r '.text // empty' 2>/dev/null | tr -d '\r\n')
-  tail -n +2 "$queue" > "$queue.tmp" && mv "$queue.tmp" "$queue"
+  tail -n +2 "$work" > "$work.tmp" && mv "$work.tmp" "$work"
   if [ -n "$text" ]; then
     type_in "Relayed by the add-on: $text" || exit 1
     echo "[cain] relayed a tap or reaction"
@@ -78,19 +82,19 @@ for s in 0710 1230 1730; do
 done
 [ -n "$slot" ] || exit 0
 [ -f "$dir/$day-$slot" ] && exit 0
-# Items someone other than Cain holds (a laptop session), from the holds the record
-# keeper publishes into Cain's copy of the record: first in the check-in, to skip.
+# Items someone other than Cain holds (a laptop session), from the record keeper's own
+# holds file (written whole, once its push is on GitHub): first in the check-in, to skip.
 # Next to them, the notes others left on items Cain holds (record.sh notes <item>),
 # each on one line, shortened, framed as words passed on, never as his go.
-holds="${HOLDS_FILE:-/data/record/state/holds.json}"
+holds="${HOLDS_FILE:-/data/record-holds.json}"
 lead=""
 if [ -f "$holds" ]; then
-  held=$(jq -r 'to_entries | map(select((.value.holder // "") != "cain") | .key | gsub("[^A-Za-z0-9._-]"; ""))
+  held=$(jq -r '.holds | to_entries | map(select((.value.holder // "") != "cain") | .key | gsub("[^A-Za-z0-9._-]"; ""))
                 | map(select(. != "")) | sort | join(", ")' "$holds" 2>/dev/null) \
     && { [ -z "$held" ] || lead="Held by others, skip these: $held. "; } \
     || lead="The holds file can't be read right now: before working an item, check it isn't held by others. "
   notes=""
-  for item in $(jq -r 'to_entries | map(select(.value.holder == "cain") | .key | gsub("[^A-Za-z0-9._-]"; ""))
+  for item in $(jq -r '.holds | to_entries | map(select(.value.holder == "cain") | .key | gsub("[^A-Za-z0-9._-]"; ""))
                        | map(select(. != "")) | sort | .[]' "$holds" 2>/dev/null); do
     n=$("${RECORD_SH:-/opt/cain/record.sh}" notes "$item" 2>/dev/null) || continue
     n=$(printf '%s' "$n" | tr -d '\000-\010\013\014\016-\037\177' | tr '\r\n\t' '   ' \

@@ -21,8 +21,9 @@ token first, or both will answer.
 - Cain asks one question at a time. The next one comes when you answer.
 - Each card names what it's about (like "P08 Q2") and its buttons answer exactly that.
 - Once a card stops mattering its buttons come off, and it says why: "You answered:
-  Filed", "Expired" or "Replaced by a newer card". Cain's questions last until the next
-  morning check-in (7:10 AM); a Ship card lasts until its pull request changes.
+  Filed", "Expired" or "Replaced by a newer card". Cain's questions and Ship cards last
+  until the next morning check-in (7:10 AM, at least two hours away); a Ship card also
+  goes when its pull request changes, merges or closes.
 - Tapping an old card does nothing, and says so.
 - Cain's answer to a tap shows as a reply to that card.
 

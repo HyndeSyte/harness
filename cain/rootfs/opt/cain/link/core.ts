@@ -33,6 +33,10 @@ const DAY = 86400_000;
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
+const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
+// Machine text he never sees on a card: a full sha, a job's session id, an ISO time.
+const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"],
+  [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, "an ISO time"]];
 const LIMIT = 2000;
 const SUPPRESS_EMBEDS = 1 << 2;
 const DIRECT_KINDS = new Set(["stopped", "resumed", "alert"]);
@@ -62,6 +66,7 @@ export interface Shown {
 }
 export interface Ask {               // Cain's question waiting behind the open one
   text: string; options: string[]; item: string; question: string; replyTo?: string; at: number; expires: number;
+  nonce?: string;                    // the same on every try, so Discord never posts it twice
 }
 export interface State {
   owner?: string; dm?: string; bot?: string; next: number;
@@ -145,17 +150,18 @@ export function nextCheckin(ms: number, tz = "America/New_York", at = "0710"): n
   return t;
 }
 
-// -- what Cain's record says (the record keeper's copy in /data/record) -------------------
+// -- what Cain's record says: PENDING.md from the keeper's copy, and the holds ----------
 export interface RecordFiles { pending: string | null; holds: string | null }   // null: no such file
 export type Holds = Record<string, { holder?: string; branches?: string[] }>;
 
-// state/holds.json, written only by the record keeper. A missing file is no holds;
-// one that can't be read is null, and nothing is decided from it.
+// The holds, from the record keeper's own file (/data/record-holds.json): written
+// whole, only once its push is on GitHub, with the holds under "holds". A missing
+// file is no holds; one that can't be read is null, and nothing is decided from it.
 export function parseHolds(text: string | null): Holds | null {
   if (text === null) return {};
   try {
-    const j = JSON.parse(text);
-    return j && typeof j === "object" && !Array.isArray(j) ? j : null;
+    const h = JSON.parse(text)?.holds;
+    return h && typeof h === "object" && !Array.isArray(h) ? h : null;
   } catch { return null; }
 }
 
@@ -199,9 +205,33 @@ function checkMeta(m: { item?: unknown; question?: unknown; replyTo?: unknown })
 }
 
 // Cards for the same item and question replace each other; so do Ship cards for the
-// same pull request, and morning messages. "none" never replaces anything.
+// same pull request, and morning messages. A card with no question id, or about no
+// item, never replaces anything.
 const keyOf = (item?: string, question?: string): string | null =>
-  !item || item === "none" ? null : `${item.toUpperCase()}\n${(question ?? "").toUpperCase()}`;
+  !item || item === "none" || !question ? null : `${item.toUpperCase()}\n${question.toUpperCase()}`;
+const sameAsk = (a: { item?: string; question?: string }, b: { item?: string; question?: string }) =>
+  (a.item ?? "none").toUpperCase() === (b.item ?? "none").toUpperCase()
+  && (a.question ?? "").toUpperCase() === (b.question ?? "").toUpperCase();
+
+// The words a card starts with, naming what it's about: "P08 Q2".
+const labelOf = (item: string, question = "") => (item === "none" ? "" : question ? `${item} ${question}` : item);
+function withLabel(text: string, label: string): string {
+  if (!label) return text;
+  const t = text.trimStart();
+  const next = t.charAt(label.length);
+  return t.toUpperCase().startsWith(label.toUpperCase()) && !/[A-Za-z0-9]/.test(next) ? text : `${label}: ${t}`;
+}
+
+// What he sees has no machine text in it (Timing and truth, in CLAUDE.md).
+function noMachineText(...texts: string[]): void {
+  for (const t of texts) for (const [re, what] of MACHINE)
+    if (re.test(t)) throw new Refusal(`his card can't show ${what}: write it as people say it, or leave it out`);
+}
+
+// The same words always carry the same nonce, so a post retried after a lost answer
+// comes back as the message already made, never a second one (Discord enforce_nonce).
+export const stableNonce = (...parts: string[]) =>
+  createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 25);
 function keyFor(m: Shown): string | null {
   if (m.kind === "ship" && m.ship) return `ship\n${m.ship.pr}`;
   if (m.kind === "morning") return "morning";
@@ -241,10 +271,14 @@ export interface Deps {
   toHarness: (path: string, body: unknown) => Promise<boolean>;     // a tap on its card
   paired: () => string;                                            // who Cain is paired with
   log?: (line: string) => void;
-  record?: () => RecordFiles;                                      // PENDING.md and holds.json, as the keeper has them
-  head?: (pr: string) => Promise<string | null>;                   // a pull request's head sha now; null: can't tell
+  record?: () => RecordFiles;                                      // PENDING.md and the keeper's holds
+  pull?: (pr: string) => Promise<Pull | null>;                     // a pull request now; null: can't tell
   tz?: string;                                                     // the check-ins' zone
 }
+
+// A pull request as GitHub has it now: its head, and whether it's still open (null
+// when that couldn't be told).
+export interface Pull { head: string | null; open: boolean | null }
 
 export type AskResult = { status: "posted"; message: string } | { status: "held"; said: string };
 
@@ -268,6 +302,9 @@ export class Link {
   }
 
   private nextMorning(ms: number): number { return nextCheckin(ms, this.d.tz ?? "America/New_York"); }
+  // An ask (and a Ship card) lasts until the first morning check-in at least two hours
+  // off: one posted at 7:05 AM lasts until tomorrow's, not five minutes.
+  private askExpiry(now: number): number { return this.nextMorning(now + ASK_GRACE_MS); }
 
   // -- identity -------------------------------------------------------------
   async identity(): Promise<{ owner: string; dm: string; bot: string }> {
@@ -306,16 +343,26 @@ export class Link {
       digest: digest(msg.content ?? "", msg.components), until: now + REMEMBER_MS };
   }
 
-  private async post(text: string, comps: any[], opts: { timeoutMs?: number; replyTo?: string } = {}): Promise<any> {
+  private async post(text: string, comps: any[], opts: { timeoutMs?: number; replyTo?: string; nonce?: string } = {}): Promise<any> {
     const { dm } = await this.identity();
     const body: any = { content: fit(text), allowed_mentions: { parse: [] }, flags: SUPPRESS_EMBEDS };
     if (comps.length) body.components = comps;
     // An answer to a tap or a message is a Discord reply to it.
     if (opts.replyTo) body.message_reference = { message_id: opts.replyTo, channel_id: dm, fail_if_not_exists: false };
+    if (opts.nonce) Object.assign(body, { nonce: opts.nonce, enforce_nonce: true });
     const msg = opts.timeoutMs === undefined ? await this.d.rest("POST", `/channels/${dm}/messages`, body)
       : await this.d.rest("POST", `/channels/${dm}/messages`, body, true, opts.timeoutMs);
     if (!msg?.id) throw new Error("no message returned");
     return msg;
+  }
+
+  // A card that must be new. Discord hands back the message already made for the same
+  // nonce (a retry after a lost answer); if that one is a card already done with (the
+  // same words asked again), this posts a fresh one.
+  private async postCard(text: string, comps: any[], opts: { replyTo?: string; nonce: string }): Promise<any> {
+    const msg = await this.post(text, comps, opts);
+    if (!this.d.load().messages[String(msg.id)]?.outcome) return msg;
+    return this.post(text, comps, { ...opts, nonce: stableNonce(opts.nonce, String(this.d.now())) });
   }
 
   // Cain may ask about an item only while no one else holds it, and not once it's closed.
@@ -329,10 +376,11 @@ export class Link {
     if (closedItems(f.pending).has(item.toUpperCase())) throw new Refusal(`${item} is closed in PENDING.md`);
   }
 
-  // Older live cards with the same key as this one: replaced. Returns their ids.
+  // Older live cards with the same key as this one: replaced. Returns their ids. A card
+  // with no buttons replaces nothing: it asks nothing.
   private markReplaced(s: State, newId: string): string[] {
     const fresh = s.messages[newId];
-    const key = fresh ? keyFor(fresh) : null;
+    const key = fresh?.buttons ? keyFor(fresh) : null;
     if (!key) return [];
     const out: string[] = [];
     for (const [id, m] of Object.entries(s.messages)) {
@@ -370,7 +418,7 @@ export class Link {
     if (!card) throw new Error(`no card ${id}`);
     if (card.shown) return card.shown;
     this.mayAsk(meta.item);
-    const msg = await this.post(card.text, card.rows, { replyTo: meta.replyTo });
+    const msg = await this.postCard(card.text, card.rows, { replyTo: meta.replyTo, nonce: stableNonce("card", String(id)) });
     const s2 = this.d.load();
     s2.cards[String(id)].shown = String(msg.id);
     this.remember(s2, msg, { card: id, kind: "card", item: meta.item, question: meta.question, posted: this.d.now(),
@@ -421,17 +469,19 @@ export class Link {
 
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
     const meta = checkMeta(a);
-    const text = String(a.text ?? "");
     const opts = (a.options ?? []).map((o) => String(o).trim()).filter(Boolean).slice(0, 5);
-    if (!text.trim()) throw new Refusal("an ask needs its question");
+    if (!String(a.text ?? "").trim()) throw new Refusal("an ask needs its question");
     if (!opts.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
+    noMachineText(String(a.text), ...opts);
+    const text = withLabel(String(a.text), labelOf(meta.item, meta.question));   // "P08 Q2: ..."
     this.mayAsk(meta.item);
     return this.serial(async () => {
       const now = this.d.now();
       const s = this.d.load();
       const key = keyOf(meta.item, meta.question);
       const entry: Ask = { text, options: opts, item: meta.item, question: meta.question, replyTo: meta.replyTo,
-        at: now, expires: this.nextMorning(now) };
+        at: now, expires: this.askExpiry(now),
+        nonce: stableNonce("ask", meta.item, meta.question, text, opts.join("\u0001"), meta.replyTo ?? "") };
       const open = this.openAsk(s, now);
       if (open && !(key && keyFor(open[1]) === key)) {
         const held = s.held ?? (s.held = []);
@@ -446,9 +496,9 @@ export class Link {
   }
 
   private async postAsk(e: Ask): Promise<string> {
-    const nonce = Math.random().toString(36).slice(2, 10);
-    const msg = await this.post(e.text, rows([e.options.map((o, i) => [o, `q:${nonce}:${i}`] as [string, string])], "q:"),
-      { replyTo: e.replyTo });
+    const nonce = e.nonce ?? stableNonce("ask", e.item, e.question, e.text, e.options.join("\u0001"), e.replyTo ?? "");
+    const msg = await this.postCard(e.text, rows([e.options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
+      { replyTo: e.replyTo, nonce });
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
       buttons: true, q: { q: excerpt(e.text), options: e.options, used: false } });
@@ -459,7 +509,8 @@ export class Link {
   }
 
   // A Ship card: Ship / Not now, for one pull request at one head. Doesn't wait its
-  // turn, and expires when the pull request's head moves.
+  // turn; lasts as long as an ask, and goes when the head moves or the pull request
+  // is merged or closed.
   async ship(a: { text: string; item?: unknown; pr?: unknown; head?: unknown; replyTo?: unknown }): Promise<AskResult> {
     const meta = checkMeta({ item: a.item, replyTo: a.replyTo });
     const pr = String(a.pr ?? "").trim();
@@ -468,14 +519,17 @@ export class Link {
     if (!m) throw new Refusal("pr must be the pull request's address: https://github.com/<owner>/<repo>/pull/<number>");
     if (!SHA.test(head)) throw new Refusal("head must be the pull request's full 40-character head sha");
     if (!String(a.text ?? "").trim()) throw new Refusal("a Ship card needs its words");
+    noMachineText(String(a.text));
+    const text = withLabel(String(a.text), labelOf(meta.item));
     this.mayAsk(meta.item);
-    const nonce = Math.random().toString(36).slice(2, 10);
+    const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
-    const msg = await this.post(String(a.text), rows([options.map((o, i) => [o, `q:${nonce}:${i}`] as [string, string])], "q:"),
-      { replyTo: meta.replyTo });
+    const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
+      { replyTo: meta.replyTo, nonce });
+    const now = this.d.now();
     const s = this.d.load();
-    this.remember(s, msg, { kind: "ship", item: meta.item, question: `ship:${m[3]}`, posted: this.d.now(), expires: null,
-      ship: { pr, head }, buttons: true, q: { q: excerpt(String(a.text)), options, used: false } });
+    this.remember(s, msg, { kind: "ship", item: meta.item, question: `ship:${m[3]}`, posted: now, expires: this.askExpiry(now),
+      ship: { pr, head }, buttons: true, q: { q: excerpt(text), options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -485,7 +539,8 @@ export class Link {
   // The one morning message, with Stop. Its Stop moves to the newest morning message.
   async morning(text: string): Promise<string> {
     if (!String(text ?? "").trim()) throw new Refusal("the morning message needs its text");
-    const msg = await this.post(String(text), rows([[["Stop", STOP]]], "q:"));
+    noMachineText(String(text));
+    const msg = await this.postCard(String(text), rows([[["Stop", STOP]]], "q:"), { nonce: stableNonce("morning", String(text)) });
     const s = this.d.load();
     this.remember(s, msg, { kind: "morning", item: "none", question: "morning", posted: this.d.now(), expires: null, buttons: true });
     const replaced = this.markReplaced(s, String(msg.id));
@@ -498,20 +553,18 @@ export class Link {
   // With --item none, it's the open ask about no item (only one ask is ever open).
   async answered(a: { item?: unknown; question?: unknown }): Promise<{ status: string; said: string }> {
     const meta = checkMeta({ item: a.item, question: a.question });
-    const key = keyOf(meta.item, meta.question);
     const ids = await this.serial(async () => {
       const now = this.d.now();
       const s = this.d.load();
       const out: string[] = [];
       for (const [id, m] of Object.entries(s.messages)) {
-        if (m.kind !== "ask" || !live(m, now)) continue;
-        if (key ? keyFor(m) !== key : (m.item ?? "none") !== "none") continue;
+        if (m.kind !== "ask" || !live(m, now) || !sameAsk(m, meta)) continue;
         m.outcome = "answered"; m.words = true; m.why = "answered in a message";
         if (m.q) m.q.used = true;
         out.push(id);
       }
       const before = (s.held ?? []).length;
-      if (key) s.held = (s.held ?? []).filter((h) => keyOf(h.item, h.question) !== key);
+      if (meta.item !== "none") s.held = (s.held ?? []).filter((h) => !sameAsk(h, meta));
       this.d.save(s);
       return { out, dropped: before - (s.held ?? []).length };
     });
@@ -599,9 +652,10 @@ export class Link {
     const rec = s.messages[msgId];
     const stop = cid === STOP || cid === RESUME;          // Stop works from any card of ours
     // Component taps only ever come for the app's own messages, so one the link doesn't
-    // know is an old card of ours: take its buttons off.
-    if (!rec) return this.deadTap(it, msgId, "not a card the link knows");
-    if (rec.outcome && !stop) return this.deadTap(it, msgId, rec.why ?? rec.outcome);
+    // know is an old card of ours: take its buttons off (Stop and Turn back on still work).
+    if (!rec && !stop) return this.deadTap(it, msgId, "not a card the link knows");
+    if (!rec || (rec.outcome && stop)) return this.toSpecialist(it, cid, msgId);
+    if (rec.outcome) return this.deadTap(it, msgId, rec.why ?? rec.outcome);
     if (!rec.outcome && digest(it.message.content ?? "", it.message.components) !== rec.digest) {
       await this.answer(it, ACK);
       this.log("tap refused: card was changed after it was posted");
@@ -616,6 +670,10 @@ export class Link {
       }
     }
     if (cid.startsWith("q:")) return this.onQuestion(it, cid, msgId);
+    return this.toSpecialist(it, cid, msgId);
+  }
+
+  private async toSpecialist(it: any, cid: string, msgId: string): Promise<string> {
     await this.answer(it, ACK);
     const card = this.cardOf(msgId);
     const ok = await this.d.toHarness("/press", {
@@ -648,7 +706,7 @@ export class Link {
   }
 
   private tapLine(m: Shown, label: string, msgId: string): string {
-    const where = `(Discord message ${msgId}: answer it with reply_to ${msgId})`;
+    const where = `(Discord message ${msgId}; its card shows his answer. If it needs words from you, reply with reply_to ${msgId})`;
     if (m.kind === "ship" && m.ship)
       return `Dane tapped "${label}" on your Ship card${m.item && m.item !== "none" ? ` for ${m.item}` : ""}: ${m.ship.pr} at head ${m.ship.head} ${where}`;
     const what = about(m.item, m.question);
@@ -666,9 +724,11 @@ export class Link {
     const content = withLine(String(it.message.content ?? ""), `You answered: ${label}`);
     m.digest = digest(content, []);
     this.d.save(s);
+    // Cain hears it the moment it's saved as answered: if the link stopped now, a tap
+    // can't be marked answered and never reach him.
+    this.d.relay(this.tapLine(m, label, msgId));
     const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
     if (ok) { const s2 = this.d.load(); if (s2.messages[msgId]) { s2.messages[msgId].buttons = false; this.d.save(s2); } }
-    this.d.relay(this.tapLine(m, label, msgId));
     if (m.kind === "ask") await this.releaseHeld();
     return "to Cain";
   }
@@ -739,15 +799,20 @@ export class Link {
       }
       const posted = rec.until - REMEMBER_MS;
       Object.assign(rec, { item: "none", question: "", posted, buttons: true });
+      // Every ask from before 0.7.0 expires now, answered or not, even one from this
+      // morning: it was asked the old way, and the morning check-in asks again exactly.
       if (rec.card !== undefined) Object.assign(rec, { kind: "card", expires: s.cards[String(rec.card)]?.expires ?? null });
-      else if (rec.q) Object.assign(rec, rec.q.used ? { kind: "ask", outcome: "expired", why: "posted before 0.7.0" }
-        : { kind: "ask", expires: this.nextMorning(posted) });
+      else if (rec.q) Object.assign(rec, { kind: "ask", outcome: "expired", why: "posted before 0.7.0" });
       else Object.assign(rec, { kind: "morning", question: "morning", expires: null });
     }
+    // Older than the look went back (or no buttons left): an unanswered ask may still
+    // have its buttons, so it's taken off too; either way a tap on it does nothing.
     for (const [id, rec] of Object.entries(s.messages)) {
-      if (rec.kind || seen.has(id)) continue;                    // not on Discord with buttons: nothing to take off
-      Object.assign(rec, { kind: rec.card !== undefined ? "card" : rec.q ? "ask" : "morning", item: "none",
-        posted: rec.until - REMEMBER_MS, buttons: false });
+      if (rec.kind || seen.has(id)) continue;
+      const ask = !!rec.q;
+      Object.assign(rec, { kind: rec.card !== undefined ? "card" : ask ? "ask" : "morning", item: "none",
+        posted: rec.until - REMEMBER_MS, buttons: ask && !rec.q!.used },
+        ask ? { outcome: "expired", why: "posted before 0.7.0" } : {});
     }
     s.migrated = true;
     this.d.save(s);
@@ -757,14 +822,15 @@ export class Link {
   // Which live cards stopped mattering, and why.
   private async decide(): Promise<void> {
     const now = this.d.now();
-    const moved = new Set<string>();
-    if (this.d.head) {
+    const pulls = new Map<string, string>();       // Ship card -> "head moved" or "merged or closed"
+    if (this.d.pull) {
       for (const [id, m] of Object.entries(this.d.load().messages)) {
         if (m.kind !== "ship" || !m.ship || !live(m, now)) continue;
         if ((this.headChecked.get(id) ?? -Infinity) + HEAD_EVERY_MS > now) continue;
         this.headChecked.set(id, now);
-        const h = await this.d.head(m.ship.pr).catch(() => null);
-        if (h && h.toLowerCase() !== m.ship.head) moved.add(id);
+        const p = await this.d.pull(m.ship.pr).catch(() => null);
+        if (p?.open === false) pulls.set(id, "merged or closed");
+        else if (p?.head && p.head.toLowerCase() !== m.ship.head) pulls.set(id, "head moved");
       }
     }
     const f = this.files();
@@ -786,7 +852,7 @@ export class Link {
       let why = "";
       if (m.expires != null && m.expires <= now) why = "expired";
       else if (m.until - DAY <= now) why = "forgetting";
-      else if (moved.has(id)) why = "head moved";
+      else if (pulls.has(id)) why = pulls.get(id)!;
       else if (item && closed.has(item.toUpperCase())) why = "item closed";
       else if (item && holds && heldElsewhere(holds, item)) why = "held elsewhere";
       else { const k = keyFor(m); if (k && newest.get(k) !== id) why = "replaced"; }
@@ -797,12 +863,15 @@ export class Link {
     if (!told.length) return;
     this.d.save(s);
     for (const [id, m, why] of told) {
-      if ((m.kind !== "ask" && m.kind !== "ship") || !["head moved", "item closed", "held elsewhere"].includes(why)) continue;
+      const because: Record<string, string> = {
+        "head moved": "the pull request's head moved, so that go would ship something else. Show a new Ship card for the new head once it's ready.",
+        "merged or closed": "the pull request was merged or closed.",
+        "item closed": `${m.item} is closed in PENDING.md.`,
+        "held elsewhere": `${m.item} is now held by another session. Don't ask him about it or say who has it.`,
+      };
+      if ((m.kind !== "ask" && m.kind !== "ship") || !because[why]) continue;
       const what = m.kind === "ship" ? `Ship card for ${m.ship?.pr}` : `question ${about(m.item, m.question) || `"${excerpt(m.q?.q ?? "", 60)}"`}`;
-      const because = why === "head moved" ? "the pull request's head moved, so that go would ship something else. Ask again with the new head once it's ready."
-        : why === "item closed" ? `${m.item} is closed in PENDING.md.`
-        : `${m.item} is now held by another session. Don't ask him about it or say who has it.`;
-      this.d.relay(`Your ${what} (Discord message ${id}) was taken off: ${because}`);
+      this.d.relay(`Your ${what} (Discord message ${id}) was taken off: ${because[why]} Nothing to tell him.`);
     }
   }
 
@@ -872,7 +941,7 @@ export class Link {
       else if (item && holds && heldElsewhere(holds, item)) lines.push(`Your held question ${what} was dropped unasked: ${item} is now held by another session. Don't ask him about it or say who has it.`);
       else keep.push(h);
     }
-    if (lines.length) { s.held = keep; this.d.save(s); for (const l of lines) this.d.relay(l); }
+    if (lines.length) { s.held = keep; this.d.save(s); for (const l of lines) this.d.relay(`${l} Nothing to tell him.`); }
     return lines;
   }
 
@@ -894,7 +963,7 @@ export class Link {
         return;
       }
       const what = about(next.item, next.question);
-      this.d.relay(`Your held question${what ? ` ${what}` : ""} is now in front of Dane (Discord message ${id}): "${excerpt(next.text, 120)}"`);
+      this.d.relay(`Your held question${what ? ` ${what}` : ""} is now in front of Dane (Discord message ${id}): "${excerpt(next.text, 120)}" Nothing to tell him.`);
     });
   }
 }

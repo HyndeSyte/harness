@@ -379,12 +379,13 @@ def test_cains_remote_trigger_hook_is_wired_and_shipped():
     import json
     hooks = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["hooks"]["PreToolUse"]
     pre = [h for h in hooks if h["matcher"] == "RemoteTrigger"]
-    assert len(pre) == 1 and pre[0]["hooks"][0]["command"] == "bun /opt/cain/hooks/remote-trigger.ts"
+    # A hook that crashes refuses (exit 2), rather than letting the run through.
+    assert len(pre) == 1 and pre[0]["hooks"][0]["command"] == "bun /opt/cain/hooks/remote-trigger.ts || exit 2"
     hook = (CAIN / "rootfs/opt/cain/hooks/remote-trigger.ts").read_text(encoding="utf-8")
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     for trig in re.findall(r"trig_[A-Za-z0-9]+", hook):
         assert trig in rules, trig
-    assert 'permissionDecision: "deny"' in hook and "/data/record/state/holds.json" in hook
+    assert 'permissionDecision: "deny"' in hook and '"/data/record-holds.json"' in hook and '"/data/link/state.json"' in hook
     assert "COPY rootfs /" in (CAIN / "Dockerfile").read_text()                       # ships with the add-on
 
 
@@ -492,14 +493,15 @@ def test_checkin_lists_items_held_by_others_first(tmp_path):
     if not shutil.which("jq"):
         import pytest
         pytest.skip("no jq")
-    holds = tmp_path / "holds.json"
-    holds.write_text(json.dumps({
+    # The record keeper's own holds file (/data/record-holds.json), holds under "holds".
+    holds = tmp_path / "record-holds.json"
+    holds.write_text(json.dumps({"holds": {
         "P33": {"holder": "laptop:9f2c", "for": "his chat", "branches": ["claude/x"],
                 "taken": "2026-11-11T13:00:00Z", "renewed": "2026-11-11T13:00:00Z"},
         "P12": {"holder": "laptop:a1;rm -rf", "for": "his chat", "branches": []},
         "P41": {"holder": "cain", "for": "Build job", "branches": ["claude/y"]},
         "P4$(x)5": {"holder": "laptop:b2", "for": "his chat", "branches": []},
-    }))
+    }, "waiting": [], "downtime": []}))
     os.environ["HOLDS_FILE"] = str(holds)
     try:
         out = _checkin(tmp_path, "0712", IDLE)
@@ -507,7 +509,7 @@ def test_checkin_lists_items_held_by_others_first(tmp_path):
         assert line.split(" -l ", 1)[1].startswith("Held by others, skip these: P12, P33, P4x5. Scheduled check-in")
         assert "P41" not in line and "laptop" not in line and "$(" not in line
         (tmp_path / "sent.txt").unlink()
-        holds.write_text("{}")
+        holds.write_text('{"holds": {}, "waiting": [], "downtime": []}')
         assert "Held by others" not in _checkin(tmp_path, "1240", IDLE)
         (tmp_path / "sent.txt").unlink()
         holds.write_text("{broken")
@@ -527,13 +529,13 @@ def test_checkin_lists_notes_left_on_items_cain_holds(tmp_path):
     if not shutil.which("jq"):
         import pytest
         pytest.skip("no jq")
-    holds = tmp_path / "holds.json"
-    holds.write_text(json.dumps({
+    holds = tmp_path / "record-holds.json"
+    holds.write_text(json.dumps({"holds": {
         "P33": {"holder": "laptop:9f2c", "for": "his chat", "branches": []},
         "P41": {"holder": "cain", "for": "Build job", "branches": ["claude/y"], "job": "Cain 0.7.0"},
         "P50": {"holder": "cain", "for": "Build job", "branches": []},
         "P51": {"holder": "cain", "for": "Build job", "branches": []},
-    }))
+    }}))
     # Stands in for the record keeper's `record.sh notes <item>`: P41 has a note over two
     # lines, P50 none, and P51's lookup fails.
     rec = tmp_path / "record.sh"
@@ -598,12 +600,20 @@ def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):
                  '{"text": "second"}\n', newline="\n")
     import os
     os.environ["RELAY_QUEUE"] = str(q)
+    sent = tmp_path / "sent.txt"
     try:
         out = _checkin(tmp_path, "0712", IDLE)
+        assert "Relayed by the add-on" in out and 'tapped "Yes"' in out and "morning" not in out
+        # The queue was moved aside whole before reading, so a line the link adds now
+        # starts a fresh queue instead of being lost, and waits its turn.
+        assert not q.exists() and (tmp_path / "relay.queue.work").read_text().strip() == '{"text": "second"}'
+        q.write_text('{"text": "third"}\n', newline="\n")
+        sent.unlink()
+        assert "Relayed by the add-on: second" in _checkin(tmp_path, "0712", IDLE)
+        sent.unlink()
+        assert "Relayed by the add-on: third" in _checkin(tmp_path, "0712", IDLE)
     finally:
         del os.environ["RELAY_QUEUE"]
-    assert "Relayed by the add-on" in out and 'tapped "Yes"' in out and "morning" not in out
-    assert q.read_text().strip() == '{"text": "second"}'
 
 
 def test_cains_morning_update_folds_in_the_digest():

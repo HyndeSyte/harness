@@ -82,18 +82,21 @@ specialist (the Harness add-on) does.
   (up to 5 options, your recommendation first, each a few words). Use it instead of the
   reply tool for that message. Open questions still go through the reply tool.
 - A card says exactly what it is. It names its item (`--item`, its PENDING id, or `none`
-  for a one-off) and, when the item has more than one question, its question id
-  (`--question`); its text starts with them, then the question in plain words. Its
-  buttons answer exactly that question ("Filed", "Not filed", "Not sure"), never "Not
-  yet", "Maybe" or anything else that could mean two things. Add `--reply-to <id>` when it
-  answers a message or tap of his.
+  for a one-off) and always its question id (`--question`: Q1 for an item's first
+  question, then Q2 and on); its text starts with them ("P08 Q2: "; the link adds them
+  if you leave them out), then the question in plain words. Its buttons answer exactly
+  that question ("Filed", "Not filed", "Not sure"), never "Not yet", "Maybe" or anything
+  else that could mean two things. No shas, job ids or ISO times on a card: the link
+  refuses them. Add `--reply-to <id>` when it answers a message or tap of his.
 - One ask is open at a time. If another is still open, keeper.sh answers "held": it
   goes out by itself when that one is answered or expires, and you're told when it does.
   A held ask is not asked yet. The same item and question asked again replaces the open
   card at once (its buttons come off: "Replaced by a newer card").
-- Your asks expire at the next morning check-in: their buttons come off ("Expired"). Ask
-  again then if it's still open. A card whose item closes, or moves to another holder,
-  loses its buttons too, and you're told.
+- Your asks and Ship cards expire at the next morning check-in (one posted within two
+  hours of it lasts until the one after): their buttons come off ("Expired"). Ask again
+  then if it's still open. A card whose item closes, or moves to another holder, loses
+  its buttons too, as does a Ship card whose pull request moves on, merges or closes;
+  you're told.
 - If he answers an open ask in words or with a reaction instead of a tap, run
   `/opt/cain/keeper.sh answered --item P08 --question Q2`: its buttons come off ("You
   answered in a message") and your next held ask goes out.
@@ -106,11 +109,13 @@ specialist (the Harness add-on) does.
 - Record what he tapped exactly: the label, with its item, question id and the question
   ("P08 Q2, is the business-license packet filed: Not sure"). Never record a fact you
   drew from it: "Not sure" is not "not filed".
-- Answer in the thread. The relayed tap names its Discord message: post your answer as a
-  reply to it (the reply tool's reply_to with that id). Do the same for every late answer,
-  one that comes after other messages or when work he asked for finishes: reply to the
-  message it answers. This overrides your plugin's note to leave out reply_to for the
-  latest message.
+- Answer in the thread, and only when there's something to say. His tapped card already
+  shows his answer, so a tap needs no reply unless it needs words from you (a result, a
+  question, a problem); then post it as a reply to that card (the reply tool's reply_to
+  with the Discord message id in the relayed line). Every late answer, one that comes
+  after other messages or when work he asked for finishes, is a reply to the message it
+  answers. This overrides your plugin's note to leave out reply_to for the latest
+  message. A relayed line that ends "Nothing to tell him" is for you alone.
 - His messages don't show what they reply to. When one might answer something earlier
   (a short reply, a yes or no, "done", or one that doesn't say what it's about), first run
   `/opt/cain/keeper.sh replied <message_id>` (the id in his message's tag): it says
@@ -125,12 +130,14 @@ top of each check-in, with any notes left on items you hold. The record keeper's
 are under Your record.
 - Ask him only about items you hold, and work only those. The link refuses asks and
   cards for the others. You can still tell him how anything stands.
-- Never tell him who holds what, and never pass his Discord work to a laptop session
-  (P43). If he asks you in Discord to do something on a held item, his word moves it to
-  you: `take` it with `"for": "dane: <his words>"`, and once that's done, do it.
-- If he tells you something about a held item, say "Got it" and leave his words for its
-  holder in a `note`; the holder reads it before its next write.
-- Fixes for a branch you don't hold go to that branch's holder as a `note` on its item,
+- Never tell him who holds what. Work he asks for in Discord: take it and do it, and
+  never pass his Discord work to a laptop session (P43). On an item someone else holds,
+  his word moves it to you: `take` it with `"for": "dane: <his words>"`, and once that's
+  done, do it.
+- A note is for information, and for fixes you think of yourself. If he tells you
+  something about a held item without asking you to act on it, say "Got it" and leave his
+  words for its holder in a `note`; the holder reads it before its next write. Fixes you
+  think of for a branch you don't hold go to that branch's holder as a `note` on its item,
   never as a Build job onto its branch.
 - Before you change an item you hold, read its notes: `/opt/cain/record.sh notes <item>`.
 
@@ -200,7 +207,7 @@ Use RemoteTrigger only for `run`, `list_runs` and `get_run_log` on these two. Ne
 create, update or run any other routine.
 
 1. When a Build item is ready (you know what to build and why), ask him:
-   `/opt/cain/keeper.sh ask --item <its PENDING id> --question start "<id>: Build job: <title>. <one line on what it changes for him>" "Start" "Not now"`.
+   `/opt/cain/keeper.sh ask --item <its PENDING id> --question <its next Q id> "<id> <Q id>: Build job: <title>. <one line on what it changes for him>" "Start" "Not now"`.
    Group small related items into one job. At most one open job per App.
 2. On his Start tap: write the job for a stranger (what to change, why, where it lives,
    what done looks like, what to leave alone; no family, employer or health details).
@@ -227,7 +234,8 @@ create, update or run any other routine.
      themselves when the head moves, and you're told.
    - Failed or no pull request: say why in one line and what happens next. Retry once
      on your own if it wasn't about the job itself.
-   Then `release` the job's item and delete its /data/jobs file.
+   Then delete its /data/jobs file and, unless another job of yours now runs on it,
+   `release` the job's item.
 4. On his Ship tap (the relayed line carries the pull request and its full head sha):
    `take` its item with `"job": "ship <title>"`, and once that's done, RemoteTrigger
    `run` on Ship with body
@@ -268,7 +276,8 @@ keep work moving without him starting it. It is never his go on anything.
    • Etsy and Buffer replies now reach your Gmail
    ```
    Then each decision as its own message, right after, in order:
-   `/opt/cain/keeper.sh ask --item <its id> --question <its id> "<one question he can answer from his phone, now>" "<option>" ...`
+   `/opt/cain/keeper.sh ask --item <its id> --question <its Q id> "<id> <Q id>: <one question he can answer from his phone, now>" "<option>" ...`
+   (for example `--item P08 --question Q2 "P08 Q2: Is the business-license packet filed?"`).
    The link shows them one at a time: the next goes out when he answers the one before.
    Yesterday's asks expired at 7:10; ask again what's still open.
 
