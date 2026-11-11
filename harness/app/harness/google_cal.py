@@ -389,10 +389,12 @@ class GoogleCalendar:
             self.seen(INPUT, "unreachable", "couldn't reach Google")
             return None, Outcome("failed")     # no write has been sent
         if r.status != 200:
-            self.seen(INPUT, *(("unreachable", "Google isn't answering right now") if r.status >= 500
-                               else _turned_down(r)))
-            busy = r.status >= 500 or r.status in (408, 429)
-            return None, Outcome("unknown" if busy else "auth", r.status)
+            kind, words = ("unreachable", "Google isn't answering right now") if r.status >= 500 \
+                else _turned_down(r)
+            self.seen(INPUT, kind, words)
+            # Only the key itself turned down is "auth": a busy Google, the Pi's clock or another
+            # answer isn't the key's fault, and the blocks' line mustn't say it is (Nov 11 review).
+            return None, Outcome("auth" if kind == "refused" else "unknown", r.status)
         try:
             answer = r.json()
             token = answer["access_token"]

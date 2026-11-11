@@ -57,7 +57,9 @@ class CainLink:
             r = c.getresponse()
             raw = r.read()
             c.close()
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:
+            # A broken answer (BadStatusLine, IncompleteRead) is the link failing too: tried again
+            # later like no answer, never a stop that strands the outbox (Nov 11 review).
             raise LinkError(0, type(e).__name__) from None
         try:
             data = json.loads(raw or b"{}")

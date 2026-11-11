@@ -1003,8 +1003,9 @@ def test_the_clock_reason_has_its_own_words_and_steps(ledger, clock):
     assert watch(ledger).tell(OWNER) == 1
     text = sent(ledger)[0]["text"]
     assert ": Google turned the sign-in down, likely because the Pi's clock is off. Blocks" in text
-    assert text.endswith("Restarting the Pi usually sets its clock right: in Home Assistant open Settings > "
-                         "System, tap the power button at the top right, then Reboot system.")
+    assert text.endswith("Restarting the Pi usually sets its clock right. In Home Assistant open Settings > "
+                         "System, tap the power button at the top right, then Advanced options, then Reboot "
+                         "system.")
 
 
 def test_the_sharing_label_is_the_same_everywhere():
@@ -1015,3 +1016,154 @@ def test_the_sharing_label_is_the_same_everywhere():
     assert "Make changes and see event details" in inputs.ADVICE[inputs.DENIED]
     assert "Make changes and see event details" in docs and "see all event details" not in docs
     assert "see all event" not in code
+
+
+# -- the third review (Nov 11): its probes, each a test -------------------------------------------------
+
+def test_probe_a_waiting_refusal_is_never_weakened(ledger, clock):
+    """Probe R1: a refusal still waiting was rewritten from the input's newest failure into "Harness
+    keeps trying", and the refusal was never told again."""
+    last_good(ledger, clock)
+    refused(ledger, clock)
+    w = watch(ledger)
+    assert w.tell(OWNER) == 1
+    told = sent(ledger)[0]["text"]
+    clock.advance(minutes=5)
+    ledger.input_failed("mail", UNREACHABLE, "unreachable")     # before its first try
+    w.tell(OWNER)
+    assert sent(ledger)[0]["text"] == told and "apppasswords" in told
+    refused(ledger, clock)
+    assert w.tell(OWNER) == 0                                   # told already, and still on its way
+
+
+def test_a_waiting_folded_message_only_loses_what_came_back(ledger, clock):
+    w = watch(ledger)
+    said = {"mail": UNREACHABLE, "family": "couldn't reach iCloud", "google": "couldn't reach Google"}
+    for name, words in said.items():
+        ledger.input_failed(name, words, "unreachable")
+    clock.advance(hours=6)
+    for name, words in said.items():
+        ledger.input_failed(name, words, "unreachable")
+    assert w.tell(OWNER) == 1
+    before = sent(ledger)[0]["text"].split("\n")
+    clock.advance(minutes=5)
+    ledger.input_failed("google", "Google answered with an error", "error")    # newer words: not told
+    ledger.input_ok("mail")
+    w.tell(OWNER)
+    after = sent(ledger)[0]["text"].split("\n")
+    assert after == [line for line in before if not line.startswith("• No email")]
+    assert "couldn't reach Google" in "\n".join(after) and "answered with an error" not in "\n".join(after)
+
+
+def test_probe_a_blip_of_minutes_isnt_folded_into_another_message(ledger, clock):
+    """Probe R2: two failed reads ten minutes apart went into another input's message."""
+    clock.t = datetime(2026, 11, 10, 15, 0, tzinfo=timezone.utc)
+    ledger.input_ok("mail")
+    clock_words = "Google turned the sign-in down, likely because the Pi's clock is off"
+    ledger.input_failed("google", clock_words, "clock")
+    clock.advance(hours=6)
+    ledger.input_failed("google", clock_words, "clock")
+    clock.t = datetime(2026, 11, 10, 21, 0, tzinfo=timezone.utc)
+    ledger.input_failed("mail", UNREACHABLE, "unreachable")
+    clock.t = datetime(2026, 11, 10, 21, 10, tzinfo=timezone.utc)
+    ledger.input_failed("mail", UNREACHABLE, "unreachable")
+    clock.t = datetime(2026, 11, 10, 21, 15, tzinfo=timezone.utc)   # the quarter hour
+    w = watch(ledger)
+    assert w.tell(OWNER) == 1
+    assert "No email has been read" not in sent(ledger)[0]["text"]
+    clock.t = datetime(2026, 11, 10, 22, 0, tzinfo=timezone.utc)    # an hour on, still failing
+    ledger.input_failed("mail", UNREACHABLE, "unreachable")
+    ledger.input_failed("family", "couldn't reach iCloud", "unreachable")
+    clock.advance(hours=6)
+    ledger.input_failed("family", "couldn't reach iCloud", "unreachable")
+    ledger.input_failed("mail", UNREACHABLE, "unreachable")
+    quarter(clock)
+    assert w.tell(OWNER) == 1                          # mail told with family: one message
+    assert sent(ledger)[1]["text"].count("\n• ") == 2
+
+
+@pytest.mark.parametrize("url, whole", [
+    ("https://myaccount.google.com@evil.example/a_b", False),     # userinfo: the host is evil.example
+    ("https://evil.example@myaccount.google.com/a_b", True),      # the host is Google's: harmless
+    ("https://myaccount.google.com:8443/a_b", True),              # a port on Google's host
+    ("https://myaccount.google.com.evil.example/a_b", False),     # a lookalike
+    ("https://myaccount.google.com./a_b", False),                 # a trailing dot: escaped
+    ("https://myaccount.google.com%2eevil.example/a_b", False),
+    ("HTTPS://MYACCOUNT.GOOGLE.COM/a_b", False),                  # not as the steps write it: escaped
+])
+def test_review_links_are_kept_whole_only_for_the_steps_own_hosts(url, whole):
+    """Review R3: confirmed."""
+    md = discord_chat.to_markdown(f"at {url} now")
+    assert (url in md) == whole, md
+
+
+def test_review_a_restart_looks_at_once_and_a_refusal_after_it_is_told(ledger, clock):
+    """Review R4: confirmed. A fresh process looks at once; a refusal confirmed after it is told."""
+    clock.t = datetime(2026, 11, 10, 15, 7, tzinfo=timezone.utc)
+    ledger.input_failed("family", "couldn't reach iCloud", "unreachable")
+    clock.advance(hours=6)
+    ledger.input_failed("family", "couldn't reach iCloud", "unreachable")
+    refused(ledger, clock, 1)                          # its first refusal, before the restart
+    w = watch(ledger)
+    assert w.tell(OWNER) == 1
+    refused(ledger, clock, 1)
+    assert w.tell(OWNER) == 1
+
+
+def test_probe_the_pis_clock_isnt_called_a_refused_key_in_the_digest(clock):
+    """Probe R5: the blocks' line said the key was refused when Google turned the sign-in down over
+    the Pi's clock."""
+    from types import SimpleNamespace
+    from harness.family_gmail import FamilyGmail
+    said = (b'{"error": "invalid_grant", "error_description": "Invalid JWT: Token must be a short-lived '
+            b'token (60 minutes) and in a reasonable timeframe. Check your iat and exp values."}')
+    seen = inputs.Seen()
+    client = google_cal.GoogleCalendar(SignIn(400, said), lambda: KEY, clock, seen=seen)
+    _, why = client.list_ours(GMAIL, clock(), clock() + DAY)
+    assert seen.take()["google"][0] == "clock" and why.kind == "unknown"
+    assert "refused" not in FamilyGmail._said(SimpleNamespace(google=None), why)
+    key = google_cal.GoogleCalendar(SignIn(400, b'{"error": "invalid_grant"}'), lambda: KEY, clock)
+    _, why = key.list_ours(GMAIL, clock(), clock() + DAY)
+    assert why.kind == "auth"                          # the key itself: still said as refused
+
+
+def test_a_folded_message_names_each_input_in_its_own_advice(ledger, clock):
+    w = watch(ledger)
+    limit = "this month's limit for sorting Family events is used up"
+    ledger.input_failed("meaning", limit, "limit")
+    ledger.input_failed("mail", UNREACHABLE, "unreachable")
+    clock.advance(hours=6)
+    ledger.input_failed("meaning", limit, "limit")
+    ledger.input_failed("mail", UNREACHABLE, "unreachable")
+    assert w.tell(OWNER) == 1
+    text = sent(ledger)[0]["text"]
+    assert text.startswith("<b>A few things Harness uses have stopped working</b>\n• ")
+    assert text.endswith("\n\nSorting Family events: it picks up again when the monthly limit resets.\n"
+                         + inputs.KEEPS_TRYING)
+    assert text.count("Harness keeps trying") == 1
+
+
+def test_a_broken_answer_from_cains_link_is_tried_again_not_a_stop(monkeypatch):
+    """Review: an http.client error that isn't an OSError (BadStatusLine) went up past the outbox."""
+    import http.client
+    from harness import cain_relay
+    from harness.chat import ChatError
+
+    class Broken:
+        def __init__(self, *a, **k):
+            pass
+
+        def request(self, *a, **k):
+            pass
+
+        def getresponse(self):
+            raise http.client.BadStatusLine("garbled")
+
+    monkeypatch.setattr(cain_relay.http.client, "HTTPConnection", Broken)
+    link = cain_relay.CainLink(lambda: "token")
+    with pytest.raises(cain_relay.LinkError) as e:
+        link.card("text", [], "input")
+    assert e.value.code == 0
+    with pytest.raises(ChatError) as e:
+        discord_chat.LinkChat(link).send_message(OWNER, "<b>x</b>", kind=inputs.KIND)
+    assert e.value.retryable

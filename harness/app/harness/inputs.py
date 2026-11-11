@@ -14,10 +14,11 @@ unlogged, and the digest named only the calendar feeds. Now:
   a new key starts that over, its clock and counts too.
 - Anything else is told once a failure is seen six hours or more after the first: a pause, a stop
   or a clock jump alone never does it. It's looked at on the quarter hour (:00, :15, :30, :45), and
-  everything due then goes in one message, with whatever else can't be reached too: a home internet
-  outage is one message.
-- A message still waiting to go, never tried, says only what's still down: it's said again without
-  what came back, and dropped once nothing it tells of is down.
+  everything due then goes in one message, with whatever else has been unreachable for an hour or
+  more: a home internet outage is one message.
+- A message still waiting to go, never tried, says only what's still down: what came back is taken
+  out of it, and nothing else in it changes; it's dropped once nothing it tells of is down. A message
+  about one input alone is never rewritten.
 - The morning digest names an input that has failed for an hour or twice, or that he was told
   about, and one line says which of the ones he knew about came back since the last digest. No
   separate "it's back".
@@ -116,8 +117,8 @@ ADVICE = {
               "https://platform.claude.com/settings/billing . If that's fine, paste a new Anthropic API "
               "key on the Harness page (Settings > Apps > Harness > Open Web UI).",
     "limit": "It picks up again when the monthly limit resets.",
-    "clock": "Restarting the Pi usually sets its clock right: in Home Assistant open Settings > System, "
-             "tap the power button at the top right, then Reboot system.",
+    "clock": "Restarting the Pi usually sets its clock right. In Home Assistant open Settings > System, "
+             "tap the power button at the top right, then Advanced options, then Reboot system.",
 }
 KEEPS_TRYING = "Harness keeps trying, and the morning digest will say when it works again."
 
@@ -254,9 +255,10 @@ class Watch:
             self._quarter = quarter
             if due:
                 names = {r["name"] for r, _ in due}
-                # Whatever else can't be reached, failing a while now too: the same outage, told with it.
+                # Whatever else can't be reached, failing an hour or more too: the same outage, told
+                # with it. A blip of a few minutes isn't.
                 due += [(r, label) for r, label in rows if r["name"] not in names
-                        and r["kind"] == UNREACHABLE and not self._told(r) and worth_naming(r)]
+                        and r["kind"] == UNREACHABLE and not self._told(r) and seen_for(r) >= NAMED_AFTER]
                 self._send(chat_id, due, "other", now)
                 sent += 1
         self.refresh(now)                  # after: a message that just took one over lets it go
@@ -276,8 +278,11 @@ class Watch:
         log.info("input %s: told him it stopped (%s)", ", ".join(r["name"] for r, _ in group), what)
 
     def refresh(self, now: datetime) -> None:
-        """Each message still waiting to go, never tried, says only what is still down: said again
-        without what came back, and dropped once nothing it tells of is down."""
+        """Each message still waiting to go, never tried, says only what is still down. What came back
+        is taken out of it, its line and its own advice, and nothing else changes, so what he was
+        told is never weakened: a refusal never becomes "Harness keeps trying". A message about one
+        input alone is never rewritten (one that came back is dropped: Ledger._reached). One that
+        tells of nothing still down is dropped."""
         waiting = self.ledger.db.execute("SELECT id, text FROM outbox WHERE kind=? AND state='queued'"
                                          " AND attempts=0", (KIND,)).fetchall()
         if not waiting:
@@ -292,11 +297,27 @@ class Watch:
                     db.execute("UPDATE outbox SET state='dropped' WHERE id=? AND state='queued'"
                                " AND attempts=0", (box["id"],))
                 continue
-            text = self.message(group, now)
+            text = self._without_the_rest(box["text"], group)
             if text != box["text"]:
                 with self.ledger.tx() as db:
                     db.execute("UPDATE outbox SET text=? WHERE id=? AND state='queued' AND attempts=0",
                                (text, box["id"]))
+
+    def _without_the_rest(self, text: str, group: list[tuple[sqlite3.Row, str]]) -> str:
+        """A folded message with only the lines of those in `group`: their bullets and their own
+        advice lines, as told. The title follows what's left; the rest stays as written."""
+        lines = text.split("\n")
+        if not any(line.startswith("• ") for line in lines):
+            return text                                    # one input alone: never rewritten
+        bullets = tuple(f"• {self._named(r['name'], label, self._spec(r['name']).stopped)} since "
+                        for r, label in group)
+        own = tuple(f"{self._spec(r['name']).name}: " for r, _ in group)
+        theirs = tuple(f"{s.name}: " for s in SPECS.values())          # one input's own advice line
+        kept = [line for line in lines[1:]
+                if (line.startswith(bullets) if line.startswith("• ")
+                    else line.startswith(own) if line.startswith(theirs) else True)]
+        title = f"<b>{self._spec(group[0][0]['name']).title}</b>" if len(group) == 1 else lines[0]
+        return "\n".join([title] + kept)
 
     # -- what he reads ---------------------------------------------------------------------
     def _spec(self, name: str) -> Spec:
@@ -334,9 +355,19 @@ class Watch:
                                     f"\n\n{self._advice(row)}")
         title = ("Harness can't reach a few things it uses" if all(r["kind"] == UNREACHABLE for r, _ in group)
                  else "A few things Harness uses have stopped working")
-        advice = list(dict.fromkeys(self._advice(row) for row, _ in group))
         body = "\n".join(f"• {self._line(row, label, now)}" for row, label in group)
-        return render.no_dashes(f"<b>{title}</b>\n{body}\n\n" + "\n".join(advice))
+        # Each input's own advice on its own line, starting with its name; "Harness keeps trying" once,
+        # at the end.
+        advice = []
+        for row, label in group:
+            said = self._advice(row)
+            if said == KEEPS_TRYING:
+                continue
+            said = said.removeprefix("Harness keeps trying. ")
+            line = f"{self._named(row['name'], label, self._spec(row['name']).name)}: {said[0].lower()}{said[1:]}"
+            if line not in advice:
+                advice.append(line)
+        return render.no_dashes(f"<b>{title}</b>\n{body}\n\n" + "\n".join(advice + [KEEPS_TRYING]))
 
     # -- the morning digest ------------------------------------------------------------------
     def digest_lines(self) -> tuple[list[str], list[str]]:

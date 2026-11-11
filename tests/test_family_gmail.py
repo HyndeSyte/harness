@@ -152,8 +152,9 @@ class FakeGoogle:
     def _token(self, method, body):
         assert method == "POST"
         self.token_calls += 1
-        if self.token_status != 200:
-            return HttpResponse(self.token_status, {}, b"{}")
+        if self.token_status != 200:              # as Google turns a key down: what it is, not shown
+            return HttpResponse(self.token_status, {}, b'{"error": "invalid_grant", "error_description": '
+                                                       b'"Invalid JWT Signature."}')
         form = parse_qs(body.decode())
         head, claims, sig = form["assertion"][0].split(".")
         pad = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
