@@ -25,7 +25,8 @@ token first, or both will answer.
   until the next morning check-in (7:10 AM, at least two hours away); a Ship card also
   goes when its pull request changes, merges or closes.
 - Tapping an old card does nothing, and says so.
-- Cain's answer to a tap shows as a reply to that card.
+- The card shows what you tapped. When a tap needs words from Cain, they come as a reply
+  to that card.
 
 ## If the calendar specialist stops
 

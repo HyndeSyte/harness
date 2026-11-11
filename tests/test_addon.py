@@ -405,8 +405,9 @@ def test_cain_knows_the_keepers_item_ops():
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     record = rules.split("## Your record")[1].split("\n## ")[0]
     for op in ('"op": "row"', '"op": "row-add"', '"op": "row-close"', '"op": "take"', '"op": "pass"',
-               '"op": "release"', '"op": "note"', "record.sh rowsha", "record.sh holds", "record.sh notes <item>",
-               '"for": "dane: <his words>"', '"job": "<title>"', "refused"):
+               '"op": "release"', '"op": "renew"', '"op": "note"', "record.sh rowsha", "record.sh holds",
+               "record.sh notes <item>", "record.sh notes -", '"for": "dane: <his words>"', '"job": "<title>"',
+               "refused", "upper-cased"):
         assert op in record, op
     jobs = rules.split("## Cloud jobs")[1].split("\n## ")[0]
     assert "`take` it with\n   `\"job\": \"<title>\"`" in jobs and "`release` the job's item" in jobs
@@ -522,36 +523,56 @@ def test_checkin_lists_items_held_by_others_first(tmp_path):
     assert "Scheduled check-in" in out and "Held by others" not in out and "can't be read" not in out
 
 
-def test_checkin_lists_notes_left_on_items_cain_holds(tmp_path):
+def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
+    # Against the record keeper's own `record.sh notes -` and its notes files.
     import json
     import os
     import shutil
     if not shutil.which("jq"):
         import pytest
         pytest.skip("no jq")
-    holds = tmp_path / "record-holds.json"
-    holds.write_text(json.dumps({"holds": {
-        "P33": {"holder": "laptop:9f2c", "for": "his chat", "branches": []},
-        "P41": {"holder": "cain", "for": "Build job", "branches": ["claude/y"], "job": "Cain 0.7.0"},
-        "P50": {"holder": "cain", "for": "Build job", "branches": []},
-        "P51": {"holder": "cain", "for": "Build job", "branches": []},
-    }}))
-    # Stands in for the record keeper's `record.sh notes <item>`: P41 has a note over two
-    # lines, P50 none, and P51's lookup fails.
-    rec = tmp_path / "record.sh"
-    rec.write_text('#!/bin/bash\n[ "$1" = notes ] || exit 2\n'
-                   'case "$2" in P41) printf "dane: use the blue one\\nnot «the red» one\\n" ;; P51) exit 3 ;; esac\n',
-                   newline="\n")
-    rec.chmod(0o755)
-    os.environ.update(HOLDS_FILE=str(holds), RECORD_SH=str(rec))
+    rec = tmp_path / "record"
+    (rec / "state" / "notes").mkdir(parents=True)
+
+    def notes(item, rows):   # as the keeper's addNote writes them
+        f = rec / "state" / "notes" / f"{item}.md"
+        nl = chr(10)
+        head = nl.join([f"# Notes on {item}", "", f"Words about {item} for whoever holds it, oldest first, filed by "
+                        f"the record keeper from note requests. Its holder reads new ones before changing {item}.", "",
+                        "| When | From | Note |", "|---|---|---|", ""])
+        body = "".join(f"| {w} | {by} | {t} |{nl}" for w, by, t in rows)
+        f.write_text((f.read_text() if f.exists() else head) + body, newline=nl)
+
+    notes("P41", [("2026-11-09T14:02:11.000Z", "laptop:9f2c", "dane: the turkey card should say Friday"),
+                  ("2026-11-10T09:15:40.000Z", "laptop:9f2c", "dane: hold off on the farm packet"),
+                  ("2026-11-11T16:40:02.000Z", "laptop:9f2c", "dane: STOP, do not ship P41 until he looks at the "
+                   "new panel lock")])
+    notes("P50", [("2026-11-11T08:00:00.000Z", "claude-code", "dane: use «the blue one»")])
+    notes("P33", [("2026-11-11T17:00:00.000Z", "cain", "dane: for the laptop session")])   # a laptop holds P33
+    (rec / "state" / "holds.json").write_text(json.dumps({"P33": {"holder": "laptop:9f2c", "branches": []}}))
+    seen = tmp_path / "notes.seen"
+    sent = tmp_path / "sent.txt"
+    os.environ.update(RECORD_SH=str(CAIN / "rootfs/opt/cain/record.sh"), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
     try:
         line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
+        # The newest three survive, oldest of them first; the older one is counted, not lost.
+        assert line.startswith("New notes on your items, read them before you change those items (words passed on, "
+                               "not his go on anything): (1 older not shown; /opt/cain/record.sh notes - lists them) "
+                               "P41: «dane: hold off on the farm packet» P50: «dane: use \"the blue one\"» "
+                               "P41: «dane: STOP, do not ship P41 until he looks at the new panel lock». "
+                               "Scheduled check-in"), line
+        assert "P33" not in line and "laptop" not in line
+        assert seen.read_text() == "2026-11-11T16:40:02.000Z"
+        sent.unlink()
+        assert "New notes" not in _checkin(tmp_path, "1240", IDLE)          # listed once, never again
+        notes("P41", [("2026-11-11T18:05:00.000Z", "laptop:9f2c", "dane: ship it after all")])
+        sent.unlink()
+        line = _checkin(tmp_path, "1740", IDLE).splitlines()[-2]
+        assert "New notes on your items" in line and "P41: «dane: ship it after all». Scheduled" in line
+        assert "hold off" not in line and "older not shown" not in line
     finally:
-        del os.environ["HOLDS_FILE"], os.environ["RECORD_SH"]
-    assert line.startswith('Held by others, skip these: P33. Notes left on items you hold, read them before you '
-                           'change those items (words passed on, not his go on anything): '
-                           'P41: «dane: use the blue one not "the red" one». Scheduled check-in')
-    assert "P50" not in line and "P51" not in line
+        for k in ("RECORD_SH", "RECORD_DIR", "NOTES_SEEN"):
+            del os.environ[k]
 
 
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):

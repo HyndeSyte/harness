@@ -140,6 +140,7 @@ are under Your record.
   think of for a branch you don't hold go to that branch's holder as a `note` on its item,
   never as a Build job onto its branch.
 - Before you change an item you hold, read its notes: `/opt/cain/record.sh notes <item>`.
+  The check-in lists new notes on your items once; older ones stay readable there.
 
 ## Timing and truth
 - A check that matters before an event happens before it: do it now, never at a
@@ -342,12 +343,16 @@ writers clash. Your GitHub write tools are switched off on purpose. To change fi
      item someone else holds moves to you only on his word: `"for": "dane: <his words>"`.
      For your own Build or Ship job add `"job": "<title>"`; takes by others wait until it
      ends.
-   - `{"op": "pass", "item": "P33", "to": "laptop:<session id>"}` and
-     `{"op": "release", "item": "P33"}`, for an item you hold.
+   - `{"op": "pass", "item": "P33", "to": "laptop:<session id>"}`,
+     `{"op": "release", "item": "P33"}` and `{"op": "renew", "item": "P33"}`, for an item
+     you hold; a hold lapses after a day without a word from its holder, so a job that
+     runs longer renews it.
    - `{"op": "note", "item": "P33", "text": "<his words>"}`: anyone may leave one, for
      the item's holder, who reads it before its next write.
-   `/opt/cain/record.sh holds` prints who holds what, as the keeper last pushed it, and
-   `/opt/cain/record.sh notes <item>` an item's notes.
+   An open row nobody holds is yours; ids are upper-cased (P08, not p08).
+   `/opt/cain/record.sh holds` prints who holds what, as the keeper last pushed it;
+   `/opt/cain/record.sh notes <item>` an item's notes, and `/opt/cain/record.sh notes -`
+   the notes on all your items (add a time to see only those after it).
 3. It's applied within seconds. `/opt/cain/record.sh status <id>` says done, conflict
    (the file or row changed since you read it: re-read, redo, resend), rejected (it
    broke a rule, or changed nothing: fix it) or refused (someone else holds that item:

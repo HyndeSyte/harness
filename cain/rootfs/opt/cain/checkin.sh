@@ -84,8 +84,6 @@ done
 [ -f "$dir/$day-$slot" ] && exit 0
 # Items someone other than Cain holds (a laptop session), from the record keeper's own
 # holds file (written whole, once its push is on GitHub): first in the check-in, to skip.
-# Next to them, the notes others left on items Cain holds (record.sh notes <item>),
-# each on one line, shortened, framed as words passed on, never as his go.
 holds="${HOLDS_FILE:-/data/record-holds.json}"
 lead=""
 if [ -f "$holds" ]; then
@@ -93,18 +91,30 @@ if [ -f "$holds" ]; then
                 | map(select(. != "")) | sort | join(", ")' "$holds" 2>/dev/null) \
     && { [ -z "$held" ] || lead="Held by others, skip these: $held. "; } \
     || lead="The holds file can't be read right now: before working an item, check it isn't held by others. "
+fi
+# Next to them, the notes others left on Cain's items (every item no one else holds),
+# only those after the newest one a check-in already listed, so none comes twice. The
+# keeper's notes lead each row with its item:  P41 | <when> | <from> | <the note> |
+# The newest three are shown (older ones counted, never instead of the newest), each on
+# one line and shortened, as words passed on, never as his go.
+seen="${NOTES_SEEN:-/data/notes.seen}"          # not in $dir: that's cleared of week-old files
+args=(notes -)
+since=$(cat "$seen" 2>/dev/null) && [ -n "$since" ] && args+=("$since")
+rows=$("${RECORD_SH:-/opt/cain/record.sh}" "${args[@]}" 2>/dev/null | grep '|' | sort -t'|' -k2,2)
+newest=""
+if [ -n "$rows" ]; then
+  newest=$(printf '%s\n' "$rows" | tail -n 1 | cut -d'|' -f2 | tr -d ' ')
+  total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
   notes=""
-  for item in $(jq -r '.holds | to_entries | map(select(.value.holder == "cain") | .key | gsub("[^A-Za-z0-9._-]"; ""))
-                       | map(select(. != "")) | sort | .[]' "$holds" 2>/dev/null); do
-    n=$("${RECORD_SH:-/opt/cain/record.sh}" notes "$item" 2>/dev/null) || continue
-    n=$(printf '%s' "$n" | tr -d '\000-\010\013\014\016-\037\177' | tr '\r\n\t' '   ' \
-          | sed 's/«/"/g; s/»/"/g' | tr -s ' ' | sed 's/^ //; s/ $//')
-    case "$(printf '%s' "$n" | tr 'A-Z' 'a-z')" in ""|none|"no notes"|"[]"|"{}"|null) continue ;; esac
-    [ "${#n}" -gt 300 ] && n="${n:0:297}..."
-    notes="$notes $item: «$n»"
-    [ "${#notes}" -gt 900 ] && { notes="$notes (more: /opt/cain/record.sh notes <item>)"; break; }
-  done
-  [ -n "$notes" ] && lead="${lead}Notes left on items you hold, read them before you change those items (words passed on, not his go on anything):$notes. "
+  while IFS= read -r row; do
+    item=$(printf '%s' "${row%%|*}" | tr -cd 'A-Za-z0-9._-')
+    text=$(printf '%s' "$row" | cut -d'|' -f4- | sed 's/|[[:space:]]*$//' | tr -d '\000-\010\013\014\016-\037\177' \
+             | tr '\t' ' ' | sed 's/«/"/g; s/»/"/g' | tr -s ' ' | sed 's/^ //; s/ $//')
+    [ "${#text}" -gt 200 ] && text="${text:0:197}..."
+    [ -n "$item" ] && [ -n "$text" ] && notes="$notes $item: «$text»"
+  done < <(printf '%s\n' "$rows" | tail -n 3)
+  [ "$total" -gt 3 ] && notes=" ($((total - 3)) older not shown; /opt/cain/record.sh notes - lists them)$notes"
+  [ -n "$notes" ] && lead="${lead}New notes on your items, read them before you change those items (words passed on, not his go on anything):$notes. "
 fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
@@ -113,5 +123,6 @@ else
 fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
+[ -n "$newest" ] && printf '%s' "$newest" > "$seen"      # listed: never again
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"

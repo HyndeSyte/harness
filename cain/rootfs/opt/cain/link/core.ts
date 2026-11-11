@@ -201,7 +201,8 @@ function checkMeta(m: { item?: unknown; question?: unknown; replyTo?: unknown })
   if (question && !QUESTION.test(question)) throw new Refusal("question must be a short id like Q2");
   const replyTo = m.replyTo === undefined || m.replyTo === null || m.replyTo === "" ? undefined : String(m.replyTo).trim();
   if (replyTo !== undefined && !SNOWFLAKE.test(replyTo)) throw new Refusal("reply_to must be a Discord message id");
-  return { item: item.toLowerCase() === "none" ? "none" : item, question, replyTo };
+  // Ids are upper-cased everywhere, as the record keeper keeps them: "p08 q2" is P08 Q2.
+  return { item: item.toLowerCase() === "none" ? "none" : item.toUpperCase(), question: question.toUpperCase(), replyTo };
 }
 
 // Cards for the same item and question replace each other; so do Ship cards for the
