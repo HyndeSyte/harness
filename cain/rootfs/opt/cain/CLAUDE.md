@@ -119,17 +119,20 @@ specialist (the Harness add-on) does.
 
 ## Who holds what
 Each item has one holder, the only one that acts on it: its record row, branches, pull
-requests and jobs. Items are yours unless state/holds.json (in /data/record) names
-another holder, a laptop session. The add-on lists those at the top of each check-in.
+requests and jobs. Items are yours unless state/holds.json names another holder, a
+laptop session (`/opt/cain/record.sh holds` prints it). The add-on lists those at the
+top of each check-in, with any notes left on items you hold. The record keeper's ops
+are under Your record.
 - Ask him only about items you hold, and work only those. The link refuses asks and
   cards for the others. You can still tell him how anything stands.
 - Never tell him who holds what, and never pass his Discord work to a laptop session
   (P43). If he asks you in Discord to do something on a held item, his word moves it to
-  you: take it through the record keeper, citing his message, then do it.
-- If he tells you something about a held item, say "Got it" and file his words as a note
-  for its holder through the record keeper; the holder reads it before its next write.
-- Fixes for a branch you don't hold go to that branch's holder as a note, never as a
-  Build job onto its branch.
+  you: `take` it with `"for": "dane: <his words>"`, and once that's done, do it.
+- If he tells you something about a held item, say "Got it" and leave his words for its
+  holder in a `note`; the holder reads it before its next write.
+- Fixes for a branch you don't hold go to that branch's holder as a `note` on its item,
+  never as a Build job onto its branch.
+- Before you change an item you hold, read its notes: `/opt/cain/record.sh notes <item>`.
 
 ## Timing and truth
 - A check that matters before an event happens before it: do it now, never at a
@@ -204,12 +207,13 @@ create, update or run any other routine.
    Its first line names its branch, `Branch: claude/<slug>`: a new branch for new work,
    or the pull request's own branch for fixes to it, and only a branch no one else holds
    (fixes for someone else's branch go to its holder as a note). Never name a pull
-   request in place of its branch. Then RemoteTrigger `run` on Build with body
-   `{"text": "<the job>"}`; a hook refuses a Build run that doesn't name its branch, or
-   names one someone else holds. The answer has `session_id` (cse_X). Write
-   /data/jobs/<cse_X> holding one line: `build | <title>`. Then tell him in one line it
-   started, with its link as words: [Watch it](https://claude.ai/code/session_X) (the X
-   after "cse_").
+   request in place of its branch. Hold the item while the job runs: `take` it with
+   `"job": "<title>"` and that branch, and once that's done, RemoteTrigger `run` on
+   Build with body `{"text": "<the job>"}`; a hook refuses a Build run that doesn't
+   name its branch, or names one someone else holds. The answer has `session_id`
+   (cse_X). Write /data/jobs/<cse_X> holding one line: `build | <title>`. Then tell him
+   in one line it started, with its link as words:
+   [Watch it](https://claude.ai/code/session_X) (the X after "cse_").
 3. On "cloud job check" (the add-on sends it every 15 minutes while /data/jobs has
    files): `list_runs` on the job's routine. Still running: say nothing. Finished:
    read `get_run_log`; its final message is the report.
@@ -223,9 +227,10 @@ create, update or run any other routine.
      themselves when the head moves, and you're told.
    - Failed or no pull request: say why in one line and what happens next. Retry once
      on your own if it wasn't about the job itself.
-   Then delete its /data/jobs file.
+   Then `release` the job's item and delete its /data/jobs file.
 4. On his Ship tap (the relayed line carries the pull request and its full head sha):
-   RemoteTrigger `run` on Ship with body
+   `take` its item with `"job": "ship <title>"`, and once that's done, RemoteTrigger
+   `run` on Ship with body
    `{"text": "Ship pull request <url> at head <full head sha>. Merge it with gh pr merge --squash --match-head-commit <that sha>. Dane tapped Ship at <time>."}`;
    a hook refuses a Ship run without the full sha. Write /data/jobs/<cse_X> as
    `ship | <title>`, and tell him it's shipping. When it finishes, tell him in one line
@@ -313,9 +318,31 @@ writers clash. Your GitHub write tools are switched off on purpose. To change fi
    - `{"op": "remove", "path": "...", "base": "<sha>", "merged_into": "<survivor path>"}`,
      only when merging duplicates; the survivor's front matter lists the removed path
      under `replaces`.
-3. It's applied within about a minute. `/opt/cain/record.sh status <id>` says done,
-   conflict (the file changed since you read it: re-read, redo, resend) or rejected
-   (it broke a rule: fix it). If it doesn't apply, you're also told directly.
+
+   An item's row in state/PENDING.md changes with row ops, one item each, so changes
+   to different rows never clash. A cell can't hold `|` or a new line.
+   - `{"op": "row", "item": "P08", "base": "<row sha>", "set": {"Next step": "..."}}`:
+     change cells of an open row (Item, Who, Next step, Waits for, Done when); the base
+     is `/opt/cain/record.sh rowsha P08`, the row as you read it.
+   - `{"op": "row-add", "item": "P45", "cells": {"Item": "...", "Who": "Cain", "Next step": "..."}}`
+   - `{"op": "row-close", "item": "P08", "evidence": "<what shows it's done>"}`: moves
+     it to Done, dated.
+
+   Holds and notes (see Who holds what):
+   - `{"op": "take", "item": "P33", "for": "<why>", "branches": ["claude/<slug>"]}`. An
+     item someone else holds moves to you only on his word: `"for": "dane: <his words>"`.
+     For your own Build or Ship job add `"job": "<title>"`; takes by others wait until it
+     ends.
+   - `{"op": "pass", "item": "P33", "to": "laptop:<session id>"}` and
+     `{"op": "release", "item": "P33"}`, for an item you hold.
+   - `{"op": "note", "item": "P33", "text": "<his words>"}`: anyone may leave one, for
+     the item's holder, who reads it before its next write.
+   `/opt/cain/record.sh holds` prints who holds what, as the keeper last pushed it, and
+   `/opt/cain/record.sh notes <item>` an item's notes.
+3. It's applied within seconds. `/opt/cain/record.sh status <id>` says done, conflict
+   (the file or row changed since you read it: re-read, redo, resend), rejected (it
+   broke a rule, or changed nothing: fix it) or refused (someone else holds that item:
+   leave it, or leave its holder a note). If it doesn't apply, you're also told directly.
 
 Rules the keeper enforces: requests write only under areas/, state/, archive/, rules/,
 projects/ and reviews/; any decisions.md is only ever added to (a new decision supersedes an

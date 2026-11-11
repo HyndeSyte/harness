@@ -9,6 +9,7 @@
 - **Exact questions.** Each card names its item and question, and its buttons answer that question ("Filed", "Not filed", "Not sure"). What you tap is recorded exactly as you tapped it, never as something read into it.
 - **Ship is pinned.** A Ship card is for one exact version of the pull request. If it changes before it merges, GitHub refuses the merge and you get a fresh card.
 - **No crossed wires with laptop sessions.** Cain leaves alone what a laptop session is working on: he won't ask you about it or build on its branch, and he never hands your Discord requests to a laptop. Cloud jobs can't send you notifications; only Cain talks to you.
+- **Your words land.** Tell Cain something about an item a laptop session is working on and he passes it on as a note; notes others leave on what Cain is working on reach him at each check-in.
 - **True words.** Cain says something was asked, sent or done only once it's confirmed, checks what matters before an event rather than after, and keeps timestamps and job ids out of what you see.
 
 ## 0.6.0

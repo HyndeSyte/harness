@@ -394,6 +394,23 @@ def test_cloud_jobs_in_this_repo_cannot_notify_him():
     assert "PushNotification" in deny
 
 
+def test_cain_cannot_edit_the_keepers_own_holds():
+    import json
+    deny = json.loads((CAIN / "rootfs/opt/cain/settings.json").read_text())["permissions"]["deny"]
+    assert {"Edit(//data/record-holds.json)", "Edit(//data/record-holds.json.next)"} <= set(deny)
+
+
+def test_cain_knows_the_keepers_item_ops():
+    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
+    record = rules.split("## Your record")[1].split("\n## ")[0]
+    for op in ('"op": "row"', '"op": "row-add"', '"op": "row-close"', '"op": "take"', '"op": "pass"',
+               '"op": "release"', '"op": "note"', "record.sh rowsha", "record.sh holds", "record.sh notes <item>",
+               '"for": "dane: <his words>"', '"job": "<title>"', "refused"):
+        assert op in record, op
+    jobs = rules.split("## Cloud jobs")[1].split("\n## ")[0]
+    assert "`take` it with\n   `\"job\": \"<title>\"`" in jobs and "`release` the job's item" in jobs
+
+
 def test_cains_cards_are_exact_and_his_words_true():
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     asking = rules.split("## Asking him")[1].split("\n## ")[0]
@@ -403,7 +420,8 @@ def test_cains_cards_are_exact_and_his_words_true():
         assert must in asking, must
     holds = rules.split("## Who holds what")[1].split("\n## ")[0]
     for must in ("state/holds.json", "Ask him only about items you hold", "Never tell him who holds what",
-                 "never pass his Discord work to a laptop session", "(P43)", '"Got it"', "as a note"):
+                 "never pass his Discord work to a laptop session", "(P43)", '"Got it"', "in a `note`",
+                 "as a `note` on its item", "read its notes"):
         assert must in holds, must
     timing = rules.split("## Timing and truth")[1].split("\n## ")[0]
     for must in ("happens before it", '"asked", "sent", "started" or "done" only once', "ISO timestamps",
@@ -500,6 +518,38 @@ def test_checkin_lists_items_held_by_others_first(tmp_path):
     fresh.mkdir()
     out = _checkin(fresh, "0712", IDLE)                         # no holds file yet: nothing said
     assert "Scheduled check-in" in out and "Held by others" not in out and "can't be read" not in out
+
+
+def test_checkin_lists_notes_left_on_items_cain_holds(tmp_path):
+    import json
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    holds = tmp_path / "holds.json"
+    holds.write_text(json.dumps({
+        "P33": {"holder": "laptop:9f2c", "for": "his chat", "branches": []},
+        "P41": {"holder": "cain", "for": "Build job", "branches": ["claude/y"], "job": "Cain 0.7.0"},
+        "P50": {"holder": "cain", "for": "Build job", "branches": []},
+        "P51": {"holder": "cain", "for": "Build job", "branches": []},
+    }))
+    # Stands in for the record keeper's `record.sh notes <item>`: P41 has a note over two
+    # lines, P50 none, and P51's lookup fails.
+    rec = tmp_path / "record.sh"
+    rec.write_text('#!/bin/bash\n[ "$1" = notes ] || exit 2\n'
+                   'case "$2" in P41) printf "dane: use the blue one\\nnot «the red» one\\n" ;; P51) exit 3 ;; esac\n',
+                   newline="\n")
+    rec.chmod(0o755)
+    os.environ.update(HOLDS_FILE=str(holds), RECORD_SH=str(rec))
+    try:
+        line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
+    finally:
+        del os.environ["HOLDS_FILE"], os.environ["RECORD_SH"]
+    assert line.startswith('Held by others, skip these: P33. Notes left on items you hold, read them before you '
+                           'change those items (words passed on, not his go on anything): '
+                           'P41: «dane: use the blue one not "the red" one». Scheduled check-in')
+    assert "P50" not in line and "P51" not in line
 
 
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):

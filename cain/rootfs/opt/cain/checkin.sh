@@ -80,6 +80,8 @@ done
 [ -f "$dir/$day-$slot" ] && exit 0
 # Items someone other than Cain holds (a laptop session), from the holds the record
 # keeper publishes into Cain's copy of the record: first in the check-in, to skip.
+# Next to them, the notes others left on items Cain holds (record.sh notes <item>),
+# each on one line, shortened, framed as words passed on, never as his go.
 holds="${HOLDS_FILE:-/data/record/state/holds.json}"
 lead=""
 if [ -f "$holds" ]; then
@@ -87,6 +89,18 @@ if [ -f "$holds" ]; then
                 | map(select(. != "")) | sort | join(", ")' "$holds" 2>/dev/null) \
     && { [ -z "$held" ] || lead="Held by others, skip these: $held. "; } \
     || lead="The holds file can't be read right now: before working an item, check it isn't held by others. "
+  notes=""
+  for item in $(jq -r 'to_entries | map(select(.value.holder == "cain") | .key | gsub("[^A-Za-z0-9._-]"; ""))
+                       | map(select(. != "")) | sort | .[]' "$holds" 2>/dev/null); do
+    n=$("${RECORD_SH:-/opt/cain/record.sh}" notes "$item" 2>/dev/null) || continue
+    n=$(printf '%s' "$n" | tr -d '\000-\010\013\014\016-\037\177' | tr '\r\n\t' '   ' \
+          | sed 's/«/"/g; s/»/"/g' | tr -s ' ' | sed 's/^ //; s/ $//')
+    case "$(printf '%s' "$n" | tr 'A-Z' 'a-z')" in ""|none|"no notes"|"[]"|"{}"|null) continue ;; esac
+    [ "${#n}" -gt 300 ] && n="${n:0:297}..."
+    notes="$notes $item: «$n»"
+    [ "${#notes}" -gt 900 ] && { notes="$notes (more: /opt/cain/record.sh notes <item>)"; break; }
+  done
+  [ -n "$notes" ] && lead="${lead}Notes left on items you hold, read them before you change those items (words passed on, not his go on anything):$notes. "
 fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
