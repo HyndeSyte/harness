@@ -115,16 +115,29 @@ def test_cain_config_denies_every_api_and_mapping():
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099" and cfg["panel_admin"] == "true"
     assert cfg["init"] == "false"
     # Keys (the record keeper's GitHub token, the review runner's three API keys) as
-    # password fields, and the review caps as bounded numbers. Nothing else.
+    # password fields, the review caps as bounded numbers, and the panel's owner (a
+    # Home Assistant user id, not a key). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        "  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\nschema:\n"
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n")
+        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n")
+
+
+def test_cain_owner_user_id_takes_a_user_id_or_nothing():
+    # Configuration checks owner_user_id when it's saved. Supervisor runs match() on any
+    # value that's there, optional or not, so the pattern takes the default "" too.
+    text = (CAIN / "config.yaml").read_text()
+    pattern = re.search(r"^  owner_user_id: match\((.*)\)\?$", text, re.M).group(1)
+    owner = "0123456789abcdef0123456789abcdef"
+    for ok in ("", owner):
+        assert re.match(pattern, ok), ok                      # voluptuous' Match is re.match
+    for bad in (owner[1:], owner + "0", owner.upper(), owner[:31] + "g", owner + '";}', " " + owner):
+        assert not re.match(pattern, bad), bad
 
 
 def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
@@ -231,6 +244,42 @@ def test_cain_start_survives_bashio_errexit():
     # session to kill) must not end the script. 0.1.0 and 0.1.1 died here.
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
     assert "kill-session -t cain 2>/dev/null || true" in run
+
+
+def test_cain_scripts_unset_the_supervisor_token_before_starting_anything():
+    # Supervisor's token reaches /addons/self: this App's own options, owner_user_id
+    # included. Both service scripts unset it before they start anything, so nothing
+    # they start (Cain's session, nginx, ttyd, the helpers) has it in its environment.
+    # bashio keeps its own unexported copy (bashio.sh declares __BASHIO_SUPERVISOR_TOKEN
+    # when it loads), so their option reads, in subshells too, still work.
+    import os, shutil, subprocess
+    unset = "unset SUPERVISOR_TOKEN HASSIO_TOKEN"
+    prefixes = {}
+    for name in ("cain", "terminal"):
+        lines = (CAIN / f"rootfs/etc/services.d/{name}/run").read_text().splitlines()
+        assert unset in lines, name
+        at = lines.index(unset)
+        ran = [l for l in lines[1:at] if l.strip() and not l.lstrip().startswith("#")]
+        assert all(l.startswith("export ") for l in ran), (name, ran)       # nothing starts before it
+        after = [l for l in lines[at + 1:] if not l.lstrip().startswith("#")]
+        assert not any(re.search(r"SUPERVISOR_TOKEN|HASSIO_TOKEN", l) for l in after), name  # nor puts it back
+        prefixes[name] = "\n".join(lines[1:at + 1])
+    bash = shutil.which("bash")
+    if not bash:
+        import pytest
+        pytest.skip("no bash")
+    env = dict(os.environ, SUPERVISOR_TOKEN="supervisor-secret", HASSIO_TOKEN="hassio-secret")
+    for name, prefix in prefixes.items():
+        script = ("declare __BASHIO_SUPERVISOR_TOKEN=${SUPERVISOR_TOKEN:-}\n"   # as bashio.sh does at load
+                  f"{prefix}\n"
+                  'echo "shell:$__BASHIO_SUPERVISOR_TOKEN"; ( echo "subshell:$__BASHIO_SUPERVISOR_TOKEN" )\n'
+                  "env\n")
+        out = subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True,
+                             timeout=20, check=True).stdout
+        assert "shell:supervisor-secret\nsubshell:supervisor-secret\n" in out, name
+        started = out.split("subshell:supervisor-secret\n", 1)[1]           # what a started program gets
+        assert not re.search(r"^(SUPERVISOR_TOKEN|HASSIO_TOKEN|__BASHIO_SUPERVISOR_TOKEN)=", started, re.M), name
+        assert "-secret" not in started, name
 
 
 def test_cain_signin_link_is_rejoined(tmp_path):

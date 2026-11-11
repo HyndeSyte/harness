@@ -6,7 +6,9 @@ plugin (research preview) and your Claude plan; no API key.
 
 ## Set up (once)
 
-1. Install and start the add-on. Leave auto-update off.
+1. Install the App and leave auto-update off. In its Configuration, set
+   `owner_user_id` to your Home Assistant user id (see **Who can open the panel**),
+   then start it.
 2. Open the **Cain** panel. It shows the Claude Code session.
 3. Sign in to Claude when it asks (the link opens in your browser; paste the code back).
 4. Type `/discord:configure` and your bot token. Then `/discord:access pair <code>`
@@ -15,6 +17,22 @@ plugin (research preview) and your Claude plan; no API key.
 
 Only one place may run the bot at a time. Stop any other session using the same
 token first, or both will answer.
+
+## Who can open the panel
+
+The panel is a live terminal into Cain's session, so it opens for one Home Assistant
+user only: the one whose user id is in `owner_user_id`. Home Assistant tells the App
+who is signed in, and anyone else gets Forbidden. While `owner_user_id` is empty, the
+panel answers Forbidden to everyone, you included. The App's log says which at each
+start. This needs Supervisor 2026.10.3 or later (Settings, About).
+
+It keeps other users out, not other Home Assistant admins: an admin can change
+`owner_user_id`.
+
+To find your user id, turn on **Advanced mode** in your user profile. Then go to
+Settings, People, **Users** and open your user: the id is the 32 letters and digits
+shown there. Put it in `owner_user_id` in this App's Configuration, save, and restart
+the App.
 
 ## Cards and questions
 
