@@ -7,18 +7,23 @@
 // Safety rules: a request leaves its queue only after the commit carrying it is
 // confirmed on GitHub; any git failure ends the round with nothing let go; a
 // request id is applied at most once; nothing is written through a link.
+// Holds (who holds which item) are the keeper's own: its copy in /data is the one
+// that counts, and the record's state/holds.json is put back to it if it drifts.
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, appendFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { parseRequest, plan, hygiene, hygieneReport, clean, type Outcome, type Request, type Tree } from "./core.ts";
+import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
+  type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; relay: string;
   branch: string; token?: string; hygieneAt: string; tz: string; now?: () => Date;
+  holds?: string;   // the keeper's own copy of the holds; default /data/record-holds.json (next to the queue)
 };
 
 const MAX_RAW = 1_000_000;
 const MAX_NOTE = 2_000;
+const DOWN_AFTER_MS = 5 * 60_000;   // this long between good rounds counts as keeper downtime
 const log = (m: string) => console.log(`[record] ${m}`);
 
 export function blobSha(content: string): string {
@@ -75,7 +80,13 @@ function tree(cfg: Config): Tree {
     if (!existsSync(f) || !linkFree(cfg, p)) return null;
     return lstatSync(f).isFile() ? readFileSync(f, "utf8") : null;
   };
-  return { read, sha: (p) => { const t = read(p); return t === null ? null : blobSha(t); },
+  // An earlier version of a file, by the blob sha a writer read it at.
+  const blob = (sha: string) => {
+    if (!/^[0-9a-f]{40}$/.test(sha)) return null;
+    const p = Bun.spawnSync(["git", "cat-file", "blob", sha], { cwd: cfg.dir, stdout: "pipe", stderr: "pipe" });
+    return p.exitCode === 0 ? p.stdout.toString() : null;
+  };
+  return { read, sha: (p) => { const t = read(p); return t === null ? null : blobSha(t); }, blob,
     isDir: (p) => { const f = join(cfg.dir, p); return existsSync(f) && lstatSync(f).isDirectory(); } };
 }
 
@@ -88,12 +99,13 @@ function readRequest(file: string): { req?: Request; error?: string } {
   return parseRequest(readFileSync(file, "utf8"));
 }
 
+const jsonNames = (d: string) => readdirSync(d).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort();
+
 function pending(cfg: Config): Pending[] {
   const out: Pending[] = [];
   mkdirSync(cfg.queue, { recursive: true });
   // Names starting with "." are still being written (record.sh copies, then renames).
-  const names = (d: string) => readdirSync(d).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort();
-  for (const name of names(cfg.queue)) {
+  for (const name of jsonNames(cfg.queue)) {
     const local = join(cfg.queue, name);
     const r = readRequest(local);
     // The local queue is Cain's alone: what's in it is from Cain, never a note from Dane.
@@ -102,13 +114,18 @@ function pending(cfg: Config): Pending[] {
     out.push({ ...(r.error ? { error: r.error, req: r.req } : r), local, name });
   }
   const inbox = join(cfg.dir, "inbox");
-  if (existsSync(inbox) && linkFree(cfg, "inbox")) for (const name of names(inbox)) {
+  if (existsSync(inbox) && linkFree(cfg, "inbox")) for (const name of jsonNames(inbox)) {
     const r = readRequest(join(inbox, name));
     if (r.req && (r.req.from === "cain" || r.req.id.startsWith("cain-"))) r.error = "requests in inbox/ can't speak for Cain";
     else if (r.req?.kind === "note" && r.req.from !== "page") r.error = "notes come only from Dane's page";
     out.push({ ...(r.error ? { error: r.error, req: r.req } : r), repoPath: `inbox/${name}`, name });
   }
   return out;
+}
+
+// Cain's queue has something in it (cheap: no git).
+export function queued(cfg: Config): boolean {
+  return existsSync(cfg.queue) && jsonNames(cfg.queue).length > 0;
 }
 
 function seenIds(cfg: Config): Set<string> {
@@ -134,59 +151,224 @@ function logOutcome(cfg: Config, o: Outcome) {
 
 const outcomeFile = (cfg: Config, id: string) => join(cfg.outcomes, `${id.replace(/[^A-Za-z0-9._:-]/g, "_")}.json`);
 
+// ---- The keeper's own state, in /data: the holds, takes waiting behind Cain's
+// jobs, and when the keeper was last able to work (for its downtime). ----
+
+type Waiting = { req: Request; since: string; local: boolean };
+type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downtime };
+
+const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
+
+function writeAtomic(file: string, text: string) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, text);
+  renameSync(tmp, file);
+}
+
+function revive(j: any): State | null {
+  if (!j || typeof j !== "object") return null;
+  const holds = parseHolds(JSON.stringify(j.holds ?? {}));
+  if (!holds) return null;
+  const waiting: Waiting[] = [];
+  for (const w of Array.isArray(j.waiting) ? j.waiting : []) {
+    const r = parseRequest(JSON.stringify(w?.req ?? null));
+    if (r.req && !r.error && typeof w.since === "string") waiting.push({ req: r.req, since: w.since, local: w.local === true });
+  }
+  const downtime = (Array.isArray(j.downtime) ? j.downtime : [])
+    .filter((d: any) => Array.isArray(d) && d.length === 2 && d.every((x: any) => typeof x === "string" && !Number.isNaN(Date.parse(x))));
+  return { holds, waiting, alive: typeof j.alive === "string" ? j.alive : undefined, downtime };
+}
+
+function publishedHolds(cfg: Config): string | null {
+  const f = join(cfg.dir, HOLDS_PATH);
+  if (!existsSync(f) || !linkFree(cfg, HOLDS_PATH) || !lstatSync(f).isFile()) return null;
+  return readFileSync(f, "utf8");
+}
+
+function publish(cfg: Config, holds: Holds) {
+  if (!linkFree(cfg, HOLDS_PATH)) throw new Error(`${HOLDS_PATH} is behind a link`);
+  const f = join(cfg.dir, HOLDS_PATH);
+  mkdirSync(dirname(f), { recursive: true });
+  writeFileSync(f, holdsText(holds));
+}
+
+function loadState(cfg: Config): State {
+  const file = stateFile(cfg);
+  let st: State | null = null;
+  if (existsSync(file)) {
+    try { st = revive(JSON.parse(readFileSync(file, "utf8"))); } catch { st = null; }
+    if (!st) {
+      // Set aside, and the copy the keeper last published stands in.
+      renameSync(file, `${file}.bad-${Date.now()}`);
+      log("the keeper's copy of the holds couldn't be read; set aside, starting from the record's copy");
+      st = { holds: parseHolds(publishedHolds(cfg)) ?? {}, waiting: [], downtime: [] };
+    }
+  }
+  // First start (a new install, or /data lost): what the keeper last published.
+  st ??= { holds: parseHolds(publishedHolds(cfg)) ?? {}, waiting: [], downtime: [] };
+  // A round that stopped between its push and saving this: its journal says what it
+  // pushed. Kept only if that push is on GitHub; otherwise its requests are still
+  // queued and run again.
+  const next = `${file}.next`;
+  if (existsSync(next)) {
+    try {
+      const j = JSON.parse(readFileSync(next, "utf8"));
+      if (typeof j.commit !== "string" || !/^[0-9a-f]{40}$/.test(j.commit)) throw new Error("no commit");
+      git(cfg, ["merge-base", "--is-ancestor", j.commit, `origin/${cfg.branch}`]);
+      const landed = revive(j.state);
+      if (landed) { st = landed; writeAtomic(file, JSON.stringify(st)); }
+    } catch { /* never landed */ }
+    rmSync(next, { force: true });
+  }
+  return st;
+}
+
+// The keeper worked just now. A long gap since the last time is downtime: holds
+// don't age through it, since nobody could renew them.
+function beat(cfg: Config, st: State, now: Date) {
+  if (st.alive && now.getTime() - Date.parse(st.alive) > DOWN_AFTER_MS) st.downtime.push([st.alive, now.toISOString()]);
+  st.alive = now.toISOString();
+  st.downtime = st.downtime.filter(([, b]) => now.getTime() - Date.parse(b) < 30 * 86_400_000).slice(-200);
+  writeAtomic(stateFile(cfg), JSON.stringify(st));
+}
+
+const message = (o: Outcome) => o.state === "done"
+  ? `${o.summary} (request ${o.id}, from ${o.from})`
+  : `Request ${o.id} ${o.state}: ${o.reason ?? "relayed to Cain"}`;
+
+// Once GitHub has it: the status file for Cain's own requests, and what Cain must hear.
+function report(cfg: Config, o: Outcome, local: boolean, req: Request | undefined, unreadable: boolean) {
+  // Status files are for Cain's own requests, so an inbox file can't overwrite one.
+  if (local) writeFileSync(outcomeFile(cfg, o.id), JSON.stringify(o));
+  log(`${o.id} from ${o.from}: ${o.state}${o.reason ? ` (${o.reason})` : ""}`);
+  if (o.state === "relayed" && req?.note) {
+    const about = req.note.about ? ` about ${clean(req.note.about, 120)}` : "";
+    const text = clean(req.note.text, MAX_NOTE);
+    relay(cfg, `Dane's page sent a note${about} (request ${o.id}). His words, as typed: «${text}»`);
+  } else if (o.state === "conflict" || o.state === "rejected") {
+    if (local) relay(cfg, `Your record change ${o.id} ("${o.summary}") was not applied: ${o.state}, ${o.reason}. Re-read the files and send it again if it's still needed.`);
+    else if (o.from === "page" && !unreadable) relay(cfg, `A change Dane made on his page (${o.id}, "${o.summary}") couldn't be saved: ${o.reason}. Apply what he meant yourself and tell him it's done.`);
+    else log(`inbox request ${o.id} from ${o.from} was ${o.state}; recorded in log/requests`);
+  } else if (o.state === "refused") {
+    if (local) relay(cfg, `Your record change ${o.id} ("${o.summary}") was refused: ${o.reason}. That item has another holder; don't send it again.`);
+    else if (o.from === "page") relay(cfg, `A change Dane made on his page (${o.id}, "${o.summary}") wasn't saved: ${o.reason}. His words still need to reach that item's holder.`);
+    else log(`inbox request ${o.id} from ${o.from} was refused; recorded in log/requests`);
+  }
+}
+
 // One pass: apply everything waiting, one commit per request, then push once.
 // If the push loses a race (a laptop pushed meanwhile), start over from the
 // record as it now stands. Nothing leaves a queue until GitHub has the commit.
 export function cycle(cfg: Config): { applied: number; ok: boolean } {
+  const clock = () => cfg.now?.() ?? new Date();
   for (let attempt = 0; attempt < 3; attempt++) {
-    let items: Pending[], outcomes: (Outcome | null)[];
+    let items: Pending[] = [];
+    const outcomes: (Outcome | null)[] = [];
+    const settled: { o: Outcome; req: Request; local: boolean }[] = [];   // takes that stopped waiting
+    let st: State;
     try {
       sync(cfg);
+      st = loadState(cfg);
+      beat(cfg, st, clock());
       items = pending(cfg);
-      if (items.length === 0) return { applied: 0, ok: true };
-      const seen = seenIds(cfg);
+      const seen = items.length ? seenIds(cfg) : new Set<string>();
       const t = tree(cfg);
-      outcomes = [];
+      let commits = 0;
+      const commit = (msg: string) => {
+        git(cfg, ["add", "-A"]);
+        git(cfg, ["commit", "--quiet", "-m", msg]);
+        commits++;
+        return git(cfg, ["rev-parse", "--short", "HEAD"]);
+      };
+      const ctx = (at: Date) => ({ at, holds: st.holds, downtime: st.downtime, tz: cfg.tz });
+      const outcomeOf = (req: Request, at: Date) => ({ id: req.id, from: clean(req.from, 80), kind: req.kind, summary: clean(req.summary, 200), at: at.toISOString() });
+      // A planned change: its files, then its holds. A failed write undoes it.
+      const apply = (p: Extract<Plan, { state: "ok" }>, base: Omit<Outcome, "state">): Outcome => {
+        if ([...p.writes.keys()].some((path) => !linkFree(cfg, path))) return { ...base, state: "rejected", reason: "writes through a link" };
+        try {
+          for (const [path, content] of p.writes) {
+            const f = join(cfg.dir, path);
+            if (content === null) rmSync(f, { force: true });
+            else { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, content); }
+          }
+        } catch (e) {
+          // Undo this request's partial writes; the others stand.
+          git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects", "reviews"]);
+          return { ...base, state: "rejected", reason: clean(`couldn't write: ${(e as Error).message}`) };
+        }
+        if (p.holdsChanged) { st.holds = p.holds; publish(cfg, st.holds); }
+        return { ...base, state: "done" };
+      };
+      const decide = (req: Request, local: boolean, base: Omit<Outcome, "state">): Outcome => {
+        const p = plan(req, t, ctx(new Date(base.at)));
+        if (p.state === "ok") return apply(p, base);
+        if (p.state === "waiting") st.waiting.push({ req, since: base.at, local });
+        return { ...base, state: p.state, reason: clean(p.reason) };
+      };
+      // Takes waiting behind one of Cain's jobs, planned again now; in the order they came.
+      const settle = () => {
+        for (let i = 0; i < st.waiting.length;) {
+          const w = st.waiting[i], at = clock();
+          const p = plan(w.req, t, ctx(at));
+          const waited = idleMs({ renewed: w.since } as any, at, st.downtime);
+          if (p.state === "waiting" && waited <= HOLD_IDLE_MS) { i++; continue; }
+          st.waiting.splice(i, 1);
+          const base = outcomeOf(w.req, at);
+          const o: Outcome = p.state === "ok" ? apply(p, base)
+            : p.state === "waiting" ? { ...base, state: "refused", reason: clean(`waited a day: ${p.reason}`) }
+            : { ...base, state: p.state, reason: clean(p.reason) };
+          logOutcome(cfg, o);
+          o.commit = commit(message(o));
+          settled.push({ o, req: w.req, local: w.local });
+        }
+      };
+
+      // Holds that went a day without a word from their holder end.
+      const now = clock();
+      const ended = Object.keys(st.holds).filter((k) => expired(st.holds[k], now, st.downtime));
+      if (ended.length) {
+        const who = ended.map((k) => `${k} (${st.holds[k].holder})`).join(", ");
+        for (const k of ended) delete st.holds[k];
+        publish(cfg, st.holds);
+        commit(`Holds: ${who} ended after a day without a word from the holder`);
+      }
+      if (st.waiting.length) settle();
+      // The record's copy is the keeper's: put back if anyone else changed it.
+      const published = publishedHolds(cfg);
+      if (published === null ? Object.keys(st.holds).length > 0 : published !== holdsText(st.holds)) {
+        publish(cfg, st.holds);
+        commit(`Holds: ${HOLDS_PATH} put back to the keeper's copy`);
+      }
+
       for (const it of items) {
-        const at = (cfg.now?.() ?? new Date()).toISOString();
+        const at = clock();
         const id = it.req?.id ?? `unreadable-${it.name}`;
         // Cain's request already applied (the reply to an earlier push was lost,
         // or the add-on restarted before letting it go): never apply twice.
         if (it.local && it.req && seen.has(id) && !it.error) { outcomes.push(null); continue; }
-        const base = { id, from: clean(it.req?.from ?? "unknown", 40), kind: it.req?.kind ?? "unknown",
-          summary: clean(it.req?.summary ?? "(unreadable request)", 200), at };
+        const base = { id, from: clean(it.req?.from ?? "unknown", 80), kind: it.req?.kind ?? "unknown",
+          summary: clean(it.req?.summary ?? "(unreadable request)", 200), at: at.toISOString() };
         let o: Outcome;
         if (it.error) o = { ...base, state: "rejected", reason: clean(it.error) };
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
-        else {
-          const p = plan(it.req!, t);
-          if (p.state !== "ok") o = { ...base, state: p.state, reason: clean(p.reason) };
-          else if ([...p.writes.keys()].some((path) => !linkFree(cfg, path))) o = { ...base, state: "rejected", reason: "writes through a link" };
-          else {
-            try {
-              for (const [path, content] of p.writes) {
-                const f = join(cfg.dir, path);
-                if (content === null) rmSync(f, { force: true });
-                else { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, content); }
-              }
-              o = { ...base, state: "done" };
-            } catch (e) {
-              // Undo this request's partial writes; the others stand.
-              git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects", "reviews"]);
-              o = { ...base, state: "rejected", reason: clean(`couldn't write: ${(e as Error).message}`) };
-            }
-          }
-        }
+        else o = decide(it.req!, !!it.local, base);
         if (it.repoPath && existsSync(join(cfg.dir, it.repoPath))) rmSync(join(cfg.dir, it.repoPath), { force: true });
         logOutcome(cfg, o);
         seen.add(id);
-        git(cfg, ["add", "-A"]);
-        const msg = o.state === "done" ? `${o.summary} (request ${o.id}, from ${o.from})` : `Request ${o.id} ${o.state}: ${o.reason ?? "relayed to Cain"}`;
-        git(cfg, ["commit", "--quiet", "-m", msg]);
-        o.commit = git(cfg, ["rev-parse", "--short", "HEAD"]);
+        o.commit = commit(message(o));
         outcomes.push(o);
+        // A hold that ended or moved may let a waiting take through, before anything newer.
+        if (o.state === "done" && st.waiting.length) settle();
       }
+      if (commits === 0) {
+        // Nothing to push: only Cain's requests that were already applied, let go now.
+        for (const it of items) if (it.local) rmSync(it.local, { force: true });
+        return { applied: items.length, ok: true };
+      }
+      // What this round pushes, in case it stops before saving it below.
+      writeAtomic(`${stateFile(cfg)}.next`, JSON.stringify({ commit: git(cfg, ["rev-parse", "HEAD"]), state: st }));
     } catch (e) {
       log(`stopped this round, nothing let go: ${(e as Error).message}`);
       return { applied: 0, ok: false };
@@ -198,25 +380,17 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
       try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch]); git(cfg, ["merge-base", "--is-ancestor", "HEAD", `origin/${cfg.branch}`]); }
       catch { log(`push didn't land (${(e as Error).message}); starting over`); continue; }
     }
-    // GitHub has it: now the requests can go, and Cain hears what needs him.
+    // GitHub has it: the holds and waiting takes are saved, the requests can go,
+    // and Cain hears what needs him.
+    writeAtomic(stateFile(cfg), JSON.stringify(st!));
+    rmSync(`${stateFile(cfg)}.next`, { force: true });
     mkdirSync(cfg.outcomes, { recursive: true });
     items.forEach((it, i) => {
-      const o = outcomes[i];
       if (it.local) rmSync(it.local, { force: true });
-      if (!o) return;
-      // Status files are for Cain's own requests, so an inbox file can't overwrite one.
-      if (it.local) writeFileSync(outcomeFile(cfg, o.id), JSON.stringify(o));
-      log(`${o.id} from ${o.from}: ${o.state}${o.reason ? ` (${o.reason})` : ""}`);
-      if (o.state === "relayed" && it.req?.note) {
-        const about = it.req.note.about ? ` about ${clean(it.req.note.about, 120)}` : "";
-        const text = clean(it.req.note.text, MAX_NOTE);
-        relay(cfg, `Dane's page sent a note${about} (request ${o.id}). His words, as typed: «${text}»`);
-      } else if (o.state === "conflict" || o.state === "rejected") {
-        if (it.local) relay(cfg, `Your record change ${o.id} ("${o.summary}") was not applied: ${o.state}, ${o.reason}. Re-read the files and send it again if it's still needed.`);
-        else if (o.from === "page" && !it.error) relay(cfg, `A change Dane made on his page (${o.id}, "${o.summary}") couldn't be saved: ${o.reason}. Apply what he meant yourself and tell him it's done.`);
-        else log(`inbox request ${o.id} from ${o.from} was ${o.state}; recorded in log/requests`);
-      }
+      const o = outcomes[i];
+      if (o) report(cfg, o, !!it.local, it.req, !!it.error);
     });
+    for (const s of settled) report(cfg, s.o, s.local, s.req, false);
     return { applied: items.length, ok: true };
   }
   log("gave up this round after three tries; will try again");
@@ -262,6 +436,38 @@ export function nightly(cfg: Config): boolean {
   }
 }
 
+// The keeper's loop. Cain's own queue is looked at every 2 seconds and a round runs
+// as soon as it has something; GitHub's inbox gets a round every minute regardless.
+// A round that fails waits for the next minute, so an outage isn't retried every
+// 2 seconds.
+export async function keep(cfg: Config, o: {
+  pollMs?: number; fullMs?: number; stop?: () => boolean; nightly?: boolean;
+  clock?: () => number; sleep?: (ms: number) => Promise<unknown>; run?: (cfg: Config) => { ok: boolean };
+} = {}) {
+  const pollMs = o.pollMs ?? 2_000, fullMs = o.fullMs ?? 60_000;
+  const clock = o.clock ?? Date.now, sleep = o.sleep ?? ((ms: number) => Bun.sleep(ms)), run = o.run ?? cycle;
+  let due = 0, paused = false, lastNight = "", lastTry = -Infinity;
+  while (!o.stop?.()) {
+    if (clock() >= due || (!paused && queued(cfg))) {
+      let ok = false;
+      try { ok = run(cfg).ok; } catch (e) { log(`cycle error: ${e}`); }
+      due = clock() + fullMs;
+      paused = !ok;
+    }
+    if (o.nightly !== false) {
+      const now = new Date();
+      const hm = now.toLocaleTimeString("en-GB", { timeZone: cfg.tz, hour: "2-digit", minute: "2-digit" }).replace(":", "");
+      const day = now.toLocaleDateString("en-CA", { timeZone: cfg.tz });
+      // At most one try an hour if it fails, so a broken check doesn't spam.
+      if (hm >= cfg.hygieneAt && lastNight !== day && Date.now() - lastTry > 3_600_000) {
+        lastTry = Date.now();
+        if (nightly(cfg)) lastNight = day;
+      }
+    }
+    await sleep(pollMs);
+  }
+}
+
 if (import.meta.main) {
   const cfg: Config = {
     remote: process.env.RECORD_REMOTE ?? "https://github.com/HyndeSyte/org.git",
@@ -273,22 +479,13 @@ if (import.meta.main) {
     token: process.env.RECORD_TOKEN || undefined,
     hygieneAt: process.env.RECORD_CHECK_AT ?? "0230",
     tz: process.env.CHECKIN_TZ ?? "America/New_York",
+    holds: process.env.RECORD_HOLDS ?? "/data/record-holds.json",
   };
   delete process.env.RECORD_TOKEN;   // kept only in cfg, handed to git per call
-  log(cfg.token ? "keeping the record" : "no GitHub token in the add-on's options yet; the record keeper is waiting");
-  let lastNight = "", lastTry = 0;
-  while (true) {
-    if (cfg.token) {
-      try { cycle(cfg); } catch (e) { log(`cycle error: ${e}`); }
-      const now = new Date();
-      const hm = now.toLocaleTimeString("en-GB", { timeZone: cfg.tz, hour: "2-digit", minute: "2-digit" }).replace(":", "");
-      const day = now.toLocaleDateString("en-CA", { timeZone: cfg.tz });
-      // At most one try an hour if it fails, so a broken check doesn't spam.
-      if (hm >= cfg.hygieneAt && lastNight !== day && Date.now() - lastTry > 3_600_000) {
-        lastTry = Date.now();
-        if (nightly(cfg)) lastNight = day;
-      }
-    }
-    await Bun.sleep(Number(process.env.RECORD_INTERVAL_S ?? 60) * 1000);
+  if (!cfg.token) {
+    log("no GitHub token in the add-on's options yet; the record keeper is waiting");
+    while (true) await Bun.sleep(3_600_000);
   }
+  log("keeping the record");
+  await keep(cfg, { fullMs: Number(process.env.RECORD_INTERVAL_S ?? 60) * 1000, pollMs: Number(process.env.RECORD_POLL_MS ?? 2000) });
 }

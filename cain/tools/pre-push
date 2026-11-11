@@ -1,0 +1,7 @@
+#!/bin/sh
+# git pre-push hook for a laptop's harness clone: refuses a push to a branch this
+# Claude Code session doesn't hold in Cain's record. It runs record-prepush.ts from
+# the harness clone named by CAIN_TOOLS (kept on main), so the guard is the same
+# whichever branch is checked out here. Install: copy this file to
+# <harness clone>/.git/hooks/pre-push. See Cain's DOCS.md, "Laptop sessions".
+exec bun "${CAIN_TOOLS:?set CAIN_TOOLS to the harness clone that has cain/tools}/cain/tools/record-prepush.ts" "$@"

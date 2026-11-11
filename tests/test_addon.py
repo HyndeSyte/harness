@@ -161,6 +161,27 @@ def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
     assert run_("submit", str(req)).returncode == 2
 
 
+def test_cain_gets_a_rows_base_and_the_holds_from_record_sh(tmp_path):
+    # A row edit's base is sha1 of the open row's line, the same as the keeper's rowHash.
+    import hashlib, shutil, subprocess
+    bash = shutil.which("bash")
+    if not bash or not shutil.which("sha1sum"):
+        import pytest
+        pytest.skip("no bash or sha1sum")
+    rec = tmp_path / "rec"
+    (rec / "state").mkdir(parents=True)
+    rows = ["| P11 | Watch | Build | Ship | | Alerts | Nov 7 |", "| P33 | Wave 1 | Build | Laptop holds it |  | Drills | Nov 10 |"]
+    text = "# Pending\n\n## Open\n\n| ID | Item | Who | Next step | Waits for | Done when | Since |\n|---|---|---|---|---|---|---|\n"
+    text += "\n".join(rows) + "\n\n## Done\n\n| Item | Date |\n|---|---|\n| P33 old: a done row that starts with the same id | Nov 1 |\n"
+    (rec / "state" / "PENDING.md").write_bytes(text.replace("\n", "\r\n").encode())
+    env = {"PATH": __import__("os").environ["PATH"], "RECORD_DIR": str(rec)}
+    run_ = lambda *a: subprocess.run([bash, str(CAIN / "rootfs/opt/cain/record.sh"), *a], env=env, capture_output=True, text=True, timeout=20)
+    for line in rows:
+        assert run_("rowsha", line.split("|")[1].strip()).stdout.strip() == hashlib.sha1(line.encode()).hexdigest()
+    assert run_("rowsha", "P99").returncode == 1
+    assert run_("holds").stdout.strip() == "{}"   # nothing pushed yet: nobody holds anything
+
+
 def test_cain_versions_agree_and_everything_is_pinned():
     cfg = flat_yaml(CAIN / "config.yaml")
     docker = (CAIN / "Dockerfile").read_text()
