@@ -150,14 +150,17 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                 family=client,
                                 budget_ok=lambda provider: controller._budget_ok(provider)),
                             meaning=judging, meaning_live=live)
-    # An input that stops is told: a refused key at once, anything else after six hours, and
-    # the digest names each one down. Only what's set up is watched.
+    # An input that stops is told: what only he can fix at once, anything else after six hours,
+    # and the digest names each one down. Only what's set up is watched: mail once its password is
+    # in (whatever the feeds say today), and the sorting of Family events only when its judgments
+    # decide his blocks (meaning_live), since in shadow it costs him nothing.
     controller.inputs = inputs.Watch(ledger, seen, tz=base.timezone, active={
-        inputs.MAIL: controller.mail_dates.configured,
+        inputs.MAIL: lambda: bool(controller.mail_dates.password()),
         inputs.FAMILY: client.configured,
         inputs.GOOGLE: google.configured,
-        inputs.MEANING: lambda: meaning.option_on(data_dir) or meaning_live.live_on(data_dir),
+        inputs.MEANING: lambda: meaning_live.live_on(data_dir),
     }, feeds=calendar.inputs, account=google.account)
+    google.mine = family_gmail._address         # what Google says about his calendar, not another's
     store = KeeperStore(os.path.join(data_dir, "discord.json"))
     keeper = DiscordKeeper(DiscordAPI(discord_token, DiscordTransport()), store.get, store.set)
     controller.discord = keeper

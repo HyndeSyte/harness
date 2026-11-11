@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .render import escape, model_text
+from .render import escape, model_text, since_words
 
 
 
@@ -34,8 +34,9 @@ class InputCoverage:
     name: str
     last_success: datetime | None
     max_age: timedelta
-    error: str = ""          # the last failure, said alongside "stale"
-    failing: bool = False    # failed since its last success: named even before it's stale
+    error: str = ""          # the last failure, said with it
+    failing: bool = False    # down, and not a single blip: named even before it's stale
+    key: str = ""            # the ledger input it stands for, if any: Digest.named says it was named
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class Digest:
     state: str           # "clear" | "decision" | "attention"
     text: str
     facts: dict = field(default_factory=dict)
+    named: tuple = ()    # the ledger inputs it named as not working (inputs.Watch.digest_sent)
 
 
 def _ago(now: datetime, then: datetime) -> str:
@@ -81,16 +83,18 @@ def compose(*, now: datetime, tz: str, inputs: list[InputCoverage],
     count as a problem and never change the state (the mirror's shadow line)."""
     local = ZoneInfo(tz)
     problems: list[str] = []
+    named: list[str] = []
+    # One shape for every input (inputs.py too): "{name}: not working since {when}; {reason}".
     for c in sorted(inputs, key=lambda c: c.name):
-        why = f" ({c.error})" if c.error else ""
+        why = f"; {c.error}" if c.error else ""
         if c.last_success is None:
-            problems.append(f"{c.name}: no successful read yet{why}")
-        elif now - c.last_success > c.max_age:
-            when = c.last_success.astimezone(local).strftime("%a %-I:%M %p")
-            problems.append(f"{c.name}: stale since {when}{why}")
-        elif c.failing:
-            when = c.last_success.astimezone(local).strftime("%a %-I:%M %p")
-            problems.append(f"{c.name}: no good read since {when}{why}")
+            problems.append(f"{c.name}: not read yet{why}")
+        elif now - c.last_success > c.max_age or c.failing:
+            problems.append(f"{c.name}: not working since {since_words(c.last_success, now, tz)}{why}")
+        else:
+            continue
+        if c.key:
+            named.append(c.key)
     if agenda is not None and agenda.read < agenda.configured:
         problems.append(f"calendar: {agenda.configured - agenda.read} of {agenda.configured} "
                         "not read today")
@@ -129,13 +133,13 @@ def compose(*, now: datetime, tz: str, inputs: list[InputCoverage],
         body = ["<b>Attention needed</b>"] + [f"• {escape(p)}" for p in problems]
         if wait_lines:
             body += ["", f"<b>Waiting on you ({len(waits)})</b>"] + wait_lines
-        return Digest("attention", "\n".join(body + tail), facts)
+        return Digest("attention", "\n".join(body + tail), facts, tuple(named))
     if waits:
         body = [f"<b>Decision needed</b> · {len(waits)} waiting"] + wait_lines
-        return Digest("decision", "\n".join(body + tail), facts)
+        return Digest("decision", "\n".join(body + tail), facts, tuple(named))
     text = (f"Clear · inputs fresh · 0 need you · 0 failures · "
             f"config unchanged since {since}")
-    return Digest("clear", "\n".join([text] + tail), facts)
+    return Digest("clear", "\n".join([text] + tail), facts, tuple(named))
 
 
 def _t(dt: datetime, local: ZoneInfo) -> str:

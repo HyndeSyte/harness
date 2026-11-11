@@ -305,8 +305,11 @@ class FamilyCalDav:
         return None
 
     def _answered(self, status: int) -> None:
-        """An answer that isn't the one asked for: no answer yet, or an error."""
-        self.seen(INPUT, "unreachable" if status >= 500 else "error", f"iCloud answered {status}")
+        """An answer that isn't the one asked for: none yet, or an error. Said without its code."""
+        if status >= 500:
+            self.seen(INPUT, "unreachable", "iCloud isn't answering right now")
+        else:
+            self.seen(INPUT, "error", "iCloud answered with an error")
 
     def create(self, uid: str, params: dict, now: datetime) -> Outcome:
         ready = self._auth()

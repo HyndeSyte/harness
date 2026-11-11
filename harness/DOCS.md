@@ -64,20 +64,25 @@ Discord link is connected, when it last heard from Discord, and this watch.
 
 ## When something it works from stops
 
-Your mail, the Family calendar, your Gmail calendar through Google, your calendar addresses and
-the judging of Family events are each watched. An outage lasts until the next success.
+Your mail, the Family calendar, your Gmail calendar through Google and your calendar addresses are
+each watched, and the sorting of Family events too while it decides your blocks (`meaning_live`).
+Something is down from the time it fails until the next time it works.
 
-- **A password or key turned down** (Gmail's app password, Family's app-specific password, the
-  Google service account key): one message at once, saying what stopped, since when, what it costs
-  you, and how to fix it from your phone. Paste the new one on the Harness page and approve its
-  card, as with any key.
-- **Anything else** (no answer, or the engine refusing): one message once nothing has worked for
-  six hours.
-- Each comes once an outage, through Cain's link, with no buttons, and not while stopped.
-- **The morning digest** names each one that's down, and says in one line which came back since the
-  last digest. There's no separate "it's back" message.
-- **The log:** a failed mail read or look-up is a warning naming only its kind (refused,
-  unreachable, error, engine or limit), when the kind changes or once an hour.
+- **What only you can fix**: Gmail's app password, Family's app-specific password or the Google
+  service account key turned down, or your Gmail calendar no longer shared with Harness. One
+  message as soon as a second try confirms it, saying what stopped, since when, what it costs you,
+  and the steps from your phone. They end on the Harness page (Settings > Apps > Harness > Open Web
+  UI, under "Replace a key") and a tap on Approve on the Discord message that follows, within 15
+  minutes. A new key that's turned down too is told again.
+- **Anything else**: Gmail, iCloud or Google not answering, or Claude turning Harness's requests
+  down. One message once it has kept failing for six hours. Whatever is down then comes in one
+  message, and a message that hasn't gone out when it works again is dropped.
+- Each comes once, until it works again, through Cain's link, with no buttons, and not while stopped.
+- **The morning digest** names each one that's down once it has failed twice or for an hour, or
+  you were told, and says in one line which came back since the last digest. There's no separate
+  "it's back" message.
+- **The log:** a failed email read or look-up is a warning naming only its reason (refused, web,
+  unreachable, error, unexpected, engine or limit), when the reason changes or once an hour.
 
 ## Calendar
 

@@ -183,16 +183,25 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     inputs = [digest.InputCoverage(ledger.get_meta("chat_name") or "Discord", ledger.last_poll_success(),
                                    CHAT_MAX_AGE)]
     agenda = None
-    notes = list(notes) + (watch.digest_lines() if watch is not None else [])
-    back = watch.back_line() if watch is not None else ""
+    notes = list(notes)
+    watched: list[str] = []
+    back = ""
+    if watch is not None:
+        try:                          # the inputs' lines never cost him the day's digest
+            lines, watched = watch.digest_lines()
+            notes += lines
+            back = watch.back_line()
+        except Exception as e:
+            log.warning("digest: couldn't check the inputs: %s", type(e).__name__)
+            notes.append("Couldn't check this morning whether email, Family and Google are working")
     day_start, day_end, day = calendar_feed.today_bounds(now, config.timezone)
     occ: list = []
     unreadable = read = configured = 0
     if calendar is not None and calendar.configured:
         cov = calendar.coverage()
-        for label, ok_at, err, failing in cov:
-            inputs.append(digest.InputCoverage(f"Calendar {label}", ok_at,
-                                               calendar_feed.MAX_AGE, err, failing))
+        for c in cov:
+            inputs.append(digest.InputCoverage(f"Calendar {c.label}" if c.label else "One of your calendars",
+                                               c.ok_at, calendar_feed.MAX_AGE, c.error, c.failing, c.name))
         occ, unreadable, read, configured = calendar.agenda(day)
         occ = list(occ)
     fam_status = None
@@ -281,7 +290,7 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
                        extra=[x for x in (family_add_line, mirror_line, back) if x])
     if fam_status is not None:
         d.facts["family"] = fam_status
-    return d
+    return replace(d, named=d.named + tuple(watched))
 
 
 def deliver(ledger: Ledger, config: Config, d: digest.Digest, *, hold: bool = False) -> bool:

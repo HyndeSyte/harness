@@ -1084,7 +1084,7 @@ class MeaningShadow:
         if not todo or room <= 0 or allowance <= 0 or engine is None or not self.budget_ok(spec.provider):
             self._backlog = False
             if todo and allowance <= 0:
-                self.ledger.input_failed("meaning", "this month's limit for judging events is used up",
+                self.ledger.input_failed("meaning", "this month's limit for sorting Family events is used up",
                                          "limit")
             self._score(evs)
             return
@@ -1135,8 +1135,8 @@ class MeaningShadow:
         try:
             results = fut.result()
         except Exception as e:
-            self.ledger.input_failed("meaning", f"judging stopped on an error ({type(e).__name__})",
-                                     "error")
+            log.warning("meaning: the sorting stopped: %s", type(e).__name__)
+            self.ledger.input_failed("meaning", "sorting stopped on an unexpected problem", "error")
             return
         spec = policy.MODELS[policy.engine_for(PURPOSE)]
         day, used = self._calls_today()
@@ -1163,7 +1163,7 @@ class MeaningShadow:
             ok, bad = ok + (j is not None), bad + (j is None)
         if any(err == "budget" or (res is None and err in ("billing", "spend_limit", "auth", "no_key"))
                for _, res, err in results):
-            self.ledger.input_failed("meaning", "the engine refused the call (key or billing)", "engine")
+            self.ledger.input_failed("meaning", "Claude turned the request down (key or billing)", "engine")
             self._backlog = False
         else:
             self.ledger.input_ok("meaning")

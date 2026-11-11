@@ -25,7 +25,7 @@ import queue
 import time
 from concurrent.futures import Executor
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -279,7 +279,11 @@ class Controller:
             if not commands.is_paused(self.ledger) and self._proactive_ok():
                 self.inputs.tell(self.config.owner_user_id)
         except Exception as e:
-            log.warning("input watch failed: %s", type(e).__name__)
+            # Each tick tries again: said when the kind changes, or once an hour.
+            now, last = self.ledger.now(), getattr(self, "_watch_warned", None)
+            if last is None or last[0] != type(e).__name__ or now - last[1] >= timedelta(hours=1):
+                log.warning("input watch failed: %s", type(e).__name__)
+                self._watch_warned = (type(e).__name__, now)
 
     # -- Discord, through Cain ---------------------------------------------------------
     # The harness has no Discord connection of its own. It hands every card to Cain's
@@ -653,8 +657,15 @@ class Controller:
         self.vault.mark_announced(p["id"])
 
     def _settings_decision(self, change_id: str, decision: str) -> str:
+        pending = self.vault.pending() or {}
         msg = self.vault.resolve_change(change_id, decision)
         self.ledger.event("settings_change", {"id": change_id, "decision": decision})
+        if (decision == "approve" and msg.startswith("Done.") and pending.get("id") == change_id
+                and self.inputs is not None):
+            try:                       # a new key: a refusal of it is told again (inputs.py)
+                self.inputs.key_changed(pending.get("field", ""))
+            except Exception as e:
+                log.warning("input watch: after a new key: %s", type(e).__name__)
         return msg
 
     def _drain_requests(self) -> None:
@@ -719,7 +730,10 @@ class Controller:
                                  if x), watch=self.inputs)
             if daily.deliver(self.ledger, cfg, d, hold=self._discord_mode()):
                 if self.inputs is not None:
-                    self.inputs.digest_sent()          # what it named is known to him now
+                    try:                               # what it named is known to him now
+                        self.inputs.digest_sent(d.named)
+                    except Exception as e:             # never at the cost of the receipts
+                        log.warning("input watch: after the digest: %s", type(e).__name__)
                 if self.meaning_live:
                     self.meaning_live.send_receipts()  # each new block's card, with Undo
 
@@ -767,10 +781,10 @@ class Controller:
                 ok = datetime.fromisoformat(row["last_success_at"]).astimezone(tz)
                 lines.append(f"{label} canary: ok {ok:%a %-I:%M %p}")
         if self.calendar is not None and self.calendar.configured:
-            for label, ok_at, err, _ in self.calendar.coverage():
-                when = f"read {ok_at.astimezone(tz):%a %-I:%M %p}" if ok_at else "not read yet"
-                lines.append(f"Calendar {render.escape(label)}: {when}" +
-                             (f" (last problem: {render.escape(err)})" if err else ""))
+            for c in self.calendar.coverage():
+                when = f"read {c.ok_at.astimezone(tz):%a %-I:%M %p}" if c.ok_at else "not read yet"
+                lines.append(f"Calendar {render.escape(c.label or c.name[9:13])}: {when}" +
+                             (f" (last problem: {render.escape(c.error)})" if c.error else ""))
         if self.family is not None and cfg.family_entity:
             lines.append("Family calendar: " + render.escape(family_line(self.family.status(), tz)))
         start = cfg.proactive_from
@@ -795,8 +809,9 @@ class Controller:
             "paused": commands.is_paused(self.ledger),
             "integrity_since": (self.ledger.get_meta("integrity_since") or None),
             "notes": list(self.notes.values()),
-            "calendar": ([{"label": label, "ok_at": ok_at.isoformat() if ok_at else None,
-                           "error": err} for label, ok_at, err, _ in self.calendar.coverage()]
+            "calendar": ([{"label": c.label or f"calendar {c.name[9:13]}",
+                           "ok_at": c.ok_at.isoformat() if c.ok_at else None,
+                           "error": c.error} for c in self.calendar.coverage()]
                          if self.calendar is not None and self.calendar.configured else []),
             "family": (self.family.status() if self.family is not None
                        and self.base_config.family_entity else None),

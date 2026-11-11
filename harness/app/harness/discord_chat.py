@@ -51,6 +51,22 @@ WORDS = (
 )
 
 _TAG = re.compile(r"<(/?)(b|i)>")
+# A link of the harness's own, kept whole so its - and _ survive (inputs.py: the steps he follows).
+# Text from anyone else reaches here defanged, its links without their scheme (render.defang), and
+# no ( ) [ ] can be part of one, so it can never become a masked link.
+_URL = re.compile(r"https?://[A-Za-z0-9._~:/?#@!$&+,;=%-]+")
+
+
+def _text(text: str) -> str:
+    """Plain text, escaped so it can't format, but for the links in it."""
+    out, pos = [], 0
+    for m in _URL.finditer(text):
+        url = m.group(0).rstrip(".,;:!?")
+        out.append(escape(text[pos:m.start()]))
+        out.append(url)
+        pos = m.start() + len(url)
+    out.append(escape(text[pos:]))
+    return "".join(out)
 
 
 def to_markdown(text: str) -> str:
@@ -59,10 +75,10 @@ def to_markdown(text: str) -> str:
         text = text.replace(old, new)
     out, pos = [], 0
     for m in _TAG.finditer(text):
-        out.append(escape(html.unescape(re.sub(r"<[^>]+>", "", text[pos:m.start()]))))
+        out.append(_text(html.unescape(re.sub(r"<[^>]+>", "", text[pos:m.start()]))))
         out.append("**" if m.group(2) == "b" else "*")
         pos = m.end()
-    out.append(escape(html.unescape(re.sub(r"<[^>]+>", "", text[pos:]))))
+    out.append(_text(html.unescape(re.sub(r"<[^>]+>", "", text[pos:]))))
     return "".join(out)
 
 
