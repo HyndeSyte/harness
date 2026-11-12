@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.4
+
+- This release brings 0.7.3's changes to your Pi. 0.7.3 was merged but never installed, because its tests failed.
+- Cain's own tests no longer fail from a fixed date: they use the real clock.
+
 ## 0.7.3
 
 - Cain reads the screenshots and files you send him in Discord without stopping to ask for approval. Before, a screenshot left his session waiting for an approval nobody was there to give.
