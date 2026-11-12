@@ -1,0 +1,13 @@
+{
+  "plugin": "discord@claude-plugins-official",
+  "marketplace": "anthropics/claude-plugins-official",
+  "commit": "e0ab6e51219eef74e417a0e1d89e5d53e5e763d4",
+  "version": "0.0.4",
+  "files": {
+    ".claude-plugin/plugin.json": "3e559b00317540f96fe3b24aee4a816af8b43d648f6e1dd9896e59aa835cd3d8",
+    ".mcp.json": "01c15597e40a5999d7b1c15bd6f9656abc8a04d3a0956704a9dfd2df01b74960",
+    "package.json": "fa2ece9108aca2ae17e7b1909f468ee8f055e53a45882eb25108a3e394f17e46",
+    "bun.lock": "c3d69584e51e46a758bd9c8a8bfef12b46fe9f2bb57a367f4deb073edd26c55e",
+    "server.ts": "6edc17d9e9d04930967361ba51c8e03b8f8508647a1dfc11d79ee6a0eb1010b7"
+  }
+}

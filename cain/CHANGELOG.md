@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.3
+
+- Cain reads the screenshots and files you send him in Discord without stopping to ask for approval. Before, a screenshot left his session waiting for an approval nobody was there to give.
+- Cain can read back recent messages in your DM with him, so he can catch up on what was said.
+- Both work only in your DM with him. Any other chat is refused, and both stop until the Discord plugin's access is you alone (allowlist, one user, no groups); the App's log says so at start if it isn't.
+- The files he downloads are deleted after 7 days, and the oldest go first if they pass 200 MB.
+- The Discord plugin is pinned to the version reviewed for this. If it ever changes, these two reads stop until it's reviewed again.
+- Both only read. Everything that writes stays as it was: calendar, mail, Slack and Home Assistant changes stay switched off, and replying, reacting and editing in Discord still go through the usual approval.
+
 ## 0.7.2
 
 - A card from the calendar specialist always reaches you and keeps its buttons until you answer it or it expires, even when someone else is working on the same job, or that job is done. Before, such a card could be held back and expire before you saw it.
