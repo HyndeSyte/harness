@@ -35,6 +35,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const limited = new Set<string>();             // the same, answered with Discord's rate limit
   const lose = { posts: 0 };                     // posts Discord makes but whose answer never arrives
   const hang = { interactions: false };          // the link stops mid-tap: its answer never returns
+  const gate = { posts: false, history: false }; // Discord is slow: posts to his DM, or reads of it, wait until release()
+  const waiting: (() => void)[] = [];
   const beyond = new Set<string>();              // on Discord, but further back than the look over his DM goes
   let seq = 0, lastId = "", tapped = "";
   const snowflake = (at = t.now) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(++seq));
@@ -46,6 +48,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     if (path === "/users/@me") return { id: BOT };
     if (path === "/users/@me/channels") return { id: DM };
     if (method === "POST" && path === `/channels/${DM}/messages`) {
+      if (gate.posts) await new Promise<void>((ok) => waiting.push(ok));
       // Discord's enforce_nonce: the same nonce within a few minutes returns the message already made.
       const seen = body.enforce_nonce && body.nonce ? nonces[body.nonce] : undefined;
       if (seen && t.now - seen.at < 5 * MIN && posted[seen.id]) return copy(posted[seen.id]);
@@ -57,9 +60,14 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       if (lose.posts > 0) { lose.posts--; throw new Error("TimeoutError: The operation timed out."); }
       return copy(msg);
     }
-    if (method === "GET" && path.startsWith(`/channels/${DM}/messages?`))
-      return Object.values(posted).filter((m: any) => !beyond.has(m.id))
-        .sort((a: any, b: any) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1)).map(copy);
+    if (method === "GET" && path.startsWith(`/channels/${DM}/messages?`)) {
+      if (gate.history) await new Promise<void>((ok) => waiting.push(ok));
+      // Discord's own paging: newest first, at most `limit`, older than `before`.
+      const q = new URLSearchParams(path.split("?")[1]);
+      const limit = Number(q.get("limit") ?? 50), before = q.get("before");
+      return Object.values(posted).filter((m: any) => !beyond.has(m.id) && (!before || BigInt(m.id) < BigInt(before)))
+        .sort((a: any, b: any) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1)).slice(0, limit).map(copy);
+    }
     const one = new RegExp(`^/channels/${DM}/messages/(\\d+)$`).exec(path);
     if (one && method === "GET") return posted[one[1]] ? copy(posted[one[1]]) : { author: { id: OWNER } };
     if (one && method === "PATCH") {
@@ -99,7 +107,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const r = {
     get link() { return link; },
-    calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, beyond, t, tap, his, snowflake,
+    calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake,
+    release: () => { gate.posts = false; gate.history = false; for (const ok of waiting.splice(0)) ok(); },
+    reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,
+    posts: () => calls.filter((c) => c.method === "POST" && c.path === `/channels/${DM}/messages`).length,
     answers: () => calls.filter((c) => c.path.startsWith("/interactions/")).map((c) => c.body.type),
     updates: () => calls.filter((c) => c.path.startsWith("/interactions/") && c.body.type === 7).map((c) => c.body.data),
     ephemerals: () => calls.filter((c) => c.path.startsWith("/webhooks/")).map((c) => c.body),

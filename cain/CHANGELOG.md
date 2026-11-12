@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.2
+
+- A card from the calendar specialist always reaches you and keeps its buttons until you answer it or it expires, even when someone else is working on the same job, or that job is done. Before, such a card could be held back and expire before you saw it.
+- A card with buttons from the calendar specialist reaches you within about 2 minutes, even if Cain is busy: if he hasn't shown it by then, it goes out by itself. A card that has already expired never goes out. If a card can't reach you, Cain is told what it was, so he can tell you himself. Cards that arrived before this update still wait for Cain.
+
 ## 0.7.1
 
 - Cain's panel opens only for the Home Assistant user set as its owner (`owner_user_id` in Configuration, which takes only a user id). Any other user who opens it gets Forbidden, and until the owner is set it's closed to everyone, you included. Needs Supervisor 2026.10.3 or later.

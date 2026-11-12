@@ -1,17 +1,19 @@
 // Runs Cain's link (core.ts): the Discord gateway for taps and reactions, the
-// REST calls, the sweep that takes buttons off cards that stopped mattering, and a
-// small local HTTP API.
+// REST calls, the sweep that posts cards Cain hasn't shown in time and takes buttons
+// off cards that stopped mattering, and a small local HTTP API.
 //
 // HTTP on port 8097, keyed with HMAC-SHA256(bot token, "harness-relay-v1"):
 //   from the calendar specialist (the Harness add-on, over the add-ons' network):
-//     POST /card {text, rows, kind, expires?}  hold a card for Cain to show (direct kinds go out now)
+//     POST /card {text, rows, kind, expires?}  hold a card for Cain to show (direct kinds go out now;
+//                                       one with buttons goes out by itself if he hasn't shown it in about 2 minutes)
 //     POST /buttons {card, rows}        change a card's buttons (after a tap)
 //     POST /answer {callback, text}     a short note only Dane sees, after a tap
 //     POST /relay {text}                a line for Cain
 //     GET  /card-of?m=<message id>      which card a Discord message is, and its item and question
 //     GET  /health                      "ok"; with the key, also the Discord connection and the watch
 //   from Cain's own scripts, on this machine only (127.0.0.1); item is a PENDING id or "none":
-//     POST /show {id, item, question?, reply_to?}            show a specialist's card
+//     POST /show {id, item, question?, reply_to?}            show a specialist's card ("posted"; "already out":
+//                                                            it only files it under his item; "expired": nothing)
 //     POST /ask {text, options, item, question?, reply_to?}  ask with buttons, one open at a time
 //     POST /ship {text, item, pr, head, reply_to?}           a Ship card for one pull request head
 //     POST /answered {item, question?}  he answered an open ask in words
@@ -183,8 +185,7 @@ Bun.serve({
         case "/buttons": await link.editButtons(Number(b.card), b.rows ?? []); return json({ status: "ok" });
         case "/answer": await link.followup(String(b.callback ?? ""), String(b.text ?? "")); return json({ status: "ok" });
         case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
-        case "/show": return json({ status: "posted",
-          message: await link.show(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }) });
+        case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
         case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
           item: b.item, question: b.question, replyTo: b.reply_to }));
         case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, replyTo: b.reply_to }));

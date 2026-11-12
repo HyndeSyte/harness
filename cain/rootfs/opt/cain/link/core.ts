@@ -1,9 +1,15 @@
 // Cain's link to Dane on Discord, for everything his plugin can't do: taps,
 // reactions, and cards. Plain code, no model.
 //
-// - Specialists (the Harness add-on, for calendars) hand cards here. A card is
-//   held until Cain shows it, unchanged; Cain is told it's waiting. Only Stop
-//   notices and "Cain can't reach you" alerts go straight out ("direct").
+// - Specialists (the Harness add-on, for calendars) hand cards here. A card waits
+//   until Cain shows it, unchanged; Cain is told it's waiting. A card with buttons goes
+//   out within about 2 minutes even if Cain is busy: if he hasn't shown it by then, the
+//   sweep posts it by itself, under no item, and tells him; his later show only files
+//   it under his item and question. If it can't go out, or its own expiry passes first
+//   (then it never goes out), Cain is told once, with what it was. Only Stop notices
+//   and "Cain can't reach you" alerts go straight out ("direct"). A specialist's card is
+//   the specialist talking to the owner: the item Cain files it under is only a label,
+//   so it goes out whoever holds that item, and whether or not the item is closed.
 // - Every tap is checked here, within Discord's 3 seconds: Dane (the bot's owner,
 //   who must also be the one Cain is paired with), in his DM, on a message this
 //   link posted, still showing exactly what it posted (Cain can edit the bot's
@@ -12,9 +18,11 @@
 //   question, and any reaction of Dane's to the bot's messages, go to Cain.
 // - Every card knows its item (a PENDING id, or "none"), its question and when it
 //   stops mattering. A sweep every minute takes the buttons off cards that were
-//   answered, expired, replaced by a newer card for the same item and question, or
-//   whose item closed or is held by someone other than Cain, and says so on the card.
-//   A tap on such a card is answered in place: "This card expired; nothing was done."
+//   answered, expired, or replaced by a newer card for the same item and question,
+//   and off Cain's own asks and Ship cards whose item closed or is held by someone
+//   other than Cain, and says so on the card. A specialist's card never loses its
+//   buttons to a hold or a closed item. A tap on a card that stopped mattering is
+//   answered in place: "This card expired; nothing was done."
 // - Cain asks one question at a time: a new ask waits while another is open, and goes
 //   out by itself when that one closes. Ship cards and specialists' cards don't wait.
 import { createHash } from "node:crypto";
@@ -34,6 +42,7 @@ const SETTLE_MS = 10 * 60_000;           // a message younger than this may stil
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
 const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
+const SHOW_WAIT_MS = 2 * 60_000;         // a card with buttons Cain hasn't shown by then goes out by itself
 // Machine text he never sees on a card: a full sha, a job's session id, an ISO time.
 const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"],
   [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, "an ISO time"]];
@@ -48,7 +57,17 @@ export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+
 
 export type Rest = (method: string, path: string, body?: unknown, auth?: boolean, timeoutMs?: number) => Promise<any>;
 
-export interface Card { text: string; rows: any[]; kind: string; created: number; shown: string | null; expires?: number | null }
+export interface Card {
+  text: string; rows: any[]; kind: string; created: number; shown: string | null; expires?: number | null;
+  due?: number | null;               // when it goes out by itself if Cain hasn't shown it (cards with buttons, from 0.7.2)
+  outcome?: "expired";               // its own expiry passed before it went out: it never goes out
+  posting?: Posting;                 // a post whose answer never came: it may be on Discord already
+  told?: boolean;                    // Cain was told it couldn't go out by itself
+  lapseTold?: boolean;               // Cain was told it expired before it reached him
+}
+// A card's post that began and never heard back: when (at), its buttons then (rows, as a
+// digest), who made it (the link by itself, or Cain's show) and the item it went under.
+export interface Posting { at: number; rows: string; byItself: boolean; item: string; question: string }
 export type Kind = "ask" | "ship" | "card" | "morning" | "legacy";
 export interface Shown {
   digest: string; until: number; card?: number;
@@ -63,6 +82,7 @@ export interface Shown {
   why?: string;                      // for the log: what made it expire
   label?: string;                    // answered: the label he tapped
   words?: boolean;                   // answered in a message, not a tap
+  byItself?: boolean;                // a specialist's card that went out by itself; Cain's show then files it
 }
 export interface Ask {               // Cain's question waiting behind the open one
   text: string; options: string[]; item: string; question: string; replyTo?: string; at: number; expires: number;
@@ -108,7 +128,7 @@ export function rows(buttons: [string, string][][], primaryPrefix = "k:a:"): any
   })).filter((r) => r.components.length);
 }
 
-function excerpt(text: string, n = 150): string {
+export function excerpt(text: string, n = 150): string {
   const t = (text ?? "").replace(/\s+/g, " ").trim();
   return t.length <= n ? t : t.slice(0, n - 3) + "...";
 }
@@ -238,7 +258,19 @@ function keyFor(m: Shown): string | null {
   if (m.kind === "morning") return "morning";
   return keyOf(m.item, m.question);
 }
+// The sweep keeps the newest card per key on each side: the specialist's cards among
+// themselves, Cain's among his own. Posting one replaces older ones of either side at
+// once (markReplaced); only a card filed after it went out by itself can share a key
+// with one of Cain's asks, and then both stand.
+const rivalKey = (m: Shown): string | null => {
+  const k = keyFor(m);
+  return k && m.kind === "card" ? `card\n${k}` : k;
+};
 const live = (m: Shown, now: number) => !!m.buttons && !m.outcome && !(m.expires != null && m.expires <= now);
+// The item whose closing, or move to another holder, ends this card: only Cain's own
+// asks and Ship cards have one. A specialist's card is the specialist talking to the
+// owner; the item Cain files it under is a label, for replacing and for the record, so "".
+const boundItem = (m: Shown): string => (m.kind !== "card" && m.item && m.item !== "none" ? m.item : "");
 const about = (item?: string, question?: string) =>
   item && item !== "none" ? `${item}${question ? ` ${question}` : ""}` : "";
 
@@ -257,11 +289,40 @@ function newerId(a: string, b: string): boolean {
   try { return BigInt(a) > BigInt(b); } catch { return a > b; }
 }
 
+// A time in ms, or null. A number below 1e11 is taken as seconds: 1e11 ms is 1973, while
+// 1e11 seconds is thousands of years off.
 function toMs(v: unknown): number | null {
-  if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) return v < 1e11 ? v * 1000 : v;
   if (typeof v === "string" && v.trim()) { const t = Date.parse(v); return Number.isFinite(t) ? t : null; }
   return null;
 }
+// Card a went up after card b (their Discord ids break a tie).
+const isNewer = (a: Shown, aId: string, b: Shown, bId: string) =>
+  (a.posted ?? 0) > (b.posted ?? 0) || ((a.posted ?? 0) === (b.posted ?? 0) && newerId(aId, bId));
+// Why a post failed, short, for the log.
+const reason = (e: unknown) => String(e instanceof Error ? e.message : e).replace(/\s+/g, " ").slice(0, 80);
+// The same, in plain words for Cain: Discord answered no, or didn't answer.
+const refused = (e: unknown) => /\bdiscord \d{3}\b/.test(String(e));
+const plainly = (e: unknown) => (refused(e) ? "Discord refused it" : "Discord didn't answer");
+
+// What Cain hears about a card the link handles by itself. Each line says what it was.
+const what = (c: Card | undefined) => `("${excerpt(c?.text ?? "", 60)}")`;
+const FRESH = "get a fresh card through /opt/cain/keeper.sh handover (see Calendars)";
+const wentOutLine = (id: number, c: Card | undefined, msg: string) =>
+  `Card ${id} ${what(c)} went out to him by itself (Discord message ${msg}): you hadn't shown it within 2 minutes. No need to show it unless it belongs under an item.`;
+const foundLine = (id: number, c: Card | undefined, msg: string) =>
+  `Card ${id} ${what(c)} reached him after all (Discord message ${msg}): the answer to your show of it was lost. Nothing more was posted.`;
+const lapsedLine = (id: number, c: Card | undefined) =>
+  `Card ${id} ${what(c)} expired before it reached him. Tell him in your own words, or ${FRESH}.`;
+function failedLine(id: number, c: Card, e: unknown, unsure: boolean, now: number): string {
+  if (unsure && c.expires != null && c.expires <= now)
+    return `Card ${id} ${what(c)} expired, and I can't tell yet whether it reached him (${plainly(e)}). I'll check again.`;
+  return `Card ${id} ${what(c)} ${unsure || !refused(e) ? "may not have gone out" : "didn't go out"}: ${plainly(e)}. Tell him in your own words if it matters; I'll keep trying${c.expires != null ? " until it expires" : ""}.`;
+}
+
+// His DM couldn't be read to see whether a card's unanswered post is there: nothing is
+// posted until it can be, so it never goes out twice.
+class Unsure extends Error {}
 
 export interface Deps {
   rest: Rest;
@@ -282,11 +343,16 @@ export interface Deps {
 export interface Pull { head: string | null; open: boolean | null }
 
 export type AskResult = { status: "posted"; message: string } | { status: "held"; said: string };
+// A specialist's card put up: its message, whether this call recorded it, and whether the
+// link made it by itself (not Cain's show).
+type Put = { message: string; first: boolean; fromLink?: boolean };
 
 export class Link {
   private chain: Promise<unknown> = Promise.resolve();
   private sweeping = false;
   private headChecked = new Map<string, number>();
+  private going = new Map<number, Promise<Put>>();   // cards being put up now (putUp)
+  private cainWaits = new Set<number>();             // cards Cain's show waits on now: a lapse found meanwhile is his to hear
   constructor(private d: Deps) {}
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
@@ -377,19 +443,26 @@ export class Link {
     if (closedItems(f.pending).has(item.toUpperCase())) throw new Refusal(`${item} is closed in PENDING.md`);
   }
 
-  // Older live cards with the same key as this one: replaced. Returns their ids. A card
-  // with no buttons replaces nothing: it asks nothing.
-  private markReplaced(s: State, newId: string): string[] {
+  // Live cards with the same key as this one: the newest keeps its buttons and the others
+  // are replaced, so a card filed under its key after it went up (one that went out by
+  // itself) never outlives a newer one. With `only`, just cards of that kind take part
+  // and held asks are left alone. Returns the ids replaced. A card with no buttons
+  // replaces nothing: it asks nothing.
+  private markReplaced(s: State, newId: string, only?: Kind): string[] {
     const fresh = s.messages[newId];
-    const key = fresh?.buttons ? keyFor(fresh) : null;
+    const key = fresh?.buttons && !fresh.outcome ? keyFor(fresh) : null;
     if (!key) return [];
+    const same = Object.entries(s.messages).filter(([id, m]) => id === newId
+      || (m.buttons && !m.outcome && keyFor(m) === key && (!only || m.kind === only)));
+    let keep = newId;
+    for (const [id, m] of same) if (isNewer(m, id, s.messages[keep], keep)) keep = id;
     const out: string[] = [];
-    for (const [id, m] of Object.entries(s.messages)) {
-      if (id === newId || !m.buttons || m.outcome || keyFor(m) !== key) continue;
+    for (const [id, m] of same) {
+      if (id === keep) continue;
       m.outcome = "replaced"; m.why = "replaced";
       out.push(id);
     }
-    if (fresh.kind === "ask" || fresh.kind === "card") s.held = (s.held ?? []).filter((h) => keyOf(h.item, h.question) !== key);
+    if (!only && (fresh.kind === "ask" || fresh.kind === "card")) s.held = (s.held ?? []).filter((h) => keyOf(h.item, h.question) !== key);
     return out;
   }
 
@@ -400,34 +473,176 @@ export class Link {
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
     const s = this.d.load();
     const id = s.next++;
-    s.cards[String(id)] = { text: String(c.text ?? ""), rows: comps, kind, created: this.d.now(), shown: null, expires: toMs(c.expires) };
-    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= this.d.now()) delete s.cards[k];
+    const now = this.d.now();
+    // A card with buttons goes out by itself if Cain hasn't shown it in time (showDue).
+    const due = comps.length && !DIRECT_KINDS.has(kind) ? now + SHOW_WAIT_MS : null;
+    const expires = toMs(c.expires);
+    if (expires === null && c.expires != null && c.expires !== "")
+      this.log(`card ${id}: its expiry isn't a time (${String(c.expires).slice(0, 40)}), so it has none`);
+    s.cards[String(id)] = { text: String(c.text ?? ""), rows: comps, kind, created: now, shown: null, expires, due };
+    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
     this.d.save(s);
     if (DIRECT_KINDS.has(kind)) {
       await this.show(id, { item: "none" });
     } else {
-      const ask = comps.length ? "It has buttons: show it now." : "Show it now if it matters today, or fold it into the morning message.";
-      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(c.text, 120)}". ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his)`);
+      const ask = due !== null ? "It has buttons: show it now, or it goes out by itself in about 2 minutes."
+        : "Show it now if it matters today, or fold it into the morning message.";
+      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(c.text, 120)}". ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
     }
     return id;
   }
 
   async show(id: number, m: { item?: unknown; question?: unknown; replyTo?: unknown }): Promise<string> {
+    return (await this.showCard(id, m)).message ?? "";
+  }
+
+  // Cain's show (POST /show). "posted": this show put it in front of him. "already out":
+  // it was up before (it went out by itself, or he showed it already); then nothing more
+  // is posted, and one that went out by itself is filed under his item and question.
+  // "expired": its own expiry passed before it reached him, and nothing is posted.
+  async showCard(id: number, m: { item?: unknown; question?: unknown; replyTo?: unknown }):
+      Promise<{ status: "posted" | "already out" | "expired"; message: string | null; said?: string }> {
     const meta = checkMeta(m);
+    let put: Put;
+    this.cainWaits.add(id);
+    try { put = await this.putUp(id, meta); }
+    catch (e) {
+      if (e instanceof Refusal) return this.lapsedAnswer(id);
+      throw e;
+    } finally { this.cainWaits.delete(id); }
+    if (put.first) return { status: "posted", message: put.message };
+    const f = await this.fileUnder(put.message, meta);
+    const under = about(meta.item, meta.question) ? ` under ${about(meta.item, meta.question)}` : "";
+    const done = "Nothing more was posted. Write no lead-in for it.";
+    return { status: "already out", message: put.message, said: !f.filed ? "It's already in front of him; nothing more was posted."
+      : f.gaveWay ? `It had gone out by itself; this filed it${under}, and as a newer card for the same question is up, its buttons came off. ${done}`
+      : f.replaced ? `It had gone out by itself; this filed it${under} and took the buttons off ${f.replaced === 1 ? "an older card" : `${f.replaced} older cards`} for the same question. ${done}`
+      : `It had gone out by itself; this only filed it${under}. ${done}` };
+  }
+
+  // Cain hears once that a card lapsed before it reached him, whether his show or the
+  // sweep found it.
+  private lapsedAnswer(id: number): { status: "expired"; message: null; said: string } {
     const s = this.d.load();
-    const card = s.cards[String(id)];
-    if (!card) throw new Error(`no card ${id}`);
-    if (card.shown) return card.shown;
-    this.mayAsk(meta.item);
-    const msg = await this.postCard(card.text, card.rows, { replyTo: meta.replyTo, nonce: stableNonce("card", String(id)) });
+    const c = s.cards[String(id)];
+    if (c?.lapseTold) return { status: "expired", message: null, said: `You were already told card ${id} expired before it reached him; nothing was posted.` };
+    if (c) { c.lapseTold = true; this.d.save(s); }
+    return { status: "expired", message: null, said: lapsedLine(id, c) };
+  }
+
+  // One put-up per card at a time: a second caller (Cain's show while the sweep posts it,
+  // or the other way round) waits for the first and gets the same message, so it's one
+  // Discord message by the link's own doing. The card's nonce stays as a second guard.
+  private putUp(id: number, meta: Meta, byItself = false): Promise<Put> {
+    const going = this.going.get(id);
+    if (going) return going.then((p) => ({ message: p.message, first: false }));
+    const run = this.postSpecialist(id, meta, byItself).finally(() => this.going.delete(id));
+    this.going.set(id, run);
+    return run;
+  }
+
+  // Puts a specialist's card in front of him and records it, for Cain's show and for the
+  // sweep when Cain hasn't shown it in time. No hold and no closed item stops it
+  // (boundItem): it's the specialist talking to him. A card already up is never posted
+  // again; one whose own expiry has passed never goes out at all.
+  private async postSpecialist(id: number, meta: Meta, byItself: boolean): Promise<Put> {
+    const before = this.d.load().cards[String(id)];
+    if (!before) throw new Error(`no card ${id}`);
+    if (before.shown) return { message: before.shown, first: false };
+    // A post whose answer never came may be on Discord already, from longer ago than
+    // Discord's nonce remembers: look in his DM first, expired or not, and post nothing
+    // while it can't be read.
+    const mark = before.posting;
+    let found: any = null;
+    if (mark) {
+      try { found = await this.findPosted(before); }
+      catch (e) { throw new Unsure(reason(e)); }
+    }
+    let msg = found;
+    if (!msg) {
+      const s = this.d.load();
+      const card = s.cards[String(id)];
+      if (!card) throw new Error(`no card ${id}`);
+      if (card.shown) return { message: card.shown, first: false };
+      if (card.outcome === "expired" || (card.expires != null && card.expires <= this.d.now())) {
+        if (!card.outcome) { card.outcome = "expired"; this.d.save(s); }
+        throw new Refusal(`card ${id} expired before it reached him; nothing was posted`);
+      }
+      if (!card.posting) {
+        card.posting = { at: this.d.now(), rows: digest("", card.rows), byItself, item: meta.item, question: meta.question };
+        this.d.save(s);
+      }
+      msg = await this.postCard(card.text, card.rows, { replyTo: meta.replyTo, nonce: stableNonce("card", String(id)) });
+    }
+    // The specialist changed its buttons while it was on its way: the message follows.
+    const rows = this.d.load().cards[String(id)]?.rows;
+    if (rows && digest("", rows) !== digest("", msg.components)) {
+      try {
+        const { dm } = await this.identity();
+        msg = (await this.d.rest("PATCH", `/channels/${dm}/messages/${msg.id}`, { components: rows, allowed_mentions: { parse: [] } })) ?? msg;
+      } catch (e) { this.log(`couldn't bring card ${id}'s buttons up to date: ${reason(e)}`); }
+    }
     const s2 = this.d.load();
-    s2.cards[String(id)].shown = String(msg.id);
-    this.remember(s2, msg, { card: id, kind: "card", item: meta.item, question: meta.question, posted: this.d.now(),
-      expires: card.expires ?? null, buttons: card.rows.length > 0 });
+    const latest = s2.cards[String(id)];
+    if (latest?.shown) return { message: latest.shown, first: false };
+    if (latest) { latest.shown = String(msg.id); delete latest.posting; }
+    // Who made the message: a post found in his DM was made by whoever began it. The sweep
+    // finding Cain's own lost show keeps his item and question.
+    const fromLink = found ? !!mark?.byItself : byItself;
+    const label = byItself && found && mark && !mark.byItself ? mark : meta;
+    this.remember(s2, msg, { card: id, kind: "card", item: label.item, question: label.question,
+      posted: found ? snowflakeTime(String(msg.id)) : this.d.now(), expires: latest?.expires ?? before.expires ?? null,
+      buttons: (msg.components ?? []).length > 0, ...(byItself && fromLink ? { byItself: true } : {}) });
     const replaced = this.markReplaced(s2, String(msg.id));
     this.d.save(s2);
     await this.stripAll(replaced);
-    return String(msg.id);
+    return { message: String(msg.id), first: true, fromLink };
+  }
+
+  // The bot's message in his DM that is this card, from its post whose answer never came:
+  // one the link doesn't know yet, posted since that post began (with a minute for the
+  // clocks), paging back until past that time. When the card's buttons have changed
+  // since, its words alone are enough. Throws when his DM can't be read, or goes back
+  // further than the link looks.
+  private async findPosted(card: Card): Promise<any> {
+    const mark = card.posting!;
+    const { dm, bot } = await this.identity();
+    const known = this.d.load().messages;
+    const words = fit(card.text).trim();
+    const exact = digest(words, card.rows);
+    const wordsAlone = digest("", card.rows) !== mark.rows;
+    const from = mark.at - 60_000;
+    let before = "";
+    for (let page = 0; page < HISTORY_PAGES; page++) {
+      const batch = await this.d.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`);
+      if (!Array.isArray(batch) || !batch.length) return null;
+      for (const m of batch) {
+        const id = String(m?.id ?? "");
+        if (String(m?.author?.id ?? "") !== bot || known[id] || snowflakeTime(id) < from) continue;
+        const text = String(m.content ?? "").trim();
+        if (digest(text, m.components) === exact || (wordsAlone && text === words)) return m;
+      }
+      before = String(batch[batch.length - 1].id);
+      if (batch.length < 100 || snowflakeTime(before) < from) return null;
+    }
+    throw new Error("his DM goes back further than the link looks");
+  }
+
+  // Cain showed a card that had already gone out by itself: it takes his item and
+  // question, so his replies to it find what it's about, and a newer card from the
+  // specialist for the same question replaces it. It only weighs against the
+  // specialist's other cards: it never takes the buttons off one of Cain's own asks or
+  // Ship cards, never gives way to one, and leaves his held asks alone.
+  private async fileUnder(messageId: string, meta: Meta): Promise<{ filed: boolean; gaveWay: boolean; replaced: number }> {
+    const s = this.d.load();
+    const m = s.messages[messageId];
+    if (!m?.byItself) return { filed: false, gaveWay: false, replaced: 0 };
+    m.item = meta.item; m.question = meta.question;
+    delete m.byItself;
+    const out = this.markReplaced(s, messageId, "card");
+    this.d.save(s);
+    await this.stripAll(out);
+    return { filed: true, gaveWay: out.includes(messageId), replaced: out.filter((x) => x !== messageId).length };
   }
 
   async editButtons(id: number, comps: any[]): Promise<void> {
@@ -436,7 +651,16 @@ export class Link {
     if (!card) return;
     const rec = card.shown ? s.messages[card.shown] : undefined;
     if (rec?.outcome && comps.length) { this.log(`card ${id} is ${rec.outcome}; its buttons stay off`); return; }
-    if (!card.shown) { card.rows = comps; this.d.save(s); return; }
+    if (!card.shown) {
+      // Not up yet: its 2 minutes run from when it has buttons, and without them it waits
+      // for Cain like any card without buttons.
+      // A card from before 0.7.2 (no due time at all) never gets one.
+      card.rows = comps;
+      if (!comps.length) { if (card.due !== undefined) card.due = null; }
+      else if (card.due === null && !DIRECT_KINDS.has(card.kind)) card.due = this.d.now() + SHOW_WAIT_MS;
+      this.d.save(s);
+      return;
+    }
     const { dm } = await this.identity();
     const msg = await this.d.rest("PATCH", `/channels/${dm}/messages/${card.shown}`,
       { components: comps, allowed_mentions: { parse: [] } });
@@ -622,16 +846,46 @@ export class Link {
     } catch (e) { this.log(`couldn't tell him a card was dead: ${String(e).slice(0, 80)}`); }
   }
 
+  // A tap on a message the link doesn't know, while a card's post never heard back: if
+  // the tapped message is that card (its words and buttons, or its words alone when its
+  // buttons changed since, posted since that post began), it's up after all. It's
+  // recorded as that card, and the tap is handled as that card's. No network: a tap is
+  // answered within Discord's 3 seconds.
+  private adoptTapped(it: any, msgId: string): boolean {
+    const s = this.d.load();
+    const m = it?.message ?? {};
+    if (!SNOWFLAKE.test(msgId) || s.messages[msgId] || (m.author?.id !== undefined && String(m.author.id) !== s.bot)) return false;
+    const text = String(m.content ?? "").trim();
+    for (const [k, c] of Object.entries(s.cards)) {
+      const mark = c.posting;
+      if (c.shown || !mark || snowflakeTime(msgId) < mark.at - 60_000) continue;
+      const words = fit(c.text).trim();
+      if (digest(text, m.components) !== digest(words, c.rows) && !(digest("", c.rows) !== mark.rows && text === words)) continue;
+      c.shown = msgId;
+      delete c.posting;
+      this.remember(s, { id: msgId, content: m.content, components: m.components }, { card: Number(k), kind: "card",
+        item: mark.item, question: mark.question, posted: snowflakeTime(msgId), expires: c.expires ?? null,
+        buttons: (m.components ?? []).length > 0, ...(mark.byItself ? { byItself: true } : {}) });
+      this.markReplaced(s, msgId);                     // the sweep takes off what it replaced
+      this.d.save(s);
+      this.log(`a tap showed card ${k} is up after all; recorded`);
+      this.d.relay(mark.byItself ? wentOutLine(Number(k), c, msgId) : foundLine(Number(k), c, msgId));
+      return true;
+    }
+    return false;
+  }
+
   // Why a card that looks live has stopped mattering, or "".
   private deadReason(m: Shown, now: number): string {
     if (m.q?.used) return "answered";
     if (m.expires != null && m.expires <= now) return "expired";
     if (m.until - DAY <= now) return "forgetting";
-    if (m.item && m.item !== "none") {
+    const item = boundItem(m);
+    if (item) {
       const f = this.files();
-      if (closedItems(f.pending).has(m.item.toUpperCase())) return "item closed";
+      if (closedItems(f.pending).has(item.toUpperCase())) return "item closed";
       const holds = parseHolds(f.holds);
-      if (holds && heldElsewhere(holds, m.item)) return "held elsewhere";
+      if (holds && heldElsewhere(holds, item)) return "held elsewhere";
     }
     return "";
   }
@@ -651,6 +905,8 @@ export class Link {
     const now = this.d.now();
     const s = this.d.load();
     const rec = s.messages[msgId];
+    // A card whose post never heard back may be the one he tapped: then it's up after all.
+    if (!rec && this.adoptTapped(it, msgId)) return this.onInteraction(it);
     const stop = cid === STOP || cid === RESUME;          // Stop works from any card of ours
     // Component taps only ever come for the app's own messages, so one the link doesn't
     // know is an old card of ours: take its buttons off (Stop and Turn back on still work).
@@ -763,10 +1019,63 @@ export class Link {
       if (!this.d.load().migrated) {
         try { await this.migrate(); } catch (e) { this.log(`couldn't look over the cards already posted yet: ${String(e).slice(0, 80)}`); }
       }
+      await this.showDue();
       await this.decide();
       await this.stripDue();
       await this.releaseHeld();
     } finally { this.sweeping = false; }
+  }
+
+  // A card with buttons that Cain hasn't shown in time goes out by itself, under no item,
+  // and he's told: the owner's card reaches him within its life, whatever Cain is doing.
+  // If it can't go out, Cain hears so once, and the link keeps trying. One whose own
+  // expiry passes first is marked expired, never goes out, and Cain hears what it was.
+  // Cards without buttons, Stop notices and cards from before 0.7.2 (no due time) are
+  // left as they are.
+  private async showDue(): Promise<void> {
+    const now = this.d.now();
+    const s = this.d.load();
+    const due: number[] = [];
+    const lapsed: string[] = [];
+    let marked = false;
+    for (const [k, c] of Object.entries(s.cards)) {
+      if (c.shown || c.outcome || c.due == null || !c.rows.length) continue;
+      const gone = c.expires != null && c.expires <= now;
+      if (gone && !c.posting) {
+        c.outcome = "expired"; marked = true;
+        if (!c.lapseTold) { c.lapseTold = true; lapsed.push(lapsedLine(Number(k), c)); }
+        this.log(`card ${k} expired before it went out; it won't be posted`);
+      } else if (gone || c.due <= now) due.push(Number(k));      // a post whose answer was lost is looked for first
+    }
+    if (marked) this.d.save(s);
+    for (const l of lapsed) this.d.relay(l);
+    for (const id of due) {
+      let out: Put;
+      try { out = await this.putUp(id, { item: "none", question: "" }, true); }
+      catch (e) {
+        if (e instanceof Refusal) {                        // it lapsed just now: the post marked it expired
+          const s2 = this.d.load();
+          const c = s2.cards[String(id)];
+          // Told once: not again if he knows, nor while his own show of it is about to tell him.
+          if (c && !c.lapseTold && !this.cainWaits.has(id)) { c.lapseTold = true; this.d.save(s2); this.d.relay(lapsedLine(id, c)); }
+          continue;
+        }
+        this.log(`couldn't post card ${id} by itself; the next sweep tries again: ${reason(e)}`);
+        if (/discord 429/.test(String(e))) break;          // rate limited: the rest at the next sweep
+        const s2 = this.d.load();
+        const c = s2.cards[String(id)];
+        if (c && !c.told && !c.shown && !c.outcome) {
+          c.told = true;
+          this.d.save(s2);
+          this.d.relay(failedLine(id, c, e, e instanceof Unsure, this.d.now()));
+        }
+        continue;
+      }
+      if (!out.first) continue;                        // Cain's own show got there first
+      const c = this.d.load().cards[String(id)];
+      this.log(`card ${id} went out by itself: Cain hadn't shown it in time`);
+      this.d.relay(out.fromLink === false ? foundLine(id, c, out.message) : wentOutLine(id, c, out.message));
+    }
   }
 
   // Once: cards posted before 0.7.0. His DM is the truth about which still have buttons.
@@ -840,7 +1149,7 @@ export class Link {
     const s = this.d.load();
     const newest = new Map<string, string>();
     for (const [id, m] of Object.entries(s.messages)) {
-      const k = keyFor(m);
+      const k = rivalKey(m);
       if (!k || !live(m, now)) continue;
       const cur = newest.get(k);
       if (!cur || (m.posted ?? 0) > (s.messages[cur].posted ?? 0)
@@ -849,14 +1158,14 @@ export class Link {
     const told: [string, Shown, string][] = [];
     for (const [id, m] of Object.entries(s.messages)) {
       if (!m.buttons || m.outcome || !m.kind) continue;
-      const item = m.item && m.item !== "none" ? m.item : "";
+      const item = boundItem(m);
       let why = "";
       if (m.expires != null && m.expires <= now) why = "expired";
       else if (m.until - DAY <= now) why = "forgetting";
       else if (pulls.has(id)) why = pulls.get(id)!;
       else if (item && closed.has(item.toUpperCase())) why = "item closed";
       else if (item && holds && heldElsewhere(holds, item)) why = "held elsewhere";
-      else { const k = keyFor(m); if (k && newest.get(k) !== id) why = "replaced"; }
+      else { const k = rivalKey(m); if (k && newest.get(k) !== id) why = "replaced"; }
       if (!why) continue;
       m.outcome = why === "replaced" ? "replaced" : "expired"; m.why = why;
       told.push([id, m, why]);
