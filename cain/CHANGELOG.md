@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.3
+
+- Cain reads the screenshots and files you send him in Discord without stopping to ask for approval. Before, a screenshot left his session waiting for an approval nobody was there to give.
+- Cain can read back recent messages in your DM with him, so he can catch up on what was said.
+- Both are read-only. Everything that writes stays as it was: calendar, mail, Slack and Home Assistant changes stay switched off, and replying, reacting and editing in Discord still go through the usual approval.
+
 ## 0.7.2
 
 - A card from the calendar specialist always reaches you and keeps its buttons until you answer it or it expires, even when someone else is working on the same job, or that job is done. Before, such a card could be held back and expire before you saw it.

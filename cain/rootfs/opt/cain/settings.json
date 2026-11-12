@@ -8,7 +8,9 @@
       "Bash(/opt/cain/record.sh)",
       "Bash(/opt/cain/record.sh:*)",
       "Bash(/opt/cain/review.sh)",
-      "Bash(/opt/cain/review.sh:*)"
+      "Bash(/opt/cain/review.sh:*)",
+      "mcp__plugin_discord_discord__download_attachment",
+      "mcp__plugin_discord_discord__fetch_messages"
     ],
     "deny": [
       "mcp__claude_ai_Google_Calendar__create_event",
