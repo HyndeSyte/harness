@@ -4,6 +4,7 @@ All names are invented. No network: Family, Google, Cain's link and the model ar
 """
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import threading
@@ -15,16 +16,20 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness import caldav, choices, drive, family_rules, handover, ical, meaning, meaning_live
+from harness import caldav, choices, drive, family_rules, handover, ical, inputs, meaning, meaning_live
+from harness.calendar_change import CalendarChange
+from harness.family_copy import FamilyCopy
 from harness.family_gmail import DROP_TITLE, FamilyGmail, _leg_title, home_from_options, leg_key
+from harness.mail_dates import MailDates
 from harness.ledger import Ledger
 from harness.net import HttpResponse, TransportError
 from conftest import Clock
-from fakes import FakeEngine, SyncExecutor, result
+from fakes import FakeEngine, ManualExecutor, SyncExecutor, result
 from fake_caldav import FAMILY_PATH, no_network  # noqa: F401  (autouse)
 from test_family_add import Rig as FamilyRig, on, rig  # noqa: F401
 from test_family_copy import Feeds, GMAIL, NY, TZ, occ, seed, when
 from test_family_gmail import KEY, RULES, FakeGoogle, count, g  # noqa: F401
+from test_mail_dates import Box
 from harness import google_cal
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1227,3 +1232,214 @@ def test_a_dated_row_must_be_a_real_date():
         assert rows is None and "for must be a date" in why
     rows, _ = meaning_live.validate_rows({"rows": [{**ROW, "for": "2026-11-21"}]})
     assert rows[0]["for"] == "2026-11-21"
+
+
+# -- 8. a judgment already waiting is flagged once, not on every pass (0.21.2) ---------------------------
+
+ONCE = "meaning: 1 judgments made again with an answer of his they hadn't seen"
+
+
+def made_again(caplog):
+    return [r.getMessage() for r in caplog.records if "made again with an answer" in r.getMessage()]
+
+
+def revive_done(ledger):
+    with ledger.tx() as db:
+        ledger.set_meta("meaning_revived", "2", db)            # long done, as on the Pi
+
+
+class Family:
+    """Family as the judge reads it: the events in the window it asks for."""
+
+    def __init__(self, *items):
+        self.items = list(items)
+
+    def items_between(self, start, end, tz):
+        return caldav.Read([i for i in self.items if i.occ.end > start and i.occ.start < end], 0)
+
+
+@pytest.fixture
+def judging(lv):
+    """The judge itself over Family, with a fake engine. Its work is held until released, as a
+    model call takes a while and passes go on meanwhile."""
+    lv.judge = FakeEngine("claude")
+    lv.work = ManualExecutor()
+    lv.family = Family()
+    lv.m = meaning.MeaningShadow(lv.ledger, lv.family, lv.feeds, lv.work, engine_fn=lambda: lv.judge,
+                                 on_fn=lambda: True, tz=TZ)
+    lv.live = meaning_live.MeaningLive(lv.ledger, lv.m, lv.feeds, tz=TZ, on_fn=lambda: True)
+    lv.live.bind(OWNER_ID)
+    return lv
+
+
+def turn(lv):
+    """One controller pass, in its order: the judge, then the questions."""
+    lv.m.run(paused=False)
+    lv.live.tick(paused=False)
+
+
+def test_a_judgment_the_judge_doesnt_reach_is_flagged_once_not_every_pass(lv, caplog):
+    # Nov 11: a judgment the judge doesn't reach stays waiting (its event is outside the read or
+    # gone, or a limit is hit), and every pass, about every 3 seconds, flagged it again: a log
+    # line, a poke and a database write each time.
+    far = item("Book club", local(lv, meaning.AHEAD_DAYS + 30))     # past what the judge reads
+    key = judge(lv.ledger, far, rel("presence")).key                 # judged before his answer
+    answer_ex(lv, "Book club", ["presence"])                         # in use; it never saw it
+    revive_done(lv.ledger)
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    lv.live.tick(paused=False)
+    assert made_again(caplog) == [ONCE] and lv.shadow.pokes == 1
+    assert meaning.stored(lv.ledger, key)["stale"] == 1
+    writes = lv.ledger.db.total_changes
+    lv.live.tick(paused=False)
+    lv.live.tick(paused=False)
+    assert made_again(caplog) == [ONCE] and lv.shadow.pokes == 1     # no line and no poke
+    assert lv.ledger.db.total_changes == writes                      # and nothing written
+    assert meaning.stored(lv.ledger, key)["stale"] == 1              # still waiting for the judge
+
+
+def shadow_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("meaning shadow")]
+
+
+@pytest.mark.parametrize("why", ["outside the read", "the day's calls used up"])
+def test_the_real_judge_stays_quiet_while_a_judgment_waits_for_it(judging, caplog, why):
+    # Nov 11 review: the judge itself, not a fake: while a judgment waits for it, passes log no
+    # score line and write nothing.
+    it = item("Book club", local(judging, meaning.AHEAD_DAYS + 30 if why == "outside the read" else 5))
+    judging.family.items.append(it)
+    judge(judging.ledger, it, rel("presence"))                     # judged before his answer
+    answer_ex(judging, "Book club", ["presence"])                  # in use; it never saw it
+    if why == "the day's calls used up":
+        today = judging.clock().astimezone(NY).date().isoformat()
+        with judging.ledger.tx() as db:
+            judging.ledger.set_meta("meaning_calls", f"{today}:{meaning.MAX_PER_DAY}", db)
+    revive_done(judging.ledger)
+    caplog.set_level("INFO", logger="harness")
+    turn(judging)                                                  # read, and flagged
+    turn(judging)                                                  # the judge looks: nothing it may do
+    scores, writes = shadow_lines(caplog), judging.ledger.db.total_changes
+    for _ in range(3):
+        turn(judging)
+    assert shadow_lines(caplog) == scores and judging.ledger.db.total_changes == writes
+    assert made_again(caplog) == [ONCE] and judging.judge.calls == []
+
+
+def test_a_judgment_in_the_read_is_flagged_once_and_made_again_with_his_answer(judging, caplog):
+    start = local(judging, 5)
+    it = item("Book club", start)
+    judging.family.items.append(it)
+    key = judge(judging.ledger, it, rel("presence")).key            # judged before his answer
+    eid = answer_ex(judging, "Book club", ["presence"])             # in use; it never saw it
+    judging.judge.script = [judged(ob("presence", start, start + timedelta(hours=1)), cites=[eid])]
+    revive_done(judging.ledger)
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    turn(judging)                                                   # flagged
+    turn(judging)                                                   # the judge is at it
+    turn(judging)                                                   # and still is
+    assert made_again(caplog) == [ONCE]
+    judging.work.run_all()                                          # its answer comes back
+    turn(judging)
+    row = meaning.stored(judging.ledger, key)
+    assert row["stale"] == 0 and json.loads(row["cites"]) == [eid]
+    assert eid in json.loads(row["candidates"])                     # made again with it in front
+    assert len(judging.judge.calls) == 1 and f"[{eid}]" in judging.judge.calls[0]["user"]
+    turn(judging)
+    assert made_again(caplog) == [ONCE]                             # seen now: never again
+    assert meaning.rejudge_for(judging.ledger, [eid], only_unseen=True) == 0
+
+
+def test_a_new_answer_still_marks_each_judgment_it_fits_but_not_one_already_waiting(lv):
+    # Kept: a new answer of his marks each judgment it fits, when it comes in (a tap, an Undo,
+    # Cain's table) and when a pass finds judgments that never saw it. Only what it newly marks
+    # is counted: one already waiting, with features or from before they were kept, is left.
+    swims = [item("Swim meet", local(lv, days)) for days in (3, 10, 17)]
+    keys = [judge(lv.ledger, it, rel()).key for it in swims]
+    judge(lv.ledger, item("Book club", local(lv, 4)), rel())        # one it doesn't fit
+    lv.ledger.db.execute("UPDATE meaning_judgments SET stale=1 WHERE key=?", (keys[2],))   # waiting
+    lv.ledger.db.execute(                                           # waiting, from before features
+        "INSERT INTO meaning_judgments(key, kind, fingerprint, anchor, obligations, cites, unsure, status,"
+        " failure, tries, policy_version, examples_version, model, judged_at, stale)"
+        " VALUES('e:old','single','fp','2026-08-15','[]','[]',1,'ok','',1,'p','v','m','2026-08-01',1)")
+
+    def waiting():
+        return {r["key"] for r in lv.ledger.db.execute("SELECT key FROM meaning_judgments WHERE stale=1")}
+
+    first = answer_ex(lv, "Swim meet", ["transport"])               # in use; none of them saw it
+    assert meaning.rejudge_for(lv.ledger, [first], only_unseen=True) == 2
+    assert waiting() == {*keys, "e:old"}
+    for it in swims[:2]:
+        judge(lv.ledger, it, rel())                                 # made again, with it in front
+    newer = answer_ex(lv, "Swim meet", [])                          # his newer word, just in
+    assert meaning.rejudge_for(lv.ledger, [newer]) == 2
+    assert waiting() == {*keys, "e:old"}
+
+
+def test_a_revive_that_fails_is_tried_again_at_the_next_read_not_every_pass(lv, caplog, monkeypatch):
+    # Nov 11 review sweep: the one-time revive stayed pending after a failure, so every pass tried
+    # it again, with a warning and a recorded failure each time, and the rest of the pass never ran.
+    judge(lv.ledger, item("Book club", local(lv, meaning.AHEAD_DAYS + 30)), rel("presence"))
+    answer_ex(lv, "Book club", ["presence"])                        # in use; it never saw it
+    revive = meaning.revive_answers
+
+    def stopped(ledger):
+        raise RuntimeError("the revive stopped")
+
+    monkeypatch.setattr(meaning, "revive_answers", stopped)
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    for _ in range(3):
+        lv.live.tick(paused=False)
+    warned = [r for r in caplog.records if r.getMessage().startswith("meaning questions failed")]
+    assert len(warned) == 1 and count(lv, "meaning_live_failed") == 1
+    assert made_again(caplog) == [ONCE] and lv.shadow.pokes == 1    # the rest of the pass runs
+    monkeypatch.setattr(meaning, "revive_answers", revive)
+    lv.feeds.generation += 1                                        # the next read
+    lv.live.tick(paused=False)
+    assert lv.ledger.get_meta("meaning_revived") == "2"
+
+
+# -- 9. idle passes are quiet (0.21.2) -------------------------------------------------------------------
+
+def test_idle_passes_are_quiet(live, caplog):
+    # Nov 11: with nothing new, the Pi logged and wrote its database every 3 seconds. A gate: with
+    # what runs on every pass in place and settled, a pass with nothing new logs nothing at INFO or
+    # above and writes nothing. Not here: the calendar reads themselves (the rig's are fakes) and
+    # what only runs with Discord (Cain's link, once a minute).
+    seen = inputs.Seen()
+    live.fa.client.seen = live.client.seen = seen                  # what iCloud and Google answer
+    live.c.inputs = inputs.Watch(live.ledger, seen, tz=TZ, active={
+        inputs.MAIL: lambda: True, inputs.FAMILY: lambda: True, inputs.GOOGLE: lambda: True,
+        inputs.MEANING: lambda: live.live_on})
+    live.c.family_copy = FamilyCopy(live.ledger, live.fa, live.feeds, name_fn=lambda: "Lee", tz=TZ)
+    live.c.calendar_change = CalendarChange(live.ledger, live.fa.client, live.client, enabled=lambda: True,
+                                            address=live.gm._address, tz=TZ)
+    live.c.mail_dates = MailDates(live.ledger, live.client, SyncExecutor(), address=live.gm._address,
+                                  password=lambda: "abcdefghijklmnop", engine_fn=lambda: live.claude,
+                                  writes_on=lambda: True, tz=TZ, mailbox=Box([]), sleep=lambda s: None,
+                                  family=live.fa.client)            # nothing new in his mail
+    live.c.config = None                                           # the controller binds them all
+    # On Family: a block on Gmail from his answer, a question waiting on him, and a judgment the
+    # judge doesn't reach with an answer of his it never saw (Nov 11 on the Pi).
+    live.feeds.window.occurrences = [occ("Errand", when(live, days=20, hour=15))]   # Gmail is read
+    club, sitting = when(live, days=3), when(live, days=2, hour=15)
+    seed(live, "Book club", club)
+    seed(live, "Kid sitting", sitting)
+    eid = answer_ex(live, "Book club", ["presence"])
+    live.judge = ByTitle()
+    live.judge.by["Book club"] = judged(ob("presence", club, club + timedelta(hours=1)), cites=[eid])
+    live.judge.by["Kid sitting"] = judged(ob("supervision", sitting, sitting + timedelta(hours=2),
+                                             certainty="medium"))
+    judge(live.ledger, item("Swim meet", local(live, meaning.AHEAD_DAYS + 30)), rel("presence"))
+    answer_ex(live, "Swim meet", ["presence"])
+    for _ in range(3):
+        go(live)                                                   # read, judged, on Gmail, asked
+    live.tick()
+    assert live.google.titles() == ["Busy (family)"] and len(open_q(live.ledger)) == 1
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+    writes = live.ledger.db.total_changes
+    for _ in range(5):
+        live.clock.advance(seconds=3)                              # a pass every 3 seconds
+        live.tick()
+    assert [f"{r.name}: {r.getMessage()}" for r in caplog.records if r.levelno >= logging.INFO] == []
+    assert live.ledger.db.total_changes == writes

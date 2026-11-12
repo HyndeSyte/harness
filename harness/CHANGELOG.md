@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.2
+
+- **The Harness no longer marks the same Family events to be judged again every few seconds.** One already waiting to be judged again is marked once, so its log stays readable and the Pi stops writing its database over and over.
+- **If judging Family events stops on an unexpected problem, it tries again at the next calendar read,** not every few seconds with a warning each time.
+
 ## 0.21.1
 
 - **You hear right away when only you can fix something.** If Gmail turns down Harness's app password or wants you to sign in on the web, iCloud turns down its app-specific password, Google turns down its service account key, or your Gmail calendar isn't shared with Harness any more, you get one message as soon as a second try confirms it. It says what stopped, since when, what it costs you, and how to fix it from your phone, down to tapping Approve on the Discord message that follows. You get it once per outage. If a new key is turned down too, you hear again.
