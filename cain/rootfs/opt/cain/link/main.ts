@@ -1,10 +1,11 @@
 // Runs Cain's link (core.ts): the Discord gateway for taps and reactions, the
-// REST calls, the sweep that takes buttons off cards that stopped mattering, and a
-// small local HTTP API.
+// REST calls, the sweep that posts cards Cain hasn't shown in time and takes buttons
+// off cards that stopped mattering, and a small local HTTP API.
 //
 // HTTP on port 8097, keyed with HMAC-SHA256(bot token, "harness-relay-v1"):
 //   from the calendar specialist (the Harness add-on, over the add-ons' network):
-//     POST /card {text, rows, kind, expires?}  hold a card for Cain to show (direct kinds go out now)
+//     POST /card {text, rows, kind, expires?}  hold a card for Cain to show (direct kinds go out now;
+//                                       one with buttons goes out by itself if he hasn't shown it in about 2 minutes)
 //     POST /buttons {card, rows}        change a card's buttons (after a tap)
 //     POST /answer {callback, text}     a short note only Dane sees, after a tap
 //     POST /relay {text}                a line for Cain

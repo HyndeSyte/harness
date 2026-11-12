@@ -3,10 +3,12 @@
 // replace an older one, and it's kept for the record. So no hold and no closed item
 // stops the card going out, takes its buttons off, or turns a tap on it away. It ends
 // only when it's answered, expires, is replaced or is forgotten. Cain's own asks and
-// Ship cards keep their hold and closed checks.
+// Ship cards keep their hold and closed checks. And a card with buttons reaches him
+// within its life whatever Cain is doing: if Cain hasn't shown it within about 2
+// minutes, it goes out by itself.
 import { describe, expect, test } from "bun:test";
-import { EXPIRED_TAP, STOP } from "../rootfs/opt/cain/link/core";
-import { keeperHolds, MIN, pendingWith, PR, rig, SHA1 } from "./link-rig";
+import { EXPIRED_TAP, RESUME, STOP } from "../rootfs/opt/cain/link/core";
+import { DM, HOUR, keeperHolds, MIN, pendingWith, PR, rig, SHA1 } from "./link-rig";
 
 const NOV11_644PM = Date.UTC(2026, 10, 11, 23, 44);                  // Wed Nov 11 2026, 6:44 PM local
 const LAPSES = NOV11_644PM + 15 * MIN;                               // the card's own 15 minutes
@@ -21,6 +23,9 @@ const ROWS = [
 const BUTTONS = ["Approve", "Decline", "Stop"];
 const elsewhere = (item: string) => keeperHolds({ [item]: { holder: "laptop:s1" } });
 const snap = (m: any) => structuredClone(m);                         // the card as his phone shows it
+const tick = () => new Promise((ok) => setTimeout(ok, 0));
+const byItself = (card: number, message: string) =>
+  `Card ${card} went out to him by itself (Discord message ${message}): you hadn't shown it within 2 minutes. Don't show it again. Nothing to tell him.`;
 
 // That evening: P49 and P50 open in the record, and P49 held by a laptop session.
 const evening = (o: { holds?: string | null; pending?: string | null } = {}) =>
@@ -67,8 +72,11 @@ describe("(a) a specialist's card goes out whoever holds its item", () => {
     const r = evening();
     const card = await approval(r);
     expect(r.relayed).toHaveLength(1);
-    expect(r.relayed[0]).toContain(`It has buttons: show it now. Run /opt/cain/keeper.sh show ${card} --item`);
+    expect(r.relayed[0]).toContain(`It has buttons: show it now, or it goes out by itself in about 2 minutes. Run /opt/cain/keeper.sh show ${card} --item`);
     expect(r.relayed[0]).toEndWith("The item is only its label: the card goes out whoever holds the item, open or closed.");
+    await r.link.addCard({ text: "Long words. ".repeat(200), rows: ROWS });
+    expect(r.relayed[1].length).toBeLessThanOrEqual(600);             // main.ts cuts a relayed line at 600 characters
+    expect(r.relayed[1]).toEndWith("open or closed.");
   });
 });
 
@@ -183,5 +191,120 @@ describe("(c) Cain's own asks and Ship cards keep the hold and closed checks", (
     expect(r.state().held).toEqual([]);
     expect(r.cards().length).toBe(1);                                 // P50's ask never went out
     expect(r.relayed).toEqual(["Your held question P50 Q1 was dropped unasked: P50 is now held by another session. Don't ask him about it or say who has it. Nothing to tell him."]);
+  });
+});
+
+describe("a card with buttons goes out within about 2 minutes, whatever Cain is doing", () => {
+  test("(d) one Cain hasn't shown goes out by itself about 2 minutes after it came, under no item, and Cain is told once", async () => {
+    const r = evening();
+    await r.link.sweep();                                             // the link's sweep at start
+    const card = await approval(r);                                   // Cain is busy with something else
+    r.relayed.length = 0;
+    r.later(MIN);
+    await r.link.sweep();
+    expect(r.cards()).toEqual([]);                                    // a minute in: still Cain's to show
+    r.later(MIN);
+    await r.link.sweep();                                             // two minutes in: out by itself
+    expect(r.cards().length).toBe(1);
+    const id = r.cards()[0].id;
+    expect(r.msg(id).content).toBe(TEXT);                             // unchanged
+    expect(r.buttons(id)).toEqual(BUTTONS);
+    expect(r.state().cards[card].shown).toBe(id);
+    expect(r.state().messages[id]).toMatchObject({ kind: "card", card, item: "none", question: "", buttons: true, expires: LAPSES });
+    expect(r.relayed).toEqual([byItself(card, id)]);
+    r.later(MIN);
+    await r.link.sweep();
+    expect(await r.link.show(card, { item: "P49" })).toBe(id);       // a late show from Cain: the same message
+    expect(r.cards().length).toBe(1);
+    expect(r.posts()).toBe(1);
+    expect(r.relayed).toEqual([byItself(card, id)]);                  // told once
+  });
+
+  test("(e) one Cain shows within the 2 minutes goes out once, and the sweep leaves it be", async () => {
+    const r = evening({ holds: null });
+    const card = await approval(r);
+    r.later(90_000);
+    const id = await r.link.show(card, { item: "P49" });
+    r.relayed.length = 0;
+    for (let i = 0; i < 3; i++) { r.later(MIN); await r.link.sweep(); }
+    expect(r.cards().length).toBe(1);
+    expect(r.posts()).toBe(1);                                        // Discord was asked once
+    expect(r.state().messages[id].item).toBe("P49");                  // Cain's own label stays
+    expect(r.relayed).toEqual([]);
+  });
+
+  test("(f) one without buttons keeps waiting for Cain, and Stop notices still go straight out, once", async () => {
+    const r = evening();
+    const plain = await r.link.addCard({ text: "Moved the call to Thu 2 PM.", rows: [] });
+    expect(r.relayed[0]).toContain("fold it into the morning message");
+    r.later(3 * MIN);
+    await r.link.sweep();
+    r.later(HOUR);
+    await r.link.sweep();
+    expect(r.cards()).toEqual([]);
+    expect(r.state().cards[plain].shown).toBeNull();
+    const id = await r.link.show(plain, { item: "none" });           // still Cain's to show, whenever he likes
+    expect(r.msg(id).content).toBe("Moved the call to Thu 2 PM.");
+    const turnBackOn = [{ type: 1, components: [{ type: 2, style: 2, label: "Turn back on", custom_id: RESUME }] }];
+    await r.link.addCard({ text: "Stopped.", rows: turnBackOn, kind: "stopped" });
+    expect(r.cards().length).toBe(2);                                 // straight out
+    r.failing.add(`POST /channels/${DM}/messages`);
+    await expect(r.link.addCard({ text: "Stopped.", rows: turnBackOn, kind: "stopped" })).rejects.toThrow("discord 500");
+    r.failing.clear();                                                // the specialist sends it again itself
+    r.later(3 * MIN);
+    await r.link.sweep();
+    expect(r.cards().length).toBe(2);                                 // the sweep posts neither again
+  });
+
+  for (const first of ["Cain", "the sweep"] as const) {
+    test(`(g) Cain's show and the sweep at the same moment make one Discord message (${first} first)`, async () => {
+      const r = evening({ holds: null });
+      await r.link.sweep();                                           // the link's sweep at start
+      const card = await approval(r);
+      r.relayed.length = 0;
+      r.later(2 * MIN);                                               // it's due to go out by itself...
+      r.gate.posts = true;                                            // ...and Discord is slow to answer
+      const go = { Cain: () => r.link.show(card, { item: "P49" }), "the sweep": () => r.link.sweep() };
+      const one = go[first](), other = go[first === "Cain" ? "the sweep" : "Cain"]();
+      for (let i = 0; i < 100 && r.posts() < 2; i++) await tick();
+      expect(r.posts()).toBe(2);                                      // both asked Discord before either heard back
+      r.release();
+      await Promise.all([one, other]);
+      expect(r.cards().length).toBe(1);                               // one message: the card's own nonce
+      const id = r.cards()[0].id;
+      expect(r.state().cards[card].shown).toBe(id);
+      expect(Object.keys(r.state().messages)).toEqual([id]);
+      // Whoever asked Discord first records it; the other gets the same message back.
+      expect(r.state().messages[id].item).toBe(first === "Cain" ? "P49" : "none");
+      expect(r.relayed).toEqual(first === "Cain" ? [] : [byItself(card, id)]);
+      expect(await r.link.show(card, { item: "P49" })).toBe(id);
+      r.later(MIN);
+      await r.link.sweep();
+      expect(r.cards().length).toBe(1);
+      expect(r.relayed.length).toBe(first === "Cain" ? 0 : 1);
+    });
+  }
+
+  test("(h) one whose own expiry passed before it went out is never posted, and is marked expired", async () => {
+    const r = evening();
+    const short = await r.link.addCard({ text: TEXT, rows: ROWS, kind: "card", expires: new Date(NOV11_644PM + MIN).toISOString() });
+    const card = await approval(r);                                   // 15 minutes
+    r.relayed.length = 0;
+    r.later(MIN);
+    await r.link.sweep();                                             // the one-minute card lapses before it's due
+    expect(r.state().cards[short]).toMatchObject({ shown: null, outcome: "expired" });
+    r.restart();                                                      // the link is down until the other has lapsed too
+    r.later(20 * MIN);
+    await r.link.sweep();
+    expect(r.cards()).toEqual([]);
+    expect(r.state().cards[card]).toMatchObject({ shown: null, outcome: "expired" });
+    expect(r.relayed).toEqual([]);                                    // as the sweep does with a specialist's card: nothing for Cain
+    await expect(r.link.show(card, { item: "P49" })).rejects.toThrow(`card ${card} expired before it went out; nothing was posted`);
+    const late = await r.link.addCard({ text: TEXT, rows: ROWS, kind: "card", expires: new Date(r.t.now + MIN).toISOString() });
+    r.later(MIN);                                                     // Cain shows it after it lapsed, before any sweep
+    await expect(r.link.show(late, { item: "none" })).rejects.toThrow("expired before it went out");
+    expect(r.state().cards[late].outcome).toBe("expired");
+    expect(r.cards()).toEqual([]);
+    expect(r.posts()).toBe(0);
   });
 });

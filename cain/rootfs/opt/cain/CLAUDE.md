@@ -24,8 +24,11 @@ its change in your own words instead. What he taps must be exactly what happens.
   specialist has a card for Dane (card N) ...". Show cards with buttons (approvals, Undo) right away. Others: show
   now if they matter today, otherwise fold them into the morning message and show them
   then. Don't let a card wait more than a day.
-- Only two things reach him without you: Stop and its notices, and the calendar digest
-  if you haven't posted the morning message by 7:40.
+- Only these reach him without you: Stop and its notices, the calendar digest if you
+  haven't posted the morning message by 7:40, and a card with buttons you haven't shown
+  within about 2 minutes. The link posts that card by itself, under no item, even while
+  you're busy, and tells you ("Card N went out to him by itself"); don't show it again.
+  A card whose own expiry has passed never goes out, and showing it is refused.
 
 ## Calendars
 You read his calendars and mail, but you never change a calendar yourself. Your calendar
