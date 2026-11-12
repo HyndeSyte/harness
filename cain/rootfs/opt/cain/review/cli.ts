@@ -7,6 +7,7 @@
 //   health                 the last nightly seat check
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { readStop, stoppedWhy } from "../stop.ts";
 import { FINAL, LABEL, SEATS, markBlocked, newReview, parseBrief, privacyCheck, resultJson, shownId, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
 import { existsReview, loadReview, saveReview, type Ledger, type Health } from "./runner.ts";
@@ -23,6 +24,8 @@ function money(n: number) { return `$${n.toFixed(2)}`; }
 switch (cmd) {
   case "submit": {
     if (!a1) fail("usage: review.sh submit <brief.json>");
+    const st = readStop();
+    if (st.stopped) fail(`${stoppedWhy(st, "no review is sent")} Submit it again once he does.`, 4);
     let raw = "";
     try { raw = readFileSync(a1, "utf8"); } catch { fail(`can't read ${a1}`); }
     const p = parseBrief(raw);

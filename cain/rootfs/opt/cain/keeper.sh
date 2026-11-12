@@ -25,12 +25,13 @@
 #                                        he answered that open ask in words: buttons off
 #   keeper.sh replied <message id>       what a message of his replied to, if anything
 #   keeper.sh morning "text"             post the one morning message (with Stop)
+#   keeper.sh stopped                    whether everything is stopped (Dane's Stop), and since when
 set -u
 dir=/data/.claude/channels/discord
 cmd="${1:-handover}"; shift || true
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning) url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped) url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -107,6 +108,7 @@ case "$cmd" in
               "$meta"' + {text: $t, pr: $p, head: $h}') ;;
   answered) body=$(jq -nc --arg it "$item" --arg q "$question" --arg r "" "$meta") ;;
   replied)  body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
+  stopped)  body='{}' ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac

@@ -6,19 +6,28 @@
 //   - a Build run names its branch ("Branch: claude/<slug>"), and every branch it names
 //     is in a hold of Cain's (taken for the job first), in the record keeper's own
 //     holds file; it names no pull request, and no branch someone else holds, anywhere;
-//   - a Ship run names a pull request and the full head sha of a Ship card he tapped
-//     Ship on, as the link recorded it.
+//   - a Ship run carries the Ship token from his Ship tap (../ship-token.ts): signed by
+//     the link's Ship key, not expired, and for the pull request and full head sha the
+//     job names;
+//   - while everything is stopped (Dane's Stop, ../stop.ts), no run starts at all.
 // A refusal goes back to Cain as the reason; anything else is left to the usual
-// permission rules. If the call, the holds or the link's cards can't be read, it's refused.
+// permission rules. If the call, the holds, the Ship key or the Stop state can't be
+// read, it's refused.
 import { readFileSync } from "node:fs";
-import { parseHolds, type State } from "../link/core.ts";
+import { parseHolds } from "../link/core.ts";
+import { findToken, publicKey, pullOf, readToken } from "../ship-token.ts";
+import { readStop, type StopState, stoppedWhy } from "../stop.ts";
 
 export const BUILD = "trig_015FTxexzFDZyjYjzw39bPv8";
 export const SHIP = "trig_015NTtUUC5DN82zDJBwmcq1r";
 const ACTIONS = new Set(["run", "list_runs", "get_run_log"]);
 const HOLDS = process.env.CAIN_HOLDS ?? "/data/record-holds.json";
-const CARDS = process.env.CAIN_LINK_STATE ?? "/data/link/state.json";
+const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? "/data/ship.pub";
 const PR_LINK = /github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/i;
+
+// What a Ship run is checked against: the link's public Ship key (null: none), the Stop
+// state, and the time now.
+export interface Env { pub?: string | null; stop?: StopState; now?: number }
 
 const clip = (s: string) => s.replace(/[^\x20-\x7e]/g, "?").slice(0, 60);
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -33,8 +42,8 @@ export function branchesOf(text: string): string[] {
 }
 
 // "" when there's nothing to object to; otherwise why it's refused, for Cain.
-// holdsText: the keeper's holds file; cardsText: the link's state. null: no such file.
-export function decide(call: any, holdsText: string | null, cardsText: string | null = null): string {
+// holdsText: the keeper's holds file (null: no such file).
+export function decide(call: any, holdsText: string | null, env: Env = {}): string {
   if (!call || typeof call !== "object") return "couldn't read the RemoteTrigger call, so it's refused";
   if (call.tool_name !== undefined && call.tool_name !== "RemoteTrigger") return "";
   const t = call.tool_input;
@@ -47,6 +56,8 @@ export function decide(call: any, holdsText: string | null, cardsText: string | 
   if (trigger !== BUILD && trigger !== SHIP)
     return `Only the Build (${BUILD}) and Ship (${SHIP}) routines; "${clip(trigger)}" is refused.`;
   if (action !== "run") return "";
+  const stop = env.stop ?? { stopped: true, at: null };
+  if (stop.stopped) return stoppedWhy(stop, "no Build or Ship run starts");
   const body = t.body ?? {};
   if (typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((k) => k !== "text"))
     return 'A run\'s body is {"text": "<the job>"} and nothing else.';
@@ -77,16 +88,21 @@ export function decide(call: any, holdsText: string | null, cardsText: string | 
     }
     return "";
   }
-  // Ship: a card he tapped Ship on, for this pull request at this head.
+  // Ship: his signed tap, for the pull request and head this job names.
   if (!/\b[0-9a-f]{40}\b/i.test(text))
     return "A Ship job carries the full 40-character head sha his Ship card was for (it's in the relayed tap), and merges with gh pr merge --squash --match-head-commit <that sha>.";
-  let cards: State | null = null;
-  try { cards = cardsText === null ? null : JSON.parse(cardsText); } catch { cards = null; }
-  if (!cards?.messages) return "The link's cards can't be read, so the Ship tap can't be checked; try again in a minute.";
-  const tapped = Object.values(cards.messages).some((m) => m?.kind === "ship" && m.outcome === "answered" && m.label === "Ship"
-    && !!m.ship && text.includes(m.ship.pr) && text.toLowerCase().includes(m.ship.head));
-  if (!tapped)
-    return "No Ship card he tapped Ship on matches this pull request and head. Ship only what he tapped, with the pull request link and the full head sha from the relayed tap.";
+  const token = findToken(text);
+  if (!token)
+    return "A Ship job carries the Ship token from his relayed Ship tap (\"Ship token: ship1....\"), exactly as it came. No token, no Ship: ask him again with a new Ship card if it's gone.";
+  if (!env.pub) return "The link's Ship key can't be read, so his Ship tap can't be checked; try again in a minute.";
+  let checked;
+  try { checked = readToken(token, publicKey(env.pub), env.now ?? Date.now()); }
+  catch { return "The link's Ship key can't be read, so his Ship tap can't be checked; try again in a minute."; }
+  if (!checked.ok)
+    return `That Ship token can't be used: ${checked.why}. Ship only with the token from his newest Ship tap; if it ran out, ask him again with a new Ship card.`;
+  const c = checked.claim;
+  if (!text.includes(pullOf(c)) || !text.toLowerCase().includes(c.head))
+    return "This Ship token is for another pull request or head. A Ship job names the pull request and full head sha his Ship tap was for, with that tap's token.";
   return "";
 }
 
@@ -96,7 +112,7 @@ function read(path: string): string | null {
 
 if (import.meta.main) {
   let reason: string;
-  try { reason = decide(JSON.parse(await Bun.stdin.text()), read(HOLDS), read(CARDS)); }
+  try { reason = decide(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now: Date.now() }); }
   catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
   if (reason) process.stdout.write(JSON.stringify({ hookSpecificOutput: {
     hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } }));

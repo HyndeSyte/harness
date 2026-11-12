@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0
+
+- Stop now stops everything: the calendar specialist, as before, and Cain's Build and Ship jobs, his Ship cards and outside reviews. The Stop notice says so, and its Turn back on button is the only way back on. Cain can't undo it.
+- Your Ship tap is signed by Cain's App for that one pull request at that one commit, and it lasts 30 minutes. Cain's Ship job can't start without it. Before, it started on Cain's word that you'd tapped.
+- If the calendar specialist doesn't answer a Stop or Turn back on tap, Cain's App posts the notice itself, so a tap is never silent.
+
 ## 0.7.4
 
 - This release brings 0.7.3's changes to your Pi. 0.7.3 was merged but never installed, because its tests failed.

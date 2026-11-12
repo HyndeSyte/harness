@@ -2,6 +2,7 @@
 // expiry; the sweep; taps on dead cards; replies in the thread; one ask at a time.
 import { describe, expect, test } from "bun:test";
 import { BUILD, decide, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
+const RUN = { stop: { stopped: false, at: null } };   // the hook's view: nothing stopped
 import { closedItems, digest, EXPIRED_TAP, nextCheckin, parseHolds, RESUME, STOP } from "../rootfs/opt/cain/link/core";
 import { BOT, DAY, DM, HOUR, keeperHolds, MIN, NOV11_8AM, OWNER, PR, pendingWith, rig, SHA1, SHA2 } from "./link-rig";
 
@@ -552,7 +553,7 @@ describe("threading", () => {
     expect(r.relayed[0]).toBe(`Dane tapped "Not filed" on your question P08 Q2: "P08 Q2: Filed?" (Discord message ${id}; its card shows his answer. If it needs words from you, reply with reply_to ${id})`);
     const s = ((await r.link.ship({ text: "Cain 0.7.0 ready.", item: "P41", pr: PR, head: SHA1.toUpperCase() })) as any).message;
     await r.tap(snap(r.msg(s)), r.ids(s)[0]);
-    expect(r.relayed[1]).toBe(`Dane tapped "Ship" on your Ship card for P41: ${PR} at head ${SHA1} (Discord message ${s}; its card shows his answer. If it needs words from you, reply with reply_to ${s})`);
+    expect(r.relayed[1]).toStartWith(`Dane tapped "Ship" on your Ship card for P41: ${PR} at head ${SHA1} (Discord message ${s}; its card shows his answer. If it needs words from you, reply with reply_to ${s}) Ship token: ship1.`);
     expect(r.msg(s).content).toBe("P41: Cain 0.7.0 ready.\n\nYou answered: Ship");
   });
 
@@ -707,10 +708,10 @@ describe("a replay of this morning (Nov 11)", () => {
   test("Cain's cloud jobs: fixes onto a laptop's branch, a pull request for a branch, a Ship with no sha: all refused", () => {
     const run = (trigger_id: string, text: string) => ({ tool_name: "RemoteTrigger", tool_input: { action: "run", trigger_id, body: { text } } });
     const holds = keeperHolds({ P42: { holder: "laptop:9f2c", branches: ["claude/cain-owner-gate"] } });
-    expect(decide(run(BUILD, "Branch: claude/review-fixes\nFix the review findings on https://github.com/HyndeSyte/harness/pull/3"), holds))
+    expect(decide(run(BUILD, "Branch: claude/review-fixes\nFix the review findings on https://github.com/HyndeSyte/harness/pull/3"), holds, RUN))
       .toContain("never a pull request");
-    expect(decide(run(BUILD, "Branch: claude/cain-owner-gate\nFix the review findings."), holds)).toContain("held by another session");
-    expect(decide(run(SHIP, "Ship pull request https://github.com/HyndeSyte/harness/pull/1. Dane tapped Ship at 9:12."), holds, "{}"))
+    expect(decide(run(BUILD, "Branch: claude/cain-owner-gate\nFix the review findings."), holds, RUN)).toContain("held by another session");
+    expect(decide(run(SHIP, "Ship pull request https://github.com/HyndeSyte/harness/pull/1. Dane tapped Ship at 9:12."), holds, RUN))
       .toContain("40-character head sha");
   });
 

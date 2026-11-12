@@ -19,9 +19,17 @@
 //     POST /answered {item, question?}  he answered an open ask in words
 //     POST /replied {m}                 what a message of his replied to
 //     POST /morning {text}              the one morning message, with Stop
+//     POST /stopped {}                  whether everything is stopped (Dane's Stop), and since when
 // Nothing is published to the LAN: the add-on has no "ports:".
-import { timingSafeEqual } from "node:crypto";
+//
+// The Ship key (wave 1, piece B): an Ed25519 key made here on first start, in the link's
+// own folder, read by nothing else. It signs Dane's Ship taps. Its public half goes to
+// /data/ship.pub (the RemoteTrigger hook checks tokens with it) and into the log at
+// start, for the copy GitHub checks against on main (.github/ship.pub).
+import { createPrivateKey, createPublicKey, generateKeyPairSync, type KeyObject, sign as edSign, timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { makeToken } from "../ship-token";
+import { readStop, since, writeStop } from "../stop";
 import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -34,6 +42,8 @@ const QUEUE = process.env.RELAY_QUEUE ?? "/data/relay.queue";
 const PORT = Number(process.env.RELAY_PORT ?? 8097);
 const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper's copy
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
+const SHIP_KEY = `${DIR}/ship.key`;
+const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? "/data/ship.pub";
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
 const SWEEP_MS = 60_000;
@@ -117,12 +127,41 @@ async function pullNow(pr: string): Promise<Pull | null> {
   } catch { return null; }
 }
 
+// The Ship key: made once, never overwritten, never printed. Its public half is written
+// where the hook reads it, and logged. No key: Ship taps carry no token, and Ship runs
+// are refused until it's fixed.
+function shipKey(): KeyObject | null {
+  try {
+    if (!existsSync(SHIP_KEY)) {
+      const { privateKey } = generateKeyPairSync("ed25519");
+      writeFileSync(SHIP_KEY, privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600, flag: "wx" });
+      console.log("[cain] link: made a new Ship key");
+    }
+    const k = createPrivateKey(readFileSync(SHIP_KEY));
+    if (k.asymmetricKeyType !== "ed25519") throw new Error("the Ship key isn't Ed25519");
+    const pub = createPublicKey(k).export({ format: "der", type: "spki" }).toString("base64");
+    if ((readOr(SHIP_PUB) ?? "").trim() !== pub) {
+      writeFileSync(`${SHIP_PUB}.tmp`, `${pub}\n`, { mode: 0o644 });
+      renameSync(`${SHIP_PUB}.tmp`, SHIP_PUB);
+    }
+    console.log(`[cain] link: Ship key (public): ${pub}`);
+    return k;
+  } catch (e) {
+    console.log(`[cain] link: no Ship key, so Ship taps carry no token: ${String(e).slice(0, 100)}`);
+    return null;
+  }
+}
+const shipPriv = shipKey();
+
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
-  relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 600) }) + "\n"),
+  // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
+  relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
+  stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
+  signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
 });
 
 // -- the gateway's health, for the Harness page ------------------------------------
@@ -158,7 +197,7 @@ async function sweepLoop(): Promise<void> {
 setTimeout(sweepLoop, 3000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -191,6 +230,12 @@ Bun.serve({
         case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, replyTo: b.reply_to }));
         case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
         case "/replied": return json(await link.replied(b.m));
+        case "/stopped": {
+          const st = link.stopped();
+          return json({ status: "ok", stopped: st.stopped, said: st.stopped
+            ? `Everything is stopped${since(st, process.env.CHECKIN_TZ)}: Dane tapped Stop. Only he can turn it back on.`
+            : "Nothing is stopped." });
+        }
         case "/morning": {
           if (list(b.options).length) throw new Refusal("the morning message asks nothing: send each decision with ask");
           const m = await link.morning(String(b.text ?? ""));
