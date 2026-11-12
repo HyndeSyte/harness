@@ -47,6 +47,18 @@
         "hooks": [
           { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15 }
         ]
+      },
+      {
+        "matcher": "mcp__plugin_discord_discord__download_attachment",
+        "hooks": [
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15 }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_discord_discord__fetch_messages",
+        "hooks": [
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15 }
+        ]
       }
     ]
   }

@@ -15,6 +15,16 @@ plugin (research preview) and your Claude plan; no API key.
    after you DM the bot, and `/discord:access policy allowlist`.
 5. Type `/exit`. The session starts again in 5 seconds with Discord connected.
 
+## What Cain reads in Discord without asking
+
+Cain reads the files you send him (`download_attachment`) and your DM's recent history
+(`fetch_messages`) without a prompt, and only in your DM with the bot: a hook refuses
+any other chat. Both also stop, with a line in the App's log at start, unless
+`/discord:access` is set to the allowlist with exactly one user (you) and no groups, and
+unless the Discord plugin is the pinned, reviewed one (`/opt/cain/discord/pin.json`).
+Files he downloads land in the plugin's inbox; the App deletes them after 7 days, and
+the oldest first whenever the inbox passes 200 MB.
+
 Only one place may run the bot at a time. Stop any other session using the same
 token first, or both will answer.
 
