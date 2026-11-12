@@ -13,6 +13,9 @@ import { createPublicKey, verify as edVerify, type KeyObject } from "node:crypto
 
 export const PREFIX = "ship1";
 export const TTL_S = 30 * 60;                    // an approval is good for 30 minutes after his tap
+const SKEW_S = 5 * 60;                           // clocks may differ by this much, no more
+// The only repository a Ship tap approves (lower case).
+export const SHIP_REPOS = new Set(["hyndesyte/harness"]);
 export const TOKEN = /(?<![A-Za-z0-9_.-])ship1\.[A-Za-z0-9_-]{20,600}\.[A-Za-z0-9_-]{86}(?![A-Za-z0-9_-])/;
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
@@ -32,7 +35,7 @@ function unb64url(s: string): Buffer {
 export function claimFor(pull: string, head: string, nowMs: number): Claim | null {
   const m = PULL_URL.exec(pull);
   const h = head.toLowerCase();
-  if (!m || !SHA.test(h)) return null;
+  if (!m || !SHA.test(h) || !SHIP_REPOS.has(m[1].toLowerCase())) return null;
   return { v: 1, repo: m[1], pr: Number(m[2]), head: h, exp: Math.floor(nowMs / 1000) + TTL_S };
 }
 
@@ -64,7 +67,9 @@ export function readToken(token: string, key: KeyObject, nowMs: number): Checked
   if (!c || c.v !== 1 || typeof c.repo !== "string" || !REPO.test(c.repo) || !Number.isSafeInteger(c.pr) || c.pr < 1
     || typeof c.head !== "string" || !SHA.test(c.head) || !Number.isSafeInteger(c.exp))
     return { ok: false, why: "its claim isn't a Ship approval" };
+  if (!SHIP_REPOS.has(c.repo.toLowerCase())) return { ok: false, why: "it's for a repository Ship doesn't approve" };
   if (c.exp * 1000 <= nowMs) return { ok: false, why: "it expired (an approval lasts 30 minutes after his tap)" };
+  if (c.exp * 1000 > nowMs + (TTL_S + SKEW_S) * 1000) return { ok: false, why: "its expiry is further off than an approval lasts" };
   return { ok: true, claim: { v: 1, repo: c.repo, pr: c.pr, head: c.head, exp: c.exp } };
 }
 
@@ -74,3 +79,6 @@ export function findToken(text: string): string | null {
 }
 
 export function pullOf(c: Claim): string { return `https://github.com/${c.repo}/pull/${c.pr}`; }
+
+// When his tap was signed (ms).
+export function signedAt(c: Claim): number { return (c.exp - TTL_S) * 1000; }

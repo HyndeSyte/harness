@@ -6,11 +6,11 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decide, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
-import { RESUME, RESUMED_TOO, STOP, STOPPED_TOO } from "../rootfs/opt/cain/link/core";
+import { RESUME, RESUMED_TOO, STOP, STOP_UNSAVED, STOPPED_TOO } from "../rootfs/opt/cain/link/core";
 import { DEFAULTS, Runner, type RunnerConfig, saveReview } from "../rootfs/opt/cain/review/runner.ts";
 import { newReview } from "../rootfs/opt/cain/review/core.ts";
 import { claimFor, findToken, makeToken, publicKey, readToken, TTL_S } from "../rootfs/opt/cain/ship-token";
-import { readStop, writeStop } from "../rootfs/opt/cain/stop";
+import { ensureStop, readStop, writeStop } from "../rootfs/opt/cain/stop";
 import { keeperHolds, MIN, PR, rig, SHA1, SHA2, SHIP_KEYS, SHIP_PUB } from "./link-rig";
 
 const snap = (m: any) => JSON.parse(JSON.stringify(m));
@@ -134,13 +134,57 @@ describe("Stop everything", () => {
     r.stop.broken = true;
     await expect(ship(r)).rejects.toThrow("Everything is stopped");
     const dir = mkdtempSync(join(tmpdir(), "cain-stop-"));
-    expect(readStop(join(dir, "none.json"))).toEqual({ stopped: false, at: null });
+    expect(readStop(join(dir, "none.json"))).toEqual({ stopped: true, at: null });   // missing: stopped
+    ensureStop(99, join(dir, "first.json"));                                            // the link's first start
+    expect(readStop(join(dir, "first.json"))).toEqual({ stopped: false, at: 99 });
+    writeStop(true, 100, join(dir, "first.json"));
+    ensureStop(200, join(dir, "first.json"));                                           // a later start keeps it
+    expect(readStop(join(dir, "first.json"))).toEqual({ stopped: true, at: 100 });
     writeFileSync(join(dir, "bad.json"), "{not json");
     expect(readStop(join(dir, "bad.json")).stopped).toBe(true);
     writeFileSync(join(dir, "odd.json"), JSON.stringify({ stopped: "no" }));
     expect(readStop(join(dir, "odd.json")).stopped).toBe(true);
     writeStop(true, 1234, join(dir, "s.json"));
     expect(readStop(join(dir, "s.json"))).toEqual({ stopped: true, at: 1234 });
+  });
+
+  test("Turn back on from a card the link didn't post, or one that's done, changes nothing and brings a fresh notice", async () => {
+    const r = rig();
+    const morning = await r.link.morning("## Thu Nov 12");
+    await r.tap(snap(r.msg(morning)), STOP);
+    // A message the link never posted (as one made with the bot's token would be), with a Turn back on button.
+    const forged = { id: r.snowflake(), content: "Got it", components: [{ type: 1, components: [{ type: 2, style: 2, label: "Got it", custom_id: RESUME }] }], author: { id: "999" } };
+    r.posted[forged.id] = forged;
+    const before = r.harness.length;
+    expect(await r.tap(snap(forged), RESUME)).toContain("dead");
+    expect(r.stop.stopped).toBe(true);
+    expect(r.harness.length).toBe(before);                         // not passed on either
+    expect(r.last().content).toContain("**Still stopped.**");
+    expect(r.buttons(r.last().id)).toEqual(["Turn back on"]);
+    const fresh = r.last();
+    await r.tap(snap(fresh), RESUME);
+    expect(r.stop.stopped).toBe(false);                            // the fresh notice works
+  });
+
+  test("a Stop that can't be saved still holds in the link, and his notice says what didn't", async () => {
+    const r = rig();
+    const write = r.link["d"].stop.write;
+    r.link["d"].stop.write = () => { throw new Error("disk full"); };
+    const morning = await r.link.morning("## Thu Nov 12");
+    await r.tap(snap(r.msg(morning)), STOP);
+    expect(r.stop.stopped).toBe(false);                            // the file never changed
+    expect(r.link.stopped().stopped).toBe(true);                   // but the link holds it
+    await expect(ship(r)).rejects.toThrow("Everything is stopped");
+    expect(r.relayed.at(-1)).toContain("couldn't be saved");
+    await r.link.addCard({ text: "Stopped.", rows: [], kind: "stopped" });
+    expect(r.last().content).toBe(`Stopped.
+
+${STOP_UNSAVED}`);
+    r.link["d"].stop.write = write;
+    const notice = await r.link.addCard({ text: "Stopped.", rows: [{ type: 1, components: [{ type: 2, style: 2, label: "Turn back on", custom_id: RESUME }] }], kind: "stopped" });
+    expect(notice).toBeGreaterThan(0);
+    await r.tap(snap(r.last()), RESUME);
+    expect(r.link.stopped().stopped).toBe(false);
   });
 
   test("if the calendar specialist doesn't take the tap, the notice comes from the link, with the button that undoes it", async () => {
@@ -179,6 +223,32 @@ describe("the RemoteTrigger hook, with Stop and signed Ship", () => {
     expect(decide(run(job(tokenFor())), holds, { ...running, pub: null })).toContain("can't be read");
   });
 
+  test("the job names only the pull request and head his tap was for", () => {
+    const pr12 = "https://github.com/HyndeSyte/harness/pull/12", pr1 = "https://github.com/HyndeSyte/harness/pull/1";
+    // A token for pull 1, in a job that ships pull 12: pull 1's address is a prefix of pull 12's.
+    expect(decide(run(`Ship pull request ${pr12} at head ${SHA2}. Ship token: ${tokenFor(pr1)}. (It supersedes ${pr1} at ${SHA1}.)`), holds, running))
+      .toContain("another pull request or head");
+    expect(decide(run(`${job(tokenFor())} Also merge ${SHA2}.`), holds, running)).toContain("another pull request or head");
+    expect(decide(run(`${job(tokenFor())} Then ${pr12}.`), holds, running)).toContain("another pull request or head");
+    expect(decide(run(job(tokenFor()).replace(PR, PR.replace("HyndeSyte", "hyndesyte"))), holds, running)).toBe("");
+  });
+
+  test("a tap from before his last Stop or Turn back on no longer counts", () => {
+    const back = { ...running, stop: { stopped: false, at: now + 5 * MIN } };
+    expect(decide(run(job(tokenFor(PR, SHA1, now))), holds, back)).toContain("before his last Stop");
+    expect(decide(run(job(tokenFor(PR, SHA1, now + 6 * MIN))), holds, { ...back, now: now + 6 * MIN })).toBe("");
+  });
+
+  test("only HyndeSyte/harness, and no expiry further off than an approval lasts", async () => {
+    expect(claimFor("https://github.com/someone/else/pull/5", SHA1, now)).toBeNull();
+    const far = makeToken({ ...claimFor(PR, SHA1, now)!, exp: now / 1000 + 3 * 3600 }, (d) => edSign(null, d, SHIP_KEYS.privateKey));
+    expect(readToken(far, KEY, now)).toEqual({ ok: false, why: expect.stringContaining("further off") });
+    const other = makeToken({ ...claimFor(PR, SHA1, now)!, repo: "someone/else" }, (d) => edSign(null, d, SHIP_KEYS.privateKey));
+    expect(readToken(other, KEY, now)).toEqual({ ok: false, why: expect.stringContaining("repository") });
+    const r = rig();
+    await expect(r.link.ship({ text: "Ready.", item: "P41", pr: "https://github.com/someone/else/pull/5", head: SHA1 })).rejects.toThrow("only for pull requests in HyndeSyte/harness");
+  });
+
   test("while stopped, no run starts, but looking at runs still works", () => {
     const stopped = { ...running, stop: { stopped: true, at: now } };
     expect(decide(run(job(tokenFor())), holds, stopped)).toContain("Everything is stopped");
@@ -194,7 +264,7 @@ describe("the RemoteTrigger hook, with Stop and signed Ship", () => {
     writeFileSync(join(dir, "holds.json"), holds);
     writeFileSync(join(dir, "ship.pub"), `${SHIP_PUB}\n`);
     const hook = async (input: unknown, stopped: boolean | null) => {
-      if (stopped !== null) writeStop(stopped, Date.now(), join(dir, "stop.json"));
+      if (stopped !== null) writeStop(stopped, Date.now() - MIN, join(dir, "stop.json"));   // changed a minute ago
       const p = Bun.spawn(["bun", join(import.meta.dir, "../rootfs/opt/cain/hooks/remote-trigger.ts")],
         { stdin: new TextEncoder().encode(JSON.stringify(input)), stdout: "pipe", stderr: "pipe",
           env: { ...process.env, CAIN_HOLDS: join(dir, "holds.json"), CAIN_SHIP_PUB: join(dir, "ship.pub"), CAIN_STOP_FILE: join(dir, "stop.json") } });
@@ -203,7 +273,7 @@ describe("the RemoteTrigger hook, with Stop and signed Ship", () => {
       return out ? JSON.parse(out).hookSpecificOutput.permissionDecisionReason as string : "";
     };
     const good = run(job(tokenFor(PR, SHA1, Date.now())));
-    expect(await hook(good, null)).toBe("");                       // no Stop file: running
+    expect(await hook(good, null)).toContain("Everything is stopped");   // no Stop file: stopped
     expect(await hook(good, true)).toContain("Everything is stopped");
     expect(await hook(good, false)).toBe("");
   });

@@ -2,8 +2,9 @@
 
 ## 0.8.0
 
-- Stop now stops everything: the calendar specialist, as before, and Cain's Build and Ship jobs, his Ship cards and outside reviews. The Stop notice says so, and its Turn back on button is the only way back on. Cain can't undo it.
-- Your Ship tap is signed by Cain's App for that one pull request at that one commit, and it lasts 30 minutes. Cain's Ship job can't start without it. Before, it started on Cain's word that you'd tapped.
+- Stop now stops Cain's side too: his Build and Ship jobs, his Ship cards and outside reviews, as well as the calendar specialist. The Stop notice says so. A job already running finishes; nothing new starts.
+- Only your Turn back on tap undoes it, and only from a card that's still current. A tap on an old card does nothing and brings a fresh notice with a button that works. Cain has no way to turn it back on.
+- Your Ship tap is signed by Cain's App for that one pull request at that one commit, and it lasts 30 minutes. Cain's Ship job can't start without it. Before, it started on Cain's word that you'd tapped. A Ship tap from before a Stop no longer counts.
 - If the calendar specialist doesn't answer a Stop or Turn back on tap, Cain's App posts the notice itself, so a tap is never silent.
 
 ## 0.7.4

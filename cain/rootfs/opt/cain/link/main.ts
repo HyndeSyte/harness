@@ -24,12 +24,13 @@
 //
 // The Ship key (wave 1, piece B): an Ed25519 key made here on first start, in the link's
 // own folder, read by nothing else. It signs Dane's Ship taps. Its public half goes to
-// /data/ship.pub (the RemoteTrigger hook checks tokens with it) and into the log at
-// start, for the copy GitHub checks against on main (.github/ship.pub).
+// /data/trust/ship.pub (the RemoteTrigger hook checks tokens with it) and into the log at
+// start, for the copy GitHub checks against on main (.github/ship.pub). /data/trust is
+// only root's to write; the Stop state lives there too (../stop.ts).
 import { createPrivateKey, createPublicKey, generateKeyPairSync, type KeyObject, sign as edSign, timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { makeToken } from "../ship-token";
-import { readStop, since, writeStop } from "../stop";
+import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
 import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -43,12 +44,16 @@ const PORT = Number(process.env.RELAY_PORT ?? 8097);
 const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper's copy
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
 const SHIP_KEY = `${DIR}/ship.key`;
-const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? "/data/ship.pub";
+const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
 const SWEEP_MS = 60_000;
 
 mkdirSync(DIR, { recursive: true, mode: 0o700 });
+mkdirSync(TRUST_DIR, { recursive: true, mode: 0o755 });
+// No Stop saved yet (a first start): written as running, so readers that find no file
+// can take it as stopped.
+try { ensureStop(Date.now()); } catch (e) { console.log(`[cain] link: couldn't write the Stop state: ${String(e).slice(0, 80)}`); }
 
 function token(): string {
   try { return readFileSync(ENV, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? ""; } catch { return ""; }

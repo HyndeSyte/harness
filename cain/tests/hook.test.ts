@@ -95,6 +95,7 @@ describe("the RemoteTrigger hook", () => {
     writeFileSync(join(dir, "record-holds.json"), holds);
     writeFileSync(join(dir, "ship.pub"), `${SHIP_PUB}
 `);
+    writeFileSync(join(dir, "stop.json"), JSON.stringify({ stopped: false, at: 0 }));   // running, as the link writes it
     const hook = async (input: string) => {
       const p = Bun.spawn(["bun", HOOK], { stdin: new TextEncoder().encode(input), stdout: "pipe", stderr: "pipe",
         env: { ...process.env, CAIN_HOLDS: join(dir, "record-holds.json"), CAIN_SHIP_PUB: join(dir, "ship.pub"), CAIN_STOP_FILE: join(dir, "stop.json") } });

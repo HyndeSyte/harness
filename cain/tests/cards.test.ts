@@ -477,7 +477,7 @@ describe("taps on dead cards", () => {
     expect(r.state().messages[id].outcome).toBe("expired");
   });
 
-  test("Stop and Turn back on still work from any card of ours, even one the link doesn't know", async () => {
+  test("Stop still works from any card of ours, even one the link doesn't know; Turn back on only from a live one (0.8.0)", async () => {
     const r = rig();
     const first = await r.link.morning("## Wed");
     const m = snap(r.msg(first));
@@ -485,11 +485,18 @@ describe("taps on dead cards", () => {
     expect(r.buttons(first)).toEqual([]);
     expect(await r.tap(m, STOP)).toBe("to specialist");
     expect(r.harness[0][1].custom_id).toBe(STOP);
+    // Turn back on undoes his Stop, so a card the link doesn't know can't: it does
+    // nothing, and a fresh notice brings a button that works.
     const id = r.snowflake(NOV11_8AM - 2 * DAY);
     r.posted[id] = { id, content: "Stopped.", author: { id: BOT },
       components: [{ type: 1, components: [{ type: 2, style: 2, label: "Turn back on", custom_id: RESUME }] }] };
-    expect(await r.tap(snap(r.posted[id]), RESUME)).toBe("to specialist");
-    expect(r.harness[1][1]).toMatchObject({ custom_id: RESUME, message_id: 0 });
+    expect(await r.tap(snap(r.posted[id]), RESUME)).toContain("dead");
+    expect(r.harness.length).toBe(1);
+    expect(r.stop.stopped).toBe(true);
+    expect(r.buttons(r.last().id)).toEqual(["Turn back on"]);
+    expect(await r.tap(snap(r.last()), RESUME)).toBe("to specialist");
+    expect(r.harness[1][1]).toMatchObject({ custom_id: RESUME });
+    expect(r.stop.stopped).toBe(false);
   });
 });
 

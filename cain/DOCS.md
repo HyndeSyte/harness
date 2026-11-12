@@ -59,17 +59,20 @@ the App.
 ## Stop
 
 The Stop button (on the morning message, the calendar digest and the calendar
-specialist's notices) stops everything: the calendar specialist, Cain's Build and Ship
-jobs, his Ship cards and outside reviews. The notice says what stopped, with a Turn back
-on button. Only your tap turns it back on; Cain has no way to. While it's stopped, Cain
-can still answer you and keep the record.
+specialist's notices) stops what would start next: the calendar specialist, Cain's
+Build and Ship jobs, his Ship cards and outside reviews. A job already running
+finishes. The notice says what stopped, with a Turn back on button. Only your tap turns
+it back on, and only from a card that's still current: a tap on an old card does
+nothing and brings a fresh notice whose button works. Cain has no way to turn it back
+on. While it's stopped, Cain can still answer you and keep the record.
 
 ## Ship
 
 Your Ship tap is signed by Cain's App with a key only the App holds, for that one pull
 request at that one commit, and the approval lasts 30 minutes. Cain's Ship job can't
 start without it, and it posts it on the pull request for GitHub to check. A tap while
-everything is stopped ships nothing, and the card says so.
+everything is stopped ships nothing, and the card says so; a tap from before a Stop no
+longer counts.
 
 ## If the calendar specialist stops
 

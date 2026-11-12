@@ -434,7 +434,7 @@ def test_cains_remote_trigger_hook_is_wired_and_shipped():
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     for trig in re.findall(r"trig_[A-Za-z0-9]+", hook):
         assert trig in rules, trig
-    assert 'permissionDecision: "deny"' in hook and '"/data/record-holds.json"' in hook and '"/data/link/state.json"' in hook
+    assert 'permissionDecision: "deny"' in hook and '"/data/record-holds.json"' in hook and '"/data/trust/ship.pub"' in hook
     assert "COPY rootfs /" in (CAIN / "Dockerfile").read_text()                       # ships with the add-on
 
 
@@ -654,7 +654,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     assert f"?? {cain_relay.PORT})" in link and cain_relay.HOST == "0fcc2575-cain"
     # Cain's scripts only, from this machine: the specialist can't show its own cards,
     # ask, put up a Ship card, or close Cain's questions.
-    assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied"])'
+    assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped"])'
             in link)
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link

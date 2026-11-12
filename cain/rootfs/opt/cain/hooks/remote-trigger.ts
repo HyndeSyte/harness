@@ -15,14 +15,16 @@
 // read, it's refused.
 import { readFileSync } from "node:fs";
 import { parseHolds } from "../link/core.ts";
-import { findToken, publicKey, pullOf, readToken } from "../ship-token.ts";
+import { findToken, publicKey, pullOf, readToken, signedAt } from "../ship-token.ts";
 import { readStop, type StopState, stoppedWhy } from "../stop.ts";
 
 export const BUILD = "trig_015FTxexzFDZyjYjzw39bPv8";
 export const SHIP = "trig_015NTtUUC5DN82zDJBwmcq1r";
 const ACTIONS = new Set(["run", "list_runs", "get_run_log"]);
 const HOLDS = process.env.CAIN_HOLDS ?? "/data/record-holds.json";
-const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? "/data/ship.pub";
+// The paths can be moved only for the tests: the hook runs in the environment Claude Code
+// was started with, which Cain's session doesn't set.
+const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? "/data/trust/ship.pub";
 const PR_LINK = /github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/i;
 
 // What a Ship run is checked against: the link's public Ship key (null: none), the Stop
@@ -101,10 +103,22 @@ export function decide(call: any, holdsText: string | null, env: Env = {}): stri
   if (!checked.ok)
     return `That Ship token can't be used: ${checked.why}. Ship only with the token from his newest Ship tap; if it ran out, ask him again with a new Ship card.`;
   const c = checked.claim;
-  if (!text.includes(pullOf(c)) || !text.toLowerCase().includes(c.head))
-    return "This Ship token is for another pull request or head. A Ship job names the pull request and full head sha his Ship tap was for, with that tap's token.";
+  // The job names one pull request and one head, the ones his tap was for, and nothing
+  // else a Ship could merge: no other pull request link, no other full sha.
+  const rest = text.split(token).join(" ");
+  const pulls = new Set([...rest.matchAll(PR_ANY)].map((m) => `${m[1]}/${m[2]}/pull/${m[3]}`.toLowerCase()));
+  const shas = new Set([...rest.matchAll(SHA_ANY)].map((m) => m[0].toLowerCase()));
+  const want = pullOf(c).replace(/^https:\/\/github\.com\//, "").toLowerCase();
+  if (pulls.size !== 1 || !pulls.has(want) || shas.size !== 1 || !shas.has(c.head))
+    return "This Ship token is for another pull request or head. A Ship job names one pull request and one full head sha, the ones his Ship tap was for, with that tap's token, and no other pull request or sha.";
+  // A tap from before his last Stop or Turn back on no longer counts.
+  if (env.stop?.at != null && signedAt(c) < env.stop.at)
+    return "That Ship token is from before his last Stop or Turn back on, so it no longer counts. Ask him again with a new Ship card.";
   return "";
 }
+
+const PR_ANY = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?!\d)/gi;
+const SHA_ANY = /(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/gi;
 
 function read(path: string): string | null {
   try { return readFileSync(path, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
