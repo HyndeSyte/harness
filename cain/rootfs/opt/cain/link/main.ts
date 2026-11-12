@@ -12,7 +12,8 @@
 //     GET  /card-of?m=<message id>      which card a Discord message is, and its item and question
 //     GET  /health                      "ok"; with the key, also the Discord connection and the watch
 //   from Cain's own scripts, on this machine only (127.0.0.1); item is a PENDING id or "none":
-//     POST /show {id, item, question?, reply_to?}            show a specialist's card
+//     POST /show {id, item, question?, reply_to?}            show a specialist's card ("posted", or "already
+//                                                            out": then it only files it under his item)
 //     POST /ask {text, options, item, question?, reply_to?}  ask with buttons, one open at a time
 //     POST /ship {text, item, pr, head, reply_to?}           a Ship card for one pull request head
 //     POST /answered {item, question?}  he answered an open ask in words
@@ -184,8 +185,7 @@ Bun.serve({
         case "/buttons": await link.editButtons(Number(b.card), b.rows ?? []); return json({ status: "ok" });
         case "/answer": await link.followup(String(b.callback ?? ""), String(b.text ?? "")); return json({ status: "ok" });
         case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
-        case "/show": return json({ status: "posted",
-          message: await link.show(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }) });
+        case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
         case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
           item: b.item, question: b.question, replyTo: b.reply_to }));
         case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, replyTo: b.reply_to }));

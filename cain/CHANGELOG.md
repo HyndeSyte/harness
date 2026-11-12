@@ -2,8 +2,8 @@
 
 ## 0.7.2
 
-- A card from the calendar specialist always reaches you and keeps its buttons until you answer it or it expires, even when another session is working on the item it's filed under, or that item is done. Before, such a card could be held back and expire before you saw it.
-- A card with buttons from the calendar specialist reaches you within about 2 minutes, even if Cain is busy: if he hasn't shown it by then, it goes out by itself. A card that has already expired never goes out.
+- A card from the calendar specialist always reaches you and keeps its buttons until you answer it or it expires, even when someone else is working on the same job, or that job is done. Before, such a card could be held back and expire before you saw it.
+- A card with buttons from the calendar specialist reaches you within about 2 minutes, even if Cain is busy: if he hasn't shown it by then, it goes out by itself. A card that has already expired never goes out. If a card can't reach you, Cain is told what it was, so he can tell you himself. Cards that arrived before this update still wait for Cain.
 
 ## 0.7.1
 
