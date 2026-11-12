@@ -92,12 +92,10 @@ describe("asks and cards name their item, and the link refuses what isn't Cain's
     expect(Object.keys(r.posted)).toEqual([]);
   });
 
-  test("/ask and /show refuse items held by someone else, and say not to tell him who", async () => {
+  test("/ask and /ship refuse items held by someone else, and say not to tell him who", async () => {
     const r = rig({ holds: laptopHolds("P12") });
     await expect(ask(r, "P12", "Q1")).rejects.toThrow("held by another session");
     await expect(ask(r, "p12", "Q1")).rejects.toThrow("Don't ask him about it or say who has it");
-    const card = await r.link.addCard({ text: "Moved it.", rows: undoRows });
-    await expect(r.link.show(card, { item: "P12" })).rejects.toThrow("held by another session");
     await expect(r.link.ship({ text: "Ship?", item: "P12", pr: PR, head: SHA1 })).rejects.toThrow("held by another session");
     expect(Object.keys(r.posted)).toEqual([]);
     expect(await ask(r, "none", "")).not.toBe("");                      // a one-off is never held
@@ -244,7 +242,7 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
     expect(r.buttons(fresh)).toEqual(["Ties me up", "Doesn't"]);
   });
 
-  test("closed or moved to another holder: off, and Cain is told", async () => {
+  test("closed or moved to another holder: Cain's ask comes off and he's told; a specialist's card stays", async () => {
     const r = rig({ pending: pendingWith(["P08", "P09"], []) });
     const a = await ask(r, "P08", "Q2");
     const card = await r.link.addCard({ text: "Moved it.", rows: undoRows });
@@ -257,8 +255,8 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
     expect(r.relayed[0]).toContain("P08 is closed");
     r.files.holds = laptopHolds("P09");
     await r.link.sweep();
-    expect(r.buttons(b)).toEqual([]);
-    expect(r.relayed.length).toBe(1);                                  // a specialist's card: nothing for Cain
+    expect(r.buttons(b)).toEqual(["Undo", "Stop"]);                    // a specialist's card: its item is only a label
+    expect(r.relayed.length).toBe(1);
   });
 
   test("a held item takes Cain's question off, and he's told not to say who has it", async () => {
@@ -462,12 +460,11 @@ describe("taps on dead cards", () => {
     await dead(r, m, m.components[0].components[0].custom_id, "\n\nYou answered: Not sure");
   });
 
-  test("a card whose item moved to another holder", async () => {
+  test("Cain's question whose item moved to another holder", async () => {
     const r = rig();
-    const card = await r.link.addCard({ text: "Moved it.", rows: undoRows });
-    const id = await r.link.show(card, { item: "P33" });
+    const id = await ask(r, "P33", "Q1");
     r.files.holds = laptopHolds("P33");
-    await dead(r, snap(r.msg(id)), "k:c:abc", "\n\nExpired");
+    await dead(r, snap(r.msg(id)), r.ids(id)[0], "\n\nExpired");
   });
 
   test("a card of ours the link doesn't know (from before it remembered)", async () => {

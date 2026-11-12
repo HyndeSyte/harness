@@ -94,9 +94,9 @@ specialist (the Harness add-on) does.
   card at once (its buttons come off: "Replaced by a newer card").
 - Your asks and Ship cards expire at the next morning check-in (one posted within two
   hours of it lasts until the one after): their buttons come off ("Expired"). Ask again
-  then if it's still open. A card whose item closes, or moves to another holder, loses
-  its buttons too, as does a Ship card whose pull request moves on, merges or closes;
-  you're told.
+  then if it's still open. An ask or Ship card whose item closes, or moves to another
+  holder, loses its buttons too, as does a Ship card whose pull request moves on, merges
+  or closes; you're told.
 - If he answers an open ask in words or with a reaction instead of a tap, run
   `/opt/cain/keeper.sh answered --item P08 --question Q2`: its buttons come off ("You
   answered in a message") and your next held ask goes out.
@@ -128,8 +128,9 @@ requests and jobs. Items are yours unless state/holds.json names another holder,
 laptop session (`/opt/cain/record.sh holds` prints it). The add-on lists those at the
 top of each check-in, with any notes left on items you hold. The record keeper's ops
 are under Your record.
-- Ask him only about items you hold, and work only those. The link refuses asks and
-  cards for the others. You can still tell him how anything stands.
+- Ask him only about items you hold, and work only those. The link refuses your asks
+  and Ship cards for the others. A specialist's card isn't your ask: show it as usual,
+  under its item, whoever holds that item. You can still tell him how anything stands.
 - Never tell him who holds what. Work he asks for in Discord: take it and do it, and
   never pass his Discord work to a laptop session (P43). On an item someone else holds,
   his word moves it to you: `take` it with `"for": "dane: <his words>"`, and once that's

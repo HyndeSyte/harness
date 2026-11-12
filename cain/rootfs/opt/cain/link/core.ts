@@ -1,9 +1,11 @@
 // Cain's link to Dane on Discord, for everything his plugin can't do: taps,
 // reactions, and cards. Plain code, no model.
 //
-// - Specialists (the Harness add-on, for calendars) hand cards here. A card is
-//   held until Cain shows it, unchanged; Cain is told it's waiting. Only Stop
-//   notices and "Cain can't reach you" alerts go straight out ("direct").
+// - Specialists (the Harness add-on, for calendars) hand cards here. A card waits
+//   until Cain shows it, unchanged; Cain is told it's waiting. Only Stop notices and
+//   "Cain can't reach you" alerts go straight out ("direct"). A specialist's card is
+//   the specialist talking to the owner: the item Cain files it under is only a label,
+//   so it goes out whoever holds that item, and whether or not the item is closed.
 // - Every tap is checked here, within Discord's 3 seconds: Dane (the bot's owner,
 //   who must also be the one Cain is paired with), in his DM, on a message this
 //   link posted, still showing exactly what it posted (Cain can edit the bot's
@@ -12,9 +14,11 @@
 //   question, and any reaction of Dane's to the bot's messages, go to Cain.
 // - Every card knows its item (a PENDING id, or "none"), its question and when it
 //   stops mattering. A sweep every minute takes the buttons off cards that were
-//   answered, expired, replaced by a newer card for the same item and question, or
-//   whose item closed or is held by someone other than Cain, and says so on the card.
-//   A tap on such a card is answered in place: "This card expired; nothing was done."
+//   answered, expired, or replaced by a newer card for the same item and question,
+//   and off Cain's own asks and Ship cards whose item closed or is held by someone
+//   other than Cain, and says so on the card. A specialist's card never loses its
+//   buttons to a hold or a closed item. A tap on a card that stopped mattering is
+//   answered in place: "This card expired; nothing was done."
 // - Cain asks one question at a time: a new ask waits while another is open, and goes
 //   out by itself when that one closes. Ship cards and specialists' cards don't wait.
 import { createHash } from "node:crypto";
@@ -239,6 +243,10 @@ function keyFor(m: Shown): string | null {
   return keyOf(m.item, m.question);
 }
 const live = (m: Shown, now: number) => !!m.buttons && !m.outcome && !(m.expires != null && m.expires <= now);
+// The item whose closing, or move to another holder, ends this card: only Cain's own
+// asks and Ship cards have one. A specialist's card is the specialist talking to the
+// owner; the item Cain files it under is a label, for replacing and for the record, so "".
+const boundItem = (m: Shown): string => (m.kind !== "card" && m.item && m.item !== "none" ? m.item : "");
 const about = (item?: string, question?: string) =>
   item && item !== "none" ? `${item}${question ? ` ${question}` : ""}` : "";
 
@@ -407,7 +415,7 @@ export class Link {
       await this.show(id, { item: "none" });
     } else {
       const ask = comps.length ? "It has buttons: show it now." : "Show it now if it matters today, or fold it into the morning message.";
-      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(c.text, 120)}". ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his)`);
+      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(c.text, 120)}". ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
     }
     return id;
   }
@@ -418,7 +426,7 @@ export class Link {
     const card = s.cards[String(id)];
     if (!card) throw new Error(`no card ${id}`);
     if (card.shown) return card.shown;
-    this.mayAsk(meta.item);
+    // No hold and no closed item stops it (boundItem): it's the specialist talking to him.
     const msg = await this.postCard(card.text, card.rows, { replyTo: meta.replyTo, nonce: stableNonce("card", String(id)) });
     const s2 = this.d.load();
     s2.cards[String(id)].shown = String(msg.id);
@@ -627,11 +635,12 @@ export class Link {
     if (m.q?.used) return "answered";
     if (m.expires != null && m.expires <= now) return "expired";
     if (m.until - DAY <= now) return "forgetting";
-    if (m.item && m.item !== "none") {
+    const item = boundItem(m);
+    if (item) {
       const f = this.files();
-      if (closedItems(f.pending).has(m.item.toUpperCase())) return "item closed";
+      if (closedItems(f.pending).has(item.toUpperCase())) return "item closed";
       const holds = parseHolds(f.holds);
-      if (holds && heldElsewhere(holds, m.item)) return "held elsewhere";
+      if (holds && heldElsewhere(holds, item)) return "held elsewhere";
     }
     return "";
   }
@@ -849,7 +858,7 @@ export class Link {
     const told: [string, Shown, string][] = [];
     for (const [id, m] of Object.entries(s.messages)) {
       if (!m.buttons || m.outcome || !m.kind) continue;
-      const item = m.item && m.item !== "none" ? m.item : "";
+      const item = boundItem(m);
       let why = "";
       if (m.expires != null && m.expires <= now) why = "expired";
       else if (m.until - DAY <= now) why = "forgetting";
