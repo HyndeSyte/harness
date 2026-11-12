@@ -4,6 +4,7 @@ All names are invented. No network: Family, Google, Cain's link and the model ar
 """
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import threading
@@ -15,8 +16,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness import caldav, choices, drive, family_rules, handover, ical, meaning, meaning_live
+from harness import caldav, choices, drive, family_rules, handover, ical, inputs, meaning, meaning_live
+from harness.calendar_change import CalendarChange
+from harness.family_copy import FamilyCopy
 from harness.family_gmail import DROP_TITLE, FamilyGmail, _leg_title, home_from_options, leg_key
+from harness.mail_dates import MailDates
 from harness.ledger import Ledger
 from harness.net import HttpResponse, TransportError
 from conftest import Clock
@@ -25,6 +29,7 @@ from fake_caldav import FAMILY_PATH, no_network  # noqa: F401  (autouse)
 from test_family_add import Rig as FamilyRig, on, rig  # noqa: F401
 from test_family_copy import Feeds, GMAIL, NY, TZ, occ, seed, when
 from test_family_gmail import KEY, RULES, FakeGoogle, count, g  # noqa: F401
+from test_mail_dates import Box
 from harness import google_cal
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1391,3 +1396,50 @@ def test_a_revive_that_fails_is_tried_again_at_the_next_read_not_every_pass(lv, 
     lv.feeds.generation += 1                                        # the next read
     lv.live.tick(paused=False)
     assert lv.ledger.get_meta("meaning_revived") == "2"
+
+
+# -- 9. idle passes are quiet (0.21.2) -------------------------------------------------------------------
+
+def test_idle_passes_are_quiet(live, caplog):
+    # Nov 11: with nothing new, the Pi logged and wrote its database every 3 seconds. A gate: with
+    # what runs on every pass in place and settled, a pass with nothing new logs nothing at INFO or
+    # above and writes nothing. Not here: the calendar reads themselves (the rig's are fakes) and
+    # what only runs with Discord (Cain's link, once a minute).
+    seen = inputs.Seen()
+    live.fa.client.seen = live.client.seen = seen                  # what iCloud and Google answer
+    live.c.inputs = inputs.Watch(live.ledger, seen, tz=TZ, active={
+        inputs.MAIL: lambda: True, inputs.FAMILY: lambda: True, inputs.GOOGLE: lambda: True,
+        inputs.MEANING: lambda: live.live_on})
+    live.c.family_copy = FamilyCopy(live.ledger, live.fa, live.feeds, name_fn=lambda: "Lee", tz=TZ)
+    live.c.calendar_change = CalendarChange(live.ledger, live.fa.client, live.client, enabled=lambda: True,
+                                            address=live.gm._address, tz=TZ)
+    live.c.mail_dates = MailDates(live.ledger, live.client, SyncExecutor(), address=live.gm._address,
+                                  password=lambda: "abcdefghijklmnop", engine_fn=lambda: live.claude,
+                                  writes_on=lambda: True, tz=TZ, mailbox=Box([]), sleep=lambda s: None,
+                                  family=live.fa.client)            # nothing new in his mail
+    live.c.config = None                                           # the controller binds them all
+    # On Family: a block on Gmail from his answer, a question waiting on him, and a judgment the
+    # judge doesn't reach with an answer of his it never saw (Nov 11 on the Pi).
+    live.feeds.window.occurrences = [occ("Errand", when(live, days=20, hour=15))]   # Gmail is read
+    club, sitting = when(live, days=3), when(live, days=2, hour=15)
+    seed(live, "Book club", club)
+    seed(live, "Kid sitting", sitting)
+    eid = answer_ex(live, "Book club", ["presence"])
+    live.judge = ByTitle()
+    live.judge.by["Book club"] = judged(ob("presence", club, club + timedelta(hours=1)), cites=[eid])
+    live.judge.by["Kid sitting"] = judged(ob("supervision", sitting, sitting + timedelta(hours=2),
+                                             certainty="medium"))
+    judge(live.ledger, item("Swim meet", local(live, meaning.AHEAD_DAYS + 30)), rel("presence"))
+    answer_ex(live, "Swim meet", ["presence"])
+    for _ in range(3):
+        go(live)                                                   # read, judged, on Gmail, asked
+    live.tick()
+    assert live.google.titles() == ["Busy (family)"] and len(open_q(live.ledger)) == 1
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+    writes = live.ledger.db.total_changes
+    for _ in range(5):
+        live.clock.advance(seconds=3)                              # a pass every 3 seconds
+        live.tick()
+    assert [f"{r.name}: {r.getMessage()}" for r in caplog.records if r.levelno >= logging.INFO] == []
+    assert live.ledger.db.total_changes == writes
