@@ -2,7 +2,8 @@
 
 ## 0.21.2
 
-- **The Harness no longer flags the same Family judgments every few seconds.** One already waiting to be redone is flagged once, so the log stays readable and the Pi stops writing its database on every pass.
+- **The Harness no longer marks the same Family events to be judged again every few seconds.** One already waiting to be judged again is marked once, so its log stays readable and the Pi stops writing its database over and over.
+- **If judging Family events stops on an unexpected problem, it tries again at the next calendar read,** not every few seconds with a warning each time.
 
 ## 0.21.1
 

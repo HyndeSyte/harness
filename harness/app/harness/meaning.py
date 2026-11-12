@@ -1141,6 +1141,7 @@ class MeaningShadow:
         except Exception as e:
             log.warning("meaning: the sorting stopped: %s", type(e).__name__)
             self.ledger.input_failed("meaning", "sorting stopped on an unexpected problem", "error")
+            self._backlog = False          # tried again at the next read, not on every pass
             return
         spec = policy.MODELS[policy.engine_for(PURPOSE)]
         day, used = self._calls_today()

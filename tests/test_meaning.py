@@ -5,6 +5,7 @@ All names are invented.
 import json
 import logging
 import re
+from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -419,6 +420,38 @@ def test_a_billing_error_stops_the_batch(m):
     go(m)
     assert len(m.judge.calls) == 1
     assert "key or billing" in m.ledger.inputs()["meaning"]["last_error"]
+
+
+class Stopped:
+    """A worker that stops outright: each job's future raises, as when the worker itself fails."""
+
+    def __init__(self):
+        self.started = 0
+
+    def submit(self, fn, *args, **kwargs):
+        self.started += 1
+        fut = Future()
+        fut.set_exception(RuntimeError("the worker stopped"))
+        return fut
+
+
+def test_a_stopped_worker_is_tried_again_at_the_next_read_not_every_pass(m, caplog):
+    # Nov 11 review: when the worker itself raised with more left to judge, every pass started
+    # the batch again, with a warning and a recorded failure each time.
+    for n in range(meaning.MAX_PER_TICK + 2):
+        seed(m, f"Event {n}", when(m, days=1 + n))           # more than one batch
+    stopped = m.m.executor = Stopped()
+    with caplog.at_level(logging.WARNING, logger="harness.meaning"):
+        go(m)
+        for _ in range(3):
+            m.tick()                                         # no new read: not started again
+    warned = [r for r in caplog.records if r.getMessage().startswith("meaning: the sorting stopped")]
+    assert stopped.started == 1 and len(warned) == 1
+    assert m.ledger.inputs()["meaning"]["failures"] == 1
+    m.m.executor = SyncExecutor()                            # the worker is back
+    m.judge.script = [judged() for _ in range(meaning.MAX_PER_TICK + 2)]
+    go(m)                                                    # the next read tries again
+    assert len(m.judge.calls) == meaning.MAX_PER_TICK
 
 
 def test_a_missed_kids_block_is_the_critical_count_and_the_line_has_its_format(m):

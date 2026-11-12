@@ -1293,6 +1293,33 @@ def test_a_judgment_the_judge_doesnt_reach_is_flagged_once_not_every_pass(lv, ca
     assert meaning.stored(lv.ledger, key)["stale"] == 1              # still waiting for the judge
 
 
+def shadow_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("meaning shadow")]
+
+
+@pytest.mark.parametrize("why", ["outside the read", "the day's calls used up"])
+def test_the_real_judge_stays_quiet_while_a_judgment_waits_for_it(judging, caplog, why):
+    # Nov 11 review: the judge itself, not a fake: while a judgment waits for it, passes log no
+    # score line and write nothing.
+    it = item("Book club", local(judging, meaning.AHEAD_DAYS + 30 if why == "outside the read" else 5))
+    judging.family.items.append(it)
+    judge(judging.ledger, it, rel("presence"))                     # judged before his answer
+    answer_ex(judging, "Book club", ["presence"])                  # in use; it never saw it
+    if why == "the day's calls used up":
+        today = judging.clock().astimezone(NY).date().isoformat()
+        with judging.ledger.tx() as db:
+            judging.ledger.set_meta("meaning_calls", f"{today}:{meaning.MAX_PER_DAY}", db)
+    revive_done(judging.ledger)
+    caplog.set_level("INFO", logger="harness")
+    turn(judging)                                                  # read, and flagged
+    turn(judging)                                                  # the judge looks: nothing it may do
+    scores, writes = shadow_lines(caplog), judging.ledger.db.total_changes
+    for _ in range(3):
+        turn(judging)
+    assert shadow_lines(caplog) == scores and judging.ledger.db.total_changes == writes
+    assert made_again(caplog) == [ONCE] and judging.judge.calls == []
+
+
 def test_a_judgment_in_the_read_is_flagged_once_and_made_again_with_his_answer(judging, caplog):
     start = local(judging, 5)
     it = item("Book club", start)
