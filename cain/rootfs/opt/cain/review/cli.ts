@@ -24,8 +24,6 @@ function money(n: number) { return `$${n.toFixed(2)}`; }
 switch (cmd) {
   case "submit": {
     if (!a1) fail("usage: review.sh submit <brief.json>");
-    const st = readStop();
-    if (st.stopped) fail(`${stoppedWhy(st, "no review is sent")} Submit it again once he does.`, 4);
     let raw = "";
     try { raw = readFileSync(a1, "utf8"); } catch { fail(`can't read ${a1}`); }
     const p = parseBrief(raw);
@@ -43,6 +41,9 @@ switch (cmd) {
     }
     saveReview(cfg.queueDir, r);
     out(b.id);
+    // While stopped it's queued all the same, and nothing goes out until he turns it back on.
+    const st = readStop();
+    if (st.stopped) console.error(`Queued, not sent: ${stoppedWhy(st, "no review is sent")} It goes out by itself once he does.`);
     break;
   }
   case "status": {

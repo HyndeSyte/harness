@@ -1,6 +1,6 @@
 // Dane's Ship approval, signed (wave 1, piece B). When he taps Ship on a Ship card,
 // Cain's link signs the repository, the pull request, its head commit and an expiry
-// with its own Ed25519 key, which nothing else on the box may read. Cain's Ship job
+// with its own Ed25519 key (link/shipkey.ts), which only the link is meant to read. Cain's Ship job
 // carries that token: the RemoteTrigger hook checks it before a Ship run starts, and
 // the job posts it on the pull request, where GitHub's ship check verifies it against
 // the public key kept on main. So the approval is his tap, checked in code, not a
@@ -12,7 +12,7 @@
 import { createPublicKey, verify as edVerify, type KeyObject } from "node:crypto";
 
 export const PREFIX = "ship1";
-export const TTL_S = 30 * 60;                    // an approval is good for 30 minutes after his tap
+export const TTL_S = 2 * 3600;                   // an approval is good for 2 hours after his tap
 const SKEW_S = 5 * 60;                           // clocks may differ by this much, no more
 // The only repository a Ship tap approves (lower case).
 export const SHIP_REPOS = new Set(["hyndesyte/harness"]);
@@ -68,7 +68,7 @@ export function readToken(token: string, key: KeyObject, nowMs: number): Checked
     || typeof c.head !== "string" || !SHA.test(c.head) || !Number.isSafeInteger(c.exp))
     return { ok: false, why: "its claim isn't a Ship approval" };
   if (!SHIP_REPOS.has(c.repo.toLowerCase())) return { ok: false, why: "it's for a repository Ship doesn't approve" };
-  if (c.exp * 1000 <= nowMs) return { ok: false, why: "it expired (an approval lasts 30 minutes after his tap)" };
+  if (c.exp * 1000 <= nowMs) return { ok: false, why: "it expired (an approval lasts 2 hours after his tap)" };
   if (c.exp * 1000 > nowMs + (TTL_S + SKEW_S) * 1000) return { ok: false, why: "its expiry is further off than an approval lasts" };
   return { ok: true, claim: { v: 1, repo: c.repo, pr: c.pr, head: c.head, exp: c.exp } };
 }

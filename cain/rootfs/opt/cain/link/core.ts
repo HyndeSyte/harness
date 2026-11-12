@@ -28,10 +28,11 @@
 // - Stop (wave 1, piece E): Dane's Stop tap, from any card of ours, stops everything:
 //   the calendar specialist (the tap goes on to it, as before), Cain's Build and Ship
 //   runs, his Ship cards and outside-review sends (../stop.ts). Only Dane's Turn back
-//   on tap undoes it; Cain has no way to. Its notice says what stopped.
+//   on tap undoes it, from a card the link posted and still knows as live; Cain has no
+//   command for it. Its notice says what stopped.
 // - Ship (wave 1, piece B): his Ship tap is signed here (../ship-token.ts) with a key
-//   only the link reads, for that pull request and head, good for 30 minutes. Cain's
-//   Ship run needs that token, and GitHub checks it before the merge.
+//   only the link is meant to read (shipkey.ts), for that pull request and head, good
+//   for 2 hours. Cain's Ship run needs that token; GitHub's own check comes next.
 import { createHash } from "node:crypto";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
@@ -102,6 +103,7 @@ export interface State {
   cards: Record<string, Card>; messages: Record<string, Shown>;
   held?: Ask[];
   migrated?: boolean;                // the one-time look over cards posted before 0.7.0 is done
+  toggle?: string;                   // a Stop or Turn back on the calendar specialist didn't take yet (0.8.0)
 }
 
 export function emptyState(): State {
@@ -351,7 +353,10 @@ export interface Deps {
 
 // What stopped, as his Stop notice says it.
 export const STOPPED_TOO = "Cain's Build and Ship jobs, Ship cards and outside reviews are stopped too, until you tap Turn back on. One already running finishes.";
-export const RESUMED_TOO = "Cain's Build and Ship jobs, Ship cards and outside reviews can run again too.";
+export const RESUMED_TOO = "Cain's Build and Ship jobs and outside reviews can run again, and Ship cards can go out.";
+// The link's own notice, when the calendar specialist didn't take his tap.
+export const STOPPED_ALONE = "Cain's Build and Ship jobs, Ship cards and outside reviews are stopped until you tap Turn back on; one already running finishes. The calendar specialist didn't answer, so it gets the Stop as soon as it does.";
+export const RESUMED_ALONE = "Cain's Build and Ship jobs and outside reviews can run again, and Ship cards can go out. The calendar specialist didn't answer, so it gets the Turn back on as soon as it does.";
 export const STOP_UNSAVED = "Cain's Ship cards are stopped, but his Build and Ship jobs and outside reviews may not be: the Stop couldn't be saved on his App. It's logged to be fixed.";
 export const RESUME_UNSAVED = "Cain's side couldn't save that, so his Build and Ship jobs and outside reviews may still be stopped. It's logged to be fixed.";
 
@@ -379,6 +384,7 @@ export class Link {
   // he tapped that couldn't be saved still holds here, in the link, until he undoes it.
   private stopHeld = false;              // his Stop, held in memory because saving it failed
   private stopUnsaved = false;           // the last Stop or Turn back on couldn't be saved
+  private changed: { kind: "stopped" | "resumed"; at: number } | null = null;   // his last tap that changed it
   stopped(): StopState {
     let s: StopState;
     try { s = this.d.stop ? this.d.stop.read() : { stopped: true, at: null }; } catch { s = { stopped: true, at: null }; }
@@ -386,8 +392,11 @@ export class Link {
   }
 
   // Only from his tap (onInteraction checks it's him first). A second Stop changes nothing.
+  // Only a change is written, so a second tap leaves its time (and the Ship taps signed
+  // since) as they were.
   private setStop(stopped: boolean): void {
     const was = this.stopped();
+    if (was.stopped === stopped && !this.stopUnsaved) return;
     let saved = true;
     try {
       if (!this.d.stop) throw new Error("no Stop state");
@@ -395,7 +404,7 @@ export class Link {
     } catch (e) { saved = false; this.log(`couldn't save the Stop state: ${String(e).slice(0, 80)}`); }
     this.stopHeld = stopped && !saved;
     this.stopUnsaved = !saved;
-    if (was.stopped === stopped && saved) return;
+    this.changed = { kind: stopped ? "stopped" : "resumed", at: this.d.now() };
     this.log(stopped ? "Dane tapped Stop: everything is stopped" : "Dane turned everything back on");
     if (!saved) {
       this.d.relay(stopped
@@ -404,13 +413,17 @@ export class Link {
       return;
     }
     this.d.relay(stopped
-      ? "Dane tapped Stop. Everything is stopped: no Build or Ship runs, no Ship cards and no review sends, and the calendar specialist starts nothing new, until he taps Turn back on. A job already running finishes. Only he can turn it back on; his notice already says so. Don't offer Start or Ship meanwhile, and tell him in one line only if he asks."
+      ? "Dane tapped Stop. Everything of yours is stopped: no Build or Ship runs, no Ship cards and no review sends, until he taps Turn back on; a job already running finishes. The calendar specialist gets the Stop too. Only he can turn it back on, and his notice already says so: never ask him to. Don't offer Start or Ship meanwhile (see Stop in your CLAUDE.md)."
       : "Dane tapped Turn back on: Build and Ship runs, Ship cards and review sends work again. A Ship tap from before his Stop no longer counts. Ask again about anything that waited.");
   }
 
   // What his Stop or Turn back on notice adds about Cain's side, from what's true now.
+  // Only for the notice that follows his tap that changed it (within 10 minutes): a
+  // specialist's "Not stopped" after a tap that changed nothing gets no line.
   private stopLine(kind: "stopped" | "resumed"): string {
     const now = this.stopped().stopped;
+    const fresh = this.changed?.kind === kind && this.d.now() - this.changed.at < 10 * 60_000;
+    if (!fresh) return "";
     if (this.stopUnsaved)
       return kind === "stopped" && now ? STOP_UNSAVED : kind === "resumed" ? RESUME_UNSAVED : "";
     if (kind === "stopped" && now) return STOPPED_TOO;
@@ -834,7 +847,9 @@ export class Link {
   async morning(text: string): Promise<string> {
     if (!String(text ?? "").trim()) throw new Refusal("the morning message needs its text");
     noMachineText(String(text));
-    const msg = await this.postCard(String(text), rows([[["Stop", STOP]]], "q:"), { nonce: stableNonce("morning", String(text)) });
+    // While stopped, its button is the one that undoes it.
+    const toggle: [string, string] = this.stopped().stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
+    const msg = await this.postCard(String(text), rows([[toggle]], "q:"), { nonce: stableNonce("morning", String(text), toggle[1]) });
     const s = this.d.load();
     this.remember(s, msg, { kind: "morning", item: "none", question: "morning", posted: this.d.now(), expires: null, buttons: true });
     const replaced = this.markReplaced(s, String(msg.id));
@@ -1021,13 +1036,49 @@ export class Link {
   // never silent, with the button that undoes it.
   private async stopTap(it: any, cid: string, msgId: string): Promise<string> {
     const out = await this.toSpecialist(it, cid, msgId);
-    if (out !== "specialist unreachable") return out;
+    await this.retoggleMorning();
+    const s = this.d.load();
+    if (out !== "specialist unreachable") {
+      if (s.toggle) { delete s.toggle; this.d.save(s); }
+      return out;
+    }
+    // Owed to the specialist: the sweep sends it the moment it answers again.
+    s.toggle = cid;
+    this.d.save(s);
     const stopped = this.stopped().stopped;
-    const line = this.stopLine(stopped ? "stopped" : "resumed");
-    await this.postToggle(stopped
-      ? `**Stopped.** ${line} The calendar specialist didn't answer, so it may still be running.`
-      : `**Turned back on.** ${line} The calendar specialist didn't answer, so it may still be stopped.`, stopped);
+    const line = this.stopUnsaved ? this.stopLine(stopped ? "stopped" : "resumed") : stopped ? STOPPED_ALONE : RESUMED_ALONE;
+    await this.postToggle(`**${stopped ? "Stopped" : "Turned back on"}.** ${line}`, stopped);
     return out;
+  }
+
+  // His morning message's button follows where things stand: Turn back on while stopped,
+  // Stop otherwise. Its record follows the edit, so his tap on it still counts.
+  private async retoggleMorning(): Promise<void> {
+    const want: [string, string] = this.stopped().stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
+    const comps = rows([[want]], "q:");
+    const ids = Object.entries(this.d.load().messages)
+      .filter(([, m]) => m.kind === "morning" && !m.outcome && m.buttons).map(([id]) => id);
+    for (const id of ids) {
+      try {
+        const { dm } = await this.identity();
+        const msg = await this.d.rest("PATCH", `/channels/${dm}/messages/${id}`, { components: comps });
+        const s = this.d.load();
+        if (s.messages[id]) { s.messages[id].digest = digest(String(msg?.content ?? ""), msg?.components ?? comps); this.d.save(s); }
+      } catch (e) { this.log(`couldn't change the morning message's button: ${String(e).slice(0, 80)}`); }
+    }
+  }
+
+  // A Stop or Turn back on the specialist didn't take: sent again until it does, as long
+  // as it still matches where things stand.
+  private async sendOwedToggle(): Promise<void> {
+    const s = this.d.load();
+    if (!s.toggle) return;
+    if ((s.toggle === STOP) !== this.stopped().stopped) { delete s.toggle; this.d.save(s); return; }
+    if (!(await this.d.toHarness("/press", { custom_id: s.toggle, message_id: 0 }))) return;
+    const s2 = this.d.load();
+    delete s2.toggle;
+    this.d.save(s2);
+    this.log(`the calendar specialist took the ${s.toggle === STOP ? "Stop" : "Turn back on"} it missed`);
   }
 
   // A notice from the link with the one button that undoes where things stand,
@@ -1106,8 +1157,9 @@ export class Link {
         extra = " Everything is stopped, so nothing ships and there's no Ship token: after he taps Turn back on, ask again with a new Ship card.";
       } else {
         const token = this.signFor(m.ship);
+        if (!token) shown = "You tapped Ship, but shipping is down right now, so nothing shipped.";
         extra = token
-          ? ` Ship token: ${token} (good for 30 minutes: put it in the Ship job's text as it is).`
+          ? ` Ship token: ${token} (good for 2 hours: put it in the Ship job's text as it is).`
           : " The link has no Ship key, so there's no Ship token and a Ship run will be refused: tell him in one line that shipping is down, and log it as a Build item.";
       }
     }
@@ -1152,6 +1204,7 @@ export class Link {
       if (!this.d.load().migrated) {
         try { await this.migrate(); } catch (e) { this.log(`couldn't look over the cards already posted yet: ${String(e).slice(0, 80)}`); }
       }
+      await this.sendOwedToggle();
       await this.showDue();
       await this.decide();
       await this.stripDue();

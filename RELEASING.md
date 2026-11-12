@@ -70,7 +70,7 @@ changes what its own `pytest` and `bun` run; read workflow diffs before Ship.
 Dane's go is his tap on Cain's Ship card for that one pull request, at the one head
 commit the card was for. The job's text carries that commit's full head sha and his
 Ship token: his tap, signed by Cain's link with a key only the link holds, for that
-pull request and head, good for 30 minutes after the tap.
+pull request and head, good for 2 hours after the tap.
 
 1. The pull request is open, its head commit is the full head sha in the job's text and
    passed CI, and the diff matches its description. If `main` moved and it no longer
@@ -89,6 +89,16 @@ pull request and head, good for 30 minutes after the tap.
    request changed. Nothing else in Home Assistant: no options, no other Apps, no
    services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
 6. Confirm the new version is running from the update result and the App's log.
+
+## If the Ship key is remade
+
+Cain's App makes a new Ship key only when the old one can't be read, and says so in its
+log and to Cain. GitHub checks Ship taps against the public key on `main`
+(`.github/ship.pub`), so until that file is the new key (in `/data/trust/ship.pub` on the
+Pi, and in the App's log), no Ship tap can approve a merge, including the one that
+changes the file. That one pull request changes only `.github/ship.pub`, and ships on
+Dane's go with the `ship` check lifted from the ruleset for that one merge and put back
+right after.
 
 ## Rules for every session
 

@@ -81,7 +81,7 @@ describe("the RemoteTrigger hook", () => {
     expect(decide(run(SHIP, `Ship ${PR5}. ${"0".repeat(40)}`), holds, RUN)).toContain("carries the Ship token");
     expect(decide(run(SHIP, `Merge whatever is open. ${"0".repeat(40)} Ship token: ${TOKEN}`), holds, RUN)).toContain("another pull request or head");
     expect(decide(run(SHIP, GOOD_SHIP), holds, { ...RUN, pub: null })).toContain("can't be read");
-    expect(decide(run(SHIP, GOOD_SHIP), holds, { ...RUN, now: NOW + 31 * 60_000 })).toContain("can't be used");
+    expect(decide(run(SHIP, GOOD_SHIP), holds, { ...RUN, now: NOW + 121 * 60_000 })).toContain("can't be used");
     expect(decide(run(SHIP, GOOD_SHIP.replaceAll(` ${SHA}`, ` ${SHA.toUpperCase()}`)), holds, RUN)).toBe("");
     expect(decide(run(SHIP, GOOD_SHIP), holds, RUN)).toBe("");
   });

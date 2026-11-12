@@ -39,15 +39,20 @@ export function ensureStop(at: number, path = STOP_FILE): void {
   try { readFileSync(path); } catch (e: any) { if (e?.code === "ENOENT") writeStop(false, at, path); }
 }
 
-// " since 3:40 PM" in his zone, or "" when the time isn't known.
-export function since(s: StopState, tz = "America/New_York"): string {
+// " since 3:40 PM" (with the day when it isn't today), in his zone; "" when unknown.
+export function since(s: StopState, tz = "America/New_York", nowMs = Date.now()): string {
   if (s.at === null) return "";
+  const day = (ms: number) => new Date(ms).toLocaleDateString("en-US", { timeZone: tz, month: "short", day: "numeric" });
   const t = new Date(s.at).toLocaleTimeString("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" });
-  return ` since ${t}`;
+  return day(s.at) === day(nowMs) ? ` since ${t}` : ` since ${day(s.at)}, ${t}`;
 }
 
 // Why something of Cain's won't run now, for Cain.
 export function stoppedWhy(s: StopState, what: string, tz?: string): string {
-  return `Everything is stopped${since(s, tz)}: Dane tapped Stop, so ${what}. Only he can turn it back on, with the `
-    + "Turn back on button. Don't ask him to; tell him in one line only if he asks about it.";
+  if (s.at === null)
+    return `Nothing runs: the Stop state can't be read, so ${what}. Tell Dane in one line that Cain's jobs are held `
+      + "because of a fault on his App, and log a Build item.";
+  return `Everything has been stopped${since(s, tz)}: Dane tapped Stop, so ${what}. Only he can turn it back on, with `
+    + "the Turn back on button; never ask him to. If this was for something he asked for or tapped, tell him in one "
+    + "line it waits until he turns things back on.";
 }

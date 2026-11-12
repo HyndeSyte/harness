@@ -132,12 +132,12 @@ export class Runner {
   // ---- the loop ----
   async tick(): Promise<void> {
     mkdirSync(this.cfg.queueDir, { recursive: true });
-    const stopped = this.isStopped();
     for (const name of readdirSync(this.cfg.queueDir).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort()) {
       const r = loadReview(this.cfg.queueDir, name.slice(0, -5));
       if (!r) continue;
-      // While stopped, an open review waits where it is: nothing is sent, nothing is given up.
-      if (stopped && !FINAL.includes(r.status)) continue;
+      // While stopped, an open review waits where it is: nothing is sent, nothing is given
+      // up. Asked again for each review, since a seat's call can take minutes.
+      if (!FINAL.includes(r.status) && this.isStopped()) continue;
       try {
         if (FINAL.includes(r.status)) {
           // Saved only when after() changed it (recorded, relayed, or blocked at the record gate).
@@ -170,6 +170,7 @@ export class Runner {
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
     for (let pass = 0; pass < 4; pass++) {
+      if (this.isStopped()) break;                       // Stop between passes: the rest waits
       const now = this.now().toISOString();
       const due = r.seats.filter((s) => this.isDue(r, s, now));
       if (due.length === 0) break;
@@ -314,8 +315,8 @@ export class Runner {
 
   async selftest(): Promise<Health> {
     // Not done, so it's tried again within the hour, and runs once he turns it back on.
-    if (this.isStopped()) throw new Error("everything is stopped, so no seat is called");
     for (const seat of SEATS) {
+      if (this.isStopped()) throw new Error("everything is stopped, so no seat is called");
       const down = this.unavailable(seat) ?? this.capCheck(seat, SELFTEST, 0, true);
       if (down) { this.markHealth(seat, { ...down, fix: fixFor(seat, down.kind, down.detail) }, false); continue; }
       const ctl = new AbortController();
