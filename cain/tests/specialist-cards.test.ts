@@ -26,11 +26,21 @@ const snap = (m: any) => structuredClone(m);                         // the card
 const tick = () => new Promise((ok) => setTimeout(ok, 0));
 // What Cain is told about a card the link handles by itself, with what it was.
 const byItself = (card: number, message: string, text = TEXT) =>
-  `Card ${card} ("${excerpt(text, 60)}") went out to him by itself (Discord message ${message}): you hadn't shown it within 2 minutes. Showing it now only files it under its item and question; it won't go out twice. Nothing to tell him.`;
-const failed = (card: number, why: string, text = TEXT, expires = true) =>
-  `Card ${card} ("${excerpt(text, 60)}") didn't go out: ${why}. I'll keep trying${expires ? " until it expires" : ""}.`;
+  `Card ${card} ("${excerpt(text, 60)}") went out to him by itself (Discord message ${message}): you hadn't shown it within 2 minutes. No need to show it unless it belongs under an item.`;
+const failed = (card: number, how: "refused" | "unanswered", text = TEXT, expires = true) =>
+  `Card ${card} ("${excerpt(text, 60)}") ${how === "refused" ? "didn't go out: Discord refused it" : "may not have gone out: Discord didn't answer"}. Tell him in your own words if it matters; I'll keep trying${expires ? " until it expires" : ""}.`;
 const lapsed = (card: number, text = TEXT) =>
-  `Card ${card} ("${excerpt(text, 60)}") expired before it reached him. Tell him in your own words, or ask the specialist to send it again.`;
+  `Card ${card} ("${excerpt(text, 60)}") expired before it reached him. Tell him in your own words, or get a fresh card through /opt/cain/keeper.sh handover (see Calendars).`;
+const unsureLapsed = (card: number, how: string, text = TEXT) =>
+  `Card ${card} ("${excerpt(text, 60)}") expired, and I can't tell yet whether it reached him (${how}). I'll check again.`;
+const foundLine = (card: number, message: string, text = TEXT) =>
+  `Card ${card} ("${excerpt(text, 60)}") reached him after all (Discord message ${message}): the answer to your show of it was lost. Nothing more was posted.`;
+const told = (card: number) => `You were already told card ${card} expired before it reached him; nothing was posted.`;
+// A second approval from the specialist, for the same question.
+const TEXT2 = "Approve the new time? Only your tap applies it. *Expires in 15 min.*";
+const ROWS2 = [{ type: 1, components: [{ type: 2, style: 2, label: "Approve", custom_id: "k:c:ok50" },
+                                       { type: 2, style: 2, label: "Decline", custom_id: "k:c:no50" }] }];
+const STOP_ONLY = [{ type: 1, components: [{ type: 2, style: 2, label: "Stop", custom_id: STOP }] }];
 // A receipt for something the specialist already did, with its Undo.
 const RECEIPT = "Moved the call to Thu 2 PM.";
 const UNDO = [{ type: 1, components: [{ type: 2, style: 2, label: "Undo", custom_id: "k:c:undo1" }] }];
@@ -220,12 +230,13 @@ describe("a card with buttons goes out within about 2 minutes, whatever Cain is 
     expect(r.buttons(id)).toEqual(BUTTONS);
     expect(r.state().cards[card].shown).toBe(id);
     expect(r.state().messages[id]).toMatchObject({ kind: "card", card, item: "none", question: "", buttons: true, expires: LAPSES, byItself: true });
+    expect(r.state().cards[card].posting).toBeUndefined();            // up and recorded: nothing left to look for
     expect(r.relayed).toEqual([byItself(card, id)]);
     r.later(MIN);
     await r.link.sweep();
     // His late show (the old "show it now" line) posts nothing; it only files it.
     expect(await r.link.showCard(card, { item: "P49" })).toEqual({ status: "already out", message: id,
-      said: "It had gone out by itself; this only filed it under P49, and nothing more was posted. Write no lead-in for it." });
+      said: "It had gone out by itself; this only filed it under P49. Nothing more was posted. Write no lead-in for it." });
     expect(r.link.cardInfo(id)).toEqual({ card, item: "P49", question: null });
     expect(r.cards().length).toBe(1);
     expect(r.posts()).toBe(1);
@@ -335,14 +346,14 @@ describe("a card with buttons goes out within about 2 minutes, whatever Cain is 
     expect(r.cards()).toEqual([]);
     expect(r.state().cards[card]).toMatchObject({ shown: null, outcome: "expired" });
     expect(r.relayed).toEqual([lapsed(short, RECEIPT), lapsed(card)]);   // once each
-    await expect(r.link.show(card, { item: "P49" })).rejects.toThrow(
-      `card ${card} ("${excerpt(TEXT, 60)}") expired before it reached him; nothing was posted. Tell him in your own words, or ask the specialist to send it again.`);
+    // Showing it now posts nothing and doesn't tell him a second time.
+    expect(await r.link.showCard(card, { item: "P49" })).toEqual({ status: "expired", message: null, said: told(card) });
     const late = await r.link.addCard({ text: TEXT, rows: ROWS, kind: "card", expires: new Date(r.t.now + MIN).toISOString() });
     r.later(MIN);                                                     // Cain shows it after it lapsed, before any sweep
-    await expect(r.link.show(late, { item: "none" })).rejects.toThrow("expired before it reached him");
+    expect(await r.link.showCard(late, { item: "none" })).toEqual({ status: "expired", message: null, said: lapsed(late) });
     expect(r.state().cards[late].outcome).toBe("expired");
     await r.link.sweep();
-    expect(r.relayed.length).toBe(3);                                 // his show was told; the sweep adds nothing
+    expect(r.relayed.filter((l) => l.includes("expired before it reached him"))).toEqual([lapsed(short, RECEIPT), lapsed(card)]);
     expect(r.posts()).toBe(0);
   });
 
@@ -359,12 +370,12 @@ describe("a card with buttons goes out within about 2 minutes, whatever Cain is 
     r.failing.add(`POST /channels/${DM}/messages`);                   // then it refuses outright
     r.later(MIN);
     await r.link.sweep();
-    expect(r.relayed).toEqual([failed(card, "discord 500: unavailable")]);
+    expect(r.relayed).toEqual([failed(card, "refused")]);
     for (let i = 0; i < 5; i++) { r.later(MIN); await r.link.sweep(); }
-    expect(r.relayed).toEqual([failed(card, "discord 500: unavailable")]);   // once, though it kept trying
+    expect(r.relayed).toEqual([failed(card, "refused")]);   // once, though it kept trying
     r.t.now = LAPSES;
     await r.link.sweep();
-    expect(r.relayed).toEqual([failed(card, "discord 500: unavailable"), lapsed(card)]);
+    expect(r.relayed).toEqual([failed(card, "refused"), lapsed(card)]);
     expect(r.cards()).toEqual([]);
   });
 
@@ -378,25 +389,22 @@ describe("a card with buttons goes out within about 2 minutes, whatever Cain is 
     r.failing.add(`POST /channels/${DM}/messages`);
     r.later(2 * MIN);
     await r.link.sweep();
-    expect(r.relayed).toEqual([failed(card, "discord 500: unavailable", today, false)]);
+    expect(r.relayed).toEqual([failed(card, "refused", today, false)]);
     for (let i = 0; i < 30; i++) { r.later(MIN); await r.link.sweep(); }
     expect(r.relayed.length).toBe(1);
     r.failing.clear();
     r.later(MIN);
     await r.link.sweep();
     expect(r.cards().length).toBe(1);
-    expect(r.relayed).toEqual([failed(card, "discord 500: unavailable", today, false), byItself(card, r.cards()[0].id, today)]);
+    expect(r.relayed).toEqual([failed(card, "refused", today, false), byItself(card, r.cards()[0].id, today)]);
   });
 });
 
-describe("a card that went out by itself is still filed and replaceable", () => {
-  const TEXT2 = "Approve the new time? Only your tap applies it. *Expires in 15 min.*";
-  const ROWS2 = [{ type: 1, components: [{ type: 2, style: 2, label: "Approve", custom_id: "k:c:ok50" },
-                                         { type: 2, style: 2, label: "Decline", custom_id: "k:c:no50" }] }];
-  const second = (r: ReturnType<typeof rig>) =>
-    r.link.addCard({ text: TEXT2, rows: ROWS2, kind: "card", expires: new Date(r.t.now + 15 * MIN).toISOString() });
-  const live = (r: ReturnType<typeof rig>) => r.cards().filter((m: any) => r.buttons(m.id).length).map((m: any) => m.id);
+const second = (r: ReturnType<typeof rig>) =>
+  r.link.addCard({ text: TEXT2, rows: ROWS2, kind: "card", expires: new Date(r.t.now + 15 * MIN).toISOString() });
+const live = (r: ReturnType<typeof rig>) => r.cards().filter((m: any) => r.buttons(m.id).length).map((m: any) => m.id);
 
+describe("a card that went out by itself is still filed and replaceable", () => {
   test("(k) v1 goes out by itself, Cain's late show files it under P49 Q1, and v2 shown under P49 Q1 replaces it: one live card", async () => {
     const r = evening({ holds: null });
     await r.link.sweep();
@@ -405,7 +413,8 @@ describe("a card that went out by itself is still filed and replaceable", () => 
     await r.link.sweep();                                             // v1 out by itself, under no item
     const m1 = r.cards()[0].id;
     expect(r.link.cardInfo(m1)).toEqual({ card: v1, item: "none", question: null });
-    expect((await r.link.showCard(v1, { item: "P49", question: "Q1" })).status).toBe("already out");
+    expect(await r.link.showCard(v1, { item: "P49", question: "Q1" })).toEqual({ status: "already out", message: m1,
+      said: "It had gone out by itself; this only filed it under P49 Q1. Nothing more was posted. Write no lead-in for it." });
     expect(r.posts()).toBe(1);
     expect(r.link.cardInfo(m1)).toEqual({ card: v1, item: "P49", question: "Q1" });   // /card-of
     const reply = r.his("approved?", m1);
@@ -425,7 +434,8 @@ describe("a card that went out by itself is still filed and replaceable", () => 
     const m1 = r.cards()[0].id;
     r.later(MIN);
     const m2 = await r.link.show(await second(r), { item: "P49", question: "Q1" });
-    await r.link.show(v1, { item: "P49", question: "Q1" });          // the old line about v1 comes last
+    const out = await r.link.showCard(v1, { item: "P49", question: "Q1" });   // the old line about v1 comes last
+    expect(out.said).toBe("It had gone out by itself; this filed it under P49 Q1, and as a newer card for the same question is up, its buttons came off. Nothing more was posted. Write no lead-in for it.");
     expect(live(r)).toEqual([m2]);
     expect(r.msg(m1).content).toBe(`${TEXT}\n\nReplaced by a newer card`);
   });
@@ -530,7 +540,8 @@ describe("a card's buttons and record stay true", () => {
     expect(r.cards().length).toBe(1);                                 // the same message, found and recorded
     const id = r.cards()[0].id;
     expect(r.state().cards[card].shown).toBe(id);
-    expect(r.relayed).toEqual([failed(card, "TimeoutError: The operation timed out."), byItself(card, id)]);
+    expect(r.state().cards[card].posting).toBeUndefined();
+    expect(r.relayed).toEqual([failed(card, "unanswered"), byItself(card, id)]);
   });
 
   test("(q) ...and one whose life ran out meanwhile is found too, so Cain is never told it didn't reach him", async () => {
@@ -549,8 +560,273 @@ describe("a card's buttons and record stay true", () => {
     const id = r.cards()[0].id;
     expect(r.cards().length).toBe(1);
     expect(r.state().cards[card]).toMatchObject({ shown: id });
-    expect(r.relayed).toEqual([failed(card, "TimeoutError: The operation timed out."), byItself(card, id)]);
+    expect(r.relayed).toEqual([failed(card, "unanswered"), byItself(card, id)]);
     expect(r.relayed.join("\n")).not.toContain("expired before it reached him");
     expect(r.buttons(id)).toEqual([]);                                // its buttons come off: it has expired
+  });
+});
+
+describe("filing a card that went out by itself weighs only against the specialist's cards", () => {
+  for (const askFirst of [true, false]) {
+    test(`(r) it never takes the buttons off Cain's own ask for the same question, nor gives way to it (${askFirst ? "his ask first" : "the card first"})`, async () => {
+      const r = evening({ holds: null });
+      await r.link.sweep();
+      let ask = askFirst ? await asked(r, "P49", "Q1") : "";
+      r.later(MIN);
+      const card = await approval(r);
+      r.later(2 * MIN);
+      await r.link.sweep();                                           // out by itself, under no item
+      const m = r.state().cards[card].shown!;
+      if (!askFirst) { r.later(MIN); ask = await asked(r, "P49", "Q1"); }
+      const out = await r.link.showCard(card, { item: "P49", question: "Q1" });
+      expect(r.buttons(ask)).toEqual(["Filed", "Not filed"]);         // his ask keeps its buttons
+      expect(r.buttons(m)).toEqual(BUTTONS);                          // and so does the card
+      for (let i = 0; i < 2; i++) { r.later(MIN); await r.link.sweep(); }   // nor does the sweep settle it between them
+      expect(r.buttons(ask)).toEqual(["Filed", "Not filed"]);
+      expect(r.buttons(m)).toEqual(BUTTONS);
+      expect(out.said).toBe("It had gone out by itself; this only filed it under P49 Q1. Nothing more was posted. Write no lead-in for it.");
+    });
+  }
+
+  test("(r) it takes the buttons off an older card of the specialist's for the same question, says so, and leaves Cain's held ask alone", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const older = await r.link.show(await second(r), { item: "P49", question: "Q1" });
+    await asked(r, "P50", "Q1");                                      // his open ask, so his P49 Q1 ask waits
+    expect((await r.link.ask({ text: "P49 Q1: Filed?", options: ["Filed", "Not filed"], item: "P49", question: "Q1" })).status).toBe("held");
+    r.later(MIN);
+    const card = await approval(r);
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // out by itself
+    const m = r.state().cards[card].shown!;
+    const out = await r.link.showCard(card, { item: "P49", question: "Q1" });
+    expect(r.buttons(older)).toEqual([]);
+    expect(r.buttons(m)).toEqual(BUTTONS);
+    expect(r.state().held!.map((h) => `${h.item} ${h.question}`)).toEqual(["P49 Q1"]);   // still waiting its turn
+    expect(out.said).toBe("It had gone out by itself; this filed it under P49 Q1 and took the buttons off an older card for the same question. Nothing more was posted. Write no lead-in for it.");
+  });
+});
+
+describe("the look-up in his DM never misses into a second message", () => {
+  test("(s) it never takes an older bot message with the same words, one he wrote himself, or one the link already knows", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const old = r.snowflake(NOV11_644PM - 10 * MIN);                  // an identical card of ours from before, forgotten
+    r.posted[old] = { id: old, content: TEXT, components: ROWS, author: { id: BOT } };
+    const card = await approval(r);
+    r.failing.add(`POST /channels/${DM}/messages`);
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // its post is refused: the look-up counts from now
+    r.failing.clear();
+    r.later(MIN);
+    await r.link.sweep();
+    const shown = r.state().cards[card].shown!;
+    expect(shown).not.toBe(old);
+    expect(r.msg(shown).content).toBe(TEXT);
+    const plain = await r.link.addCard({ text: RECEIPT, rows: [] });
+    r.failing.add(`POST /channels/${DM}/messages`);
+    await expect(r.link.show(plain, { item: "none" })).rejects.toThrow("discord 500");
+    r.failing.clear();
+    const his = r.his(RECEIPT);                                       // he typed the same words himself
+    const mine = await r.link.show(plain, { item: "none" });
+    expect(mine).not.toBe(his.id);
+    expect(r.msg(mine).author.id).toBe(BOT);
+    const twin = await approval(r);
+    r.failing.add(`POST /channels/${DM}/messages`);
+    r.later(3 * MIN);
+    await r.link.sweep();                                             // the twin's post is refused
+    r.failing.clear();
+    const known = await r.link.show(await approval(r), { item: "none" });   // the same words and buttons, up and recorded since
+    r.later(MIN);
+    await r.link.sweep();
+    expect(r.state().cards[twin].shown).toBeTruthy();
+    expect(r.state().cards[twin].shown).not.toBe(known);
+  });
+
+  test("(t) while his DM can't be read, a card whose post never heard back isn't posted again, even before it expires", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const card = await approval(r);
+    r.relayed.length = 0;
+    r.lose.posts = 1;
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // on Discord, but the link never heard
+    r.failing.add(`GET /channels/${DM}/messages?`);                   // his DM can't be read; posting still works
+    for (let i = 0; i < 6; i++) { r.later(MIN); await r.link.sweep(); }
+    expect(r.posts()).toBe(1);                                        // nothing posted again
+    r.failing.clear();
+    r.later(MIN);
+    await r.link.sweep();
+    expect(r.cards().length).toBe(1);
+    const id = r.cards()[0].id;
+    expect(r.state().cards[card].shown).toBe(id);
+    expect(r.relayed).toEqual([failed(card, "unanswered"), byItself(card, id)]);
+  });
+
+  test("(u) it pages back past the time its post began, so a card under many newer messages is still found", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const card = await approval(r);
+    r.lose.posts = 1;
+    r.later(2 * MIN);
+    await r.link.sweep();
+    const lost = r.last().id;
+    r.failing.add(`/channels/${DM}/messages`);                        // Discord is down for 6 minutes...
+    for (let i = 0; i < 6; i++) { r.later(MIN); await r.link.sweep(); }
+    r.failing.clear();
+    for (let i = 0; i < 120; i++) r.his(`message ${i}`);              // ...and he wrote a lot meanwhile
+    const before = r.reads();
+    r.later(MIN);
+    await r.link.sweep();
+    expect(r.state().cards[card].shown).toBe(lost);
+    expect(r.cards().length).toBe(1);
+    expect(r.reads() - before).toBe(2);                               // two pages of his DM
+  });
+
+  test("(v) when its buttons changed since its post began, its words alone find it, and the message gets the new buttons", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const card = await approval(r);
+    r.lose.posts = 1;
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // on Discord with Approve, Decline, Stop; unheard
+    const lost = r.last().id;
+    await r.link.editButtons(card, STOP_ONLY);                        // the specialist changed its buttons meanwhile
+    r.failing.add(`/channels/${DM}/messages`);
+    for (let i = 0; i < 6; i++) { r.later(MIN); await r.link.sweep(); }
+    r.failing.clear();
+    r.later(MIN);
+    await r.link.sweep();
+    expect(r.state().cards[card].shown).toBe(lost);
+    expect(r.cards().length).toBe(1);
+    expect(r.buttons(lost)).toEqual(["Stop"]);
+  });
+
+  test("(x) a tap on the card's message while its post never heard back is that card's tap; another unknown message gets today's answer", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const card = await approval(r);
+    r.relayed.length = 0;
+    r.lose.posts = 1;
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // on Discord, unheard; he sees it and taps
+    const lost = r.last().id;
+    const other = r.snowflake(NOV11_644PM - DAY);                     // an old card of ours the link doesn't know
+    r.posted[other] = { id: other, content: "Old card", author: { id: BOT },
+      components: [{ type: 1, components: [{ type: 2, style: 2, label: "Undo", custom_id: "k:c:old" }] }] };
+    expect(await r.tap(snap(r.posted[other]), "k:c:old")).toBe("dead: not a card the link knows");
+    expect(await r.tap(snap(r.posted[lost]), "k:c:ok49")).toBe("to specialist");
+    expect(r.harness.at(-1)[1]).toMatchObject({ custom_id: "k:c:ok49", message_id: card });
+    expect(r.state().cards[card].shown).toBe(lost);
+    expect(r.state().cards[card].posting).toBeUndefined();
+    expect(r.relayed).toEqual([failed(card, "unanswered"), byItself(card, lost)]);
+  });
+});
+
+describe("what Cain hears stays true, and once", () => {
+  test("(y) a card that lapsed while his DM can't be read: he hears it can't be told yet, then that it reached him", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const card = await r.link.addCard({ text: TEXT, rows: ROWS, kind: "card", expires: new Date(NOV11_644PM + MIN).toISOString() });
+    r.relayed.length = 0;
+    r.lose.posts = 1;
+    await expect(r.link.show(card, { item: "P49" })).rejects.toThrow("timed out");   // Discord's answer to his show is lost
+    const lost = r.last().id;
+    r.failing.add(`GET /channels/${DM}/messages?`);
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // lapsed, and his DM can't be read
+    expect(r.relayed).toEqual([unsureLapsed(card, "Discord refused it")]);
+    r.later(MIN);
+    await r.link.sweep();
+    expect(r.relayed.length).toBe(1);                                 // once
+    r.failing.clear();
+    r.later(MIN);
+    await r.link.sweep();                                             // readable again: it did reach him
+    expect(r.state().cards[card].shown).toBe(lost);
+    expect(r.state().messages[lost]).toMatchObject({ item: "P49", buttons: false });   // his item; expired, so its buttons came off
+    expect(r.relayed).toEqual([unsureLapsed(card, "Discord refused it"), foundLine(card, lost)]);
+  });
+
+  test("(z) when Cain's show and the sweep find a card lapsed at the same moment, he hears it once", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const card = await r.link.addCard({ text: TEXT, rows: ROWS, kind: "card", expires: new Date(NOV11_644PM + 3 * MIN).toISOString() });
+    r.failing.add(`POST /channels/${DM}/messages`);
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // its post is refused: nothing on Discord
+    r.failing.clear();
+    r.later(2 * MIN);                                                 // and now it has lapsed
+    r.gate.history = true;                                            // the sweep's look in his DM is slow...
+    const swept = r.link.sweep();
+    await until(() => r.reads() === 2);
+    const answer = r.link.showCard(card, { item: "none" });          // ...and his show comes in meanwhile
+    for (let i = 0; i < 20; i++) await tick();
+    r.release();
+    await swept;
+    expect(await answer).toEqual({ status: "expired", message: null, said: lapsed(card) });
+    expect(r.relayed.filter((l) => l.includes("expired before it reached him"))).toEqual([]);
+  });
+
+  test("(z) ...and one after the other, either way round, he still hears it once", async () => {
+    const r = evening();
+    const a = await r.link.addCard({ text: TEXT, rows: ROWS, kind: "card", expires: new Date(NOV11_644PM + MIN).toISOString() });
+    const b = await r.link.addCard({ text: RECEIPT, rows: UNDO, kind: "reply", expires: new Date(NOV11_644PM + MIN).toISOString() });
+    r.relayed.length = 0;
+    r.later(MIN);
+    expect(await r.link.showCard(b, { item: "none" })).toEqual({ status: "expired", message: null, said: lapsed(b, RECEIPT) });
+    await r.link.sweep();                                             // the sweep tells him about a, not b again
+    expect(r.relayed).toEqual([lapsed(a)]);
+    expect(await r.link.showCard(a, { item: "none" })).toEqual({ status: "expired", message: null, said: told(a) });
+    expect(r.relayed).toEqual([lapsed(a)]);
+  });
+});
+
+describe("the details the reviews asked to pin down", () => {
+  test("(w) a card from before 0.7.2 that gains buttons still never goes out by itself", async () => {
+    const r = evening();
+    const s = r.state();
+    s.cards["77"] = { text: RECEIPT, rows: [], kind: "reply", created: NOV11_644PM - 10 * MIN, shown: null };
+    r.setState(s);
+    await r.link.editButtons(77, UNDO);
+    expect(r.state().cards["77"].due).toBeUndefined();
+    for (let i = 0; i < 4; i++) { r.later(MIN); await r.link.sweep(); }
+    await r.link.editButtons(77, []);
+    await r.link.editButtons(77, UNDO);                               // nor after losing and regaining them
+    for (let i = 0; i < 4; i++) { r.later(MIN); await r.link.sweep(); }
+    expect(r.cards()).toEqual([]);
+    expect(r.state().cards["77"].due).toBeUndefined();
+  });
+
+  test("(aa) a post found later keeps its own time, so a card shown after it still counts as newer", async () => {
+    const r = evening({ holds: null });
+    await r.link.sweep();
+    const a = await approval(r);
+    r.lose.posts = 1;
+    r.later(2 * MIN);
+    await r.link.sweep();                                             // a's post made at 6:46, unheard
+    const lost = r.last().id;
+    r.later(MIN);
+    const mb = await r.link.show(await second(r), { item: "P49", question: "Q1" });   // b up at 6:47
+    r.failing.add(`/channels/${DM}/messages`);
+    for (let i = 0; i < 6; i++) { r.later(MIN); await r.link.sweep(); }
+    r.failing.clear();
+    r.later(MIN);
+    await r.link.sweep();                                             // a found at 6:54
+    expect(r.state().messages[lost].posted).toBe(NOV11_644PM + 2 * MIN);
+    expect((await r.link.showCard(a, { item: "P49", question: "Q1" })).said).toContain("as a newer card for the same question is up");
+    expect(live(r)).toEqual([mb]);
+  });
+
+  test("(aa) a Stop notice whose post failed never gets a due time, even when it gains buttons", async () => {
+    const r = evening();
+    await r.link.sweep();
+    r.failing.add(`POST /channels/${DM}/messages`);
+    await expect(r.link.addCard({ text: "Stopped.", rows: [], kind: "stopped" })).rejects.toThrow("discord 500");
+    r.failing.clear();
+    const id = Number(Object.keys(r.state().cards)[0]);
+    await r.link.editButtons(id, [{ type: 1, components: [{ type: 2, style: 2, label: "Turn back on", custom_id: RESUME }] }]);
+    expect(r.state().cards[id].due).toBeNull();
+    for (let i = 0; i < 4; i++) { r.later(MIN); await r.link.sweep(); }
+    expect(r.cards()).toEqual([]);                                    // the specialist sends its notices again itself
   });
 });

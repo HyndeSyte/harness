@@ -12,8 +12,8 @@
 //     GET  /card-of?m=<message id>      which card a Discord message is, and its item and question
 //     GET  /health                      "ok"; with the key, also the Discord connection and the watch
 //   from Cain's own scripts, on this machine only (127.0.0.1); item is a PENDING id or "none":
-//     POST /show {id, item, question?, reply_to?}            show a specialist's card ("posted", or "already
-//                                                            out": then it only files it under his item)
+//     POST /show {id, item, question?, reply_to?}            show a specialist's card ("posted"; "already out":
+//                                                            it only files it under his item; "expired": nothing)
 //     POST /ask {text, options, item, question?, reply_to?}  ask with buttons, one open at a time
 //     POST /ship {text, item, pr, head, reply_to?}           a Ship card for one pull request head
 //     POST /answered {item, question?}  he answered an open ask in words
