@@ -240,6 +240,7 @@ class MeaningLive:
         self.chat_id: int | None = None
         self._why: dict[str, dict] = {}    # Gmail key -> what the block is for (receipts)
         self._none_said: dict[str, str] = {}   # occurrence -> why it got no block, as last logged
+        self._revive_tried: tuple = ()     # the read the one-time revive was last tried at
         self.places = places.PlaceBook(ledger, tz=tz)   # where a named place is (places.py)
 
     def bind(self, owner: int) -> None:
@@ -545,9 +546,14 @@ class MeaningLive:
     def _revive(self) -> None:
         """Once: his answers wrongly overruled by a seeded example (meaning.revive_answers) come
         back, and every judgment any answer of his could touch is made again, so none still
-        rests on what was judged before his answer counted."""
+        rests on what was judged before his answer counted. One that fails is tried again at
+        the next read, not on every pass."""
         if self.ledger.get_meta("meaning_revived") == "2":
             return
+        read = (getattr(self.calendar, "generation", None),)
+        if self._revive_tried == read:
+            return                         # failed at this read: tried again at the next one
+        self._revive_tried = read
         ids = meaning.revive_answers(self.ledger)
         mine = [e.id for e in meaning.active_examples(self.ledger) if e.source not in meaning.SEEDED]
         n = meaning.rejudge_for(self.ledger, mine, only_unseen=True)   # judged without it

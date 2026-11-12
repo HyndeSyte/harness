@@ -16,7 +16,7 @@ from harness.family_gmail import DROP_TITLE, PICK_TITLE
 from fakes import own, FakeEngine, SyncExecutor, result
 from fake_caldav import FAMILY_PATH, no_network  # noqa: F401  (autouse)
 from test_family_add import on, rig  # noqa: F401
-from test_family_copy import NY, TZ, seed, when
+from test_family_copy import NY, TZ, events, seed, when
 from test_family_gmail import g  # noqa: F401
 
 
@@ -452,6 +452,34 @@ def test_a_stopped_worker_is_tried_again_at_the_next_read_not_every_pass(m, capl
     m.judge.script = [judged() for _ in range(meaning.MAX_PER_TICK + 2)]
     go(m)                                                    # the next read tries again
     assert len(m.judge.calls) == meaning.MAX_PER_TICK
+
+
+def test_a_batch_that_fails_to_start_is_tried_again_at_the_next_read_not_every_pass(m, caplog, monkeypatch):
+    # Nov 11 review: when starting a batch raised with more left to judge, every pass started it
+    # again, with a warning and a recorded failure each time.
+    for n in range(meaning.MAX_PER_TICK + 2):
+        seed(m, f"Event {n}", when(m, days=1 + n))           # more than one batch
+    built, starts, start = meaning.user_content, [], m.m._start
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("a prompt that can't be built")
+
+    def counted():
+        starts.append(1)
+        start()
+
+    monkeypatch.setattr(meaning, "user_content", broken)
+    m.m._start = counted
+    with caplog.at_level(logging.WARNING, logger="harness.meaning"):
+        go(m)
+        for _ in range(3):
+            m.tick()                                         # no new read: not started again
+    warned = [r for r in caplog.records if r.getMessage().startswith("meaning shadow failed")]
+    assert len(starts) == 1 and len(warned) == 1 and events(m, "meaning_failed") == 1
+    monkeypatch.setattr(meaning, "user_content", built)
+    m.judge.script = [judged() for _ in range(meaning.MAX_PER_TICK + 2)]
+    go(m)                                                    # the next read judges as usual
+    assert len(starts) == 2 and len(m.judge.calls) == meaning.MAX_PER_TICK
 
 
 def test_a_missed_kids_block_is_the_critical_count_and_the_line_has_its_format(m):

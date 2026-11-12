@@ -1368,3 +1368,26 @@ def test_a_new_answer_still_marks_each_judgment_it_fits_but_not_one_already_wait
     newer = answer_ex(lv, "Swim meet", [])                          # his newer word, just in
     assert meaning.rejudge_for(lv.ledger, [newer]) == 2
     assert waiting() == {*keys, "e:old"}
+
+
+def test_a_revive_that_fails_is_tried_again_at_the_next_read_not_every_pass(lv, caplog, monkeypatch):
+    # Nov 11 review sweep: the one-time revive stayed pending after a failure, so every pass tried
+    # it again, with a warning and a recorded failure each time, and the rest of the pass never ran.
+    judge(lv.ledger, item("Book club", local(lv, meaning.AHEAD_DAYS + 30)), rel("presence"))
+    answer_ex(lv, "Book club", ["presence"])                        # in use; it never saw it
+    revive = meaning.revive_answers
+
+    def stopped(ledger):
+        raise RuntimeError("the revive stopped")
+
+    monkeypatch.setattr(meaning, "revive_answers", stopped)
+    caplog.set_level("INFO", logger="harness.meaning_live")
+    for _ in range(3):
+        lv.live.tick(paused=False)
+    warned = [r for r in caplog.records if r.getMessage().startswith("meaning questions failed")]
+    assert len(warned) == 1 and count(lv, "meaning_live_failed") == 1
+    assert made_again(caplog) == [ONCE] and lv.shadow.pokes == 1    # the rest of the pass runs
+    monkeypatch.setattr(meaning, "revive_answers", revive)
+    lv.feeds.generation += 1                                        # the next read
+    lv.live.tick(paused=False)
+    assert lv.ledger.get_meta("meaning_revived") == "2"

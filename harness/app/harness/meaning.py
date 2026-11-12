@@ -1046,6 +1046,7 @@ class MeaningShadow:
                 self._start()
                 self._collect()            # already done when the executor runs it in place
         except Exception as e:
+            self._backlog = False          # tried again at the next read, not on every pass
             log.warning("meaning shadow failed: %s", type(e).__name__)
             self.ledger.event("meaning_failed", {"error": type(e).__name__})
 
@@ -1139,9 +1140,9 @@ class MeaningShadow:
         try:
             results = fut.result()
         except Exception as e:
+            self._backlog = False          # tried again at the next read, not on every pass
             log.warning("meaning: the sorting stopped: %s", type(e).__name__)
             self.ledger.input_failed("meaning", "sorting stopped on an unexpected problem", "error")
-            self._backlog = False          # tried again at the next read, not on every pass
             return
         spec = policy.MODELS[policy.engine_for(PURPOSE)]
         day, used = self._calls_today()
