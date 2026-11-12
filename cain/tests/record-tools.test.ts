@@ -5,15 +5,21 @@ import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 
 import { join, resolve } from "node:path";
 import { openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
 import { cycle } from "../rootfs/opt/cain/record/main.ts";
-import { A, B, PENDING, SA, SB, T0, cleanEnv, hrs, rig, sh } from "./rig.ts";
+import { A, B, PENDING, SA, SB, cleanEnv, rig, sh } from "./rig.ts";
 
 const TOOLS = resolve(import.meta.dir, "../tools");
 const REPO = resolve(import.meta.dir, "../..");
 const take = (item: string, f: string, extra: Record<string, unknown> = {}) => ({ op: "take", item, for: f, ...extra });
 
-// A rig plus a laptop's clone of the record, where the tools run.
+// A rig plus a laptop's clone of the record, where the tools run. The tools read the
+// real clock (a hold ends after a day idle, a renew is due after 6 hours), so the
+// keeper's clock starts at the real time too, and hrs(n) counts from there. A fixed
+// start (the rig's T0) made these tests fail every run from a day after T0 on.
 function laptop() {
   const r = rig();
+  const t0 = new Date();
+  r.at(t0);
+  const hrs = (n: number) => new Date(t0.getTime() + n * 3_600_000);
   const clone = join(r.root, "laptop");
   sh(["git", "-c", "core.autocrlf=false", "clone", "--quiet", r.remote, clone], r.root);
   sh(["git", "config", "user.name", "HyndeSyte"], clone);
@@ -26,13 +32,12 @@ function laptop() {
     return { code: p.exitCode, out: p.stdout.toString().trim(), err: p.stderr.toString().trim() };
   };
   const inboxNames = () => sh(["git", "ls-tree", "--name-only", "main", "inbox/"], r.remote).split("\n").filter(Boolean);
-  return { ...r, clone, tool, inboxNames };
+  return { ...r, t0, hrs, clone, tool, inboxNames };
 }
 
 describe("record-send", () => {
   test("stamps who sent it, puts it in the inbox, waits for the keeper and prints what happened", async () => {
     const l = laptop();
-    l.at(new Date());
     writeFileSync(join(l.root, "req.json"), JSON.stringify({ from: "cain", kind: "change", summary: "Take P33 for the collision fix",
       ops: [take("P33", "dane: build the collision fix (laptop chat, 8:20 AM)", { branches: ["claude/record-holds"] })] }));
     const env = cleanEnv({ RECORD_CLONE: l.clone, RECORD_SEND_POLL_MS: "100", CLAUDE_CODE_SESSION_ID: SA });
@@ -55,7 +60,6 @@ describe("record-send", () => {
 
   test("a take behind Cain's job is reported as waiting, then done once the job lets go", async () => {
     const l = laptop();
-    l.at(new Date());
     l.cain({ id: "cain-job-take", ops: [take("P33", "his Start tap", { job: "build cse_01X" })] });
     cycle(l.cfg);
     writeFileSync(join(l.root, "req.json"), JSON.stringify({ kind: "change", summary: "Take P33", ops: [take("P33", "dane: finish it here (laptop chat)")] }));
@@ -107,7 +111,7 @@ describe("record-holds", () => {
     expect(first.out).toContain("branches claude/record-holds; for: dane: build the collision fix");
     expect(hook(SB)).toEqual({ code: 0, out: "", err: "" });   // nothing held: nothing said
     // A day passes without a word from the session; the keeper ends the hold.
-    l.running(hrs(25));
+    l.running(l.hrs(25));
     cycle(l.cfg);
     const after = l.tool("record-holds.ts", [], { session: SA });
     expect(after.out).toContain("Your hold on P33 has ended");
@@ -161,9 +165,9 @@ describe("record-holds", () => {
     expect(l.tool("record-holds.ts", ["--renew"], { session: SA }).code).toBe(0);
     const [name] = l.inboxNames();
     expect(JSON.parse(sh(["git", "show", `main:${name}`], l.remote)).ops).toEqual([{ op: "renew", item: "P33" }]);   // never a take
-    l.running(hrs(2));
+    l.running(l.hrs(2));
     cycle(l.cfg);
-    expect(l.holds().P33).toMatchObject({ holder: A, for: "dane: build it", branches: ["claude/a"], taken: T0.toISOString(), renewed: hrs(2).toISOString() });
+    expect(l.holds().P33).toMatchObject({ holder: A, for: "dane: build it", branches: ["claude/a"], taken: l.t0.toISOString(), renewed: l.hrs(2).toISOString() });
     l.tool("record-holds.ts", ["--renew"], { session: SA });
     expect(l.inboxNames()).toEqual([]);   // renewed within 6 hours: nothing sent
   }, 60_000);
