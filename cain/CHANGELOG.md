@@ -7,6 +7,7 @@
 - Your Ship tap is now signed by Cain's App, not by Cain, for that one pull request at that one commit, and it lasts 2 hours. Cain's Ship job is checked for it before it starts. Before, that check read the App's own record of your tap, which Cain's session could change. A Ship tap from before a Stop no longer counts. GitHub starts checking it too with the next update.
 - If the calendar specialist doesn't answer a Stop or Turn back on tap, Cain's App posts the notice itself, and passes the tap on as soon as the specialist answers again.
 - An outside review asked for while stopped waits and goes out once you turn things back on.
+- Cain's checks on his cloud jobs and Discord reads now hold when they're slow: a check that times out refuses, instead of letting the call through.
 
 ## 0.7.4
 
