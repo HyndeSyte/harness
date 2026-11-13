@@ -46,9 +46,9 @@ describe("cards from the calendar specialist", () => {
     const r = rig();
     const id = await r.link.addCard({ text: "Moved it.", rows: undoRows });
     const m = await r.link.show(id, { item: "P06", question: "Q1" });
-    expect(r.link.cardInfo(m)).toEqual({ card: id, item: "P06", question: "Q1" });
+    expect(r.link.cardInfo(m)).toEqual({ card: id, item: "P06", question: "Q1", buttons: ["Undo", "Stop"], live: true });
     expect(r.link.cardOf(m)).toBe(id);
-    expect(r.link.cardInfo("123")).toEqual({ card: null, item: null, question: null });
+    expect(r.link.cardInfo("123")).toEqual({ card: null, item: null, question: null, buttons: [], live: null });
   });
 });
 

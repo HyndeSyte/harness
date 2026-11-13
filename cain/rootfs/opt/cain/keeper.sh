@@ -26,28 +26,41 @@
 #   keeper.sh replied <message id>       what a message of his replied to, if anything
 #   keeper.sh morning "text"             post the one morning message (with Stop)
 #   keeper.sh stopped                    whether everything is stopped (Dane's Stop), and since when
+#   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
+#                                        the buttons on it, and what the link knows of it
+#   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
+#                                        what the message gate would do with a reply (or an edit),
+#                                        against the cards up now; sends nothing
+#   keeper.sh replay [days]              the gate's rules over his DM (default 14 days), reading only;
+#                                        you hear one line when it's done
+#   keeper.sh connector --item P41 "what waits"
+#                                        the one notice that Claude's Home Assistant connector needs
+#                                        him to sign in again, with a button to its settings
 set -u
-dir=/data/.claude/channels/discord
+# Moved only for the tests.
+dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
+link="${CAIN_LINK:-http://127.0.0.1:8097}"
 cmd="${1:-handover}"; shift || true
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped) url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head=""
+item="" question="" reply_to="" pr="" head="" edit=""
 case "$cmd" in
-  show|ask|ship|answered)
+  show|ask|ship|answered|check|connector)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        --item|--question|--reply-to|--pr|--head)
+        --item|--question|--reply-to|--pr|--head|--edit)
           [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
           case "$1" in
             --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
-            --pr) pr="$2" ;; --head) head="$2" ;;
+            --pr) pr="$2" ;; --head) head="$2" ;; --edit) edit="$2" ;;
           esac
           shift 2 ;;
         *) rest+=("$1"); shift ;;
@@ -109,6 +122,10 @@ case "$cmd" in
   answered) body=$(jq -nc --arg it "$item" --arg q "$question" --arg r "" "$meta") ;;
   replied)  body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   stopped)  body='{}' ;;
+  card)     body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
+  check)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" --arg e "$edit" \n              '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
+  replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
+  connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac

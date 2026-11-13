@@ -370,7 +370,8 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     # To the specialist: requests and the digest. To Cain's own link, on this machine only:
     # showing a card, asking with buttons, the morning message.
     assert f'url="http://0fcc2575-harness:{handover.PORT}/$cmd"' in code
-    assert 'url="http://127.0.0.1:8097/$cmd"; ctx=harness-relay-v1' in code
+    assert 'link="${CAIN_LINK:-http://127.0.0.1:8097}"' in code and 'url="$link/$cmd"; ctx=harness-relay-v1' in code
+    assert 'card) url="$link/look"; ctx=harness-relay-v1' in code
     for route in ("handover", "digest"):
         assert f"/{route}" in handover.ROUTES
     # Nothing of his is passed: only Cain's own suggestion and who Cain is paired with.
@@ -420,6 +421,15 @@ def test_keeper_sends_cards_with_their_item_question_and_thread(tmp_path):
     assert call("answered", "--item", "P08", "--question", "Q2")[1] == {"item": "P08", "question": "Q2"}
     assert call("replied", "1234567890123456789")[1] == {"m": "1234567890123456789"}
     assert call("morning", "## Wed")[1] == {"text": "## Wed", "options": []}
+    # Piece D: look at a message now, check a reply against the gate, replay, the connector notice.
+    out, body, url = call("card", "1234567890123456789")
+    assert url == "http://127.0.0.1:8097/look" and body == {"m": "1234567890123456789"}
+    _, body, url = call("check", "--reply-to", "1234567890123456789", "Tap Undo if it's wrong.")
+    assert url.endswith("/check") and body == {"text": "Tap Undo if it's wrong.", "reply_to": "1234567890123456789"}
+    assert call("check", "--edit", "99999999999999999", "Fixed.")[1] == {"text": "Fixed.", "edit": "99999999999999999"}
+    assert call("replay")[1] == {"days": 14} and call("replay", "30")[1] == {"days": 30}
+    _, body, url = call("connector", "--item", "P41", "Installing Harness 0.22.0")
+    assert url.endswith("/connector") and body == {"item": "P41", "text": "Installing Harness 0.22.0"}
     missing = subprocess.run([bash, keeper, "ask", "--item"], env=env, capture_output=True, text=True, timeout=20)
     assert missing.returncode == 2 and "--item needs a value" in missing.stdout
 
@@ -654,8 +664,8 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     assert f"?? {cain_relay.PORT})" in link and cain_relay.HOST == "0fcc2575-cain"
     # Cain's scripts only, from this machine: the specialist can't show its own cards,
     # ask, put up a Ship card, or close Cain's questions.
-    assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped"])'
-            in link)
+    assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", '
+            '"/look", "/cards", "/check", "/replay", "/connector"])' in link)
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

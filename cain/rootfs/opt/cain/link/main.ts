@@ -20,7 +20,17 @@
 //     POST /replied {m}                 what a message of his replied to
 //     POST /morning {text}              the one morning message, with Stop
 //     POST /stopped {}                  whether everything is stopped (Dane's Stop), and since when
-// Nothing is published to the LAN: the add-on has no "ports:".
+//     POST /look {m}                    a message in his DM as Discord has it now (keeper.sh card)
+//     GET  /cards                       the cards up now, no text (the reply hook's read)
+//     POST /check {text, reply_to?, edit?}  what the gate would do with a reply or edit, sending nothing
+//     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
+//     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+// Nothing is published to the LAN: the App has no "ports:".
+//
+// The gate, in report mode (piece D): every send point logs what its rules would have done
+// to Cain's folder (../gate/log.ts), and nothing is refused or rewritten yet. The cards go
+// to /data/trust/cards.json (publish.ts) on every save and after each sweep. The first
+// start with no replay on record replays his DM once by itself.
 //
 // The Ship key (wave 1, piece B; shipkey.ts) signs Dane's Ship taps once they're in main.
 // Its public half goes to /data/trust/ship.pub, where the RemoteTrigger hook checks
@@ -32,10 +42,12 @@ import { sign as edSign, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { appendGate } from "../gate/log";
 import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, inMain, land, type MergeDeps } from "./merge";
+import { publishCards, readTranscripts, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -82,6 +94,12 @@ function load(): State {
 function save(s: State): void {
   writeFileSync(`${STATE}.tmp`, JSON.stringify(s), { mode: 0o600 });
   renameSync(`${STATE}.tmp`, STATE);
+  publish(s);
+}
+// The cards for the reply hook, whenever the state changes and after each sweep. A failure
+// is logged, never in the way: the hook asks the link first anyway.
+function publish(s: State): void {
+  try { publishCards(s, Date.now()); } catch (e) { console.log(`[cain] link: couldn't publish the cards: ${String(e).slice(0, 80)}`); }
 }
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
@@ -180,6 +198,9 @@ const link = new Link({
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr) : null; },
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
+  report: (r) => { try { appendGate({ at: Date.now(), ...r }); } catch (e) { console.log(`[cain] link: couldn't log the gate's report: ${String(e).slice(0, 80)}`); } },
+  transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
+  writeReplay: (r) => writeReplayReport(r),
 });
 
 // -- the gateway's health, for the Harness page ------------------------------------
@@ -202,20 +223,26 @@ every(CHECK_MS, () => check(watch, harnessAlive,
   async (text) => { await link.notice(text, NOTICE_TIMEOUT_MS); },
   watchLog,
   (what) => link.relayLine(what === "down"
-    ? "The add-on told Dane the calendar specialist hasn't answered for 5 minutes. Calendar handovers will fail until it's back; don't promise calendar changes."
-    : "The add-on told Dane the calendar specialist is answering again.")), watchLog);
+    ? "Your App told Dane the calendar specialist hasn't answered for 5 minutes. Calendar handovers will fail until it's back; don't promise calendar changes."
+    : what === "still"
+      ? "Your App told Dane the calendar specialist is still down after 30 minutes, and how to restart it. Nothing more to tell him."
+      : "Your App told Dane the calendar specialist is answering again.")), watchLog);
 
 // -- the sweep: at start (the first one also looks over cards already posted), then
 //    every minute, never two at once ---------------------------------------------------
 const sweepLog = (line: string) => console.log(`[cain] link: ${line}`);
 async function sweepLoop(): Promise<void> {
   try { if (token()) await link.sweep(); } catch (e) { sweepLog(`sweep failed: ${String(e).slice(0, 80)}`); }
-  finally { setTimeout(sweepLoop, SWEEP_MS); }
+  finally { publish(load()); setTimeout(sweepLoop, SWEEP_MS); }
 }
 setTimeout(sweepLoop, 3000);
 
+// The gate's replay, once by itself on the first start with none on record: everything in
+// his DM from the last 30 days, read only. Cain hears when it's done and files it.
+setTimeout(() => { if (token() && !load().replayed) link.replay(30); }, 120_000);
+
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -232,6 +259,7 @@ Bun.serve({
     if (LOCAL_ONLY.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
       return json({ status: "refused" }, 403);
     if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
+    if (req.method === "GET" && url.pathname === "/cards") return json(link.cardsNow());
     if (req.method !== "POST") return json({ status: "not found" }, 404);
     const raw = await req.text();
     if (raw.length > 16384) return json({ status: "too large" }, 413);
@@ -249,6 +277,10 @@ Bun.serve({
         case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, replyTo: b.reply_to }));
         case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
         case "/replied": return json(await link.replied(b.m));
+        case "/look": return json(await link.look(b.m));
+        case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
+        case "/replay": return json(link.replay(b.days));
+        case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

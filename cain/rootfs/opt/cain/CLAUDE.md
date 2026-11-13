@@ -67,7 +67,7 @@ specialist (the Harness add-on) does.
   put it in PENDING as a Build item (Cloud jobs). Asking him to repeat himself is the last resort,
   only when the specialist says it can't tell what he meant ("stale" or "nothing").
 - In a message with two jobs, hand over the calendar part and do the rest yourself.
-- Your add-on watches the specialist. If it stops answering, the add-on tells him itself
+- Your App watches the specialist. If it stops answering, the App tells him itself
   and you get a relayed line; don't repeat it, and don't promise calendar changes until
   you hear it's back.
 - When he tells you what a kind of Family event means for him ("Pat's dentist means I have
@@ -139,6 +139,26 @@ specialist (the Harness add-on) does.
   `/opt/cain/keeper.sh replied <message_id>` (the id in his message's tag): it says
   whether he used Discord's reply on one of your messages or cards, and its item and
   question.
+
+## The message gate
+Rules in code check what reaches him: no em dashes, Apps not add-ons, no "and N more",
+no shas, job ids, ISO times or Discord ids, and no button named that isn't on the
+message (or, for your reply, on the live card it answers). For now they only report: a
+hook on your reply and edit tools and the link's own send points log what they would
+have done to /data/work/gate-report.jsonl, and nothing is refused or changed. Write as
+if they refused.
+- Lines about a specialist's card, and the answers of show, replied and /card-of, list
+  its buttons. Name a button to him only in a reply to the card that has it, while it's
+  up. Look before you say what a card shows: `/opt/cain/keeper.sh card <message id>`
+  reads it from Discord now, with the buttons on it.
+- `/opt/cain/keeper.sh check [--reply-to <id>] "text"` says what the gate would do with a
+  reply, sending nothing (`--edit <id>` for an edit).
+- Gate replay: the link replays his DM once by itself after this release is installed,
+  and `/opt/cain/keeper.sh replay [days]` runs another. When you hear it's done, read
+  /data/work/gate-replay.json and file it through the record keeper as
+  projects/org-v2/gate-replay-<YYYY-MM-DD>.md: the range and pages, messages by writer,
+  hits per rule and writer (fix, refuse, can't tell), each hit's time, rule and short
+  excerpt, and its line on "(edited)". Nothing to tell him.
 
 ## Who holds what
 Each item has one holder, the only one that acts on it: its record row, branches, pull
@@ -243,9 +263,11 @@ create, update or run any other routine.
    [Watch it](https://claude.ai/code/session_X) (the X after "cse_").
 3. On "cloud job check" (the add-on sends it every 15 minutes while /data/jobs has
    files): `list_runs` on the job's routine. Still running: say nothing. Finished:
-   read `get_run_log`; its final message is the report.
+   read `get_run_log`; its final message is the report. A `connector` file isn't a
+   job: see Home Assistant first, below.
    - Build finished with a pull request: get an outside review of the diff (read it
-     with the GitHub connector; brief per Outside reviews), then show the Ship card for
+     with the GitHub connector; brief per Outside reviews), check Home Assistant first
+     (below), then show the Ship card for
      the pull request's head commit as it is now (its full sha, from the connector):
      `/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> "<App> <version> ready: <what he'll notice>. CI passed. Reviewed: ..."`.
      Its buttons are "Ship" "Not now". The link adds a line of its own from GitHub (how
@@ -261,12 +283,15 @@ create, update or run any other routine.
 4. On his Ship tap, the link lands the pull request in main itself, at once: main is
    locked so that only the link can change it. His card says how it went, and you hear
    once it's settled:
-   - Landed ("The link landed it ... Ship token: ..."): `take` its item with
+   - Landed ("The link landed it ... Ship token: ..."): check Home Assistant first
+     (below), then `take` its item with
      `"job": "ship <title>"`, and once that's done, RemoteTrigger `run` on Ship with
      body `{"text": "Install pull request <url>, landed in main at <full head sha>. Ship token: <the token, exactly as relayed>. Dane tapped Ship at <time>."}`;
      a hook refuses a Ship run without his token for that pull request and head, or
      once it has run out (2 hours). Write /data/jobs/<cse_X> as `ship | <title>`. When
      it finishes, tell him in one line what's now running, or why it isn't installed.
+     If it ends with `Home Assistant connector: needs signing in again` (or `no
+     answer`), nothing was installed: treat it as Home Assistant first says.
    - Waiting (GitHub didn't answer, or its checks are still running): nothing to do. The
      link keeps trying for up to 2 hours, his card says so, and you hear when it
      settles.
@@ -277,6 +302,28 @@ create, update or run any other routine.
      head. It stays up, and his tap on it gives a fresh token to install it.
    Never merge or push to main any other way, and never ask a job to: GitHub refuses
    everyone but the link.
+   - Home Assistant first. The Ship job installs through Claude's Home Assistant
+     connector, and a claude.ai outage can sign it out, so his tap is never spent on an
+     install that can't run. Before you show a Ship card, and again before the Ship run,
+     read Home Assistant once through your read-only connector (the update entity of the
+     App it installs). It answers: go on. It doesn't:
+     - Write /data/jobs/connector-<item> holding one line:
+       `connector | <item> | <pull request url> | <full head sha>`. Show no card and
+       start no run meanwhile.
+     - Only when the connector says it must be signed in again: run, once,
+       `/opt/cain/keeper.sh connector --item <item> "Installing <App> <version>"`. The
+       link posts one notice whose only button opens Claude's connector settings, the
+       fix one tap away, and says it goes ahead by itself. No answer, or a passing
+       error: tell him nothing; it's retried.
+     - At each cloud job check, read Home Assistant again. Still not answering: say
+       nothing, and `touch` the file so it stays. Answering: delete the file and go on
+       where you stopped: show the Ship card, or start the Ship run while his token is
+       good (2 hours from his tap), or once it has run out, show a new Ship card for the
+       same pull request and head (his tap on it gives a fresh token). A new Ship card
+       goes out only once Home Assistant answers again.
+     Never ask him to check anything or to tell you it's back. Only you start the
+     install: no laptop session installs around it, and nothing is installed from Home
+     Assistant's own page unless he says so.
 5. A laptop session hands you a finished pull request by passing you its item, with a
    note naming the pull request and its head; you hear at once. Check it yourself (open,
    at that head, CI passed, how it was reviewed; get an outside review if it had none),

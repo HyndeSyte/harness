@@ -25,16 +25,16 @@ const elsewhere = (item: string) => keeperHolds({ [item]: { holder: "laptop:s1" 
 const snap = (m: any) => structuredClone(m);                         // the card as his phone shows it
 const tick = () => new Promise((ok) => setTimeout(ok, 0));
 // What Cain is told about a card the link handles by itself, with what it was.
-const byItself = (card: number, message: string, text = TEXT) =>
-  `Card ${card} ("${excerpt(text, 60)}") went out to him by itself (Discord message ${message}): you hadn't shown it within 2 minutes. No need to show it unless it belongs under an item.`;
+const byItself = (card: number, message: string, text = TEXT, buttons = BUTTONS) =>
+  `Card ${card} ("${excerpt(text, 60)}") went out to him by itself (Discord message ${message}): you hadn't shown it within 2 minutes. ${buttons.length ? `Its buttons: ${buttons.join(", ")}.` : "It has no buttons."} No need to show it unless it belongs under an item.`;
 const failed = (card: number, how: "refused" | "unanswered", text = TEXT, expires = true) =>
   `Card ${card} ("${excerpt(text, 60)}") ${how === "refused" ? "didn't go out: Discord refused it" : "may not have gone out: Discord didn't answer"}. Tell him in your own words if it matters; I'll keep trying${expires ? " until it expires" : ""}.`;
 const lapsed = (card: number, text = TEXT) =>
   `Card ${card} ("${excerpt(text, 60)}") expired before it reached him. Tell him in your own words, or get a fresh card through /opt/cain/keeper.sh handover (see Calendars).`;
 const unsureLapsed = (card: number, how: string, text = TEXT) =>
   `Card ${card} ("${excerpt(text, 60)}") expired, and I can't tell yet whether it reached him (${how}). I'll check again.`;
-const foundLine = (card: number, message: string, text = TEXT) =>
-  `Card ${card} ("${excerpt(text, 60)}") reached him after all (Discord message ${message}): the answer to your show of it was lost. Nothing more was posted.`;
+const foundLine = (card: number, message: string, text = TEXT, buttons = BUTTONS) =>
+  `Card ${card} ("${excerpt(text, 60)}") reached him after all (Discord message ${message}): the answer to your show of it was lost. ${buttons.length ? `Its buttons: ${buttons.join(", ")}.` : "It has no buttons."} Nothing more was posted.`;
 const told = (card: number) => `You were already told card ${card} expired before it reached him; nothing was posted.`;
 // A second approval from the specialist, for the same question.
 const TEXT2 = "Approve the new time? Only your tap applies it. *Expires in 15 min.*";
@@ -67,7 +67,7 @@ describe("(a) a specialist's card goes out whoever holds its item", () => {
     expect(r.msg(id).content).toBe(TEXT);                             // unchanged
     expect(r.buttons(id)).toEqual(BUTTONS);
     expect(r.state().messages[id]).toMatchObject({ kind: "card", card, item: "P49", buttons: true, expires: LAPSES });
-    expect(r.link.cardInfo(id)).toEqual({ card, item: "P49", question: null });
+    expect(r.link.cardInfo(id)).toEqual({ card, item: "P49", question: null, buttons: BUTTONS, live: true });
     expect(await r.link.show(card, { item: "P49" })).toBe(id);       // shown once
     expect(r.cards().length).toBe(1);
   });
@@ -235,9 +235,9 @@ describe("a card with buttons goes out within about 2 minutes, whatever Cain is 
     r.later(MIN);
     await r.link.sweep();
     // His late show (the old "show it now" line) posts nothing; it only files it.
-    expect(await r.link.showCard(card, { item: "P49" })).toEqual({ status: "already out", message: id,
+    expect(await r.link.showCard(card, { item: "P49" })).toEqual({ status: "already out", message: id, buttons: BUTTONS,
       said: "It had gone out by itself; this only filed it under P49. Nothing more was posted. Write no lead-in for it." });
-    expect(r.link.cardInfo(id)).toEqual({ card, item: "P49", question: null });
+    expect(r.link.cardInfo(id)).toEqual({ card, item: "P49", question: null, buttons: BUTTONS, live: true });
     expect(r.cards().length).toBe(1);
     expect(r.posts()).toBe(1);
     expect(r.relayed).toEqual([byItself(card, id)]);                  // told once
@@ -254,7 +254,7 @@ describe("a card with buttons goes out within about 2 minutes, whatever Cain is 
     expect(r.posts()).toBe(1);                                        // Discord was asked once
     expect(r.state().messages[id].item).toBe("P49");                  // Cain's own label stays
     expect(r.relayed).toEqual([]);
-    expect(await r.link.showCard(card, { item: "P50" })).toEqual({ status: "already out", message: id,
+    expect(await r.link.showCard(card, { item: "P50" })).toEqual({ status: "already out", message: id, buttons: BUTTONS,
       said: "It's already in front of him; nothing more was posted." });
     expect(r.state().messages[id].item).toBe("P49");                  // a second show of his doesn't relabel it
   });
@@ -396,7 +396,7 @@ describe("a card with buttons goes out within about 2 minutes, whatever Cain is 
     r.later(MIN);
     await r.link.sweep();
     expect(r.cards().length).toBe(1);
-    expect(r.relayed).toEqual([failed(card, "refused", today, false), byItself(card, r.cards()[0].id, today)]);
+    expect(r.relayed).toEqual([failed(card, "refused", today, false), byItself(card, r.cards()[0].id, today, ["Stop"])]);
   });
 });
 
@@ -412,11 +412,11 @@ describe("a card that went out by itself is still filed and replaceable", () => 
     r.later(2 * MIN);
     await r.link.sweep();                                             // v1 out by itself, under no item
     const m1 = r.cards()[0].id;
-    expect(r.link.cardInfo(m1)).toEqual({ card: v1, item: "none", question: null });
-    expect(await r.link.showCard(v1, { item: "P49", question: "Q1" })).toEqual({ status: "already out", message: m1,
+    expect(r.link.cardInfo(m1)).toMatchObject({ card: v1, item: "none", question: null });
+    expect(await r.link.showCard(v1, { item: "P49", question: "Q1" })).toEqual({ status: "already out", message: m1, buttons: BUTTONS,
       said: "It had gone out by itself; this only filed it under P49 Q1. Nothing more was posted. Write no lead-in for it." });
     expect(r.posts()).toBe(1);
-    expect(r.link.cardInfo(m1)).toEqual({ card: v1, item: "P49", question: "Q1" });   // /card-of
+    expect(r.link.cardInfo(m1)).toMatchObject({ card: v1, item: "P49", question: "Q1" });   // /card-of
     const reply = r.his("approved?", m1);
     expect(await r.link.replied(reply.id)).toMatchObject({ reply_to: m1, card: v1, item: "P49", question: "Q1" });
     r.later(MIN);

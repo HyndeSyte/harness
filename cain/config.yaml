@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.8.1"
+version: "0.9.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private

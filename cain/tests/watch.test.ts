@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACK, backText, check, classify, DOWN, downText, every, fileStore, GRACE_MS, healthBody, hmacKey,
-  MAX_SHOWN_MS, minutes, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "../rootfs/opt/cain/link/watch";
+  MAX_SHOWN_MS, minutes, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness, STILL, STILL_MS, stillText } from "../rootfs/opt/cain/link/watch";
 import { emptyState, Link, State } from "../rootfs/opt/cain/link/core";
 
 function rig(saved: any = null, start = 1_000_000) {
@@ -96,11 +96,75 @@ describe("the watch on the calendar specialist", () => {
     expect(told[1]).toContain("answering again, after about 8 minutes");
   });
 
-  test("the words", () => {
+  test("the words: the first notice asks nothing, and no message says add-on", () => {
     expect(minutes(20_000)).toBe("1 minute");
     expect(minutes(7_200_000)).toBe("2 hours");
-    expect(downText(300_000)).toContain("restart Harness in Home Assistant");
+    expect(downText(300_000)).toBe("The calendar specialist (Harness) hasn't answered for 5 minutes. Calendar requests, its cards and the morning calendar wait until it's back. You'll hear once it is.");
+    expect(stillText()).toBe("Harness is still down. Restarting it should bring it back: Settings > Apps > Harness > Restart.");
     expect(backText(60_000)).toContain("answering again");
+    for (const t of [downText(300_000), stillText(), backText(60_000)]) {
+      expect(t).not.toMatch(/add-?on/i);
+      expect(t).not.toContain("—");
+    }
+    expect(downText(300_000)).not.toMatch(/restart/i);
+  });
+
+  test("still down after 30 minutes: the restart line goes once, never after it's back", () => {
+    const { w, clock } = rig();
+    w.observe(true);
+    const seen: string[] = [];
+    const minute = (up: boolean) => { clock.t += 60_000; const due = w.observe(up); if (due) { seen.push(due); w.sent(due); } };
+    for (let i = 0; i < 90; i++) minute(false);
+    expect(seen).toEqual([DOWN, STILL]);
+    minute(true);
+    expect(seen).toEqual([DOWN, STILL, BACK]);
+    // A short outage: down and back, no restart line.
+    for (let i = 0; i < 10; i++) minute(false);
+    minute(true);
+    for (let i = 0; i < 40; i++) minute(true);
+    expect(seen).toEqual([DOWN, STILL, BACK, DOWN, BACK]);
+    // The next long outage gets its own.
+    for (let i = 0; i < 40; i++) minute(false);
+    expect(seen.slice(5)).toEqual([DOWN, STILL]);
+  });
+
+  test("the restart line waits for the first notice, and goes at 30 minutes", () => {
+    const { w, clock } = rig();
+    w.observe(false);
+    clock.t += STILL_MS - 60_000;
+    expect(w.observe(false)).toBe(DOWN);              // not sent yet: no restart line before it
+    clock.t += 120_000;
+    expect(w.observe(false)).toBe(DOWN);
+    w.sent(DOWN);
+    expect(w.observe(false)).toBe(STILL);
+  });
+
+  test("a restart of Cain mid-outage never sends the restart line twice, and still sends it once", () => {
+    const a = rig();
+    a.w.observe(false);
+    a.clock.t += GRACE_MS;
+    a.w.sent(a.w.observe(false));                      // the first notice
+    a.clock.t += 5 * 60_000;
+    const b = rig(a.file(), a.clock.t);                   // restarted 10 minutes in, before the restart line
+    const seen: string[] = [];
+    for (let i = 0; i < 40; i++) { b.clock.t += 60_000; const due = b.w.observe(false); if (due) { seen.push(due); b.w.sent(due); } }
+    expect(seen).toEqual([STILL]);
+    const c = rig(b.file(), b.clock.t);                   // and again after it went
+    for (let i = 0; i < 40; i++) { c.clock.t += 60_000; expect(c.w.observe(false)).toBeNull(); }
+    c.clock.t += 60_000;
+    expect(c.w.observe(true)).toBe(BACK);
+    c.w.sent(BACK);
+    expect(c.file().still_at).toBeNull();
+  });
+
+  test("check: the restart line goes through the same send, and Cain hears it", async () => {
+    const { w, clock } = rig();
+    const told: string[] = [], relayed: string[] = [];
+    const tell = async (t: string) => { told.push(t); };
+    await check(w, async () => false, tell, () => {}, (d) => relayed.push(String(d)));
+    for (let i = 0; i < 31; i++) { clock.t += 60_000; await check(w, async () => false, tell, () => {}, (d) => relayed.push(String(d))); }
+    expect(told).toEqual([downText(GRACE_MS), stillText()]);
+    expect(relayed).toEqual([DOWN, STILL]);
   });
 });
 

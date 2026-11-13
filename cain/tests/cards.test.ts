@@ -593,7 +593,7 @@ describe("threading", () => {
     const a = await ask(r, "P08", "Q2");
     const reply = r.his("not sure actually", a);
     expect(await r.link.replied(reply.id)).toEqual({ status: "ok", reply_to: a, card: null, item: "P08", question: "Q2",
-      asked: "P08 Q2: Filed?", open: true });
+      asked: "P08 Q2: Filed?", open: true, buttons: ["Filed", "Not filed", "Not sure"], live: true });
     const plain = r.his("what's on today?");
     expect((await r.link.replied(plain.id)).reply_to).toBeNull();
     await expect(r.link.replied(a)).rejects.toThrow("isn't one of his messages");

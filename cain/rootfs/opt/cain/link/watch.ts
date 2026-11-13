@@ -1,13 +1,15 @@
-// Cain's half of the mutual watch: is the calendar specialist (the Harness add-on)
-// still there? The other half is harness/app/harness/watch.py, with the same rules.
+// Cain's half of the mutual watch: is the calendar specialist (the Harness App) still
+// there? The other half is harness/app/harness/watch.py, with the same rules.
 //
 // main.ts asks the specialist's /health once a minute. When it hasn't answered for
-// GRACE_MS, Dane is told once; when it answers again, once more. A restart or an
-// update takes well under GRACE_MS, so it says nothing. A message that couldn't be
-// sent is tried again at the next check, and only then.
+// GRACE_MS, Dane is told once, with nothing asked of him; if it's still down STILL_MS
+// after it stopped, he's told once more how to restart it (the fix, ready); when it
+// answers again, once more. A restart or an update takes well under GRACE_MS, so it
+// says nothing. A message that couldn't be sent is tried again at the next check, and
+// only then.
 //
 // The state is a few timestamps in /data/link/watch.json, so a restart of Cain during
-// an outage doesn't tell him twice. An outage not told yet starts over after a restart:
+// an outage doesn't tell him anything twice. An outage not told yet starts over after a restart:
 // Cain may have been off itself for longer than the specialist was.
 //
 // The grace period is timed on the monotonic clock (performance.now), so a clock jump at
@@ -22,11 +24,12 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const GRACE_MS = 5 * 60_000;
+export const STILL_MS = 30 * 60_000;              // still down this long: the restart line, once
 export const CHECK_MS = 60_000;
 export const NOTICE_TIMEOUT_MS = 15_000;
 export const MAX_SHOWN_MS = 30 * 24 * 3_600_000;   // a shown duration longer than this is a clock jump
-export const DOWN = "down", BACK = "back";
-export type Due = typeof DOWN | typeof BACK | null;
+export const DOWN = "down", BACK = "back", STILL = "still";
+export type Due = typeof DOWN | typeof BACK | typeof STILL | null;
 export type Probe = "up" | "down" | "refused";
 
 // The key both add-ons derive from the bot token (handover.key_for in Python).
@@ -54,7 +57,7 @@ export async function probeHarness(fetcher: (signal: AbortSignal) => Promise<Res
 const num = (v: any) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const clamp = (ms: number) => Math.min(Math.max(0, ms), MAX_SHOWN_MS);
 
-export interface WatchState { down_since: number | null; alerted_at: number | null; last_ok: number | null }
+export interface WatchState { down_since: number | null; alerted_at: number | null; last_ok: number | null; still_at: number | null }
 
 export interface WatchDeps {
   load: () => Partial<WatchState> | null;
@@ -77,8 +80,8 @@ export class PeerWatch {
     this.mono = d.mono ?? (() => performance.now());
     let raw: any = null;
     try { raw = d.load(); } catch { raw = null; }
-    this.s = { down_since: num(raw?.down_since), alerted_at: num(raw?.alerted_at), last_ok: num(raw?.last_ok) };
-    if (!this.s.alerted_at) this.s.down_since = null;
+    this.s = { down_since: num(raw?.down_since), alerted_at: num(raw?.alerted_at), last_ok: num(raw?.last_ok), still_at: num(raw?.still_at) };
+    if (!this.s.alerted_at) { this.s.down_since = null; this.s.still_at = null; }
   }
 
   private save(): void { this.d.save({ ...this.s }); }
@@ -100,12 +103,14 @@ export class PeerWatch {
     if (this.downMono === null) this.downMono = mono;
     if (!this.s.down_since) { this.s.down_since = now; this.save(); }
     if (!this.s.alerted_at && mono - this.downMono >= this.grace) return DOWN;
+    if (this.s.alerted_at && !this.s.still_at && this.downFor() >= STILL_MS) return STILL;
     return null;
   }
 
   sent(what: Due): void {
     if (what === DOWN) this.s.alerted_at = this.d.now();
-    else if (what === BACK) { this.s.alerted_at = null; this.s.down_since = null; this.downMono = null; }
+    else if (what === STILL) this.s.still_at = this.d.now();
+    else if (what === BACK) { this.s.alerted_at = null; this.s.down_since = null; this.s.still_at = null; this.downMono = null; }
     this.save();
   }
 
@@ -136,15 +141,19 @@ export function minutes(ms: number): string {
   return `${(m / 60).toFixed(1).replace(/\.0$/, "")} hours`;
 }
 
+// The first notice says what's down and what waits, and asks nothing of him.
 export function downText(ms: number): string {
-  return `The calendar specialist (the Harness add-on) hasn't answered for ${minutes(ms)}. ` +
-    "Calendar requests, its cards and the morning calendar wait until it's back. " +
-    "If it doesn't come back by itself, restart Harness in Home Assistant. " +
-    "(From Cain's add-on; I'll say once when it's back.)";
+  return `The calendar specialist (Harness) hasn't answered for ${minutes(ms)}. ` +
+    "Calendar requests, its cards and the morning calendar wait until it's back. You'll hear once it is.";
+}
+
+// Once, if it's still down after STILL_MS: the fix, ready.
+export function stillText(): string {
+  return "Harness is still down. Restarting it should bring it back: Settings > Apps > Harness > Restart.";
 }
 
 export function backText(ms: number): string {
-  return `The calendar specialist is answering again, after about ${minutes(ms)}. (From Cain's add-on.)`;
+  return `The calendar specialist (Harness) is answering again, after about ${minutes(ms)}.`;
 }
 
 // One check: probe, decide, tell, then (best effort) tell Cain. probe never throws;
@@ -161,7 +170,7 @@ export async function check(w: PeerWatch, probe: () => Promise<boolean | Probe>,
   if (!due) return null;
   const ms = w.downFor();
   try {
-    await tell(due === DOWN ? downText(ms) : backText(ms), due);
+    await tell(due === DOWN ? downText(ms) : due === STILL ? stillText() : backText(ms), due);
   } catch (e) {
     log(`watch: couldn't tell Dane the specialist is ${due}: ${String(e).slice(0, 80)}`);
     return null;

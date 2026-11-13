@@ -56,6 +56,17 @@ the App.
 - Tapping an old card does nothing, and says so.
 - The card shows what you tapped. When a tap needs words from Cain, they come as a reply
   to that card.
+- Stop is red wherever it is.
+
+## Words that reach you
+
+Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing hidden
+behind "and 3 more", no commit or job ids or ISO times, and no button named that the
+message (or the card Cain's reply answers) doesn't have. In this release they only keep
+a log on the Pi of what they would have caught, in Cain's own folder, and once after
+installing they read back over your DM the same way, posting nothing. Cain files what
+they found in the record, and the rules are tuned from it before they're switched on.
+Nothing for you to do.
 
 ## Stop
 
@@ -83,6 +94,13 @@ Stop after your Ship tap ends that tap for good, even once you turn things back 
 Then Cain installs it: his Ship job needs your tap, signed by the App for that pull
 request and commit and good for 2 hours. A tap from before a Stop no longer counts.
 
+Installing goes through Claude's Home Assistant connector. Cain checks Home Assistant
+answers before he shows you a Ship card and again before the install. If it doesn't,
+he waits and checks again every 15 minutes, and goes ahead once it does. Only if the
+connector needs you to sign in again do you get one message, with a button that opens
+Claude's connector settings. If your Ship tap ran out meanwhile (2 hours), a new Ship
+card comes once Home Assistant answers.
+
 A Ship card has a line of the App's own, from GitHub: how many commits and files the
 change has, and whether it touches the parts that matter most (Cain's link, his hooks,
 permissions or rules, Ship and Stop, GitHub's workflows, an App's image, the release
@@ -95,10 +113,11 @@ key, and Cain is told if it doesn't.
 
 ## If the calendar specialist stops
 
-Cain's add-on and the Harness add-on check each other every minute. If Harness hasn't
-answered for 5 minutes, you get one Discord message from Cain's add-on, and one more when
-it's back. If Cain's add-on is the one that stops, or its Discord connection stays down,
-Harness tells you itself, both when it goes and when it's back. Restarts and
+Cain's App and the Harness App check each other every minute. If Harness hasn't
+answered for 5 minutes, you get one Discord message from Cain's App, and one more when
+it's back. If it's still down after 30 minutes, one more line says how to restart it
+(Settings > Apps > Harness > Restart). If Cain's App is the one that stops, or its
+Discord connection stays down, Harness tells you itself, the same way. Restarts and
 updates are shorter than 5 minutes and say nothing.
 
 ## Outside reviews (once)

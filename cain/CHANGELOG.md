@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- Cain now knows each card's buttons. When the calendar specialist has a card for you, Cain is told which buttons it has, and he can read any message back from Discord to see the buttons on it now, so he won't point you at a button that isn't there.
+- The App now checks the words that reach you: no em dashes, Apps not add-ons, nothing hidden behind "and 3 more", no commit or job ids, and no button named that the message doesn't have. For now it only keeps a log on the Pi of what it would have caught. Nothing is held back or changed yet.
+- Once after this update, the App reads back over your DM with the same checks, posting nothing, and Cain files what it found. The checks are tuned from that before they're switched on.
+- Before you get a Ship card, Cain checks that Home Assistant answers, so your tap is never spent on an install that can't run. If Claude's Home Assistant connector needs you to sign in again, you get one message with a button that opens its settings, and Cain goes ahead by himself once it's back.
+- If Harness stops answering, the first message just says so. If it's still down after 30 minutes, one more line says how to restart it.
+- Stop is red.
+
 ## 0.8.1
 
 - Your Ship tap now ships the change itself, right away: Cain's App puts it in main the moment you tap, and the card says "Shipped" or why not. Then Cain installs it.

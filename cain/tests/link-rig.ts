@@ -52,10 +52,14 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const files: { pending: string | null; holds: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null };
   const pulls: Record<string, Pull> = {};
   const calls: any[] = [], relayed: string[] = [], harness: any[] = [], logs: string[] = [];
+  const reports: any[] = [], replays: any[] = [];          // the gate's report log, and the replay's reports
+  const sent = { ids: new Set<string>(), texts: new Set<string>() };   // what Cain's transcripts say he sent
+  const discord = { marksButtonEdits: false };      // whether an edit of buttons alone marks a message edited
   const posted: Record<string, any> = {};
   const nonces: Record<string, { id: string; at: number }> = {};
   const failing = new Set<string>();             // path prefixes that fail, like "/interactions/" or "PATCH"
   const limited = new Set<string>();             // the same, answered with Discord's rate limit
+  const limitN: Record<string, number> = {};     // the next n calls to a path prefix are rate limited
   const lose = { posts: 0 };                     // posts Discord makes but whose answer never arrives
   const hang = { interactions: false };          // the link stops mid-tap: its answer never returns
   const gate = { posts: false, history: false }; // Discord is slow: posts to his DM, or reads of it, wait until release()
@@ -67,6 +71,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     calls.push({ method, path, body: copy(body), auth });
     for (const f of failing) if (path.startsWith(f) || `${method} ${path}`.startsWith(f)) throw new Error("discord 500: unavailable");
     for (const f of limited) if (path.startsWith(f) || `${method} ${path}`.startsWith(f)) throw new Error("discord 429: You are being rate limited.");
+    for (const [f, n] of Object.entries(limitN)) if (n > 0 && (path.startsWith(f) || `${method} ${path}`.startsWith(f))) {
+      limitN[f] = n - 1;
+      throw new Error("discord 429: You are being rate limited.");
+    }
     if (path === "/oauth2/applications/@me") return { owner: { id: OWNER } };
     if (path === "/users/@me") return { id: BOT };
     if (path === "/users/@me/channels") return { id: DM };
@@ -98,6 +106,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       if (!m) throw new Error("discord 404: Unknown Message");
       if (body.content !== undefined) m.content = body.content;
       if (body.components !== undefined) m.components = body.components;
+      if (body.content !== undefined || discord.marksButtonEdits) m.edited_timestamp = new Date(t.now).toISOString();
       return copy(m);
     }
     if (method === "POST" && path.startsWith("/interactions/")) {
@@ -132,6 +141,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     facts: opts.facts ? () => github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts) : undefined,
     factsMs: 50,
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,
+    report: (x: any) => { reports.push(copy(x)); },
+    transcripts: () => sent,
+    writeReplay: (x: any) => { replays.push(copy(x)); return "/data/work/gate-replay.json"; },
+    replayPauseMs: 0,
   };
   let link = new Link(deps);
   const tap = (msg: any, custom_id: string, over: any = {}) => {
@@ -149,6 +162,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return link; },
     calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
+    reports, replays, sent, discord, limitN,
     release: () => { gate.posts = false; gate.history = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

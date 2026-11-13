@@ -62,6 +62,18 @@
         "hooks": [
           { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15, "onFailure": "block" }
         ]
+      },
+      {
+        "matcher": "mcp__plugin_discord_discord__reply",
+        "hooks": [
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
+        ]
+      },
+      {
+        "matcher": "mcp__plugin_discord_discord__edit_message",
+        "hooks": [
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
+        ]
       }
     ]
   }

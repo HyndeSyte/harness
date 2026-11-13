@@ -38,7 +38,16 @@
 //   main, the tap is signed (../ship-token.ts) with a key only the link is meant to read
 //   (shipkey.ts), for that pull request and head, good for 2 hours: Cain's Ship run,
 //   which installs it, needs that token.
+// - Cards as data (piece D): every message the link posts records the labels of its
+//   buttons, kept after they come off, and Cain's lines and answers name them. The link
+//   publishes the cards (no text) for the reply hook, and reads any message back from
+//   Discord for keeper.sh card.
+// - The gate, in report mode (piece D, ../gate/rules.ts): each send point logs what the
+//   rules would have done; nothing is refused or rewritten yet. The replay runs the same
+//   rules over his DM, reading only, and writes what it found to Cain's folder.
 import { createHash } from "node:crypto";
+import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
+import { AT, check as gateCheck, type Context, type Hit, RULES, type Rule } from "../gate/rules";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import type { Facts, Landed } from "./merge";
@@ -66,6 +75,11 @@ const STOPPED_FIRST: Landed = { ok: false, why: "his Stop came first", again: fa
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
 const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
 const SHOW_WAIT_MS = 2 * 60_000;         // a card with buttons Cain hasn't shown by then goes out by itself
+export const CONNECTOR_URL = "https://claude.ai/settings/connectors";   // where Claude's connectors are signed in again
+export const CONNECTOR_LABEL = "Open connector settings";
+const CONNECTOR_ONCE_MS = 12 * 3_600_000;  // one notice about the connector per item in this long
+const REPLAY_PAGES = 60;                 // the replay reads at most this many pages of 100 messages
+const REPLAY_TRIES = 5;                  // a page Discord rate-limits is asked again this often
 // Machine text he never sees on a card: a full sha, a job's session id, an ISO time.
 const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"],
   [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, "an ISO time"]];
@@ -91,9 +105,11 @@ export interface Card {
 // A card's post that began and never heard back: when (at), its buttons then (rows, as a
 // digest), who made it (the link by itself, or Cain's show) and the item it went under.
 export interface Posting { at: number; rows: string; byItself: boolean; item: string; question: string }
-export type Kind = "ask" | "ship" | "card" | "morning" | "legacy";
+export type Kind = "ask" | "ship" | "card" | "morning" | "legacy" | "notice";
 export interface Shown {
   digest: string; until: number; card?: number;
+  labels?: string[];                 // its buttons' labels as last posted or edited, kept once they come off (0.9.0)
+  off?: number;                      // when its buttons came off (0.9.0)
   q?: { q: string; options: string[]; used: boolean };
   kind?: Kind;                       // absent on records from before 0.7.0 until the first sweep
   item?: string; question?: string;  // what the card is about: a PENDING id (or "none") and a question id
@@ -126,6 +142,7 @@ export interface State {
   // The daily check that GitHub still knows the deploy key (0.8.1): when, whether it was
   // refused, and since when GitHub hasn't answered at all.
   key?: { checked: number; refused?: boolean; unanswered?: number; toldUnanswered?: boolean };
+  replayed?: number;                 // when the gate's replay over his DM last finished (0.9.0)
 }
 
 export function emptyState(): State {
@@ -152,11 +169,12 @@ export function withLine(content: string, line: string): string {
   return `${head}\n\n${line}`;
 }
 
+// Buttons as Discord takes them. Stop is red (danger), one look for it everywhere.
 export function rows(buttons: [string, string][][], primaryPrefix = "k:a:"): any[] {
   return buttons.slice(0, 5).map((row) => ({
     type: 1,
     components: row.slice(0, 5).map(([label, id]) => ({
-      type: 2, style: id.startsWith(primaryPrefix) ? 1 : 2, label: label.slice(0, 80), custom_id: id.slice(0, 100),
+      type: 2, style: id === STOP ? 4 : id.startsWith(primaryPrefix) ? 1 : 2, label: label.slice(0, 80), custom_id: id.slice(0, 100),
     })),
   })).filter((r) => r.components.length);
 }
@@ -168,6 +186,48 @@ export function excerpt(text: string, n = 150): string {
 
 function buttonIds(components: any[] | undefined): string[] {
   return (components ?? []).flatMap((r: any) => (r.components ?? []).map((c: any) => String(c.custom_id ?? "")));
+}
+
+// The labels on a message's buttons, in order, link buttons included.
+export function labelsOf(components: any[] | undefined): string[] {
+  return (components ?? []).flatMap((r: any) => (r.components ?? []).map((c: any) => String(c.label ?? "").trim())).filter(Boolean);
+}
+
+// How a line names a card's buttons for Cain.
+export function buttonsLine(labels: string[] | undefined): string {
+  return labels?.length ? `Its buttons: ${labels.join(", ")}.` : "It has no buttons.";
+}
+
+// Whose words a message the link posted carries: Cain's asks, Ship cards and morning
+// message are his words through the link; a specialist's card is the specialist's; the
+// link's own Stop notices and notices are the link's.
+export function writerOf(m: Shown): Writer {
+  if (m.kind === "ask" || m.kind === "ship" || m.kind === "morning") return "cain";
+  if (m.kind === "card" && m.card !== undefined) return "specialist";
+  return "link";
+}
+
+const CARDS_KEEP_MS = 2 * 86400_000;         // finished cards stay in the published view this long
+
+// The cards as the reply hook reads them (/cards, and /data/trust/cards.json when the
+// link doesn't answer): every message with buttons up, and every one the link posted in
+// the last 2 days or whose buttons came off since. No text.
+export function cardsView(s: State, now: number): CardsView {
+  const cards: CardView[] = [];
+  for (const [id, m] of Object.entries(s.messages)) {
+    if (!m.buttons && (m.off ?? m.posted ?? 0) < now - CARDS_KEEP_MS) continue;
+    const linkButtons = m.kind === "notice" && (m.labels ?? []).length > 0;   // a link button is always up
+    cards.push({ message: id, kind: m.kind ?? "legacy", writer: writerOf(m), labels: [...(m.labels ?? [])],
+      live: linkButtons || live(m, now), item: m.item ?? null, question: m.question || null, posted: m.posted ?? null });
+  }
+  cards.sort((a, b) => (a.posted ?? 0) - (b.posted ?? 0));
+  return { written_at: now, owner: s.owner ?? null, dm: s.dm ?? null, cards };
+}
+
+// The link's outcome and landing lines, taken off the end of a card's words.
+const OUTCOME = /\n\n(?:You answered(?::| in a message)[^\n]*|Answered|Expired|Replaced by a newer card|Turned back on since\.|Stopped again since\.|You tapped Ship[^\n]*|Shipped: [^\n]*|Not shipped: [^\n]*)$/;
+export function withoutOutcome(content: string): string {
+  return String(content ?? "").replace(OUTCOME, "");
 }
 
 // Discord ids carry their own creation time.
@@ -346,10 +406,10 @@ const plainly = (e: unknown) => (refused(e) ? "Discord refused it" : "Discord di
 // What Cain hears about a card the link handles by itself. Each line says what it was.
 const what = (c: Card | undefined) => `("${excerpt(c?.text ?? "", 60)}")`;
 const FRESH = "get a fresh card through /opt/cain/keeper.sh handover (see Calendars)";
-const wentOutLine = (id: number, c: Card | undefined, msg: string) =>
-  `Card ${id} ${what(c)} went out to him by itself (Discord message ${msg}): you hadn't shown it within 2 minutes. No need to show it unless it belongs under an item.`;
-const foundLine = (id: number, c: Card | undefined, msg: string) =>
-  `Card ${id} ${what(c)} reached him after all (Discord message ${msg}): the answer to your show of it was lost. Nothing more was posted.`;
+const wentOutLine = (id: number, c: Card | undefined, msg: string, labels?: string[]) =>
+  `Card ${id} ${what(c)} went out to him by itself (Discord message ${msg}): you hadn't shown it within 2 minutes. ${buttonsLine(labels ?? labelsOf(c?.rows))} No need to show it unless it belongs under an item.`;
+const foundLine = (id: number, c: Card | undefined, msg: string, labels?: string[]) =>
+  `Card ${id} ${what(c)} reached him after all (Discord message ${msg}): the answer to your show of it was lost. ${buttonsLine(labels ?? labelsOf(c?.rows))} Nothing more was posted.`;
 const lapsedLine = (id: number, c: Card | undefined) =>
   `Card ${id} ${what(c)} expired before it reached him. Tell him in your own words, or ${FRESH}.`;
 function failedLine(id: number, c: Card, e: unknown, unsure: boolean, now: number): string {
@@ -382,6 +442,27 @@ export interface Deps {
   facts?: (pr: string) => Promise<Facts | null>;                   // what GitHub says the pull request changes
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
+  // The gate in report mode (piece D): what the rules would have done at a send point.
+  report?: (r: GateReport) => void;
+  // The replay: Cain's own replies and edits as his transcripts have them (since a time),
+  // where its report goes, and the pause between pages of his DM (tests: 0).
+  transcripts?: (since: number) => Sent;
+  writeReplay?: (r: ReplayReport) => string | void;             // where it was written
+  replayPauseMs?: number;
+}
+
+// One send point's hits, for the gate's report log.
+export interface GateReport { point: string; writer: Writer | "unknown"; message?: string; hits: Hit[] }
+// What Cain's transcripts say he sent with his plugin: message ids, and the exact texts.
+export interface Sent { ids: Set<string>; texts: Set<string> }
+type Tally = Record<string, Record<string, number>>;   // rule -> result -> count
+export interface ReplayReport {
+  written_at: number;
+  range: { from: number; to: number; days: number; pages: number; page_cap: number; reached_cutoff: boolean; stopped: string | null };
+  messages: { read: number; by_writer: Record<string, number>; skipped: Record<string, number>; cards_never_posted: number };
+  hits: { by_rule: Tally; by_writer: Record<string, Tally>; total: number };
+  list: { at: number; message: string; writer: string; rule: string; result: string; around: string; label?: string }[];
+  edited: { morning_messages: number; buttons_changed: number; marked_edited: number; buttons_only_edits_marked: boolean | null; said: string };
 }
 
 // What stopped, as his Stop notice says it.
@@ -431,6 +512,36 @@ export class Link {
   constructor(private d: Deps) {}
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
+
+  // -- the gate, in report mode (../gate/rules.ts) ---------------------------------------
+  // What the rules would have done with words about to go out, logged; never in the way.
+  private gate(point: string, writer: Writer, text: string, ctx: Context, message?: string): void {
+    if (!this.d.report) return;
+    try {
+      const r = gateCheck(String(text ?? ""), ctx);
+      if (r.hits.length) this.d.report({ point, writer, ...(message ? { message } : {}), hits: r.hits });
+    } catch (e) { this.log(`the gate's report failed: ${String(e).slice(0, 80)}`); }
+  }
+
+  // Labels on the cards whose buttons are up and count now.
+  private liveLabels(s = this.d.load(), now = this.d.now()): string[] {
+    return Object.values(s.messages).filter((m) => live(m, now)).flatMap((m) => m.labels ?? []);
+  }
+
+  // The cards now, as the reply hook reads them (GET /cards).
+  cardsNow(): CardsView { return cardsView(this.d.load(), this.d.now()); }
+
+  // keeper.sh check: what the gate would do with a reply or an edit of Cain's, against the
+  // cards up now. Sends nothing, logs nothing.
+  checkSend(a: { text?: unknown; replyTo?: unknown; edit?: unknown }): Decision & { status: "ok" } {
+    const text = String(a.text ?? "");
+    if (!text.trim()) throw new Refusal("needs the text to check");
+    const id = (v: unknown) => (v === undefined || v === null || v === "" ? undefined : String(v).trim());
+    const replyTo = id(a.replyTo), target = id(a.edit);
+    for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
+    const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(), this.d.tz);
+    return { status: "ok", ...d };
+  }
 
   // -- Stop everything ----------------------------------------------------------
   // A state that can't be read counts as stopped: when in doubt, nothing ships. A Stop
@@ -613,13 +724,18 @@ export class Link {
     s.cards[String(id)] = { text: String(c.text ?? ""), rows: comps, kind, created: now, shown: null, expires, due };
     for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
     this.d.save(s);
+    // The gate's report: the specialist's words with its own buttons; the link's added line
+    // with the link's rules.
+    const own = line ? String(c.text ?? "").slice(0, -(line.length + 2)) : String(c.text ?? "");
+    this.gate("card", "specialist", own, { rules: AT.card, buttons: labelsOf(comps), known: this.liveLabels(s, now) });
+    if (line) this.gate("card", "link", line, { rules: AT.link });
     if (DIRECT_KINDS.has(kind)) {
       const shown = await this.show(id, { item: "none" });
       if (shown && (kind === "stopped" || kind === "resumed")) await this.retireToggles(shown);
     } else {
       const ask = due !== null ? "It has buttons: show it now, or it goes out by itself in about 2 minutes."
         : "Show it now if it matters today, or fold it into the morning message.";
-      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(c.text, 120)}". ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
+      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(c.text, 120)}". ${buttonsLine(labelsOf(comps))} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
     }
     return id;
   }
@@ -633,7 +749,7 @@ export class Link {
   // is posted, and one that went out by itself is filed under his item and question.
   // "expired": its own expiry passed before it reached him, and nothing is posted.
   async showCard(id: number, m: { item?: unknown; question?: unknown; replyTo?: unknown }):
-      Promise<{ status: "posted" | "already out" | "expired"; message: string | null; said?: string }> {
+      Promise<{ status: "posted" | "already out" | "expired"; message: string | null; said?: string; buttons?: string[] }> {
     const meta = checkMeta(m);
     let put: Put;
     this.cainWaits.add(id);
@@ -642,14 +758,20 @@ export class Link {
       if (e instanceof Refusal) return this.lapsedAnswer(id);
       throw e;
     } finally { this.cainWaits.delete(id); }
-    if (put.first) return { status: "posted", message: put.message };
+    if (put.first) return { status: "posted", message: put.message, buttons: this.upNow(put.message) };
     const f = await this.fileUnder(put.message, meta);
     const under = about(meta.item, meta.question) ? ` under ${about(meta.item, meta.question)}` : "";
     const done = "Nothing more was posted. Write no lead-in for it.";
-    return { status: "already out", message: put.message, said: !f.filed ? "It's already in front of him; nothing more was posted."
+    return { status: "already out", message: put.message, buttons: this.upNow(put.message), said: !f.filed ? "It's already in front of him; nothing more was posted."
       : f.gaveWay ? `It had gone out by itself; this filed it${under}, and as a newer card for the same question is up, its buttons came off. ${done}`
       : f.replaced ? `It had gone out by itself; this filed it${under} and took the buttons off ${f.replaced === 1 ? "an older card" : `${f.replaced} older cards`} for the same question. ${done}`
       : `It had gone out by itself; this only filed it${under}. ${done}` };
+  }
+
+  // The labels on a message's buttons while they're up, as far as the link knows ([] once off).
+  private upNow(messageId: string): string[] {
+    const m = this.d.load().messages[messageId];
+    return m?.buttons ? [...(m.labels ?? [])] : [];
   }
 
   // Cain hears once that a card lapsed before it reached him, whether his show or the
@@ -724,7 +846,8 @@ export class Link {
     const label = byItself && found && mark && !mark.byItself ? mark : meta;
     this.remember(s2, msg, { card: id, kind: "card", item: label.item, question: label.question,
       posted: found ? snowflakeTime(String(msg.id)) : this.d.now(), expires: latest?.expires ?? before.expires ?? null,
-      buttons: (msg.components ?? []).length > 0, ...(byItself && fromLink ? { byItself: true } : {}) });
+      buttons: (msg.components ?? []).length > 0, labels: labelsOf(msg.components),
+      ...(byItself && fromLink ? { byItself: true } : {}) });
     const replaced = this.markReplaced(s2, String(msg.id));
     this.d.save(s2);
     await this.stripAll(replaced);
@@ -798,7 +921,9 @@ export class Link {
       { components: comps, allowed_mentions: { parse: [] } });
     const s2 = this.d.load();
     if (s2.cards[String(id)]) s2.cards[String(id)].rows = comps;
-    if (msg?.id) this.remember(s2, msg, { card: id, buttons: comps.length > 0 });
+    // Its labels follow the edit; a card whose buttons all came off keeps the last ones.
+    if (msg?.id) this.remember(s2, msg, { card: id, buttons: comps.length > 0,
+      ...(comps.length ? { labels: labelsOf(comps) } : { off: this.d.now() }) });
     this.d.save(s2);
   }
 
@@ -806,16 +931,72 @@ export class Link {
     return this.d.load().messages[messageId]?.card ?? null;
   }
 
-  // Which card a message is, and what it's about (GET /card-of).
-  cardInfo(messageId: string): { card: number | null; item: string | null; question: string | null } {
+  // Which card a message is, what it's about, and the buttons it has up now (GET /card-of).
+  cardInfo(messageId: string): { card: number | null; item: string | null; question: string | null; buttons: string[]; live: boolean | null } {
     const m = this.d.load().messages[messageId];
-    return { card: m?.card ?? null, item: m?.item ?? null, question: m?.question || null };
+    return { card: m?.card ?? null, item: m?.item ?? null, question: m?.question || null,
+      buttons: m?.buttons ? [...(m.labels ?? [])] : [], live: m ? live(m, this.d.now()) : null };
+  }
+
+  // keeper.sh card (POST /look): a message in his DM as Discord has it now, its first 200
+  // characters and the buttons on it, with what the link knows of it. Look, don't recall.
+  async look(messageId: unknown): Promise<Record<string, unknown>> {
+    const id = String(messageId ?? "").trim();
+    if (!SNOWFLAKE.test(id)) throw new Refusal("needs a Discord message id");
+    const { owner, dm, bot } = await this.identity();
+    let msg: any;
+    try { msg = await this.d.rest("GET", `/channels/${dm}/messages/${id}`); }
+    catch (e) {
+      if (/discord 404/.test(String(e))) throw new Refusal("no message with that id in his DM");
+      throw e;
+    }
+    const author = String(msg?.author?.id ?? "");
+    const m = this.d.load().messages[id];
+    return { status: "ok", message: id, from: author === bot ? "the bot" : author === owner ? "Dane" : "someone else",
+      text: String(msg?.content ?? "").slice(0, 200), buttons: labelsOf(msg?.components), edited: !!msg?.edited_timestamp,
+      known: m ? { kind: m.kind ?? "legacy", writer: writerOf(m), item: m.item ?? null, question: m.question || null,
+        card: m.card ?? null, live: live(m, this.d.now()), labels: [...(m.labels ?? [])] } : null };
   }
 
   // -- the mutual watch (watch.ts): a plain notice, straight to his DM ---------------
   async notice(text: string, timeoutMs?: number): Promise<string> {
+    this.gate("notice", "link", text, { rules: AT.link });
     const msg = await this.post(text, [], { timeoutMs });
+    try {
+      const s = this.d.load();
+      this.remember(s, msg, { kind: "notice", item: "none", question: "notice", posted: this.d.now(), expires: null, buttons: false });
+      this.d.save(s);
+    } catch (e) { this.log(`couldn't record a notice: ${String(e).slice(0, 80)}`); }
     return String(msg.id);
+  }
+
+  // -- Claude's Home Assistant connector needs signing in again (keeper.sh connector) --
+  // One notice per item while it lasts (CONNECTOR_ONCE_MS), with one link button: Claude's
+  // connector settings, the fix one tap away. It asks nothing back: Cain checks Home
+  // Assistant again by himself and goes ahead once it answers.
+  async connector(a: { item?: unknown; text?: unknown }): Promise<{ status: "posted" | "already told"; message: string; said: string }> {
+    const meta = checkMeta({ item: a.item });
+    const waits = String(a.text ?? "").replace(/\s+/g, " ").trim().replace(/[.\s]+$/, "");
+    if (!waits) throw new Refusal('say what waits, in a few words, like "Installing Harness 0.21.4"');
+    if (waits.length > 120) throw new Refusal("say only what waits, in a few words");
+    noMachineText(waits);
+    const now = this.d.now();
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.kind === "notice" && m.question === "connector"
+      && (m.item ?? "none") === meta.item && (m.posted ?? 0) > now - CONNECTOR_ONCE_MS);
+    if (prior) return { status: "already told", message: prior[0],
+      said: "He already has the notice about Home Assistant's connector; nothing more was posted. Check Home Assistant again at each cloud job check, and go ahead once it answers." };
+    this.gate("connector", "cain", waits, { rules: AT.cain, buttons: [CONNECTOR_LABEL], known: this.liveLabels() });
+    const text = withLabel(`${waits} waits until Claude can reach Home Assistant again: its connector needs you to sign in again. `
+      + "Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.",
+      labelOf(meta.item));
+    const comps = [{ type: 1, components: [{ type: 2, style: 5, label: CONNECTOR_LABEL, url: CONNECTOR_URL }] }];
+    const msg = await this.post(text, comps, { nonce: stableNonce("connector", meta.item, waits) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: meta.item, question: "connector", posted: now, expires: null, buttons: false,
+      labels: [CONNECTOR_LABEL] });
+    this.d.save(s);
+    return { status: "posted", message: String(msg.id),
+      said: "Posted. Write /data/jobs/connector-<item> as the Cloud jobs section says, and check Home Assistant again at each cloud job check." };
   }
 
   // -- Cain's own words with buttons ----------------------------------------------
@@ -854,11 +1035,13 @@ export class Link {
 
   private async postAsk(e: Ask): Promise<string> {
     const nonce = e.nonce ?? stableNonce("ask", e.item, e.question, e.text, e.options.join("\u0001"), e.replyTo ?? "");
+    this.gate("ask", "cain", e.text, { rules: AT.cain, buttons: e.options, known: this.liveLabels() });
+    for (const o of e.options) this.gate("ask option", "cain", o, { rules: ["dash", "app", "count", "machine"] });
     const msg = await this.postCard(e.text, rows([e.options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
       { replyTo: e.replyTo, nonce });
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
-      buttons: true, q: { q: excerpt(e.text), options: e.options, used: false } });
+      buttons: true, labels: [...e.options], q: { q: excerpt(e.text), options: e.options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -882,6 +1065,7 @@ export class Link {
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(String(a.text));
     this.mayAsk(meta.item);
+    this.gate("ship", "cain", String(a.text), { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() });
     // A line of the link's own, from GitHub: what the tap would land, whatever the
     // card's words say.
     let words = String(a.text);
@@ -902,7 +1086,7 @@ export class Link {
     const now = this.d.now();
     const s = this.d.load();
     this.remember(s, msg, { kind: "ship", item: meta.item, question: `ship:${m[3]}`, posted: now, expires: this.askExpiry(now),
-      ship: { pr, head }, buttons: true, q: { q: excerpt(text), options, used: false } });
+      ship: { pr, head }, buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -915,9 +1099,11 @@ export class Link {
     noMachineText(String(text));
     // While stopped, its button is the one that undoes it.
     const toggle: [string, string] = this.stopped().stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
+    this.gate("morning", "cain", String(text), { rules: AT.cain, buttons: [toggle[0]], known: this.liveLabels() });
     const msg = await this.postCard(String(text), rows([[toggle]], "q:"), { nonce: stableNonce("morning", String(text), toggle[1]) });
     const s = this.d.load();
-    this.remember(s, msg, { kind: "morning", item: "none", question: "morning", posted: this.d.now(), expires: null, buttons: true });
+    this.remember(s, msg, { kind: "morning", item: "none", question: "morning", posted: this.d.now(), expires: null, buttons: true,
+      labels: [toggle[0]] });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -963,8 +1149,10 @@ export class Link {
     if (!ref?.message_id || Number(ref.type ?? 0) !== 0) return { status: "ok", reply_to: null, said: "Not a reply to anything: read it on its own." };
     const rid = String(ref.message_id);
     const m = this.d.load().messages[rid];
+    const now = this.d.now();
     return { status: "ok", reply_to: rid, card: m?.card ?? null, item: m?.item ?? null, question: m?.question || null,
-      asked: m?.q?.q ?? null, open: m ? live(m, this.d.now()) : null };
+      asked: m?.q?.q ?? null, open: m ? live(m, now) : null,
+      buttons: m?.buttons ? [...(m.labels ?? [])] : [], live: m ? live(m, now) : null };
   }
 
   // -- taps -------------------------------------------------------------------
@@ -1015,11 +1203,12 @@ export class Link {
       delete c.posting;
       this.remember(s, { id: msgId, content: m.content, components: m.components }, { card: Number(k), kind: "card",
         item: mark.item, question: mark.question, posted: snowflakeTime(msgId), expires: c.expires ?? null,
-        buttons: (m.components ?? []).length > 0, ...(mark.byItself ? { byItself: true } : {}) });
+        buttons: (m.components ?? []).length > 0, labels: labelsOf(m.components), ...(mark.byItself ? { byItself: true } : {}) });
       this.markReplaced(s, msgId);                     // the sweep takes off what it replaced
       this.d.save(s);
       this.log(`a tap showed card ${k} is up after all; recorded`);
-      this.d.relay(mark.byItself ? wentOutLine(Number(k), c, msgId) : foundLine(Number(k), c, msgId));
+      const shown = labelsOf(m.components);
+      this.d.relay(mark.byItself ? wentOutLine(Number(k), c, msgId, shown) : foundLine(Number(k), c, msgId, shown));
       return true;
     }
     return false;
@@ -1134,7 +1323,11 @@ export class Link {
         const { dm } = await this.identity();
         const msg = await this.d.rest("PATCH", `/channels/${dm}/messages/${id}`, { components: comps });
         const s = this.d.load();
-        if (s.messages[id]) { s.messages[id].digest = digest(String(msg?.content ?? ""), msg?.components ?? comps); this.d.save(s); }
+        if (s.messages[id]) {
+          s.messages[id].digest = digest(String(msg?.content ?? ""), msg?.components ?? comps);
+          s.messages[id].labels = [want[0]];
+          this.d.save(s);
+        }
       } catch (e) { this.log(`couldn't change the morning message's button: ${String(e).slice(0, 80)}`); }
     }
   }
@@ -1157,9 +1350,12 @@ export class Link {
   private async postToggle(text: string, stopped: boolean): Promise<void> {
     try {
       const button: [string, string] = stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
-      const msg = await this.post(text.replace(/\s{2,}/g, " "), rows([[button]], "q:"));
+      const words = text.replace(/\s{2,}/g, " ");
+      this.gate("stop notice", "link", words, { rules: AT.link });
+      const msg = await this.post(words, rows([[button]], "q:"));
       const s = this.d.load();
-      this.remember(s, msg, { kind: "card", item: "none", question: "stop", posted: this.d.now(), expires: null, buttons: true, toggle: button[1] });
+      this.remember(s, msg, { kind: "card", item: "none", question: "stop", posted: this.d.now(), expires: null, buttons: true,
+        toggle: button[1], labels: [button[0]] });
       this.d.save(s);
       await this.retireToggles(String(msg.id));
     } catch (e) { this.log(`couldn't post the Stop notice: ${String(e).slice(0, 80)}`); }
@@ -1210,7 +1406,8 @@ export class Link {
     r.outcome ??= "expired"; r.why ??= why;
     if (r.q) r.q.used = true;
     r.buttons = !ok;                                     // the sweep tries again if Discord didn't take it
-    if (ok) r.digest = digest(shown, []);
+    if (ok) { r.digest = digest(shown, []); r.off = this.d.now(); }
+    if (!r.labels) r.labels = labelsOf(it.message?.components);
     this.d.save(s);
     await this.ephemeral(it, EXPIRED_TAP);
     this.log(`tap on a card that stopped mattering (${why}): answered in place`);
@@ -1269,7 +1466,7 @@ export class Link {
     if (ok) {
       const s2 = this.d.load();
       const m2 = s2.messages[msgId];
-      if (m2) { m2.buttons = false; if (m2.shipping?.line === LANDING_LINE) m2.shipping.edited = true; this.d.save(s2); }
+      if (m2) { m2.buttons = false; m2.off = this.d.now(); if (m2.shipping?.line === LANDING_LINE) m2.shipping.edited = true; this.d.save(s2); }
     }
     if (m.kind === "ask") await this.releaseHeld();
     if (landing) await this.landShip(msgId);
@@ -1378,6 +1575,7 @@ export class Link {
   private async showLanding(msgId: string): Promise<void> {
     const sh = this.d.load().messages[msgId]?.shipping;
     if (!sh?.line) return;
+    if (sh.edited === false) this.gate("ship line", "link", sh.line, { rules: AT.link }, msgId);
     let done = false;
     try {
       const { dm } = await this.identity();
@@ -1391,7 +1589,7 @@ export class Link {
     if (!done) return;
     const s = this.d.load();
     const m = s.messages[msgId];
-    if (m?.shipping?.line === sh.line) { m.shipping.edited = true; m.buttons = false; this.d.save(s); }
+    if (m?.shipping?.line === sh.line) { m.shipping.edited = true; if (m.buttons) m.off = this.d.now(); m.buttons = false; this.d.save(s); }
   }
 
   // Landings due another try: one that can't land yet, and one the link was cut off from
@@ -1466,8 +1664,159 @@ export class Link {
   async followup(callback: string, text: string): Promise<void> {
     const [app, token] = [callback.split(":")[0], callback.split(":").slice(1).join(":")];
     if (!app || !token || !text) return;
+    this.gate("answer", "specialist", text, { rules: AT.answer });
     await this.d.rest("POST", `/webhooks/${app}/${token}`,
       { content: fit(text), flags: EPHEMERAL, allowed_mentions: { parse: [] } }, false);
+  }
+
+  // -- the replay (keeper.sh replay): the gate's rules over his DM, reading only ---------
+  // Pages back through his DM to the start of the range, reads every bot message, says
+  // whose words it carries from the link's own records and Cain's transcripts (one bot
+  // token posts them all, so Discord can't tell), and runs the rules in report mode.
+  // Nothing is posted, edited or logged as a send. Cain hears one line when it's done.
+  private replaying: Promise<void> | null = null;
+
+  replay(daysIn?: unknown): { status: "started" | "running"; said: string } {
+    if (this.replaying) return { status: "running", said: "A replay is already running; you'll hear one line when it's done." };
+    const n = Number(daysIn ?? 14);
+    const days = Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 60) : 14;
+    this.replaying = this.runReplay(days)
+      .catch((e) => {
+        this.log(`the gate's replay failed: ${reason(e)}`);
+        this.d.relay(`The gate's replay over his DM failed (${reason(e)}). Nothing was posted or changed; run /opt/cain/keeper.sh replay again later. Nothing to tell him.`);
+      })
+      .finally(() => { this.replaying = null; });
+    return { status: "started", said: `Reading the last ${days} days of his DM against the gate's rules. Nothing is posted or changed. You'll hear one line when it's done.` };
+  }
+
+  whenReplayed(): Promise<void> { return this.replaying ?? Promise.resolve(); }
+
+  private async runReplay(days: number): Promise<void> {
+    const { owner, dm, bot } = await this.identity();
+    const now = this.d.now();
+    const from = now - days * DAY;
+    const pause = this.d.replayPauseMs ?? 1000;
+    const sleep = (ms: number) => new Promise<void>((ok) => setTimeout(ok, ms));
+    const seen: any[] = [];
+    let before = "", pages = 0, reached = false, stopped: string | null = null;
+    while (!reached) {
+      if (pages >= REPLAY_PAGES) { stopped = `it read its most, ${REPLAY_PAGES} pages of 100 messages, before the start of the range`; break; }
+      let batch: any = null;
+      for (let tries = 1; ; tries++) {
+        try { batch = await this.d.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`); break; }
+        catch (e) {
+          if (!/discord 429/.test(String(e)) || tries >= REPLAY_TRIES) { stopped = `${plainly(e)} (${reason(e)})`; break; }
+          await sleep(Math.max(pause, 1) * 5);                 // rate limited: wait it out, then the same page again
+        }
+      }
+      if (stopped) break;
+      pages++;
+      if (!Array.isArray(batch) || !batch.length) { reached = true; break; }
+      for (const m of batch) {
+        if (snowflakeTime(String(m?.id ?? "")) < from) { reached = true; continue; }
+        seen.push(m);
+      }
+      before = String(batch[batch.length - 1].id);
+      if (batch.length < 100) reached = true;
+      if (!reached) await sleep(pause);
+    }
+
+    const s = this.d.load();
+    const sent: Sent = (() => { try { return this.d.transcripts?.(from) ?? { ids: new Set(), texts: new Set() }; }
+      catch { return { ids: new Set<string>(), texts: new Set<string>() }; } })();
+    const byId = new Map(seen.map((m) => [String(m.id), m]));
+    const allLabels = [...new Set(Object.values(s.messages).flatMap((m) => m.labels ?? []))];
+    const byWriter: Record<string, number> = { cain: 0, specialist: 0, link: 0, unknown: 0 };
+    const skipped: Record<string, number> = { his: 0, permission_prompts: 0, others: 0 };
+    const empty = (): Record<string, number> => ({ fix: 0, refuse: 0, unsure: 0 });
+    const byRule: Tally = Object.fromEntries(RULES.map((r) => [r, empty()]));
+    const perWriter: Record<string, Tally> = {};
+    const list: ReplayReport["list"] = [];
+    const judge = (message: string, at: number, writer: string, text: string, ctx: Context) => {
+      for (const h of gateCheck(text, ctx).hits) {
+        list.push({ at, message, writer, rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}) });
+        byRule[h.rule][h.result]++;
+        const w = perWriter[writer] ??= Object.fromEntries(RULES.map((r) => [r, empty()]));
+        w[h.rule][h.result]++;
+      }
+    };
+    for (const m of seen) {
+      const id = String(m.id), at = snowflakeTime(id), author = String(m?.author?.id ?? "");
+      if (author === owner) { skipped.his++; continue; }
+      if (author !== bot) { skipped.others++; continue; }
+      if (buttonIds(m.components).some((x) => x.startsWith("perm:"))) { skipped.permission_prompts++; continue; }
+      const content = withoutOutcome(String(m.content ?? ""));
+      const rec = s.messages[id];
+      if (rec) {                                           // the link posted it: its own record says whose words
+        const writer = writerOf(rec);
+        byWriter[writer]++;
+        const own = rec.labels ?? labelsOf(m.components);
+        const card = rec.card !== undefined ? s.cards[String(rec.card)] : undefined;
+        if (writer === "specialist") judge(id, at, writer, card?.text ?? content, { rules: AT.card, buttons: own, known: allLabels });
+        else if (writer === "cain") judge(id, at, writer, rec.shipping?.text ?? content, { rules: AT.cain, buttons: own, known: allLabels });
+        else judge(id, at, writer, content, { rules: AT.link });
+        continue;
+      }
+      const raw = String(m.content ?? "");
+      if (sent.ids.has(id) || sent.texts.has(raw.trim())) {   // Cain's reply, by his transcripts
+        byWriter.cain++;
+        const ref = m.message_reference?.message_id ? String(m.message_reference.message_id) : "";
+        let buttons: string[] | null = [], answersHim = false;
+        if (ref) {
+          const target = s.messages[ref], there = byId.get(ref);
+          if (target) buttons = target.off != null && target.off <= at ? [] : target.labels ?? null;
+          else if (there && String(there.author?.id ?? "") === owner) answersHim = true;
+          else if (there) buttons = labelsOf(there.components);
+          else buttons = null;                             // can't tell what it answered
+        }
+        judge(id, at, "cain", raw, { rules: AT.cain, buttons, known: allLabels, answersHim });
+        continue;
+      }
+      byWriter.unknown++;
+      judge(id, at, "unknown", content, { rules: AT.cain, buttons: labelsOf(m.components), known: allLabels });
+    }
+    // The specialist's cards from the same days that never went out, as the link received them.
+    let unposted = 0;
+    for (const [k, c] of Object.entries(s.cards)) {
+      if (c.shown || c.created < from) continue;
+      unposted++;
+      judge(`card ${k}`, c.created, "specialist", c.text, { rules: AT.card, buttons: labelsOf(c.rows), known: allLabels });
+    }
+    // Whether Discord marks a message "(edited)" when only its buttons change: every edit
+    // the link makes to a morning message is to its buttons alone (its Stop moves or comes off).
+    let mornings = 0, changed = 0, marked = 0;
+    for (const m of seen) {
+      if (s.messages[String(m.id)]?.kind !== "morning") continue;
+      mornings++;
+      const edited = !!m.edited_timestamp;
+      if (edited || !labelsOf(m.components).length) changed++;   // its Stop came off (or moved): an edit of buttons alone
+      if (edited) marked++;
+    }
+    const marks = changed ? marked > 0 : null;
+    const total = list.length;
+    const n = (r: "fix" | "refuse" | "unsure") => list.filter((h) => h.result === r).length;
+    const report: ReplayReport = {
+      written_at: now,
+      range: { from, to: now, days, pages, page_cap: REPLAY_PAGES, reached_cutoff: reached, stopped },
+      messages: { read: seen.length, by_writer: byWriter, skipped, cards_never_posted: unposted },
+      hits: { by_rule: byRule, by_writer: perWriter, total },
+      list,
+      edited: { morning_messages: mornings, buttons_changed: changed, marked_edited: marked, buttons_only_edits_marked: marks,
+        said: marks === null ? "No morning message in range has had its buttons changed, so this can't tell yet."
+          : marks ? `Yes: ${marked} of ${changed} morning messages whose buttons alone changed show "(edited)".`
+          : `No: none of ${changed} morning messages whose buttons alone changed shows "(edited)".` },
+    };
+    let where = "";
+    try { where = this.d.writeReplay ? String(this.d.writeReplay(report) ?? "") : ""; }
+    catch (e) { throw new Error(`its report couldn't be written: ${reason(e)}`); }
+    const s2 = this.d.load();
+    s2.replayed = this.d.now();
+    this.d.save(s2);
+    this.log(`the gate's replay read ${seen.length} messages over ${pages} pages: ${total} hits`);
+    this.d.relay(`The gate's replay over the last ${days} days of his DM is done: ${seen.length} messages read (Cain ${byWriter.cain}, `
+      + `the specialist ${byWriter.specialist}, the link ${byWriter.link}, unknown ${byWriter.unknown})${stopped ? `, stopped early: ${stopped}` : ""}. `
+      + `${total} hits: ${n("refuse")} would be refused, ${n("fix")} fixed, ${n("unsure")} can't tell. Buttons-only edits and "(edited)": ${report.edited.said} `
+      + `Nothing was posted or changed. Read ${where || "the replay's report"} and file it in the record as your CLAUDE.md says (Gate replay). Nothing to tell him.`);
   }
 
   // -- reactions ----------------------------------------------------------------
@@ -1492,6 +1841,7 @@ export class Link {
       if (!this.d.load().migrated) {
         try { await this.migrate(); } catch (e) { this.log(`couldn't look over the cards already posted yet: ${String(e).slice(0, 80)}`); }
       }
+      this.backfillLabels();
       await this.sendOwedToggle();
       await this.retryLandings();
       await this.checkKey();
@@ -1500,6 +1850,22 @@ export class Link {
       await this.stripDue();
       await this.releaseHeld();
     } finally { this.sweeping = false; }
+  }
+
+  // Cards from before 0.9.0 recorded no labels: they're filled in from what the link still
+  // has (an ask's options, a specialist card's rows, a Stop notice's toggle), once.
+  private backfillLabels(): void {
+    const s = this.d.load();
+    let changed = false;
+    for (const m of Object.values(s.messages)) {
+      if (m.labels) continue;
+      const c = m.card !== undefined ? s.cards[String(m.card)] : undefined;
+      m.labels = m.q ? [...m.q.options] : c ? labelsOf(c.rows)
+        : m.toggle ? [m.toggle === RESUME ? "Turn back on" : "Stop"]
+        : m.kind === "morning" && m.buttons ? [this.stopped().stopped ? "Turn back on" : "Stop"] : [];
+      changed = true;
+    }
+    if (changed) this.d.save(s);
   }
 
   // A card with buttons that Cain hasn't shown in time goes out by itself, under no item,
@@ -1580,11 +1946,12 @@ export class Link {
       if (!rec) {
         if (snowflakeTime(id) > now - SETTLE_MS) continue;       // may be on its way into the state
         s.messages[id] = { digest: digest(m.content ?? "", m.components), until: now + REMEMBER_MS, kind: "legacy",
-          item: "none", posted: snowflakeTime(id), buttons: true, outcome: "expired", why: "posted before 0.7.0" };
+          item: "none", posted: snowflakeTime(id), buttons: true, outcome: "expired", why: "posted before 0.7.0",
+          labels: labelsOf(m.components) };
         continue;
       }
       const posted = rec.until - REMEMBER_MS;
-      Object.assign(rec, { item: "none", question: "", posted, buttons: true });
+      Object.assign(rec, { item: "none", question: "", posted, buttons: true, labels: rec.labels ?? labelsOf(m.components) });
       // Every ask from before 0.7.0 expires now, answered or not, even one from this
       // morning: it was asked the old way, and the morning check-in asks again exactly.
       if (rec.card !== undefined) Object.assign(rec, { kind: "card", expires: s.cards[String(rec.card)]?.expires ?? null });
@@ -1681,7 +2048,7 @@ export class Link {
     const line = outcomeLine(m);
     const gone = () => {
       const s = this.d.load();
-      if (s.messages[id]) { s.messages[id].buttons = false; this.d.save(s); }
+      if (s.messages[id]) { s.messages[id].buttons = false; s.messages[id].off = this.d.now(); this.d.save(s); }
       return "done" as const;
     };
     const failed = (e: unknown) => {
@@ -1693,6 +2060,7 @@ export class Link {
     try { dm = (await this.identity()).dm; } catch (e) { this.log(`can't reach Discord to take buttons off: ${String(e).slice(0, 80)}`); return "limited"; }
     const body: any = { components: [], allowed_mentions: { parse: [] } };
     if (line) {
+      this.gate("outcome line", "link", line, { rules: AT.link }, id);
       try {
         const cur = await this.d.rest("GET", `/channels/${dm}/messages/${id}`);
         body.content = withLine(String(cur?.content ?? ""), line);
@@ -1704,6 +2072,7 @@ export class Link {
     const r = s.messages[id];
     if (r) {
       r.buttons = false;
+      r.off = this.d.now();
       r.digest = digest(String(msg?.content ?? body.content ?? ""), []);
       if (r.q) r.q.used = true;
       if (r.card !== undefined && s.cards[String(r.card)]) s.cards[String(r.card)].rows = [];

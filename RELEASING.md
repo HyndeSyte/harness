@@ -105,11 +105,38 @@ for 2 hours, without which Cain can't start the job.
    `git merge-base --is-ancestor <sha> origin/main`) and the pull request shows merged.
    If not, stop and report. Merge nothing and change no code. CI already passed on that
    exact commit, so there's nothing more to wait for.
-2. In Home Assistant: check for App updates, then update only the App(s) the pull
+2. Check Home Assistant first: one read through its connector (the update entity of
+   the App to install). If the connector is missing, asks to be signed in again, or
+   doesn't answer, stop: install nothing, change nothing, and end with one line,
+   `Home Assistant connector: needs signing in again` (or `no answer`). main keeps
+   the commit; only the install waits (If Home Assistant's connector lapses, below).
+3. In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed, with a backup taken first. Nothing else in Home Assistant: no
    options, no other Apps, no services. Never read Cain's App info (`ha_get_app`): it
    holds his GitHub token.
-3. Confirm the new version is running from the update result and the App's log.
+4. Confirm the new version is running from the update result and the App's log.
+
+## If Home Assistant's connector lapses
+
+Cain's Ship job installs through the claude.ai Home Assistant connector, and a
+claude.ai outage can sign it out (Nov 13). Landing in main doesn't use it and isn't
+affected. So Cain reads Home Assistant (through his own read-only connector) before he
+shows a Ship card and again before he starts a Ship run, and the job's first step
+checks its own connector, which can lapse alone.
+
+- If Home Assistant doesn't answer, nothing goes to Dane: Cain shows no card and starts
+  no run, and checks again at each 15-minute cloud job check (a `connector` file in
+  /data/jobs keeps that check coming; it isn't a job).
+- If the connector says it must be signed in again, Cain's link posts one notice whose
+  only button opens Claude's connector settings, the fix one tap away. It asks nothing
+  back: Cain keeps checking by himself.
+- Once Home Assistant answers, Cain goes on where he stopped: he shows the Ship card,
+  or starts the run while Dane's Ship token is good (2 hours from his tap), or shows a
+  new Ship card for the same pull request and head once it has run out. A new Ship card
+  goes out only once Home Assistant answers again.
+
+One installer: no laptop session installs around a waiting Ship job, and nothing is
+installed from Home Assistant's own page unless Dane says so.
 
 ## If the Ship key is remade
 

@@ -118,7 +118,10 @@ describe("the RemoteTrigger hook", () => {
     const command: string = pre.hooks[0].command;
     expect(command).toBe("bun /opt/cain/hooks/remote-trigger.ts || exit 2");
     // A hook that times out lets the call through unless its failure blocks (Claude Code 2.1.295+).
-    for (const e of settings.hooks.PreToolUse) for (const h of e.hooks) expect(h.onFailure).toBe("block");
+    // The one exception is the message gate in report mode, which must never hold a reply
+    // up (discord-send.test.ts).
+    for (const e of settings.hooks.PreToolUse) for (const h of e.hooks)
+      if (!String(h.command).includes("/discord-send.ts")) expect(h.onFailure).toBe("block");
     // Claude Code reads exit 2 as a refusal: a hook that dies refuses, rather than letting the run through.
     const crash = Bun.spawn(["bash", "-c", command.replace("/opt/cain/hooks/remote-trigger.ts", join(tmpdir(), "no-such-hook.ts"))],
       { stdout: "ignore", stderr: "ignore" });
