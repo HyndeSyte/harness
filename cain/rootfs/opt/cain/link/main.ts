@@ -34,8 +34,9 @@ import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
 import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
 import { loadDeployKey } from "./deploykey";
-import { facts, keyAnswer, land, type MergeDeps } from "./merge";
+import { facts, inMain, keyAnswer, land, type MergeDeps } from "./merge";
 import { loadShipKey } from "./shipkey";
+import { runBounded } from "./spawn";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
@@ -157,17 +158,11 @@ async function githubApi(path: string): Promise<{ status: number; body: any }> {
   return { status: r.status, body: await r.json().catch(() => null) };
 }
 const SSH = ["ssh", "-F", "/dev/null", "-i", DEPLOY_KEY, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
-  "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${KNOWN_HOSTS}`, "-o", "ConnectTimeout=15"];
+  "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${KNOWN_HOSTS}`, "-o", "ConnectTimeout=15",
+  "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2"];
 const GIT_ENV: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: DIR, GIT_TERMINAL_PROMPT: "0",
   GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
-async function run(args: string[], env: Record<string, string>, timeoutMs: number): Promise<{ code: number; out: string; err: string }> {
-  const p = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", env });
-  const timer = setTimeout(() => p.kill(), timeoutMs);
-  const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
-  const code = await p.exited;
-  clearTimeout(timer);
-  return { code, out, err };
-}
+const run = runBounded;
 async function gitRun(args: string[], o: { ssh?: boolean; timeoutMs?: number } = {}): Promise<{ code: number; out: string; err: string }> {
   const env = o.ssh ? { ...GIT_ENV, GIT_SSH_COMMAND: SSH.join(" ") } : GIT_ENV;
   if (!existsSync(`${REPO_DIR}/HEAD`)) {
@@ -198,6 +193,7 @@ const link = new Link({
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
     return land({ ...github, stopped }, { repo: p.repo, pr: p.pr, head });
   } : undefined,
+  landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr) : null; },
   keyKnown: deployKey ? keyKnown : undefined,
 });

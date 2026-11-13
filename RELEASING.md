@@ -91,8 +91,11 @@ commit the card was for (its full head sha). On that tap Cain's link lands it it
 - it pushes exactly that commit to `main`, as a fast-forward, never forced. GitHub marks
   the pull request merged.
 
-If GitHub doesn't answer, it tries again for up to 2 hours, and the card says so. While
-Dane has everything stopped, nothing lands, and a landing still waiting ends.
+If GitHub doesn't answer, or the checks are still running, it tries again for up to 2
+hours, and the card says so; after that nothing is pushed, and a landing the link was
+cut off from (a restart) is settled from `main` itself. While Dane has everything
+stopped, nothing lands, and a Stop since his tap ends that landing for good, even once
+he has turned things back on: a new tap ships it.
 
 Then Cain starts the Ship job, which only installs. Its text carries the full head sha
 and Dane's Ship token: his tap, signed by the link for that pull request and head, good

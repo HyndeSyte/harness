@@ -41,6 +41,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     facts: null as Facts | null,
     key: true as boolean | null,                   // GitHub knows the deploy key
     hold: false,                                   // a landing waits until go()
+    readable: true,                                // main can be read (for landings over 2 hours old)
   };
   const landWaiting: (() => void)[] = [];
   const stop = { stopped: false, at: null as number | null, broken: false };
@@ -125,6 +126,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       github.main.push(l.head);
       return { ok: true, already: false };
     },
+    landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }) => github.readable ? github.main.includes(ship.head) : null,
     facts: opts.facts ? async () => github.facts : undefined,
     keyKnown: opts.keyCheck ? async () => github.key : undefined,
   };

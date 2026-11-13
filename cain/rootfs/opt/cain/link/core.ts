@@ -60,7 +60,7 @@ const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long 
 const LANDING_TRY_MS = 2 * 3_600_000;    // while GitHub doesn't answer, a landing is tried again this long after his tap
 const KEY_CHECK_MS = DAY;                // how often the link asks GitHub whether it still knows the deploy key
 const LANDING_LINE = "You tapped Ship: landing it in main now.";
-const WAITING_LINE = "You tapped Ship. Waiting on GitHub: it lands as soon as GitHub answers.";
+const STOPPED_FIRST: Landed = { ok: false, why: "his Stop came first", again: false, stopped: true };
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
 const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
 const SHOW_WAIT_MS = 2 * 60_000;         // a card with buttons Cain hasn't shown by then goes out by itself
@@ -107,7 +107,8 @@ export interface Shown {
   // His Ship tap, landing in main (0.8.1): when it began, how it ended, and the card's
   // words before it, for the line that says how it went.
   shipping?: { state: "landing" | "landed" | "not landed"; at: number; text: string; why?: string;
-    tries?: number; next?: number };  // GitHub didn't answer: how often it was tried, and when it's tried next
+    tries?: number; next?: number;    // it can't land yet: how often it was tried, and when it's tried next
+    line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
 }
 export interface Ask {               // Cain's question waiting behind the open one
@@ -373,6 +374,7 @@ export interface Deps {
   signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
+  landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string) => Promise<Facts | null>;                   // what GitHub says the pull request changes
   keyKnown?: () => Promise<boolean | null>;                        // does GitHub still know the deploy key; null: can't tell
 }
@@ -875,7 +877,10 @@ export class Link {
       const f = await this.d.facts(pr).catch(() => null);
       if (f?.head && f.head !== head)
         throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
-      words = `${words.trimEnd()}\n${factsLine(f)}`;
+      // Cain's words give way, so the line is never cut off.
+      const line = factsLine(f), room = LIMIT - line.length - 40;
+      const own = words.trimEnd();
+      words = `${own.length <= room ? own : own.slice(0, room - 2).trimEnd() + " …"}\n${line}`;
     }
     const text = withLabel(words, labelOf(meta.item));
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
@@ -1237,7 +1242,7 @@ export class Link {
         extra = " The link has no deploy key, so nothing can land in main: tell him in one line that shipping is down, and log it as a Build item.";
       } else {
         shown = LANDING_LINE;
-        m.shipping = { state: "landing", at: this.d.now(), text: words };
+        m.shipping = { state: "landing", at: this.d.now(), text: words, line: LANDING_LINE, edited: false };
         landing = true;
       }
     }
@@ -1249,7 +1254,11 @@ export class Link {
     // (the sweep settles one the link was cut off from).
     if (!landing) this.d.relay(this.tapLine(m, label, msgId) + extra);
     const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
-    if (ok) { const s2 = this.d.load(); if (s2.messages[msgId]) { s2.messages[msgId].buttons = false; this.d.save(s2); } }
+    if (ok) {
+      const s2 = this.d.load();
+      const m2 = s2.messages[msgId];
+      if (m2) { m2.buttons = false; if (m2.shipping?.line === LANDING_LINE) m2.shipping.edited = true; this.d.save(s2); }
+    }
     if (m.kind === "ask") await this.releaseHeld();
     if (landing) await this.landShip(msgId);
     return "to Cain";
@@ -1259,14 +1268,26 @@ export class Link {
   // One at a time: a second tap waits for the first to settle.
   private landingNow = new Set<string>();
   private landChain: Promise<unknown> = Promise.resolve();
+
+  // His tap stops counting once he taps Stop, and stays void after he turns things back
+  // on: the Stop state's time is when it last changed. Only a later tap counts again.
+  private voided(tapped: number): boolean {
+    const st = this.stopped();
+    return st.stopped || (st.at !== null && st.at > tapped);
+  }
+
   private landShip(msgId: string): Promise<void> {
     this.landingNow.add(msgId);
     const run = this.landChain.then(async () => {
       const m = this.d.load().messages[msgId];
       if (!m?.ship || m.shipping?.state !== "landing") return;
+      const tapped = m.shipping.at;
       let r: Landed;
-      try { r = await this.d.land!({ pr: m.ship.pr, head: m.ship.head, stopped: () => this.stopped().stopped }); }
-      catch (e) { r = { ok: false, why: `the link hit an error (${String(e).slice(0, 80)})`, again: true }; }
+      if (this.voided(tapped)) r = STOPPED_FIRST;
+      else {
+        try { r = await this.d.land!({ pr: m.ship.pr, head: m.ship.head, stopped: () => this.voided(tapped) }); }
+        catch (e) { r = { ok: false, why: `the link hit an error (${String(e).slice(0, 80)})`, again: true }; }
+      }
       await this.settleLanding(msgId, r);
     }).finally(() => this.landingNow.delete(msgId));
     this.landChain = run.catch(() => {});
@@ -1274,88 +1295,113 @@ export class Link {
   }
 
   // How his Ship tap went: on its card, and to Cain once. In main, it's signed for the
-  // install, unless everything was stopped meanwhile. While GitHub doesn't answer, it's
-  // tried again (the sweep), for up to 2 hours after his tap, and his card says so.
+  // install, unless a Stop came since his tap (then a new tap installs it). While GitHub
+  // doesn't answer, or its checks are still running, it's tried again (the sweep), for
+  // up to 2 hours after his tap, and his card says what it waits on.
   private async settleLanding(msgId: string, r: Landed): Promise<void> {
     const s = this.d.load();
     const m = s.messages[msgId];
     if (!m?.ship || m.shipping?.state !== "landing") return;
     const now = this.d.now();
+    const tapped = m.shipping.at;
     const words = m.shipping.text;
     const tap = this.tapLine(m, "Ship", msgId);
-    if (!r.ok && r.again && !r.stopped && now - m.shipping.at < LANDING_TRY_MS) {
+    if (!r.ok && (r.stopped || this.voided(tapped))) r = STOPPED_FIRST;   // a Stop since his tap ends it, even one undone since
+    if (!r.ok && r.again && now - tapped < LANDING_TRY_MS) {
       const tries = (m.shipping.tries ?? 0) + 1;
-      const first = tries === 1;
-      m.shipping = { ...m.shipping, tries, next: now + Math.min(15, 2 ** tries) * 60_000, why: r.why };
-      const content = withLine(words, WAITING_LINE);
-      m.digest = digest(content, []);
+      const waiting = `You tapped Ship. Waiting: ${r.why}. It lands by itself as soon as it can.`;
+      const changed = m.shipping.line !== waiting;
+      m.shipping = { ...m.shipping, tries, next: now + Math.min(15, 2 ** tries) * 60_000, why: r.why,
+        ...(changed ? { line: waiting, edited: false } : {}) };
+      m.digest = digest(withLine(words, waiting), []);
       this.d.save(s);
-      this.log(`his Ship tap is waiting on GitHub (${r.why}); trying again`);
-      if (!first) return;
-      this.d.relay(`${tap} GitHub didn't answer (${r.why}), so the link keeps trying for up to 2 hours and lands it by itself; you'll hear when it settles. Nothing to tell him: his card says so.`);
-      await this.editShown(msgId, content);
+      this.log(`his Ship tap is waiting (${r.why}); trying again`);
+      if (tries === 1)
+        this.d.relay(`${tap} It can't land yet (${r.why}), so the link keeps trying for up to 2 hours and lands it by itself; you'll hear when it settles. Nothing to tell him: his card says so.`);
+      if (changed) await this.showLanding(msgId);
       return;
     }
     let shown: string, line: string;
     if (r.ok) {
-      const stopped = this.stopped().stopped;
-      const token = stopped ? null : this.signFor(m.ship);
-      m.shipping = { state: "landed", at: now, text: words };
+      const stopped = this.stopped().stopped, voided = this.voided(tapped), late = now - tapped >= LANDING_TRY_MS;
+      const token = voided || late ? null : this.signFor(m.ship);
       shown = `Shipped: it's in main as of ${clockTime(now, this.d.tz)}. ${stopped ? "Installing it waits until you turn things back on."
+        : voided ? "Installing it needs your tap again, since you tapped Stop meanwhile."
+        : late ? "Installing it needs your tap again, since your tap is over 2 hours old."
         : token ? "Installing it is next." : "Installing it is down right now, so it isn't installed yet."}`;
-      line = `${tap} The link landed it: main has that commit now${r.already ? " (it was there already)" : ""}.` + (stopped
-        ? " Everything is stopped now, so there's no Ship token and it isn't installed: after he taps Turn back on, show a new Ship card for the same pull request and head, and his tap gives the token to install it."
+      line = `${tap} The link landed it: main has that commit now${r.already ? " (it was there already)" : ""}.` + (voided || late
+        ? ` There's no Ship token, ${voided ? "since he tapped Stop after his Ship tap" : "since his tap is over 2 hours old"}, so it isn't installed: ${stopped ? "once he taps Turn back on, " : ""}show a new Ship card for the same pull request and head, and his tap on it gives the token to install it.`
         : token
           ? ` Ship token: ${token} (good for 2 hours): start the Ship job now to install it, with that token in its text as it is.`
           : " The link has no Ship key, so there's no Ship token and the install run will be refused: tell him in one line that it's in main but installing is down, and log a Build item.");
+      m.shipping = { state: "landed", at: now, text: words, line: shown, edited: false };
+    } else if (r.stopped) {
+      shown = "You tapped Ship, but Stop came before it landed, so nothing shipped.";
+      line = `${tap} The link didn't land it: his Stop came first. Nothing changed in main, and there's no Ship token. Once nothing is stopped, ask again with a new Ship card.`;
+      m.shipping = { state: "not landed", at: now, text: words, why: r.why, line: shown, edited: false };
     } else {
-      const waited = r.again && !r.stopped ? ", for 2 hours" : "";
-      m.shipping = { state: "not landed", at: now, text: words, why: r.why };
-      shown = r.stopped ? "You tapped Ship, but everything was stopped before it landed, so nothing shipped." : `Not shipped: ${r.why}${waited}. Nothing changed in main.`;
-      line = `${tap} The link didn't land it: ${r.why}${waited}. Nothing changed in main, and there's no Ship token.` + (r.stopped
-        ? " Everything is stopped: after he taps Turn back on, ask again with a new Ship card."
-        : " Tell him in one line, as a reply to the card, what happens next.");
+      const waited = r.again ? ", for 2 hours" : "";
+      shown = `Not shipped: ${r.why}${waited}. Nothing changed in main.`;
+      line = `${tap} The link didn't land it: ${r.why}${waited}. Nothing changed in main, and there's no Ship token. Tell him in one line, as a reply to the card, what happens next.`;
+      m.shipping = { state: "not landed", at: now, text: words, why: r.why, line: shown, edited: false };
     }
-    const content = withLine(words, shown);
-    m.digest = digest(content, []);
+    m.digest = digest(withLine(words, shown), []);
     this.d.save(s);
     this.d.relay(line);
     this.log(r.ok ? `his Ship tap landed ${m.ship.pr} in main` : `his Ship tap didn't land ${m.ship.pr}: ${r.why}`);
-    await this.editShown(msgId, content);
+    await this.showLanding(msgId);
   }
 
-  // His card, as the link last saved it, with no buttons. Edited with the bot's own
-  // key, so it works long after his tap.
-  private async editShown(msgId: string, content: string): Promise<void> {
+  // His card as the landing last left it, with no buttons. Edited with the bot's own key,
+  // so it works long after his tap; one that didn't take is edited again by the sweep.
+  private async showLanding(msgId: string): Promise<void> {
+    const sh = this.d.load().messages[msgId]?.shipping;
+    if (!sh?.line) return;
+    let done = false;
     try {
       const { dm } = await this.identity();
-      await this.d.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } });
-      const s = this.d.load();
-      if (s.messages[msgId]) { s.messages[msgId].buttons = false; this.d.save(s); }
-    } catch (e) { this.log(`couldn't show on his Ship card how it's going: ${String(e).slice(0, 80)}`); }
+      await this.d.rest("PATCH", `/channels/${dm}/messages/${msgId}`,
+        { content: withLine(sh.text, sh.line), components: [], allowed_mentions: { parse: [] } });
+      done = true;
+    } catch (e) {
+      if (/discord 404/.test(String(e))) done = true;   // the message is gone: nothing left to edit
+      else this.log(`couldn't show on his Ship card how it's going: ${String(e).slice(0, 80)}`);
+    }
+    if (!done) return;
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    if (m?.shipping?.line === sh.line) { m.shipping.edited = true; m.buttons = false; this.d.save(s); }
   }
 
-  // Landings due another try: one GitHub didn't answer, and one the link was cut off
-  // from (a restart). Each try starts by reading main, so one that landed is settled as
-  // landed. After 2 hours it's given up, with the last reason.
+  // Landings due another try: one that can't land yet, and one the link was cut off from
+  // (a restart). Each try starts by reading main, so one that landed is settled as landed.
+  // A Stop since his tap ends it. Over 2 hours after his tap nothing is pushed any more:
+  // main alone says whether it landed.
   private async retryLandings(): Promise<void> {
     const now = this.d.now();
     for (const [id, m] of Object.entries(this.d.load().messages)) {
       const sh = m.shipping;
-      if (sh?.state !== "landing" || !m.ship || this.landingNow.has(id)) continue;
+      if (!sh || !m.ship || this.landingNow.has(id)) continue;
+      if (sh.edited === false && now - sh.at < DAY) await this.showLanding(id);
+      if (sh.state !== "landing") continue;
+      if (this.voided(sh.at)) { await this.settleLanding(id, STOPPED_FIRST); continue; }
       if ((sh.next ?? sh.at + LANDING_STALE_MS) > now) continue;
-      if (this.stopped().stopped) { await this.settleLanding(id, { ok: false, why: "everything is stopped", again: false, stopped: true }); continue; }
+      if (now - sh.at >= LANDING_TRY_MS) {
+        const inMain = this.d.landed ? await this.d.landed(m.ship).catch(() => null) : null;
+        if (inMain === true) await this.settleLanding(id, { ok: true, already: true });
+        else if (inMain === false) await this.settleLanding(id, { ok: false, why: `it couldn't land within 2 hours of the tap${sh.why ? `: ${sh.why}` : ""}`, again: false });
+        continue;                                    // can't tell: the next sweep looks again
+      }
       if (!this.d.land) { await this.settleLanding(id, { ok: false, why: "the link has no deploy key now", again: false }); continue; }
-      await this.landShip(id);                      // past 2 hours, a try that still can't is the last one
+      await this.landShip(id);
     }
   }
 
-  // His Stop ends every landing still waiting; one under way checks Stop again right
-  // before its push, and says whether it landed first.
+  // His Stop ends every landing still waiting; one under way checks again right before
+  // its push, and says whether it landed first.
   private async cancelLandings(): Promise<void> {
     for (const [id, m] of Object.entries(this.d.load().messages))
-      if (m.shipping?.state === "landing" && !this.landingNow.has(id))
-        await this.settleLanding(id, { ok: false, why: "everything is stopped", again: false, stopped: true });
+      if (m.shipping?.state === "landing" && !this.landingNow.has(id)) await this.settleLanding(id, STOPPED_FIRST);
   }
 
   // Once a day: does GitHub still know the link's deploy key? A key added with an OAuth

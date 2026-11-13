@@ -77,7 +77,8 @@ Ship tap lands that one pull request at that one commit in `main`, right then: t
 checks it's still open and at that commit, that its tests passed, and that nothing else
 landed meanwhile, then puts exactly that commit on `main`. The card says "Shipped" or
 why not. If GitHub doesn't answer, the card says it's waiting, and it lands by itself as
-soon as GitHub answers, for up to 2 hours. While everything is stopped, nothing lands.
+soon as it can, for up to 2 hours. While everything is stopped, nothing lands, and a
+Stop after your Ship tap ends that tap for good, even once you turn things back on.
 
 Then Cain installs it: his Ship job needs your tap, signed by the App for that pull
 request and commit and good for 2 hours. A tap from before a Stop no longer counts.

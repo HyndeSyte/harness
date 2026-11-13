@@ -288,3 +288,24 @@ describe("what GitHub says", () => {
     expect(await facts({ api: async () => ({ status: 500, body: null }) }, REPO, 13)).toBeNull();
   });
 });
+
+describe("review fixes (Fable, Nov 13)", () => {
+  test("a key GitHub refuses, a host key that isn't GitHub's, or a pull request that isn't there won't mend by waiting", async () => {
+    const said = async (err: string) => {
+      const { d } = gh();
+      const git = d.git;
+      d.git = async (args, o) => args.includes("fetch") ? { code: 128, out: "", err } : git(args, o);
+      return land(d, L);
+    };
+    const refused = { ok: false, why: "GitHub refused the link's deploy key, so shipping needs its key set up again", again: false };
+    expect(await said("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.")).toEqual(refused);
+    expect(await said("ERROR: Repository not found.\nfatal: Could not read from remote repository.")).toEqual(refused);
+    expect(await said("Host key verification failed.\nfatal: Could not read from remote repository."))
+      .toEqual({ ok: false, why: "GitHub's SSH host key isn't one the link knows, so it won't send anything there", again: false });
+    expect(await said("ssh: connect to host github.com port 22: Connection timed out\nfatal: Could not read from remote repository."))
+      .toMatchObject({ ok: false, again: true });
+    const missing = gh();
+    missing.d.api = async () => ({ status: 404, body: { message: "Not Found" } });
+    expect(await land(missing.d, L)).toEqual({ ok: false, why: "GitHub has no such pull request", again: false });
+  });
+});
