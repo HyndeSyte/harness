@@ -83,6 +83,36 @@ describe("the keeper's holds", () => {
     expect(r.reason("lap-take-b")).toBe(`P33 is held by ${A}`);
   }, 30_000);
 
+  test("an item a laptop passes to Cain reaches him at once, with the note it left", () => {
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/ship-lock"] })] }]);
+    cycle(r.cfg);
+    expect(r.relayed()).toBe("");
+    r.inbox(["2.json", { id: "lap-pass-1", from: A, ops: [
+      { op: "note", item: "P33", text: "Ready to ship: https://github.com/HyndeSyte/harness/pull/13 at head abc; CI passed; reviewed by Fable and Opus" },
+      { op: "pass", item: "P33", to: "cain" }] }]);
+    expect(cycle(r.cfg).ok).toBe(true);
+    expect(r.holds().P33).toMatchObject({ holder: "cain", branches: ["claude/ship-lock"] });
+    const said = r.relayed();
+    expect(said).toContain(`${A} passed P33 to you (request lap-pass-1): it's yours now.`);
+    expect(said).toContain("Its note: «Ready to ship: https://github.com/HyndeSyte/harness/pull/13 at head abc; CI passed; reviewed by Fable and Opus»");
+    expect(said).toContain("/opt/cain/record.sh notes P33");
+  }, 30_000);
+
+  test("Cain hears nothing about a pass that isn't to him, or one he made", () => {
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    cycle(r.cfg);
+    r.inbox(["2.json", { id: "lap-pass-b", from: A, ops: [{ op: "pass", item: "P33", to: B }] }]);
+    cycle(r.cfg);
+    expect(r.holds().P33).toMatchObject({ holder: B });
+    expect(r.relayed()).toBe("");
+    r.cain({ id: "cain-take", ops: [take("P34", "his Start tap")] });
+    r.cain({ id: "cain-pass", ops: [{ op: "pass", item: "P34", to: A }] });
+    cycle(r.cfg);
+    expect(r.relayed()).not.toContain("passed");
+  }, 30_000);
+
   test("a hold ends after a day without a word from its holder", () => {
     const r = rig();
     r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);

@@ -22,7 +22,7 @@ const NOW = Date.now();
 const RUN = { pub: SHIP_PUB, stop: { stopped: false, at: null }, now: NOW };
 const TOKEN = makeToken(claimFor(PR5, SHA, NOW)!, (d) => edSign(null, d, SHIP_KEYS.privateKey));
 const GOOD_BUILD = "Branch: claude/one-voice-cards\nFix the sweep. Done when tests pass.";
-const GOOD_SHIP = `Ship pull request ${PR5} at head ${SHA}. Ship token: ${TOKEN}. Merge it with gh pr merge --squash --match-head-commit ${SHA}. Dane tapped Ship at 9:40.`;
+const GOOD_SHIP = `Install pull request ${PR5}, landed in main at ${SHA}. Ship token: ${TOKEN}. Dane tapped Ship at 9:40.`;
 
 describe("the RemoteTrigger hook", () => {
   test("allows only run, list_runs and get_run_log", () => {

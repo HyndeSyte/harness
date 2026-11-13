@@ -560,8 +560,8 @@ describe("threading", () => {
     expect(r.relayed[0]).toBe(`Dane tapped "Not filed" on your question P08 Q2: "P08 Q2: Filed?" (Discord message ${id}; its card shows his answer. If it needs words from you, reply with reply_to ${id})`);
     const s = ((await r.link.ship({ text: "Cain 0.7.0 ready.", item: "P41", pr: PR, head: SHA1.toUpperCase() })) as any).message;
     await r.tap(snap(r.msg(s)), r.ids(s)[0]);
-    expect(r.relayed[1]).toStartWith(`Dane tapped "Ship" on your Ship card for P41: ${PR} at head ${SHA1} (Discord message ${s}; its card shows his answer. If it needs words from you, reply with reply_to ${s}) Ship token: ship1.`);
-    expect(r.msg(s).content).toBe("P41: Cain 0.7.0 ready.\n\nYou answered: Ship");
+    expect(r.relayed[1]).toStartWith(`Dane tapped "Ship" on your Ship card for P41: ${PR} at head ${SHA1} (Discord message ${s}; its card shows his answer. If it needs words from you, reply with reply_to ${s}) The link landed it: main has that commit now. Ship token: ship1.`);
+    expect(r.msg(s).content).toBe("P41: Cain 0.7.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is next.");
   });
 
   test("the link's posts that answer a tap or a message are Discord replies", async () => {

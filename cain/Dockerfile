@@ -20,7 +20,7 @@ ARG CODEX_SHA_X86_64=9d64836106d5b374e90ee4454c7ebcde7ca7106558bd7e41a34b9f26ebd
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git unzip tmux nginx ripgrep jq tzdata bubblewrap \
+        ca-certificates curl git openssh-client unzip tmux nginx ripgrep jq tzdata bubblewrap \
     && rm -rf /var/lib/apt/lists/* \
     && case "${BUILD_ARCH}" in \
          aarch64) TT=aarch64; TS="${TTYD_SHA_AARCH64}"; CS="${CODEX_SHA_AARCH64}" ;; \
@@ -49,6 +49,6 @@ RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.8.0" \
+    io.hass.version="0.8.1" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"

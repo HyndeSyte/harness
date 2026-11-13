@@ -51,7 +51,8 @@ the App.
 - Once a card stops mattering its buttons come off, and it says why: "You answered:
   Filed", "Expired" or "Replaced by a newer card". Cain's questions and Ship cards last
   until the next morning check-in (7:10 AM, at least two hours away); a Ship card also
-  goes when its pull request changes, merges or closes.
+  goes when its pull request changes or closes. One for a change that's already in main
+  stays: your tap on it starts the install.
 - Tapping an old card does nothing, and says so.
 - The card shows what you tapped. When a tap needs words from Cain, they come as a reply
   to that card.
@@ -60,23 +61,36 @@ the App.
 
 The Stop button (on the morning message, the calendar digest and the calendar
 specialist's notices) stops what would start next: the calendar specialist, Cain's
-Build and Ship jobs, his Ship cards and outside reviews. A job already running
-finishes. The notice says what stopped, and the morning message's button becomes Turn
-back on. Only your tap turns it back on, and only from a card that's still current: a
-tap on an old card does nothing and brings a fresh notice whose button works. Cain has
-no button or command for it. While it's stopped, Cain can still answer you and keep
-the record.
+Build and Ship jobs, his Ship cards and outside reviews, and nothing lands in main. A
+job already running finishes. The notice says what stopped, and the morning message's
+button becomes Turn back on. Only your tap turns it back on, and only from a card
+that's still current: a tap on an old card does nothing and brings a fresh notice whose
+button works. An older notice loses a button that no longer does what it says ("Turned
+back on since."). Cain has no button or command for it. While it's stopped, Cain can
+still answer you and keep the record.
 
 ## Ship
 
-Your Ship tap is signed by Cain's App, not by Cain, for that one pull request at that
-one commit, and the approval lasts 2 hours. Cain's Ship job is checked for it before it
-starts, and it posts it on the pull request; GitHub starts checking it too with the
-next update. A tap while everything is stopped ships nothing, and the card says so; a
-tap from before a Stop no longer counts.
+`main` is what Home Assistant installs, and it's locked on GitHub so that only Cain's
+App can change it, with a key of its own (a deploy key) that never leaves the Pi. Your
+Ship tap lands that one pull request at that one commit in `main`, right then: the App
+checks it's still open and at that commit, that its tests passed, and that nothing else
+landed meanwhile, then puts exactly that commit on `main`. The card says "Shipped" or
+why not. If GitHub doesn't answer, the card says it's waiting, and it lands by itself as
+soon as GitHub answers, for up to 2 hours. While everything is stopped, nothing lands.
 
-The key that signs it is kept by the App. Cain's tools are barred from it, and once his
-session runs as its own user (the next step) he can't reach it at all.
+Then Cain installs it: his Ship job needs your tap, signed by the App for that pull
+request and commit and good for 2 hours. A tap from before a Stop no longer counts.
+
+A Ship card has a line of the App's own, from GitHub: how many commits and files the
+change has, and whether it touches the parts that matter most (Cain's link, his hooks,
+permissions or rules, Ship and Stop, GitHub's workflows, an App's image, the release
+rules), whatever Cain's own words on the card say.
+
+Both keys are kept by the App and left out of Home Assistant's backups. Cain's tools
+are barred from them, and once his session runs as its own user (the next step) he
+can't reach them at all. Once a day the App checks that GitHub still knows its deploy
+key, and Cain is told if it doesn't.
 
 ## If the calendar specialist stops
 

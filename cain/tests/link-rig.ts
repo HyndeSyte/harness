@@ -1,6 +1,7 @@
 // A fake Discord, record and clock around Cain's link (link/core.ts), for the tests.
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { emptyState, Link, type Pull, State } from "../rootfs/opt/cain/link/core";
+import type { Facts, Landed } from "../rootfs/opt/cain/link/merge";
 import { makeToken } from "../rootfs/opt/cain/ship-token";
 
 // The link's Ship key, for the tests: its public half as the hook and GitHub read it.
@@ -29,8 +30,19 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
   return JSON.stringify({ holds: full, waiting: [], downtime: [] });
 }
 
-export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean } = {}) {
+export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean } = {}) {
   let state: State = emptyState();
+  // GitHub, as the link's landings see it (merge.ts is tested on its own).
+  const github = {
+    main: [] as string[],                          // heads landed in main
+    landings: [] as { pr: string; head: string }[],
+    answers: [] as Landed[],                       // what the next landings answer; none left: it lands
+    facts: null as Facts | null,
+    key: true as boolean | null,                   // GitHub knows the deploy key
+    hold: false,                                   // a landing waits until go()
+  };
+  const landWaiting: (() => void)[] = [];
   const stop = { stopped: false, at: null as number | null, broken: false };
   const harnessDown = { down: false };                // the calendar specialist doesn't take taps
   const t = { now: opts.now ?? NOV11_8AM };
@@ -104,6 +116,17 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       write: (stopped: boolean, at: number) => { stop.stopped = stopped; stop.at = at; },
     },
     signShip: opts.noKey ? undefined : (claim: any) => makeToken(claim, (d) => edSign(null, d, SHIP_KEYS.privateKey)),
+    land: opts.noDeployKey ? undefined : async (l: { pr: string; head: string; stopped: () => boolean }): Promise<Landed> => {
+      github.landings.push({ pr: l.pr, head: l.head });
+      if (github.hold) await new Promise<void>((ok) => landWaiting.push(ok));
+      const next = github.answers.shift();
+      if (next) { if (next.ok) github.main.push(l.head); return next; }
+      if (l.stopped()) return { ok: false, why: "everything is stopped", again: false, stopped: true };
+      github.main.push(l.head);
+      return { ok: true, already: false };
+    },
+    facts: opts.facts ? async () => github.facts : undefined,
+    keyKnown: opts.keyCheck ? async () => github.key : undefined,
   };
   let link = new Link(deps);
   const tap = (msg: any, custom_id: string, over: any = {}) => {
@@ -120,8 +143,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const r = {
     get link() { return link; },
-    calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown,
+    calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
     release: () => { gate.posts = false; gate.history = false; for (const ok of waiting.splice(0)) ok(); },
+    go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,
     posts: () => calls.filter((c) => c.method === "POST" && c.path === `/channels/${DM}/messages`).length,
     answers: () => calls.filter((c) => c.path.startsWith("/interactions/")).map((c) => c.body.type),

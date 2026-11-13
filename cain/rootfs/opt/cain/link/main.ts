@@ -22,15 +22,19 @@
 //     POST /stopped {}                  whether everything is stopped (Dane's Stop), and since when
 // Nothing is published to the LAN: the add-on has no "ports:".
 //
-// The Ship key (wave 1, piece B; shipkey.ts) signs Dane's Ship taps. Its public half goes
-// to /data/trust/ship.pub (the RemoteTrigger hook checks tokens with it) and into the log,
-// for the copy GitHub checks against on main (.github/ship.pub). /data/trust is only
-// root's to write; the Stop state lives there too (../stop.ts).
+// The Ship key (wave 1, piece B; shipkey.ts) signs Dane's Ship taps once they're in main.
+// Its public half goes to /data/trust/ship.pub, where the RemoteTrigger hook checks
+// tokens with it. /data/trust is only root's to write; the Stop state lives there too
+// (../stop.ts). The deploy key (deploykey.ts) is the one key main is locked to: with it
+// the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
+// are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
 import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
+import { loadDeployKey } from "./deploykey";
+import { facts, keyAnswer, land, type MergeDeps } from "./merge";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -45,6 +49,9 @@ const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper'
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
+const DEPLOY_KEY = `${DIR}/deploy_key`;
+const REPO_DIR = `${DIR}/repo.git`;                  // the link's own copy, for landing his Ship taps
+const KNOWN_HOSTS = "/opt/cain/link/github_known_hosts";
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
 const SWEEP_MS = 60_000;
@@ -117,7 +124,8 @@ async function pullNow(pr: string): Promise<Pull | null> {
     if (r.ok) {
       const j: any = await r.json();
       const head = String(j?.head?.sha ?? "");
-      return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null };
+      return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null,
+        merged: j?.merged === true };
     }
   } catch { /* fall back to the refs */ }
   try {
@@ -137,6 +145,45 @@ async function pullNow(pr: string): Promise<Pull | null> {
 const shipKey = loadShipKey(SHIP_KEY, SHIP_PUB, (line) => console.log(`[cain] link: ${line}`));
 const shipPriv = shipKey?.key ?? null;
 
+// The deploy key: made once, never printed. No key: nothing lands in main.
+const deployKey = loadDeployKey(DEPLOY_KEY, (line) => console.log(`[cain] link: ${line}`));
+
+// GitHub, for landing his Ship taps: its API without a key (a public repository; 60 asks
+// an hour), and git in the link's own copy, over SSH with the deploy key and GitHub's
+// pinned host keys. Nothing else's config or credentials take part.
+async function githubApi(path: string): Promise<{ status: number; body: any }> {
+  const r = await fetch(`https://api.github.com${path}`, { redirect: "error", signal: AbortSignal.timeout(15000),
+    headers: { accept: "application/vnd.github+json", "user-agent": "cain-link", "x-github-api-version": "2022-11-28" } });
+  return { status: r.status, body: await r.json().catch(() => null) };
+}
+const SSH = ["ssh", "-F", "/dev/null", "-i", DEPLOY_KEY, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
+  "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${KNOWN_HOSTS}`, "-o", "ConnectTimeout=15"];
+const GIT_ENV: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: DIR, GIT_TERMINAL_PROMPT: "0",
+  GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+async function run(args: string[], env: Record<string, string>, timeoutMs: number): Promise<{ code: number; out: string; err: string }> {
+  const p = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", env });
+  const timer = setTimeout(() => p.kill(), timeoutMs);
+  const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+  const code = await p.exited;
+  clearTimeout(timer);
+  return { code, out, err };
+}
+async function gitRun(args: string[], o: { ssh?: boolean; timeoutMs?: number } = {}): Promise<{ code: number; out: string; err: string }> {
+  const env = o.ssh ? { ...GIT_ENV, GIT_SSH_COMMAND: SSH.join(" ") } : GIT_ENV;
+  if (!existsSync(`${REPO_DIR}/HEAD`)) {
+    mkdirSync(REPO_DIR, { recursive: true, mode: 0o700 });
+    await run(["git", "-C", REPO_DIR, "init", "--bare", "--quiet"], GIT_ENV, 30_000);
+  }
+  return run(["git", "-C", REPO_DIR, ...args], env, o.timeoutMs ?? 60_000);
+}
+const github: MergeDeps = { api: githubApi, git: gitRun, stopped: () => readStop().stopped };
+const SHIP_REPO = "HyndeSyte/harness";
+async function keyKnown(): Promise<boolean | null> {
+  const r = await run([...SSH, "-T", "git@github.com"], GIT_ENV, 30_000).catch(() => null);
+  return r ? keyAnswer(`${r.out}\n${r.err}`, SHIP_REPO) : null;
+}
+const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
+
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
@@ -146,6 +193,13 @@ const link = new Link({
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
+  land: deployKey ? async ({ pr, head, stopped }) => {
+    const p = pullOf(pr);
+    if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
+    return land({ ...github, stopped }, { repo: p.repo, pr: p.pr, head });
+  } : undefined,
+  facts: async (pr) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr) : null; },
+  keyKnown: deployKey ? keyKnown : undefined,
 });
 
 // -- the gateway's health, for the Harness page ------------------------------------
@@ -236,7 +290,9 @@ Bun.serve({
 });
 console.log(`[cain] link listening on ${PORT}`);
 if (shipKey?.remade)
-  link.relayLine(`The Ship key couldn't be read, so a new one was made. GitHub checks Ship taps against the old one until main's .github/ship.pub is the new public key (it's in /data/trust/ship.pub), so nothing can merge until then. Tell Dane in one line that shipping is down until it's fixed, and log a Build item: "Ship key remade: put the new public key on main" (RELEASING.md, If the Ship key is remade).`);
+  link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
+if (!deployKey || deployKey.remade)
+  link.relayLine(`${deployKey ? "The deploy key couldn't be read, so a new one was made" : "The link has no deploy key"}, so his Ship taps can't land anything in main until ${deployKey ? "its public half (in the add-on's log) is added on GitHub and the old one deleted there" : "that's fixed"}. Tell Dane in one line that shipping is down until then: it needs a laptop session at his PC (RELEASING.md, If the deploy key is remade). Keep it in PENDING marked "At his PC".`);
 
 // -- the gateway: taps and reactions ---------------------------------------------------
 let ws: WebSocket | null = null;

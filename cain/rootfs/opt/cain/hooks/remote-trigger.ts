@@ -92,7 +92,7 @@ export function decide(call: any, holdsText: string | null, env: Env = {}): stri
   }
   // Ship: his signed tap, for the pull request and head this job names.
   if (!/\b[0-9a-f]{40}\b/i.test(text))
-    return "A Ship job carries the full 40-character head sha his Ship card was for (it's in the relayed tap), and merges with gh pr merge --squash --match-head-commit <that sha>.";
+    return "A Ship job carries the full 40-character head sha his Ship card was for (it's in the relayed line that says the link landed it), and installs that commit.";
   const token = findToken(text);
   if (!token)
     return "A Ship job carries the Ship token from his relayed Ship tap (\"Ship token: ship1....\"), exactly as it came. No token, no Ship: ask him again with a new Ship card if it's gone.";

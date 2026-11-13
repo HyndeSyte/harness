@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1
+
+- Your Ship tap now ships the change itself, right away: Cain's App puts it in main the moment you tap, and the card says "Shipped" or why not. Then Cain installs it.
+- Once main is locked to the App on GitHub (right after this update), nothing else can change main: not Cain, not his cloud jobs, not a laptop session.
+- Stop now freezes shipping too: while stopped, nothing lands in main.
+- If GitHub doesn't answer when you tap Ship, the card says it's waiting, and it lands by itself as soon as GitHub answers, for up to 2 hours.
+- A Ship card carries a line of its own from GitHub: how many commits and files the change has, and whether it touches the parts that matter most.
+- An old Stop notice loses its Turn back on button once things are back on, and says so.
+- When a laptop session hands a finished change to Cain, he hears at once, so it reaches your Ship card without waiting for a check-in.
+- The App's two keys are left out of Home Assistant backups.
+
 ## 0.8.0
 
 - Stop now stops Cain's side too: his Build and Ship jobs, his Ship cards and outside reviews, as well as the calendar specialist. The Stop notice says so, and the morning message's button turns into Turn back on. A job already running finishes; nothing new starts.

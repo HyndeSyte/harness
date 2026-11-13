@@ -257,6 +257,19 @@ function beat(st: State, now: Date) {
   st.downtime = st.downtime.filter(([, b]) => now.getTime() - Date.parse(b) < 30 * 86_400_000).slice(-200);
 }
 
+// An item passed to Cain is his from now on, and he hears it at once, with the notes
+// the same request left on it: a laptop's pull request goes to Dane's Ship card that
+// way, without waiting for a check-in.
+export function passLines(req: Request, o: Outcome): string[] {
+  if (o.from === "cain") return [];
+  const ops: any[] = Array.isArray(req.ops) ? req.ops : [];
+  return ops.filter((p) => p?.op === "pass" && p.to === "cain").map((p) => {
+    const notes = ops.filter((n) => n?.op === "note" && n.item === p.item && typeof n.text === "string").map((n) => clean(n.text, MAX_NOTE));
+    const said = notes.length ? ` Its note: «${notes.join(" ")}»` : "";
+    return `${o.from} passed ${clean(p.item, 20)} to you (request ${o.id}): it's yours now.${said} Read its notes with /opt/cain/record.sh notes ${clean(p.item, 20)} before you act on it.`;
+  });
+}
+
 const message = (o: Outcome) => o.state === "done"
   ? `${o.summary} (request ${o.id}, from ${o.from})`
   : `Request ${o.id} ${o.state}: ${o.reason ?? "relayed to Cain"}`;
@@ -266,7 +279,9 @@ function report(cfg: Config, o: Outcome, local: boolean, req: Request | undefine
   // Status files are for Cain's own requests, so an inbox file can't overwrite one.
   if (local) writeFileSync(outcomeFile(cfg, o.id), JSON.stringify(o));
   log(`${o.id} from ${o.from}: ${o.state}${o.reason ? ` (${o.reason})` : ""}`);
-  if (o.state === "relayed" && req?.note) {
+  if (o.state === "done" && req) {
+    for (const line of passLines(req, o)) relay(cfg, line);
+  } else if (o.state === "relayed" && req?.note) {
     const about = req.note.about ? ` about ${clean(req.note.about, 120)}` : "";
     const text = clean(req.note.text, MAX_NOTE);
     relay(cfg, `Dane's page sent a note${about} (request ${o.id}). His words, as typed: «${text}»`);

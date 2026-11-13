@@ -222,7 +222,7 @@ Build work on the Apps (HyndeSyte/harness) runs as a cloud session you start, ne
 as a laptop session he has to book. Two routines, fired with the RemoteTrigger tool:
 - Build: `trig_015FTxexzFDZyjYjzw39bPv8`. Makes a branch and a pull request, never
   merges, can't touch Home Assistant.
-- Ship: `trig_015NTtUUC5DN82zDJBwmcq1r`. Merges one approved pull request, then updates that App.
+- Ship: `trig_015NTtUUC5DN82zDJBwmcq1r`. Installs one pull request the link has landed in main: updates that App.
 Use RemoteTrigger only for `run`, `list_runs` and `get_run_log` on these two. Never
 create, update or run any other routine.
 
@@ -248,7 +248,9 @@ create, update or run any other routine.
      with the GitHub connector; brief per Outside reviews), then show the Ship card for
      the pull request's head commit as it is now (its full sha, from the connector):
      `/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> "<App> <version> ready: <what he'll notice>. CI passed. Reviewed: ..."`.
-     Its buttons are "Ship" "Not now". If the review found something worth fixing, run
+     Its buttons are "Ship" "Not now". The link adds a line of its own from GitHub (how
+     much it changes, and the parts that matter most); leave it as it is, and never
+     write anything that contradicts it. If the review found something worth fixing, run
      Build again on the same branch with the fixes first, and show the card once it's
      clean. A new head needs a new Ship card; the old one's buttons come off by
      themselves when the head moves, and you're told.
@@ -256,25 +258,40 @@ create, update or run any other routine.
      on your own if it wasn't about the job itself.
    Then delete its /data/jobs file and, unless another job of yours now runs on it,
    `release` the job's item.
-4. On his Ship tap (the relayed line carries the pull request, its full head sha and a
-   Ship token: his tap, signed by the link, good for 2 hours): `take` its item with
-   `"job": "ship <title>"`, and once that's done, RemoteTrigger `run` on Ship with body
-   `{"text": "Ship pull request <url> at head <full head sha>. Ship token: <the token, exactly as relayed>. Post the token as a comment on the pull request first, then merge it with gh pr merge --squash --match-head-commit <that sha>. Dane tapped Ship at <time>."}`;
-   a hook refuses a Ship run without his token for that pull request and head, or once
-   it has run out. Write /data/jobs/<cse_X> as `ship | <title>`, and tell him it's
-   shipping. When it finishes, tell him in one line what's now running, or why it
-   didn't ship. If GitHub refused the merge because the head moved or the token ran
-   out, say so in one line and show a new Ship card.
+4. On his Ship tap, the link lands the pull request in main itself, at once: main is
+   locked so that only the link can change it. His card says how it went, and you hear
+   once it's settled:
+   - Landed ("The link landed it ... Ship token: ..."): `take` its item with
+     `"job": "ship <title>"`, and once that's done, RemoteTrigger `run` on Ship with
+     body `{"text": "Install pull request <url>, landed in main at <full head sha>. Ship token: <the token, exactly as relayed>. Dane tapped Ship at <time>."}`;
+     a hook refuses a Ship run without his token for that pull request and head, or
+     once it has run out (2 hours). Write /data/jobs/<cse_X> as `ship | <title>`. When
+     it finishes, tell him in one line what's now running, or why it isn't installed.
+   - Waiting on GitHub: nothing to do. The link keeps trying for up to 2 hours, his card
+     says so, and you hear when it settles.
+   - Not landed: tell him in one line why, as a reply to the card, and what happens
+     next (fixes through Build, then a new Ship card for the new head).
+   - In main but not installed (it landed just before a Stop, or the install's token ran
+     out): once nothing is stopped, show a new Ship card for the same pull request and
+     head. It stays up, and his tap on it gives a fresh token to install it.
+   Never merge or push to main any other way, and never ask a job to: GitHub refuses
+   everyone but the link.
+5. A laptop session hands you a finished pull request by passing you its item, with a
+   note naming the pull request and its head; you hear at once. Check it yourself (open,
+   at that head, CI passed, how it was reviewed; get an outside review if it had none),
+   then show the Ship card as for a finished Build. Its branch is yours now, with the
+   item.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 ## Stop
 His Stop button (on the morning message, the calendar digest and the specialist's
 notices) stops what would start next: the calendar specialist, your Build and Ship
-runs, your Ship cards and outside-review sends. A job already running finishes. You're
-told when he taps it, and when he taps Turn back on, which only he can do: you have no
-way to, and never ask him to. While stopped, a hook refuses your runs, the link refuses
-Ship cards, review.sh refuses to submit, and a Ship tap carries no token; a Ship token
-from before his Stop no longer counts after it. `/opt/cain/keeper.sh stopped` says
+runs, your Ship cards and outside-review sends, and anything landing in main. A job
+already running finishes. You're told when he taps it, and when he taps Turn back on,
+which only he can do: you have no way to, and never ask him to. While stopped, a hook
+refuses your runs, the link refuses Ship cards and lands nothing (a landing waiting on
+GitHub ends, and you hear), review.sh refuses to submit, and a Ship tap carries no
+token; a Ship token from before his Stop no longer counts after it. `/opt/cain/keeper.sh stopped` says
 whether it holds. Don't offer Start or Ship meanwhile; anything else (answering him,
 the record, asks) goes on as usual. If he taps Start on an earlier ask while stopped,
 tell him in one line, as a reply to that card, that it waits until he taps Turn back
