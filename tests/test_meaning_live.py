@@ -1044,6 +1044,50 @@ def test_a_block_moved_after_a_read_found_it_is_read_again_where_it_is(drives):
     assert drives.live.send_receipts() == 1
 
 
+def not_confirmed_then_moved(rig, *, sent: bool):
+    """A block three reads didn't find (its receipt sent with the digest, or not yet), then moved
+    by us to 1:00 PM the next day. Returns the block's row and its new start."""
+    start = when(rig, days=3, hour=10)
+    goes(rig, "Eye doctor", start, CLINIC)
+    go(rig)
+    go(rig)                                                   # written: its receipt waits for a read
+    [r] = rig.live.written()
+    for _ in range(meaning_live.READS_TO_CONFIRM):
+        rig.live.read_back(r["id"], False)
+    assert [x["state"] for x in receipts(rig)] == ["unconfirmed"]
+    if sent:
+        assert rig.live.send_receipts() == 1                  # out with the digest, as not confirmed
+    row = rig.ledger.db.execute("SELECT * FROM family_gmail WHERE key=?", (r["gmail_key"],)).fetchone()
+    later = when(rig, days=4, hour=13)
+    rig.gm._moved(row, Want(row["key"], row["title"], later, later + timedelta(hours=1),
+                            place=CLINIC, state="confirmed"))
+    return row, later
+
+
+def test_a_block_not_confirmed_then_moved_is_read_again_where_it_is(drives):
+    """Its receipt hadn't gone out: its reads start over where the block is now, and once a read
+    finds it there, it says Added, at the new time."""
+    row, later = not_confirmed_then_moved(drives, sent=False)
+    [r] = receipts(drives)
+    assert r["state"] == "written" and r["reads"] == 0
+    block = google_cal.Block(row["event_id"], '"9"', row["title"], later, later + timedelta(hours=1), True, CLINIC)
+    drives.gm._read_back({row["event_id"]: block}, drives.clock(), later + timedelta(days=30))
+    [r] = receipts(drives)
+    assert r["state"] == "new" and datetime.fromisoformat(r["start"]) == later
+    assert "not confirmed" not in drives.live.digest_line()
+    assert drives.live.send_receipts() == 1
+    drives.tick()
+    _, text, _, _ = drives.with_button("Not mine")
+    assert text.startswith("Added to your Gmail: Busy (family), ") and ", 1:00 PM to 2:00 PM, " in text
+
+
+def test_a_not_confirmed_receipt_already_sent_stays_as_it_went_after_a_move(drives):
+    not_confirmed_then_moved(drives, sent=True)
+    [r] = receipts(drives)
+    assert r["state"] == "shown" and r["reads"] == meaning_live.READS_TO_CONFIRM
+    assert drives.live.written() == [] and drives.live.send_receipts() == 0
+
+
 def test_receipts_waiting_from_before_wait_for_a_read(tmp_path):
     """Unsent receipts from before 0.22.0 were never read back: the first open makes them wait for a
     read like a new one, once."""

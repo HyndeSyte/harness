@@ -419,10 +419,13 @@ class MeaningLive:
 
     def moved(self, key: str, generation: int) -> None:
         """Its block moved before its receipt went out: the receipt waits for a read of where it is
-        now, and then says that."""
+        now, and then says that. That holds for one not confirmed yet too: its reads start over
+        where the block is now. Both states go out with the digest and become 'shown' as they do
+        (send_receipts), so one already sent is left as it went."""
         with self.ledger.tx() as db:
             db.execute("UPDATE meaning_receipts SET state='written', reads=0, updated_at=? WHERE id=?"
-                       " AND state='new'", (iso(self.ledger.now()), receipt_id(key, generation)))
+                       " AND state IN ('new','unconfirmed')",
+                       (iso(self.ledger.now()), receipt_id(key, generation)))
 
     def written(self) -> list:
         """Receipts waiting for a read of Gmail to find their block as written."""

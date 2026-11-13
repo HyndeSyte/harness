@@ -66,6 +66,7 @@ MAX_TAPLESS_PER_DAY = 5
 RECHECK_EVERY = timedelta(hours=1)    # a bake-in check that couldn't complete
 READS_TO_CONFIRM = 3                  # reads that don't find a written add before it's "not confirmed"
 READ_AGAIN = timedelta(minutes=1)     # how soon a read that couldn't tell is tried again
+MAX_READS_PER_PASS = 10               # written adds read back in one pass, oldest first: a backlog waits its turn
 UNCONFIRMED_AFTER = timedelta(minutes=30)   # written this long with no read finding it: "not confirmed"
 
 # What the thread is told when a write did not end in a success.
@@ -655,10 +656,17 @@ class FamilyAdd:
         self._fail_orphans()
         for p in self._approved():
             self._execute(p, paused)
+        # Each read is a request to iCloud on this thread, so a pass reads at most
+        # MAX_READS_PER_PASS, the longest waiting first; a read moves its add to the back.
         now = self.ledger.now()
-        for row in self.ledger.db.execute("SELECT * FROM family_adds WHERE state='written'").fetchall():
+        reads = 0
+        for row in self.ledger.db.execute("SELECT * FROM family_adds WHERE state='written'"
+                                          " ORDER BY updated_at, rowid").fetchall():
+            if reads >= MAX_READS_PER_PASS:
+                break
             if datetime.fromisoformat(row["updated_at"]) + READ_AGAIN <= now:
                 self._read_back(row)
+                reads += 1
         for row in self.ledger.db.execute(
                 "SELECT * FROM family_adds WHERE undo_state='requested'").fetchall():
             self._undo(row, paused)

@@ -552,6 +552,32 @@ def test_half_an_hour_of_reads_that_cant_tell_is_not_confirmed(on, monkeypatch):
     assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("unconfirmed", 0)
 
 
+def test_a_pass_reads_back_at_most_ten_written_adds_the_longest_waiting_first(on, monkeypatch):
+    """Each read is a request to iCloud on the controller's thread: a backlog is read over
+    passes, the longest waiting first, never all in one."""
+    asked = []
+
+    def cant_tell(href):
+        asked.append(href)
+        return caldav.Outcome("failed"), ""
+    monkeypatch.setattr(on.fa.client, "fetch", cant_tell)
+    n = family_add.MAX_READS_PER_PASS + 2
+    for _ in range(n):
+        on.ask()
+        on.press(on.with_button("Approve"), "Approve")
+        on.advance(seconds=1)                           # each written a moment after the one before
+    oldest_first = [on.fa.client.href_for(r["uid"]) for r in on.ledger.db.execute(
+        "SELECT uid FROM family_adds WHERE state='written' ORDER BY updated_at")]
+    assert len(oldest_first) == n and len(asked) == n   # each read once, right after its write
+    asked.clear()
+    on.advance(minutes=2)
+    on.tick()
+    assert asked == oldest_first[:family_add.MAX_READS_PER_PASS]
+    asked.clear()
+    on.tick()                                           # the rest at the next pass
+    assert asked == oldest_first[family_add.MAX_READS_PER_PASS:]
+
+
 ICLOUD = "\r\n".join([
     "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Apple Inc.//iCloud Web Calendar//EN", "CALSCALE:GREGORIAN",
     "BEGIN:VTIMEZONE", "TZID:America/New_York", "BEGIN:DAYLIGHT", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400",
