@@ -10,9 +10,10 @@ Home Assistant offers an update when `version` in an App's `config.yaml` changes
 `main`. So `main` is what gets installed: nothing reaches it without passing CI and
 without Dane's go.
 
-`main` changes only through pull requests (a GitHub ruleset): no direct pushes from
-anyone, laptop sessions included, and a pull request merges only when its branch is up
-to date with `main` and these checks pass on it:
+`main` changes only on Dane's Ship tap. Two GitHub rulesets (below) lock it so that
+only Cain's link can update it, with a deploy key only the link holds, and the link
+does that only for the pull request and head commit his Ship card was for, once its
+branch is up to date with `main` and these checks passed on it:
 
 - `pytest`: the Python tests.
 - `bun`: Cain's tests.
@@ -33,17 +34,25 @@ to date with `main` and these checks pass on it:
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.
 
-The ruleset on `main`, as set up:
+The rulesets on `main`, as set up:
 
-- Bypass list: empty. Nobody bypasses it, the repository owner included.
-- Require a pull request before merging; block force pushes and deletions.
-- Require status checks to pass, with "Require branches to be up to date before
-  merging" on.
-- Required checks `pytest`, `bun` and `pr`, each pinned to the GitHub Actions app as its
-  source, so a status posted by anything else can't stand in for one.
+- **Only Cain's link updates it** (ruleset 27164827): "Restrict updates" (only its
+  bypass list may update `main`) and "Require a pull request before merging". Bypass
+  list: deploy keys, always. The repository has exactly one deploy key with write
+  access: the link's.
+- **Checks and history** (no bypass list, so it binds the link's key too): required
+  checks `pytest`, `bun` and `pr`, each pinned to the GitHub Actions app as its source,
+  with "Require branches to be up to date before merging" on; block force pushes and
+  deletions.
 
-Once the ruleset is on, a pull request that changes `.github/workflows/tests.yml`
-changes what its own `pytest` and `bun` run; read workflow diffs before Ship.
+So GitHub refuses every other update of `main`, pull request merges included: Dane's
+own account, laptop sessions, cloud jobs and Cain. Changing a ruleset or adding a
+deploy key takes admin rights on the repository, which cloud jobs don't have (the Claude
+GitHub app they use has administration read only).
+
+A pull request that changes `.github/workflows/tests.yml` changes what its own `pytest`
+and `bun` run, and the Claude GitHub app can write workflow files: read workflow diffs
+before Ship. A Ship card says when a change touches GitHub's workflows.
 
 ## Build (a branch and a pull request)
 
@@ -63,42 +72,72 @@ changes what its own `pytest` and `bun` run; read workflow diffs before Ship.
    anything Dane must do (for example a new option to switch on).
 7. Wait for the `pytest`, `bun` and `pr` checks on the pull request to pass. Fix until
    they do.
-8. Never merge, never push `main`, never force-push. Shipping is a separate step.
+8. Never merge, never push `main`, never force-push. GitHub refuses it anyway: shipping
+   is Dane's tap.
+9. A laptop session hands its finished pull request to Cain: it passes its record item
+   to `cain` with a note naming the pull request, its full head sha, that CI passed,
+   and how it was reviewed. The record keeper tells Cain at once, and Cain shows Dane
+   the Ship card.
 
 ## Ship (only after Dane's go)
 
 Dane's go is his tap on Cain's Ship card for that one pull request, at the one head
-commit the card was for. The job's text carries that commit's full head sha and his
-Ship token: his tap, signed by Cain's link with a key only the link holds, for that
-pull request and head, good for 2 hours after the tap.
+commit the card was for (its full head sha). On that tap Cain's link lands it itself
+(`cain/rootfs/opt/cain/link/merge.ts`), with the deploy key only it holds:
 
-1. The pull request is open, its head commit is the full head sha in the job's text and
-   passed CI, and the diff matches its description. If `main` moved and it no longer
-   merges cleanly, or the head isn't that sha, stop and report.
-2. Post the Ship token, exactly as given and nothing else, as a comment on the pull
-   request: `gh pr comment <number> --body "<token>"`. Where `main` has the `ship`
-   check (`.github/workflows/ship.yml`), wait for it to pass on the head: it fails when
-   the token isn't his, has run out, or is for another pull request or head, and then
-   nothing merges, so stop and report.
-3. Squash-merge it into `main`, pinned to that head with GitHub's head match:
-   `gh pr merge <number> --squash --match-head-commit <full head sha>`. If GitHub refuses
-   because the head moved, nothing is merged: stop and report, and Cain asks again with a
-   new Ship card.
-4. Wait for CI on `main` to pass.
-5. In Home Assistant: check for App updates, then update only the App(s) the pull
-   request changed. Nothing else in Home Assistant: no options, no other Apps, no
-   services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
-6. Confirm the new version is running from the update result and the App's log.
+- it checks the pull request is open, into `main`, from a branch of this repository and
+  still at that head, and that its `pytest`, `bun` and `pr` checks passed there;
+- it checks `main` is an ancestor of that head, and that nothing is stopped;
+- it pushes exactly that commit to `main`, as a fast-forward, never forced. GitHub marks
+  the pull request merged.
+
+If GitHub doesn't answer, or the checks are still running, it tries again for up to 2
+hours, and the card says so; after that nothing is pushed, and a landing the link was
+cut off from (a restart) is settled from `main` itself. While Dane has everything
+stopped, nothing lands, and a Stop since his tap ends that landing for good, even once
+he has turned things back on: a new tap ships it.
+
+Then Cain starts the Ship job, which only installs. Its text carries the full head sha
+and Dane's Ship token: his tap, signed by the link for that pull request and head, good
+for 2 hours, without which Cain can't start the job.
+
+1. Check `main` contains that commit (`git fetch origin main`, then
+   `git merge-base --is-ancestor <sha> origin/main`) and the pull request shows merged.
+   If not, stop and report. Merge nothing and change no code. CI already passed on that
+   exact commit, so there's nothing more to wait for.
+2. In Home Assistant: check for App updates, then update only the App(s) the pull
+   request changed, with a backup taken first. Nothing else in Home Assistant: no
+   options, no other Apps, no services. Never read Cain's App info (`ha_get_app`): it
+   holds his GitHub token.
+3. Confirm the new version is running from the update result and the App's log.
 
 ## If the Ship key is remade
 
-Cain's App makes a new Ship key only when the old one can't be read, and says so in its
-log and to Cain. GitHub checks Ship taps against the public key on `main`
-(`.github/ship.pub`), so until that file is the new key (in `/data/trust/ship.pub` on the
-Pi, and in the App's log), no Ship tap can approve a merge, including the one that
-changes the file. That one pull request changes only `.github/ship.pub`, and ships on
-Dane's go with the `ship` check lifted from the ruleset for that one merge and put back
-right after.
+The link makes a new Ship key only when the old one can't be read (and on a restored
+Pi, since backups leave it out), and says so. Ship tokens from before it no longer
+count, so an install waiting on one needs a new Ship card. Nothing else to do.
+
+## If the deploy key is remade, or GitHub loses it
+
+The link makes a new deploy key only when the old one can't be read (and on a restored
+Pi, since backups leave it out). It logs the new public half, and Cain is told; once a
+day it also checks that GitHub still knows its key, and Cain is told if it doesn't.
+Until it's fixed, no Ship tap can land. The fix is at Dane's PC, on his OK: a laptop
+session adds the new public key in GitHub's web page (Settings, Deploy keys, Add deploy
+key, with write access), and deletes the old one there. Never add it with the `gh` CLI
+or another OAuth app's token: GitHub deletes a key added that way when the token is
+revoked. Keep exactly one deploy key with write access.
+
+## Break glass (the link can't ship)
+
+If the link itself is broken (a bad release, or the Pi is lost) and a fix has to reach
+`main`, then on Dane's OK, at his PC: a laptop session makes a temporary SSH key, adds
+it as a deploy key with write access in GitHub's web page, pushes the fix's commit to
+`main` as a fast-forward (`git push git@github.com:HyndeSyte/harness.git
+<sha>:refs/heads/main`), and deletes that key right after. The "Checks and history"
+ruleset still applies to it: the commit's checks must have passed, and no force push or
+deletion. Then install the App with a backup taken first, so a bad release can be
+rolled back from Home Assistant.
 
 ## Rules for every session
 

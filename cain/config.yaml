@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.8.0"
+version: "0.8.1"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -24,6 +24,12 @@ homeassistant_api: false
 hassio_api: false
 auth_api: false
 backup: cold
+# The link's two keys stay out of backups: whoever holds a backup can't sign a Ship
+# tap or update main with them. A restored Pi makes new ones (RELEASING.md, "If the
+# deploy key is remade").
+backup_exclude:
+  - "link/deploy_key*"
+  - "link/ship.key*"
 timeout: 30
 # Keys, entered by Dane here, never shown or logged. github_token: the record
 # keeper's GitHub fine-grained token for the org repo only (Contents read and write).

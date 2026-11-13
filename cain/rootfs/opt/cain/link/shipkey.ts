@@ -1,12 +1,12 @@
-// The link's Ship key (wave 1, piece B): an Ed25519 key that signs Dane's Ship taps,
-// made on first start in the link's own folder. Only the link is meant to read it:
-// Cain's tools are denied it, and once his session runs as its own user it can't
-// reach it at all. Its public half goes where the RemoteTrigger hook reads it, and
-// into the log, for the copy GitHub checks against on main (.github/ship.pub).
+// The link's Ship key (wave 1, piece B): an Ed25519 key that signs Dane's Ship taps once
+// they're in main, so Cain's Ship run can install them. Made on first start in the
+// link's own folder. Only the link is meant to read it: Cain's tools are denied it, and
+// once his session runs as its own user it can't reach it at all. Its public half goes
+// where the RemoteTrigger hook reads it, and into the log.
 //
 // Written whole or not at all. A key that can't be read is moved aside and a new one
-// made, so Ship taps are signed again at once; the new public half then has to reach
-// main before GitHub takes them (RELEASING.md, "If the Ship key is remade").
+// made, so Ship taps are signed again at once (RELEASING.md, "If the Ship key is
+// remade"). Home Assistant's backups leave it out (config.yaml, backup_exclude).
 import { createPrivateKey, createPublicKey, generateKeyPairSync, type KeyObject } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 

@@ -46,24 +46,35 @@ describe("Ship tokens", () => {
       .toThrow("Ed25519");
   });
 
-  test("his Ship tap carries a token for that pull request and head; Not now carries none", async () => {
+  test("his Ship tap, once it's in main, carries a token for that pull request and head; Not now carries none", async () => {
     const r = rig();
     const id = await ship(r);
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
+    expect(r.github.main).toEqual([SHA1]);
     const token = findToken(r.relayed[0])!;
     expect(r.relayed[0]).toContain(`Ship token: ${token} (good for 2 hours`);
     expect(readToken(token, KEY, r.t.now)).toEqual({ ok: true, claim: claimFor(PR, SHA1, r.t.now) });
-    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nYou answered: Ship");
+    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is next.");
     const no = await ship(r, SHA2);
     await r.tap(snap(r.msg(no)), r.ids(no)[1]);
     expect(findToken(r.relayed[1])).toBeNull();
+    expect(r.github.landings).toHaveLength(1);
   });
 
-  test("with no Ship key, a tap says so and carries nothing a Ship run would take", async () => {
+  test("with no Ship key, it lands but says so, and carries nothing a Ship run would take", async () => {
     const r = rig({ noKey: true });
     const id = await ship(r);
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
     expect(r.relayed[0]).toContain("no Ship key");
+    expect(findToken(r.relayed[0])).toBeNull();
+  });
+
+  test("with no deploy key, nothing lands, and Cain hears shipping is down", async () => {
+    const r = rig({ noDeployKey: true });
+    const id = await ship(r);
+    await r.tap(snap(r.msg(id)), r.ids(id)[0]);
+    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nYou tapped Ship, but shipping is down right now, so nothing shipped.");
+    expect(r.relayed[0]).toContain("The link has no deploy key, so nothing can land in main");
     expect(findToken(r.relayed[0])).toBeNull();
   });
 });
@@ -127,7 +138,8 @@ describe("Stop everything", () => {
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
     expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nYou tapped Ship, but everything is stopped, so nothing shipped.");
     expect(findToken(r.relayed.at(-1)!)).toBeNull();
-    expect(r.relayed.at(-1)).toContain("nothing ships");
+    expect(r.relayed.at(-1)).toContain("nothing lands in main");
+    expect(r.github.landings).toEqual([]);
   });
 
   test("a Stop state that can't be read counts as stopped", async () => {
@@ -211,7 +223,7 @@ describe("the RemoteTrigger hook, with Stop and signed Ship", () => {
     makeToken(claimFor(pr, head, at)!, (d) => edSign(null, d, key));
   const run = (text: string) => ({ tool_name: "RemoteTrigger", tool_input: { action: "run", trigger_id: SHIP, body: { text } } });
   const job = (token: string, pr = PR, head = SHA1) =>
-    `Ship pull request ${pr} at head ${head}. Ship token: ${token}. Post the token as a comment on the pull request first, then merge it with gh pr merge --squash --match-head-commit ${head}. Dane tapped Ship at 10:00.`;
+    `Install pull request ${pr}, landed in main at ${head}. Ship token: ${token}. Dane tapped Ship at 10:00.`;
 
   test("a Ship run needs his token for that pull request and head, still in time", () => {
     expect(decide(run(job(tokenFor())), holds, running)).toBe("");
@@ -390,11 +402,11 @@ describe("second review round (Opus, Nov 12)", () => {
     expect(RESUMED_TOO).not.toContain("cards can run");
   });
 
-  test("with no Ship key, his Ship card says nothing shipped", async () => {
+  test("with no Ship key, his Ship card says it's in main but not installed", async () => {
     const r = rig({ noKey: true });
     const id = await ship(r);
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
-    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nYou tapped Ship, but shipping is down right now, so nothing shipped.");
+    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is down right now, so it isn't installed yet.");
   });
 
   test("the Ship key: made once, kept, and remade when it can't be read", () => {

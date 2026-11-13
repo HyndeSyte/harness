@@ -852,11 +852,13 @@ def test_build_work_runs_as_cloud_jobs_with_his_go():
     releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
     assert "## Build" in releasing and "## Ship (only after Dane's go)" in releasing
     assert "Never read Cain's App info" in releasing
-    # A Build job names its branch; a Ship card and job carry the full head sha, and the
-    # merge is pinned to it with GitHub's head match.
+    # A Build job names its branch; a Ship card carries the full head sha, his tap lands
+    # exactly that commit in main (the link, with the one key main takes), and the Ship
+    # job only installs it.
     jobs = rules.split("## Cloud jobs")[1].split("\n## ")[0]
     assert "`Branch: claude/<slug>`" in jobs and "Never name a pull\n   request in place of its branch" in jobs
     assert "/opt/cain/keeper.sh ship --item" in jobs and "--head <full head sha>" in jobs
-    assert "gh pr merge --squash --match-head-commit <that sha>" in jobs
+    assert "landed in main at <full head sha>" in jobs and "Never merge or push to main any other way" in jobs
+    assert "gh pr merge" not in jobs
     ship = releasing.split("## Ship (only after Dane's go)")[1].split("\n## ")[0]
-    assert "--match-head-commit" in ship and "full head sha" in ship
+    assert "full head sha" in ship and "deploy key" in ship and "gh pr merge" not in ship
