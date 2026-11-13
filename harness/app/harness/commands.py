@@ -64,7 +64,7 @@ def card_stopped(ledger: Ledger, chat_id: int, db) -> int:
         drop = choices.mint(ledger, kind="stopped_drop", target=job_id, chat_id=chat_id,
                             ttl_s=STOPPED_CARD_TTL_S, db=db)
         ledger.enqueue(chat_id=chat_id, kind="card", job_id=job_id, db=db,
-                       text=f"While I was stopped, you asked: “{_few_words(text)}”. Do it now?",
+                       text=f"While I was stopped, you asked: \u201c{_few_words(text)}\u201d. Do it now?",
                        buttons=[[("Do it now", choices.callback_data(redo)),
                                  ("Drop it", choices.callback_data(drop))]],
                        binds=[{"type": "choice", "nonce": redo}, {"type": "choice", "nonce": drop}])
