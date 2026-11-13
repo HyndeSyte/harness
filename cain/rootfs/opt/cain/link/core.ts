@@ -54,6 +54,8 @@ const UPDATE = 7;
 const EPHEMERAL = 64;
 const REMEMBER_MS = 35 * 86400_000;
 const DAY = 86400_000;
+const HOUR = 3_600_000;
+const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub's facts before it says it couldn't read them
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long after his tap was cut off (a restart)
@@ -121,7 +123,9 @@ export interface State {
   held?: Ask[];
   migrated?: boolean;                // the one-time look over cards posted before 0.7.0 is done
   toggle?: string;                   // a Stop or Turn back on the calendar specialist didn't take yet (0.8.0)
-  key?: { checked: number; refused?: boolean };   // the daily check that GitHub still knows the deploy key (0.8.1)
+  // The daily check that GitHub still knows the deploy key (0.8.1): when, whether it was
+  // refused, and since when GitHub hasn't answered at all.
+  key?: { checked: number; refused?: boolean; unanswered?: number; toldUnanswered?: boolean };
 }
 
 export function emptyState(): State {
@@ -376,7 +380,8 @@ export interface Deps {
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string) => Promise<Facts | null>;                   // what GitHub says the pull request changes
-  keyKnown?: () => Promise<boolean | null>;                        // does GitHub still know the deploy key; null: can't tell
+  factsMs?: number;                                                // how long a Ship card waits for them (tests)
+  keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
 }
 
 // What stopped, as his Stop notice says it.
@@ -398,6 +403,13 @@ export function factsLine(f: Facts | null): string {
   const n = (k: number, one: string) => `${k} ${one}${k === 1 ? "" : "s"}`;
   const list = (xs: string[]) => xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`;
   return `From GitHub: ${n(f.commits, "commit")} and ${n(f.files, "file")}${f.areas.length ? `, including ${list(f.areas)}` : ""}.`;
+}
+
+// A promise's answer, or null once ms have passed.
+async function within<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((ok) => { timer = setTimeout(() => ok(null), ms); });
+  try { return await Promise.race([p, late]); } finally { clearTimeout(timer); }
 }
 
 // A time as people say it, in the check-ins' zone: "4:12 AM".
@@ -874,7 +886,7 @@ export class Link {
     // card's words say.
     let words = String(a.text);
     if (this.d.facts) {
-      const f = await this.d.facts(pr).catch(() => null);
+      const f = await within(this.d.facts(pr).catch(() => null), this.d.factsMs ?? FACTS_MS);
       if (f?.head && f.head !== head)
         throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
       // Cain's words give way, so the line is never cut off.
@@ -1276,9 +1288,20 @@ export class Link {
     return st.stopped || (st.at !== null && st.at > tapped);
   }
 
-  private landShip(msgId: string): Promise<void> {
+  // Work on a landing goes in line behind the one before it, and the card is marked as
+  // under way meanwhile, so nothing else starts on it.
+  private queue(msgId: string, job: () => Promise<void>): Promise<void> {
     this.landingNow.add(msgId);
-    const run = this.landChain.then(async () => {
+    const run = this.landChain.then(job).finally(() => this.landingNow.delete(msgId));
+    this.landChain = run.catch(() => {});
+    return run;
+  }
+
+  // Settles once every landing in line now has (for the tests; the sweep never waits).
+  whenLanded(): Promise<void> { return this.landChain.then(() => {}); }
+
+  private landShip(msgId: string): Promise<void> {
+    return this.queue(msgId, async () => {
       const m = this.d.load().messages[msgId];
       if (!m?.ship || m.shipping?.state !== "landing") return;
       const tapped = m.shipping.at;
@@ -1289,9 +1312,7 @@ export class Link {
         catch (e) { r = { ok: false, why: `the link hit an error (${String(e).slice(0, 80)})`, again: true }; }
       }
       await this.settleLanding(msgId, r);
-    }).finally(() => this.landingNow.delete(msgId));
-    this.landChain = run.catch(() => {});
-    return run;
+    });
   }
 
   // How his Ship tap went: on its card, and to Cain once. In main, it's signed for the
@@ -1376,7 +1397,8 @@ export class Link {
   // Landings due another try: one that can't land yet, and one the link was cut off from
   // (a restart). Each try starts by reading main, so one that landed is settled as landed.
   // A Stop since his tap ends it. Over 2 hours after his tap nothing is pushed any more:
-  // main alone says whether it landed.
+  // main alone says whether it landed. The tries go in line and the sweep doesn't wait
+  // for them, so other cards keep moving while GitHub is slow.
   private async retryLandings(): Promise<void> {
     const now = this.d.now();
     for (const [id, m] of Object.entries(this.d.load().messages)) {
@@ -1387,13 +1409,16 @@ export class Link {
       if (this.voided(sh.at)) { await this.settleLanding(id, STOPPED_FIRST); continue; }
       if ((sh.next ?? sh.at + LANDING_STALE_MS) > now) continue;
       if (now - sh.at >= LANDING_TRY_MS) {
-        const inMain = this.d.landed ? await this.d.landed(m.ship).catch(() => null) : null;
-        if (inMain === true) await this.settleLanding(id, { ok: true, already: true });
-        else if (inMain === false) await this.settleLanding(id, { ok: false, why: `it couldn't land within 2 hours of the tap${sh.why ? `: ${sh.why}` : ""}`, again: false });
-        continue;                                    // can't tell: the next sweep looks again
+        const ship = m.ship, why = sh.why;
+        void this.queue(id, async () => {
+          const inMain = this.d.landed ? await this.d.landed(ship).catch(() => null) : null;
+          if (inMain === true) await this.settleLanding(id, { ok: true, already: true });
+          else if (inMain === false) await this.settleLanding(id, { ok: false, why: `it couldn't land within 2 hours of the tap${why ? `: ${why}` : ""}`, again: false });
+        });                                          // can't tell: the next sweep looks again
+        continue;
       }
       if (!this.d.land) { await this.settleLanding(id, { ok: false, why: "the link has no deploy key now", again: false }); continue; }
-      await this.landShip(id);
+      void this.landShip(id);
     }
   }
 
@@ -1406,23 +1431,34 @@ export class Link {
 
   // Once a day: does GitHub still know the link's deploy key? A key added with an OAuth
   // app's token goes when that token is revoked, and then no Ship tap can land. Cain
-  // hears it once, with what fixes it, and again once it's back.
+  // hears it once, with what fixes it, and again once it's back. No answer is asked
+  // again in an hour; two days of none, and Cain hears that too.
   private async checkKey(): Promise<void> {
     if (!this.d.keyKnown) return;
     const now = this.d.now();
     const s = this.d.load();
     if (!s.key) { s.key = { checked: now }; this.d.save(s); return; }   // the first look is a day after the key is in use
     if (s.key.checked + KEY_CHECK_MS > now) return;
-    const known = await this.d.keyKnown().catch(() => null);
-    if (known === null) return;                      // GitHub didn't answer: tried again at the next sweep
+    const said = await this.d.keyKnown().catch(() => null);
     const s2 = this.d.load();
-    const was = s2.key?.refused === true;
-    s2.key = { checked: now, refused: !known };
+    const k = s2.key ?? { checked: now };
+    if (said === null) {
+      const since = k.unanswered ?? now;
+      const tell = now - since >= 2 * DAY && !k.toldUnanswered;
+      s2.key = { ...k, checked: now - KEY_CHECK_MS + HOUR, unanswered: since, ...(tell ? { toldUnanswered: true } : {}) };
+      this.d.save(s2);
+      if (tell) this.d.relay("The link hasn't reached GitHub over SSH for 2 days (port 22 blocked, or GitHub down), so his Ship taps may not land. Nothing for him to do yet; if it's still so tomorrow, tell him in one line and keep it in PENDING.");
+      return;
+    }
+    const bad = said !== "known", was = k.refused === true;
+    s2.key = { checked: now, refused: bad };
     this.d.save(s2);
-    if (!known && !was) {
-      this.log("GitHub doesn't know the deploy key any more");
-      this.d.relay("GitHub no longer knows the link's deploy key, so his Ship taps can't land anything in main. A laptop session at his PC adds it again (its public half is in the add-on's log; RELEASING.md, If the deploy key is remade). Tell him in one line that shipping is down until then, and keep it in PENDING marked \"At his PC\".");
-    } else if (known && was) {
+    if (bad && !was) {
+      this.log(said === "host key" ? "GitHub's SSH host key isn't one the link knows" : "GitHub doesn't know the deploy key any more");
+      this.d.relay(said === "host key"
+        ? "GitHub's SSH host key isn't one the link knows (a change on GitHub's side, or something in between), so the link won't land anything there. A laptop session checks GitHub's published keys and updates the pinned ones in a new release. Tell him in one line that shipping is down until then."
+        : "GitHub no longer knows the link's deploy key, so his Ship taps can't land anything in main. A laptop session at his PC adds it again (its public half is in the add-on's log; RELEASING.md, If the deploy key is remade). Tell him in one line that shipping is down until then, and keep it in PENDING marked \"At his PC\".");
+    } else if (!bad && was) {
       this.d.relay("GitHub knows the link's deploy key again: his Ship taps land again. Nothing to tell him unless he's waiting on it.");
     }
   }

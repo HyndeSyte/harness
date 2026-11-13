@@ -84,16 +84,19 @@ async function read(d: Pick<MergeDeps, "api">, path: string): Promise<any | "mis
   return null;
 }
 
-// Fetched over SSH with the deploy key: the pull request's head and main, as GitHub has
-// them now, into refs the link keeps for itself.
-// A key GitHub refuses, or a host key that isn't GitHub's, won't mend by waiting: those
-// end the landing; anything else (the network, a timeout) is tried again.
-async function fetchBoth(d: MergeDeps, l: Landing): Promise<Landed | null> {
+// Fetched over SSH with the deploy key: main as GitHub has it now, and the very commit
+// his card was for (by its sha, so no ref that lags behind can stand in for it), into
+// refs the link keeps for itself. A key GitHub refuses, a host key that isn't GitHub's,
+// a commit GitHub doesn't have, or one that fails the link's check won't mend by
+// waiting: those end the landing. Anything else (the network, a timeout) is tried again.
+async function fetchBoth(d: MergeDeps, l: Landing, withHead: boolean): Promise<Landed | null> {
   const r = await d.git(["-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", where(d, l.repo),
-    `+refs/pull/${l.pr}/head:refs/ship/pull`, "+refs/heads/main:refs/ship/main"], { ssh: true, timeoutMs: 90_000 });
+    ...(withHead ? [`+${l.head}:refs/ship/pull`] : []), "+refs/heads/main:refs/ship/main"], { ssh: true, timeoutMs: 90_000 });
   if (r.code === 0) return null;
   if (KEY_REFUSED.test(r.err)) return no(DEPLOY_KEY_REFUSED);
   if (HOST_KEY.test(r.err)) return no("GitHub's SSH host key isn't one the link knows, so it won't send anything there");
+  if (/not our ref|unadvertised object|couldn't find remote ref|no such remote ref/i.test(r.err)) return no("GitHub doesn't have that commit");
+  if (/fsck|is corrupt|bad object|missing (blob|tree|commit)/i.test(r.err)) return no("what GitHub sent failed the link's check (fsck), so it won't land it");
   return no(`the link couldn't fetch it from GitHub (${first(r.err) || `git exit ${r.code}`})`, true);
 }
 const KEY_REFUSED = /permission denied \(publickey\)|denied to deploy key|ERROR: Repository not found/i;
@@ -146,12 +149,12 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
     const bad = failedChecks(checks.check_runs);
     if (bad) return bad;
   }
-  const fetched = await fetchBoth(d, l);
+  const fetched = await fetchBoth(d, l, !merged);
   if (fetched) return fetched;
   // Already in main (an earlier tap landed it, or GitHub says it's merged): nothing to push.
   if (await ancestor(d, l.head, "refs/ship/main")) return { ok: true, already: true };
   if (merged) return no("GitHub says it's merged, but main doesn't have that commit");
-  if ((await sha(d, "refs/ship/pull")) !== l.head) return no("its branch moved on since the card: it has newer commits");
+  if ((await sha(d, "refs/ship/pull")) !== l.head) return no("GitHub sent something other than the commit his card was for");
   if (!(await ancestor(d, "refs/ship/main", l.head)))
     return no("main moved on since its branch was made: the branch needs main merged in, then a new Ship card");
   if (d.stopped()) return { ok: false, why: "everything is stopped", again: false, stopped: true };

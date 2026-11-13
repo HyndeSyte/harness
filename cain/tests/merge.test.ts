@@ -49,9 +49,11 @@ function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; 
       if (cmd === "fetch") {
         expect(o?.ssh).toBe(true);
         if (state.fetchFails) return { code: 128, out: "", err: "ssh: connect to host github.com port 22: Connection timed out" };
-        for (const spec of args.filter((a) => a.startsWith("+refs/"))) {
+        for (const spec of args.filter((a) => a.startsWith("+") && a.includes(":"))) {
           const [src, dst] = spec.slice(1).split(":");
-          const sha = src === "refs/heads/main" ? state.main : state.prHead;
+          // main by its name; the tapped commit by its sha, which GitHub has when it's the branch's head
+          const sha = src === "refs/heads/main" ? state.main : src === state.prHead || src.startsWith("refs/") ? state.prHead : "";
+          if (!sha) return { code: 128, out: "", err: `fatal: remote error: upload-pack: not our ref ${src}` };
           state.local.set(dst, sha); known(sha);
         }
         return { code: 0, out: "", err: "" };
@@ -210,6 +212,7 @@ describe("landing, with real git", () => {
     const origin = join(root, "origin.git"), work = join(root, "work"), link = join(root, "link.git");
     for (const [dir, bare] of [[origin, true], [work, false], [link, true]] as const)
       Bun.spawnSync(["git", "init", "--quiet", ...(bare ? ["--bare"] : []), "-b", "main", dir], { env });
+    sh(origin, "config", "uploadpack.allowReachableSHA1InWant", "true");   // as GitHub allows: a commit fetched by its sha
     sh(work, "config", "user.email", "t@example.com");
     sh(work, "config", "user.name", "t");
     const commit = (file: string) => {
@@ -304,6 +307,10 @@ describe("review fixes (Fable, Nov 13)", () => {
       .toEqual({ ok: false, why: "GitHub's SSH host key isn't one the link knows, so it won't send anything there", again: false });
     expect(await said("ssh: connect to host github.com port 22: Connection timed out\nfatal: Could not read from remote repository."))
       .toMatchObject({ ok: false, again: true });
+    // (Opus, Nov 13) A commit GitHub doesn't have, or one that fails the link's own check.
+    expect(await said(`fatal: remote error: upload-pack: not our ref ${H1}`)).toEqual({ ok: false, why: "GitHub doesn't have that commit", again: false });
+    expect(await said("error: object 1234: badTimezone: invalid author/committer line\nfatal: fsck error in packed object"))
+      .toEqual({ ok: false, why: "what GitHub sent failed the link's check (fsck), so it won't land it", again: false });
     const missing = gh();
     missing.d.api = async () => ({ status: 404, body: { message: "Not Found" } });
     expect(await land(missing.d, L)).toEqual({ ok: false, why: "GitHub has no such pull request", again: false });

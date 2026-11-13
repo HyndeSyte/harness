@@ -39,7 +39,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     landings: [] as { pr: string; head: string }[],
     answers: [] as Landed[],                       // what the next landings answer; none left: it lands
     facts: null as Facts | null,
-    key: true as boolean | null,                   // GitHub knows the deploy key
+    key: "known" as "known" | "refused" | "host key" | null,   // what GitHub says to the deploy key
+    keyAsked: 0,                                   // how often the link asked
+    factsHang: false,                              // GitHub never answers about a pull request's facts
     hold: false,                                   // a landing waits until go()
     readable: true,                                // main can be read (for landings over 2 hours old)
   };
@@ -127,8 +129,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       return { ok: true, already: false };
     },
     landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }) => github.readable ? github.main.includes(ship.head) : null,
-    facts: opts.facts ? async () => github.facts : undefined,
-    keyKnown: opts.keyCheck ? async () => github.key : undefined,
+    facts: opts.facts ? () => github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts) : undefined,
+    factsMs: 50,
+    keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,
   };
   let link = new Link(deps);
   const tap = (msg: any, custom_id: string, over: any = {}) => {

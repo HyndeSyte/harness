@@ -26,13 +26,13 @@ describe("the link's deploy key", () => {
     const lines: string[] = [];
     const t = fake();
     const k = loadDeployKey(path, (l) => lines.push(l), t);
-    expect(k).toEqual({ path, pub: PUB, remade: false });
+    expect(k).toEqual({ path, pub: PUB, made: true, remade: false });
     expect(lines).toEqual(["made a new deploy key", `deploy key (public): ${PUB} cain-link`]);
     expect(readdirSync(dir).sort()).toEqual(["deploy_key"]);
     expect(lines.join("\n")).not.toContain("PRIVATE");
     // A second start keeps it.
     const again: string[] = [];
-    expect(loadDeployKey(path, (l) => again.push(l), t)).toEqual({ path, pub: PUB, remade: false });
+    expect(loadDeployKey(path, (l) => again.push(l), t)).toEqual({ path, pub: PUB, made: false, remade: false });
     expect(t.made).toBe(1);
     expect(again).toEqual([`deploy key (public): ${PUB} cain-link`]);
   });
@@ -43,7 +43,7 @@ describe("the link's deploy key", () => {
     writeFileSync(path, "garbage", { mode: 0o600 });
     const lines: string[] = [];
     const k = loadDeployKey(path, (l) => lines.push(l), fake());
-    expect(k).toMatchObject({ pub: PUB, remade: true });
+    expect(k).toMatchObject({ pub: PUB, made: true, remade: true });
     expect(existsSync(`${path}.bad-1700000000000`)).toBe(true);
     expect(readFileSync(path, "utf8")).toBe("PRIVATE 1\n");
     expect(lines[0]).toContain("the deploy key couldn't be read (Error: invalid format), so it was moved aside and a new one made");

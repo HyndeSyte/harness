@@ -13,6 +13,8 @@ const tick = () => new Promise((ok) => setTimeout(ok, 5));
 const ship = async (r: ReturnType<typeof rig>, head = SHA1, pr = PR) =>
   ((await r.link.ship({ text: "P41: Cain 0.8.1 ready.", item: "P41", pr, head })) as any).message as string;
 const card = "P41: Cain 0.8.1 ready.";
+// The sweep doesn't wait for landings; the tests do.
+const sweep = async (r: ReturnType<typeof rig>) => { await r.link.sweep(); await r.link.whenLanded(); };
 const toggle = (label: string, id: string) => [{ type: 1, components: [{ type: 2, style: 2, label, custom_id: id }] }];
 
 describe("his Ship tap lands it in main", () => {
@@ -56,10 +58,10 @@ describe("his Ship tap lands it in main", () => {
     expect(r.relayed[0]).toContain("It can't land yet (GitHub didn't answer about the pull request), so the link keeps trying for up to 2 hours and lands it by itself");
     expect(findToken(r.relayed[0])).toBeNull();
     r.later(MIN);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.github.landings).toHaveLength(1);              // its next try is 2 minutes after the first
     r.later(2 * MIN);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.github.landings).toHaveLength(2);
     expect(r.msg(id).content).toBe(`${card}\n\nShipped: it's in main as of 8:03 AM. Installing it is next.`);
     expect(r.relayed).toHaveLength(2);
@@ -71,13 +73,13 @@ describe("his Ship tap lands it in main", () => {
     const id = await ship(r);
     for (let i = 0; i < 30; i++) r.github.answers.push({ ok: false, why: "the link couldn't fetch it from GitHub (timed out)", again: true });
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
-    for (let i = 0; i < 10; i++) { r.later(15 * MIN); await r.link.sweep(); }
+    for (let i = 0; i < 10; i++) { r.later(15 * MIN); await sweep(r); }
     expect(r.msg(id).content).toBe(`${card}\n\nNot shipped: it couldn't land within 2 hours of the tap: the link couldn't fetch it from GitHub (timed out). Nothing changed in main.`);
     expect(r.relayed).toHaveLength(2);                        // waiting, then given up: nothing in between
     expect(r.relayed[1]).toContain("didn't land it: it couldn't land within 2 hours of the tap");
     const tries = r.github.landings.length;
     r.later(HOUR);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.github.landings).toHaveLength(tries);          // given up means no more tries
   });
 
@@ -91,7 +93,7 @@ describe("his Ship tap lands it in main", () => {
     expect(r.msg(id).content).toBe(`${card}\n\nYou tapped Ship, but Stop came before it landed, so nothing shipped.`);
     expect(r.relayed.at(-1)).toContain("his Stop came first. Nothing changed in main, and there's no Ship token. Once nothing is stopped, ask again with a new Ship card.");
     r.later(HOUR);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.github.landings).toHaveLength(1);
 
     const r2 = rig();
@@ -134,10 +136,10 @@ describe("his Ship tap lands it in main", () => {
     r.restart();                                             // the add-on restarted mid-landing
     r.github.hold = false;
     r.later(4 * MIN);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.github.landings).toHaveLength(1);
     r.later(2 * MIN);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.github.landings).toHaveLength(2);
     expect(r.msg(id).content).toBe(`${card}\n\nShipped: it's in main as of 8:06 AM. Installing it is next.`);
     expect(findToken(r.relayed.at(-1)!)).not.toBeNull();
@@ -180,7 +182,7 @@ describe("the link's own line on a Ship card, from GitHub", () => {
     const r = rig();
     const id = await ship(r);
     r.pulls[PR] = { head: SHA1, open: false, merged: true };
-    await r.link.sweep();
+    await sweep(r);
     expect(r.buttons(id)).toEqual(["Ship", "Not now"]);
     r.github.main.push(SHA1);
     r.github.answers.push({ ok: true, already: true });
@@ -190,7 +192,7 @@ describe("the link's own line on a Ship card, from GitHub", () => {
     const r2 = rig();
     const c = await ship(r2);
     r2.pulls[PR] = { head: SHA2, open: false, merged: true };
-    await r2.link.sweep();
+    await sweep(r2);
     expect(r2.buttons(c)).toEqual([]);
     expect(r2.relayed.at(-1)).toContain("was taken off: the pull request was merged or closed");
   });
@@ -199,26 +201,76 @@ describe("the link's own line on a Ship card, from GitHub", () => {
 describe("GitHub still knows the deploy key", () => {
   test("checked once a day; Cain hears once when it's gone, and once when it's back", async () => {
     const r = rig({ keyCheck: true });
-    await r.link.sweep();
+    await sweep(r);
     expect(r.state().key).toEqual({ checked: r.t.now });
-    r.github.key = false;
+    r.github.key = "refused";
     r.later(DAY - MIN);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.relayed.filter((l) => l.includes("deploy key"))).toEqual([]);
     r.later(2 * MIN);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.relayed.filter((l) => l.includes("deploy key"))).toHaveLength(1);
     expect(r.relayed.at(-1)).toContain("GitHub no longer knows the link's deploy key, so his Ship taps can't land anything in main.");
     r.later(DAY + MIN);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.relayed.filter((l) => l.includes("deploy key"))).toHaveLength(1);
-    r.github.key = null;                                     // GitHub didn't answer: nothing said
+    r.github.key = "known";
     r.later(DAY + MIN);
-    await r.link.sweep();
-    expect(r.relayed.filter((l) => l.includes("deploy key"))).toHaveLength(1);
-    r.github.key = true;
-    await r.link.sweep();
+    await sweep(r);
     expect(r.relayed.at(-1)).toContain("GitHub knows the link's deploy key again");
+  });
+
+  test("no answer is asked again in an hour, not every minute; two days of none, and Cain hears it once", async () => {
+    const r = rig({ keyCheck: true });
+    await sweep(r);
+    r.github.key = null;
+    r.later(DAY + MIN);
+    await sweep(r);
+    expect(r.github.keyAsked).toBe(1);
+    r.later(MIN);
+    await sweep(r);
+    expect(r.github.keyAsked).toBe(1);
+    r.later(HOUR);
+    await sweep(r);
+    expect(r.github.keyAsked).toBe(2);
+    for (let i = 0; i < 50; i++) { r.later(HOUR); await sweep(r); }
+    expect(r.relayed.filter((l) => l.includes("hasn't reached GitHub over SSH for 2 days"))).toHaveLength(1);
+  });
+
+  test("a host key that isn't GitHub's is said as that", async () => {
+    const r = rig({ keyCheck: true });
+    await sweep(r);
+    r.github.key = "host key";
+    r.later(DAY + MIN);
+    await sweep(r);
+    expect(r.relayed.at(-1)).toContain("GitHub's SSH host key isn't one the link knows");
+  });
+});
+
+describe("review fixes (Opus, Nov 13)", () => {
+  test("the sweep doesn't wait on a slow landing: other cards keep moving", async () => {
+    const r = rig();
+    const id = await ship(r);
+    r.github.answers.push({ ok: false, why: "GitHub didn't answer about the pull request", again: true });
+    await r.tap(snap(r.msg(id)), r.ids(id)[0]);
+    await r.link.addCard({ text: "Moved your dentist to 3.", rows: toggle("Undo", "k:undo:1") });
+    r.github.hold = true;                                     // the next try hangs on GitHub
+    r.later(3 * MIN);
+    await r.link.sweep();                                     // returns while that try still hangs
+    expect(r.github.landings).toHaveLength(2);
+    expect(r.cards().some((m: any) => m.content === "Moved your dentist to 3.")).toBe(true);
+    r.go();
+    await r.link.whenLanded();
+    expect(r.github.main).toEqual([SHA1]);
+  });
+
+  test("a Ship card waits only a few seconds for GitHub's facts", async () => {
+    const r = rig({ facts: true });
+    r.github.factsHang = true;
+    const t0 = Date.now();
+    const id = await ship(r);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(r.msg(id).content).toBe(`${card}\nFrom GitHub: the pull request couldn't be read just now.`);
   });
 });
 
@@ -262,7 +314,7 @@ describe("review fixes (Fable, Nov 13)", () => {
     expect(r.github.main).toEqual([]);
     expect(r.msg(id).content).toBe(`${card}\n\nYou tapped Ship, but Stop came before it landed, so nothing shipped.`);
     r.later(HOUR);
-    await r.link.sweep();
+    await sweep(r);
     expect(r.github.landings).toHaveLength(1);
   });
 
@@ -281,7 +333,7 @@ describe("review fixes (Fable, Nov 13)", () => {
     expect(r.msg(id).content).toBe(`${card}\n\nYou tapped Ship, but Stop came before it landed, so nothing shipped.`);
     r.later(1000);
     await r.tap(snap(r.msg(morning)), RESUME);
-    for (let i = 0; i < 4; i++) { r.later(15 * MIN); await r.link.sweep(); }
+    for (let i = 0; i < 4; i++) { r.later(15 * MIN); await sweep(r); }
     expect(r.github.landings).toHaveLength(1);
     expect(r.github.main).toEqual([]);
   });
@@ -298,7 +350,7 @@ describe("review fixes (Fable, Nov 13)", () => {
       if (inMain) r.github.main.push(SHA1);
       r.github.readable = readable;
       r.later(3 * DAY);
-      await r.link.sweep();
+      await sweep(r);
       expect(r.github.landings).toHaveLength(1);             // nothing pushed after the restart
       return { r, id };
     };
@@ -321,10 +373,10 @@ describe("review fixes (Fable, Nov 13)", () => {
     expect(r.msg(id).content).toBe(`${card}\n\nYou tapped Ship: landing it in main now.`);
     expect(r.relayed).toHaveLength(1);                      // Cain is told all the same
     r.failing.delete("PATCH");
-    await r.link.sweep();
+    await sweep(r);
     expect(r.msg(id).content).toBe(`${card}\n\nShipped: it's in main as of 8:00 AM. Installing it is next.`);
     const edits = r.calls.filter((c) => c.method === "PATCH").length;
-    await r.link.sweep();
+    await sweep(r);
     expect(r.calls.filter((c) => c.method === "PATCH").length).toBe(edits);   // once taken, not again
   });
 

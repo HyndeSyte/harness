@@ -10,7 +10,9 @@
 // leave it out (config.yaml, backup_exclude), so a restored Pi makes a new one.
 import { existsSync, renameSync, rmSync } from "node:fs";
 
-export interface DeployKey { path: string; pub: string; remade: boolean }
+// made: a new key this start (a first start, a restored Pi, or a remade one), which GitHub
+// doesn't know yet; remade: the old one couldn't be read.
+export interface DeployKey { path: string; pub: string; made: boolean; remade: boolean }
 
 export interface KeyTools {
   keygen: (path: string) => void;         // writes path (0600) and path.pub, or throws
@@ -48,19 +50,19 @@ function make(path: string, t: KeyTools): void {
 
 export function loadDeployKey(path: string, log: (line: string) => void, t: KeyTools = sshTools): DeployKey | null {
   try {
-    let remade = false;
-    if (!existsSync(path)) { make(path, t); log("made a new deploy key"); }
+    let remade = false, made = false;
+    if (!existsSync(path)) { make(path, t); made = true; log("made a new deploy key"); }
     let pub: string;
     try { pub = t.pubOf(path); }
     catch (e) {
       renameSync(path, `${path}.bad-${t.now()}`);
       make(path, t);
       pub = t.pubOf(path);
-      remade = true;
+      remade = made = true;
       log(`the deploy key couldn't be read (${String(e).slice(0, 60)}), so it was moved aside and a new one made`);
     }
     log(`deploy key (public): ${pub} cain-link`);
-    return { path, pub, remade };
+    return { path, pub, made, remade };
   } catch (e) {
     log(`no deploy key, so a Ship tap can't merge: ${String(e).slice(0, 100)}`);
     return null;

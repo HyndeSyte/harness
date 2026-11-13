@@ -29,14 +29,14 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
 import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
 import { loadDeployKey } from "./deploykey";
-import { facts, inMain, keyAnswer, land, type MergeDeps } from "./merge";
+import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
+import { facts, inMain, land, type MergeDeps } from "./merge";
 import { loadShipKey } from "./shipkey";
-import { runBounded } from "./spawn";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
@@ -157,26 +157,10 @@ async function githubApi(path: string): Promise<{ status: number; body: any }> {
     headers: { accept: "application/vnd.github+json", "user-agent": "cain-link", "x-github-api-version": "2022-11-28" } });
   return { status: r.status, body: await r.json().catch(() => null) };
 }
-const SSH = ["ssh", "-F", "/dev/null", "-i", DEPLOY_KEY, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
-  "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${KNOWN_HOSTS}`, "-o", "ConnectTimeout=15",
-  "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2"];
-const GIT_ENV: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: DIR, GIT_TERMINAL_PROMPT: "0",
-  GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
-const run = runBounded;
-async function gitRun(args: string[], o: { ssh?: boolean; timeoutMs?: number } = {}): Promise<{ code: number; out: string; err: string }> {
-  const env = o.ssh ? { ...GIT_ENV, GIT_SSH_COMMAND: SSH.join(" ") } : GIT_ENV;
-  if (!existsSync(`${REPO_DIR}/HEAD`)) {
-    mkdirSync(REPO_DIR, { recursive: true, mode: 0o700 });
-    await run(["git", "-C", REPO_DIR, "init", "--bare", "--quiet"], GIT_ENV, 30_000);
-  }
-  return run(["git", "-C", REPO_DIR, ...args], env, o.timeoutMs ?? 60_000);
-}
+const SSH = sshArgs(DEPLOY_KEY, KNOWN_HOSTS);
+const gitRun = makeGit({ repoDir: REPO_DIR, ssh: SSH.join(" "), home: DIR, timeoutBin: timeoutBin() });
 const github: MergeDeps = { api: githubApi, git: gitRun, stopped: () => readStop().stopped };
 const SHIP_REPO = "HyndeSyte/harness";
-async function keyKnown(): Promise<boolean | null> {
-  const r = await run([...SSH, "-T", "git@github.com"], GIT_ENV, 30_000).catch(() => null);
-  return r ? keyAnswer(`${r.out}\n${r.err}`, SHIP_REPO) : null;
-}
 const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
 
 const link = new Link({
@@ -195,7 +179,7 @@ const link = new Link({
   } : undefined,
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr) : null; },
-  keyKnown: deployKey ? keyKnown : undefined,
+  keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
 });
 
 // -- the gateway's health, for the Harness page ------------------------------------
@@ -236,7 +220,8 @@ const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { sta
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
 Bun.serve({
-  port: PORT, hostname: "0.0.0.0",
+  // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
+  port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
   async fetch(req, server) {
     const url = new URL(req.url);
     const keyOk = same(req.headers.get("x-harness-key") ?? "", key("harness-relay-v1"));
@@ -287,8 +272,10 @@ Bun.serve({
 console.log(`[cain] link listening on ${PORT}`);
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
-if (!deployKey || deployKey.remade)
-  link.relayLine(`${deployKey ? "The deploy key couldn't be read, so a new one was made" : "The link has no deploy key"}, so his Ship taps can't land anything in main until ${deployKey ? "its public half (in the add-on's log) is added on GitHub and the old one deleted there" : "that's fixed"}. Tell Dane in one line that shipping is down until then: it needs a laptop session at his PC (RELEASING.md, If the deploy key is remade). Keep it in PENDING marked "At his PC".`);
+if (!deployKey)
+  link.relayLine("The link has no deploy key, so his Ship taps can't land anything in main until that's fixed. Tell Dane in one line that shipping is down, and log a Build item.");
+else if (deployKey.made)
+  link.relayLine(`The link made a new deploy key${deployKey.remade ? " (the old one couldn't be read)" : ""}. Until its public half (in the add-on's log) is added on GitHub, and any old one deleted there, his Ship taps can't land anything in main (RELEASING.md, If the deploy key is remade). If a laptop session is installing this release, it adds the key itself: nothing to tell him. Otherwise (a restored Pi, say), tell him in one line that shipping is down until a laptop session at his PC adds it, and keep it in PENDING marked "At his PC".`);
 
 // -- the gateway: taps and reactions ---------------------------------------------------
 let ws: WebSocket | null = null;
