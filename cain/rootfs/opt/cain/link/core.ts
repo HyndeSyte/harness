@@ -142,7 +142,7 @@ export interface State {
   // The daily check that GitHub still knows the deploy key (0.8.1): when, whether it was
   // refused, and since when GitHub hasn't answered at all.
   key?: { checked: number; refused?: boolean; unanswered?: number; toldUnanswered?: boolean };
-  replayed?: number;                 // when the gate's replay last read his whole range (0.9.0)
+  replayed?: number;                 // when the gate's replay last finished: his whole range, or its page cap (0.9.0)
   labelled?: boolean;                // the labels of cards from before 0.9.0 were filled in, once
 }
 
@@ -459,7 +459,8 @@ export interface Sent { ids: Set<string>; texts: Set<string> }
 type Tally = Record<string, Record<string, number>>;   // rule -> result -> count
 export interface ReplayReport {
   written_at: number;
-  range: { from: number; to: number; days: number; pages: number; page_cap: number; reached_cutoff: boolean; stopped: string | null };
+  // capped: it read its most pages before the start of the range, so the oldest part wasn't read.
+  range: { from: number; to: number; days: number; pages: number; page_cap: number; reached_cutoff: boolean; capped: boolean; stopped: string | null };
   messages: { read: number; by_writer: Record<string, number>; skipped: Record<string, number>; cards_never_posted: number };
   hits: { by_rule: Tally; by_writer: Record<string, Tally>; total: number };
   list: { at: number; message: string; writer: string; rule: string; result: string; around: string; label?: string }[];
@@ -965,7 +966,9 @@ export class Link {
     const msg = await this.post(text, [], { timeoutMs });
     try {
       const s = this.d.load();
-      this.remember(s, msg, { kind: "notice", item: "none", question: "notice", posted: this.d.now(), expires: null, buttons: false });
+      // No buttons, said outright: a reply to it naming one is judged against none, never unknown.
+      this.remember(s, msg, { kind: "notice", item: "none", question: "notice", posted: this.d.now(), expires: null, buttons: false,
+        labels: [] });
       this.d.save(s);
     } catch (e) { this.log(`couldn't record a notice: ${String(e).slice(0, 80)}`); }
     return String(msg.id);
@@ -1671,7 +1674,8 @@ export class Link {
   }
 
   // -- the replay (keeper.sh replay): the gate's rules over his DM, reading only ---------
-  // Pages back through his DM to the start of the range, reads every bot message, says
+  // Pages back through his DM to the start of the range (at most REPLAY_PAGES pages: past
+  // that the oldest part isn't read, and it says so), reads every bot message, says
   // whose words it carries from the link's own records and Cain's transcripts (one bot
   // token posts them all, so Discord can't tell), and runs the rules in report mode.
   // Nothing is posted, edited or logged as a send. Cain hears one line when it's done.
@@ -1699,9 +1703,11 @@ export class Link {
     const pause = this.d.replayPauseMs ?? 1000;
     const sleep = (ms: number) => new Promise<void>((ok) => setTimeout(ok, ms));
     const seen: any[] = [];
-    let before = "", pages = 0, reached = false, stopped: string | null = null;
+    let before = "", pages = 0, reached = false, capped = false, stopped: string | null = null;
     while (!reached) {
-      if (pages >= REPLAY_PAGES) { stopped = `it read its most, ${REPLAY_PAGES} pages of 100 messages, before the start of the range`; break; }
+      // Its most pages, the start of the range still further back: a rerun would stop at the
+      // same place, so this is how far it reads, not a stop.
+      if (pages >= REPLAY_PAGES) { capped = true; break; }
       let batch: any = null;
       for (let tries = 1; ; tries++) {
         try { batch = await this.d.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`); break; }
@@ -1808,7 +1814,7 @@ export class Link {
     const n = (r: "fix" | "refuse" | "unsure") => list.filter((h) => h.result === r).length;
     const report: ReplayReport = {
       written_at: now,
-      range: { from, to: now, days, pages, page_cap: REPLAY_PAGES, reached_cutoff: reached, stopped },
+      range: { from, to: now, days, pages, page_cap: REPLAY_PAGES, reached_cutoff: reached, capped, stopped },
       messages: { read: seen.length, by_writer: byWriter, skipped, cards_never_posted: unposted },
       hits: { by_rule: byRule, by_writer: perWriter, total },
       list,
@@ -1820,20 +1826,24 @@ export class Link {
     let where = "";
     try { where = this.d.writeReplay ? String(this.d.writeReplay(report) ?? "") : ""; }
     catch (e) { throw new Error(`its report couldn't be written: ${reason(e)}`); }
-    // Done only once it read back to the start of the range with nothing stopping it; one
-    // cut short is run again (the link's own run retries at its next start).
-    const whole = reached && !stopped;
+    // Done once it read back to the start of the range, or read its most pages (a rerun would
+    // stop at the same place, so it says the oldest part wasn't read instead). One an error or
+    // rate limits stopped is run again (the link's own run retries at its next start).
+    const whole = (reached || capped) && !stopped;
     if (whole) {
       const s2 = this.d.load();
       s2.replayed = this.d.now();
       this.d.save(s2);
     }
-    this.log(`the gate's replay read ${seen.length} messages over ${pages} pages: ${total} hits${whole ? "" : " (cut short)"}`);
+    this.log(`the gate's replay read ${seen.length} messages over ${pages} pages: ${total} hits`
+      + `${!whole ? " (cut short)" : capped ? " (its most pages: the oldest part of the range wasn't read)" : ""}`);
     const counts = `${seen.length} messages read (Cain ${byWriter.cain}, the specialist ${byWriter.specialist}, the link ${byWriter.link}, `
       + `unknown ${byWriter.unknown}). ${total} hits: ${n("refuse")} would be refused, ${n("fix")} fixed, ${n("unsure")} can't tell.`;
+    const cap = capped ? `It read its most, ${REPLAY_PAGES} pages of 100 messages, so the oldest part of the range wasn't read; a rerun would stop at the same place. ` : "";
     this.d.relay(whole
-      ? `The gate's replay over the last ${days} days of his DM is done: ${counts} Buttons-only edits and "(edited)": ${report.edited.said} `
-        + `Nothing was posted or changed. Read ${where || "the replay's report"} and file it in the record as your CLAUDE.md says (Gate replay). Nothing to tell him.`
+      ? `The gate's replay over the last ${days} days of his DM is done: ${counts} ${cap}Buttons-only edits and "(edited)": ${report.edited.said} `
+        + `Nothing was posted or changed. Read ${where || "the replay's report"} and file it in the record as your CLAUDE.md says (Gate replay)`
+        + `${capped ? ", saying the oldest part of the range wasn't read" : ""}. Nothing to tell him.`
       : `The gate's replay over the last ${days} days of his DM stopped before it was done: ${stopped ?? "it didn't reach the start of the range"}. `
         + `So far ${counts} Nothing was posted or changed, and it isn't done: run /opt/cain/keeper.sh replay ${days} again in an hour, and file `
         + `the report once a replay finishes. Nothing to tell him.`);

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { STOP } from "../rootfs/opt/cain/link/core";
 import { readTranscripts } from "../rootfs/opt/cain/link/publish";
-import { BOT, DAY, DM, HOUR, MIN, OWNER, rig } from "./link-rig";
+import { BOT, DAY, DM, HOUR, MIN, OWNER, PR, rig, SHA1 } from "./link-rig";
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 const STOP_ONLY = [{ type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
@@ -126,19 +126,53 @@ describe("the replay", () => {
     expect(rep.list[0].message).toMatch(/^card \d+$/);
   });
 
-  test("respects its page cap and says so", async () => {
+  test("reads at most its page cap: done all the same, and says the oldest part wasn't read", async () => {
     const r = rig();
     for (let i = 0; i < 6100; i++) botMessage(r, "x", { at: r.t.now - 6100 + i });
     r.link.replay(14);
     const rep = await done(r);
-    expect(rep.range).toMatchObject({ pages: 60, reached_cutoff: false });
-    expect(rep.range.stopped).toContain("60 pages");
+    expect(rep.range).toMatchObject({ pages: 60, page_cap: 60, reached_cutoff: false, capped: true, stopped: null });
     expect(rep.messages.read).toBe(6000);
-    // Cut short isn't done: no "replayed", and Cain runs it again in an hour.
+    // A rerun would stop at the same place, so it's done: "replayed" is set (the link's start
+    // doesn't run it again), and Cain files it rather than running it again in an hour.
+    expect(r.state().replayed).toBe(r.t.now);
+    const line = r.relayed.at(-1)!;
+    expect(line).toStartWith("The gate's replay over the last 14 days of his DM is done:");
+    expect(line).toContain("It read its most, 60 pages of 100 messages, so the oldest part of the range wasn't read");
+    expect(line).toContain("file it in the record as your CLAUDE.md says (Gate replay), saying the oldest part of the range wasn't read.");
+    expect(line).not.toContain("again in an hour");
+    expect(line).not.toContain("stopped before it was done");
+  });
+
+  test("an error partway is a stop, not the cap: not done, and Cain runs it again in an hour", async () => {
+    const r = rig();
+    for (let i = 0; i < 250; i++) botMessage(r, "x", { at: r.t.now - 250 + i });
+    r.gate.history = true;                                              // its first page waits
+    r.link.replay(14);
+    for (let i = 0; i < 200 && !r.reads(); i++) await Bun.sleep(1);
+    expect(r.reads()).toBe(1);
+    r.failing.add(`/channels/${DM}/messages?`);                        // every page after the first fails
+    r.release();
+    const rep = await done(r);
+    expect(rep.range).toMatchObject({ pages: 1, reached_cutoff: false, capped: false });
+    expect(rep.range.stopped).toContain("Discord refused it");
+    expect(rep.messages.read).toBe(100);
     expect(r.state().replayed).toBeUndefined();
     expect(r.relayed.at(-1)).toContain("stopped before it was done");
     expect(r.relayed.at(-1)).toContain("run /opt/cain/keeper.sh replay 14 again in an hour");
     expect(r.relayed.at(-1)).not.toContain("file it in the record as your CLAUDE.md says");
+  });
+
+  test("rate limits past its tries are a stop too", async () => {
+    const r = rig();
+    await dm(r);
+    r.limitN[`/channels/${DM}/messages?`] = 5;                         // its fifth try is limited too
+    r.link.replay(14);
+    const rep = await done(r);
+    expect(rep.range).toMatchObject({ pages: 0, reached_cutoff: false, capped: false });
+    expect(rep.range.stopped).toContain("discord 429");
+    expect(r.state().replayed).toBeUndefined();
+    expect(r.relayed.at(-1)).toContain("again in an hour");
   });
 
   test("waits out a rate limit and reads the same page again", async () => {
@@ -187,6 +221,39 @@ describe("the replay", () => {
     expect(rep.list.filter((h: any) => h.message === shown)).toMatchObject([{ rule: "button", result: "unsure", label: "Undo" }]);
     expect(rep.list.filter((h: any) => h.message === reply)).toMatchObject([{ rule: "button", result: "unsure" }]);
     expect(rep.hits.by_rule.button.refuse).toBe(0);
+  });
+
+  test("a notice records that it has no buttons: a reply naming one is refused, not can't tell", async () => {
+    const r = rig();
+    await r.link.sweep();                                               // the one backfill is done before it goes out
+    const notice = await r.link.notice("The calendar specialist hasn't answered for 5 minutes.");
+    expect(r.state().messages[notice]).toMatchObject({ kind: "notice", buttons: false, labels: [] });
+    const reply = botMessage(r, "Tap Undo on it.", { replyTo: notice });
+    r.sent.ids.add(reply);
+    r.link.replay(14);
+    const rep = await done(r);
+    expect(rep.list.filter((h: any) => h.message === reply)).toMatchObject([{ rule: "button", result: "refuse", label: "Undo" }]);
+  });
+
+  test("every message the link posts records the labels it posted, no buttons as none", async () => {
+    const r = rig();
+    await r.link.sweep();
+    const ids = [
+      await r.link.notice("The calendar specialist hasn't answered for 5 minutes."),
+      (await r.link.connector({ item: "P07", text: "Installing Harness 0.22.0" })).message,
+      (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message,
+      (await r.link.ship({ text: "Harness 0.22.0 ready.", item: "P09", pr: PR, head: SHA1 }) as any).message,
+      await r.link.show(await r.link.addCard({ text: "Moved Swim.", rows: [{ type: 1, components: [btn("Undo", "k:c:u")] }], kind: "card" }), { item: "none" }),
+    ];
+    const morning = await r.link.morning("## Thu Nov 12");
+    r.harnessDown.down = true;
+    await r.tap(structuredClone(r.msg(morning)), STOP);                 // the link posts its own Stop notice
+    const toggle = r.last().id;
+    for (const id of [...ids, morning, toggle]) {
+      expect(r.state().messages[id].labels).toBeDefined();
+      expect(r.state().messages[id].labels).toEqual(r.buttons(id));
+    }
+    expect(r.buttons(toggle)).toEqual(["Turn back on"]);
   });
 
   test("the one backfill keeps what it knows: an ask's options, a live morning message's button", async () => {

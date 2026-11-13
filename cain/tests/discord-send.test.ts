@@ -115,6 +115,29 @@ describe("the gate's log", () => {
     expect(said).toHaveLength(1);
     expect(said[0]).toContain("couldn't log the gate's report");
   });
+
+  test("appends in the same tick go one at a time: a full log moves aside once, and no line is lost", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate-log-"));
+    const path = join(dir, "gate-report.jsonl");
+    writeFileSync(path, "x".repeat(2000));                              // over the limit
+    const all = Array.from({ length: 20 }, (_, n) => appendGate({ n }, path, 1000));
+    expect(await Promise.all(all)).toEqual(Array(20).fill(undefined));   // each settles, none throws
+    expect(readFileSync(`${path}.1`, "utf8")).toBe("x".repeat(2000));   // the full log, kept
+    const NL = String.fromCharCode(10);
+    expect(readFileSync(path, "utf8")).toBe(Array.from({ length: 20 }, (_, n) => JSON.stringify({ n }) + NL).join(""));
+  });
+
+  test("a log line that can't be made, or a logger that throws, never stops the appends after it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate-log-"));
+    const path = join(dir, "gate-report.jsonl");
+    const loop: any = {};
+    loop.self = loop;                                                    // JSON can't write it
+    const first = appendGate(loop, path, 1000, () => { throw new Error("no console"); });
+    const second = appendGate({ n: 2 }, path, 1000);
+    await expect(first).resolves.toBeUndefined();
+    await second;
+    expect(readFileSync(path, "utf8")).toBe('{"n":2}' + String.fromCharCode(10));
+  });
 });
 
 describe("run as Claude Code runs it", () => {
