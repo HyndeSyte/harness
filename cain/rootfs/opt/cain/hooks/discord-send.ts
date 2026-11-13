@@ -5,7 +5,11 @@
 // runs the gate's rules (../gate/send.ts, the same decision keeper.sh check gives), and
 // logs what they would have done to Cain's folder (../gate/log.ts: the rule, fix or
 // refuse, and at most 60 characters around each hit). It prints nothing, exits 0 on any
-// error, and gives up on the link within a couple of seconds, so a reply is never held up.
+// error, and gives up on the link within a couple of seconds.
+//
+// settings.json runs it with "async": true, so Claude Code starts it and sends the reply
+// without waiting: in report mode it never adds a moment to a reply. D2 removes async when
+// the gate starts enforcing, since a hook that refuses has to be waited for.
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { appendGate } from "../gate/log";
@@ -67,7 +71,7 @@ if (import.meta.main) {
       const now = Date.now();
       const { cards, from } = await cardsNow(askLink, () => { try { return readFileSync(CARDS, "utf8"); } catch { return null; } }, now);
       const line = entry(call, cards, from, now);
-      if (line) appendGate(line);
+      if (line) await appendGate(line);
     }
   } catch { /* report mode: nothing here may ever hold a reply up */ }
   process.exit(0);

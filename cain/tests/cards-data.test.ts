@@ -3,11 +3,11 @@
 // message back from Discord; the cards are published for the reply hook without text;
 // and each send point logs what the gate's rules would have done, changing nothing.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
-import { publishCards } from "../rootfs/opt/cain/link/publish";
+import { CardsWriter, publishCards, stateFile } from "../rootfs/opt/cain/link/publish";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
@@ -133,20 +133,44 @@ describe("the cards, published for the reply hook", () => {
     expect(v.cards.map((c) => c.message)).toEqual([card]);               // its buttons are still up; the rest finished over 2 days ago
   });
 
-  test("written whole through a rename, readable by all", () => {
+  test("written whole through a rename, readable by all", async () => {
     const r = rig();
     const dir = mkdtempSync(join(tmpdir(), "cards-"));
     const path = join(dir, "trust", "cards.json");
-    publishCards(r.state(), 5, path);
+    await publishCards(r.state(), 5, path);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ written_at: 5, owner: null, dm: null, cards: [] });
     if (process.platform !== "win32") expect((statSync(path).mode & 0o777).toString(8)).toBe("644");
   });
 
-  test("the link publishes them on every save and after each sweep, and answers /cards itself", () => {
+  test("a save never writes them; one write shortly after carries the latest state", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cards-"));
+    const statePath = join(dir, "state.json"), cardsPath = join(dir, "trust", "cards.json");
+    let reads = 0;
+    const writer = new CardsWriter(() => { reads++; return store.load(); }, cardsPath, 40);
+    const store = stateFile(statePath, () => writer.soon());
+    const r = rig();
+    await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
+    const s = r.state();
+    store.save(s);
+    expect(existsSync(statePath)).toBe(true);
+    expect(existsSync(cardsPath)).toBe(false);                            // nothing on the save itself
+    store.save({ ...s, owner: "4242" });
+    store.save({ ...s, owner: "4343" });
+    await writer.settled();
+    expect(reads).toBe(1);                                                // three saves, one write
+    expect(JSON.parse(readFileSync(cardsPath, "utf8"))).toMatchObject({ owner: "4343", cards: [{ kind: "ask", labels: ["Filed", "Not filed"] }] });
+    store.save({ ...s, owner: "4444" });
+    await writer.settled();
+    expect(JSON.parse(readFileSync(cardsPath, "utf8")).owner).toBe("4444");
+  });
+
+  test("the link asks for a write after each save and each sweep, and answers /cards itself", () => {
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
-    expect(main).toMatch(/renameSync\(`\$\{STATE\}\.tmp`, STATE\);\s+publish\(s\);/);
-    expect(main).toContain("finally { publish(load()); setTimeout(sweepLoop, SWEEP_MS); }");
+    expect(main).toContain("const stateStore = stateFile(STATE, () => cards.soon());");
+    expect(main).toContain("function save(s: State): void { stateStore.save(s); }");
+    expect(main).toContain("finally { cards.soon(); setTimeout(sweepLoop, SWEEP_MS); }");
     expect(main).toContain('url.pathname === "/cards") return json(link.cardsNow())');
+    expect(main).not.toContain("publishCards(");                          // only through the writer
   });
 });
 
@@ -205,7 +229,7 @@ describe("the notice that Home Assistant's connector needs signing in again", ()
     const msg = r.msg(out.message);
     expect(msg.content).toBe("P41: Installing Harness 0.22.0 waits until Claude can reach Home Assistant again: its connector needs you to sign in again. Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.");
     expect(msg.components).toEqual([{ type: 1, components: [{ type: 2, style: 5, label: CONNECTOR_LABEL, url: CONNECTOR_URL }] }]);
-    expect(CONNECTOR_URL).toBe("https://claude.ai/settings/connectors");
+    expect(CONNECTOR_URL).toBe("https://claude.ai/customize/connectors");   // settings/connectors only says they moved
     expect(msg.content).not.toMatch(/tap|reconnected|tell me|let me know/i);
     expect(r.state().messages[out.message]).toMatchObject({ kind: "notice", question: "connector", labels: [CONNECTOR_LABEL] });
     expect(cardsView(r.state(), r.t.now).cards.find((c) => c.message === out.message)).toMatchObject({ live: true, writer: "link" });

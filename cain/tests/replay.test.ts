@@ -134,7 +134,11 @@ describe("the replay", () => {
     expect(rep.range).toMatchObject({ pages: 60, reached_cutoff: false });
     expect(rep.range.stopped).toContain("60 pages");
     expect(rep.messages.read).toBe(6000);
-    expect(r.relayed.at(-1)).toContain("stopped early");
+    // Cut short isn't done: no "replayed", and Cain runs it again in an hour.
+    expect(r.state().replayed).toBeUndefined();
+    expect(r.relayed.at(-1)).toContain("stopped before it was done");
+    expect(r.relayed.at(-1)).toContain("run /opt/cain/keeper.sh replay 14 again in an hour");
+    expect(r.relayed.at(-1)).not.toContain("file it in the record as your CLAUDE.md says");
   });
 
   test("waits out a rate limit and reads the same page again", async () => {
@@ -155,6 +159,63 @@ describe("the replay", () => {
     const rep = await done(r);
     expect(rep.range.stopped).toContain("Discord refused it");
     expect(rep.messages.read).toBe(0);
+    expect(r.state().replayed).toBeUndefined();
+    expect(r.relayed.at(-1)).toContain("again in an hour");
+    r.failing.clear();
+    r.link.replay(14);
+    await done(r);
+    expect(r.state().replayed).toBe(r.t.now);                         // done once it reads the whole range
+  });
+
+  test("a card from before 0.9.0 whose buttons came off: can't tell, never refused", async () => {
+    const r = rig();
+    const card = await r.link.addCard({ text: "Moved Swim. If that's wrong, tap Undo.", rows: [{ type: 1, components: [btn("Undo", "k:c:u")] }], kind: "card", expires: r.t.now + 15 * MIN });
+    const shown = await r.link.show(card, { item: "none" });
+    r.later(HOUR);
+    await r.link.sweep();                                               // expired: its buttons and rows go
+    const old = r.state();
+    delete old.messages[shown].labels;                                  // as a record from before 0.9.0
+    delete old.labelled;
+    r.setState(old);
+    await r.link.sweep();                                               // the one backfill can't know them
+    expect(r.state().messages[shown].labels).toBeUndefined();
+    expect(r.state().labelled).toBe(true);
+    const reply = botMessage(r, "Tap Undo on it.", { replyTo: shown });
+    r.sent.ids.add(reply);
+    r.link.replay(14);
+    const rep = await done(r);
+    expect(rep.list.filter((h: any) => h.message === shown)).toMatchObject([{ rule: "button", result: "unsure", label: "Undo" }]);
+    expect(rep.list.filter((h: any) => h.message === reply)).toMatchObject([{ rule: "button", result: "unsure" }]);
+    expect(rep.hits.by_rule.button.refuse).toBe(0);
+  });
+
+  test("the one backfill keeps what it knows: an ask's options, a live morning message's button", async () => {
+    const r = rig();
+    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const morning = await r.link.morning("## Thu Nov 12");
+    const s = r.state();
+    for (const id of [ask, morning]) delete s.messages[id].labels;
+    r.setState(s);
+    await r.link.sweep();
+    expect(r.state().messages[ask].labels).toEqual(["Filed", "Not filed"]);
+    expect(r.state().messages[morning].labels).toEqual(["Stop"]);
+    const again = r.state();
+    delete again.messages[ask].labels;
+    r.setState(again);
+    await r.link.sweep();                                               // once: it doesn't run again
+    expect(r.state().messages[ask].labels).toBeUndefined();
+  });
+
+  test("a record from before 0.7.0 is read as unknown words, under Cain's rules", async () => {
+    const r = rig();
+    const id = botMessage(r, "Two blocks and 3 more — sorted.");
+    const s = r.state();
+    s.messages[id] = { digest: "", until: r.t.now + 30 * DAY, kind: "legacy", item: "none", posted: r.t.now, buttons: false };
+    r.setState(s);
+    r.link.replay(14);
+    const rep = await done(r);
+    expect(rep.messages.by_writer).toMatchObject({ link: 0, unknown: 1 });
+    expect(rep.list.filter((h: any) => h.message === id).map((h: any) => `${h.writer} ${h.rule}`)).toEqual(["unknown count", "unknown dash"]);
   });
 
   test("says whether Discord marks an edit of buttons alone as (edited)", async () => {
@@ -200,26 +261,57 @@ describe("the replay", () => {
 });
 
 describe("Cain's transcripts", () => {
-  test("give the ids and words of what he sent with the plugin, from files changed in the range", async () => {
+  const line = (o: unknown) => JSON.stringify(o);
+  const use = (id: string, name: string, input: unknown) => line({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } });
+  const result = (id: string, content: unknown) => line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content }] } });
+  const REPLY = "mcp__plugin_discord_discord__reply", EDIT = "mcp__plugin_discord_discord__edit_message";
+  const NL = String.fromCharCode(10);
+
+  test("give the ids from the plugin's own answers and the words of what he sent, from files changed in the range", async () => {
     const root = mkdtempSync(join(tmpdir(), "transcripts-"));
     mkdirSync(join(root, "-data-work"));
-    const line = (o: unknown) => JSON.stringify(o);
     const lines = [
-      line({ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "mcp__plugin_discord_discord__reply", input: { chat_id: DM, text: "Moved it to 4:30.", reply_to: "1300000000000000001" } }] } }),
-      line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "sent (id: 1300000000000000777)" }] }] } }),
-      line({ type: "assistant", message: { content: [{ type: "tool_use", id: "t2", name: "mcp__plugin_discord_discord__edit_message", input: { chat_id: DM, message_id: "1300000000000000778", text: "Moved it to 5:00." } }] } }),
-      line({ type: "assistant", message: { content: [{ type: "tool_use", id: "t3", name: "Bash", input: { command: "echo 1300000000000000999" } }] } }),
-      line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t3", content: "1300000000000000998" }] } }),
+      use("t1", REPLY, { chat_id: DM, text: "Moved it to 4:30.", reply_to: "1300000000000000001" }),
+      result("t1", [{ type: "text", text: "sent (id: 1300000000000000777)" }]),
+      use("t2", EDIT, { chat_id: DM, message_id: "1300000000000000778", text: "Moved it to 5:00." }),
+      result("t2", "edited (id: 1300000000000000778)"),
+      use("t4", REPLY, { chat_id: DM, text: "A long one." }),
+      result("t4", "sent 2 parts (ids: 1300000000000000779, 1300000000000000780)"),
+      use("t5", REPLY, { chat_id: DM, text: "Another." }),
+      result("t5", "sent (id: 1300000000000000781) after 1300000000000000997 was read"),   // only the answer's own id
+      use("t6", EDIT, { chat_id: DM, message_id: "1300000000000000996", text: "Never edited." }),
+      result("t6", "error: that message isn't yours to edit"),          // an edit that failed names nothing
+      use("t3", "Bash", { command: "echo 1300000000000000999" }),
+      result("t3", "sent (id: 1300000000000000998)"),                    // not the plugin's answer
       "not json",
     ];
-    writeFileSync(join(root, "-data-work", "a.jsonl"), lines.join("\n"));
+    writeFileSync(join(root, "-data-work", "a.jsonl"), lines.join(NL));
     writeFileSync(join(root, "-data-work", "old.jsonl"), lines[0].replace("Moved it to 4:30.", "Old words."));
     utimesSync(join(root, "-data-work", "old.jsonl"), new Date(Date.now() - 30 * DAY), new Date(Date.now() - 30 * DAY));
     const sent = await readTranscripts(root, Date.now() - 14 * DAY);
-    expect([...sent.ids].sort()).toEqual(["1300000000000000777", "1300000000000000778"]);
-    expect([...sent.texts].sort()).toEqual(["Moved it to 4:30.", "Moved it to 5:00."]);
+    expect([...sent.ids].sort()).toEqual(["1300000000000000777", "1300000000000000778", "1300000000000000779",
+      "1300000000000000780", "1300000000000000781"]);
+    expect([...sent.texts].sort()).toEqual(["A long one.", "Another.", "Moved it to 4:30.", "Moved it to 5:00.", "Never edited."]);
     expect(await readTranscripts(join(root, "none"), 0)).toEqual({ ids: new Set(), texts: new Set() });
-    // A file too big to read whole is left out, so a tap never waits on it.
-    expect((await readTranscripts(root, 0, 10)).ids.size).toBe(0);
   });
+
+  test("a long session is read in turns, so a timer fires during the read, and a huge line is skipped", async () => {
+    const root = mkdtempSync(join(tmpdir(), "transcripts-big-"));
+    mkdirSync(join(root, "-data-work"));
+    const filler = line({ type: "assistant", message: { content: [{ type: "text", text: "x".repeat(2000) }] } });
+    const parts: string[] = [];
+    for (let i = 0; i < 6000; i++) parts.push(filler);                   // about 12 MB of other work
+    parts.push(use("t1", REPLY, { chat_id: DM, text: "Found in a long session." }), result("t1", "sent (id: 1300000000000000801)"));
+    parts.push(`{"type":"assistant","message":{"content":[{"type":"text","text":"plugin_discord_discord__ ${"y".repeat(5 * 1024 * 1024)}"}]}}`);
+    parts.push(use("t2", REPLY, { chat_id: DM, text: "After the huge line." }), result("t2", "sent (id: 1300000000000000802)"));
+    writeFileSync(join(root, "-data-work", "long.jsonl"), parts.join(NL));
+    let firedAt = 0;
+    setTimeout(() => { firedAt = performance.now(); }, 0);
+    const sent = await readTranscripts(root, 0);
+    const doneAt = performance.now();
+    expect(firedAt).toBeGreaterThan(0);
+    expect(firedAt).toBeLessThan(doneAt);                                 // the loop had turns while it read
+    expect([...sent.ids].sort()).toEqual(["1300000000000000801", "1300000000000000802"]);
+    expect([...sent.texts].sort()).toEqual(["After the huge line.", "Found in a long session."]);
+  }, 60_000);
 });

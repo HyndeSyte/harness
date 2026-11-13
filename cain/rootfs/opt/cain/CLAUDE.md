@@ -158,7 +158,8 @@ if they refused.
   /data/work/gate-replay.json and file it through the record keeper as
   projects/org-v2/gate-replay-<YYYY-MM-DD>.md: the range and pages, messages by writer,
   hits per rule and writer (fix, refuse, can't tell), each hit's time, rule and short
-  excerpt, and its line on "(edited)". Nothing to tell him.
+  excerpt, and its line on "(edited)". Nothing to tell him. If you hear it stopped
+  before it was done, run it again in an hour; file only one that finished.
 
 ## Who holds what
 Each item has one holder, the only one that acts on it: its record row, branches, pull

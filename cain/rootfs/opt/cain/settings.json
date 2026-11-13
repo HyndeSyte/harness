@@ -66,13 +66,13 @@
       {
         "matcher": "mcp__plugin_discord_discord__reply",
         "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5, "async": true }
         ]
       },
       {
         "matcher": "mcp__plugin_discord_discord__edit_message",
         "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5, "async": true }
         ]
       }
     ]

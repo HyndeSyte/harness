@@ -29,7 +29,7 @@
 //
 // The gate, in report mode (piece D): every send point logs what its rules would have done
 // to Cain's folder (../gate/log.ts), and nothing is refused or rewritten yet. The cards go
-// to /data/trust/cards.json (publish.ts) on every save and after each sweep. The first
+// to /data/trust/cards.json (publish.ts) shortly after each save and each sweep. The first
 // start with no replay on record replays his DM once by itself.
 //
 // The Ship key (wave 1, piece B; shipkey.ts) signs Dane's Ship taps once they're in main.
@@ -39,15 +39,15 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
-import { appendGate } from "../gate/log";
-import { emptyState, Link, Protocol, PULL, type Pull, Refusal, State } from "./core";
+import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
+import { Link, Protocol, PULL, type Pull, Refusal, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, inMain, land, type MergeDeps } from "./merge";
-import { publishCards, readTranscripts, TRANSCRIPTS, writeReplayReport } from "./publish";
+import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -88,19 +88,13 @@ function same(a: string, b: string): boolean {
 function paired(): string {
   try { return String(JSON.parse(readFileSync(ACCESS, "utf8")).allowFrom?.[0] ?? ""); } catch { return ""; }
 }
-function load(): State {
-  try { return JSON.parse(readFileSync(STATE, "utf8")); } catch { return emptyState(); }
-}
-function save(s: State): void {
-  writeFileSync(`${STATE}.tmp`, JSON.stringify(s), { mode: 0o600 });
-  renameSync(`${STATE}.tmp`, STATE);
-  publish(s);
-}
-// The cards for the reply hook, whenever the state changes and after each sweep. A failure
-// is logged, never in the way: the hook asks the link first anyway.
-function publish(s: State): void {
-  try { publishCards(s, Date.now()); } catch (e) { console.log(`[cain] link: couldn't publish the cards: ${String(e).slice(0, 80)}`); }
-}
+// The cards for the reply hook go out off the save, never inside it (publish.ts): a save
+// asks for one write half a second later, and so does each sweep. A failure is logged,
+// never in the way: the hook asks the link first anyway.
+const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) => console.log(`[cain] link: ${line}`));
+const stateStore = stateFile(STATE, () => cards.soon());
+function load(): State { return stateStore.load(); }
+function save(s: State): void { stateStore.save(s); }
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -198,7 +192,8 @@ const link = new Link({
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr) : null; },
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
-  report: (r) => { try { appendGate({ at: Date.now(), ...r }); } catch (e) { console.log(`[cain] link: couldn't log the gate's report: ${String(e).slice(0, 80)}`); } },
+  // Not awaited: the log is written in the background and never throws (gate/log.ts).
+  report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
 });
@@ -233,7 +228,7 @@ every(CHECK_MS, () => check(watch, harnessAlive,
 const sweepLog = (line: string) => console.log(`[cain] link: ${line}`);
 async function sweepLoop(): Promise<void> {
   try { if (token()) await link.sweep(); } catch (e) { sweepLog(`sweep failed: ${String(e).slice(0, 80)}`); }
-  finally { publish(load()); setTimeout(sweepLoop, SWEEP_MS); }
+  finally { cards.soon(); setTimeout(sweepLoop, SWEEP_MS); }
 }
 setTimeout(sweepLoop, 3000);
 

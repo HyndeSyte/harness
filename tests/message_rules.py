@@ -96,7 +96,9 @@ def _dashes(text: str, seen: str) -> list[tuple[int, int, str]]:
         before = "\n" if at == 0 else text[at - 1]
         after = "\n" if end >= len(text) else text[end]
         put = ", "
-        if before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
+        if re.match(r"[0-9]", before) and re.match(r"[0-9]", after):
+            put = " to "                  # "6 — 8 PM" is "6 to 8 PM"
+        elif before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
             put = ""
         elif re.match(r"[,;:]", before):
             put = " "
@@ -104,8 +106,8 @@ def _dashes(text: str, seen: str) -> list[tuple[int, int, str]]:
     return out
 
 
-_OWNERS = ("the|this|that|these|those|its|your|his|my|our|each|both|other|assistant|"
-           "cain['\u2019]s|cains|cain|harness['\u2019]s|harness['\u2019]|harness")
+# Only the words that make it one of these two Apps: "your add-on order" is something else.
+_OWNERS = "the|cain['\u2019]s|cain|harness['\u2019]s|harness['\u2019]|harness"
 _APP = re.compile(r"(?:\b(?:" + _OWNERS + r")|>)[*_~]*\s+[*_~]*(add\\?-?ons?(?:['\u2019]s?)?)(?![A-Za-z0-9])",
                   re.I | A)
 
@@ -148,13 +150,22 @@ _Q = "[\"\u201c\u201d'\u2018\u2019*_]*"
 _VERB = "(?:[Tt]ap|[Tt]apping|[Pp]ress|[Pp]ressing|[Hh]it|[Cc]lick|[Cc]hoose|[Pp]ick|[Ss]elect)"
 
 
+# "with X" names a button only for labels that are never plain words (rules.ts WITH_LABELS):
+# "ends with Stop", "go with No" and "syncs with Gmail" (a live card's option) are just words.
+WITH_LABELS = (
+    "Undo", "Undo both", "Undo these", "Not mine", "Wrong time", "Just this once", "Turn back on", "Not now",
+    "Use new", "Keep old", "Keep rule", "Drop rule", "All of it", "Part of it", "None wrong: stop checking",
+    "Something was off: keep checking", "Open connector settings",
+)
+
+
 def _named(seen: str, label: str) -> list[tuple[int, int]]:
     L = re.escape(label)
     forms = (
         r"(?<![A-Za-z])" + _VERB + r"\s+(?:(?:on\s+)?the\s+|on\s+)?" + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",
         r"(?<![A-Za-z0-9])" + _Q + "(" + L + ")" + _Q + r"\s+[Bb]uttons?\b",
-        r"(?<![A-Za-z])[Ww]ith\s+(?:the\s+)?" + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",
-    )
+    ) + ((r"(?<![A-Za-z])[Ww]ith\s+(?:the\s+)?" + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",)
+         if label in WITH_LABELS else ())
     out: list[tuple[int, int]] = []
     for form in forms:
         for m in re.finditer(form, seen, A):

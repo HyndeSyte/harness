@@ -6,6 +6,7 @@ import { createHmac } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { appendGate } from "../rootfs/opt/cain/gate/log";
 import { decideSend, type CardsView } from "../rootfs/opt/cain/gate/send";
 import { callOf, cardsNow, entry, STALE_MS } from "../rootfs/opt/cain/hooks/discord-send";
 
@@ -91,6 +92,31 @@ describe("where the hook gets the cards", () => {
   });
 });
 
+describe("the gate's log", () => {
+  test("written in the background, never in the way: the call returns before the line lands", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate-log-"));
+    const path = join(dir, "work", "gate-report.jsonl");
+    const pending = appendGate({ point: "reply", hits: [] }, path);
+    expect(existsSync(path)).toBe(false);                               // nothing written on the caller's turn
+    await pending;
+    expect(readFileSync(path, "utf8")).toBe('{"point":"reply","hits":[]}' + String.fromCharCode(10));
+  });
+
+  test("a full log moves aside, and one that can't be written is only logged", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate-log-"));
+    const path = join(dir, "gate-report.jsonl");
+    writeFileSync(path, "x".repeat(50));
+    await appendGate({ n: 1 }, path, 10);
+    expect(readFileSync(`${path}.1`, "utf8")).toBe("x".repeat(50));
+    expect(readFileSync(path, "utf8")).toBe('{"n":1}' + String.fromCharCode(10));
+    writeFileSync(join(dir, "blocker"), "a file where the folder would be");
+    const said: string[] = [];
+    await appendGate({ n: 2 }, join(dir, "blocker", "gate.jsonl"), 10, (l) => said.push(l));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toContain("couldn't log the gate's report");
+  });
+});
+
 describe("run as Claude Code runs it", () => {
   const dir = mkdtempSync(join(tmpdir(), "cain-send-"));
   const TOKEN = "not-a-real-token.for-the-gate-test";
@@ -146,6 +172,9 @@ describe("run as Claude Code runs it", () => {
       const h = e.hooks[0];
       expect(h.command).toBe("bun /opt/cain/hooks/discord-send.ts || true");
       expect(h.onFailure).toBeUndefined();                                // a timeout lets the call through
+      // Report mode never adds a moment to a reply: Claude Code starts it and goes on.
+      // D2 removes async when the gate starts enforcing.
+      expect(h.async).toBe(true);
       expect(h.timeout).toBeLessThanOrEqual(5);
     }
     // The plugin's send tools stay off the allow list: the gate doesn't make them run unasked.

@@ -75,7 +75,7 @@ const STOPPED_FIRST: Landed = { ok: false, why: "his Stop came first", again: fa
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
 const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
 const SHOW_WAIT_MS = 2 * 60_000;         // a card with buttons Cain hasn't shown by then goes out by itself
-export const CONNECTOR_URL = "https://claude.ai/settings/connectors";   // where Claude's connectors are signed in again
+export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
 export const CONNECTOR_LABEL = "Open connector settings";
 const CONNECTOR_ONCE_MS = 12 * 3_600_000;  // one notice about the connector per item in this long
 const REPLAY_PAGES = 60;                 // the replay reads at most this many pages of 100 messages
@@ -142,7 +142,8 @@ export interface State {
   // The daily check that GitHub still knows the deploy key (0.8.1): when, whether it was
   // refused, and since when GitHub hasn't answered at all.
   key?: { checked: number; refused?: boolean; unanswered?: number; toldUnanswered?: boolean };
-  replayed?: number;                 // when the gate's replay over his DM last finished (0.9.0)
+  replayed?: number;                 // when the gate's replay last read his whole range (0.9.0)
+  labelled?: boolean;                // the labels of cards from before 0.9.0 were filled in, once
 }
 
 export function emptyState(): State {
@@ -1749,9 +1750,17 @@ export class Link {
       const content = withoutOutcome(String(m.content ?? ""));
       const rec = s.messages[id];
       if (rec) {                                           // the link posted it: its own record says whose words
+        // Its buttons as posted; unknown labels (a card from before 0.9.0 whose rows are
+        // gone) with none on Discord now can't be told, never "no buttons".
+        const now_ = labelsOf(m.components);
+        const own = rec.labels ?? (now_.length ? now_ : null);
+        if (!rec.kind || rec.kind === "legacy") {          // from before 0.7.0: whose words isn't known
+          byWriter.unknown++;
+          judge(id, at, "unknown", content, { rules: AT.cain, buttons: own, known: allLabels });
+          continue;
+        }
         const writer = writerOf(rec);
         byWriter[writer]++;
-        const own = rec.labels ?? labelsOf(m.components);
         const card = rec.card !== undefined ? s.cards[String(rec.card)] : undefined;
         if (writer === "specialist") judge(id, at, writer, card?.text ?? content, { rules: AT.card, buttons: own, known: allLabels });
         else if (writer === "cain") judge(id, at, writer, rec.shipping?.text ?? content, { rules: AT.cain, buttons: own, known: allLabels });
@@ -1765,7 +1774,8 @@ export class Link {
         let buttons: string[] | null = [], answersHim = false;
         if (ref) {
           const target = s.messages[ref], there = byId.get(ref);
-          if (target) buttons = target.off != null && target.off <= at ? [] : target.labels ?? null;
+          // Unknown labels stay unknown; known ones count only while they were up.
+          if (target) buttons = target.labels === undefined ? null : target.off != null && target.off <= at ? [] : target.labels;
           else if (there && String(there.author?.id ?? "") === owner) answersHim = true;
           else if (there) buttons = labelsOf(there.components);
           else buttons = null;                             // can't tell what it answered
@@ -1810,14 +1820,23 @@ export class Link {
     let where = "";
     try { where = this.d.writeReplay ? String(this.d.writeReplay(report) ?? "") : ""; }
     catch (e) { throw new Error(`its report couldn't be written: ${reason(e)}`); }
-    const s2 = this.d.load();
-    s2.replayed = this.d.now();
-    this.d.save(s2);
-    this.log(`the gate's replay read ${seen.length} messages over ${pages} pages: ${total} hits`);
-    this.d.relay(`The gate's replay over the last ${days} days of his DM is done: ${seen.length} messages read (Cain ${byWriter.cain}, `
-      + `the specialist ${byWriter.specialist}, the link ${byWriter.link}, unknown ${byWriter.unknown})${stopped ? `, stopped early: ${stopped}` : ""}. `
-      + `${total} hits: ${n("refuse")} would be refused, ${n("fix")} fixed, ${n("unsure")} can't tell. Buttons-only edits and "(edited)": ${report.edited.said} `
-      + `Nothing was posted or changed. Read ${where || "the replay's report"} and file it in the record as your CLAUDE.md says (Gate replay). Nothing to tell him.`);
+    // Done only once it read back to the start of the range with nothing stopping it; one
+    // cut short is run again (the link's own run retries at its next start).
+    const whole = reached && !stopped;
+    if (whole) {
+      const s2 = this.d.load();
+      s2.replayed = this.d.now();
+      this.d.save(s2);
+    }
+    this.log(`the gate's replay read ${seen.length} messages over ${pages} pages: ${total} hits${whole ? "" : " (cut short)"}`);
+    const counts = `${seen.length} messages read (Cain ${byWriter.cain}, the specialist ${byWriter.specialist}, the link ${byWriter.link}, `
+      + `unknown ${byWriter.unknown}). ${total} hits: ${n("refuse")} would be refused, ${n("fix")} fixed, ${n("unsure")} can't tell.`;
+    this.d.relay(whole
+      ? `The gate's replay over the last ${days} days of his DM is done: ${counts} Buttons-only edits and "(edited)": ${report.edited.said} `
+        + `Nothing was posted or changed. Read ${where || "the replay's report"} and file it in the record as your CLAUDE.md says (Gate replay). Nothing to tell him.`
+      : `The gate's replay over the last ${days} days of his DM stopped before it was done: ${stopped ?? "it didn't reach the start of the range"}. `
+        + `So far ${counts} Nothing was posted or changed, and it isn't done: run /opt/cain/keeper.sh replay ${days} again in an hour, and file `
+        + `the report once a replay finishes. Nothing to tell him.`);
   }
 
   // -- reactions ----------------------------------------------------------------
@@ -1853,20 +1872,24 @@ export class Link {
     } finally { this.sweeping = false; }
   }
 
-  // Cards from before 0.9.0 recorded no labels: they're filled in from what the link still
-  // has (an ask's options, a specialist card's rows, a Stop notice's toggle), once.
+  // Cards from before 0.9.0 recorded no labels: they're filled in once, from what the link
+  // still knows for sure (an ask's options, a specialist card's rows while it has them, a
+  // Stop notice's toggle, a live morning message's toggle). What it can't know stays
+  // unknown: a specialist card whose rows a strip already emptied, a morning message whose
+  // button came off. Unknown is never "no buttons": the replay reads it as can't tell.
   private backfillLabels(): void {
     const s = this.d.load();
-    let changed = false;
+    if (s.labelled) return;
     for (const m of Object.values(s.messages)) {
       if (m.labels) continue;
       const c = m.card !== undefined ? s.cards[String(m.card)] : undefined;
-      m.labels = m.q ? [...m.q.options] : c ? labelsOf(c.rows)
+      const known = m.q ? [...m.q.options] : c?.rows.length ? labelsOf(c.rows)
         : m.toggle ? [m.toggle === RESUME ? "Turn back on" : "Stop"]
-        : m.kind === "morning" && m.buttons ? [this.stopped().stopped ? "Turn back on" : "Stop"] : [];
-      changed = true;
+        : m.kind === "morning" && m.buttons ? [this.stopped().stopped ? "Turn back on" : "Stop"] : undefined;
+      if (known) m.labels = known;
     }
-    if (changed) this.d.save(s);
+    s.labelled = true;
+    this.d.save(s);
   }
 
   // A card with buttons that Cain hasn't shown in time goes out by itself, under no item,

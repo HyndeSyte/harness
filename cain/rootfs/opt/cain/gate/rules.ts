@@ -82,7 +82,8 @@ function dashes(text: string, seen: string): { at: number; end: number; put: str
     const at = m.index!, end = at + m[0].length;
     const before = at === 0 ? "\n" : text[at - 1], after = end >= text.length ? "\n" : text[end];
     let put = ", ";
-    if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
+    if (/\d/.test(before) && /\d/.test(after)) put = " to ";            // "6 — 8 PM" is "6 to 8 PM"
+    else if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
     else if (/[,;:]/.test(before)) put = " ";
     out.push({ at, end, put });
   }
@@ -90,7 +91,8 @@ function dashes(text: string, seen: string): { at: number; end: number; put: str
 }
 
 // -- app -------------------------------------------------------------------------------
-const OWNERS = "the|this|that|these|those|its|your|his|my|our|each|both|other|assistant|cain['’]s|cains|cain|harness['’]s|harness['’]|harness";
+// Only the words that make it one of these two Apps: "your add-on order" is something else.
+const OWNERS = "the|cain['’]s|cain|harness['’]s|harness['’]|harness";
 const APP = new RegExp(`(?:\\b(?:${OWNERS})|>)[*_~]*\\s+[*_~]*(add\\\\?-?ons?(?:['’]s?)?)(?![A-Za-z0-9])`, "gid");
 function apps(seen: string): { at: number; end: number; put: string }[] {
   const out: { at: number; end: number; put: string }[] = [];
@@ -126,12 +128,20 @@ const JOB = /\bjob\s+(?:id\s+)?#?([0-9a-f]{6,})\b/gi;
 // -- button ----------------------------------------------------------------------------
 const Q = "[\"“”'‘’*_]*";
 const VERB = "(?:[Tt]ap|[Tt]apping|[Pp]ress|[Pp]ressing|[Hh]it|[Cc]lick|[Cc]hoose|[Pp]ick|[Ss]elect)";
+// "with X" names a button only for labels that are never plain words: "ends with Stop",
+// "go with No" and "syncs with Gmail" (a live card's option) are just words.
+export const WITH_LABELS: readonly string[] = [
+  "Undo", "Undo both", "Undo these", "Not mine", "Wrong time", "Just this once", "Turn back on", "Not now",
+  "Use new", "Keep old", "Keep rule", "Drop rule", "All of it", "Part of it", "None wrong: stop checking",
+  "Something was off: keep checking", "Open connector settings",
+];
 function named(seen: string, label: string): { at: number; end: number }[] {
   const L = escapeRe(label);
   const forms = [
     new RegExp(`(?<![A-Za-z])${VERB}\\s+(?:(?:on\\s+)?the\\s+|on\\s+)?${Q}(${L})${Q}(?![A-Za-z0-9])`, "gd"),
     new RegExp(`(?<![A-Za-z0-9])${Q}(${L})${Q}\\s+[Bb]uttons?\\b`, "gd"),
-    new RegExp(`(?<![A-Za-z])[Ww]ith\\s+(?:the\\s+)?${Q}(${L})${Q}(?![A-Za-z0-9])`, "gd"),
+    ...(WITH_LABELS.includes(label)
+      ? [new RegExp(`(?<![A-Za-z])[Ww]ith\\s+(?:the\\s+)?${Q}(${L})${Q}(?![A-Za-z0-9])`, "gd")] : []),
   ];
   const out: { at: number; end: number }[] = [];
   for (const re of forms) for (const m of seen.matchAll(re)) {
