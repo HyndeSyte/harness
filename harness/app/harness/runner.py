@@ -129,8 +129,8 @@ class Runner:
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "cancelled",
                                    receipt=json.dumps({"reason": "stopped"}), db=db)
-            self._reply(db, job, "I'm stopped, so I didn't act on that. Send /resume to "
-                                 "start again, then resend it.")
+            # Never a resend ask: the Resumed notice says what wasn't acted on (commands.py).
+            self._reply(db, job, "I'm stopped, so I didn't act on that.")
 
     def _start(self, job) -> bool:
         text = self.ledger.job_text(job["id"])

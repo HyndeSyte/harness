@@ -106,6 +106,21 @@ def test_every_message_is_a_card_for_cain_and_buttons_carry_stop():
     assert ids(link.last()) == []
 
 
+def test_stop_is_red_everywhere_and_turn_back_on_is_not():
+    from harness.discord_api import DANGER, PRIMARY, SECONDARY
+    link = FakeLink()
+    chat = LinkChat(link)
+    chat.send_message(1, "Approve this?", [[("Approve", "a:x"), ("Decline", "d:x")]])
+    styles = {c["label"]: c["style"] for r in link.last()["rows"] for c in r["components"]}
+    assert styles == {"Approve": PRIMARY, "Decline": SECONDARY, "Stop": DANGER}
+    assert link.last()["rows"][-1]["components"] == [{"type": 2, "style": DANGER, "label": "Stop",
+                                                      "custom_id": STOP}]       # on its own row
+    chat.send_message(1, "Good morning.", None, kind="digest")
+    assert [c["style"] for r in link.last()["rows"] for c in r["components"]] == [DANGER]
+    LinkChat(link, paused=lambda: True).send_message(1, "x", None, kind="stopped")
+    assert [c["style"] for r in link.last()["rows"] for c in r["components"]] == [SECONDARY]
+
+
 def test_when_stopped_the_button_turns_it_back_on():
     link = FakeLink()
     LinkChat(link, paused=lambda: True).send_message(1, "x", None, kind="stopped")

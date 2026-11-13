@@ -1198,12 +1198,28 @@ def test_two_gmail_calendars_says_so(g):
     assert "exactly one" in g.gm.status_line()
 
 
+def test_waiting_changes_are_named_by_block_and_day(g):
+    first = when(g, days=2)
+    said = g.gm._capped([("Busy (watching kids)", first + timedelta(days=3)),
+                         ("Busy (school pickup)", first + timedelta(days=1)),
+                         ("Busy (watching kids)", first)])
+    day = lambda d: f"{d.astimezone(NY):%a %b} {d.astimezone(NY).day}"
+    assert said == ("Blocks on Gmail from Family: past today's limit, these wait for tomorrow: "
+                    f"Busy (watching kids) on {day(first)}, {day(first + timedelta(days=3))}; "
+                    f"Busy (school pickup) on {day(first + timedelta(days=1))}. Those days may be wrong until then.")
+
+
 def test_the_days_cap_holds_and_says_so(g):
     for i in range(MAX_WRITES_PER_DAY + 4):
         sit(g, days=2 + i % 50, hour=6 + i % 12)
     go(g)
     assert len(g.google.live()) == MAX_WRITES_PER_DAY
-    assert "4 more changes wait" in problem(g)
+    # Each change that waits is named by its block and day, never counted (Nov 11).
+    said = problem(g)
+    assert "past today's limit, these wait for tomorrow: Busy (watching kids) on " in said
+    assert "more" not in said and said.count(", ") + 1 >= 1
+    waiting = said.split("Busy (watching kids) on ", 1)[1].split(". ", 1)[0].split(", ")
+    assert 1 <= len(waiting) <= 4 and all(w[:3] in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun") for w in waiting)
     g.advance(days=1)
     go(g)
     assert len(g.google.live()) > MAX_WRITES_PER_DAY - 3

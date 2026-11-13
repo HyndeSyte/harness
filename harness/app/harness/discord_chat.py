@@ -13,8 +13,8 @@ link (cain_relay.py), which holds it until Cain shows it, unchanged.
   event title can't format, link or ping.
 - Each button's id is the harness's callback data with a "k:" prefix, so
   Cain's plugin, which only answers its own "perm:" buttons, leaves them alone.
-- A Stop button rides along with every set of buttons and on the digest. When
-  stopped, a Turn back on button takes its place.
+- A Stop button rides along with every set of buttons and on the digest, red (danger),
+  the one look Stop has everywhere. When stopped, a Turn back on button takes its place.
 - Stop's notices and the 7:40 digest fallback are "direct": the link posts them
   at once, because they exist for when Cain can't be relied on. So is word that
   an input stopped (inputs.py), with no buttons: there's nothing to decide.
@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 
 from .cain_relay import CainLink, LinkError
 from .chat import ChatError
-from .discord_api import PRIMARY, components, escape
+from .discord_api import DANGER, PRIMARY, components, escape
 
 PREFIX = "k:"
 STOP, RESUME = "k:stop", "k:resume"
@@ -101,7 +101,7 @@ class LinkChat:
         rows = [[(label, PREFIX + data) for label, data in row] for row in (buttons or [])]
         if rows or kind in TOGGLE_KINDS:
             rows.append([("Turn back on", RESUME)] if self.paused() else [("Stop", STOP)])
-        return components(rows, styles={"k:a:": PRIMARY})
+        return components(rows, styles={"k:a:": PRIMARY, STOP: DANGER})
 
     def send_message(self, chat_id: int, text: str, buttons=None, *, html: bool = True,
                      kind: str | None = None, expires: str | None = None) -> int:

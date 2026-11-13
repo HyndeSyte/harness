@@ -62,7 +62,8 @@ def test_stop_cancels_new_work_and_resume_restores_it(ledger, config):
     _, [job] = w.say("draft the coop email")
     w.step()
     assert ledger.job(job)["state"] == "cancelled" and w.eng.calls == []
-    assert "/resume" in w.last()
+    # Says it wasn't acted on, and asks nothing: no resend, no button this message lacks.
+    assert w.last() == "I'm stopped, so I didn't act on that."
     w.say("/resume")
     w.step()
     assert not is_paused(ledger) and "Resumed." in w.last()

@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness import caldav, commands, daily, effects, family_add, prompts, render, schema
+from harness import caldav, choices, commands, daily, effects, family_add, prompts, render, schema
 from harness.config import Config
 from fakes import receive, own, TestController as Controller
 from harness.family_add import FamilyAdd
@@ -298,7 +298,32 @@ def test_only_his_tap_on_the_card_turns_it_on(rig):
     assert not rig.fa.enabled()
     rig.press_data(data, mid)
     assert rig.fa.enabled()
-    assert "Each add shows you a card" in rig.texts()[-1]
+    assert any("Each add shows you a card" in x for x in rig.texts()[-2:])
+
+
+def test_turning_it_on_brings_the_events_card_back_without_a_resend(rig):
+    rig.ask()
+    card = rig.last()
+    assert "Send" not in card[1]
+    rig.claude.script = [proposal()]                    # his same message, read again
+    rig.press(card, "Turn on")
+    texts = rig.texts()
+    reply = next(x for x in texts if "Adding to the Family calendar is on" in x)
+    assert "The card for your event comes next." in reply and "again" not in reply
+    assert "Add to the Family calendar?" in rig.with_button("Approve")[1]
+    assert rig.jobs("proposed")                         # the same job, now waiting for his Approve
+    assert rig.ledger.db.execute("SELECT COUNT(*) FROM events WHERE kind='family_add_asked_again'"
+                                 ).fetchone()[0] == 1
+
+
+def test_turning_it_on_brings_back_only_the_message_it_was_for(rig):
+    rig.ask()
+    card = rig.last()
+    [job] = rig.jobs("no_action")
+    nonce = choices.parse(card[2][0][0][1])
+    assert rig.ledger.db.execute("SELECT target FROM choices WHERE nonce=?", (nonce,)).fetchone()[0] == job["id"]
+    with rig.ledger.tx() as db:                         # any other job is left as it is
+        assert rig.fa._ask_again(db, "no-such-job") is False
 
 
 def test_turning_it_on_expires(rig, clock):
@@ -341,7 +366,7 @@ def test_a_card_comes_first_and_only_the_tap_writes_one_event(on, ledger):
     assert on.icloud.log == [] and not on.icloud.events
     assert "Add to the Family calendar?" in text
     on.press(on.last(), "Approve")
-    assert on.icloud.methods() == ["PROPFIND", "PUT"]
+    assert on.icloud.methods() == ["PROPFIND", "PUT", "PROPFIND", "GET"]
     assert len(on.icloud.family()) == 1
     [job] = on.jobs("executed")
     assert on.receipt(job["id"])["http_status"] == 201
@@ -463,11 +488,67 @@ def test_the_receipt_comes_from_the_response_and_has_undo(on):
     on.ask()
     on.press(on.last(), "Approve")
     _, text, buttons, _ = on.with_button("Undo")
-    assert "Added to the Family calendar" in text and "HTTP 201" in text
+    assert "Added to the Family calendar" in text and "HTTP" not in text and "job" not in text
+    assert text.endswith("Nothing to do if that's right; tap Undo if it's wrong.")
     assert "Tue Oct 27, 2026, 3:00 PM to 4:00 PM EDT" in text
     [job] = on.jobs("executed")
     assert on.receipt(job["id"])["uid"] == caldav.uid_for(
         on.ledger.db.execute("SELECT id FROM proposals").fetchone()["id"])
+
+
+def test_added_is_said_only_once_a_read_finds_it_as_written(on, monkeypatch):
+    real = on.fa.client.fetch
+    monkeypatch.setattr(on.fa.client, "fetch", lambda href: (caldav.Outcome("failed"), ""))
+    on.ask()
+    on.press(on.last(), "Approve")
+    assert on.icloud.family()                           # written
+    assert not any("Added to the Family calendar" in x for x in on.texts())
+    assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("written", 0)
+    on.tick()                                           # a read that can't tell waits a minute
+    monkeypatch.setattr(on.fa.client, "fetch", real)
+    on.advance(minutes=2)
+    on.tick()                                           # read again inside the specialist
+    _, text, buttons, _ = on.with_button("Undo")
+    assert text.startswith("<b>Added to the Family calendar.</b>")
+    assert on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "created"
+
+
+def test_an_add_reads_never_find_gets_the_not_confirmed_line_with_its_undo(on):
+    on.ask()
+    path = None
+
+    def written_then_changed(*a):
+        nonlocal path
+        out = real(*a)
+        path = next(iter(on.icloud.family()))
+        on.icloud.human_edit(path, "SUMMARY:Dentist", "SUMMARY:Dentist moved")   # not what was written
+        return out
+    real = on.fa.client.create
+    on.fa.client.create = written_then_changed
+    on.press(on.last(), "Approve")
+    for _ in range(family_add.READS_TO_CONFIRM):
+        on.advance(minutes=2)
+        on.tick()
+    _, text, buttons, _ = on.with_button("Undo")       # it keeps its Undo
+    assert text.startswith("<b>Written to the Family calendar but not confirmed.</b>")
+    assert "Added to the Family calendar" not in text
+    assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("unconfirmed", 3)
+    assert "Written to the Family calendar but not confirmed by a read: Dentist Tue Oct 27." in on.fa.digest_line()
+    assert len([x for x in on.texts() if "not confirmed" in x]) == 1     # once
+
+
+def test_a_read_compares_title_start_end_and_place():
+    from harness.family_add import _as_written
+    params = {"title": "Swim, then lunch", "start": "2026-10-27T15:00:00-04:00",
+              "end": "2026-10-27T16:00:00-04:00", "location": "1 Pool Rd"}
+    from datetime import datetime, timezone
+    ics = caldav.build_ics("hx-1", params, datetime(2026, 10, 1, tzinfo=timezone.utc))
+    assert _as_written(ics, "hx-1", params)
+    assert not _as_written(ics, "hx-2", params)
+    assert not _as_written(ics, "hx-1", {**params, "title": "Swim"})
+    assert not _as_written(ics, "hx-1", {**params, "end": "2026-10-27T17:00:00-04:00"})
+    assert not _as_written(ics, "hx-1", {**params, "location": ""})
+    assert not _as_written("", "hx-1", params)
 
 
 def test_a_lost_response_is_unknown_and_is_not_retried(on, ledger):
@@ -498,14 +579,14 @@ def test_a_refused_write_is_said_with_its_status_and_no_undo(on):
     on.icloud.force_status = 403
     on.press(on.last(), "Approve")
     _, text, buttons, _ = on.last()
-    assert "Not added" in text and "HTTP 403" in text and buttons is None
+    assert "Not added" in text and "iCloud turned it down" in text and "403" not in text and buttons is None
     assert not on.icloud.events
 
 
 def test_no_etag_at_all_means_no_undo_button_and_says_so(on, monkeypatch):
     on.ask()
-    monkeypatch.setattr(on.fa.client, "create",
-                        lambda *a: caldav.Outcome("ok", 201, None))
+    real = on.fa.client.create                         # written, but iCloud gives no version tag
+    monkeypatch.setattr(on.fa.client, "create", lambda *a: caldav.Outcome("ok", 201, None) if real(*a) else None)
     on.press(on.last(), "Approve")
     _, text, buttons, _ = on.last()
     assert "can't offer Undo" in text and buttons is None
@@ -815,7 +896,7 @@ def test_after_his_tap_adds_skip_approve_and_keep_receipt_undo_and_stop(on):
     on.icloud.log.clear()
     on.bot.sent.clear()
     on.ask(start="2027-01-06T15:00:00-05:00", end="2027-01-06T16:00:00-05:00")
-    assert on.icloud.methods() == ["PROPFIND", "PUT"]
+    assert on.icloud.methods() == ["PROPFIND", "PUT", "PROPFIND", "GET"]
     assert not any("Add to the Family calendar?" in t for t in on.texts())
     receipt = on.with_button("Undo")
     assert "Added to the Family calendar" in receipt[1]
@@ -1093,7 +1174,7 @@ def loose(on):
 
 def test_loose_adds_write_with_no_card(loose):
     loose.ask(**fresh())
-    assert loose.icloud.methods() == ["PROPFIND", "PUT"]
+    assert loose.icloud.methods() == ["PROPFIND", "PUT", "PROPFIND", "GET"]
     assert not any("Add to the Family calendar?" in t for t in loose.texts())
 
 
@@ -1202,7 +1283,7 @@ def test_a_wrong_end_offset_warns_too(on):
 def test_a_warned_card_can_still_be_approved_by_his_tap(on):
     on.ask(**WRONG_OFFSET)
     on.press(on.last(), "Approve")
-    assert on.icloud.methods() == ["PROPFIND", "PUT"]
+    assert on.icloud.methods() == ["PROPFIND", "PUT", "PROPFIND", "GET"]
 
 
 def test_the_right_offset_on_each_side_of_the_clock_change_has_no_warning(on):
@@ -1265,7 +1346,7 @@ def test_loose_a_wrong_offset_never_writes_and_gets_a_warned_card(loose):
     text = loose.last()[1]
     assert "Add to the Family calendar?" in text and "different UTC offset" in text
     loose.press(loose.last(), "Approve")
-    assert loose.icloud.methods() == ["PROPFIND", "PUT"]
+    assert loose.icloud.methods() == ["PROPFIND", "PUT", "PROPFIND", "GET"]
 
 
 def test_a_same_title_same_start_is_a_suspected_duplicate(on):
@@ -1992,7 +2073,7 @@ def test_the_record_does_not_reach_across_a_reset(on):
     text = ask_cards(on)[0][1]
     assert "10 approved and added, 0 declined" in text and "Before this count" not in text
     assert "0 of those 10" in text
-    assert on.icloud.methods().count("GET") == 10
+    assert on.icloud.methods().count("GET") == 10 + 10   # each add's read, then the check of those 10
 
 
 def test_a_later_restart_does_not_bring_back_what_a_reset_forgot(on):
@@ -2047,7 +2128,7 @@ def test_the_missing_check_stays_inside_the_count(on):
     on.press(receipt, "Undo")
     on.icloud.log.clear()
     count_up(on, 10, 14)
-    assert on.icloud.methods().count("GET") == 10
+    assert on.icloud.methods().count("GET") == 10 + 10   # each add's read, then the check of those 10
 
 
 def test_the_record_counts_cancelled_refused_and_warned(on):

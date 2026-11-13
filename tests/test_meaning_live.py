@@ -5,6 +5,7 @@ All names are invented. No network: Family, Google, Cain's link and the model ar
 import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import threading
@@ -249,7 +250,7 @@ def test_a_yes_stores_a_confirmed_example_and_judges_again(lv):
     it, q = ask_one(lv)
     words = sorted(family_rules.words("Kid sitting"))
     reply = lv.live.on_choice("meaning_answer", f"{q['id']}:yes")
-    assert reply == "Thanks. Kid sitting is on your calendar as yours."
+    assert reply == "Thanks. I'll put Kid sitting on your calendar as yours."    # what will happen
     [ex] = [e for e in meaning.active_examples(lv.ledger) if e.source == "answer"]
     assert ex.types == ("supervision",) and sorted(ex.words) == words and ex.confirmed and ex.trusted
     row = lv.ledger.db.execute("SELECT stale FROM meaning_judgments").fetchone()
@@ -342,7 +343,7 @@ def test_a_tap_goes_through_the_choice_binding(on):
     card = on.with_button("Depends")
     on.press(card, "Yes")
     assert any(e.source == "answer" for e in meaning.active_examples(on.ledger))
-    assert "Kid sitting is on your calendar" in on.bot.sent[-1][1]
+    assert "put Kid sitting on your calendar" in on.bot.sent[-1][1]
     on.press(card, "No")                                       # one tap per card
     assert [e.types for e in meaning.active_examples(on.ledger) if e.source == "answer"] == [("supervision",)]
 
@@ -635,6 +636,8 @@ def confirmed(live, title="Turkey harvest", days=3):
     go(live)
     go(live)
     assert live.google.titles() == ["Busy (watching kids)"]
+    assert live.live.send_receipts() == 0                     # written, not read back yet
+    go(live)                                                  # a later read finds it as written
     assert live.live.send_receipts() == 1
     live.tick()                                               # the outbox sends it
     return live.with_button("Not mine")
@@ -644,10 +647,85 @@ def test_a_new_confirmed_block_gets_one_receipt_with_three_buttons(live):
     card = confirmed(live)
     _, text, buttons, _ = card
     assert labels(buttons) == ["Not mine", "Wrong time", "Just this once"]
-    assert text.startswith("On your Gmail: Busy (watching kids), ") and text.endswith(", for Turkey harvest.")
+    # A notice, not a question (Nov 10), with the block's whole time.
+    assert text.startswith("Added to your Gmail: Busy (watching kids), ")
+    assert ", for Turkey harvest on Family. Nothing to do if that's right; tap a button only if it's wrong." in text
+    assert " to " in text and "?" not in text
     go(live)                                                  # a refresh is not a new receipt
     assert live.live.send_receipts() == 0
-    assert "each on its own card with Undo" not in live.live.digest_line()
+    assert "Undo" not in live.live.digest_line()
+
+
+def test_the_receipt_waits_for_a_read_that_finds_the_block_as_written(live):
+    start = when(live, days=3)
+    seed(live, "Turkey harvest", start)
+    eid = answer_ex(live, "Turkey harvest", ["supervision"])
+    live.judge.script = [judged(ob("supervision", start, start + timedelta(hours=1)), cites=[eid])]
+    go(live)
+    go(live)                                                  # written: Google said ok
+    [r] = live.ledger.db.execute("SELECT * FROM meaning_receipts").fetchall()
+    assert r["state"] == "written" and live.live.digest_line() == ""
+    [uid] = live.google.live()
+    live.google.hand_edit(uid, summary="Busy (watching kids)", start={"dateTime": (start + timedelta(hours=2)).isoformat()},
+                          end={"dateTime": (start + timedelta(hours=3)).isoformat()})
+    go(live)                                                  # read back: not as written
+    r = live.ledger.db.execute("SELECT * FROM meaning_receipts").fetchone()
+    assert r["state"] == "written" and r["reads"] == 1
+    assert live.live.send_receipts() == 0
+
+
+def test_a_block_never_found_gets_the_not_confirmed_line_with_its_buttons(live):
+    start = when(live, days=3)
+    seed(live, "Turkey harvest", start)
+    eid = answer_ex(live, "Turkey harvest", ["supervision"])
+    live.judge.script = [judged(ob("supervision", start, start + timedelta(hours=1)), cites=[eid])]
+    go(live)
+    go(live)
+    [rid] = [r["id"] for r in live.live.written()]
+    for _ in range(meaning_live.READS_TO_CONFIRM):             # three reads that don't find it
+        live.live.read_back(rid, False)
+    r = live.ledger.db.execute("SELECT * FROM meaning_receipts").fetchone()
+    assert r["state"] == "unconfirmed"
+    line = live.live.digest_line()
+    assert "Written but not confirmed by a read of your calendar: Busy (watching kids)" in line
+    assert live.live.send_receipts() == 1
+    live.tick()
+    _, text, buttons, _ = live.with_button("Not mine")
+    assert text.startswith("Written to your Gmail but not confirmed: Busy (watching kids), ")
+    assert labels(buttons) == ["Not mine", "Wrong time", "Just this once"]   # it keeps its buttons
+    assert not text.startswith("Added")
+
+
+def test_a_read_that_cant_tell_leaves_the_receipt_waiting(live):
+    start = when(live, days=3)
+    seed(live, "Turkey harvest", start)
+    eid = answer_ex(live, "Turkey harvest", ["supervision"])
+    live.judge.script = [judged(ob("supervision", start, start + timedelta(hours=1)), cites=[eid])]
+    go(live)
+    go(live)
+    live.google.fail["GET"] = 503                             # Gmail can't be read: nothing is decided
+    go(live)
+    r = live.ledger.db.execute("SELECT * FROM meaning_receipts").fetchone()
+    assert r["state"] == "written" and r["reads"] == 0
+    del live.google.fail["GET"]
+    go(live)                                                  # tried again inside the specialist
+    assert live.ledger.db.execute("SELECT state FROM meaning_receipts").fetchone()["state"] == "new"
+
+
+def test_every_reply_to_a_choice_tap_says_what_will_happen_not_a_done_calendar(lv):
+    """Section 7: a tap reply never claims a calendar is already so before a read finds it."""
+    done = re.compile(r"(?i)\b(?:is|are|stays?)\s+(?:now\s+)?(?:on|off)\s+(?:your|the)\b"
+                      r"|\b(?:added|moved|removed|undone|taken off)\s+(?:to|from|on|off)\s+your\b")
+    replies = []
+    for n, code in enumerate(("yes", "all", "part", "no", "depends")):
+        if n:
+            lv.clock.advance(days=1)                          # the next day's batch
+        it, q = ask_one(lv, f"Swim {code}", 5)
+        replies.append(lv.live.on_choice("meaning_answer", f"{q['id']}:{code}"))
+    replies.append(lv.live.on_choice("meaning_answer", "nothing:yes"))
+    replies.append(lv.live.on_choice("meaning_undo", "nothing:not_mine"))
+    for reply in replies:
+        assert not done.search(reply), reply
 
 
 def test_not_mine_removes_it_and_learns_nothing_ties_him_up(live):
@@ -1106,6 +1184,7 @@ def test_undo_takes_the_events_drives_off_with_it_at_once(drives):
     go(drives)
     go(drives)
     assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (family)", "Busy (drive back)"]
+    go(drives)                                                # the read that finds it as written
     assert drives.live.send_receipts() == 1
     drives.tick()
     card = drives.with_button("Not mine")

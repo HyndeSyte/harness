@@ -1,0 +1,241 @@
+"""What he sees keeps to his standards (R-004): plain words, no em dash, Apps not add-ons,
+nothing hidden behind a count, no machine ids, no button named that the message lacks, no
+upkeep asks that the 30-minute line doesn't cover.
+
+Two halves, so neither a template nor a message slips through:
+  * static: every string literal in harness/app/harness, read with Python's ast (docstrings,
+    logging calls, regular expressions, raised errors and the model's own prompts left out),
+    each f-string with its values standing in as "3". A short allowlist below, each entry with
+    its reason. A failure names the file and line.
+  * dynamic: tests/conftest.py checks every message any test sends, as he'd see it.
+The rules are Cain's (cain/rootfs/opt/cain/gate/rules.ts), ported in tests/message_rules.py and
+kept equal by the shared cases in cain/tests/gate-cases.json, run here and by bun.
+"""
+from __future__ import annotations
+
+import ast
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+import message_rules
+from conftest import labels_of, rule_problems
+
+ROOT = Path(__file__).resolve().parents[1]
+APP = ROOT / "harness" / "app" / "harness"
+CASES = ROOT / "cain" / "tests" / "gate-cases.json"
+
+LOG_NAMES = {"log", "logging", "logger"}
+LOG_CALLS = {"debug", "info", "warning", "warn", "error", "exception", "critical"}
+PROMPT_NAME = re.compile(r"(?i)system|prompt|instruction|schema")
+RESTART_ASK = re.compile(r"(?i)\brestart(?:ing)?\s+(?:it|cain|harness|the|your|him|this|that|home)\b")
+APP_WORD = re.compile(r"(?i)\badd[\\-]*ons?\b")
+MACHINE_VALUE = re.compile(r"(?i)\b(?:job|http|uid|nonce)\s*\{\}")
+
+# (file, words in the literal, why it may stay). Kept short: each one is a decision.
+ALLOWED = [
+    ("drive.py", "addon", "the HTTP User-Agent to OpenStreetMap: a header, never a message"),
+    ("watch.py", "Restarting it should bring it back: Settings > Apps > Cain > Restart.",
+     "the 30-minute line: sent once, only while Cain is still down, with the exact path"),
+    ("watch.py", "Restarting Cain should bring it back: Settings > Apps > Cain > Restart.",
+     "the 30-minute line, when Cain's Discord connection is the part that's down"),
+    ("calendar_change.py", "restart Harness, then turn it on again",
+     "his own step to allow changes again after a reset, on purpose (/checkadds)"),
+    ("calendar_change.py", "restart Harness, then turn it on to allow them again",
+     "the same reset step, on the status line"),
+    ("inputs.py", "Restarting the Pi usually sets its clock right",
+     "the fix for a wrong clock, sent only when only he can fix it, with the exact path"),
+    ("meaning.py", " more)", "the shadow score's log lines, which stay on the Pi"),
+    ("mail_dates.py", "UID ", "an IMAP command to the mail server, never a message"),
+]
+
+
+def _strings(tree: ast.AST):
+    """(line, text) for each literal he might see; an f-string's values stand in as "{}"."""
+    skip: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                skip.add(id(body[0].value))                         # a docstring
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute) and (
+                    (isinstance(f.value, ast.Name) and f.value.id in LOG_NAMES and f.attr in LOG_CALLS)
+                    or (isinstance(f.value, ast.Name) and f.value.id == "re")):
+                for sub in ast.walk(node):                           # a log line or a pattern
+                    skip.add(id(sub))
+        if isinstance(node, ast.Raise):
+            for sub in ast.walk(node):                               # an error, for the log
+                skip.add(id(sub))
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and PROMPT_NAME.search(t.id) for t in targets):
+                for sub in ast.walk(node):                           # the model's prompt
+                    skip.add(id(sub))
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.JoinedStr):
+            text = "".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)
+            for v in node.values:
+                skip.add(id(v))
+            yield node.lineno, text
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.lineno, node.value
+
+
+def _allowed(name: str, text: str) -> bool:
+    return any(name == f and words in text for f, words, _ in ALLOWED)
+
+
+def problems_in(name: str, source: str) -> list[str]:
+    out = []
+    for line, text in _strings(ast.parse(source)):
+        if _allowed(name, text):
+            continue
+        shown = text.replace("{}", "3")
+        found = []
+        if "—" in text:
+            found.append("an em dash")
+        if APP_WORD.search(text):
+            found.append('"add-on" (they\'re Apps)')
+        if message_rules.check(shown, rules=("count",)).hits:
+            found.append("a hidden count")
+        if message_rules.check(shown, rules=("machine",)).hits or MACHINE_VALUE.search(text):
+            found.append("a machine id")
+        if RESTART_ASK.search(text):
+            found.append("a restart ask")
+        out += [f"{name}:{line}: {what}: {text[:80]!r}" for what in found]
+    return out
+
+
+def test_no_template_he_sees_breaks_his_standards():
+    found = []
+    for path in sorted(APP.glob("*.py")):
+        if path.name == "prompts.py":          # the model's own instructions, never shown to him
+            continue
+        found += problems_in(path.name, path.read_text(encoding="utf-8"))
+    assert not found, "\n".join(found)
+
+
+def test_every_allowed_literal_is_still_there_and_has_its_reason():
+    for name, words, why in ALLOWED:
+        texts = [text for _, text in _strings(ast.parse((APP / name).read_text(encoding="utf-8")))]
+        assert why and any(words in text for text in texts), (name, words)
+
+
+@pytest.mark.parametrize("source, what", [
+    ('x = "Moved it — done."', "an em dash"),
+    ('x = "Restart the add-on."', '"add-on"'),
+    ('x = f"{n} more changes wait for tomorrow"', "a hidden count"),
+    ('x = f"Lunch and {n} more"', "a hidden count"),
+    ('x = f"<i>job {short(job_id)}</i>"', "a machine id"),
+    ('x = f"iCloud answered HTTP {out.status}."', "a machine id"),
+    ('x = "If it doesn\'t come back, restart Cain in Home Assistant."', "a restart ask"),
+])
+def test_the_scan_finds_each_kind(source, what):
+    assert any(what in p for p in problems_in("x.py", source)), source
+
+
+def test_the_scan_leaves_logs_patterns_docstrings_and_prompts_alone():
+    source = '\n'.join([
+        '"""A docstring may say add-on and 3 more."""',
+        'log.info("the add-on restarted — job %s", 1)',
+        'X = re.compile(r"[—–]")',
+        'SYSTEM = "You read the add-on\'s mail and 3 more items."',
+        'def f():',
+        '    """Restart the add-on."""',
+        '    raise ValueError(f"job {job_id}: bad")',
+    ])
+    assert problems_in("x.py", source) == []
+
+
+# -- tap replies say what will happen (section 7) ------------------------------------------------
+# What every choice tap can get back, by module and function (callbacks.py routes them). None may
+# say a calendar is already so: that's for the receipt, once a read finds it.
+TAP_REPLIES = {"callbacks.py": ("handle", "_apply_choice"), "meaning_live.py": ("on_choice", "_answer", "_undo"),
+               "family_add.py": ("on_choice",), "mail_dates.py": ("on_choice",),
+               "calendar_change.py": ("on_choice",), "places.py": ("on_choice",)}
+DONE_CLAIM = re.compile(r"(?i)\b(?:is|are|stays?)\s+(?:now\s+)?(?:on|off)\s+(?:your|the)\b"
+                        r"|\b(?:added|moved|removed|undone|taken off)\s+(?:it\s+)?(?:to|from|on|off)\s+your\b")
+
+
+def tap_replies() -> list[tuple[str, int, str]]:
+    out = []
+    for name, funcs in TAP_REPLIES.items():
+        tree = ast.parse((APP / name).read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in funcs:
+                out += [(name, line, text) for line, text in _strings(fn)]
+    return out
+
+
+def test_no_reply_to_a_tap_says_a_calendar_is_already_so():
+    replies = tap_replies()
+    assert any("I'll put" in text for _, _, text in replies)           # the scan reads the replies
+    found = [f"{name}:{line}: {text!r}" for name, line, text in replies if DONE_CLAIM.search(text)]
+    assert not found, "\n".join(found)
+
+
+def test_the_done_claim_check_catches_one():
+    assert DONE_CLAIM.search("Thanks. Swim is on your calendar as yours.")
+    assert DONE_CLAIM.search("Thanks. Swim stays off your calendar.")
+    assert not DONE_CLAIM.search("Thanks. I'll put Swim on your calendar as yours.")
+    assert not DONE_CLAIM.search("Taking it off your Gmail, just this once.")
+
+
+# -- the rules, equal on both sides ------------------------------------------------------------
+
+def cases():
+    return json.loads(CASES.read_text(encoding="utf-8"))
+
+
+def test_the_port_has_the_same_labels_as_cains_rules():
+    assert list(message_rules.STATIC_LABELS) == cases()["static_labels"]
+    rules_ts = (ROOT / "cain" / "rootfs" / "opt" / "cain" / "gate" / "rules.ts").read_text(encoding="utf-8")
+    for label in message_rules.STATIC_LABELS:
+        assert f'"{label}"' in rules_ts, label
+
+
+@pytest.mark.parametrize("case", cases()["cases"], ids=lambda c: c["name"])
+def test_each_shared_case(case):
+    ctx = case.get("context", {})
+    r = message_rules.check(case["text"], rules=ctx.get("rules"),
+                            buttons=ctx["buttons"] if "buttons" in ctx else (),
+                            known=ctx.get("known", ()), answers_him=ctx.get("answers_him", False))
+    assert {k: r.rules(k) for k in ("fix", "refuse", "unsure")} == \
+        {k: sorted(case.get(k, [])) for k in ("fix", "refuse", "unsure")}
+    assert r.fixed == case.get("fixed", case["text"])
+    assert all(len(h.around) <= 60 for h in r.hits)
+
+
+# -- the dynamic half's own checks ---------------------------------------------------------------
+
+def test_the_check_reads_both_shapes_of_buttons():
+    assert labels_of([[("Undo", "c:1"), ("Stop", "k:stop")]]) == ["Undo", "Stop"]
+    assert labels_of([{"type": 1, "components": [{"type": 2, "label": "Undo", "custom_id": "k:c:1"}]}]) == ["Undo"]
+    assert rule_problems("card", "Tap Undo if it's wrong.", ["Undo"]) == []
+    assert rule_problems("card", "Tap Undo if it's wrong.", ["Stop"])
+
+
+@pytest.mark.raw_words
+def test_a_message_that_breaks_a_rule_fails_the_test_that_sent_it(request):
+    """The fixture's own check, run here by hand: a card naming a button it lacks."""
+    from harness.discord_chat import LinkChat, to_markdown
+    sent = []
+
+    class Link:
+        def card(self, text, rows, kind, expires=None):
+            sent.append((text, rows))
+            return 1
+
+    chat = LinkChat(Link())
+    chat.send_message(1, "Moved swim — tap Undo if it's wrong.", None)
+    text, rows = sent[0]
+    found = rule_problems("card", text, labels_of(rows))
+    assert any("button" in f and "Undo" in f for f in found) and any("dash" in f for f in found)
+    assert to_markdown("<b>x</b>") == "**x**"

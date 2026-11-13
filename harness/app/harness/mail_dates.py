@@ -16,8 +16,10 @@ written busy, at that time, with his usual reminder and the street address the e
 that another email about the same appointment gave (the same sender, day and time), so work
 and Family see him busy and Maps opens it. Until the mail_dates option is on, it finds dates
 and writes nothing (shadow), so the first batch can be checked against his inbox before
-anything lands. Each batch that lands gets one message with one Undo. An entry he has changed
-in any way is his, and is left alone.
+anything lands. What lands is told in one message with one Undo, once a read of each entry by
+its id finds it as written (title, day or time, place, busy or free); a read that can't tell is
+tried again a minute later, and three that don't find one say it was written but not confirmed,
+with the Undo all the same. An entry he has changed in any way is his, and is left alone.
 
 Google's own email about a failed run of the work holds script becomes a digest line.
 """
@@ -59,6 +61,8 @@ MAX_WHAT = 60
 AGAIN_DAYS = 120                      # how far back an email behind a written appointment is looked for
 WARN_EVERY = timedelta(hours=1)       # a read failing the same way is logged again after this
 MAX_WRITES_PER_DAY = 20
+READS_TO_CONFIRM = 3                  # reads that don't find an entry before it's "not confirmed"
+READ_AGAIN_S = 60                     # how soon entries waiting for a read are read again
 AHEAD = timedelta(days=365)           # a date further out than this is a misread
 UNDO_TTL_S = 7 * 86400
 KINDS = ("deadline", "window_closes", "appointment", "renewal", "event")
@@ -453,6 +457,7 @@ class MailDates:
         self._future: Future | None = None
         self._listed = False
         self._warned: tuple[str, datetime] | None = None   # the last failure logged: its kind, when
+        self._read_at: float | None = None                  # the last read of what waits to be told
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -476,6 +481,7 @@ class MailDates:
                 self._retime()
                 self._write_found()
                 self._real_appointments()
+            self._read_back()
         except Exception as e:                     # a bug here is a record, never a stopped loop
             log.warning("mail dates failed: %s", type(e).__name__)
             self.ledger.event("mail_dates_failed", {"error": type(e).__name__})
@@ -791,9 +797,9 @@ class MailDates:
             f = Found(row["what"], day, row["kind"], at=f"{start:%H:%M}" if start else "", place=place)
             out = self.google.add_note(address, row["event_id"], title(f), day, start, place=place, busy=busy)
             if out.kind == "ok":
-                with self.ledger.tx() as db:
-                    db.execute("UPDATE mail_dates SET state='live', batch=?, busy=?, shown=? WHERE key=?",
-                               (batch, BUSY if busy else 0, place, row["key"]))
+                with self.ledger.tx() as db:     # told once a read finds it (_read_back)
+                    db.execute("UPDATE mail_dates SET state='live', batch=?, busy=?, shown=?, told='added',"
+                               " reads=0 WHERE key=?", (batch, BUSY if busy else 0, place, row["key"]))
                     self.ledger.event("mail_date_added", {"day": row["day"]}, db=db)
                 landed.append(f)
                 room -= 1
@@ -802,7 +808,7 @@ class MailDates:
             else:
                 break                              # Google is having trouble: next tick
         if landed or moved:
-            self._tell(batch, landed, moved)
+            self._read_back(now=True)
 
     def _on_day(self, address: str, day: date) -> list[tuple[str, datetime | None]] | None:
         """(title, start) of everything that day on Gmail and Family: ours too, since a note he
@@ -865,7 +871,8 @@ class MailDates:
             if out.kind != "ok":
                 return None if out.kind == "unknown" else False
             with self.ledger.tx() as db:
-                db.execute("UPDATE mail_dates SET day=?, what=?, at=?, busy=?, shown=?, place=? WHERE key=?",
+                db.execute("UPDATE mail_dates SET day=?, what=?, at=?, busy=?, shown=?, place=?, told='moved',"
+                           " reads=0 WHERE key=?",
                            (day.isoformat(), row["what"], _at(row), BUSY if busy else old["busy"],
                             place if busy else old["shown"], row["place"] or old["place"], old["key"]))
                 db.execute("UPDATE mail_dates SET state='skipped' WHERE key=?", (row["key"],))
@@ -992,7 +999,65 @@ class MailDates:
         with self.ledger.tx() as db:
             db.execute("UPDATE mail_dates SET state=? WHERE key=?", (state, key))
 
-    def _tell(self, batch: str, landed: list[Found], moved: list[Found] = ()) -> None:
+    # -- told only once a read finds it ---------------------------------------------------------
+    def _read_back(self, *, now: bool = False) -> None:
+        """What was written or moved is told only once a read of each entry by its id finds it as
+        written: on his calendar, with its title, its day or time, its place and busy or free. A
+        read that can't tell stops the pass, and the next one, a minute later, reads again. One that
+        READS_TO_CONFIRM reads don't find is told as written but not confirmed, with the same Undo,
+        and the next digest names it."""
+        address = self.address()
+        if not address or not self.google.configured():
+            return
+        rows = self.ledger.db.execute("SELECT * FROM mail_dates WHERE state='live' AND told IN ('added','moved')"
+                                      " ORDER BY day").fetchall()
+        if not rows:
+            return
+        clock = self.monotonic()
+        if not now and self._read_at is not None and clock - self._read_at < READ_AGAIN_S:
+            return
+        self._read_at = clock
+        found, unsure = [], []
+        for row in rows:
+            day = date.fromisoformat(row["day"])
+            start = self._start_at(row, day)
+            if row["busy"] == HIS:             # his now: nothing of ours to tell
+                with self.ledger.tx() as db:
+                    db.execute("UPDATE mail_dates SET told='' WHERE key=?", (row["key"],))
+                continue
+            state, e = self.google.look(address, row["event_id"])
+            if state == "unknown":
+                break                          # can't tell: the next pass reads again
+            f = Found(row["what"], day, row["kind"], at=_at(row) if start else "", place=row["shown"])
+            if state == "ok" and e.get("status") != "cancelled" and google_cal.note_as_written(
+                    e, title(f), day, start, place=row["shown"], busy=row["busy"] == BUSY):
+                found.append((row, f))
+                continue
+            reads = row["reads"] + 1
+            with self.ledger.tx() as db:
+                db.execute("UPDATE mail_dates SET reads=? WHERE key=?", (reads, row["key"]))
+            if reads >= READS_TO_CONFIRM:
+                unsure.append((row, f))
+        if found:
+            self._tell(found, confirmed=True)
+        if unsure:
+            self._tell(unsure, confirmed=False)
+
+    def _tell(self, items: list, *, confirmed: bool) -> None:
+        """One message for what a read found (or didn't find, three times), with one Undo for
+        exactly those entries."""
+        keys = [row["key"] for row, _ in items]
+        batch = hashlib.sha256(f"{iso(self.ledger.now())}|{'|'.join(keys)}".encode()).hexdigest()[:16]
+        landed = [f for row, f in items if row["told"] == "added"]
+        moved = [f for row, f in items if row["told"] == "moved"]
+        with self.ledger.tx() as db:
+            for key in keys:
+                db.execute("UPDATE mail_dates SET batch=?, told=? WHERE key=?",
+                           (batch, "told" if confirmed else "unconfirmed", key))
+            if not confirmed:
+                for f in landed + moved:
+                    self.ledger.event("mail_date_unconfirmed", {"title": title(f), "day": f.day.isoformat(),
+                                                                "at": f.at}, db=db)
         if self.chat_id is None:
             return
         busy = [f for f in landed if f.kind == "appointment" and f.at]
@@ -1004,7 +1069,12 @@ class MailDates:
         how = ("An appointment with a time is busy, so work and Family see it. " if busy else "") + \
               ("The rest are free, nothing at work. " if len(busy) < len(landed) + len(moved) else "") + \
               "One with a time has your usual reminder; the rest have none."
-        text = "<b>From your mail, on your calendar:</b>\n" + "\n".join(lines) + more + "\n" + how
+        if confirmed:
+            text = "<b>From your mail, on your calendar:</b>\n" + "\n".join(lines) + more + "\n" + how
+        else:
+            text = ("<b>From your mail, written to your calendar but not confirmed:</b>\n" + "\n".join(lines)
+                    + more + "\nReads of your calendar haven't found these as written, so they may not be "
+                    "there. Nothing to do if that's fine; tap Undo these if they shouldn't be there.")
         with self.ledger.tx() as db:
             nonce = choices.mint(self.ledger, kind="mail_dates_undo", target=batch, chat_id=self.chat_id,
                                  ttl_s=UNDO_TTL_S, db=db)
@@ -1069,4 +1139,15 @@ class MailDates:
                 continue
         if made:                                   # every one by name, never "and N more"
             parts.append("From your mail, now busy so work and Family see them: " + "; ".join(made) + ".")
+        unsure = []
+        for r in self.ledger.db.execute("SELECT detail FROM events WHERE kind='mail_date_unconfirmed' AND at>=?"
+                                        " ORDER BY id", (iso(since) if since else "",)):
+            try:
+                d = json.loads(r["detail"])
+                day = date.fromisoformat(d["day"])
+                unsure.append(f"{day:%a %b} {day.day}{_clock(d.get('at', ''))}: {d['title']}")
+            except (ValueError, KeyError, TypeError):
+                continue
+        if unsure:                                 # each by name
+            parts.append("From your mail, written but not confirmed by a read: " + "; ".join(unsure) + ".")
         return " ".join(parts)

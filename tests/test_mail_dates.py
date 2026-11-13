@@ -178,6 +178,65 @@ def test_a_date_lands_free_all_day_with_no_reminder_and_one_undo(g):
     assert g.google.live() == {}
 
 
+def test_what_lands_is_told_only_once_a_read_finds_it(g, monkeypatch):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    real = g.client.look
+    monkeypatch.setattr(g.client, "look", lambda address, uid: ("unknown", None))   # can't tell
+    read(g)
+    g.c.outbox.flush()
+    assert len(g.google.live()) == 1                            # written
+    assert not any("From your mail" in s[1] for s in g.bot.sent)
+    assert g.ledger.db.execute("SELECT told, reads FROM mail_dates").fetchone()[:] == ("added", 0)
+    monkeypatch.setattr(g.client, "look", real)
+    g.md.run(paused=False)                                      # within the minute: not read again
+    assert g.ledger.db.execute("SELECT told FROM mail_dates").fetchone()[0] == "added"
+    g.md._read_at -= 61
+    g.md.run(paused=False)                                      # read again: found as written
+    g.c.outbox.flush()
+    said = g.bot.sent[-1]
+    assert said[1].startswith("<b>From your mail, on your calendar:</b>") and said[2][0][0][0] == "Undo these"
+    assert g.ledger.db.execute("SELECT told FROM mail_dates").fetchone()[0] == "told"
+
+
+def test_one_three_reads_dont_find_is_told_as_not_confirmed_with_its_undo(g, monkeypatch):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    monkeypatch.setattr(g.client, "look", lambda address, uid: ("gone", None))
+    read(g)
+    for _ in range(2):
+        g.md._read_at -= 61
+        g.md.run(paused=False)
+    g.c.outbox.flush()
+    said = [s for s in g.bot.sent if "From your mail" in s[1]]
+    assert len(said) == 1
+    text, buttons = said[0][1], said[0][2]
+    assert text.startswith("<b>From your mail, written to your calendar but not confirmed:</b>")
+    assert "Last day: Amazon return: PC parts" in text and buttons[0][0][0] == "Undo these"
+    assert g.ledger.db.execute("SELECT told, reads FROM mail_dates").fetchone()[:] == ("unconfirmed", 3)
+    assert "From your mail, written but not confirmed by a read: Thu Nov 26: Last day: Amazon return: PC parts."         in g.md.digest_line()
+    g.md._read_at -= 61
+    g.md.run(paused=False)                                      # never read or told again
+    g.c.outbox.flush()
+    assert len([s for s in g.bot.sent if "From your mail" in s[1]]) == 1
+    nonce = choices.parse(buttons[0][0][1])                     # its Undo still takes it off
+    batch = g.ledger.db.execute("SELECT target FROM choices WHERE nonce=?", (nonce,)).fetchone()[0]
+    assert g.md.on_choice("mail_dates_undo", batch).startswith("Taking those off")
+
+
+def test_a_read_compares_the_note_with_what_was_written(g):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    real = g.client.add_note
+
+    def then_he_moves_it(address, uid, *a, **kw):
+        out = real(address, uid, *a, **kw)
+        g.google.hand_edit(uid, start={"date": "2026-11-27"}, end={"date": "2026-11-28"})
+        return out
+    g.client.add_note = then_he_moves_it
+    read(g)
+    g.c.outbox.flush()
+    assert not any("on your calendar:" in s[1] for s in g.bot.sent)   # there, but not as written
+    assert g.ledger.db.execute("SELECT reads FROM mail_dates").fetchone()[0] == 1
+
+
 def test_the_same_date_from_two_emails_lands_once(g):
     rig_mail(g, [msg(1, "Your order of PC parts"), msg(2, "Your order has shipped")],
              {"Your order of PC parts": RETURN,

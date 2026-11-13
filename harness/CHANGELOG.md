@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.22.0
+
+- **A receipt comes only once your calendar shows the change.** "Added to your Gmail", "From your mail, on your calendar" and "Added to the Family calendar" now go out after a read of the calendar finds it as it was written, not when Google or iCloud only says the write worked. If three reads don't find it, one card says it was written but not confirmed, with its Undo, and the next morning digest names it.
+- **Tap replies say what will happen:** "Thanks. I'll put Swim on your calendar as yours."
+- **Receipts read as notices:** "Added to your Gmail: Busy (family), Fri Nov 20, 1:00 PM to 3:00 PM, for Swim on Family. Nothing to do if that's right; tap a button only if it's wrong."
+- **No message names a button it doesn't have.** Turning on Family adds brings your event's card back by itself, and a stop or a restart no longer asks you to send something again.
+- **Changes that wait past the day's limit are each named,** by block and day, never counted.
+- **Stop is red** on every card and on the digest.
+- **If Cain is down, the first message just says so.** If he's still down after 30 minutes, one more line says how to restart him: Settings > Apps > Cain > Restart.
+- **No codes:** a refused Family add says iCloud turned it down, and its receipt has no job number.
+
 ## 0.21.3
 
 - **The Resumed notice no longer asks you to send things again.** It says plainly that what you sent while stopped wasn't acted on.

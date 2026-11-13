@@ -18,7 +18,10 @@ turns them into his calendar and lets him correct it, all model-free:
     means), and the judgments whose candidates include it are judged again under the usual
     limits. [Depends] stores nothing and marks the kind "ask each time". The occurrence he
     answered about follows his answer at once.
-  * A receipt card for each new confirmed block, sent with the next morning digest:
+  * A receipt card for each new confirmed block, sent with the next morning digest once a
+    later read of Gmail finds the block as written (title, start and end): a write that Google
+    answered ok isn't enough. Three reads that don't find it, and the card says it was written
+    but not confirmed, with the same buttons:
     [Not mine] removes it and stores "nothing" for that kind; [Wrong time] removes it and
     stores the obligation with its window marked untrusted, so the next one asks;
     [Just this once] removes only that block and stores nothing. A block removed by hand on
@@ -60,6 +63,7 @@ MIN_TTL_S = 3600
 MAX_TTL_S = 14 * 24 * 3600
 RECEIPT_TTL_S = 7 * 24 * 3600
 MAX_RECEIPTS = 5                        # receipt cards with one digest; the rest the next day
+READS_TO_CONFIRM = 3                    # reads of Gmail that don't find a block before it's "not confirmed"
 
 # Each answer, as what it stores: types, and (for presence) the scope.
 CRITICAL_ASK = {"supervision": "are you watching the kids?", "transport": "are you driving?"}
@@ -200,6 +204,12 @@ def _day(d: datetime) -> str:
 
 def _when(d: datetime, all_day: bool) -> str:
     return _day(d) if all_day else f"{_day(d)} {meaning._clock(d)}"
+
+
+def _span(start: datetime, end: datetime) -> str:
+    """Fri Nov 20, 1:00 PM to 3:00 PM (the end's day too when it's another day)."""
+    until = meaning._clock(end) if end.date() == start.date() else f"{_day(end)}, {meaning._clock(end)}"
+    return f"{_day(start)}, {meaning._clock(start)} to {until}"
 
 
 def question_text(ask: str, title: str, start: datetime, all_day: bool) -> str:
@@ -389,7 +399,8 @@ class MeaningLive:
 
     # -- receipts ----------------------------------------------------------------------------------
     def applied(self, want: Want, generation: int) -> None:
-        """A new confirmed block landed on Gmail (not a refresh, not a move): one receipt."""
+        """A new confirmed block was written to Gmail (not a refresh, not a move): one receipt,
+        held until a later read finds the block as written (family_gmail.py)."""
         meta = self._why.get(want.key)
         if meta is None or want.state != "confirmed":
             return
@@ -397,31 +408,61 @@ class MeaningLive:
         with self.ledger.tx() as db:
             db.execute("INSERT OR IGNORE INTO meaning_receipts(id, gmail_key, title, said, start,"
                        " end, features, state, action, created_at, updated_at)"
-                       " VALUES(?,?,?,?,?,?,?,'new','',?,?)",
+                       " VALUES(?,?,?,?,?,?,?,'written','',?,?)",
                        (f"{want.key[:24]}.{generation}", want.key, want.title, meta["said"],
                         want.start.isoformat(), want.end.isoformat(), json.dumps(meta), now, now))
 
+    def written(self) -> list:
+        """Receipts waiting for a read of Gmail to find their block as written."""
+        return self.ledger.db.execute("SELECT * FROM meaning_receipts WHERE state='written'"
+                                      " ORDER BY start").fetchall()
+
+    def read_back(self, rid: str, found: bool | None) -> None:
+        """What a read of Gmail found for this receipt's block. True: there as written, so its
+        receipt goes out with the next digest. False: not there as written; after
+        READS_TO_CONFIRM of those, the next digest says it was written but not confirmed. None:
+        there's nothing left to tell (the block is gone, his, written again, or over)."""
+        now = iso(self.ledger.now())
+        with self.ledger.tx() as db:
+            if found is None:
+                db.execute("UPDATE meaning_receipts SET state='past', updated_at=? WHERE id=?"
+                           " AND state='written'", (now, rid))
+            elif found:
+                db.execute("UPDATE meaning_receipts SET state='new', updated_at=? WHERE id=?"
+                           " AND state='written'", (now, rid))
+            else:
+                db.execute("UPDATE meaning_receipts SET reads=reads+1, updated_at=? WHERE id=?"
+                           " AND state='written'", (now, rid))
+                db.execute("UPDATE meaning_receipts SET state='unconfirmed' WHERE id=? AND state='written'"
+                           " AND reads>=?", (rid, READS_TO_CONFIRM))
+
     def digest_line(self) -> str:
-        n = self.ledger.db.execute("SELECT COUNT(*) FROM meaning_receipts WHERE state='new'"
-                                   ).fetchone()[0]
-        if not n:
+        rows = self.ledger.db.execute("SELECT title, start, state FROM meaning_receipts WHERE state IN"
+                                      " ('new','unconfirmed') ORDER BY start").fetchall()
+        if not rows:
             return ""
-        shown = min(n, MAX_RECEIPTS)
-        # What's held is named, never just counted (Nov 11): its own block and day.
+        shown = min(len(rows), MAX_RECEIPTS)
+        # Named, never just counted (Nov 11): each block and its day.
         zone = ZoneInfo(self.tz)
-        held = [f"{r['title']} {_day(datetime.fromisoformat(r['start']).astimezone(zone))}"     # escaped in the digest
-                for r in self.ledger.db.execute("SELECT title, start FROM meaning_receipts WHERE state='new'"
-                                                " ORDER BY start LIMIT -1 OFFSET ?", (MAX_RECEIPTS,))]
+
+        def named(r) -> str:
+            return f"{r['title']} {_day(datetime.fromisoformat(r['start']).astimezone(zone))}"   # escaped in the digest
+        held = [named(r) for r in rows[MAX_RECEIPTS:]]
+        unsure = [named(r) for r in rows[:MAX_RECEIPTS] if r["state"] == "unconfirmed"]
         more = f" (tomorrow: {', '.join(held)})" if held else ""
-        return (f"New on Gmail from what Family events mean: {shown} block{'s' * (shown != 1)}, "
-                f"each on its own card with Undo{more}.")
+        line = (f"New on Gmail from what Family events mean: {shown} block{'s' * (shown != 1)}, "
+                f"each on its own card{more}.")
+        if unsure:
+            line += f" Written but not confirmed by a read of your calendar: {', '.join(unsure)}."
+        return line
 
     def send_receipts(self) -> int:
-        """With the morning digest: one card per new confirmed block, three buttons each. One
-        card each, so one tap can't use up another block's buttons."""
+        """With the morning digest: one card per new confirmed block, three buttons each, once a
+        read found it as written; one written but not confirmed says so, with the same buttons.
+        One card each, so one tap can't use up another block's buttons."""
         if self.chat_id is None:
             return 0
-        rows = self.ledger.db.execute("SELECT * FROM meaning_receipts WHERE state='new'"
+        rows = self.ledger.db.execute("SELECT * FROM meaning_receipts WHERE state IN ('new','unconfirmed')"
                                       " ORDER BY start LIMIT ?", (MAX_RECEIPTS,)).fetchall()
         zone = ZoneInfo(self.tz)
         now = self.ledger.now()
@@ -430,8 +471,14 @@ class MeaningLive:
             if datetime.fromisoformat(r["end"]) <= now:
                 self._receipt(r["id"], "past")
                 continue
-            text = (f"On your Gmail: {render.escape(r['title'])}, {_when(start, False)}, "
-                    f"for {render.escape(r['said'])}.")
+            end = datetime.fromisoformat(r["end"]).astimezone(zone)
+            what = f"{render.escape(r['title'])}, {_span(start, end)}, for {render.escape(r['said'])} on Family."
+            if r["state"] == "new":
+                text = f"Added to your Gmail: {what} Nothing to do if that's right; tap a button only if it's wrong."
+            else:
+                text = (f"Written to your Gmail but not confirmed: {what} A read of your calendar hasn't found it "
+                        "as written, so it may not be there. Nothing to do if that's fine; tap a button only if "
+                        "it's wrong.")
             with self.ledger.tx() as db:
                 nonces = [(label, choices.mint(self.ledger, kind="meaning_undo",
                                                target=f"{r['id']}:{code}", chat_id=self.chat_id,
@@ -508,10 +555,11 @@ class MeaningLive:
                 self._example(f, "answer", ["presence"], scope="part" if code == "part" else "")
             else:
                 self._example(f, "answer", [q["ask"]], place=f.get("place", "none"))
-        return {"yes": f"Thanks. {said} is on your calendar as yours.",
-                "all": f"Thanks. {said} is on your calendar as yours.",
+        # What will happen, never a calendar that's already so: the block follows at the next read.
+        return {"yes": f"Thanks. I'll put {said} on your calendar as yours.",
+                "all": f"Thanks. I'll put {said} on your calendar as yours.",
                 "part": f"Thanks. {said} ties you up for part of it.",
-                "no": f"Thanks. {said} stays off your calendar."}[code]
+                "no": f"Thanks. I'll keep {said} off your calendar."}[code]
 
     def _undo(self, rid: str, code: str) -> str:
         r = self.ledger.db.execute("SELECT * FROM meaning_receipts WHERE id=?", (rid,)).fetchone()

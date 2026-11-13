@@ -48,18 +48,19 @@ with a card you approve by tapping.
 
 ## Stop
 
-Every card with buttons, and the digest, carries a **Stop** button: start nothing new
+Every card with buttons, and the digest, carries a red **Stop** button: start nothing new
 until you tap **Turn back on**, which takes its place while stopped. What it's doing,
 spend this month and canary results are on the Harness page.
 
-## If Cain's add-on stops
+## If Cain stops
 
-This add-on and Cain's check each other every minute. If Cain's add-on hasn't answered for
+This App and Cain's check each other every minute. If Cain hasn't answered for
 5 minutes, or says its Discord connection has been down that long, you get one Discord
 message from here (Cain is the usual path, and it's the one that's down), and one more
 from here when it's back. Until then Stop and the buttons
-don't work; calendar work goes on and cards wait. Restarts and updates are shorter than
-5 minutes and say nothing. The Discord section of the Harness page shows whether the
+don't work; calendar work goes on and cards wait. If Cain is still down after 30 minutes,
+one more line says how to restart it (Settings > Apps > Cain > Restart), once per outage.
+Restarts and updates are shorter than 5 minutes and say nothing. The Discord section of the Harness page shows whether the
 Discord link is connected, when it last heard from Discord, and this watch.
 
 ## When something it works from stops
@@ -72,8 +73,8 @@ Something is down from the time it fails until the next time it works.
   service account key turned down, Gmail wanting you to sign in on the web, or your Gmail calendar
   no longer shared with Harness. One message as soon as a second try confirms it, saying what
   stopped, since when, what it costs you, and the steps from your phone. They end on the Harness
-  page (Settings > Apps > Harness > Open Web UI, under "Replace a key") and a tap on Approve on the
-  Discord message that follows, within 15 minutes. If a new key is turned down too, you hear again.
+  page (Settings > Apps > Harness > Open Web UI, under "Replace a key") and confirming it on the
+  card that follows, within 15 minutes. If a new key is turned down too, you hear again.
 - **Anything else**: Gmail, iCloud or Google not answering, Claude turning Harness's requests down,
   or the Pi's clock being off. One message once it has kept failing for six hours, sent on the
   quarter hour with everything else that's down then, so a home internet outage is one message.
@@ -202,14 +203,17 @@ Then send something like "add dentist Tuesday 3pm":
   (`Dr.Smith`) gets a warning on the card and never skips the tap. A time written with a UTC
   offset your zone doesn't have at that moment, or the same title and start as another add,
   also puts a warning on the card. Read it before you approve.
-- **The reply** gives iCloud's answer and an *Undo* button, good for 7 days. Undo deletes
-  only that event, once. If someone changed the event since, Undo refuses and leaves it.
+- **The receipt** comes once a read of the event finds it as written (title, start, end and
+  place), with an *Undo* button, good for 7 days. A read that can't tell is tried again a minute
+  later; if three reads don't find it, you get one card saying it was written but not confirmed,
+  with the same *Undo*, and the next digest names it. Undo deletes only that event, once. If
+  someone changed the event since, Undo refuses and leaves it.
 
 If iCloud's answer is lost, or it has a server error, the event may or may not be there.
 The reply says so and asks you to check the calendar, and it doesn't retry. A failed write,
 a rejected password or a calendar whose name isn't Family is said in the thread, and stays
-in `/status` and the digest until a write succeeds. `/stop` blocks adds and undos; after
-`/resume`, send the event again.
+in `/status` and the digest until a write succeeds. `/stop` blocks adds and undos. If adds are
+off when you ask for one, tapping *Turn on* brings that event's card back by itself.
 
 **Checking each add.** The app counts events added and days since the first. At 10 adds
 and 14 days, whichever is later, with no undo and no failed or unknown write, it reads the
@@ -282,7 +286,9 @@ at its time with your usual reminder, and at the street address that email gave,
 email about it gave (the same sender, day and time). Timed appointments already written free are
 made busy, their own emails are looked up once for an address, and the next digest names them. A
 rescheduling email moves the entry, with its own address. An entry you've changed is yours and
-left alone.
+left alone. What lands or moves is told in one message with *Undo these* once a read of each entry
+finds it as written; if three reads don't find one, the message says it was written but not
+confirmed, still with *Undo these*, and the next digest names it.
 
 ## Copies from your Gmail calendar
 
@@ -363,8 +369,10 @@ how many blocks are on Gmail.
   the two title settings. A block backed by your own answer is "Busy (...)"; kids or driving in the
   next 48 hours that it isn't sure of is "Maybe busy (...)", shown free so it never reaches work.
   When it can't tell and it matters in the next two weeks, Cain shows you one question with buttons.
-  Each new block gets a card with Not mine, Wrong time and Just this once. Turn it off to go straight
-  back to the title rules. All the limits and safety above still apply.
+  Each new block gets a card with Not mine, Wrong time and Just this once, once a later read of
+  Gmail finds the block as written; if three reads don't, the card says it was written but not
+  confirmed, with the same buttons. Turn it off to go straight back to the title rules. All the
+  limits and safety above still apply.
 - **Drive blocks (live):** an event you go to yourself, at a street address, gets its street address
   on its block (only that, never a name or note from Family, so it opens in Maps) and, with
   `home_location` set ("lat, lon" or a street address), separate "Busy (drive there)" and

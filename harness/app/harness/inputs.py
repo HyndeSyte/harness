@@ -57,8 +57,7 @@ KEYS = {"gmail_app_password": MAIL, "family_apple_id": FAMILY, "family_app_passw
 # How a new key gets in: the Harness page (setup_web.py), then his tap on its card (controller.py,
 # SETTINGS_TTL_S), as each fix ends.
 TAIL = (' In Home Assistant open Settings > Apps > Harness > Open Web UI. Under "Replace a key", paste '
-        'it into "{field}" and save. Then tap Approve on the Discord message that follows, within 15 '
-        'minutes.')
+        'it into "{field}" and save. Then confirm it on the card that follows, within 15 minutes.')
 GMAIL_TAIL = TAIL.format(field="Gmail mail: app password")
 
 

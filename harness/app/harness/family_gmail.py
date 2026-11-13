@@ -412,6 +412,8 @@ class FamilyGmail:
         if blocks is None:
             self._problem(self._said(why))
             return
+        if self.live is not None:
+            self._read_back({b.id: b for b in blocks}, now, until)
         if self.drives is not None:
             self.drives.begin()            # one allowance of lookups for the whole read
         self.leg_note = ""
@@ -703,10 +705,31 @@ class FamilyGmail:
         return datetime.fromisoformat(value)
 
     # -- what's already there ------------------------------------------------------------
+    def _read_back(self, blocks: dict, now: datetime, until: datetime) -> None:
+        """A new block's receipt (meaning_live.py) goes out only once a read of Gmail after its
+        write finds the block as written: ours, on his calendar, with its title, start and end.
+        This read is that check, before anything here changes. A block no longer ours to tell of
+        (gone from the record, his, written again, or over) drops its receipt; one past what was
+        read waits for a read that covers it."""
+        for r in self.live.written():
+            rid = r["id"]
+            row = self.ledger.db.execute("SELECT * FROM family_gmail WHERE key=?", (r["gmail_key"],)).fetchone()
+            start, end = self._when(r["start"]), self._when(r["end"])
+            if row is None or row["state"] != "live" or str(row["generation"]) != rid.rsplit(".", 1)[-1] \
+                    or end <= now:
+                self.live.read_back(rid, None)
+                continue
+            if start >= until:
+                continue                   # not read this time: neither found nor missing
+            block = blocks.get(row["event_id"])
+            self.live.read_back(rid, block is not None and block.plain and block.title == r["title"]
+                                and _same(block.start, start) and _same(block.end, end))
+
     def _follow(self, address: str, wants: dict, blocks: dict, now: datetime, until: datetime,
                 family_clean: bool, thin: bool) -> str:
         gone, absent = [], []
-        held = waiting = 0
+        held = 0
+        waiting: list[tuple[str, datetime]] = []
         failed = ""
         for row in self._live():
             title, start, end = row["title"], self._when(row["start"]), self._when(row["end"])
@@ -746,7 +769,7 @@ class FamilyGmail:
             if row["missing"]:
                 self._update(row, missing=0)
             if not self._room():
-                waiting += 1
+                waiting.append((want.title, want.start))
                 continue
             self._update(row, intent=_intent(want.title, want.start, want.end, want.place))
             out = self.google.move(address, block, want.title, want.start, want.end, want.place)
@@ -769,10 +792,16 @@ class FamilyGmail:
             problem = self._capped(waiting)
         return problem
 
-    @staticmethod
-    def _capped(n: int) -> str:
-        return (f"Blocks on Gmail from Family: {n} more changes wait for tomorrow, past today's "
-                "limit. Those days may be wrong until then.")
+    def _capped(self, waiting: list[tuple[str, datetime]]) -> str:
+        """Past today's limit: each change that waits, by its block's title and day, never a count."""
+        zone = ZoneInfo(self.tz)
+        days: dict[str, list[str]] = {}
+        for title, start in sorted(waiting, key=lambda w: w[1]):
+            local = start.astimezone(zone)
+            days.setdefault(title, []).append(f"{local:%a %b} {local.day}")
+        named = "; ".join(f"{title} on {', '.join(dict.fromkeys(ds))}" for title, ds in days.items())
+        return (f"Blocks on Gmail from Family: past today's limit, these wait for tomorrow: {named}. "
+                "Those days may be wrong until then.")
 
     @staticmethod
     def _landed(block: google_cal.Block, want: Want) -> bool:
@@ -822,7 +851,7 @@ class FamilyGmail:
                     "That looks like a bad read, so I left them on Gmail.")
         for n, (row, block) in enumerate(ready):
             if not self._room():
-                return self._capped(len(ready) - n)
+                return self._capped([(r["title"], self._when(r["start"])) for r, _ in ready[n:]])
             out = self.google.remove(address, block)
             if out.kind in ("ok", "gone"):
                 self._set(row, "cancelled")
@@ -862,7 +891,7 @@ class FamilyGmail:
         failed = ""
         for n, (want, generation) in enumerate(new):
             if not self._room():
-                return self._capped(len(new) - n)
+                return self._capped([(w.title, w.start) for w, _ in new[n:]])
             uid = google_cal.event_id(f"{want.key}:{generation}")
             out = self.google.add(address, uid, want.title, want.start, want.end, want.place)
             if out.kind == "exists":

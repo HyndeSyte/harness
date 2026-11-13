@@ -142,7 +142,7 @@ def test_paused_jobs_are_cancelled_with_a_receipt(ledger, config):
     job = send(ledger, "x")
     r.start_pending(paused=True)
     assert eng.calls == [] and ledger.job(job)["state"] == "cancelled"
-    assert "/resume" in queued(ledger)[0]["text"]
+    assert queued(ledger)[0]["text"] == "I'm stopped, so I didn't act on that."   # never a resend ask
 
 
 def test_rule_becomes_a_typed_rule_with_an_undo_button(ledger, config):

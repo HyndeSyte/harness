@@ -340,7 +340,8 @@ class Controller:
     def _watch_cain(self, status: dict | None) -> None:
         """The mutual watch (watch.py): Cain down for the grace period is told once,
         straight to his DM with the bot token, since Cain is the usual path and is the
-        one that's down; back is told once, the same way (a card held by Cain might
+        one that's down; still down after 30 minutes, one line with how to restart it;
+        back is told once, the same way (a card held by Cain might
         never be shown). Cain counts as down when its link doesn't answer, or when it
         says its Discord connection is down (newer links only say). A failed send is
         tried again at the next check. Nothing here may stop the loop."""
@@ -355,7 +356,8 @@ class Controller:
                 log.info("watch: Cain is %s, but Discord isn't ready here yet; next check", due)
                 return
             down_s = self.cain_watch.down_for()
-            text = watch.down_text(down_s, why) if due == watch.DOWN else watch.back_text(down_s)
+            text = (watch.down_text(down_s, why) if due == watch.DOWN else watch.still_text(why)
+                    if due == watch.STILL else watch.back_text(down_s))
             self.discord.api.send(self.discord.dm(), escape(text), timeout=PROBE_S)
             self.cain_watch.sent(due)
             log.info("watch: told him Cain's add-on is %s (%s, after %.0fs)", due, why, down_s)

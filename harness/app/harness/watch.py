@@ -1,13 +1,17 @@
-"""The mutual watch: is the other add-on still there?
+"""The mutual watch: is the other App still there?
 
 Cain and the calendar specialist run side by side on the Pi, and each checks
-the other about once a minute (Cain's link /health from here; this add-on's
+the other about once a minute (Cain's link /health from here; this App's
 handover /health from Cain). Nobody else would notice one of them stopping.
 
-When the other has not answered for GRACE_S, he is told once. When it answers
-again, he is told once more. A restart or an update takes well under GRACE_S,
-so it tells him nothing. A message that couldn't be sent is tried again at the
-next check, and only then: a failing send is the only thing that repeats.
+When the other has not answered for GRACE_S, he is told once: what's down and that
+he'll hear when it's back, with nothing to do. If it's still down STILL_S after it
+went down, one more line says how to restart it, once per outage (a restart of
+this App mid-outage doesn't say it twice, and it never comes after it's back).
+When it answers again, he is told once more. A restart or an update takes well
+under GRACE_S, so it tells him nothing. A message that couldn't be sent is tried
+again at the next check, and only then: a failing send is the only thing that
+repeats.
 
 Plain code, no model. The state is a few timestamps in the keeper's own small
 file (discord.json), so a restart of this add-on during an outage doesn't tell
@@ -32,8 +36,10 @@ from datetime import datetime, timezone
 from typing import Callable
 
 GRACE_S = 5 * 60
+STILL_S = 30 * 60                     # still down this long: the line with how to restart it
 CHECK_S = 60
-DOWN, BACK = "down", "back"
+DOWN, BACK, STILL = "down", "back", "still"
+KEPT = ("down_since", "alerted_at", "last_ok", "still_at")
 MAX_SHOWN_S = 30 * 24 * 3600          # a shown duration longer than this is a clock jump
 LINK, DISCORD = "link", "discord"     # why Cain counts as down
 
@@ -84,15 +90,15 @@ class PeerWatch:
         except (TypeError, ValueError):
             raw = {}
         raw = raw if isinstance(raw, dict) else {}
-        s = {k: num(raw.get(k)) for k in ("down_since", "alerted_at", "last_ok")}
+        s = {k: num(raw.get(k)) for k in KEPT}
         if not s["alerted_at"]:
             s["down_since"] = None          # not told yet: start the outage over
+            s["still_at"] = None
         s["last_check"] = None
         return s
 
     def _save(self) -> None:
-        self._set(self.key, json.dumps({k: self.s.get(k) for k in
-                                        ("down_since", "alerted_at", "last_ok")}))
+        self._set(self.key, json.dumps({k: self.s.get(k) for k in KEPT}))
 
     def observe(self, ok: bool) -> str | None:
         """One check's result. Returns what he should be told now, if anything."""
@@ -115,15 +121,20 @@ class PeerWatch:
             self._save()
         if not self.s.get("alerted_at") and mono - self.down_mono >= self.grace_s:
             return DOWN
+        if self.s.get("alerted_at") and not self.s.get("still_at") and self.down_for() >= STILL_S:
+            return STILL                    # stays due until sent()
         return None
 
     def sent(self, what: str) -> None:
         """He has been told."""
         if what == DOWN:
             self.s["alerted_at"] = self.clock()
+        elif what == STILL:
+            self.s["still_at"] = self.clock()
         elif what == BACK:
             self.s["alerted_at"] = None
             self.s["down_since"] = None
+            self.s["still_at"] = None
             self.down_mono = None
         self._save()
 
@@ -152,16 +163,25 @@ class PeerWatch:
 
 
 def down_text(down_s: float, why: str = LINK) -> str:
+    """What's down and what that stops, and that he'll hear when it's back. No ask: a
+    restart or an update is over long before this, and most outages end by themselves."""
     if why == DISCORD:
         return (f"Cain is running, but his Discord connection has been down for "
                 f"{minutes(down_s)}. Until it's back, Stop and the buttons on cards don't "
                 "work, and Cain can't see your messages. Calendar work goes on and its cards "
-                "wait. If it doesn't come back by itself, restart Cain in Home Assistant. "
-                "(From the calendar specialist; I'll say once when it's back.)")
+                "wait. Nothing to do now: you'll hear once it's back. (From the calendar specialist.)")
     return (f"Cain hasn't answered for {minutes(down_s)}. Until he's back, "
             "Stop and the buttons on cards don't work, and Cain can't reply. Calendar work "
-            "goes on and its cards wait. If it doesn't come back by itself, restart Cain "
-            "in Home Assistant. (From the calendar specialist; I'll say once when it's back.)")
+            "goes on and its cards wait. Nothing to do now: you'll hear once he's back. "
+            "(From the calendar specialist.)")
+
+
+def still_text(why: str = LINK) -> str:
+    """Once an outage, after STILL_S: the fix, ready, with the exact path."""
+    if why == DISCORD:
+        return ("Cain's Discord connection is still down. Restarting Cain should bring it back: "
+                "Settings > Apps > Cain > Restart.")
+    return "Cain is still down. Restarting it should bring it back: Settings > Apps > Cain > Restart."
 
 
 def back_text(down_s: float) -> str:

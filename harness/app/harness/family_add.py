@@ -4,12 +4,15 @@ Off until his tap on a bound card turns it on. That setting is its own: it
 does not move the stage, and no other effect looks at it.
 
     his message -> a model's typed proposal -> a card from plain code
-                -> his tap (approvals) -> this module -> caldav -> a receipt
+                -> his tap (approvals) -> this module -> caldav -> a read of the event
+                -> a receipt
 
 Everything here runs on the controller's thread, after the tick's commands,
 so a /stop in the same batch as a tap wins. A write is recorded as "sending"
 before the request and its result after it, so a crash in between is never
-silent: it is reported as unknown, and nothing is retried.
+silent: it is reported as unknown, and nothing is retried. "Added" is said only once a read of
+the event by its uid finds it as written; a read that can't tell is tried again, and three that
+don't find it say it was written but not confirmed, still with its Undo.
 
 Plain code checks every proposal. An impossible one (over 24 hours, over a year
 ahead, or text the card couldn't show exactly) is refused in words. Anything
@@ -39,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import caldav, choices, commands, effects, policy, render, rules
+from . import caldav, choices, commands, effects, ical, policy, render, rules
 from .canonical import canonical_hash
 from .ledger import Ledger, iso
 
@@ -60,6 +63,8 @@ ASK_AGAIN_AFTER = timedelta(days=7)   # an ignored card, at most this often
 MAX_DURATION = timedelta(hours=24)
 MAX_TAPLESS_PER_DAY = 5
 RECHECK_EVERY = timedelta(hours=1)    # a bake-in check that couldn't complete
+READS_TO_CONFIRM = 3                  # reads that don't find a written add before it's "not confirmed"
+READ_AGAIN = timedelta(minutes=1)     # how soon a read that couldn't tell is tried again
 
 # What the thread is told when a write did not end in a success.
 FAILED_WORDS = {
@@ -84,12 +89,36 @@ PROBLEM_WORDS = {
     "mismatch": "Family calendar: name mismatch, the saved address isn't Family",
     "no_credentials": "Family calendar: credentials aren't set",
     "failed": "Family calendar: the last write failed",
+    "unconfirmed": "Family calendar: the last add was written, but reads haven't found it as written",
 }
 
 
 def _detail(out: caldav.Outcome) -> str:
-    return (f"iCloud answered HTTP {out.status}." if out.status
-            else "I couldn't reach iCloud.")
+    """What iCloud said, in words: never its code (the code stays in the record)."""
+    if not out.status:
+        return "I couldn't reach iCloud."
+    return "iCloud had a server error." if out.status >= 500 else "iCloud turned it down."
+
+
+def _as_written(ics: str, uid: str, params: dict) -> bool:
+    """A read of the event finds what was written: one plain event of ours, with its title, start,
+    end and place."""
+    if not ics or not caldav._is_ours(ics, uid):
+        return False
+    try:
+        _, events = ical.parse_calendar(ics)
+        ev = events[0]
+        utc = ZoneInfo("UTC")
+        start = ical.parse_when(ev.first("DTSTART"), utc)
+        end = ical.parse_when(ev.first("DTEND"), utc)
+    except (IndexError, AttributeError, ical.Unreadable):
+        return False
+    summary, where = ev.first("SUMMARY"), ev.first("LOCATION")
+    return (isinstance(start, datetime) and isinstance(end, datetime)
+            and start == datetime.fromisoformat(params["start"])
+            and end == datetime.fromisoformat(params["end"])
+            and ical.unescape(summary.value if summary else "") == params["title"]
+            and ical.unescape(where.value if where else "") == (params.get("location") or ""))
 
 
 def _one_year_after(dt: datetime) -> datetime:
@@ -194,15 +223,25 @@ class FamilyAdd:
         return f"Family calendar adds: on, each needs your tap ({b['n']} since the last problem)"
 
     def digest_line(self) -> str:
-        """On every digest while adds skip the tap, so Clear can't hide it."""
-        if not (self.enabled() and self.loosened()):
-            return ""
+        """Adds written but not confirmed since the last digest, each by name. And on every digest
+        while adds skip the tap, so Clear can't hide it."""
         since = self.ledger.meta_time("last_digest_at")
-        n = self.ledger.db.execute(
-            "SELECT COUNT(*) FROM family_adds WHERE state='created' AND created_at>=?",
-            (iso(since) if since else "",)).fetchone()[0]
-        return (f"Family calendar adds skip the Approve tap: {n} added since the last digest. "
-                "/checkadds brings the tap back.")
+        zone = ZoneInfo(self.tz)
+        unsure = []
+        for r in self.ledger.db.execute(
+                "SELECT p.params_json FROM family_adds a JOIN proposals p ON p.id=a.proposal_id"
+                " WHERE a.state='unconfirmed' AND a.updated_at>=? ORDER BY a.rowid", (iso(since) if since else "",)):
+            params = json.loads(r["params_json"])
+            start = datetime.fromisoformat(params["start"]).astimezone(zone)
+            unsure.append(f"{params['title']} {start:%a %b} {start.day}")
+        parts = [f"Written to the Family calendar but not confirmed by a read: {'; '.join(unsure)}."] if unsure else []
+        if self.enabled() and self.loosened():
+            n = self.ledger.db.execute(
+                "SELECT COUNT(*) FROM family_adds WHERE state='created' AND created_at>=?",
+                (iso(since) if since else "",)).fetchone()[0]
+            parts.append(f"Family calendar adds skip the Approve tap: {n} added since the last digest. "
+                         "/checkadds brings the tap back.")
+        return " ".join(parts)
 
     def check_adds(self) -> str:
         """/checkadds: plain code, at once, and only a fresh count can undo it."""
@@ -302,8 +341,8 @@ class FamilyAdd:
                 "refused": states.get("refused", 0) + events("family_add_refused"),
                 "warned": events("family_add_warned"),
                 "undone": adds("undo_state='undone'"),
-                "failed": adds("state NOT IN ('created','sending','unknown')"),
-                "unknown": adds("state='unknown' OR undo_state='unknown'")}
+                "failed": adds("state NOT IN ('created','written','sending','unknown','unconfirmed')"),
+                "unknown": adds("state IN ('unknown','unconfirmed') OR undo_state='unknown'")}
 
     def _record(self, b: dict, days: int, missing: int) -> str:
         first = datetime.fromisoformat(b["first"]).astimezone(ZoneInfo(self.tz))
@@ -324,7 +363,8 @@ class FamilyAdd:
 
     def _counted_uids(self, b: dict) -> list[str]:
         return [r["uid"] for r in self.ledger.db.execute(
-            "SELECT uid FROM family_adds WHERE state='created' AND rowid>?", (b["marks"][1],))]
+            "SELECT uid FROM family_adds WHERE state IN ('created','written','unconfirmed') AND rowid>?",
+            (b["marks"][1],))]
 
     def _snapshot(self, b: dict, missing: int) -> dict:
         """What a card says, to compare with the truth when he taps it."""
@@ -392,8 +432,8 @@ class FamilyAdd:
                       "<b>Were any of these adds wrong?</b>\n"
                       "If none were, you can say yes: an add then goes straight to the Family "
                       "calendar without the Approve tap, unless a check finds something off. You "
-                      "still get the receipt, the Undo button and /stop, though Undo can't recall "
-                      "an alert already delivered. Nothing else changes: "
+                      "still get a receipt you can undo, and /stop still works, though undoing can't "
+                      "recall an alert already delivered. Nothing else changes: "
                       "edits, deletes and messages to people still need your go. Only your tap "
                       "changes this."),
                 buttons=[[("None wrong: stop checking", choices.callback_data(yes))],
@@ -486,9 +526,7 @@ class FamilyAdd:
             with self.ledger.tx() as db:
                 self.ledger.transition(job["id"], "cancelled", db=db,
                                        receipt=json.dumps({**receipt, "reason": "stopped"}))
-                self._say(db, job["chat_id"], job["id"],
-                          "I'm stopped, so nothing was added. Send /resume to start again, "
-                          "then resend it.")
+                self._say(db, job["chat_id"], job["id"], "I'm stopped, so nothing was added.")
             return True
         if self.enabled():
             why = self._impossible(params)
@@ -500,7 +538,8 @@ class FamilyAdd:
             self.ledger.transition(job["id"], "no_action", db=db,
                                    receipt=json.dumps({**receipt, "reason": "family_add_off"}))
             if self.client.configured():
-                nonce = choices.mint(self.ledger, kind="family_add_enable", target="on",
+                # Bound to this message, so his tap brings its card back without a resend.
+                nonce = choices.mint(self.ledger, kind="family_add_enable", target=job["id"],
                                      chat_id=job["chat_id"], ttl_s=ENABLE_TTL_S, db=db)
                 self._say(db, job["chat_id"], job["id"],
                           "Adding to the Family calendar is off, so nothing was added. Turn it "
@@ -549,8 +588,9 @@ class FamilyAdd:
             with self.ledger.tx() as db:
                 self.ledger.set_meta(ENABLED, "1", db)
                 self.ledger.event("family_add_enabled", {}, db=db)
+                again = self._ask_again(db, target)
             return ("Adding to the Family calendar is on. Each add shows you a card to approve, "
-                    "and /stop blocks it. Send the event again.")
+                    "and /stop blocks it." + (" The card for your event comes next." if again else ""))
         if kind == "family_add_loosen":
             self._check_authority()
             b = self._bake()
@@ -578,8 +618,8 @@ class FamilyAdd:
                 self.ledger.set_meta(LOOSENED, json.dumps(self._authority()), db)
                 self.ledger.event("family_add_loosened", {"adds": b["n"]}, db=db)
             return ("Done. Adds to the Family calendar no longer wait for your tap, unless a "
-                    "check finds something off. You still get the receipt and the Undo button, "
-                    "/stop still blocks them, and /checkadds brings the tap back. Nothing else "
+                    "check finds something off. You still get a receipt you can undo, /stop "
+                    "still blocks them, and /checkadds brings the tap back. Nothing else "
                     "changed.")
         if kind == "family_add_keep":
             if target == self._bake()["epoch"]:
@@ -604,6 +644,10 @@ class FamilyAdd:
         self._fail_orphans()
         for p in self._approved():
             self._execute(p, paused)
+        now = self.ledger.now()
+        for row in self.ledger.db.execute("SELECT * FROM family_adds WHERE state='written'").fetchall():
+            if datetime.fromisoformat(row["updated_at"]) + READ_AGAIN <= now:
+                self._read_back(row)
         for row in self.ledger.db.execute(
                 "SELECT * FROM family_adds WHERE undo_state='requested'").fetchall():
             self._undo(row, paused)
@@ -615,8 +659,9 @@ class FamilyAdd:
         self._check_authority()
         self._fail_orphans()
         for p in self._approved():
+            # Never a resend ask: an interrupted job is run again by itself (runner.RETRYABLE).
             self._refused(p, "interrupted", "The harness restarted before it wrote that, so "
-                                            "nothing was added. Send it again.")
+                                            "nothing was added.")
         for row in self.ledger.db.execute(
                 "SELECT * FROM family_adds WHERE undo_state='requested'").fetchall():
             self._reoffer(row, "The harness restarted before it could undo that, so it's still "
@@ -674,7 +719,7 @@ class FamilyAdd:
         """Checked last thing before the request. No request has been sent, so
         none of these is a failed write."""
         if paused:
-            return "stopped", "I'm stopped, so nothing was added. Send /resume, then resend it."
+            return "stopped", "I'm stopped, so nothing was added."
         if not self.enabled():
             return "family_add_off", "Adding to the Family calendar is off, so nothing was added."
         if p["state"] == "auto_approved" and not self.loosened():
@@ -724,9 +769,10 @@ class FamilyAdd:
             ok = out.kind == "ok"
             db.execute("UPDATE proposals SET state=? WHERE id=?",
                        ("executed" if ok else "failed", p["id"]))
+            # Written isn't added yet: the receipt waits for a read of the event (_read_back).
             db.execute("UPDATE family_adds SET state=?, http_status=?, etag=?, undo_state=?,"
                        " updated_at=? WHERE proposal_id=?",
-                       ("created" if ok else out.kind, out.status, out.etag,
+                       ("written" if ok else out.kind, out.status, out.etag,
                         "open" if ok and out.etag else "none", now, p["id"]))
             if not ok:
                 self.ledger.transition(job_id, "failed", db=db, receipt=json.dumps(
@@ -742,17 +788,68 @@ class FamilyAdd:
                 {"effect": effects.FAMILY_ADD, "uid": uid, "http_status": out.status}))
             self._count_add(db)
             db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
-            text = (f"<b>Added to the Family calendar.</b> iCloud answered HTTP {out.status}.\n"
-                    f"{render.family_event_text(params, self.tz)}\n"
-                    f"<i>job {render.short(job_id)}</i>")
-            if out.etag:
-                buttons, binds = self._undo_button(db, p["id"])
-                self._say(db, self.chat_id, job_id, text, buttons=buttons, binds=binds)
+            if not out.etag and p["state"] == "auto_approved":
+                self._setback(db, "an add went in with no Undo available")
+        self._read_back(self.ledger.db.execute("SELECT * FROM family_adds WHERE proposal_id=?",
+                                               (p["id"],)).fetchone())
+
+    # -- the read after the write -------------------------------------------------------
+    def _read_back(self, row) -> None:
+        """He hears "Added" only once a read of the event by its uid finds it as written: ours, on
+        the Family calendar, with its title, start, end and place. A read that can't tell is tried
+        again a minute later. READS_TO_CONFIRM reads that don't find it, and he hears it was
+        written but not confirmed, with its Undo all the same."""
+        p = self.ledger.db.execute("SELECT params_json FROM proposals WHERE id=?",
+                                   (row["proposal_id"],)).fetchone()
+        params = json.loads(p["params_json"])
+        out, ics = self.client.fetch(self.client.href_for(row["uid"]))
+        found = _as_written(ics, row["uid"], params) if out.kind == "ok" else False if out.kind == "gone" else None
+        now = iso(self.ledger.now())
+        with self.ledger.tx() as db:
+            cur = db.execute("SELECT state, reads FROM family_adds WHERE proposal_id=?",
+                             (row["proposal_id"],)).fetchone()
+            if cur is None or cur["state"] != "written":
+                return
+            if found is None:              # can't tell: read again later
+                db.execute("UPDATE family_adds SET updated_at=? WHERE proposal_id=?", (now, row["proposal_id"]))
+                return
+            reads = cur["reads"] + (0 if found else 1)
+            state = "created" if found else "unconfirmed" if reads >= READS_TO_CONFIRM else "written"
+            db.execute("UPDATE family_adds SET state=?, reads=?, updated_at=? WHERE proposal_id=?",
+                       (state, reads, now, row["proposal_id"]))
+            if state == "written":
+                return
+            if state == "unconfirmed":
+                self._setback(db, "an add was written, but reads couldn't find it as written")
+                self._set_problem(db, "unconfirmed")
+            event = render.family_event_text(params, self.tz)
+            text = (f"<b>Added to the Family calendar.</b>\n{event}" if found else
+                    f"<b>Written to the Family calendar but not confirmed.</b>\n{event}\n"
+                    "Reads of the calendar haven't found it as written, so it may not be there.")
+            if row["etag"]:
+                buttons, binds = self._undo_button(db, row["proposal_id"])
+                self._say(db, self.chat_id, row["job_id"],
+                          text + "\nNothing to do if that's right; tap Undo if it's wrong.",
+                          buttons=buttons, binds=binds)
             else:
-                self._say(db, self.chat_id, job_id, text + "\niCloud gave no version tag for "
+                self._say(db, self.chat_id, row["job_id"], text + "\niCloud gave no version tag for "
                           "it, so I can't offer Undo safely. Delete it on the calendar if needed.")
-                if p["state"] == "auto_approved":
-                    self._setback(db, "an add went in with no Undo available")
+
+    def _ask_again(self, db, job_id: str) -> bool:
+        """His tap that turned adds on brings back the message it was for, as if just sent, so its
+        card comes next: only that one message, only while it waits for exactly this."""
+        job = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        last = db.execute("SELECT detail FROM receipts WHERE job_id=? ORDER BY id DESC LIMIT 1",
+                          (job_id,)).fetchone()
+        try:
+            reason = json.loads(last["detail"]).get("reason") if last is not None else None
+        except (TypeError, ValueError, AttributeError):
+            reason = None
+        if job is None or job["state"] != "no_action" or reason != "family_add_off":
+            return False
+        self.ledger.transition(job_id, "received", db=db)
+        self.ledger.event("family_add_asked_again", {"job": job_id}, db=db)
+        return True
 
     # -- undo ---------------------------------------------------------------------------
     def _undo_button(self, db, proposal_id: str) -> tuple[list, list]:

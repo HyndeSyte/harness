@@ -8,7 +8,78 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "app"))
 
 from harness.ledger import Ledger  # noqa: E402
 
+import message_rules  # noqa: E402
+
 OWNER = 424242
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "raw_words: the test sends words the message rules refuse, on purpose "
+                                       "(a test of escaping or of the rules themselves)")
+
+
+# -- what he sees keeps to his standards (test_message_text.py has the static half) -------------
+# Every message any test sends through the chat (FakeBot, or LinkChat to a fake link, in-process
+# or over HTTP) and every note after a tap is checked as he'd see it: the words after
+# to_markdown, and its buttons with the Stop row LinkChat adds. No em dash, no app word, no
+# hidden count, no machine id, and no button named that the message lacks.
+TOGGLE = ("Stop", "Turn back on")
+
+
+def labels_of(buttons) -> list[str]:
+    """Button labels from either shape: [[(label, data), ...]] or Discord's components."""
+    out = []
+    for row in buttons or []:
+        if isinstance(row, dict):
+            out += [str(c.get("label", "")) for c in row.get("components", [])]
+        else:
+            out += [str(b[0]) for b in row]
+    return out
+
+
+def rule_problems(where: str, text: str, labels) -> list[str]:
+    report = message_rules.check(text, buttons=list(labels))
+    return [f"{where}: {h.rule} ({h.result}{', ' + h.label if h.label else ''}) in {h.around!r}"
+            for h in report.hits]
+
+
+@pytest.fixture(autouse=True)
+def he_sees_no_broken_rule(request, monkeypatch):
+    if request.node.get_closest_marker("raw_words"):
+        yield
+        return
+    import fakes
+    from harness import discord_chat
+    from harness.discord_api import escape
+    found: list[str] = []
+
+    real_bot = fakes.FakeBot.send_message
+
+    def bot_send(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None):
+        shown = discord_chat.to_markdown(text) if html else escape(text)
+        toggle = TOGGLE if buttons or kind in discord_chat.TOGGLE_KINDS else ()
+        found.extend(rule_problems("message", shown, [*labels_of(buttons), *toggle]))
+        return real_bot(self, chat_id, text, buttons, html=html, kind=kind, expires=expires)
+
+    real_card = discord_chat.LinkChat.send_message
+
+    def card_send(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None):
+        shown = discord_chat.to_markdown(text) if html else escape(text)
+        found.extend(rule_problems("card", shown, labels_of(self._rows(buttons, kind))))
+        return real_card(self, chat_id, text, buttons, html=html, kind=kind, expires=expires)
+
+    real_note = discord_chat.LinkChat.answer_callback
+
+    def tap_note(self, callback_id, text=None):
+        if text:
+            found.extend(rule_problems("note after a tap", text, ()))
+        return real_note(self, callback_id, text)
+
+    monkeypatch.setattr(fakes.FakeBot, "send_message", bot_send)
+    monkeypatch.setattr(discord_chat.LinkChat, "send_message", card_send)
+    monkeypatch.setattr(discord_chat.LinkChat, "answer_callback", tap_note)
+    yield
+    assert not found, "A message breaks his standards:\n" + "\n".join(dict.fromkeys(found))
 
 
 class Clock:

@@ -359,6 +359,7 @@ TRANSITIONS = {
     "approved": {"executed", "failed"},
     "failed": {"received"},          # a retry of a failure that wasn't his doing (runner)
     "needs_clarification": {"received"},   # a note from Cain for the question it asked (controller)
+    "no_action": {"received"},       # an add he asked for while adds were off, once his tap turns them on (family_add)
 }
 
 
@@ -418,8 +419,11 @@ class Ledger:
             "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"),),
             # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
             # who sent it, the address found, the one written, and whether it was written busy.
+            # 0.22.0: what a read must still find before it's told ("added" or "moved", then
+            # "told", or "unconfirmed" once the reads ran out), and how many reads didn't find it.
             "mail_dates": (("sender", "TEXT NOT NULL DEFAULT ''"), ("place", "TEXT NOT NULL DEFAULT ''"),
-                           ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0")),
+                           ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0"),
+                           ("told", "TEXT NOT NULL DEFAULT ''"), ("reads", "INTEGER NOT NULL DEFAULT 0")),
             # 0.21.1: an input that stops is told (inputs.py). Its outage: the last failure's
             # kind, the first failure, how many failures and refusals were seen, what he was told
             # and by which message, whether a digest named it, when one he knew about came back,
@@ -430,7 +434,12 @@ class Ledger:
                        ("refusals", "INTEGER NOT NULL DEFAULT 0"),
                        ("told_at", "TEXT"), ("told_kind", "TEXT NOT NULL DEFAULT ''"),
                        ("told_outbox", "INTEGER"), ("named", "INTEGER NOT NULL DEFAULT 0"),
-                       ("back_at", "TEXT"), ("label", "TEXT NOT NULL DEFAULT ''"))}
+                       ("back_at", "TEXT"), ("label", "TEXT NOT NULL DEFAULT ''")),
+            # 0.22.0: a receipt goes out only once a read finds what was written: how many reads
+            # haven't found it yet (meaning_live.py, family_add.py). Rows from before have nothing
+            # waiting.
+            "meaning_receipts": (("reads", "INTEGER NOT NULL DEFAULT 0"),),
+            "family_adds": (("reads", "INTEGER NOT NULL DEFAULT 0"),)}
         with self.tx() as db:              # all or nothing: a stop halfway leaves the file as it was
             for table, cols in added.items():
                 have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}

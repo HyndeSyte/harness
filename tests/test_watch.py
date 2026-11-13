@@ -18,6 +18,7 @@ from harness.discord_keeper import KeeperStore
 from harness.setup_web import SetupApp, render_page
 from harness.vault import Vault
 from test_discord_keeper import DM, TOKEN, Rig
+from conftest import rule_problems
 
 
 class Mem:
@@ -141,6 +142,74 @@ def test_the_words_name_the_time_and_what_stops_working():
     assert "about 1 minute." in watch.back_text(20)
 
 
+def test_the_first_notice_asks_nothing_and_says_he_will_hear():
+    for why in (watch.LINK, watch.DISCORD):
+        text = watch.down_text(300, why)
+        assert "restart" not in text.lower() and "add-on" not in text and "addon" not in text
+        assert "Nothing to do now" in text and "once" in text
+        assert rule_problems("watch", text, ()) == []
+    for text in (watch.still_text(watch.LINK), watch.still_text(watch.DISCORD), watch.back_text(60)):
+        assert rule_problems("watch", text, ()) == []
+    assert watch.still_text() == ("Cain is still down. Restarting it should bring it back: "
+                                  "Settings > Apps > Cain > Restart.")
+
+
+def test_the_30_minute_line_goes_once_and_only_while_still_down():
+    w, _, t = pw()
+    w.observe(True)
+    seen = []
+    for _ in range(90):                      # an hour and a half down, checked each minute
+        t.t += 60
+        due = w.observe(False)
+        if due:
+            seen.append((due, round(w.down_for() / 60)))
+            w.sent(due)
+    assert [d for d, _ in seen] == [watch.DOWN, watch.STILL]
+    assert seen[1][1] >= 30                  # not before half an hour
+    t.t += 60
+    assert w.observe(True) == watch.BACK
+    w.sent(watch.BACK)
+    for _ in range(40):                      # up again: never the 30-minute line
+        t.t += 60
+        assert w.observe(True) is None
+
+
+def test_back_before_30_minutes_never_sends_the_line():
+    w, _, t = pw()
+    w.observe(False)
+    t.t += watch.GRACE_S
+    w.sent(w.observe(False))
+    t.t += 10 * 60
+    assert w.observe(False) is None
+    t.t += 60
+    assert w.observe(True) == watch.BACK
+    w.sent(watch.BACK)
+    w.observe(False)                         # a new outage gets its own line, after its own half hour
+    t.t += watch.GRACE_S
+    assert w.observe(False) == watch.DOWN
+    w.sent(watch.DOWN)
+    t.t += 20 * 60
+    assert w.observe(False) is None
+    t.t += 5 * 60
+    assert w.observe(False) == watch.STILL
+
+
+def test_a_restart_mid_outage_never_sends_the_line_twice():
+    w, mem, t = pw()
+    w.observe(False)
+    t.t += watch.GRACE_S
+    w.sent(w.observe(False))
+    t.t += 30 * 60
+    assert w.observe(False) == watch.STILL
+    w.sent(watch.STILL)
+    w2, _, _ = pw(mem, t)                    # this App restarted
+    for _ in range(60):
+        t.t += 60
+        assert w2.observe(False) is None
+    t.t += 60
+    assert w2.observe(True) == watch.BACK    # and back is still told
+
+
 # -- in the controller -----------------------------------------------------------------------
 
 class Sent:
@@ -197,6 +266,24 @@ def test_cain_down_is_told_straight_to_his_dm_once_and_back_the_same_way(rig, cl
     assert len(sent.msgs) == 2 and sent.msgs[1][0] == DM and "answering again" in sent.msgs[1][1]
     assert rig.c.status_box["discord"]["cain"]["state"] == "up"
     assert all(t <= 5 for t in sent.timeouts)                # a short send, never a stuck loop
+
+
+def test_still_down_after_30_minutes_he_gets_the_restart_line_once(rig, clock, tmp_path):
+    sent = watched(rig, clock, tmp_path)
+    minute(rig, clock)
+    rig.link.up = False
+    minute(rig, clock, 6)
+    assert len(sent.msgs) == 1 and "restart" not in sent.msgs[0][1].lower()
+    minute(rig, clock, 30)
+    assert len(sent.msgs) == 2 and sent.msgs[1][0] == DM
+    assert r"Settings \> Apps \> Cain \> Restart" in sent.msgs[1][1]   # escaped for Discord
+    minute(rig, clock, 60)
+    assert len(sent.msgs) == 2                               # once
+    for _, text in sent.msgs:
+        assert rule_problems("watch", text, ()) == []
+    rig.link.up = True
+    minute(rig, clock, 2)
+    assert len(sent.msgs) == 3 and "answering again" in sent.msgs[2][1]
 
 
 def test_a_failed_dm_is_tried_again_next_minute(rig, clock, tmp_path):

@@ -339,8 +339,7 @@ class CalendarChange:
     def refuse(self, job, receipt: dict, params: dict) -> bool:
         """True when this goes no further; the words are queued."""
         if commands.is_paused(self.ledger):
-            words, state, why = ("I'm stopped, so nothing changed. Send /resume to start again, "
-                                 "then resend it."), "cancelled", "stopped"
+            words, state, why = "I'm stopped, so nothing changed.", "cancelled", "stopped"
         elif not self.on():
             words, state, why = ("Changing calendar events is off, so nothing changed. It's the "
                                  "calendar_changes option in Harness's settings."), "no_action", "off"
@@ -579,8 +578,9 @@ class CalendarChange:
     def reconcile_after_restart(self) -> None:
         self._fail_orphans()
         for p in self._approved():
+            # Never a resend ask: an interrupted job is run again by itself (runner.RETRYABLE).
             self._refused(p, "interrupted", "The harness restarted before it did that, so nothing "
-                                            "changed. Send it again.")
+                                            "changed.")
         for row in self.ledger.db.execute(
                 "SELECT * FROM calendar_changes WHERE undo_state IN ('requested','undoing')"
                 ).fetchall():
@@ -654,7 +654,7 @@ class CalendarChange:
     def _execute(self, p, paused: bool) -> None:
         params = json.loads(p["params_json"])
         if paused:
-            self._refused(p, "stopped", "I'm stopped, so nothing changed. Send /resume, then resend it.")
+            self._refused(p, "stopped", "I'm stopped, so nothing changed.")
             return
         if not self.on():
             self._refused(p, "off", "Changing calendar events is off, so nothing changed.")

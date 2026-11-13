@@ -98,8 +98,8 @@ def test_gmail_refusing_the_app_password_is_told_from_its_second_read_with_the_s
     assert text.endswith(
         "To fix it from your phone: make a new app password at https://myaccount.google.com/apppasswords "
         "and name it Harness, then copy it. In Home Assistant open Settings > Apps > Harness > Open Web UI. "
-        'Under "Replace a key", paste it into "Gmail mail: app password" and save. Then tap Approve on the '
-        "Discord message that follows, within 15 minutes.")
+        'Under "Replace a key", paste it into "Gmail mail: app password" and save. Then confirm it on the '
+        "card that follows, within 15 minutes.")                  # names no button it doesn't have
     readable(text)
     for _ in range(24):                                # two more hours of refused reads
         refused(ledger, clock, 1)
