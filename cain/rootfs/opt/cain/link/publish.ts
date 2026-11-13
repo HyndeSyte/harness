@@ -33,8 +33,10 @@ const ID = /(?<!\d)\d{17,20}(?!\d)/g;
 
 // The ids and exact texts of what Cain sent with the plugin's reply and edit tools, from
 // his transcripts changed since a time: the tool's input text, the message an edit names,
-// and the ids in the tool's answer.
-export function readTranscripts(root: string, since: number): Sent {
+// and the ids in the tool's answer. Only lines that name the plugin's tools, or answer one
+// of those calls, are parsed, and it yields between files, so the link's taps never wait
+// on it (a tap is answered within Discord's 3 seconds).
+export async function readTranscripts(root: string, since: number, maxBytes = 50_000_000): Promise<Sent> {
   const ids = new Set<string>(), texts = new Set<string>();
   let dirs: string[] = [];
   try { dirs = readdirSync(root).map((d) => join(root, d)); } catch { return { ids, texts }; }
@@ -42,11 +44,17 @@ export function readTranscripts(root: string, since: number): Sent {
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f)); } catch { continue; }
     for (const f of files) {
+      await new Promise((ok) => setTimeout(ok, 0));
       let text: string;
-      try { if (statSync(f).mtimeMs < since) continue; text = readFileSync(f, "utf8"); } catch { continue; }
+      try {
+        const st = statSync(f);
+        if (st.mtimeMs < since || st.size > maxBytes) continue;
+        text = readFileSync(f, "utf8");
+      } catch { continue; }
       const sends = new Set<string>();
       for (const line of text.split("\n")) {
-        if (!line.includes("plugin_discord_discord__") && !line.includes("tool_result")) continue;
+        const named = line.includes("plugin_discord_discord__");
+        if (!named && !(sends.size && line.includes("tool_result") && [...sends].some((s) => line.includes(s)))) continue;
         let o: any;
         try { o = JSON.parse(line); } catch { continue; }
         const content = o?.message?.content;
@@ -58,6 +66,7 @@ export function readTranscripts(root: string, since: number): Sent {
             if (t) texts.add(t);
             if (b.input?.message_id) ids.add(String(b.input.message_id));
           } else if (b?.type === "tool_result" && sends.has(String(b.tool_use_id ?? ""))) {
+            sends.delete(String(b.tool_use_id));
             const out = typeof b.content === "string" ? b.content
               : Array.isArray(b.content) ? b.content.map((x: any) => String(x?.text ?? "")).join(" ") : "";
             for (const m of out.matchAll(ID)) ids.add(m[0]);

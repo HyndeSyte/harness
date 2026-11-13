@@ -446,7 +446,7 @@ export interface Deps {
   report?: (r: GateReport) => void;
   // The replay: Cain's own replies and edits as his transcripts have them (since a time),
   // where its report goes, and the pause between pages of his DM (tests: 0).
-  transcripts?: (since: number) => Sent;
+  transcripts?: (since: number) => Sent | Promise<Sent>;
   writeReplay?: (r: ReplayReport) => string | void;             // where it was written
   replayPauseMs?: number;
 }
@@ -1722,8 +1722,9 @@ export class Link {
     }
 
     const s = this.d.load();
-    const sent: Sent = (() => { try { return this.d.transcripts?.(from) ?? { ids: new Set(), texts: new Set() }; }
-      catch { return { ids: new Set<string>(), texts: new Set<string>() }; } })();
+    let sent: Sent = { ids: new Set<string>(), texts: new Set<string>() };
+    try { if (this.d.transcripts) sent = await this.d.transcripts(from); }
+    catch (e) { this.log(`the replay couldn't read Cain's transcripts: ${reason(e)}`); }
     const byId = new Map(seen.map((m) => [String(m.id), m]));
     const allLabels = [...new Set(Object.values(s.messages).flatMap((m) => m.labels ?? []))];
     const byWriter: Record<string, number> = { cain: 0, specialist: 0, link: 0, unknown: 0 };

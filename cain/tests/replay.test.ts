@@ -200,7 +200,7 @@ describe("the replay", () => {
 });
 
 describe("Cain's transcripts", () => {
-  test("give the ids and words of what he sent with the plugin, from files changed in the range", () => {
+  test("give the ids and words of what he sent with the plugin, from files changed in the range", async () => {
     const root = mkdtempSync(join(tmpdir(), "transcripts-"));
     mkdirSync(join(root, "-data-work"));
     const line = (o: unknown) => JSON.stringify(o);
@@ -215,9 +215,11 @@ describe("Cain's transcripts", () => {
     writeFileSync(join(root, "-data-work", "a.jsonl"), lines.join("\n"));
     writeFileSync(join(root, "-data-work", "old.jsonl"), lines[0].replace("Moved it to 4:30.", "Old words."));
     utimesSync(join(root, "-data-work", "old.jsonl"), new Date(Date.now() - 30 * DAY), new Date(Date.now() - 30 * DAY));
-    const sent = readTranscripts(root, Date.now() - 14 * DAY);
+    const sent = await readTranscripts(root, Date.now() - 14 * DAY);
     expect([...sent.ids].sort()).toEqual(["1300000000000000777", "1300000000000000778"]);
     expect([...sent.texts].sort()).toEqual(["Moved it to 4:30.", "Moved it to 5:00."]);
-    expect(readTranscripts(join(root, "none"), 0)).toEqual({ ids: new Set(), texts: new Set() });
+    expect(await readTranscripts(join(root, "none"), 0)).toEqual({ ids: new Set(), texts: new Set() });
+    // A file too big to read whole is left out, so a tap never waits on it.
+    expect((await readTranscripts(root, 0, 10)).ids.size).toBe(0);
   });
 });
