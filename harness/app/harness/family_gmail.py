@@ -707,23 +707,29 @@ class FamilyGmail:
     # -- what's already there ------------------------------------------------------------
     def _read_back(self, blocks: dict, now: datetime, until: datetime) -> None:
         """A new block's receipt (meaning_live.py) goes out only once a read of Gmail after its
-        write finds the block as written: ours, on his calendar, with its title, start and end.
-        This read is that check, before anything here changes. A block no longer ours to tell of
-        (gone from the record, his, written again, or over) drops its receipt; one past what was
-        read waits for a read that covers it."""
+        write finds the block as written: ours, on his calendar, with the title, start and end its
+        row says were last written (a move since the receipt was made counts, and the receipt then
+        says where it is). This read is that check, before anything here changes. A block no longer
+        ours to tell of (gone from the record, his, written again, or over) drops its receipt; one
+        past what was read waits for a read that covers it."""
         for r in self.live.written():
             rid = r["id"]
             row = self.ledger.db.execute("SELECT * FROM family_gmail WHERE key=?", (r["gmail_key"],)).fetchone()
-            start, end = self._when(r["start"]), self._when(r["end"])
-            if row is None or row["state"] != "live" or str(row["generation"]) != rid.rsplit(".", 1)[-1] \
-                    or end <= now:
+            if row is None or row["state"] != "live" or str(row["generation"]) != rid.rsplit(".", 1)[-1]:
+                self.live.read_back(rid, None)
+                continue
+            title, start, end = row["title"], self._when(row["start"]), self._when(row["end"])
+            if end <= now:
                 self.live.read_back(rid, None)
                 continue
             if start >= until:
                 continue                   # not read this time: neither found nor missing
             block = blocks.get(row["event_id"])
-            self.live.read_back(rid, block is not None and block.plain and block.title == r["title"]
-                                and _same(block.start, start) and _same(block.end, end))
+            if block is not None and block.plain and block.title == title and _same(block.start, start) \
+                    and _same(block.end, end):
+                self.live.read_back(rid, True, title=title, start=start, end=end)
+            else:
+                self.live.read_back(rid, False)
 
     def _follow(self, address: str, wants: dict, blocks: dict, now: datetime, until: datetime,
                 family_clean: bool, thin: bool) -> str:
@@ -868,6 +874,8 @@ class FamilyGmail:
                      place=want.place, missing=0, intent="")
         self._log("family_gmail_moved", row["key"])
         self.writes += 1
+        if self.live is not None:          # a receipt not sent yet waits for a read of where it is now
+            self.live.moved(row["key"], row["generation"])
         if self.live is not None and want.state == "confirmed" \
                 and row["title"].startswith(google_cal.FREE_PREFIX):
             self.live.applied(want, row["generation"])     # a maybe he now has for sure

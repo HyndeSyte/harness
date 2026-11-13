@@ -2,6 +2,8 @@
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from harness import choices, google_cal
 from harness.engines import EngineResult
 from harness.mail_dates import (MAX_TO_ENGINE, MailDates, Message, clean, parse_items, picked,
@@ -180,14 +182,14 @@ def test_a_date_lands_free_all_day_with_no_reminder_and_one_undo(g):
 
 def test_what_lands_is_told_only_once_a_read_finds_it(g, monkeypatch):
     rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
-    real = g.client.look
-    monkeypatch.setattr(g.client, "look", lambda address, uid: ("unknown", None))   # can't tell
+    real = g.client.read_back
+    monkeypatch.setattr(g.client, "read_back", lambda address, uid: ("unknown", None))   # can't tell
     read(g)
     g.c.outbox.flush()
     assert len(g.google.live()) == 1                            # written
     assert not any("From your mail" in s[1] for s in g.bot.sent)
     assert g.ledger.db.execute("SELECT told, reads FROM mail_dates").fetchone()[:] == ("added", 0)
-    monkeypatch.setattr(g.client, "look", real)
+    monkeypatch.setattr(g.client, "read_back", real)
     g.md.run(paused=False)                                      # within the minute: not read again
     assert g.ledger.db.execute("SELECT told FROM mail_dates").fetchone()[0] == "added"
     g.md._read_at -= 61
@@ -200,7 +202,7 @@ def test_what_lands_is_told_only_once_a_read_finds_it(g, monkeypatch):
 
 def test_one_three_reads_dont_find_is_told_as_not_confirmed_with_its_undo(g, monkeypatch):
     rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
-    monkeypatch.setattr(g.client, "look", lambda address, uid: ("gone", None))
+    monkeypatch.setattr(g.client, "read_back", lambda address, uid: ("gone", None))
     read(g)
     for _ in range(2):
         g.md._read_at -= 61
@@ -220,6 +222,138 @@ def test_one_three_reads_dont_find_is_told_as_not_confirmed_with_its_undo(g, mon
     nonce = choices.parse(buttons[0][0][1])                     # its Undo still takes it off
     batch = g.ledger.db.execute("SELECT target FROM choices WHERE nonce=?", (nonce,)).fetchone()[0]
     assert g.md.on_choice("mail_dates_undo", batch).startswith("Taking those off")
+
+
+LAMP = [{"what": "Lamp return", "date": "2026-11-27", "kind": "window_closes"}]
+
+
+def told(g):
+    return [r[0] for r in g.ledger.db.execute("SELECT told FROM mail_dates ORDER BY day")]
+
+
+def test_with_no_chat_nothing_is_marked_and_it_waits_to_be_told(g):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    g.md.chat_id = None
+    read(g)
+    assert len(g.google.live()) == 1 and told(g) == ["added"]          # written, waiting
+    g.c.outbox.flush()
+    assert not any("From your mail" in s[1] for s in g.bot.sent)
+    g.md.bind(1)
+    g.md._read_at = None
+    g.md.run(paused=False)
+    g.c.outbox.flush()
+    assert g.bot.sent[-1][1].startswith("<b>From your mail, on your calendar:</b>") and told(g) == ["told"]
+
+
+def test_marked_told_and_queued_together_or_not_at_all(g, monkeypatch):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    real = g.ledger.enqueue
+
+    def broken(*a, **kw):
+        raise RuntimeError("the disk said no")
+    monkeypatch.setattr(g.ledger, "enqueue", broken)
+    read(g)                                                     # caught: never a stopped loop
+    assert told(g) == ["added"]                                 # nothing marked
+    assert g.ledger.db.execute("SELECT COUNT(*) FROM choices WHERE kind='mail_dates_undo'").fetchone()[0] == 0
+    monkeypatch.setattr(g.ledger, "enqueue", real)
+    g.md._read_at = None
+    g.md.run(paused=False)
+    g.c.outbox.flush()
+    assert told(g) == ["told"] and g.bot.sent[-1][1].startswith("<b>From your mail, on your calendar:</b>")
+
+
+@pytest.mark.parametrize("which", [0, 1])
+def test_undo_on_either_message_takes_a_moved_entry_off(g, which):
+    rig_mail(g, [msg(1, "Your service appointment")], {"Your service appointment": APPT})
+    read(g)
+    g.c.outbox.flush()
+    first = g.bot.sent[-1]
+    g.box.messages.append(msg(2, "Appointment rescheduled"))
+    g.engine.answers["Appointment rescheduled"] = [{"what": "Service appointment at Valley Motors",
+                                                   "date": "2026-11-20", "kind": "appointment",
+                                                   "rescheduled": True}]
+    read(g)
+    g.c.outbox.flush()
+    second = g.bot.sent[-1]
+    assert "moved there, as the email says" in second[1] and second[3] != first[3]
+    nonce = choices.parse((first, second)[which][2][0][0][1])
+    batch = g.ledger.db.execute("SELECT target FROM choices WHERE nonce=?", (nonce,)).fetchone()[0]
+    assert g.md.on_choice("mail_dates_undo", batch).startswith("Taking those off")
+    g.md.run(paused=False)
+    assert g.google.live() == {}
+
+
+def test_one_entry_that_cant_be_read_doesnt_hold_up_the_rest(g, monkeypatch):
+    rig_mail(g, [msg(1, "Your order of PC parts"), msg(2, "Your order of a lamp")],
+             {"Your order of PC parts": RETURN, "Your order of a lamp": LAMP})
+    real, first = g.client.read_back, []
+
+    def one_unreadable(address, uid):
+        first.append(uid)
+        return ("unknown", None) if uid == first[0] else real(address, uid)
+    monkeypatch.setattr(g.client, "read_back", one_unreadable)
+    read(g)
+    g.c.outbox.flush()
+    assert told(g) == ["added", "told"]                         # the other one is told
+    said = [s[1] for s in g.bot.sent if "From your mail" in s[1]]
+    assert len(said) == 1 and "Lamp return" in said[0] and "PC parts" not in said[0]
+
+
+def test_a_calendar_that_cant_be_read_ends_the_pass(g, monkeypatch):
+    rig_mail(g, [msg(1, "Your order of PC parts"), msg(2, "Your order of a lamp")],
+             {"Your order of PC parts": RETURN, "Your order of a lamp": LAMP})
+    calls = []
+    monkeypatch.setattr(g.client, "read_back", lambda address, uid: calls.append(uid) or ("down", None))
+    read(g)
+    assert len(calls) == 1 and told(g) == ["added", "added"]    # nothing more is read, nothing marked
+
+
+def test_at_most_ten_reads_a_pass(g, monkeypatch):
+    subjects = [f"Your order {n}" for n in range(3)]
+    answers = {s: [{"what": f"Return {s} part {i}",
+                    "date": (date(2026, 11, 20) + timedelta(days=5 * n + i)).isoformat(),
+                    "kind": "window_closes"} for i in range(5)] for n, s in enumerate(subjects)}
+    rig_mail(g, [msg(n + 1, s) for n, s in enumerate(subjects)], answers)
+    calls = []
+    monkeypatch.setattr(g.client, "read_back", lambda address, uid: calls.append(uid) or ("unknown", None))
+    read(g)
+    assert len(g.google.live()) == 15 and len(calls) == 10      # the rest at the next pass
+    g.md._read_at = None
+    g.md.run(paused=False)
+    assert len(calls) == 20
+
+
+def test_half_an_hour_without_a_read_that_finds_it_is_not_confirmed(g, monkeypatch):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    monkeypatch.setattr(g.client, "read_back", lambda address, uid: ("unknown", None))
+    read(g)
+    g.advance(minutes=29)
+    g.md._read_at = None
+    g.md.run(paused=False)
+    assert told(g) == ["added"]                                 # not yet
+    g.advance(minutes=2)
+    g.md._read_at = None
+    g.md.run(paused=False)
+    g.c.outbox.flush()
+    said = [s for s in g.bot.sent if "From your mail" in s[1]]
+    assert len(said) == 1 and said[0][2][0][0][0] == "Undo these"
+    assert said[0][1].startswith("<b>From your mail, written to your calendar but not confirmed:</b>")
+    assert told(g) == ["unconfirmed"]
+    assert g.ledger.db.execute("SELECT reads FROM mail_dates").fetchone()[0] == 0   # none of them answered
+
+
+def test_a_read_back_tells_one_entry_from_the_whole_calendar(g):
+    rig_mail(g, [msg(1, "Your order of PC parts")], {"Your order of PC parts": RETURN})
+    read(g)
+    [uid] = g.google.live()
+    assert g.client.read_back(GMAIL, uid)[0] == "ok"
+    assert g.client.read_back(GMAIL, "a" * 26) == ("gone", None)
+    assert g.client.read_back(GMAIL, "not an id!") == ("unknown", None)    # this one entry
+    for failure in (503, 429, 401, "drop"):                                # the calendar itself
+        g.google.fail["GET"] = failure
+        assert g.client.read_back(GMAIL, uid) == ("down", None), failure
+    del g.google.fail["GET"]
+    assert g.client.read_back(GMAIL, uid)[0] == "ok"
 
 
 def test_a_read_compares_the_note_with_what_was_written(g):
@@ -668,9 +802,12 @@ def test_the_receipt_names_every_date_never_and_n_more(g):
                     "kind": "window_closes"} for i in range(5)] for n, s in enumerate(subjects)}
     rig_mail(g, [msg(n + 1, s) for n, s in enumerate(subjects)], answers)
     read(g)
+    g.md._read_at = None
+    g.md.run(paused=False)                                      # at most ten reads a pass: the rest now
     g.c.outbox.flush()
-    text = g.bot.sent[-1][1]
-    assert text.count("Last day: Return") == 15 and "more" not in text
+    texts = [s[1] for s in g.bot.sent if "From your mail" in s[1]]
+    assert len(texts) == 2 and sum(x.count("Last day: Return") for x in texts) == 15
+    assert not any("more" in x for x in texts)
 
 
 # -- 0.21.0: a timed appointment from his mail is a real one (Nov 11) ---------------------------

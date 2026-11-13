@@ -206,6 +206,11 @@ def _when(d: datetime, all_day: bool) -> str:
     return _day(d) if all_day else f"{_day(d)} {meaning._clock(d)}"
 
 
+def receipt_id(key: str, generation: int) -> str:
+    """One receipt per block as written: its key, and which writing of it."""
+    return f"{key[:24]}.{generation}"
+
+
 def _span(start: datetime, end: datetime) -> str:
     """Fri Nov 20, 1:00 PM to 3:00 PM (the end's day too when it's another day)."""
     until = meaning._clock(end) if end.date() == start.date() else f"{_day(end)}, {meaning._clock(end)}"
@@ -409,17 +414,26 @@ class MeaningLive:
             db.execute("INSERT OR IGNORE INTO meaning_receipts(id, gmail_key, title, said, start,"
                        " end, features, state, action, created_at, updated_at)"
                        " VALUES(?,?,?,?,?,?,?,'written','',?,?)",
-                       (f"{want.key[:24]}.{generation}", want.key, want.title, meta["said"],
+                       (receipt_id(want.key, generation), want.key, want.title, meta["said"],
                         want.start.isoformat(), want.end.isoformat(), json.dumps(meta), now, now))
+
+    def moved(self, key: str, generation: int) -> None:
+        """Its block moved before its receipt went out: the receipt waits for a read of where it is
+        now, and then says that."""
+        with self.ledger.tx() as db:
+            db.execute("UPDATE meaning_receipts SET state='written', reads=0, updated_at=? WHERE id=?"
+                       " AND state='new'", (iso(self.ledger.now()), receipt_id(key, generation)))
 
     def written(self) -> list:
         """Receipts waiting for a read of Gmail to find their block as written."""
         return self.ledger.db.execute("SELECT * FROM meaning_receipts WHERE state='written'"
                                       " ORDER BY start").fetchall()
 
-    def read_back(self, rid: str, found: bool | None) -> None:
+    def read_back(self, rid: str, found: bool | None, *, title: str | None = None,
+                  start: datetime | None = None, end: datetime | None = None) -> None:
         """What a read of Gmail found for this receipt's block. True: there as written, so its
-        receipt goes out with the next digest. False: not there as written; after
+        receipt goes out with the next digest, saying what's there (title, start and end when
+        given: a block moved since is told where it is). False: not there as written; after
         READS_TO_CONFIRM of those, the next digest says it was written but not confirmed. None:
         there's nothing left to tell (the block is gone, his, written again, or over)."""
         now = iso(self.ledger.now())
@@ -430,6 +444,9 @@ class MeaningLive:
             elif found:
                 db.execute("UPDATE meaning_receipts SET state='new', updated_at=? WHERE id=?"
                            " AND state='written'", (now, rid))
+                if title is not None and start is not None and end is not None:
+                    db.execute("UPDATE meaning_receipts SET title=?, start=?, end=? WHERE id=? AND state='new'",
+                               (title, start.isoformat(), end.isoformat(), rid))
             else:
                 db.execute("UPDATE meaning_receipts SET reads=reads+1, updated_at=? WHERE id=?"
                            " AND state='written'", (now, rid))

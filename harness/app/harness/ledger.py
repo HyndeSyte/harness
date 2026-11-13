@@ -420,10 +420,13 @@ class Ledger:
             # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
             # who sent it, the address found, the one written, and whether it was written busy.
             # 0.22.0: what a read must still find before it's told ("added" or "moved", then
-            # "told", or "unconfirmed" once the reads ran out), and how many reads didn't find it.
+            # "told", or "unconfirmed" once reads haven't found it), how many reads didn't find it,
+            # when it was last written, and the batch of the last message that told it (its first
+            # message keeps "batch", so the Undo on either message takes it off).
             "mail_dates": (("sender", "TEXT NOT NULL DEFAULT ''"), ("place", "TEXT NOT NULL DEFAULT ''"),
                            ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0"),
-                           ("told", "TEXT NOT NULL DEFAULT ''"), ("reads", "INTEGER NOT NULL DEFAULT 0")),
+                           ("told", "TEXT NOT NULL DEFAULT ''"), ("reads", "INTEGER NOT NULL DEFAULT 0"),
+                           ("wrote_at", "TEXT NOT NULL DEFAULT ''"), ("told_batch", "TEXT NOT NULL DEFAULT ''")),
             # 0.21.1: an input that stops is told (inputs.py). Its outage: the last failure's
             # kind, the first failure, how many failures and refusals were seen, what he was told
             # and by which message, whether a digest named it, when one he knew about came back,
@@ -436,16 +439,20 @@ class Ledger:
                        ("told_outbox", "INTEGER"), ("named", "INTEGER NOT NULL DEFAULT 0"),
                        ("back_at", "TEXT"), ("label", "TEXT NOT NULL DEFAULT ''")),
             # 0.22.0: a receipt goes out only once a read finds what was written: how many reads
-            # haven't found it yet (meaning_live.py, family_add.py). Rows from before have nothing
-            # waiting.
+            # haven't found it yet (meaning_live.py, family_add.py).
             "meaning_receipts": (("reads", "INTEGER NOT NULL DEFAULT 0"),),
             "family_adds": (("reads", "INTEGER NOT NULL DEFAULT 0"),)}
         with self.tx() as db:              # all or nothing: a stop halfway leaves the file as it was
+            unread = "reads" not in {r[1] for r in db.execute("PRAGMA table_info(meaning_receipts)")}
             for table, cols in added.items():
                 have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
                 for name, decl in cols:
                     if name not in have:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            if unread:
+                # Once, as 0.22.0 first opens the file: a receipt still waiting to go out was never
+                # read back, so it waits for a read like any new one, and nothing goes out unread.
+                db.execute("UPDATE meaning_receipts SET state='written' WHERE state='new'")
 
     def _rules_need_a_tap(self) -> None:
         """Once, on the first open by 0.5.1 or later: rules stored before his tap existed

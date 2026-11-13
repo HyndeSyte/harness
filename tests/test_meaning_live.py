@@ -20,7 +20,7 @@ import pytest
 from harness import caldav, choices, drive, family_rules, handover, ical, inputs, meaning, meaning_live
 from harness.calendar_change import CalendarChange
 from harness.family_copy import FamilyCopy
-from harness.family_gmail import DROP_TITLE, FamilyGmail, _leg_title, home_from_options, leg_key
+from harness.family_gmail import DROP_TITLE, FamilyGmail, Want, _leg_title, home_from_options, leg_key
 from harness.mail_dates import MailDates
 from harness.ledger import Ledger
 from harness.net import HttpResponse, TransportError
@@ -996,6 +996,72 @@ def test_time_enough_goes_home_between(drives):
         ("Busy (drive there)", b - 30 * M, b, ""),
         ("Busy (family)", b, b + 60 * M, PARK),
         ("Busy (drive back)", b + 60 * M, b + 90 * M, "")]
+
+
+def receipts(rig):
+    return rig.ledger.db.execute("SELECT * FROM meaning_receipts").fetchall()
+
+
+def test_a_block_moved_before_a_read_found_it_is_told_where_it_is(drives):
+    """Written, then moved by us (a move whose answer came late), then found: one Added receipt,
+    at the new time, never a false "not confirmed"."""
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)                                                # written: its receipt waits for a read
+    [r] = drives.live.written()
+    row = drives.ledger.db.execute("SELECT * FROM family_gmail WHERE key=?", (r["gmail_key"],)).fetchone()
+    later = when(drives, days=4, hour=13)
+    drives.gm._moved(row, Want(row["key"], row["title"], later, later + timedelta(hours=1),
+                               place=CLINIC, state="confirmed"))
+    block = google_cal.Block(row["event_id"], '"9"', row["title"], later, later + timedelta(hours=1), True, CLINIC)
+    drives.gm._read_back({row["event_id"]: block}, drives.clock(), later + timedelta(days=30))
+    [r] = receipts(drives)
+    assert r["state"] == "new" and r["reads"] == 0
+    assert datetime.fromisoformat(r["start"]) == later and datetime.fromisoformat(r["end"]) == later + timedelta(hours=1)
+    assert drives.live.send_receipts() == 1
+    drives.tick()
+    _, text, _, _ = drives.with_button("Not mine")
+    assert text.startswith("Added to your Gmail: Busy (family), ") and ", 1:00 PM to 2:00 PM, " in text
+
+
+def test_a_block_moved_after_a_read_found_it_is_read_again_where_it_is(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    seed(drives, "Book club", when(drives, days=9))           # Family isn't otherwise empty
+    drives.judge.by["Book club"] = judged()
+    go(drives)
+    go(drives)
+    go(drives)                                                # found: waits for the digest
+    assert [r["state"] for r in receipts(drives)] == ["new"]
+    later = when(drives, days=4, hour=13)
+    goes(drives, "Eye doctor", later, CLINIC)                 # moved on Family before it went out
+    go(drives)
+    go(drives)                                                # the block follows: read again there
+    go(drives)
+    [r] = receipts(drives)
+    assert r["state"] == "new" and datetime.fromisoformat(r["start"]) == later
+    assert drives.live.send_receipts() == 1
+
+
+def test_receipts_waiting_from_before_wait_for_a_read(tmp_path):
+    """Unsent receipts from before 0.22.0 were never read back: the first open makes them wait for a
+    read like a new one, once."""
+    path = str(tmp_path / "old.sqlite")
+    old = Ledger(path)
+    for rid, state in (("k.0", "new"), ("k.1", "shown")):
+        old.db.execute("INSERT INTO meaning_receipts(id, gmail_key, title, said, start, end, features, state,"
+                       " action, created_at, updated_at) VALUES(?,'k','Busy (watching kids)','Swim',"
+                       " '2026-11-20T13:00:00+00:00','2026-11-20T14:00:00+00:00','{}',?,'','x','x')", (rid, state))
+    old.db.execute("ALTER TABLE meaning_receipts DROP COLUMN reads")
+    old.db.close()
+    again = Ledger(path)
+    assert dict(again.db.execute("SELECT id, state FROM meaning_receipts").fetchall()) == {"k.0": "written",
+                                                                                         "k.1": "shown"}
+    again.db.execute("UPDATE meaning_receipts SET state='new' WHERE id='k.0'")   # found since
+    again.db.close()
+    third = Ledger(path)
+    assert third.db.execute("SELECT state FROM meaning_receipts WHERE id='k.0'").fetchone()[0] == "new"   # once
 
 
 def test_the_place_is_ours_so_the_block_still_follows_and_goes(drives):

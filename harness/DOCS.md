@@ -205,8 +205,8 @@ Then send something like "add dentist Tuesday 3pm":
   also puts a warning on the card. Read it before you approve.
 - **The receipt** comes once a read of the event finds it as written (title, start, end and
   place), with an *Undo* button, good for 7 days. A read that can't tell is tried again a minute
-  later; if three reads don't find it, you get one card saying it was written but not confirmed,
-  with the same *Undo*, and the next digest names it. Undo deletes only that event, once. If
+  later. If three reads don't find it, or half an hour passes without one that does, you get one
+  card saying it was written but not confirmed, with the same *Undo*, and the next digest names it. Undo deletes only that event, once. If
   someone changed the event since, Undo refuses and leaves it.
 
 If iCloud's answer is lost, or it has a server error, the event may or may not be there.
@@ -287,8 +287,9 @@ email about it gave (the same sender, day and time). Timed appointments already 
 made busy, their own emails are looked up once for an address, and the next digest names them. A
 rescheduling email moves the entry, with its own address. An entry you've changed is yours and
 left alone. What lands or moves is told in one message with *Undo these* once a read of each entry
-finds it as written; if three reads don't find one, the message says it was written but not
-confirmed, still with *Undo these*, and the next digest names it.
+finds it as written. If three reads don't find one, or half an hour passes without one that does,
+the message says it was written but not confirmed, still with *Undo these*, and the next digest
+names it. An entry that moves is told again, and *Undo these* on either message takes it off.
 
 ## Copies from your Gmail calendar
 

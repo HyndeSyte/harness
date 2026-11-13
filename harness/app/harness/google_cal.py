@@ -617,6 +617,32 @@ class GoogleCalendar:
             return "unknown", None
         return ("ok", found) if isinstance(found, dict) else ("unknown", None)
 
+    def read_back(self, address: str, uid: str) -> tuple[str, dict | None]:
+        """One event, read to check what was written: "ok" and it, "gone", "unknown" when this one
+        answer says nothing about it, or "down" when the calendar itself can't be read now (no key
+        or token, no answer, turned down, or busy), so the rest can't be read either."""
+        url = self._events(address)
+        token, _ = self._access()
+        if url is None or token is None:
+            return "down", None
+        if not _ANY_ID_RE.fullmatch(uid):
+            return "unknown", None
+        try:
+            r = self._call(token, "GET", f"{url}/{uid}")
+        except TransportError:
+            return "down", None
+        if r.status in (404, 410):
+            return "gone", None
+        if r.status in (401, 403, 408, 429) or r.status >= 500:
+            if r.status == 401:
+                self._token = None
+            return "down", None
+        try:
+            found = r.json() if r.status == 200 else None
+        except ValueError:
+            found = None
+        return ("ok", found) if isinstance(found, dict) else ("unknown", None)
+
     def _ask(self, address: str, method: str, uid: str, body: dict | None, etag: str | None) -> Outcome:
         url = self._events(address)
         if url is None or (uid and not _ANY_ID_RE.fullmatch(uid)):

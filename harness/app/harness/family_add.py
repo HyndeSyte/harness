@@ -11,8 +11,9 @@ Everything here runs on the controller's thread, after the tick's commands,
 so a /stop in the same batch as a tap wins. A write is recorded as "sending"
 before the request and its result after it, so a crash in between is never
 silent: it is reported as unknown, and nothing is retried. "Added" is said only once a read of
-the event by its uid finds it as written; a read that can't tell is tried again, and three that
-don't find it say it was written but not confirmed, still with its Undo.
+the event by its uid finds it as written; a read that can't tell is tried again, and three reads
+that don't find it, or half an hour without one that does, say it was written but not confirmed,
+still with its Undo.
 
 Plain code checks every proposal. An impossible one (over 24 hours, over a year
 ahead, or text the card couldn't show exactly) is refused in words. Anything
@@ -65,6 +66,7 @@ MAX_TAPLESS_PER_DAY = 5
 RECHECK_EVERY = timedelta(hours=1)    # a bake-in check that couldn't complete
 READS_TO_CONFIRM = 3                  # reads that don't find a written add before it's "not confirmed"
 READ_AGAIN = timedelta(minutes=1)     # how soon a read that couldn't tell is tried again
+UNCONFIRMED_AFTER = timedelta(minutes=30)   # written this long with no read finding it: "not confirmed"
 
 # What the thread is told when a write did not end in a success.
 FAILED_WORDS = {
@@ -100,9 +102,16 @@ def _detail(out: caldav.Outcome) -> str:
     return "iCloud had a server error." if out.status >= 500 else "iCloud turned it down."
 
 
+def _said(value: str) -> str:
+    """Text as a calendar may hand it back: unescaped, its spaces and line breaks run together."""
+    return " ".join(ical.unescape(value or "").split())
+
+
 def _as_written(ics: str, uid: str, params: dict) -> bool:
-    """A read of the event finds what was written: one plain event of ours, with its title, start,
-    end and place."""
+    """A read of the event finds what was written: one plain event of ours (its uid and our
+    marker, strictly), starting and ending at the same instants however the zone is written, with
+    its title and place as iCloud may hand them back (escapes and spacing aside; a place may come
+    back with more after it, never with less)."""
     if not ics or not caldav._is_ours(ics, uid):
         return False
     try:
@@ -114,11 +123,13 @@ def _as_written(ics: str, uid: str, params: dict) -> bool:
     except (IndexError, AttributeError, ical.Unreadable):
         return False
     summary, where = ev.first("SUMMARY"), ev.first("LOCATION")
+    title, place = _said(summary.value if summary else ""), _said(where.value if where else "")
+    meant = _said(params.get("location") or "")
     return (isinstance(start, datetime) and isinstance(end, datetime)
             and start == datetime.fromisoformat(params["start"])
             and end == datetime.fromisoformat(params["end"])
-            and ical.unescape(summary.value if summary else "") == params["title"]
-            and ical.unescape(where.value if where else "") == (params.get("location") or ""))
+            and title == _said(params["title"])
+            and (place == meant or (bool(meant) and place.startswith(meant))))
 
 
 def _one_year_after(dt: datetime) -> datetime:
@@ -797,24 +808,25 @@ class FamilyAdd:
     def _read_back(self, row) -> None:
         """He hears "Added" only once a read of the event by its uid finds it as written: ours, on
         the Family calendar, with its title, start, end and place. A read that can't tell is tried
-        again a minute later. READS_TO_CONFIRM reads that don't find it, and he hears it was
-        written but not confirmed, with its Undo all the same."""
+        again a minute later. READS_TO_CONFIRM reads that don't find it, or UNCONFIRMED_AFTER since
+        it was written with none that does (whatever the reads said), and he hears it was written
+        but not confirmed, with its Undo all the same."""
         p = self.ledger.db.execute("SELECT params_json FROM proposals WHERE id=?",
                                    (row["proposal_id"],)).fetchone()
         params = json.loads(p["params_json"])
         out, ics = self.client.fetch(self.client.href_for(row["uid"]))
         found = _as_written(ics, row["uid"], params) if out.kind == "ok" else False if out.kind == "gone" else None
-        now = iso(self.ledger.now())
+        moment = self.ledger.now()
+        now = iso(moment)
+        overdue = moment - datetime.fromisoformat(row["created_at"]) >= UNCONFIRMED_AFTER
         with self.ledger.tx() as db:
             cur = db.execute("SELECT state, reads FROM family_adds WHERE proposal_id=?",
                              (row["proposal_id"],)).fetchone()
             if cur is None or cur["state"] != "written":
                 return
-            if found is None:              # can't tell: read again later
-                db.execute("UPDATE family_adds SET updated_at=? WHERE proposal_id=?", (now, row["proposal_id"]))
-                return
-            reads = cur["reads"] + (0 if found else 1)
-            state = "created" if found else "unconfirmed" if reads >= READS_TO_CONFIRM else "written"
+            reads = cur["reads"] + (1 if found is False else 0)    # can't tell: no answer, no miss
+            state = ("created" if found else "unconfirmed" if reads >= READS_TO_CONFIRM or overdue
+                     else "written")
             db.execute("UPDATE family_adds SET state=?, reads=?, updated_at=? WHERE proposal_id=?",
                        (state, reads, now, row["proposal_id"]))
             if state == "written":

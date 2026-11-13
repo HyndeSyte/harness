@@ -537,6 +537,53 @@ def test_an_add_reads_never_find_gets_the_not_confirmed_line_with_its_undo(on):
     assert len([x for x in on.texts() if "not confirmed" in x]) == 1     # once
 
 
+def test_half_an_hour_of_reads_that_cant_tell_is_not_confirmed(on, monkeypatch):
+    monkeypatch.setattr(on.fa.client, "fetch", lambda href: (caldav.Outcome("failed"), ""))
+    on.ask()
+    on.press(on.last(), "Approve")
+    on.advance(minutes=29)
+    on.tick()                                           # still can't tell, still waiting
+    assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("written", 0)
+    assert not any("not confirmed" in x for x in on.texts())
+    on.advance(minutes=2)
+    on.tick()
+    _, text, buttons, _ = on.with_button("Undo")       # bounded: said, with its Undo
+    assert text.startswith("<b>Written to the Family calendar but not confirmed.</b>")
+    assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("unconfirmed", 0)
+
+
+ICLOUD = "\r\n".join([
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Apple Inc.//iCloud Web Calendar//EN", "CALSCALE:GREGORIAN",
+    "BEGIN:VTIMEZONE", "TZID:America/New_York", "BEGIN:DAYLIGHT", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400",
+    "DTSTART:20070311T020000", "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU", "TZNAME:EDT", "END:DAYLIGHT",
+    "BEGIN:STANDARD", "TZOFFSETFROM:-0400", "TZOFFSETTO:-0500", "DTSTART:20071104T020000",
+    "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU", "TZNAME:EST", "END:STANDARD", "END:VTIMEZONE",
+    "BEGIN:VEVENT", "UID:hx-1", "DTSTAMP:20261001T120000Z", "CREATED:20261001T120000Z",
+    "LAST-MODIFIED:20261001T120001Z", "SEQUENCE:0",
+    "DTSTART;TZID=America/New_York:20261027T150000", "DTEND;TZID=America/New_York:20261027T160000",
+    "SUMMARY:Swim\\, then  lunch at the",
+    "  pool", "LOCATION:1 Pool Rd\\nSpringfield", "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+    "X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=1 Pool Rd:geo:38.1,-78.1",
+    "X-HARNESS-OWNED:1", "END:VEVENT", "END:VCALENDAR"]) + "\r\n"
+
+
+def test_a_read_allows_what_icloud_does_to_an_event():
+    """iCloud's own lines, a fold, a zone written its way, and a place it filled in: still as written."""
+    from harness.family_add import _as_written
+    params = {"title": "Swim, then lunch at the pool", "start": "2026-10-27T15:00:00-04:00",
+              "end": "2026-10-27T16:00:00-04:00", "location": "1 Pool Rd"}
+    assert caldav.MARKER == "X-HARNESS-OWNED"
+    assert _as_written(ICLOUD, "hx-1", params)
+    assert _as_written(ICLOUD, "hx-1", {**params, "start": "2026-10-27T19:00:00+00:00",
+                                        "end": "2026-10-27T20:00:00+00:00"})              # the same instants
+    assert not _as_written(ICLOUD, "hx-2", params)                                         # not ours
+    assert not _as_written(ICLOUD.replace("X-HARNESS-OWNED:1", "X-OTHER:1"), "hx-1", params)
+    assert not _as_written(ICLOUD, "hx-1", {**params, "start": "2026-10-27T16:00:00-04:00"})
+    assert not _as_written(ICLOUD, "hx-1", {**params, "title": "Swim"})
+    assert not _as_written(ICLOUD, "hx-1", {**params, "location": "2 Pool Rd"})
+    assert not _as_written(ICLOUD, "hx-1", {**params, "location": ""})                    # a place from nowhere
+
+
 def test_a_read_compares_title_start_end_and_place():
     from harness.family_add import _as_written
     params = {"title": "Swim, then lunch", "start": "2026-10-27T15:00:00-04:00",
