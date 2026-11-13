@@ -537,7 +537,7 @@ class Broken(inputs.Watch):
 
 def test_the_digest_goes_out_even_when_the_inputs_cant_be_checked(ledger):
     d = daily.gather(ledger, Config(owner_user_id=OWNER), paused=False, watch=Broken(ledger, tz=TZ))
-    assert "Couldn't check this morning whether email, Family and Google are working" in d.text
+    assert "Couldn't tell this morning whether email, Family and Google are working" in d.text
 
 
 class Receipts:

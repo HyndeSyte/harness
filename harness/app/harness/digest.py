@@ -99,8 +99,8 @@ def compose(*, now: datetime, tz: str, inputs: list[InputCoverage],
         problems.append(f"calendar: {agenda.configured - agenda.read} of {agenda.configured} "
                         "not read today")
     if agenda is not None and agenda.unreadable:
-        problems.append(f"calendar: {agenda.unreadable} event(s) I couldn't read; "
-                        "check the calendar itself")
+        problems.append(f"calendar: {agenda.unreadable} event(s) I couldn't read, so they aren't "
+                        "listed below")
     if canary_ok is None:
         problems.append("canary: did not run")
     elif canary_ok is False:

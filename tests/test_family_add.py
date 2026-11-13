@@ -205,12 +205,12 @@ def test_the_definition_fixes_the_calendar_and_no_people():
 def test_the_other_effects_stay_locked_at_s1_with_the_switch_on(on, ledger):
     bad = {"type": "proposal", "effect_type": "calendar_hold",
            "params": {"start": "2026-10-27T15:00:00-04:00", "duration_min": 30}, "summary": "s"}
-    on.claude.script = [result(bad)]
+    on.claude.script = [result(bad), result(bad)]       # tried once more by itself, the same
     on.say("hold tuesday")
     assert "didn't fit the allowed shapes" in on.texts()[-1]
     mirror = {"type": "proposal", "effect_type": "work_mirror_copy",
               "params": {"op": "delete", "event_id": "m1" + "a" * 20}, "summary": "s"}
-    on.claude.script = [result(mirror)]
+    on.claude.script = [result(mirror), result(mirror)]
     on.say("mirror")
     assert "didn't fit the allowed shapes" in on.texts()[-1]
     with pytest.raises(effects.ParamError):
@@ -624,27 +624,76 @@ def test_a_read_compares_title_start_end_and_place():
     assert not _as_written("", "hx-1", params)
 
 
-def test_a_lost_response_is_unknown_and_is_not_retried(on, ledger):
+def test_a_lost_response_is_read_and_the_receipt_follows(on, ledger):
+    """It landed and the answer was lost: a read by its uid a minute later finds it, and he gets
+    the usual receipt with its Undo. Nothing is written twice, and nothing asks him to look."""
     on.ask()
     on.icloud.drop_response_next = True
     on.press(on.last(), "Approve")
-    text = on.texts()[-1]
-    assert "don't know whether that was added" in text and "Check the Family calendar" in text
-    assert "Added to the Family calendar" not in text
-    assert on.icloud.methods().count("PUT") == 1
+    assert not any("Added to the Family calendar" in t or "don't know" in t for t in on.texts())
+    assert "isn't confirmed yet; I'm still checking" in on.fa.problem()
+    on.advance(minutes=1)
     on.tick()
-    on.tick()
-    assert on.icloud.methods().count("PUT") == 1
-    [job] = on.jobs("failed")
-    assert on.receipt(job["id"])["reason"] == "family_unknown"
-    assert not on.jobs("executed")
+    _, text, buttons, _ = on.last()
+    assert text.startswith("<b>Added to the Family calendar.</b>") and buttons
+    assert on.icloud.methods().count("PUT") == 1 and on.fa.problem() == ""
+    [job] = on.jobs("executed")
+    assert not on.jobs("failed")
 
 
-def test_a_server_error_is_unknown_too(on):
+def test_a_server_error_after_the_write_is_read_too(on):
     on.ask()
     on.icloud.status_after_write = 500
     on.press(on.last(), "Approve")
-    assert "don't know whether" in on.texts()[-1]
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>")
+    assert on.icloud.methods().count("PUT") == 1
+
+
+def test_a_write_that_never_landed_is_written_once_more(on):
+    on.ask()
+    on.icloud.force_status = 500               # not written, and the answer says nothing
+    on.press(on.last(), "Approve")
+    assert not on.icloud.family()
+    on.advance(minutes=1)
+    on.tick()                                  # read: nothing there, so once more, by itself
+    assert on.icloud.methods().count("PUT") == 2 and len(on.icloud.family()) == 1
+    assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>") and on.last()[2]
+
+
+def test_a_write_that_never_lands_twice_is_said_plainly(on):
+    on.ask()
+    on.icloud.force_status = 500
+    on.press(on.last(), "Approve")
+    on.advance(minutes=1)
+    on.icloud.force_status = 500
+    on.tick()
+    on.advance(minutes=1)
+    on.tick()
+    _, text, buttons, _ = on.last()
+    assert text.startswith("<b>Not added.</b> That didn't go through, so nothing was added.")
+    assert buttons is None and on.icloud.methods().count("PUT") == 2 and not on.icloud.family()
+    [job] = on.jobs("failed")
+    assert on.receipt(job["id"])["reason"] == "family_not_added"
+
+
+def test_a_read_that_cant_tell_says_so_once_after_an_hour_then_the_answer(on):
+    on.ask()
+    on.icloud.drop_response_next = True
+    on.press(on.last(), "Approve")
+    on.icloud.down = True
+    for minutes in (1, 1, 30, 30, 1):
+        on.advance(minutes=minutes)
+        on.tick()
+    still = [t for t in on.texts() if "I couldn't confirm yet whether" in t]
+    assert still == ["I couldn't confirm yet whether Dentist on Tue Oct 27 was added; I'm still checking."]
+    assert "Not confirmed yet, still checking: Dentist Tue Oct 27." in on.fa.digest_line()
+    on.icloud.down = False
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>")
+    assert on.icloud.methods().count("PUT") == 1
 
 
 def test_a_refused_write_is_said_with_its_status_and_no_undo(on):
@@ -669,7 +718,7 @@ class Crash(BaseException):
     """The process dies mid-request (as the stop signal does)."""
 
 
-def test_a_restart_during_the_write_is_loud_and_never_retried(on, ledger):
+def test_a_restart_during_the_write_is_read_then_written_once(on, ledger):
     on.add_one()
     assert on.fa._bake()["n"] == 1
     on.bot.sent.clear()
@@ -685,13 +734,12 @@ def test_a_restart_during_the_write_is_loud_and_never_retried(on, ledger):
     assert ledger.db.execute("SELECT state FROM family_adds ORDER BY created_at DESC, rowid DESC"
                              ).fetchone()["state"] == "sending"
     on.start()
+    assert on.fa._bake()["n"] == 0             # the record starts over: an outcome no answer gave
     on.bot.batches.append([])
-    on.tick()
-    assert any("don't know whether that was added" in t for t in on.texts())
-    [job] = on.jobs("failed")
-    assert on.receipt(job["id"])["reason"] == "family_unknown"
-    assert on.icloud.methods().count("PUT") == 1
-    assert "outcome is unknown" in on.fa.problem() and on.fa._bake()["n"] == 0
+    on.tick()                                  # read: nothing there, so it's written once more
+    assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>")
+    assert on.icloud.methods().count("PUT") == 2 and len(on.icloud.family()) == 2
+    assert not on.jobs("failed") and on.fa.problem() == ""
 
 
 def test_a_restart_after_the_tap_before_the_write_fails_and_says_nothing_was_sent(on, ledger):
@@ -750,13 +798,40 @@ def test_undo_of_something_already_deleted_deletes_nothing(on):
     assert "any more" in on.texts()[-1] and "DELETE" not in on.icloud.methods()
 
 
-def test_undo_with_a_lost_answer_is_unknown_and_offers_nothing_more(on):
+def test_undo_with_a_lost_answer_is_read_and_said_undone(on):
     card = on.add_one()
-    on.icloud.drop_response_next = True
+    on.icloud.drop_response_next = True        # the delete lands; its answer is lost
     on.press(card, "Undo")
+    assert not any("don't know" in t for t in on.texts())
+    on.advance(minutes=1)
+    on.tick()
     _, text, buttons, _ = on.last()
-    assert "don't know whether that was undone" in text and buttons is None
-    assert on.icloud.methods().count("DELETE") == 1
+    assert text == "<b>Undone.</b> That event is off the Family calendar." and buttons is None
+    assert on.icloud.methods().count("DELETE") == 1 and not on.icloud.family()
+
+
+def test_undo_whose_delete_never_landed_deletes_once_more(on):
+    card = on.add_one()
+    on.icloud.force_status = 500               # not deleted, and the answer says nothing
+    on.press(card, "Undo")
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar."
+    assert on.icloud.methods().count("DELETE") == 2 and not on.icloud.family()
+
+
+def test_undo_whose_delete_never_lands_twice_offers_its_undo_again(on):
+    card = on.add_one()
+    on.icloud.force_status = 500
+    on.press(card, "Undo")
+    on.advance(minutes=1)
+    on.icloud.force_status = 500
+    on.tick()
+    on.advance(minutes=1)
+    on.tick()
+    _, text, buttons, _ = on.last()
+    assert text.startswith("<b>Not undone.</b> That didn't go through") and buttons
+    assert on.icloud.methods().count("DELETE") == 2 and len(on.icloud.family()) == 1
 
 
 def test_a_rejected_password_on_undo_keeps_the_undo_offered(on):
@@ -778,7 +853,7 @@ def test_undo_expires(on):
     assert "DELETE" not in on.icloud.methods()
 
 
-def test_a_restart_during_the_undo_is_loud_and_never_retried(on):
+def test_a_restart_during_the_undo_reads_then_finishes_it(on):
     card = on.add_one()
 
     def die():
@@ -787,9 +862,9 @@ def test_a_restart_during_the_undo_is_loud_and_never_retried(on):
     with pytest.raises(Crash):
         on.press(card, "Undo")
     on.start()
-    on.tick()
-    assert any("don't know whether that was undone" in t for t in on.texts())
-    assert on.icloud.methods().count("DELETE") == 1
+    on.tick()                                  # read: still there as written, so deleted once more
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar."
+    assert not on.icloud.family() and not any("don't know" in t for t in on.texts())
 
 
 # -- 7. credentials ------------------------------------------------------------------------
@@ -1067,7 +1142,6 @@ def test_the_card_waits_while_stopped(on):
 # -- 10. the failure signal ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("arrange, thread, standing", [
-    (lambda r: setattr(r.icloud, "force_status", 500), "don't know whether", "outcome is unknown"),
     (lambda r: setattr(r.icloud, "force_status", 403), "Not added", "last write failed"),
     (lambda r: r.vault.set_key("family_app_password", "zzzz-zzzz-zzzz-zzzz", by="Owner"),
      "rejected the password", "rejected the password"),
@@ -1298,8 +1372,8 @@ def test_an_undo_after_loosening_restores_the_tap_and_says_why(loose):
 
 @pytest.mark.parametrize("arrange, why", [
     (lambda r: setattr(r.icloud, "force_status", 403), "a write failed"),
-    (lambda r: setattr(r.icloud, "drop_response_next", True), "outcome is unknown"),
-    (lambda r: setattr(r.icloud, "status_after_write", 500), "outcome is unknown"),
+    (lambda r: setattr(r.icloud, "drop_response_next", True), "outcome wasn't confirmed"),
+    (lambda r: setattr(r.icloud, "status_after_write", 500), "outcome wasn't confirmed"),
     (lambda r: r.icloud.names.__setitem__(FAMILY_PATH, "Other"), "a write failed"),
 ])
 def test_a_failed_or_unknown_write_after_loosening_restores_the_tap(loose, arrange, why):
@@ -1319,14 +1393,14 @@ def test_a_crash_during_a_loose_write_restores_the_tap(loose):
     loose.start()
     assert not loose.fa.loosened()
     loose.tick()
-    assert any("outcome is unknown" in t and "Approve tap again" in t for t in loose.texts())
+    assert any("outcome wasn't confirmed" in t and "Approve tap again" in t for t in loose.texts())
 
 
 def test_a_lost_undo_answer_keeps_the_tap_and_restarts(on):
     receipt = on.add_one()
     on.icloud.drop_response_next = True
     on.press(receipt, "Undo")
-    assert on.fa._bake()["n"] == 0 and "unknown" in on.fa.problem()
+    assert on.fa._bake()["n"] == 0 and "last undo isn't confirmed yet" in on.fa.problem()
 
 
 def test_stop_stays_as_it_was_and_does_not_tighten(loose):
@@ -1567,13 +1641,13 @@ def test_a_check_that_cant_complete_says_so_and_offers_nothing_until_it_can(on, 
     on.advance(days=1)
     on.tick()
     assert ask_cards(on) == []
-    told = [s for s in on.bot.sent if "couldn't check the calendar" in s[1]]
+    told = [s for s in on.bot.sent if "couldn't read the calendar" in s[1]]
     assert len(told) == 1 and told[0][2] is None
     on.tick()
     on.advance(hours=2)
     on.tick()
     assert ask_cards(on) == []
-    assert len([s for s in on.bot.sent if "couldn't check the calendar" in s[1]]) == 1
+    assert len([s for s in on.bot.sent if "couldn't read the calendar" in s[1]]) == 1
     on.icloud.down = False
     on.icloud.names[FAMILY_PATH] = "Family"
     on.advance(hours=2)
@@ -1764,11 +1838,11 @@ def test_a_crash_writing_the_card_leaves_no_silent_proposal(on, ledger, monkeypa
     monkeypatch.setattr(ledger, "enqueue", real)
     assert ledger.db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] == 0
     assert on.jobs("running")
-    on.start()
+    on.claude.script = [proposal()]
+    on.start()                                 # the job the restart cut off runs once more, by itself
     on.tick()
-    [job] = on.jobs("failed")
-    assert on.receipt(job["id"])["reason"] == "interrupted"
-    assert "restarted while working" in on.texts()[-1]
+    assert any("restarted while working" in t and "running it once more" in t for t in on.texts())
+    assert ledger.db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] == 1 and on.with_button("Approve")
 
 
 def test_an_expired_offer_says_so_and_has_a_receipt(on):
@@ -1931,11 +2005,12 @@ def test_two_tapless_adds_in_one_tick_second_is_refused_after_the_tap_returns(lo
     batch(loose, a, b)
     assert not loose.fa.loosened()
     assert loose.icloud.methods().count("PUT") == 1 and "Second one" not in titles(loose)
-    said = "\n".join(loose.texts())
-    assert "The Approve tap came back before I wrote this" in said and "Second one" in said
-    assert loose.jobs("failed")[-1]["id"]
-    reasons = [loose.receipt(j["id"])["reason"] for j in loose.jobs("failed")]
-    assert "tap_restored" in reasons
+    # Never "send it again": the second comes back by itself as his card to tap.
+    card = loose.with_button("Approve")
+    assert "Second one" in card[1] and "the Approve tap came back before I added it" in card[1]
+    assert not any("Send it again" in t for t in loose.texts())
+    loose.press(card, "Approve")
+    assert "Second one" in titles(loose)
 
 
 def test_two_clean_tapless_adds_in_one_tick_both_write(loose):
@@ -2071,7 +2146,7 @@ def test_a_tap_when_the_check_cant_complete_loosens_nothing_and_says_why(on):
     card = ask_cards(on)[0]
     on.icloud.down = True
     on.press(card, STOP)
-    assert not on.fa.loosened() and "couldn't check the calendar" in on.texts()[-1]
+    assert not on.fa.loosened() and "couldn't read the calendar" in on.texts()[-1]
     assert len(ask_cards(on)) == 1
     on.icloud.down = False
     on.advance(hours=2)
@@ -2522,3 +2597,15 @@ def test_a_tapped_add_with_no_undo_does_not_restart_the_count(on, monkeypatch):
     on.ask(**fresh())
     on.press(on.last(), "Approve")
     assert on.fa._bake()["n"] == 1
+
+
+def test_a_reset_drops_an_add_waiting_for_a_read_without_a_word_or_a_write(on):
+    on.ask()
+    on.icloud.force_status = 500               # not written; a read would write it once more
+    on.press(on.last(), "Approve")
+    on.fa.forget()
+    on.icloud.log.clear()
+    said = len(on.texts())
+    on.advance(minutes=5)
+    on.tick()
+    assert "PUT" not in on.icloud.methods() and len(on.texts()) == said

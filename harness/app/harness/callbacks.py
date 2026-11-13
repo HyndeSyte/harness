@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
-from . import approvals, choices, render, rules
+from . import approvals, choices, commands, render, rules
 from .chat import ChatError
 from .ledger import Ledger
 
@@ -55,8 +55,8 @@ class Callbacks:
             self._answer(inc, "Stopped. Nothing changed.")
             with self.ledger.tx() as db:
                 self.ledger.enqueue(chat_id=inc.chat_id, kind="reply", db=db, text=(
-                    "I'm stopped, so nothing changed and I didn't check the calendar. After "
-                    "/resume, tap that card again."))
+                    "I'm stopped, so nothing changed and I didn't read the calendar. That card "
+                    "still works after you turn me back on."))
             return "stopped"
         if nonce is not None:
             v = choices.verify_and_consume(self.ledger, inc, owner_user_id=self.owner)
@@ -108,6 +108,8 @@ class Callbacks:
             return self.calendar_change.on_choice(kind, target)
         if kind == "mail_dates_undo" and self.mail_dates is not None:
             return self.mail_dates.on_choice(kind, target)
+        if kind in ("stopped_redo", "stopped_drop"):
+            return commands.on_stopped_choice(self.ledger, kind, target)   # what he asked while stopped
         if kind in ("meaning_answer", "meaning_undo", "place_skip") and self.meaning_live is not None:
             return self.meaning_live.on_choice(kind, target)   # templates only, no model words
         return "Nothing changed."

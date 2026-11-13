@@ -677,19 +677,29 @@ class GoogleCalendar:
 
     def really_gone(self, address: str, uid: str) -> bool:
         """Asked by id, because a list can come back short. Only a clear yes is a yes."""
+        return self.gone_how(address, uid) in ("deleted", "never")
+
+    def gone_how(self, address: str, uid: str) -> str:
+        """One event by id: "there"; "deleted" (Google keeps a deleted event and answers it as
+        cancelled, or 410 Gone); "never" (404: Google has nothing by that id, so it never existed
+        on this calendar, which a list just read); or "unknown" (no clear answer)."""
         url = self._events(address)
-        if url is None:
-            return False
+        if url is None or not _ANY_ID_RE.fullmatch(uid):
+            return "unknown"
         token, _ = self._access()
         if token is None:
-            return False
+            return "unknown"
         try:
             r = self._call(token, "GET", f"{url}/{uid}")
-            if r.status in (404, 410):
-                return True
-            return r.status == 200 and r.json().get("status") == "cancelled"
+            if r.status == 404:
+                return "never"
+            if r.status == 410:
+                return "deleted"
+            if r.status != 200:
+                return "unknown"
+            return "deleted" if r.json().get("status") == "cancelled" else "there"
         except (TransportError, ValueError, AttributeError):
-            return False
+            return "unknown"
 
     def move(self, address: str, block: Block, title: str, start: datetime, end: datetime,
              location: str = "") -> Outcome:

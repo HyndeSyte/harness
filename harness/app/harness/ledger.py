@@ -356,10 +356,13 @@ TRANSITIONS = {
     "running": {"answered", "proposed", "needs_clarification", "no_action",
                 "failed", "cancelled"},
     "proposed": {"approved", "declined", "expired", "cancelled"},
-    "approved": {"executed", "failed"},
+    # "proposed": an add going in without a tap, when the tap came back before its write, is his
+    # card again (family_add)
+    "approved": {"executed", "failed", "proposed"},
     "failed": {"received"},          # a retry of a failure that wasn't his doing (runner)
     "needs_clarification": {"received"},   # a note from Cain for the question it asked (controller)
     "no_action": {"received"},       # an add he asked for while adds were off, once his tap turns them on (family_add)
+    "cancelled": {"received"},       # a request he sent while stopped, at his tap on its card (commands)
 }
 
 
@@ -416,7 +419,9 @@ class Ledger:
                                   ("stale", "INTEGER NOT NULL DEFAULT 0"),
                                   ("good", "INTEGER NOT NULL DEFAULT 0")),
             # 0.19.6: the street address written on a block, so his own edit to it still shows.
-            "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"),),
+            # 0.23.0: whether a block Google said it wrote, but that never existed, was written
+            # once more (family_gmail.py).
+            "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"), ("rewritten", "INTEGER NOT NULL DEFAULT 0")),
             # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
             # who sent it, the address found, the one written, and whether it was written busy.
             # 0.22.0: what a read must still find before it's told ("added" or "moved", then
@@ -440,8 +445,11 @@ class Ledger:
                        ("back_at", "TEXT"), ("label", "TEXT NOT NULL DEFAULT ''")),
             # 0.22.0: a receipt goes out only once a read finds what was written: how many reads
             # haven't found it yet (meaning_live.py, family_add.py).
+            # 0.23.0: an outcome a write couldn't confirm is settled by reading (calendar_change.py,
+            # family_add.py): each write recorded before it's sent, and how the reads are going.
             "meaning_receipts": (("reads", "INTEGER NOT NULL DEFAULT 0"),),
-            "family_adds": (("reads", "INTEGER NOT NULL DEFAULT 0"),)}
+            "family_adds": (("reads", "INTEGER NOT NULL DEFAULT 0"), ("settle_json", "TEXT NOT NULL DEFAULT ''")),
+            "calendar_changes": (("settle_json", "TEXT NOT NULL DEFAULT ''"),)}
         with self.tx() as db:              # all or nothing: a stop halfway leaves the file as it was
             unread = "reads" not in {r[1] for r in db.execute("PRAGMA table_info(meaning_receipts)")}
             for table, cols in added.items():

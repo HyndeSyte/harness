@@ -66,11 +66,74 @@ def test_stop_cancels_new_work_and_resume_restores_it(ledger, config):
     assert w.last() == "I'm stopped, so I didn't act on that."
     w.say("/resume")
     w.step()
-    assert not is_paused(ledger) and "Resumed." in w.last()
-    assert "resend" not in w.last()                  # it never asks him to send it again
+    assert not is_paused(ledger)
+    assert "<b>Resumed.</b> What you asked while I was stopped comes next, one card each." in w.bot.texts()
+    assert not any("resend" in t or "send it again" in t.lower() for t in w.bot.texts())
     _, [job2] = w.say("draft the coop email")
     w.step()
     assert ledger.job(job2)["state"] == "answered"
+
+
+def stopped_card(w, words):
+    return next(s for s in reversed(w.bot.sent) if s[2] and words in s[1])
+
+
+def test_each_request_sent_while_stopped_comes_back_as_its_own_card(ledger, config, clock):
+    w = World(ledger, config, [result(text="Here's the draft.")])
+    w.say("/stop")
+    w.step()
+    _, [first] = w.say("draft the coop email")
+    _, [second] = w.say("what's on Friday?")
+    w.step()
+    clock.advance(hours=2)
+    w.say("/resume")
+    w.step()
+    one, two = stopped_card(w, "coop"), stopped_card(w, "Friday")
+    assert one[1] == "While I was stopped, you asked: \u201cdraft the coop email\u201d. Do it now?"
+    assert [b for b, _ in one[2][0]] == ["Do it now", "Drop it"] and one[3] != two[3]
+    # Do it now: that message runs, and the model is told when he sent it.
+    assert w.tap(one[2][0][0][1], message_id=one[3]) == "ok"
+    w.step()
+    assert ledger.job(first)["state"] == "answered" and "Here's the draft." in w.last()
+    assert "He sent this message on Wednesday, October 21 at 9:00 AM." in w.eng.calls[-1]["user"]
+    # Drop it: nothing runs.
+    assert w.tap(two[2][0][1][1], message_id=two[3]) == "ok"
+    w.step()
+    assert ledger.job(second)["state"] == "cancelled" and len(w.eng.calls) == 1
+    assert "Dropped. Nothing was done." in w.bot.texts()
+    # Each card works once, and a second /resume brings none back.
+    assert w.tap(one[2][0][0][1], message_id=one[3]) == "already used"
+    w.say("/resume")
+    w.step()
+    assert "Not stopped. Nothing to resume." in w.last()
+
+
+def test_nothing_sent_while_stopped_means_no_cards(ledger, config):
+    w = World(ledger, config)
+    w.say("/stop")
+    w.step()
+    w.say("/resume")
+    w.step()
+    assert w.last() == "<b>Resumed.</b>" and not any(s[2] for s in w.bot.sent)
+
+
+def test_do_it_now_while_stopped_again_waits_for_the_next_resume(ledger, config):
+    w = World(ledger, config)
+    w.say("/stop")
+    w.step()
+    _, [job] = w.say("draft the coop email")
+    w.step()
+    w.say("/resume")
+    w.step()
+    card = stopped_card(w, "coop")
+    w.say("/stop")
+    w.step()
+    assert w.tap(card[2][0][0][1], message_id=card[3]) == "ok"
+    w.step()
+    assert ledger.job(job)["state"] == "cancelled" and w.eng.calls == []
+    w.say("/resume")
+    w.step()
+    assert stopped_card(w, "coop")[3] != card[3]          # its card again, fresh
 
 
 def test_every_command_is_a_job_with_a_receipt(ledger, config):

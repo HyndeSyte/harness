@@ -163,8 +163,8 @@ def family_problem(view, tz: str) -> str:
     if view.status == "unavailable":
         return f"Family calendar: Home Assistant couldn't read it (as of {when})"
     if view.status == "window":
-        return ("Family calendar: the last push isn't about today "
-                "(check Home Assistant's time zone)")
+        return ("Family calendar: the last push isn't about today, so Home Assistant's time "
+                "zone may not be yours")
     return ""
 
 
@@ -193,7 +193,7 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
             back = watch.back_line()
         except Exception as e:
             log.warning("digest: couldn't check the inputs: %s", type(e).__name__)
-            notes.append("Couldn't check this morning whether email, Family and Google are working")
+            notes.append("Couldn't tell this morning whether email, Family and Google are working")
     day_start, day_end, day = calendar_feed.today_bounds(now, config.timezone)
     occ: list = []
     unreadable = read = configured = 0
@@ -329,12 +329,16 @@ WHY = {
     "off": "changing calendars was off",
     "interrupted": "the harness restarted first",
     "expired": "it waited too long for a tap",
-    "calendar_unknown": "it stopped partway, so check the calendar",
+    "calendar_unknown": "not confirmed yet, still checking",
+    "partway": "it stopped partway",
     "calendar_change_impossible": "the calendar refused it",
     "family_add_off": "adding to Family was off",
     "family_add_impossible": "Family refused it",
-    "family_unknown": "it stopped partway, so check Family",
-    "unknown": "I don't know if it went through, so check the calendar",
+    "family_unknown": "not confirmed yet, still checking",
+    "family_not_added": "it didn't go through",
+    "not_landed": "it didn't go through",
+    "put_back": "half of it went through, so that was put back",
+    "unknown": "not confirmed yet, still checking",
     "failed": "the calendar refused it",
 }
 
@@ -356,9 +360,11 @@ def _failed(ledger: Ledger, job, detail: dict, tz: str) -> str:
     t = datetime.fromisoformat(job["created_at"]).astimezone(ZoneInfo(tz))
     when = f"{t:%a} {t.hour % 12 or 12}:{t:%M} {'AM' if t.hour < 12 else 'PM'}"
     reason = str(detail.get("reason") or detail.get("outcome") or "")
-    partway = detail.get("steps") or reason in ("calendar_unknown", "family_unknown", "unknown")
-    if partway and reason not in ("calendar_unknown", "family_unknown", "unknown"):
-        reason = "calendar_unknown"            # some of it landed, then it stopped
+    if reason in ("calendar_unknown", "family_unknown", "unknown"):
+        return f"{what} ({when}): {WHY[reason]}."   # never "check the calendar" (org rule R-004)
+    partway = bool(detail.get("steps"))
+    if partway:
+        reason = "partway"                     # some of it landed, then it stopped: the receipt said what
     why = WHY.get(reason) or (reason.replace("_", " ") if reason else "it didn't finish")
     tail = "" if partway else " Nothing changed."
     done = "only partly went through" if partway else "wasn't done"

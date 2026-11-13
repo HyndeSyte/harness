@@ -23,8 +23,9 @@ import time
 from concurrent.futures import Executor, Future
 from datetime import datetime, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
 
-from . import approvals, effects, policy, prompts, render, rules, schema
+from . import approvals, commands, effects, policy, prompts, render, rules, schema
 from .config import Config
 from .engines import CallOutcome, Engine, EngineError, EngineResult, call_with_retries
 from .ledger import Ledger, iso
@@ -67,11 +68,14 @@ PROVENANCE = {
 }
 
 
-# With Cain in front, a failure he didn't cause is never handed back to him as
-# "send it again": these are retried once, from the same message, on their own.
+# A failure he didn't cause is never handed back to him as "send it again", with Cain in front or
+# not: these are retried once, from the same message, on their own.
 RETRYABLE = frozenset({"deadline", "interrupted", "internal_error", "rate_limited", "overloaded",
                        "server_error", "timeout", "network", "tls", "incomplete", "bad_output"})
 RETRY_WINDOW_S = 24 * 3600
+# A message that runs this long after he sent it (one sent while stopped, run at his tap, or run
+# once more after a failure) is given to the model with the time he sent it.
+SENT_NOTE_AFTER = timedelta(minutes=10)
 
 
 def reason_text(reason: str, engine: str | None) -> str:
@@ -129,7 +133,8 @@ class Runner:
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "cancelled",
                                    receipt=json.dumps({"reason": "stopped"}), db=db)
-            # Never a resend ask: the Resumed notice says what wasn't acted on (commands.py).
+            # Never a resend ask: it comes back on its own card after /resume (commands.py).
+            commands.note_stopped(self.ledger, job["id"], db)
             self._reply(db, job, "I'm stopped, so I didn't act on that.")
 
     def _start(self, job) -> bool:
@@ -155,7 +160,8 @@ class Runner:
                                        family_add=family, calendar_change=change)
         if self.family_add is not None:
             self.family_add.note_message(text)
-        user = prompts.user_content(text, earlier=self._earlier(job))
+        sent = self._sent(job, now)
+        user = prompts.user_content(text, earlier=self._earlier(job), sent=sent)
         out_schema = prompts.output_schema(self.config.stage_at_least, family_add=family,
                                            calendar_change=change)
         with self.ledger.tx() as db:
@@ -176,7 +182,7 @@ class Runner:
             # It counts against the job's own deadline, so retries never outlive the job
             # (Nov 8: a message with Cain's context ran past 10 minutes and was cut off).
             with_calendar = prompts.user_content(text, earlier=earlier, recent=recent,
-                                                 calendar=cc.context_for(text, now)) if cc else user
+                                                 calendar=cc.context_for(text, now), sent=sent) if cc else user
             spent = self.monotonic() - t0
             if spent > 20:
                 log.info("job %s: reading his calendar for context took %d s", job_id, spent)
@@ -185,6 +191,14 @@ class Runner:
                                      monotonic=self.monotonic)
         self._futures[job["id"]] = self.executor.submit(call)
         return True
+
+    def _sent(self, job, now: datetime) -> str:
+        """When he sent a message that runs well after it came in, in words the model reads."""
+        sent = datetime.fromisoformat(job["created_at"])
+        if now - sent < SENT_NOTE_AFTER:
+            return ""
+        local = sent.astimezone(ZoneInfo(self.config.timezone))
+        return f"on {local:%A, %B} {local.day} at {render.clock_words(local, suffix=True)}"
 
     def _refuse(self, job, reason: str, engine_name: str) -> None:
         with self.ledger.tx() as db:
@@ -434,19 +448,16 @@ class Runner:
                 self.ledger.event("job_retry", {"job": job["id"], "reason": reason}, db=db)
                 self._reply(db, job, f"That didn't finish ({reason_text(reason, engine)}), "
                                      "so I'm running it once more.", kind="notice")
-            elif self.answers_to_cain:
+            else:
                 again = " It failed twice, so it's logged for a fix." \
                     if self.ledger.get_meta(f"job_retried:{job['id']}") else ""
                 self._reply(db, job, f"I couldn't finish that: {reason_text(reason, engine)}. "
                                      f"Nothing was done.{again}")
-            else:
-                self._reply(db, job, f"I couldn't finish that: {reason_text(reason, engine)}. "
-                                     "Nothing was done. Send it again to retry.")
 
     def _may_retry(self, job, reason: str) -> bool:
-        """Once per message, only for failures that aren't his doing, only with Cain in
-        front (who would otherwise hand the retry back to Dane)."""
-        if not self.answers_to_cain or reason not in RETRYABLE or job["kind"] != "message":
+        """Once per message, only for failures that aren't his doing, whoever is in front:
+        a resend is never his to make (org rule R-004)."""
+        if reason not in RETRYABLE or job["kind"] != "message":
             return False
         if self.ledger.get_meta(f"job_retried:{job['id']}"):
             return False
@@ -457,8 +468,6 @@ class Runner:
         """After a restart (often an update with a fix): a message that failed for a
         reason that wasn't his, in the last day and never retried, runs once more.
         A change from it still waits for his tap."""
-        if not self.answers_to_cain:
-            return 0
         n = 0
         for job in self.ledger.jobs_in("failed"):
             try:

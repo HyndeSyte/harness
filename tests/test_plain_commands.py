@@ -453,8 +453,41 @@ def test_no_done_until_the_calendar_reads_back_the_change(m):
     m.gmail.change = lands_but_reads_old
     m.tells("PT 11:30", ask(MOVE_PT))
     m.gmail.change, m.gmail.down = real, False
+    assert not any(t.startswith("Done") for t in m.seen())    # not before a read says so
+    assert m.copy_times() == ("12:00", "13:00")               # its copy waits for that read too
+    later(m)
     receipt = m.seen()[-1]
-    assert not receipt.startswith("Done") and "written but not confirmed" in receipt
+    assert receipt.startswith("Done.") and "Moved PT to 11:30 to 12:30 today (Gmail and Family)" in receipt
+    assert m.copy_times() == ("11:30", "12:30")               # the rest of it, finished by itself
+
+
+def later(m, minutes=1):
+    """A minute on: the read that settles what no answer did."""
+    m.clock.advance(minutes=minutes)
+    m.days_done()
+    m.c.tick()
+
+
+def test_half_a_change_that_cant_be_finished_is_put_back(m):
+    """The Gmail move landed but no answer said so; its copy then can't move. His approval was
+    for both, so Gmail goes back, and he hears what's true."""
+    real = m.gmail.change
+
+    def lands_but_reads_old(address, uid, fields, etag):
+        out = real(address, uid, fields, etag)
+        m.gmail.down = True
+        return out
+    m.gmail.change = lands_but_reads_old
+    m.tells("PT 11:30", ask(MOVE_PT))
+    m.gmail.change, m.gmail.down = real, False
+    m.icloud.force_status = 403                               # the copy's write is turned down
+    later(m)
+    receipt = m.seen()[-1]
+    assert receipt.startswith("Nothing changed.")
+    assert ("Not done: Move PT to 11:30 to 12:30 today (Gmail and Family). It went through on Gmail, "
+            "not on the Family copy, so I put it back as it was on Gmail.") in receipt
+    assert m.gmail_times(PT_ID) == ("12:00", "13:00") and m.copy_times() == ("12:00", "13:00")
+    assert "Undo" not in m.labels()
 
 
 # -- c and d. as he reads it ---------------------------------------------------------------------
@@ -634,8 +667,10 @@ def test_a_lost_answer_is_never_called_nothing_changed(m):
     m.gmail.change = lost
     m.gmail.drop = lambda address, uid, etag: caldav.Outcome("denied")
     m.tells("PT 11:30, no drop-off", ask(MOVE_PT, DROP_OFF))
+    later(m)
     receipt = m.seen()[-1]
-    assert receipt.startswith("Not sure that went through.") and "Nothing changed" not in receipt
+    assert receipt.startswith("Only part of that went through.") and "Nothing changed" not in receipt
+    assert "Moved PT to 11:30 to 12:30 today (Gmail and Family)" in receipt
 
 
 def test_a_misread_at_the_run_is_said_not_a_stopped_tick(m, monkeypatch):
@@ -786,11 +821,10 @@ def test_a_write_the_read_back_cant_confirm_is_said_as_what_he_asked(m):
     m.gmail.change = lands_but_reads_nothing
     m.tells("PT 11:30", ask(MOVE_PT))
     m.gmail.change, m.gmail.down = real, False
+    later(m)
     receipt = m.seen()[-1]
-    assert receipt.startswith("Not sure that went through.")
-    assert ("Not sure: Move PT to 11:30 to 12:30 today (Gmail and Family), written but not confirmed: "
-            "reading it back failed. Check the calendar.") in receipt
-    assert "Gmail: PT" not in receipt and "on Nov 11 moved" not in receipt
+    assert receipt.startswith("Done.") and "Moved PT to 11:30 to 12:30 today (Gmail and Family)" in receipt
+    assert "Gmail: PT" not in receipt and "on Nov 11 moved" not in receipt and "Check" not in receipt
 
 
 def test_a_note_rerun_keeps_its_place_in_the_ledger(m):

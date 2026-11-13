@@ -674,6 +674,27 @@ def test_the_receipt_waits_for_a_read_that_finds_the_block_as_written(live):
     assert live.live.send_receipts() == 0
 
 
+def test_a_block_google_never_had_is_written_once_more_and_its_receipt_waits(live):
+    """D1's open edge: a block Google answered "ok" but never had (404 by its id) isn't his
+    removal. It's written once more, and its receipt waits for the read that finds it."""
+    start = when(live, days=3)
+    seed(live, "Turkey harvest", start)
+    eid = answer_ex(live, "Turkey harvest", ["supervision"])
+    live.judge.script = [judged(ob("supervision", start, start + timedelta(hours=1)), cites=[eid])]
+    go(live)
+    go(live)                                                  # written: Google said ok
+    [uid] = live.google.live()
+    del live.google.events[uid]                               # but it has nothing by that id
+    go(live)
+    go(live)                                                  # by its id, never there: once more
+    assert uid in live.google.live() and count(live, "family_gmail_removed") == 0
+    r = live.ledger.db.execute("SELECT * FROM meaning_receipts").fetchone()
+    assert r["state"] == "written"                            # still waiting, not dropped
+    go(live)                                                  # the read that finds it
+    r = live.ledger.db.execute("SELECT * FROM meaning_receipts").fetchone()
+    assert r["state"] == "new" and live.live.send_receipts() == 1
+
+
 def test_a_block_never_found_gets_the_not_confirmed_line_with_its_buttons(live):
     start = when(live, days=3)
     seed(live, "Turkey harvest", start)

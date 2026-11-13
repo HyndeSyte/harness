@@ -282,6 +282,12 @@ def count(rig, kind):
     return rig.ledger.db.execute("SELECT COUNT(*) FROM events WHERE kind=?", (kind,)).fetchone()[0]
 
 
+def he_deletes(rig, uid):
+    """As Google keeps an event he deleted: cancelled, and read by its id as cancelled."""
+    rig.google.events[uid]["status"] = "cancelled"
+    rig.google.events[uid]["etag"] = rig.google._etag()
+
+
 # -- the setting ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("text, n", [
@@ -580,7 +586,7 @@ def test_a_gone_from_gmail_count_starts_over_after_a_read_with_an_unreadable_eve
     seed(g, "Mom at work", when(g, days=5))
     sit(g)
     go(g)
-    del g.google.events[only(g)["id"]]
+    he_deletes(g, only(g)["id"])
     go(g)                                      # the first of two good reads
     strange = seed(g, "Strange", when(g, days=6), extra=["RRULE:FREQ=HOURLY"])
     go(g)
@@ -974,7 +980,7 @@ def test_a_block_he_dragged_out_of_what_is_read_becomes_his_and_the_message_stop
 def test_google_not_answering_about_one_block_keeps_it(g):
     sit(g)
     go(g)
-    del g.google.events[only(g)["id"]]
+    he_deletes(g, only(g)["id"])
     g.google.fail["GET"] = 500
     go(g)
     del g.google.fail["GET"]
@@ -1023,7 +1029,7 @@ def test_a_lost_add_and_a_move_puts_it_right(g):
 def test_a_block_he_removed_isnt_put_back(g):
     sit(g)
     go(g)
-    del g.google.events[only(g)["id"]]
+    he_deletes(g, only(g)["id"])
     n = len(g.google.writes())
     go(g)
     assert count(g, "family_gmail_removed") == 0   # one read can be wrong
@@ -1031,6 +1037,53 @@ def test_a_block_he_removed_isnt_put_back(g):
         go(g)
     assert g.google.live() == {} and len(g.google.writes()) == n
     assert count(g, "family_gmail_removed") == 1
+
+
+def test_google_tells_a_deleted_block_from_one_it_never_had(g):
+    """What D1 left open: both read as gone from the list. By its id, Google answers a deleted
+    event as cancelled and one it never had with 404, and only the first is his answer."""
+    sit(g)
+    go(g)
+    uid = only(g)["id"]
+    assert g.client.gone_how(GMAIL, uid) == "there"
+    assert g.client.gone_how(GMAIL, google_cal.event_id("never-written")) == "never"
+    he_deletes(g, uid)
+    assert g.client.gone_how(GMAIL, uid) == "deleted" and g.client.really_gone(GMAIL, uid)
+    g.google.fail["GET"] = 500
+    assert g.client.gone_how(GMAIL, uid) == "unknown" and not g.client.really_gone(GMAIL, uid)
+
+
+def test_a_block_google_never_had_is_written_once_more_not_taken_as_his_answer(g):
+    sit(g)
+    go(g)
+    uid = only(g)["id"]
+    del g.google.events[uid]                   # Google said "ok", but has nothing by that id
+    n = len(g.google.writes())
+    go(g)
+    go(g)                                      # two reads without it: never there, so once more
+    assert only(g)["id"] == uid and len(g.google.writes()) == n + 1
+    row = g.ledger.db.execute("SELECT state, rewritten FROM family_gmail").fetchone()
+    assert (row["state"], row["rewritten"]) == ("live", 1)
+    assert count(g, "family_gmail_removed") == 0 and count(g, "family_gmail_rewritten") == 1
+    go(g)
+    assert len(g.google.writes()) == n + 1 and not problem(g)
+
+
+def test_a_block_google_never_has_twice_is_said_and_not_tried_a_third_time(g):
+    sit(g)
+    go(g)
+    uid = only(g)["id"]
+    del g.google.events[uid]
+    go(g)
+    go(g)                                      # written once more
+    del g.google.events[uid]                   # and again never there
+    n = len(g.google.writes())
+    for _ in range(3):
+        go(g)
+    assert g.google.live() == {} and len(g.google.writes()) == n
+    row = g.ledger.db.execute("SELECT state FROM family_gmail").fetchone()
+    assert row["state"] == "unwritten" and count(g, "family_gmail_removed") == 0
+    assert "didn't go through" in problem(g) and "Busy (watching kids)" in problem(g)
 
 
 def test_a_block_he_made_all_day_is_his_and_doesnt_stop_the_rest(g):
@@ -1051,7 +1104,7 @@ def test_many_gone_from_gmail_at_once_is_held_for_a_while(g):
     sit(g, extra=["RRULE:FREQ=WEEKLY"])
     go(g)
     for uid in list(g.google.live()):
-        del g.google.events[uid]
+        he_deletes(g, uid)
     go(g)
     assert "look gone from Gmail" in problem(g)
     rows = g.ledger.db.execute("SELECT state FROM family_gmail").fetchall()

@@ -15,6 +15,9 @@ The mirror image of family_copy.py, and it keeps the same safety:
     good, and one someone removed, with its Family event still there, stays removed.
   * Nothing is removed, or taken as removed, on one read. It takes two good reads in a
     row, and more than a few at once is held back for a while as a sign the read is wrong.
+  * Only a block Google answers as deleted is taken as his removal. One Google has nothing by
+    that id for (it answered the write "ok", but it never existed) is a write that didn't land:
+    written once more, its receipt still waiting for the read that finds it (google_cal.gone_how).
   * If Family or Google can't be read, nothing happens.
 
 School days work the same way, from the `family_school` option, which names the Family
@@ -448,7 +451,8 @@ class FamilyGmail:
         problem = self._follow(address, wants, {b.id: b for b in blocks}, now, until,
                                family.unreadable == 0, self._thin(len(family.items) - len(named)))
         added = self._add_new(address, wants)
-        self._problem(problem or added or self.school_note or self.me_note or self.leg_note)
+        self._problem(problem or added or self.school_note or self.me_note or self.leg_note
+                      or self._unwritten(now))
         confirm_soon(self.ledger, "family_gmail", self.calendar)
 
     def _school_runs(self, items: list[caldav.Item], runs: dict[str, Want] | None = None) -> dict[str, Want]:
@@ -620,7 +624,8 @@ class FamilyGmail:
                          "so a drive block is missing. I'll try again at the next read.")
         if not_found:
             notes.append(f"Blocks on Gmail from Family: couldn't find a drive to {which(not_found)}, "
-                         "so a drive block is missing. Check the address on Family.")
+                         "so a drive block is missing: the map couldn't place the address that "
+                         "event has on Family.")
         return " ".join(notes)
 
     def _thin(self, rest: int) -> bool:
@@ -675,7 +680,7 @@ class FamilyGmail:
             return ("Blocks on Gmail from Family: Google refused the service account key, so "
                     "nothing changed.")
         if kind == "denied":
-            return ("Blocks on Gmail from Family: Google refused. Check your Gmail calendar is "
+            return ("Blocks on Gmail from Family: Google refused. Your Gmail calendar needs to be "
                     f"shared with {self.google.account()} on \"Make changes and see event "
                     "details\". "
                     "Nothing changed.")
@@ -831,7 +836,9 @@ class FamilyGmail:
         for row, want in absent:
             if row["missing"] + 1 < READS_BEFORE_REMOVING:
                 self._update(row, missing=row["missing"] + 1)
-            elif not self.google.really_gone(address, row["event_id"]):
+                continue
+            how = self.google.gone_how(address, row["event_id"])
+            if how in ("there", "unknown"):
                 # The list left it out but it's there, or Google won't say. In time, it's been
                 # moved out of what's read: his now.
                 if row["missing"] + 1 >= GIVE_UP_READS:
@@ -842,10 +849,49 @@ class FamilyGmail:
                            "what's on Gmail, so I changed nothing. I'll try again.")
             elif want is None:
                 self._set(row, "cancelled")    # gone on both sides: nothing to learn
+            elif how == "never":
+                # Google has nothing by that id: a write it answered "ok" never landed. That's no
+                # answer of his, so it's written once more, and its receipt waits for the read
+                # that finds it (meaning_live.read_back). A deleted block is answered "cancelled".
+                problem = self._write_again(address, row, want) or problem
             else:
                 self._set(row, "removed")      # taken as his answer, and not put back
                 self._log("family_gmail_removed", row["key"])
         return problem
+
+    def _unwritten(self, now: datetime) -> str:
+        """Each block Google said it wrote, twice, but never had, by its title and day, until it's
+        over: a fact, with nothing for him to do but know it."""
+        zone = ZoneInfo(self.tz)
+        named = [f"{r['title']} on {self._when(r['start']).astimezone(zone):%a %b} "
+                 f"{self._when(r['start']).astimezone(zone).day}"
+                 for r in self.ledger.db.execute("SELECT * FROM family_gmail WHERE state='unwritten'"
+                                                 " ORDER BY start").fetchall() if self._when(r["end"]) > now]
+        if not named:
+            return ""
+        return (f"Blocks on Gmail from Family: {'; '.join(named)} didn't go through. Google said "
+                f"{'it was' if len(named) == 1 else 'they were'} written, twice, but "
+                f"{'it isn' if len(named) == 1 else 'they aren'}'t on Gmail.")
+
+    def _write_again(self, address: str, row, want: Want) -> str:
+        """A block Google said it wrote but never had: once more, under the same id, which
+        Google has never used. A second that never lands is said by name, not tried again."""
+        if row["rewritten"]:
+            self._set(row, "unwritten")        # said by name until it's over (_unwritten)
+            return ""
+        if not self._room():
+            return ""                          # past today's limit: the next read tries
+        out = self.google.add(address, row["event_id"], want.title, want.start, want.end, want.place)
+        if out.kind in ("ok", "unknown"):      # landed, or a read finds out: either way, read again
+            self._update(row, missing=0, rewritten=1, title=want.title, start=want.start.isoformat(),
+                         end=want.end.isoformat(), place=want.place)
+            self._log("family_gmail_rewritten", row["key"])
+            self.writes += 1
+            return ""
+        if out.kind == "exists":               # Google has the id after all: a new one next time
+            self._set(row, "lost")
+            return ""
+        return self._said(out)
 
     def _cancel(self, address: str, gone: list, thin: bool) -> str:
         ready = [(row, block) for row, block in gone
@@ -1010,7 +1056,7 @@ class FamilyGmail:
                 " ON CONFLICT(key) DO UPDATE SET event_id=excluded.event_id,"
                 " generation=excluded.generation, intent='', title=excluded.title,"
                 " start=excluded.start, end=excluded.end, state=excluded.state, missing=0,"
-                " updated_at=excluded.updated_at, place=excluded.place",
+                " updated_at=excluded.updated_at, place=excluded.place, rewritten=0",
                 (want.key, uid, generation, want.title, want.start.isoformat(),
                  want.end.isoformat(), state, now, now, want.place))
 

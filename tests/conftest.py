@@ -1,3 +1,4 @@
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,10 +38,42 @@ def labels_of(buttons) -> list[str]:
     return out
 
 
+# A chore handed to him instead of done (org rule R-004): check something, send it again, report
+# back. The harness reads to settle what it doesn't know and retries what failed by itself. Its
+# own "I won't ask again", "I'd ask again" and "I'll try again" are about itself, not asks.
+# Python's own rule: not one of Cain's (message_rules.py mirrors those).
+ASK = re.compile(r"""(?ix)
+    \bcheck(?:ing)?\s+(?:the|that|this|these|your|it|its|whether|if|on|first|back|again|before)\b
+  | \bdouble[\s-]check
+  | \bre-?send\b
+  | \b(?:send|say|type|post)\s+(?:it|that|this|them|one)\s+again\b
+  | (?<!I'd\s)(?<!won't\s)(?<!I'll\s)\b(?:ask|try)\s+(?:it\s+|that\s+|me\s+)?again\b
+  | \blet\s+me\s+know\b
+  | \btell\s+me\s+(?:if|whether|when|what|how|once)\b
+  | \breport(?:ing)?\s+back\b
+  | \bget\s+back\s+to\s+me\b
+  | \b(?:run|do)\s+(?:a|the)\s+(?:test|drill)\b
+""")
+# Asks that may stay, each a decision: (words, why). Checked against what he sees (below) and
+# against the literals (test_message_text.py).
+ASK_ALLOWED = [
+    ("Check before approving:", "a card's own warning, read before the tap it asks for: part of "
+                                "that decision, not a chore after it"),
+    ("you asked to check these with", "says what his own /checkadds asked for: a tap on each change"),
+]
+
+
+def asks_in(text: str) -> list[str]:
+    for words, _ in ASK_ALLOWED:
+        text = text.replace(words, "")
+    return [m.group(0) for m in ASK.finditer(text)]
+
+
 def rule_problems(where: str, text: str, labels) -> list[str]:
     report = message_rules.check(text, buttons=list(labels))
     return [f"{where}: {h.rule} ({h.result}{', ' + h.label if h.label else ''}) in {h.around!r}"
-            for h in report.hits]
+            for h in report.hits] + [f"{where}: a check, resend or report-back ask in {a!r}"
+                                     for a in asks_in(text)]
 
 
 @pytest.fixture(autouse=True)

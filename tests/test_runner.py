@@ -85,13 +85,14 @@ def test_a_proposal_before_s2_fails_closed(ledger, config):
     bad = {"type": "proposal", "effect_type": "calendar_hold",
            "params": {"start": "2026-10-23T14:00:00-04:00", "duration_min": 90},
            "summary": "hold"}
-    r, _ = make(ledger, config, [result(bad)])
+    r, _ = make(ledger, config, [result(bad), result(bad)])
     job = send(ledger, "hold friday 2pm")
     run(r)
+    run(r)                                     # tried once more by itself: the same answer
     assert ledger.job(job)["state"] == "failed"
     assert receipt(ledger, job)["reason"] == "bad_output"
     assert ledger.db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] == 0
-    assert "Nothing was done" in queued(ledger)[0]["text"]
+    assert "Nothing was done" in queued(ledger)[-1]["text"]
 
 
 @pytest.mark.parametrize("res, reason", [
@@ -101,9 +102,10 @@ def test_a_proposal_before_s2_fails_closed(ledger, config):
     (result({"type": "answer", "text": ""}), "bad_output"),
 ])
 def test_unusable_replies_fail_with_a_receipt_and_are_still_billed(ledger, config, res, reason):
-    r, _ = make(ledger, config, [res])
+    r, _ = make(ledger, config, [res, res])
     job = send(ledger, "x")
     run(r)
+    run(r)                                     # one that isn't his doing is tried once more
     assert ledger.job(job)["state"] == "failed" and receipt(ledger, job)["reason"] == reason
     assert ledger.spend_month("anthropic") > 0
 
@@ -217,7 +219,7 @@ def test_still_working_then_deadline_then_late_result_discarded(ledger, config, 
     assert sum("Still working" in q["text"] for q in queued(ledger)) == 1   # once
     clock.advance(seconds=policy.JOB_DEADLINE_S)
     r.check_timers()
-    assert ledger.job(job)["state"] == "failed"
+    assert ledger.job(job)["state"] == "received"      # failed, and put back for one more try
     assert receipt(ledger, job)["reason"] == "deadline"
     ex.run_all()
     r.collect()
@@ -235,9 +237,9 @@ def test_restart_fails_orphaned_running_jobs(ledger, config):
     r.start_pending(paused=False)
     r2, _ = make(ledger, config)                     # a new process: no worker for it
     assert r2.reconcile_after_restart() == 1
-    assert ledger.job(job)["state"] == "failed"
+    assert ledger.job(job)["state"] == "received"      # failed, and put back for one more try
     assert receipt(ledger, job)["reason"] == "interrupted"
-    assert "restarted" in queued(ledger)[-1]["text"]
+    assert "restarted" in queued(ledger)[-1]["text"] and "running it once more" in queued(ledger)[-1]["text"]
 
 
 def test_a_reply_carries_the_exchange_it_answers(ledger, config):
@@ -314,16 +316,45 @@ def test_after_a_restart_a_recent_failure_runs_once_more(ledger, config, clock):
 
 
 def test_restart_retry_picks_up_an_old_unretried_failure(ledger, config):
-    r, _ = make(ledger, config, [result(text="ok")])    # failed while not yet answering Cain
+    r, _ = make(ledger, config, [result(text="ok")])
     job = send(ledger, "Turkey harvest ties me up")
     r.start_pending(paused=False)
     r._futures.clear()
-    r._fail(ledger.job(job), "deadline", "claude")
-    assert ledger.job(job)["state"] == "failed"
-    r.answers_to_cain = True                            # the restarted, fixed harness
-    assert r.retry_recent_failures() == 1
+    with ledger.tx() as db:                             # failed under a version that didn't retry
+        ledger.transition(job, "failed", db=db, receipt=json.dumps({"reason": "deadline"}))
+    assert r.retry_recent_failures() == 1               # Cain in front or not
     run(r)
     assert ledger.job(job)["state"] == "answered"
+
+
+def test_without_cain_a_failure_is_retried_once_by_itself_never_handed_back(ledger, config, monkeypatch):
+    """Nov 13: "Send it again to retry" was the one resend ask left (org rule R-004)."""
+    r, _ = make(ledger, config, [result(text="a"), result(text="b")])
+    assert not r.answers_to_cain
+    job = send(ledger, "Turkey harvest ties me up")
+
+    def boom(*a, **k):
+        raise KeyError("rule")
+    monkeypatch.setattr(r, "_on_answer", boom)
+    run(r)
+    assert ledger.job(job)["state"] == "received"
+    assert any("running it once more" in o["text"] for o in queued(ledger))
+    run(r)                                              # the retry hits the same bug
+    assert ledger.job(job)["state"] == "failed"
+    texts = [o["text"] for o in queued(ledger)]
+    assert "failed twice" in texts[-1]
+    assert not any("again to retry" in t or "Send it again" in t for t in texts)
+
+
+def test_a_message_run_long_after_it_came_in_tells_the_model_when_he_sent_it(ledger, config, clock):
+    r, eng = make(ledger, config, [result(text="ok")])
+    send(ledger, "move PT to tomorrow at 3")
+    clock.advance(hours=3)
+    run(r)
+    assert "He sent this message on Wednesday, October 21 at 9:00 AM." in eng.calls[-1]["user"]
+    send(ledger, "what's on Friday?", uid=2)
+    run(r)
+    assert "He sent this message" not in eng.calls[-1]["user"]      # just sent: no note
 
 
 def test_reading_his_calendar_counts_against_the_jobs_deadline(ledger, config, monkeypatch):

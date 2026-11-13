@@ -37,18 +37,16 @@ TOGGLE_KINDS = ("digest", "stopped", "resumed", "alert")   # carry Stop / Turn b
 # there's nothing to decide.
 PLAIN_ALERTS = ("input",)
 
-# The words a few older messages use for commands that don't exist here.
+# The words a few older messages use for commands that don't exist here. Only what some message
+# still says: none of them asks him to send anything again (org rule R-004).
 WORDS = (
-    ("Send /resume to start again", "Tap Turn back on to start again"),
     ("After /resume, tap", "After you turn me back on, tap"),
-    ("Send /resume, then resend it", "Turn me back on, then ask again"),
     ("After /resume", "After you turn me back on"),
     ("until /resume", "until you turn me back on"),
     ("(/resume)", "(Turn back on)"),
     ("/resume", "Turn back on"),
     ("/checkadds", "\"check each change\""),
     ("/stop", "Stop"),
-    ("/status", "the Harness page"),
 )
 
 _TAG = re.compile(r"<(/?)(b|i)>")

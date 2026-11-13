@@ -12,17 +12,89 @@
   /checkadds  every Family calendar add needs his Approve tap again, at once.
 
 Each command is a job of its own, so it gets a receipt like anything else.
+
+What he asked while stopped isn't lost and isn't his to send again (org rule R-004): each request
+not acted on is kept (note_stopped), and after /resume (Turn back on) comes back as a card of its
+own, his words in short with "Do it now" and "Drop it". Do it now runs that message as if just
+sent, with the time he sent it given to the model, so "tomorrow" still means his tomorrow.
 """
 from __future__ import annotations
 
 import json
 from typing import Callable
 
-from . import render, rules
+from . import choices, render, rules
 from .ledger import Ledger, iso
+
+STOPPED = "stopped_requests"           # his requests not acted on while stopped: job ids, in order
+STOPPED_CARD_TTL_S = 3 * 24 * 3600
+FEW_WORDS = 60                         # his request on its card, in about this many characters
+
 
 def is_paused(ledger: Ledger) -> bool:
     return ledger.get_meta("paused") == "1"
+
+
+def note_stopped(ledger: Ledger, job_id: str, db) -> None:
+    """A request of his that wasn't acted on because he'd stopped it: it comes back after /resume."""
+    ids = json.loads(ledger.get_meta(STOPPED) or "[]")
+    if job_id not in ids:
+        ledger.set_meta(STOPPED, json.dumps(ids + [job_id]), db)
+
+
+def _few_words(text: str) -> str:
+    """His request, short enough for a card: whole words, his own."""
+    words = " ".join(text.split("\n\n[A suggestion from Cain", 1)[0].split())
+    if len(words) > FEW_WORDS:
+        words = words[:FEW_WORDS].rsplit(" ", 1)[0].rstrip(",;:.") + "..."
+    return render.escape(render.defang(render.no_dashes(words)))
+
+
+def card_stopped(ledger: Ledger, chat_id: int, db) -> int:
+    """One card per request he sent while stopped: a decision, never a chore."""
+    ids = json.loads(ledger.get_meta(STOPPED) or "[]")
+    n = 0
+    for job_id in ids:
+        job = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        text = ledger.job_text(job_id)
+        if job is None or job["state"] not in ("cancelled", "failed") or not text.strip():
+            continue
+        redo = choices.mint(ledger, kind="stopped_redo", target=job_id, chat_id=chat_id,
+                            ttl_s=STOPPED_CARD_TTL_S, db=db)
+        drop = choices.mint(ledger, kind="stopped_drop", target=job_id, chat_id=chat_id,
+                            ttl_s=STOPPED_CARD_TTL_S, db=db)
+        ledger.enqueue(chat_id=chat_id, kind="card", job_id=job_id, db=db,
+                       text=f"While I was stopped, you asked: “{_few_words(text)}”. Do it now?",
+                       buttons=[[("Do it now", choices.callback_data(redo)),
+                                 ("Drop it", choices.callback_data(drop))]],
+                       binds=[{"type": "choice", "nonce": redo}, {"type": "choice", "nonce": drop}])
+        n += 1
+    db.execute("DELETE FROM meta WHERE key=?", (STOPPED,))
+    return n
+
+
+def on_stopped_choice(ledger: Ledger, kind: str, job_id: str) -> str:
+    """His tap on one of those cards. Do it now: that message runs again, as if just sent."""
+    job = ledger.job(job_id)
+    receipts = ledger.receipts(job_id) if job is not None else []
+    try:
+        reason = json.loads(receipts[-1]["detail"] or "{}").get("reason") if receipts else None
+    except (ValueError, TypeError, AttributeError):
+        reason = None
+    if job is None or job["state"] not in ("cancelled", "failed") or reason != "stopped":
+        return "That isn't waiting any more, so nothing changed."
+    if kind == "stopped_drop":
+        with ledger.tx() as db:
+            ledger.event("stopped_dropped", {"job": job_id}, db=db)
+        return "Dropped. Nothing was done."
+    if is_paused(ledger):
+        with ledger.tx() as db:
+            note_stopped(ledger, job_id, db)
+        return "I'm stopped again, so it waits. Its card comes back after you turn me back on."
+    with ledger.tx() as db:
+        ledger.transition(job_id, "received", db=db)
+        ledger.event("stopped_redone", {"job": job_id}, db=db)
+    return "Doing it now."
 
 
 def _args(text: str) -> tuple[str, str]:
@@ -62,6 +134,8 @@ class Commands:
                                    receipt=json.dumps({"command": name}), db=db)
             self.ledger.enqueue(chat_id=job["chat_id"], kind="reply", job_id=job["id"],
                                 text=render.fit(reply), db=db)
+            if name == "/resume" and not is_paused(self.ledger):
+                card_stopped(self.ledger, job["chat_id"], db)
             self.ledger.release_held(db=db)
 
     # -- the commands ---------------------------------------------------------
@@ -82,7 +156,9 @@ class Commands:
         with self.ledger.tx() as db:
             self.ledger.set_meta("paused", "0", db)
             self.ledger.event("resumed", {}, db=db)
-        return "<b>Resumed.</b> Anything you sent while stopped was not acted on."
+        if json.loads(self.ledger.get_meta(STOPPED) or "[]"):
+            return "<b>Resumed.</b> What you asked while I was stopped comes next, one card each."
+        return "<b>Resumed.</b>"
 
     def _cancel(self, arg: str) -> str:
         cancelled: list[str] = []

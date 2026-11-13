@@ -1,6 +1,8 @@
 """What he sees keeps to his standards (R-004): plain words, no em dash, Apps not add-ons,
 nothing hidden behind a count, no machine ids, no button named that the message lacks, no
-upkeep asks that the 30-minute line doesn't cover.
+upkeep asks that the 30-minute line doesn't cover, and no chore handed to him: nothing asks him
+to check something, send it again or report back (conftest.ASK, a rule of Python's own; its
+short allowlist, each entry with its reason, is conftest.ASK_ALLOWED).
 
 Two halves, so neither a template nor a message slips through:
   * static: every string literal in harness/app/harness, read with Python's ast (docstrings,
@@ -21,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import message_rules
-from conftest import labels_of, rule_problems
+from conftest import ASK_ALLOWED, asks_in, labels_of, rule_problems
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "harness" / "app" / "harness"
@@ -109,6 +111,8 @@ def problems_in(name: str, source: str) -> list[str]:
             found.append("a machine id")
         if RESTART_ASK.search(text):
             found.append("a restart ask")
+        if asks_in(text):
+            found.append("a check, resend or report-back ask")
         out += [f"{name}:{line}: {what}: {text[:80]!r}" for what in found]
     return out
 
@@ -126,6 +130,10 @@ def test_every_allowed_literal_is_still_there_and_has_its_reason():
     for name, words, why in ALLOWED:
         texts = [text for _, text in _strings(ast.parse((APP / name).read_text(encoding="utf-8")))]
         assert why and any(words in text for text in texts), (name, words)
+    every = [text for path in sorted(APP.glob("*.py"))
+             for _, text in _strings(ast.parse(path.read_text(encoding="utf-8")))]
+    for words, why in ASK_ALLOWED:
+        assert why and any(words in text for text in every), words
 
 
 @pytest.mark.parametrize("source, what", [
@@ -136,9 +144,28 @@ def test_every_allowed_literal_is_still_there_and_has_its_reason():
     ('x = f"<i>job {short(job_id)}</i>"', "a machine id"),
     ('x = f"iCloud answered HTTP {out.status}."', "a machine id"),
     ('x = "If it doesn\'t come back, restart Cain in Home Assistant."', "a restart ask"),
+    ('x = "It may or may not have gone through. Check the calendar."', "a check"),
+    ('x = "I don\'t know whether that was added. Check the Family calendar."', "a check"),
+    ('x = "Something I can\'t read, so check that nothing else keeps going."', "a check"),
+    ('x = "Nothing was done. Send it again to retry."', "resend"),
+    ('x = "Send /resume, then resend it"', "resend"),
+    ('x = "Turn me back on, then ask again"', "resend"),
+    ('x = "Say it again without that."', "resend"),
+    ('x = "Let me know if it shows up."', "report-back"),
+    ('x = "Tell me if the block is there."', "report-back"),
+    ('x = "Look, then report back."', "report-back"),
 ])
 def test_the_scan_finds_each_kind(source, what):
     assert any(what in p for p in problems_in("x.py", source)), source
+
+
+@pytest.mark.parametrize("words", [
+    "I won't ask again.", "before I'd ask again.", "I'll try again at the next read.",
+    "Undo tries what's left again.", "I couldn't read the calendar just now, so nothing changed.",
+    "⚠ Check before approving: it ends Piano.", "I couldn't confirm yet whether PT changed; I'm still checking.",
+])
+def test_its_own_words_about_itself_are_not_asks(words):
+    assert asks_in(words) == [], words
 
 
 def test_the_scan_leaves_logs_patterns_docstrings_and_prompts_alone():
@@ -239,3 +266,30 @@ def test_a_message_that_breaks_a_rule_fails_the_test_that_sent_it(request):
     found = rule_problems("card", text, labels_of(rows))
     assert any("button" in f and "Undo" in f for f in found) and any("dash" in f for f in found)
     assert to_markdown("<b>x</b>") == "**x**"
+
+
+# -- the asks D left: each one gone from every message (0.23.0) ---------------------------------
+OLD_ASKS = ("Check the calendar", "check the calendar", "Check the Family calendar", "check the Family",
+            "Send it again", "send it again", "resend", "ask again", "I won't retry", "Say it again",
+            "check that nothing else", "Check your Gmail calendar", "Check the address",
+            "reload and try again", "tap Undo again", "tap that card again")
+
+
+def test_nothing_emits_the_old_asks():
+    found = []
+    for path in sorted(APP.glob("*.py")):
+        for line, text in _strings(ast.parse(path.read_text(encoding="utf-8"))):
+            found += [f"{path.name}:{line}: {old!r}" for old in OLD_ASKS
+                      if old in text and old not in ("ask again",)]
+            if "ask again" in text and asks_in(text):
+                found.append(f"{path.name}:{line}: 'ask again'")
+    assert not found, "\n".join(found)
+
+
+def test_the_discord_words_hold_no_resend_and_only_what_something_says():
+    from harness import discord_chat
+    every = [text for path in sorted(APP.glob("*.py")) if path.name != "discord_chat.py"
+             for _, text in _strings(ast.parse(path.read_text(encoding="utf-8")))]
+    for old, new in discord_chat.WORDS:
+        assert not asks_in(new), new
+        assert any(old in text for text in every), f"nothing says {old!r} any more"

@@ -298,7 +298,7 @@ def make_handler(app: SetupApp):
             form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace"),
                                                 keep_blank_values=True).items()}
             if not hmac.compare_digest(form.get("csrf", ""), app.csrf):
-                return self._send(HTTPStatus.FORBIDDEN, "Stale page; reload and try again.")
+                return self._send(HTTPStatus.FORBIDDEN, "This page was out of date, so nothing was saved.")
             uid, name = who
             if not app.vault.claim_setup_user(uid, name):
                 return self._send(HTTPStatus.FORBIDDEN, "Only the person who set this up can "

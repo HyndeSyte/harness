@@ -412,6 +412,8 @@ class Controller:
             with self.ledger.tx() as db:
                 self.ledger.enqueue(chat_id=owner, kind="stopped" if cid == STOP else "resumed",
                                     text=text, db=db)
+                if cid == RESUME and not commands.is_paused(self.ledger):
+                    commands.card_stopped(self.ledger, owner, db)   # what he asked meanwhile
             return
         try:
             inc = Incoming(update_id=int(p["id"]), kind="callback", user_id=owner,

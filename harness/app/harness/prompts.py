@@ -129,8 +129,9 @@ def system_prompt(*, now: datetime, tz: str, rules: Iterable,
 
 
 def user_content(text: str, *, earlier: list[tuple[str, str]] = (), calendar: list[str] = (),
-                 recent: list[str] = ()) -> str:
-    """His message, with the recent exchange it continues, clearly fenced."""
+                 recent: list[str] = (), sent: str = "") -> str:
+    """His message, with the recent exchange it continues, clearly fenced. `sent`: when he sent a
+    message that runs well after it came in (one sent while stopped, run at his tap)."""
     parts = []
     if earlier:
         parts.append("Earlier in this conversation (for context only):")
@@ -147,6 +148,9 @@ def user_content(text: str, *, earlier: list[tuple[str, str]] = (), calendar: li
                      " share words with his message (for context only):")
         parts.append("<calendar>\n" + "\n".join(calendar) + "\n</calendar>")
         parts.append("")
+    if sent:
+        parts.append(f"He sent this message {sent}. Read today, tomorrow and other words like them"
+                     " from when he sent it.")
     parts.append("His message:")
     parts.append(f"<message>\n{text}\n</message>")
     return "\n".join(parts)

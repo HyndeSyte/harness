@@ -385,10 +385,18 @@ def test_someone_editing_in_between_stops_the_write(r):
     assert "changed that event" in r.texts()[-1]
 
 
-def test_a_lost_answer_is_unknown_and_not_retried(r):
+def test_a_lost_answer_is_read_and_the_receipt_follows(r):
+    """It landed and the answer was lost: a read a minute later finds it, and he gets the usual
+    receipt. Nothing is written twice, and nothing asks him to look."""
     r.icloud.drop_response_next = True
+    before = len(r.texts())
     r.tell(change(dates="2026-11-23"))
-    assert r.icloud.methods().count("PUT") == 1 and "may or may not" in r.texts()[-1]
+    assert len(r.texts()) == before                      # nothing said yet: a read settles it
+    r.advance(minutes=1)
+    r.tick()
+    assert r.texts()[-1].startswith("<b>Done.</b>") and "Nov 23" in r.texts()[-1]
+    assert r.with_button("Undo") and r.icloud.methods().count("PUT") == 1
+    assert "2026-11-23" not in days_of(r.body())
 
 
 def test_pasted_words_get_a_tap(r):
@@ -438,15 +446,16 @@ def test_a_day_that_comes_back_gets_a_digest_line(r):
     assert "came back" in r.cc.digest_line() and "Nov 23" in r.cc.digest_line()
 
 
-def test_a_restart_during_a_write_is_said_out_loud(r):
+def test_a_restart_during_a_write_is_read_and_told(r):
     r.tell(change(dates="2026-11-23"))
     with r.ledger.tx() as db:
         db.execute("UPDATE calendar_changes SET state='sending'")
         db.execute("UPDATE jobs SET state='approved' WHERE id=(SELECT job_id FROM calendar_changes)")
+    r.bot.sent.clear()
     r.start()
     r.cc.bind(r.vault.owner_id())
     r.tick()
-    assert any("how far that got" in t for t in r.texts())
+    assert r.texts()[-1].startswith("<b>Done.</b>") and r.icloud.methods().count("PUT") == 1
 
 
 def test_a_crash_while_planning_never_runs_it_twice(r, monkeypatch):
@@ -463,7 +472,7 @@ def test_a_crash_while_planning_never_runs_it_twice(r, monkeypatch):
     monkeypatch.undo()
     r.tick()
     assert "2026-11-23" in days_of(r.body())
-    assert any("how far that got" in t for t in r.texts())
+    assert any("stopped before anything was written" in t for t in r.texts())
 
 
 # -- Gmail --------------------------------------------------------------------------------------
@@ -531,14 +540,20 @@ def test_a_read_back_that_disagrees_is_said_out_loud_and_undo_stays(r):
         return real(method, url, **kw)
     r.icloud.request = drops_it
     r.tell(change(dates="2026-11-23"))
-    assert "Done" not in r.texts()[-1] and "read it back" in r.texts()[-1]
-    assert r.with_button("Undo")
+    for _ in range(2):                         # it reads, writes once more, and reads that too
+        r.advance(minutes=1)
+        r.tick()
+    last = r.bot.sent[-1]
+    assert last[1].startswith("<b>Nothing changed.</b>") and "it didn't go through" in last[1]
+    assert last[2] is None and r.icloud.methods().count("PUT") == 2
 
 
 def test_a_lost_answer_isnt_called_nothing_changed(r):
     r.icloud.drop_response_next = True
     r.tell(change(dates="2026-11-23"))
-    assert "Not sure" in r.texts()[-1] and "Nothing changed" not in r.texts()[-1]
+    r.advance(minutes=1)
+    r.tick()
+    assert "Done" in r.texts()[-1] and "Nothing changed" not in r.texts()[-1]
 
 
 def harness_transport_error():
@@ -559,7 +574,10 @@ def test_a_failed_read_back_still_offers_undo(r):
         return answer
     r.icloud.request = down_after_put
     r.tell(change(dates="2026-11-23"))
-    assert "reading it back failed" in r.texts()[-1] and r.with_button("Undo")
+    r.icloud.request = real
+    r.advance(minutes=1)
+    r.tick()
+    assert r.texts()[-1].startswith("<b>Done.</b>") and r.with_button("Undo")
 
 
 def test_the_exact_title_wins_over_one_that_only_contains_it(r):
@@ -628,13 +646,15 @@ def test_undo_of_two_steps_on_one_event_survives_a_server_that_rewrites(r):
     assert "2026-11-23" in days_of(r.body()) and "2027-03-08" in days_of(r.body())
 
 
-def test_an_undo_that_stops_can_be_tried_again(r):
+def test_an_undo_whose_answer_is_lost_runs_again_by_itself(r):
     r.tell(change(dates="2026-11-23"))
-    r.icloud.force_status = 503
+    r.icloud.force_status = 503                # not written, and the answer says nothing
     r.press(r.with_button("Undo"), "Undo")
-    assert "Not fully undone" in r.texts()[-1]
-    r.press(r.with_button("Undo"), "Undo")
+    assert not any("Not fully undone" in t or "Undone" in t for t in r.texts())
+    r.advance(minutes=1)
+    r.tick()
     assert "Undone" in r.texts()[-1] and "2026-11-23" in days_of(r.body())
+    assert ical.unfold(r.body()) == ical.unfold(SERIES)
 
 
 def test_a_reply_to_a_receipt_gets_a_tap(r):
@@ -888,10 +908,11 @@ def test_a_failed_read_isnt_called_already_gone(r):
                   end="2026-11-20T10:00:00-05:00"))
     r.gmail.down = True
     r.press(r.with_button("Undo"), "Undo")
-    assert "Not undone" in r.texts()[-1]
+    assert not any("Not undone" in t for t in r.texts())     # not read is never "already gone"
     assert next(iter(r.gmail.events.values())).get("status") != "cancelled"
     r.gmail.down = False
-    r.press(r.with_button("Undo"), "Undo")
+    r.advance(minutes=1)
+    r.tick()
     assert "Undone" in r.texts()[-1]
     assert next(iter(r.gmail.events.values()))["status"] == "cancelled"
 
@@ -907,9 +928,11 @@ def test_gmail_undo_works_after_a_read_back_that_failed(r):
     r.gmail.change = then_down
     r.tell(change(calendar="gmail", op="move", title="piano", dates="2026-11-09",
                   start="2026-11-09T10:00:00-05:00", end="2026-11-09T11:00:00-05:00"))
-    assert "written but not confirmed" in r.texts()[-1]
     r.gmail.change = real
     r.gmail.down = False
+    r.advance(minutes=1)
+    r.tick()
+    assert r.texts()[-1].startswith("<b>Done.</b>")
     r.press(r.with_button("Undo"), "Undo")
     assert "Undone" in r.texts()[-1]
 
@@ -946,7 +969,10 @@ def test_a_write_that_landed_is_named_in_the_receipt(r):
         return answer
     r.icloud.request = down_after_put
     r.tell(change(dates="2026-11-23"))
-    assert "written but not confirmed" in r.texts()[-1] and "School Day" in r.texts()[-1]
+    r.icloud.request = real
+    r.advance(minutes=1)
+    r.tick()
+    assert r.texts()[-1].startswith("<b>Done.</b>") and "School Day" in r.texts()[-1]
 
 
 def test_an_ended_series_that_comes_back_later_is_still_caught(r):
@@ -982,8 +1008,10 @@ def test_an_unreadable_option_clears_nothing(r):
 def test_something_unreadable_is_said_when_ending(r):
     r.icloud.seed(FAMILY_PATH + "odd.ics", SERIES.replace(UID, "ODD").replace("BYDAY=MO,WE", "BYSETPOS=1;BYDAY=TU"))
     r.tell(change(op="end_series", dates="2026-12-01"))
+    card = r.with_button("Approve")[1]
+    assert "can't be read, so another series called" in card and "School Day may keep going" in card   # a fact
     r.approve()                                # ending a series is tapped
-    assert "can't read" in r.texts()[-1]
+    assert "can't be read" in r.texts()[-1] and "check" not in r.texts()[-1].lower()
 
 
 def test_an_event_with_a_link_in_its_title_can_still_come_off(r):
@@ -1131,9 +1159,12 @@ def test_a_change_that_stopped_partway_isnt_called_nothing_changed(r):
     from harness import daily
     job = {"id": "j", "created_at": "2026-11-05T15:00:00+00:00"}
     line = daily._failed(r.ledger, job, {"effect": "calendar_change", "steps": 1, "outcome": "failed"}, TZ)
-    assert "Nothing changed" not in line and "check the calendar" in line
+    assert "Nothing changed" not in line and "stopped partway" in line and "check" not in line
     line = daily._failed(r.ledger, job, {"reason": "not_found"}, TZ)
     assert "Nothing changed" in line and "a request (Thu 10:00 AM)" in line
+    for reason in ("calendar_unknown", "family_unknown", "unknown"):     # what no read settled yet
+        line = daily._failed(r.ledger, job, {"reason": reason}, TZ)
+        assert line.endswith(": not confirmed yet, still checking.") and "check the" not in line
 
 
 # -- "again": what his calendar already says, not a question ------------------------------------
@@ -1172,3 +1203,138 @@ def test_a_series_repeat_is_only_one_to_four_weeks():
     with pytest.raises(ChangeRefusal):
         _one_change(change(calendar="gmail", op="add", title="Coffee", start="2026-11-13T08:30:00-05:00",
                            end="2026-11-13T10:00:00-05:00") | {"every": "2"})
+
+
+# -- an outcome no write confirmed is settled by reading, never handed to him (0.23.0) ----------
+
+class Crash(BaseException):
+    """The process dies mid-request (as the stop signal does)."""
+
+
+def receipts(r):
+    return [t for t in r.texts() if t.startswith(("<b>Done.</b>", "<b>Nothing changed.</b>",
+                                                   "<b>Only part", "<b>That stopped"))]
+
+
+def test_nothing_landed_is_written_once_more_then_read(r):
+    r.icloud.force_status = 503                # not written, and the answer says nothing
+    r.tell(change(dates="2026-11-23"))
+    assert "2026-11-23" in days_of(r.body()) and receipts(r) == []
+    r.advance(minutes=1)
+    r.tick()                                   # read: as it was, so written once more
+    assert r.icloud.methods().count("PUT") == 2 and "2026-11-23" not in days_of(r.body())
+    assert receipts(r)[-1].startswith("<b>Done.</b>") and r.with_button("Undo")
+
+
+def test_nothing_landed_twice_is_said_plainly(r):
+    r.icloud.force_status = 503
+    r.tell(change(dates="2026-11-23"))
+    r.advance(minutes=1)
+    r.icloud.force_status = 503                # the second try's answer says nothing either
+    r.tick()
+    assert receipts(r) == []
+    r.advance(minutes=1)
+    r.tick()                                   # read: still as it was, and no third try
+    [said] = receipts(r)
+    assert said.startswith("<b>Nothing changed.</b>") and "because it didn't go through" in said
+    assert r.icloud.methods().count("PUT") == 2 and r.bot.sent[-1][2] is None
+    assert ical.unfold(r.body()) == ical.unfold(SERIES)
+
+
+def test_a_read_that_cant_tell_says_so_once_after_an_hour_then_the_answer_once(r):
+    r.icloud.drop_response_next = True         # it lands, and the answer is lost
+    r.tell(change(dates="2026-11-23"))
+    r.icloud.down = True                       # and then no read can tell
+    for minutes in (1, 1, 30, 30, 1, 1):
+        r.advance(minutes=minutes)
+        r.tick()
+    still = [t for t in r.texts() if "I couldn't confirm yet whether" in t]
+    assert len(still) == 1 and still[0].endswith("School Day changed; I'm still checking.")
+    line = r.cc.digest_line()
+    assert "Not confirmed yet, still checking: Take off the 8:30" in line and "School Day on Mon Nov 23 (Family)." in line
+    r.icloud.down = False
+    r.advance(minutes=1)
+    r.tick()
+    r.advance(minutes=1)
+    r.tick()
+    assert len(receipts(r)) == 1 and receipts(r)[0].startswith("<b>Done.</b>")
+    assert r.icloud.methods().count("PUT") == 1 and "still checking" not in r.cc.digest_line()
+
+
+def test_a_restart_mid_write_is_read_then_finished(r):
+    r.icloud.before_write = lambda: (_ for _ in ()).throw(Crash())
+    r.claude.script = [ask(change(dates="2026-11-23"))]
+    with pytest.raises(Crash):
+        r.say("no school Nov 23")
+    assert r.ledger.db.execute("SELECT state FROM calendar_changes").fetchone()[0] == "sending"
+    r.start()
+    r.cc.bind(r.vault.owner_id())
+    r.tick()                                   # read: never landed, so written once, by itself
+    assert "2026-11-23" not in days_of(r.body()) and receipts(r)[-1].startswith("<b>Done.</b>")
+
+
+def test_a_restart_mid_undo_finishes_the_undo(r):
+    r.tell(change(dates="2026-11-23"))
+    r.icloud.before_write = lambda: (_ for _ in ()).throw(Crash())
+    with pytest.raises(Crash):
+        r.press(r.with_button("Undo"), "Undo")
+    r.start()
+    r.cc.bind(r.vault.owner_id())
+    r.c.calendar_change = r.cc
+    r.cc.reconcile_after_restart()
+    r.tick()
+    assert r.texts()[-1] == "<b>Undone.</b> It's back the way it was."
+    assert ical.unfold(r.body()) == ical.unfold(SERIES)
+    assert not any("Check the calendar" in t or "tap Undo again" in t for t in r.texts())
+
+
+def test_an_undo_that_landed_before_a_restart_is_said_undone_without_a_second_write(r):
+    r.tell(change(dates="2026-11-23"))
+    r.icloud.drop_response_next = True         # the undo lands; its answer is lost
+    r.press(r.with_button("Undo"), "Undo")
+    puts = r.icloud.methods().count("PUT")
+    r.advance(minutes=1)
+    r.tick()
+    assert r.texts()[-1] == "<b>Undone.</b> It's back the way it was."
+    assert r.icloud.methods().count("PUT") == puts and ical.unfold(r.body()) == ical.unfold(SERIES)
+
+
+def test_a_gmail_add_whose_answer_is_lost_is_never_made_twice(r):
+    real = r.gmail.insert
+
+    def lost(address, event):
+        real(address, event)
+        return caldav.Outcome("unknown")       # it landed; the answer didn't
+    r.gmail.insert = lost
+    r.tell(change(calendar="gmail", op="add", title="Dentist", start="2026-11-20T09:00:00-05:00",
+                  end="2026-11-20T10:00:00-05:00"))
+    r.advance(minutes=1)
+    r.tick()
+    assert [k for k, _ in r.gmail.log].count("insert") == 1
+    assert receipts(r)[-1].startswith("<b>Done.</b>") and "Dentist" in receipts(r)[-1]
+
+
+def test_a_lost_answer_waits_while_stopped(r):
+    r.icloud.drop_response_next = True
+    r.tell(change(dates="2026-11-23"))
+    r.say("/stop")
+    r.icloud.log.clear()
+    r.advance(minutes=5)
+    r.tick()
+    assert "GET" not in r.icloud.methods() and receipts(r) == []
+    r.say("/resume")
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>")
+
+
+def test_a_reset_drops_a_change_waiting_for_a_read_without_a_word_or_a_write(r):
+    r.icloud.force_status = 503                # not written; a read would write it once more
+    r.tell(change(dates="2026-11-23"))
+    r.cc.forget()
+    r.icloud.log.clear()
+    said = len(r.texts())
+    r.advance(minutes=5)
+    r.tick()
+    assert "PUT" not in r.icloud.methods() and len(r.texts()) == said
+    assert r.ledger.db.execute("SELECT state FROM calendar_changes").fetchone()[0] == "reset"

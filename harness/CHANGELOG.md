@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.23.0
+
+- **Nothing asks you to check the calendar or send something again.** When a change's answer is lost, or it can't be read back, Harness reads the calendar itself a minute later. If it went through, you get the usual receipt with Undo. If it didn't, it's written once more, only if nothing changed since, and if it still didn't go through you're told so plainly. If half of it went through, the rest is finished, or that half is put back.
+- **When a read can't tell, you hear once.** After an hour, one line says it isn't confirmed yet and is still being checked, and the receipt follows once it's known. The morning digest says "not confirmed yet, still checking".
+- **An undo cut short by a restart finishes by itself,** or says it's already undone.
+- **What you send while stopped comes back after Turn back on,** one card each, with Do it now and Drop it.
+- **A failure that isn't yours is retried once by itself,** whether or not Cain is in front.
+- **A block Google said it wrote but never had is written once more,** not taken as you removing it.
+- **A Family add whose Approve tap came back before it went in comes back as its own card.**
+
 ## 0.22.0
 
 - **A receipt comes only once your calendar shows the change.** "Added to your Gmail", "From your mail, on your calendar" and "Added to the Family calendar" now go out after a read of the calendar finds it as it was written, not when Google or iCloud only says the write worked. If three reads don't find it, or for an add or a date from your mail half an hour passes without one that does, one card says it was written but not confirmed, with its Undo, and the next morning digest names it.
