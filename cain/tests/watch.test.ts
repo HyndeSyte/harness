@@ -104,7 +104,7 @@ describe("the watch on the calendar specialist", () => {
     expect(backText(60_000)).toContain("answering again");
     for (const t of [downText(300_000), stillText(), backText(60_000)]) {
       expect(t).not.toMatch(/add-?on/i);
-      expect(t).not.toContain("—");
+      expect(t).not.toContain("—");                              // no em dash
     }
     expect(downText(300_000)).not.toMatch(/restart/i);
   });

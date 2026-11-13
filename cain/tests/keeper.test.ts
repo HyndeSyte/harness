@@ -18,7 +18,10 @@ describe("keeper.sh against a fake link", () => {
     const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
     const seen: { path: string; keyed: boolean; body: any }[] = [];
     const server = Bun.serve({ port: 0, async fetch(req) {
-      seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body: await req.json() });
+      const raw = await req.text();
+      let body: any;
+      try { body = JSON.parse(raw); } catch { body = { not_json: raw }; }   // shown in the diff, never thrown
+      seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body });
       return Response.json({ status: "ok" });
     } });
     const env = { ...process.env, CAIN_LINK: `http://127.0.0.1:${server.port}`, CAIN_DISCORD_DIR: dir };
