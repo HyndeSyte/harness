@@ -25,7 +25,17 @@
 //   answered in place: "This card expired; nothing was done."
 // - Cain asks one question at a time: a new ask waits while another is open, and goes
 //   out by itself when that one closes. Ship cards and specialists' cards don't wait.
+// - Stop (wave 1, piece E): Dane's Stop tap, from any card of ours, stops everything:
+//   the calendar specialist (the tap goes on to it, as before), Cain's Build and Ship
+//   runs, his Ship cards and outside-review sends (../stop.ts). Only Dane's Turn back
+//   on tap undoes it, from a card the link posted and still knows as live; Cain has no
+//   command for it. Its notice says what stopped.
+// - Ship (wave 1, piece B): his Ship tap is signed here (../ship-token.ts) with a key
+//   only the link is meant to read (shipkey.ts), for that pull request and head, good
+//   for 2 hours. Cain's Ship run needs that token; GitHub's own check comes next.
 import { createHash } from "node:crypto";
+import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
+import type { StopState } from "../stop";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -93,6 +103,7 @@ export interface State {
   cards: Record<string, Card>; messages: Record<string, Shown>;
   held?: Ask[];
   migrated?: boolean;                // the one-time look over cards posted before 0.7.0 is done
+  toggle?: string;                   // a Stop or Turn back on the calendar specialist didn't take yet (0.8.0)
 }
 
 export function emptyState(): State {
@@ -336,7 +347,18 @@ export interface Deps {
   record?: () => RecordFiles;                                      // PENDING.md and the keeper's holds
   pull?: (pr: string) => Promise<Pull | null>;                     // a pull request now; null: can't tell
   tz?: string;                                                     // the check-ins' zone
+  stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
+  signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
 }
+
+// What stopped, as his Stop notice says it.
+export const STOPPED_TOO = "Cain's Build and Ship jobs, Ship cards and outside reviews are stopped too, until you tap Turn back on. One already running finishes.";
+export const RESUMED_TOO = "Cain's Build and Ship jobs and outside reviews can run again, and Ship cards can go out.";
+// The link's own notice, when the calendar specialist didn't take his tap.
+export const STOPPED_ALONE = "Cain's Build and Ship jobs, Ship cards and outside reviews are stopped until you tap Turn back on; one already running finishes. The calendar specialist didn't answer, so it gets the Stop as soon as it does.";
+export const RESUMED_ALONE = "Cain's Build and Ship jobs and outside reviews can run again, and Ship cards can go out. The calendar specialist didn't answer, so it gets the Turn back on as soon as it does.";
+export const STOP_UNSAVED = "Cain's Ship cards are stopped, but his Build and Ship jobs and outside reviews may not be: the Stop couldn't be saved on his App. It's logged to be fixed.";
+export const RESUME_UNSAVED = "Cain's side couldn't save that, so his Build and Ship jobs and outside reviews may still be stopped. It's logged to be fixed.";
 
 // A pull request as GitHub has it now: its head, and whether it's still open (null
 // when that couldn't be told).
@@ -356,6 +378,58 @@ export class Link {
   constructor(private d: Deps) {}
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
+
+  // -- Stop everything ----------------------------------------------------------
+  // A state that can't be read counts as stopped: when in doubt, nothing ships. A Stop
+  // he tapped that couldn't be saved still holds here, in the link, until he undoes it.
+  private stopHeld = false;              // his Stop, held in memory because saving it failed
+  private stopUnsaved = false;           // the last Stop or Turn back on couldn't be saved
+  private changed: { kind: "stopped" | "resumed"; at: number } | null = null;   // his last tap that changed it
+  stopped(): StopState {
+    let s: StopState;
+    try { s = this.d.stop ? this.d.stop.read() : { stopped: true, at: null }; } catch { s = { stopped: true, at: null }; }
+    return this.stopHeld && !s.stopped ? { stopped: true, at: null } : s;
+  }
+
+  // Only from his tap (onInteraction checks it's him first). A second Stop changes nothing.
+  // Only a change is written, so a second tap leaves its time (and the Ship taps signed
+  // since) as they were.
+  private setStop(stopped: boolean): void {
+    const was = this.stopped();
+    if (was.stopped === stopped && !this.stopUnsaved) return;
+    let saved = true;
+    try {
+      if (!this.d.stop) throw new Error("no Stop state");
+      this.d.stop.write(stopped, this.d.now());
+    } catch (e) { saved = false; this.log(`couldn't save the Stop state: ${String(e).slice(0, 80)}`); }
+    this.stopHeld = stopped && !saved;
+    this.stopUnsaved = !saved;
+    this.changed = { kind: stopped ? "stopped" : "resumed", at: this.d.now() };
+    this.log(stopped ? "Dane tapped Stop: everything is stopped" : "Dane turned everything back on");
+    if (!saved) {
+      this.d.relay(stopped
+        ? "Dane tapped Stop, but it couldn't be saved, so your Build and Ship runs and review sends may not be held. The link still refuses Ship cards and won't sign a Ship tap. Run nothing until it's saved; his notice says so. Log it as a Build item."
+        : "Dane tapped Turn back on, but it couldn't be saved, so your runs and review sends may still be stopped. His notice says so. Log it as a Build item.");
+      return;
+    }
+    this.d.relay(stopped
+      ? "Dane tapped Stop. Everything of yours is stopped: no Build or Ship runs, no Ship cards and no review sends, until he taps Turn back on; a job already running finishes. The calendar specialist gets the Stop too. Only he can turn it back on, and his notice already says so: never ask him to. Don't offer Start or Ship meanwhile (see Stop in your CLAUDE.md)."
+      : "Dane tapped Turn back on: Build and Ship runs, Ship cards and review sends work again. A Ship tap from before his Stop no longer counts. Ask again about anything that waited.");
+  }
+
+  // What his Stop or Turn back on notice adds about Cain's side, from what's true now.
+  // Only for the notice that follows his tap that changed it (within 10 minutes): a
+  // specialist's "Not stopped" after a tap that changed nothing gets no line.
+  private stopLine(kind: "stopped" | "resumed"): string {
+    const now = this.stopped().stopped;
+    const fresh = this.changed?.kind === kind && this.d.now() - this.changed.at < 10 * 60_000;
+    if (!fresh) return "";
+    if (this.stopUnsaved)
+      return kind === "stopped" && now ? STOP_UNSAVED : kind === "resumed" ? RESUME_UNSAVED : "";
+    if (kind === "stopped" && now) return STOPPED_TOO;
+    if (kind === "resumed" && !now) return RESUMED_TOO;
+    return "";
+  }
 
   // Asks go out one at a time, so two can never both be "the open one".
   private serial<T>(fn: () => Promise<T>): Promise<T> {
@@ -471,6 +545,10 @@ export class Link {
     const kind = String(c.kind ?? "reply");
     const comps = (c.rows ?? []).filter((r: any) => (r.components ?? []).every((b: any) =>
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
+    // The specialist's Stop and Turn back on notices also say what that did on Cain's
+    // side, from what's true now.
+    const line = kind === "stopped" || kind === "resumed" ? this.stopLine(kind) : "";
+    if (line) c = { ...c, text: `${String(c.text ?? "").trimEnd()}\n\n${line}` };
     const s = this.d.load();
     const id = s.next++;
     const now = this.d.now();
@@ -742,8 +820,12 @@ export class Link {
     const head = String(a.head ?? "").trim().toLowerCase();
     const m = PULL.exec(pr);
     if (!m) throw new Refusal("pr must be the pull request's address: https://github.com/<owner>/<repo>/pull/<number>");
+    if (!SHIP_REPOS.has(`${m[1]}/${m[2]}`.toLowerCase())) throw new Refusal("Ship cards are only for pull requests in HyndeSyte/harness");
     if (!SHA.test(head)) throw new Refusal("head must be the pull request's full 40-character head sha");
     if (!String(a.text ?? "").trim()) throw new Refusal("a Ship card needs its words");
+    const stop = this.stopped();
+    if (stop.stopped)
+      throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(String(a.text));
     const text = withLabel(String(a.text), labelOf(meta.item));
     this.mayAsk(meta.item);
@@ -765,7 +847,9 @@ export class Link {
   async morning(text: string): Promise<string> {
     if (!String(text ?? "").trim()) throw new Refusal("the morning message needs its text");
     noMachineText(String(text));
-    const msg = await this.postCard(String(text), rows([[["Stop", STOP]]], "q:"), { nonce: stableNonce("morning", String(text)) });
+    // While stopped, its button is the one that undoes it.
+    const toggle: [string, string] = this.stopped().stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
+    const msg = await this.postCard(String(text), rows([[toggle]], "q:"), { nonce: stableNonce("morning", String(text), toggle[1]) });
     const s = this.d.load();
     this.remember(s, msg, { kind: "morning", item: "none", question: "morning", posted: this.d.now(), expires: null, buttons: true });
     const replaced = this.markReplaced(s, String(msg.id));
@@ -907,18 +991,34 @@ export class Link {
     const rec = s.messages[msgId];
     // A card whose post never heard back may be the one he tapped: then it's up after all.
     if (!rec && this.adoptTapped(it, msgId)) return this.onInteraction(it);
-    const stop = cid === STOP || cid === RESUME;          // Stop works from any card of ours
+    // Stop only ever makes things safer, so it's his from any card of ours, as it shows
+    // now, and it stops whatever else the card says.
+    if (cid === STOP) { this.setStop(true); return this.stopTap(it, cid, msgId); }
+    // Turn back on undoes his Stop, so it counts only from a card this link posted and
+    // still knows as live, showing exactly what was posted. From anything else it does
+    // nothing (not even on the calendar specialist's side), and while things are
+    // stopped he gets a fresh notice whose button works.
+    if (cid === RESUME) {
+      const changed = !!rec && !rec.outcome && digest(it.message.content ?? "", it.message.components) !== rec.digest;
+      if (!rec || rec.outcome || changed) {
+        let out: string;
+        if (changed) { await this.answer(it, ACK); out = "refused: card was changed after it was posted"; }
+        else out = await this.deadTap(it, msgId, rec ? (rec.why ?? rec.outcome ?? "done") : "not a card the link knows");
+        this.log(`Turn back on refused (${out}); nothing changed`);
+        if (this.stopped().stopped) await this.postToggle(`**Still stopped.** That button was on an old or changed card, so nothing changed. ${this.stopLine("stopped")}`.trim(), true);
+        return out;
+      }
+    }
     // Component taps only ever come for the app's own messages, so one the link doesn't
-    // know is an old card of ours: take its buttons off (Stop and Turn back on still work).
-    if (!rec && !stop) return this.deadTap(it, msgId, "not a card the link knows");
-    if (!rec || (rec.outcome && stop)) return this.toSpecialist(it, cid, msgId);
+    // know is an old card of ours: take its buttons off.
+    if (!rec) return this.deadTap(it, msgId, "not a card the link knows");
     if (rec.outcome) return this.deadTap(it, msgId, rec.why ?? rec.outcome);
-    if (!rec.outcome && digest(it.message.content ?? "", it.message.components) !== rec.digest) {
+    if (digest(it.message.content ?? "", it.message.components) !== rec.digest) {
       await this.answer(it, ACK);
       this.log("tap refused: card was changed after it was posted");
       return "refused: card was changed after it was posted";
     }
-    if (!stop) {
+    if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
       if (why) {
         rec.outcome = why === "answered" ? "answered" : "expired"; rec.why = why;
@@ -927,7 +1027,70 @@ export class Link {
       }
     }
     if (cid.startsWith("q:")) return this.onQuestion(it, cid, msgId);
+    if (cid === RESUME) { this.setStop(false); return this.stopTap(it, cid, msgId); }
     return this.toSpecialist(it, cid, msgId);
+  }
+
+  // Stop and Turn back on go on to the calendar specialist, whose notice says what
+  // happened. If it doesn't take the tap, the notice comes from here, so the tap is
+  // never silent, with the button that undoes it.
+  private async stopTap(it: any, cid: string, msgId: string): Promise<string> {
+    const out = await this.toSpecialist(it, cid, msgId);
+    await this.retoggleMorning();
+    const s = this.d.load();
+    if (out !== "specialist unreachable") {
+      if (s.toggle) { delete s.toggle; this.d.save(s); }
+      return out;
+    }
+    // Owed to the specialist: the sweep sends it the moment it answers again.
+    s.toggle = cid;
+    this.d.save(s);
+    const stopped = this.stopped().stopped;
+    const line = this.stopUnsaved ? this.stopLine(stopped ? "stopped" : "resumed") : stopped ? STOPPED_ALONE : RESUMED_ALONE;
+    await this.postToggle(`**${stopped ? "Stopped" : "Turned back on"}.** ${line}`, stopped);
+    return out;
+  }
+
+  // His morning message's button follows where things stand: Turn back on while stopped,
+  // Stop otherwise. Its record follows the edit, so his tap on it still counts.
+  private async retoggleMorning(): Promise<void> {
+    const want: [string, string] = this.stopped().stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
+    const comps = rows([[want]], "q:");
+    const ids = Object.entries(this.d.load().messages)
+      .filter(([, m]) => m.kind === "morning" && !m.outcome && m.buttons).map(([id]) => id);
+    for (const id of ids) {
+      try {
+        const { dm } = await this.identity();
+        const msg = await this.d.rest("PATCH", `/channels/${dm}/messages/${id}`, { components: comps });
+        const s = this.d.load();
+        if (s.messages[id]) { s.messages[id].digest = digest(String(msg?.content ?? ""), msg?.components ?? comps); this.d.save(s); }
+      } catch (e) { this.log(`couldn't change the morning message's button: ${String(e).slice(0, 80)}`); }
+    }
+  }
+
+  // A Stop or Turn back on the specialist didn't take: sent again until it does, as long
+  // as it still matches where things stand.
+  private async sendOwedToggle(): Promise<void> {
+    const s = this.d.load();
+    if (!s.toggle) return;
+    if ((s.toggle === STOP) !== this.stopped().stopped) { delete s.toggle; this.d.save(s); return; }
+    if (!(await this.d.toHarness("/press", { custom_id: s.toggle, message_id: 0 }))) return;
+    const s2 = this.d.load();
+    delete s2.toggle;
+    this.d.save(s2);
+    this.log(`the calendar specialist took the ${s.toggle === STOP ? "Stop" : "Turn back on"} it missed`);
+  }
+
+  // A notice from the link with the one button that undoes where things stand,
+  // recorded so his tap on it counts.
+  private async postToggle(text: string, stopped: boolean): Promise<void> {
+    try {
+      const button: [string, string] = stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
+      const msg = await this.post(text.replace(/\s{2,}/g, " "), rows([[button]], "q:"));
+      const s = this.d.load();
+      this.remember(s, msg, { kind: "card", item: "none", question: "stop", posted: this.d.now(), expires: null, buttons: true });
+      this.d.save(s);
+    } catch (e) { this.log(`couldn't post the Stop notice: ${String(e).slice(0, 80)}`); }
   }
 
   private async toSpecialist(it: any, cid: string, msgId: string): Promise<string> {
@@ -962,6 +1125,14 @@ export class Link {
     return `dead: ${why}`;
   }
 
+  // A token for his Ship tap on this pull request and head, or null (no key, or it failed).
+  private signFor(ship: { pr: string; head: string }): string | null {
+    const claim = claimFor(ship.pr, ship.head, this.d.now());
+    if (!claim || !this.d.signShip) return null;
+    try { return this.d.signShip(claim); }
+    catch (e) { this.log(`couldn't sign a Ship tap: ${String(e).slice(0, 80)}`); return null; }
+  }
+
   private tapLine(m: Shown, label: string, msgId: string): string {
     const where = `(Discord message ${msgId}; its card shows his answer. If it needs words from you, reply with reply_to ${msgId})`;
     if (m.kind === "ship" && m.ship)
@@ -978,12 +1149,26 @@ export class Link {
     if (!m || !q || q.used || !(i >= 0 && i < q.options.length)) return this.deadTap(it, msgId, "answered");
     const label = q.options[i];
     q.used = true; m.outcome = "answered"; m.label = label; m.why = "answered";
-    const content = withLine(String(it.message.content ?? ""), `You answered: ${label}`);
+    // His Ship tap is signed here, unless everything is stopped.
+    let shown = `You answered: ${label}`, extra = "";
+    if (m.kind === "ship" && m.ship && label === "Ship") {
+      if (this.stopped().stopped) {
+        shown = "You tapped Ship, but everything is stopped, so nothing shipped.";
+        extra = " Everything is stopped, so nothing ships and there's no Ship token: after he taps Turn back on, ask again with a new Ship card.";
+      } else {
+        const token = this.signFor(m.ship);
+        if (!token) shown = "You tapped Ship, but shipping is down right now, so nothing shipped.";
+        extra = token
+          ? ` Ship token: ${token} (good for 2 hours: put it in the Ship job's text as it is).`
+          : " The link has no Ship key, so there's no Ship token and a Ship run will be refused: tell him in one line that shipping is down, and log it as a Build item.";
+      }
+    }
+    const content = withLine(String(it.message.content ?? ""), shown);
     m.digest = digest(content, []);
     this.d.save(s);
     // Cain hears it the moment it's saved as answered: if the link stopped now, a tap
     // can't be marked answered and never reach him.
-    this.d.relay(this.tapLine(m, label, msgId));
+    this.d.relay(this.tapLine(m, label, msgId) + extra);
     const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
     if (ok) { const s2 = this.d.load(); if (s2.messages[msgId]) { s2.messages[msgId].buttons = false; this.d.save(s2); } }
     if (m.kind === "ask") await this.releaseHeld();
@@ -1019,6 +1204,7 @@ export class Link {
       if (!this.d.load().migrated) {
         try { await this.migrate(); } catch (e) { this.log(`couldn't look over the cards already posted yet: ${String(e).slice(0, 80)}`); }
       }
+      await this.sendOwedToggle();
       await this.showDue();
       await this.decide();
       await this.stripDue();

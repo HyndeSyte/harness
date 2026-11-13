@@ -68,20 +68,37 @@ changes what its own `pytest` and `bun` run; read workflow diffs before Ship.
 ## Ship (only after Dane's go)
 
 Dane's go is his tap on Cain's Ship card for that one pull request, at the one head
-commit the card was for. The job's text carries that commit's full head sha.
+commit the card was for. The job's text carries that commit's full head sha and his
+Ship token: his tap, signed by Cain's link with a key only the link holds, for that
+pull request and head, good for 2 hours after the tap.
 
 1. The pull request is open, its head commit is the full head sha in the job's text and
    passed CI, and the diff matches its description. If `main` moved and it no longer
    merges cleanly, or the head isn't that sha, stop and report.
-2. Squash-merge it into `main`, pinned to that head with GitHub's head match:
+2. Post the Ship token, exactly as given and nothing else, as a comment on the pull
+   request: `gh pr comment <number> --body "<token>"`. Where `main` has the `ship`
+   check (`.github/workflows/ship.yml`), wait for it to pass on the head: it fails when
+   the token isn't his, has run out, or is for another pull request or head, and then
+   nothing merges, so stop and report.
+3. Squash-merge it into `main`, pinned to that head with GitHub's head match:
    `gh pr merge <number> --squash --match-head-commit <full head sha>`. If GitHub refuses
    because the head moved, nothing is merged: stop and report, and Cain asks again with a
    new Ship card.
-3. Wait for CI on `main` to pass.
-4. In Home Assistant: check for App updates, then update only the App(s) the pull
+4. Wait for CI on `main` to pass.
+5. In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed. Nothing else in Home Assistant: no options, no other Apps, no
    services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
-5. Confirm the new version is running from the update result and the App's log.
+6. Confirm the new version is running from the update result and the App's log.
+
+## If the Ship key is remade
+
+Cain's App makes a new Ship key only when the old one can't be read, and says so in its
+log and to Cain. GitHub checks Ship taps against the public key on `main`
+(`.github/ship.pub`), so until that file is the new key (in `/data/trust/ship.pub` on the
+Pi, and in the App's log), no Ship tap can approve a merge, including the one that
+changes the file. That one pull request changes only `.github/ship.pub`, and ships on
+Dane's go with the `ship` check lifted from the ruleset for that one merge and put back
+right after.
 
 ## Rules for every session
 

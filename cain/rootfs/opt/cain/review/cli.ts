@@ -7,6 +7,7 @@
 //   health                 the last nightly seat check
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { readStop, stoppedWhy } from "../stop.ts";
 import { FINAL, LABEL, SEATS, markBlocked, newReview, parseBrief, privacyCheck, resultJson, shownId, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
 import { existsReview, loadReview, saveReview, type Ledger, type Health } from "./runner.ts";
@@ -40,6 +41,9 @@ switch (cmd) {
     }
     saveReview(cfg.queueDir, r);
     out(b.id);
+    // While stopped it's queued all the same, and nothing goes out until he turns it back on.
+    const st = readStop();
+    if (st.stopped) console.error(`Queued, not sent: ${stoppedWhy(st, "no review is sent")} It goes out by itself once he does.`);
     break;
   }
   case "status": {

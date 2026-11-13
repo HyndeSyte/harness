@@ -1,5 +1,11 @@
 // A fake Discord, record and clock around Cain's link (link/core.ts), for the tests.
+import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { emptyState, Link, type Pull, State } from "../rootfs/opt/cain/link/core";
+import { makeToken } from "../rootfs/opt/cain/ship-token";
+
+// The link's Ship key, for the tests: its public half as the hook and GitHub read it.
+export const SHIP_KEYS = generateKeyPairSync("ed25519");
+export const SHIP_PUB = SHIP_KEYS.publicKey.export({ format: "der", type: "spki" }).toString("base64");
 
 export const OWNER = "4242", DM = "5151", BOT = "999";
 export const NOV11_8AM = Date.UTC(2026, 10, 11, 13, 0);   // Wed Nov 11 2026, 8:00 AM in New York
@@ -23,8 +29,10 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
   return JSON.stringify({ holds: full, waiting: [], downtime: [] });
 }
 
-export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null } = {}) {
+export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean } = {}) {
   let state: State = emptyState();
+  const stop = { stopped: false, at: null as number | null, broken: false };
+  const harnessDown = { down: false };                // the calendar specialist doesn't take taps
   const t = { now: opts.now ?? NOV11_8AM };
   const files: { pending: string | null; holds: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null };
   const pulls: Record<string, Pull> = {};
@@ -88,9 +96,14 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const deps = {
     rest, load: () => copy(state), save: (s: State) => { state = copy(s); }, now: () => t.now,
-    relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return true; },
+    relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
     record: () => ({ ...files }), pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
+    stop: {
+      read: () => { if (stop.broken) throw new Error("unreadable"); return { stopped: stop.stopped, at: stop.at }; },
+      write: (stopped: boolean, at: number) => { stop.stopped = stopped; stop.at = at; },
+    },
+    signShip: opts.noKey ? undefined : (claim: any) => makeToken(claim, (d) => edSign(null, d, SHIP_KEYS.privateKey)),
   };
   let link = new Link(deps);
   const tap = (msg: any, custom_id: string, over: any = {}) => {
@@ -107,7 +120,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const r = {
     get link() { return link; },
-    calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake,
+    calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown,
     release: () => { gate.posts = false; gate.history = false; for (const ok of waiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,
     posts: () => calls.filter((c) => c.method === "POST" && c.path === `/channels/${DM}/messages`).length,

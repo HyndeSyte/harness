@@ -87,7 +87,7 @@ describe("settings.json wires the hook on exactly the two reads", () => {
   test("one PreToolUse entry per read, by exact name", () => {
     const entries = settings.hooks.PreToolUse.filter((e: any) => String(e.hooks?.[0]?.command).includes("discord-read.ts"));
     expect(entries.map((e: any) => e.matcher).sort()).toEqual([...READS].sort());
-    for (const e of entries) expect(e.hooks).toEqual([{ type: "command", command: "bun /opt/cain/hooks/discord-read.ts || exit 2", timeout: 15 }]);
+    for (const e of entries) expect(e.hooks).toEqual([{ type: "command", command: "bun /opt/cain/hooks/discord-read.ts || exit 2", timeout: 15, onFailure: "block" }]);
     expect(settings.hooks.PreToolUse.find((e: any) => e.matcher === "RemoteTrigger")).toBeTruthy();
   });
 });

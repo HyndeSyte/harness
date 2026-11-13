@@ -32,6 +32,9 @@
       "mcp__claude_ai_GitHub__create_branch",
       "mcp__claude_ai_GitHub__merge_pull_request",
       "Read(//data/options.json)",
+      "Read(//data/link/**)",
+      "Edit(//data/link/**)",
+      "Edit(//data/trust/**)",
       "Read(//data/codex/**)",
       "Edit(//data/codex/**)",
       "Edit(//data/review-queue/**)",
@@ -45,19 +48,19 @@
       {
         "matcher": "RemoteTrigger",
         "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15 }
+          { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15, "onFailure": "block" }
         ]
       },
       {
         "matcher": "mcp__plugin_discord_discord__download_attachment",
         "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15 }
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15, "onFailure": "block" }
         ]
       },
       {
         "matcher": "mcp__plugin_discord_discord__fetch_messages",
         "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15 }
+          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15, "onFailure": "block" }
         ]
       }
     ]

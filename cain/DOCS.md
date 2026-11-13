@@ -56,6 +56,28 @@ the App.
 - The card shows what you tapped. When a tap needs words from Cain, they come as a reply
   to that card.
 
+## Stop
+
+The Stop button (on the morning message, the calendar digest and the calendar
+specialist's notices) stops what would start next: the calendar specialist, Cain's
+Build and Ship jobs, his Ship cards and outside reviews. A job already running
+finishes. The notice says what stopped, and the morning message's button becomes Turn
+back on. Only your tap turns it back on, and only from a card that's still current: a
+tap on an old card does nothing and brings a fresh notice whose button works. Cain has
+no button or command for it. While it's stopped, Cain can still answer you and keep
+the record.
+
+## Ship
+
+Your Ship tap is signed by Cain's App, not by Cain, for that one pull request at that
+one commit, and the approval lasts 2 hours. Cain's Ship job is checked for it before it
+starts, and it posts it on the pull request; GitHub starts checking it too with the
+next update. A tap while everything is stopped ships nothing, and the card says so; a
+tap from before a Stop no longer counts.
+
+The key that signs it is kept by the App. Cain's tools are barred from it, and once his
+session runs as its own user (the next step) he can't reach it at all.
+
 ## If the calendar specialist stops
 
 Cain's add-on and the Harness add-on check each other every minute. If Harness hasn't

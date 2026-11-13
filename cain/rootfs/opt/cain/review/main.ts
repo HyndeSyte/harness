@@ -3,6 +3,7 @@
 // its own environment only; they are read once, removed from the environment, and
 // never printed. Codex (the OpenAI seat) gets an environment with none of them.
 import { mkdirSync } from "node:fs";
+import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
 import { claudeSeat } from "./seats/claude.ts";
@@ -32,6 +33,7 @@ if (import.meta.main) {
 
   const runner = new Runner(cfg, {
     seats, log,
+    stopped: () => readStop().stopped,
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });
   log(`seats: ${(["openai", "gemini", "perplexity", "claude"] as const).map((s) => `${s} ${runner.unavailable(s) ? "off" : "on"}`).join(", ")}`);

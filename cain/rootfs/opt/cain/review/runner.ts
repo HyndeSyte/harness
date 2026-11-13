@@ -35,6 +35,7 @@ export type RunnerDeps = {
   seats: Partial<Record<SeatName, SeatFn>>;
   unavailable?: (seat: SeatName) => Unavailable;   // e.g. Codex not signed in
   now?: () => Date; rand?: () => number; log?: (m: string) => void;
+  stopped?: () => boolean;                         // Dane's Stop (../stop.ts): nothing is sent while it holds
 };
 
 export type SpendRow = { usd: number; runs: number; findings: number; searches: number };
@@ -122,12 +123,21 @@ export class Runner {
     return null;
   }
 
+  // Dane's Stop: nothing goes out to an outside model while it holds. A state that can't
+  // be read counts as stopped.
+  isStopped(): boolean {
+    try { return this.deps.stopped?.() ?? false; } catch { return true; }
+  }
+
   // ---- the loop ----
   async tick(): Promise<void> {
     mkdirSync(this.cfg.queueDir, { recursive: true });
     for (const name of readdirSync(this.cfg.queueDir).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort()) {
       const r = loadReview(this.cfg.queueDir, name.slice(0, -5));
       if (!r) continue;
+      // While stopped, an open review waits where it is: nothing is sent, nothing is given
+      // up. Asked again for each review, since a seat's call can take minutes.
+      if (!FINAL.includes(r.status) && this.isStopped()) continue;
       try {
         if (FINAL.includes(r.status)) {
           // Saved only when after() changed it (recorded, relayed, or blocked at the record gate).
@@ -160,6 +170,7 @@ export class Runner {
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
     for (let pass = 0; pass < 4; pass++) {
+      if (this.isStopped()) break;                       // Stop between passes: the rest waits
       const now = this.now().toISOString();
       const due = r.seats.filter((s) => this.isDue(r, s, now));
       if (due.length === 0) break;
@@ -303,7 +314,9 @@ export class Runner {
   }
 
   async selftest(): Promise<Health> {
+    // Not done, so it's tried again within the hour, and runs once he turns it back on.
     for (const seat of SEATS) {
+      if (this.isStopped()) throw new Error("everything is stopped, so no seat is called");
       const down = this.unavailable(seat) ?? this.capCheck(seat, SELFTEST, 0, true);
       if (down) { this.markHealth(seat, { ...down, fix: fixFor(seat, down.kind, down.detail) }, false); continue; }
       const ctl = new AbortController();
