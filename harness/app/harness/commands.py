@@ -82,7 +82,7 @@ class Commands:
         with self.ledger.tx() as db:
             self.ledger.set_meta("paused", "0", db)
             self.ledger.event("resumed", {}, db=db)
-        return "<b>Resumed.</b> Anything you sent while stopped was not acted on; resend it."
+        return "<b>Resumed.</b> Anything you sent while stopped was not acted on."
 
     def _cancel(self, arg: str) -> str:
         cancelled: list[str] = []

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.3
+
+- **The Resumed notice no longer asks you to send things again.** It says plainly that what you sent while stopped wasn't acted on.
+
 ## 0.21.2
 
 - **The Harness no longer marks the same Family events to be judged again every few seconds.** One already waiting to be judged again is marked once, so its log stays readable and the Pi stops writing its database over and over.

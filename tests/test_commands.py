@@ -66,6 +66,7 @@ def test_stop_cancels_new_work_and_resume_restores_it(ledger, config):
     w.say("/resume")
     w.step()
     assert not is_paused(ledger) and "Resumed." in w.last()
+    assert "resend" not in w.last()                  # it never asks him to send it again
     _, [job2] = w.say("draft the coop email")
     w.step()
     assert ledger.job(job2)["state"] == "answered"
