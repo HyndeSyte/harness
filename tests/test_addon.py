@@ -665,7 +665,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # Cain's scripts only, from this machine: the specialist can't show its own cards,
     # ask, put up a Ship card, or close Cain's questions.
     assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", '
-            '"/look", "/cards", "/check", "/replay", "/connector"])' in link)
+            '"/look", "/cards", "/check", "/replay", "/connector", "/sent"])' in link)
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

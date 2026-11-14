@@ -5,13 +5,16 @@ runs them there). Nothing in harness/app imports this: what he sees is kept clea
 tests that use it.
 
   dash     an em dash                         fix: ", " (removed at a line's start or end, or
-                                              before a stop), never inside code or a link
+                                              before a stop; " to " only between two clock
+                                              times), never inside code or a link
   app      "the add-on", "Cain's add-on", "Settings > Add-ons" and the like, also "addon" and
            the escaped "add\\-on"             fix: "App", "Apps", "App's". A bare "add-on" (a
                                               browser add-on in a calendar title) is left alone.
   count    "and 3 more", "+2 more", "(+2)", "4 more changes"     refuse: name each one
-  machine  a full sha, a cloud job id, an ISO date-time, a Discord id (17 to 20 digits; passes in
-           a reply to his own message), "job" and a hex id       refuse
+  machine  a full sha, a cloud job id, an ISO date-time, a Discord id (17 to 20 digits), "job"
+           and a hex id                                          refuse. In a reply to his own
+                                                                  message a long number, and
+                                                                  anything in code, passes.
   button   a known button label named as one ("tap Undo", "the Stop button", "with Undo"), exact
            case, when the message doesn't have it                refuse; "unsure" when which
                                                                   buttons are up can't be told
@@ -25,12 +28,12 @@ RULES = ("dash", "app", "count", "machine", "button")
 
 # Both Apps' own button labels (rules.ts STATIC_LABELS).
 STATIC_LABELS = (
-    # Cain's link
-    "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings",
+    # Cain's link, and his own asks (CLAUDE.md, Check-ins)
+    "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings", "Do it", "I'll do it", "Drop it",
     # the calendar specialist
     "Approve", "Decline", "Undo", "Undo both", "Undo these", "Use new", "Keep old", "Not mine", "Wrong time",
     "Just this once", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
-    "Turn on", "None wrong: stop checking", "Something was off: keep checking",
+    "Turn on", "None wrong: stop checking", "Something was off: keep checking", "Do it now",
 )
 
 # Which rules each send point applies (rules.ts AT).
@@ -60,8 +63,10 @@ class Report:
         return sorted({h.rule for h in self.hits if h.result == result})
 
 
-def hidden(text: str, only_targets: bool = False) -> str:
-    """What isn't visible text, hidden in place (same length, new lines kept)."""
+def hidden(text: str, only_targets: bool | str = False) -> str:
+    """What isn't visible text, hidden in place (same length, new lines kept). "code" hides
+    link targets and code but not bare links: what the machine rule reads in a reply to his
+    own message."""
     t = list(text)
 
     def cover(start: int, end: int) -> None:
@@ -74,9 +79,10 @@ def hidden(text: str, only_targets: bool = False) -> str:
             cover(m.start() + offset, m.end())
 
     each(r"\]\([^)\s]*\)", 1)
-    if not only_targets:
+    if only_targets is not True:
         each(r"```[\s\S]*?```")
         each(r"`[^`\n]+`")
+    if only_targets is False:
         each(r"<?https?://[^\s<>()]+>?")
     return "".join(t)
 
@@ -89,6 +95,20 @@ def around(text: str, at: int, end: int, n: int = 60) -> str:
     return re.sub(r"\s+", " ", text[start:stop]).strip()[:n]
 
 
+# " to " only between two clock times (rules.ts clockRange): one side says it's a time (a
+# colon, or AM or PM) and the other is a time or a bare hour. Any other pair of numbers gets ", ".
+_MERIDIEM = r"\s?[AaPp]\.?[Mm]\.?"
+_CLOCK_END = re.compile(r"(?<![\d:.])(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")$", A)
+_HOUR_END = re.compile(r"(?<![\d:])(?<!\d[.,])\d{1,2}$", A)                 # not "1.5" or "2026"
+_CLOCK_START = re.compile(r"^(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")(?![A-Za-z0-9:])", A)
+_HOUR_START = re.compile(r"^\d{1,2}(?![A-Za-z0-9:]|[.,]\d)", A)
+
+
+def _clock_range(left: str, right: str) -> bool:
+    lt, rt = bool(_CLOCK_END.search(left)), bool(_CLOCK_START.search(right))
+    return (lt and (rt or bool(_HOUR_START.search(right)))) or (rt and bool(_HOUR_END.search(left)))
+
+
 def _dashes(text: str, seen: str) -> list[tuple[int, int, str]]:
     out = []
     for m in re.finditer("[ \t]*\u2014+[ \t]*", seen):
@@ -96,8 +116,8 @@ def _dashes(text: str, seen: str) -> list[tuple[int, int, str]]:
         before = "\n" if at == 0 else text[at - 1]
         after = "\n" if end >= len(text) else text[end]
         put = ", "
-        if re.match(r"[0-9]", before) and re.match(r"[0-9]", after):
-            put = " to "                  # "6 — 8 PM" is "6 to 8 PM"
+        if _clock_range(text[max(0, at - 12):at], text[end:end + 12]):
+            put = " to "                  # "9:30 to 10:15", never "Room 4 to 5"
         elif before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
             put = ""
         elif re.match(r"[,;:]", before):
@@ -130,7 +150,8 @@ def _apps(seen: str) -> list[tuple[int, int, str]]:
 _NUM = (r"(?:\d+|a\s+few|a\s+couple(?:\s+of)?|several|two|three|four|five|six|seven|eight|nine|ten"
         r"|a\s+dozen)")
 _UNIT = r"(?:minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|seconds?|secs?|times?|tries)"
-_ITEMS = (r"(?:changes|events|blocks|cards|items|messages|notes|places|questions|things|ones"
+# Not "questions": "two more questions after this" is how he's told a few asks follow.
+_ITEMS = (r"(?:changes|events|blocks|cards|items|messages|notes|places|things|ones"
           r"|appointments|receipts)")
 _COUNTS = (
     re.compile(r"\band\s+" + _NUM + r"\s+(?:more|others?)\b(?!\s+" + _UNIT + r"\b)", re.I | A),
@@ -183,7 +204,8 @@ def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = Fa
     """buttons: the labels on this message; None when which buttons are up can't be told."""
     t = str(text or "")
     on = set(RULES if rules is None else rules)
-    seen, targets_only = hidden(t), hidden(t, True)
+    # The machine rule reads code too, except in a reply to his own message.
+    seen, targets_only = hidden(t), hidden(t, "code" if answers_him else True)
     hits: list[Hit] = []
 
     def add(rule: str, result: str, at: int, end: int, label: str = "") -> None:

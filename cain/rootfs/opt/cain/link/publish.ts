@@ -11,6 +11,7 @@
 import { createReadStream, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { answerText, sentIds } from "../gate/plugin";
 import { cardsView, emptyState, type ReplayReport, type Sent, type State } from "./core";
 
 export const CARDS_FILE = process.env.CAIN_CARDS ?? "/data/trust/cards.json";
@@ -70,16 +71,7 @@ export function writeReplayReport(r: ReplayReport, path = REPLAY_FILE): string {
 }
 
 const SEND = /plugin_discord_discord__(reply|edit_message)$/;
-// The plugin's own answers: "sent (id: X)", "sent N parts (ids: X, Y)", "edited (id: X)".
-// Only those say which messages it made; any other long number in a result is not proof.
-const ONE = /\b(?:sent|edited) \(id: (\d{17,20})\)/g;
-const PARTS = /\bsent \d+ parts \(ids: (\d{17,20}(?:,\s*\d{17,20})*)\)/g;
-export function sentIds(answer: string): string[] {
-  const out: string[] = [];
-  for (const m of answer.matchAll(ONE)) out.push(m[1]);
-  for (const m of answer.matchAll(PARTS)) out.push(...m[1].split(/,\s*/));
-  return out;
-}
+export { sentIds };
 
 const MAX_LINE = 4 * 1024 * 1024;         // a longer line is skipped, never buffered
 const YIELD_BYTES = 256 * 1024;           // the event loop gets a turn at least this often
@@ -112,9 +104,7 @@ export async function readTranscripts(root: string, since: number): Promise<Sent
             if (t) texts.add(t);
           } else if (b?.type === "tool_result" && sends.has(String(b.tool_use_id ?? ""))) {
             sends.delete(String(b.tool_use_id));
-            const out = typeof b.content === "string" ? b.content
-              : Array.isArray(b.content) ? b.content.map((x: any) => String(x?.text ?? "")).join(" ") : "";
-            for (const id of sentIds(out)) ids.add(id);
+            for (const id of sentIds(answerText(b.content))) ids.add(id);
           }
         }
       };

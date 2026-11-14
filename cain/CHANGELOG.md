@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.0
+
+- The checks on the words that reach you are on now. Em dashes and "add-on" are fixed as they go out. Anything else they catch is held back for Cain to rewrite first: a list cut short with "and 3 more", a commit or job id, or a button the message doesn't have.
+- They were tuned from the read-back over your DM: "two more questions after this" is fine, and an em dash between two times reads "to" ("9:30 to 10:15") while other numbers get a comma.
+- The checks can't silence Cain: if he's held back twice within 10 minutes, his third try goes out as it is, and he hears so and can fix it.
+- The calendar specialist's cards are never held back, since a held approval or Undo would be lost to you: their wording is fixed, and Cain hears about anything else so he can set it right himself.
+- Cain can edit only his own replies, never a card or a notice from his App.
+- Stop is within reach: one red Stop sits on the newest plain message from Cain or his App, never on a card that asks something, so it's never next to Ship or Approve. It moves down only when none of the last 5 messages has a Stop, and Discord shows "(edited)" on the messages it moves between.
+- While everything is stopped, that Stop comes off and Turn back on stays near the bottom: the stopped notice is posted again when it's out of reach, at most once an hour or after you write.
+- How it was checked: tests show that a question from Cain, and a reply of his, naming a button the card doesn't have are held back before anything is sent. The calendar specialist's own words are checked by the test scan on every change, and logged by the App as they go out.
+- After this update the App reads back over your DM once more with the tuned checks, posting nothing, and Cain files what it found and checks the new behavior himself. Nothing for you to do.
+
 ## 0.9.0
 
 - Cain now knows each card's buttons. When the calendar specialist has a card for you, Cain is told which buttons it has, and he can read any message back from Discord to see the buttons on it now, so he won't point you at a button that isn't there.

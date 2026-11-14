@@ -169,23 +169,27 @@ describe("the watch on the calendar specialist", () => {
 });
 
 describe("the link's notice", () => {
-  test("goes straight to his DM, with no buttons and no pings", async () => {
-    let state: State = emptyState();
-    const calls: any[] = [];
-    const rest = async (method: string, path: string, body?: any) => {
-      calls.push({ method, path, body });
-      if (path === "/oauth2/applications/@me") return { owner: { id: "4242" } };
-      if (path === "/users/@me") return { id: "999" };
-      if (path === "/users/@me/channels") return { id: "5151" };
-      return { id: "7001", content: body?.content };
-    };
-    const link = new Link({ rest, load: () => JSON.parse(JSON.stringify(state)), save: (s) => { state = s; },
-      now: () => 1, relay: () => {}, toHarness: async () => true, paired: () => "4242", log: () => {} });
-    await link.notice(downText(GRACE_MS));
-    const post = calls.find((c) => c.method === "POST" && c.path === "/channels/5151/messages");
-    expect(post.body.content).toContain("calendar specialist");
-    expect(post.body.components).toBeUndefined();
-    expect(post.body.allowed_mentions).toEqual({ parse: [] });
+  test("goes straight to his DM with no pings, carrying the moving Stop unless things are stopped", async () => {
+    for (const stopped of [false, true]) {
+      let state: State = emptyState();
+      const calls: any[] = [];
+      const rest = async (method: string, path: string, body?: any) => {
+        calls.push({ method, path, body });
+        if (path === "/oauth2/applications/@me") return { owner: { id: "4242" } };
+        if (path === "/users/@me") return { id: "999" };
+        if (path === "/users/@me/channels") return { id: "5151" };
+        return { id: "7001", content: body?.content, components: body?.components };
+      };
+      const link = new Link({ rest, load: () => JSON.parse(JSON.stringify(state)), save: (s) => { state = s; },
+        now: () => 1, relay: () => {}, toHarness: async () => true, paired: () => "4242", log: () => {},
+        stop: { read: () => ({ stopped, at: 0 }), write: () => {} } });
+      await link.notice(downText(GRACE_MS));
+      const post = calls.find((c) => c.method === "POST" && c.path === "/channels/5151/messages");
+      expect(post.body.content).toContain("calendar specialist");
+      expect(post.body.components).toEqual(stopped ? undefined
+        : [{ type: 1, components: [{ type: 2, style: 4, label: "Stop", custom_id: "k:stop" }] }]);
+      expect(post.body.allowed_mentions).toEqual({ parse: [] });
+    }
   });
 });
 

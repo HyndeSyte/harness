@@ -121,7 +121,8 @@ describe("the cards, published for the reply hook", () => {
     expect(v.cards.find((c) => c.message === card)).toEqual({ message: card, kind: "card", writer: "specialist", labels: RECEIPT,
       live: true, item: "none", question: null, posted: r.t.now });
     expect(v.cards.find((c) => c.message === ask)).toMatchObject({ kind: "ask", writer: "cain", labels: ["Filed", "Not filed"], live: true, question: "Q2" });
-    expect(v.cards.find((c) => c.kind === "notice")).toMatchObject({ writer: "link", labels: [], live: false });
+    const notice = v.cards.find((c) => c.kind === "notice")!;
+    expect(notice).toMatchObject({ writer: "link", labels: ["Stop"], live: true });   // it carries the moving Stop
     expect(JSON.stringify(v)).not.toContain("private");
     await r.link.answered({ item: "P08", question: "Q2" });
     r.later(DAY);
@@ -130,7 +131,19 @@ describe("the cards, published for the reply hook", () => {
     expect(v.cards.find((c) => c.message === ask)).toMatchObject({ live: false, labels: ["Filed", "Not filed"] });
     r.later(DAY + HOUR);
     v = cardsView(r.state(), r.t.now);
-    expect(v.cards.map((c) => c.message)).toEqual([card]);               // its buttons are still up; the rest finished over 2 days ago
+    // Their buttons are still up (the receipt's, and the notice's Stop); the rest finished over 2 days ago.
+    expect(v.cards.map((c) => c.message).sort()).toEqual([card, notice.message].sort());
+  });
+
+  test("with the ids of Cain's own replies from the last 35 days, the only messages he may edit", async () => {
+    const r = rig();
+    const old = r.snowflake(r.t.now - 36 * DAY), recent = r.snowflake(r.t.now - DAY);
+    expect(r.link.seedSent([old, recent, "not-an-id"])).toBe(1);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false });
+    const v = cardsView(r.state(), r.t.now);
+    expect(v.sent).toHaveLength(2);
+    expect(v.sent).toContain(recent);
+    expect(v.sent).not.toContain(old);
   });
 
   test("written whole through a rename, readable by all", async () => {
@@ -138,7 +151,7 @@ describe("the cards, published for the reply hook", () => {
     const dir = mkdtempSync(join(tmpdir(), "cards-"));
     const path = join(dir, "trust", "cards.json");
     await publishCards(r.state(), 5, path);
-    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ written_at: 5, owner: null, dm: null, cards: [] });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ written_at: 5, owner: null, dm: null, cards: [], sent: [] });
     if (process.platform !== "win32") expect((statSync(path).mode & 0o777).toString(8)).toBe("644");
   });
 
@@ -174,22 +187,53 @@ describe("the cards, published for the reply hook", () => {
   });
 });
 
-describe("the gate's report at the link's send points", () => {
-  test("Cain's words through the link: logged with the rule, and still sent as they were", async () => {
+describe("the gate at the link's send points", () => {
+  test("exit drill: Cain's ask naming a button it lacks is refused before anything is sent, saying what to change", async () => {
     const r = rig();
-    const out = await r.link.ask({ text: "P08 Q2: Filed? If not, tap Undo — then Filed.", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
-    expect(out.status).toBe("posted");
-    expect(r.last().content).toBe("P08 Q2: Filed? If not, tap Undo — then Filed.");   // nothing changed in D1
-    expect(r.reports).toMatchObject([{ point: "ask", writer: "cain", hits: [{ rule: "button", result: "refuse", label: "Undo" }, { rule: "dash", result: "fix" }] }]);
+    const ask = r.link.ask({ text: "P08 Q2: Filed? If not, tap Undo.", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
+    await expect(ask).rejects.toThrow('The message gate held this ask: "Undo" isn\'t one of its buttons (Filed, Not filed). Rewrite it and send it again.');
+    expect(r.posts()).toBe(0);
+    expect(r.reports).toMatchObject([{ point: "ask", writer: "cain", did: "refused", hits: [{ rule: "button", result: "refuse", label: "Undo" }] }]);
     for (const h of r.reports[0].hits) expect(h.around.length).toBeLessThanOrEqual(60);
   });
 
-  test("a specialist card naming a button it lacks is posted unchanged, and logged", async () => {
+  test("Cain's words through the link: em dashes and add-ons fixed before the card is made, and the answer says so", async () => {
     const r = rig();
-    const card = await r.link.addCard({ text: "Three blocks added, each on its own card with Undo.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
+    const out = await r.link.ask({ text: "P08 Q2: Is the add-on back — or not?", options: ["Back — yes", "Not yet"], item: "P08", question: "Q2" }) as any;
+    expect(out).toMatchObject({ status: "posted", said: "Posted. The message gate fixed its wording first: no em dashes; Apps, not add-ons." });
+    expect(r.last().content).toBe("P08 Q2: Is the App back, or not?");
+    expect(r.buttons(out.message)).toEqual(["Back, yes", "Not yet"]);
+    expect(r.state().messages[out.message].labels).toEqual(["Back, yes", "Not yet"]);
+    // The same words again make the same card: the nonce is made from the fixed words.
+    const again = await r.link.ask({ text: "P08 Q2: Is the add-on back — or not?", options: ["Back — yes", "Not yet"], item: "P08", question: "Q2" }) as any;
+    expect(again.message).toBe(out.message);
+    expect(r.reports.filter((x) => x.point === "ask")).toMatchObject([{ did: "fixed" }, { did: "fixed" }]);
+  });
+
+  test("a hidden count or machine text is refused on an ask, a Ship card, the morning message and the connector notice", async () => {
+    const r = rig();
+    await expect(r.link.ask({ text: "P08 Q2: Two blocks and 3 more: fine?", options: ["Yes", "No"], item: "P08", question: "Q2" })).rejects.toThrow("name each one instead of a count");
+    await expect(r.link.ask({ text: "P08 Q2: Fine?", options: ["Yes", "Yes and 2 more"], item: "P08", question: "Q2" })).rejects.toThrow("held this ask's option");
+    await expect(r.link.ship({ text: "Harness 0.23.0 ready, and 2 more fixes.", item: "P41", pr: PR, head: SHA1 })).rejects.toThrow("held this Ship card");
+    await expect(r.link.morning("## Thu Nov 12\nTap Undo on the receipt.")).rejects.toThrow('"Undo" isn\'t one of its buttons (Stop)');
+    await expect(r.link.connector({ item: "P41", text: "Installing Harness, see message 123456789012345678" })).rejects.toThrow("held this notice");
+    expect(r.posts()).toBe(0);
+    const ship = await r.link.ship({ text: "Harness 0.23.0 ready — the gate on.", item: "P41", pr: PR, head: SHA1 }) as any;
+    expect(ship.said).toContain("no em dashes");
+    expect(r.msg(ship.message).content).toStartWith("P41: Harness 0.23.0 ready, the gate on.");
+    expect((await r.link.morningPost("## Thu Nov 12\n• Swim — 4:30")).said).toContain("no em dashes");
+    expect(r.last().content).toBe("## Thu Nov 12\n• Swim, 4:30");
+  });
+
+  test("a specialist card naming a button it lacks is never refused: posted as it is, logged, and Cain told once", async () => {
+    const r = rig();
+    const card = await r.link.addCard({ text: "Three blocks added — each on its own card with Undo.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
+    expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Undo" isn\'t one of its buttons. It goes out as it is');
     const id = await r.link.show(card, { item: "none" });
-    expect(r.msg(id).content).toBe("Three blocks added, each on its own card with Undo.");
-    expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", hits: [{ rule: "button", label: "Undo" }] }]);
+    expect(r.msg(id).content).toBe("Three blocks added, each on its own card with Undo.");   // the dash fixed, the rest as it was
+    expect(r.state().cards[String(card)].text).toBe("Three blocks added, each on its own card with Undo.");
+    expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", did: "posted as it is", hits: [{ rule: "dash" }, { rule: "button", label: "Undo" }] }]);
+    expect(r.relayed.filter((l) => l.includes("flags its words"))).toHaveLength(1);
   });
 
   test("the specialist's numbers aren't checked as machine text; its notes after a tap get only the fixes", async () => {
@@ -197,14 +241,15 @@ describe("the gate's report at the link's send points", () => {
     await r.link.addCard({ text: "Room 123456789012345678 booked.", rows: [], kind: "card" });
     expect(r.reports).toEqual([]);
     await r.link.followup("999:tok", "Done, tap Undo — if wrong.");
-    expect(r.reports).toMatchObject([{ point: "answer", writer: "specialist", hits: [{ rule: "dash", result: "fix" }] }]);
+    expect(r.reports).toMatchObject([{ point: "answer", writer: "specialist", did: "fixed", hits: [{ rule: "dash", result: "fix" }] }]);
+    expect(r.ephemerals().at(-1).content).toBe("Done, tap Undo, if wrong.");
   });
 
-  test("the link's own notices are checked with its rules", async () => {
+  test("the link's own notices are fixed", async () => {
     const r = rig();
     await r.link.notice("The add-on — is back.");
-    expect(r.reports).toMatchObject([{ point: "notice", writer: "link", hits: [{ rule: "app" }, { rule: "dash" }] }]);
-    expect(r.last().content).toBe("The add-on — is back.");
+    expect(r.reports).toMatchObject([{ point: "notice", writer: "link", did: "fixed", hits: [{ rule: "app" }, { rule: "dash" }] }]);
+    expect(r.last().content).toBe("The App, is back.");
   });
 
   test("keeper.sh check gives the hook's decision against the cards up now, and sends nothing", async () => {
@@ -213,11 +258,38 @@ describe("the gate's report at the link's send points", () => {
     const posts = r.posts();
     expect(r.link.checkSend({ text: "If it's wrong, tap Undo.", replyTo: id })).toMatchObject({ status: "ok", would: "refuse" });
     expect(r.link.checkSend({ text: "Tap Wrong time if it's off.", replyTo: id }).would).toBe("pass");
+    expect(r.link.checkSend({ text: "Moved swim — at 4:30.", replyTo: id })).toMatchObject({ would: "fix", fixed: "Moved swim, at 4:30." });
     expect(r.link.checkSend({ text: "Fixed.", edit: id }).hits).toMatchObject([{ rule: "target", result: "refuse" }]);
     expect(() => r.link.checkSend({ text: " " })).toThrow("needs the text");
     expect(() => r.link.checkSend({ text: "x", replyTo: "abc" })).toThrow("Discord id");
     expect(r.posts()).toBe(posts);
     expect(r.reports.filter((x) => x.point === "reply")).toEqual([]);
+  });
+});
+
+describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
+  test("his ids go on his edit allowlist, each part of a reply; an edit only updates whether it asks something", async () => {
+    const r = rig();
+    const [a, b] = [r.snowflake(), r.snowflake()];
+    for (const id of [a, b]) r.posted[id] = { id, content: "A long reply, in two parts.", author: { id: "999" }, components: [] };
+    await r.link.sent({ tool: "reply", ids: [a, b], question: false });
+    expect(r.state().sent).toMatchObject({ [a]: { last: false, asks: false }, [b]: { last: true, asks: false } });
+    await r.link.sent({ tool: "edit", ids: [b], question: true });
+    expect(r.state().sent![b]).toMatchObject({ last: true, asks: true });
+    await expect(r.link.sent({ tool: "reply", ids: ["nope"] })).rejects.toThrow("needs the ids");
+  });
+
+  test("what the safety net found reaches Cain, with what to fix, or that his third try went out as it was", async () => {
+    const r = rig();
+    const id = r.snowflake();
+    await r.link.sent({ tool: "reply", ids: [id], question: false,
+      net: { released: false, fixed: "Moved swim, and art.", hits: [{ rule: "dash", result: "fix", around: "Moved swim — and art." }] } });
+    expect(r.relayed.at(-1)).toBe(`The message gate should have held your reply (Discord message ${id}), but it went out: "Moved swim — and art." (no em dashes). Fix it now with an edit (edit_message), and don't mention it to him; it's logged for a fix. Fixed, it reads: Moved swim, and art.`);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, net: { released: true, hits: [] } });
+    expect(r.relayed.at(-1)).toContain("went out as it was after the message gate held it twice. If what it held still matters, fix it with an edit");
+    const relayed = r.relayed.length;
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false });
+    expect(r.relayed.length).toBe(relayed);                                // nothing found: nothing said
   });
 });
 

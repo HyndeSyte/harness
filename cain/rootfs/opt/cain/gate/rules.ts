@@ -1,12 +1,13 @@
 // The message gate's rules (piece D): what a message to Dane may not say, as plain
-// code, no model and no I/O. In this release they only report: the reply hook
-// (hooks/discord-send.ts), the link's send points and the replay log what each rule
-// would have done, and nothing is refused or rewritten. tests/message_rules.py is a
-// port for the calendar specialist's tests, kept equal to this file by
-// cain/tests/gate-cases.json.
+// code, no model and no I/O. Since Cain 0.10.0 they act: the reply hook
+// (hooks/discord-send.ts) and the link's send points fix what's fixable and hold back
+// what isn't (each send point's table is in DOCS.md and the link's core.ts), and the
+// replay reads his DM with them. tests/message_rules.py is a port for the calendar
+// specialist's tests, kept equal to this file by cain/tests/gate-cases.json.
 //
 //   dash     an em dash                    fix: ", " (removed at a line's start or end,
-//                                          or before a stop), never inside code or a link
+//                                          or before a stop; " to " only between two
+//                                          clock times), never inside code or a link
 //   app      "the add-on", "Cain's add-on", "Harness add-on", "Settings > Add-ons" and
 //            the like (also "addon" and the specialist's escaped "add\-on"; plural and
 //            possessive)                   fix: "App", "Apps", "App's". A bare "add-on"
@@ -14,8 +15,8 @@
 //   count    "and 3 more", "and a few more", "+2 more", "(+2)", "4 more changes"
 //                                          refuse: name each one
 //   machine  a full commit sha, a cloud job id (cse_), an ISO date-time, a Discord id
-//            (17 to 20 digits; passes in a reply to his own message), "job" and a hex id
-//                                          refuse: say it as people say it
+//            (17 to 20 digits), "job" and a hex id     refuse: say it as people say it.
+//            In a reply to his own message a long number, and anything in code, passes.
 //   button   a known button label named as one ("tap Undo", "press Ship", "the Stop
 //            button", "with Undo"), exact case, when the message (or the live card a
 //            reply answers) doesn't have it        refuse; "unsure" when which buttons
@@ -24,6 +25,9 @@
 // left alone: "9 – 11" would lose its meaning as "9, 11".
 
 export const RULES = ["dash", "app", "count", "machine", "button"] as const;
+// Goes up whenever a rule changes what it catches: the link replays his DM once more by
+// itself with the new rules (1: Cain 0.9.0, report mode; 2: 0.10.0, tuned from the replay).
+export const RULES_VERSION = 2;
 export type Rule = (typeof RULES)[number];
 export type Result = "fix" | "refuse" | "unsure";
 export interface Hit { rule: Rule; result: Result; at: number; end: number; around: string; label?: string }
@@ -33,34 +37,36 @@ export interface Context {
   buttons?: readonly string[] | null;    // labels on this message, or on the live card a reply answers;
                                          // null: which buttons are up can't be told
   known?: readonly string[];             // labels on live cards, on top of the static list
-  answersHim?: boolean;                  // a reply to a message of his: a long number he asked for passes
+  answersHim?: boolean;                  // a reply to a message of his: a long number he asked for, or code, passes
 }
 
 // Both Apps' own button labels, so "Undo" is known as a button even when no card with
 // Undo is up. Labels on live cards come on top (Context.known).
 export const STATIC_LABELS: readonly string[] = [
-  // Cain's link
-  "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings",
+  // Cain's link, and his own asks (CLAUDE.md, Check-ins)
+  "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings", "Do it", "I'll do it", "Drop it",
   // the calendar specialist
   "Approve", "Decline", "Undo", "Undo both", "Undo these", "Use new", "Keep old", "Not mine", "Wrong time",
   "Just this once", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
-  "Turn on", "None wrong: stop checking", "Something was off: keep checking",
+  "Turn on", "None wrong: stop checking", "Something was off: keep checking", "Do it now",
 ];
 
 const HIDE = "\u0000";   // a character no rule can match, put over what isn't visible text
 
 // What isn't visible text, or isn't his words to judge, hidden in place (same length,
 // new lines kept): masked link targets always; code and bare links unless only targets.
-export function hidden(text: string, onlyTargets = false): string {
+// "code" hides targets and code but not bare links: what the machine rule reads in a
+// reply to his own message.
+export function hidden(text: string, onlyTargets: boolean | "code" = false): string {
   const t = text.split("");
   const cover = (from: number, to: number) => { for (let i = from; i < to; i++) if (t[i] !== "\n") t[i] = HIDE; };
   const each = (re: RegExp, from = 0) => { for (const m of text.matchAll(re)) cover(m.index! + from, m.index! + m[0].length); };
   each(/\]\([^)\s]*\)/g, 1);                          // [words](target): the target
-  if (!onlyTargets) {
+  if (onlyTargets !== true) {
     each(/```[\s\S]*?```/g);
     each(/`[^`\n]+`/g);
-    each(/<?https?:\/\/[^\s<>()]+>?/g);
   }
+  if (onlyTargets === false) each(/<?https?:\/\/[^\s<>()]+>?/g);
   return t.join("");
 }
 
@@ -76,13 +82,26 @@ export function around(text: string, at: number, end: number, n = 60): string {
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // -- dash ----------------------------------------------------------------------------
+// " to " only between two clock times: a dash between 9:30 and 10:15, 6 PM and 8 PM, or 6
+// and 8 PM, where one side says it's a time (a colon, or AM or PM) and the other is a time
+// or a bare hour. Any other pair of numbers (Room 4 and 5, a score of 3 and 2) gets ", ".
+const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
+const CLOCK_END = new RegExp(`(?<![\\d:.])(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})$`);
+const HOUR_END = /(?<![\d:])(?<!\d[.,])\d{1,2}$/;               // not "1.5" or "2026"
+const CLOCK_START = new RegExp(`^(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})(?![A-Za-z0-9:])`);
+const HOUR_START = /^\d{1,2}(?![A-Za-z0-9:]|[.,]\d)/;
+function clockRange(left: string, right: string): boolean {
+  const l = CLOCK_END.test(left), r = CLOCK_START.test(right);
+  return (l && (r || HOUR_START.test(right))) || (r && HOUR_END.test(left));
+}
+
 function dashes(text: string, seen: string): { at: number; end: number; put: string }[] {
   const out: { at: number; end: number; put: string }[] = [];
   for (const m of seen.matchAll(/[ \t]*—+[ \t]*/g)) {
     const at = m.index!, end = at + m[0].length;
     const before = at === 0 ? "\n" : text[at - 1], after = end >= text.length ? "\n" : text[end];
     let put = ", ";
-    if (/\d/.test(before) && /\d/.test(after)) put = " to ";            // "6 — 8 PM" is "6 to 8 PM"
+    if (clockRange(text.slice(Math.max(0, at - 12), at), text.slice(end, end + 12))) put = " to ";   // 9:30 to 10:15
     else if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
     else if (/[,;:]/.test(before)) put = " ";
     out.push({ at, end, put });
@@ -108,7 +127,8 @@ function apps(seen: string): { at: number; end: number; put: string }[] {
 // -- count -----------------------------------------------------------------------------
 const NUM = "(?:\\d+|a\\s+few|a\\s+couple(?:\\s+of)?|several|two|three|four|five|six|seven|eight|nine|ten|a\\s+dozen)";
 const UNIT = "(?:minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|seconds?|secs?|times?|tries)";
-const ITEMS = "(?:changes|events|blocks|cards|items|messages|notes|places|questions|things|ones|appointments|receipts)";
+// Not "questions": "two more questions after this" is how he's told a few asks follow.
+const ITEMS = "(?:changes|events|blocks|cards|items|messages|notes|places|things|ones|appointments|receipts)";
 const COUNTS: RegExp[] = [
   new RegExp(`\\band\\s+${NUM}\\s+(?:more|others?)\\b(?!\\s+${UNIT}\\b)`, "gi"),
   /\+\s?\d+\s+more\b/gi,
@@ -156,7 +176,8 @@ const overlaps = (a: { at: number; end: number }, b: { at: number; end: number }
 export function check(text: string, ctx: Context = {}): Report {
   const t = String(text ?? "");
   const on = new Set<Rule>(ctx.rules ?? RULES);
-  const seen = hidden(t), targetsOnly = hidden(t, true);
+  // The machine rule reads code too, except in a reply to his own message (what he asked for).
+  const seen = hidden(t), targetsOnly = hidden(t, ctx.answersHim ? "code" : true);
   const hits: Hit[] = [];
   const add = (rule: Rule, result: Result, at: number, end: number, label?: string) => {
     if (hits.some((h) => h.rule === rule && overlaps(h, { at, end }))) return;
@@ -207,3 +228,18 @@ export const AT: Record<string, readonly Rule[]> = {
   answer: ["dash", "app"],                              // the specialist's notes after a tap
   link: ["dash", "app"],                                // the link's own notices and lines
 };
+
+// What each rule asks of the writer, for the line that says why words were held back.
+export const WHY: Record<Rule, string> = {
+  dash: "no em dashes",
+  app: "Home Assistant calls them Apps, not add-ons",
+  count: "name each one instead of a count",
+  machine: "no shas, job ids, ISO times or Discord ids; say it as people say it",
+  button: "name only a button the message has",
+};
+
+// The fixable hits, as a few words: "no em dashes; Apps, not add-ons".
+export function fixedWhat(hits: readonly Hit[]): string {
+  const rules = RULES.filter((r) => hits.some((h) => h.result === "fix" && h.rule === r));
+  return rules.map((r) => (r === "app" ? "Apps, not add-ons" : WHY[r])).join("; ");
+}

@@ -62,11 +62,15 @@ the App.
 
 Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing hidden
 behind "and 3 more", no commit or job ids or ISO times, and no button named that the
-message (or the card Cain's reply answers) doesn't have. In this release they only keep
-a log on the Pi of what they would have caught, in Cain's own folder, and once after
-installing they read back over your DM the same way, posting nothing. Cain files what
-they found in the record, and the rules are tuned from it before they're switched on.
-Nothing for you to do.
+message (or the card Cain's reply answers) doesn't have. Em dashes and "add-on" are
+fixed as they go out. Anything else is held back for Cain to rewrite before you see it.
+If he's held back twice within 10 minutes, his third try goes out as it is, so the
+rules can never silence him, and he hears so. The calendar specialist's cards are
+never held back, since a held approval or Undo would be lost to you: their wording is
+fixed, and Cain hears about anything else. Cain can edit only his own replies. A log on
+the Pi, in Cain's own folder, keeps what the rules caught. After an update that changes
+the rules, the App reads back over your DM once with them, posting nothing, and Cain
+files what they found. Nothing for you to do.
 
 ## Stop
 
@@ -79,6 +83,15 @@ that's still current: a tap on an old card does nothing and brings a fresh notic
 button works. An older notice loses a button that no longer does what it says ("Turned
 back on since."). Cain has no button or command for it. While it's stopped, Cain can
 still answer you and keep the record.
+
+One red Stop is always near the bottom of your DM. It sits on the newest plain message
+from Cain or his App, one that asks nothing, and never on a card that asks something,
+so it's never next to Ship, Start, Approve or Undo. It moves down only when none of the
+last 5 messages has a Stop (the morning message and the calendar specialist's cards have
+their own), and Discord shows "(edited)" on the messages it moves between. While
+everything is stopped it comes off, and Turn back on stays near the bottom instead: on
+the morning message and the stopped notice, which is posted again when it's out of
+reach, at most once an hour or after you write.
 
 ## Ship
 
@@ -290,8 +303,9 @@ nothing is installed by this release.
   `--renew` to renew its holds with `renew` ops, at most every 6 hours.
 - `record-prepush.ts`, run by `pre-push`: refuses a push to any branch of
   HyndeSyte/harness the session doesn't hold, reading `state/holds.json` fresh from
-  the record's main. Pushes to any other repository pass through. With no session id
-  (Dane in a terminal), `git push --no-verify` skips it.
+  the record's main. Pushes to any other repository pass through, and a push from a
+  linked worktree reads the record the same way. With no session id (Dane in a
+  terminal), `git push --no-verify` skips it.
 - `record-preflight.ts <request.json> <clone>`: the keeper's checks only.
 
 The tools refuse a record clone that follows anything but the record's `main`. The

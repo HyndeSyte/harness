@@ -52,6 +52,16 @@ describe("keeper.sh against a fake link", () => {
     } finally { server.stop(true); }
   }, 30_000);
 
+  test.skipIf(!Bun.which("bash"))("selftest runs the message gate's reply hook on its own, with no key and no link", async () => {
+    const hooks = join(import.meta.dir, "../rootfs/opt/cain/hooks");
+    const p = Bun.spawn(["bash", KEEPER, "selftest"], { stdout: "pipe", stderr: "pipe",
+      env: { ...process.env, CAIN_HOOKS: hooks, CAIN_SETTINGS: join(import.meta.dir, "../rootfs/opt/cain/settings.json"),
+        CAIN_DISCORD_DIR: join(tmpdir(), "no-discord-here") } });
+    const out = JSON.parse((await new Response(p.stdout).text()).trim());
+    expect(await p.exited).toBe(0);
+    expect(out).toMatchObject({ status: "ok", said: expect.stringContaining("passed its self-test") });
+  }, 60_000);
+
   test("its link is the local one unless a test moves it, and card goes to /look (the link's /card is the specialist's)", async () => {
     const text = await Bun.file(KEEPER).text();
     expect(text).toContain('link="${CAIN_LINK:-http://127.0.0.1:8097}"');

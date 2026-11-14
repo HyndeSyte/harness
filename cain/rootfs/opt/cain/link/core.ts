@@ -40,14 +40,28 @@
 //   which installs it, needs that token.
 // - Cards as data (piece D): every message the link posts records the labels of its
 //   buttons, kept after they come off, and Cain's lines and answers name them. The link
-//   publishes the cards (no text) for the reply hook, and reads any message back from
-//   Discord for keeper.sh card.
-// - The gate, in report mode (piece D, ../gate/rules.ts): each send point logs what the
-//   rules would have done; nothing is refused or rewritten yet. The replay runs the same
-//   rules over his DM, reading only, and writes what it found to Cain's folder.
+//   publishes the cards (no text) for the reply hook, with the ids of Cain's own replies
+//   (the only messages he may edit), and reads any message back from Discord for
+//   keeper.sh card.
+// - The gate (piece D, ../gate/rules.ts), enforcing since 0.10.0. Cain's words through the
+//   link (asks and their options, Ship cards, the morning message, the connector notice):
+//   em dashes and "add-on" fixed before anything is posted, and the answer says so; a
+//   hidden count, machine text or a button the card lacks refused. The specialist's cards:
+//   fixed and posted, never refused (a refused card would be lost to him); Cain hears once
+//   what the gate flagged. Its notes after a tap, and the link's own words: fixed only.
+//   Every hit is logged. The replay runs the same rules over his DM, reading only.
+// - Stop within reach (0.10.0): one red Stop on its own row sits on the newest plain bot
+//   message (Cain's reply, or a notice of the link's, that asks nothing), never on an ask,
+//   a Ship card, a specialist's card, the connector notice, a permission prompt or the
+//   morning message. Notices carry it when posted; Cain's replies get it when the
+//   PostToolUse hook (../hooks/discord-sent.ts) says what went out. It moves only when
+//   none of the newest 5 bot messages carries a Stop, Stop first on the new message and
+//   then off the old; moves wait for a quiet channel, in the same queue as his Stop taps.
+//   While stopped it comes off, and Turn back on is kept within reach instead.
 import { createHash } from "node:crypto";
+import { asksSomething } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
-import { AT, check as gateCheck, type Context, type Hit, RULES, type Rule } from "../gate/rules";
+import { AT, check as gateCheck, type Context, fixedWhat, type Hit, RULES, type Rule, RULES_VERSION, WHY } from "../gate/rules";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import type { Facts, Landed } from "./merge";
@@ -80,6 +94,12 @@ export const CONNECTOR_LABEL = "Open connector settings";
 const CONNECTOR_ONCE_MS = 12 * 3_600_000;  // one notice about the connector per item in this long
 const REPLAY_PAGES = 60;                 // the replay reads at most this many pages of 100 messages
 const REPLAY_TRIES = 5;                  // a page Discord rate-limits is asked again this often
+const STOP_REACH = 5;                    // the moving Stop moves only when none of this many newest bot messages carries one
+const RESUME_REACH = 2;                  // while stopped, Turn back on is re-posted when it isn't on one of this many
+const QUIET_MS = 60_000;                 // moves wait this long after Discord rate-limited the link
+const MOVED = "stop moved";              // a message's Stop moved on: its buttons come off, with no line
+const REPOSTED = "moved down";           // an older Stopped notice, once a newer one carries Turn back on
+export const STILL_STOPPED = "**Still stopped.** Cain's Build and Ship jobs, Ship cards and outside reviews stay stopped, and nothing lands in main, until you tap Turn back on.";
 // Machine text he never sees on a card: a full sha, a job's session id, an ISO time.
 const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"],
   [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, "an ISO time"]];
@@ -105,11 +125,14 @@ export interface Card {
 // A card's post that began and never heard back: when (at), its buttons then (rows, as a
 // digest), who made it (the link by itself, or Cain's show) and the item it went under.
 export interface Posting { at: number; rows: string; byItself: boolean; item: string; question: string }
-export type Kind = "ask" | "ship" | "card" | "morning" | "legacy" | "notice";
+// plain (0.10.0): one of Cain's replies that holds, or held, the moving Stop.
+export type Kind = "ask" | "ship" | "card" | "morning" | "legacy" | "notice" | "plain";
 export interface Shown {
   digest: string; until: number; card?: number;
   labels?: string[];                 // its buttons' labels as last posted or edited, kept once they come off (0.9.0)
   off?: number;                      // when its buttons came off (0.9.0)
+  asks?: boolean;                    // a notice whose last line asks something: never holds the moving Stop (0.10.0)
+  gone?: boolean;                    // Discord no longer has it (a 404 putting Stop on it): never holds it again
   q?: { q: string; options: string[]; used: boolean };
   kind?: Kind;                       // absent on records from before 0.7.0 until the first sweep
   item?: string; question?: string;  // what the card is about: a PENDING id (or "none") and a question id
@@ -143,8 +166,19 @@ export interface State {
   // refused, and since when GitHub hasn't answered at all.
   key?: { checked: number; refused?: boolean; unanswered?: number; toldUnanswered?: boolean };
   replayed?: number;                 // when the gate's replay last finished: his whole range, or its page cap (0.9.0)
+  replayedRules?: number;            // the rules version that replay ran with (0.10.0; absent: 1, if it ran)
   labelled?: boolean;                // the labels of cards from before 0.9.0 were filled in, once
+  // Cain's own replies (0.10.0), 35 days: the only messages he may edit, and where the
+  // moving Stop can sit. From the PostToolUse hook, and seeded from his transcripts.
+  sent?: Record<string, SentRec>;
+  seeded?: number;                   // when his transcripts were last read for them
+  stopAt?: string;                   // the message holding the moving Stop
+  repostedAt?: number;               // while stopped: when Turn back on was last re-posted
+  hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
 }
+// last: the newest part of what he sent; asks: its last line asks something. Seeded ids
+// have neither, so they never hold the moving Stop.
+export interface SentRec { at: number; last?: boolean; asks?: boolean }
 
 export function emptyState(): State {
   // Card ids start from the clock, so a fresh state never reuses an id the
@@ -200,10 +234,11 @@ export function buttonsLine(labels: string[] | undefined): string {
 }
 
 // Whose words a message the link posted carries: Cain's asks, Ship cards and morning
-// message are his words through the link; a specialist's card is the specialist's; the
-// link's own Stop notices and notices are the link's.
+// message are his words through the link, and a reply of his that holds the moving Stop is
+// his; a specialist's card is the specialist's; the link's own Stop notices and notices
+// are the link's.
 export function writerOf(m: Shown): Writer {
-  if (m.kind === "ask" || m.kind === "ship" || m.kind === "morning") return "cain";
+  if (m.kind === "ask" || m.kind === "ship" || m.kind === "morning" || m.kind === "plain") return "cain";
   if (m.kind === "card" && m.card !== undefined) return "specialist";
   return "link";
 }
@@ -212,17 +247,19 @@ const CARDS_KEEP_MS = 2 * 86400_000;         // finished cards stay in the publi
 
 // The cards as the reply hook reads them (/cards, and /data/trust/cards.json when the
 // link doesn't answer): every message with buttons up, and every one the link posted in
-// the last 2 days or whose buttons came off since. No text.
+// the last 2 days or whose buttons came off since. No text. With them, the ids of Cain's
+// own replies from the last 35 days, the only messages he may edit.
 export function cardsView(s: State, now: number): CardsView {
   const cards: CardView[] = [];
   for (const [id, m] of Object.entries(s.messages)) {
     if (!m.buttons && (m.off ?? m.posted ?? 0) < now - CARDS_KEEP_MS) continue;
-    const linkButtons = m.kind === "notice" && (m.labels ?? []).length > 0;   // a link button is always up
+    const linkButton = m.kind === "notice" && m.question === "connector";   // a link button is always up
     cards.push({ message: id, kind: m.kind ?? "legacy", writer: writerOf(m), labels: [...(m.labels ?? [])],
-      live: linkButtons || live(m, now), item: m.item ?? null, question: m.question || null, posted: m.posted ?? null });
+      live: linkButton || live(m, now), item: m.item ?? null, question: m.question || null, posted: m.posted ?? null });
   }
   cards.sort((a, b) => (a.posted ?? 0) - (b.posted ?? 0));
-  return { written_at: now, owner: s.owner ?? null, dm: s.dm ?? null, cards };
+  const sent = Object.entries(s.sent ?? {}).filter(([, r]) => r.at > now - REMEMBER_MS).map(([id]) => id);
+  return { written_at: now, owner: s.owner ?? null, dm: s.dm ?? null, cards, sent };
 }
 
 // The link's outcome and landing lines, taken off the end of a card's words.
@@ -368,11 +405,12 @@ const boundItem = (m: Shown): string => (m.kind !== "card" && m.item && m.item !
 const about = (item?: string, question?: string) =>
   item && item !== "none" ? `${item}${question ? ` ${question}` : ""}` : "";
 
-// What the card says once its buttons are off. A morning message asked nothing: its
-// Stop just goes.
+// What the card says once its buttons are off. A morning message, a notice and a plain
+// message asked nothing: their Stop just goes, and so does an older Stopped notice's
+// Turn back on once a newer notice carries it.
 function outcomeLine(m: Shown | undefined): string {
   if (!m) return EXPIRED;
-  if (m.kind === "morning") return "";
+  if (m.kind === "morning" || m.kind === "notice" || m.kind === "plain" || m.why === MOVED || m.why === REPOSTED) return "";
   if (m.outcome === "answered") return m.label ? `You answered: ${m.label}` : m.words ? "You answered in a message" : "Answered";
   // An older Stop notice, once a newer one carries the button that counts.
   if (m.outcome === "replaced" && m.why === TURNED_ON) return "Turned back on since.";
@@ -443,7 +481,7 @@ export interface Deps {
   facts?: (pr: string) => Promise<Facts | null>;                   // what GitHub says the pull request changes
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
-  // The gate in report mode (piece D): what the rules would have done at a send point.
+  // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
   // The replay: Cain's own replies and edits as his transcripts have them (since a time),
   // where its report goes, and the pause between pages of his DM (tests: 0).
@@ -452,13 +490,15 @@ export interface Deps {
   replayPauseMs?: number;
 }
 
-// One send point's hits, for the gate's report log.
-export interface GateReport { point: string; writer: Writer | "unknown"; message?: string; hits: Hit[] }
+// One send point's hits, for the gate's log, and what was done: "fixed" (and posted),
+// "refused" (nothing posted), "posted as it is" (a specialist's card, never refused).
+export interface GateReport { point: string; writer: Writer | "unknown"; message?: string; hits: Hit[]; did?: string }
 // What Cain's transcripts say he sent with his plugin: message ids, and the exact texts.
 export interface Sent { ids: Set<string>; texts: Set<string> }
 type Tally = Record<string, Record<string, number>>;   // rule -> result -> count
 export interface ReplayReport {
   written_at: number;
+  rules_version: number;
   // capped: it read its most pages before the start of the range, so the oldest part wasn't read.
   range: { from: number; to: number; days: number; pages: number; page_cap: number; reached_cutoff: boolean; capped: boolean; stopped: string | null };
   messages: { read: number; by_writer: Record<string, number>; skipped: Record<string, number>; cards_never_posted: number };
@@ -500,7 +540,37 @@ export function clockTime(ms: number, tz = "America/New_York"): string {
   return new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(new Date(ms));
 }
 
-export type AskResult = { status: "posted"; message: string } | { status: "held"; said: string };
+export type AskResult = { status: "posted"; message: string; said?: string } | { status: "held"; said: string };
+
+// Why the gate held words back, for Cain: what to change, and the buttons this has.
+function heldLine(what: string, hits: Hit[], buttons?: readonly string[]): string {
+  const parts = hits.map((h) => h.rule === "button" && h.label
+    ? `"${h.label}" isn't one of its buttons (${buttons?.length ? buttons.join(", ") : "it has none"})`
+    : `"${h.around}": ${WHY[h.rule]}`);
+  return `The message gate held this ${what}: ${parts.join("; ")}. Rewrite it and send it again.`;
+}
+// What the gate flagged in a specialist's words, for Cain (its card goes out all the same).
+function flaggedLine(hits: Hit[]): string {
+  return hits.map((h) => h.rule === "button" && h.label ? `"${h.label}" isn't one of its buttons` : `"${h.around}" (${WHY[h.rule]})`).join("; ");
+}
+const fixedSaid = (hits: Hit[]) => (hits.length ? `The message gate fixed its wording first: ${fixedWhat(hits)}.` : "");
+
+// What the safety net (../hooks/discord-sent.ts) found in something of Cain's that went out.
+function netLine(tool: string, id: string, net: { hits: any[]; released?: boolean; fixed?: string }): string {
+  const what = net.hits.slice(0, 4).map((h: any) => `"${String(h?.around ?? "").slice(0, 60)}" (${WHY[h?.rule as Rule] ?? "a message rule"})`).join("; ");
+  const kind = tool === "edit" ? "edit" : "reply";
+  if (net.released)
+    return `Your ${kind} (Discord message ${id}) went out as it was after the message gate held it twice${what ? `: ${what}` : ""}. If what it held still matters, fix it with an edit (edit_message); don't mention the gate to him.`;
+  return `The message gate should have held your ${kind} (Discord message ${id}), but it went out: ${what}. Fix it now with an edit (edit_message), and don't mention it to him; it's logged for a fix.${net.fixed ? ` Fixed, it reads: ${String(net.fixed).slice(0, 600)}` : ""}`;
+}
+
+// What the link appended to a specialist's Stop or Turn back on notice: its own words.
+const LINK_LINES = () => [STOPPED_TOO, RESUMED_TOO, STOP_UNSAVED, RESUME_UNSAVED];
+export function splitLinkLine(text: string): [string, string] {
+  const t = String(text ?? "");
+  for (const line of LINK_LINES()) if (t.endsWith(`\n\n${line}`)) return [t.slice(0, -(line.length + 2)), line];
+  return [t, ""];
+}
 // A specialist's card put up: its message, whether this call recorded it, and whether the
 // link made it by itself (not Cain's show).
 type Put = { message: string; first: boolean; fromLink?: boolean };
@@ -511,18 +581,54 @@ export class Link {
   private headChecked = new Map<string, number>();
   private going = new Map<number, Promise<Put>>();   // cards being put up now (putUp)
   private cainWaits = new Set<number>();             // cards Cain's show waits on now: a lapse found meanwhile is his to hear
-  constructor(private d: Deps) {}
+  private limitedAt = -Infinity;                     // when Discord last rate-limited the link
+  private rest: Rest;
+  constructor(private d: Deps) {
+    // Every call to Discord, noting a rate limit: the moving Stop waits a minute after one.
+    this.rest = async (...a) => {
+      try { return await d.rest(...a); }
+      catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
+    };
+  }
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
 
-  // -- the gate, in report mode (../gate/rules.ts) ---------------------------------------
-  // What the rules would have done with words about to go out, logged; never in the way.
-  private gate(point: string, writer: Writer, text: string, ctx: Context, message?: string): void {
-    if (!this.d.report) return;
+  // -- the gate (../gate/rules.ts) -----------------------------------------------------
+  // The rules for a send point, on words about to go out: every hit is logged, dash and
+  // app hits come back fixed, and the refusals come back for the caller to act on. A rule
+  // that fails lets the words go as they are.
+  private words(point: string, writer: Writer, text: string, ctx: Context, message?: string):
+      { text: string; refused: Hit[]; fixed: Hit[]; hits: Hit[] } {
+    const t = String(text ?? "");
     try {
-      const r = gateCheck(String(text ?? ""), ctx);
-      if (r.hits.length) this.d.report({ point, writer, ...(message ? { message } : {}), hits: r.hits });
-    } catch (e) { this.log(`the gate's report failed: ${String(e).slice(0, 80)}`); }
+      const r = gateCheck(t, ctx);
+      return { text: r.fixed, hits: r.hits, fixed: r.hits.filter((h) => h.result === "fix"),
+        refused: r.hits.filter((h) => h.result === "refuse" || h.result === "unsure") };
+    } catch (e) {
+      this.log(`the gate failed on a ${point}: ${String(e).slice(0, 80)}`);
+      return { text: t, hits: [], fixed: [], refused: [] };
+    }
+  }
+  private report(point: string, writer: Writer, hits: Hit[], did: string, message?: string): void {
+    if (!hits.length || !this.d.report) return;
+    try { this.d.report({ point, writer, ...(message ? { message } : {}), hits, did }); }
+    catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
+  }
+  // Cain's words through the link: fixed, or refused with what to change.
+  private cainWords(point: string, what: string, text: string, ctx: Context): { text: string; fixed: Hit[] } {
+    const w = this.words(point, "cain", text, ctx);
+    if (w.refused.length) {
+      this.report(point, "cain", w.hits, "refused");
+      throw new Refusal(heldLine(what, w.refused, ctx.buttons ?? undefined));
+    }
+    this.report(point, "cain", w.hits, "fixed");
+    return w;
+  }
+  // The link's own words, and the specialist's notes after a tap: fixed only.
+  private ownWords(point: string, writer: Writer, text: string, message?: string): string {
+    const w = this.words(point, writer, text, { rules: writer === "specialist" ? AT.answer : AT.link });
+    this.report(point, writer, w.hits, "fixed", message);
+    return w.text;
   }
 
   // Labels on the cards whose buttons are up and count now.
@@ -533,15 +639,15 @@ export class Link {
   // The cards now, as the reply hook reads them (GET /cards).
   cardsNow(): CardsView { return cardsView(this.d.load(), this.d.now()); }
 
-  // keeper.sh check: what the gate would do with a reply or an edit of Cain's, against the
-  // cards up now. Sends nothing, logs nothing.
+  // keeper.sh check: what the gate does with a reply or an edit of Cain's, against the cards
+  // up now (the reply hook's decision, less its third try). Sends nothing, logs nothing.
   checkSend(a: { text?: unknown; replyTo?: unknown; edit?: unknown }): Decision & { status: "ok" } {
     const text = String(a.text ?? "");
     if (!text.trim()) throw new Refusal("needs the text to check");
     const id = (v: unknown) => (v === undefined || v === null || v === "" ? undefined : String(v).trim());
     const replyTo = id(a.replyTo), target = id(a.edit);
     for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
-    const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(), this.d.tz);
+    const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(), { tz: this.d.tz });
     return { status: "ok", ...d };
   }
 
@@ -572,6 +678,9 @@ export class Link {
     this.stopUnsaved = !saved;
     this.changed = { kind: stopped ? "stopped" : "resumed", at: this.d.now() };
     this.log(stopped ? "Dane tapped Stop: everything is stopped" : "Dane turned everything back on");
+    // In the moving Stop's queue: a move under way finishes first, then this one reads the
+    // new state (stopped: the moving Stop comes off; back on: it returns).
+    void this.inStopQueue(() => this.placeStop());
     if (!saved) {
       this.d.relay(stopped
         ? "Dane tapped Stop, but it couldn't be saved, so your Build and Ship runs and review sends may not be held. The link still refuses Ship cards and won't sign a Ship tap. Run nothing until it's saved; his notice says so. Log it as a Build item."
@@ -617,12 +726,12 @@ export class Link {
   async identity(): Promise<{ owner: string; dm: string; bot: string }> {
     const s = this.d.load();
     if (s.owner && s.dm && s.bot) return { owner: s.owner, dm: s.dm, bot: s.bot };
-    const app = await this.d.rest("GET", "/oauth2/applications/@me");
+    const app = await this.rest("GET", "/oauth2/applications/@me");
     const owner = String(app?.team?.owner_user_id ?? app?.owner?.id ?? "");
-    const me = await this.d.rest("GET", "/users/@me");
+    const me = await this.rest("GET", "/users/@me");
     const bot = String(me?.id ?? "");
     if (!owner || !bot) throw new Error("Discord didn't say whose bot this is");
-    const ch = await this.d.rest("POST", "/users/@me/channels", { recipient_id: owner });
+    const ch = await this.rest("POST", "/users/@me/channels", { recipient_id: owner });
     const dm = String(ch?.id ?? "");
     if (!dm) throw new Error("no DM channel");
     const s2 = this.d.load();
@@ -657,8 +766,8 @@ export class Link {
     // An answer to a tap or a message is a Discord reply to it.
     if (opts.replyTo) body.message_reference = { message_id: opts.replyTo, channel_id: dm, fail_if_not_exists: false };
     if (opts.nonce) Object.assign(body, { nonce: opts.nonce, enforce_nonce: true });
-    const msg = opts.timeoutMs === undefined ? await this.d.rest("POST", `/channels/${dm}/messages`, body)
-      : await this.d.rest("POST", `/channels/${dm}/messages`, body, true, opts.timeoutMs);
+    const msg = opts.timeoutMs === undefined ? await this.rest("POST", `/channels/${dm}/messages`, body)
+      : await this.rest("POST", `/channels/${dm}/messages`, body, true, opts.timeoutMs);
     if (!msg?.id) throw new Error("no message returned");
     return msg;
   }
@@ -711,10 +820,15 @@ export class Link {
     const kind = String(c.kind ?? "reply");
     const comps = (c.rows ?? []).filter((r: any) => (r.components ?? []).every((b: any) =>
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
+    // The specialist's words: em dashes and "add-on" fixed, and stored that way, so the card
+    // posted is exactly the card kept. Never refused: its outbox takes a refusal as dead,
+    // and an approval or an Undo would be lost to him. What else the gate flags, Cain hears.
+    const w = this.words("card", "specialist", String(c.text ?? ""), { rules: AT.card, buttons: labelsOf(comps), known: this.liveLabels() });
+    this.report("card", "specialist", w.hits, w.refused.length ? "posted as it is" : "fixed");
     // The specialist's Stop and Turn back on notices also say what that did on Cain's
-    // side, from what's true now.
-    const line = kind === "stopped" || kind === "resumed" ? this.stopLine(kind) : "";
-    if (line) c = { ...c, text: `${String(c.text ?? "").trimEnd()}\n\n${line}` };
+    // side, from what's true now: the link's own words.
+    const line = kind === "stopped" || kind === "resumed" ? this.ownWords("card", "link", this.stopLine(kind)) : "";
+    const text = line ? `${w.text.trimEnd()}\n\n${line}` : w.text;
     const s = this.d.load();
     const id = s.next++;
     const now = this.d.now();
@@ -723,21 +837,19 @@ export class Link {
     const expires = toMs(c.expires);
     if (expires === null && c.expires != null && c.expires !== "")
       this.log(`card ${id}: its expiry isn't a time (${String(c.expires).slice(0, 40)}), so it has none`);
-    s.cards[String(id)] = { text: String(c.text ?? ""), rows: comps, kind, created: now, shown: null, expires, due };
+    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due };
     for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
     this.d.save(s);
-    // The gate's report: the specialist's words with its own buttons; the link's added line
-    // with the link's rules.
-    const own = line ? String(c.text ?? "").slice(0, -(line.length + 2)) : String(c.text ?? "");
-    this.gate("card", "specialist", own, { rules: AT.card, buttons: labelsOf(comps), known: this.liveLabels(s, now) });
-    if (line) this.gate("card", "link", line, { rules: AT.link });
+    const flagged = w.refused.length ? flaggedLine(w.refused) : "";
     if (DIRECT_KINDS.has(kind)) {
       const shown = await this.show(id, { item: "none" });
       if (shown && (kind === "stopped" || kind === "resumed")) await this.retireToggles(shown);
+      if (flagged) this.d.relay(`The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`);
     } else {
       const ask = due !== null ? "It has buttons: show it now, or it goes out by itself in about 2 minutes."
         : "Show it now if it matters today, or fold it into the morning message.";
-      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(c.text, 120)}". ${buttonsLine(labelsOf(comps))} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
+      const flag = flagged ? ` The message gate flags its words: ${flagged}. It goes out as it is; if it matters, set it right in one line of your own after it.` : "";
+      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(text, 120)}". ${buttonsLine(labelsOf(comps))}${flag} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
     }
     return id;
   }
@@ -835,7 +947,7 @@ export class Link {
     if (rows && digest("", rows) !== digest("", msg.components)) {
       try {
         const { dm } = await this.identity();
-        msg = (await this.d.rest("PATCH", `/channels/${dm}/messages/${msg.id}`, { components: rows, allowed_mentions: { parse: [] } })) ?? msg;
+        msg = (await this.rest("PATCH", `/channels/${dm}/messages/${msg.id}`, { components: rows, allowed_mentions: { parse: [] } })) ?? msg;
       } catch (e) { this.log(`couldn't bring card ${id}'s buttons up to date: ${reason(e)}`); }
     }
     const s2 = this.d.load();
@@ -871,7 +983,7 @@ export class Link {
     const from = mark.at - 60_000;
     let before = "";
     for (let page = 0; page < HISTORY_PAGES; page++) {
-      const batch = await this.d.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`);
+      const batch = await this.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`);
       if (!Array.isArray(batch) || !batch.length) return null;
       for (const m of batch) {
         const id = String(m?.id ?? "");
@@ -919,7 +1031,7 @@ export class Link {
       return;
     }
     const { dm } = await this.identity();
-    const msg = await this.d.rest("PATCH", `/channels/${dm}/messages/${card.shown}`,
+    const msg = await this.rest("PATCH", `/channels/${dm}/messages/${card.shown}`,
       { components: comps, allowed_mentions: { parse: [] } });
     const s2 = this.d.load();
     if (s2.cards[String(id)]) s2.cards[String(id)].rows = comps;
@@ -947,7 +1059,7 @@ export class Link {
     if (!SNOWFLAKE.test(id)) throw new Refusal("needs a Discord message id");
     const { owner, dm, bot } = await this.identity();
     let msg: any;
-    try { msg = await this.d.rest("GET", `/channels/${dm}/messages/${id}`); }
+    try { msg = await this.rest("GET", `/channels/${dm}/messages/${id}`); }
     catch (e) {
       if (/discord 404/.test(String(e))) throw new Refusal("no message with that id in his DM");
       throw e;
@@ -961,14 +1073,19 @@ export class Link {
   }
 
   // -- the mutual watch (watch.ts): a plain notice, straight to his DM ---------------
+  // It carries the moving Stop when it's posted (unless things are stopped, or it asks
+  // something), and the message that held it before loses it at the next quiet moment.
   async notice(text: string, timeoutMs?: number): Promise<string> {
-    this.gate("notice", "link", text, { rules: AT.link });
-    const msg = await this.post(text, [], { timeoutMs });
+    const words = this.ownWords("notice", "link", text);
+    const asking = asksSomething(words);
+    const stop = !asking && !this.stopped().stopped;
+    const msg = await this.post(words, stop ? rows([[["Stop", STOP]]]) : [], { timeoutMs });
     try {
       const s = this.d.load();
-      // No buttons, said outright: a reply to it naming one is judged against none, never unknown.
-      this.remember(s, msg, { kind: "notice", item: "none", question: "notice", posted: this.d.now(), expires: null, buttons: false,
-        labels: [] });
+      // Its buttons, said outright: a reply to it naming another is judged against these, never unknown.
+      this.remember(s, msg, { kind: "notice", item: "none", question: "notice", posted: this.d.now(), expires: null, buttons: stop,
+        labels: stop ? ["Stop"] : [], ...(asking ? { asks: true } : {}) });
+      if (stop) this.takeStop(s, String(msg.id));
       this.d.save(s);
     } catch (e) { this.log(`couldn't record a notice: ${String(e).slice(0, 80)}`); }
     return String(msg.id);
@@ -989,18 +1106,18 @@ export class Link {
       && (m.item ?? "none") === meta.item && (m.posted ?? 0) > now - CONNECTOR_ONCE_MS);
     if (prior) return { status: "already told", message: prior[0],
       said: "He already has the notice about Home Assistant's connector; nothing more was posted. Check Home Assistant again at each cloud job check, and go ahead once it answers." };
-    this.gate("connector", "cain", waits, { rules: AT.cain, buttons: [CONNECTOR_LABEL], known: this.liveLabels() });
-    const text = withLabel(`${waits} waits until Claude can reach Home Assistant again: its connector needs you to sign in again. `
+    const w = this.cainWords("connector", "notice", waits, { rules: AT.cain, buttons: [CONNECTOR_LABEL], known: this.liveLabels() });
+    const text = withLabel(`${w.text} waits until Claude can reach Home Assistant again: its connector needs you to sign in again. `
       + "Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.",
       labelOf(meta.item));
     const comps = [{ type: 1, components: [{ type: 2, style: 5, label: CONNECTOR_LABEL, url: CONNECTOR_URL }] }];
-    const msg = await this.post(text, comps, { nonce: stableNonce("connector", meta.item, waits) });
+    const msg = await this.post(text, comps, { nonce: stableNonce("connector", meta.item, w.text) });
     const s = this.d.load();
     this.remember(s, msg, { kind: "notice", item: meta.item, question: "connector", posted: now, expires: null, buttons: false,
       labels: [CONNECTOR_LABEL] });
     this.d.save(s);
     return { status: "posted", message: String(msg.id),
-      said: "Posted. Write /data/jobs/connector-<item> as the Cloud jobs section says, and check Home Assistant again at each cloud job check." };
+      said: `Posted.${w.fixed.length ? ` ${fixedSaid(w.fixed)}` : ""} Write /data/jobs/connector-<item> as the Cloud jobs section says, and check Home Assistant again at each cloud job check.` };
   }
 
   // -- Cain's own words with buttons ----------------------------------------------
@@ -1011,19 +1128,24 @@ export class Link {
 
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
     const meta = checkMeta(a);
-    const opts = (a.options ?? []).map((o) => String(o).trim()).filter(Boolean).slice(0, 5);
+    const raw = (a.options ?? []).map((o) => String(o).trim()).filter(Boolean).slice(0, 5);
     if (!String(a.text ?? "").trim()) throw new Refusal("an ask needs its question");
-    if (!opts.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
-    noMachineText(String(a.text), ...opts);
-    const text = withLabel(String(a.text), labelOf(meta.item, meta.question));   // "P08 Q2: ..."
+    if (!raw.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
+    noMachineText(String(a.text), ...raw);
+    // The gate, before the nonce is made: the same words always make the same card.
+    const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }));
+    const w = this.cainWords("ask", "ask", String(a.text), { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() });
+    const options = opts.map((o) => o.text);
+    const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
+    const text = withLabel(w.text, labelOf(meta.item, meta.question));   // "P08 Q2: ..."
     this.mayAsk(meta.item);
     return this.serial(async () => {
       const now = this.d.now();
       const s = this.d.load();
       const key = keyOf(meta.item, meta.question);
-      const entry: Ask = { text, options: opts, item: meta.item, question: meta.question, replyTo: meta.replyTo,
+      const entry: Ask = { text, options, item: meta.item, question: meta.question, replyTo: meta.replyTo,
         at: now, expires: this.askExpiry(now),
-        nonce: stableNonce("ask", meta.item, meta.question, text, opts.join("\u0001"), meta.replyTo ?? "") };
+        nonce: stableNonce("ask", meta.item, meta.question, text, options.join("\u0001"), meta.replyTo ?? "") };
       const open = this.openAsk(s, now);
       if (open && !(key && keyFor(open[1]) === key)) {
         const held = s.held ?? (s.held = []);
@@ -1031,21 +1153,22 @@ export class Link {
         if (same >= 0) held[same] = entry; else held.push(entry);
         this.d.save(s);
         const which = about(open[1].item, open[1].question) || `"${excerpt(open[1].q?.q ?? "", 60)}"`;
-        return { status: "held", said: `Not asked yet: your question ${which} is still open. This one goes out by itself when that one is answered or expires, and you'll be told when it does.` };
+        return { status: "held", said: `Not asked yet: your question ${which} is still open. This one goes out by itself when that one is answered or expires, and you'll be told when it does.${fixed ? ` ${fixed}` : ""}` };
       }
-      return { status: "posted", message: await this.postAsk(entry) };
+      return { status: "posted", message: await this.postAsk(entry), ...(fixed ? { said: `Posted. ${fixed}` } : {}) };
     });
   }
 
   private async postAsk(e: Ask): Promise<string> {
     const nonce = e.nonce ?? stableNonce("ask", e.item, e.question, e.text, e.options.join("\u0001"), e.replyTo ?? "");
-    this.gate("ask", "cain", e.text, { rules: AT.cain, buttons: e.options, known: this.liveLabels() });
-    for (const o of e.options) this.gate("ask option", "cain", o, { rules: ["dash", "app", "count", "machine"] });
-    const msg = await this.postCard(e.text, rows([e.options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
+    // Checked when it was asked; one held since before 0.10.0 gets the fixes now.
+    const text = this.words("ask", "cain", e.text, { rules: ["dash", "app"] }).text;
+    const options = e.options.map((o) => this.words("ask option", "cain", o, { rules: ["dash", "app"] }).text);
+    const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
       { replyTo: e.replyTo, nonce });
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
-      buttons: true, labels: [...e.options], q: { q: excerpt(e.text), options: e.options, used: false } });
+      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -1069,16 +1192,16 @@ export class Link {
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(String(a.text));
     this.mayAsk(meta.item);
-    this.gate("ship", "cain", String(a.text), { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() });
+    const w = this.cainWords("ship", "Ship card", String(a.text), { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() });
     // A line of the link's own, from GitHub: what the tap would land, whatever the
     // card's words say.
-    let words = String(a.text);
+    let words = w.text;
     if (this.d.facts) {
       const f = await within(this.d.facts(pr).catch(() => null), this.d.factsMs ?? FACTS_MS);
       if (f?.head && f.head !== head)
         throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
       // Cain's words give way, so the line is never cut off.
-      const line = factsLine(f), room = LIMIT - line.length - 40;
+      const line = this.ownWords("ship facts", "link", factsLine(f)), room = LIMIT - line.length - 40;
       const own = words.trimEnd();
       words = `${own.length <= room ? own : own.slice(0, room - 2).trimEnd() + " …"}\n${line}`;
     }
@@ -1094,24 +1217,27 @@ export class Link {
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
-    return { status: "posted", message: String(msg.id) };
+    return { status: "posted", message: String(msg.id), ...(w.fixed.length ? { said: `Posted. ${fixedSaid(w.fixed)}` } : {}) };
   }
 
   // The one morning message, with Stop. Its Stop moves to the newest morning message.
-  async morning(text: string): Promise<string> {
+  async morning(text: string): Promise<string> { return (await this.morningPost(text)).message; }
+
+  // The same, with what the gate fixed (POST /morning).
+  async morningPost(text: string): Promise<{ message: string; said?: string }> {
     if (!String(text ?? "").trim()) throw new Refusal("the morning message needs its text");
     noMachineText(String(text));
     // While stopped, its button is the one that undoes it.
     const toggle: [string, string] = this.stopped().stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
-    this.gate("morning", "cain", String(text), { rules: AT.cain, buttons: [toggle[0]], known: this.liveLabels() });
-    const msg = await this.postCard(String(text), rows([[toggle]], "q:"), { nonce: stableNonce("morning", String(text), toggle[1]) });
+    const w = this.cainWords("morning", "morning message", String(text), { rules: AT.cain, buttons: [toggle[0]], known: this.liveLabels() });
+    const msg = await this.postCard(w.text, rows([[toggle]], "q:"), { nonce: stableNonce("morning", w.text, toggle[1]) });
     const s = this.d.load();
     this.remember(s, msg, { kind: "morning", item: "none", question: "morning", posted: this.d.now(), expires: null, buttons: true,
       labels: [toggle[0]] });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
-    return String(msg.id);
+    return { message: String(msg.id), ...(w.fixed.length ? { said: `Posted. ${fixedSaid(w.fixed)}` } : {}) };
   }
 
   // He answered an open ask in words: its buttons come off, and the next one goes out.
@@ -1147,7 +1273,7 @@ export class Link {
     const id = String(messageId ?? "").trim();
     if (!SNOWFLAKE.test(id)) throw new Refusal("needs his message's id (message_id in its tag)");
     const { owner, dm } = await this.identity();
-    const msg = await this.d.rest("GET", `/channels/${dm}/messages/${id}`);
+    const msg = await this.rest("GET", `/channels/${dm}/messages/${id}`);
     if (String(msg?.author?.id ?? "") !== owner) throw new Refusal("that isn't one of his messages in your DM");
     const ref = msg?.message_reference;
     if (!ref?.message_id || Number(ref.type ?? 0) !== 0) return { status: "ok", reply_to: null, said: "Not a reply to anything: read it on its own." };
@@ -1173,7 +1299,7 @@ export class Link {
 
   private async answer(it: any, kind: number, data?: unknown): Promise<boolean> {
     try {
-      await this.d.rest("POST", `/interactions/${it.id}/${it.token}/callback`, data ? { type: kind, data } : { type: kind }, false);
+      await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, data ? { type: kind, data } : { type: kind }, false);
       return true;
     } catch (e) {
       this.log(`couldn't answer a tap in time: ${String(e).slice(0, 80)}`);
@@ -1183,7 +1309,7 @@ export class Link {
 
   private async ephemeral(it: any, text: string): Promise<void> {
     try {
-      await this.d.rest("POST", `/webhooks/${String(it.application_id ?? "")}/${it.token}`,
+      await this.rest("POST", `/webhooks/${String(it.application_id ?? "")}/${it.token}`,
         { content: text, flags: EPHEMERAL, allowed_mentions: { parse: [] } }, false);
     } catch (e) { this.log(`couldn't tell him a card was dead: ${String(e).slice(0, 80)}`); }
   }
@@ -1264,9 +1390,12 @@ export class Link {
     // stopped he gets a fresh notice whose button works.
     if (cid === RESUME) {
       const changed = !!rec && !rec.outcome && digest(it.message.content ?? "", it.message.components) !== rec.digest;
-      if (!rec || rec.outcome || changed) {
+      // And only from a message whose labels include it: never one holding the moving Stop.
+      const carries = !!rec && !!rec.buttons && (rec.labels ?? []).includes("Turn back on");
+      if (!rec || rec.outcome || changed || !carries) {
         let out: string;
         if (changed) { await this.answer(it, ACK); out = "refused: card was changed after it was posted"; }
+        else if (rec && !rec.outcome) { await this.answer(it, ACK); out = "refused: that message doesn't carry Turn back on"; }
         else out = await this.deadTap(it, msgId, rec ? (rec.why ?? rec.outcome ?? "done") : "not a card the link knows");
         this.log(`Turn back on refused (${out}); nothing changed`);
         if (this.stopped().stopped) await this.postToggle(`**Still stopped.** That button was on an old or changed card, so nothing changed. ${this.stopLine("stopped")}`.trim(), true);
@@ -1325,7 +1454,7 @@ export class Link {
     for (const id of ids) {
       try {
         const { dm } = await this.identity();
-        const msg = await this.d.rest("PATCH", `/channels/${dm}/messages/${id}`, { components: comps });
+        const msg = await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { components: comps });
         const s = this.d.load();
         if (s.messages[id]) {
           s.messages[id].digest = digest(String(msg?.content ?? ""), msg?.components ?? comps);
@@ -1351,17 +1480,23 @@ export class Link {
 
   // A notice from the link with the one button that undoes where things stand,
   // recorded so his tap on it counts.
-  private async postToggle(text: string, stopped: boolean): Promise<void> {
+  // repost: the same notice brought down to keep Turn back on within reach while stopped;
+  // the link's older ones lose theirs, with no line (nothing happened to them).
+  private async postToggle(text: string, stopped: boolean, repost = false): Promise<void> {
     try {
       const button: [string, string] = stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
-      const words = text.replace(/\s{2,}/g, " ");
-      this.gate("stop notice", "link", words, { rules: AT.link });
+      const words = this.ownWords("stop notice", "link", text.replace(/\s{2,}/g, " "));
       const msg = await this.post(words, rows([[button]], "q:"));
       const s = this.d.load();
       this.remember(s, msg, { kind: "card", item: "none", question: "stop", posted: this.d.now(), expires: null, buttons: true,
         toggle: button[1], labels: [button[0]] });
+      if (stopped) s.repostedAt = this.d.now();
+      const older: string[] = [];
+      if (repost) for (const [id, m] of Object.entries(s.messages))
+        if (id !== String(msg.id) && m.toggle === RESUME && m.buttons && !m.outcome) { m.outcome = "replaced"; m.why = REPOSTED; older.push(id); }
       this.d.save(s);
       await this.retireToggles(String(msg.id));
+      await this.stripAll(older);
     } catch (e) { this.log(`couldn't post the Stop notice: ${String(e).slice(0, 80)}`); }
   }
 
@@ -1383,6 +1518,177 @@ export class Link {
     if (!old.length) return;
     this.d.save(s);
     await this.stripAll(old);
+  }
+
+  // -- Stop within reach (0.10.0) -----------------------------------------------------
+  // One moving Stop on the newest plain message: Cain's reply, or a notice of the link's,
+  // whose last line asks nothing. Never an ask, a Ship card, a specialist's card, the
+  // connector notice, a Stop notice, a permission prompt or the morning message. It moves
+  // only when none of the newest 5 bot messages carries a Stop (the specialist's Stop rows
+  // and the morning message count), Stop first on the new message and then off the old, in
+  // one queue with his Stop taps, and only when Discord is quiet: no card's outcome edit
+  // waiting, no rate limit in the last minute. A strip that fails is tried again by the
+  // sweep, and an old Stop keeps working meanwhile. Each move edits buttons alone, which
+  // Discord marks "(edited)". The plugin's text edits leave a message's buttons alone
+  // (discord.js edit(text) sends only the content), so Cain editing the message that
+  // holds it changes nothing here, unless the edit makes it ask something.
+  private stopChain: Promise<void> = Promise.resolve();
+  private inStopQueue(job: () => Promise<void>): Promise<void> {
+    const run = this.stopChain.then(job).catch((e) => this.log(`couldn't keep Stop within reach: ${reason(e)}`));
+    this.stopChain = run;
+    return run;
+  }
+  whenStopPlaced(): Promise<void> { return this.stopChain; }   // for the tests
+
+  // What Cain just sent with his plugin (POST /sent, from the PostToolUse hook): its ids go
+  // on his edit allowlist, the moving Stop follows, and what the safety net found reaches him.
+  async sent(n: any): Promise<{ status: "ok"; said: string }> {
+    const ids: string[] = (Array.isArray(n?.ids) ? n.ids : []).map(String).filter((x: string) => SNOWFLAKE.test(x)).slice(0, 10);
+    if (!ids.length) throw new Refusal("needs the ids of what went out");
+    const tool = n?.tool === "edit" ? "edit" : "reply";
+    const asking = n?.question === true;
+    const now = this.d.now();
+    const s = this.d.load();
+    const sent = s.sent ?? (s.sent = {});
+    if (tool === "reply") ids.forEach((id, i) => { sent[id] = { at: snowflakeTime(id) || now, last: i === ids.length - 1, asks: asking }; });
+    else { const id = ids[ids.length - 1]; sent[id] = { ...(sent[id] ?? { at: snowflakeTime(id) || now }), asks: asking }; }
+    for (const [id, r] of Object.entries(sent)) if (r.at <= now - REMEMBER_MS) delete sent[id];
+    // A reply to a message that is neither the link's nor Cain's: one of his, so he wrote then.
+    const replyTo = typeof n?.reply_to === "string" && SNOWFLAKE.test(n.reply_to) ? n.reply_to : "";
+    if (replyTo && !s.messages[replyTo] && !sent[replyTo]) s.hisAt = Math.max(s.hisAt ?? 0, snowflakeTime(replyTo));
+    this.d.save(s);
+    const net = n?.net && typeof n.net === "object" ? { ...n.net, hits: Array.isArray(n.net.hits) ? n.net.hits : [] } : null;
+    if (net && (net.released === true || net.hits.length)) this.d.relay(netLine(tool, ids[ids.length - 1], net));
+    await this.inStopQueue(() => this.placeStop());
+    return { status: "ok", said: "Noted." };
+  }
+
+  // Cain's replies from his transcripts (at start, and every few hours): his edit allowlist.
+  // Whether each one asks something isn't known, so none of them holds the moving Stop.
+  seedSent(ids: Iterable<string>): number {
+    const now = this.d.now();
+    const s = this.d.load();
+    const sent = s.sent ?? (s.sent = {});
+    let added = 0;
+    for (const id of ids) {
+      const at = SNOWFLAKE.test(id) && !sent[id] ? snowflakeTime(id) : 0;
+      if (!at || at <= now - REMEMBER_MS) continue;
+      sent[id] = { at };
+      added++;
+    }
+    s.seeded = now;
+    this.d.save(s);
+    return added;
+  }
+
+  // A message the link just posted carrying Stop: it holds it now, and the one before loses
+  // it at the next quiet moment (its strip is due).
+  private takeStop(s: State, id: string): void {
+    const old = s.stopAt;
+    s.stopAt = id;
+    const m = old && old !== id ? s.messages[old] : undefined;
+    if (m?.buttons && !m.outcome) { m.outcome = "replaced"; m.why = MOVED; }
+  }
+
+  // The bot's messages the link knows of, newest first: its own posts and Cain's replies.
+  private newestBot(s: State, n: number): string[] {
+    const ids = new Set<string>(Object.keys(s.sent ?? {}));
+    for (const [id, m] of Object.entries(s.messages)) if (m.kind && m.kind !== "legacy") ids.add(id);
+    return [...ids].filter((id) => SNOWFLAKE.test(id)).sort((a, b) => (newerId(a, b) ? -1 : 1)).slice(0, n);
+  }
+
+  private carries(s: State, id: string, label: string): boolean {
+    const m = s.messages[id];
+    return !!m?.buttons && !m.outcome && (m.labels ?? []).includes(label);
+  }
+
+  // Where the moving Stop may sit (above): Cain's reply whose newest part asks nothing, or a
+  // notice of the link's own that asks nothing.
+  private plainOk(s: State, id: string): boolean {
+    const m = s.messages[id];
+    if (m?.gone) return false;
+    if (m && m.kind === "notice") return m.question === "notice" && !m.asks;
+    if (m && m.kind !== "plain") return false;
+    const r = s.sent?.[id];
+    return !!r && r.last === true && r.asks === false;
+  }
+
+  private newestPlain(s: State): string | null {
+    for (const id of this.newestBot(s, Infinity)) if (this.plainOk(s, id)) return id;
+    return null;
+  }
+
+  // Stop onto a message, before the one that held it loses it. False when Discord didn't take it.
+  private async hold(id: string): Promise<boolean> {
+    let msg: any;
+    try {
+      const { dm } = await this.identity();
+      msg = await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { components: rows([[["Stop", STOP]]]), allowed_mentions: { parse: [] } });
+    } catch (e) {
+      if (/discord 404/.test(String(e))) {                       // gone from his DM: never a holder again
+        const s = this.d.load();
+        if (s.messages[id]) s.messages[id].gone = true;
+        if (s.sent?.[id]) s.sent[id].last = false;
+        this.d.save(s);
+      } else this.log(`couldn't put Stop on a message: ${reason(e)}`);
+      return false;
+    }
+    const s = this.d.load();
+    const was = s.messages[id];
+    if (was) {
+      Object.assign(was, { buttons: true, labels: ["Stop"], digest: digest(String(msg?.content ?? ""), msg?.components ?? []) });
+      delete was.outcome; delete was.why; delete was.off;
+    } else this.remember(s, msg?.id ? msg : { id }, { kind: "plain", item: "none", question: "plain", posted: snowflakeTime(id),
+      expires: null, buttons: true, labels: ["Stop"] });
+    s.stopAt = id;
+    this.d.save(s);
+    this.log("Stop moved to the newest plain message");
+    return true;
+  }
+
+  // Stop off a message: buttons only, no line.
+  private async unhold(id: string, why: string): Promise<void> {
+    const s = this.d.load();
+    const m = s.messages[id];
+    if (s.stopAt === id) delete s.stopAt;
+    if (m?.buttons && !m.outcome) { m.outcome = "replaced"; m.why = why; }
+    this.d.save(s);
+    await this.strip(id);
+  }
+
+  private async placeStop(): Promise<void> {
+    if (!this.d.stop) return;                                  // no Stop state to follow
+    if (this.d.now() - this.limitedAt < QUIET_MS) return;      // Discord rate-limited the link just now
+    const s = this.d.load();
+    // A card's outcome edit goes first; the moving Stop's own strips are part of a move.
+    if (Object.values(s.messages).some((m) => m.buttons && m.outcome && m.why !== MOVED && m.why !== REPOSTED)) return;
+    const holder = s.stopAt && this.carries(s, s.stopAt, "Stop") ? s.stopAt : null;
+    const st = this.stopped();
+    if (st.stopped) {
+      if (holder) await this.unhold(holder, MOVED);
+      if (st.at !== null || this.stopHeld) await this.keepResumeInReach(st.at ?? this.changed?.at ?? 0);
+      return;
+    }
+    const holderOk = !!holder && this.plainOk(s, holder);
+    const within = this.newestBot(s, STOP_REACH).some((id) => this.carries(s, id, "Stop") && (id !== holder || holderOk));
+    const target = within ? null : this.newestPlain(s);
+    if (target && target !== holder) {
+      if (!(await this.hold(target))) return;
+      if (holder) await this.unhold(holder, MOVED);
+    } else if (holder && !holderOk) await this.unhold(holder, MOVED);   // it asks something now
+  }
+
+  // While stopped, Turn back on stays within reach: when neither the morning message nor a
+  // Stopped notice carrying it is one of the newest 2 bot messages, the link's Stopped
+  // notice is posted again, at most hourly (from his Stop, or the last one), or sooner once
+  // he has written since. Never every few messages.
+  private async keepResumeInReach(since: number): Promise<void> {
+    const s = this.d.load(), now = this.d.now();
+    if (this.newestBot(s, RESUME_REACH).some((id) => this.carries(s, id, "Turn back on"))) return;
+    const shown = Object.values(s.messages).filter((m) => m.buttons && !m.outcome && (m.labels ?? []).includes("Turn back on"));
+    const last = Math.max(since, s.repostedAt ?? 0, ...shown.map((m) => m.posted ?? 0));
+    if (now - last < HOUR && !((s.hisAt ?? 0) > last)) return;
+    await this.postToggle(STILL_STOPPED, true, true);
   }
 
   private async toSpecialist(it: any, cid: string, msgId: string): Promise<string> {
@@ -1529,9 +1835,11 @@ export class Link {
     const words = m.shipping.text;
     const tap = this.tapLine(m, "Ship", msgId);
     if (!r.ok && (r.stopped || this.voided(tapped))) r = STOPPED_FIRST;   // a Stop since his tap ends it, even one undone since
+    // Its lines on his card are the link's own words, fixed (a reason can come from GitHub).
+    const own = (t: string) => this.words("ship line", "link", t, { rules: AT.link }).text;
     if (!r.ok && r.again && now - tapped < LANDING_TRY_MS) {
       const tries = (m.shipping.tries ?? 0) + 1;
-      const waiting = `You tapped Ship. Waiting: ${r.why}. It lands by itself as soon as it can.`;
+      const waiting = own(`You tapped Ship. Waiting: ${r.why}. It lands by itself as soon as it can.`);
       const changed = m.shipping.line !== waiting;
       m.shipping = { ...m.shipping, tries, next: now + Math.min(15, 2 ** tries) * 60_000, why: r.why,
         ...(changed ? { line: waiting, edited: false } : {}) };
@@ -1563,7 +1871,7 @@ export class Link {
       m.shipping = { state: "not landed", at: now, text: words, why: r.why, line: shown, edited: false };
     } else {
       const waited = r.again ? ", for 2 hours" : "";
-      shown = `Not shipped: ${r.why}${waited}. Nothing changed in main.`;
+      shown = own(`Not shipped: ${r.why}${waited}. Nothing changed in main.`);
       line = `${tap} The link didn't land it: ${r.why}${waited}. Nothing changed in main, and there's no Ship token. Tell him in one line, as a reply to the card, what happens next.`;
       m.shipping = { state: "not landed", at: now, text: words, why: r.why, line: shown, edited: false };
     }
@@ -1579,11 +1887,10 @@ export class Link {
   private async showLanding(msgId: string): Promise<void> {
     const sh = this.d.load().messages[msgId]?.shipping;
     if (!sh?.line) return;
-    if (sh.edited === false) this.gate("ship line", "link", sh.line, { rules: AT.link }, msgId);
     let done = false;
     try {
       const { dm } = await this.identity();
-      await this.d.rest("PATCH", `/channels/${dm}/messages/${msgId}`,
+      await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`,
         { content: withLine(sh.text, sh.line), components: [], allowed_mentions: { parse: [] } });
       done = true;
     } catch (e) {
@@ -1668,9 +1975,9 @@ export class Link {
   async followup(callback: string, text: string): Promise<void> {
     const [app, token] = [callback.split(":")[0], callback.split(":").slice(1).join(":")];
     if (!app || !token || !text) return;
-    this.gate("answer", "specialist", text, { rules: AT.answer });
-    await this.d.rest("POST", `/webhooks/${app}/${token}`,
-      { content: fit(text), flags: EPHEMERAL, allowed_mentions: { parse: [] } }, false);
+    const words = this.ownWords("answer", "specialist", text);
+    await this.rest("POST", `/webhooks/${app}/${token}`,
+      { content: fit(words), flags: EPHEMERAL, allowed_mentions: { parse: [] } }, false);
   }
 
   // -- the replay (keeper.sh replay): the gate's rules over his DM, reading only ---------
@@ -1681,11 +1988,13 @@ export class Link {
   // Nothing is posted, edited or logged as a send. Cain hears one line when it's done.
   private replaying: Promise<void> | null = null;
 
-  replay(daysIn?: unknown): { status: "started" | "running"; said: string } {
+  // why "rules": the link's own run after the rules changed (RULES_VERSION): its done line
+  // also has Cain check the gate end to end.
+  replay(daysIn?: unknown, why?: "rules"): { status: "started" | "running"; said: string } {
     if (this.replaying) return { status: "running", said: "A replay is already running; you'll hear one line when it's done." };
     const n = Number(daysIn ?? 14);
     const days = Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 60) : 14;
-    this.replaying = this.runReplay(days)
+    this.replaying = this.runReplay(days, why)
       .catch((e) => {
         this.log(`the gate's replay failed: ${reason(e)}`);
         this.d.relay(`The gate's replay over his DM failed (${reason(e)}). Nothing was posted or changed; run /opt/cain/keeper.sh replay again later. Nothing to tell him.`);
@@ -1696,7 +2005,17 @@ export class Link {
 
   whenReplayed(): Promise<void> { return this.replaying ?? Promise.resolve(); }
 
-  private async runReplay(days: number): Promise<void> {
+  // Whether the gate's rules changed since the last replay that finished (the link's start
+  // runs one by itself then). A replay from before 0.10.0 ran with version 1.
+  replayDue(): boolean {
+    const s = this.d.load();
+    return (s.replayedRules ?? (s.replayed ? 1 : 0)) < RULES_VERSION;
+  }
+
+  private async runReplay(days: number, why?: "rules"): Promise<void> {
+    // The first replay to finish after the rules changed asks for the end-to-end checks,
+    // whoever started it (the link's own run may have been cut short).
+    const rulesRun = why === "rules" || this.replayDue();
     const { owner, dm, bot } = await this.identity();
     const now = this.d.now();
     const from = now - days * DAY;
@@ -1710,7 +2029,7 @@ export class Link {
       if (pages >= REPLAY_PAGES) { capped = true; break; }
       let batch: any = null;
       for (let tries = 1; ; tries++) {
-        try { batch = await this.d.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`); break; }
+        try { batch = await this.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`); break; }
         catch (e) {
           if (!/discord 429/.test(String(e)) || tries >= REPLAY_TRIES) { stopped = `${plainly(e)} (${reason(e)})`; break; }
           await sleep(Math.max(pause, 1) * 5);                 // rate limited: wait it out, then the same page again
@@ -1755,7 +2074,7 @@ export class Link {
       if (buttonIds(m.components).some((x) => x.startsWith("perm:"))) { skipped.permission_prompts++; continue; }
       const content = withoutOutcome(String(m.content ?? ""));
       const rec = s.messages[id];
-      if (rec) {                                           // the link posted it: its own record says whose words
+      if (rec && rec.kind !== "plain") {                   // the link posted it: its own record says whose words
         // Its buttons as posted; unknown labels (a card from before 0.9.0 whose rows are
         // gone) with none on Discord now can't be told, never "no buttons".
         const now_ = labelsOf(m.components);
@@ -1768,13 +2087,19 @@ export class Link {
         const writer = writerOf(rec);
         byWriter[writer]++;
         const card = rec.card !== undefined ? s.cards[String(rec.card)] : undefined;
-        if (writer === "specialist") judge(id, at, writer, card?.text ?? content, { rules: AT.card, buttons: own, known: allLabels });
-        else if (writer === "cain") judge(id, at, writer, rec.shipping?.text ?? content, { rules: AT.cain, buttons: own, known: allLabels });
+        if (writer === "specialist") {
+          // A Stop notice's last line is the link's own, saying what stopped on Cain's side.
+          const [words, linkLine] = splitLinkLine(card?.text ?? content);
+          judge(id, at, writer, words, { rules: AT.card, buttons: own, known: allLabels });
+          if (linkLine) judge(id, at, "link", linkLine, { rules: AT.link });
+        } else if (writer === "cain") judge(id, at, writer, rec.shipping?.text ?? content, { rules: AT.cain, buttons: own, known: allLabels });
         else judge(id, at, writer, content, { rules: AT.link });
         continue;
       }
       const raw = String(m.content ?? "");
-      if (sent.ids.has(id) || sent.texts.has(raw.trim())) {   // Cain's reply, by his transcripts
+      // Cain's reply: by the link's own list of them (one that held the moving Stop among
+      // them), or by his transcripts.
+      if (rec?.kind === "plain" || s.sent?.[id] || sent.ids.has(id) || sent.texts.has(raw.trim())) {
         byWriter.cain++;
         const ref = m.message_reference?.message_id ? String(m.message_reference.message_id) : "";
         let buttons: string[] | null = [], answersHim = false;
@@ -1797,7 +2122,9 @@ export class Link {
     for (const [k, c] of Object.entries(s.cards)) {
       if (c.shown || c.created < from) continue;
       unposted++;
-      judge(`card ${k}`, c.created, "specialist", c.text, { rules: AT.card, buttons: labelsOf(c.rows), known: allLabels });
+      const [words, linkLine] = splitLinkLine(c.text);
+      judge(`card ${k}`, c.created, "specialist", words, { rules: AT.card, buttons: labelsOf(c.rows), known: allLabels });
+      if (linkLine) judge(`card ${k}`, c.created, "link", linkLine, { rules: AT.link });
     }
     // Whether Discord marks a message "(edited)" when only its buttons change: every edit
     // the link makes to a morning message is to its buttons alone (its Stop moves or comes off).
@@ -1814,6 +2141,7 @@ export class Link {
     const n = (r: "fix" | "refuse" | "unsure") => list.filter((h) => h.result === r).length;
     const report: ReplayReport = {
       written_at: now,
+      rules_version: RULES_VERSION,
       range: { from, to: now, days, pages, page_cap: REPLAY_PAGES, reached_cutoff: reached, capped, stopped },
       messages: { read: seen.length, by_writer: byWriter, skipped, cards_never_posted: unposted },
       hits: { by_rule: byRule, by_writer: perWriter, total },
@@ -1830,11 +2158,21 @@ export class Link {
     // stop at the same place, so it says the oldest part wasn't read instead). One an error or
     // rate limits stopped is run again (the link's own run retries at its next start).
     const whole = (reached || capped) && !stopped;
+    let holder = "";
     if (whole) {
       const s2 = this.d.load();
       s2.replayed = this.d.now();
+      s2.replayedRules = RULES_VERSION;
+      holder = s2.stopAt && this.carries(s2, s2.stopAt, "Stop") ? s2.stopAt : "";
       this.d.save(s2);
     }
+    // After the rules changed, Cain checks the gate end to end once, by himself.
+    const after = rulesRun && whole
+      ? ` The message gate's rules changed (version ${RULES_VERSION}) and it holds things back now, so once it's filed, check it end to end, telling him nothing: `
+        + "run /opt/cain/keeper.sh selftest (it should say ok); run /opt/cain/keeper.sh check --reply-to <a live card's message id> with a made-up text "
+        + "that taps a button that card doesn't have (it should say refuse); and run /opt/cain/keeper.sh card on "
+        + `${holder ? `Discord message ${holder}, which carries Stop now` : "the newest message carrying Stop"} (it should list Stop). File what each said with the replay.`
+      : "";
     this.log(`the gate's replay read ${seen.length} messages over ${pages} pages: ${total} hits`
       + `${!whole ? " (cut short)" : capped ? " (its most pages: the oldest part of the range wasn't read)" : ""}`);
     const counts = `${seen.length} messages read (Cain ${byWriter.cain}, the specialist ${byWriter.specialist}, the link ${byWriter.link}, `
@@ -1843,7 +2181,7 @@ export class Link {
     this.d.relay(whole
       ? `The gate's replay over the last ${days} days of his DM is done: ${counts} ${cap}Buttons-only edits and "(edited)": ${report.edited.said} `
         + `Nothing was posted or changed. Read ${where || "the replay's report"} and file it in the record as your CLAUDE.md says (Gate replay)`
-        + `${capped ? ", saying the oldest part of the range wasn't read" : ""}. Nothing to tell him.`
+        + `${capped ? ", saying the oldest part of the range wasn't read" : ""}.${after} Nothing to tell him.`
       : `The gate's replay over the last ${days} days of his DM stopped before it was done: ${stopped ?? "it didn't reach the start of the range"}. `
         + `So far ${counts} Nothing was posted or changed, and it isn't done: run /opt/cain/keeper.sh replay ${days} again in an hour, and file `
         + `the report once a replay finishes. Nothing to tell him.`);
@@ -1854,7 +2192,7 @@ export class Link {
     if (r?.guild_id) return "ignored";
     const { owner, dm, bot } = await this.identity();
     if (String(r.user_id) !== owner || String(r.channel_id) !== dm) return "ignored";
-    const msg = await this.d.rest("GET", `/channels/${dm}/messages/${r.message_id}`);
+    const msg = await this.rest("GET", `/channels/${dm}/messages/${r.message_id}`);
     if (String(msg?.author?.id ?? "") !== bot) return "ignored";   // his own message
     const emoji = String(r.emoji?.name ?? "?").slice(0, 32);
     const m = this.d.load().messages[String(r.message_id)];
@@ -1879,6 +2217,7 @@ export class Link {
       await this.decide();
       await this.stripDue();
       await this.releaseHeld();
+      await this.inStopQueue(() => this.placeStop());   // last: moves are the lowest priority
     } finally { this.sweeping = false; }
   }
 
@@ -1960,7 +2299,7 @@ export class Link {
     const found: any[] = [];
     let before = "";
     for (let page = 0; page < HISTORY_PAGES; page++) {
-      const batch = await this.d.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`);
+      const batch = await this.rest("GET", `/channels/${dm}/messages?limit=100${before ? `&before=${before}` : ""}`);
       if (!Array.isArray(batch) || batch.length === 0) break;
       for (const m of batch) {
         const ids = buttonIds(m?.components);
@@ -2094,14 +2433,13 @@ export class Link {
     try { dm = (await this.identity()).dm; } catch (e) { this.log(`can't reach Discord to take buttons off: ${String(e).slice(0, 80)}`); return "limited"; }
     const body: any = { components: [], allowed_mentions: { parse: [] } };
     if (line) {
-      this.gate("outcome line", "link", line, { rules: AT.link }, id);
       try {
-        const cur = await this.d.rest("GET", `/channels/${dm}/messages/${id}`);
-        body.content = withLine(String(cur?.content ?? ""), line);
+        const cur = await this.rest("GET", `/channels/${dm}/messages/${id}`);
+        body.content = withLine(String(cur?.content ?? ""), this.ownWords("outcome line", "link", line, id));
       } catch (e) { return failed(e); }
     }
     let msg: any;
-    try { msg = await this.d.rest("PATCH", `/channels/${dm}/messages/${id}`, body); } catch (e) { return failed(e); }
+    try { msg = await this.rest("PATCH", `/channels/${dm}/messages/${id}`, body); } catch (e) { return failed(e); }
     const s = this.d.load();
     const r = s.messages[id];
     if (r) {

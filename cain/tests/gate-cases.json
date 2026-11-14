@@ -1,10 +1,10 @@
 {
   "about": "Shared synthetic cases for the message gate's rules (cain/rootfs/opt/cain/gate/rules.ts). bun runs them against rules.ts (cain/tests/gate.test.ts) and pytest against the Python port (tests/message_rules.py), so the two stay equal. Made-up words only. Each case: the text, its context (rules: the rules that apply, all when absent; buttons: the labels on the message, null when they can't be told; known: labels on live cards; answers_him: a reply to his own message), the text with the fixes applied (fixed, the text itself when absent), and which rules fix, refuse or can't tell.",
   "static_labels": [
-    "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings",
+    "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings", "Do it", "I'll do it", "Drop it",
     "Approve", "Decline", "Undo", "Undo both", "Undo these", "Use new", "Keep old", "Not mine", "Wrong time",
     "Just this once", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
-    "Turn on", "None wrong: stop checking", "Something was off: keep checking"
+    "Turn on", "None wrong: stop checking", "Something was off: keep checking", "Do it now"
   ],
   "cases": [
     {"name": "an em dash mid-sentence", "text": "Moved the swim lesson — it starts at 4:30 now.", "fixed": "Moved the swim lesson, it starts at 4:30 now.", "fix": ["dash"]},
@@ -13,8 +13,14 @@
     {"name": "an em dash before a stop", "text": "All set —.", "fixed": "All set.", "fix": ["dash"]},
     {"name": "an em dash after a comma", "text": "Done, — nothing else.", "fixed": "Done, nothing else.", "fix": ["dash"]},
     {"name": "an en dash is left alone", "text": "Open 9 – 11 on Saturday."},
-    {"name": "an em dash between numbers is a range", "text": "Open 6 — 8 PM.", "fixed": "Open 6 to 8 PM.", "fix": ["dash"]},
+    {"name": "an em dash between a bare hour and a time is a range", "text": "Open 6 — 8 PM.", "fixed": "Open 6 to 8 PM.", "fix": ["dash"]},
     {"name": "an em dash between times with no spaces", "text": "Swim 9:30—10:15 today.", "fixed": "Swim 9:30 to 10:15 today.", "fix": ["dash"]},
+    {"name": "an em dash between two times with PM", "text": "Party 6 PM — 8 PM.", "fixed": "Party 6 PM to 8 PM.", "fix": ["dash"]},
+    {"name": "an em dash between a time and a bare hour", "text": "Swim 9:30 — 11 on Saturday.", "fixed": "Swim 9:30 to 11 on Saturday.", "fix": ["dash"]},
+    {"name": "an em dash between two numbers that aren't times", "text": "Room 4—5 is free.", "fixed": "Room 4, 5 is free.", "fix": ["dash"]},
+    {"name": "an em dash between two bare numbers", "text": "Scores were 3 — 2.", "fixed": "Scores were 3, 2.", "fix": ["dash"]},
+    {"name": "an em dash between years", "text": "From 2026 — 2027 it runs.", "fixed": "From 2026, 2027 it runs.", "fix": ["dash"]},
+    {"name": "an em dash after a time before words", "text": "Done by 9:30 — then lunch.", "fixed": "Done by 9:30, then lunch.", "fix": ["dash"]},
     {"name": "a dash in code is left alone", "text": "Run `tidy — all` now."},
     {"name": "a dash in a link target is left alone", "text": "[Open it](https://example.com/a—b)"},
     {"name": "a dash in a bare link is left alone", "text": "See https://example.com/a—b today."},
@@ -65,8 +71,14 @@
     {"name": "with Stop is just words", "text": "It ends with Stop and nothing else.", "context": {"buttons": []}},
     {"name": "with No is just words", "text": "Go with No for now.", "context": {"buttons": []}},
     {"name": "with an unambiguous label still names it", "text": "Each was added on its own card with Not mine.", "context": {"buttons": ["Undo"]}, "refuse": ["button"]},
-    {"name": "click Start is left for the replay to settle", "text": "Click Start when you're ready.", "context": {"buttons": []}, "refuse": ["button"]},
-    {"name": "two more questions is left for the replay to settle", "text": "There are two more questions after this.", "refuse": ["count"]},
+    {"name": "click Start stays refused", "text": "Click Start when you're ready.", "context": {"buttons": []}, "refuse": ["button"]},
+    {"name": "two more questions after this passes", "text": "There are two more questions after this."},
+    {"name": "and 1 more in a morning list stays refused", "text": "Trash to the road and 1 more", "refuse": ["count"]},
+    {"name": "tap Do it on a card that has it", "text": "Tap Do it if you want me to.", "context": {"buttons": ["Do it", "I'll do it", "Drop it"]}},
+    {"name": "tap Do it now on a card without it", "text": "Tap Do it now on that one.", "context": {"buttons": ["Do it"]}, "refuse": ["button"]},
+    {"name": "a sha in code, in a reply to his own message", "text": "It's `0123456789abcdef0123456789abcdef01234567` you asked for.", "context": {"answers_him": true}},
+    {"name": "a sha in code elsewhere", "text": "It's `0123456789abcdef0123456789abcdef01234567` now.", "refuse": ["machine"]},
+    {"name": "a bare commit link in a reply to his own message stays refused", "text": "See https://github.com/example/repo/commit/0123456789abcdef0123456789abcdef01234567 for it.", "context": {"answers_him": true}, "refuse": ["machine"]},
     {"name": "a bare commit link stays refused", "text": "See https://github.com/example/repo/commit/0123456789abcdef0123456789abcdef01234567 for it.", "refuse": ["machine"]},
     {"name": "only the rules that apply", "text": "Two blocks and 3 more — tap Undo.", "context": {"rules": ["dash", "app"], "buttons": []}, "fixed": "Two blocks and 3 more, tap Undo.", "fix": ["dash"]},
     {"name": "a fix and a refusal together", "text": "Moved swim — tap Undo.", "context": {"buttons": []}, "fixed": "Moved swim, tap Undo.", "fix": ["dash"], "refuse": ["button"]}

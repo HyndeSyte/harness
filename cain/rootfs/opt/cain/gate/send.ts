@@ -1,9 +1,15 @@
-// What the gate would do with one of Cain's own Discord replies or edits, against the
-// cards that are up now (piece D). Pure: the reply hook (../hooks/discord-send.ts) and
-// the link's dry run (keeper.sh check) both call it, so they always agree. In this
-// release nothing acts on it: the hook only logs it.
-
-import { AT, check, type Hit, type Result, verdict } from "./rules";
+// What the gate does with one of Cain's own Discord replies or edits, against the cards
+// that are up now (piece D, enforcing since Cain 0.10.0). Pure: the reply hook
+// (../hooks/discord-send.ts) and the link's dry run (keeper.sh check) both call it, so
+// they always agree.
+//
+//   pass    nothing to change
+//   fix     only em dashes or "add-on": the hook sends the fixed words in its place
+//   refuse  held back, with what to change: a hidden count, machine text, a button the
+//           card it answers doesn't have, or a named button while which buttons are up
+//           can't be told; never released by a third try (hard): a chat that isn't his
+//           DM, or an edit of a message that isn't one of Cain's own replies
+import { AT, check, type Hit, type Result, WHY } from "./rules";
 
 export type Writer = "cain" | "specialist" | "link";
 
@@ -13,56 +19,83 @@ export interface CardView {
   message: string; kind: string; writer: Writer; labels: string[]; live: boolean;
   item: string | null; question: string | null; posted: number | null;
 }
-export interface CardsView { written_at: number; owner: string | null; dm: string | null; cards: CardView[] }
+// sent: the ids of Cain's own replies (35 days): the only messages he may edit (0.10.0).
+export interface CardsView { written_at: number; owner: string | null; dm: string | null; cards: CardView[]; sent?: string[] }
 
-export interface SendCall { tool: "reply" | "edit"; text: string; replyTo?: string; target?: string }
+export interface SendCall { tool: "reply" | "edit"; text: string; replyTo?: string; target?: string; chat?: string }
 export interface GateHit { rule: string; result: Result; around: string; label?: string }
-export interface Decision { would: "pass" | "fix" | "refuse" | "unsure"; fixed: string; hits: GateHit[]; said: string }
+export interface Decision {
+  would: "pass" | "fix" | "refuse";
+  fixed: string; hits: GateHit[]; said: string;
+  hard: boolean;                       // a refusal no third try releases
+  chat: "his" | "other" | "unknown";   // whether the send goes to his DM, as far as can be told
+}
 
 const when = (ms: number | null, tz: string) => (ms ? new Intl.DateTimeFormat("en-US",
-  { timeZone: tz, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(ms)) : "time unknown");
+  { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(new Date(ms)) : "time unknown");
 
-const WHY: Record<string, string> = {
-  dash: "no em dashes",
-  app: "Home Assistant calls them Apps",
-  count: "name each one instead of a count",
-  machine: "no shas, job ids, ISO times or Discord ids: say it as people say it",
-};
+export const HELD = "The message gate held this:";
+export const REWRITE = "Rewrite and send now; don't mention it to him.";
 
 // cards: the link's view now, or null when it can't be had (the link down and its file
-// missing or stale): then a named button is "can't tell".
-export function decideSend(call: SendCall, cards: CardsView | null, tz = "America/New_York"): Decision {
+// missing or stale): then a named button can't be checked, and an edit waits. dm: his
+// DM's channel id when known (the view's, or the hook's cached one). early: only the
+// rules that need no cards (the hook runs them before it asks the link): a long number
+// or code in a reply is given the benefit of the doubt (it may answer him), and buttons
+// and edit targets wait for the cards.
+export function decideSend(call: SendCall, cards: CardsView | null,
+                           o: { tz?: string; dm?: string | null; early?: boolean } = {}): Decision {
+  const tz = o.tz ?? "America/New_York";
+  const dm = cards?.dm ?? o.dm ?? null;
   const target = call.replyTo && cards ? cards.cards.find((c) => c.message === call.replyTo) : undefined;
+  const live = (cards?.cards ?? []).filter((c) => c.live);
   // Known labels: those on live cards, and the card a reply answers even once its buttons
   // are off (naming one then points him at a button that's gone).
-  const known = cards ? [...cards.cards.filter((c) => c.live).flatMap((c) => c.labels), ...(target?.labels ?? [])] : [];
-  // An edit names no button. A reply names only buttons on the live card it answers; one
-  // to a message the link didn't post answers him (or an older reply of Cain's).
-  const buttons = call.tool === "edit" || !call.replyTo ? [] : !cards ? null : target?.live ? target.labels : [];
-  const answersHim = call.tool === "reply" && !!call.replyTo && !!cards && !target;
-  const r = check(call.text, { rules: AT.cain, buttons, known, answersHim });
+  const known = cards ? [...live.flatMap((c) => c.labels), ...(target?.labels ?? [])] : [];
+  // An edit names no button. A reply names only buttons on the live card it answers.
+  // "tap Stop" is true while any live message carries Stop (it sits on the newest plain one).
+  const buttons: string[] | null = call.tool === "edit" || !call.replyTo ? [] : !cards ? null : target?.live ? [...target.labels] : [];
+  if (buttons && live.some((c) => c.labels.includes("Stop"))) buttons.push("Stop");
+  // A reply to a message that is neither one the link posted nor one of Cain's own answers him.
+  const answersHim = call.tool === "reply" && !!call.replyTo
+    && (o.early ? true : !!cards && !target && !(cards.sent ?? []).includes(call.replyTo));
+  const r = check(call.text, { rules: o.early ? ["dash", "app", "count", "machine"] : AT.cain, buttons, known, answersHim });
   const hits: GateHit[] = r.hits.map((h: Hit) => ({ rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}) }));
-  // An edit is for Cain's own replies, never a message the link posted.
-  if (call.tool === "edit") {
-    if (!cards) hits.push({ rule: "target", result: "unsure", around: "" });
-    else if (cards.cards.some((c) => c.message === call.target))
-      hits.push({ rule: "target", result: "refuse", around: "" });
+  let hard = false;
+  // Only his DM: the plugin's own allowlist holds that today; this says so in words.
+  const chat = !call.chat || !dm ? "unknown" : call.chat === dm ? "his" : "other";
+  if (chat === "other") { hits.push({ rule: "chat", result: "refuse", around: "" }); hard = true; }
+  // An edit is for Cain's own replies only, never a card or notice the link posted.
+  if (call.tool === "edit" && !o.early) {
+    if (!cards) { hits.push({ rule: "target", result: "unsure", around: "" }); hard = true; }
+    else if (!call.target || !(cards.sent ?? []).includes(call.target)) { hits.push({ rule: "target", result: "refuse", around: "" }); hard = true; }
   }
-  const would = hits.some((h) => h.result === "refuse") ? "refuse" : verdict(r) === "fix" ? "fix"
-    : hits.some((h) => h.result === "unsure") ? "unsure" : "pass";
+  const held = hits.some((h) => h.result === "refuse" || h.result === "unsure");
+  const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
   const lines: string[] = [];
   for (const h of hits) {
     if (h.rule === "button" && h.label) {
-      const with_ = (cards?.cards ?? []).filter((c) => c.live && c.labels.includes(h.label!));
-      lines.push(h.result === "unsure"
-        ? `"${h.label}" names a button, and which buttons are up can't be checked right now: say it without naming a button, or try again in a minute.`
-        : `"${h.label}" isn't a button on ${call.tool === "reply" && target ? "the card this answers" : "this message"}${with_.length
-          ? `; live cards with it: ${with_.map((c) => `message ${c.message} (${when(c.posted, tz)})`).join(", ")}` : ", and no live card has it"}.`);
+      const with_ = live.filter((c) => c.labels.includes(h.label!) && c.message !== call.replyTo);
+      const where = with_.length ? `; live card${with_.length > 1 ? "s" : ""} with it: ${with_.map((c) => `message ${c.message} (${when(c.posted, tz)})`).join(", ")}`
+        : "; no live card has it";
+      if (h.result === "unsure")
+        lines.push(`"${h.label}" names a button, and which buttons are up can't be checked right now: say it without naming a button, or try again in a minute.`);
+      else if (call.tool === "reply" && target)
+        lines.push(`"${h.label}" isn't on the card this answers (its buttons: ${target.live && target.labels.length ? target.labels.join(", ") : "none up now"})${where}.`);
+      else
+        lines.push(`"${h.label}" names a button, and ${call.tool === "edit" ? "an edit" : "this reply"} answers no card that has it: name one only in a reply to its card${where}.`);
     } else if (h.rule === "target") {
-      lines.push(h.result === "unsure" ? "Which messages are cards can't be checked right now, so an edit waits: try again in a minute."
-        : "That message is one the link posted (a card or notice): edit only your own replies.");
-    } else if (h.result === "refuse") lines.push(`"${h.around}": ${WHY[h.rule] ?? "change it"}.`);
+      lines.push(h.result === "unsure" ? "Which messages are your own replies can't be checked right now, so an edit waits: try again in a minute."
+        : "That message isn't one of your own replies: edit only your own.");
+    } else if (h.rule === "chat") {
+      lines.push("That chat isn't his DM: send only to him, in his DM.");
+    } else if (h.result === "refuse") lines.push(`"${h.around}": ${WHY[h.rule as keyof typeof WHY] ?? "change it"}.`);
   }
-  if (would === "fix") lines.push(`Send exactly this instead: ${r.fixed}`);
-  return { would, fixed: r.fixed, hits, said: lines.join(" ") || "Nothing to change." };
+  let said: string;
+  if (would === "refuse") {
+    const fixes = hits.some((h) => h.result === "fix") ? " Its em dashes and add-ons are fixed for you when it goes." : "";
+    said = `${HELD} ${lines.join(" ")}${fixes} ${REWRITE}`;
+  } else if (would === "fix") said = `Send exactly this instead: ${r.fixed}`;
+  else said = "Nothing to change.";
+  return { would, fixed: r.fixed, hits, said, hard, chat };
 }

@@ -46,6 +46,13 @@ if ! tmux -u has-session -t cain 2>/dev/null; then
   exit 1
 fi
 bashio::log.info "Cain is running"
+# The message gate's reply hook, checked once at each start as Claude Code runs it, from
+# the settings just installed: an em dash fixed in place, "and 3 more" held back, a clean
+# reply let through. The line says how long a reply waits on it; if it fails, Cain hears.
+(
+  sleep 20
+  echo "[cain] gate hook self-test: $(timeout 120 bun /opt/cain/hooks/discord-send.ts --self-test --relay 2>&1 | tail -n 1)"
+) &
 # Which connectors Cain has, by name only (addresses removed), so the tools it
 # must not use can be blocked by their exact names (/opt/cain/settings.json).
 (

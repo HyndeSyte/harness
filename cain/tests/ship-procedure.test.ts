@@ -58,11 +58,21 @@ describe("Cain's rules", () => {
     expect(jobs).toContain("If it ends with `Home Assistant connector: needs signing in again` (or `no\n     answer`), nothing was installed");
   });
 
-  test("the message gate: buttons named only from the card that has them, look first, the replay filed", () => {
+  test("the message gate: it acts, buttons named only from the card that has them, look first, the replay filed", () => {
     const gate = section(rules, "## The message gate");
-    for (const must of ["only report", "/data/work/gate-report.jsonl", "Name a button to him only in a reply to the card that has it",
-      "/opt/cain/keeper.sh card <message id>", "/opt/cain/keeper.sh check", "/data/work/gate-replay.json",
-      "projects/org-v2/gate-replay-<YYYY-MM-DD>.md", "through the record keeper", "Nothing to tell him"])
+    for (const must of ["They act", "/data/work/gate-report.jsonl", "\"The message gate held this:\"", "don't mention the gate to him",
+      "third try goes as it is", "Send only\n  to his DM, and edit only your own replies", "A specialist's card is never refused",
+      "Name a button to him only in a reply to the card that has it", "/opt/cain/keeper.sh card <message id>", "/opt/cain/keeper.sh check",
+      "/opt/cain/keeper.sh selftest", "/data/work/gate-replay.json", "projects/org-v2/gate-replay-<YYYY-MM-DD>.md", "through the record keeper",
+      "check the gate end to end", "Nothing to tell him"])
       expect(gate).toContain(must);
+    expect(gate).not.toContain("only report");
+  });
+
+  test("Stop: within reach of his newest message, never on a card that asks something, and off while stopped", () => {
+    const stop = section(rules, "## Stop");
+    for (const must of ["the link\nputs it on the newest plain message", "never on an ask, a Ship card or a specialist's card",
+      "none of the newest 5 bot messages carries a Stop", "The moving Stop comes off meanwhile", "never ask him to"])
+      expect(stop).toContain(must);
   });
 });

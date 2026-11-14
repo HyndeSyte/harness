@@ -29,8 +29,10 @@
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
-#                                        what the message gate would do with a reply (or an edit),
+#                                        what the message gate does with a reply (or an edit),
 #                                        against the cards up now; sends nothing
+#   keeper.sh selftest                   the message gate's reply hook, run as Claude Code runs it,
+#                                        on a fix, a refusal and a clean reply; sends nothing
 #   keeper.sh replay [days]              the gate's rules over his DM (default 14 days), reading only;
 #                                        you hear one line when it's done
 #   keeper.sh connector --item P41 "what waits"
@@ -40,7 +42,10 @@ set -u
 # Moved only for the tests.
 dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
 link="${CAIN_LINK:-http://127.0.0.1:8097}"
+hooks="${CAIN_HOOKS:-/opt/cain/hooks}"
 cmd="${1:-handover}"; shift || true
+# Needs no key and no link: it runs the hook itself.
+if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;

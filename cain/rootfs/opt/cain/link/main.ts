@@ -21,16 +21,19 @@
 //     POST /morning {text}              the one morning message, with Stop
 //     POST /stopped {}                  whether everything is stopped (Dane's Stop), and since when
 //     POST /look {m}                    a message in his DM as Discord has it now (keeper.sh card)
-//     GET  /cards                       the cards up now, no text (the reply hook's read)
-//     POST /check {text, reply_to?, edit?}  what the gate would do with a reply or edit, sending nothing
+//     GET  /cards                       the cards up now, no text, and the ids of Cain's own replies (the reply hook's read)
+//     POST /check {text, reply_to?, edit?}  what the gate does with a reply or edit, sending nothing
+//     POST /sent {tool, ids, question, reply_to?, net?}  what Cain just sent (the PostToolUse hook): his edit
+//                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
 // Nothing is published to the LAN: the App has no "ports:".
 //
-// The gate, in report mode (piece D): every send point logs what its rules would have done
-// to Cain's folder (../gate/log.ts), and nothing is refused or rewritten yet. The cards go
-// to /data/trust/cards.json (publish.ts) shortly after each save and each sweep. The first
-// start with no replay on record replays his DM once by itself.
+// The gate (piece D), enforcing since 0.10.0: the link's send points fix and refuse
+// (core.ts), and log every hit to Cain's folder (../gate/log.ts). The cards go to
+// /data/trust/cards.json (publish.ts) shortly after each save and each sweep. A start whose
+// gate rules are newer than the last replay's replays his DM once by itself. Cain's own
+// replies are read from his transcripts at start and every 6 hours, for his edit allowlist.
 //
 // The Ship key (wave 1, piece B; shipkey.ts) signs Dane's Ship taps once they're in main.
 // Its public half goes to /data/trust/ship.pub, where the RemoteTrigger hook checks
@@ -232,12 +235,27 @@ async function sweepLoop(): Promise<void> {
 }
 setTimeout(sweepLoop, 3000);
 
-// The gate's replay, once by itself on the first start with none on record: everything in
-// his DM from the last 30 days, read only. Cain hears when it's done and files it.
-setTimeout(() => { if (token() && !load().replayed) link.replay(30); }, 120_000);
+// The gate's replay, once by itself when its rules are newer than the last replay's (or none
+// is on record): everything in his DM from the last 30 days, read only. Cain hears when
+// it's done, files it, and checks the gate end to end.
+setTimeout(() => { if (token() && link.replayDue()) link.replay(30, "rules"); }, 120_000);
+
+// Cain's own replies, from his transcripts: the messages he may edit (35 days). Then every
+// 6 hours, only files changed since (the PostToolUse hook tells the link of each one too).
+const SEED_EVERY_MS = 6 * 3_600_000;
+async function seed(): Promise<void> {
+  try {
+    const was = load().seeded;
+    const sent = await readTranscripts(TRANSCRIPTS, was ? was - 3_600_000 : Date.now() - 35 * 86_400_000);
+    const n = link.seedSent(sent.ids);
+    if (n) console.log(`[cain] link: ${n} of Cain's replies added to the ones he may edit`);
+  } catch (e) { console.log(`[cain] link: couldn't read Cain's transcripts for his replies: ${String(e).slice(0, 80)}`); }
+  finally { setTimeout(seed, SEED_EVERY_MS); }
+}
+setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -274,6 +292,7 @@ Bun.serve({
         case "/replied": return json(await link.replied(b.m));
         case "/look": return json(await link.look(b.m));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
+        case "/sent": return json(await link.sent(b));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/stopped": {
@@ -284,9 +303,9 @@ Bun.serve({
         }
         case "/morning": {
           if (list(b.options).length) throw new Refusal("the morning message asks nothing: send each decision with ask");
-          const m = await link.morning(String(b.text ?? ""));
+          const m = await link.morningPost(String(b.text ?? ""));
           await toHarness("/morning-posted", {});
-          return json({ status: "posted", message: m });
+          return json({ status: "posted", ...m });
         }
       }
     } catch (e) {

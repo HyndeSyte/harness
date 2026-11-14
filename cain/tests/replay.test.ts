@@ -1,6 +1,6 @@
 // The gate's replay over his DM (piece D, core.ts replay): it reads only, says whose words
-// each bot message carries from the link's records and Cain's transcripts (one bot token
-// posts them all), runs the rules in report mode and writes what it found for Cain.
+// each bot message carries from the link's records, Cain's own replies and his transcripts
+// (one bot token posts them all), runs the rules over each and writes what it found for Cain.
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -74,7 +74,7 @@ describe("the replay", () => {
     expect(hits(m.reply2)).toEqual([]);                                  // a long number in a reply to him
     expect(hits(m.reply3)).toMatchObject([{ rule: "button", result: "unsure", label: "Approve" }]);
     expect(hits(m.digestMsg)).toMatchObject([{ writer: "specialist", rule: "button", result: "refuse", label: "Undo" }]);
-    expect(hits(m.ask)).toMatchObject([{ writer: "cain", rule: "dash", result: "fix" }]);
+    expect(hits(m.ask)).toEqual([]);                                    // its dash was fixed before it was posted
     expect(hits(m.stranger)).toMatchObject([{ writer: "unknown", rule: "dash" }]);
     expect(rep.hits.by_rule.button).toEqual({ fix: 0, refuse: 2, unsure: 1 });
     expect(rep.hits.by_writer.cain.button).toEqual({ fix: 0, refuse: 1, unsure: 1 });
@@ -223,11 +223,11 @@ describe("the replay", () => {
     expect(rep.hits.by_rule.button.refuse).toBe(0);
   });
 
-  test("a notice records that it has no buttons: a reply naming one is refused, not can't tell", async () => {
+  test("a notice records its buttons: a reply naming another is refused, not can't tell", async () => {
     const r = rig();
     await r.link.sweep();                                               // the one backfill is done before it goes out
     const notice = await r.link.notice("The calendar specialist hasn't answered for 5 minutes.");
-    expect(r.state().messages[notice]).toMatchObject({ kind: "notice", buttons: false, labels: [] });
+    expect(r.state().messages[notice]).toMatchObject({ kind: "notice", buttons: true, labels: ["Stop"] });
     const reply = botMessage(r, "Tap Undo on it.", { replyTo: notice });
     r.sent.ids.add(reply);
     r.link.replay(14);
@@ -246,13 +246,17 @@ describe("the replay", () => {
       await r.link.show(await r.link.addCard({ text: "Moved Swim.", rows: [{ type: 1, components: [btn("Undo", "k:c:u")] }], kind: "card" }), { item: "none" }),
     ];
     const morning = await r.link.morning("## Thu Nov 12");
+    const posted = [...ids, morning].map((id) => r.buttons(id));        // as they went out
     r.harnessDown.down = true;
     await r.tap(structuredClone(r.msg(morning)), STOP);                 // the link posts its own Stop notice
+    await r.link.whenStopPlaced();                                      // and the moving Stop comes off the notice
     const toggle = r.last().id;
-    for (const id of [...ids, morning, toggle]) {
+    for (const [i, id] of [...ids, morning, toggle].entries()) {
       expect(r.state().messages[id].labels).toBeDefined();
-      expect(r.state().messages[id].labels).toEqual(r.buttons(id));
+      expect(r.state().messages[id].labels).toEqual(i < posted.length ? (id === morning ? ["Turn back on"] : posted[i]) : r.buttons(id));
     }
+    expect(posted[0]).toEqual(["Stop"]);                                // the notice went out with the moving Stop
+    expect(r.buttons(ids[0])).toEqual([]);                              // which came off with his Stop; its label stays
     expect(r.buttons(toggle)).toEqual(["Turn back on"]);
   });
 
@@ -315,15 +319,79 @@ describe("the replay", () => {
     expect(line).toContain("/data/work/gate-replay.json");
     expect(line).toEndWith("Nothing to tell him.");
     for (const h of rep.list) expect(h.around.length).toBeLessThanOrEqual(60);
-    expect(Object.keys(rep)).toEqual(["written_at", "range", "messages", "hits", "list", "edited"]);
+    expect(Object.keys(rep)).toEqual(["written_at", "rules_version", "range", "messages", "hits", "list", "edited"]);
+    expect(rep.rules_version).toBe(2);
   });
 
   test("keyed and on this machine only", () => {
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
     const local = /const LOCAL_ONLY = new Set\(\[([^\]]*)\]\)/.exec(main)![1];
-    for (const route of ["/replay", "/look", "/cards", "/check", "/connector"]) expect(local).toContain(`"${route}"`);
+    for (const route of ["/replay", "/look", "/cards", "/check", "/connector", "/sent"]) expect(local).toContain(`"${route}"`);
     expect(main.indexOf('if (!keyOk) return json({ status: "refused" }, 403);')).toBeLessThan(main.indexOf('case "/replay"'));
-    expect(main).toContain("if (token() && !load().replayed) link.replay(30)");   // once by itself after the install
+    expect(main).toContain('if (token() && link.replayDue()) link.replay(30, "rules")');   // once by itself after the rules change
+  });
+});
+
+describe("the replay after the rules were tuned (0.10.0)", () => {
+  test("the link's own line on a specialist's Stop notice is judged as the link's words", async () => {
+    const r = rig();
+    r.stop.stopped = true; r.stop.at = r.t.now;
+    // As 0.9.0 recorded it: a specialist's Stopped notice, with the link's line, its buttons gone.
+    const card = await r.link.addCard({ text: "Stopped. Nothing runs.\n\nCain's Build and Ship jobs, Ship cards and outside reviews are stopped too, and nothing lands in main, until you tap Turn back on. A job already running finishes.",
+      rows: [], kind: "card" });
+    const id = await r.link.show(card, { item: "none" });
+    r.link.replay(14);
+    const rep = await done(r);
+    expect(rep.list.filter((h: any) => h.message === id)).toEqual([]);   // no "can't tell" for the link's line
+  });
+
+  test("a reply of Cain's that held the moving Stop is read as his, against the card it answered", async () => {
+    const r = rig();
+    const card = await r.link.addCard({ text: "Moved Swim to 4:30.", rows: [{ type: 1, components: [btn("Undo", "k:c:u")] }], kind: "card" });
+    const shown = await r.link.show(card, { item: "none" });
+    const reply = botMessage(r, "Tap Not mine if it's wrong.", { replyTo: shown });
+    await r.link.sent({ tool: "reply", ids: [reply], question: false });   // not in his transcripts: the link's own list says it's his
+    r.link.replay(14);
+    const rep = await done(r);
+    expect(rep.list.filter((h: any) => h.message === reply)).toMatchObject([{ writer: "cain", rule: "button", result: "refuse", label: "Not mine" }]);
+  });
+
+  test("runs by itself once after the rules change, and then has Cain check the gate end to end", async () => {
+    const r = rig();
+    expect(r.link.replayDue()).toBe(true);                               // none on record
+    const s = r.state();
+    s.replayed = r.t.now - 2 * DAY;                                      // one from 0.9.0
+    r.setState(s);
+    expect(r.link.replayDue()).toBe(true);
+    const notice = await r.link.notice("The calendar specialist is answering again.");
+    r.link.replay(30, "rules");
+    await done(r);
+    expect(r.link.replayDue()).toBe(false);
+    expect(r.state().replayedRules).toBe(2);
+    const line = r.relayed.at(-1)!;
+    expect(line).toContain("The message gate's rules changed (version 2)");
+    expect(line).toContain("/opt/cain/keeper.sh selftest");
+    expect(line).toContain("/opt/cain/keeper.sh check --reply-to");
+    expect(line).toContain(`/opt/cain/keeper.sh card on Discord message ${notice}, which carries Stop now`);
+    expect(line).toEndWith("Nothing to tell him.");
+    r.link.replay(14);                                                   // Cain's own run, rules unchanged: no checks asked
+    await done(r);
+    expect(r.relayed.at(-1)).not.toContain("end to end");
+  });
+
+  test("if the link's own run is cut short, the first replay that finishes asks for the checks", async () => {
+    const r = rig();
+    await r.link.morning("## Thu Nov 12");
+    r.failing.add(`/channels/${DM}/messages?`);
+    r.link.replay(30, "rules");
+    await done(r);
+    expect(r.relayed.at(-1)).toContain("stopped before it was done");
+    expect(r.link.replayDue()).toBe(true);
+    r.failing.clear();
+    r.link.replay(30);                                                   // Cain's run, an hour on
+    await done(r);
+    expect(r.relayed.at(-1)).toContain("check it end to end");
+    expect(r.link.replayDue()).toBe(false);
   });
 });
 

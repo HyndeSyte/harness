@@ -54,4 +54,13 @@ describe("Cain's permissions", () => {
   test("no allow entry is a wildcard over an MCP server", () => {
     for (const t of allow.filter((a) => a.startsWith("mcp__"))) expect(t).not.toMatch(/\*/);
   });
+
+  test("the reply and edit tools have the message gate in front, waited for, and the safety net after, in the background", () => {
+    const hooksOf = (event: string, tool: string) => (settings.hooks[event] ?? []).filter((e: any) => e.matcher === tool).flatMap((e: any) => e.hooks);
+    for (const t of ["mcp__plugin_discord_discord__reply", "mcp__plugin_discord_discord__edit_message"]) {
+      expect(hooksOf("PreToolUse", t)).toEqual([{ type: "command", command: "bun /opt/cain/hooks/discord-send.ts || true", timeout: 5 }]);
+      expect(hooksOf("PostToolUse", t)).toEqual([{ type: "command", command: "bun /opt/cain/hooks/discord-sent.ts || true", timeout: 15, async: true }]);
+    }
+    expect(hooksOf("PreToolUse", "mcp__plugin_discord_discord__react")).toEqual([]);   // a reaction carries no words
+  });
 });
