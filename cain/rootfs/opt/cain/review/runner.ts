@@ -3,16 +3,21 @@
 // retried with backoff, then stood in for by Claude (marked substituted, never
 // counted as independent); a consequential review waits for two non-Claude
 // families, retrying hourly for up to a day. Every step re-runs the privacy gate.
+// Each finished review's Reviewed line is published to /data/trust/reviewed.json
+// (../reviewed.ts) before Cain hears it's done, and the file is rebuilt from the queue
+// at start, so it survives a restart.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
   FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, estimate, fixFor, independent, markBlocked, outbound, recordRequest,
-  relayLine, reviewCheck, safeId, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
+  relayLine, reviewCheck, reviewedLine, safeId, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 
 export type RunnerConfig = {
   queueDir: string; spendFile: string; healthFile: string; termsFile: string; recordQueue: string; relayFile: string;
+  reviewedFile?: string;             // where the Reviewed lines are published (configFromEnv); none: not published
   caps: { gemini: number; perplexity: number; claude: number; openaiRuns: number };
   reviewLimit: number;
   timeoutS: Record<SeatName, number>;
@@ -129,8 +134,41 @@ export class Runner {
     try { return this.deps.stopped?.() ?? false; } catch { return true; }
   }
 
+  // ---- the Reviewed lines, for the link and the reply hook (../reviewed.ts) ----
+  // Rebuilt whole from the queue: every finished review that has a line, never one blocked
+  // for privacy, from the last 30 days, at most 200. also: a review that changed and isn't
+  // saved yet. A write that fails is tried again at the end of each tick until it lands.
+  private publishOwed = false;
+  publishReviewed(also?: Review): boolean {
+    const path = this.cfg.reviewedFile;
+    if (!path) return true;
+    try {
+      mkdirSync(this.cfg.queueDir, { recursive: true });
+      const list: Reviewed[] = [];
+      const ids = readdirSync(this.cfg.queueDir).filter((n) => n.endsWith(".json") && !n.startsWith(".")).map((n) => n.slice(0, -5));
+      for (const id of new Set([...ids, ...(also ? [also.id] : [])])) {
+        const r = also?.id === id ? also : loadReview(this.cfg.queueDir, id);
+        if (!r || !FINAL.includes(r.status) || r.id_private || !safeId(r.id) || !r.finished_at) continue;
+        const line = reviewedLine(r);
+        if (line) list.push({ id: r.id, line, finished_at: r.finished_at });
+      }
+      writeReviewed(keptReviewed(list, this.now().getTime()), path);
+      this.publishOwed = false;
+      return true;
+    } catch (e) {
+      this.publishOwed = true;
+      this.log(`couldn't publish the reviews' lines; tried again next tick: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
+      return false;
+    }
+  }
+
   // ---- the loop ----
   async tick(): Promise<void> {
+    try { await this.reviews(); }
+    finally { if (this.publishOwed) this.publishReviewed(); }
+  }
+
+  private async reviews(): Promise<void> {
     mkdirSync(this.cfg.queueDir, { recursive: true });
     for (const name of readdirSync(this.cfg.queueDir).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort()) {
       const r = loadReview(this.cfg.queueDir, name.slice(0, -5));
@@ -276,7 +314,8 @@ export class Runner {
     this.log(`review ${shownId(r)}: ${status}`);
   }
 
-  // Record first, then Cain's one line. Each happens once, even across restarts.
+  // Record first, then Cain's one line. Each happens once, even across restarts. Its
+  // Reviewed line is published before he hears it, so a Ship card naming the review finds it.
   private after(r: Review) {
     if (!r.recorded && r.brief && (r.status === "done" || r.status === "incomplete")) {
       // The same gate again before anything reaches the record: a review read
@@ -289,7 +328,7 @@ export class Runner {
       r.recorded = true;
       r.record_dir = req.ops[0].path.split("/").slice(0, 2).join("/");
     }
-    if (!r.relayed) { this.relay(relayLine(r)); r.relayed = true; }
+    if (!r.relayed) { this.publishReviewed(r); this.relay(relayLine(r)); r.relayed = true; }
   }
 
   block(r: Review, why: string[]) {

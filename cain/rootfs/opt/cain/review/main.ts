@@ -37,6 +37,8 @@ if (import.meta.main) {
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });
   log(`seats: ${(["openai", "gemini", "perplexity", "claude"] as const).map((s) => `${s} ${runner.unavailable(s) ? "off" : "on"}`).join(", ")}`);
+  // The Reviewed lines, rebuilt from the queue: a restart loses none (../reviewed.ts).
+  runner.publishReviewed();
 
   // The ChatGPT sign-in page, reached as <Cain page>/codex through nginx.
   const login = new CodexLogin({ home: codexHome });

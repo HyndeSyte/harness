@@ -418,6 +418,22 @@ export function seatName(s: SeatRun): string {
   return s.stands_in_for ? `Claude stand-in for ${LABEL[s.stands_in_for]}` : s.seat === "openai" ? "OpenAI (Codex)" : LABEL[s.seat];
 }
 
+// The one line that says who reviewed it and how (Cain 0.11.0): verdicts.md ends with it, the
+// relay line gives it to Cain to say as it is, and /data/trust/reviewed.json carries it for
+// his Ship cards and the message gate. Every seat that answered, in the order verdicts.md
+// lists them, by name only (no model, no "(Codex)", no cost): "Reviewed: OpenAI, approve
+// with changes; Gemini, approve." Claude's own reading and a Claude stand-in say they aren't
+// independent. Only seat names and verdicts go into it, never model text. null when no seat
+// answered, and for a review blocked for privacy.
+export function reviewedLine(r: Review): string | null {
+  if (r.status === "blocked: privacy") return null;
+  const done = r.seats.filter((s) => s.state === "done" && Object.hasOwn(LABEL, s.seat) && VERDICTS.includes(s.verdict as Verdict)
+    && (!s.stands_in_for || Object.hasOwn(LABEL, s.stands_in_for)));
+  if (!done.length) return null;
+  const who = (s: SeatRun) => (s.stands_in_for ? `Claude standing in for ${LABEL[s.stands_in_for]}` : LABEL[s.seat]);
+  return `Reviewed: ${done.map((s) => `${who(s)}, ${human(s.verdict)}${s.seat === "claude" ? " (not independent)" : ""}`).join("; ")}.`;
+}
+
 export function recordDir(r: Review): string {
   const day = String(r.created_at ?? "").slice(0, 10);
   if (!safeId(r.id) || !/^\d{4}-\d\d-\d\d$/.test(day)) throw new Error("not a safe review id");
@@ -435,15 +451,13 @@ export function verdictsMd(r: Review): string {
     const list = (s.findings ?? []).map((f, i) => `${i + 1}. ${oneLine(f.problem)} Fix: ${oneLine(f.fix)}`).join("\n") || "No findings.";
     return `## ${seatName(s)}: ${human(s.verdict)}\n\n${list}\n`;
   });
-  const done = r.seats.filter((s) => s.state === "done");
-  const reviewed = done.map((s) => `${seatName(s)}, ${human(s.verdict)}`).join("; ") || "no seat answered";
   const ind = independent(r);
   const lines = [
     `# Review: ${oneLine(topicOf(r), 120)} (${r.created_at.slice(0, 10)})`, "",
     `Brief: brief.txt. Status: ${r.status}. Digest: ${r.digest}.${r.consequential ? ` Consequential: needs two non-Claude families; got ${ind.length ? ind.map((s) => LABEL[s]).join(" and ") : "none"}.` : ""}`, "",
     "| Seat | Model | Verdict | Findings | Cost |", "| --- | --- | --- | --- | --- |", ...rows, "",
     ...sections,
-    `Reviewed: ${reviewed}. Cost $${r.cost_usd.toFixed(3)}.`, "",
+    `${reviewedLine(r) ?? "Reviewed: no seat answered."} Cost $${r.cost_usd.toFixed(3)}.`, "",
   ];
   let out = lines.join("\n");
   if (Buffer.byteLength(out) > 55_000) out = out.slice(0, 54_000) + "\n\n(cut at the record's size limit; result.json has every finding)\n";
@@ -487,7 +501,8 @@ export function recordRequest(r: Review): { id: string; from: "cain"; kind: "cha
 }
 
 // The line Cain hears. Built from a template: ids, counts, seat names, states and
-// fixed fix texts only; no model text ever goes into it.
+// fixed fix texts only; no model text ever goes into it. It ends with the Reviewed line he
+// says as it is when he reports the work (the gate refuses any other), when there is one.
 export function relayLine(r: Review): string {
   if (r.status === "blocked: privacy")
     return r.id_private || !safeId(r.id)
@@ -505,5 +520,6 @@ export function relayLine(r: Review): string {
       ? `Review ${shownId(r)} incomplete: a consequential review needs two non-Claude families and got ${independent(r).length} within a day, so the decision waits.`
       : `Review ${shownId(r)} incomplete: no seat answered.`)
     : `Review ${shownId(r)} done: ${tally || "no verdicts"}${who ? ` (${who})` : ""}.`;
-  return [head, ...(down.length ? [`${down.join("; ")}.`] : []), where].join(" ");
+  const line = reviewedLine(r);
+  return [head, ...(down.length ? [`${down.join("; ")}.`] : []), where, ...(line ? [`Say it as: ${line}`] : [])].join(" ");
 }

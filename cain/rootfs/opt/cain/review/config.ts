@@ -16,6 +16,7 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
     termsFile: env.REVIEW_TERMS ?? "/data/review-private-terms.txt",
     recordQueue: env.RECORD_QUEUE ?? "/data/record-queue",
     relayFile: env.RELAY_QUEUE ?? "/data/relay.queue",
+    reviewedFile: env.CAIN_REVIEWED ?? "/data/trust/reviewed.json",   // ../reviewed.ts
     caps: {
       gemini: num(env.REVIEW_CAP_GEMINI_USD, d.caps.gemini),
       perplexity: num(env.REVIEW_CAP_PERPLEXITY_USD, d.caps.perplexity),
