@@ -225,15 +225,13 @@ describe("a Reviewed line in Cain's reply or edit (0.11.0): only as the review s
     expect(decide(edit(`Fixed it. ${LINES[1].line}`, MINE), CARDS, { reviewed: LINES })).toMatchObject({ would: "pass" });
   });
 
-  test("while the lines can't be read it's held softly: the third try lets it go; a reply without one never needs them", () => {
+  test("while the lines can't be read it's held for good too: no try passes off a claim nobody can check; a reply without one never needs them", () => {
     const c = callOf(reply(`Done. ${LINES[0].line}`))!;
     const d = decideSend(c, CARDS, { reviewed: null });
-    expect(d).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "reviewed", result: "unsure" }] });
+    expect(d).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "reviewed", result: "unsure" }] });
     expect(d.said).toBe("The message gate held this: Reviews can't be checked right now: leave the Reviewed line out, or send it in a minute. Rewrite and send now; don't mention it to him.");
     const t: Tries = {};
-    expect(act(c, d, t, NOW).did).toBe("refused");
-    expect(act(c, d, t, NOW + 1).did).toBe("refused");
-    expect(act(c, d, t, NOW + 2).did).toBe("passed after two refusals");
+    for (let i = 0; i < 4; i++) expect(act(c, d, t, NOW + i).did).toBe("refused");
     expect(decideSend(callOf(reply("Moved swim to 4:30."))!, CARDS).would).toBe("pass");
   });
 });
@@ -618,7 +616,7 @@ describe("run as Claude Code runs it", () => {
     } finally { link.server.stop(true); }
   }, 30_000);
 
-  test("a Reviewed line is read against the published lines: the exact one passes, an edited one is denied, an unreadable file lets the third try go", async () => {
+  test("a Reviewed line is read against the published lines: the exact one passes, an edited one is denied, and so is any while the file can't be read", async () => {
     const link = fakeLink(() => CARDS);
     try {
       const file = join(dir, "reviewed.json");
@@ -632,8 +630,8 @@ describe("run as Claude Code runs it", () => {
       const input = reply(`Done. ${LINES[0].line}`);
       expect((await run(input, missing)).json.permissionDecisionReason).toContain("Reviews can't be checked right now");
       expect((await run(input, missing)).json.permissionDecision).toBe("deny");
-      expect(await run(input, missing)).toMatchObject({ out: "", code: 0 });
-      expect(lines(missing.CAIN_GATE_LOG).map((l) => l.did)).toEqual(["refused", "refused", "passed after two refusals"]);
+      expect((await run(input, missing)).json.permissionDecision).toBe("deny");   // no third try lets it go
+      expect(lines(missing.CAIN_GATE_LOG).map((l) => l.did)).toEqual(["refused", "refused", "refused"]);
       expect(lines(missing.CAIN_GATE_LOG)[0].hits).toEqual([{ rule: "reviewed", result: "unsure", around: LINES[0].line }]);
     } finally { link.server.stop(true); }
   }, 30_000);

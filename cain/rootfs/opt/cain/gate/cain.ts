@@ -2,75 +2,192 @@
 // shared ones in rules.ts. Pure, no I/O. They aren't in tests/message_rules.py: that port is
 // for the calendar specialist's tests, and the specialist never writes these.
 //
-//   reviewed     a "Reviewed:" sentence (in his replies and edits, his asks and their options,
-//                the morning message and the connector notice) goes only as the review
-//                service gave it (../reviewed.ts), word for word: refuse, offering its newest
-//                lines; "unsure" while those lines can't be read. The reply hook holds a made-up
-//                line for good (no third try lets it through) and an unreadable file softly.
-//   ship words   on a Ship card, his own line claiming evidence the link adds itself: the word
-//                "reviewed", or a CI, check, test or build word with pass, passed, green,
-//                succeeded, fail, failed or red within about 30 characters after it: refuse.
-// Code spans and links are never read, as in rules.ts.
+//   reviewed     a review claim (in his replies and edits, his asks and their options, the
+//                morning message and the connector notice) goes only as the review service
+//                gave it (../reviewed.ts), word for word: refuse, offering its newest lines;
+//                "unsure" while those lines can't be read. A claim is a "Reviewed" heading (then
+//                optional spaces and ":" or "-"), "reviewed by" a seat, or a seat's name in the
+//                same sentence as a verdict word. After a line the service gave, the rest of its
+//                paragraph may carry no other claim. The reply hook holds a made-up claim for
+//                good (no third try lets it through) and holds softly while the lines can't
+//                be read.
+//   ship words   on a Ship card, his own line claiming evidence the link adds itself: any review
+//                claim (a real line too) or the word "reviewed", or a CI claim: a CI, check,
+//                test or build word and pass, passed, green, succeeded, fail, failed or red,
+//                either way round, with at most a few small words between ("checks are green",
+//                "Passed all checks", "the pipeline is green"): refuse.
+//   codes        a record code in his words: an item id his record has (P64), with a question
+//                id right after it ("P08 Q2"). He can't tell what those are, so the thing is
+//                named by what it does for him. Ids the record doesn't have and ordinary words
+//                ("Q4 taxes", "vitamin D3", "a P100 filter") pass, as do code spans and links;
+//                with no record to read, nothing is a code. Held softly, like the wording
+//                rules: his third try goes.
+// Both read the words as he'd see them, so nothing slips past by its spelling: compatibility
+// forms folded (NFKC), zero-width and bidi characters dropped, Cyrillic and Greek letters that
+// look like Latin ones read as those, markdown emphasis, quote marks and code marks dropped
+// (code is read, not skipped). Links aren't words: a masked link reads as its words, a bare
+// one not at all.
 import type { Reviewed } from "../reviewed";
-import { around, hidden, hostsOnly } from "./rules";
+import { around, hidden, linkSpans } from "./rules";
 
-export type CainRule = "reviewed" | "ship words";
-export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words"];
+export type CainRule = "reviewed" | "ship words" | "codes";
+export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes"];
 export interface CainHit { rule: CainRule; result: "refuse" | "unsure"; at: number; end: number; around: string }
 
-const REVIEWED = /(?<![A-Za-z0-9])reviewed:/gi;
-// Whether a text has a "Reviewed:" sentence at all, before anything is read to check it.
-export function mentionsReviewed(text: string): boolean {
-  return /(?<![A-Za-z0-9])reviewed:/i.test(hidden(String(text ?? "")));
+// -- reading the words as he'd see them -----------------------------------------------------
+const INVISIBLE = new RegExp("[\\u00ad\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]", "g");
+// Cyrillic and Greek letters that look like Latin ones.
+const LOOKALIKE = new Map<string, string>(([
+  [0x0430, "a"], [0x0435, "e"], [0x043e, "o"], [0x0440, "p"], [0x0441, "c"], [0x0443, "y"], [0x0445, "x"], [0x0456, "i"],
+  [0x0458, "j"], [0x0455, "s"], [0x04bb, "h"], [0x0501, "d"], [0x051b, "q"], [0x051d, "w"], [0x04cf, "l"], [0x04af, "y"],
+  [0x0410, "A"], [0x0412, "B"], [0x0415, "E"], [0x041a, "K"], [0x041c, "M"], [0x041d, "H"], [0x041e, "O"], [0x0420, "P"],
+  [0x0421, "C"], [0x0422, "T"], [0x0423, "Y"], [0x0425, "X"], [0x0406, "I"], [0x0408, "J"], [0x0405, "S"], [0x04ae, "Y"],
+  [0x051a, "Q"], [0x051c, "W"], [0x04c0, "I"],
+  [0x03b1, "a"], [0x03bf, "o"], [0x03c1, "p"], [0x03bd, "v"], [0x03b9, "i"], [0x03ba, "k"], [0x03c5, "u"], [0x03c7, "x"],
+  [0x03b5, "e"], [0x03c4, "t"], [0x0391, "A"], [0x0392, "B"], [0x0395, "E"], [0x0396, "Z"], [0x0397, "H"], [0x0399, "I"],
+  [0x039a, "K"], [0x039c, "M"], [0x039d, "N"], [0x039f, "O"], [0x03a1, "P"], [0x03a4, "T"], [0x03a5, "Y"], [0x03a7, "X"],
+] as [number, string][]).map(([cp, latin]) => [String.fromCharCode(cp), latin]));
+const LOOKALIKES = new RegExp(`[${[...LOOKALIKE.keys()].join("")}]`, "g");
+const DOUBLE_QUOTES = new RegExp("[\"\\u201c\\u201d\\u201e\\u201f\\u00ab\\u00bb]", "g");
+// A single quote mark, not an apostrophe inside a word ("ChatGPT's" keeps its).
+const SINGLE_QUOTES = new RegExp("(^|[^A-Za-z0-9])['\\u2018\\u2019\\u201a\\u201b]+|['\\u2018\\u2019\\u201a\\u201b]+(?=[^A-Za-z0-9]|$)", "g");
+
+export function claimText(text: string): string {
+  let t = String(text ?? "").normalize("NFKC").replace(INVISIBLE, "").replace(LOOKALIKES, (c) => LOOKALIKE.get(c) ?? c);
+  t = t.replace(/\]\([^)\s]*\)/g, "]");                         // [words](target): its words
+  let bare = "", i = 0;                                          // a bare link: not words
+  for (const [a, b] of linkSpans(t)) { bare += `${t.slice(i, a)} `; i = b; }
+  t = bare + t.slice(i);
+  return t.replace(/[*~`[\]]/g, "")                              // emphasis, code marks (the code is read), brackets
+    .replace(/(^|[^A-Za-z0-9])_+|_+(?=[^A-Za-z0-9]|$)/g, "$1")   // _emphasis_, never an underscore inside a word
+    .replace(DOUBLE_QUOTES, "").replace(SINGLE_QUOTES, "$1")
+    .replace(/^[ \t]*>+[ \t]?/gm, "");                           // block quotes
 }
 
-// Each "Reviewed:" sentence: from the word to the full stop that ends it, or the end of its line.
-function reviewedSentences(text: string): { at: number; end: number; said: string }[] {
-  const t = String(text ?? "");
-  const out: { at: number; end: number; said: string }[] = [];
-  for (const m of hidden(t).matchAll(REVIEWED)) {
+// -- review claims ------------------------------------------------------------------------------
+const WORD = (alts: string) => `(?<![A-Za-z0-9])(?:${alts})(?![A-Za-z0-9])`;
+const SEATS = "openai|chatgpt|codex|gpt|gemini|perplexity|claude";
+const VERDICTS = "approve|approved|approves|approval|verdict|verdicts|reject|rejected|rejects|signed[ \\t]+off|lgtm";
+const HEADING = new RegExp("(?<![A-Za-z0-9])reviewed[ \\t]*[:\\-\\u2013\\u2014]", "gi");
+const SEAT = new RegExp(WORD(SEATS), "i");
+const VERDICT = new RegExp(WORD(VERDICTS), "i");
+const BY_SEAT = new RegExp(`(?<![A-Za-z0-9])reviewed\\s+by\\s+(?:the\\s+)?${WORD(SEATS)}`, "i");
+
+interface Claim { at: number; end: number; said: string; heading: boolean }
+// A "Reviewed" heading's claim runs to the full stop that ends its sentence, or its line's end.
+function headings(t: string): Claim[] {
+  return [...t.matchAll(HEADING)].map((m) => {
     const at = m.index!;
     const stop = /\.(?=\s|$)|\n/.exec(t.slice(at));
     const end = stop ? at + stop.index + (stop[0] === "." ? 1 : 0) : t.length;
-    out.push({ at, end, said: t.slice(at, end).trim() });
+    return { at, end, said: t.slice(at, end).trim(), heading: true };
+  });
+}
+// Sentences end at a full stop, "!" or "?" before a space or the end, at ";", and at a line's end.
+function sentences(t: string): [number, number][] {
+  const out: [number, number][] = [];
+  let from = 0;
+  const add = (a: number, b: number) => {
+    while (a < b && /\s/.test(t[a])) a++;
+    while (b > a && /\s/.test(t[b - 1])) b--;
+    if (b > a) out.push([a, b]);
+  };
+  for (const m of t.matchAll(/[.!?]+(?=\s|$)|;|\n/g)) { add(from, m.index! + m[0].length); from = m.index! + m[0].length; }
+  add(from, t.length);
+  return out;
+}
+// Every claim in words already read as he'd see them (claimText), in order.
+function claimsIn(t: string): Claim[] {
+  const out = headings(t);
+  for (const [a, b] of sentences(t)) {
+    const s = t.slice(a, b);
+    if ((SEAT.test(s) && VERDICT.test(s)) || BY_SEAT.test(s)) out.push({ at: a, end: b, said: s, heading: false });
+  }
+  return out.sort((x, y) => x.at - y.at);
+}
+// Whether his words claim anything about a review, before the service's lines are read.
+export function claimsReview(text: string): boolean { return claimsIn(claimText(text)).length > 0; }
+
+// A line as the gate compares it, the same on both sides: spaces as one, the heading as
+// "Reviewed: ", and the full stop at its end may go.
+const canon = (s: string) => s.replace(/\s+/g, " ").trim()
+  .replace(new RegExp("^reviewed\\s*[:\\-\\u2013\\u2014]\\s*", "i"), "Reviewed: ").replace(/\.$/, "");
+const excerpt = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 60);
+
+// published: the review service's lines; null (or not given) when they can't be read. Each
+// claim that isn't a line the service gave is a hit, once, with itself as its excerpt.
+export function reviewedHits(text: string, published: readonly Reviewed[] | null | undefined): CainHit[] {
+  const t = claimText(text);
+  const heads = headings(t);
+  if (!heads.length && !claimsIn(t).length) return [];
+  let rest = t;
+  if (published) {
+    const real = new Set(published.map((p) => canon(claimText(p.line))));
+    // A line the service gave is taken out; whatever claim is left, around it too, is a hit.
+    for (const c of heads) if (real.has(canon(c.said))) rest = rest.slice(0, c.at) + " ".repeat(c.end - c.at) + rest.slice(c.end);
+  }
+  const out: CainHit[] = [];
+  for (const c of claimsIn(rest)) {
+    if (out.some((h) => h.at < c.end && c.at < h.end)) continue;
+    out.push({ rule: "reviewed", result: published ? "refuse" : "unsure", at: c.at, end: c.end, around: excerpt(rest.slice(c.at, c.end)) });
   }
   return out;
 }
 
-// One line as he may say it: its own words, the full stop at its end may go.
-const same = (s: string) => s.replace(/\s+/g, " ").trim().replace(/\.$/, "");
+// -- ship words -----------------------------------------------------------------------------------
+const CI = "ci|checks?|tests?|tested|builds?|pipelines?";
+const RESULT = "pass|passes|passed|passing|green|succeeded|succeeds|fail|fails|failed|failing|red";
+const SMALL = "is|are|was|were|has|have|had|been|all|both|now|still|already|just|and|fully|the|every|each|went|turned|came|back|of";
+const GAP = `[ \\t:,\\-]+(?:(?:${SMALL})[ \\t:,\\-]+){0,3}`;
+const CI_CLAIMS = [new RegExp(`${WORD(CI)}${GAP}${WORD(RESULT)}`, "gi"), new RegExp(`${WORD(RESULT)}${GAP}${WORD(CI)}`, "gi")];
+const REVIEWED_WORD = new RegExp(WORD("reviewed"), "gi");
 
-// published: the review service's lines; null (or not given) when they can't be read.
-export function reviewedHits(text: string, published: readonly Reviewed[] | null | undefined): CainHit[] {
-  const t = String(text ?? "");
-  const found = reviewedSentences(t);
-  if (!found.length) return [];
-  const real = published ? new Set(published.map((p) => same(p.line))) : null;
-  // Its excerpt is the sentence itself (up to 60 characters, a link only its host), so he sees what he wrote.
-  return found.filter((s) => !real || !real.has(same(s.said)))
-    .map((s) => ({ rule: "reviewed" as const, result: real ? "refuse" as const : "unsure" as const, at: s.at, end: s.end,
-      around: hostsOnly(s.said).replace(/\s+/g, " ").trim().slice(0, 60) }));
+function ciClaimSpans(t: string): [number, number][] {
+  return CI_CLAIMS.flatMap((re) => [...t.matchAll(re)].map((m): [number, number] => [m.index!, m.index! + m[0].length]));
 }
+// Whether words claim checks passed or failed, or anything about a review (a title from GitHub).
+export function claimsChecks(text: string): boolean { return ciClaimSpans(claimText(text)).length > 0; }
 
-const CI_WORD = "ci|checks?|tests?|tested|builds?";
-const RESULT_WORD = "pass|passes|passed|passing|green|succeeded|succeeds|fail|fails|failed|failing|red";
-const SHIP_WORDS: RegExp[] = [
-  /(?<![A-Za-z0-9])reviewed(?![A-Za-z0-9])/gi,
-  new RegExp(`(?<![A-Za-z0-9])(?:${CI_WORD})(?![A-Za-z0-9])[^\\n]{0,30}?(?<![A-Za-z0-9])(?:${RESULT_WORD})(?![A-Za-z0-9])`, "gi"),
-];
 export function shipWordsHits(text: string): CainHit[] {
-  const t = String(text ?? "");
-  const seen = hidden(t);
+  const t = claimText(text);
+  const spans: [number, number][] = [...claimsIn(t).map((c): [number, number] => [c.at, c.end]),
+    ...[...t.matchAll(REVIEWED_WORD)].map((m): [number, number] => [m.index!, m.index! + m[0].length]), ...ciClaimSpans(t)];
   const out: CainHit[] = [];
-  for (const re of SHIP_WORDS) for (const m of seen.matchAll(re)) {
-    const at = m.index!, end = at + m[0].length;
+  for (const [at, end] of spans.sort((a, b) => a[0] - b[0])) {
     if (out.some((h) => h.at < end && at < h.end)) continue;
     out.push({ rule: "ship words", result: "refuse", at, end, around: around(t, at, end) });
   }
-  return out.sort((a, b) => a.at - b.at);
+  return out;
 }
 
-// What each asks of him, for the line that says why his words were held back.
+// -- record codes -------------------------------------------------------------------------------
+// The item ids his record has, open or done, from state/PENDING.md, as "P" and the number
+// ("P08" is P8); null when there's no record to read, and then nothing is a code.
+export function recordItems(pending: string | null | undefined): Set<string> | null {
+  if (typeof pending !== "string") return null;
+  const out = new Set<string>();
+  for (const line of pending.split(/\r?\n/)) {
+    const m = /^\|\s*P0*(\d{1,4})(?![A-Za-z0-9])/i.exec(line);
+    if (m) out.add(`P${Number(m[1])}`);
+  }
+  return out.size ? out : null;
+}
+const CODE = /(?<![A-Za-z0-9])P0*(\d{1,4})(?![A-Za-z0-9])(?:[ \t]+Q\d{1,2}(?![A-Za-z0-9]))?/gi;
+export function codesHits(text: string, items: ReadonlySet<string> | null | undefined): CainHit[] {
+  if (!items?.size) return [];
+  const t = String(text ?? "");
+  const seen = hidden(t);                                        // code spans and links aren't read
+  const out: CainHit[] = [];
+  for (const m of seen.matchAll(CODE)) {
+    if (!items.has(`P${Number(m[1])}`)) continue;
+    const at = m.index!, end = at + m[0].length;
+    out.push({ rule: "codes", result: "refuse", at, end, around: around(t, at, end) });
+  }
+  return out;
+}
+
+// -- what each asks of him, for the line that says why his words were held back -----------------
+export const CODES_WHY = "name it by what it does for him, not by its record code: he can't tell what those are";
 export const SHIP_WORDS_WHY = "the link adds the checks and the Reviewed line itself, so leave CI, check and review claims out of your words";
 export const REVIEWED_UNSURE = "reviews can't be checked right now: leave the Reviewed line out, or send it in a minute";
 // n: how many of the service's newest lines to offer (each with its review id).
@@ -82,6 +199,7 @@ export function reviewedWhy(published: readonly Reviewed[] | null | undefined, n
 }
 export function cainWhy(h: Pick<CainHit, "rule" | "result">, published?: readonly Reviewed[] | null, n = 3): string {
   if (h.rule === "ship words") return SHIP_WORDS_WHY;
+  if (h.rule === "codes") return CODES_WHY;
   return h.result === "unsure" ? REVIEWED_UNSURE : reviewedWhy(published, n);
 }
 

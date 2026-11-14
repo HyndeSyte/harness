@@ -45,7 +45,7 @@ import { createHash, createHmac } from "node:crypto";
 import { appendFileSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { mentionsReviewed } from "../gate/cain";
+import { claimsReview, recordItems } from "../gate/cain";
 import { appendGate } from "../gate/log";
 import { answerText, REPLY_TOOL, SENDS, sentIds } from "../gate/plugin";
 import { DASH_WHY, fixedWhat, type Hit } from "../gate/rules";
@@ -59,6 +59,9 @@ const CARDS = process.env.CAIN_CARDS ?? "/data/trust/cards.json";
 const ENV = process.env.CAIN_DISCORD_ENV ?? "/data/.claude/channels/discord/.env";
 export const TRIES = process.env.CAIN_GATE_TRIES ?? "/data/work/gate-tries.json";
 export const DM_FILE = process.env.CAIN_GATE_DM ?? "/data/work/gate-dm.json";
+// His record's open list (the record keeper's copy), for the codes rule: which item ids exist.
+const PENDING = process.env.CAIN_PENDING ?? "/data/record/state/PENDING.md";
+const readItems = (): Set<string> | null => { try { return recordItems(readFileSync(PENDING, "utf8")); } catch { return null; } };
 export const STALE_MS = 3 * 60_000;      // a cards file older than this is the link being down
 export const LINK_MS = 1_500;            // how long the link gets to answer
 export const TRY_MS = 10 * 60_000;       // two refusals within this, and the third try goes
@@ -237,10 +240,12 @@ export async function run(raw: string, o: { ask?: () => Promise<CardsView | null
   const got = await cardsNow(o.ask ?? askLink, o.file ?? (() => { try { return readFileSync(CARDS, "utf8"); } catch { return null; } }), now);
   keepDm(got.cards?.dm);
   // The cached DM id only when there are no cards at all (decideSend). The review service's
-  // lines only for a text with a "Reviewed:" sentence.
+  // lines only for a text that claims a review; the record's item ids only for one with
+  // something like an id in it.
   const d = decideSend(call, got.cards, { dm: got.cards ? null : readDm(), tz, now,
     ...(call.tool === "edit" ? { replied: repliedIn(input?.transcript_path) } : {}),
-    ...(mentionsReviewed(call.text) ? { reviewed: readReviewed() } : {}) });
+    ...(claimsReview(call.text) ? { reviewed: readReviewed() } : {}),
+    ...(/P\d/i.test(call.text) ? { items: readItems() } : {}) });
   const tries = readTries();
   let out = act(call, d, tries, now);
   if (!writeTries(tries, now) && out.counted) out = { output: null, did: "passed, tries not counted" };

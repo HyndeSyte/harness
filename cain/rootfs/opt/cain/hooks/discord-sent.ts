@@ -8,15 +8,19 @@
 //     link. A hit means the reply hook was bypassed, or let a third try through: it's logged
 //     here, and the link tells Cain the rule and a short excerpt, and to fix it by an edit.
 //     Never through this hook's own output, which Claude Code would show him as the hook's.
+//     A review claim the review service didn't give (0.11.0; ../reviewed.ts), which the reply
+//     hook holds for good, is logged here as a bypass too, and only logged.
 // A note the link doesn't take (no answer, or a 5xx or 429) is sent again, up to 3 times,
 // inside the hook's 15 seconds, the same note each time: it names its tool call
 // (tool_use_id, or a hash of the text), so the link tells Cain once per send, never once
 // per message. Nothing is kept beyond that: Cain's next reply places Stop again.
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { claimsReview, reviewedHits } from "../gate/cain";
 import { appendGate } from "../gate/log";
 import { answerText, asksSomething, SENDS, sentIds } from "../gate/plugin";
 import { check } from "../gate/rules";
+import { readReviewed, type Reviewed } from "../reviewed";
 import { keyOf, readTries, textHash, type Tries, wasReleased } from "./discord-send";
 
 const LINK = process.env.CAIN_LINK ?? "http://127.0.0.1:8097";
@@ -59,6 +63,15 @@ export function noteOf(input: any, now: number, tries: Tries = readTries()): Sen
   return note;
 }
 
+// The review claims in what went out that the review service didn't give, read only when it
+// claims one. None while its lines can't be read: then it can't be told.
+export function madeUpReviews(text: string, read: () => Reviewed[] | null = () => readReviewed()): NetHit[] {
+  if (!claimsReview(text)) return [];
+  const published = read();
+  if (!published) return [];
+  return reviewedHits(text, published).filter((h) => h.result === "refuse").map((h) => ({ rule: h.rule, result: h.result, around: h.around }));
+}
+
 // POST /sent until the link takes it: true once it does. A refusal (another 4xx) is final:
 // the same note would be refused again.
 export async function tellLink(note: SentNote, post: (body: string, timeoutMs: number) => Promise<Response>,
@@ -83,11 +96,14 @@ function linkKey(): string {
 if (import.meta.main) {
   try {
     const now = Date.now();
-    const note = noteOf(JSON.parse(await Bun.stdin.text()), now);
+    const input = JSON.parse(await Bun.stdin.text());
+    const note = noteOf(input, now);
     if (note) {
       // A let-through third try is already logged by the reply hook; a bypass is logged here.
       if (note.net && !note.net.released) await appendGate({ at: now, point: "sent", writer: "cain", message: note.ids.at(-1),
         did: "bypassed", hits: note.net.hits });
+      const made = madeUpReviews(String(input?.tool_input?.text ?? ""));
+      if (made.length) await appendGate({ at: now, point: "sent", writer: "cain", message: note.ids.at(-1), did: "bypassed", hits: made });
       const key = linkKey();
       await tellLink(note, (body, timeoutMs) => fetch(`${LINK}/sent`, { method: "POST", body, signal: AbortSignal.timeout(timeoutMs),
         headers: { "content-type": "application/json", "x-harness-key": key } }));

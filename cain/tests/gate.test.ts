@@ -4,7 +4,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cainReasons, mentionsReviewed, reviewedHits, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
+import { cainReasons, claimsReview, CODES_WHY, codesHits, recordItems, reviewedHits, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
+import { decideSend } from "../rootfs/opt/cain/gate/send";
 import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, MAX_EXCERPTS, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
 const shared = JSON.parse(readFileSync(join(import.meta.dir, "gate-cases.json"), "utf8"));
@@ -251,8 +252,13 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
       expect(shipWordsHits(text)).toEqual([]);
     // Within about 30 characters, on one line; never in code or a link.
     expect(shipWordsHits("The tests for the morning message and the Stop row now pass")).toEqual([]);
-    expect(shipWordsHits("Tests\npass")).toEqual([]);
-    expect(shipWordsHits("Run `CI passed` and see https://example.com/ci-passed for it.")).toEqual([]);
+    expect(shipWordsHits("Tests\npass")).toEqual([]);                 // a Ship card's line is made one line first (link/core.ts)
+    // Code is read, so a claim in a code span is still one; a link isn't words.
+    expect(shipWordsHits("Run `CI passed` now.")).toHaveLength(1);
+    expect(shipWordsHits("See https://example.com/ci-passed for it.")).toEqual([]);
+    for (const text of ["Passed all checks, and OpenAI and Gemini approved it.", "The pipeline is green.", "Green CI.", "All checks passed."])
+      expect(shipWordsHits(text).length).toBeGreaterThan(0);
+    for (const text of ["Check your red folder.", "Build cards pass through the gate."]) expect(shipWordsHits(text)).toEqual([]);
     expect(shipWordsHits("CI passed. Reviewed: OpenAI, approve.").map((h) => h.around)).toEqual(["CI passed. Reviewed: OpenAI, approve.", "CI passed. Reviewed: OpenAI, approve."]);
     expect(cainReasons(shipWordsHits("CI passed."))).toEqual(['"CI passed.": the link adds the checks and the Reviewed line itself, so leave CI, check and review claims out of your words']);
   });
@@ -262,16 +268,45 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
     expect(reviewedHits(`Done. ${LINES[1].line} Next up, the digest.`, LINES)).toEqual([]);
     expect(reviewedHits(`Done.\n${LINES[0].line.slice(0, -1)}\nNext.`, LINES)).toEqual([]);
     expect(reviewedHits("Done, nothing reviewed today.", LINES)).toEqual([]);      // the word alone isn't a Reviewed line
-    for (const text of ["Reviewed: OpenAI, approve.", "Reviewed: OpenAI (Codex), approve with changes; Gemini, approve.", "reviewed: OpenAI, approve with changes; Gemini, approve.",
-      "**Reviewed:** OpenAI, approve with changes; Gemini, approve.", `${LINES[0].line} Reviewed: Gemini, approve.`])
+    // A real line is the same line however it's dressed: case, bold.
+    for (const text of ["reviewed: OpenAI, approve with changes; Gemini, approve.", "**Reviewed:** OpenAI, approve with changes; Gemini, approve."])
+      expect(reviewedHits(text, LINES)).toEqual([]);
+    // A made-up claim is caught however it's written (0.11.0, Fable and ChatGPT's reviews): spacing,
+    // invisible or lookalike letters, markdown, code, "reviewed by", a seat and a verdict, a tail.
+    for (const text of ["Reviewed: OpenAI, approve.", "Reviewed: OpenAI (Codex), approve with changes; Gemini, approve.", "**Reviewed**: OpenAI, approve.",
+      `${LINES[0].line} Reviewed: Gemini, approve.`, "Reviewed : OpenAI, approve.", "Reviewed : OpenAI, approve.", "Reviewed​: OpenAI, approve.",
+      "Rеviewed: OpenAI, approve.", "Reviewed： OpenAI, approve.", "Reviewed - OpenAI, approve.", "Reviewed by OpenAI and Gemini: both approve.",
+      "Review: OpenAI approved.", "`Reviewed: OpenAI, approve.`", "```\nReviewed: OpenAI, approve.\n```", `${LINES[0].line.slice(0, -1)}. Gemini, approve too.`,
+      "Reviewed: OpenAI, approve\n; Gemini, approve.", "See `Reviewed: anything` for the shape."])
       expect(reviewedHits(text, LINES).map((h) => [h.rule, h.result])).toContainEqual(["reviewed", "refuse"]);
     expect(reviewedHits("Shipped. Reviewed: OpenAI, approve. Then lunch.", LINES)).toMatchObject([{ rule: "reviewed", result: "refuse", around: "Reviewed: OpenAI, approve." }]);
-    expect(reviewedHits("See `Reviewed: anything` for the shape.", LINES)).toEqual([]);   // code is never read
+    // Words that aren't a review claim pass, seat names and "reviewed" included.
+    for (const text of ["I reviewed your calendar for next week.", "The lease was reviewed by your accountant.", "ChatGPT's sign-in needs you on the Cain page.",
+      "Gemini's seat is down; it's retried on its own."])
+      expect(reviewedHits(text, LINES)).toEqual([]);
     // Can't be read: "unsure", only where a Reviewed sentence needs it.
     expect(reviewedHits(LINES[0].line, null)).toMatchObject([{ rule: "reviewed", result: "unsure" }]);
     expect(reviewedHits("Moved swim to 4:30.", null)).toEqual([]);
-    expect(mentionsReviewed("Done. Reviewed: x.")).toBe(true);
-    expect(mentionsReviewed("Done, reviewed and all.")).toBe(false);
+    expect(claimsReview("Done. Reviewed: x.")).toBe(true);
+    expect(claimsReview("Done, reviewed and all.")).toBe(false);
+  });
+
+  test("codes: a record code he can't tell the meaning of is held softly; ids the record doesn't have and ordinary words pass", () => {
+    const items = recordItems("# Pending\n\n## Open\n\n| ID | Item |\n|---|---|\n| P64 | x |\n| P08 | y |\n\n## Done\n\n| P63 D1: z | done |\n");
+    expect([...items!].sort()).toEqual(["P63", "P64", "P8"]);
+    expect(recordItems(null)).toBeNull();
+    expect(recordItems("# Pending\n\nNothing open.\n")).toBeNull();
+    expect(codesHits("P64 is ready.", items)).toHaveLength(1);
+    expect(codesHits("P08 Q2 is settled, and so is p8.", items)).toHaveLength(2);
+    for (const text of ["Q4 taxes are due.", "Vitamin D3 and a P100 filter.", "P.S. done.", "`P64` in code.", "P65 isn't in the record."])
+      expect(codesHits(text, items)).toEqual([]);
+    expect(codesHits("P64 is ready.", null)).toEqual([]);                  // no record: nothing is a code
+    expect(cainReasons(codesHits("P64 is ready.", items))[0]).toEndWith(`: ${CODES_WHY}`);
+    // In a reply: held, softly (his third try goes), with the reason.
+    const d = decideSend({ tool: "reply", text: "P64 is ready." }, null, { items });
+    expect(d).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "codes", result: "refuse" }] });
+    expect(d.said).toContain(CODES_WHY);
+    expect(decideSend({ tool: "reply", text: "P64 is ready." }, null, {}).would).toBe("pass");
   });
 
   test("what the reasons say: the service's newest lines with their ids, or how to wait", () => {
