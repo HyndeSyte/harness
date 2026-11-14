@@ -9,10 +9,13 @@
 //   refuse  held back, with what to change: any em dash (only he knows whether he meant a
 //           range or a break, so he says it again without one), a hidden count, machine
 //           text, a button the card it answers doesn't have, or a named button while which
-//           buttons are up can't be told.
-//           Never released by a third try (hard): a chat the link says isn't his DM, or
-//           an edit of a message that isn't one of Cain's own replies, or whose owner
-//           can't be told right now
+//           buttons are up can't be told; a Reviewed line while the review service's lines
+//           can't be read (0.11.0).
+//           Never released by a third try (hard): a chat the link says isn't his DM, an
+//           edit of a message that isn't one of Cain's own replies, or whose owner can't be
+//           told right now, or a Reviewed line the review service didn't give (0.11.0)
+import type { Reviewed } from "../reviewed";
+import { cainReasons, reviewedHits } from "./cain";
 import { snowflakeTime } from "./plugin";
 import { AT, check, type Hit, reasonParts, type Result } from "./rules";
 
@@ -52,9 +55,12 @@ export const EDIT_WINDOW_MS = 10 * 60_000;
 // the chats it sends to. Cards that name no DM (the link hasn't asked Discord yet, say
 // after a new bot token) leave the chat unknown: the cache may be the old bot's.
 // now: for the edit window. replied: the ids the plugin's reply tool answered with in this
-// session, from its transcript (the hook's, never the link's).
+// session, from its transcript (the hook's, never the link's). reviewed: the review service's
+// lines (../reviewed.ts), needed only when the text has a "Reviewed:" sentence; null or not
+// given: they can't be read.
 export function decideSend(call: SendCall, cards: CardsView | null,
-                           o: { tz?: string; dm?: string | null; now?: number; replied?: ReadonlySet<string> } = {}): Decision {
+                           o: { tz?: string; dm?: string | null; now?: number; replied?: ReadonlySet<string>;
+                                reviewed?: readonly Reviewed[] | null } = {}): Decision {
   const tz = o.tz ?? "America/New_York";
   const now = o.now ?? Date.now();
   const dm = cards ? cards.dm ?? null : o.dm ?? null;
@@ -80,12 +86,19 @@ export function decideSend(call: SendCall, cards: CardsView | null,
     const t = editTarget(call.target, cards, now, o.replied);
     if (t !== "ok") { hits.push({ rule: "target", result: t, around: "" }); hard = true; }
   }
+  const sendHard = hard;
+  // A Reviewed line goes only as the review service gave it (gate/cain.ts): a made-up one is
+  // held for good, since no third try may pass off a review that didn't happen; while its
+  // lines can't be read, softly.
+  const reviewed = reviewedHits(call.text, o.reviewed);
+  for (const h of reviewed) hits.push({ rule: h.rule, result: h.result, around: h.around });
+  if (reviewed.some((h) => h.result === "refuse")) hard = true;
   const held = hits.some((h) => h.result === "refuse" || h.result === "unsure");
   const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
   const lines: string[] = [];
   // The wording refusals, each reason said once with its excerpts (an em dash's for all of them).
-  const worded = hits.filter((h) => h.result === "refuse" && !["button", "target", "chat"].includes(h.rule));
-  let wordedSaid = false;
+  const worded = hits.filter((h) => h.result === "refuse" && !["button", "target", "chat", "reviewed"].includes(h.rule));
+  let wordedSaid = false, reviewedSaid = false;
   for (const h of hits) {
     if (h.rule === "button" && h.label) {
       const with_ = live.filter((c) => c.labels.includes(h.label!) && c.message !== call.replyTo);
@@ -101,8 +114,11 @@ export function decideSend(call: SendCall, cards: CardsView | null,
       lines.push(h.result === "unsure" ? "Which messages are your own replies can't be checked right now: send it as a new reply instead, or edit in a minute."
         : "That message isn't one of your own replies: edit only your own, or say it in a new reply.");
     } else if (h.rule === "chat") {
-      lines.push(hard ? "That chat isn't his DM: send only to him, in his DM."
+      lines.push(sendHard ? "That chat isn't his DM: send only to him, in his DM."
         : "That chat isn't his DM as last seen (the link can't be asked right now): send only to him, in his DM.");
+    } else if (h.rule === "reviewed") {
+      if (!reviewedSaid) for (const part of cainReasons(reviewed, o.reviewed, 3)) lines.push(`${part.charAt(0).toUpperCase()}${part.slice(1)}.`);
+      reviewedSaid = true;
     } else if (h.result === "refuse" && !wordedSaid) {
       wordedSaid = true;
       for (const part of reasonParts(worded, 5)) lines.push(`${part}.`);

@@ -13,6 +13,7 @@ import { asksSomething } from "../rootfs/opt/cain/gate/plugin";
 import { decideSend, EDIT_WINDOW_MS, type CardsView } from "../rootfs/opt/cain/gate/send";
 import { act, callOf, cardsNow, entry, plainInput, readDm, keepDm, keyOf, releasable, repliedIn, selfTest, STALE_MS, textHash, TRY_MS, type Tries, wasReleased } from "../rootfs/opt/cain/hooks/discord-send";
 import { AGAIN_MS, noteOf, tellLink } from "../rootfs/opt/cain/hooks/discord-sent";
+import type { Reviewed } from "../rootfs/opt/cain/reviewed";
 
 const HOOK = join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-send.ts");
 const SENT_HOOK = join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-sent.ts");
@@ -37,8 +38,11 @@ const reply = (text: string, reply_to?: string, chat_id = DM) => ({ session_id: 
   tool_input: { chat_id, text, ...(reply_to ? { reply_to } : {}) } });
 const edit = (text: string, message_id: string, chat_id = DM) => ({ session_id: "s1", tool_name: EDIT, hook_event_name: "PreToolUse",
   tool_input: { chat_id, message_id, text } });
-const decide = (input: any, cards: CardsView | null = CARDS, o: { dm?: string | null; now?: number; replied?: Set<string> } = {}) =>
+const decide = (input: any, cards: CardsView | null = CARDS, o: { dm?: string | null; now?: number; replied?: Set<string>; reviewed?: Reviewed[] | null } = {}) =>
   decideSend(callOf(input)!, cards, { now: NOW, ...o });
+// The review service's lines (/data/trust/reviewed.json), newest first.
+const LINES: Reviewed[] = [{ id: "2026-11-12-gate", line: "Reviewed: OpenAI, approve with changes; Gemini, approve.", finished_at: "2026-11-12T14:00:00.000Z" },
+  { id: "2026-11-11-ship", line: "Reviewed: Gemini, approve.", finished_at: "2026-11-11T14:00:00.000Z" }];
 
 describe("what the gate does with Cain's reply", () => {
   test("Nov 10, synthetic: tap Undo in a reply to a receipt without Undo is held, naming its buttons and the live card with Undo", () => {
@@ -204,6 +208,33 @@ describe("what the gate does with Cain's reply", () => {
     expect(callOf({ tool_name: REPLY })).toBeNull();
     expect(callOf(reply("hi", "not-an-id"))).toEqual({ tool: "reply", text: "hi", chat: DM, session: "s1", replyTo: undefined,
       input: { chat_id: DM, text: "hi", reply_to: "not-an-id" } });
+  });
+});
+
+describe("a Reviewed line in Cain's reply or edit (0.11.0): only as the review service gave it", () => {
+  test("the exact line passes; an edited one is held for good, offering the service's newest lines with their ids", () => {
+    expect(decide(reply(`The gate is done. ${LINES[0].line}`), CARDS, { reviewed: LINES })).toMatchObject({ would: "pass", hits: [] });
+    const d = decide(reply("The gate is done. Reviewed: OpenAI, approve."), CARDS, { reviewed: LINES });
+    expect(d).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "reviewed", result: "refuse", around: "Reviewed: OpenAI, approve." }] });
+    expect(d.said).toBe(`The message gate held this: "Reviewed: OpenAI, approve.": a Reviewed line goes only as the review service gave it, word for word, or not at all (review 2026-11-12-gate: "${LINES[0].line}"; review 2026-11-11-ship: "${LINES[1].line}"). Rewrite and send now; don't mention it to him.`);
+    const c = callOf(reply("The gate is done. Reviewed: OpenAI, approve."))!;
+    expect(releasable(d)).toBe(false);
+    const t: Tries = {};
+    for (let i = 0; i < 4; i++) expect(act(c, d, t, NOW + i)).toMatchObject({ did: "refused" });   // no third try passes off a review
+    expect(decide(edit("Reviewed: Gemini, approve with changes.", MINE), CARDS, { reviewed: LINES })).toMatchObject({ would: "refuse", hard: true });
+    expect(decide(edit(`Fixed it. ${LINES[1].line}`, MINE), CARDS, { reviewed: LINES })).toMatchObject({ would: "pass" });
+  });
+
+  test("while the lines can't be read it's held softly: the third try lets it go; a reply without one never needs them", () => {
+    const c = callOf(reply(`Done. ${LINES[0].line}`))!;
+    const d = decideSend(c, CARDS, { reviewed: null });
+    expect(d).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "reviewed", result: "unsure" }] });
+    expect(d.said).toBe("The message gate held this: Reviews can't be checked right now: leave the Reviewed line out, or send it in a minute. Rewrite and send now; don't mention it to him.");
+    const t: Tries = {};
+    expect(act(c, d, t, NOW).did).toBe("refused");
+    expect(act(c, d, t, NOW + 1).did).toBe("refused");
+    expect(act(c, d, t, NOW + 2).did).toBe("passed after two refusals");
+    expect(decideSend(callOf(reply("Moved swim to 4:30."))!, CARDS).would).toBe("pass");
   });
 });
 
@@ -584,6 +615,26 @@ describe("run as Claude Code runs it", () => {
       expect(await run(reply("Moved swim to 4:30.", RECEIPT), env)).toMatchObject({ out: "", code: 0 });
       expect(lines(f.CAIN_GATE_LOG)).toMatchObject([{ did: "refused", cards: "link" }, { did: "fixed" }, { did: "refused", hits: [{ rule: "dash", result: "refuse" }] }]);
       expect(readDm(f.CAIN_GATE_DM)).toBe(DM);                            // kept from the link's answer
+    } finally { link.server.stop(true); }
+  }, 30_000);
+
+  test("a Reviewed line is read against the published lines: the exact one passes, an edited one is denied, an unreadable file lets the third try go", async () => {
+    const link = fakeLink(() => CARDS);
+    try {
+      const file = join(dir, "reviewed.json");
+      writeFileSync(file, JSON.stringify({ reviews: LINES }));
+      const env = { ...files(), CAIN_LINK: link.url, CAIN_CARDS: join(dir, "none.json"), CAIN_REVIEWED: file };
+      expect(await run(reply(`Done. ${LINES[0].line}`), env)).toMatchObject({ out: "", code: 0 });
+      const held = await run(reply("Done. Reviewed: OpenAI, approve."), env);
+      expect(held.json).toMatchObject({ permissionDecision: "deny" });
+      expect(held.json.permissionDecisionReason).toContain(`review 2026-11-12-gate: "${LINES[0].line}"`);
+      const missing = { ...files(), CAIN_LINK: link.url, CAIN_CARDS: join(dir, "none.json"), CAIN_REVIEWED: join(dir, "no-such-reviewed.json") };
+      const input = reply(`Done. ${LINES[0].line}`);
+      expect((await run(input, missing)).json.permissionDecisionReason).toContain("Reviews can't be checked right now");
+      expect((await run(input, missing)).json.permissionDecision).toBe("deny");
+      expect(await run(input, missing)).toMatchObject({ out: "", code: 0 });
+      expect(lines(missing.CAIN_GATE_LOG).map((l) => l.did)).toEqual(["refused", "refused", "passed after two refusals"]);
+      expect(lines(missing.CAIN_GATE_LOG)[0].hits).toEqual([{ rule: "reviewed", result: "unsure", around: LINES[0].line }]);
     } finally { link.server.stop(true); }
   }, 30_000);
 

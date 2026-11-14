@@ -15,7 +15,10 @@
 //   - deny, with what to change: any em dash (rewritten without one: only Cain knows
 //     whether he meant a range or a break), a hidden count, machine text, a button the
 //     card it answers lacks (or any named button while the cards can't be read), a chat
-//     that isn't his DM, or an edit of a message that isn't one of his own replies.
+//     that isn't his DM, an edit of a message that isn't one of his own replies, or (0.11.0)
+//     a Reviewed line the review service didn't give, word for word, with its newest lines
+//     offered (read from /data/trust/reviewed.json, ../reviewed.ts, only for a text that has
+//     a "Reviewed:" sentence; while that can't be read, the third try lets it go).
 // The cards come first, always (decision F): the link's local route gets 1.5 s, then
 // /data/trust/cards.json while it's under 3 minutes old. So every rule runs on every send,
 // however slow the link is, and the link's DM id wins over the cached one, rewriting it.
@@ -42,10 +45,12 @@ import { createHash, createHmac } from "node:crypto";
 import { appendFileSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { mentionsReviewed } from "../gate/cain";
 import { appendGate } from "../gate/log";
 import { answerText, REPLY_TOOL, SENDS, sentIds } from "../gate/plugin";
 import { DASH_WHY, fixedWhat, type Hit } from "../gate/rules";
 import { type CardsView, decideSend, type Decision, type SendCall } from "../gate/send";
+import { readReviewed } from "../reviewed";
 
 export { SENDS };
 // Moved only for the tests: the hook runs in the environment Claude Code was started with.
@@ -231,9 +236,11 @@ export async function run(raw: string, o: { ask?: () => Promise<CardsView | null
   const tz = process.env.CHECKIN_TZ ?? "America/New_York";
   const got = await cardsNow(o.ask ?? askLink, o.file ?? (() => { try { return readFileSync(CARDS, "utf8"); } catch { return null; } }), now);
   keepDm(got.cards?.dm);
-  // The cached DM id only when there are no cards at all (decideSend).
+  // The cached DM id only when there are no cards at all (decideSend). The review service's
+  // lines only for a text with a "Reviewed:" sentence.
   const d = decideSend(call, got.cards, { dm: got.cards ? null : readDm(), tz, now,
-    ...(call.tool === "edit" ? { replied: repliedIn(input?.transcript_path) } : {}) });
+    ...(call.tool === "edit" ? { replied: repliedIn(input?.transcript_path) } : {}),
+    ...(mentionsReviewed(call.text) ? { reviewed: readReviewed() } : {}) });
   const tries = readTries();
   let out = act(call, d, tries, now);
   if (!writeTries(tries, now) && out.counted) out = { output: null, did: "passed, tries not counted" };

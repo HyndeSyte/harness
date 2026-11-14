@@ -4,6 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { cainReasons, mentionsReviewed, reviewedHits, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
 import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, MAX_EXCERPTS, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
 const shared = JSON.parse(readFileSync(join(import.meta.dir, "gate-cases.json"), "utf8"));
@@ -235,5 +236,56 @@ describe("the rules", () => {
     expect(verdict(check("Moved swim — then art."))).toBe("fix");
     expect(verdict(check("Tap Undo.", { buttons: null }))).toBe("unsure");
     expect(verdict(check("Moved swim to 4:30."))).toBe("pass");
+  });
+});
+
+describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or their Python port", () => {
+  const LINES = [{ id: "2026-11-14-a", line: "Reviewed: OpenAI, approve with changes; Gemini, approve.", finished_at: "2026-11-14T15:00:00Z" },
+    { id: "2026-11-13-b", line: "Reviewed: Claude standing in for Gemini, approve (not independent).", finished_at: "2026-11-13T15:00:00Z" }];
+  test("ship words: CI, checks and review claims are refused; plain lines pass", () => {
+    for (const text of ["CI passed", "CI passed.", "checks are green", "All checks are green now.", "Reviewed by X", "reviewed: yes", "The tests pass.",
+      "Build succeeded", "the build failed twice", "tests are red", "Tested and passing.", "CI: green."])
+      expect(shipWordsHits(text).length).toBeGreaterThan(0);
+    for (const text of ["Tests now cover the Stop button", "Stop stays in reach", "Stop is red and on its own row.", "The review service names who answered.",
+      "Build jobs name their branch.", "Cain checks Home Assistant first.", "Ship cards say what installs.", "", "Passed by the build team long ago in a meeting room."])
+      expect(shipWordsHits(text)).toEqual([]);
+    // Within about 30 characters, on one line; never in code or a link.
+    expect(shipWordsHits("The tests for the morning message and the Stop row now pass")).toEqual([]);
+    expect(shipWordsHits("Tests\npass")).toEqual([]);
+    expect(shipWordsHits("Run `CI passed` and see https://example.com/ci-passed for it.")).toEqual([]);
+    expect(shipWordsHits("CI passed. Reviewed: OpenAI, approve.").map((h) => h.around)).toEqual(["CI passed. Reviewed: OpenAI, approve.", "CI passed. Reviewed: OpenAI, approve."]);
+    expect(cainReasons(shipWordsHits("CI passed."))).toEqual(['"CI passed.": the link adds the checks and the Reviewed line itself, so leave CI, check and review claims out of your words']);
+  });
+
+  test("reviewed: each \"Reviewed:\" sentence must be one of the service's lines, word for word; the full stop at its end may go", () => {
+    expect(reviewedHits(`Done. ${LINES[0].line}`, LINES)).toEqual([]);
+    expect(reviewedHits(`Done. ${LINES[1].line} Next up, the digest.`, LINES)).toEqual([]);
+    expect(reviewedHits(`Done.\n${LINES[0].line.slice(0, -1)}\nNext.`, LINES)).toEqual([]);
+    expect(reviewedHits("Done, nothing reviewed today.", LINES)).toEqual([]);      // the word alone isn't a Reviewed line
+    for (const text of ["Reviewed: OpenAI, approve.", "Reviewed: OpenAI (Codex), approve with changes; Gemini, approve.", "reviewed: OpenAI, approve with changes; Gemini, approve.",
+      "**Reviewed:** OpenAI, approve with changes; Gemini, approve.", `${LINES[0].line} Reviewed: Gemini, approve.`])
+      expect(reviewedHits(text, LINES).map((h) => [h.rule, h.result])).toContainEqual(["reviewed", "refuse"]);
+    expect(reviewedHits("Shipped. Reviewed: OpenAI, approve. Then lunch.", LINES)).toMatchObject([{ rule: "reviewed", result: "refuse", around: "Reviewed: OpenAI, approve." }]);
+    expect(reviewedHits("See `Reviewed: anything` for the shape.", LINES)).toEqual([]);   // code is never read
+    // Can't be read: "unsure", only where a Reviewed sentence needs it.
+    expect(reviewedHits(LINES[0].line, null)).toMatchObject([{ rule: "reviewed", result: "unsure" }]);
+    expect(reviewedHits("Moved swim to 4:30.", null)).toEqual([]);
+    expect(mentionsReviewed("Done. Reviewed: x.")).toBe(true);
+    expect(mentionsReviewed("Done, reviewed and all.")).toBe(false);
+  });
+
+  test("what the reasons say: the service's newest lines with their ids, or how to wait", () => {
+    const hits = reviewedHits("Reviewed: OpenAI, approve.", LINES);
+    expect(cainReasons(hits, LINES)).toEqual([`"Reviewed: OpenAI, approve.": a Reviewed line goes only as the review service gave it, word for word, or not at all (review 2026-11-14-a: "${LINES[0].line}"; review 2026-11-13-b: "${LINES[1].line}")`]);
+    expect(cainReasons(hits, LINES, 0)).toEqual([`a Reviewed line goes only as the review service gave it, word for word, or not at all (review 2026-11-14-a: "${LINES[0].line}")`]);
+    expect(cainReasons(reviewedHits("Reviewed: OpenAI, approve.", []), [])).toEqual(['"Reviewed: OpenAI, approve.": a Reviewed line goes only as the review service gave it, and it has given none yet: leave it out']);
+    expect(cainReasons(reviewedHits("Reviewed: x.", null), null)).toEqual(["reviews can't be checked right now: leave the Reviewed line out, or send it in a minute"]);
+  });
+
+  test("the shared rules and their port don't have them", () => {
+    expect([...RULES]).toEqual(["dash", "app", "count", "machine", "button"]);
+    expect(check("CI passed. Reviewed: OpenAI, approve.", { rules: AT.cain, refusable: true }).hits).toEqual([]);
+    const port = readFileSync(join(import.meta.dir, "../../tests/message_rules.py"), "utf8");
+    expect(port).not.toMatch(/reviewed|ship words/i);
   });
 });
