@@ -275,6 +275,22 @@ def test_the_port_reads_javascripts_spaces():
     assert message_rules.around("\x85a\ufeff", 1, 2) == "\x85a"                 # trim() keeps U+0085, takes U+FEFF
 
 
+def test_the_port_finds_links_once_caps_excerpts_and_reads_ip_hosts():
+    """At most MAX_EXCERPTS excerpts, and one more for a kind past them; an IP address with a path and
+    a domain's trailing dot are links; a long run of hits is quick (rules.ts check)."""
+    text = "Moved swim — it starts. " * 25 + "And 3 more."
+    hits = message_rules.check(text, refusable=True).hits
+    assert [h.rule for h in hits].count("dash") == message_rules.MAX_EXCERPTS
+    assert [h.rule for h in hits].count("count") == 1
+    assert message_rules.hosts_only("Open 192.168.1.1/admin?pw=SECRET now.") == "Open 192.168.1.1/… now."
+    assert message_rules.hosts_only("Open example.com./SECRET now.") == "Open example.com./… now."
+    assert message_rules.hosts_only("Versions 1.2.3.4 and 0.10.0 now.") == "Versions 1.2.3.4 and 0.10.0 now."
+    import time
+    started = time.perf_counter()
+    message_rules.check("a.b—" * 1000, rules=message_rules.AT["card"])
+    assert time.perf_counter() - started < 5                              # once cubic: seconds at this length
+
+
 def test_the_port_keeps_a_dash_beside_the_same_words():
     """The words that keep a dash in words never refused are the same list on both sides."""
     assert list(message_rules.DASH_WORDS) == cases()["dash_words"]

@@ -48,7 +48,7 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
-import { Link, Protocol, PULL, type Pull, Refusal, type State } from "./core";
+import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, inMain, land, type MergeDeps } from "./merge";
@@ -310,7 +310,7 @@ Bun.serve({
         }
       }
     } catch (e) {
-      if (e instanceof Refusal) return json({ status: "refused", said: e.message.slice(0, 300) }, 400);
+      if (e instanceof Refusal) return json({ status: "refused", said: e.message.slice(0, SAID_MAX) }, 400);
       return json({ status: "error", said: String(e).slice(0, 200) }, 500);
     }
     return json({ status: "not found" }, 404);

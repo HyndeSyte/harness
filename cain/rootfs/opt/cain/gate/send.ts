@@ -14,7 +14,7 @@
 //           an edit of a message that isn't one of Cain's own replies, or whose owner
 //           can't be told right now
 import { snowflakeTime } from "./plugin";
-import { AT, check, type Hit, type Result, whyOf } from "./rules";
+import { AT, check, type Hit, reasonParts, type Result } from "./rules";
 
 export type Writer = "cain" | "specialist" | "link";
 
@@ -83,6 +83,9 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   const held = hits.some((h) => h.result === "refuse" || h.result === "unsure");
   const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
   const lines: string[] = [];
+  // The wording refusals, each reason said once with its excerpts (an em dash's for all of them).
+  const worded = hits.filter((h) => h.result === "refuse" && !["button", "target", "chat"].includes(h.rule));
+  let wordedSaid = false;
   for (const h of hits) {
     if (h.rule === "button" && h.label) {
       const with_ = live.filter((c) => c.labels.includes(h.label!) && c.message !== call.replyTo);
@@ -100,7 +103,10 @@ export function decideSend(call: SendCall, cards: CardsView | null,
     } else if (h.rule === "chat") {
       lines.push(hard ? "That chat isn't his DM: send only to him, in his DM."
         : "That chat isn't his DM as last seen (the link can't be asked right now): send only to him, in his DM.");
-    } else if (h.result === "refuse") lines.push(`"${h.around}": ${whyOf(h)}.`);
+    } else if (h.result === "refuse" && !wordedSaid) {
+      wordedSaid = true;
+      for (const part of reasonParts(worded, 5)) lines.push(`${part}.`);
+    }
   }
   let said: string;
   if (would === "refuse") {

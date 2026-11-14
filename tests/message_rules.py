@@ -24,6 +24,7 @@ tests that use it.
 """
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass, field
 
@@ -104,26 +105,33 @@ def hidden(text: str, only_targets: bool | str = False) -> str:
 
 
 # A link has any scheme ("https://", "wss://", in any case), or none and starts with "www." or is
-# a domain with a path; it runs to the next space or line break, whatever stands between ("<",
-# ">" and brackets included; the zero-width U+FEFF too). Its authority runs to the first "/",
-# "?", "#" or backslash (rules.ts GAP, LABEL, SCHEMED, BARE, LINK).
+# a host with a path (a domain, its trailing dot too, or a dotted quad); it runs to the next space
+# or line break, whatever stands between ("<", ">" and brackets included; the zero-width U+FEFF
+# too). Its authority runs to the first "/", "?", "#" or backslash. Each part is bounded, so
+# finding links stays quick (rules.ts GAP, LABEL, SCHEMED, HOST_PATH, BARE, LINK).
 _GAP = "\\t-\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000"
 _LABEL = "[^" + _GAP + "\\x00-\\x2c\\x2e\\x2f\\x3a-\\x40\\x5b-\\x5e\\x60\\x7b-\\x7f]"
 _SCHEMED = "(?<![A-Za-z0-9+.\\-])[A-Za-z0-9+.\\-]+:\\/\\/[^" + _GAP + "]+"
-_BARE = ("(?<![A-Za-z0-9_\\-.@])(?:[^" + _GAP + "\\/?#\\\\]*@)?"
-         + "(?:[Ww][Ww][Ww]\\.|(?:" + _LABEL + "+\\.)+(?:[A-Za-z]|[^" + _GAP + "\\x00-\\x7f])" + _LABEL
-         + "+(?::\\d*)?(?=[\\/\\\\]|[?#][^" + _GAP + "]))[^" + _GAP + "]*")
+_HOST_PATH = ("(?:(?:" + _LABEL + "{1,63}\\.){1,16}(?:[A-Za-z]|[^" + _GAP + "\\x00-\\x7f])" + _LABEL
+              + "{1,62}|(?:\\d{1,3}\\.){3}\\d{1,3})\\.?(?::\\d{0,5})?(?=[\\/\\\\]|[?#][^" + _GAP + "])")
+_BARE = ("(?<![A-Za-z0-9_\\-.@])(?:[^" + _GAP + "\\/?#\\\\]{0,256}@)?(?:[Ww][Ww][Ww]\\.|" + _HOST_PATH
+         + ")[^" + _GAP + "]*")
 _LINK = re.compile(_SCHEMED + "|" + _BARE, A)
 
 
-def around(text: str, at: int, end: int, n: int = 60) -> str:
+def link_spans(text: str) -> list[tuple[int, int, str]]:
+    """Each link in the text, once: where it starts and ends, and how it shows (rules.ts linkSpans)."""
+    return [(m.start(), m.end(), link_host(m.group(0))) for m in _LINK.finditer(str(text or ""))]
+
+
+def around(text: str, at: int, end: int, n: int = 60, links=None) -> str:
     """Up to n characters around a hit, on one line; a link keeps only its scheme and host
-    (rules.ts)."""
+    (rules.ts). links: the text's links, found once."""
     pad = max(0, (n - min(end - at, n)) // 2)
     start = max(0, at - pad)
     stop = min(len(text), start + n)
     start = max(0, stop - n)
-    return re.sub(_S + "+", " ", hosts_only(text, start, stop)).strip(_SPACES)[:n]
+    return re.sub(_S + "+", " ", hosts_only(text, start, stop, links)).strip(_SPACES)[:n]
 
 
 _HOST = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(?::\d*)?\Z", A)
@@ -144,19 +152,26 @@ def link_host(link: str) -> str:
     return scheme.lower() + h.group(1).lower() + ("/\u2026" if len(s) > len(scheme) + len(h.group(1)) else "")
 
 
-def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
+def hosts_only(text: str, start: int = 0, stop: int | None = None, links=None) -> str:
     """text[start:stop] with each link as link_host has it. A link that runs past either end of
     the window still comes out whole, as its host (rules.ts hostsOnly)."""
     t = str(text or "")
     stop = len(t) if stop is None else min(stop, len(t))
+    spans = link_spans(t) if links is None else links
+    lo, hi = 0, len(spans)                  # the first link that ends after start
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if spans[mid][1] <= start:
+            lo = mid + 1
+        else:
+            hi = mid
     out, i = [], start
-    for m in _LINK.finditer(t):
-        a, b = m.start(), m.end()
+    for a, b, host in spans[lo:]:
         if b <= i:
             continue
         if a >= stop:
             break
-        out.append(t[i:max(i, a)] + link_host(m.group(0)))
+        out.append(t[i:max(i, a)] + host)
         i = b
     out.append(t[i:max(i, stop)])
     return "".join(out)
@@ -192,39 +207,95 @@ DASH_WORDS = (
 )
 _RANGE_WORDS = frozenset(DASH_WORDS)
 _LOWER_WORDS = frozenset(("may", "march", "sat", "sun", "wed"))   # lower case alone, these are words
-_WORD = re.compile("[A-Za-z]+(?:['\u2019-][A-Za-z]+)*\\Z", A)
-_LINE_BREAK = re.compile("[\n\r\u2028\u2029]")
-_SPACE_RUN = re.compile("[\t\v\f \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff]+")   # JavaScript's \s, less a line break
+_WORD = re.compile("[A-Za-z]+(?:['\\u2019-][A-Za-z]+)*\\Z", A)
+_LEAD = re.compile("^[(\\[\"'\\u2018\\u201c]+")
+_TRAIL = re.compile("[.,;:!?)\\]}\"'\\u2019\\u201d]+\\Z")
+_MAX_WORD = 40                          # a longer run without a space is no plain word (rules.ts MAX_WORD)
+_SPACE_CHARS = frozenset("\t\n\v\f\r \u00a0\u1680\u2028\u2029\u202f\u205f\u3000\ufeff" + "".join(map(chr, range(0x2000, 0x200B))))
+_BREAK_CHARS = frozenset("\n\r\u2028\u2029")
 
 
 def _plain_word(token: str) -> bool:
     """A plain word, once opening quotes and brackets before it and marks after it are set aside."""
-    w = re.sub("[.,;:!?)\\]}\"'\u2019\u201d]+\\Z", "", re.sub("^[(\\[\"'\u2018\u201c]+", "", token))
+    w = _TRAIL.sub("", _LEAD.sub("", token))
     return len(w) >= 2 and _WORD.match(w) is not None and (w.lower() not in _RANGE_WORDS or w in _LOWER_WORDS)
 
 
-def _between_plain_words(text: str, at: int, end: int) -> bool:
+def _words_of(text: str):
+    """Where the spaces and line breaks are, once per text (rules.ts wordsOf): for each place, the last
+    space and the last other character before it, the first of each at or after it, and how many line
+    breaks come before it."""
+    n = len(text)
+    prev_space, prev_word, breaks = [0] * (n + 1), [0] * (n + 1), [0] * (n + 1)
+    next_space, next_word = [0] * (n + 1), [0] * (n + 1)
+    space = word = -1
+    count = 0
+    for i in range(n + 1):
+        prev_space[i], prev_word[i], breaks[i] = space, word, count
+        if i == n:
+            break
+        c = text[i]
+        if c in _SPACE_CHARS:
+            space = i
+            if c in _BREAK_CHARS:
+                count += 1
+        else:
+            word = i
+    space = word = n
+    for i in range(n, -1, -1):
+        if i < n:
+            if text[i] in _SPACE_CHARS:
+                space = i
+            else:
+                word = i
+        next_space[i], next_word[i] = space, word
+    return prev_space, prev_word, next_space, next_word, breaks
+
+
+def _between_plain_words(text: str, w, at: int, end: int) -> bool:
     """Whether the dash at [at, end) stands between plain words: two on each side, on its line."""
-    before = [x for x in _SPACE_RUN.split(_LINE_BREAK.split(text[:at])[-1]) if x][-2:]
-    after = [x for x in _SPACE_RUN.split(_LINE_BREAK.split(text[end:])[0]) if x][:2]
-    return (len(before) == 2 and len(after) == 2 and re.search("[A-Za-z]\\Z", before[1]) is not None
-            and re.match("[A-Za-z]", after[0]) is not None and all(_plain_word(t) for t in before + after))
+    prev_space, prev_word, next_space, next_word, breaks = w
+    s1 = prev_space[at] + 1
+    q = prev_word[s1]
+    e2 = next_space[end]
+    r = next_word[e2]
+    if s1 >= at or e2 <= end or q < 0 or r >= len(text):
+        return False
+    if breaks[s1] != breaks[q + 1] or breaks[r] != breaks[e2]:
+        return False
+    s0, e3 = prev_space[q] + 1, next_space[r]
+    if at - s1 > _MAX_WORD or q + 1 - s0 > _MAX_WORD or e2 - end > _MAX_WORD or e3 - r > _MAX_WORD:
+        return False
+    words = [text[s0:q + 1], text[s1:at], text[end:e2], text[r:e3]]
+    return (re.search("[A-Za-z]\\Z", words[1]) is not None and re.match("[A-Za-z]", words[2]) is not None
+            and all(_plain_word(x) for x in words))
 
 
-def _dashes(text: str, seen: str, refusable: bool) -> list[tuple[int, int, str | None, str]]:
+def _dashes(text: str, seen: str, refusable: bool, links) -> list[tuple[int, int, str | None, str]]:
     """Each em dash, what goes in its place (None: it stays, refused or kept and flagged), and why
     one is kept."""
     out: list[tuple[int, int, str | None, str]] = []
     # The links a comma could run into: any but a masked link's target, which its brackets close.
-    links = [] if refusable else [(m.start(), m.end()) for m in _LINK.finditer(text)
-                                  if text[max(0, m.start() - 2):m.start()] != "]("]
+    near = [] if refusable else [s for s in links if text[max(0, s[0] - 2):s[0]] != "]("]
+    w = None
     for m in _DASH.finditer(seen):
         at, end = m.start(), m.end()
         if refusable:
             out.append((at, end, None, ""))
-        elif any(a < at <= b for a, b in links):
+            continue
+        lo, hi = 0, len(near)               # the last link that starts before the dash
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if near[mid][0] < at:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo > 0 and near[lo - 1][1] >= at:
             out.append((at, end, None, "link"))
-        elif _between_plain_words(text, at, end):
+            continue
+        if w is None:
+            w = _words_of(text)
+        if _between_plain_words(text, w, at, end):
             out.append((at, end, ", ", ""))
         else:
             out.append((at, end, None, "range"))
@@ -293,16 +364,34 @@ def _named(seen: str, label: str) -> list[tuple[int, int]]:
     ) + ((_js(r"(?<![A-Za-z])[Ww]ith\s+(?:the\s+)?") + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",)
          if label in WITH_LABELS else ())
     out: list[tuple[int, int]] = []
+    starts: set[int] = set()
     for form in forms:
         for m in re.finditer(form, seen, A):
             at, end = m.start(1), m.end(1)
-            if not any(x[0] == at for x in out):
+            if at not in starts:
+                starts.add(at)
                 out.append((at, end))
     return out
 
 
-def _overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
-    return a[0] < b[1] and b[0] < a[1]
+class _Taken:
+    """Spans found so far, in order and none overlapping; a new one is taken only if it overlaps none,
+    which its neighbours alone can tell (rules.ts Taken)."""
+
+    def __init__(self) -> None:
+        self.spans: list[tuple[int, int]] = []
+
+    def take(self, at: int, end: int) -> bool:
+        i = bisect.bisect_left(self.spans, (at, -1))   # the first one starting at or after at
+        if (i > 0 and self.spans[i - 1][1] > at) or (i < len(self.spans) and self.spans[i][0] < end):
+            return False
+        self.spans.insert(i, (at, end))
+        return True
+
+
+# At most this many excerpts, the first hits, and one more for each kind of hit not among them
+# (rules.ts MAX_EXCERPTS).
+MAX_EXCERPTS = 20
 
 
 def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = False, refusable: bool = False) -> Report:
@@ -312,16 +401,18 @@ def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = Fa
     on = set(RULES if rules is None else rules)
     # The machine rule reads code too, except in a reply to his own message.
     seen, targets_only = hidden(t), hidden(t, "code" if answers_him else True)
-    hits: list[Hit] = []
+    links = link_spans(t)
+    found: list[tuple[str, str, int, int, str, str]] = []
+    taken: dict[str, _Taken] = {}
 
     def add(rule: str, result: str, at: int, end: int, label: str = "", kept: str = "") -> None:
-        if any(h.rule == rule and _overlaps((h.at, h.end), (at, end)) for h in hits):
+        if not taken.setdefault(rule, _Taken()).take(at, end):
             return
-        hits.append(Hit(rule, result, at, end, around(t, at, end), label, kept))
+        found.append((rule, result, at, end, label, kept))
 
     edits: list[tuple[int, int, str]] = []
     if "dash" in on:
-        for at, end, put, kept in _dashes(t, seen, refusable):
+        for at, end, put, kept in _dashes(t, seen, refusable, links):
             if put is None:
                 add("dash", "refuse", at, end, kept=kept)
                 continue
@@ -348,20 +439,27 @@ def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = Fa
         has = None if buttons is None else set(buttons)
         labels = list(dict.fromkeys(x for x in (str(l).strip(_SPACES) for l in (*STATIC_LABELS, *known)) if x))
         labels = sorted(labels, key=lambda l: -len(l))
-        taken: list[tuple[int, int]] = []
+        named = _Taken()
         for label in labels:
             for span in _named(seen, label):
-                if any(_overlaps(x, span) for x in taken):
+                if not named.take(span[0], span[1]):
                     continue
-                taken.append(span)
                 if has is not None and label in has:
                     continue
                 add("button", "unsure" if has is None else "refuse", span[0], span[1], label)
-    hits.sort(key=lambda h: (h.at, RULES.index(h.rule)))
-    fixed = t
-    for at, end, put in sorted(edits, key=lambda e: -e[0]):
-        fixed = fixed[:at] + put + fixed[end:]
-    return Report(hits, fixed)
+    found.sort(key=lambda h: (h[2], RULES.index(h[0])))
+    kinds: set[tuple[str, str, str, str]] = set()
+    hits: list[Hit] = []
+    for i, (rule, result, at, end, label, kept) in enumerate(found):
+        kind = (rule, result, kept, label)
+        if i < MAX_EXCERPTS or kind not in kinds:
+            hits.append(Hit(rule, result, at, end, around(t, at, end, 60, links), label, kept))
+        kinds.add(kind)
+    out, i = [], 0                          # the fixes, in one pass
+    for at, end, put in sorted(edits, key=lambda e: e[0]):
+        out.append(t[i:at] + put)
+        i = end
+    return Report(hits, "".join(out) + t[i:])
 
 
 def verdict(report: Report) -> str:

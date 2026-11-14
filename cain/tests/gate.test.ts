@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
+import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, MAX_EXCERPTS, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
 const shared = JSON.parse(readFileSync(join(import.meta.dir, "gate-cases.json"), "utf8"));
 const rulesOf = (r: ReturnType<typeof check>, result: string) => [...new Set(r.hits.filter((h) => h.result === result).map((h) => h.rule))].sort();
@@ -200,12 +200,34 @@ describe("the rules", () => {
       [`Open example.com${B}reset?token=SECRET and 3 more.`, "Open example.com/… and 3 more."],
       ["Open https://example.com\ufeff/SECRET and 3 more.", "Open a link and 3 more."],
       ["Lanes 1.5/2, e.g./i.e. and 4:30/5:00 and 3 more.", "Lanes 1.5/2, e.g./i.e. and 4:30/5:00 and 3 more."],
+      // Fable, round four: an IP address with a path, and a domain's trailing dot.
+      ["Open 192.168.1.1/admin?pw=SECRET and 3 more.", "Open 192.168.1.1/… and 3 more."],
+      ["Open 1.2.3.4:8080/SECRET and 3 more.", "Open 1.2.3.4/… and 3 more."],
+      ["Open example.com./SECRET and 3 more.", "Open example.com./… and 3 more."],
+      ["Versions 1.2.3.4 and 0.10.0, and 3 more.", "Versions 1.2.3.4 and 0.10.0, and 3 more."],
     ]) {
       const r = check(t, { rules: ["count"] });
       expect(r.hits.map((h) => h.around)).toEqual([whole]);
       expect(around(t, 0, t.length)).toBe(whole);
       expect(hostsOnly(t)).toBe(whole);
     }
+  });
+
+  test("a long message is checked quickly, its links found once, with at most MAX_EXCERPTS excerpts and one more per kind", () => {
+    // Fable, round four: "a.b" and a dash over and over took 2.7 s at 2,000 characters, 25 s at 4,000.
+    const D = "—";
+    for (const t of [`a.b${D}`.repeat(5000), D.repeat(20000), `aa bb ${D} cc dd `.repeat(1500), `x.y/a${D}`.repeat(4000), "a@".repeat(10000), "www.".repeat(5000)]) {
+      for (const ctx of [{ rules: AT.cain, refusable: true }, { rules: AT.card }]) {
+        const t0 = performance.now();
+        const r = check(t, ctx);
+        expect(performance.now() - t0).toBeLessThan(1000);          // about 25 ms on the builder's laptop; room for a slow box
+        expect(r.hits.length).toBeLessThanOrEqual(MAX_EXCERPTS + 10);
+      }
+    }
+    const r = check(`Moved swim ${D} it's at 4:30. `.repeat(40) + "And 3 more.", { rules: AT.cain, refusable: true });
+    expect(r.hits.filter((h) => h.rule === "dash")).toHaveLength(MAX_EXCERPTS);
+    expect(r.hits.filter((h) => h.rule === "count")).toHaveLength(1);   // a kind past the cap still has its one
+    expect(check(`aa bb ${D} cc dd `.repeat(1500), { rules: AT.card }).fixed).toBe("aa bb, cc dd ".repeat(1500));   // every fix made
   });
 
   test("a verdict: refuse beats fix, fix beats can't tell", () => {

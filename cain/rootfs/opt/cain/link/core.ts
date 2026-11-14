@@ -70,7 +70,7 @@
 import { createHash } from "node:crypto";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
-import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, RULES, RULES_VERSION, whyOf } from "../gate/rules";
+import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import type { Facts, Landed } from "./merge";
@@ -508,7 +508,9 @@ export interface GateReport { point: string; writer: Writer | "unknown"; message
 // What Cain's transcripts say he sent with his plugin: message ids (replies and edits), the
 // exact texts, and the ids of his replies alone (his edit allowlist is seeded from those).
 export interface Sent { ids: Set<string>; texts: Set<string>; replies?: Set<string> }
-type Tally = Record<string, Record<string, number>>;   // rule -> result -> count
+// rule -> what happened -> count: fixed, refused, can't tell, or kept as it is and flagged
+// (in words that are never refused: those are never counted as refused).
+type Tally = Record<string, Record<string, number>>;
 export interface ReplayReport {
   written_at: number;
   rules_version: number;
@@ -516,7 +518,7 @@ export interface ReplayReport {
   range: { from: number; to: number; days: number; pages: number; page_cap: number; reached_cutoff: boolean; capped: boolean; stopped: string | null };
   messages: { read: number; by_writer: Record<string, number>; skipped: Record<string, number>; cards_never_posted: number };
   hits: { by_rule: Tally; by_writer: Record<string, Tally>; total: number };
-  list: { at: number; message: string; writer: string; rule: string; result: string; around: string; label?: string }[];
+  list: { at: number; message: string; writer: string; rule: string; result: string; around: string; label?: string; kept?: string }[];
   edited: { morning_messages: number; buttons_changed: number; marked_edited: number; buttons_only_edits_marked: boolean | null; said: string };
 }
 
@@ -555,13 +557,22 @@ export function clockTime(ms: number, tz = "America/New_York"): string {
 
 export type AskResult = { status: "posted"; message: string; said?: string } | { status: "held"; said: string };
 
-// Why the gate held words back, for Cain: what to change, and the buttons this has.
-// Two with the same excerpt and reason (two em dashes close together) are said once.
+// The most a refusal says over the link's HTTP answer (main.ts cuts its words there).
+export const SAID_MAX = 1000;
+// Why the gate held words back, for Cain: what to change, and the buttons this has. Each
+// reason is said once, after the excerpts it covers (an em dash's for all of them); when the
+// line would run past SAID_MAX, fewer excerpts, then none, so every reason fits whole.
 function heldLine(what: string, hits: Hit[], buttons?: readonly string[]): string {
-  const parts = hits.map((h) => h.rule === "button" && h.label
-    ? `"${h.label}" isn't one of its buttons (${buttons?.length ? buttons.join(", ") : "it has none"})`
-    : `"${h.around}": ${whyOf(h)}`);
-  return `The message gate held this ${what}: ${[...new Set(parts)].join("; ")}. Rewrite it and send it again.`;
+  const labels = [...new Set(hits.filter((h) => h.rule === "button" && h.label).map((h) => h.label!))];
+  const named = labels.length ? [`${labels.map((l) => `"${l}"`).join(", ")} ${labels.length > 1 ? "aren't among" : "isn't one of"} its buttons`
+    + ` (${buttons?.length ? buttons.join(", ") : "it has none"})`] : [];
+  const worded = hits.filter((h) => !(h.rule === "button" && h.label));
+  let line = "";
+  for (const each of [3, 1, 0]) {
+    line = `The message gate held this ${what}: ${[...reasonParts(worded, each), ...named].join("; ")}. Rewrite it and send it again.`;
+    if (line.length <= SAID_MAX) break;
+  }
+  return line;
 }
 // What the gate flagged in a specialist's words, for Cain (its card goes out all the same).
 function flaggedLine(hits: Hit[]): string {
@@ -2249,16 +2260,17 @@ export class Link {
     const allLabels = [...new Set(Object.values(s.messages).flatMap((m) => m.labels ?? []))];
     const byWriter: Record<string, number> = { cain: 0, specialist: 0, link: 0, unknown: 0 };
     const skipped: Record<string, number> = { his: 0, permission_prompts: 0, others: 0 };
-    const empty = (): Record<string, number> => ({ fix: 0, refuse: 0, unsure: 0 });
+    const empty = (): Record<string, number> => ({ fix: 0, refuse: 0, unsure: 0, kept: 0 });
     const byRule: Tally = Object.fromEntries(RULES.map((r) => [r, empty()]));
     const perWriter: Record<string, Tally> = {};
     const list: ReplayReport["list"] = [];
     const judge = (message: string, at: number, writer: string, text: string, ctx: Context) => {
       for (const h of gateCheck(text, ctx).hits) {
-        list.push({ at, message, writer, rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}) });
-        byRule[h.rule][h.result]++;
+        list.push({ at, message, writer, rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}), ...(h.kept ? { kept: h.kept } : {}) });
+        const did = h.kept ? "kept" : h.result;     // a dash kept as it is, flagged, is never refused
+        byRule[h.rule][did]++;
         const w = perWriter[writer] ??= Object.fromEntries(RULES.map((r) => [r, empty()]));
-        w[h.rule][h.result]++;
+        w[h.rule][did]++;
       }
     };
     for (const m of seen) {
@@ -2332,7 +2344,7 @@ export class Link {
     }
     const marks = changed ? marked > 0 : null;
     const total = list.length;
-    const n = (r: "fix" | "refuse" | "unsure") => list.filter((h) => h.result === r).length;
+    const n = (r: "fix" | "refuse" | "unsure" | "kept") => list.filter((h) => (h.kept ? "kept" : h.result) === r).length;
     const report: ReplayReport = {
       written_at: now,
       rules_version: RULES_VERSION,
@@ -2370,7 +2382,8 @@ export class Link {
     this.log(`the gate's replay read ${seen.length} messages over ${pages} pages: ${total} hits`
       + `${!whole ? " (cut short)" : capped ? " (its most pages: the oldest part of the range wasn't read)" : ""}`);
     const counts = `${seen.length} messages read (Cain ${byWriter.cain}, the specialist ${byWriter.specialist}, the link ${byWriter.link}, `
-      + `unknown ${byWriter.unknown}). ${total} hits: ${n("refuse")} would be refused, ${n("fix")} fixed, ${n("unsure")} can't tell.`;
+      + `unknown ${byWriter.unknown}). ${total} hits: ${n("refuse")} would be refused, ${n("fix")} fixed, ${n("kept")} kept as they are and flagged `
+      + `(em dashes in words that are never refused), ${n("unsure")} can't tell.`;
     const cap = capped ? `It read its most, ${REPLAY_PAGES} pages of 100 messages, so the oldest part of the range wasn't read; a rerun would stop at the same place. ` : "";
     this.d.relay(whole
       ? `The gate's replay over the last ${days} days of his DM is done: ${counts} ${cap}Buttons-only edits and "(edited)": ${report.edited.said} `

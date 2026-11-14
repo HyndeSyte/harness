@@ -76,8 +76,8 @@ describe("the replay", () => {
     expect(hits(m.digestMsg)).toMatchObject([{ writer: "specialist", rule: "button", result: "refuse", label: "Undo" }]);
     expect(hits(m.ask)).toEqual([]);                                    // its add-on was fixed before it was posted
     expect(hits(m.stranger)).toMatchObject([{ writer: "unknown", rule: "dash", result: "refuse" }]);   // read as Cain's: every em dash refused
-    expect(rep.hits.by_rule.button).toEqual({ fix: 0, refuse: 2, unsure: 1 });
-    expect(rep.hits.by_writer.cain.button).toEqual({ fix: 0, refuse: 1, unsure: 1 });
+    expect(rep.hits.by_rule.button).toEqual({ fix: 0, refuse: 2, unsure: 1, kept: 0 });
+    expect(rep.hits.by_writer.cain.button).toEqual({ fix: 0, refuse: 1, unsure: 1, kept: 0 });
     expect(rep.hits.total).toBe(rep.list.length);
   });
 
@@ -221,6 +221,21 @@ describe("the replay", () => {
     expect(rep.list.filter((h: any) => h.message === shown)).toMatchObject([{ rule: "button", result: "unsure", label: "Undo" }]);
     expect(rep.list.filter((h: any) => h.message === reply)).toMatchObject([{ rule: "button", result: "unsure" }]);
     expect(rep.hits.by_rule.button.refuse).toBe(0);
+  });
+
+  test("a specialist's em dash kept as it is is counted as kept, never as refused, and Cain's line says so", async () => {
+    // Fable, round four: "would be refused" counted the specialist's kept dashes, which are never refused.
+    const r = rig();
+    const card = await r.link.show(await r.link.addCard({ text: "Swim moved to 4:30 — 2 blocks shifted.", rows: [], kind: "card" }), { item: "none" });
+    const reply = botMessage(r, "Moved swim — it's at 4:30.");
+    r.sent.ids.add(reply);
+    r.link.replay(14);
+    const rep = await done(r);
+    expect(rep.list.filter((h: any) => h.message === card)).toMatchObject([{ writer: "specialist", rule: "dash", result: "refuse", kept: "range" }]);
+    expect(rep.list.filter((h: any) => h.message === reply)).toMatchObject([{ writer: "cain", rule: "dash", result: "refuse" }]);
+    expect(rep.hits.by_rule.dash).toEqual({ fix: 0, refuse: 1, unsure: 0, kept: 1 });
+    expect(rep.hits.by_writer.specialist.dash).toEqual({ fix: 0, refuse: 0, unsure: 0, kept: 1 });
+    expect(r.relayed.at(-1)).toContain("2 hits: 1 would be refused, 0 fixed, 1 kept as they are and flagged (em dashes in words that are never refused), 0 can't tell.");
   });
 
   test("a notice records its buttons: a reply naming another is refused, not can't tell", async () => {

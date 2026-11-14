@@ -73,10 +73,11 @@ never held back, since a held approval or Undo would be lost to you: their wordi
 fixed, but an em dash becomes a comma only between plain words; one near a number, a
 day, a month, a time of day, a symbol, a single letter or a link is left as it is, and
 Cain hears about it and anything else. Cain can edit only his own replies. A log on the Pi, in Cain's own folder, keeps what the rules caught, as short
-excerpts in which a link of any kind, with "https://" or without, is only its site.
-After an update that changes
+excerpts in which a link of any kind, with "https://" or without, or an IP address with
+a path, is only its site. After an update that changes
 the rules, the App reads back over your DM once with them, posting nothing, and Cain
-files what they found. Nothing for you to do.
+files what they found, the specialist's kept em dashes counted apart from what would be
+held back. Nothing for you to do.
 
 ## Stop
 

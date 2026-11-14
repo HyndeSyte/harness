@@ -184,7 +184,7 @@ logged to /data/work/gate-report.jsonl.
   `/opt/cain/keeper.sh replay [days]` runs another. When you hear it's done, read
   /data/work/gate-replay.json and file it through the record keeper as
   projects/org-v2/gate-replay-<YYYY-MM-DD>.md: the range and pages, messages by writer,
-  hits per rule and writer (fix, refuse, can't tell), each hit's time, rule and short
+  hits per rule and writer (fix, refuse, kept, can't tell), each hit's time, rule and short
   excerpt, and its line on "(edited)". The first one to finish after the rules change
   also asks you to check the gate end to end: do those checks and file what each said
   with it. Nothing to tell him. If you hear it stopped before it was done, run it again

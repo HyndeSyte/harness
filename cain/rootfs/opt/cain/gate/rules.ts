@@ -83,24 +83,26 @@ export function hidden(text: string, onlyTargets: boolean | "code" = false): str
 
 // Up to n characters of the text around a hit, on one line. A link in it keeps only its
 // scheme and host: the rest can carry an id, a token or a password, and excerpts go to the
-// gate's log, the safety net's note and lines for Cain.
-export function around(text: string, at: number, end: number, n = 60): string {
+// gate's log, the safety net's note and lines for Cain. links: the text's links, found once.
+export function around(text: string, at: number, end: number, n = 60, links?: readonly LinkSpan[]): string {
   const pad = Math.max(0, Math.floor((n - Math.min(end - at, n)) / 2));
   let from = Math.max(0, at - pad);
   const to = Math.min(text.length, from + n);
   from = Math.max(0, to - n);
-  return hostsOnly(text, from, to).replace(/\s+/g, " ").trim().slice(0, n);
+  return hostsOnly(text, from, to, links).replace(/\s+/g, " ").trim().slice(0, n);
 }
 
 // A link as its scheme and host alone, with "/…" when anything else was cut: never a user
 // name, password, port, path, query or fragment ("https://github.com/…"). A link has any
 // scheme (letters, digits, "+", "." and "-" before "://": "https://", "wss://", in any case),
-// or none and starts with "www." or is a domain with a path ("example.com/reset?token=…").
-// It runs to the next space or line break, whatever stands between ("<", ">" and brackets
-// included; the zero-width U+FEFF too, which hides in text). Its authority runs to the first
-// "/", "?", "#" or "\" (a browser reads "\" as "/"); its host is what follows the authority's
-// last "@", less any port; one that isn't a plain name or address is "a link". Nothing after
-// the host comes back, not even a sentence's own marks.
+// or none and starts with "www." or is a host with a path ("example.com/reset?token=…",
+// "192.168.1.1/admin"; a domain's trailing dot counts). It runs to the next space or line
+// break, whatever stands between ("<", ">" and brackets included; the zero-width U+FEFF too,
+// which hides in text). Its authority runs to the first "/", "?", "#" or "\" (a browser reads
+// "\" as "/"); its host is what follows the authority's last "@", less any port; one that isn't
+// a plain name or address is "a link". Nothing after the host comes back, not even a
+// sentence's own marks. Each part is bounded (a user name up to 256 characters, up to 16
+// labels of up to 63), so finding the links in a long run without spaces stays quick.
 const GAP = "\\t-\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";   // what ends a link
 // A character of a domain's name: a letter, a digit, "-", "_", or anything past ASCII but a space.
 const LABEL = `[^${GAP}\\x00-\\x2c\\x2e\\x2f\\x3a-\\x40\\x5b-\\x5e\\x60\\x7b-\\x7f]`;
@@ -108,9 +110,15 @@ const SCHEMED = `(?<![A-Za-z0-9+.\\-])[A-Za-z0-9+.\\-]+:\\/\\/[^${GAP}]+`;
 // One with no scheme never starts right after a letter, a digit, "-", "_", "." or "@" of
 // ASCII (a name going on); after anything else (a space, a bracket, a quote of any kind, ":"
 // or "/") it may. A user name before an "@" comes with it.
-const BARE = `(?<![A-Za-z0-9_\\-.@])(?:[^${GAP}\\/?#\\\\]*@)?`
-  + `(?:[Ww][Ww][Ww]\\.|(?:${LABEL}+\\.)+(?:[A-Za-z]|[^${GAP}\\x00-\\x7f])${LABEL}+(?::\\d*)?(?=[\\/\\\\]|[?#][^${GAP}]))[^${GAP}]*`;
+const HOST_PATH = `(?:(?:${LABEL}{1,63}\\.){1,16}(?:[A-Za-z]|[^${GAP}\\x00-\\x7f])${LABEL}{1,62}|(?:\\d{1,3}\\.){3}\\d{1,3})\\.?(?::\\d{0,5})?(?=[\\/\\\\]|[?#][^${GAP}])`;
+const BARE = `(?<![A-Za-z0-9_\\-.@])(?:[^${GAP}\\/?#\\\\]{0,256}@)?(?:[Ww][Ww][Ww]\\.|${HOST_PATH})[^${GAP}]*`;
 const LINK = new RegExp(`${SCHEMED}|${BARE}`, "g");
+// A link found in a text: where it starts and ends, and how it shows (linkHost).
+export type LinkSpan = readonly [number, number, string];
+export function linkSpans(text: string): LinkSpan[] {
+  const t = String(text ?? "");
+  return [...t.matchAll(LINK)].map((m) => [m.index!, m.index! + m[0].length, linkHost(m[0])] as const);
+}
 const HOST = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(?::\d*)?$/;
 export function linkHost(link: string): string {
   const s = String(link ?? "");
@@ -122,16 +130,20 @@ export function linkHost(link: string): string {
 }
 
 // text[from, to) with each link as linkHost has it. A link that runs past either end of the
-// window still comes out whole, as its host: never a piece of what follows the host.
-export function hostsOnly(text: string, from = 0, to = text.length): string {
+// window still comes out whole, as its host: never a piece of what follows the host. links:
+// the text's links, when they've been found already.
+export function hostsOnly(text: string, from = 0, to = text.length, links?: readonly LinkSpan[]): string {
   const t = String(text ?? "");
   const stop = Math.min(to, t.length);
+  const spans = links ?? linkSpans(t);
+  let lo = 0, hi = spans.length;                     // the first link that ends after from
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (spans[mid][1] <= from) lo = mid + 1; else hi = mid; }
   let out = "", i = from;
-  for (const m of t.matchAll(LINK)) {
-    const a = m.index!, b = a + m[0].length;
+  for (let k = lo; k < spans.length; k++) {
+    const [a, b, host] = spans[k];
     if (b <= i) continue;
     if (a >= stop) break;
-    out += t.slice(i, Math.max(i, a)) + linkHost(m[0]);
+    out += t.slice(i, Math.max(i, a)) + host;
     i = b;
   }
   return out + t.slice(i, Math.max(i, stop));
@@ -178,34 +190,67 @@ export const DASH_WORDS: readonly string[] = [
 ];
 const RANGE_WORDS = new Set(DASH_WORDS);
 const LOWER_WORDS = new Set(["may", "march", "sat", "sun", "wed"]);
-const WORD = /^[A-Za-z]+(?:['\u2019-][A-Za-z]+)*$/;
-const LINE_BREAK = /[\n\r\u2028\u2029]/;
-const SPACE_RUN = /[\t\v\f \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff]+/;   // JavaScript's \s, less a line break
+const WORD = new RegExp("^[A-Za-z]+(?:['\\u2019-][A-Za-z]+)*$");
+const LEAD = new RegExp("^[(\\[\"'\\u2018\\u201c]+"), TRAIL = new RegExp("[.,;:!?)\\]}\"'\\u2019\\u201d]+$");
+const MAX_WORD = 40;                                 // a longer run without a space is no plain word
 // A plain word, once opening quotes and brackets before it and marks after it are set aside.
 function plainWord(token: string): boolean {
-  const w = token.replace(/^[(\["'\u2018\u201c]+/, "").replace(/[.,;:!?)\]}"'\u2019\u201d]+$/, "");
+  const w = token.replace(LEAD, "").replace(TRAIL, "");
   return w.length >= 2 && WORD.test(w) && (!RANGE_WORDS.has(w.toLowerCase()) || LOWER_WORDS.has(w));
 }
+// JavaScript's \s, and the line breaks among it.
+const isSpace = (c: number) => (c >= 9 && c <= 13) || c === 32 || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a)
+  || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+const isBreak = (c: number) => c === 10 || c === 13 || c === 0x2028 || c === 0x2029;
+// Where the spaces and line breaks are, found once per text, so each dash finds its nearest
+// words at once however long the runs without a space: for each place, the last space and
+// the last other character before it, the first of each at or after it, and how many line
+// breaks come before it.
+interface Words { prevSpace: Int32Array; prevWord: Int32Array; nextSpace: Int32Array; nextWord: Int32Array; breaks: Int32Array }
+function wordsOf(text: string): Words {
+  const n = text.length;
+  const w: Words = { prevSpace: new Int32Array(n + 1), prevWord: new Int32Array(n + 1), nextSpace: new Int32Array(n + 1),
+    nextWord: new Int32Array(n + 1), breaks: new Int32Array(n + 1) };
+  let space = -1, word = -1, breaks = 0;
+  for (let i = 0; i <= n; i++) {
+    w.prevSpace[i] = space; w.prevWord[i] = word; w.breaks[i] = breaks;
+    if (i === n) break;
+    const c = text.charCodeAt(i);
+    if (isSpace(c)) { space = i; if (isBreak(c)) breaks++; } else word = i;
+  }
+  space = n; word = n;
+  for (let i = n; i >= 0; i--) {
+    if (i < n) { if (isSpace(text.charCodeAt(i))) space = i; else word = i; }
+    w.nextSpace[i] = space; w.nextWord[i] = word;
+  }
+  return w;
+}
 // Whether the dash at [at, end) stands between plain words: two on each side, on its line.
-function betweenPlainWords(text: string, at: number, end: number): boolean {
-  const before = text.slice(0, at).split(LINE_BREAK).pop()!.split(SPACE_RUN).filter(Boolean).slice(-2);
-  const after = text.slice(end).split(LINE_BREAK)[0].split(SPACE_RUN).filter(Boolean).slice(0, 2);
-  return before.length === 2 && after.length === 2 && /[A-Za-z]$/.test(before[1]) && /^[A-Za-z]/.test(after[0])
-    && [...before, ...after].every(plainWord);
+function betweenPlainWords(text: string, w: Words, at: number, end: number): boolean {
+  const s1 = w.prevSpace[at] + 1, q = w.prevWord[s1];        // the word right before it ends at at; the one before that, at q
+  const e2 = w.nextSpace[end], r = w.nextWord[e2];           // the word right after it starts at end; the one after that, at r
+  if (s1 >= at || e2 <= end || q < 0 || r >= text.length) return false;
+  if (w.breaks[s1] !== w.breaks[q + 1] || w.breaks[r] !== w.breaks[e2]) return false;   // a line break between
+  const s0 = w.prevSpace[q] + 1, e3 = w.nextSpace[r];
+  if (at - s1 > MAX_WORD || q + 1 - s0 > MAX_WORD || e2 - end > MAX_WORD || e3 - r > MAX_WORD) return false;
+  const words = [text.slice(s0, q + 1), text.slice(s1, at), text.slice(end, e2), text.slice(r, e3)];
+  return /[A-Za-z]$/.test(words[1]) && /^[A-Za-z]/.test(words[2]) && words.every(plainWord);
 }
 
 // Each em dash and what goes in its place; null: it stays (refused, or kept and flagged).
 interface Dash { at: number; end: number; put: string | null; kept?: Kept }
-function dashes(text: string, seen: string, refusable: boolean): Dash[] {
+function dashes(text: string, seen: string, refusable: boolean, links: readonly LinkSpan[]): Dash[] {
   const out: Dash[] = [];
   // The links a comma could run into: any but a masked link's target, which its brackets close.
-  const links = refusable ? [] : [...text.matchAll(LINK)].filter((m) => text.slice(Math.max(0, m.index! - 2), m.index!) !== "](")
-    .map((m) => [m.index!, m.index! + m[0].length]);
+  const near = refusable ? [] : links.filter(([a]) => text.slice(Math.max(0, a - 2), a) !== "](");
+  let words: Words | undefined;
   for (const m of seen.matchAll(DASH)) {
     const at = m.index!, end = at + m[0].length;
-    if (refusable) out.push({ at, end, put: null });
-    else if (links.some(([a, b]) => a < at && b >= at)) out.push({ at, end, put: null, kept: "link" });
-    else if (betweenPlainWords(text, at, end)) out.push({ at, end, put: ", " });
+    if (refusable) { out.push({ at, end, put: null }); continue; }
+    let lo = 0, hi = near.length;                    // the last link that starts before the dash
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (near[mid][0] < at) lo = mid + 1; else hi = mid; }
+    if (lo > 0 && near[lo - 1][1] >= at) out.push({ at, end, put: null, kept: "link" });
+    else if (betweenPlainWords(text, words ??= wordsOf(text), at, end)) out.push({ at, end, put: ", " });
     else out.push({ at, end, put: null, kept: "range" });
   }
   return out;
@@ -266,27 +311,48 @@ function named(seen: string, label: string): { at: number; end: number }[] {
       ? [new RegExp(`(?<![A-Za-z])[Ww]ith\\s+(?:the\\s+)?${Q}(${L})${Q}(?![A-Za-z0-9])`, "gd")] : []),
   ];
   const out: { at: number; end: number }[] = [];
+  const starts = new Set<number>();
   for (const re of forms) for (const m of seen.matchAll(re)) {
     const [at, end] = m.indices![1];
-    if (!out.some((x) => x.at === at)) out.push({ at, end });
+    if (!starts.has(at)) { starts.add(at); out.push({ at, end }); }
   }
   return out;
 }
 
-const overlaps = (a: { at: number; end: number }, b: { at: number; end: number }) => a.at < b.end && b.at < a.end;
+// Spans found so far, in order and none overlapping: a new one is taken only if it overlaps
+// none, which its neighbours alone can tell.
+class Taken {
+  private list: [number, number][] = [];
+  take(at: number, end: number): boolean {
+    let lo = 0, hi = this.list.length;                 // the first one starting at or after at
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (this.list[mid][0] < at) lo = mid + 1; else hi = mid; }
+    if ((lo > 0 && this.list[lo - 1][1] > at) || (lo < this.list.length && this.list[lo][0] < end)) return false;
+    this.list.splice(lo, 0, [at, end]);
+    return true;
+  }
+}
+
+// A message gets at most this many excerpts, the first hits in it, and one more for each kind
+// of hit (rule, result, why it's kept, label) not among them: enough to say what to change,
+// and quick however many hits a long message holds.
+export const MAX_EXCERPTS = 20;
 
 export function check(text: string, ctx: Context = {}): Report {
   const t = String(text ?? "");
   const on = new Set<Rule>(ctx.rules ?? RULES);
   // The machine rule reads code too, except in a reply to his own message (what he asked for).
   const seen = hidden(t), targetsOnly = hidden(t, ctx.answersHim ? "code" : true);
-  const hits: Hit[] = [];
+  const links = linkSpans(t);                        // found once, for every excerpt
+  const found: Omit<Hit, "around">[] = [];
+  const taken = new Map<Rule, Taken>();              // a rule's hits never overlap: the first found stays
   const add = (rule: Rule, result: Result, at: number, end: number, label?: string, kept?: Kept) => {
-    if (hits.some((h) => h.rule === rule && overlaps(h, { at, end }))) return;
-    hits.push({ rule, result, at, end, around: around(t, at, end), ...(label ? { label } : {}), ...(kept ? { kept } : {}) });
+    let spans = taken.get(rule);
+    if (!spans) taken.set(rule, spans = new Taken());
+    if (!spans.take(at, end)) return;
+    found.push({ rule, result, at, end, ...(label ? { label } : {}), ...(kept ? { kept } : {}) });
   };
   const edits: { at: number; end: number; put: string }[] = [];
-  if (on.has("dash")) for (const e of dashes(t, seen, !!ctx.refusable)) {
+  if (on.has("dash")) for (const e of dashes(t, seen, !!ctx.refusable, links)) {
     if (e.put === null) { add("dash", "refuse", e.at, e.end, undefined, e.kept); continue; }
     add("dash", "fix", e.at, e.end);
     edits.push({ at: e.at, end: e.end, put: e.put });
@@ -304,18 +370,27 @@ export function check(text: string, ctx: Context = {}): Report {
     const has = ctx.buttons === null ? null : new Set(ctx.buttons ?? []);
     const labels = [...new Set([...STATIC_LABELS, ...(ctx.known ?? [])].map((l) => String(l).trim()).filter(Boolean))]
       .sort((a, b) => b.length - a.length);
-    const taken: { at: number; end: number }[] = [];
+    const named_ = new Taken();
     for (const label of labels) for (const span of named(seen, label)) {
-      if (taken.some((x) => overlaps(x, span))) continue;
-      taken.push(span);
+      if (!named_.take(span.at, span.end)) continue;
       if (has && has.has(label)) continue;
       add("button", has === null ? "unsure" : "refuse", span.at, span.end, label);
     }
   }
-  hits.sort((a, b) => a.at - b.at || RULES.indexOf(a.rule) - RULES.indexOf(b.rule));
-  let fixed = t;
-  for (const e of edits.sort((a, b) => b.at - a.at)) fixed = fixed.slice(0, e.at) + e.put + fixed.slice(e.end);
-  return { hits, fixed };
+  found.sort((a, b) => a.at - b.at || RULES.indexOf(a.rule) - RULES.indexOf(b.rule));
+  const kinds = new Set<string>();
+  const hits: Hit[] = [];
+  found.forEach((h, i) => {
+    const kind = `${h.rule}|${h.result}|${h.kept ?? ""}|${h.label ?? ""}`;
+    if (i < MAX_EXCERPTS || !kinds.has(kind))
+      hits.push({ rule: h.rule, result: h.result, at: h.at, end: h.end, around: around(t, h.at, h.end, 60, links),
+        ...(h.label ? { label: h.label } : {}), ...(h.kept ? { kept: h.kept } : {}) });
+    kinds.add(kind);
+  });
+  // The fixes, in one pass.
+  let fixed = "", i = 0;
+  for (const e of edits.sort((a, b) => a.at - b.at)) { fixed += t.slice(i, e.at) + e.put; i = e.end; }
+  return { hits, fixed: fixed + t.slice(i) };
 }
 
 // The one word for a report: refuse beats fix, fix beats unsure.
@@ -355,6 +430,27 @@ export const LINK_WHY = "say it without the dash; a comma there would run into t
 export function whyOf(h: { rule: string; result?: string; kept?: string }): string {
   if (h.rule === "dash" && h.result === "refuse") return h.kept === "range" ? RANGE_WHY : h.kept === "link" ? LINK_WHY : DASH_WHY;
   return WHY[h.rule as Rule] ?? "a message rule";
+}
+// DASH_WHY, said once for several em dashes.
+export const DASHES_WHY = 'em dashes; rewrite each without one, using a comma or a new sentence for a break, "to" or "through" for a range';
+
+// Hits as parts of a line to the writer: each reason said once, after the excerpts it covers
+// (each excerpt once, at most `each` of them), in the order the reasons first come.
+export function reasonParts(hits: readonly { rule: string; result?: string; around: string; kept?: string }[], each = 3): string[] {
+  const order: string[] = [];
+  const quotes = new Map<string, { said: string[]; n: number }>();
+  for (const h of hits) {
+    const why = whyOf(h);
+    let q = quotes.get(why);
+    if (!q) { quotes.set(why, q = { said: [], n: 0 }); order.push(why); }
+    q.n++;
+    if (h.around && !q.said.includes(h.around)) q.said.push(h.around);
+  }
+  return order.map((why) => {
+    const q = quotes.get(why)!;
+    const reason = why === DASH_WHY && q.n > 1 ? DASHES_WHY : why;
+    return each > 0 && q.said.length ? `${q.said.slice(0, each).map((a) => `"${a}"`).join(", ")}: ${reason}` : reason;
+  });
 }
 
 // The fixable hits, as a few words: "no em dashes; Apps, not add-ons".

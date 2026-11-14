@@ -238,6 +238,11 @@
     {"name": "a unit of time beside a dash keeps it", "text": "Allow an hour — maybe more though.", "refuse": ["dash"]},
     {"name": "a season beside a dash keeps it", "text": "Open from spring — fall each year.", "refuse": ["dash"]},
     {"name": "a word past ASCII beside a dash keeps it", "text": "Meet at the café — it opens soon.", "refuse": ["dash"]},
-    {"name": "a word on the next line doesn't count", "text": "Moved the\n— swim starts now.", "refuse": ["dash"]}
+    {"name": "a word on the next line doesn't count", "text": "Moved the\n— swim starts now.", "refuse": ["dash"]},
+    {"name": "an IP address with a path is cut to its host", "text": "Open 192.168.1.1/admin?pw=SECRET and 3 more.", "refuse": ["count"], "around": ["Open 192.168.1.1/… and 3 more."]},
+    {"name": "an IP address with a port and a path is cut to its host", "text": "Open 1.2.3.4:8080/SECRET and 3 more.", "refuse": ["count"], "around": ["Open 1.2.3.4/… and 3 more."]},
+    {"name": "a domain's trailing dot before a path is cut to its host", "text": "Open example.com./SECRET and 3 more.", "refuse": ["count"], "around": ["Open example.com./… and 3 more."]},
+    {"name": "version numbers with no path aren't links", "text": "Versions 1.2.3.4 and 0.10.0, and 3 more.", "refuse": ["count"], "around": ["Versions 1.2.3.4 and 0.10.0, and 3 more."]},
+    {"name": "many em dashes make at most twenty excerpts, and another kind still has its one", "text": "Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. Moved swim — it starts. And 3 more.", "context": {"refusable": true}, "refuse": ["count", "dash"]}
   ]
 }

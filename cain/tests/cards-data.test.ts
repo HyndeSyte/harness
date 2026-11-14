@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
+import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
@@ -258,6 +258,26 @@ describe("the gate at the link's send points", () => {
     expect(r.posts()).toBe(posts);
     expect(r.reports.filter((x) => x.did === "refused")).toMatchObject([{ point: "ask", hits: [{ rule: "dash", result: "refuse" }] },
       { point: "ask option", hits: [{ rule: "dash", result: "refuse" }] }]);
+  });
+
+  test("a refusal says each reason once, whole, within what the link's answer carries", async () => {
+    // Fable, round four: the em dash reason, said per dash, pushed the count's reason past the 300 characters main.ts kept.
+    const r = rig();
+    const two = await r.link.ask({ text: "P08 Q3: Swim moves — ok? And art — ok? And the dentist on the far side of town next week — ok? Plus and 3 more.",
+      options: ["Yes", "No"], item: "P08", question: "Q3" }).catch((e) => String(e.message));
+    expect(two.match(/em dashes; rewrite each without one/g)).toHaveLength(1);
+    expect(two).toContain(": name each one instead of a count.");
+    expect(two).toEndWith(". Rewrite it and send it again.");
+    // However many hits: fewer excerpts, then none, never a reason cut.
+    const many = Array.from({ length: 30 }, (_, i) => `Part ${i} of the plan for the week — job ${"0123456789abcdef".slice(0, 8 + (i % 8))} and 3 more, tap Undo`).join(". ");
+    const said = await r.link.ask({ text: `P08 Q3: ${many}?`, options: ["Yes", "No"], item: "P08", question: "Q3" }).catch((e) => String(e.message));
+    expect(said.length).toBeLessThanOrEqual(SAID_MAX);
+    for (const why of ["em dashes; rewrite each without one", "no shas, job ids, ISO times or Discord ids; say it as people say it",
+      "name each one instead of a count", "\"Undo\" isn't one of its buttons (Yes, No)"]) expect(said).toContain(why);
+    expect(said).toEndWith(". Rewrite it and send it again.");
+    expect(r.posts()).toBe(0);
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    expect(main).toContain('json({ status: "refused", said: e.message.slice(0, SAID_MAX) }, 400)');
   });
 
   test("a hidden count or machine text is refused on an ask, a Ship card, the morning message and the connector notice", async () => {

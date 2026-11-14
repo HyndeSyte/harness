@@ -167,7 +167,7 @@ describe("what the gate does with Cain's reply", () => {
     // Fable, round four: a comma for a dash still made ranges lists (bold numbers, units, "Week 1" and "Week 3").
     const d = decide(reply("Room 4—5 is free — then lunch."));
     expect(d).toMatchObject({ would: "refuse", hard: false, fixed: "Room 4—5 is free — then lunch.", hits: [{ rule: "dash", result: "refuse" }, { rule: "dash", result: "refuse" }] });
-    expect(d.said).toBe("The message gate held this: \"Room 4—5 is free — then lunch.\": an em dash; rewrite it without one, using a comma or a new sentence for a break, \"to\" or \"through\" for a range. Rewrite and send now; don't mention it to him.");
+    expect(d.said).toBe("The message gate held this: \"Room 4—5 is free — then lunch.\": em dashes; rewrite each without one, using a comma or a new sentence for a break, \"to\" or \"through\" for a range. Rewrite and send now; don't mention it to him.");
     for (const text of ["Moved swim — it's at 4:30 now.", "Swim is **5** — **6 PM**.", "Swim takes 30 min — 1 hr.", "Week 1 — Week 3 are booked.", "Out Monday morning — Friday evening."]) {
       const one = decide(reply(text));
       expect(one).toMatchObject({ would: "refuse", hard: false, fixed: text, hits: [{ rule: "dash", result: "refuse" }] });
@@ -178,6 +178,15 @@ describe("what the gate does with Cain's reply", () => {
     expect(both.said).toContain("Its add-ons are fixed for you when it goes.");
     // An edit's em dash is held the same way.
     expect(decide(edit("Moved swim — now at 5.", MINE))).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "dash", result: "refuse" }] });
+  });
+
+  test("each reason is said once: the em dashes' excerpts together, then the count's", () => {
+    const text = `Moved the swim lesson to Tuesday — the pool is closed. ${"Then the art class stays where it was all along. ".repeat(3)}And the dentist — it moved too, and 3 more.`;
+    const d = decide(reply(text));
+    expect(d.said.match(/em dashes; rewrite each without one/g)).toHaveLength(1);
+    expect(d.said).not.toContain("an em dash;");
+    expect(d.said).toContain(": name each one instead of a count.");
+    expect(d.said).toEndWith("Rewrite and send now; don't mention it to him.");
   });
 
   test("an em dash is a wording refusal like the others: the third try lets it go", () => {
