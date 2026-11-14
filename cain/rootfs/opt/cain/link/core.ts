@@ -48,8 +48,8 @@
 //   "add-on" fixed before anything is posted, and the answer says so; any em dash (only he
 //   knows whether he meant a range or a break), a hidden count, machine text, or a button
 //   the card lacks refused. The specialist's cards: fixed and posted, never refused (a
-//   refused card would be lost to him), an em dash between two numbers, times or dates, or
-//   right after a link, kept as it is; Cain hears once what the gate flagged.
+//   refused card would be lost to him), an em dash made ", " only between plain words and
+//   any other kept as it is; Cain hears once what the gate flagged.
 //   Its notes after a tap, and the link's own words: fixed only. Every hit is logged, its
 //   excerpt with links cut to their host. The replay runs the same rules over his DM,
 //   reading only. Cain's edit allowlist holds his replies alone: never a message the link

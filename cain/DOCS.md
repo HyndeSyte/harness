@@ -70,10 +70,9 @@ held back for Cain to rewrite before you see it too.
 If he's held back twice within 10 minutes, his third try goes out as it is, so the
 rules can never silence him, and he hears so. The calendar specialist's cards are
 never held back, since a held approval or Undo would be lost to you: their wording is
-fixed, but an em dash between two numbers, times or dates (a day or a month by name,
-noon and midnight count too, even behind bold, brackets or quotes), or right after a
-link, is left as it is, and Cain hears about anything else. Cain can edit only his own
-replies. A log on the Pi, in Cain's own folder, keeps what the rules caught, as short
+fixed, but an em dash becomes a comma only between plain words; one near a number, a
+day, a month, a time of day, a symbol, a single letter or a link is left as it is, and
+Cain hears about it and anything else. Cain can edit only his own replies. A log on the Pi, in Cain's own folder, keeps what the rules caught, as short
 excerpts in which a link of any kind, with "https://" or without, is only its site.
 After an update that changes
 the rules, the App reads back over your DM once with them, posting nothing, and Cain

@@ -6,13 +6,10 @@ tests that use it.
 
   dash     an em dash, never inside code or a link. A writer the gate refuses (refusable=True:
            Cain's own words): every one       refuse: rewrite it without one.
-           Words that are never refused       fix: ", " (removed at a line's start or end, or
-                                              before a stop), never " to ". One with a number
-                                              right on both sides (a digit, a clock time, a day
-                                              or a month by name, noon or midnight, past
-                                              markdown: "2026" and "2027", "**6 PM**" and "8",
-                                              "Monday" and "Friday"), or right after a link,
-                                              stays as it is, flagged (kept)
+           Words that are never refused       fix: ", ", only between plain words (two on each
+                                              side: no digit, day, month, time of day, symbol or
+                                              single letter), never " to ". Any other stays as
+                                              it is, flagged (kept)
   app      "the add-on", "Cain's add-on", "Settings > Add-ons" and the like, also "addon" and
            the escaped "add\\-on"             fix: "App", "Apps", "App's". A bare "add-on" (a
                                               browser add-on in a calendar title) is left alone.
@@ -166,34 +163,52 @@ def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
 
 
 # In Cain's words (refusable) every em dash is refused, none fixed in place (rules.ts dashes). In
-# words that are never refused it's never read as "to": one with a number right on both sides
-# stays as it is, flagged, and so does one right after a link (or in one). A number: a digit;
-# before the dash also a clock time ending in AM or PM, an ordinal or a percentage; after it also
-# a currency sign and its digits; on either side a day or a month by name (full or short, any
-# case, with or without a period, though lower-case "may", "march", "sat", "sun" and "wed" are
-# words), noon or midnight, past markdown's "*", "_", "~" and "`" too. Every other one gets ", " or
-# goes. The spaces around it, any but a new line, go with it, and so does another dash with only
-# spaces between.
+# words that are never refused one becomes ", " only between plain words: the nearest two words on
+# each side, on its own line, touching it with a letter, each of letters alone (an apostrophe or a
+# hyphen between them), two or more, and none of DASH_WORDS. Anything else stays as it is,
+# flagged ("range"), and so does one right after a link, or in one ("link"). The spaces around it,
+# any but a new line, go with it, and so does another dash with only spaces between.
 _DASH = re.compile("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*\u2014+)+[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*")
-_MERIDIEM = _S + r"?[AaPp]\.?[Mm]\.?"
-_CLOCK = r"(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")"
+# Words a range can be made of, in lower case (rules.ts DASH_WORDS, and gate-cases.json dash_words).
+DASH_WORDS = (
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "mondays", "tuesdays", "wednesdays", "thursdays", "fridays", "saturdays", "sundays",
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november",
+    "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "morning", "mornings", "afternoon", "afternoons", "evening", "evenings", "night", "nights", "tonight", "today",
+    "tomorrow", "yesterday", "noon", "midday", "midnight", "dawn", "dusk", "sunrise", "sunset", "now", "later",
+    "overnight", "weekend", "weekends", "weekday", "weekdays", "am", "pm", "o'clock", "o\u2019clock", "breakfast",
+    "brunch", "lunch", "dinner", "supper", "bedtime",
+    "spring", "summer", "fall", "autumn", "winter", "christmas", "easter", "thanksgiving", "halloween",
+    "second", "seconds", "sec", "secs", "minute", "minutes", "min", "mins", "hour", "hours", "hr", "hrs",
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+    "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty",
+    "fifty", "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "dozen", "half", "quarter",
+    "first", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth",
+    "twentieth", "thirtieth",
+    "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii",
+)
+_RANGE_WORDS = frozenset(DASH_WORDS)
+_LOWER_WORDS = frozenset(("may", "march", "sat", "sun", "wed"))   # lower case alone, these are words
+_WORD = re.compile("[A-Za-z]+(?:['\u2019-][A-Za-z]+)*\\Z", A)
+_LINE_BREAK = re.compile("[\n\r\u2028\u2029]")
+_SPACE_RUN = re.compile("[\t\v\f \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff]+")   # JavaScript's \s, less a line break
 
 
-def _any_case(s: str) -> str:
-    """Any case, spelled out letter by letter, so lower case alone can be told apart (rules.ts anyCase)."""
-    return re.sub("[a-z]", lambda m: "[" + m.group(0).upper() + m.group(0) + "]", s)
+def _plain_word(token: str) -> bool:
+    """A plain word, once opening quotes and brackets before it and marks after it are set aside."""
+    w = re.sub("[.,;:!?)\\]}\"'\u2019\u201d]+\\Z", "", re.sub("^[(\\[\"'\u2018\u201c]+", "", token))
+    return len(w) >= 2 and _WORD.match(w) is not None and (w.lower() not in _RANGE_WORDS or w in _LOWER_WORDS)
 
 
-_NAMES = ("(?!(?:may|march|sat|sun|wed)(?![A-Za-z]))" + _any_case(
-    "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february"
-    "|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov"
-    "|dec|noon|midnight)") + r"\.?")
-# Past what can stand between a number and the dash (rules.ts PAST_LEFT, PAST_RIGHT).
-_PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
-_PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
-_NUMBER_BEFORE = re.compile(r"(?:\d(?:[Ss][Tt]|[Nn][Dd]|[Rr][Dd]|[Tt][Hh]|%)?|(?<![\d:.])" + _CLOCK + r"|(?<![A-Za-z])" + _NAMES
-                            + ")" + _PAST_LEFT + r"\Z", A)
-_NUMBER_AFTER = re.compile("^" + _PAST_RIGHT + "(?:[$\\u20ac\\u00a3]?\\d|" + _NAMES + r"(?![A-Za-z]))", A)
+def _between_plain_words(text: str, at: int, end: int) -> bool:
+    """Whether the dash at [at, end) stands between plain words: two on each side, on its line."""
+    before = [x for x in _SPACE_RUN.split(_LINE_BREAK.split(text[:at])[-1]) if x][-2:]
+    after = [x for x in _SPACE_RUN.split(_LINE_BREAK.split(text[end:])[0]) if x][:2]
+    return (len(before) == 2 and len(after) == 2 and re.search("[A-Za-z]\\Z", before[1]) is not None
+            and re.match("[A-Za-z]", after[0]) is not None and all(_plain_word(t) for t in before + after))
 
 
 def _dashes(text: str, seen: str, refusable: bool) -> list[tuple[int, int, str | None, str]]:
@@ -207,21 +222,12 @@ def _dashes(text: str, seen: str, refusable: bool) -> list[tuple[int, int, str |
         at, end = m.start(), m.end()
         if refusable:
             out.append((at, end, None, ""))
-            continue
-        if any(a < at <= b for a, b in links):
+        elif any(a < at <= b for a, b in links):
             out.append((at, end, None, "link"))
-            continue
-        if _NUMBER_BEFORE.search(text[:at]) and _NUMBER_AFTER.search(text[end:]):
+        elif _between_plain_words(text, at, end):
+            out.append((at, end, ", ", ""))
+        else:
             out.append((at, end, None, "range"))
-            continue
-        before = "\n" if at == 0 else text[at - 1]
-        after = "\n" if end >= len(text) else text[end]
-        put = ", "
-        if before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
-            put = ""
-        elif re.match(r"[,;:]", before):
-            put = " "
-        out.append((at, end, put, ""))
     return out
 
 

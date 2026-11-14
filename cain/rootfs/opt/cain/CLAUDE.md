@@ -165,10 +165,10 @@ logged to /data/work/gate-report.jsonl.
 - Your asks and their options, Ship cards, morning message and connector notice: the
   link fixes "add-on" before it posts (keeper.sh's answer says so) and refuses an em dash
   and the rest with what to change. Rewrite it and send it again.
-- A specialist's card is never refused: the link fixes its em dashes and "add-on"
-  (one between two numbers, times or dates, or right after a link, stays as it is), and
-  the line about the card says what else the gate flags. Show it as usual; if it matters,
-  set it right in one line of your own after it.
+- A specialist's card is never refused: the link fixes its "add-on", and an em dash only
+  between plain words (one near a number, a day, a month, a time, a symbol or a link stays
+  as it is), and the line about the card says what else the gate flags. Show it as usual;
+  if it matters, set it right in one line of your own after it.
 - If you hear the gate should have held something of yours that went out, fix it with
   an edit at once, as the line says. If the edit is held, send a one-line correction as
   a new reply instead.

@@ -275,17 +275,28 @@ def test_the_port_reads_javascripts_spaces():
     assert message_rules.around("\x85a\ufeff", 1, 2) == "\x85a"                 # trim() keeps U+0085, takes U+FEFF
 
 
+def test_the_port_keeps_a_dash_beside_the_same_words():
+    """The words that keep a dash in words never refused are the same list on both sides."""
+    assert list(message_rules.DASH_WORDS) == cases()["dash_words"]
+    assert len(set(message_rules.DASH_WORDS)) == len(message_rules.DASH_WORDS)
+    rules_ts = (ROOT / "cain" / "rootfs" / "opt" / "cain" / "gate" / "rules.ts").read_text(encoding="utf-8")
+    for word in message_rules.DASH_WORDS:
+        assert json.dumps(word, ensure_ascii=True) in rules_ts, word
+
+
 def test_cains_em_dashes_are_refused_and_the_others_kept_or_fixed():
-    """refusable=True (Cain's words): every em dash refused, none fixed. Otherwise markdown round the
-    dash doesn't hide its numbers, lower-case "may" and the like are words, and a dash right after
-    a link stays (rules.ts, gate.test.ts)."""
+    """refusable=True (Cain's words): every em dash refused, none fixed. Otherwise a dash becomes ", "
+    only between plain words, two on each side, and any other stays, flagged (rules.ts, gate.test.ts)."""
     for text in ("Swim is **5** \u2014 **6 PM**.", "Swim takes 30 min \u2014 1 hr.", "Week 1 \u2014 Week 3 are booked.",
                  "Moved swim \u2014 it's at 4:30 now."):
         r = message_rules.check(text, refusable=True)
         assert [(h.rule, h.result, h.kept) for h in r.hits] == [("dash", "refuse", "")] and r.fixed == text, text
     assert [h.kept for h in message_rules.check("Swim is **5** \u2014 **6 PM**.").hits] == ["range"]
     assert [h.kept for h in message_rules.check("See https://example.com/a \u2014 then reply.").hits] == ["link"]
-    assert message_rules.check("We march \u2014 5 of us.").fixed == "We march, 5 of us."
+    assert message_rules.check("We march \u2014 all of us together.").fixed == "We march, all of us together."
+    for text in ("We march \u2014 5 of us.", "Moved \u2014 swim starts now.", "Open all morning \u2014 until we close.",
+                 "Rooms A \u2014 C are free.", "Done, \u2014 nothing else."):
+        assert [(h.result, h.kept) for h in message_rules.check(text).hits] == [("refuse", "range")], text
     assert message_rules.check("Restarted the add-on \u2014 all set.", refusable=True).fixed == "Restarted the App \u2014 all set."
 
 

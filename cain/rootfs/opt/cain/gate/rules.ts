@@ -11,11 +11,10 @@
 //                                          refuse: rewrite it without one, since only he
 //                                          knows whether he meant a range or a break.
 //            In words that are never refused (the specialist's cards and notes, the
-//            link's own)                   fix: ", " (removed at a line's start or end,
-//                                          or before a stop), never " to ". One with a
-//            number right on both sides (a digit, a clock time, a day or a month by name,
-//            noon or midnight, past markdown: "2026" and "2027", "**6 PM**" and "8",
-//            "Monday" and "Friday"), or right after a link, stays as it is, flagged
+//            link's own)                   fix: ", ", only between plain words (two on
+//                                          each side: no digit, day, month, time of day,
+//            symbol or single letter), never " to ". Any other stays as it is, flagged:
+//            a flag costs nothing, and a comma could make a range a list
 //   app      "the add-on", "Cain's add-on", "Harness add-on", "Settings > Add-ons" and
 //            the like (also "addon" and the specialist's escaped "add\-on"; plural and
 //            possessive)                   fix: "App", "Apps", "App's". A bare "add-on"
@@ -38,7 +37,8 @@ export const RULES = ["dash", "app", "count", "machine", "button"] as const;
 export const RULES_VERSION = 2;
 export type Rule = (typeof RULES)[number];
 export type Result = "fix" | "refuse" | "unsure";
-// Why a dash in words that are never refused stays as it is: a number on both sides, or a link right before it.
+// Why a dash in words that are never refused stays as it is: anything but plain words round
+// it ("range": a range may be meant), or a link right before it ("link").
 export type Kept = "range" | "link";
 export interface Hit { rule: Rule; result: Result; at: number; end: number; around: string; label?: string; kept?: Kept }
 export interface Report { hits: Hit[]; fixed: string }
@@ -144,30 +144,55 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // still turned ranges into lists wherever the numbers sat behind markdown, units or words
 // (a dash between bold "5" and "6 PM", "30 min" and "1 hr", "Week 1" and "Week 3"), and only
 // he knows whether he meant a range or a break, so he says it again without one.
-// In words that are never refused an em dash is never read as "to". One with a number right
-// on both sides stays as it is, flagged, since ", " could make a range a list and " to " a
-// list a range; so does one right after a link (or in one), where a comma would run into it.
-// A number here is a digit; before the dash also a clock time ending in AM or PM, an ordinal
-// or a percentage; after it also a currency sign and its digits; and on either side a day or
-// a month by name (full or short, any case, with or without a period, though lower-case
-// "may", "march", "sat", "sun" and "wed" are words), noon or midnight: "2026" and "2027",
-// "6 PM" and "8", "Monday" and "Friday", "Nov 12" and "Nov 14", "noon" and "1 PM". Every
-// other em dash gets ", " or goes. The spaces around it, any but a new line (the Unicode ones
-// too), go with it, and so does another dash with only spaces between.
+// In words that are never refused a flag costs nothing (the dash stays, and Cain hears of
+// it), so an em dash becomes ", " only between plain words: the nearest two words on each
+// side, on its own line, touching it with a letter, each of letters alone (an apostrophe or a
+// hyphen between them), two or more, and none of DASH_WORDS. Anything else stays as it is,
+// flagged: a digit, a day, a month or a time of day, a symbol ("%", "$", "°", "#", "~"), a
+// single letter, markdown, a bracket or a mark against it, a line's start or end, a link
+// (kept for a link right before it, or round it: a comma would run into it). Never " to ".
+// The spaces around it, any but a new line (the Unicode ones too), go with it, and so does
+// another dash with only spaces between.
 const DASH = new RegExp("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*\\u2014+)+[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*", "g");
-const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
-const CLOCK = `(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})`;
-// Any case, spelled out letter by letter, so lower case alone can be told apart.
-const anyCase = (s: string) => s.replace(/[a-z]/g, (c) => `[${c.toUpperCase()}${c}]`);
-const NAMES = "(?!(?:may|march|sat|sun|wed)(?![A-Za-z]))" + anyCase("(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)") + "\\.?";
-// Past what can stand between a number and the dash: on the left, closing brackets, quotes,
-// "!" and "."; on the right, opening brackets and quotes; on both, markdown's "*", "_", "~"
-// and "`", spaces, zero-width characters and a line break, so numbers in bold and a dash at a
-// line's end or start between numbers count too.
-const PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
-const PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
-const NUMBER_BEFORE = new RegExp(`(?:\\d(?:[Ss][Tt]|[Nn][Dd]|[Rr][Dd]|[Tt][Hh]|%)?|(?<![\\d:.])${CLOCK}|(?<![A-Za-z])${NAMES})${PAST_LEFT}$`);
-const NUMBER_AFTER = new RegExp(`^${PAST_RIGHT}(?:[$€£]?\\d|${NAMES}(?![A-Za-z]))`);
+// Words a range can be made of, in lower case: days and months, full and short; times of day,
+// of the week and of the year; units of time; numbers and ordinals in words; Roman numerals.
+// Lower-case "may", "march", "sat", "sun" and "wed" alone are words (LOWER_WORDS). Kept equal
+// to the port by gate-cases.json (dash_words).
+export const DASH_WORDS: readonly string[] = [
+  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+  "mondays", "tuesdays", "wednesdays", "thursdays", "fridays", "saturdays", "sundays",
+  "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+  "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+  "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+  "morning", "mornings", "afternoon", "afternoons", "evening", "evenings", "night", "nights", "tonight", "today", "tomorrow",
+  "yesterday", "noon", "midday", "midnight", "dawn", "dusk", "sunrise", "sunset", "now", "later", "overnight", "weekend",
+  "weekends", "weekday", "weekdays", "am", "pm", "o'clock", "o\u2019clock", "breakfast", "brunch", "lunch", "dinner", "supper", "bedtime",
+  "spring", "summer", "fall", "autumn", "winter", "christmas", "easter", "thanksgiving", "halloween",
+  "second", "seconds", "sec", "secs", "minute", "minutes", "min", "mins", "hour", "hours", "hr", "hrs",
+  "day", "days", "week", "weeks", "month", "months", "year", "years",
+  "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+  "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty", "sixty",
+  "seventy", "eighty", "ninety", "hundred", "thousand", "million", "dozen", "half", "quarter",
+  "first", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth", "twentieth", "thirtieth",
+  "ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii",
+];
+const RANGE_WORDS = new Set(DASH_WORDS);
+const LOWER_WORDS = new Set(["may", "march", "sat", "sun", "wed"]);
+const WORD = /^[A-Za-z]+(?:['\u2019-][A-Za-z]+)*$/;
+const LINE_BREAK = /[\n\r\u2028\u2029]/;
+const SPACE_RUN = /[\t\v\f \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff]+/;   // JavaScript's \s, less a line break
+// A plain word, once opening quotes and brackets before it and marks after it are set aside.
+function plainWord(token: string): boolean {
+  const w = token.replace(/^[(\["'\u2018\u201c]+/, "").replace(/[.,;:!?)\]}"'\u2019\u201d]+$/, "");
+  return w.length >= 2 && WORD.test(w) && (!RANGE_WORDS.has(w.toLowerCase()) || LOWER_WORDS.has(w));
+}
+// Whether the dash at [at, end) stands between plain words: two on each side, on its line.
+function betweenPlainWords(text: string, at: number, end: number): boolean {
+  const before = text.slice(0, at).split(LINE_BREAK).pop()!.split(SPACE_RUN).filter(Boolean).slice(-2);
+  const after = text.slice(end).split(LINE_BREAK)[0].split(SPACE_RUN).filter(Boolean).slice(0, 2);
+  return before.length === 2 && after.length === 2 && /[A-Za-z]$/.test(before[1]) && /^[A-Za-z]/.test(after[0])
+    && [...before, ...after].every(plainWord);
+}
 
 // Each em dash and what goes in its place; null: it stays (refused, or kept and flagged).
 interface Dash { at: number; end: number; put: string | null; kept?: Kept }
@@ -178,14 +203,10 @@ function dashes(text: string, seen: string, refusable: boolean): Dash[] {
     .map((m) => [m.index!, m.index! + m[0].length]);
   for (const m of seen.matchAll(DASH)) {
     const at = m.index!, end = at + m[0].length;
-    if (refusable) { out.push({ at, end, put: null }); continue; }
-    if (links.some(([a, b]) => a < at && b >= at)) { out.push({ at, end, put: null, kept: "link" }); continue; }
-    if (NUMBER_BEFORE.test(text.slice(0, at)) && NUMBER_AFTER.test(text.slice(end))) { out.push({ at, end, put: null, kept: "range" }); continue; }
-    const before = at === 0 ? "\n" : text[at - 1], after = end >= text.length ? "\n" : text[end];
-    let put = ", ";
-    if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
-    else if (/[,;:]/.test(before)) put = " ";
-    out.push({ at, end, put });
+    if (refusable) out.push({ at, end, put: null });
+    else if (links.some(([a, b]) => a < at && b >= at)) out.push({ at, end, put: null, kept: "link" });
+    else if (betweenPlainWords(text, at, end)) out.push({ at, end, put: ", " });
+    else out.push({ at, end, put: null, kept: "range" });
   }
   return out;
 }
@@ -327,8 +348,8 @@ export const WHY: Record<Rule, string> = {
 // The same for one hit. An em dash of Cain's is refused, every one: what to put instead.
 export const DASH_WHY = 'an em dash; rewrite it without one, using a comma or a new sentence for a break, "to" or "through" for a range';
 // One kept in words that are never refused (flagged to Cain on a specialist's card): it
-// stands between two numbers, times or dates, and may or may not be a range; or a comma in
-// its place would run into the link before it.
+// isn't between plain words, so it may be a range; or a comma in its place would run into
+// the link before it.
 export const RANGE_WHY = "say it without the dash, as a range in words if it is one";
 export const LINK_WHY = "say it without the dash; a comma there would run into the link";
 export function whyOf(h: { rule: string; result?: string; kept?: string }): string {

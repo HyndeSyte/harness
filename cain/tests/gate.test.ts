@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { around, AT, check, DASH_WHY, hostsOnly, LINK_WHY, linkHost, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
+import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
 const shared = JSON.parse(readFileSync(join(import.meta.dir, "gate-cases.json"), "utf8"));
 const rulesOf = (r: ReturnType<typeof check>, result: string) => [...new Set(r.hits.filter((h) => h.result === result).map((h) => h.rule))].sort();
@@ -61,9 +61,9 @@ describe("the rules", () => {
   });
 
   test("code spans and link targets are never rewritten", () => {
-    const text = "See `a — b` and [the page](https://example.com/x—y) — then the add-on.";
+    const text = "See `a — b` and the [linked page](https://example.com/x—y) for it — then the add-on.";
     const r = check(text);
-    expect(r.fixed).toBe("See `a — b` and [the page](https://example.com/x—y), then the App.");
+    expect(r.fixed).toBe("See `a — b` and the [linked page](https://example.com/x—y) for it, then the App.");
   });
 
   test("Cain's words: every em dash is refused, none fixed in place, and the reason says how to say it without one", () => {
@@ -85,21 +85,33 @@ describe("the rules", () => {
     expect(check("Moved swim — it's at 4:30 now.").fixed).toBe("Moved swim, it's at 4:30 now.");
   });
 
-  test("in words never refused, markdown round a dash doesn't hide its numbers, and lower-case may, march, sat, sun and wed are words", () => {
-    for (const text of ["Swim is **5** — **6 PM**.", "Swim is _5_ — _6 PM_.", "Use `5` — `6` for the lanes.", "Swim was ~~5~~ — 6 PM.", "Booked May — 3 nights.", "Open SUN — 6 PM."]) {
+  test("in words never refused, a dash becomes a comma only between plain words, two on each side; any other is kept, flagged", () => {
+    // The coordinator, round four: a flag costs nothing, so flag generously.
+    for (const [text, fixed] of [["Moved the swim lesson — it starts at 4:30 now.", "Moved the swim lesson, it starts at 4:30 now."],
+      ["Moved swim—it starts now.", "Moved swim, it starts now."], ["The drop-off moved — it's all set.", "The drop-off moved, it's all set."],
+      ["We may — or may not — go home.", "We may, or may not, go home."], ["We march — all of us together.", "We march, all of us together."],
+      ["The cat sat — quite still there.", "The cat sat, quite still there."], ["They wed — after many years.", "They wed, after many years."]]) {
+      expect(check(text)).toMatchObject({ fixed, hits: text.match(/—/g)!.map(() => ({ rule: "dash", result: "fix" })) });
+    }
+    for (const text of ["Swim is **5** — **6 PM**.", "Swim is _5_ — _6 PM_.", "Use `5` — `6` for the lanes.", "Swim was ~~5~~ — 6 PM.", "Booked May — 3 nights.", "Open SUN — 6 PM.",
+      "Swim takes 30 min — 1 hr.", "Week 1 — Week 3 are booked.", "Out Monday morning — Friday evening.", "Open all morning — until we close.", "Kids aged five — eight are here.",
+      "Allow an hour — maybe more though.", "Open from spring — fall each year.", "Rooms A — C are free.", "Gates A1 — B2 are open.", "Its tag is #ready — or not yet.",
+      "Costs 5 — ~10 now.", "Moved — swim starts now.", "Moved the swim — done.", "Bake sale—Friday", "Done, — nothing else.", "All set —.", "Pickup moved —\nall set.",
+      "**Moved** — swim is at 4:30.", "Meet at the café — it opens soon.", "Swim moved to 4:30 — that works.", "It's Friday — swim day."]) {
       const r = check(text);
       expect(r.hits).toMatchObject([{ rule: "dash", result: "refuse", kept: "range" }]);
       expect(r.fixed).toBe(text);
       expect(whyOf(r.hits[0])).toBe(RANGE_WHY);
     }
-    expect(check("We may — 5 of us — go.").fixed).toBe("We may, 5 of us, go.");
-    expect(check("We march — 5 of us.").fixed).toBe("We march, 5 of us.");
-    expect(check("The cat sat — 3 hours straight.").fixed).toBe("The cat sat, 3 hours straight.");
-    expect(check("Out in the sun — 3 hours.").fixed).toBe("Out in the sun, 3 hours.");
-    expect(check("They wed — 5 years ago.").fixed).toBe("They wed, 5 years ago.");
   });
 
-  test("in words never refused, a dash right after a link (or in one) stays, flagged, since a comma would run into it; one before a link gets its comma", () => {
+  test("the words that keep a dash are the same list on both sides", () => {
+    expect([...DASH_WORDS]).toEqual(shared.dash_words);
+    expect(new Set(DASH_WORDS).size).toBe(DASH_WORDS.length);
+    for (const w of DASH_WORDS) expect(w).toBe(w.toLowerCase());
+  });
+
+  test("in words never refused, a dash right after a link (or in one) stays, flagged, since a comma would run into it; so does one before a link", () => {
     // ChatGPT, round four: a dash right after a link became a comma right against the link.
     for (const text of ["See https://example.com/a — then reply.", "See https://example.com/a\u00a0— then reply.", "Open wss://h.example/x — then.", "See www.example.com — then.",
       "See example.com/a — then reply.", "See www.example.com/a—b today.", "See https://example.com/a —.", "See https://example.com/a —\nthen."]) {
@@ -108,8 +120,9 @@ describe("the rules", () => {
       expect(r.fixed).toBe(text);
       expect(whyOf(r.hits[0])).toBe(LINK_WHY);
     }
-    expect(check("The notes — https://example.com/a").fixed).toBe("The notes, https://example.com/a");
-    expect(check("Read [the notes](https://example.com/x) — then reply.").fixed).toBe("Read [the notes](https://example.com/x), then reply.");   // its brackets close it
+    // A link is never a plain word: a dash before one, or after a masked one, is kept too, for its own reason.
+    expect(check("The notes — https://example.com/a")).toMatchObject({ fixed: "The notes — https://example.com/a", hits: [{ rule: "dash", kept: "range" }] });
+    expect(check("Read [the notes](https://example.com/x) — then reply.")).toMatchObject({ hits: [{ rule: "dash", kept: "range" }] });
   });
 
   test("an em dash with a number, time or date right on both sides, in words never refused, is kept, never read as \"to\", and the reason doesn't call it a range", () => {
@@ -126,8 +139,8 @@ describe("the rules", () => {
       expect(whyOf(r.hits[0])).toBe(RANGE_WHY);
     }
     expect(RANGE_WHY).toBe("say it without the dash, as a range in words if it is one");
-    expect(check("Swim moved to 4:30 — that works.").fixed).toBe("Swim moved to 4:30, that works.");   // a time against words
-    expect(check("It's Friday — swim day.").fixed).toBe("It's Friday, swim day.");                 // a day against words
+    expect(check("Swim moved to 4:30 — that works.").fixed).toBe("Swim moved to 4:30 — that works.");   // a time against words: kept too
+    expect(check("It's Friday — swim day.").fixed).toBe("It's Friday — swim day.");                 // a day against words: kept too
     expect(whyOf({ rule: "dash", result: "fix" })).toBe("no em dashes");
     expect(whyOf({ rule: "nonsense", result: "refuse" })).toBe("a message rule");
   });
