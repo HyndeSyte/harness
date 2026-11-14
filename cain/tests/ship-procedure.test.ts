@@ -96,7 +96,7 @@ describe("Cain's rules", () => {
     const flat = build.replace(/\s+/g, " ");
     expect(build).toContain('`/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he\'ll notice, in one line>"`');
     for (const must of ["through the review service", "Your line says only what he'll notice", "the question (which Apps and versions the tap installs)",
-      "whether its checks passed", "that review's Reviewed line", "Your line holds no check, test, build or CI words and no review, verdict or AI names: the link refuses them",
+      "whether its checks passed", "that review's Reviewed line", "Your line holds no check, test, build or CI words, no GitHub, job, status or result words (passed, green, success), and no review, verdict or AI names: the link refuses them",
       "a check failed or hasn't run yet", "a review of another head", "A new head needs a new review of it and a new Ship card"])
       expect(flat).toContain(must);
     expect(flat.indexOf("through the review service")).toBeLessThan(flat.indexOf("keeper.sh ship --item"));
@@ -112,7 +112,8 @@ describe("Cain's rules", () => {
       + "word for word. The gate refuses any other Reviewed line");
     const gate = section(rules, "## The message gate").replace(/\s+/g, " ");
     for (const must of ["a Reviewed line only as the review service gave it", "A Reviewed line goes out only as the review service gave it",
-      "On a Ship card your line may claim no checks or review: the link adds those"])
+      "On a Ship card your line may claim no checks or review: the link adds those",
+      "never give a review's outcome in any words but the service's line"])
       expect(gate).toContain(must);
   });
 

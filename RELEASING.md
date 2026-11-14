@@ -97,7 +97,8 @@ so Ship only installs it."); and its last line is the review service's own Revie
 names, which must be a review of that very pull request and head, followed by "The
 reviewers read Cain's summary of the change, not the code." ("No outside review
 attached." when he names none). Cain's own line says only what Dane will notice, on one
-line, with no check, test, build or CI words and no review, verdict or AI names. No card shows a record code like
+line, with no check, test, build or CI words, no GitHub, job, status or result words, and
+no review, verdict or AI names. No card shows a record code like
 P64: the item stays as data.
 
 On that tap Cain's link lands it itself

@@ -171,7 +171,10 @@ the review service gave it, and no record codes. They act, and every hit is logg
   ..."), word for word. Any other is held every time, with the real lines offered, and
   no third try lets it through; so is any review claim in other words ("OpenAI approved
   it"). A seat's name with a verdict word counts as one, so say an API's answer without
-  verdict words ("Gemini's key stopped working"). While those lines can't be read, it's held every time too: leave the Reviewed
+  verdict words ("Gemini's key stopped working"). The gate knows the usual verdict words
+  (approved, rejected, signed off, greenlit, go-ahead, blessing, thumbs up), but no list
+  knows every way to say one: never give a review's outcome in any words but the
+  service's line. While those lines can't be read, it's held every time too: leave the Reviewed
   line out, or send it once they can be read.
 - A record code (an item id your record has, like P64, or "P08 Q2") is held every time,
   and no third try lets it through: name the thing by what it does for him.
@@ -322,7 +325,8 @@ create, update or run any other routine.
      line from GitHub (how much it changes, the parts that matter most, and whether its
      checks passed; not the title), and that review's Reviewed line, with a note that the
      reviewers read your summary, not the code. Your line holds no check, test, build or
-     CI words and no review, verdict or AI names: the link refuses them. It also
+     CI words, no GitHub, job, status or result words (passed, green, success), and no
+     review, verdict or AI names: the link refuses them. It also
      refuses the card while a check failed or hasn't run yet, and for a review of another
      head (or one that names none). If the review found something worth fixing, run
      Build again on the same branch with the fixes first. A new head needs a new review
