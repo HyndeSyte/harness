@@ -24,7 +24,7 @@
 //     GET  /cards                       the cards up now, no text, and the ids of Cain's own replies (the reply hook's read);
 //                                       with no DM id yet, it asks Discord for it first, for 0.8 s at most
 //     POST /check {text, reply_to?, edit?}  what the gate does with a reply or edit, sending nothing
-//     POST /sent {tool, ids, question, reply_to?, net?}  what Cain just sent (the PostToolUse hook): his edit
+//     POST /sent {tool, ids, question, call, reply_to?, net?}  what Cain just sent (the PostToolUse hook): his edit
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in

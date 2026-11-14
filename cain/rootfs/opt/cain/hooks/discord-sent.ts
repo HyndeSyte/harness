@@ -9,14 +9,15 @@
 //     here, and the link tells Cain the rule and a short excerpt, and to fix it by an edit.
 //     Never through this hook's own output, which Claude Code would show him as the hook's.
 // A note the link doesn't take (no answer, or a 5xx or 429) is sent again, up to 3 times,
-// inside the hook's 15 seconds. Nothing is kept beyond that: Cain's next reply places Stop
-// again.
+// inside the hook's 15 seconds, the same note each time: it names its tool call
+// (tool_use_id, or a hash of the text), so the link tells Cain once per send, never once
+// per message. Nothing is kept beyond that: Cain's next reply places Stop again.
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { appendGate } from "../gate/log";
 import { answerText, asksSomething, SENDS, sentIds } from "../gate/plugin";
 import { check } from "../gate/rules";
-import { keyOf, readTries, type Tries, wasReleased } from "./discord-send";
+import { keyOf, readTries, textHash, type Tries, wasReleased } from "./discord-send";
 
 const LINK = process.env.CAIN_LINK ?? "http://127.0.0.1:8097";
 const ENV = process.env.CAIN_DISCORD_ENV ?? "/data/.claude/channels/discord/.env";
@@ -27,9 +28,12 @@ export const AGAIN_MS = [500, 1_000, 2_000];         // the waits before each of
 
 export interface NetHit { rule: string; result: string; around: string }
 export interface SentNote {
-  tool: "reply" | "edit"; ids: string[]; question: boolean; chat?: string; reply_to?: string;
+  tool: "reply" | "edit"; ids: string[]; question: boolean;
+  call: string;                     // the tool call's own id (tool_use_id), else a hash of its text: one send, however often its note goes
+  chat?: string; reply_to?: string;
   net?: { hits: NetHit[]; released: boolean };
 }
+const CALL = /^[A-Za-z0-9_-]{1,100}$/;
 
 // What to tell the link about one call that went out, or null when nothing went out (the
 // plugin's answer names no message: it failed, or it's another tool).
@@ -44,7 +48,9 @@ export function noteOf(input: any, now: number, tries: Tries = readTries()): Sen
   // A long number or code in a reply may be what he asked for: only the cards can tell, so
   // the net gives it the benefit of the doubt.
   const r = check(text, { rules: ["dash", "app", "count", "machine"], answersHim: !!replyTo });
-  const note: SentNote = { tool, ids, question: asksSomething(text), ...(chat ? { chat } : {}), ...(replyTo ? { reply_to: replyTo } : {}) };
+  // Which send this is: a retried note keeps it, and a second edit of the same message has its own.
+  const call = typeof input?.tool_use_id === "string" && CALL.test(input.tool_use_id) ? input.tool_use_id : textHash(text);
+  const note: SentNote = { tool, ids, question: asksSomething(text), call, ...(chat ? { chat } : {}), ...(replyTo ? { reply_to: replyTo } : {}) };
   // A third try the reply hook let through is always told, hits here or not (a button the
   // card lacks is one only the cards can show).
   const released = wasReleased(tries, keyOf(String(input?.session_id ?? ""), chat), text, now);

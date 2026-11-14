@@ -385,21 +385,27 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     expect(main).not.toContain("seedSent(");
   });
 
-  test("an edit of a message the link posted (the reply hook bypassed) is logged and Cain hears it once", async () => {
+  test("an edit of a message the link posted (the reply hook bypassed) is logged and Cain hears it once per edit", async () => {
     const r = rig();
     const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
-    await r.link.sent({ tool: "edit", ids: [ask], question: false });
+    await r.link.sent({ tool: "edit", ids: [ask], question: false, call: "toolu_01first" });
     expect(r.state().sent?.[ask]).toBeUndefined();
     expect(r.reports.at(-1)).toMatchObject({ point: "sent", writer: "cain", message: ask, did: "bypassed: an edit of a message the link posted" });
     expect(r.relayed.at(-1)).toBe(`Your edit changed Discord message ${ask}, a card your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
     // The hook sends a note again when its answer is lost: the line, and the log, come once.
     const said = r.relayed.length, logged = r.reports.length;
-    await r.link.sent({ tool: "edit", ids: [ask], question: false });
+    await r.link.sent({ tool: "edit", ids: [ask], question: false, call: "toolu_01first" });
     expect([r.relayed.length, r.reports.length]).toEqual([said, logged]);
-    // A later edit of it, past the minute a retry takes, is told again.
-    r.later(2 * MIN);
-    await r.link.sent({ tool: "edit", ids: [ask], question: false });
+    // A second, different edit of the same card within the minute is its own send: told too.
+    await r.link.sent({ tool: "edit", ids: [ask], question: false, call: "toolu_01second" });
+    expect([r.relayed.length, r.reports.length]).toEqual([said + 1, logged + 1]);
+    await r.link.sent({ tool: "edit", ids: [ask], question: false, call: "toolu_01second" });   // and its retry isn't
     expect(r.relayed.length).toBe(said + 1);
+    // The same for what the safety net found: once per send, a retry not again, another send again.
+    const net = { released: false, hits: [{ rule: "count", result: "refuse", around: "and 3 more" }] };
+    const mine = r.snowflake();
+    for (const call of ["toolu_01a", "toolu_01a", "toolu_01b"]) await r.link.sent({ tool: "reply", ids: [mine], question: false, call, net });
+    expect(r.relayed.filter((l) => l.includes(`(Discord message ${mine})`))).toHaveLength(2);
   });
 
   test("what the safety net found reaches Cain as each rule and a short excerpt, with what to fix, or that his third try went out as it was", async () => {

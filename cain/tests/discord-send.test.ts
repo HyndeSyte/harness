@@ -402,13 +402,15 @@ describe("the safety net after the send (discord-sent.ts)", () => {
   const sent = (text: string, response: unknown, extra: any = {}) => ({ session_id: "s1", tool_name: REPLY, hook_event_name: "PostToolUse",
     tool_input: { chat_id: DM, text, ...extra }, tool_response: response });
 
-  test("tells the link the ids the plugin answered with, and whether the last line asks something", () => {
-    expect(noteOf(sent("Moved swim to 4:30.", [{ type: "text", text: "sent (id: 1300000000000000777)" }]), NOW, {}))
-      .toEqual({ tool: "reply", ids: ["1300000000000000777"], question: false, chat: DM });
+  test("tells the link the ids the plugin answered with, whether the last line asks something, and which tool call it was", () => {
+    expect(noteOf({ ...sent("Moved swim to 4:30.", [{ type: "text", text: "sent (id: 1300000000000000777)" }]), tool_use_id: "toolu_01AbC" }, NOW, {}))
+      .toEqual({ tool: "reply", ids: ["1300000000000000777"], question: false, call: "toolu_01AbC", chat: DM });
+    // No tool_use_id (or one that isn't an id): a hash of the text tells the send apart.
     expect(noteOf(sent("Want me to move it?", "sent 2 parts (ids: 1300000000000000778, 1300000000000000779)", { reply_to: HIS }), NOW, {}))
-      .toEqual({ tool: "reply", ids: ["1300000000000000778", "1300000000000000779"], question: true, chat: DM, reply_to: HIS });
+      .toEqual({ tool: "reply", ids: ["1300000000000000778", "1300000000000000779"], question: true, call: textHash("Want me to move it?"), chat: DM, reply_to: HIS });
+    expect(noteOf({ ...sent("Moved swim.", "sent (id: 1300000000000000777)"), tool_use_id: "not an id!" }, NOW, {})!.call).toBe(textHash("Moved swim."));
     expect(noteOf({ ...sent("x", "edited (id: 1300000000000000010)"), tool_name: EDIT, tool_input: { chat_id: DM, message_id: MINE, text: "Fixed the time." } }, NOW, {}))
-      .toMatchObject({ tool: "edit", ids: [MINE], question: false });
+      .toMatchObject({ tool: "edit", ids: [MINE], question: false, call: textHash("Fixed the time.") });
     expect(noteOf(sent("x", "reply failed after 0 of 1 chunk(s) sent: boom"), NOW, {})).toBeNull();   // nothing went out
     expect(noteOf({ ...sent("x", "sent (id: 1300000000000000777)"), tool_name: "Bash" }, NOW, {})).toBeNull();
   });

@@ -46,8 +46,8 @@
 // - The gate (piece D, ../gate/rules.ts), enforcing since 0.10.0. Cain's words through the
 //   link (asks and their options, Ship cards, the morning message, the connector notice):
 //   em dashes and "add-on" fixed before anything is posted, and the answer says so; a
-//   hidden count, machine text, an em dash between two numbers (or a time and a number)
-//   that isn't a clock range, or a button the card lacks refused. The specialist's cards:
+//   hidden count, machine text, an em dash between two numbers, times or dates (never
+//   read as "to"), or a button the card lacks refused. The specialist's cards:
 //   fixed and posted, never refused (a refused card would be lost to him); Cain hears
 //   once what the gate flagged.
 //   Its notes after a tap, and the link's own words: fixed only. Every hit is logged, its
@@ -887,6 +887,8 @@ export class Link {
     if (DIRECT_KINDS.has(kind)) {
       const shown = await this.show(id, { item: "none" });
       if (shown && (kind === "stopped" || kind === "resumed")) await this.retireToggles(shown);
+      // A Turn back on notice with a Stop of its own: a moving Stop placed meanwhile comes off.
+      if (shown && kind === "resumed") void this.inStopQueue(() => this.placeStop());
       if (flagged) this.d.relay(`The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`);
     } else {
       const ask = due !== null ? "It has buttons: show it now, or it goes out by itself in about 2 minutes."
@@ -1552,6 +1554,8 @@ export class Link {
       this.d.save(s);
       await this.retireToggles(String(msg.id));
       await this.stripAll(older);
+      // Its own Stop is the one within reach now: a moving Stop placed meanwhile comes off.
+      if (!stopped) void this.inStopQueue(() => this.placeStop());
     } catch (e) { this.log(`couldn't post the Stop notice: ${String(e).slice(0, 80)}`); }
   }
 
@@ -1646,7 +1650,10 @@ export class Link {
     if (replyTo && !s.messages[replyTo] && !sent[replyTo]) s.hisAt = Math.max(s.hisAt ?? 0, Math.min(now, snowflakeTime(replyTo)));
     this.d.save(s);
     // A note sent again (its answer lost) is told once: the bypassed edit, and what the net found.
-    if (theirs && this.firstTime("bypassed", tool, ids)) {
+    // Which send it is comes from its tool call's own id (or a hash of its text): a second edit
+    // of the same card is a send of its own, and is told too.
+    const call = typeof n?.call === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(n.call) ? n.call : "";
+    if (theirs && this.firstTime("bypassed", call, tool, ids)) {
       const m = s.messages[theirs];
       this.log(`Cain's edit changed a message the link posted (${m.kind ?? "legacy"}): the reply hook was bypassed`);
       try { this.d.report?.({ point: "sent", writer: "cain", message: theirs, hits: [], did: "bypassed: an edit of a message the link posted" }); }
@@ -1654,7 +1661,7 @@ export class Link {
       this.d.relay(`Your edit changed Discord message ${theirs}, ${m.kind === "notice" || m.kind === "morning" ? "a message" : "a card"} your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
     }
     const net = netOf(n?.net);
-    if (net && this.firstTime(tool, ids, net)) this.d.relay(netLine(tool, last, net));
+    if (net && this.firstTime(call, tool, ids, net)) this.d.relay(netLine(tool, last, net));
     const placing = this.inStopQueue(() => this.placeStop());
     if (!o.background) await placing;
     return { status: "ok", said: "Noted." };
@@ -1796,22 +1803,44 @@ export class Link {
     if (st.stopped) {
       // Turn back on stays within reach however it's stopped: his tap, a Stop that couldn't
       // be saved, or a Stop state that can't be read (no time: it's posted at once).
+      this.moveWait = { fails: 0, next: 0 };                   // no move is pending while stopped
       if (holder) await this.unhold(holder, MOVED);
       await this.keepResumeInReach(st.at ?? this.changed?.at ?? 0);
       return;
     }
+    const reach = this.newestBot(s, STOP_REACH), newest = this.newestPlain(s);
+    // Refusals are kept only for what Stop could still go to: the messages within reach, and
+    // the newest plain one.
+    for (const id of [...this.holdFails.keys()]) if (id !== newest && !reach.includes(id)) this.holdFails.delete(id);
+    // His Stop or Turn back on notice carries a Stop of its own: newer than the moving one and
+    // within reach, it's the one, and the moving Stop comes off (one Stop after Turn back on).
+    if (holder && reach.some((id) => id !== holder && newerId(id, holder) && this.stopNotice(s, id) && this.carries(s, id, "Stop"))) {
+      this.moveWait = { fails: 0, next: 0 };
+      await this.unhold(holder, MOVED);
+      return;
+    }
     const holderOk = !!holder && this.plainOk(s, holder);
-    const within = this.newestBot(s, STOP_REACH).some((id) => this.carries(s, id, "Stop") && (id !== holder || holderOk));
-    let target = within ? null : this.newestPlain(s);
+    const within = reach.some((id) => this.carries(s, id, "Stop") && (id !== holder || holderOk));
+    let target = within ? null : newest;
     // Discord refused the newest plain message three times: the newest plain one within reach
     // that it hasn't refused instead. None, and Stop stays where it is: nothing is posted for it.
-    if (target && this.skipped(target))
-      target = this.newestBot(s, STOP_REACH).find((id) => this.plainOk(s, id) && !this.skipped(id)) ?? null;
+    if (target && this.skipped(target)) target = reach.find((id) => this.plainOk(s, id) && !this.skipped(id)) ?? null;
+    // No move pending: the waits after an unanswered move start over at the next one.
+    if (!target || target === holder) this.moveWait = { fails: 0, next: 0 };
     if (target && target !== holder) {
       if (now < this.moveWait.next) return;                    // Discord didn't answer the last move: waiting
       if (!(await this.hold(target))) return;
       if (holder) await this.unhold(holder, MOVED);
     } else if (holder && !holderOk) await this.unhold(holder, MOVED);   // it asks something now
+  }
+
+  // His Stop or Turn back on notice: the link's own, or the calendar specialist's.
+  private stopNotice(s: State, id: string): boolean {
+    const m = s.messages[id];
+    if (!m) return false;
+    if (m.toggle) return true;
+    const c = m.card !== undefined ? s.cards[String(m.card)] : undefined;
+    return !!c && (c.kind === "stopped" || c.kind === "resumed");
   }
 
   // While stopped, Turn back on stays within reach: when neither the morning message nor a

@@ -279,6 +279,39 @@ describe("moving it safely", () => {
     expect(next).toBeTruthy();
   });
 
+  test("a move that turns out not to be needed starts the waits over: the next unanswered one waits a minute again", async () => {
+    const r = rig();
+    r.failing.add("PATCH");
+    await cainSays(r, "Moved swim to 4:30.");                        // the move fails: a minute's wait
+    r.failing.clear();
+    const n = await r.link.notice("The calendar specialist is answering again.");   // its own Stop: no move pending now
+    await r.link.sweep();
+    expect(holder(r)).toBe(n);
+    r.failing.add("PATCH");
+    const later = await replies(r, 5);                               // out of reach again, and the move fails
+    expect(patchesOf(r, later[4])).toHaveLength(1);
+    r.failing.clear();
+    r.later(MIN);
+    await r.link.sweep();
+    expect(holder(r)).toBe(later[4]);                                // a minute on, not two
+  });
+
+  test("refusals are forgotten once their message is out of reach and no longer the newest plain one", async () => {
+    const r = rig();
+    await cainSays(r, "Moved swim to 4:30.");
+    await replies(r, 4);
+    const stuck = r.snowflake();
+    r.posted[stuck] = { id: stuck, content: "All set.", author: { id: BOT }, components: [] };
+    r.refusing.add(`PATCH /channels/${DM}/messages/${stuck}`);
+    await r.link.sent({ tool: "reply", ids: [stuck], question: false });
+    await r.link.sweep();
+    await r.link.sweep();
+    const fails = (r.link as any).holdFails as Map<string, number>;
+    expect(fails.get(stuck)).toBe(3);
+    await replies(r, 6);
+    expect(fails.size).toBe(0);
+  });
+
   test("with every plain message within reach refused, Stop stays where it was: nothing is posted to carry it", async () => {
     const r = rig();
     const first = await cainSays(r, "Moved swim to 4:30.");
@@ -473,6 +506,49 @@ describe("Stop and Turn back on", () => {
       for (let i = 0; i < 5; i++) { r.later(MIN); await r.link.sweep(); }
       expect(r.posts()).toBe(posts);                                   // one is up and within reach: no more
     }
+  });
+
+  test("with no Stop time, Turn back on still comes at most hourly, or every 10 minutes while he writes", async () => {
+    for (const hisWrites of [false, true]) {
+      const r = rig();
+      await cainSays(r, "Moved swim to 4:30.");
+      r.stop.stopped = true; r.stop.at = null;
+      const at: number[] = [];
+      let n = 0;
+      for (let m = 1; m <= 130; m++) {
+        r.later(MIN);
+        if (m % 2 === 0) await cainSays(r, `Note ${m}.`, hisWrites ? { replyTo: r.his(`and ${m}?`).id } : {});
+        await r.link.sweep();
+        const posts = r.cards().filter((x: any) => String(x.content) === STILL_STOPPED).length;
+        if (posts > n) { at.push(m); n = posts; }
+      }
+      if (!hisWrites) expect(at).toEqual([1, 61, 121]);
+      else {
+        expect(at.length).toBeGreaterThanOrEqual(10);
+        for (let i = 1; i < at.length; i++) expect(at[i] - at[i - 1]).toBeGreaterThanOrEqual(10);
+      }
+    }
+  });
+
+  test("after Turn back on, exactly one message carries Stop: the notice's own, with no moving Stop beside it", async () => {
+    // Fable's probe, Nov 14: the newest reply and the Turned back on notice both carried Stop.
+    const r = rig();
+    r.harnessDown.down = true;                                       // so the link posts its own notices
+    const reply = await cainSays(r, "Moved swim to 4:30.");
+    await r.tap(structuredClone(r.msg(reply)), STOP);
+    await r.link.whenStopPlaced();
+    await replies(r, 6);                                             // plain messages a moving Stop could go to
+    const notice = r.cards().filter((m: any) => r.buttons(m.id).includes("Turn back on")).at(-1);
+    await r.tap(structuredClone(notice), RESUME);
+    await r.link.whenStopPlaced();
+    r.later(MIN);
+    await r.link.sweep();
+    const carrying = r.cards().filter((m: any) => r.buttons(m.id).includes("Stop"));
+    expect(carrying).toHaveLength(1);
+    expect(String(carrying[0].content)).toStartWith("**Turned back on.**");
+    // Once that notice is out of reach, the moving Stop comes back to the newest plain message.
+    const later = await replies(r, 5);
+    expect(r.buttons(later[4])).toEqual(["Stop"]);
   });
 
   test("a Stopped notice known gone from his DM isn't one that's up: Turn back on is posted again at once", async () => {
