@@ -6,8 +6,12 @@
 // specialist's tests, kept equal to this file by cain/tests/gate-cases.json.
 //
 //   dash     an em dash                    fix: ", " (removed at a line's start or end,
-//                                          or before a stop; " to " only between two
-//                                          clock times), never inside code or a link
+//                                          or before a stop; " to " only in a confirmed
+//                                          clock range), never inside code or a link.
+//            One with a digit right on both sides that isn't a confirmed clock range
+//            (between "2026" and "2027", or "Room 4" and "5") could be a range or a
+//            list: refuse, to be said in words (a writer that's never refused keeps it
+//            as it is, flagged)
 //   app      "the add-on", "Cain's add-on", "Harness add-on", "Settings > Add-ons" and
 //            the like (also "addon" and the specialist's escaped "add\-on"; plural and
 //            possessive)                   fix: "App", "Apps", "App's". A bare "add-on"
@@ -70,38 +74,75 @@ export function hidden(text: string, onlyTargets: boolean | "code" = false): str
   return t.join("");
 }
 
-// Up to n characters of the text around a hit, on one line.
+// Up to n characters of the text around a hit, on one line. A link in it keeps only its
+// host: a path or query can carry an id or a token, and excerpts go to the gate's log, the
+// safety net's note and lines for Cain.
 export function around(text: string, at: number, end: number, n = 60): string {
   const pad = Math.max(0, Math.floor((n - Math.min(end - at, n)) / 2));
   let from = Math.max(0, at - pad);
   const to = Math.min(text.length, from + n);
   from = Math.max(0, to - n);
-  return text.slice(from, to).replace(/\s+/g, " ").trim().slice(0, n);
+  for (const m of text.matchAll(LINK)) {                  // a window that starts inside a link shows its host
+    if (m.index! < from && from < m.index! + m[0].length) { from = m.index!; break; }
+  }
+  return hostsOnly(text, from, to).replace(/\s+/g, " ").trim().slice(0, n);
+}
+
+// text[from, to) with every link's path and query cut to "/…" ("https://github.com/…").
+const LINK = /https?:\/\/[^\s<>()]+/g;
+export function hostsOnly(text: string, from = 0, to = text.length): string {
+  const t = String(text ?? "");
+  const cut: [number, number][] = [];
+  for (const m of t.matchAll(LINK)) {
+    const host = /^https?:\/\/[^/?#]*/.exec(m[0])![0].length;
+    if (m[0].length > host) cut.push([m.index! + host, m.index! + m[0].length]);
+  }
+  let out = "";
+  for (let i = from; i < Math.min(to, t.length); i++) {
+    const c = cut.find(([a, b]) => i >= a && i < b);
+    if (!c) { out += t[i]; continue; }
+    out += "/…";
+    i = c[1] - 1;
+  }
+  return out;
 }
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // -- dash ----------------------------------------------------------------------------
-// " to " only between two clock times: a dash between 9:30 and 10:15, 6 PM and 8 PM, or 6
-// and 8 PM, where one side says it's a time (a colon, or AM or PM) and the other is a time
-// or a bare hour. Any other pair of numbers (Room 4 and 5, a score of 3 and 2) gets ", ".
+// " to " only in a confirmed clock range:
+//   - a clock time on both sides (a colon, or AM or PM): 9:30 to 10:15, 6 PM to 8 PM;
+//   - a bare hour, then a time with AM or PM, the hour starting the text or a line, or
+//     after punctuation or one of from, between, at, by, around, about, until, till:
+//     "6 to 8 PM", "from 6 to 8 PM" (never "Nov 12 to 4:30 PM" or "Room 4 to 5:30");
+//   - a clock time, then a bare hour at the end of the text or a line, or before
+//     punctuation: "6 PM to 8." (never "6 PM to 8 people").
+// Any other em dash with a digit right on both sides is held: ", " would make a range a
+// list ("2026, 2027"). Every other em dash gets ", " or goes.
 const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
-const CLOCK_END = new RegExp(`(?<![\\d:.])(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})$`);
-const HOUR_END = /(?<![\d:])(?<!\d[.,])\d{1,2}$/;               // not "1.5" or "2026"
-const CLOCK_START = new RegExp(`^(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})(?![A-Za-z0-9:])`);
-const HOUR_START = /^\d{1,2}(?![A-Za-z0-9:]|[.,]\d)/;
+const CLOCK = `(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})`;
+const CLOCK_END = new RegExp(`(?<![\\d:.])${CLOCK}$`);
+const CLOCK_START = new RegExp(`^${CLOCK}(?![A-Za-z0-9:])`);
+const MERIDIEM_START = new RegExp(`^\\d{1,2}(?::\\d{2})?${MERIDIEM}(?![A-Za-z0-9])`);
+const WHEN = "(?:[Ff]rom|[Bb]etween|[Aa]t|[Bb]y|[Aa]round|[Aa]bout|[Uu]ntil|[Tt]ill)";
+// A period after a month's short name is a date's ("Nov. 12"), not a stop.
+const STOP_DOT = "(?<!Jan)(?<!Feb)(?<!Mar)(?<!Apr)(?<!Jun)(?<!Jul)(?<!Aug)(?<!Sep)(?<!Sept)(?<!Oct)(?<!Nov)(?<!Dec)\\.";
+const HOUR_LEFT = new RegExp(`(?:^|\\n[ \\t]*|(?:[,;:!?)\\]•]|${STOP_DOT})[ \\t]+|[(\\[]|(?<![A-Za-z])${WHEN}[ \\t]+)\\d{1,2}$`);
+const HOUR_RIGHT = /^\d{1,2}(?=[ \t]*(?:$|\n|[;!?)\]]|[.,](?!\d)))/;
 function clockRange(left: string, right: string): boolean {
-  const l = CLOCK_END.test(left), r = CLOCK_START.test(right);
-  return (l && (r || HOUR_START.test(right))) || (r && HOUR_END.test(left));
+  const l = CLOCK_END.test(left);
+  return (l && CLOCK_START.test(right)) || (MERIDIEM_START.test(right) && HOUR_LEFT.test(left)) || (l && HOUR_RIGHT.test(right));
 }
 
-function dashes(text: string, seen: string): { at: number; end: number; put: string }[] {
-  const out: { at: number; end: number; put: string }[] = [];
+// Each em dash and what goes in its place; null: it stays, and the writer says it in words.
+function dashes(text: string, seen: string): { at: number; end: number; put: string | null }[] {
+  const out: { at: number; end: number; put: string | null }[] = [];
   for (const m of seen.matchAll(/[ \t]*—+[ \t]*/g)) {
     const at = m.index!, end = at + m[0].length;
     const before = at === 0 ? "\n" : text[at - 1], after = end >= text.length ? "\n" : text[end];
-    let put = ", ";
-    if (clockRange(text.slice(Math.max(0, at - 12), at), text.slice(end, end + 12))) put = " to ";   // 9:30 to 10:15
+    let put: string | null = ", ";
+    if (clockRange(text.slice(0, at), text.slice(end))) put = " to ";             // 9:30 to 10:15
+    else if (/\d/.test(before) && /\d/.test(after)) put = null;                   // a range or a list
     else if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
     else if (/[,;:]/.test(before)) put = " ";
     out.push({ at, end, put });
@@ -184,7 +225,11 @@ export function check(text: string, ctx: Context = {}): Report {
     hits.push({ rule, result, at, end, around: around(t, at, end), ...(label ? { label } : {}) });
   };
   const edits: { at: number; end: number; put: string }[] = [];
-  if (on.has("dash")) for (const e of dashes(t, seen)) { add("dash", "fix", e.at, e.end); edits.push(e); }
+  if (on.has("dash")) for (const e of dashes(t, seen)) {
+    if (e.put === null) { add("dash", "refuse", e.at, e.end); continue; }
+    add("dash", "fix", e.at, e.end);
+    edits.push({ at: e.at, end: e.end, put: e.put });
+  }
   if (on.has("app")) for (const e of apps(seen)) { add("app", "fix", e.at, e.end); edits.push(e); }
   if (on.has("count")) for (const re of COUNTS) for (const m of seen.matchAll(re)) add("count", "refuse", m.index!, m.index! + m[0].length);
   if (on.has("machine")) {
@@ -237,6 +282,12 @@ export const WHY: Record<Rule, string> = {
   machine: "no shas, job ids, ISO times or Discord ids; say it as people say it",
   button: "name only a button the message has",
 };
+// The same for one hit: an em dash that's held is one between two numbers.
+export const RANGE_WHY = "say the range in words";
+export function whyOf(h: { rule: string; result?: string }): string {
+  if (h.rule === "dash" && h.result === "refuse") return RANGE_WHY;
+  return WHY[h.rule as Rule] ?? "a message rule";
+}
 
 // The fixable hits, as a few words: "no em dashes; Apps, not add-ons".
 export function fixedWhat(hits: readonly Hit[]): string {

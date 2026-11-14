@@ -238,6 +238,8 @@ def test_each_shared_case(case):
         {k: sorted(case.get(k, [])) for k in ("fix", "refuse", "unsure")}
     assert r.fixed == case.get("fixed", case["text"])
     assert all(len(h.around) <= 60 for h in r.hits)
+    if "around" in case:
+        assert [h.around for h in r.hits] == case["around"]
 
 
 # -- the dynamic half's own checks ---------------------------------------------------------------

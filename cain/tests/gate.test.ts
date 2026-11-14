@@ -1,10 +1,10 @@
-// The message gate's rules (gate/rules.ts), in report mode in this release. The shared
-// cases in gate-cases.json are run here against rules.ts and by pytest against the
-// Python port (tests/message_rules.py), so the two stay equal.
+// The message gate's rules (gate/rules.ts). The shared cases in gate-cases.json are run
+// here against rules.ts and by pytest against the Python port (tests/message_rules.py), so
+// the two stay equal.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { around, AT, check, RULES, STATIC_LABELS, verdict } from "../rootfs/opt/cain/gate/rules";
+import { around, AT, check, hostsOnly, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
 const shared = JSON.parse(readFileSync(join(import.meta.dir, "gate-cases.json"), "utf8"));
 const rulesOf = (r: ReturnType<typeof check>, result: string) => [...new Set(r.hits.filter((h) => h.result === result).map((h) => h.rule))].sort();
@@ -18,6 +18,7 @@ describe("the shared cases", () => {
       expect(rulesOf(r, "fix")).toEqual([...(c.fix ?? [])].sort());
       expect(rulesOf(r, "refuse")).toEqual([...(c.refuse ?? [])].sort());
       expect(rulesOf(r, "unsure")).toEqual([...(c.unsure ?? [])].sort());
+      if (c.around) expect(r.hits.map((h) => h.around)).toEqual(c.around);
     });
   }
 
@@ -63,6 +64,26 @@ describe("the rules", () => {
     const text = "See `a — b` and [the page](https://example.com/x—y) — then the add-on.";
     const r = check(text);
     expect(r.fixed).toBe("See `a — b` and [the page](https://example.com/x—y), then the App.");
+  });
+
+  test("an em dash between two numbers that isn't a clock range is held, and the reason says to say the range in words", () => {
+    for (const text of ["From 2026 — 2027 it runs.", "Room 4—5 is free.", "Swim moved to 4:30 — 2 blocks shifted.", "Nov 12 — 4:30 PM swim is set.", "Room 4 — 5:30 start."]) {
+      const r = check(text);
+      expect(r.hits).toMatchObject([{ rule: "dash", result: "refuse" }]);
+      expect(r.fixed).toBe(text);                                     // never ", ": a range would read as a list
+      expect(whyOf(r.hits[0])).toBe(RANGE_WHY);
+    }
+    expect(whyOf({ rule: "dash", result: "fix" })).toBe("no em dashes");
+    expect(whyOf({ rule: "nonsense", result: "refuse" })).toBe("a message rule");
+  });
+
+  test("a link in an excerpt keeps only its host, wherever the excerpt starts or ends", () => {
+    expect(hostsOnly("See https://github.com/a/b?token=x and https://example.com now.")).toBe("See https://github.com/… and https://example.com now.");
+    const text = `${"x".repeat(70)} https://example.com/private/ids/0123456789abcdef0123456789abcdef01234567?key=1 and more words`;
+    const r = check(text);
+    expect(r.hits).toMatchObject([{ rule: "machine" }]);
+    expect(r.hits[0].around).toBe("https://example.com/… and");
+    expect(around(text, 100, 110)).not.toContain("private");
   });
 
   test("a verdict: refuse beats fix, fix beats can't tell", () => {

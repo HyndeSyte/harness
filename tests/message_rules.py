@@ -5,8 +5,11 @@ runs them there). Nothing in harness/app imports this: what he sees is kept clea
 tests that use it.
 
   dash     an em dash                         fix: ", " (removed at a line's start or end, or
-                                              before a stop; " to " only between two clock
-                                              times), never inside code or a link
+                                              before a stop; " to " only in a confirmed clock
+                                              range), never inside code or a link. One with a
+                                              digit right on both sides that isn't a confirmed
+                                              range (between "2026" and "2027") is refused:
+                                              said in words
   app      "the add-on", "Cain's add-on", "Settings > Add-ons" and the like, also "addon" and
            the escaped "add\\-on"             fix: "App", "Apps", "App's". A bare "add-on" (a
                                               browser add-on in a calendar title) is left alone.
@@ -87,37 +90,80 @@ def hidden(text: str, only_targets: bool | str = False) -> str:
     return "".join(t)
 
 
+_LINK = re.compile(r"https?://[^\s<>()]+", A)
+
+
 def around(text: str, at: int, end: int, n: int = 60) -> str:
+    """Up to n characters around a hit, on one line; a link keeps only its host (rules.ts)."""
     pad = max(0, (n - min(end - at, n)) // 2)
     start = max(0, at - pad)
     stop = min(len(text), start + n)
     start = max(0, stop - n)
-    return re.sub(r"\s+", " ", text[start:stop]).strip()[:n]
+    for m in _LINK.finditer(text):        # a window that starts inside a link shows its host
+        if m.start() < start < m.end():
+            start = m.start()
+            break
+    return re.sub(r"\s+", " ", hosts_only(text, start, stop)).strip()[:n]
 
 
-# " to " only between two clock times (rules.ts clockRange): one side says it's a time (a
-# colon, or AM or PM) and the other is a time or a bare hour. Any other pair of numbers gets ", ".
+def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
+    """text[start:stop] with every link's path and query cut to "/\u2026" (rules.ts hostsOnly)."""
+    t = str(text or "")
+    stop = len(t) if stop is None else min(stop, len(t))
+    cut = []
+    for m in _LINK.finditer(t):
+        host = len(re.match(r"https?://[^/?#]*", m.group(0), A).group(0))
+        if len(m.group(0)) > host:
+            cut.append((m.start() + host, m.end()))
+    out, i = [], start
+    while i < stop:
+        c = next((c for c in cut if c[0] <= i < c[1]), None)
+        if c is None:
+            out.append(t[i])
+            i += 1
+        else:
+            out.append("/\u2026")
+            i = c[1]
+    return "".join(out)
+
+
+# " to " only in a confirmed clock range (rules.ts clockRange): a clock time on both sides (a
+# colon, or AM or PM); a bare hour, then a time with AM or PM, the hour starting the text or a
+# line, or after punctuation or one of from, between, at, by, around, about, until, till; or
+# a clock time, then a bare hour at the end of the text or a line, or before punctuation. Any
+# other em dash with a digit right on both sides is refused; every other one gets ", " or goes.
 _MERIDIEM = r"\s?[AaPp]\.?[Mm]\.?"
-_CLOCK_END = re.compile(r"(?<![\d:.])(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")$", A)
-_HOUR_END = re.compile(r"(?<![\d:])(?<!\d[.,])\d{1,2}$", A)                 # not "1.5" or "2026"
-_CLOCK_START = re.compile(r"^(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")(?![A-Za-z0-9:])", A)
-_HOUR_START = re.compile(r"^\d{1,2}(?![A-Za-z0-9:]|[.,]\d)", A)
+_CLOCK = r"(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")"
+_CLOCK_END = re.compile(r"(?<![\d:.])" + _CLOCK + r"\Z", A)
+_CLOCK_START = re.compile(r"^" + _CLOCK + r"(?![A-Za-z0-9:])", A)
+_MERIDIEM_START = re.compile(r"^\d{1,2}(?::\d{2})?" + _MERIDIEM + r"(?![A-Za-z0-9])", A)
+_WHEN = r"(?:[Ff]rom|[Bb]etween|[Aa]t|[Bb]y|[Aa]round|[Aa]bout|[Uu]ntil|[Tt]ill)"
+# A period after a month's short name is a date's ("Nov. 12"), not a stop.
+_STOP_DOT = r"(?<!Jan)(?<!Feb)(?<!Mar)(?<!Apr)(?<!Jun)(?<!Jul)(?<!Aug)(?<!Sep)(?<!Sept)(?<!Oct)(?<!Nov)(?<!Dec)\."
+_HOUR_LEFT = re.compile(r"(?:^|\n[ \t]*|(?:[,;:!?)\]\u2022]|" + _STOP_DOT + r")[ \t]+|[(\[]|(?<![A-Za-z])" + _WHEN
+                        + r"[ \t]+)\d{1,2}\Z", A)
+_HOUR_RIGHT = re.compile(r"^\d{1,2}(?=[ \t]*(?:\Z|\n|[;!?)\]]|[.,](?!\d)))", A)
 
 
 def _clock_range(left: str, right: str) -> bool:
-    lt, rt = bool(_CLOCK_END.search(left)), bool(_CLOCK_START.search(right))
-    return (lt and (rt or bool(_HOUR_START.search(right)))) or (rt and bool(_HOUR_END.search(left)))
+    lt = bool(_CLOCK_END.search(left))
+    return ((lt and bool(_CLOCK_START.search(right)))
+            or (bool(_MERIDIEM_START.search(right)) and bool(_HOUR_LEFT.search(left)))
+            or (lt and bool(_HOUR_RIGHT.search(right))))
 
 
-def _dashes(text: str, seen: str) -> list[tuple[int, int, str]]:
+def _dashes(text: str, seen: str) -> list[tuple[int, int, str | None]]:
+    """Each em dash and what goes in its place; None: it stays, and the writer says it in words."""
     out = []
     for m in re.finditer("[ \t]*\u2014+[ \t]*", seen):
         at, end = m.start(), m.end()
         before = "\n" if at == 0 else text[at - 1]
         after = "\n" if end >= len(text) else text[end]
-        put = ", "
-        if _clock_range(text[max(0, at - 12):at], text[end:end + 12]):
-            put = " to "                  # "9:30 to 10:15", never "Room 4 to 5"
+        put: str | None = ", "
+        if _clock_range(text[:at], text[end:]):
+            put = " to "                  # "9:30 to 10:15", never "Room 4 to 5:30"
+        elif re.match(r"\d", before, A) and re.match(r"\d", after, A):
+            put = None                    # a range or a list
         elif before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
             put = ""
         elif re.match(r"[,;:]", before):
@@ -215,9 +261,12 @@ def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = Fa
 
     edits: list[tuple[int, int, str]] = []
     if "dash" in on:
-        for e in _dashes(t, seen):
-            add("dash", "fix", e[0], e[1])
-            edits.append(e)
+        for at, end, put in _dashes(t, seen):
+            if put is None:
+                add("dash", "refuse", at, end)
+                continue
+            add("dash", "fix", at, end)
+            edits.append((at, end, put))
     if "app" in on:
         for e in _apps(seen):
             add("app", "fix", e[0], e[1])
