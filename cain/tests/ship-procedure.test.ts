@@ -126,7 +126,7 @@ describe("Cain's rules", () => {
   test("no record codes to him (0.11.0): things named by what they do, cards without labels, the gate holds the codes", () => {
     const flat = rules.replace(/\s+/g, " ");
     for (const must of ["Never show him a record code", "go with it as data, never in its words",
-      "A record code (an item id your record has, like P64, or \"P08 Q2\") is held like your other words", "\"head\": \"<its full head sha>\""])
+      "A record code (an item id your record has, like P64, or \"P08 Q2\") is held every time, and no third try lets it through", "\"head\": \"<its full head sha>\""])
       expect(flat).toContain(must);
     expect(flat).not.toContain("its text starts with them");
     expect(rules).not.toMatch(/"P\d+ Q\d+: [A-Z]/);                       // no example card's words start with a label

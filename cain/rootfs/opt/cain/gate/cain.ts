@@ -21,7 +21,8 @@
 //                id right after it ("P08 Q2"). He can't tell what those are, so the thing is
 //                named by what it does for him. Ids the record doesn't have and ordinary words
 //                ("Q4 taxes", "vitamin D3", "a P100 filter") pass; with no record to read,
-//                nothing is a code. Held softly, like the wording rules: his third try goes.
+//                nothing is a code. Held for good (no third try lets one through): he asked
+//                that none reach him, and the thing can always be named instead.
 // All three read the words as he'd see them, so nothing slips past by its spelling:
 // compatibility forms folded (NFKC, full-width letters and digits too), invisible characters
 // and combining marks dropped, Cyrillic and Greek letters that look like Latin ones read as

@@ -272,7 +272,7 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
   test("ids the record doesn't have and ordinary words pass; with no record, nothing is a code", () => {
     const r = rig();
     r.files.pending = pendingWith(["P64", "P08"], ["P63"]);
-    expect(r.link.checkSend({ text: "P64 is ready." })).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "codes", result: "refuse" }] });
+    expect(r.link.checkSend({ text: "P64 is ready." })).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "codes", result: "refuse" }] });
     expect(r.link.checkSend({ text: "P08 Q2 is settled." }).said).toContain(CODES_WHY);
     for (const text of ["Q4 taxes are due Monday.", "Vitamin D3 is on the list.", "A P100 filter is in the cart.", "P.S. it's done."])
       expect(r.link.checkSend({ text })).toMatchObject({ would: "pass" });

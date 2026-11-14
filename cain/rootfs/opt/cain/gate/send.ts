@@ -9,11 +9,11 @@
 //   refuse  held back, with what to change: any em dash (only he knows whether he meant a
 //           range or a break, so he says it again without one), a hidden count, machine
 //           text, a button the card it answers doesn't have, or a named button while which
-//           buttons are up can't be told; a record code like P64 (0.11.0).
+//           buttons are up can't be told.
 //           Never released by a third try (hard): a chat the link says isn't his DM, an
 //           edit of a message that isn't one of Cain's own replies, or whose owner can't be
 //           told right now, or a review claim the review service didn't give, or any review
-//           claim while its lines can't be read (0.11.0)
+//           claim while its lines can't be read, or a record code like P64 (0.11.0)
 import type { Reviewed } from "../reviewed";
 import { cainReasons, codesHits, reviewedHits } from "./cain";
 import { snowflakeTime } from "./plugin";
@@ -95,9 +95,11 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   const reviewed = reviewedHits(call.text, o.reviewed);
   for (const h of reviewed) hits.push({ rule: h.rule, result: h.result, around: h.around });
   if (reviewed.length) hard = true;
-  // A record code he can't tell the meaning of (gate/cain.ts): held softly, like the wording.
+  // A record code he can't tell the meaning of (gate/cain.ts): held for good, since he asked
+  // that none reach him and Cain can always name the thing instead, so no third try is needed.
   const codes = codesHits(call.text, o.items);
   for (const h of codes) hits.push({ rule: h.rule, result: h.result, around: h.around });
+  if (codes.length) hard = true;
   const held = hits.some((h) => h.result === "refuse" || h.result === "unsure");
   const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
   const lines: string[] = [];

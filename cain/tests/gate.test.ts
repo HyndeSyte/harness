@@ -311,9 +311,9 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
       expect(codesHits(text, items)).toHaveLength(1);
     }
     expect(cainReasons(codesHits("P64 is ready.", items))[0]).toEndWith(`: ${CODES_WHY}`);
-    // In a reply: held, softly (his third try goes), with the reason.
+    // In a reply: held for good (no third try lets a code through), with the reason.
     const d = decideSend({ tool: "reply", text: "P64 is ready." }, null, { items });
-    expect(d).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "codes", result: "refuse" }] });
+    expect(d).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "codes", result: "refuse" }] });
     expect(d.said).toContain(CODES_WHY);
     expect(decideSend({ tool: "reply", text: "P64 is ready." }, null, {}).would).toBe("pass");
   });

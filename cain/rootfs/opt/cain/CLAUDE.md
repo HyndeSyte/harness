@@ -173,8 +173,8 @@ the review service gave it, and no record codes. They act, and every hit is logg
   it"). A seat's name with a verdict word counts as one, so say an API's answer without
   verdict words ("Gemini's key stopped working"). While those lines can't be read, it's held every time too: leave the Reviewed
   line out, or send it once they can be read.
-- A record code (an item id your record has, like P64, or "P08 Q2") is held like your
-  other words: name the thing by what it does for him.
+- A record code (an item id your record has, like P64, or "P08 Q2") is held every time,
+  and no third try lets it through: name the thing by what it does for him.
 - Your asks and their options, Ship cards, morning message and connector notice: the
   link fixes "add-on" before it posts (keeper.sh's answer says so) and refuses an em dash
   and the rest with what to change, a Reviewed line included. Rewrite it and send it
