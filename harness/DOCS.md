@@ -208,7 +208,8 @@ Then send something like "add dentist Tuesday 3pm":
   also puts a warning on the card. Read it before you approve.
 - **The receipt** comes once a read of the event finds it there, with an *Undo* button, good for
   7 days. If it reads differently there than what was written (title, start, end and place), the
-  receipt says so. Another event at its address isn't called added, and has no Undo. If a read a
+  receipt says so. Another event at its address isn't called added, and has no Undo; a read with
+  no event in it says nothing, and is read again. If a read a
   minute or more after the write doesn't find it, it's written once more at the same address, and
   if it's still not there you're told so plainly. Undo deletes only that event, once. If someone
   changed the event since, Undo refuses and leaves it.
@@ -221,9 +222,10 @@ each minute for the first hour, every 15 minutes for the rest of the day, then h
 hour, one line says it isn't confirmed yet, and you hear once more when it's known; once the event
 is over or a week has passed, one line says it couldn't be confirmed, with *Undo* when iCloud
 answered the write with a version, and the reads stop. An undo cut short the same way is read too:
-gone is undone, and still there is deleted once more, at most; a read that can't get through is
-tried again on the same schedule. One iCloud turns down is said plainly, with *Undo*; when it
-turns down that second try, a read comes first, so you hear undone, or still there with *Undo*.
+gone is undone, and still there is deleted once more, at most, counted only when that delete goes
+out; a read that can't get through is tried again on the same schedule. One iCloud turns down is
+said plainly, with *Undo*; when it turns down that second try, a read comes first, so you hear
+undone, or still there with *Undo*. Any read that finds it changed since leaves it, and says so.
 A failed write,
 a rejected password or a calendar whose name isn't Family is said in the thread, and stays
 in `/status` and the digest until a write succeeds. `/stop` blocks adds and undos, and an add's
@@ -290,10 +292,11 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   reads every event the change touched a minute after the write was sent. Landed is the usual
   receipt. Nothing landed is written once more, only over the very version it was written over;
   an event changed on the calendar in the meantime, even back to how it was, is left as it is,
-  and the receipt says so. One that landed and that you changed before that read, a note or an
-  alert you added included, is done, but Undo leaves it as you left it. Lines iCloud adds of its
-  own, like a default alert, aren't anyone's change. Half of an event and its copy landed is
-  finished, or put back. Reads
+  and the receipt says so. One that landed and that you changed before that read (a note or an
+  alert you added or took away, or travel time, included) is done, but Undo leaves it as you left
+  it, and so does Undo of a Gmail add you've added a note, a guest or an attachment to. Lines iCloud
+  adds of its own, like a default alert it puts on, aren't anyone's change. Half of an event and its
+  copy landed is finished, or put back. Reads
   that can't tell come each minute for the first hour, every 15 minutes for the rest of the day,
   then hourly; after an hour one line says it isn't confirmed yet, and the receipt follows once
   it's known, or says it couldn't be confirmed once the event is over or a week has passed. An
