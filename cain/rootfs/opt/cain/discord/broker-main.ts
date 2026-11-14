@@ -110,9 +110,12 @@ function connection(sock: Socket): void {
   const proc = Bun.spawn(SERVER_CMD ?? ["setpriv", "--reuid=discord", "--regid=discord", "--init-groups", "--no-new-privs",
     "--inh-caps=-all", "--bounding-set=-all", "/usr/local/bin/bun", join(PLUGIN, "server.ts")], {
     cwd: PLUGIN,
-    // The token's only way in: this process's environment, never its command line.
-    env: { HOME: STATE, PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", DISCORD_STATE_DIR: STATE,
-      DISCORD_ACCESS_MODE: "static", DISCORD_BOT_TOKEN: token() },
+    // The token's only way in: this process's environment, never its command line. The smoke
+    // test's stand-in (c1/smoke-server.ts) gets no token, only where to note what it was sent.
+    env: env.CAIN_BROKER_SMOKE === "1"
+      ? { HOME: "/run/cain/root-tmp", PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", SMOKE_LOG: env.SMOKE_LOG ?? "" }
+      : { HOME: STATE, PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", DISCORD_STATE_DIR: STATE,
+          DISCORD_ACCESS_MODE: "static", DISCORD_BOT_TOKEN: token() },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   });
   const conn = { sock, session: null as unknown as BrokerSession };
