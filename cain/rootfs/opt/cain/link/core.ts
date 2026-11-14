@@ -60,10 +60,11 @@
 // - Ship cards built from GitHub and the review service (0.11.0): the question names each
 //   App and version the tap installs, a line from GitHub has the pull request's title, how
 //   much it changes, the parts that matter most and its checks (read as the landing reads
-//   them: a failed check, or one not run yet, refuses the card), and the last line is the
-//   review service's own for the review Cain names, refused if that review finished before
-//   the head commit. Cain's words say only what Dane will notice. Anything going wrong while
-//   the new lines are built gives the card as it was (never no card).
+//   them: a failed check, or one not run yet, refuses the card; merged at that head, it's in
+//   main already), and the last line is the review service's own for the review Cain names,
+//   which must be a review of that very head. Cain's words say only what Dane will notice, on
+//   one line. Anything going wrong while the new lines are built gives the card as it was
+//   (never no card).
 // - Stop within reach (0.10.0): one red Stop on its own row sits on the newest plain bot
 //   message (Cain's reply, or a notice of the link's, that asks nothing), never on an ask,
 //   a Ship card, a specialist's card, the connector notice, a permission prompt or the
@@ -78,15 +79,15 @@
 //   Turn back on, the notice's own Stop is the one until it's out of reach; when the moving
 //   Stop then goes onto a newer message, the notice's comes off.
 import { createHash } from "node:crypto";
-import { cainReasons, type CainHit, mentionsReviewed, reviewedHits, shipWordsHits } from "../gate/cain";
+import { cainReasons, type CainHit, claimsChecks, claimsReview, codesHits, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
-import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
+import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, linkSpans, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { safeId } from "../review/core";
-import type { Reviewed } from "../reviewed";
+import { freshReviewed, type Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
-import { bumpsOf, judgeChecks, type Facts, type Landed } from "./merge";
+import { judgeChecks, type Facts, type Landed } from "./merge";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -100,7 +101,7 @@ const EPHEMERAL = 64;
 const REMEMBER_MS = 35 * 86400_000;
 const DAY = 86400_000;
 const HOUR = 3_600_000;
-const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub (its facts, checks and head time, asked at once) before it says it couldn't read them
+const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub (its facts and checks, asked at once) before it says it couldn't read them
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long after his tap was cut off (a restart)
@@ -391,14 +392,11 @@ const sameAsk = (a: { item?: string; question?: string }, b: { item?: string; qu
   (a.item ?? "none").toUpperCase() === (b.item ?? "none").toUpperCase()
   && (a.question ?? "").toUpperCase() === (b.question ?? "").toUpperCase();
 
-// The words a card starts with, naming what it's about: "P08 Q2".
-const labelOf = (item: string, question = "") => (item === "none" ? "" : question ? `${item} ${question}` : item);
-function withLabel(text: string, label: string): string {
-  if (!label) return text;
-  const t = text.trimStart();
-  const next = t.charAt(label.length);
-  return t.toUpperCase().startsWith(label.toUpperCase()) && !/[A-Za-z0-9]/.test(next) ? text : `${label}: ${t}`;
-}
+// A card used to start with words naming what it's about ("P08 Q2: "). He can't tell what
+// those are (0.11.0), so no card shows one: the item and question stay as data (binding,
+// replacing, holds, expiry, replied), and one Cain wrote at the start of his words is taken off.
+const LEADING_LABEL = /^\s*P\d{1,4}(?:[ \t]+Q\d{1,2})?[ \t]*:[ \t]*/i;
+export const unlabeled = (text: string): string => String(text ?? "").replace(LEADING_LABEL, "");
 
 // What he sees has no machine text in it (Timing and truth, in CLAUDE.md).
 function noMachineText(...texts: string[]): void {
@@ -504,9 +502,8 @@ export interface Deps {
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
-  facts?: (pr: string) => Promise<Facts | null>;                   // what GitHub says the pull request changes
+  facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<any[] | "missing" | null>;   // the head's check runs (merge.ts checkRuns)
-  headTime?: (pr: string, head: string) => Promise<number | null>; // when the head commit was made, on GitHub; null: can't tell
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -564,43 +561,55 @@ const changes = (f: Facts) => {
   return `${n(f.commits, "commit")} and ${n(f.files, "file")}${f.areas.length ? `, including ${list(f.areas)}` : ""}`;
 };
 
-// A Ship card's question (0.11.0): what the tap installs, from the config.yaml patches.
+// A Ship card's question (0.11.0): what the tap installs, from each App's config.yaml read at
+// the very head the card names and at its pull request's base (merge.ts bumpsAt).
 export function shipQuestion(f: Facts | null): string {
-  const bumps = f ? bumpsOf(f.configs) : null;
+  const bumps = f?.bumps ?? null;
   if (!bumps) return "Ship it?";
   if (!bumps.length) return "Ship it? No App version changes, so nothing installs.";
   return `Ship ${bumps.map((b) => `${b.app} ${b.version}`).join(" and ")}?`;
 }
 
-// What a Ship card says about the checks, from the head's runs (null: they couldn't be read).
+// What a Ship card says about the checks, from the head's runs (null: they couldn't be read),
+// or that the pull request is in main already (the landing then asks nothing of its checks).
 export const CHECKS_PASSED = "Checks passed.";
-export const CHECKS_RUNNING = "Checks are still running; Ship lands it once they pass.";
+export const CHECKS_RUNNING = "Checks are still running; Ship lands it if they pass within 2 hours of the tap.";
 export const CHECKS_UNREAD = "Checks couldn't be read just now; Ship checks them before it lands.";
+export const IN_MAIN = "Already in main.";
+// The last line when Cain names no review: none is attached, which isn't to say none happened.
+export const NO_REVIEW = "No outside review attached.";
 
-// The link's line from GitHub (0.11.0): the pull request's title as GitHub has it (one line,
-// quoted, cut at 120 characters), how much it changes and the parts that matter most, then
-// the checks.
+// The pull request's title as he may see it: one line, double quotes made single, a markdown
+// link its words, markdown marks gone, cut at 120 characters. "" (left out) when it still has
+// a commit sha, an ISO time, a link, or a claim about checks or a review: the line from GitHub
+// is the link's, and says only what GitHub says.
 export const TITLE_MAX = 120;
+export function titleOf(raw: unknown): string {
+  const t = String(raw ?? "").replace(/\s+/g, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(DOUBLE_QUOTE, "'")
+    .replace(/\*+|~~|`+/g, "").replace(/(^|[^A-Za-z0-9])_+|_+(?=[^A-Za-z0-9]|$)/g, "$1")
+    .replace(/^#+\s*/, "").replace(/\s+/g, " ").trim();
+  if (/(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/i.test(t) || /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(t) || linkSpans(t).length
+      || claimsChecks(t) || claimsReview(t)) return "";
+  return t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 3).trimEnd()}...`;
+}
+const DOUBLE_QUOTE = new RegExp("[\"\\u201c\\u201d\\u201e\\u201f]", "g");
+
+// The link's line from GitHub (0.11.0): the pull request's title (titleOf, quoted), how much it
+// changes and the parts that matter most, then the checks.
 export function githubLine(f: Facts, checks: string): string {
-  const t = String(f.title ?? "").replace(/\s+/g, " ").trim();
-  const title = t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 3).trimEnd()}...`;
+  const title = titleOf(f.title);
   return `From GitHub: ${title ? `"${title}", ` : ""}${changes(f)}. ${checks}`;
 }
 
-// A Ship card's words: the question with the card's label, Cain's line, then the link's
-// lines. His line gives way, so the link's are never cut off.
+// A Ship card's words: the question, Cain's line, then the link's lines. His line gives way,
+// so the link's are never cut off.
 function shipCard(top: string, own: string, rest: string[]): string {
   const room = LIMIT - [top, ...rest].join("\n").length - 1;
   const mine = own.trimEnd();
   const cut = mine.length <= room ? mine : `${mine.slice(0, Math.max(0, room - 2)).trimEnd()} …`;
   return [top, cut, ...rest].join("\n");
-}
-
-// His line, without the card's label in front ("P41: "): the label leads the question.
-function withoutLabel(text: string, label: string): string {
-  const t = String(text ?? "").trim();
-  if (!label || !t.toUpperCase().startsWith(label.toUpperCase()) || /[A-Za-z0-9]/.test(t.charAt(label.length))) return t;
-  return t.slice(label.length).replace(/^[\s:.,-]+/, "").trim();
 }
 
 // A promise's answer, or null once ms have passed.
@@ -721,8 +730,8 @@ export class Link {
   }
   // Cain's words through the link: fixed, or refused with what to change. He's a writer the
   // gate refuses, so every em dash of his is refused, none fixed. His own rules too
-  // (../gate/cain.ts): a Reviewed line only as the review service gave it (reviewed), and on
-  // a Ship card no checks or review claimed (shipWords).
+  // (../gate/cain.ts): a Reviewed line only as the review service gave it (reviewed), on a
+  // Ship card no checks or review claimed (shipWords), and never a record code (always).
   private cainWords(point: string, what: string, text: string, ctx: Context,
                     also: { reviewed?: boolean; shipWords?: boolean } = {}): { text: string; fixed: Hit[] } {
     const w = this.words(point, "cain", text, { ...ctx, refusable: true });
@@ -730,7 +739,8 @@ export class Link {
     let published: Reviewed[] | null = null;
     try {
       if (also.shipWords) cain.push(...shipWordsHits(text));
-      if (also.reviewed && mentionsReviewed(text)) { published = this.published(); cain.push(...reviewedHits(text, published)); }
+      if (also.reviewed && claimsReview(text)) { published = this.published(); cain.push(...reviewedHits(text, published)); }
+      if (/P\d/i.test(text)) cain.push(...codesHits(text, this.itemIds()));
     } catch (e) { this.log(`the gate's own rules for Cain failed on a ${point}: ${String(e).slice(0, 80)}`); }
     if (w.refused.length || cain.length) {
       this.report(point, "cain", [...w.hits, ...cain], "refused");
@@ -739,9 +749,15 @@ export class Link {
     this.report(point, "cain", w.hits, "fixed");
     return w;
   }
-  // The review service's lines now; null when they can't be read.
+  // The item ids his record has (open or done), for the codes rule; null when it can't be read.
+  private itemIds(): Set<string> | null {
+    try { return recordItems(this.files().pending); } catch { return null; }
+  }
+  // The review service's lines now, from the last 30 days; null when they can't be read.
   private published(): Reviewed[] | null {
-    try { return this.d.reviewed?.() ?? null; } catch { return null; }
+    let list: Reviewed[] | null;
+    try { list = this.d.reviewed?.() ?? null; } catch { list = null; }
+    return list && freshReviewed(list, this.d.now());
   }
   // The link's own words, and the specialist's notes after a tap: fixed only.
   private ownWords(point: string, writer: Writer, text: string, message?: string): string {
@@ -780,7 +796,8 @@ export class Link {
     const replyTo = id(a.replyTo), target = id(a.edit);
     for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
     const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(),
-      { tz: this.d.tz, now: this.d.now(), ...(mentionsReviewed(text) ? { reviewed: this.published() } : {}) });
+      { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
+        ...(/P\d/i.test(text) ? { items: this.itemIds() } : {}) });
     return { status: "ok", ...d };
   }
 
@@ -1254,9 +1271,8 @@ export class Link {
     if (prior) return { status: "already told", message: prior[0],
       said: "He already has the notice about Home Assistant's connector; nothing more was posted. Check Home Assistant again at each cloud job check, and go ahead once it answers." };
     const w = this.cainWords("connector", "notice", waits, { rules: AT.cain, buttons: [CONNECTOR_LABEL], known: this.liveLabels() }, { reviewed: true });
-    const text = withLabel(`${w.text} waits until Claude can reach Home Assistant again: its connector needs you to sign in again. `
-      + "Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.",
-      labelOf(meta.item));
+    const text = `${w.text} waits until Claude can reach Home Assistant again: its connector needs you to sign in again. `
+      + "Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.";
     const comps = [{ type: 1, components: [{ type: 2, style: 5, label: CONNECTOR_LABEL, url: CONNECTOR_URL }] }];
     const msg = await this.post(text, comps, { nonce: stableNonce("connector", meta.item, w.text) });
     const s = this.d.load();
@@ -1276,15 +1292,16 @@ export class Link {
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
     const meta = checkMeta(a);
     const raw = (a.options ?? []).map((o) => String(o).trim()).filter(Boolean).slice(0, 5);
-    if (!String(a.text ?? "").trim()) throw new Refusal("an ask needs its question");
+    const asked = unlabeled(String(a.text ?? "")).trim();
+    if (!asked) throw new Refusal("an ask needs its question");
     if (!raw.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
-    noMachineText(String(a.text), ...raw);
+    noMachineText(asked, ...raw);
     // The gate, before the nonce is made: the same words always make the same card.
     const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }));
-    const w = this.cainWords("ask", "ask", String(a.text), { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
+    const w = this.cainWords("ask", "ask", asked, { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
     const options = opts.map((o) => o.text);
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
-    const text = withLabel(w.text, labelOf(meta.item, meta.question));   // "P08 Q2: ..."
+    const text = w.text;                 // no "P08 Q2: ": the item and question are data
     this.mayAsk(meta.item);
     return this.serial(async () => {
       const now = this.d.now();
@@ -1336,16 +1353,19 @@ export class Link {
     if (!SHA.test(head)) throw new Refusal("head must be the pull request's full 40-character head sha");
     const review = a.review === undefined || a.review === null || String(a.review).trim() === "" ? null : String(a.review).trim();
     if (review !== null && !safeId(review)) throw new Refusal("review must be a review's id, as review.sh submit printed it");
-    if (!String(a.text ?? "").trim()) throw new Refusal("a Ship card needs its words");
+    // His words as one line, without a "P64: " in front: a second line of his can't pose as
+    // one of the link's, and he can't tell what a record code is.
+    const said = unlabeled(String(a.text ?? "")).replace(/\s*[\r\n]+\s*/g, " ").trim();
+    if (!said) throw new Refusal("a Ship card needs its words");
     const stop = this.stopped();
     if (stop.stopped)
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
-    noMachineText(String(a.text));
+    noMachineText(said);
     this.mayAsk(meta.item);
-    const w = this.cainWords("ship", "Ship card", String(a.text), { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
+    const w = this.cainWords("ship", "Ship card", said, { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
-    const built = this.d.facts ? await this.shipText(meta, pr, head, review, w.text) : { text: withLabel(w.text, labelOf(meta.item)), own: undefined };
+    const built = this.d.facts ? await this.shipText(pr, head, review, w.text) : { text: w.text, own: undefined };
     const text = built.text;
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
@@ -1363,21 +1383,21 @@ export class Link {
   }
 
   // The Ship card's words, built by the link (0.11.0):
-  //   P64: Ship Cain 0.11.0?
+  //   Ship Cain 0.11.0?
   //   <Cain's line: what Dane will notice>
   //   From GitHub: "<title>", 4 commits and 12 files, including Cain's link. Checks passed.
   //   Reviewed: OpenAI, approve with changes; Gemini, approve.
-  // The review service's lines are read first (they're on the Pi); then GitHub is asked for
-  // the pull request, the head's check runs and (with a review) the head commit's time, all
-  // at once and within FACTS_MS, and a part that doesn't come says so. Refused: no line for
-  // that review, its lines unreadable, a newer head on GitHub, a check that failed or hasn't
-  // run, a review that finished before the head commit. Anything else going wrong while the
-  // new lines are built gives the card as it was before: "Ship it?", his line and the line
-  // from GitHub as it was. Never no card.
-  private async shipText(meta: Meta, pr: string, head: string, review: string | null, words: string): Promise<{ text: string; own: string }> {
-    const label = labelOf(meta.item);
-    const top = (q: string) => (label ? `${label}: ${q}` : q);
-    const own = withoutLabel(words, label);
+  // The review service's lines are read first (they're on the Pi): the review he names must be
+  // done, and of this very head (and pull request, when it says one), never just finished at
+  // some time. Then GitHub is asked for the pull request and the head's check runs at once,
+  // within FACTS_MS, and a part that doesn't come says so. Refused: no line for that review, a
+  // review of another head or none named in it, its lines unreadable, a newer head on GitHub, a
+  // commit GitHub doesn't have, a check that failed or hasn't run. A pull request merged at
+  // this head is in main already: the landing asks nothing of its checks, so neither does the
+  // card. Anything else going wrong while the new lines are built gives the card as it was
+  // before: "Ship it?", his line and the line from GitHub as it was. Never no card.
+  private async shipText(pr: string, head: string, review: string | null, words: string): Promise<{ text: string; own: string }> {
+    const own = words.trim();
     if (!own) throw new Refusal("a Ship card needs a line saying what he'll notice");
     let rev: Reviewed | null = null;
     if (review !== null) {
@@ -1385,36 +1405,34 @@ export class Link {
       if (!list) throw new Refusal("reviews can't be read right now: try again in a minute, or leave --review out");
       rev = list.find((x) => x.id === review && x.line) ?? null;
       if (!rev) throw new Refusal(`review ${review} isn't finished, or has no answers: show the card once it's done, or leave --review out`);
+      if (!rev.head) throw new Refusal(`review ${review} wasn't submitted for this pull request's head: submit it with pr and head`);
+      if (rev.head !== head || (rev.pr !== null && rev.pr.toLowerCase() !== pr.toLowerCase()))
+        throw new Refusal(`review ${review} was of another head or pull request: get a review of this head as it is now`);
     }
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
-    const { facts, checkRuns, headTime } = this.d;
-    const [f, runs, made] = await Promise.all([
-      ask(() => facts!(pr)),
-      ask(checkRuns && (() => checkRuns(pr, head))),
-      ask(rev && headTime ? () => headTime(pr, head) : undefined),
-    ]);
+    const { facts, checkRuns } = this.d;
+    const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
     try {
-      const checks = Array.isArray(runs) ? judgeChecks(runs) : null;
+      const inMain = f?.merged === true && f.head === head;
+      if (!inMain && runs === "missing") throw new Refusal("GitHub doesn't have that commit: show the card for its head as it is now");
+      const checks = !inMain && Array.isArray(runs) ? judgeChecks(runs) : null;
       const failed = checks?.find((c) => c.state === "failed");
       if (failed) throw new Refusal(`its ${failed.name} check didn't pass (${failed.conclusion}): fix it through Build first, then show a new Ship card`);
       const notRun = checks?.find((c) => c.state === "missing");
       if (notRun) throw new Refusal(`CI hasn't run ${notRun.name} on it yet: show the card once its checks have run`);
-      if (rev && made !== null && !(Date.parse(rev.finished_at) >= made))
-        throw new Refusal(`review ${rev.id} finished before the pull request's newest commit: get a review of the head as it is now`);
-      const said = !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
+      const said = inMain ? IN_MAIN : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
       const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
-      const reviewed = rev ? `${rev.line}${made === null ? " Not checked against the newest commit." : ""}` : "No outside review.";
-      return { text: shipCard(top(shipQuestion(f)), own, [github, reviewed]), own };
+      return { text: shipCard(shipQuestion(f), own, [github, rev ? rev.line : NO_REVIEW]), own };
     } catch (e) {
       if (e instanceof Refusal) throw e;
       this.log(`couldn't build a Ship card's new lines, so it goes as it was: ${reason(e)}`);
       let line: string;
       try { line = factsLine(f); } catch { line = factsLine(null); }
-      return { text: shipCard(top("Ship it?"), own, [this.ownWords("ship facts", "link", line)]), own };
+      return { text: shipCard("Ship it?", own, [this.ownWords("ship facts", "link", line)]), own };
     }
   }
 
@@ -2395,7 +2413,7 @@ export class Link {
     let published: Reviewed[] | null | undefined;              // read once, when a Reviewed line first needs it
     const judge = (message: string, at: number, writer: string, text: string, ctx: Context) => {
       const hits: { rule: string; result: string; around: string; label?: string; kept?: string }[] = [...gateCheck(text, ctx).hits];
-      if (ctx.refusable && mentionsReviewed(text)) hits.push(...reviewedHits(text, published === undefined ? (published = this.published()) : published));
+      if (ctx.refusable && claimsReview(text)) hits.push(...reviewedHits(text, published === undefined ? (published = this.published()) : published));
       for (const h of hits) {
         list.push({ at, message, writer, rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}), ...(h.kept ? { kept: h.kept } : {}) });
         const did = h.kept ? "kept" : h.result;     // a dash kept as it is, flagged, is never refused

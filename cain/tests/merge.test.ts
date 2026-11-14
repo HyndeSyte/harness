@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, bumpsOf, checkRuns, commitTime, facts, inMain, judgeChecks, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, bumpsAt, checkRuns, facts, inMain, judgeChecks, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
@@ -280,48 +280,85 @@ describe("what GitHub says", () => {
     expect(keyAnswer("ssh: connect to host github.com port 22: Network is unreachable", REPO)).toBeNull();
   });
 
-  test("about a pull request: its commits, its files, the parts that matter most, its title and the Apps' config.yaml patches", async () => {
+  test("about a pull request: its commits, its files, the parts that matter most, its title, and what the tap installs", async () => {
+    const B = M0;                                   // its base
     const files = ["cain/rootfs/opt/cain/link/core.ts", "cain/rootfs/opt/cain/CLAUDE.md", ".github/workflows/tests.yml",
       "cain/config.yaml", "cain/CHANGELOG.md", "cain/tests/merge.test.ts"].map((filename) => ({ filename }));
+    const cfg = (v: string) => ({ status: 200, body: { encoding: "base64", content: Buffer.from(`name: X\nversion: "${v}"\nslug: x\n`).toString("base64") } });
     const api = async (path: string) => path === `/repos/${REPO}/pulls/13`
-      ? { status: 200, body: { head: { sha: H1.toUpperCase() }, commits: 3, changed_files: 6 } }
-      : path === `/repos/${REPO}/pulls/13/files?per_page=100&page=1` ? { status: 200, body: files } : { status: 404, body: null };
+      ? { status: 200, body: { head: { sha: H1.toUpperCase() }, base: { sha: B }, commits: 3, changed_files: 6 } }
+      : path === `/repos/${REPO}/pulls/13/files?per_page=100&page=1` ? { status: 200, body: files }
+      : path === `/repos/${REPO}/contents/cain/config.yaml?ref=${B}` ? cfg("0.10.0")
+      : path === `/repos/${REPO}/contents/cain/config.yaml?ref=${H1}` ? cfg("0.11.0")
+      : path.startsWith(`/repos/${REPO}/contents/harness/config.yaml?ref=`) ? cfg("0.23.0")
+      : { status: 404, body: null };
     expect(await facts({ api }, REPO, 13)).toEqual({ head: H1, commits: 3, files: 6,
-      areas: ["Cain's link", "Cain's rules", "GitHub's workflows"], title: "", configs: [{ app: "Cain", patch: null }] });
+      areas: ["Cain's link", "Cain's rules", "GitHub's workflows"], title: "", bumps: [{ app: "Cain", version: "0.11.0" }], merged: false });
     expect(await facts({ api: async () => ({ status: 500, body: null }) }, REPO, 13)).toBeNull();
-    // The title as GitHub has it, and each config.yaml's patch, from every page of files.
-    const many = [...Array.from({ length: 100 }, (_, i) => ({ filename: `harness/app/f${i}.py`, patch: "@@ x" })),
-      { filename: "harness/config.yaml", patch: '@@ -1 +1 @@\n-version: "0.23.0"\n+version: "0.24.0"' }, { filename: "cain/config.yaml.bak", patch: "+version: 9.9.9" }];
-    const paged = async (path: string) => path === `/repos/${REPO}/pulls/13`
-      ? { status: 200, body: { head: { sha: H1 }, commits: 1, changed_files: 102, title: "Harness 0.24.0: the digest says less" } }
-      : path.startsWith(`/repos/${REPO}/pulls/13/files?per_page=100&page=`)
-        ? { status: 200, body: path.endsWith("page=1") ? many.slice(0, 100) : many.slice(100) } : { status: 404, body: null };
-    expect(await facts({ api: paged }, REPO, 13)).toMatchObject({ title: "Harness 0.24.0: the digest says less",
-      configs: [{ app: "Harness", patch: '@@ -1 +1 @@\n-version: "0.23.0"\n+version: "0.24.0"' }] });
+    // The files are read for the parts they touch, 3 pages at most; the versions never come
+    // from them, so a long list costs only a part not named.
+    const asked: string[] = [];
+    const many = Array.from({ length: 400 }, (_, i) => ({ filename: i === 399 ? "cain/rootfs/opt/cain/CLAUDE.md" : `harness/app/f${i}.py` }));
+    const paged = async (path: string) => {
+      asked.push(path);
+      const page = Number(new URL(`http://x${path}`).searchParams.get("page"));
+      return path === `/repos/${REPO}/pulls/13`
+        ? { status: 200, body: { head: { sha: H1 }, base: { sha: B }, commits: 1, changed_files: 400, title: "Harness 0.24.0: the digest says less" } }
+        : path.startsWith(`/repos/${REPO}/pulls/13/files?`) ? { status: 200, body: many.slice((page - 1) * 100, page * 100) }
+        : path === `/repos/${REPO}/contents/harness/config.yaml?ref=${H1}` ? cfg("0.24.0")
+        : path.startsWith(`/repos/${REPO}/contents/`) ? cfg(path.includes("harness") ? "0.23.0" : "0.10.0")
+        : { status: 404, body: null };
+    };
+    const f = await facts({ api: paged }, REPO, 13);
+    expect(f).toMatchObject({ title: "Harness 0.24.0: the digest says less", files: 400, bumps: [{ app: "Harness", version: "0.24.0" }] });
+    expect(f!.areas).toEqual([]);
+    expect(asked.filter((p) => p.includes("/files?")).length).toBe(3);
+    // The versions are read at the head the card names, not the one GitHub gives later.
+    asked.length = 0;
+    await facts({ api: paged }, REPO, 13, H2);
+    expect(asked).toContain(`/repos/${REPO}/contents/cain/config.yaml?ref=${H2}`);
+    expect(asked.some((p) => p.endsWith(`?ref=${H1}`))).toBe(false);
   });
 
-  test("what the tap installs: the added version line in each App's config.yaml patch, quoted or not", () => {
-    const patch = (from: string, to: string) => `@@ -4,7 +4,7 @@\n name: X\n-version: ${from}\n+version: ${to}\n slug: x`;
-    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0"') }])).toEqual([{ app: "Cain", version: "0.11.0" }]);
-    expect(bumpsOf([{ app: "Harness", patch: patch("'0.23.0'", "0.24.0") }, { app: "Cain", patch: patch("0.10.0", "'0.11.0'  # minor") }]))
+  test("what the tap installs: each App's version at the head against its base, read at those very commits", async () => {
+    const B = M0;
+    const at = (map: Record<string, string | null | number>) => async (path: string) => {
+      for (const [k, v] of Object.entries(map)) if (path === `/repos/${REPO}/contents/${k}`) {
+        if (v === null) return { status: 500, body: null };
+        if (v === 404) return { status: 404, body: { message: "Not Found" } };
+        return { status: 200, body: { encoding: "base64", content: Buffer.from(String(v)).toString("base64") } };
+      }
+      return { status: 404, body: null };
+    };
+    const v = (x: string) => `name: X\nversion: ${x}\nslug: x\n`;
+    const both = (cb: string, ch: string, hb: string, hh: string) => at({
+      [`cain/config.yaml?ref=${B}`]: v(cb), [`cain/config.yaml?ref=${H1}`]: v(ch),
+      [`harness/config.yaml?ref=${B}`]: v(hb), [`harness/config.yaml?ref=${H1}`]: v(hh) });
+    expect(await bumpsAt({ api: both('"0.10.0"', '"0.11.0"', "0.23.0", "0.23.0") }, REPO, B, H1)).toEqual([{ app: "Cain", version: "0.11.0" }]);
+    expect(await bumpsAt({ api: both("0.10.0", "'0.11.0'  # minor", '"0.23.0"', '"0.24.0"') }, REPO, B, H1))
       .toEqual([{ app: "Cain", version: "0.11.0" }, { app: "Harness", version: "0.24.0" }]);   // Cain first
-    expect(bumpsOf([{ app: "Cain", patch: "@@ -40 +40 @@\n-  review_limit_usd: 1.5\n+  review_limit_usd: 2" }])).toEqual([]);   // options only
-    expect(bumpsOf([])).toEqual([]);
-    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0"').replace(/\n/g, "\r\n") }])).toEqual([{ app: "Cain", version: "0.11.0" }]);
-    // Can't be told: a patch GitHub left out, a version that isn't one, or nothing read at all.
-    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0"') }, { app: "Harness", patch: null }])).toBeNull();
-    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"soon"') }])).toBeNull();
-    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0\'') }])).toBeNull();
-    expect(bumpsOf(undefined)).toBeNull();
+    // The same version at both ends installs nothing, whatever the diff did to its line.
+    expect(await bumpsAt({ api: both('"0.10.0"', "0.10.0", "0.23.0", "0.23.0") }, REPO, B, H1)).toEqual([]);
+    // Can't be told: a read GitHub didn't answer, a version that isn't one, or not a commit.
+    expect(await bumpsAt({ api: at({ [`cain/config.yaml?ref=${B}`]: v("0.10.0"), [`cain/config.yaml?ref=${H1}`]: null,
+      [`harness/config.yaml?ref=${B}`]: v("0.23.0"), [`harness/config.yaml?ref=${H1}`]: v("0.23.0") }) }, REPO, B, H1)).toBeNull();
+    expect(await bumpsAt({ api: both("0.10.0", '"soon"', "0.23.0", "0.23.0") }, REPO, B, H1)).toBeNull();
+    expect(await bumpsAt({ api: both("0.10.0", "0.11.0", "0.23.0", "0.23.0") }, REPO, "main", H1)).toBeNull();
+    // An App with no config.yaml at the head installs nothing; one new at the head does.
+    expect(await bumpsAt({ api: at({ [`cain/config.yaml?ref=${B}`]: 404, [`cain/config.yaml?ref=${H1}`]: v("0.1.0"),
+      [`harness/config.yaml?ref=${B}`]: v("0.23.0"), [`harness/config.yaml?ref=${H1}`]: 404 }) }, REPO, B, H1))
+      .toEqual([{ app: "Cain", version: "0.1.0" }]);
   });
 
-  test("the head commit's time, from its committer's date; null when GitHub doesn't say", async () => {
-    const api = async (path: string) => path === `/repos/${REPO}/git/commits/${H1}`
-      ? { status: 200, body: { sha: H1, committer: { name: "x", date: "2026-11-14T15:04:05Z" } } } : { status: 404, body: null };
-    expect(await commitTime({ api }, REPO, H1)).toBe(Date.UTC(2026, 10, 14, 15, 4, 5));
-    expect(await commitTime({ api }, REPO, H2)).toBeNull();
-    expect(await commitTime({ api: async () => ({ status: 200, body: { committer: { date: "not a date" } } }) }, REPO, H1)).toBeNull();
-    expect(await commitTime({ api: async () => { throw new Error("timeout"); } }, REPO, H1)).toBeNull();
+  test("a rate limit or a refusal from GitHub isn't asked again at once; anything else once more", async () => {
+    for (const status of [403, 429]) {
+      let calls = 0;
+      expect(await checkRuns({ api: async () => { calls++; return { status, body: { message: "API rate limit exceeded" } }; } }, REPO, H1)).toBeNull();
+      expect(calls).toBe(1);
+    }
+    let calls = 0;
+    expect(await checkRuns({ api: async () => { calls++; return { status: 502, body: null }; } }, REPO, H1)).toBeNull();
+    expect(calls).toBe(2);
   });
 });
 
@@ -344,10 +381,27 @@ describe("the checks, read one way for the landing and the Ship card", () => {
     const runs = [run("pytest", "success")];
     const api = async (path: string) => { seen.push(path); return path.includes(H1) ? { status: 200, body: { check_runs: runs } } : { status: 404, body: null }; };
     expect(await checkRuns({ api }, REPO, H1)).toEqual(runs);
-    expect(seen[0]).toBe(`/repos/${REPO}/commits/${H1}/check-runs?per_page=100`);
+    expect(seen[0]).toBe(`/repos/${REPO}/commits/${H1}/check-runs?per_page=100&page=1`);
     expect(await checkRuns({ api }, REPO, H2)).toBe("missing");
     expect(await checkRuns({ api: async () => ({ status: 200, body: { message: "odd" } }) }, REPO, H1)).toBeNull();
     expect(await checkRuns({ api: async () => { throw new Error("timeout"); } }, REPO, H1)).toBeNull();
+  });
+
+  test("every page of the runs is read, so a pinned run on a later page is never read as not run; part of them is none", async () => {
+    const other = (i: number) => run(`lint-${i}`, "success", "completed", ACTIONS_APP, 100 + i);
+    const pages = [Array.from({ length: 100 }, (_, i) => other(i)), [run("pytest", "success"), run("bun", "success"), run("pr", "success")]];
+    const api = async (path: string) => {
+      const page = Number(new URL(`http://x${path}`).searchParams.get("page"));
+      return { status: 200, body: { total_count: 103, check_runs: pages[page - 1] ?? [] } };
+    };
+    const got = await checkRuns({ api }, REPO, H1);
+    expect(Array.isArray(got) ? got.length : got).toBe(103);
+    expect(judgeChecks(got as any[]).map((c) => c.state)).toEqual(["passed", "passed", "passed"]);
+    // A page that doesn't come: nothing is judged from part of the list.
+    const broken = async (path: string) => path.endsWith("page=1") ? { status: 200, body: { total_count: 103, check_runs: pages[0] } } : { status: 500, body: null };
+    expect(await checkRuns({ api: broken }, REPO, H1)).toBeNull();
+    // More runs than the link reads: none judged, never "passed" from part of them.
+    expect(await checkRuns({ api: async () => ({ status: 200, body: { total_count: 5000, check_runs: pages[0] } }) }, REPO, H1)).toBeNull();
   });
 });
 

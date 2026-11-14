@@ -50,12 +50,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     factsHang: false,                              // GitHub never answers about a pull request's facts
     hold: false,                                   // a landing waits until go()
     readable: true,                                // main can be read (for landings over 2 hours old)
-    // A Ship card's other reads (with facts): the head's check runs (null: no answer), when the
-    // head commit was made (null: GitHub doesn't say), each of which can hang; what was asked.
+    // A Ship card's other read (with facts): the head's check runs ("missing": GitHub has no such
+    // commit; null: no answer), which can hang; and what was asked, in order.
     runs: passing() as any[] | "missing" | null,
     runsHang: false,
-    madeAt: (opts.now ?? NOV11_8AM) - HOUR as number | null,
-    madeHang: false,
     asked: [] as string[],
   };
   // The review service's lines, as /data/trust/reviewed.json has them (null: it can't be read).
@@ -163,7 +161,6 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }) => github.readable ? github.main.includes(ship.head) : null,
     facts: opts.facts ? (pr: string) => { github.asked.push(`facts ${pr}`); return github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts); } : undefined,
     checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(copy(github.runs)); } : undefined,
-    headTime: opts.facts ? (pr: string, head: string) => { github.asked.push(`made ${head}`); return github.madeHang ? new Promise<null>(() => {}) : Promise.resolve(github.madeAt); } : undefined,
     factsMs: opts.factsMs ?? 50,
     reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,

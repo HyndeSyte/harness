@@ -53,7 +53,7 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { checkRuns, commitTime, facts, inMain, land, type MergeDeps } from "./merge";
+import { checkRuns, facts, inMain, land, type MergeDeps } from "./merge";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
@@ -197,11 +197,10 @@ const link = new Link({
     return land({ ...github, stopped }, { repo: p.repo, pr: p.pr, head });
   } : undefined,
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
-  facts: async (pr) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr) : null; },
-  // A Ship card reads the head's checks as the landing does (merge.ts), and its commit's time
-  // for the review it names; and the review service's lines (/data/trust/reviewed.json).
+  facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
+  // A Ship card reads the head's checks as the landing does (merge.ts), and the review
+  // service's lines (/data/trust/reviewed.json), for a review of that head.
   checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? checkRuns(github, p.repo, head) : null; },
-  headTime: async (pr, head) => { const p = pullOf(pr); return p ? commitTime(github, p.repo, head) : null; },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).

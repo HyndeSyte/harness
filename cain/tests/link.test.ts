@@ -123,11 +123,11 @@ describe("reactions", () => {
     const r = rig();
     await r.link.ask({ text: "Want me to draft it?", options: ["Draft it"], item: "P17", question: "Q1" });
     const mid = r.last().id;
-    expect(r.last().content).toBe("P17 Q1: Want me to draft it?");            // the link names it
+    expect(r.last().content).toBe("Want me to draft it?");            // the link names it
     expect(await r.link.onReaction({ user_id: OWNER, channel_id: DM, message_id: mid, emoji: { name: "👍" } })).toBe("to Cain");
     expect(await r.link.onReaction({ user_id: "333", channel_id: DM, message_id: mid, emoji: { name: "👎" } })).toBe("ignored");
     expect(await r.link.onReaction({ user_id: OWNER, channel_id: DM, message_id: "1", emoji: { name: "👍" } })).toBe("ignored");
-    expect(r.relayed).toEqual([`Dane reacted 👍 to your message (P17 Q1): "P17 Q1: Want me to draft it?" (Discord message ${mid})`]);
+    expect(r.relayed).toEqual([`Dane reacted 👍 to your message (P17 Q1): "Want me to draft it?" (Discord message ${mid})`]);
   });
 });
 

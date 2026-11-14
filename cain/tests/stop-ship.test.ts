@@ -16,7 +16,7 @@ import { keeperHolds, MIN, PR, rig, SHA1, SHA2, SHIP_KEYS, SHIP_PUB } from "./li
 
 const snap = (m: any) => JSON.parse(JSON.stringify(m));
 const ship = async (r: ReturnType<typeof rig>, head = SHA1) =>
-  ((await r.link.ship({ text: "P41: Cain 0.8.0 ready.", item: "P41", pr: PR, head })) as any).message as string;
+  ((await r.link.ship({ text: "Cain 0.8.0 ready.", item: "P41", pr: PR, head })) as any).message as string;
 const KEY = publicKey(SHIP_PUB);
 
 describe("Ship tokens", () => {
@@ -54,7 +54,7 @@ describe("Ship tokens", () => {
     const token = findToken(r.relayed[0])!;
     expect(r.relayed[0]).toContain(`Ship token: ${token} (good for 2 hours`);
     expect(readToken(token, KEY, r.t.now)).toEqual({ ok: true, claim: claimFor(PR, SHA1, r.t.now) });
-    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is next.");
+    expect(r.msg(id).content).toBe("Cain 0.8.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is next.");
     const no = await ship(r, SHA2);
     await r.tap(snap(r.msg(no)), r.ids(no)[1]);
     expect(findToken(r.relayed[1])).toBeNull();
@@ -73,7 +73,7 @@ describe("Ship tokens", () => {
     const r = rig({ noDeployKey: true });
     const id = await ship(r);
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
-    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nYou tapped Ship, but shipping is down right now, so nothing shipped.");
+    expect(r.msg(id).content).toBe("Cain 0.8.0 ready.\n\nYou tapped Ship, but shipping is down right now, so nothing shipped.");
     expect(r.relayed[0]).toContain("The link has no deploy key, so nothing can land in main");
     expect(findToken(r.relayed[0])).toBeNull();
   });
@@ -136,7 +136,7 @@ describe("Stop everything", () => {
     await r.tap(snap(r.msg(morning)), STOP);
     await expect(ship(r, SHA2)).rejects.toThrow("Everything is stopped");
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
-    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nYou tapped Ship, but everything is stopped, so nothing shipped.");
+    expect(r.msg(id).content).toBe("Cain 0.8.0 ready.\n\nYou tapped Ship, but everything is stopped, so nothing shipped.");
     expect(findToken(r.relayed.at(-1)!)).toBeNull();
     expect(r.relayed.at(-1)).toContain("nothing lands in main");
     expect(r.github.landings).toEqual([]);
@@ -406,7 +406,7 @@ describe("second review round (Opus, Nov 12)", () => {
     const r = rig({ noKey: true });
     const id = await ship(r);
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
-    expect(r.msg(id).content).toBe("P41: Cain 0.8.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is down right now, so it isn't installed yet.");
+    expect(r.msg(id).content).toBe("Cain 0.8.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is down right now, so it isn't installed yet.");
   });
 
   test("the Ship key: made once, kept, and remade when it can't be read", () => {

@@ -41,15 +41,19 @@ export function keyAnswer(said: string, repo: string): boolean | null {
 
 // What a pull request changes, for the lines the link builds its Ship card from: GitHub's
 // count of its commits and files, the parts it touches that matter most, and (0.11.0) its
-// title and the two Apps' config.yaml patches, which say what the tap installs.
+// title and what the tap installs.
 export interface Facts {
   head: string; commits: number; files: number; areas: string[];
   title?: string;
-  configs?: AppConfig[];             // cain/config.yaml and harness/config.yaml, when the pull request changes them
+  bumps?: Bump[] | null;             // what the tap installs (bumpsAt); null: it can't be told
+  merged?: boolean;                  // GitHub says it's merged (its head is in main)
 }
-// One App's config.yaml in a pull request's files, with GitHub's patch (null: GitHub left it out).
-export interface AppConfig { app: string; patch: string | null }
-const APP_CONFIGS: Record<string, string> = { "cain/config.yaml": "Cain", "harness/config.yaml": "Harness" };
+export interface Bump { app: string; version: string }
+const APP_CONFIGS: [string, string][] = [["Cain", "cain/config.yaml"], ["Harness", "harness/config.yaml"]];
+const SHA = /^[0-9a-f]{40}$/;
+// At most this many pages of a pull request's files are read, for the parts it touches: the
+// Apps' versions don't come from them, so a cut list costs only a part not named.
+const FILE_PAGES = 3;
 const AREAS: [RegExp, string][] = [
   [/^cain\/rootfs\/opt\/cain\/link\//, "Cain's link"],
   [/^cain\/rootfs\/opt\/cain\/hooks\//, "Cain's hooks"],
@@ -61,55 +65,81 @@ const AREAS: [RegExp, string][] = [
   [/^RELEASING\.md$/, "the release rules"],
 ];
 
-export async function facts(d: Pick<MergeDeps, "api">, repo: string, pr: number): Promise<Facts | null> {
+// head: the commit the Ship card names. The Apps' versions are read at that very commit (and
+// at the pull request's base), never from the pull request's files, which can change between
+// two reads; without a head, at the head GitHub gives.
+export async function facts(d: Pick<MergeDeps, "api">, repo: string, pr: number, head?: string): Promise<Facts | null> {
   const p = await read(d, `/repos/${repo}/pulls/${pr}`);
   if (!p || p === "missing") return null;
-  const names: string[] = [], configs: AppConfig[] = [];
-  for (let page = 1; page <= 30; page++) {
-    const f = await read(d, `/repos/${repo}/pulls/${pr}/files?per_page=100&page=${page}`);
-    if (!Array.isArray(f)) return null;
-    for (const x of f) {
-      const name = String(x?.filename ?? "");
-      names.push(name);
-      if (Object.hasOwn(APP_CONFIGS, name)) configs.push({ app: APP_CONFIGS[name], patch: typeof x?.patch === "string" ? x.patch : null });
-    }
-    if (f.length < 100) break;
-  }
+  const at = (head && SHA.test(head.toLowerCase()) ? head : String(p.head?.sha ?? "")).toLowerCase();
+  const base = String(p.base?.sha ?? "").toLowerCase();
+  const [names, bumps] = await Promise.all([fileNames(d, repo, pr), bumpsAt(d, repo, base, at).catch(() => null)]);
+  if (!names) return null;
   return {
     head: String(p.head?.sha ?? "").toLowerCase(),
     commits: Number(p.commits) || 0,
     files: Number(p.changed_files) || names.length,
     areas: AREAS.filter(([re]) => names.some((n) => re.test(n))).map(([, w]) => w),
     title: typeof p.title === "string" ? p.title : "",
-    configs,
+    bumps,
+    merged: p.merged === true,
   };
 }
 
-// What the tap installs: each App whose version the pull request changes, from the added
-// `version:` line in its config.yaml's patch (quoted or not), Cain first; [] when none
-// changes. null when a config.yaml's patch was left out (GitHub does that for a big diff),
-// or its new version can't be read: then what installs can't be told.
-const APP_ORDER = ["Cain", "Harness"];
-export function bumpsOf(configs: readonly AppConfig[] | undefined): { app: string; version: string }[] | null {
-  if (!configs) return null;
-  const out: { app: string; version: string }[] = [];
-  for (const c of configs) {
-    if (typeof c?.patch !== "string") return null;
-    const added = c.patch.split(/\r?\n/).filter((l) => /^\+version:/.test(l));
-    if (!added.length) continue;                       // its version stays as it is
-    const m = /^\+version:[ \t]*(["']?)([0-9]+(?:\.[0-9]+){1,3})\1[ \t]*(?:#.*)?$/.exec(added[added.length - 1]);
-    if (!m) return null;
-    out.push({ app: c.app, version: m[2] });
+// The names of a pull request's files, up to FILE_PAGES pages; null when GitHub doesn't answer.
+async function fileNames(d: Pick<MergeDeps, "api">, repo: string, pr: number): Promise<string[] | null> {
+  const names: string[] = [];
+  for (let page = 1; page <= FILE_PAGES; page++) {
+    const f = await read(d, `/repos/${repo}/pulls/${pr}/files?per_page=100&page=${page}`);
+    if (!Array.isArray(f)) return null;
+    names.push(...f.map((x: any) => String(x?.filename ?? "")));
+    if (f.length < 100) break;
   }
-  return out.sort((a, b) => APP_ORDER.indexOf(a.app) - APP_ORDER.indexOf(b.app));
+  return names;
+}
+
+// What the tap installs (0.11.0): each App whose config.yaml version at the head differs from
+// its version at the pull request's base, both read at those very commits, Cain first; []
+// when none differs. null when any of it can't be read: then what installs can't be told,
+// and the card never says nothing does. An App with no config.yaml at the head installs nothing.
+export async function bumpsAt(d: Pick<MergeDeps, "api">, repo: string, base: string, head: string): Promise<Bump[] | null> {
+  if (!SHA.test(base) || !SHA.test(head)) return null;
+  const got = await Promise.all(APP_CONFIGS.flatMap(([, path]) => [versionAt(d, repo, path, base), versionAt(d, repo, path, head)]));
+  if (got.some((v) => v === null)) return null;
+  const out: Bump[] = [];
+  APP_CONFIGS.forEach(([app], i) => {
+    const before = got[2 * i], after = got[2 * i + 1];
+    if (after !== "none" && after !== before) out.push({ app, version: after as string });
+  });
+  return out;
+}
+
+// An App's version in its config.yaml at one commit: the version, "none" (no such file
+// there), or null (GitHub didn't answer, or the file has no version line it can read).
+const VERSION_LINE = /^version:[ \t]*(["']?)([0-9]+(?:\.[0-9]+){1,3})\1[ \t]*(?:#.*)?$/m;
+async function versionAt(d: Pick<MergeDeps, "api">, repo: string, path: string, sha: string): Promise<string | "none" | null> {
+  const r = await read(d, `/repos/${repo}/contents/${path}?ref=${sha}`);
+  if (r === "missing") return "none";
+  if (!r || typeof r.content !== "string" || r.encoding !== "base64") return null;
+  const m = VERSION_LINE.exec(Buffer.from(r.content, "base64").toString("utf8"));
+  return m ? m[2] : null;
 }
 
 // A commit's check runs as GitHub has them, read one way for the landing and the Ship card
-// (0.11.0): the runs, "missing" (GitHub has no such commit), or null (no answer).
+// (0.11.0): every page of them, so a pinned run on a later page is never read as not run.
+// The runs, "missing" (GitHub has no such commit), or null (no answer, for any page).
+const RUN_PAGES = 10;
 export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<any[] | "missing" | null> {
-  const r = await read(d, `/repos/${repo}/commits/${head}/check-runs?per_page=100`);
-  if (r === "missing") return "missing";
-  return r && Array.isArray(r.check_runs) ? r.check_runs : null;
+  const all: any[] = [];
+  for (let page = 1; page <= RUN_PAGES; page++) {
+    const r = await read(d, `/repos/${repo}/commits/${head}/check-runs?per_page=100&page=${page}`);
+    if (r === "missing") return page === 1 ? "missing" : null;
+    if (!r || !Array.isArray(r.check_runs)) return null;
+    all.push(...r.check_runs);
+    const total = Number(r.total_count);
+    if (r.check_runs.length < 100 || (Number.isFinite(total) && all.length >= total)) return all;
+  }
+  return null;                       // more runs than RUN_PAGES pages: not all read, so none judged
 }
 
 // Each required check's newest run from GitHub Actions: passed (success only), still
@@ -127,23 +157,16 @@ export function judgeChecks(runs: any[]): CheckState[] {
   });
 }
 
-// When a commit was made, as GitHub has it (its committer's date), for a review that must
-// have finished after the pull request's newest commit; null when GitHub doesn't say.
-export async function commitTime(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<number | null> {
-  const c = await read(d, `/repos/${repo}/git/commits/${head}`);
-  if (!c || c === "missing") return null;
-  const t = Date.parse(String(c.committer?.date ?? ""));
-  return Number.isFinite(t) ? t : null;
-}
-
 // One answer from GitHub's API, tried twice: its body, "missing" (GitHub says there's no
-// such thing), or null (no answer).
+// such thing), or null (no answer). A 403 or 429 (a rate limit, or a refusal) isn't asked
+// again: the link shares 60 unauthenticated reads an hour, and asking at once won't mend it.
 async function read(d: Pick<MergeDeps, "api">, path: string): Promise<any | "missing" | null> {
   for (let i = 0; i < 2; i++) {
     try {
       const r = await d.api(path);
       if (r.status === 200 && r.body) return r.body;
       if (r.status === 404) return "missing";
+      if (r.status === 403 || r.status === 429) return null;
     } catch { /* try once more */ }
   }
   return null;

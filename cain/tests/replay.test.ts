@@ -26,7 +26,7 @@ const done = async (r: ReturnType<typeof rig>) => { await r.link.whenReplayed();
 // replies (one naming a button the card it answers lacks), his own messages, a permission
 // prompt, something else on the bot's token, and a morning message whose Stop came off.
 async function dm(r: ReturnType<typeof rig>) {
-  const ask = (await r.link.ask({ text: "P08 Q2: Is the add-on's packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+  const ask = (await r.link.ask({ text: "Is the add-on's packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
   await r.tap(structuredClone(r.msg(ask)), r.ids(ask)[0]);
   const digest = await r.link.addCard({ text: "Three blocks added, each on its own card with Undo.", rows: STOP_ONLY, kind: "digest" });
   const digestMsg = await r.link.show(digest, { item: "none" });
@@ -83,7 +83,7 @@ describe("the replay", () => {
 
   test("takes the link's outcome lines off before reading a card's words", async () => {
     const r = rig();
-    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     await r.tap(structuredClone(r.msg(ask)), r.ids(ask)[1]);
     r.posted[ask].content += " Wrong time";                              // as if his tap's line named a label
     r.link.replay(14);
@@ -256,7 +256,7 @@ describe("the replay", () => {
     const ids = [
       await r.link.notice("The calendar specialist hasn't answered for 5 minutes."),
       (await r.link.connector({ item: "P07", text: "Installing Harness 0.22.0" })).message,
-      (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message,
+      (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message,
       (await r.link.ship({ text: "Harness 0.22.0 ready.", item: "P09", pr: PR, head: SHA1 }) as any).message,
       await r.link.show(await r.link.addCard({ text: "Moved Swim.", rows: [{ type: 1, components: [btn("Undo", "k:c:u")] }], kind: "card" }), { item: "none" }),
     ];
@@ -277,7 +277,7 @@ describe("the replay", () => {
 
   test("the one backfill keeps what it knows: an ask's options, a live morning message's button", async () => {
     const r = rig();
-    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     const morning = await r.link.morning("## Thu Nov 12");
     const s = r.state();
     for (const id of [ask, morning]) delete s.messages[id].labels;

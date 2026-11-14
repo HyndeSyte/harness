@@ -168,7 +168,7 @@ describe("(c) Cain's own asks and Ship cards keep the hold and closed checks", (
   test("an ask or a Ship card under an item another session holds is refused, and so is an ask under a closed item", async () => {
     const r = evening({ pending: pendingWith(["P49"], ["P50"]) });
     await expect(asked(r, "P49")).rejects.toThrow("held by another session");
-    await expect(r.link.ship({ text: "P49: ready.", item: "P49", pr: PR, head: SHA1 })).rejects.toThrow("held by another session");
+    await expect(r.link.ship({ text: "ready.", item: "P49", pr: PR, head: SHA1 })).rejects.toThrow("held by another session");
     await expect(asked(r, "P50")).rejects.toThrow("P50 is closed");
     expect(Object.keys(r.posted)).toEqual([]);
   });
@@ -176,11 +176,11 @@ describe("(c) Cain's own asks and Ship cards keep the hold and closed checks", (
   test("an open ask and a Ship card lose their buttons when their item moves to another session, and Cain is told", async () => {
     const r = evening({ holds: null });
     const a = await asked(r, "P49");
-    const s = ((await r.link.ship({ text: "P49: ready.", item: "P49", pr: PR, head: SHA1 })) as any).message as string;
+    const s = ((await r.link.ship({ text: "ready.", item: "P49", pr: PR, head: SHA1 })) as any).message as string;
     r.files.holds = elsewhere("P49");
     await r.link.sweep();
     expect(r.buttons(a)).toEqual([]);
-    expect(r.msg(a).content).toBe("P49 Q1: Filed?\n\nExpired");
+    expect(r.msg(a).content).toBe("Filed?\n\nExpired");
     expect(r.buttons(s)).toEqual([]);
     expect(r.relayed).toEqual([
       `Your question P49 Q1 (Discord message ${a}) was taken off: P49 is now held by another session. Don't ask him about it or say who has it. Nothing to tell him.`,
@@ -200,7 +200,7 @@ describe("(c) Cain's own asks and Ship cards keep the hold and closed checks", (
   test("a tap on Cain's ask after its item moved does nothing, and a held ask whose item moved is dropped unasked", async () => {
     const r = evening({ holds: null });
     const open = await asked(r, "P49");
-    expect((await r.link.ask({ text: "P50 Q1: Signed?", options: ["Signed"], item: "P50", question: "Q1" })).status).toBe("held");
+    expect((await r.link.ask({ text: "Signed?", options: ["Signed"], item: "P50", question: "Q1" })).status).toBe("held");
     const m = snap(r.msg(open));
     r.files.holds = keeperHolds({ P49: { holder: "laptop:s1" }, P50: { holder: "laptop:s2" } });
     expect(await r.tap(m, r.ids(open)[0])).toBe("dead: held elsewhere");
@@ -593,7 +593,7 @@ describe("filing a card that went out by itself weighs only against the speciali
     await r.link.sweep();
     const older = await r.link.show(await second(r), { item: "P49", question: "Q1" });
     await asked(r, "P50", "Q1");                                      // his open ask, so his P49 Q1 ask waits
-    expect((await r.link.ask({ text: "P49 Q1: Filed?", options: ["Filed", "Not filed"], item: "P49", question: "Q1" })).status).toBe("held");
+    expect((await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P49", question: "Q1" })).status).toBe("held");
     r.later(MIN);
     const card = await approval(r);
     r.later(2 * MIN);

@@ -78,7 +78,7 @@ describe("where the moving Stop sits", () => {
   test("never onto an ask, a Ship card, a specialist's card, the connector notice or a question", async () => {
     const r = rig();
     const first = await cainSays(r, "Moved swim to 4:30.");
-    await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
+    await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
     await r.link.ship({ text: "Harness 0.23.0 ready.", item: "P41", pr: PR, head: SHA1 });
     await r.link.show(await r.link.addCard({ text: "Moved Swim.", rows: [{ type: 1, components: [btn("Undo", "k:c:u")] }], kind: "card" }), { item: "none" });
     await r.link.connector({ item: "P41", text: "Installing Harness 0.23.0" });
@@ -219,7 +219,7 @@ describe("moving it safely", () => {
 
   test("it waits while a card's outcome edit is pending", async () => {
     const r = rig();
-    await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
+    await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
     r.failing.add("PATCH");
     await r.link.answered({ item: "P08", question: "Q2" });            // its strip fails: the outcome edit waits
     r.failing.clear();
@@ -231,7 +231,7 @@ describe("moving it safely", () => {
 
   test("an outcome edit that keeps failing holds moves up for 10 minutes at most", async () => {
     const r = rig();
-    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     r.failing.add(`PATCH /channels/${DM}/messages/${ask}`);
     await r.link.answered({ item: "P08", question: "Q2" });            // its strip keeps failing
     const reply = await cainSays(r, "Noted.");

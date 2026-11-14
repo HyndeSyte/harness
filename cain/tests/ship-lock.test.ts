@@ -11,8 +11,8 @@ import { DAY, HOUR, MIN, PR, rig, SHA1, SHA2 } from "./link-rig";
 const snap = (m: any) => JSON.parse(JSON.stringify(m));
 const tick = () => new Promise((ok) => setTimeout(ok, 5));
 const ship = async (r: ReturnType<typeof rig>, head = SHA1, pr = PR) =>
-  ((await r.link.ship({ text: "P41: Cain 0.8.1 ready.", item: "P41", pr, head })) as any).message as string;
-const card = "P41: Cain 0.8.1 ready.";
+  ((await r.link.ship({ text: "Cain 0.8.1 ready.", item: "P41", pr, head })) as any).message as string;
+const card = "Cain 0.8.1 ready.";
 // The sweep doesn't wait for landings; the tests do.
 const sweep = async (r: ReturnType<typeof rig>) => { await r.link.sweep(); await r.link.whenLanded(); };
 const toggle = (label: string, id: string) => [{ type: 1, components: [{ type: 2, style: 2, label, custom_id: id }] }];
@@ -167,7 +167,7 @@ describe("his Ship tap lands it in main", () => {
 describe("the link's own line on a Ship card, from GitHub", () => {
   // Since 0.11.0 the link builds the card: its question, his line, the line from GitHub (with
   // the checks) and the Reviewed line (ship-card.test.ts has the rest).
-  const built = (question: string, github: string) => `P41: ${question}\nCain 0.8.1 ready.\n${github}\nNo outside review.`;
+  const built = (question: string, github: string) => `${question}\nCain 0.8.1 ready.\n${github}\nNo outside review attached.`;
   test("how much it changes and the parts that matter most; a newer head on GitHub refuses the card", async () => {
     const r = rig({ facts: true });
     r.github.facts = { head: SHA1, commits: 2, files: 9, areas: ["Cain's link", "Cain's rules", "GitHub's workflows"] };
@@ -273,7 +273,7 @@ describe("review fixes (Opus, Nov 13)", () => {
     const t0 = Date.now();
     const id = await ship(r);
     expect(Date.now() - t0).toBeLessThan(2_000);
-    expect(r.msg(id).content).toBe("P41: Ship it?\nCain 0.8.1 ready.\nFrom GitHub: the pull request couldn't be read just now.\nNo outside review.");
+    expect(r.msg(id).content).toBe("Ship it?\nCain 0.8.1 ready.\nFrom GitHub: the pull request couldn't be read just now.\nNo outside review attached.");
   });
 });
 
@@ -386,10 +386,10 @@ describe("review fixes (Fable, Nov 13)", () => {
   test("a long card keeps the link's line from GitHub: Cain's words give way", async () => {
     const r = rig({ facts: true });
     r.github.facts = { head: SHA1, commits: 1, files: 2, areas: ["GitHub's workflows"] };
-    const id = ((await r.link.ship({ text: `P41: ${"word ".repeat(600)}`, item: "P41", pr: PR, head: SHA1 })) as any).message;
+    const id = ((await r.link.ship({ text: `${"word ".repeat(600)}`, item: "P41", pr: PR, head: SHA1 })) as any).message;
     const c: string = r.msg(id).content;
     expect(c.length).toBeLessThanOrEqual(2000);
-    expect(c).toStartWith("P41: Ship it?\nword word");
-    expect(c).toEndWith(" …\nFrom GitHub: 1 commit and 2 files, including GitHub's workflows. Checks passed.\nNo outside review.");
+    expect(c).toStartWith("Ship it?\nword word");
+    expect(c).toEndWith(" …\nFrom GitHub: 1 commit and 2 files, including GitHub's workflows. Checks passed.\nNo outside review attached.");
   });
 });

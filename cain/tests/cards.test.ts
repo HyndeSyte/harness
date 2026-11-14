@@ -20,7 +20,7 @@ async function ask(r: ReturnType<typeof rig>, item: string, question = "Q1", tex
   const out = await r.link.ask({ text, options, item, question, replyTo });
   return out.status === "posted" ? out.message : "";
 }
-const ship = async (r: ReturnType<typeof rig>, head = SHA1, text = "P41: Cain 0.7.0 ready.") =>
+const ship = async (r: ReturnType<typeof rig>, head = SHA1, text = "Cain 0.7.0 ready.") =>
   ((await r.link.ship({ text, item: "P41", pr: PR, head })) as any).message as string;
 
 // A card posted before 0.7.0: on Discord with its buttons, and the link's old record of it.
@@ -59,12 +59,12 @@ describe("the check-in clock", () => {
     const r = rig({ now: Date.UTC(2026, 10, 11, 11, 50) });              // 6:50 AM
     const a = await ask(r, "P08", "Q2");
     r.later(10 * MIN);
-    expect((await r.link.ask({ text: "P11 Q1: Signed?", options: ["Signed"], item: "P11", question: "Q1" })).status).toBe("held");
+    expect((await r.link.ask({ text: "Signed?", options: ["Signed"], item: "P11", question: "Q1" })).status).toBe("held");
     r.later(11 * MIN);                                                   // 7:11
     await r.link.sweep();
     expect(r.relayed).toEqual([]);                                      // nothing dropped
     await r.tap(snap(r.msg(a)), r.ids(a)[0]);
-    expect(r.last().content).toBe("P11 Q1: Signed?");
+    expect(r.last().content).toBe("Signed?");
   });
 });
 
@@ -113,30 +113,31 @@ describe("asks and cards name their item, and the link refuses what isn't Cain's
     expect(await ask(r, "P08")).not.toBe("");
   });
 
-  test("the link puts the item and question first when the words leave them out", async () => {
+  test("a card never shows its item and question (0.11.0): they stay data, and a label written first is taken off", async () => {
     const r = rig();
-    await ask(r, "P08", "Q2", "Is the business-license packet filed?");
-    expect(r.last().content).toBe("P08 Q2: Is the business-license packet filed?");
+    const first = await ask(r, "P08", "Q2", "Is the business-license packet filed?");
+    expect(r.last().content).toBe("Is the business-license packet filed?");
+    expect(r.link.cardInfo(first)).toMatchObject({ item: "P08", question: "Q2" });
     await r.link.answered({ item: "P08", question: "Q2" });
-    await ask(r, "P08", "Q3", "p08 q3 - want me to call the county?");
-    expect(r.last().content).toBe("p08 q3 - want me to call the county?");   // already says it
+    await ask(r, "P08", "Q3", "P08 Q3: Want me to call the county?");      // an old habit: taken off
+    expect(r.last().content).toBe("Want me to call the county?");
     await r.link.answered({ item: "P08", question: "Q3" });
-    await ask(r, "P080", "Q1", "P08 Q1: not this one");
-    expect(r.last().content).toBe("P080 Q1: P08 Q1: not this one");
+    await ask(r, "P080", "Q1", "p080 q1: not this one");
+    expect(r.last().content).toBe("not this one");
     await r.link.answered({ item: "P080", question: "Q1" });
     const lower = await ask(r, "p09", "q1", "Signed?");                // ids are upper-cased, as the keeper keeps them
-    expect(r.msg(lower).content).toBe("P09 Q1: Signed?");
+    expect(r.msg(lower).content).toBe("Signed?");
     expect(r.link.cardInfo(lower)).toMatchObject({ item: "P09", question: "Q1" });
-    await ship(r, SHA1, "Cain 0.7.0 ready.");
-    expect(r.last().content).toBe("P41: Cain 0.7.0 ready.");
+    await ship(r, SHA1, "P41: Cain 0.7.0 ready.");
+    expect(r.last().content).toBe("Cain 0.7.0 ready.");
   });
 
   test("no sha, job id or ISO time ever reaches his card", async () => {
     const r = rig();
-    for (const text of [`P08 Q2: Merge ${SHA1}?`, "P08 Q2: Job cse_01ABCdef finished. Ship?", "P08 Q2: Filed by 2026-11-12T09:00?"])
+    for (const text of [`Merge ${SHA1}?`, "Job cse_01ABCdef finished. Ship?", "Filed by 2026-11-12T09:00?"])
       await expect(ask(r, "P08", "Q2", text)).rejects.toThrow("his card can't show");
-    await expect(ask(r, "P08", "Q2", "P08 Q2: Which one?", [`Ship ${SHA2}`])).rejects.toThrow("a commit sha");
-    await expect(ship(r, SHA1, `P41: ready at ${SHA1}`)).rejects.toThrow("a commit sha");
+    await expect(ask(r, "P08", "Q2", "Which one?", [`Ship ${SHA2}`])).rejects.toThrow("a commit sha");
+    await expect(ship(r, SHA1, `ready at ${SHA1}`)).rejects.toThrow("a commit sha");
     await expect(r.link.morning("## Wed\nJob cse_01XYZ done")).rejects.toThrow("a job id");
     expect(Object.keys(r.posted)).toEqual([]);
   });
@@ -152,7 +153,7 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
     r.failing.clear();
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
-    expect(r.msg(id).content).toBe("P08 Q2: Filed?\n\nYou answered: Filed");
+    expect(r.msg(id).content).toBe("Filed?\n\nYou answered: Filed");
   });
 
   test("expired: Cain's asks at the next morning check-in", async () => {
@@ -164,7 +165,7 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
     r.t.now = NOV12_710;
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
-    expect(r.msg(id).content).toBe("P08 Q2: Filed?\n\nExpired");
+    expect(r.msg(id).content).toBe("Filed?\n\nExpired");
     expect(r.relayed).toEqual([]);                                     // he re-asks at the check-in
   });
 
@@ -182,7 +183,7 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
     r.later(4 * MIN);
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
-    expect(r.msg(id).content).toBe("P41: Cain 0.7.0 ready.\n\nExpired");
+    expect(r.msg(id).content).toBe("Cain 0.7.0 ready.\n\nExpired");
     expect(r.relayed[0]).toContain("head moved");
     expect(r.relayed[0]).toContain(PR);
     expect(r.relayed[0]).toEndWith("Nothing to tell him.");
@@ -196,7 +197,7 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
     expect(r.buttons(merged)).toEqual([]);
     expect(r.relayed[0]).toContain("merged or closed");
     const other = "https://github.com/HyndeSyte/harness/pull/6";
-    const later = ((await r.link.ship({ text: "P42: Harness 0.21.0 ready.", item: "P42", pr: other, head: SHA2 })) as any).message;
+    const later = ((await r.link.ship({ text: "Harness 0.21.0 ready.", item: "P42", pr: other, head: SHA2 })) as any).message;
     r.pulls[other] = { head: null, open: null };                        // GitHub couldn't be read: nothing changes
     r.t.now = NOV12_710 - MIN;
     await r.link.sweep();
@@ -231,15 +232,15 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
 
   test("replaced: a newer card for the same item and question", async () => {
     const r = rig();
-    const card = await r.link.addCard({ text: "P06 Q1: Tie you up for the turkey harvest?", rows: undoRows });
+    const card = await r.link.addCard({ text: "Tie you up for the turkey harvest?", rows: undoRows });
     const old = await r.link.show(card, { item: "P06", question: "Q1" });
     r.failing.add("PATCH");                                            // the immediate take-off fails...
-    const fresh = await ask(r, "P06", "Q1", "P06 Q1: Does the turkey harvest (Fri Nov 21) tie you up?", ["Ties me up", "Doesn't"]);
+    const fresh = await ask(r, "P06", "Q1", "Does the turkey harvest (Fri Nov 21) tie you up?", ["Ties me up", "Doesn't"]);
     expect(r.buttons(old)).toEqual(["Undo", "Stop"]);
     r.failing.clear();
     await r.link.sweep();                                              // ...and the sweep finishes it
     expect(r.buttons(old)).toEqual([]);
-    expect(r.msg(old).content).toBe("P06 Q1: Tie you up for the turkey harvest?\n\nReplaced by a newer card");
+    expect(r.msg(old).content).toBe("Tie you up for the turkey harvest?\n\nReplaced by a newer card");
     expect(r.buttons(fresh)).toEqual(["Ties me up", "Doesn't"]);
   });
 
@@ -389,15 +390,15 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
 describe("cards replace each other only for the same item and question", () => {
   test("two asks on one item with no question id: the second waits, the first keeps its buttons", async () => {
     const r = rig();
-    const a = await ask(r, "P08", "", "P08: Is the packet filed?", ["Filed", "Not filed"]);
-    const b = await r.link.ask({ text: "P08: Want me to call the county?", options: ["Call", "Leave it"], item: "P08" });
+    const a = await ask(r, "P08", "", "Is the packet filed?", ["Filed", "Not filed"]);
+    const b = await r.link.ask({ text: "Want me to call the county?", options: ["Call", "Leave it"], item: "P08" });
     expect(b.status).toBe("held");
     expect(r.buttons(a)).toEqual(["Filed", "Not filed"]);
   });
 
   test("a card with no buttons replaces nothing", async () => {
     const r = rig();
-    const a = await ask(r, "P06", "Q1", "P06 Q1: Does the harvest tie you up?", ["Ties me up", "Doesn't"]);
+    const a = await ask(r, "P06", "Q1", "Does the harvest tie you up?", ["Ties me up", "Doesn't"]);
     const c = await r.link.addCard({ text: "Turkey harvest is on Fri Nov 21.", rows: [] });
     await r.link.show(c, { item: "P06", question: "Q1" });
     await r.link.sweep();
@@ -446,7 +447,7 @@ describe("taps on dead cards", () => {
 
   test("a replaced card", async () => {
     const r = rig();
-    const id = await ask(r, "P08", "Q2", "P08 Q2: Filed yet?", ["Filed", "Not yet"]);
+    const id = await ask(r, "P08", "Q2", "Filed yet?", ["Filed", "Not yet"]);
     const m = snap(r.msg(id));
     await ask(r, "P08", "Q2");
     await dead(r, m, m.components[0].components[1].custom_id, "\n\nReplaced by a newer card");
@@ -513,7 +514,7 @@ describe("a tap is never lost, and a card never posted twice", () => {
     r.restart();
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
-    expect(r.msg(id).content).toBe("P08 Q2: Filed?\n\nYou answered: Not filed");
+    expect(r.msg(id).content).toBe("Filed?\n\nYou answered: Not filed");
     expect(r.relayed.length).toBe(1);                                 // once
   });
 
@@ -557,17 +558,17 @@ describe("threading", () => {
     const r = rig();
     const id = await ask(r, "P08", "Q2");
     await r.tap(snap(r.msg(id)), r.ids(id)[1]);
-    expect(r.relayed[0]).toBe(`Dane tapped "Not filed" on your question P08 Q2: "P08 Q2: Filed?" (Discord message ${id}; its card shows his answer. If it needs words from you, reply with reply_to ${id})`);
+    expect(r.relayed[0]).toBe(`Dane tapped "Not filed" on your question P08 Q2: "Filed?" (Discord message ${id}; its card shows his answer. If it needs words from you, reply with reply_to ${id})`);
     const s = ((await r.link.ship({ text: "Cain 0.7.0 ready.", item: "P41", pr: PR, head: SHA1.toUpperCase() })) as any).message;
     await r.tap(snap(r.msg(s)), r.ids(s)[0]);
     expect(r.relayed[1]).toStartWith(`Dane tapped "Ship" on your Ship card for P41: ${PR} at head ${SHA1} (Discord message ${s}; its card shows his answer. If it needs words from you, reply with reply_to ${s}) The link landed it: main has that commit now. Ship token: ship1.`);
-    expect(r.msg(s).content).toBe("P41: Cain 0.7.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is next.");
+    expect(r.msg(s).content).toBe("Cain 0.7.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is next.");
   });
 
   test("the link's posts that answer a tap or a message are Discord replies", async () => {
     const r = rig();
     const his = r.his("Is the license packet in?");
-    const a = await ask(r, "P08", "Q2", "P08 Q2: Filed?", ["Filed"], his.id);
+    const a = await ask(r, "P08", "Q2", "Filed?", ["Filed"], his.id);
     expect(r.msg(a).message_reference).toEqual({ message_id: his.id, channel_id: DM, fail_if_not_exists: false });
     const card = await r.link.addCard({ text: "Moved it.", rows: undoRows });
     const b = await r.link.show(card, { item: "none", replyTo: his.id });
@@ -582,9 +583,9 @@ describe("threading", () => {
     const r = rig();
     const a = await ask(r, "P08", "Q2");
     const his = r.his("And the farm one?");
-    await ask(r, "P11", "Q1", "P11 Q1: Signed?", ["Signed", "Not signed"], his.id);
+    await ask(r, "P11", "Q1", "Signed?", ["Signed", "Not signed"], his.id);
     await r.tap(snap(r.msg(a)), r.ids(a)[0]);
-    expect(r.last().content).toBe("P11 Q1: Signed?");
+    expect(r.last().content).toBe("Signed?");
     expect(r.last().message_reference.message_id).toBe(his.id);
   });
 
@@ -593,7 +594,7 @@ describe("threading", () => {
     const a = await ask(r, "P08", "Q2");
     const reply = r.his("not sure actually", a);
     expect(await r.link.replied(reply.id)).toEqual({ status: "ok", reply_to: a, card: null, item: "P08", question: "Q2",
-      asked: "P08 Q2: Filed?", open: true, buttons: ["Filed", "Not filed", "Not sure"], live: true });
+      asked: "Filed?", open: true, buttons: ["Filed", "Not filed", "Not sure"], live: true });
     const plain = r.his("what's on today?");
     expect((await r.link.replied(plain.id)).reply_to).toBeNull();
     await expect(r.link.replied(a)).rejects.toThrow("isn't one of his messages");
@@ -605,15 +606,15 @@ describe("one open ask at a time", () => {
   test("a second ask waits until the first is answered, then goes out by itself", async () => {
     const r = rig();
     const a = await ask(r, "P08", "Q2");
-    const held = await r.link.ask({ text: "P11 Q1: Signed?", options: ["Signed", "Not signed"], item: "P11", question: "Q1" });
+    const held = await r.link.ask({ text: "Signed?", options: ["Signed", "Not signed"], item: "P11", question: "Q1" });
     expect(held.status).toBe("held");
     expect((held as any).said).toContain("Not asked yet");
     expect(Object.keys(r.posted).length).toBe(1);
     await r.tap(snap(r.msg(a)), r.ids(a)[0]);
     expect(Object.keys(r.posted).length).toBe(2);
-    expect(r.last().content).toBe("P11 Q1: Signed?");
+    expect(r.last().content).toBe("Signed?");
     expect(r.relayed[0]).toContain('Dane tapped "Filed"');
-    expect(r.relayed[1]).toBe(`Your held question P11 Q1 is now in front of Dane (Discord message ${r.last().id}): "P11 Q1: Signed?" Nothing to tell him.`);
+    expect(r.relayed[1]).toBe(`Your held question P11 Q1 is now in front of Dane (Discord message ${r.last().id}): "Signed?" Nothing to tell him.`);
   });
 
   test("...or when the open one's item closes or moves", async () => {
@@ -622,7 +623,7 @@ describe("one open ask at a time", () => {
     await ask(r, "P11", "Q1");
     r.files.holds = laptopHolds("P08");
     await r.link.sweep();
-    expect(r.last().content).toBe("P11 Q1: Filed?");
+    expect(r.last().content).toBe("Filed?");
   });
 
   test("held asks that outlive their morning are dropped unasked, and Cain is told", async () => {
@@ -639,14 +640,14 @@ describe("one open ask at a time", () => {
 
   test("the same item and question asked again replaces the open card at once, or the held one", async () => {
     const r = rig();
-    const a = await ask(r, "P08", "Q2", "P08 Q2: Filed?", ["Filed", "Not yet"]);
-    const b = await ask(r, "P08", "Q2", "P08 Q2: Is the business-license packet filed?");
+    const a = await ask(r, "P08", "Q2", "Filed?", ["Filed", "Not yet"]);
+    const b = await ask(r, "P08", "Q2", "Is the business-license packet filed?");
     expect(b).not.toBe("");
     expect(r.buttons(a)).toEqual([]);
     expect(r.msg(a).content.endsWith("Replaced by a newer card")).toBe(true);
     await ask(r, "P11", "Q1", "first wording");
     await ask(r, "P11", "Q1", "second wording");
-    expect(r.state().held!.map((h) => h.text)).toEqual(["P11 Q1: second wording"]);
+    expect(r.state().held!.map((h) => h.text)).toEqual(["second wording"]);
   });
 
   test("Ship cards and specialists' cards don't wait their turn", async () => {
@@ -665,7 +666,7 @@ describe("one open ask at a time", () => {
     expect((await r.link.answered({ item: "P08", question: "Q2" })).status).toBe("closed");
     expect(r.buttons(a)).toEqual([]);
     expect(r.msg(a).content.endsWith("You answered in a message")).toBe(true);
-    expect(r.last().content).toBe("P11 Q1: Filed?");
+    expect(r.last().content).toBe("Filed?");
     expect((await r.link.answered({ item: "P99", question: "Q1" })).status).toBe("none open");
     const n = await ask(r, "none", "", "Want the long version?", ["Yes"]);
     expect(n).toBe("");                                               // P11 is open
@@ -685,7 +686,7 @@ describe("a replay of this morning (Nov 11)", () => {
     expect(r.msg(old).content).toBe("Farm Q2: business license?\n\nExpired");
     expect(await r.tap(m, m.components[0].components[1].custom_id)).toStartWith("dead:");   // "Not yet" does nothing
     expect(r.ephemerals().at(-1).content).toBe(EXPIRED_TAP);
-    const exact = await r.link.ask({ text: "P08 Q2: Is the business-license packet filed? (Not the land-use one.)",
+    const exact = await r.link.ask({ text: "Is the business-license packet filed? (Not the land-use one.)",
       options: ["Filed", "Not filed", "Not sure"], item: "P08", question: "Q2" });
     expect(exact.status).toBe("posted");
     expect(r.relayed).toEqual([]);                                    // nothing recorded from the old card
@@ -693,22 +694,22 @@ describe("a replay of this morning (Nov 11)", () => {
 
   test("a re-asked card strips the old one", async () => {
     const r = rig();
-    const old = await ask(r, "P08", "Q2", "P08 Q2: Farm business license?", ["Done", "Not yet"]);
-    const exact = await ask(r, "P08", "Q2", "P08 Q2: Is the business-license packet filed? (Not the land-use one.)");
+    const old = await ask(r, "P08", "Q2", "Farm business license?", ["Done", "Not yet"]);
+    const exact = await ask(r, "P08", "Q2", "Is the business-license packet filed? (Not the land-use one.)");
     expect(r.buttons(old)).toEqual([]);
-    expect(r.msg(old).content).toBe("P08 Q2: Farm business license?\n\nReplaced by a newer card");
+    expect(r.msg(old).content).toBe("Farm business license?\n\nReplaced by a newer card");
     expect(r.buttons(exact)).toEqual(["Filed", "Not filed", "Not sure"]);
   });
 
   test("a tap is answered in its thread", async () => {
     const r = rig();
-    const q = await ask(r, "P08", "Q2", "P08 Q2: Is the business-license packet filed?", ["Filed", "Not filed", "Not sure"]);
+    const q = await ask(r, "P08", "Q2", "Is the business-license packet filed?", ["Filed", "Not filed", "Not sure"]);
     await r.tap(snap(r.msg(q)), r.ids(q)[2]);
     const line = r.relayed[0];
     expect(line).toContain(`"Not sure"`);
     expect(line).toContain(`reply_to ${q}`);
     const replyTo = /reply_to (\d+)/.exec(line)![1];
-    const follow = await ask(r, "P08", "Q3", "P08 Q3: Want me to check with the county?", ["Check", "Leave it"], replyTo);
+    const follow = await ask(r, "P08", "Q3", "Want me to check with the county?", ["Check", "Leave it"], replyTo);
     expect(r.msg(follow).message_reference.message_id).toBe(q);
   });
 
@@ -724,8 +725,8 @@ describe("a replay of this morning (Nov 11)", () => {
 
   test("the Ship card carries the full head, and a new head replaces it", async () => {
     const r = rig();
-    const first = await ship(r, SHA1, "P41: Ready.");
-    const second = await ship(r, SHA2, "P41: Ready, with fixes.");
+    const first = await ship(r, SHA1, "Ready.");
+    const second = await ship(r, SHA2, "Ready, with fixes.");
     expect(r.buttons(first)).toEqual([]);
     expect(r.msg(first).content.endsWith("Replaced by a newer card")).toBe(true);
     expect(r.state().messages[second].ship).toEqual({ pr: PR, head: SHA2 });

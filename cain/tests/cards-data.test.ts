@@ -27,7 +27,7 @@ describe("each card's buttons, as data", () => {
   test("recorded for every kind the link posts, and kept once they come off", async () => {
     const r = rig();
     const { id: card } = await receipt(r, undefined, undefined, r.t.now + 15 * MIN);
-    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     const ship = (await r.link.ship({ text: "Cain 0.9.0 ready.", item: "P41", pr: PR, head: SHA1 }) as any).message;
     const morning = await r.link.morning("## Thu Nov 12");
     const s = r.state().messages;
@@ -114,7 +114,7 @@ describe("the cards, published for the reply hook", () => {
   test("live cards and two days of finished ones, with labels and writers, and no text", async () => {
     const r = rig();
     const { id: card } = await receipt(r, "Added Swim, a private title, to your Gmail.");
-    const ask = (await r.link.ask({ text: "P08 Q2: Is the private packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Is the private packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     await r.link.notice("A plain notice.");
     let v = cardsView(r.state(), r.t.now);
     expect(v).toMatchObject({ written_at: r.t.now, owner: "4242", dm: DM });
@@ -137,7 +137,7 @@ describe("the cards, published for the reply hook", () => {
 
   test("every message the link posts is in the published view at once, buttons or not: an edit of one is never taken for a fresh reply", async () => {
     const r = rig();
-    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     const ship = (await r.link.ship({ text: "Cain 0.10.0 ready.", item: "P41", pr: PR, head: SHA1 }) as any).message;
     const morning = await r.link.morning("## Thu Nov 12");
     const notice = await r.link.notice("The calendar specialist is answering again.");
@@ -179,7 +179,7 @@ describe("the cards, published for the reply hook", () => {
     const writer = new CardsWriter(() => { reads++; return store.load(); }, cardsPath, 40);
     const store = stateFile(statePath, () => writer.soon());
     const r = rig();
-    await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
+    await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
     const s = r.state();
     store.save(s);
     expect(existsSync(statePath)).toBe(true);
@@ -232,7 +232,7 @@ describe("the cards, published for the reply hook", () => {
 describe("the gate at the link's send points", () => {
   test("exit drill: Cain's ask naming a button it lacks is refused before anything is sent, saying what to change", async () => {
     const r = rig();
-    const ask = r.link.ask({ text: "P08 Q2: Filed? If not, tap Undo.", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
+    const ask = r.link.ask({ text: "Filed? If not, tap Undo.", options: ["Filed", "Not filed"], item: "P08", question: "Q2" });
     await expect(ask).rejects.toThrow('The message gate held this ask: "Undo" isn\'t one of its buttons (Filed, Not filed). Rewrite it and send it again.');
     expect(r.posts()).toBe(0);
     expect(r.reports).toMatchObject([{ point: "ask", writer: "cain", did: "refused", hits: [{ rule: "button", result: "refuse", label: "Undo" }] }]);
@@ -241,19 +241,19 @@ describe("the gate at the link's send points", () => {
 
   test("Cain's words through the link: add-ons fixed before the card is made, and the answer says so; every em dash refused, an option's too", async () => {
     const r = rig();
-    const out = await r.link.ask({ text: "P08 Q2: Is the add-on back?", options: ["The add-on's back", "Not yet"], item: "P08", question: "Q2" }) as any;
+    const out = await r.link.ask({ text: "Is the add-on back?", options: ["The add-on's back", "Not yet"], item: "P08", question: "Q2" }) as any;
     expect(out).toMatchObject({ status: "posted", said: "Posted. The message gate fixed its wording first: Apps, not add-ons." });
-    expect(r.last().content).toBe("P08 Q2: Is the App back?");
+    expect(r.last().content).toBe("Is the App back?");
     expect(r.buttons(out.message)).toEqual(["The App's back", "Not yet"]);
     expect(r.state().messages[out.message].labels).toEqual(["The App's back", "Not yet"]);
     // The same words again make the same card: the nonce is made from the fixed words.
-    const again = await r.link.ask({ text: "P08 Q2: Is the add-on back?", options: ["The add-on's back", "Not yet"], item: "P08", question: "Q2" }) as any;
+    const again = await r.link.ask({ text: "Is the add-on back?", options: ["The add-on's back", "Not yet"], item: "P08", question: "Q2" }) as any;
     expect(again.message).toBe(out.message);
     expect(r.reports.filter((x) => x.point === "ask")).toMatchObject([{ did: "fixed" }, { did: "fixed" }]);
     const posts = r.posts();
-    await expect(r.link.ask({ text: "P08 Q3: Is the App back — or not?", options: ["Back", "Not yet"], item: "P08", question: "Q3" }))
-      .rejects.toThrow('The message gate held this ask: "P08 Q3: Is the App back — or not?": an em dash; rewrite it without one, using a comma or a new sentence for a break, "to" or "through" for a range. Rewrite it and send it again.');
-    await expect(r.link.ask({ text: "P08 Q3: Is the App back?", options: ["Back — yes", "Not yet"], item: "P08", question: "Q3" }))
+    await expect(r.link.ask({ text: "Is the App back — or not?", options: ["Back", "Not yet"], item: "P08", question: "Q3" }))
+      .rejects.toThrow('The message gate held this ask: "Is the App back — or not?": an em dash; rewrite it without one, using a comma or a new sentence for a break, "to" or "through" for a range. Rewrite it and send it again.');
+    await expect(r.link.ask({ text: "Is the App back?", options: ["Back — yes", "Not yet"], item: "P08", question: "Q3" }))
       .rejects.toThrow("The message gate held this ask's option: \"Back — yes\": an em dash");
     expect(r.posts()).toBe(posts);
     expect(r.reports.filter((x) => x.did === "refused")).toMatchObject([{ point: "ask", hits: [{ rule: "dash", result: "refuse" }] },
@@ -263,14 +263,14 @@ describe("the gate at the link's send points", () => {
   test("a refusal says each reason once, whole, within what the link's answer carries", async () => {
     // Fable, round four: the em dash reason, said per dash, pushed the count's reason past the 300 characters main.ts kept.
     const r = rig();
-    const two = await r.link.ask({ text: "P08 Q3: Swim moves — ok? And art — ok? And the dentist on the far side of town next week — ok? Plus and 3 more.",
+    const two = await r.link.ask({ text: "Swim moves — ok? And art — ok? And the dentist on the far side of town next week — ok? Plus and 3 more.",
       options: ["Yes", "No"], item: "P08", question: "Q3" }).catch((e) => String(e.message));
     expect(two.match(/em dashes; rewrite each without one/g)).toHaveLength(1);
     expect(two).toContain(": name each one instead of a count.");
     expect(two).toEndWith(". Rewrite it and send it again.");
     // However many hits: fewer excerpts, then none, never a reason cut.
     const many = Array.from({ length: 30 }, (_, i) => `Part ${i} of the plan for the week — job ${"0123456789abcdef".slice(0, 8 + (i % 8))} and 3 more, tap Undo`).join(". ");
-    const said = await r.link.ask({ text: `P08 Q3: ${many}?`, options: ["Yes", "No"], item: "P08", question: "Q3" }).catch((e) => String(e.message));
+    const said = await r.link.ask({ text: `${many}?`, options: ["Yes", "No"], item: "P08", question: "Q3" }).catch((e) => String(e.message));
     expect(said.length).toBeLessThanOrEqual(SAID_MAX);
     for (const why of ["em dashes; rewrite each without one", "no shas, job ids, ISO times or Discord ids; say it as people say it",
       "name each one instead of a count", "\"Undo\" isn't one of its buttons (Yes, No)"]) expect(said).toContain(why);
@@ -282,8 +282,8 @@ describe("the gate at the link's send points", () => {
 
   test("a hidden count or machine text is refused on an ask, a Ship card, the morning message and the connector notice", async () => {
     const r = rig();
-    await expect(r.link.ask({ text: "P08 Q2: Two blocks and 3 more: fine?", options: ["Yes", "No"], item: "P08", question: "Q2" })).rejects.toThrow("name each one instead of a count");
-    await expect(r.link.ask({ text: "P08 Q2: Fine?", options: ["Yes", "Yes and 2 more"], item: "P08", question: "Q2" })).rejects.toThrow("held this ask's option");
+    await expect(r.link.ask({ text: "Two blocks and 3 more: fine?", options: ["Yes", "No"], item: "P08", question: "Q2" })).rejects.toThrow("name each one instead of a count");
+    await expect(r.link.ask({ text: "Fine?", options: ["Yes", "Yes and 2 more"], item: "P08", question: "Q2" })).rejects.toThrow("held this ask's option");
     await expect(r.link.ship({ text: "Harness 0.23.0 ready, and 2 more fixes.", item: "P41", pr: PR, head: SHA1 })).rejects.toThrow("held this Ship card");
     await expect(r.link.morning("## Thu Nov 12\nTap Undo on the receipt.")).rejects.toThrow('"Undo" isn\'t one of its buttons (Stop)');
     await expect(r.link.connector({ item: "P41", text: "Installing Harness, see message 123456789012345678" })).rejects.toThrow("held this notice");
@@ -294,7 +294,7 @@ describe("the gate at the link's send points", () => {
     expect(r.posts()).toBe(0);
     const ship = await r.link.ship({ text: "Harness 0.23.0 ready: the add-on's gate is on.", item: "P41", pr: PR, head: SHA1 }) as any;
     expect(ship.said).toBe("Posted. The message gate fixed its wording first: Apps, not add-ons.");
-    expect(r.msg(ship.message).content).toStartWith("P41: Harness 0.23.0 ready: the App's gate is on.");
+    expect(r.msg(ship.message).content).toStartWith("Harness 0.23.0 ready: the App's gate is on.");
     expect((await r.link.morningPost("## Thu Nov 12\n• The add-on restarts at 4:30")).said).toContain("Apps, not add-ons");
     expect(r.last().content).toBe("## Thu Nov 12\n• The App restarts at 4:30");
   });
@@ -328,10 +328,10 @@ describe("the gate at the link's send points", () => {
 
   test("an em dash between two numbers, or a time and a number: Cain's ask is refused like any of his em dashes; a specialist's card keeps it, flagged", async () => {
     const r = rig();
-    await expect(r.link.ask({ text: "P08 Q2: Is Room 4—5 free?", options: ["Yes", "No"], item: "P08", question: "Q2" }))
-      .rejects.toThrow('The message gate held this ask: "P08 Q2: Is Room 4—5 free?": an em dash; rewrite it without one, using a comma or a new sentence for a break, "to" or "through" for a range. Rewrite it and send it again.');
+    await expect(r.link.ask({ text: "Is Room 4—5 free?", options: ["Yes", "No"], item: "P08", question: "Q2" }))
+      .rejects.toThrow('The message gate held this ask: "Is Room 4—5 free?": an em dash; rewrite it without one, using a comma or a new sentence for a break, "to" or "through" for a range. Rewrite it and send it again.');
     await expect(r.link.ship({ text: "Harness 0.23.0 ready, for 2026 — 2027.", item: "P41", pr: PR, head: SHA1 })).rejects.toThrow("an em dash; rewrite it without one");
-    await expect(r.link.ask({ text: "P08 Q2: Party at 6 PM — 8 people, fine?", options: ["Yes", "No"], item: "P08", question: "Q2" })).rejects.toThrow("an em dash; rewrite it without one");
+    await expect(r.link.ask({ text: "Party at 6 PM — 8 people, fine?", options: ["Yes", "No"], item: "P08", question: "Q2" })).rejects.toThrow("an em dash; rewrite it without one");
     expect(r.posts()).toBe(0);
     const card = await r.link.addCard({ text: "Swim moved to 4:30 — 2 blocks shifted.", rows: [], kind: "card" });
     expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Swim moved to 4:30 — 2 blocks shifted." (say it without the dash, as a range in words if it is one). It goes out as it is');
@@ -387,7 +387,7 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
 
   test("a message the link knows as its own never goes on his list: not from a note, not from his transcripts", async () => {
     const r = rig();
-    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     const notice = await r.link.notice("The calendar specialist is answering again.");
     const mine = r.snowflake();
     await r.link.sent({ tool: "reply", ids: [ask, mine], question: false });
@@ -426,7 +426,7 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
 
   test("an edit of a message the link posted (the reply hook bypassed) is logged and Cain hears it once per edit", async () => {
     const r = rig();
-    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
     await r.link.sent({ tool: "edit", ids: [ask], question: false, call: "toolu_01first" });
     expect(r.state().sent?.[ask]).toBeUndefined();
     expect(r.reports.at(-1)).toMatchObject({ point: "sent", writer: "cain", message: ask, did: "bypassed: an edit of a message the link posted" });
@@ -487,7 +487,7 @@ describe("the notice that Home Assistant's connector needs signing in again", ()
     const out = await r.link.connector({ item: "P41", text: "Installing Harness 0.22.0" });
     expect(out.status).toBe("posted");
     const msg = r.msg(out.message);
-    expect(msg.content).toBe("P41: Installing Harness 0.22.0 waits until Claude can reach Home Assistant again: its connector needs you to sign in again. Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.");
+    expect(msg.content).toBe("Installing Harness 0.22.0 waits until Claude can reach Home Assistant again: its connector needs you to sign in again. Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.");
     expect(msg.components).toEqual([{ type: 1, components: [{ type: 2, style: 5, label: CONNECTOR_LABEL, url: CONNECTOR_URL }] }]);
     expect(CONNECTOR_URL).toBe("https://claude.ai/customize/connectors");   // settings/connectors only says they moved
     expect(msg.content).not.toMatch(/tap|reconnected|tell me|let me know/i);
@@ -517,7 +517,7 @@ describe("the notice that Home Assistant's connector needs signing in again", ()
 
 describe("outcome lines", () => {
   test("come off the end of a card's words", () => {
-    expect(withoutOutcome("P08 Q2: Filed?\n\nYou answered: Filed")).toBe("P08 Q2: Filed?");
+    expect(withoutOutcome("Filed?\n\nYou answered: Filed")).toBe("Filed?");
     expect(withoutOutcome("Added Swim.\n\nExpired")).toBe("Added Swim.");
     expect(withoutOutcome("Cain 0.9.0 ready.\n\nShipped: it's in main as of 4:10 PM. Installing it is next.")).toBe("Cain 0.9.0 ready.");
     expect(withoutOutcome("Plain words.")).toBe("Plain words.");
