@@ -39,9 +39,17 @@ export function keyAnswer(said: string, repo: string): boolean | null {
   return null;
 }
 
-// What a pull request changes, for the line the link adds to its Ship card: GitHub's
-// count of its commits and files, and the parts it touches that matter most.
-export interface Facts { head: string; commits: number; files: number; areas: string[] }
+// What a pull request changes, for the lines the link builds its Ship card from: GitHub's
+// count of its commits and files, the parts it touches that matter most, and (0.11.0) its
+// title and the two Apps' config.yaml patches, which say what the tap installs.
+export interface Facts {
+  head: string; commits: number; files: number; areas: string[];
+  title?: string;
+  configs?: AppConfig[];             // cain/config.yaml and harness/config.yaml, when the pull request changes them
+}
+// One App's config.yaml in a pull request's files, with GitHub's patch (null: GitHub left it out).
+export interface AppConfig { app: string; patch: string | null }
+const APP_CONFIGS: Record<string, string> = { "cain/config.yaml": "Cain", "harness/config.yaml": "Harness" };
 const AREAS: [RegExp, string][] = [
   [/^cain\/rootfs\/opt\/cain\/link\//, "Cain's link"],
   [/^cain\/rootfs\/opt\/cain\/hooks\//, "Cain's hooks"],
@@ -56,11 +64,15 @@ const AREAS: [RegExp, string][] = [
 export async function facts(d: Pick<MergeDeps, "api">, repo: string, pr: number): Promise<Facts | null> {
   const p = await read(d, `/repos/${repo}/pulls/${pr}`);
   if (!p || p === "missing") return null;
-  const names: string[] = [];
+  const names: string[] = [], configs: AppConfig[] = [];
   for (let page = 1; page <= 30; page++) {
     const f = await read(d, `/repos/${repo}/pulls/${pr}/files?per_page=100&page=${page}`);
     if (!Array.isArray(f)) return null;
-    names.push(...f.map((x: any) => String(x?.filename ?? "")));
+    for (const x of f) {
+      const name = String(x?.filename ?? "");
+      names.push(name);
+      if (Object.hasOwn(APP_CONFIGS, name)) configs.push({ app: APP_CONFIGS[name], patch: typeof x?.patch === "string" ? x.patch : null });
+    }
     if (f.length < 100) break;
   }
   return {
@@ -68,7 +80,60 @@ export async function facts(d: Pick<MergeDeps, "api">, repo: string, pr: number)
     commits: Number(p.commits) || 0,
     files: Number(p.changed_files) || names.length,
     areas: AREAS.filter(([re]) => names.some((n) => re.test(n))).map(([, w]) => w),
+    title: typeof p.title === "string" ? p.title : "",
+    configs,
   };
+}
+
+// What the tap installs: each App whose version the pull request changes, from the added
+// `version:` line in its config.yaml's patch (quoted or not), Cain first; [] when none
+// changes. null when a config.yaml's patch was left out (GitHub does that for a big diff),
+// or its new version can't be read: then what installs can't be told.
+const APP_ORDER = ["Cain", "Harness"];
+export function bumpsOf(configs: readonly AppConfig[] | undefined): { app: string; version: string }[] | null {
+  if (!configs) return null;
+  const out: { app: string; version: string }[] = [];
+  for (const c of configs) {
+    if (typeof c?.patch !== "string") return null;
+    const added = c.patch.split(/\r?\n/).filter((l) => /^\+version:/.test(l));
+    if (!added.length) continue;                       // its version stays as it is
+    const m = /^\+version:[ \t]*(["']?)([0-9]+(?:\.[0-9]+){1,3})\1[ \t]*(?:#.*)?$/.exec(added[added.length - 1]);
+    if (!m) return null;
+    out.push({ app: c.app, version: m[2] });
+  }
+  return out.sort((a, b) => APP_ORDER.indexOf(a.app) - APP_ORDER.indexOf(b.app));
+}
+
+// A commit's check runs as GitHub has them, read one way for the landing and the Ship card
+// (0.11.0): the runs, "missing" (GitHub has no such commit), or null (no answer).
+export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<any[] | "missing" | null> {
+  const r = await read(d, `/repos/${repo}/commits/${head}/check-runs?per_page=100`);
+  if (r === "missing") return "missing";
+  return r && Array.isArray(r.check_runs) ? r.check_runs : null;
+}
+
+// Each required check's newest run from GitHub Actions: passed (success only), still
+// running, failed (any other conclusion, skipped and neutral too), or not run yet. The one
+// judgment for the landing (failedChecks) and the Ship card.
+export interface CheckState { name: string; state: "passed" | "running" | "failed" | "missing"; conclusion?: string }
+export function judgeChecks(runs: any[]): CheckState[] {
+  return CHECKS.map((name): CheckState => {
+    const mine = runs.filter((r) => r?.name === name && r?.app?.id === ACTIONS_APP).sort((a, b) => Number(b.id) - Number(a.id));
+    const r = mine[0];
+    if (!r) return { name, state: "missing" };
+    if (r.status !== "completed") return { name, state: "running" };
+    if (r.conclusion !== "success") return { name, state: "failed", conclusion: String(r.conclusion ?? "no result") };
+    return { name, state: "passed" };
+  });
+}
+
+// When a commit was made, as GitHub has it (its committer's date), for a review that must
+// have finished after the pull request's newest commit; null when GitHub doesn't say.
+export async function commitTime(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<number | null> {
+  const c = await read(d, `/repos/${repo}/git/commits/${head}`);
+  if (!c || c === "missing") return null;
+  const t = Date.parse(String(c.committer?.date ?? ""));
+  return Number.isFinite(t) ? t : null;
 }
 
 // One answer from GitHub's API, tried twice: its body, "missing" (GitHub says there's no
@@ -121,13 +186,12 @@ export async function inMain(d: MergeDeps, repo: string, head: string): Promise<
   return ancestor(d, head, "refs/ship/main");
 }
 
+// The first check, in order, that keeps it from landing.
 function failedChecks(runs: any[]): Landed | null {
-  for (const name of CHECKS) {
-    const mine = runs.filter((r) => r?.name === name && r?.app?.id === ACTIONS_APP).sort((a, b) => Number(b.id) - Number(a.id));
-    const r = mine[0];
-    if (!r) return no(`CI hasn't run ${name} on it`);
-    if (r.status !== "completed") return no(`CI is still running ${name} on it`, true);
-    if (r.conclusion !== "success") return no(`CI's ${name} check didn't pass on it (${String(r.conclusion ?? "no result")})`);
+  for (const c of judgeChecks(runs)) {
+    if (c.state === "missing") return no(`CI hasn't run ${c.name} on it`);
+    if (c.state === "running") return no(`CI is still running ${c.name} on it`, true);
+    if (c.state === "failed") return no(`CI's ${c.name} check didn't pass on it (${c.conclusion})`);
   }
   return null;
 }
@@ -143,10 +207,10 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
     if (String(pull.base?.ref ?? "") !== "main") return no("it isn't a pull request into main");
     if (String(pull.head?.repo?.full_name ?? "").toLowerCase() !== repo) return no("its branch isn't in this repository");
     if (String(pull.head?.sha ?? "").toLowerCase() !== l.head) return no("its branch moved on since the card: it has newer commits");
-    const checks = await read(d, `/repos/${l.repo}/commits/${l.head}/check-runs?per_page=100`);
-    if (checks === "missing") return no("GitHub doesn't have that commit");
-    if (!checks || !Array.isArray(checks.check_runs)) return no("GitHub didn't answer about its checks", true);
-    const bad = failedChecks(checks.check_runs);
+    const runs = await checkRuns(d, l.repo, l.head);
+    if (runs === "missing") return no("GitHub doesn't have that commit");
+    if (!runs) return no("GitHub didn't answer about its checks", true);
+    const bad = failedChecks(runs);
     if (bad) return bad;
   }
   const fetched = await fetchBoth(d, l, !merged);

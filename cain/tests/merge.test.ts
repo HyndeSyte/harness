@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, facts, inMain, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, bumpsOf, checkRuns, commitTime, facts, inMain, judgeChecks, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
@@ -280,15 +280,74 @@ describe("what GitHub says", () => {
     expect(keyAnswer("ssh: connect to host github.com port 22: Network is unreachable", REPO)).toBeNull();
   });
 
-  test("about a pull request: its commits, its files, and the parts that matter most", async () => {
+  test("about a pull request: its commits, its files, the parts that matter most, its title and the Apps' config.yaml patches", async () => {
     const files = ["cain/rootfs/opt/cain/link/core.ts", "cain/rootfs/opt/cain/CLAUDE.md", ".github/workflows/tests.yml",
       "cain/config.yaml", "cain/CHANGELOG.md", "cain/tests/merge.test.ts"].map((filename) => ({ filename }));
     const api = async (path: string) => path === `/repos/${REPO}/pulls/13`
       ? { status: 200, body: { head: { sha: H1.toUpperCase() }, commits: 3, changed_files: 6 } }
       : path === `/repos/${REPO}/pulls/13/files?per_page=100&page=1` ? { status: 200, body: files } : { status: 404, body: null };
     expect(await facts({ api }, REPO, 13)).toEqual({ head: H1, commits: 3, files: 6,
-      areas: ["Cain's link", "Cain's rules", "GitHub's workflows"] });
+      areas: ["Cain's link", "Cain's rules", "GitHub's workflows"], title: "", configs: [{ app: "Cain", patch: null }] });
     expect(await facts({ api: async () => ({ status: 500, body: null }) }, REPO, 13)).toBeNull();
+    // The title as GitHub has it, and each config.yaml's patch, from every page of files.
+    const many = [...Array.from({ length: 100 }, (_, i) => ({ filename: `harness/app/f${i}.py`, patch: "@@ x" })),
+      { filename: "harness/config.yaml", patch: '@@ -1 +1 @@\n-version: "0.23.0"\n+version: "0.24.0"' }, { filename: "cain/config.yaml.bak", patch: "+version: 9.9.9" }];
+    const paged = async (path: string) => path === `/repos/${REPO}/pulls/13`
+      ? { status: 200, body: { head: { sha: H1 }, commits: 1, changed_files: 102, title: "Harness 0.24.0: the digest says less" } }
+      : path.startsWith(`/repos/${REPO}/pulls/13/files?per_page=100&page=`)
+        ? { status: 200, body: path.endsWith("page=1") ? many.slice(0, 100) : many.slice(100) } : { status: 404, body: null };
+    expect(await facts({ api: paged }, REPO, 13)).toMatchObject({ title: "Harness 0.24.0: the digest says less",
+      configs: [{ app: "Harness", patch: '@@ -1 +1 @@\n-version: "0.23.0"\n+version: "0.24.0"' }] });
+  });
+
+  test("what the tap installs: the added version line in each App's config.yaml patch, quoted or not", () => {
+    const patch = (from: string, to: string) => `@@ -4,7 +4,7 @@\n name: X\n-version: ${from}\n+version: ${to}\n slug: x`;
+    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0"') }])).toEqual([{ app: "Cain", version: "0.11.0" }]);
+    expect(bumpsOf([{ app: "Harness", patch: patch("'0.23.0'", "0.24.0") }, { app: "Cain", patch: patch("0.10.0", "'0.11.0'  # minor") }]))
+      .toEqual([{ app: "Cain", version: "0.11.0" }, { app: "Harness", version: "0.24.0" }]);   // Cain first
+    expect(bumpsOf([{ app: "Cain", patch: "@@ -40 +40 @@\n-  review_limit_usd: 1.5\n+  review_limit_usd: 2" }])).toEqual([]);   // options only
+    expect(bumpsOf([])).toEqual([]);
+    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0"').replace(/\n/g, "\r\n") }])).toEqual([{ app: "Cain", version: "0.11.0" }]);
+    // Can't be told: a patch GitHub left out, a version that isn't one, or nothing read at all.
+    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0"') }, { app: "Harness", patch: null }])).toBeNull();
+    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"soon"') }])).toBeNull();
+    expect(bumpsOf([{ app: "Cain", patch: patch('"0.10.0"', '"0.11.0\'') }])).toBeNull();
+    expect(bumpsOf(undefined)).toBeNull();
+  });
+
+  test("the head commit's time, from its committer's date; null when GitHub doesn't say", async () => {
+    const api = async (path: string) => path === `/repos/${REPO}/git/commits/${H1}`
+      ? { status: 200, body: { sha: H1, committer: { name: "x", date: "2026-11-14T15:04:05Z" } } } : { status: 404, body: null };
+    expect(await commitTime({ api }, REPO, H1)).toBe(Date.UTC(2026, 10, 14, 15, 4, 5));
+    expect(await commitTime({ api }, REPO, H2)).toBeNull();
+    expect(await commitTime({ api: async () => ({ status: 200, body: { committer: { date: "not a date" } } }) }, REPO, H1)).toBeNull();
+    expect(await commitTime({ api: async () => { throw new Error("timeout"); } }, REPO, H1)).toBeNull();
+  });
+});
+
+describe("the checks, read one way for the landing and the Ship card", () => {
+  const run = (name: string, conclusion: string | null, status = "completed", app = ACTIONS_APP, id = 1) => ({ id, name, status, conclusion, app: { id: app } });
+  test("each required check's newest run from GitHub Actions: passed, running, failed or not run", () => {
+    expect(judgeChecks([run("pytest", "success"), run("bun", "success"), run("pr", "success")]).map((c) => c.state)).toEqual(["passed", "passed", "passed"]);
+    expect(judgeChecks([run("pytest", "success"), run("bun", null, "in_progress")])).toEqual([
+      { name: "pytest", state: "passed" }, { name: "bun", state: "running" }, { name: "pr", state: "missing" }]);
+    expect(judgeChecks([run("pytest", "skipped"), run("bun", null), run("pr", "neutral")])).toEqual([
+      { name: "pytest", state: "failed", conclusion: "skipped" }, { name: "bun", state: "failed", conclusion: "no result" },
+      { name: "pr", state: "failed", conclusion: "neutral" }]);
+    // Another app's pass doesn't count, and the newest run decides.
+    expect(judgeChecks([run("pytest", "failure", "completed", ACTIONS_APP, 1), run("pytest", "success", "completed", 1236702, 9)])[0].state).toBe("failed");
+    expect(judgeChecks([run("pytest", "failure", "completed", ACTIONS_APP, 1), run("pytest", "success", "completed", ACTIONS_APP, 2)])[0].state).toBe("passed");
+  });
+
+  test("the runs from the head's check runs, as the landing reads them: missing, no answer, or the list", async () => {
+    const seen: string[] = [];
+    const runs = [run("pytest", "success")];
+    const api = async (path: string) => { seen.push(path); return path.includes(H1) ? { status: 200, body: { check_runs: runs } } : { status: 404, body: null }; };
+    expect(await checkRuns({ api }, REPO, H1)).toEqual(runs);
+    expect(seen[0]).toBe(`/repos/${REPO}/commits/${H1}/check-runs?per_page=100`);
+    expect(await checkRuns({ api }, REPO, H2)).toBe("missing");
+    expect(await checkRuns({ api: async () => ({ status: 200, body: { message: "odd" } }) }, REPO, H1)).toBeNull();
+    expect(await checkRuns({ api: async () => { throw new Error("timeout"); } }, REPO, H1)).toBeNull();
   });
 });
 
