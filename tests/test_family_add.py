@@ -983,7 +983,7 @@ def test_a_refused_second_undo_whose_read_cant_tell_keeps_reading(on, ending):
         on.icloud.down = False
         on.advance(minutes=1)
         on.tick()
-        assert on.texts()[-1] == "<b>Not undone.</b> That didn't go through, so it's still on the Family calendar."
+        assert on.texts()[-1] == "<b>Not undone.</b> iCloud turned it down. It's still on the Family calendar."
         assert on.with_button("Undo")[1] == on.texts()[-1]
     else:
         on.advance(days=7)                     # past its end, Oct 27 at 4:00 PM
@@ -1037,6 +1037,38 @@ def test_a_later_read_of_an_undo_finds_it_changed_since_and_leaves_it(on, how):
     assert on.texts()[-1] == family_add.CHANGED and on.last()[2] is None
     assert "Dentist moved" in on.icloud.family()[path_of(on)][1] and on.icloud.methods().count("DELETE") == 2
     assert on.ledger.db.execute("SELECT undo_state FROM family_adds").fetchone()[0] == "changed"
+
+
+@pytest.mark.parametrize("body", [b"", b"<html><body>Service temporarily busy</body></html>"],
+                         ids=["empty", "a web page"])
+def test_a_later_undo_read_with_no_event_in_it_says_nothing_yet(on, body):
+    """The delete's answer says nothing, nor does the one more's, and the next read is a 200 with
+    no event in it. That isn't the event changed: it says nothing, and the read after it finds the
+    event still there as written, with Undo."""
+    from harness.net import HttpResponse
+    card = on.add_one()
+    on.icloud.force_status = 503               # not deleted, and the answer says nothing
+    on.press(card, "Undo")
+    on.icloud.force_status = 503               # nor the one more's
+    on.advance(minutes=1)
+    on.tick()
+    real, bad = on.icloud.request, []
+
+    def once(method, url, **kw):
+        if method == "GET" and url.endswith(".ics") and not bad:
+            bad.append(url)
+            return HttpResponse(200, {"etag": '"x"'}, body)
+        return real(method, url, **kw)
+    on.icloud.request = once
+    said = len(on.texts())
+    on.advance(minutes=1)
+    on.tick()
+    assert bad and len(on.texts()) == said
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1] == "<b>Not undone.</b> That didn't go through, so it's still on the Family calendar."
+    assert on.with_button("Undo")[1] == on.texts()[-1] and len(on.icloud.family()) == 1
+    assert not any(t == family_add.CHANGED for t in on.texts())
 
 
 @pytest.mark.parametrize("body", [b"", b"<html><body>Service temporarily busy</body></html>"],

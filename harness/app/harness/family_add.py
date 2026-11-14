@@ -1290,15 +1290,19 @@ class FamilyAdd:
         have landed. An answer that turns the one more down (the password, the address, a 4xx) says
         nothing about the first either, so it's read before anything is said: gone is undone; still
         there as written was turned down, said plainly with Undo offered again; a read that can't
-        tell is read again on the schedule. Every read checks the event is still as written:
-        changed since is left alone and said so, never "still there"."""
+        tell is read again on the schedule, and the refusal is kept so a later read says it. Every
+        read checks the event is still as written: changed since is left alone and said so, never
+        "still there", and an answer with no event in it can't tell."""
         state = _settling(row)
         now = iso(self.ledger.now())
         href = self.client.href_for(row["uid"])
-        refused = ""
         if state.get("retried"):
-            kind = self._where(row, *self.client.fetch(href), there="still")
+            refused = state.get("refused", "")      # why the one more was turned down, if it was
+            kind = self._where(row, *self.client.fetch(href), there="refused" if refused else "still")
         else:
+            state.pop("refused", None)              # a new try: an earlier refusal says nothing of it
+            refused = ""
+
             def one_more() -> None:            # counted as it goes out, so a try that never sends spends nothing
                 state["retried"] = True
                 with self.ledger.tx() as db:
@@ -1311,8 +1315,8 @@ class FamilyAdd:
             elif _turned_down(out):
                 with self.ledger.tx() as db:
                     self._set_problem(db, out.kind)
+                refused = state["refused"] = _still_there(out)     # kept, for a later read to say
                 kind = self._where(row, *self.client.fetch(href), there="refused")
-                refused = _still_there(out)
             else:
                 kind = {"gone": "ok", "changed": "changed"}.get(out.kind, "unread")
         if kind == "unread":
@@ -1335,10 +1339,11 @@ class FamilyAdd:
     @staticmethod
     def _where(row, out: caldav.Outcome, body: str, *, there: str) -> str:
         """Where an undo's event stands, by a read: gone ("ok"); still there as it was written, ours
-        with the same version (`there`); changed since; or "unread" when the read can't tell."""
+        with the same version (`there`); changed since; or "unread" when the read can't tell, an
+        answer with no event in it (empty, a web page) included."""
         if out.kind == "gone":
             return "ok"
-        if out.kind != "ok":
+        if out.kind != "ok" or not caldav._uids(body):
             return "unread"
         return there if caldav._is_ours(body, row["uid"]) and out.etag == row["etag"] else "changed"
 
