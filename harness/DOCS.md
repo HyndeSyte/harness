@@ -222,7 +222,9 @@ hour, one line says it isn't confirmed yet, and you hear once more when it's kno
 is over or a week has passed, one line says it couldn't be confirmed, with *Undo* when iCloud
 answered the write with a version, and the reads stop. An undo cut short the same way is read too:
 gone is undone, and still there is deleted once more, at most; a read that can't get through is
-tried again on the same schedule. One iCloud turns down is said plainly, with *Undo*. A failed write,
+tried again on the same schedule. One iCloud turns down is said plainly, with *Undo*; when it
+turns down that second try, a read comes first, so you hear undone, or still there with *Undo*.
+A failed write,
 a rejected password or a calendar whose name isn't Family is said in the thread, and stays
 in `/status` and the digest until a write succeeds. `/stop` blocks adds and undos, and an add's
 reads wait until you turn it back on. If adds are off when you ask for one, tapping *Turn on*
@@ -288,8 +290,10 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   reads every event the change touched a minute after the write was sent. Landed is the usual
   receipt. Nothing landed is written once more, only over the very version it was written over;
   an event changed on the calendar in the meantime, even back to how it was, is left as it is,
-  and the receipt says so. One that landed and that you changed before that read is done, but
-  Undo leaves it as you left it. Half of an event and its copy landed is finished, or put back. Reads
+  and the receipt says so. One that landed and that you changed before that read, a note or an
+  alert you added included, is done, but Undo leaves it as you left it. Lines iCloud adds of its
+  own, like a default alert, aren't anyone's change. Half of an event and its copy landed is
+  finished, or put back. Reads
   that can't tell come each minute for the first hour, every 15 minutes for the rest of the day,
   then hourly; after an hour one line says it isn't confirmed yet, and the receipt follows once
   it's known, or says it couldn't be confirmed once the event is over or a week has passed. An
