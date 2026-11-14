@@ -909,8 +909,8 @@ def test_undo_whose_delete_never_lands_twice_offers_its_undo_again(on):
 
 
 def test_an_undo_refused_after_a_lost_answer_is_said_and_never_sent_each_minute(on):
-    """One more delete at most, recorded before it's sent. Refused (a 403), it's said plainly with
-    Undo offered again, and no read or delete follows each minute."""
+    """One more delete at most, recorded before it's sent. Refused (a 403), a read finds it still
+    there as written: said plainly with Undo offered again, and no read or delete each minute."""
     card = on.add_one()
     on.icloud.force_status = 503               # not deleted, and the answer says nothing
     on.press(card, "Undo")
@@ -926,13 +926,72 @@ def test_an_undo_refused_after_a_lost_answer_is_said_and_never_sent_each_minute(
         on.tick()
     assert on.icloud.methods().count("DELETE") == 2 and len(on.icloud.family()) == 1
     said = [t for t in on.texts() if t.startswith("<b>Not undone.</b>")]
-    assert said == ["<b>Not undone.</b> iCloud turned it down. Nothing was changed."]
+    assert said == ["<b>Not undone.</b> iCloud turned it down. It's still on the Family calendar."]
     fresh = on.with_button("Undo")
     assert fresh[1] == said[0]
     assert on.ledger.db.execute("SELECT undo_state FROM family_adds").fetchone()[0] == "open"
     on.icloud.request = real
     on.press(fresh, "Undo")
     assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar."
+
+
+def test_a_refused_second_undo_is_read_first_and_said_undone_when_the_first_went_through(on):
+    """The delete lands and its answer is lost; the one more is turned down. That says nothing about
+    the first, so a read decides what's said: gone, so it's undone, never "Nothing was changed"."""
+    from harness.net import HttpResponse
+    card = on.add_one()
+    on.icloud.drop_response_next = True        # the delete lands; its answer is lost
+    on.press(card, "Undo")
+    real, refused = on.icloud.request, []
+
+    def turned_down_once(method, url, **kw):
+        if method == "PROPFIND" and not refused:
+            refused.append(method)
+            return HttpResponse(403)           # the one more is turned down
+        return real(method, url, **kw)
+    on.icloud.request = turned_down_once
+    on.advance(minutes=1)
+    on.tick()
+    assert refused and on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar."
+    assert not any("Not undone" in t or "Nothing was changed" in t for t in on.texts())
+    assert on.icloud.methods().count("DELETE") == 1 and on.last()[2] is None
+
+
+@pytest.mark.parametrize("ending", ["read later", "never read"])
+def test_a_refused_second_undo_whose_read_cant_tell_keeps_reading(on, ending):
+    """The one more delete is turned down, and the read after it can't get through: nothing is said
+    yet. A later read says where it stands; reads that never can end with one plain line."""
+    card = on.add_one()
+    on.icloud.force_status = 503               # not deleted, and the answer says nothing
+    on.press(card, "Undo")
+    real = on.icloud.request
+
+    def turned_down_then_out_of_reach(method, url, **kw):
+        if method != "DELETE":
+            return real(method, url, **kw)
+        on.icloud.force_status = 403           # the one more is turned down
+        out = real(method, url, **kw)
+        on.icloud.down = True                  # and the read after it can't get through
+        return out
+    on.icloud.request = turned_down_then_out_of_reach
+    said = len(on.texts())
+    on.advance(minutes=1)
+    on.tick()
+    assert len(on.texts()) == said and on.icloud.methods().count("DELETE") == 2
+    on.icloud.request = real
+    if ending == "read later":
+        on.icloud.down = False
+        on.advance(minutes=1)
+        on.tick()
+        assert on.texts()[-1] == "<b>Not undone.</b> That didn't go through, so it's still on the Family calendar."
+        assert on.with_button("Undo")[1] == on.texts()[-1]
+    else:
+        on.advance(days=7)                     # past its end, Oct 27 at 4:00 PM
+        on.tick()
+        assert on.texts()[-1] == ("<b>Not confirmed:</b> reads couldn't tell whether Dentist on Tue Oct 27 "
+                                  "was undone, and it's over now, so I've stopped reading it.")
+    assert on.icloud.methods().count("DELETE") == 2
+    assert not any("Nothing was changed" in t for t in on.texts())
 
 
 def test_a_restart_finishes_an_undo_he_asked_for(on):

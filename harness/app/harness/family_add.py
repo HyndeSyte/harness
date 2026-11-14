@@ -25,8 +25,9 @@ said once as not confirmed and read no more, with its Undo when iCloud answered 
 version. The first read of a write whose answer was lost comes a minute after it was sent, so a
 late write shows before any second one. An undo cut short the same way is settled by the same
 read: gone is undone, and still there as written is deleted once more, at most. No answer there,
-iCloud out of reach or a server error, is read again; only a refusal is said. While stopped,
-nothing here is read, written or said: it waits for Turn back on.
+iCloud out of reach or a server error, is read again, and so is a refusal before anything is said
+of it: gone is undone, still there is said with Undo again. While stopped, nothing here is read,
+written or said: it waits for Turn back on.
 
 Plain code checks every proposal. An impossible one (over 24 hours, over a year
 ahead, or text the card couldn't show exactly) is refused in words. Anything
@@ -176,6 +177,14 @@ def _turned_down(out: caldav.Outcome) -> bool:
     4xx. No answer, iCloud out of reach or a server error says nothing about the event."""
     return out.kind in ("auth", "no_credentials", "mismatch") or (
         out.kind == "failed" and out.status is not None and 400 <= out.status < 500)
+
+
+def _still_there(out: caldav.Outcome) -> str:
+    """An undo iCloud turned down, read afterwards and found still there as written: why, and where
+    it is. Never "Nothing was changed": only the read says what stands."""
+    words = FAILED_WORDS.get(out.kind, FAILED_WORDS["failed"]).format(detail=_detail(out))
+    return words.replace("Not added", "Not undone").replace(" Nothing was changed.", "") + \
+        " It's still on the Family calendar."
 
 
 def _said(value: str) -> str:
@@ -1273,12 +1282,15 @@ class FamilyAdd:
     def _settle_undo(self, row) -> None:
         """An undo whose delete no answer settled: gone is undone; still there as written is
         deleted once more (client.undo reads it first), then read. The one more is recorded before
-        it's sent, so it's never a second, let alone one a minute. An answer that turns it down (the
-        password, the address, a 4xx) settles nothing by waiting: said plainly, Undo offered. No
-        answer that says (iCloud out of reach, a server error, a lost answer) is read again on the
-        schedule: the first delete may have landed, and later passes only read."""
+        it's sent, so it's never a second, let alone one a minute. No answer that says (iCloud out
+        of reach, a server error, a lost answer) is read again on the schedule: the first delete may
+        have landed, and later passes only read. An answer that turns the one more down (the
+        password, the address, a 4xx) says nothing about the first either, so it's read before
+        anything is said: gone is undone; still there as written was turned down, said plainly with
+        Undo offered again; a read that can't tell is read again on the schedule."""
         state = _settling(row)
         now = iso(self.ledger.now())
+        refused = ""
         if state.get("retried"):
             out, _ = self.client.fetch(self.client.href_for(row["uid"]))
             kind = "ok" if out.kind == "gone" else "still" if out.kind == "ok" else "unread"
@@ -1293,17 +1305,18 @@ class FamilyAdd:
                 kind = "ok" if back.kind == "gone" else "unread"
             elif _turned_down(out):
                 with self.ledger.tx() as db:
-                    db.execute("UPDATE family_adds SET settle_json='' WHERE proposal_id=?", (row["proposal_id"],))
                     self._set_problem(db, out.kind)
-                words = FAILED_WORDS.get(out.kind, FAILED_WORDS["failed"]).format(detail=_detail(out))
-                self._reoffer(row, words.replace("Not added", "Not undone"))
-                return
+                back, body = self.client.fetch(self.client.href_for(row["uid"]))
+                kind = ("ok" if back.kind == "gone" else "unread" if back.kind != "ok"
+                        else "refused" if caldav._is_ours(body, row["uid"]) and back.etag == row["etag"]
+                        else "changed")
+                refused = _still_there(out)
             else:
                 kind = {"gone": "ok", "changed": "changed"}.get(out.kind, "unread")
         if kind == "unread":
             self._not_yet(row, state, "undone")
             return
-        final = {"ok": ("undone", UNDONE), "changed": ("changed", CHANGED),
+        final = {"ok": ("undone", UNDONE), "changed": ("changed", CHANGED), "refused": ("open", refused),
                  "still": ("open", "<b>Not undone.</b> That didn't go through, so it's still on the "
                                    "Family calendar.")}[kind]
         with self.ledger.tx() as db:
@@ -1313,7 +1326,8 @@ class FamilyAdd:
                                                   "settled": "read"}, db=db)
             if kind == "ok":
                 db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
-            buttons, binds = self._undo_button(db, row["proposal_id"]) if kind == "still" else (None, None)
+            again = kind in ("still", "refused")
+            buttons, binds = self._undo_button(db, row["proposal_id"]) if again else (None, None)
             self._say(db, self.chat_id, row["job_id"], final[1], buttons=buttons, binds=binds)
 
     # -- output ---------------------------------------------------------------------------
