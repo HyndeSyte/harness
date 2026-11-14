@@ -7,7 +7,7 @@
 //   pass    nothing to change
 //   fix     only em dashes or "add-on": the hook sends the fixed words in its place
 //   refuse  held back, with what to change: a hidden count, machine text, an em dash
-//           between two numbers (or a time and a number) that isn't a clock range, a
+//           between two numbers, times or dates (never read as "to"), a
 //           button the card it answers doesn't have, or a named button while which
 //           buttons are up can't be told.
 //           Never released by a third try (hard): a chat the link says isn't his DM, or

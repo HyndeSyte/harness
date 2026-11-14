@@ -5,11 +5,11 @@ runs them there). Nothing in harness/app imports this: what he sees is kept clea
 tests that use it.
 
   dash     an em dash                         fix: ", " (removed at a line's start or end, or
-                                              before a stop; " to " only in a confirmed clock
-                                              range), never inside code or a link. One with a
-                                              number right after it, and a number or a clock
-                                              time right before it, that isn't a confirmed
-                                              range ("2026" and "2027", "6 PM" and "8") is
+                                              before a stop), never " to ", and never inside
+                                              code or a link. One with a number right on both
+                                              sides (a digit, a clock time, a day or a month
+                                              by name, noon or midnight: "2026" and "2027",
+                                              "6 PM" and "8", "Monday" and "Friday") is
                                               refused: said without it
   app      "the add-on", "Cain's add-on", "Settings > Add-ons" and the like, also "addon" and
            the escaped "add\\-on"             fix: "App", "Apps", "App's". A bare "add-on" (a
@@ -103,7 +103,9 @@ def hidden(text: str, only_targets: bool | str = False) -> str:
     return "".join(t)
 
 
-_LINK = re.compile(r"https?://[^" + _SC + r"<>()]+", A)
+# A link runs to the next space or angle bracket, parentheses included (a user name can hold
+# them), and its scheme may be in any case (rules.ts LINK).
+_LINK = re.compile(r"https?://[^" + _SC + r"<>]+", re.I | A)
 
 
 def around(text: str, at: int, end: int, n: int = 60) -> str:
@@ -116,25 +118,20 @@ def around(text: str, at: int, end: int, n: int = 60) -> str:
     return re.sub(_S + "+", " ", hosts_only(text, start, stop)).strip(_SPACES)[:n]
 
 
-_TRAIL = re.compile("[.,;:!?'\"\u2019\u201d*_~\\]]+\\Z")
-_HOST = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(:\d*)?\Z", A)
+_HOST = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(?::\d*)?\Z", A)
 
 
 def link_host(link: str) -> str:
     """A link as its scheme and host alone, with "/\u2026" when anything else was cut: never a user
-    name, password, port, path, query or fragment. One whose host isn't a plain name or address
-    is "a link". A sentence's own marks after it stay (rules.ts linkHost)."""
-    m = _TRAIL.search(link)
-    trail = m.group(0) if m else ""
-    url = link[:len(link) - len(trail)]
-    m = re.match(r"(https?://)([^/?#\\]*)", url)
+    name, password, port, path, query or fragment. Its host is what follows the authority's last
+    "@", less any port; one that isn't a plain name or address is "a link". Nothing after the
+    host comes back (rules.ts linkHost)."""
+    m = re.match(r"(https?://)([^/?#]*)", link, re.I | A)
     auth = m.group(2) if m else ""
-    at = auth.rfind("@")
-    h = _HOST.match(auth[at + 1:]) if m else None
+    h = _HOST.match(auth[auth.rfind("@") + 1:]) if m else None
     if not m or not h:
-        return "a link" + trail
-    cut = at >= 0 or h.group(2) is not None or len(url) > m.end()
-    return m.group(1) + h.group(1).lower() + ("/\u2026" if cut else "") + trail
+        return "a link"
+    return m.group(1).lower() + h.group(1).lower() + ("/\u2026" if len(link) > len(m.group(1)) + len(h.group(1)) else "")
 
 
 def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
@@ -155,39 +152,31 @@ def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
     return "".join(out)
 
 
-# " to " only in a confirmed clock range (rules.ts clockRange): a clock time on both sides (a
-# colon, or AM or PM); or a bare hour, then a time with AM or PM, the hour starting the text or
-# a line, or right after one of from, between, at, by, around, about, until, till, a colon
-# after a word, or an opening bracket. Never after a period or a comma, and a bare number on
-# the right is never an hour. Any other em dash with a number right after it, and a number or
-# a clock time right before it, is refused; every other one gets ", " or goes.
+# An em dash is never read as "to" (rules.ts dashes). One with a number right on both sides is
+# refused: a digit; before the dash also a clock time ending in AM or PM, an ordinal or a
+# percentage; after it also a currency sign and its digits; on either side a day or a month by
+# name (full or short, any case, with or without a period), noon or midnight. Every other one
+# gets ", " or goes. The spaces around it, any but a new line, go with it, and so does another dash
+# with only spaces between.
+_DASH = re.compile("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*\u2014+)+[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*")
 _MERIDIEM = _S + r"?[AaPp]\.?[Mm]\.?"
 _CLOCK = r"(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")"
-_CLOCK_END = re.compile(r"(?<![\d:.])" + _CLOCK + r"\Z", A)
-_CLOCK_START = re.compile(r"^" + _CLOCK + r"(?![A-Za-z0-9:])", A)
-_MERIDIEM_START = re.compile(r"^\d{1,2}(?::\d{2})?" + _MERIDIEM + r"(?![A-Za-z0-9])", A)
-_WHEN = r"(?:[Ff]rom|[Bb]etween|[Aa]t|[Bb]y|[Aa]round|[Aa]bout|[Uu]ntil|[Tt]ill)"
-_HOUR_LEFT = re.compile(r"(?:(?:^|\n)[ \t]*|(?<![A-Za-z])" + _WHEN + r"[ \t]+|(?<!\d):[ \t]*|[(\[][ \t]*)\d{1,2}\Z", A)
-
-
-def _clock_range(left: str, right: str) -> bool:
-    return ((bool(_CLOCK_END.search(left)) and bool(_CLOCK_START.search(right)))
-            or (bool(_MERIDIEM_START.search(right)) and bool(_HOUR_LEFT.search(left))))
+_NAMES = r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)\.?"
+_NUMBER_BEFORE = re.compile(r"(?:\d(?:st|nd|rd|th|%)?|(?<![\d:.])" + _CLOCK + r"|(?<![A-Za-z])" + _NAMES + r")\Z",
+                            re.I | A)
+_NUMBER_AFTER = re.compile("^(?:[$\\u20ac\\u00a3]?\\d|" + _NAMES + r"(?![A-Za-z]))", re.I | A)
 
 
 def _dashes(text: str, seen: str) -> list[tuple[int, int, str | None]]:
     """Each em dash and what goes in its place; None: it stays, and the writer says it without it."""
     out = []
-    for m in re.finditer("[ \t]*\u2014+[ \t]*", seen):
+    for m in _DASH.finditer(seen):
         at, end = m.start(), m.end()
-        left, right = text[:at], text[end:]
         before = "\n" if at == 0 else text[at - 1]
         after = "\n" if end >= len(text) else text[end]
         put: str | None = ", "
-        if _clock_range(left, right):
-            put = " to "                  # "9:30 to 10:15", never "Room 4 to 5:30"
-        elif re.match(r"\d", after, A) and (re.match(r"\d", before, A) or _CLOCK_END.search(left)):
-            put = None                    # a range or a list: "2026, 2027", "6 PM, 8"
+        if _NUMBER_BEFORE.search(text[:at]) and _NUMBER_AFTER.search(text[end:]):
+            put = None                    # a range or a list: said without the dash
         elif before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
             put = ""
         elif re.match(r"[,;:]", before):

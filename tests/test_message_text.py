@@ -229,26 +229,35 @@ def test_the_port_has_the_same_labels_as_cains_rules():
 
 
 def test_a_link_in_an_excerpt_is_its_scheme_and_host_alone():
-    """No user name, password, port, path, query or fragment; one that can't be read is "a link"
-    (rules.ts linkHost, gate.test.ts)."""
-    assert message_rules.link_host("https://user:secret@example.com/private?key=abc") == "https://example.com/\u2026"
-    assert message_rules.link_host("https://a@b@Example.COM:8443/x#frag") == "https://example.com/\u2026"
+    """No user name, password, port, path, query or fragment, nothing after the host at all; one
+    that can't be read is "a link" (rules.ts linkHost, gate.test.ts)."""
+    cut = "https://example.com/\u2026"
+    assert message_rules.link_host("https://user:secret@example.com/private?key=abc") == cut
+    assert message_rules.link_host("https://a@b@Example.COM:8443/x#frag") == cut
     assert message_rules.link_host("http://example.com") == "http://example.com"
     assert message_rules.link_host("https://[::1]:80/x") == "https://[::1]/\u2026"
-    assert message_rules.link_host("https://example.com/a?b=1,") == "https://example.com/\u2026,"
     for bad in ("https://", "https://user:secret@", "https://exa%mple.com/x", "https://b\xfccher.example/x",
-                "https://example.com:port/x"):
+                "https://example.com:port/x", "https://example.com,", "https://h\\SECRET"):
         assert message_rules.link_host(bad) == "a link", bad
-    text = "Call https://user:secret@example.com:8443/reset?token=abc today."
-    for start in range(len(text)):
-        for stop in (start + 1, start + 9, len(text)):
-            assert not re.search("user|secret|8443|reset|token", message_rules.hosts_only(text, start, stop))
-    assert message_rules.around(text, 30, 40) == "https://example.com/\u2026 today."
+    for tail in ("__", "~~", "!!", '"x"', "'x'", "[x]", "x)", "x.", "x,"):
+        assert message_rules.link_host("https://example.com/private?token=" + tail) == cut, tail
+    assert message_rules.hosts_only("See https://user:p(ss)@example.com/private?key=abc now.") == "See " + cut + " now."
+    assert message_rules.hosts_only("See https://en.wikipedia.org/wiki/Foo_(bar)?token=X now.") == "See https://en.wikipedia.org/\u2026 now."
+    assert message_rules.hosts_only("See HTTPS://user:pw@Host.example/x?key=1 now.") == "See https://host.example/\u2026 now."
+    for text in ("Call https://user:secret@example.com:8443/reset?token=abc today.",
+                 "Call HTTPS://user:p(se)cret@example.com:8443/reset?token=abc__ today."):
+        for start in range(len(text)):
+            for stop in (start + 1, start + 9, len(text)):
+                assert not re.search(r"user|secret|se\)|8443|reset|token|abc", message_rules.hosts_only(text, start, stop))
+        assert message_rules.around(text, 30, 40).startswith(cut + " to")
 
 
 def test_the_port_reads_javascripts_spaces():
-    """JavaScript's \\s takes U+00A0, U+202F and the other Unicode spaces even without the u flag."""
-    assert message_rules.check("6\u202fPM \u2014 8\u202fPM").fixed == "6\u202fPM to 8\u202fPM"
+    """JavaScript's \\s takes U+00A0, U+202F and the other Unicode spaces even without the u flag; next to
+    a dash, any of them but a new line goes with it, leaving one ordinary space."""
+    assert message_rules.check("6\u202fPM \u2014 8\u202fPM").rules("refuse") == ["dash"]
+    assert message_rules.check("Away 2026\u202f\u2014\u202f2027.").rules("refuse") == ["dash"]
+    assert message_rules.check("Moved swim\xa0\u2014\xa0it's at 4:30.").fixed == "Moved swim, it's at 4:30."
     assert message_rules.check("Two blocks and\xa03 more.").rules("refuse") == ["count"]
     assert message_rules.check("Two blocks and\u200b3 more.").hits == []      # U+200B isn't a space in either
     assert message_rules.around("\x85a\ufeff", 1, 2) == "\x85a"                 # trim() keeps U+0085, takes U+FEFF

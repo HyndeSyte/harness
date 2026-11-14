@@ -66,10 +66,14 @@ describe("the rules", () => {
     expect(r.fixed).toBe("See `a — b` and [the page](https://example.com/x—y), then the App.");
   });
 
-  test("an em dash between two numbers, or a time and a number, that isn't a clock range is held, and the reason doesn't call it a range", () => {
+  test("an em dash with a number, time or date right on both sides is held, never read as \"to\", and the reason doesn't call it a range", () => {
     for (const text of ["From 2026 — 2027 it runs.", "Room 4—5 is free.", "Swim moved to 4:30 — 2 blocks shifted.", "Nov 12 — 4:30 PM swim is set.", "Room 4 — 5:30 start.",
       "Sat. 5 — 6 PM", "No. 5 — 6 PM", "Thursday, 12 — 4:30 PM swim is set.", "Dec 3, 12 — 1 PM lunch", "1. 12 — 1 PM", "Swim is 9:30 — 11.",
-      "Party is 6 PM — 8.", "At 6 PM — 3, maybe 4 people will arrive.", "Gate 8 — 6:30 PM start", "Dinner at 6 p.m. — 8 guests.", "Done by 6 PM — 3 events moved."]) {
+      "Party is 6 PM — 8.", "At 6 PM — 3, maybe 4 people will arrive.", "Gate 8 — 6:30 PM start", "Dinner at 6 p.m. — 8 guests.", "Done by 6 PM — 3 events moved.",
+      // Round three: what " to " once read as a range is held as well, and days, months, noon and midnight count.
+      "Swim 9:30 — 10:15.", "6 — 8 PM works.", "from 6 — 8 PM", "Gate:8 — 6:30 PM departure.", "between 5 — 6 PM", "Today:\n5 — 6 PM swim",
+      "Swim moved to 4:30 — 2 PM pickup stays.", "Camp runs Monday — Friday.", "Away Nov 12 — Nov 14.", "June — August", "noon — 1 PM", "Open 9 AM — noon.",
+      "Away the 5th — 7th.", "Tickets are $5 — $10.", "Down 50% — 60% today."]) {
       const r = check(text);
       expect(r.hits).toMatchObject([{ rule: "dash", result: "refuse" }]);
       expect(r.fixed).toBe(text);                                     // never ", " or " to ": either could change what it says
@@ -77,6 +81,7 @@ describe("the rules", () => {
     }
     expect(RANGE_WHY).toBe("say it without the dash, as a range in words if it is one");
     expect(check("Swim moved to 4:30 — that works.").fixed).toBe("Swim moved to 4:30, that works.");   // a time against words
+    expect(check("It's Friday — swim day.").fixed).toBe("It's Friday, swim day.");                 // a day against words
     expect(whyOf({ rule: "dash", result: "fix" })).toBe("no em dashes");
     expect(whyOf({ rule: "nonsense", result: "refuse" })).toBe("a message rule");
   });
@@ -97,16 +102,24 @@ describe("the rules", () => {
     expect(linkHost("https://a@b@Example.COM:8443/x#frag")).toBe("https://example.com/…");
     expect(linkHost("http://example.com")).toBe("http://example.com");
     expect(linkHost("https://[::1]:80/x")).toBe("https://[::1]/…");
-    expect(linkHost("https://example.com/a?b=1,")).toBe("https://example.com/…,");      // a sentence's own mark stays
-    expect(linkHost("https://example.com\\@evil.example/x")).toBe("https://example.com/…");
-    for (const bad of ["https://", "https://user:secret@", "https://exa%mple.com/x", "https://bücher.example/x", "https://ex ample.com", "https://example.com:port/x"])
+    expect(linkHost("https://example.com\\@evil.example/x")).toBe("https://evil.example/…");   // the authority runs to the first slash
+    for (const bad of ["https://", "https://user:secret@", "https://exa%mple.com/x", "https://bücher.example/x", "https://ex ample.com", "https://example.com:port/x",
+      "https://example.com,", "https://h\\SECRET"])
       expect(linkHost(bad)).toBe("a link");
+    // Round three: nothing after the host comes back, parentheses don't end a link, and the scheme is any case.
+    for (const tail of ["__", "~~", "!!", "\"x\"", "'x'", "[x]", "x)", "x.", "x,"])
+      expect(linkHost(`https://example.com/private?token=${tail}`)).toBe("https://example.com/…");
+    expect(hostsOnly("See https://user:p(ss)@example.com/private?key=abc now.")).toBe("See https://example.com/… now.");
+    expect(hostsOnly("See https://en.wikipedia.org/wiki/Foo_(bar)?token=X now.")).toBe("See https://en.wikipedia.org/… now.");
+    expect(hostsOnly("See HTTPS://user:pw@Host.example/x?key=1 now.")).toBe("See https://host.example/… now.");
+    expect(hostsOnly("See Https://example.com/reset?token=X, then.")).toBe("See https://example.com/… then.");
     // The window's edges never cut into a link: it comes out whole, as its host.
-    const t = "Call https://user:secret@example.com:8443/reset?token=abc today.";
-    for (let from = 0; from < t.length; from++)
-      for (const to of [from + 1, from + 9, t.length]) expect(hostsOnly(t, from, to)).not.toMatch(/user|secret|8443|reset|token/);
-    expect(hostsOnly(t, 10, 20)).toBe("https://example.com/…");
-    expect(around(t, 30, 40)).toBe("https://example.com/… today.");
+    for (const t of ["Call https://user:secret@example.com:8443/reset?token=abc today.", "Call HTTPS://user:p(se)cret@example.com:8443/reset?token=abc__ today."]) {
+      for (let from = 0; from < t.length; from++)
+        for (const to of [from + 1, from + 9, t.length]) expect(hostsOnly(t, from, to)).not.toMatch(/user|secret|se\)|8443|reset|token|abc/);
+      expect(hostsOnly(t, 10, 20)).toBe("https://example.com/…");
+      expect(around(t, 30, 40)).toStartWith("https://example.com/… to");
+    }
   });
 
   test("a verdict: refuse beats fix, fix beats can't tell", () => {

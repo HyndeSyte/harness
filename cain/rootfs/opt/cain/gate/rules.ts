@@ -6,12 +6,12 @@
 // specialist's tests, kept equal to this file by cain/tests/gate-cases.json.
 //
 //   dash     an em dash                    fix: ", " (removed at a line's start or end,
-//                                          or before a stop; " to " only in a confirmed
-//                                          clock range), never inside code or a link.
-//            One with a number right after it, and a number or a clock time right
-//            before it, that isn't a confirmed clock range ("2026" and "2027", "Room 4"
-//            and "5", "6 PM" and "8") could be a range or a list: refuse, to be said
-//            without it (a writer that's never refused keeps it as it is, flagged)
+//                                          or before a stop), never " to ", and never
+//                                          inside code or a link. One with a number right
+//            on both sides (a digit, a clock time, a day or a month by name, noon or
+//            midnight: "2026" and "2027", "6 PM" and "8", "Monday" and "Friday") could
+//            be a range or a list: refuse, to be said without it (a writer that's never
+//            refused keeps it as it is, flagged)
 //   app      "the add-on", "Cain's add-on", "Harness add-on", "Settings > Add-ons" and
 //            the like (also "addon" and the specialist's escaped "add\-on"; plural and
 //            possessive)                   fix: "App", "Apps", "App's". A bare "add-on"
@@ -86,20 +86,19 @@ export function around(text: string, at: number, end: number, n = 60): string {
 }
 
 // A link as its scheme and host alone, with "/…" when anything else was cut: never a user
-// name, password, port, path, query or fragment ("https://github.com/…"). One whose host
-// isn't a plain name or address is "a link". A sentence's own marks after it stay.
-const LINK = /https?:\/\/[^\s<>()]+/g;
-const TRAIL = /[.,;:!?'"’”*_~\]]+$/;
-const HOST = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(:\d*)?$/;
+// name, password, port, path, query or fragment ("https://github.com/…"). A link runs to the
+// next space or angle bracket, parentheses included (a user name can hold them), and its
+// scheme may be in any case. Its host is what follows the authority's last "@", less any
+// port; one that isn't a plain name or address is "a link". Nothing after the host comes
+// back, not even a sentence's own marks.
+const LINK = /https?:\/\/[^\s<>]+/gi;
+const HOST = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(?::\d*)?$/;
 export function linkHost(link: string): string {
-  const trail = TRAIL.exec(link)?.[0] ?? "";
-  const url = link.slice(0, link.length - trail.length);
-  const m = /^(https?:\/\/)([^/?#\\]*)/.exec(url);
-  const auth = m?.[2] ?? "", at = auth.lastIndexOf("@");
-  const h = m ? HOST.exec(auth.slice(at + 1)) : null;
-  if (!m || !h) return `a link${trail}`;
-  const cut = at >= 0 || h[2] !== undefined || url.length > m[0].length;
-  return `${m[1]}${h[1].toLowerCase()}${cut ? "/…" : ""}${trail}`;
+  const m = /^(https?:\/\/)([^/?#]*)/i.exec(link);
+  const auth = m?.[2] ?? "";
+  const h = m ? HOST.exec(auth.slice(auth.lastIndexOf("@") + 1)) : null;
+  if (!m || !h) return "a link";
+  return `${m[1].toLowerCase()}${h[1].toLowerCase()}${link.length > m[1].length + h[1].length ? "/…" : ""}`;
 }
 
 // text[from, to) with each link as linkHost has it. A link that runs past either end of the
@@ -121,38 +120,30 @@ export function hostsOnly(text: string, from = 0, to = text.length): string {
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // -- dash ----------------------------------------------------------------------------
-// " to " only in a confirmed clock range:
-//   - a clock time on both sides (a colon, or AM or PM): 9:30 to 10:15, 6 PM to 8 PM;
-//   - a bare hour, then a time with AM or PM, the hour starting the text or a line, or
-//     right after one of from, between, at, by, around, about, until, till, a colon after
-//     a word, or an opening bracket: "6 to 8 PM", "from 6 to 8 PM", "Swim: 5 to 6 PM",
-//     "(5 to 6 PM)". Never after a period or a comma ("Sat. 5", "Thursday, 12" are dates,
-//     "No. 5" a number), and a bare number on the right is never an hour.
-// Any other em dash with a number right after it, and a number or a clock time right
-// before it, is held: ", " could make a range a list ("2026, 2027", "6 PM, 8"), and " to "
-// a list a range ("6 PM to 3, maybe 4 people"). Every other em dash gets ", " or goes: a
-// clock time against words is no range ("Swim moved to 4:30, that works").
+// An em dash is never read as "to": rewriting one into a range changed what messages said,
+// round after round. One with a number right on both sides is held instead, since ", "
+// could make a range a list and " to " a list a range. A number here is a digit; before the
+// dash also a clock time ending in AM or PM, an ordinal or a percentage; after it also a
+// currency sign and its digits; and on either side a day or a month by name (full or
+// short, any case, with or without a period), noon or midnight: "2026" and "2027", "6 PM"
+// and "8", "Monday" and "Friday", "Nov 12" and "Nov 14", "noon" and "1 PM". Every other em
+// dash gets ", " or goes. The spaces around it, any but a new line (the Unicode ones too), go
+// with it, and so does another dash with only spaces between.
+const DASH = new RegExp("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*\\u2014+)+[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*", "g");
 const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
 const CLOCK = `(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})`;
-const CLOCK_END = new RegExp(`(?<![\\d:.])${CLOCK}$`);
-const CLOCK_START = new RegExp(`^${CLOCK}(?![A-Za-z0-9:])`);
-const MERIDIEM_START = new RegExp(`^\\d{1,2}(?::\\d{2})?${MERIDIEM}(?![A-Za-z0-9])`);
-const WHEN = "(?:[Ff]rom|[Bb]etween|[Aa]t|[Bb]y|[Aa]round|[Aa]bout|[Uu]ntil|[Tt]ill)";
-const HOUR_LEFT = new RegExp(`(?:(?:^|\\n)[ \\t]*|(?<![A-Za-z])${WHEN}[ \\t]+|(?<!\\d):[ \\t]*|[(\\[][ \\t]*)\\d{1,2}$`);
-function clockRange(left: string, right: string): boolean {
-  return (CLOCK_END.test(left) && CLOCK_START.test(right)) || (MERIDIEM_START.test(right) && HOUR_LEFT.test(left));
-}
+const NAMES = "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)\\.?";
+const NUMBER_BEFORE = new RegExp(`(?:\\d(?:st|nd|rd|th|%)?|(?<![\\d:.])${CLOCK}|(?<![A-Za-z])${NAMES})$`, "i");
+const NUMBER_AFTER = new RegExp(`^(?:[$€£]?\\d|${NAMES}(?![A-Za-z]))`, "i");
 
 // Each em dash and what goes in its place; null: it stays, and the writer says it without it.
 function dashes(text: string, seen: string): { at: number; end: number; put: string | null }[] {
   const out: { at: number; end: number; put: string | null }[] = [];
-  for (const m of seen.matchAll(/[ \t]*—+[ \t]*/g)) {
+  for (const m of seen.matchAll(DASH)) {
     const at = m.index!, end = at + m[0].length;
-    const left = text.slice(0, at), right = text.slice(end);
     const before = at === 0 ? "\n" : text[at - 1], after = end >= text.length ? "\n" : text[end];
     let put: string | null = ", ";
-    if (clockRange(left, right)) put = " to ";                                    // 9:30 to 10:15
-    else if (/\d/.test(after) && (/\d/.test(before) || CLOCK_END.test(left))) put = null;   // a range or a list
+    if (NUMBER_BEFORE.test(text.slice(0, at)) && NUMBER_AFTER.test(text.slice(end))) put = null;   // a range or a list
     else if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
     else if (/[,;:]/.test(before)) put = " ";
     out.push({ at, end, put });
@@ -292,8 +283,8 @@ export const WHY: Record<Rule, string> = {
   machine: "no shas, job ids, ISO times or Discord ids; say it as people say it",
   button: "name only a button the message has",
 };
-// The same for one hit: an em dash that's held stands between two numbers, or a time and a
-// number, and may or may not be a range.
+// The same for one hit: an em dash that's held stands between two numbers, times or dates,
+// and may or may not be a range.
 export const RANGE_WHY = "say it without the dash, as a range in words if it is one";
 export function whyOf(h: { rule: string; result?: string }): string {
   if (h.rule === "dash" && h.result === "refuse") return RANGE_WHY;
