@@ -3,8 +3,8 @@
 ## 0.11.0
 
 - Ship cards now say what your tap installs ("Ship Cain 0.11.0?", or that nothing installs), then one line from Cain on what you'll notice.
-- Under it, a line from GitHub: the change's title, how big it is, the parts that matter most, and whether its checks passed. A change whose checks failed gets no card.
-- The last line is the outside review's verdicts as the review service recorded them, for a review of the change as it is now, or "No outside review attached." Cain's own words on the card can't claim checks or a review.
+- Under it, a line from GitHub: how big the change is, the parts that matter most, and whether its checks passed. A change whose checks failed gets no card.
+- The last line is the outside review's verdicts as the review service recorded them, for a review of the change as it is now, with a note that the reviewers read Cain's summary of it, not the code; or "No outside review attached." Cain's own words on the card can't speak of checks or reviews.
 - When Cain tells you work was reviewed, his Reviewed line is the review service's own, word for word.
 - Cards and Cain's messages no longer show record codes like P64: things are named by what they do.
 - After this update the App reads back over your DM once more with the new check, posting nothing, and Cain files what it found. Nothing for you to do.

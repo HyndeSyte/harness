@@ -69,9 +69,9 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
    that expose a private email). Message: `<App> <version>: <what, in a line>`.
 6. Push the branch and open a pull request into `main`. The description follows the
    template's four sections: what changed, how it was tested, what is not verified, and
-   anything Dane must do (for example a new option to switch on). Its title is quoted
-   on Dane's Ship card as GitHub has it: `<App> <version>: <what he'll notice>`, in plain
-   words, with no em dashes, shas or ids.
+   anything Dane must do (for example a new option to switch on). Its title,
+   `<App> <version>: <what he'll notice>`, is plain words with no em dashes, shas or ids.
+   Dane's Ship card doesn't show it: the link writes every line there but Cain's own.
 7. Wait for the `pytest`, `bun` and `pr` checks on the pull request to pass. Fix until
    they do.
 8. Never merge, never push `main`, never force-push. GitHub refuses it anyway: shipping
@@ -89,15 +89,15 @@ commit the card was for (its full head sha). The link builds that card itself
 (`cain/rootfs/opt/cain/link/core.ts`), so what it says comes from code: its question
 names each App and version the tap installs (each App's `config.yaml` read at that very
 head and at the pull request's base; "Ship it?" when any of it can't be read); a line
-from GitHub gives the pull request's title (as plain words, left out if it claims checks
-or a review, or carries a record code), its commit and file counts, the parts that matter
-most, and its checks, read the way the landing reads them, each required check's latest
+from GitHub gives its commit and file counts, the parts that matter most, and its checks
+(the pull request's title isn't shown: free text can't pose as the link's lines), read the way the landing reads them, each required check's latest
 runs in one whole answer (a check that failed or hasn't run yet refuses the card; a pull
 request already merged at that head, once main is seen to have it, says "Already in main,
 so Ship only installs it."); and its last line is the review service's own Reviewed line for the review Cain
-names, which must be a review of that very pull request and head ("No outside review
+names, which must be a review of that very pull request and head, followed by "The
+reviewers read Cain's summary of the change, not the code." ("No outside review
 attached." when he names none). Cain's own line says only what Dane will notice, on one
-line, and checks or review claims in it are refused. No card shows a record code like
+line, with no check, test, build or CI words and no review, verdict or AI names. No card shows a record code like
 P64: the item stays as data.
 
 On that tap Cain's link lands it itself

@@ -27,13 +27,14 @@ describe("RELEASING.md", () => {
     for (const must of ["The link builds that card itself", "names each App and version the tap installs", "read at that very head and at the pull request's base",
       "read the way the landing reads them", "a check that failed or hasn't run yet refuses the card", "\"Already in main, so Ship only installs it.\"", "each required check's latest runs in one whole answer",
       "the review service's own Reviewed line for the review Cain names", "must be a review of that very pull request and head",
-      "\"No outside review attached.\"", "Cain's own line says only what Dane will notice", "No card shows a record code"])
+      "\"No outside review attached.\"", "Cain's own line says only what Dane will notice", "No card shows a record code",
+      "\"The reviewers read Cain's summary of the change, not the code.\"", "the pull request's title isn't shown"])
       expect(flat).toContain(must);
     expect(flat).not.toContain("finished before the head commit");
     const build = section(releasing, "## Build (a branch and a pull request)").replace(/\s+/g, " ");
     expect(build).toContain("gets an outside review of the diff through his review service");
     expect(build).not.toContain("that CI passed, and how it was reviewed");
-    expect(build).toContain("Its title is quoted on Dane's Ship card as GitHub has it");
+    expect(build).toContain("Dane's Ship card doesn't show it");
   });
 
   test("a section says what happens when the connector lapses, with no report-back tap", () => {
@@ -95,7 +96,7 @@ describe("Cain's rules", () => {
     const flat = build.replace(/\s+/g, " ");
     expect(build).toContain('`/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he\'ll notice, in one line>"`');
     for (const must of ["through the review service", "Your line says only what he'll notice", "the question (which Apps and versions the tap installs)",
-      "whether its checks passed", "that review's Reviewed line", "Leave CI, checks and review claims out of your words: the link refuses them",
+      "whether its checks passed", "that review's Reviewed line", "Your line holds no check, test, build or CI words and no review, verdict or AI names: the link refuses them",
       "a check failed or hasn't run yet", "a review of another head", "A new head needs a new review of it and a new Ship card"])
       expect(flat).toContain(must);
     expect(flat.indexOf("through the review service")).toBeLessThan(flat.indexOf("keeper.sh ship --item"));
