@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.0
+
+- Ship cards now say what your tap installs ("Ship Cain 0.11.0?", or that nothing installs), then one line from Cain on what you'll notice.
+- Under it, a line from GitHub: the change's title, how big it is, the parts that matter most, and whether its checks passed. A change whose checks failed gets no card.
+- The last line is the outside review's verdicts as the review service recorded them, for a review of the change as it is now, or "No outside review." Cain's own words on the card can't claim checks or a review.
+- When Cain tells you work was reviewed, his Reviewed line is the review service's own, word for word.
+- After this update the App reads back over your DM once more with the new check, posting nothing, and Cain files what it found. Nothing for you to do.
+
 ## 0.10.0
 
 - The checks on the words that reach you are on now. "add-on" is fixed as it goes out. Anything else they catch is held back for Cain to rewrite first: an em dash, a list cut short with "and 3 more", a commit or job id, or a button the message doesn't have.
