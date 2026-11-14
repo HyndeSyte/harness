@@ -135,8 +135,9 @@ title, how many commits and files it has, whether it touches the parts that matt
 (Cain's link, his hooks, permissions or rules, Ship and Stop, GitHub's workflows, an
 App's image, the release rules), and whether its checks passed; a change whose checks
 failed gets no card. The last line is the outside review's verdicts as the review
-service recorded them, for a review of the change as it is now, or "No outside review."
-Cain's own line says only what you'll notice.
+service recorded them, for a review of the change as it is now, or "No outside review
+attached." Cain's own line says only what you'll notice. Cards and Cain's messages never
+show record codes like P64.
 
 Both keys are kept by the App and left out of Home Assistant's backups. Cain's tools
 are barred from them, and once his session runs as its own user (the next step) he

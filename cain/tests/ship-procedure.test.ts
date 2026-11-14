@@ -24,10 +24,12 @@ describe("RELEASING.md", () => {
 
   test("the Ship card's words come from code (0.11.0), and a handed-over pull request is reviewed by the service first", () => {
     const flat = ship.replace(/\s+/g, " ");
-    for (const must of ["The link builds that card itself", "names each App and version the tap installs", "read the way the landing reads them",
-      "a check that failed or hasn't run yet refuses the card", "the review service's own Reviewed line for the review Cain names",
-      "refused if that review finished before the head commit", "\"No outside review.\"", "Cain's own line says only what Dane will notice"])
+    for (const must of ["The link builds that card itself", "names each App and version the tap installs", "read at that very head and at the pull request's base",
+      "read the way the landing reads them", "a check that failed or hasn't run yet refuses the card", "\"Already in main.\"",
+      "the review service's own Reviewed line for the review Cain names", "must be a review of that very pull request and head",
+      "\"No outside review attached.\"", "Cain's own line says only what Dane will notice", "No card shows a record code"])
       expect(flat).toContain(must);
+    expect(flat).not.toContain("finished before the head commit");
     const build = section(releasing, "## Build (a branch and a pull request)").replace(/\s+/g, " ");
     expect(build).toContain("gets an outside review of the diff through his review service");
     expect(build).not.toContain("that CI passed, and how it was reviewed");
@@ -94,7 +96,7 @@ describe("Cain's rules", () => {
     expect(build).toContain('`/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he\'ll notice, in one line>"`');
     for (const must of ["through the review service", "Your line says only what he'll notice", "the question (which Apps and versions the tap installs)",
       "whether its checks passed", "that review's Reviewed line", "Leave CI, checks and review claims out of your words: the link refuses them",
-      "a check failed or hasn't run yet", "a review that finished before the head commit", "A new head needs a new review of it and a new Ship card"])
+      "a check failed or hasn't run yet", "a review of another head", "A new head needs a new review of it and a new Ship card"])
       expect(flat).toContain(must);
     expect(flat.indexOf("through the review service")).toBeLessThan(flat.indexOf("keeper.sh ship --item"));
     expect(jobs).not.toContain("CI passed. Reviewed:");
@@ -118,5 +120,15 @@ describe("Cain's rules", () => {
     for (const must of ["the link\nputs it on the newest plain message", "never on an ask, a Ship card or a specialist's card",
       "none of the newest 5 bot messages carries a Stop", "The moving Stop comes off meanwhile", "never ask him to"])
       expect(stop).toContain(must);
+  });
+
+  test("no record codes to him (0.11.0): things named by what they do, cards without labels, the gate holds the codes", () => {
+    const flat = rules.replace(/\s+/g, " ");
+    for (const must of ["Never show him a record code", "go with it as data, never in its words",
+      "A record code (an item id your record has, like P64, or \"P08 Q2\") is held like your other words", "\"head\": \"<its full head sha>\""])
+      expect(flat).toContain(must);
+    expect(flat).not.toContain("its text starts with them");
+    expect(rules).not.toMatch(/"P\d+ Q\d+: [A-Z]/);                       // no example card's words start with a label
+    expect(rules).not.toContain("<id> <Q id>:");
   });
 });

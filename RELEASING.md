@@ -87,14 +87,17 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
 Dane's go is his tap on Cain's Ship card for that one pull request, at the one head
 commit the card was for (its full head sha). The link builds that card itself
 (`cain/rootfs/opt/cain/link/core.ts`), so what it says comes from code: its question
-names each App and version the tap installs (from the `version:` lines the pull
-request's `config.yaml` patches add); a line from GitHub gives the pull request's title,
-its commit and file counts, the parts that matter most, and its checks, read the way the
-landing reads them (a check that failed or hasn't run yet refuses the card); and its last
-line is the review service's own Reviewed line for the review Cain names, refused if
-that review finished before the head commit ("No outside review." when he names none).
-Cain's own line says only what Dane will notice, and checks or review claims in it are
-refused.
+names each App and version the tap installs (each App's `config.yaml` read at that very
+head and at the pull request's base; "Ship it?" when any of it can't be read); a line
+from GitHub gives the pull request's title (as plain words, left out if it claims checks
+or a review), its commit and file counts, the parts that matter most, and its checks,
+read the way the landing reads them, every page of them (a check that failed or hasn't
+run yet refuses the card; a pull request already merged at that head says "Already in
+main."); and its last line is the review service's own Reviewed line for the review Cain
+names, which must be a review of that very pull request and head ("No outside review
+attached." when he names none). Cain's own line says only what Dane will notice, on one
+line, and checks or review claims in it are refused. No card shows a record code like
+P64: the item stays as data.
 
 On that tap Cain's link lands it itself
 (`cain/rootfs/opt/cain/link/merge.ts`), with the deploy key only it holds:
