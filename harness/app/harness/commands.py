@@ -110,7 +110,9 @@ def card_stopped(ledger: Ledger, chat_id: int, db) -> int:
 
 
 def _on_stopped_undo(ledger: Ledger, kind: str, key: str, undo: Callable[[str, str], str] | None) -> str:
-    """His tap on the card of an Undo he tapped while stopped. Do it now carries out that Undo."""
+    """His tap on the card of an Undo he tapped while stopped. Do it now carries out that Undo: it's
+    asked for (undo_state 'requested') in the same transaction as the card's answer, so a restart
+    right after can't lose it, and its own module finishes it, reading each event first."""
     if _dropped(ledger, key):
         return "That was dropped, so nothing was done."
     if not _undo_waiting(ledger.db, key):
@@ -128,7 +130,10 @@ def _on_stopped_undo(ledger: Ledger, kind: str, key: str, undo: Callable[[str, s
     with ledger.tx() as db:
         ledger.event("stopped_redone", {"job": key}, db=db)
         db.execute("DELETE FROM meta WHERE key=?", (UNDO_WORDS + key,))
-    return undo(which, target) if undo is not None else "Nothing changed."
+        for pid in target.split():
+            db.execute(f"UPDATE {_UNDO_TABLES[which]} SET undo_state='requested', updated_at=?"
+                       " WHERE proposal_id=? AND undo_state='open'", (iso(ledger.now()), pid))
+    return undo(which, target) if undo is not None else "Undoing it now."
 
 
 def on_stopped_choice(ledger: Ledger, kind: str, job_id: str,

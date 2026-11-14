@@ -336,6 +336,7 @@ WHY = {
     "family_add_impossible": "Family refused it",
     "family_unknown": "not confirmed yet, still checking",
     "family_not_added": "it didn't go through",
+    "family_not_ours": "another event was at its place on Family",
     "not_landed": "it didn't go through",
     "put_back": "half of it went through, so that was put back",
     "unknown": "not confirmed yet, still checking",

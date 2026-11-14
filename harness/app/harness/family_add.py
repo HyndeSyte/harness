@@ -11,7 +11,8 @@ Everything here runs on the controller's thread, after the tick's commands,
 so a /stop in the same batch as a tap wins. A write is recorded as "sending"
 before the request and its result after it, so a crash in between is never
 silent. "Added" is said only once a read of the event by its uid finds it there: as written is the
-usual receipt, and reading differently is said as that.
+usual receipt, and reading differently is said as that. Another event at its address, under
+another id, isn't the add: said plainly, with no Undo.
 
 An outcome no answer settled (a lost answer, a server error, a restart mid-request), or a read
 after the write that doesn't find it, is settled by reading the event by its uid, never handed to
@@ -20,10 +21,12 @@ stands in the way, at the same address and only where nothing is, so it can neve
 and not there after that is said plainly. A read that can't tell is read again each minute for
 the first hour, every 15 minutes until a day has passed, then hourly; it's said once after an
 hour as not confirmed yet, told once it's known, and once the event is over or a week has passed,
-said once as not confirmed and read no more. The first read of a write whose answer was lost comes
-a minute after it was sent, so a late write shows before any second one. An undo cut short the
-same way is settled by the same read: gone is undone, and still there as written is deleted once
-more, at most.
+said once as not confirmed and read no more, with its Undo when iCloud answered the write with a
+version. The first read of a write whose answer was lost comes a minute after it was sent, so a
+late write shows before any second one. An undo cut short the same way is settled by the same
+read: gone is undone, and still there as written is deleted once more, at most. No answer there,
+iCloud out of reach or a server error, is read again; only a refusal is said. While stopped,
+nothing here is read, written or said: it waits for Turn back on.
 
 Plain code checks every proposal. An impossible one (over 24 hours, over a year
 ahead, or text the card couldn't show exactly) is refused in words. Anything
@@ -81,7 +84,7 @@ READ_AGAIN = timedelta(minutes=1)
 READ_LATER = timedelta(minutes=15)
 READ_SLOW = timedelta(hours=1)
 GIVE_UP_AFTER = timedelta(days=7)
-MAX_READS_PER_PASS = 10               # written adds read back in one pass, oldest first: a backlog waits its turn
+MAX_READS_PER_PASS = 10               # adds read in one pass, oldest first; it counts rows, not requests
 STILL_CHECKING_AFTER = timedelta(hours=1)   # reads that can't tell, this long and this many, are
 STILL_CHECKING_PASSES = 3                   # said once as not confirmed yet
 
@@ -110,15 +113,17 @@ PROBLEM_WORDS = {
     "failed": "Family calendar: the last write failed",
     "unconfirmed": "Family calendar: reads couldn't tell whether the last add went in",
     "undo_unconfirmed": "Family calendar: reads couldn't tell whether the last undo went through",
+    "not_ours": "Family calendar: the last add found another event at its place",
 }
 
 
 UNDONE = "<b>Undone.</b> That event is off the Family calendar."
 CHANGED = ("<b>Not undone.</b> The event changed since I wrote it, so someone may have edited it. "
            "I left it alone.")
-STOPPED_UNDO = ("I'm stopped, so I didn't undo that. It's still on the Family calendar, and it comes back "
-                "as its own card after you turn me back on.")
+STOPPED_UNDO = "I'm stopped, so I didn't undo that. It comes back as its own card after you turn me back on."
 NOT_ADDED = "<b>Not added.</b> That didn't go through, so nothing was added."
+NOT_OURS = ("<b>Not added.</b> Another event is at its place on the Family calendar, not the one I wrote, "
+            "so I left it alone.")
 
 
 def _settling(row) -> dict:
@@ -164,6 +169,13 @@ def _detail(out: caldav.Outcome) -> str:
     if not out.status:
         return "I couldn't reach iCloud."
     return "iCloud had a server error." if out.status >= 500 else "iCloud turned it down."
+
+
+def _turned_down(out: caldav.Outcome) -> bool:
+    """An answer that turns a request down: the password, the address, credentials not set, or a
+    4xx. No answer, iCloud out of reach or a server error says nothing about the event."""
+    return out.kind in ("auth", "no_credentials", "mismatch") or (
+        out.kind == "failed" and out.status is not None and 400 <= out.status < 500)
 
 
 def _said(value: str) -> str:
@@ -740,6 +752,16 @@ class FamilyAdd:
             return "Undoing it now."
         return "Nothing changed."
 
+    def undo_asked(self, target: str) -> str:
+        """His Do it now on an Undo he tapped while stopped. commands has already asked for it, in
+        the same transaction as the card's answer, so a restart right then can't lose it: run_pending
+        carries it out, reading the event first. Here the count starts over, as at any Undo."""
+        if self.stopped():
+            return ""                          # a /stop came in with the tap: it waits, and says so
+        with self.ledger.tx() as db:
+            self._setback(db, "you undid an event")
+        return "Undoing it now."
+
     # -- each tick ----------------------------------------------------------------------
     def run_pending(self, *, paused: bool, held: bool = False) -> None:
         self._check_authority()
@@ -747,18 +769,20 @@ class FamilyAdd:
         self._fail_orphans()
         for p in self._approved():
             self._execute(p, paused)
-        # Each read is a request to iCloud on this thread, so a pass reads at most
-        # MAX_READS_PER_PASS, the longest waiting first; a read moves its add to the back.
-        now = self.ledger.now()
-        reads = 0
-        for row in self.ledger.db.execute("SELECT * FROM family_adds WHERE state='written'"
-                                          " ORDER BY updated_at, rowid").fetchall():
-            if reads >= MAX_READS_PER_PASS:
-                break
-            if read_due(self._read_state(row), now):
-                self._read_back(row)
-                reads += 1
         if not paused:
+            # Each read is a request to iCloud on this thread, so a pass reads at most
+            # MAX_READS_PER_PASS rows (rows, not requests: settling one can also write it once
+            # more), the longest waiting first; a read moves its add to the back. While stopped
+            # nothing is read, written or said: an add's reads wait for Turn back on.
+            now = self.ledger.now()
+            reads = 0
+            for row in self.ledger.db.execute("SELECT * FROM family_adds WHERE state='written'"
+                                              " ORDER BY updated_at, rowid").fetchall():
+                if reads >= MAX_READS_PER_PASS:
+                    break
+                if read_due(self._read_state(row), now):
+                    self._read_back(row)
+                    reads += 1
             # What no answer settled is read the same way (_settle), within the same allowance.
             for row in self.ledger.db.execute("SELECT * FROM family_adds WHERE state='settling'"
                                               " OR undo_state='settling' ORDER BY updated_at, rowid").fetchall():
@@ -935,25 +959,24 @@ class FamilyAdd:
     def _read_back(self, row, seen: tuple | None = None) -> None:
         """He hears "Added" once a read of the event by its uid finds it there: ours, on the Family
         calendar, with its title, start, end and place is the usual receipt, and there but reading
-        differently is said as that. Not there, a minute or more after it was written, is settled
+        differently is said as that. Another event at its address, under another id, isn't the add:
+        said plainly, with no Undo. Not there, a minute or more after it was written, is settled
         like any add no answer confirmed: written once more at the same address, only where nothing
-        is, and not there after that is said plainly. A read that can't tell is read again on the
-        schedule (_not_yet). `seen`: a read just made, (out, ics)."""
+        is, and not there after that is said plainly; while stopped, it waits instead. A read that
+        can't tell is read again on the schedule (_not_yet). `seen`: a read just made, (out, ics)."""
         p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (row["proposal_id"],)).fetchone()
         params = json.loads(p["params_json"])
         out, ics = seen if seen is not None else self.client.fetch(self.client.href_for(row["uid"]))
         moment = self.ledger.now()
-        now = iso(moment)
         state = self._read_state(row)
         if out.kind == "gone":
-            if moment - datetime.fromisoformat(row["created_at"]) < READ_AGAIN:
-                # A calendar can take a moment to show a write: not missing yet, read again.
-                state["read_at"] = now
-                with self.ledger.tx() as db:
-                    db.execute("UPDATE family_adds SET settle_json=?, updated_at=? WHERE proposal_id=?"
-                               " AND state='written'", (json.dumps(state), now, row["proposal_id"]))
+            blocked = self._blocked({**dict(p), "state": "approved"}, params, self.stopped())
+            if moment - datetime.fromisoformat(row["created_at"]) < READ_AGAIN \
+                    or (blocked is not None and blocked[0] == "stopped"):
+                # A calendar can take a moment to show a write: not missing yet. Or stopped: nothing
+                # is written or said until he turns it back on. Read again.
+                self._read_later(row, state)
                 return
-            blocked = self._blocked({**dict(p), "state": "approved"}, params, False)
             if not state.get("retried") and blocked is None:
                 self._once_more(row, p, params, state)
             else:
@@ -962,6 +985,10 @@ class FamilyAdd:
         if out.kind != "ok":
             self._not_yet(row, state, "added")
             return
+        if caldav._uids(ics) != {row["uid"]}:
+            self._not_ours(row, params)
+            return
+        now = iso(moment)
         written = _as_written(ics, row["uid"], params)
         with self.ledger.tx() as db:
             cur = db.execute("SELECT state FROM family_adds WHERE proposal_id=?",
@@ -1015,22 +1042,38 @@ class FamilyAdd:
         self._read_back(self.ledger.db.execute("SELECT * FROM family_adds WHERE proposal_id=?",
                                                (row["proposal_id"],)).fetchone())
 
-    def _not_added(self, row, params: dict, blocked: tuple | None) -> None:
-        """Not there, and written once more already or not allowed to be: said plainly."""
+    def _not_added(self, row, params: dict, blocked: tuple | None, *, state: str = "not_added",
+                   words: str = NOT_ADDED, why: str = "a read didn't find it", problem: str = "failed") -> None:
+        """Not there, and written once more already or not allowed to be: said plainly. Also another
+        event at its address (_not_ours), with its own words."""
         now = iso(self.ledger.now())
         with self.ledger.tx() as db:
-            db.execute("UPDATE family_adds SET state='not_added', undo_state='none', settle_json='',"
-                       " updated_at=? WHERE proposal_id=?", (now, row["proposal_id"]))
+            db.execute("UPDATE family_adds SET state=?, undo_state='none', settle_json='',"
+                       " updated_at=? WHERE proposal_id=?", (state, now, row["proposal_id"]))
             db.execute("UPDATE proposals SET state='failed' WHERE id=?", (row["proposal_id"],))
             job = db.execute("SELECT state FROM jobs WHERE id=?", (row["job_id"],)).fetchone()
             if job is not None and job["state"] not in TERMINAL:
                 self.ledger.transition(row["job_id"], "failed", db=db, receipt=json.dumps(
-                    {"reason": "family_not_added", "blocked": blocked[0] if blocked else ""}))
+                    {"reason": f"family_{state}", "blocked": blocked[0] if blocked else ""}))
             else:                                      # it was answered as written: the count was wrong
-                self._setback(db, "an add was written, but a read didn't find it")
-            self._set_problem(db, "failed")
+                self._setback(db, f"an add was written, but {why}")
+            self._set_problem(db, problem)
             self._say(db, self.chat_id, row["job_id"],
-                      f"{NOT_ADDED}\n{render.family_event_text(params, self.tz)}")
+                      f"{words}\n{render.family_event_text(params, self.tz)}")
+
+    def _not_ours(self, row, params: dict) -> None:
+        """A read finds another event at its address, under another id: that isn't the add, so it
+        isn't called added and gets no Undo, and that event is left as it is."""
+        self._not_added(row, params, None, state="not_ours", words=NOT_OURS,
+                        why="a read found another event at its place", problem="not_ours")
+
+    def _read_later(self, row, state: dict) -> None:
+        """Nothing settled by this read: read again on the schedule, with nothing written or said."""
+        now = iso(self.ledger.now())
+        state["read_at"] = now
+        with self.ledger.tx() as db:
+            db.execute("UPDATE family_adds SET settle_json=?, updated_at=? WHERE proposal_id=? AND state=?",
+                       (json.dumps(state), now, row["proposal_id"], row["state"]))
 
     def _ask_again(self, db, job_id: str) -> bool:
         """His tap that turned adds on brings back the message it was for, as if just sent, so its
@@ -1160,9 +1203,13 @@ class FamilyAdd:
                           f"I couldn't confirm yet whether {what} was {verb}; I'm still checking.")
 
     def _unconfirmed(self, row, verb: str, why: str) -> None:
-        """Reads couldn't tell, and the event is over or a week has passed: said once, read no more."""
+        """Reads couldn't tell, and the event is over or a week has passed: said once, read no more.
+        An add iCloud answered as written, with a version, keeps its Undo on that line: Undo's own
+        checks decide what it does (it deletes only the event as it was written)."""
         params, what = self._event_words(row)
         now = iso(self.ledger.now())
+        offer = (verb == "added" and row["state"] == "written" and bool(row["etag"])
+                 and row["undo_state"] == "open")
         with self.ledger.tx() as db:
             if verb == "undone":
                 db.execute("UPDATE family_adds SET undo_state='unknown', settle_json='', updated_at=? WHERE"
@@ -1180,9 +1227,10 @@ class FamilyAdd:
                 self._set_problem(db, "unconfirmed")
             self.ledger.event("family_add_unconfirmed", {"proposal": row["proposal_id"], "verb": verb,
                                                          "why": why}, db=db)
+            buttons, binds = self._undo_button(db, row["proposal_id"]) if offer else (None, None)
             self._say(db, self.chat_id, row["job_id"],
                       f"<b>Not confirmed:</b> reads couldn't tell whether {what} was {verb}, and "
-                      f"{GAVE_UP_WORDS[why]}, so I've stopped reading it.")
+                      f"{GAVE_UP_WORDS[why]}, so I've stopped reading it.", buttons=buttons, binds=binds)
 
     def _settle(self, row) -> None:
         """A write whose outcome no answer gave: a read of the event by its uid."""
@@ -1206,11 +1254,17 @@ class FamilyAdd:
             self._read_back(self.ledger.db.execute("SELECT * FROM family_adds WHERE proposal_id=?",
                                                    (row["proposal_id"],)).fetchone(), seen=(out, ics))
             return
+        if out.kind == "ok" and caldav._uids(ics) != {row["uid"]}:
+            self._not_ours(row, params)                # another event there, under another id
+            return
         if out.kind != "gone":
             self._not_yet(row, state, "added")
             return
-        # Nothing there. Once more, at the same address, only where nothing is.
-        blocked = self._blocked({**dict(p), "state": "approved"}, params, False)
+        # Nothing there. Once more, at the same address, only where nothing is: not while stopped.
+        blocked = self._blocked({**dict(p), "state": "approved"}, params, self.stopped())
+        if blocked is not None and blocked[0] == "stopped":
+            self._read_later(row, state)
+            return
         if not state.get("retried") and blocked is None:
             self._once_more(row, p, params, state)
             return
@@ -1220,7 +1274,9 @@ class FamilyAdd:
         """An undo whose delete no answer settled: gone is undone; still there as written is
         deleted once more (client.undo reads it first), then read. The one more is recorded before
         it's sent, so it's never a second, let alone one a minute. An answer that turns it down (the
-        password, the address, a refusal) settles nothing by waiting: said plainly, Undo offered."""
+        password, the address, a 4xx) settles nothing by waiting: said plainly, Undo offered. No
+        answer that says (iCloud out of reach, a server error, a lost answer) is read again on the
+        schedule: the first delete may have landed, and later passes only read."""
         state = _settling(row)
         now = iso(self.ledger.now())
         if state.get("retried"):
@@ -1235,15 +1291,15 @@ class FamilyAdd:
             if out.kind == "ok":
                 back, _ = self.client.fetch(self.client.href_for(row["uid"]))
                 kind = "ok" if back.kind == "gone" else "unread"
-            elif out.kind in ("unknown", "gone", "changed"):
-                kind = {"gone": "ok", "changed": "changed"}.get(out.kind, "unread")
-            else:
+            elif _turned_down(out):
                 with self.ledger.tx() as db:
                     db.execute("UPDATE family_adds SET settle_json='' WHERE proposal_id=?", (row["proposal_id"],))
                     self._set_problem(db, out.kind)
                 words = FAILED_WORDS.get(out.kind, FAILED_WORDS["failed"]).format(detail=_detail(out))
                 self._reoffer(row, words.replace("Not added", "Not undone"))
                 return
+            else:
+                kind = {"gone": "ok", "changed": "changed"}.get(out.kind, "unread")
         if kind == "unread":
             self._not_yet(row, state, "undone")
             return

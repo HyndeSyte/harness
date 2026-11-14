@@ -2739,3 +2739,122 @@ def test_a_reset_drops_an_add_waiting_for_a_read_without_a_word_or_a_write(on):
     on.advance(minutes=5)
     on.tick()
     assert "PUT" not in on.icloud.methods() and len(on.texts()) == said
+
+
+# -- the D2 re-check: what a read or a stop can't tell is never said (0.23.0) --------------------
+
+@pytest.mark.parametrize("unread", ["unreachable", "server error"])
+def test_an_undo_that_landed_unheard_is_read_again_when_its_read_cant_get_through(on, unread):
+    """The delete lands and its answer is lost, and a minute later iCloud can't be reached, or
+    answers with a server error. That says nothing about the delete: no "Not undone" and no Undo
+    again, only another read once iCloud answers, which finds it gone."""
+    from harness.net import HttpResponse
+    card = on.add_one()
+    on.icloud.drop_response_next = True        # the delete lands; its answer is lost
+    on.press(card, "Undo")
+    assert not on.icloud.family()
+    real = on.icloud.request
+    if unread == "unreachable":
+        on.icloud.down = True
+    else:
+        on.icloud.request = lambda method, url, **kw: (HttpResponse(503) if method in ("PROPFIND", "GET")
+                                                       else real(method, url, **kw))
+    said = len(on.texts())
+    on.advance(minutes=1)
+    on.tick()
+    assert len(on.texts()) == said
+    assert on.ledger.db.execute("SELECT undo_state FROM family_adds").fetchone()[0] == "settling"
+    on.icloud.down, on.icloud.request = False, real
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar." and on.last()[2] is None
+    assert on.icloud.methods().count("DELETE") == 1
+
+
+def test_while_stopped_an_adds_read_writes_nothing_and_says_nothing(on):
+    """Answered ok, then a read finds nothing there, and he taps Stop before the next read: the
+    one more write, and anything said about it, waits for Turn back on."""
+    on.ask()
+    real = on.fa.client.create
+
+    def written_then_gone(*a):
+        out = real(*a)
+        on.icloud.events.clear()               # a read after this finds nothing there
+        return out
+    on.fa.client.create = written_then_gone
+    on.press(on.last(), "Approve")
+    on.fa.client.create = real
+    on.say("/stop")
+    puts, said = on.icloud.methods().count("PUT"), len(on.texts())
+    for _ in range(3):
+        on.advance(minutes=1)
+        on.tick()
+    assert on.icloud.methods().count("PUT") == puts and len(on.texts()) == said
+    on.say("/resume")
+    assert on.icloud.methods().count("PUT") == puts + 1 and len(on.icloud.family()) == 1
+    assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>")
+
+
+def test_do_it_now_on_a_stopped_undo_is_kept_through_a_restart_right_then(on, monkeypatch):
+    """His Do it now is taken, and the process dies before the Undo's own module runs: the Undo was
+    asked for with the card's answer, so the next process carries it out."""
+    from harness import callbacks
+    card = on.add_one()
+    on.say("/stop")
+    on.press(card, "Undo")
+    on.say("/resume")
+    back = next(s for s in reversed(on.bot.sent) if s[2] and "you asked to undo" in s[1])
+
+    def dies(self, which, target):
+        raise Crash()
+    monkeypatch.setattr(callbacks.Callbacks, "_undo_kept", dies)
+    with pytest.raises(Crash):
+        on.press(back, "Do it now")
+    on.start()
+    on.tick()
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar." and not on.icloud.family()
+
+
+def test_another_event_at_its_address_isnt_called_added(on):
+    """A read of its address finds an event under another id: that isn't the add. No "Added" and no
+    Undo for it; said plainly, and that event is left as it is."""
+    on.ask()
+    real = on.fa.client.create
+
+    def written_then_replaced(*a):
+        out = real(*a)
+        path = next(iter(on.icloud.family()))
+        on.icloud.seed(path, on.icloud.events[path][1].replace("UID:hx-", "UID:zz-"))
+        return out
+    on.fa.client.create = written_then_replaced
+    on.press(on.last(), "Approve")
+    _, text, buttons, _ = on.last()
+    assert text.startswith("<b>Not added.</b> Another event is at its place on the Family calendar, not the "
+                           "one I wrote, so I left it alone.\nDentist") and buttons is None
+    assert not any("Added to the Family calendar" in t for t in on.texts())
+    assert on.ledger.db.execute("SELECT state, undo_state FROM family_adds").fetchone()[:] == ("not_ours", "none")
+    assert len(on.icloud.family()) == 1 and "DELETE" not in on.icloud.methods()
+
+
+def test_an_add_reads_never_confirm_keeps_its_undo_on_the_line_that_says_so(on, monkeypatch):
+    """iCloud answered the add with a version, and no read could tell for a week: the line that
+    says so has Undo, and Undo's own checks decide what it does."""
+    monkeypatch.setattr(on.fa.client, "fetch", lambda href: (caldav.Outcome("failed"), ""))
+    on.ask(start="2027-03-02T15:00:00-05:00", end="2027-03-02T16:00:00-05:00")
+    on.press(on.last(), "Approve")
+    on.advance(days=7, minutes=1)
+    on.tick()
+    _, text, buttons, _ = on.last()
+    assert text == ("<b>Not confirmed:</b> reads couldn't tell whether Dentist on Tue Mar 2 was added, and a "
+                    "week has passed, so I've stopped reading it.")
+    assert [t for row in buttons or [] for t, _ in row] == ["Undo"]
+    on.press(on.last(), "Undo")
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar." and not on.icloud.family()
+
+
+def test_a_stopped_undo_says_only_that_it_wasnt_done(on):
+    card = on.add_one()
+    on.say("/stop")
+    on.press(card, "Undo")
+    assert on.texts()[-1] == ("I'm stopped, so I didn't undo that. It comes back as its own card after you "
+                              "turn me back on.")

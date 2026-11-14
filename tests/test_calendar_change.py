@@ -1883,3 +1883,25 @@ def test_undo_of_a_write_a_restart_cut_short_clears_what_it_recorded(r):
     r.advance(minutes=31)
     r.tick()
     assert "came back" not in r.cc.digest_line()
+
+
+def test_do_it_now_on_a_stopped_undo_is_kept_through_a_restart_right_then(r, monkeypatch):
+    """His Do it now is taken, and the process dies before the Undo's own module runs: the Undo was
+    asked for with the card's answer, so the next process carries it out."""
+    from harness import callbacks
+    r.tell(change(dates="2026-11-23"))
+    receipt = r.with_button("Undo")
+    r.say("/stop")
+    r.press(receipt, "Undo")
+    r.say("/resume")
+    card = next(s for s in reversed(r.bot.sent) if s[2] and "you asked to undo" in s[1])
+
+    def dies(self, which, target):
+        raise Crash()
+    monkeypatch.setattr(callbacks.Callbacks, "_undo_kept", dies)
+    with pytest.raises(Crash):
+        r.press(card, "Do it now")
+    r.start()
+    r.cc.bind(r.vault.owner_id())
+    r.tick()
+    assert "Undone" in r.texts()[-1] and ical.unfold(r.body()) == ical.unfold(SERIES)

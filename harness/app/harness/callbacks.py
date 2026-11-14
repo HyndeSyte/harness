@@ -115,11 +115,12 @@ class Callbacks:
         return "Nothing changed."
 
     def _undo_kept(self, which: str, target: str) -> str:
-        """An Undo he tapped while stopped, carried out at his Do it now by its own module."""
+        """An Undo he tapped while stopped, at his Do it now: commands has already asked for it, with
+        the card's answer, and its own module carries it out, reading each event first."""
         if which == "calendar_change" and self.calendar_change is not None:
-            return self.calendar_change.on_choice("calendar_change_undo", target)
+            return "Undoing it now."
         if which == "family_add" and self.family_add is not None:
-            return self.family_add.on_choice("family_add_undo", target)
+            return self.family_add.undo_asked(target)
         return "Nothing changed."
 
     def _keep_rule(self, target: str) -> str:
