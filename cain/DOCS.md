@@ -62,18 +62,20 @@ the App.
 
 Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing hidden
 behind "and 3 more", no commit or job ids or ISO times, and no button named that the
-message (or the card Cain's reply answers) doesn't have. Em dashes and "add-on" are
-fixed as they go out, but one between two numbers, times or dates (a day or a month by
-name, noon and midnight count too), even with brackets, quotes or a line break between,
-is never turned into "to": it's held for Cain to say in words, since "to" or a comma
-could change what it says. Anything else is held back for Cain to rewrite before you
-see it.
+message (or the card Cain's reply answers) doesn't have. "add-on" is fixed as it goes
+out. Every em dash of Cain's is held back for him to rewrite, never fixed: only he
+knows whether he meant a break (a comma or a new sentence) or a range ("to" or
+"through"), and a comma in its place can turn a range into a list. Anything else is
+held back for Cain to rewrite before you see it too.
 If he's held back twice within 10 minutes, his third try goes out as it is, so the
 rules can never silence him, and he hears so. The calendar specialist's cards are
 never held back, since a held approval or Undo would be lost to you: their wording is
-fixed, and Cain hears about anything else. Cain can edit only his own replies. A log on
-the Pi, in Cain's own folder, keeps what the rules caught, as short excerpts in which a
-link is only its site. After an update that changes
+fixed, but an em dash between two numbers, times or dates (a day or a month by name,
+noon and midnight count too, even behind bold, brackets or quotes), or right after a
+link, is left as it is, and Cain hears about anything else. Cain can edit only his own
+replies. A log on the Pi, in Cain's own folder, keeps what the rules caught, as short
+excerpts in which a link of any kind, with "https://" or without, is only its site.
+After an update that changes
 the rules, the App reads back over your DM once with them, posting nothing, and Cain
 files what they found. Nothing for you to do.
 
@@ -102,7 +104,8 @@ stopped notice, which is posted again when it's out of reach, at most once an ho
 10 minutes after the last one once you write. If none is up anywhere, it's posted each
 minute until one is, also when the App can't read whether things are stopped, which it
 counts as stopped. After Turn back on, the notice's own Stop is the only one near the
-bottom until newer messages push it out of reach.
+bottom; once newer messages push it out of reach, the Stop moves down to the newest
+plain message and comes off the notice.
 
 ## Ship
 
