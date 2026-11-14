@@ -660,6 +660,23 @@ describe("one open ask at a time", () => {
     expect(r.last().content).toBe(`The plan is done. ${LINE} Start the build?`);
   });
 
+  test("the review lines coming back between two reads don't lose a held ask: one read decides (ChatGPT's fifth look)", async () => {
+    const r = rig();
+    const LINE = "Reviewed: Gemini, approve.";
+    r.reviews.list = [{ id: "2026-11-11-a", line: LINE, finished_at: new Date(NOV11_8AM - 10 * MIN).toISOString(), pr: null, head: null }];
+    const a = await ask(r, "P08", "Q2");
+    expect((await r.link.ask({ text: `The plan is done. ${LINE} Start the build?`, options: ["Start", "Not now"], item: "P11", question: "Q1" })).status).toBe("held");
+    // The link's first read of the lines finds them unreadable; every later read finds them.
+    const link = r.link as any, read = link.published.bind(link);
+    let reads = 0;
+    link.published = () => (reads++ === 0 ? null : read());
+    await r.tap(snap(r.msg(a)), r.ids(a)[0]);
+    expect((r.state().held ?? []).length).toBe(1);             // unreadable at its one read: it waits, never dropped
+    expect(r.relayed.some((l) => l.includes("wasn't posted"))).toBe(false);
+    await r.link.releaseHeld();                                  // readable now: it goes out
+    expect(r.last().content).toBe(`The plan is done. ${LINE} Start the build?`);
+  });
+
   test("...or when the open one's item closes or moves", async () => {
     const r = rig();
     await ask(r, "P08", "Q2");

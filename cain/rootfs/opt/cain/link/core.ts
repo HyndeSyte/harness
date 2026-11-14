@@ -732,13 +732,18 @@ export class Link {
   // (../gate/cain.ts): a Reviewed line only as the review service gave it (reviewed), on a
   // Ship card no checks or review claimed (shipWords), and never a record code (always).
   private cainWords(point: string, what: string, text: string, ctx: Context,
-                    also: { reviewed?: boolean; shipWords?: boolean } = {}): { text: string; fixed: Hit[] } {
+                    also: { reviewed?: boolean; shipWords?: boolean; published?: Reviewed[] | null } = {}): { text: string; fixed: Hit[] } {
     const w = this.words(point, "cain", text, { ...ctx, refusable: true });
     const cain: CainHit[] = [];
     let published: Reviewed[] | null = null;
     try {
       if (also.shipWords) cain.push(...shipWordsHits(text));
-      if (also.reviewed && claimsReview(text)) { published = this.published(); cain.push(...reviewedHits(text, published)); }
+      // published: the review service's lines as the caller already read them, so a check and
+      // what its result means rest on the same read (a held ask, below); else read now.
+      if (also.reviewed && claimsReview(text)) {
+        published = also.published !== undefined ? also.published : this.published();
+        cain.push(...reviewedHits(text, published));
+      }
       if (mayHaveCode(text)) cain.push(...codesHits(text, this.itemIds()));
     } catch (e) { this.log(`the gate's own rules for Cain failed on a ${point}: ${String(e).slice(0, 80)}`); }
     if (w.refused.length || cain.length) {
@@ -1323,9 +1328,10 @@ export class Link {
   }
 
   // A held ask under today's rules: refused (a Refusal) when its question or an option fails.
-  private recheckHeld(e: Ask): void {
-    const options = e.options.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }).text);
-    this.cainWords("ask", "ask", unlabeled(e.text, e.item, e.question), { rules: AT.cain, buttons: options, known: this.liveLabels() }, { reviewed: true });
+  // published: the review service's lines, read once by the caller for the whole check.
+  private recheckHeld(e: Ask, published: Reviewed[] | null): void {
+    const options = e.options.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true, published }).text);
+    this.cainWords("ask", "ask", unlabeled(e.text, e.item, e.question), { rules: AT.cain, buttons: options, known: this.liveLabels() }, { reviewed: true, published });
   }
 
   private async postAsk(e: Ask): Promise<string> {
@@ -2859,11 +2865,13 @@ export class Link {
       // it goes out (its question and every option): one that fails them is dropped, never
       // retried as it is, and Cain asks again in words that pass. One held only because the
       // review service's lines can't be read just now waits in line for the next sweep (until
-      // its own expiry), since its words may be fine.
-      try { this.recheckHeld(next); }
+      // its own expiry), since its words may be fine. The lines are read once, so the check and
+      // what its result means can't disagree when they come back in between.
+      const published = this.published();
+      try { this.recheckHeld(next, published); }
       catch (e) {
         if (!(e instanceof Refusal)) throw e;
-        const waiting = this.published() === null && [next.text, ...next.options].some((t) => claimsReview(t));
+        const waiting = published === null && [next.text, ...next.options].some((t) => claimsReview(t));
         if (waiting) {
           const s2 = this.d.load();
           s2.held = [next, ...(s2.held ?? [])];
