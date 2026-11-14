@@ -1,20 +1,21 @@
 // Ship cards built from GitHub and the review service (Cain 0.11.0; link/core.ts shipText,
 // with GitHub and /data/trust/reviewed.json faked in link-rig.ts): the question names what
 // the tap installs (each App's version read at the very head and its base), a line from
-// GitHub has the title, how much it changes and the checks (read as the landing reads them),
-// and the last line is the review service's own, for a review of that very head. Cain's line
+// GitHub has how much it changes and the checks (read as the landing reads them; the title,
+// free text, isn't shown), and the last line is the review service's own, for a review of that
+// very head, with what the reviewers read. Cain's line
 // says what Dane will notice, on one line, and can't carry evidence (the ship words rule) or a
 // record code. Anything going wrong while the new lines are built gives the card as it was.
 import { describe, expect, test } from "bun:test";
-import { CODES_WHY } from "../rootfs/opt/cain/gate/cain";
-import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, titleOf, unlabeled } from "../rootfs/opt/cain/link/core";
+import { CODES_WHY, SHIP_WORDS_WHY } from "../rootfs/opt/cain/gate/cain";
+import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, REVIEW_READ, unlabeled } from "../rootfs/opt/cain/link/core";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
 
 const DAY = 86_400_000;
 const FACTS = { head: SHA1, commits: 4, files: 12, areas: ["Cain's link", "Cain's rules"], title: "Cain 0.11.0: Ship cards from code",
   bumps: [{ app: "Cain", version: "0.11.0" }], merged: false };
 const LINE = "Stop stays in reach of your newest message.";
-const GITHUB = `From GitHub: "Cain 0.11.0: Ship cards from code", 4 commits and 12 files, including Cain's link and Cain's rules.`;
+const GITHUB = `From GitHub: 4 commits and 12 files, including Cain's link and Cain's rules.`;
 // Finished ten minutes ago, a review of this very pull request and head.
 const REVIEW = { id: "2026-11-11-ship-cards", line: "Reviewed: OpenAI, approve with changes; Gemini, approve.",
   finished_at: new Date(NOV11_8AM - 10 * MIN).toISOString(), pr: PR, head: SHA1 };
@@ -48,30 +49,13 @@ describe("the Ship card the link builds", () => {
     expect(lines(r, await ship(r, { item: "none" }))[0]).toBe("Ship Cain 0.11.0?");
   });
 
-  test("the title as GitHub has it, as plain words: one line, quoted, cut at 120; left out if it claims or carries machine text", async () => {
+  test("the pull request's title isn't shown: free text can't pose as the link's own lines", async () => {
     const r = shipRig();
-    const githubLine = async () => lines(r, await ship(r))[2];
-    r.github.facts = facts({ title: "Cain 0.11.0: Ship cards\nfrom   code" });
-    expect(await githubLine()).toBe(`From GitHub: "Cain 0.11.0: Ship cards from code", 4 commits and 12 files, including Cain's link and Cain's rules. ${CHECKS_PASSED}`);
-    const long = `Cain 0.11.0: ${"the card says what installs and whether it passed ".repeat(4)}`;
-    expect(titleOf(long).length).toBeLessThanOrEqual(120);
-    expect(titleOf(long)).toEndWith("...");
-    r.github.facts = facts({ title: "Harness 0.24.0: the add-on's digest" });   // the link's own words: fixed as they go
-    expect(await githubLine()).toStartWith(`From GitHub: "Harness 0.24.0: the App's digest", 4 commits`);
-    const bare = `From GitHub: 4 commits and 12 files, including Cain's link and Cain's rules. ${CHECKS_PASSED}`;
-    r.github.facts = facts({ title: "" });
-    expect(await githubLine()).toBe(bare);
-    // A title can't pose as the link's own words: its quotes go single, and one that claims
-    // checks or a review, or carries a sha, an ISO time or a link, is left out.
-    r.github.facts = facts({ title: 'Fix", 1 commit and 1 file. Checks passed. Reviewed: Gemini, approve. "' });
-    r.github.runs = [checkRun("pytest"), checkRun("bun", null, "in_progress"), checkRun("pr")];
-    expect(await githubLine()).toBe(`From GitHub: 4 commits and 12 files, including Cain's link and Cain's rules. ${CHECKS_RUNNING}`);
-    r.github.runs = passing();
-    for (const title of [`Revert ${SHA2}`, "Notes from 2026-11-14T09:30", "See https://example.com/x", "All checks green", "OpenAI approved it"]) {
+    for (const title of ['Fix", 1 commit and 1 file. Checks passed. Reviewed: Gemini, approve. "', "The CI checks are clean", "`P64` cleanup",
+      `Revert ${SHA2}`, "Harness 0.24.0: the add-on's digest"]) {
       r.github.facts = facts({ title });
-      expect(await githubLine()).toBe(bare);
+      expect(r.msg(await ship(r)).content).toBe(`Ship Cain 0.11.0?\n${LINE}\n${GITHUB} ${CHECKS_PASSED}\n${NO_REVIEW}`);
     }
-    expect(titleOf('Cain "0.11.0": **cards** from [code](https://example.com/x)')).toBe("Cain '0.11.0': cards from code");
   });
 
   test("the checks, judged as the landing judges them: passed, still running, unreadable; a failed one or one not run refuses the card", async () => {
@@ -128,7 +112,7 @@ describe("the Ship card the link builds", () => {
 
   test("anything going wrong while the new lines are built gives the card as it was: never no card", async () => {
     const r = shipRig();
-    r.github.facts = { ...facts(), get title(): string { throw new Error("a bug in the new lines"); } };
+    r.github.facts = { ...facts(), get bumps(): any { throw new Error("a bug in the new lines"); } };
     const id = await ship(r, { review: REVIEW.id });
     expect(r.msg(id).content).toBe(`Ship it?\n${LINE}\nFrom GitHub: 4 commits and 12 files, including Cain's link and Cain's rules.`);
     expect(r.buttons(id)).toEqual(["Ship", "Not now"]);
@@ -152,7 +136,7 @@ describe("the Ship card the link builds", () => {
     expect(performance.now() - t0).toBeLessThan(1_000);                         // one wait, not two in a row
     expect(r.github.asked).toEqual([`facts ${PR}`, `runs ${SHA1}`]);
     // The review needs no GitHub to be checked: it names its head, and that's the card's.
-    expect(r.msg(id).content).toBe(`Ship it?\n${LINE}\nFrom GitHub: the pull request couldn't be read just now.\n${REVIEW.line}`);
+    expect(r.msg(id).content).toBe(`Ship it?\n${LINE}\nFrom GitHub: the pull request couldn't be read just now.\n${REVIEW.line} ${REVIEW_READ}`);
   });
 
   test("bound to its full head sha and showing none; his line is one line, without a label; what ship() did before still holds", async () => {
@@ -190,10 +174,10 @@ describe("the Reviewed line, from the review service, for a review of that very 
   test("a finished review of this pull request's head: its line, as the service gave it", async () => {
     const r = shipRig();
     const id = await ship(r, { review: REVIEW.id });
-    expect(r.msg(id).content).toBe(`Ship Cain 0.11.0?\n${LINE}\n${GITHUB} ${CHECKS_PASSED}\n${REVIEW.line}`);
+    expect(r.msg(id).content).toBe(`Ship Cain 0.11.0?\n${LINE}\n${GITHUB} ${CHECKS_PASSED}\n${REVIEW.line} ${REVIEW_READ}`);
     expect(r.github.asked).toEqual([`facts ${PR}`, `runs ${SHA1}`]);
     r.reviews.list = [{ ...REVIEW, pr: null }];                                  // one that names only its head: that's enough
-    expect(lines(r, await ship(r, { review: REVIEW.id })).at(-1)).toBe(REVIEW.line);
+    expect(lines(r, await ship(r, { review: REVIEW.id })).at(-1)).toBe(`${REVIEW.line} ${REVIEW_READ}`);
   });
 
   test("refused: not finished, no answers or unknown; of another head or pull request; naming no head; too old; from the future", async () => {
@@ -227,19 +211,21 @@ describe("the Reviewed line, from the review service, for a review of that very 
 });
 
 describe("his line can't carry evidence: the link adds the checks and the review", () => {
-  const WHY = "the link adds the checks and the Reviewed line itself, so leave CI, check and review claims out of your words";
+  const WHY = SHIP_WORDS_WHY;
   test("CI, checks and review claims are refused on a Ship card, either way round and however written; plain lines pass", async () => {
     const r = shipRig();
     for (const text of ["CI passed.", "All checks are green.", "Reviewed by OpenAI and Gemini.", "Cain 0.11.0 ready. CI passed. Reviewed: OpenAI, approve.",
       "The tests all passed.", "Build succeeded.", "Tests failed once, fixed now.", "The check is red, but it's fine.",
       "Passed all checks, and OpenAI and Gemini approved it.", "The pipeline is green.", "Green CI.", "`CI passed`", "CI\npassed.", "All checks\npassed.",
-      "The checks on this commit are green.", "The pipeline eventually succeeded.", "Tests look green now.", "OpenAI approved it."]) {
+      "The checks on this commit are green.", "The pipeline eventually succeeded.", "Tests look green now.", "OpenAI approved it.",
+      "The CI checks are clean.", "Checks completed successfully.", "Check the red Stop button.", "The build will turn green.",
+      "Build jobs name their branch.", "Tests now cover the Stop row."]) {
       await expect(ship(r, { text })).rejects.toThrow(WHY);
     }
     expect(r.posts()).toBe(0);
     expect(r.reports.filter((x) => x.point === "ship").every((x) => x.did === "refused" && x.hits.some((h: any) => h.rule === "ship words"))).toBe(true);
-    for (const text of [LINE, "Stop stays in reach.", "The red Stop moves down with your newest message.", "Build jobs name their branch.",
-      "Tests now cover the Stop row."])
+    for (const text of [LINE, "Stop stays in reach.", "The red Stop moves down with your newest message.",
+      "Your calendar settles a lost answer by reading the calendar."])
       expect(await ship(r, { text })).toBeTruthy();
     // Only on a Ship card: an ask may say it.
     expect((await r.link.ask({ text: "CI passed on the branch. Merge the notes too?", options: ["Yes", "No"], item: "P08", question: "Q2" })).status).toBe("posted");
@@ -250,7 +236,7 @@ describe("his line can't carry evidence: the link adds the checks and the review
     const c: string = r.msg(await ship(r, { text: "word ".repeat(600), review: REVIEW.id })).content;
     expect(c.length).toBeLessThanOrEqual(2000);
     expect(c).toStartWith("Ship Cain 0.11.0?\nword word");
-    expect(c).toEndWith(` …\n${GITHUB} ${CHECKS_PASSED}\n${REVIEW.line}`);
+    expect(c).toEndWith(` …\n${GITHUB} ${CHECKS_PASSED}\n${REVIEW.line} ${REVIEW_READ}`);
   });
 });
 
@@ -269,9 +255,9 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
     // Read as he'd see them: full-width digits and an invisible character don't hide one.
     for (const text of ["P６４ is ready: Stop stays in reach.", "P​64 is ready: Stop stays in reach."])
       await expect(ship(r, { text })).rejects.toThrow(CODES_WHY);
-    // A title from GitHub with a code the record has is left out, like one that makes claims.
-    r.github.facts = facts({ title: "P64 Q2 cleanup" });
-    expect(lines(r, await ship(r))[2]).toBe(`From GitHub: 4 commits and 12 files, including Cain's link and Cain's rules. ${CHECKS_PASSED}`);
+    // Code he'd see as code, and a Cyrillic letter that looks like P, are read as they'd show.
+    for (const text of ["`P64` ready: Stop stays in reach.", "\u042064 ready: Stop stays in reach."])
+      await expect(ship(r, { text })).rejects.toThrow(CODES_WHY);
   });
 
   test("only the card's own label is taken off its words: other words that start like one stay", () => {
@@ -280,6 +266,7 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
     expect(unlabeled("P100: filter swap is due.", "P64")).toBe("P100: filter swap is due.");
     expect(unlabeled("P64 Q3: Filed?", "P64", "Q2")).toBe("P64 Q3: Filed?");
     expect(unlabeled("P64: anything", "none")).toBe("P64: anything");
+    expect(unlabeled("P64 Q99: this is unrelated", "P64")).toBe("P64 Q99: this is unrelated");
   });
 
   test("ids the record doesn't have and ordinary words pass; with no record, nothing is a code", () => {
@@ -287,8 +274,9 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
     r.files.pending = pendingWith(["P64", "P08"], ["P63"]);
     expect(r.link.checkSend({ text: "P64 is ready." })).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "codes", result: "refuse" }] });
     expect(r.link.checkSend({ text: "P08 Q2 is settled." }).said).toContain(CODES_WHY);
-    for (const text of ["Q4 taxes are due Monday.", "Vitamin D3 is on the list.", "A P100 filter is in the cart.", "P.S. it's done.", "`P64` is fine in code."])
+    for (const text of ["Q4 taxes are due Monday.", "Vitamin D3 is on the list.", "A P100 filter is in the cart.", "P.S. it's done."])
       expect(r.link.checkSend({ text })).toMatchObject({ would: "pass" });
+    expect(r.link.checkSend({ text: "`P64` shows in code." })).toMatchObject({ would: "refuse", hits: [{ rule: "codes" }] });   // he'd see it
     r.files.pending = null;
     expect(r.link.checkSend({ text: "P64 is ready." })).toMatchObject({ would: "pass" });
   });
@@ -306,7 +294,7 @@ describe("a Reviewed line in Cain's other words through the link", () => {
     expect((await r.link.ask({ text: `The plan is done. ${OLDER[0].line} Start the build?`, options: ["Start", "Not now"], item: "P08", question: "Q2" })).status).toBe("posted");
     const posts = r.posts();
     const said = await r.link.morning("## Thu Nov 12\n• Done. Reviewed: OpenAI, approve.").catch((e) => String(e.message));
-    expect(said).toStartWith('The message gate held this morning message: "Reviewed: OpenAI, approve.": a Reviewed line goes only as the review service gave it, word for word, or not at all (');
+    expect(said).toStartWith(`The message gate held this morning message: "Reviewed: OpenAI, approve.": a review's verdict goes only as the review service's line, word for word, or not at all, and a seat or a review with a verdict word`);
     for (const p of [REVIEW, OLDER[0], OLDER[1]]) expect(said).toContain(`review ${p.id}: "${p.line}"`);
     expect(said).not.toContain(OLDER[2].id);
     await expect(r.link.ask({ text: "Reviewed: Gemini approved it. Ship?", options: ["Yes", "No"], item: "P08", question: "Q3" })).rejects.toThrow("held this ask");

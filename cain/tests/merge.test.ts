@@ -394,7 +394,7 @@ describe("the checks, read one way for the landing and the Ship card", () => {
       return { status: 200, body: { total_count: byName[name].length, check_runs: byName[name] } };
     };
     expect(await checkRuns({ api }, REPO, H1)).toEqual([...byName.pytest, ...byName.bun]);
-    expect([...seen].sort()).toEqual(["bun", "pr", "pytest"].map((n) => `/repos/${REPO}/commits/${H1}/check-runs?check_name=${n}&filter=latest&per_page=100`));
+    expect([...seen].sort()).toEqual(["bun", "pr", "pytest"].map((n) => `/repos/${REPO}/commits/${H1}/check-runs?check_name=${n}&app_id=${ACTIONS_APP}&filter=latest&per_page=100&page=1`));
     expect(await checkRuns({ api }, REPO, H2)).toBe("missing");
     expect(await checkRuns({ api: async () => ({ status: 200, body: { message: "odd" } }) }, REPO, H1)).toBeNull();
     expect(await checkRuns({ api: async () => { throw new Error("timeout"); } }, REPO, H1)).toBeNull();
@@ -412,6 +412,24 @@ describe("the checks, read one way for the landing and the Ship card", () => {
     // Whole answers: judged as the landing judges them, a failed newest run included.
     const whole = await checkRuns({ api: one("pytest", 2, [run("pytest", "success", "completed", ACTIONS_APP, 1), run("pytest", "failure", "completed", ACTIONS_APP, 2)]) }, REPO, H1);
     expect(judgeChecks(whole as any[]).map((c) => c.state)).toEqual(["failed", "passed", "passed"]);
+  });
+
+  test("more than 100 runs of a check are read page by page, whole, or not judged at all (ChatGPT's third look)", async () => {
+    const many = (n: number, from = 1) => Array.from({ length: n }, (_, i) => run("pytest", "success", "completed", ACTIONS_APP, from + i));
+    const paged = (pages: { total: number; runs: any[] }[]) => async (path: string) => {
+      const q = new URL(`http://x${path}`).searchParams;
+      if (q.get("check_name") !== "pytest") return { status: 200, body: { total_count: 1, check_runs: [run(q.get("check_name")!, "success")] } };
+      const p = pages[Number(q.get("page")) - 1];
+      return p ? { status: 200, body: { total_count: p.total, check_runs: p.runs } } : { status: 500, body: null };
+    };
+    // 101 runs over two pages that agree: all read, and judged.
+    const whole = await checkRuns({ api: paged([{ total: 101, runs: many(100) }, { total: 101, runs: [run("pytest", "failure", "completed", ACTIONS_APP, 500)] }]) }, REPO, H1);
+    expect(Array.isArray(whole) ? whole.filter((r: any) => r.name === "pytest").length : whole).toBe(101);
+    expect(judgeChecks(whole as any[])[0]).toEqual({ name: "pytest", state: "failed", conclusion: "failure" });
+    // A total that shifts between pages, a run that comes twice, or a page that doesn't come: none judged.
+    expect(await checkRuns({ api: paged([{ total: 101, runs: many(100) }, { total: 102, runs: many(2, 101) }]) }, REPO, H1)).toBeNull();
+    expect(await checkRuns({ api: paged([{ total: 101, runs: many(100) }, { total: 101, runs: many(1, 100) }]) }, REPO, H1)).toBeNull();
+    expect(await checkRuns({ api: paged([{ total: 101, runs: many(100) }]) }, REPO, H1)).toBeNull();
   });
 });
 

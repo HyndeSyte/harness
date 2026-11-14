@@ -82,7 +82,7 @@ import { createHash } from "node:crypto";
 import { cainReasons, type CainHit, claimsReview, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
-import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, linkSpans, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
+import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
@@ -404,8 +404,8 @@ export function unlabeled(text: string, item?: string, question?: string): strin
   const t = String(text ?? "");
   const m = LEADING_LABEL.exec(t);
   if (!m || numberOf(item, "P") !== Number(m[1])) return t;
-  const q = numberOf(question, "Q");
-  if (m[2] !== undefined && q !== null && q !== Number(m[2])) return t;
+  // A label with a question id is the card's own only when the card has that very question.
+  if (m[2] !== undefined && numberOf(question, "Q") !== Number(m[2])) return t;
   return t.slice(m[0].length);
 }
 
@@ -592,29 +592,15 @@ export const MERGED_UNREAD = "Merged on GitHub; Ship checks main has it before a
 // The last line when Cain names no review: none is attached, which isn't to say none happened.
 export const NO_REVIEW = "No outside review attached.";
 
-// The pull request's title as he may see it: one line, double quotes made single, a markdown
-// link its words, markdown marks gone, cut at 120 characters. "" (left out) when it still has
-// a commit sha, an ISO time, a link, or a claim about checks or a review: the line from GitHub
-// is the link's, and says only what GitHub says.
-export const TITLE_MAX = 120;
-export function titleOf(raw: unknown): string {
-  const t = String(raw ?? "").replace(/\s+/g, " ")
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(DOUBLE_QUOTE, "'")
-    .replace(/\*+|~~|`+/g, "").replace(/(^|[^A-Za-z0-9])_+|_+(?=[^A-Za-z0-9]|$)/g, "$1")
-    .replace(/^#+\s*/, "").replace(/\s+/g, " ").trim();
-  if (/(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/i.test(t) || /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(t) || linkSpans(t).length
-      || shipWordsHits(t).length) return "";
-  return t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 3).trimEnd()}...`;
-}
-const DOUBLE_QUOTE = new RegExp("[\"\\u201c\\u201d\\u201e\\u201f]", "g");
-
-// The link's line from GitHub (0.11.0): the pull request's title (titleOf, quoted), how much it
-// changes and the parts that matter most, then the checks.
+// The link's line from GitHub (0.11.0): how much it changes and the parts that matter most,
+// then the checks. The pull request's title isn't shown: it's free text from whoever opened
+// it, and every line here but Cain's is the link's own, so nothing quoted can pose as one.
 export function githubLine(f: Facts, checks: string): string {
-  const title = titleOf(f.title);
-  return `From GitHub: ${title ? `"${title}", ` : ""}${changes(f)}. ${checks}`;
+  return `From GitHub: ${changes(f)}. ${checks}`;
 }
+// Under the review service's line on a Ship card: what the reviewers read. The service sends
+// them Cain's written summary of the change, never the code, so the card says so.
+export const REVIEW_READ = "The reviewers read Cain's summary of the change, not the code.";
 
 // A Ship card's words: the question, Cain's line, then the link's lines. His line gives way,
 // so the link's are never cut off.
@@ -1336,6 +1322,12 @@ export class Link {
     });
   }
 
+  // A held ask under today's rules: refused (a Refusal) when its question or an option fails.
+  private recheckHeld(e: Ask): void {
+    const options = e.options.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }).text);
+    this.cainWords("ask", "ask", unlabeled(e.text, e.item, e.question), { rules: AT.cain, buttons: options, known: this.liveLabels() }, { reviewed: true });
+  }
+
   private async postAsk(e: Ask): Promise<string> {
     const nonce = e.nonce ?? stableNonce("ask", e.item, e.question, e.text, e.options.join("\u0001"), e.replyTo ?? "");
     // Checked when it was asked; one held since before 0.10.0 gets the fixes now, and one held
@@ -1446,10 +1438,8 @@ export class Link {
       if (notRun) throw new Refusal(`CI hasn't run ${notRun.name} on it yet: show the card once its checks have run`);
       const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
         : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
-      // A title carrying a record code is left out like one that makes claims.
-      const shown = f && f.title && codesHits(f.title, this.itemIds()).length ? { ...f, title: "" } : f;
-      const github = this.ownWords("ship facts", "link", shown ? githubLine(shown, said) : factsLine(null));
-      return { text: shipCard(shipQuestion(f), own, [github, rev ? rev.line : NO_REVIEW]), own };
+      const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
+      return { text: shipCard(shipQuestion(f), own, [github, rev ? `${rev.line} ${REVIEW_READ}` : NO_REVIEW]), own };
     } catch (e) {
       if (e instanceof Refusal) throw e;
       this.log(`couldn't build a Ship card's new lines, so it goes as it was: ${reason(e)}`);
@@ -2865,6 +2855,16 @@ export class Link {
       if (this.openAsk(s, this.d.now()) || !(s.held ?? []).length) return;
       const next = s.held!.shift()!;
       this.d.save(s);
+      // A held ask, one from an older version too, is checked again under today's rules before
+      // it goes out (its question and every option): one that fails them is dropped, never
+      // retried as it is, and Cain asks again in words that pass.
+      try { this.recheckHeld(next); }
+      catch (e) {
+        if (!(e instanceof Refusal)) throw e;
+        const what = about(next.item, next.question);
+        this.d.relay(`Your held question${what ? ` ${what}` : ""} wasn't posted: ${e.message} Ask it again in words that pass, if it still matters. Nothing to tell him.`);
+        return;
+      }
       let id: string;
       try { id = await this.postAsk(next); }
       catch (e) {

@@ -414,9 +414,10 @@ describe("the replay with Cain's own rules (0.11.0)", () => {
   test("a Reviewed line of his is judged against the service's lines; on a Ship card the link built, only his own line is his", async () => {
     const r = rig({ facts: true });
     r.reviews.list = [{ id: "2026-11-11-a", line: "Reviewed: Gemini, approve.", finished_at: "2026-11-11T12:00:00.000Z" }];
-    r.github.facts = { head: SHA1, commits: 1, files: 1, areas: [], title: "Harness 0.22.0 \u2014 the digest says less", configs: [] };
+    // A dash next to a number, in the link's own line from GitHub: kept there, and never judged as Cain's.
+    r.github.facts = { head: SHA1, commits: 1, files: 1, areas: ["parts 2 \u2014 3"], title: "", bumps: [] };
     const ship = (await r.link.ship({ text: "The digest says less.", item: "P09", pr: PR, head: SHA1 }) as any).message;
-    expect(r.msg(ship).content).toContain("Harness 0.22.0 \u2014 the digest says less");   // the link's own words keep that dash
+    expect(r.msg(ship).content).toContain("parts 2 \u2014 3");
     const good = botMessage(r, "Done. Reviewed: Gemini, approve.");
     const made = botMessage(r, "Done. Reviewed: OpenAI, approve.");
     for (const id of [good, made]) r.sent.ids.add(id);

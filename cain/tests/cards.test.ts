@@ -628,6 +628,21 @@ describe("one open ask at a time", () => {
     expect(r.last().content).toBe("Signed?");
   });
 
+  test("a held ask that fails today's rules (an option an older link stored) is dropped, not posted or retried, and Cain asks again", async () => {
+    const r = rig({ pending: pendingWith(["P08", "P11"], []) });
+    const a = await ask(r, "P08", "Q2");
+    expect((await r.link.ask({ text: "Signed?", options: ["Signed", "Not signed"], item: "P11", question: "Q1" })).status).toBe("held");
+    const s = r.state();
+    s.held![0].options = ["P11 is ready", "No"];                // a record code, as an older link stored it
+    r.setState(s);
+    const posts = Object.keys(r.posted).length;
+    await r.tap(snap(r.msg(a)), r.ids(a)[0]);
+    await r.link.releaseHeld();                                  // a later sweep doesn't bring it back
+    expect(Object.keys(r.posted).length).toBe(posts);
+    expect(r.state().held ?? []).toEqual([]);
+    expect(r.relayed.some((l) => l.startsWith("Your held question P11 Q1 wasn't posted:") && l.includes("Ask it again in words that pass"))).toBe(true);
+  });
+
   test("...or when the open one's item closes or moves", async () => {
     const r = rig();
     await ask(r, "P08", "Q2");

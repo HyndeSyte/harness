@@ -126,22 +126,33 @@ async function versionAt(d: Pick<MergeDeps, "api">, repo: string, path: string, 
 }
 
 // A commit's check runs as GitHub has them, read one way for the landing and the Ship card
-// (0.11.0): for each required check, by its name, its latest runs, each in one answer whose
-// count GitHub says and whose list agree, so a judgment never rests on part of them or on a
-// list that shifted between pages. The runs, "missing" (GitHub has no such commit), or null
-// (no answer, or an answer whose count and list disagree: then nothing is judged).
-export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<any[] | "missing" | null> {
-  const each = await Promise.all(CHECKS.map((name) =>
-    read(d, `/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`)));
-  if (each.some((r) => r === "missing")) return "missing";
-  const all: any[] = [];
-  for (const r of each) {
+// (0.11.0): for each required check, by its name, GitHub Actions' latest runs of it, whole: a
+// longer list is read page by page, and kept only when every page gives the same total, no
+// run comes twice, and the pages add up to that total. So a judgment never rests on part of
+// the runs, or on a list that shifted while it was read. The runs, "missing" (GitHub has no
+// such commit), or null (no answer, or a list that isn't whole: then nothing is judged).
+const RUN_PAGES = 5;
+async function runsOf(d: Pick<MergeDeps, "api">, repo: string, head: string, name: string): Promise<any[] | "missing" | null> {
+  const got: any[] = [];
+  let total: number | null = null;
+  for (let page = 1; page <= RUN_PAGES; page++) {
+    const r = await read(d, `/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(name)}&app_id=${ACTIONS_APP}&filter=latest&per_page=100&page=${page}`);
+    if (r === "missing") return page === 1 ? "missing" : null;
     if (!r || !Array.isArray(r.check_runs)) return null;
-    const total = Number(r.total_count);
-    if (!Number.isInteger(total) || total !== r.check_runs.length) return null;
-    all.push(...r.check_runs);
+    const t = Number(r.total_count);
+    if (!Number.isInteger(t) || (total !== null && t !== total)) return null;
+    total = t;
+    got.push(...r.check_runs);
+    if (got.length >= total || r.check_runs.length < 100) break;
   }
-  return all;
+  const ids = new Set(got.map((x) => x?.id));
+  return got.length === total && ids.size === got.length ? got : null;
+}
+export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<any[] | "missing" | null> {
+  const each = await Promise.all(CHECKS.map((name) => runsOf(d, repo, head, name)));
+  if (each.some((r) => r === "missing")) return "missing";
+  if (each.some((r) => r === null)) return null;
+  return (each as any[][]).flat();
 }
 
 // Each required check's newest run from GitHub Actions: passed (success only), still
