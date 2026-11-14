@@ -290,14 +290,17 @@ while has_session; do
       bashio::log.info "The calendar specialist now signs its requests: asking the Supervisor to restart this App, so Cain switches to his own user in a new container"
       bashio::addon.restart || bashio::log.warning "The Supervisor didn't take the restart; asking again in 10 minutes"
     fi
-  elif [ "$mode" = old ] && [ ! -f /data/c1/a-relayed ] && [ -f /data/c1/a-since ] \
-       && [ $(( $(date +%s) - $(head -c 20 /data/c1/a-since) )) -gt 1800 ]; then
+  elif [ "$mode" = old ] && [ ! -f /data/c1/a-relayed ] \
+       && since="$(head -c 20 /data/c1/a-since 2>/dev/null | tr -cd '0-9')" && [ -n "$since" ] \
+       && [ $(( $(date +%s) - since )) -gt 1800 ]; then
     relay "The calendar App still uses its old key 30 minutes after this App's update, so its update didn't happen or didn't finish. Its cards wait at the link, none lost, and you stay on the old way until it updates. Show him a new Ship card for the same pull request and head (this App's part is already installed, so his tap installs the calendar App's), and file a note on P33 for the laptop session."
     touch /data/c1/a-relayed
   fi
   if [ "$mode" = own ] && [ -f /run/cain/discord.state ]; then
+    st=""; at=""
     read -r st at < /run/cain/discord.state || true
-    if [ "$st" = down ] && [ -n "${at:-}" ] && [ $(( $(date +%s) - at )) -gt 90 ]; then
+    at="$(printf '%s' "$at" | tr -cd '0-9')"
+    if [ "$st" = down ] && [ -n "$at" ] && [ $(( $(date +%s) - at )) -gt 90 ]; then
       bashio::log.warning "Cain's Discord channel has been down 90 seconds: restarting his session"
       $TMUX_CMD -u kill-session -t cain 2>/dev/null || true
       break
