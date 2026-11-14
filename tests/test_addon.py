@@ -1,4 +1,5 @@
 """The add-on package keeps the boundary the design promised."""
+import os
 import re
 from pathlib import Path
 
@@ -251,6 +252,60 @@ def test_cain_start_survives_bashio_errexit():
     # session to kill) must not end the script. 0.1.0 and 0.1.1 died here.
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
     assert "kill-session -t cain 2>/dev/null || true" in run
+    # And no status is read on the line after its command ("cmd; rc=$?"): errexit ends the
+    # script at cmd first. C1's switch did that once, before it shipped.
+    assert not re.search(r";\s*[A-Za-z_]+=\$\?", run)
+
+
+def test_cain_start_decides_every_switch_outcome_under_errexit(tmp_path):
+    """The start's switch decision (C1), run as bashio runs it (errexit, nounset, pipefail),
+    with each answer the switch can give: it carries on to the right way of running instead
+    of ending the start."""
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        import pytest
+        pytest.skip("no bash")
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    block = run[run.index('relay() {'):run.index('[ -z "$stopped_why" ] || bashio::log.error')]
+    data = tmp_path / "data"
+    opt = tmp_path / "opt"
+    (data / "link").mkdir(parents=True)
+    (data / "link/specialist-signs").write_text("1")
+    (opt / "c1").mkdir(parents=True)
+    stub = {
+        "c1/state.sh": 'cat "$STUB_DIR/state" 2>/dev/null || echo fresh',
+        "c1/cutover.sh": 'echo cutover >> "$STUB_DIR/calls"; [ "$STUB_RC" = 1 ] && echo x >> "$STUB_DATA/c1/failed"; exit "$STUB_RC"',
+        "c1/lock.sh": 'echo "lock $1" >> "$STUB_DIR/calls"; exit 0',
+    }
+    for name, body in stub.items():
+        f = opt / name
+        f.write_text("#!/bin/bash\n" + body + "\n")
+        f.chmod(0o755)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "bun").write_text('#!/bin/bash\ncase "$2" in container-id) echo "boot:1";; may-retry) exit 1;;'
+                                ' write-state) printf %s "$4" > "$3";; *) exit 0;; esac\n')
+    (bindir / "bun").chmod(0o755)
+    (bindir / "jq").write_text("#!/bin/bash\ncat >/dev/null; echo '{}'\n")
+    (bindir / "jq").chmod(0o755)
+    body = (block.replace("/data/", f"{data.as_posix()}/")
+                 .replace("install -d -m 0700 -o root -g root", "mkdir -p"))
+    script = ("set -o errexit -o nounset -o pipefail\n"
+              "bashio::log.info() { :; }; bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
+              f'OPT="{opt.as_posix()}"\n' + body + '\necho "mode=$mode restart=$restart_first stopped=$switch_stopped"\n')
+    (tmp_path / "start.sh").write_text(script)
+    want = {"0": "mode=own", "1": "mode=old", "2": "mode=none restart= stopped=1",
+            "3": "mode=old", "4": "mode=none restart=1"}
+    for rc, expect in want.items():
+        (data / "c1").mkdir(exist_ok=True)
+        for f in ("failed", "uid1000-ran", "legacy-ran"):
+            (data / "c1" / f).unlink(missing_ok=True)
+        env = {**os.environ, "STUB_RC": rc, "STUB_DIR": tmp_path.as_posix(), "STUB_DATA": data.as_posix(),
+               "PATH": f"{bindir.as_posix()}:{os.environ.get('PATH', '')}"}
+        out = subprocess.run(["bash", (tmp_path / "start.sh").as_posix()], capture_output=True, text=True, env=env)
+        assert out.returncode == 0, (rc, out.stderr[-500:])
+        assert out.stdout.strip().startswith(expect), (rc, out.stdout, out.stderr[-300:])
 
 
 def test_cain_scripts_unset_the_supervisor_token_before_starting_anything():

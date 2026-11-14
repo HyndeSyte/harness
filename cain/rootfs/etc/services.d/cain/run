@@ -31,7 +31,9 @@ if ! "$OPT/c1/lock.sh" run; then
   bashio::log.error "Couldn't set up /run/cain; Cain doesn't start until that's fixed"
   mode=none
 else
-  state="$("$OPT/c1/state.sh")"
+  # bashio runs this with errexit: every status is caught where it's read ("|| rc=$?",
+  # "|| true"), or one non-zero answer would end the whole start (tests/test_addon.py).
+  state="$("$OPT/c1/state.sh" || true)"
   case "$state" in
     cut) mode=own ;;
     fresh|switching)
@@ -40,7 +42,7 @@ else
         bashio::log.info "Switching Cain to his own user (state $state)"
         tries_before="$(wc -l < /data/c1/failed 2>/dev/null || echo 0)"
         for try in 1 2 3; do
-          "$OPT/c1/cutover.sh"; rc=$?
+          rc=0; "$OPT/c1/cutover.sh" || rc=$?
           case "$rc" in
             0) mode=own; break ;;
             2) mode=none; switch_stopped=1; stopped_why="the switch to his own user stopped part way"; break ;;
@@ -70,7 +72,7 @@ case "$mode" in
        # the switch never begins in such a container (c1/cutover.sh), so no process of the old
        # session can outlive it into the new way. And never in a container where a process of
        # uid 1000 ran (a validation): what it left behind mustn't meet the old root session.
-       cid="$(bun "$OPT/c1/tools.ts" container-id 2>/dev/null)"
+       cid="$(bun "$OPT/c1/tools.ts" container-id 2>/dev/null || true)"
        if [ -z "$cid" ] || { [ -f /data/c1/uid1000-ran ] && [ "$(head -c 200 /data/c1/uid1000-ran)" = "$cid" ]; }; then
          mode=none; restart_first=1; stopped_why="a validation ran as his user in this container, so the old way waits for a new one"
        elif ! "$OPT/c1/lock.sh" old; then
