@@ -64,7 +64,9 @@
 //   and the notices that may carry it, so none lands with Stop once he has stopped. Only
 //   Discord refusing a message (a 4xx) three times retires it as a holder; when Discord
 //   doesn't answer, moves back off and try again. While stopped it comes off, and Turn
-//   back on is kept within reach instead, even when the Stop state can't be read.
+//   back on is kept within reach instead, even when the Stop state can't be read. After
+//   Turn back on, the notice's own Stop is the one until it's out of reach; when the moving
+//   Stop then goes onto a newer message, the notice's comes off.
 import { createHash } from "node:crypto";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
@@ -1833,7 +1835,25 @@ export class Link {
       if (now < this.moveWait.next) return;                    // Discord didn't answer the last move: waiting
       if (!(await this.hold(target))) return;
       if (holder) await this.unhold(holder, MOVED);
+      if (!this.stopped().stopped) await this.retireNoticeStops(target);
     } else if (holder && !holderOk) await this.unhold(holder, MOVED);   // it asks something now
+  }
+
+  // A Stop or Turn back on notice's own Stop (after Turn back on), out of reach now that the
+  // moving Stop is on a newer message: it comes off too, buttons only, with no line, so one
+  // Stop shows. The morning message and the specialist's other cards keep theirs.
+  private async retireNoticeStops(keep: string): Promise<void> {
+    const s = this.d.load();
+    const old: string[] = [];
+    for (const [id, m] of Object.entries(s.messages)) {
+      if (id === keep || !newerId(keep, id) || !this.stopNotice(s, id) || !this.carries(s, id, "Stop")) continue;
+      if ((m.labels ?? []).some((l) => l !== "Stop")) continue;   // a button of another kind stays, and so does its row
+      m.outcome = "replaced"; m.why = MOVED;
+      old.push(id);
+    }
+    if (!old.length) return;
+    this.d.save(s);
+    await this.stripAll(old);
   }
 
   // His Stop or Turn back on notice: the link's own, or the calendar specialist's.

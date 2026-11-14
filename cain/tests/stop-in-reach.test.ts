@@ -551,6 +551,35 @@ describe("Stop and Turn back on", () => {
     expect(r.buttons(later[4])).toEqual(["Stop"]);
   });
 
+  test("once the Turned back on notice is out of reach and a newer plain message has the moving Stop, the notice loses its own, with no line", async () => {
+    // ChatGPT, round four: on that path two messages carried Stop again once the notice aged out.
+    for (const own of [true, false]) {                               // the link's own notices, or the calendar specialist's
+      const r = rig();
+      r.harnessDown.down = own;
+      const reply = await cainSays(r, "Moved swim to 4:30.");
+      await r.tap(structuredClone(r.msg(reply)), STOP);
+      await r.link.whenStopPlaced();
+      if (!own) await r.link.addCard({ text: "**Stopped.** Nothing new starts.", rows: [{ type: 1, components: [btn("Turn back on", RESUME)] }], kind: "stopped" });
+      await replies(r, 6);
+      const stopped = r.cards().filter((m: any) => r.buttons(m.id).includes("Turn back on")).at(-1);
+      await r.tap(structuredClone(stopped), RESUME);
+      await r.link.whenStopPlaced();
+      if (!own) await r.link.addCard({ text: "**Turned back on.** The calendar specialist is back.", rows: STOP_ROW, kind: "resumed" });
+      await r.link.whenStopPlaced();
+      r.later(MIN);
+      await r.link.sweep();
+      const carrying = r.cards().filter((m: any) => r.buttons(m.id).includes("Stop"));
+      expect(carrying).toHaveLength(1);
+      const notice = carrying[0].id, words = String(carrying[0].content);
+      expect(words).toStartWith("**Turned back on.**");
+      const later = await replies(r, 5);
+      expect(r.buttons(later[4])).toEqual(["Stop"]);
+      expect(r.buttons(notice)).toEqual([]);                          // its Stop came off as the moving one took over
+      expect(r.msg(notice).content).toBe(words);                      // buttons only: no line
+      expect(r.cards().filter((m: any) => r.buttons(m.id).includes("Stop")).map((m: any) => m.id)).toEqual([later[4]]);
+    }
+  });
+
   test("a Stopped notice known gone from his DM isn't one that's up: Turn back on is posted again at once", async () => {
     const r = rig();
     r.harnessDown.down = true;                                         // so the link posts its own Stopped notice
