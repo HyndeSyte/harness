@@ -44,8 +44,9 @@
 // (../stop.ts). The deploy key (deploykey.ts) is the one key main is locked to: with it
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
-import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { sign as edSign } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { CAIN_ROUTES, type Caller, checkRequest, RequestLog, routeAllowed, sameKey, SIG_HEADER, signResponse } from "./auth";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
@@ -58,8 +59,10 @@ import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, 
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
-const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
-const ACCESS = "/data/.claude/channels/discord/access.json";
+// The bot token and the plugin's allowlist, root's since C1 (the run script points these at
+// their old places only for the old way of starting, before the first cutover).
+const ENV = process.env.LINK_ENV ?? "/data/link/discord.env";
+const ACCESS = process.env.LINK_ACCESS ?? "/data/discord/access.json";
 const DIR = process.env.LINK_DIR ?? "/data/link";
 const STATE = `${DIR}/state.json`;
 const WATCH = `${DIR}/watch.json`;
@@ -87,10 +90,6 @@ function token(): string {
 }
 function key(context: string): string {
   return hmacKey(token(), context);
-}
-function same(a: string, b: string): boolean {
-  const x = Buffer.from(a), y = Buffer.from(b);
-  return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
 }
 function paired(): string {
   try { return String(JSON.parse(readFileSync(ACCESS, "utf8")).allowFrom?.[0] ?? ""); } catch { return ""; }
@@ -262,32 +261,114 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent"]);
+// Three callers, each opening only its own routes (auth.ts, C1): the calendar specialist
+// signs each request with its key, never sending it; Cain shows his own key, made at each
+// start, from this machine only; root's services (the broker) use a unix socket only root
+// can open. A caller that proves nothing gets only /health's "ok".
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
+const KEYS = process.env.CAIN_KEYS ?? "/run/cain/keys";
+const LINK_SOCK = process.env.CAIN_LINK_SOCK ?? "/run/cain/link.sock";
+function cainKey(): string { try { return readFileSync(`${KEYS}/cain.key`, "utf8").trim(); } catch { return ""; } }
+const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+
+async function route(req: Request, url: URL, caller: Caller, raw: string, reqId?: string): Promise<Response> {
+  if (!routeAllowed(caller, url.pathname)) return json({ status: "refused" }, 403);
+  if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
+  if (req.method === "GET" && url.pathname === "/cards") return json(await link.cardsFor());
+  if (req.method !== "POST") return json({ status: "not found" }, 404);
+  if (raw.length > 16384) return json({ status: "too large" }, 413);
+  let b: any = {};
+  try { b = raw ? JSON.parse(raw) : {}; } catch { return json({ status: "not JSON" }, 400); }
+  return handle(url, b, reqId);
+}
+
+// The specialist's signed requests: each id handled once, its answer kept 10 minutes and
+// signed back. Its old bare-key header counts only until its first signed request (Harness
+// 0.24.0 signs); from then on, never again (the marker survives restarts).
+const requests = new RequestLog(`${DIR}/requests.json`);
+// Recorded at the specialist's first signed request: until then the run script keeps every
+// process of Cain's user stopped (3.12), so an old Harness's bare key never meets one.
+const SIGNS = `${DIR}/specialist-signs`;
+let specialistSigns = existsSync(SIGNS);
+const LEGACY_AUTH = process.env.LINK_LEGACY_AUTH === "1";
+const health = (known: boolean) => json(healthBody(known, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
 
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
   port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
   async fetch(req, server) {
     const url = new URL(req.url);
-    const keyOk = same(req.headers.get("x-harness-key") ?? "", key("harness-relay-v1"));
-    if (req.method === "GET" && url.pathname === "/health")
-      return json(healthBody(keyOk, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
-    if (!keyOk) return json({ status: "refused" }, 403);
+    const raw = req.method === "POST" ? await req.text() : "";
+    const target = url.pathname + url.search;
+    const relay = key("harness-relay-v1");
+    const id = checkRequest(req.headers.get(SIG_HEADER), relay, req.method, target, raw);
+    if (id) {
+      if (!specialistSigns) {
+        specialistSigns = true;
+        try { writeFileSync(SIGNS, String(Date.now()), { mode: 0o600 }); } catch (e) { console.log(`[cain] link: couldn't record that the specialist signs: ${String(e).slice(0, 80)}`); }
+      }
+      const signed = (status: number, body: string) => new Response(body, { status,
+        headers: { "content-type": "application/json", [SIG_HEADER]: signResponse(relay, id, status, body) } });
+      if (req.method !== "POST") {
+        const res = url.pathname === "/health" ? health(true) : await route(req, url, "specialist", raw);
+        return signed(res.status, await res.text());
+      }
+      // Each operation once: done, the stored answer; received but never done (the link
+      // stopped mid-way), reconciled, never simply repeated: a card is found by the request id
+      // stored on it (addCard), an answer to a tap isn't sent again, and buttons and relays
+      // only set state or add a line.
+      const stored = requests.get(id);
+      if (stored?.state === "done") return signed(stored.status ?? 200, stored.body ?? "{}");
+      if (stored?.state === "received" && url.pathname === "/answer") {
+        const body = JSON.stringify({ status: "ok", said: "already handled before a restart" });
+        requests.put(id, { at: Date.now(), state: "done", status: 200, body });
+        return signed(200, body);
+      }
+      requests.put(id, { at: Date.now(), state: "received" });
+      const res = await route(req, url, "specialist", raw, id);
+      const body = await res.text();
+      requests.put(id, { at: Date.now(), state: "done", status: res.status, body });
+      return signed(res.status, body);
+    }
     const ip = server.requestIP(req)?.address ?? "";
-    if (LOCAL_ONLY.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
-      return json({ status: "refused" }, 403);
-    if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
-    if (req.method === "GET" && url.pathname === "/cards") return json(await link.cardsFor());
-    if (req.method !== "POST") return json({ status: "not found" }, 404);
-    const raw = await req.text();
-    if (raw.length > 16384) return json({ status: "too large" }, 413);
-    let b: any = {};
-    try { b = raw ? JSON.parse(raw) : {}; } catch { return json({ status: "not JSON" }, 400); }
+    const bare = req.headers.get("x-harness-key") ?? "";
+    // The old way of starting (3.12 state A: Cain runs as root, as 0.11.0 did, and no process
+    // of his user exists): the old rules, the relay key for every route, Cain's from this
+    // machine only. The run script sets this only then.
+    if (LEGACY_AUTH && sameKey(bare, relay)) {
+      if (req.method === "GET" && url.pathname === "/health") return health(true);
+      if ((CAIN_ROUTES.has(url.pathname) || url.pathname === "/sent") && !loopback(ip)) return json({ status: "refused" }, 403);
+      return route(req, url, CAIN_ROUTES.has(url.pathname) ? "cain" : url.pathname === "/sent" ? "root" : "specialist", raw);
+    }
+    // From 0.12.0 on, the specialist's bare key is never taken: 503 and nothing done, so an
+    // old Harness keeps its card and retries until it signs (its outbox drops only refusals
+    // that will never change).
+    if (sameKey(bare, relay)) {
+      if (req.method === "GET" && url.pathname === "/health") return health(false);
+      return json({ status: "upgrading", said: "the link takes only signed requests now" }, 503);
+    }
+    const caller: Caller = loopback(ip) && sameKey(bare, cainKey()) ? "cain" : "none";
+    if (req.method === "GET" && url.pathname === "/health") return health(caller !== "none");
+    if (caller === "none") return json({ status: "refused" }, 403);
+    return route(req, url, caller, raw);
+  },
+});
+// Root's own: the broker reads the cards and says what Cain sent. The folder is root's.
+try { rmSync(LINK_SOCK, { force: true }); } catch { /* none */ }
+Bun.serve({
+  unix: LINK_SOCK, idleTimeout: 30,
+  async fetch(req) {
+    const url = new URL(req.url);
+    return route(req, url, "root", req.method === "POST" ? await req.text() : "");
+  },
+});
+try { chmodSync(LINK_SOCK, 0o600); } catch (e) { console.log(`[cain] link: couldn't close its root socket to others: ${String(e).slice(0, 80)}`); }
+
+async function handle(url: URL, b: any, reqId?: string): Promise<Response> {
     try {
       switch (url.pathname) {
-        case "/card": return json({ id: await link.addCard({ text: String(b.text ?? ""), rows: b.rows ?? [], kind: b.kind, expires: b.expires }) });
+        case "/card": return json({ id: await link.addCard({ text: String(b.text ?? ""), rows: b.rows ?? [], kind: b.kind, expires: b.expires, req: reqId }) });
         case "/buttons": await link.editButtons(Number(b.card), b.rows ?? []); return json({ status: "ok" });
         case "/answer": await link.followup(String(b.callback ?? ""), String(b.text ?? "")); return json({ status: "ok" });
         case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
@@ -320,9 +401,8 @@ Bun.serve({
       return json({ status: "error", said: String(e).slice(0, 200) }, 500);
     }
     return json({ status: "not found" }, 404);
-  },
-});
-console.log(`[cain] link listening on ${PORT}`);
+}
+console.log(`[cain] link listening on ${PORT} and ${LINK_SOCK}`);
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
 if (!deployKey)

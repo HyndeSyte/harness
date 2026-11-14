@@ -38,6 +38,12 @@ function openOwned(path: string, uid: number): { fd: number; size: number } | Ex
   } catch { try { closeSync(fd); } catch { /* closed */ } return { ok: false, why: "unreadable" }; }
 }
 
+// An open descriptor on a regular file of uid's, for streaming it (the caller closes it), or null.
+export function openOwnedFd(path: string, uid = CAIN_UID): { fd: number; size: number } | null {
+  const o = openOwned(path, uid);
+  return "fd" in o ? o : null;
+}
+
 function readRange(fd: number, from: number, length: number): string {
   const buf = Buffer.alloc(length);
   let off = 0;

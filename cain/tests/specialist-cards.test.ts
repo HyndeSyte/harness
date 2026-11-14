@@ -830,3 +830,19 @@ describe("the details the reviews asked to pin down", () => {
     expect(r.cards()).toEqual([]);                                    // the specialist sends its notices again itself
   });
 });
+
+// C1: the specialist's signed request carries its id to the card. If the link stopped after
+// making the card but before answering, the same request (retried with the same id) gets that
+// card again, never a second one, and Cain hears about it once.
+describe("one request, one card", () => {
+  test("a retried request with the same id returns the card it made", async () => {
+    const r = rig();
+    const first = await r.link.addCard({ text: "A card for him", rows: [], kind: "card", req: "f".repeat(32) });
+    const heard = r.relayed.length;
+    const again = await r.link.addCard({ text: "A card for him", rows: [], kind: "card", req: "f".repeat(32) });
+    expect(again).toBe(first);
+    expect(r.relayed.length).toBe(heard);
+    const other = await r.link.addCard({ text: "A card for him", rows: [], kind: "card", req: "e".repeat(32) });
+    expect(other).not.toBe(first);
+  });
+});

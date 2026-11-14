@@ -5,11 +5,11 @@
 //
 // What it does besides passing lines:
 //   - A reply's files: it reads each one here, as Cain, and sends the bytes instead of the
-//     path, so a reply can attach only what Cain himself can read. Ten files, 25 MB in all.
+//     path, so a reply can attach only what Cain himself can read. Ten files, 8 MB in all.
 //   - Until the first connection, everything waits here (the broker may still be starting).
-//   - The broker restarting: it reconnects by itself, replays Claude Code's initialize so
-//     the new server is ready, and answers any call in flight with an error to send again,
-//     so Cain keeps his channel without a restart of his own.
+//   - Once connected, a lost connection ends the channel: calls in flight are told their
+//     outcome is unknown (a send may have gone out), and the bridge exits. Nothing is
+//     replayed; the run script restarts Cain's session when the channel stays down.
 // MCP over stdio is one JSON message a line, both ways.
 import { readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
@@ -17,9 +17,11 @@ import { connect, type Socket } from "node:net";
 
 export const SOCK = process.env.CAIN_DISCORD_SOCK ?? "/run/cain/discord.sock";
 export const MAX_FILES = 10;
-export const MAX_BYTES = 25 * 1024 * 1024;
-export const RESTARTED = "The Discord channel restarted before this finished; send it again.";
-export const RECONNECTING = "The Discord channel is reconnecting; send it again in a few seconds.";
+export const MAX_BYTES = 8 * 1024 * 1024;
+// The one limit on what goes to the broker: the whole line, text, names and encoded bytes
+// included (the broker refuses longer lines too).
+export const MAX_LINE = 12 * 1024 * 1024;
+export const UNKNOWN = "The Discord channel stopped before it confirmed this; it may have gone out. Read the chat (fetch_messages) before sending it again.";
 
 type Msg = Record<string, any>;
 const isCall = (m: Msg | null) => !!m && m.id !== undefined && typeof m.method === "string";
@@ -53,20 +55,15 @@ export function withFileBytes(m: Msg, read = (p: string) => readFileSync(p), siz
 }
 
 export class Bridge {
-  private sock: Socket | null = null;            // connected, or connecting
-  private up = false;                            // the current socket is connected
-  private everUp = false;
+  private sock: Socket | null = null;
+  private up = false;
   private buf = "";
   private pending = new Map<string, Msg>();      // Claude Code's calls not yet answered
-  private waiting: string[] = [];                // lines held until the socket is up
-  private init: Msg | null = null;               // Claude Code's initialize, replayed on reconnect
-  private initialized: Msg | null = null;        // and its notifications/initialized
-  private replaying = new Set<string>();         // ids of replayed initializes, whose answers stay here
+  private waiting: string[] = [];                // lines held until the first connection
   private backoff = 0;
-  private replays = 0;
   private closed = false;
 
-  constructor(private path: string, private toClaude: (line: string) => void,
+  constructor(private path: string, private toClaude: (line: string) => void, private exit: (code: number) => void,
               private connectFn: (path: string) => Socket = (p) => connect(p),
               private wait: (ms: number, f: () => void) => unknown = (ms, f) => setTimeout(f, ms)) {}
 
@@ -75,18 +72,11 @@ export class Bridge {
   private open(): void {
     if (this.closed) return;
     const s = this.connectFn(this.path);
-    this.sock = s; this.up = false;
+    this.sock = s;
     s.setEncoding("utf8");
     s.on("connect", () => {
       if (this.sock !== s) return;
-      const again = this.everUp;
-      this.up = true; this.everUp = true; this.backoff = 0;
-      if (again && this.init) {
-        const id = `bridge-reinit-${++this.replays}`;
-        this.replaying.add(id);
-        s.write(JSON.stringify({ ...this.init, id }) + "\n");
-        if (this.initialized) s.write(JSON.stringify(this.initialized) + "\n");
-      }
+      this.up = true;
       const lines = this.waiting;
       this.waiting = [];
       for (const line of lines) s.write(line + "\n");
@@ -94,19 +84,18 @@ export class Bridge {
     s.on("data", (chunk: string) => { if (this.sock === s) this.fromBroker(chunk); });
     s.on("error", () => { /* close follows */ });
     s.on("close", () => {
-      if (this.sock !== s) return;
-      const wasUp = this.up;
-      this.sock = null; this.up = false; this.buf = "";
-      if (this.everUp) {
-        // Calls in flight never get their answer from the old server: say so now. Lines still
-        // waiting are dropped, their calls answered the same way (they're in pending too).
-        for (const m of this.pending.values()) this.toClaude(failed(m.id, RESTARTED));
-        this.pending.clear();
-        this.waiting = [];
+      if (this.sock !== s || this.closed) return;
+      if (!this.up) {                                 // never connected: the broker may be starting
+        this.sock = null;
+        this.backoff = Math.min(5_000, Math.max(500, this.backoff * 2));
+        this.wait(this.backoff, () => this.open());
+        return;
       }
-      if (this.closed) return;
-      this.backoff = wasUp ? 1000 : Math.min(10_000, Math.max(1000, this.backoff * 2));
-      this.wait(this.backoff, () => this.open());
+      // Connected once and lost: every call in flight may or may not have happened.
+      for (const m of this.pending.values()) this.toClaude(failed(m.id, UNKNOWN));
+      this.pending.clear();
+      this.closed = true;
+      this.exit(1);
     });
   }
 
@@ -119,28 +108,21 @@ export class Bridge {
       if (!line.trim()) continue;
       let m: Msg | null = null;
       try { m = JSON.parse(line); } catch { /* not ours to judge: pass it on */ }
-      if (m && m.id !== undefined && m.method === undefined) {
-        const key = String(m.id);
-        if (this.replaying.delete(key)) continue;       // a replayed initialize's answer
-        this.pending.delete(key);
-      }
+      if (m && m.id !== undefined && m.method === undefined) this.pending.delete(String(m.id));
       this.toClaude(line);
     }
   }
 
   // One line from Claude Code.
   fromClaude(line: string): void {
-    if (!line.trim()) return;
+    if (!line.trim() || this.closed) return;
     let m: Msg | null = null;
     try { m = JSON.parse(line); } catch { m = null; }
-    if (m && typeof m === "object") {
-      if (m.method === "initialize") this.init = m;
-      if (m.method === "notifications/initialized") this.initialized = m;
-      m = withFileBytes(m);
-      line = JSON.stringify(m);
+    if (m && typeof m === "object") { m = withFileBytes(m); line = JSON.stringify(m); }
+    if (Buffer.byteLength(line) > MAX_LINE) {
+      if (isCall(m)) this.toClaude(failed(m!.id, `This is over the channel's limit of ${MAX_LINE / 1048576} MB in all; send less (smaller or fewer files, or shorter text).`));
+      return;
     }
-    // Between connections, after the first: a call is answered at once, a notification dropped.
-    if (!this.sock && this.everUp) { if (isCall(m)) this.toClaude(failed(m!.id, RECONNECTING)); return; }
     if (isCall(m)) this.pending.set(String(m!.id), m!);
     if (!this.up) { this.waiting.push(line); return; }
     this.sock!.write(line + "\n");
@@ -150,7 +132,7 @@ export class Bridge {
 }
 
 if (import.meta.main) {
-  const bridge = new Bridge(SOCK, (line) => process.stdout.write(line + "\n"));
+  const bridge = new Bridge(SOCK, (line) => process.stdout.write(line + "\n"), (code) => process.exit(code));
   bridge.start();
   let buf = "";
   process.stdin.setEncoding("utf8");

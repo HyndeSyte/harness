@@ -2,6 +2,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 ADDON = ROOT / "harness"
 
@@ -660,12 +662,17 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     sys.path.insert(0, str(ADDON / "app"))
     from harness import cain_relay
     link = (CAIN / "rootfs/opt/cain/link/main.ts").read_text(encoding="utf-8")
-    assert f'key("{cain_relay.KEY_CONTEXT.decode()}")' in link and "timingSafeEqual" in link
+    auth = (CAIN / "rootfs/opt/cain/link/auth.ts").read_text(encoding="utf-8")
+    # The specialist signs with the relay key (C1): the link checks it, and signs its answers.
+    assert f'const relay = key("{cain_relay.KEY_CONTEXT.decode()}");' in link
+    assert "checkRequest(req.headers.get(SIG_HEADER), relay" in link and "signResponse(relay, id" in link
+    assert "timingSafeEqual" in auth and f'SIG_HEADER = "{cain_relay.SIG_HEADER}"' in auth
     assert f"?? {cain_relay.PORT})" in link and cain_relay.HOST == "0fcc2575-cain"
-    # Cain's scripts only, from this machine: the specialist can't show its own cards,
-    # ask, put up a Ship card, or close Cain's questions.
-    assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", '
-            '"/look", "/cards", "/check", "/replay", "/connector", "/sent"])' in link)
+    # The specialist's routes only: it can't show its own cards, ask, put up a Ship card, or
+    # close Cain's questions; those are Cain's, from this machine, with his own key.
+    assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
+    assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
+            '  "/look", "/cards", "/check", "/replay", "/connector"])' in auth.replace("\r\n", "\n"))
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")
@@ -872,3 +879,63 @@ def test_build_work_runs_as_cloud_jobs_with_his_go():
     assert "gh pr merge" not in jobs
     ship = releasing.split("## Ship (only after Dane's go)")[1].split("\n## ")[0]
     assert "full head sha" in ship and "deploy key" in ship and "gh pr merge" not in ship
+
+
+# The link's signatures, both ways (link/auth.ts and cain_relay.py, C1): one vector both
+# languages must give, so neither drifts. cain/tests/link-auth.test.ts checks the same one.
+SIG_VECTOR = {
+    "key": "a" * 64, "path": "/card", "body": '{"text": "x"}', "t": 1794686000000,
+    "id": "ac5e14e39c2294e982a8a34f4e5beaf9",
+    "request": "id=ac5e14e39c2294e982a8a34f4e5beaf9,t=1794686000000,s=aa669cbb6222600a41f35eef346f0aa6b625ee988ad85d2baf455e48ce078b3d",
+    "response": "s=cb4516fb923369d50bc4b6ba1331f56ed258c0f9e398ffec6071b4f78b302da2",
+}
+
+
+def test_link_signatures_match_the_vector():
+    import sys
+    sys.path.insert(0, str(ADDON / "app"))
+    from harness.cain_relay import request_id, sign_request, sign_response
+    v = SIG_VECTOR
+    assert request_id("POST", v["path"], v["body"]) == v["id"]
+    assert sign_request(v["key"], "POST", v["path"], v["body"], v["t"]) == (v["id"], v["request"])
+    assert sign_response(v["key"], v["id"], 200, '{"id": 4}') == v["response"]
+
+
+def test_an_answer_the_link_didnt_sign_is_no_answer():
+    """Anything holding the link's port while it restarts (Cain's own user can bind it)
+    gets the signed request but can't sign an answer: the specialist takes none."""
+    import sys
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    sys.path.insert(0, str(ADDON / "app"))
+    from harness.cain_relay import CainLink, LinkError
+
+    class Squatter(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _answer(self):
+            data = b'{"id": 99, "status": "ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("x-harness-sig", "s=" + "0" * 64)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+            self._answer()
+
+        def do_GET(self):
+            self._answer()
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Squatter)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        link = CainLink(lambda: "bot-token", host="127.0.0.1", port=httpd.server_address[1])
+        with pytest.raises(LinkError):
+            link.card("a card", [], "card")
+        assert link.status() is None
+    finally:
+        httpd.shutdown()

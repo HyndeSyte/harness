@@ -149,6 +149,7 @@ export interface Card {
   posting?: Posting;                 // a post whose answer never came: it may be on Discord already
   told?: boolean;                    // Cain was told it couldn't go out by itself
   lapseTold?: boolean;               // Cain was told it expired before it reached him
+  req?: string;                      // the specialist's signed request that made it (C1): one request, one card
 }
 // A card's post that began and never heard back: when (at), its buttons then (rows, as a
 // digest), who made it (the link by itself, or Cain's show) and the item it went under.
@@ -970,7 +971,10 @@ export class Link {
   }
 
   // -- cards from specialists -------------------------------------------------
-  async addCard(c: { text: string; rows?: any[]; kind?: string; expires?: unknown }): Promise<number> {
+  async addCard(c: { text: string; rows?: any[]; kind?: string; expires?: unknown; req?: string }): Promise<number> {
+    // A request already made a card (the link stopped before it could answer): that card,
+    // never a second one.
+    if (c.req) { const had = Object.entries(this.d.load().cards).find(([, v]) => v.req === c.req); if (had) return Number(had[0]); }
     const kind = String(c.kind ?? "reply");
     const comps = (c.rows ?? []).filter((r: any) => (r.components ?? []).every((b: any) =>
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
@@ -991,7 +995,7 @@ export class Link {
     const expires = toMs(c.expires);
     if (expires === null && c.expires != null && c.expires !== "")
       this.log(`card ${id}: its expiry isn't a time (${String(c.expires).slice(0, 40)}), so it has none`);
-    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due };
+    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due, ...(c.req ? { req: c.req } : {}) };
     for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
     this.d.save(s);
     const flagged = w.refused.length ? flaggedLine(w.refused) : "";

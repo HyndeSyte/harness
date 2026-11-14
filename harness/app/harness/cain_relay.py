@@ -9,6 +9,14 @@ come back to handover.py /press, already checked by the link.
 
 Local only: the add-ons' own network on the Pi. Keyed with
 HMAC-SHA256(bot token, "harness-relay-v1"); both add-ons hold the token.
+
+Signed both ways, the key never sent (Harness 0.24.0, with Cain 0.12.0): Cain's session
+runs as its own user since then, and could hold the link's port while the link restarts.
+A request carries x-harness-sig: id=<its id>,t=<ms>,s=HMAC(key, "request", method,
+path, id, t, body); the link answers with x-harness-sig: s=HMAC(key, "response", id,
+status, body). An answer without a good signature is no answer: retried like one that
+never came. The id is the request's own hash, so a retry of the same operation keeps it
+and the link does it once (link/auth.ts).
 """
 from __future__ import annotations
 
@@ -17,6 +25,7 @@ import hmac
 import http.client
 import json
 import logging
+import time
 from typing import Callable
 from urllib.parse import quote
 
@@ -24,10 +33,31 @@ log = logging.getLogger("harness.link")
 
 HOST, PORT = "0fcc2575-cain", 8097
 KEY_CONTEXT = b"harness-relay-v1"
+SIG_HEADER = "x-harness-sig"
 
 
 def key_for(token: str) -> str:
     return hmac.new(token.encode(), KEY_CONTEXT, hashlib.sha256).hexdigest()
+
+
+def _mac(key: str, parts: list) -> str:
+    return hmac.new(key.encode(), "\n".join(str(p) for p in parts).encode(), hashlib.sha256).hexdigest()
+
+
+def request_id(method: str, path: str, body: str) -> str:
+    """One operation's id: the same request, retried, keeps it (link/auth.ts requestId)."""
+    return hashlib.sha256(f"{method.upper()}\n{path}\n{body}".encode()).hexdigest()[:32]
+
+
+def sign_request(key: str, method: str, path: str, body: str, t: int | None = None) -> tuple[str, str]:
+    """The request's id and its x-harness-sig header."""
+    rid = request_id(method, path, body)
+    t = int(time.time() * 1000) if t is None else t
+    return rid, f"id={rid},t={t},s={_mac(key, ['request', method.upper(), path, rid, t, body])}"
+
+
+def sign_response(key: str, rid: str, status: int, body: str) -> str:
+    return "s=" + _mac(key, ["response", rid, status, body])
 
 
 class LinkError(Exception):
@@ -48,19 +78,25 @@ class CainLink:
         token = self._token_fn()
         if not token:
             raise LinkError(0, "no bot token set")
+        key = key_for(token)
+        text = json.dumps(body) if body is not None else ""
+        rid, sig = sign_request(key, method, path, text)
         try:
             c = http.client.HTTPConnection(self.host, self.port,
                                            timeout=timeout or self.timeout)
-            c.request(method, path, body=json.dumps(body) if body is not None else None,
-                      headers={"content-type": "application/json",
-                               "x-harness-key": key_for(token)})
+            c.request(method, path, body=text.encode() if body is not None else None,
+                      headers={"content-type": "application/json", SIG_HEADER: sig})
             r = c.getresponse()
             raw = r.read()
+            got = r.getheader(SIG_HEADER) or ""
             c.close()
         except (OSError, http.client.HTTPException) as e:
             # A broken answer (BadStatusLine, IncompleteRead) is the link failing too: tried again
             # later like no answer, never a stop that strands the outbox (Nov 11 review).
             raise LinkError(0, type(e).__name__) from None
+        # Only the link can sign its answer: anything else holding its port isn't it.
+        if not hmac.compare_digest(got, sign_response(key, rid, r.status, raw.decode("utf-8", "replace"))):
+            raise LinkError(0, "an answer the link didn't sign")
         try:
             data = json.loads(raw or b"{}")
         except ValueError:

@@ -1,8 +1,8 @@
 // Cain's end of the Discord channel (rootfs/opt/cain/discord/bridge.ts): lines pass both ways;
-// a reply's files go as bytes read as Cain; a broker restart costs a resend, never the channel.
+// a reply's files go as bytes read as Cain; a lost channel says "unknown" and ends, never replays.
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { Bridge, MAX_BYTES, RECONNECTING, RESTARTED, withFileBytes } from "../rootfs/opt/cain/discord/bridge";
+import { Bridge, MAX_BYTES, MAX_LINE, UNKNOWN, withFileBytes } from "../rootfs/opt/cain/discord/bridge";
 
 class FakeSock extends EventEmitter {
   connecting = true; destroyed = false; written: string[] = [];
@@ -18,10 +18,11 @@ function rig() {
   const socks: FakeSock[] = [];
   const timers: (() => void)[] = [];
   const toClaude: any[] = [];
-  const b = new Bridge("/sock", (l) => toClaude.push(JSON.parse(l)), () => { const s = new FakeSock(); socks.push(s); return s as any; },
-    (_ms, f) => { timers.push(f); });
+  let exited: number | null = null;
+  const b = new Bridge("/sock", (l) => toClaude.push(JSON.parse(l)), (c) => { exited = c; },
+    () => { const s = new FakeSock(); socks.push(s); return s as any; }, (_ms, f) => { timers.push(f); });
   b.start();
-  return { b, socks, toClaude, tick: () => timers.shift()?.() };
+  return { b, socks, toClaude, tick: () => timers.shift()?.(), exited: () => exited };
 }
 const init = { jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-code" } } };
 const inited = { jsonrpc: "2.0", method: "notifications/initialized" };
@@ -37,6 +38,17 @@ describe("the bridge", () => {
     expect(t.socks[0].lines().map((m) => m.method)).toEqual(["initialize", "notifications/initialized"]);
   });
 
+  test("a broker that isn't up yet: the first lines keep waiting through retries", () => {
+    const t = rig();
+    t.b.fromClaude(JSON.stringify(init));
+    t.socks[0].destroy();
+    expect(t.toClaude).toEqual([]);
+    expect(t.exited()).toBeNull();
+    t.tick();
+    t.socks[1].up();
+    expect(t.socks[1].lines()[0]).toEqual(init);
+  });
+
   test("answers and notifications come back to Claude Code unchanged", () => {
     const t = rig();
     t.socks[0].up();
@@ -46,41 +58,28 @@ describe("the bridge", () => {
     expect(t.toClaude.map((m) => m.id ?? m.method)).toEqual([5, "notifications/claude/channel"]);
   });
 
-  test("a broker restart: calls in flight are told to resend, the new server gets the initialize again", () => {
+  test("a line over the one limit never leaves: the call is answered here", () => {
     const t = rig();
-    t.b.fromClaude(JSON.stringify(init));
-    t.b.fromClaude(JSON.stringify(inited));
     t.socks[0].up();
-    t.socks[0].say({ jsonrpc: "2.0", id: 0, result: { protocolVersion: "2025-06-18", capabilities: {} } });
-    t.b.fromClaude(JSON.stringify(reply(7)));
-    t.socks[0].destroy();
-    expect(t.toClaude.at(-1)).toEqual({ jsonrpc: "2.0", id: 7, error: { code: -32000, message: RESTARTED } });
-
-    // While it's down, a call is answered at once and a notification goes nowhere.
-    t.b.fromClaude(JSON.stringify(reply(8)));
-    expect(t.toClaude.at(-1)).toEqual({ jsonrpc: "2.0", id: 8, error: { code: -32000, message: RECONNECTING } });
-
-    t.tick();
-    t.socks[1].up();
-    const sent = t.socks[1].lines();
-    expect(sent[0].method).toBe("initialize");
-    expect(String(sent[0].id)).toStartWith("bridge-reinit-");
-    expect(sent[1].method).toBe("notifications/initialized");
-    const before = t.toClaude.length;
-    t.socks[1].say({ jsonrpc: "2.0", id: sent[0].id, result: { protocolVersion: "2025-06-18" } });
-    expect(t.toClaude.length).toBe(before);            // the replay's answer stays in the bridge
-    t.b.fromClaude(JSON.stringify(reply(9)));
-    expect(t.socks[1].lines().at(-1).id).toBe(9);
+    t.b.fromClaude(JSON.stringify(reply(4, "x".repeat(MAX_LINE))));
+    expect(t.socks[0].written).toEqual([]);
+    expect(t.toClaude[0].error.message).toContain("over the channel's limit");
   });
 
-  test("a broker that isn't up yet: the first lines keep waiting through retries", () => {
+  test("a lost channel: calls in flight hear their outcome is unknown, and the bridge ends", () => {
     const t = rig();
-    t.b.fromClaude(JSON.stringify(init));
+    t.socks[0].up();
+    t.b.fromClaude(JSON.stringify(reply(7)));
+    t.b.fromClaude(JSON.stringify(reply(8)));
+    t.socks[0].say({ jsonrpc: "2.0", id: 8, result: { content: [{ type: "text", text: "sent (id: 2)" }] } });
     t.socks[0].destroy();
-    expect(t.toClaude).toEqual([]);
-    t.tick();
-    t.socks[1].up();
-    expect(t.socks[1].lines()[0]).toEqual(init);
+    expect(t.toClaude.at(-1)).toEqual({ jsonrpc: "2.0", id: 7, error: { code: -32000, message: UNKNOWN } });
+    expect(t.toClaude.filter((m) => m.error)).toHaveLength(1);
+    expect(t.exited()).toBe(1);
+    // Nothing is replayed or retried.
+    expect(t.socks).toHaveLength(1);
+    t.b.fromClaude(JSON.stringify(reply(9)));
+    expect(t.toClaude.some((m) => m.id === 9)).toBe(false);
   });
 });
 
@@ -105,9 +104,9 @@ describe("a reply's files", () => {
     expect(m.params.arguments.files_error).toBe("can't read /data/options.json: EACCES");
   });
 
-  test("more than ten, or more than 25 MB, is refused", () => {
+  test("more than ten, or more than 8 MB, is refused", () => {
     expect(withFileBytes(call(Array(11).fill("/w/chart.png")), read, size).params.arguments.files_error).toContain("at most 10");
-    expect(withFileBytes(call(["/w/chart.png"]), read, () => MAX_BYTES + 1).params.arguments.files_error).toContain("more than 25 MB");
+    expect(withFileBytes(call(["/w/chart.png"]), read, () => MAX_BYTES + 1).params.arguments.files_error).toContain("more than 8 MB");
   });
 
   test("anything else passes untouched", () => {

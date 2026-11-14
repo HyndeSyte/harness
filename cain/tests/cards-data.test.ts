@@ -10,6 +10,9 @@ import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, SAID_MAX, STOP, with
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
+// Transcripts are read only if they are files of Cain's user (C1); here, the test's own.
+process.env.CAIN_TRANSCRIPT_UID = String(typeof process.getuid === "function" ? process.getuid() : 0);
+
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 // A receipt for something the specialist did, as the Harness builds it.
 const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm1"), btn("Wrong time", "k:c:wt1"), btn("Just this once", "k:c:jo1")] },

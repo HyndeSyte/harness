@@ -5,9 +5,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { STOP } from "../rootfs/opt/cain/link/core";
 import { readTranscripts } from "../rootfs/opt/cain/link/publish";
 import { BOT, DAY, DM, HOUR, MIN, OWNER, PR, rig, SHA1 } from "./link-rig";
+
+// Transcripts are read only if they are files of Cain's user (C1); here, the test's own.
+process.env.CAIN_TRANSCRIPT_UID = String(typeof process.getuid === "function" ? process.getuid() : 0);
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 const STOP_ONLY = [{ type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
@@ -338,11 +342,17 @@ describe("the replay", () => {
     expect(rep.rules_version).toBe(3);
   });
 
-  test("keyed and on this machine only", () => {
+  test("Cain's, from this machine only; /sent root's alone (C1)", () => {
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
-    const local = /const LOCAL_ONLY = new Set\(\[([^\]]*)\]\)/.exec(main)![1];
-    for (const route of ["/replay", "/look", "/cards", "/check", "/connector", "/sent"]) expect(local).toContain(`"${route}"`);
-    expect(main.indexOf('if (!keyOk) return json({ status: "refused" }, 403);')).toBeLessThan(main.indexOf('case "/replay"'));
+    for (const route of ["/replay", "/look", "/cards", "/check", "/connector"]) {
+      expect(routeAllowed("cain", route)).toBe(true);
+      expect(routeAllowed("specialist", route)).toBe(false);
+    }
+    expect(routeAllowed("cain", "/sent")).toBe(false);
+    expect(routeAllowed("root", "/sent")).toBe(true);
+    // Cain's key counts only from this machine, and only routes the caller may use are routed.
+    expect(main).toContain('loopback(ip) && sameKey(bare, cainKey()) ? "cain" : "none"');
+    expect(main.indexOf("if (!routeAllowed(caller, url.pathname)) return json({ status: \"refused\" }, 403);")).toBeLessThan(main.indexOf('case "/replay"'));
     expect(main).toContain('if (token() && link.replayDue()) link.replay(30, "rules")');   // once by itself after the rules change
   });
 });

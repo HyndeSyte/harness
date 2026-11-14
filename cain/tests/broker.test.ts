@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BrokerSession, checkArgs, fileOutbox, type GateVerdict, MAX_BAD, MAX_PENDING } from "../rootfs/opt/cain/discord/broker";
+import { BrokerSession, checkArgs, fileOutbox, type GateVerdict, MAX_BAD, MAX_PENDING, UNKNOWN } from "../rootfs/opt/cain/discord/broker";
 
 const DM = "1569045703332855809";
 const MSG = "1571141530771525664";
@@ -197,6 +197,17 @@ describe("from the server", () => {
     t.s.fromServer(JSON.stringify({ jsonrpc: "2.0", id: 30, result: {} }));
     expect(t.toClient).toHaveLength(1);
     expect(t.toClient[0].error).toBeDefined();
+  });
+
+  test("a send the server took and never answered is an unknown outcome, never \"send it again\"", async () => {
+    const t = rig();
+    await t.call(50, "reply", { chat_id: DM, text: "x" });
+    t.s.serverGone();
+    expect(t.toClient[0].error.message).toBe(UNKNOWN);
+    const u = rig();
+    await u.call(51, "edit_message", { chat_id: DM, message_id: MSG, text: "y" });
+    u.timers[0].f();
+    expect(u.toClient[0].error.message).toBe(UNKNOWN);
   });
 
   test("when the server goes, every call in flight is told and the connection ends", async () => {

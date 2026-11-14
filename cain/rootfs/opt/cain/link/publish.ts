@@ -9,15 +9,21 @@
 // transcripts, for which of the bot's messages he sent with the Discord plugin (one bot
 // token posts them all), and which of them his reply tool made (seedReplies). They are
 // streamed in chunks and the event loop gets a turn often, so a tap is never kept waiting.
-import { createReadStream, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, fstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { answerText, sentIds } from "../gate/plugin";
+import { CAIN_UID, openOwnedFd } from "../owned";
 import { cardsView, emptyState, type ReplayReport, type Sent, type State } from "./core";
+
+// Whose transcripts these are (tests set their own user), read at each call.
+const transcriptUid = () => Number(process.env.CAIN_TRANSCRIPT_UID ?? CAIN_UID);
 
 export const CARDS_FILE = process.env.CAIN_CARDS ?? "/data/trust/cards.json";
 export const REPLAY_FILE = process.env.CAIN_GATE_REPLAY ?? "/data/work/gate-replay.json";
-export const TRANSCRIPTS = process.env.CAIN_TRANSCRIPTS ?? "/data/.claude/projects";
+// Cain's own (C1: his home is /data/cain). Each file is opened only if it's a regular file of
+// his user's, never through a link (../owned.ts), since he can put anything there.
+export const TRANSCRIPTS = process.env.CAIN_TRANSCRIPTS ?? "/data/cain/.claude/projects";
 export const CARDS_DELAY_MS = 500;
 
 // The link's state file: read whole, written whole through a rename. A save tells onSave
@@ -92,7 +98,9 @@ export async function readTranscripts(root: string, since: number): Promise<Sent
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f)); } catch { continue; }
     for (const f of files) {
-      try { if (statSync(f).mtimeMs < since) continue; } catch { continue; }
+      const owned = openOwnedFd(f, transcriptUid());
+      if (!owned) continue;
+      try { if (fstatSync(owned.fd).mtimeMs < since) { closeSync(owned.fd); continue; } } catch { try { closeSync(owned.fd); } catch { /* closed */ } continue; }
       const sends = new Map<string, boolean>();       // the plugin's send calls not answered yet: a reply?
       const take = (line: Buffer) => {
         if (!line.includes(NAME) && !(sends.size && line.includes(RESULT) && [...sends.keys()].some((s) => line.includes(s)))) return;
@@ -115,7 +123,7 @@ export async function readTranscripts(root: string, since: number): Promise<Sent
       };
       let parts: Buffer[] = [], held = 0, skipping = false, read = 0;
       try {
-        for await (const chunk of createReadStream(f, { highWaterMark: 64 * 1024 })) {
+        for await (const chunk of createReadStream("", { fd: owned.fd, highWaterMark: 64 * 1024, autoClose: true })) {
           const buf = chunk as Buffer;
           let pos = 0;
           for (let nl = buf.indexOf(10, pos); nl !== -1; nl = buf.indexOf(10, pos)) {   // only the new chunk is searched

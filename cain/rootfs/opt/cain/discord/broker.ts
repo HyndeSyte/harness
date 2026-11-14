@@ -17,16 +17,18 @@
 //     notifications/message. The initialize answer loses the permission-relay capability,
 //     so Claude Code never sends a prompt here.
 // The gate's hard rules fail closed: an error refuses the call, and no retry passes a hard
-// refusal. Limits: 4 MB a line, 32 calls in flight, 60 s a call, 20 bad frames.
+// refusal. Limits: 12 MB a line (8 MB of attachments), 32 calls in flight, 60 s a call, 20 bad
+// frames. A call that may have done something (a send, an edit, a reaction, a download) and
+// never got its answer is told its outcome is unknown, never "send it again".
 import { chownSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-export const MAX_LINE = 4 * 1024 * 1024;
+export const MAX_LINE = 12 * 1024 * 1024;
 export const MAX_PENDING = 32;
 export const CALL_MS = 60_000;
 export const MAX_BAD = 20;
 export const MAX_FILES = 10;
-export const MAX_FILE_BYTES = 25 * 1024 * 1024;
+export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 export const MAX_TEXT = 20_000;
 
 type Msg = Record<string, any>;
@@ -67,6 +69,8 @@ export interface BrokerDeps {
 interface Pending { method: string; tool?: string; args?: Record<string, unknown>; outbox?: string; note?: string; timer?: unknown; initialize?: boolean }
 
 const err = (id: unknown, message: string, code = -32000) => JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });
+export const UNKNOWN = "The Discord channel stopped before it confirmed this; it may have gone out. Read the chat (fetch_messages) before sending it again.";
+const ACTS = new Set(["reply", "edit_message", "react", "download_attachment"]);
 const toolError = (id: unknown, text: string) => JSON.stringify({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError: true } });
 
 // The arguments of a call, checked against its tool's fields: the clean copy, or why not.
@@ -97,7 +101,7 @@ export function checkArgs(name: string, args: unknown): { args: Record<string, u
       if (!/^[A-Za-z0-9+/]*={0,2}$/.test((x as any).data)) return { why: "a file's bytes aren't base64" };
       total += Math.floor(((x as any).data.length * 3) / 4);
     }
-    if (total > MAX_FILE_BYTES) return { why: "the files come to more than 25 MB" };
+    if (total > MAX_FILE_BYTES) return { why: "the files come to more than 8 MB" };
   }
   return { args: { ...a } };
 }
@@ -130,7 +134,7 @@ export class BrokerSession {
     for (const [key, p] of this.pending) {
       this.d.clearTimer?.(p.timer);
       if (p.outbox) this.d.outbox.drop(p.outbox);
-      this.d.toClient(err(JSON.parse(key), "The Discord channel restarted before this finished; send it again."));
+      this.d.toClient(err(JSON.parse(key), p.tool && ACTS.has(p.tool) && p.args ? UNKNOWN : "The Discord channel stopped before this finished; try it again."));
     }
     this.pending.clear();
     this.end();
@@ -203,7 +207,7 @@ export class BrokerSession {
     p.timer = this.d.setTimer?.(CALL_MS, () => {
       if (!this.pending.has(key)) return;
       this.untrack(key);
-      this.d.toClient(err(id, "The Discord channel didn't answer in time; send it again."));
+      this.d.toClient(err(id, p.tool && ACTS.has(p.tool) && p.args ? UNKNOWN : "The Discord channel didn't answer in time; try it again."));
     });
     this.pending.set(key, p);
   }

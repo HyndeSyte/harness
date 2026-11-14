@@ -4,14 +4,23 @@
 //   - Cain (his scripts, on this machine): a key of his own, made at each start into
 //     /run/cain/keys/cain.key, that opens nothing of the specialist's;
 //   - root's own services (the broker): the link's unix socket, which only root can open.
-// The specialist signs each request rather than sending its key: a port Cain holds while the
-// link restarts would otherwise learn the key and could post cards as the specialist. A
-// signature covers the method, the path with its query, the time and the body; it counts
-// within a minute of now, once.
-import { createHmac, timingSafeEqual } from "node:crypto";
+// The specialist and the link sign both ways rather than sending the key, since the link's
+// TCP port could be held by Cain while the link restarts:
+//   request:  x-harness-sig: id=<request id>,t=<ms>,s=HMAC(key, "request", method, path and
+//             query, id, t, body), counted within a minute of now;
+//   response: x-harness-sig: s=HMAC(key, "response", id, status, body).
+// One request id is one operation: the link records it before acting (received) and after
+// (done, with its answer), durably, for 48 hours. A repeat of a done id gets the stored answer
+// and nothing is done again; one received but never done (the link stopped mid-way) is
+// reconciled, never simply repeated (main.ts). So a request someone holds and forwards late
+// runs at most once, and an answer the specialist can't verify is no answer.
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { dirname } from "node:path";
 
 export const SIG_HEADER = "x-harness-sig";
 export const SIG_WINDOW_MS = 60_000;
+export const KEEP_MS = 48 * 3_600_000;           // longer than the specialist retries an operation
 
 export const SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"]);
 export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
@@ -24,30 +33,52 @@ export function sameKey(a: string, b: string): boolean {
   return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
 }
 
-const mac = (key: string, method: string, target: string, t: number, body: string) =>
-  createHmac("sha256", key).update(`${method.toUpperCase()}\n${target}\n${t}\n${body}`).digest("hex");
+const mac = (key: string, parts: (string | number)[]) => createHmac("sha256", key).update(parts.join("\n")).digest("hex");
 
-// The header a caller sends: t=<ms since 1970>,s=<hex>.
-export function signRequest(key: string, method: string, target: string, body: string, t = Date.now()): string {
-  return `t=${t},s=${mac(key, method, target, t, body)}`;
+// A request's id from what it asks: the same operation, retried, keeps its id.
+export const requestId = (method: string, target: string, body: string) =>
+  createHash("sha256").update(`${method.toUpperCase()}\n${target}\n${body}`).digest("hex").slice(0, 32);
+
+export function signRequest(key: string, method: string, target: string, body: string, t = Date.now(), id = requestId(method, target, body)): string {
+  return `id=${id},t=${t},s=${mac(key, ["request", method.toUpperCase(), target, id, t, body])}`;
+}
+export function signResponse(key: string, id: string, status: number, body: string): string {
+  return `s=${mac(key, ["response", id, status, body])}`;
 }
 
-export class Signatures {
-  private seen = new Map<string, number>();
-  constructor(private windowMs = SIG_WINDOW_MS) {}
+// The request's id when its signature is good and within the window; otherwise null.
+export function checkRequest(header: string | null, key: string, method: string, target: string, body: string, now = Date.now()): string | null {
+  if (!header || !key) return null;
+  const m = /^id=([0-9a-f]{32}),t=(\d{10,16}),s=([0-9a-f]{64})$/.exec(header.trim());
+  if (!m) return null;
+  const t = Number(m[2]);
+  if (!Number.isSafeInteger(t) || Math.abs(now - t) > SIG_WINDOW_MS) return null;
+  return sameKey(m[3], mac(key, ["request", method.toUpperCase(), target, m[1], t, body])) ? m[1] : null;
+}
 
-  // True once for a good signature within the window; a repeat, a stale or a future one, false.
-  check(header: string | null, key: string, method: string, target: string, body: string, now = Date.now()): boolean {
-    if (!header || !key) return false;
-    const m = /^t=(\d{10,16}),s=([0-9a-f]{64})$/.exec(header.trim());
-    if (!m) return false;
-    const t = Number(m[1]);
-    if (!Number.isSafeInteger(t) || Math.abs(now - t) > this.windowMs) return false;
-    if (!sameKey(m[2], mac(key, method, target, t, body))) return false;
-    for (const [s, at] of this.seen) if (now - at > 2 * this.windowMs) this.seen.delete(s);
-    if (this.seen.has(m[2])) return false;
-    this.seen.set(m[2], now);
-    return true;
+export interface Stored { at: number; state: "received" | "done"; status?: number; body?: string }
+
+// What the link did with each signed request, by id, kept 48 hours on disk, each change synced.
+export class RequestLog {
+  private map = new Map<string, Stored>();
+  constructor(private path: string | null) {
+    if (!path) return;
+    try { for (const [id, s] of Object.entries(JSON.parse(readFileSync(path, "utf8")))) this.map.set(id, s as Stored); } catch { /* none yet */ }
+  }
+  get(id: string, now = Date.now()): Stored | null {
+    const s = this.map.get(id);
+    return s && now - s.at <= KEEP_MS ? s : null;
+  }
+  put(id: string, s: Stored): void {
+    for (const [k, v] of this.map) if (s.at - v.at > KEEP_MS) this.map.delete(k);
+    this.map.set(id, s);
+    if (!this.path) return;
+    mkdirSync(dirname(this.path), { recursive: true });
+    const tmp = `${this.path}.tmp`;
+    const fd = openSync(tmp, "w", 0o600);
+    try { writeSync(fd, JSON.stringify(Object.fromEntries(this.map))); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmp, this.path);
+    try { const dir = openSync(dirname(this.path), "r"); try { fsyncSync(dir); } finally { closeSync(dir); } } catch { /* not every platform syncs a folder */ }
   }
 }
 
