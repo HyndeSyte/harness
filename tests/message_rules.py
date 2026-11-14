@@ -162,9 +162,12 @@ _DASH = re.compile("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u
 _MERIDIEM = _S + r"?[AaPp]\.?[Mm]\.?"
 _CLOCK = r"(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")"
 _NAMES = r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)\.?"
-_NUMBER_BEFORE = re.compile(r"(?:\d(?:st|nd|rd|th|%)?|(?<![\d:.])" + _CLOCK + r"|(?<![A-Za-z])" + _NAMES + r")\Z",
-                            re.I | A)
-_NUMBER_AFTER = re.compile("^(?:[$\\u20ac\\u00a3]?\\d|" + _NAMES + r"(?![A-Za-z]))", re.I | A)
+# Past what can stand between a number and the dash (rules.ts PAST_LEFT, PAST_RIGHT).
+_PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
+_PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
+_NUMBER_BEFORE = re.compile(r"(?:\d(?:st|nd|rd|th|%)?|(?<![\d:.])" + _CLOCK + r"|(?<![A-Za-z])" + _NAMES + ")" + _PAST_LEFT
+                            + r"\Z", re.I | A)
+_NUMBER_AFTER = re.compile("^" + _PAST_RIGHT + "(?:[$\\u20ac\\u00a3]?\\d|" + _NAMES + r"(?![A-Za-z]))", re.I | A)
 
 
 def _dashes(text: str, seen: str) -> list[tuple[int, int, str | None]]:

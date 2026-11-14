@@ -133,8 +133,13 @@ const DASH = new RegExp("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u20
 const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
 const CLOCK = `(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})`;
 const NAMES = "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)\\.?";
-const NUMBER_BEFORE = new RegExp(`(?:\\d(?:st|nd|rd|th|%)?|(?<![\\d:.])${CLOCK}|(?<![A-Za-z])${NAMES})$`, "i");
-const NUMBER_AFTER = new RegExp(`^(?:[$€£]?\\d|${NAMES}(?![A-Za-z]))`, "i");
+// Past what can stand between a number and the dash: on the left, closing brackets, quotes,
+// "!" and "."; on the right, opening brackets and quotes; on both, spaces, zero-width
+// characters and a line break, so a dash at a line's end or start between numbers counts too.
+const PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
+const PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
+const NUMBER_BEFORE = new RegExp(`(?:\\d(?:st|nd|rd|th|%)?|(?<![\\d:.])${CLOCK}|(?<![A-Za-z])${NAMES})${PAST_LEFT}$`, "i");
+const NUMBER_AFTER = new RegExp(`^${PAST_RIGHT}(?:[$€£]?\\d|${NAMES}(?![A-Za-z]))`, "i");
 
 // Each em dash and what goes in its place; null: it stays, and the writer says it without it.
 function dashes(text: string, seen: string): { at: number; end: number; put: string | null }[] {

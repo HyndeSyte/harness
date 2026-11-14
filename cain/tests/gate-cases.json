@@ -149,6 +149,20 @@
     {"name": "a link's scheme in capitals is cut to its host too", "text": "See HTTPS://user:pw@Host.example/x?key=1 — then reply.", "fixed": "See HTTPS://user:pw@Host.example/x?key=1, then reply.", "fix": ["dash"], "around": ["See https://host.example/… — then reply."]},
     {"name": "a link with parentheses in its path is cut to its host", "text": "See https://en.wikipedia.org/wiki/Foo_(bar)?token=X — ok.", "fixed": "See https://en.wikipedia.org/wiki/Foo_(bar)?token=X, ok.", "fix": ["dash"], "around": ["See https://en.wikipedia.org/… — ok."]},
     {"name": "two dashes with a space between are one dash, between numbers", "text": "5 — — 6 PM", "refuse": ["dash"]},
-    {"name": "two dashes with a space between are one dash, between words", "text": "Moved — — swim.", "fixed": "Moved, swim.", "fix": ["dash"]}
+    {"name": "two dashes with a space between are one dash, between words", "text": "Moved — — swim.", "fixed": "Moved, swim.", "fix": ["dash"]},
+    {"name": "a number in brackets, then a time, is said in words", "text": "Swim (lane 4) — 5 PM.", "refuse": ["dash"]},
+    {"name": "a number in square brackets, then a time, is said in words", "text": "Swim [lane 4] — 5 PM.", "refuse": ["dash"]},
+    {"name": "a number in quotes, then a time, is said in words", "text": "Ask for \"5\" — 6 PM.", "refuse": ["dash"]},
+    {"name": "a number with a bang, then a time, is said in words", "text": "5! — 6 PM", "refuse": ["dash"]},
+    {"name": "a number with a stop, then a time, is said in words", "text": "at 5. — 6 PM", "refuse": ["dash"]},
+    {"name": "a number, then a time in brackets, is said in words", "text": "Swim at 5 — (6 PM).", "refuse": ["dash"]},
+    {"name": "a number, then a time in quotes, is said in words", "text": "Swim at 5 — “6 PM”.", "refuse": ["dash"]},
+    {"name": "zero-width spaces beside the dash don't hide the numbers", "text": "Swim is 5\u200b—\u200b6 PM", "refuse": ["dash"]},
+    {"name": "word joiners beside the dash don't hide the numbers", "text": "Pages 3\u2060—\u20604", "refuse": ["dash"]},
+    {"name": "a zero-width non-joiner beside the dash doesn't hide a number", "text": "Swim 5\u200c — 6 PM", "refuse": ["dash"]},
+    {"name": "a dash at a line's end between two times is said in words", "text": "Swim 6 PM —\n8 PM", "refuse": ["dash"]},
+    {"name": "a dash at a line's start between two numbers is said in words", "text": "Rooms 4\n— 5 are free.", "refuse": ["dash"]},
+    {"name": "a dash at a line's end between words still goes", "text": "Moved swim —\nall set.", "fixed": "Moved swim\nall set.", "fix": ["dash"]},
+    {"name": "a number in brackets against words still gets a comma", "text": "Swim (lane 4) — see you there.", "fixed": "Swim (lane 4), see you there.", "fix": ["dash"]}
   ]
 }

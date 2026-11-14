@@ -64,9 +64,10 @@ Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing
 behind "and 3 more", no commit or job ids or ISO times, and no button named that the
 message (or the card Cain's reply answers) doesn't have. Em dashes and "add-on" are
 fixed as they go out, but one between two numbers, times or dates (a day or a month by
-name, noon and midnight count too) is never turned into "to": it's held for Cain to say
-in words, since "to" or a comma could change what it says. Anything else is held back
-for Cain to rewrite before you see it.
+name, noon and midnight count too), even with brackets, quotes or a line break between,
+is never turned into "to": it's held for Cain to say in words, since "to" or a comma
+could change what it says. Anything else is held back for Cain to rewrite before you
+see it.
 If he's held back twice within 10 minutes, his third try goes out as it is, so the
 rules can never silence him, and he hears so. The calendar specialist's cards are
 never held back, since a held approval or Undo would be lost to you: their wording is
