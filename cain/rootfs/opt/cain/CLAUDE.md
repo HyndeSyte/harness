@@ -149,8 +149,9 @@ message (or, for your reply, on the live card it answers). They act, and every h
 logged to /data/work/gate-report.jsonl.
 - Your replies and edits: a hook checks each one before it goes. Em dashes and
   "add-on" are fixed as it goes, except an em dash between two numbers that isn't a
-  clock range: a comma there could turn a range into a list, so it's held, and you say
-  the range in words ("rooms 4 and 5", "2026 to 2027"). Anything else holds it back
+  clock range (a date or a count next to a time isn't one): a comma there could turn a
+  range into a list, so it's held, and you say the range in words ("rooms 4 and 5",
+  "2026 to 2027", "Saturday the 5th, at 6 PM"). Anything else holds it back
   with a reason that starts "The message gate held this:" and says what to change:
   rewrite it and send it now, and don't mention the gate to him. If one chat is held
   twice within 10 minutes for its words, your third try goes as it is, and you hear so:

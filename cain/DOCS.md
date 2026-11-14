@@ -64,13 +64,17 @@ Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing
 behind "and 3 more", no commit or job ids or ISO times, and no button named that the
 message (or the card Cain's reply answers) doesn't have. Em dashes and "add-on" are
 fixed as they go out; one between two numbers that isn't a time range is held for Cain
-to say in words, since a comma could turn a range into a list. Anything else is held
-back for Cain to rewrite before you see it.
+to say in words, since a comma could turn a range into a list. A time range is two
+times ("9:30 to 10:15"), or an hour then a time with AM or PM, the hour starting the
+line or following from, between, at, by, around, about, until, till, a colon or a
+bracket ("from 6 to 8 PM"); a date or a count next to a time isn't one. Anything else
+is held back for Cain to rewrite before you see it.
 If he's held back twice within 10 minutes, his third try goes out as it is, so the
 rules can never silence him, and he hears so. The calendar specialist's cards are
 never held back, since a held approval or Undo would be lost to you: their wording is
 fixed, and Cain hears about anything else. Cain can edit only his own replies. A log on
-the Pi, in Cain's own folder, keeps what the rules caught. After an update that changes
+the Pi, in Cain's own folder, keeps what the rules caught, as short excerpts in which a
+link is only its site. After an update that changes
 the rules, the App reads back over your DM once with them, posting nothing, and Cain
 files what they found. Nothing for you to do.
 
@@ -90,10 +94,15 @@ One red Stop is always near the bottom of your DM. It sits on the newest plain m
 from Cain or his App, one that asks nothing, and never on a card that asks something,
 so it's never next to Ship, Start, Approve or Undo. It moves down only when none of the
 last 5 messages has a Stop (the morning message and the calendar specialist's cards have
-their own), and Discord shows "(edited)" on the messages it moves between. While
-everything is stopped it comes off, and Turn back on stays near the bottom instead: on
-the morning message and the stopped notice, which is posted again when it's out of
-reach, at most once an hour, or 10 minutes after the last one once you write.
+their own), and Discord shows "(edited)" on the messages it moves between. If Discord
+doesn't answer, the move is tried again after 1, 2 and 5 minutes, then every 10; a
+message Discord refuses it on three times is passed over for the newest plain one among
+the last 5, and nothing is posted just to carry it. While everything is stopped it comes
+off, and Turn back on stays near the bottom instead: on the morning message and the
+stopped notice, which is posted again when it's out of reach, at most once an hour, or
+10 minutes after the last one once you write. If none is up anywhere, it's posted each
+minute until one is, also when the App can't read whether things are stopped, which it
+counts as stopped.
 
 ## Ship
 
