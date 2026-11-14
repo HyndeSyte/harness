@@ -1,12 +1,12 @@
 // Decision A, against the real Claude Code CLI (local only). Cain runs `claude
 // --permission-mode auto`, and the hooks docs say an updatedInput that comes without a
 // decision can be refused in auto mode, so the reply hook answers "allow" with the call's
-// whole input and only its text fixed. This proves the CLI then sends the fixed text to an
-// MCP tool named like the plugin's, and hands that same input to the PostToolUse hook
-// (discord-sent.ts, wired in the background as settings.json wires it), which tells the link
-// what went out; that a refusal reaches the model as the hook's reason, with nothing sent;
-// and that an edit straight after a reply passes on the session's own transcript, before
-// the link has heard of the reply.
+// whole input and only its text fixed ("add-on" made "App"). This proves the CLI then sends
+// the fixed text to an MCP tool named like the plugin's, and hands that same input to the
+// PostToolUse hook (discord-sent.ts, wired in the background as settings.json wires it),
+// which tells the link what went out; that a refusal ("and 3 more", or any em dash) reaches
+// the model as the hook's reason, with nothing sent; and that an edit straight after a reply
+// passes on the session's own transcript, before the link has heard of the reply.
 //
 // The model is a stand-in: a local server speaking the Messages API that answers the
 // session's first turn with one reply tool call (then, when asked, one edit of that reply)
@@ -126,13 +126,13 @@ async function session(text: string, o: { edit?: string; told?: number } = {}) {
 }
 
 live("an allowed updatedInput reaches the plugin's reply tool in auto mode, and the PostToolUse hook sees it", async () => {
-  const s = await session("Moved swim — it's at 4:30 now.", { told: 1 });
+  const s = await session("Restarted the add-on at 4:30.", { told: 1 });
   if (!s.calls.length) console.log(`claude said: ${s.said}`);
   // The plugin got the fixed words, and the rest of the input as the model wrote it.
-  expect(s.calls.map((c: any) => ({ name: c.name, arguments: c.arguments }))).toEqual([{ name: "reply", arguments: { chat_id: DM, text: "Moved swim, it's at 4:30 now." } }]);
+  expect(s.calls.map((c: any) => ({ name: c.name, arguments: c.arguments }))).toEqual([{ name: "reply", arguments: { chat_id: DM, text: "Restarted the App at 4:30." } }]);
   const id = sentIds(s.calls[0].answer)[0];
-  // The PostToolUse hook, in the background, saw the fixed words and the plugin's answer: the id, nothing for the net.
-  expect(s.told).toEqual([{ tool: "reply", ids: [id], question: false, chat: DM }]);
+  // The PostToolUse hook, in the background, saw the fixed words and the plugin's answer: the id and its tool call, nothing for the net.
+  expect(s.told).toEqual([{ tool: "reply", ids: [id], question: false, call: "toolu_gate_1", chat: DM }]);
   expect(JSON.stringify(s.results)).toContain(`sent (id: ${id})`);
   expect(s.gate).toContain('"did":"fixed"');
 }, 180_000);
@@ -147,17 +147,27 @@ live("a refusal reaches the model as the hook's reason, and nothing is sent", as
   expect(s.gate).toContain('"did":"refused"');
 }, 180_000);
 
-// Both carry an em dash, so the hook decides each (allow, fixed) and auto mode's classifier,
+live("an em dash is refused the same way, never fixed: nothing is sent, and the reason says how to say it without one", async () => {
+  const s = await session("Moved swim — it's at 4:30 now.");
+  if (!s.results.length) console.log(`claude said: ${s.said}`);
+  expect(s.calls).toEqual([]);
+  expect(s.told).toEqual([]);
+  expect(JSON.stringify(s.results)).toContain("The message gate held this:");
+  expect(JSON.stringify(s.results)).toContain("an em dash; rewrite it without one");
+  expect(s.gate).toContain('"did":"refused"');
+}, 180_000);
+
+// Both carry "add-on", so the hook decides each (allow, fixed) and auto mode's classifier,
 // which the stand-in model can't play, never runs: the edit is fixed in place only once its
 // target passed as his own reply.
 live("an edit straight after a reply passes on the session's transcript, though the link's list doesn't have the reply", async () => {
-  const s = await session("Moved swim — it's at 4:30.", { edit: "Moved swim — it's at 5:00 now.", told: 2 });
+  const s = await session("Restarted the add-on at 4:30.", { edit: "Restarted the add-on at 5:00.", told: 2 });
   if (s.calls.length < 2) console.log(`claude said: ${s.said} results: ${JSON.stringify(s.results).slice(0, 600)}`);
   const id = sentIds(s.calls[0]?.answer ?? "")[0];
   expect(s.calls.map((c: any) => ({ name: c.name, arguments: c.arguments }))).toEqual([
-    { name: "reply", arguments: { chat_id: DM, text: "Moved swim, it's at 4:30." } },
-    { name: "edit_message", arguments: { chat_id: DM, message_id: id, text: "Moved swim, it's at 5:00 now." } },
+    { name: "reply", arguments: { chat_id: DM, text: "Restarted the App at 4:30." } },
+    { name: "edit_message", arguments: { chat_id: DM, message_id: id, text: "Restarted the App at 5:00." } },
   ]);
   expect(s.gate.trim().split(String.fromCharCode(10)).map((l) => JSON.parse(l).did)).toEqual(["fixed", "fixed"]);
-  expect(s.told).toContainEqual({ tool: "edit", ids: [id], question: false, chat: DM });
+  expect(s.told).toContainEqual({ tool: "edit", ids: [id], question: false, call: "toolu_gate_2", chat: DM });
 }, 180_000);

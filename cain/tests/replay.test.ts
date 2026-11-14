@@ -26,7 +26,7 @@ const done = async (r: ReturnType<typeof rig>) => { await r.link.whenReplayed();
 // replies (one naming a button the card it answers lacks), his own messages, a permission
 // prompt, something else on the bot's token, and a morning message whose Stop came off.
 async function dm(r: ReturnType<typeof rig>) {
-  const ask = (await r.link.ask({ text: "P08 Q2: Filed — or not?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+  const ask = (await r.link.ask({ text: "P08 Q2: Is the add-on's packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
   await r.tap(structuredClone(r.msg(ask)), r.ids(ask)[0]);
   const digest = await r.link.addCard({ text: "Three blocks added, each on its own card with Undo.", rows: STOP_ONLY, kind: "digest" });
   const digestMsg = await r.link.show(digest, { item: "none" });
@@ -74,8 +74,8 @@ describe("the replay", () => {
     expect(hits(m.reply2)).toEqual([]);                                  // a long number in a reply to him
     expect(hits(m.reply3)).toMatchObject([{ rule: "button", result: "unsure", label: "Approve" }]);
     expect(hits(m.digestMsg)).toMatchObject([{ writer: "specialist", rule: "button", result: "refuse", label: "Undo" }]);
-    expect(hits(m.ask)).toEqual([]);                                    // its dash was fixed before it was posted
-    expect(hits(m.stranger)).toMatchObject([{ writer: "unknown", rule: "dash" }]);
+    expect(hits(m.ask)).toEqual([]);                                    // its add-on was fixed before it was posted
+    expect(hits(m.stranger)).toMatchObject([{ writer: "unknown", rule: "dash", result: "refuse" }]);   // read as Cain's: every em dash refused
     expect(rep.hits.by_rule.button).toEqual({ fix: 0, refuse: 2, unsure: 1 });
     expect(rep.hits.by_writer.cain.button).toEqual({ fix: 0, refuse: 1, unsure: 1 });
     expect(rep.hits.total).toBe(rep.list.length);

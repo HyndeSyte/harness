@@ -1,5 +1,5 @@
 // The message gate on Cain's own Discord replies and edits (hooks/discord-send.ts and
-// gate/send.ts), enforcing since 0.10.0: em dashes and "add-on" fixed in place, the rest
+// gate/send.ts), enforcing since 0.10.0: "add-on" fixed in place, every em dash and the rest
 // held back with what to change, the third try let through, and the safety net after the
 // send (hooks/discord-sent.ts). Each hook is also run as a child process, as Claude Code
 // runs it.
@@ -79,12 +79,12 @@ describe("what the gate does with Cain's reply", () => {
     expect(decide(reply("Run `0123456789abcdef0123456789abcdef01234567`.", HIS)).would).toBe("pass");
   });
 
-  test("a fix sends the fixed words; a fix and a refusal together hold it, saying the fix is made for him", () => {
-    const d = decide(reply("Moved swim — it's at 4:30 now."));
-    expect(d).toMatchObject({ would: "fix", fixed: "Moved swim, it's at 4:30 now.", chat: "his" });
-    const both = decide(reply("Moved swim — tap Undo."));
+  test("an \"add-on\" fix sends the fixed words; a fix and a refusal together hold it, saying the fix is made for him", () => {
+    const d = decide(reply("Restarted the add-on at 4:30."));
+    expect(d).toMatchObject({ would: "fix", fixed: "Restarted the App at 4:30.", chat: "his" });
+    const both = decide(reply("Restarted the add-on, tap Undo."));
     expect(both.would).toBe("refuse");
-    expect(both.said).toContain("Its em dashes and add-ons are fixed for you when it goes.");
+    expect(both.said).toContain("Its add-ons are fixed for you when it goes.");
   });
 
   test("with no cards, a named button is held and the text rules still run", () => {
@@ -163,15 +163,31 @@ describe("what the gate does with Cain's reply", () => {
     expect(decide(edit("Fixed.", NOTICE), null).hits).toMatchObject([{ rule: "target", result: "unsure" }]);
   });
 
-  test("an em dash between two numbers, or a time and a number, is held, saying to say it without the dash, and the other fixes are still made", () => {
+  test("every em dash is held, never fixed, saying how to say it without one; two close together are said once, and add-ons are still fixed", () => {
+    // Fable, round four: a comma for a dash still made ranges lists (bold numbers, units, "Week 1" and "Week 3").
     const d = decide(reply("Room 4—5 is free — then lunch."));
-    expect(d).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "dash", result: "refuse" }, { rule: "dash", result: "fix" }] });
-    expect(d.said).toBe("The message gate held this: \"Room 4—5 is free — then lunch.\": say it without the dash, as a range in words if it is one. Its other em dashes and add-ons are fixed for you when it goes. Rewrite and send now; don't mention it to him.");
-    // A time and a number: held, and the reason doesn't call it a range.
-    const party = decide(reply("Party is 6 PM — 8."));
-    expect(party).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "dash", result: "refuse" }] });
-    expect(party.said).toBe("The message gate held this: \"Party is 6 PM — 8.\": say it without the dash, as a range in words if it is one. Rewrite and send now; don't mention it to him.");
-    expect(decide(reply("Swim moved to 4:30 — that works."))).toMatchObject({ would: "fix", fixed: "Swim moved to 4:30, that works." });
+    expect(d).toMatchObject({ would: "refuse", hard: false, fixed: "Room 4—5 is free — then lunch.", hits: [{ rule: "dash", result: "refuse" }, { rule: "dash", result: "refuse" }] });
+    expect(d.said).toBe("The message gate held this: \"Room 4—5 is free — then lunch.\": an em dash; rewrite it without one, using a comma or a new sentence for a break, \"to\" or \"through\" for a range. Rewrite and send now; don't mention it to him.");
+    for (const text of ["Moved swim — it's at 4:30 now.", "Swim is **5** — **6 PM**.", "Swim takes 30 min — 1 hr.", "Week 1 — Week 3 are booked.", "Out Monday morning — Friday evening."]) {
+      const one = decide(reply(text));
+      expect(one).toMatchObject({ would: "refuse", hard: false, fixed: text, hits: [{ rule: "dash", result: "refuse" }] });
+      expect(one.said).toBe(`The message gate held this: "${text}": an em dash; rewrite it without one, using a comma or a new sentence for a break, "to" or "through" for a range. Rewrite and send now; don't mention it to him.`);
+    }
+    const both = decide(reply("Restarted the add-on — all set."));
+    expect(both).toMatchObject({ would: "refuse", fixed: "Restarted the App — all set." });
+    expect(both.said).toContain("Its add-ons are fixed for you when it goes.");
+    // An edit's em dash is held the same way.
+    expect(decide(edit("Moved swim — now at 5.", MINE))).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "dash", result: "refuse" }] });
+  });
+
+  test("an em dash is a wording refusal like the others: the third try lets it go", () => {
+    const c = callOf(reply("Moved swim — it's at 4:30 now."))!;
+    const d = decideSend(c, CARDS);
+    expect(releasable(d)).toBe(true);
+    const t: Tries = {};
+    expect(act(c, d, t, NOW)).toMatchObject({ did: "refused", counted: true });
+    expect(act(c, d, t, NOW + 60_000).did).toBe("refused");
+    expect(act(c, d, t, NOW + 120_000)).toEqual({ output: null, did: "passed after two refusals" });
   });
 
   test("only the two sends are read, with the chat, the session and the whole input", () => {
@@ -185,19 +201,19 @@ describe("what the gate does with Cain's reply", () => {
 describe("what the hook answers, and the third try", () => {
   const call = (text: string, chat = DM) => callOf(reply(text, undefined, chat))!;
   test("a fix to his DM goes out in place: allow, with the whole input and only the text changed", () => {
-    const c = callOf(reply("Moved swim — it's at 4:30 now.", HIS))!;
+    const c = callOf(reply("Restarted the add-on at 4:30.", HIS))!;
     const out = act(c, decideSend(c, CARDS), {}, NOW);
     expect(out.did).toBe("fixed");
     expect(out.output).toEqual({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow",
-      permissionDecisionReason: expect.stringContaining("fixed its wording"),
-      updatedInput: { chat_id: DM, text: "Moved swim, it's at 4:30 now.", reply_to: HIS } } });
+      permissionDecisionReason: "The message gate fixed its wording as it went: Apps, not add-ons.",
+      updatedInput: { chat_id: DM, text: "Restarted the App at 4:30.", reply_to: HIS } } });
   });
 
   test("a fix while his DM can't be told is a refusal that says exactly what to send", () => {
-    const c = call("Moved swim — it's at 4:30 now.");
+    const c = call("Restarted the add-on at 4:30.");
     const out = act(c, decideSend(c, null, { dm: null }), {}, NOW);
     expect(out.output).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny",
-      permissionDecisionReason: "Send exactly this instead: Moved swim, it's at 4:30 now." } });
+      permissionDecisionReason: "Send exactly this instead: Restarted the App at 4:30." } });
   });
 
   test("two refusals in 10 minutes, and the third try goes as it is, logged; a pass resets the count", () => {
@@ -275,31 +291,31 @@ describe("what the hook answers, and the third try", () => {
     expect(act(held, dh, t, NOW + 1).did).toBe("refused");
     expect(act(held, dh, t, NOW + 2)).toEqual({ output: null, did: "passed after two refusals" });
     // A fix goes in place only to his DM: elsewhere it's "send exactly this instead", never a loop.
-    const fix = callOf(reply("Moved swim — it's at 4:30 now."))!;
+    const fix = callOf(reply("Restarted the add-on at 4:30."))!;
     const df = decideSend(fix, { ...CARDS, dm: null });
     expect(df).toMatchObject({ would: "fix", chat: "unknown" });
     const tf: Tries = {};
-    expect(act(fix, df, tf, NOW).output).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny", permissionDecisionReason: "Send exactly this instead: Moved swim, it's at 4:30 now." } });
+    expect(act(fix, df, tf, NOW).output).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny", permissionDecisionReason: "Send exactly this instead: Restarted the App at 4:30." } });
     expect(act(fix, df, tf, NOW + 1).did).toBe("refused");
     expect(act(fix, df, tf, NOW + 2).did).toBe("passed after two refusals");
-    const sent = callOf(reply("Moved swim, it's at 4:30 now."))!;
+    const sent = callOf(reply("Restarted the App at 4:30."))!;
     expect(act(sent, decideSend(sent, { ...CARDS, dm: null }), {}, NOW)).toEqual({ output: null, did: "passed, his DM unknown" });
   });
 
   test("allow only for a plain call: with anything else (files to attach), a fix says what to send instead and auto mode checks the call", () => {
-    const files = callOf({ ...reply("Moved swim — see the photo.", HIS), tool_input: { chat_id: DM, text: "Moved swim — see the photo.", reply_to: HIS, files: ["/tmp/a.png"] } })!;
+    const files = callOf({ ...reply("Restarted the add-on, see the photo.", HIS), tool_input: { chat_id: DM, text: "Restarted the add-on, see the photo.", reply_to: HIS, files: ["/tmp/a.png"] } })!;
     expect(plainInput(files)).toBe(false);
     const out = act(files, decideSend(files, CARDS), {}, NOW);
     expect(out).toMatchObject({ did: "refused", counted: true, output: { hookSpecificOutput: { permissionDecision: "deny",
-      permissionDecisionReason: "Send exactly this instead: Moved swim, see the photo." } } });
+      permissionDecisionReason: "Send exactly this instead: Restarted the App, see the photo." } } });
     // The fixed words, sent again with the file, carry nothing to fix: the hook says nothing, and auto mode decides.
-    const again = callOf({ ...reply("x", HIS), tool_input: { chat_id: DM, text: "Moved swim, see the photo.", reply_to: HIS, files: ["/tmp/a.png"] } })!;
+    const again = callOf({ ...reply("x", HIS), tool_input: { chat_id: DM, text: "Restarted the App, see the photo.", reply_to: HIS, files: ["/tmp/a.png"] } })!;
     expect(act(again, decideSend(again, CARDS), {}, NOW)).toEqual({ output: null, did: "passed" });
     // An edit's plain input is chat_id, message_id and text: its fix goes in place.
-    const e = callOf(edit("Moved swim — now at 5.", MINE))!;
+    const e = callOf(edit("Restarted the add-on at 5.", MINE))!;
     expect(plainInput(e)).toBe(true);
     expect(act(e, decideSend(e, CARDS), {}, NOW)).toMatchObject({ did: "fixed",
-      output: { hookSpecificOutput: { permissionDecision: "allow", updatedInput: { chat_id: DM, message_id: MINE, text: "Moved swim, now at 5." } } } });
+      output: { hookSpecificOutput: { permissionDecision: "allow", updatedInput: { chat_id: DM, message_id: MINE, text: "Restarted the App at 5." } } } });
   });
 
   test("a log line for each hit and each refusal, never for a clean reply to his DM", () => {
@@ -418,7 +434,8 @@ describe("the safety net after the send (discord-sent.ts)", () => {
   test("what went out is read again with the rules that need no cards: a hit is a bypass, unless the third try let it through", () => {
     const text = "Two blocks moved — and 3 more.";
     const bypass = noteOf(sent(text, "sent (id: 1300000000000000777)"), NOW, {})!;
-    expect(bypass.net).toEqual({ released: false, hits: [{ rule: "dash", result: "fix", around: text }, { rule: "count", result: "refuse", around: text }] });
+    // Cain's em dash is one the gate refuses, never one it fixes.
+    expect(bypass.net).toEqual({ released: false, hits: [{ rule: "dash", result: "refuse", around: text }, { rule: "count", result: "refuse", around: text }] });
     // Never the corrected words, and an excerpt's link keeps only its host.
     const link = noteOf(sent("See https://example.com/private/path?token=abc — and 3 more.", "sent (id: 1300000000000000777)"), NOW, {})!;
     expect(JSON.stringify(link)).not.toContain("private");
@@ -549,11 +566,14 @@ describe("run as Claude Code runs it", () => {
       expect(held.json).toMatchObject({ hookEventName: "PreToolUse", permissionDecision: "deny" });
       expect(held.json.permissionDecisionReason).toContain("\"Undo\" isn't on the card this answers");
       expect(link.asked).toEqual(["/cards true"]);
-      const fixed = await run(reply("Moved swim — it's at 4:30 now.", RECEIPT), env);
+      const fixed = await run(reply("Restarted the add-on at 4:30.", RECEIPT), env);
       expect(fixed.json).toEqual({ hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: expect.any(String),
-        updatedInput: { chat_id: DM, text: "Moved swim, it's at 4:30 now.", reply_to: RECEIPT } });
+        updatedInput: { chat_id: DM, text: "Restarted the App at 4:30.", reply_to: RECEIPT } });
+      const dash = await run(reply("Moved swim — it's at 4:30 now.", RECEIPT), env);
+      expect(dash).toMatchObject({ code: 0, json: { hookEventName: "PreToolUse", permissionDecision: "deny" } });
+      expect(dash.json.permissionDecisionReason).toContain("an em dash; rewrite it without one");
       expect(await run(reply("Moved swim to 4:30.", RECEIPT), env)).toMatchObject({ out: "", code: 0 });
-      expect(lines(f.CAIN_GATE_LOG)).toMatchObject([{ did: "refused", cards: "link" }, { did: "fixed" }]);
+      expect(lines(f.CAIN_GATE_LOG)).toMatchObject([{ did: "refused", cards: "link" }, { did: "fixed" }, { did: "refused", hits: [{ rule: "dash", result: "refuse" }] }]);
       expect(readDm(f.CAIN_GATE_DM)).toBe(DM);                            // kept from the link's answer
     } finally { link.server.stop(true); }
   }, 30_000);
@@ -623,7 +643,7 @@ describe("run as Claude Code runs it", () => {
     const env = { ...f, CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };
     writeFileSync(f.CAIN_GATE_DM, JSON.stringify({ dm: DM, at: Date.now() }));
     expect(await run(reply("Two blocks moved and 3 more."), env)).toMatchObject({ out: "", code: 0 });
-    expect((await run(reply("Moved swim — it's at 4:30 now."), env)).json.permissionDecision).toBe("allow");
+    expect((await run(reply("Restarted the add-on at 4:30."), env)).json.permissionDecision).toBe("allow");
     const link = fakeLink(() => CARDS);                                  // a hard refusal needs no count
     try { expect((await run(reply("Moved swim to 4:30.", undefined, OTHER), { ...env, CAIN_LINK: link.url })).json.permissionDecision).toBe("deny"); }
     finally { link.server.stop(true); }
@@ -702,10 +722,10 @@ describe("run as Claude Code runs it", () => {
     for (const t of [REPLY, EDIT]) expect(settings.permissions.allow).not.toContain(t);
   });
 
-  test("the self-test runs the installed command on a fix, a refusal and a clean reply, and fails on a wiring that can't hold anything", async () => {
+  test("the self-test runs the installed command on an \"add-on\" fix, an em dash and a count held back, and a clean reply, and fails on a wiring that can't hold anything", async () => {
     const ok = await selfTest(SETTINGS);
     expect(ok.status).toBe("ok");
-    expect(ok.said).toContain("passed its self-test");
+    expect(ok.said).toMatch(/^The message gate's reply hook passed its self-test: it fixes "add-on" in place, holds back an em dash and "and 3 more", and lets a clean reply go, in about \d+ ms a reply\.$/);
     const settings = JSON.parse(readFileSync(SETTINGS, "utf8"));
     settings.hooks.PreToolUse.find((e: any) => e.matcher === REPLY).hooks[0].async = true;
     const broken = join(dir, "settings-async.json");

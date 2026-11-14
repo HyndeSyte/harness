@@ -46,8 +46,9 @@ export function noteOf(input: any, now: number, tries: Tries = readTries()): Sen
   const text = String(t.text ?? "");
   const chat = id(t.chat_id), replyTo = tool === "reply" ? id(t.reply_to) : undefined;
   // A long number or code in a reply may be what he asked for: only the cards can tell, so
-  // the net gives it the benefit of the doubt.
-  const r = check(text, { rules: ["dash", "app", "count", "machine"], answersHim: !!replyTo });
+  // the net gives it the benefit of the doubt. His words are a writer's the gate refuses:
+  // any em dash in them is one it should have held.
+  const r = check(text, { rules: ["dash", "app", "count", "machine"], answersHim: !!replyTo, refusable: true });
   // Which send this is: a retried note keeps it, and a second edit of the same message has its own.
   const call = typeof input?.tool_use_id === "string" && CALL.test(input.tool_use_id) ? input.tool_use_id : textHash(text);
   const note: SentNote = { tool, ids, question: asksSomething(text), call, ...(chat ? { chat } : {}), ...(replyTo ? { reply_to: replyTo } : {}) };

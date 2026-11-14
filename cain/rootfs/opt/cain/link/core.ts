@@ -45,11 +45,11 @@
 //   keeper.sh card.
 // - The gate (piece D, ../gate/rules.ts), enforcing since 0.10.0. Cain's words through the
 //   link (asks and their options, Ship cards, the morning message, the connector notice):
-//   em dashes and "add-on" fixed before anything is posted, and the answer says so; a
-//   hidden count, machine text, an em dash between two numbers, times or dates (never
-//   read as "to"), or a button the card lacks refused. The specialist's cards:
-//   fixed and posted, never refused (a refused card would be lost to him); Cain hears
-//   once what the gate flagged.
+//   "add-on" fixed before anything is posted, and the answer says so; any em dash (only he
+//   knows whether he meant a range or a break), a hidden count, machine text, or a button
+//   the card lacks refused. The specialist's cards: fixed and posted, never refused (a
+//   refused card would be lost to him), an em dash between two numbers, times or dates, or
+//   right after a link, kept as it is; Cain hears once what the gate flagged.
 //   Its notes after a tap, and the link's own words: fixed only. Every hit is logged, its
 //   excerpt with links cut to their host. The replay runs the same rules over his DM,
 //   reading only. Cain's edit allowlist holds his replies alone: never a message the link
@@ -554,15 +554,16 @@ export function clockTime(ms: number, tz = "America/New_York"): string {
 export type AskResult = { status: "posted"; message: string; said?: string } | { status: "held"; said: string };
 
 // Why the gate held words back, for Cain: what to change, and the buttons this has.
+// Two with the same excerpt and reason (two em dashes close together) are said once.
 function heldLine(what: string, hits: Hit[], buttons?: readonly string[]): string {
   const parts = hits.map((h) => h.rule === "button" && h.label
     ? `"${h.label}" isn't one of its buttons (${buttons?.length ? buttons.join(", ") : "it has none"})`
     : `"${h.around}": ${whyOf(h)}`);
-  return `The message gate held this ${what}: ${parts.join("; ")}. Rewrite it and send it again.`;
+  return `The message gate held this ${what}: ${[...new Set(parts)].join("; ")}. Rewrite it and send it again.`;
 }
 // What the gate flagged in a specialist's words, for Cain (its card goes out all the same).
 function flaggedLine(hits: Hit[]): string {
-  return hits.map((h) => h.rule === "button" && h.label ? `"${h.label}" isn't one of its buttons` : `"${h.around}" (${whyOf(h)})`).join("; ");
+  return [...new Set(hits.map((h) => h.rule === "button" && h.label ? `"${h.label}" isn't one of its buttons` : `"${h.around}" (${whyOf(h)})`))].join("; ");
 }
 const fixedSaid = (hits: Hit[]) => (hits.length ? `The message gate fixed its wording first: ${fixedWhat(hits)}.` : "");
 
@@ -587,7 +588,7 @@ export function netOf(v: unknown): NetSeen | null {
 // each rule and its short excerpt, and what to do.
 const OR_NEW = "or, if the edit is held, send a one-line correction as a new reply instead";
 function netLine(tool: string, id: string, net: NetSeen): string {
-  const what = net.hits.map((h) => `"${h.around}" (${whyOf(h)})`).join("; ");
+  const what = [...new Set(net.hits.map((h) => `"${h.around}" (${whyOf(h)})`))].join("; ");
   const kind = tool === "edit" ? "edit" : "reply";
   if (net.released)
     return `Your ${kind} (Discord message ${id}) went out as it was after the message gate held it twice${what ? `: ${what}` : ""}. If what it held still matters, fix it with an edit (edit_message), ${OR_NEW}; don't mention the gate to him.`;
@@ -644,9 +645,10 @@ export class Link {
     try { this.d.report({ point, writer, ...(message ? { message } : {}), hits, did }); }
     catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
   }
-  // Cain's words through the link: fixed, or refused with what to change.
+  // Cain's words through the link: fixed, or refused with what to change. He's a writer the
+  // gate refuses, so every em dash of his is refused, none fixed.
   private cainWords(point: string, what: string, text: string, ctx: Context): { text: string; fixed: Hit[] } {
-    const w = this.words(point, "cain", text, ctx);
+    const w = this.words(point, "cain", text, { ...ctx, refusable: true });
     if (w.refused.length) {
       this.report(point, "cain", w.hits, "refused");
       throw new Refusal(heldLine(what, w.refused, ctx.buttons ?? undefined));
@@ -2253,7 +2255,7 @@ export class Link {
         const own = rec.labels ?? (now_.length ? now_ : null);
         if (!rec.kind || rec.kind === "legacy") {          // from before 0.7.0: whose words isn't known
           byWriter.unknown++;
-          judge(id, at, "unknown", content, { rules: AT.cain, buttons: own, known: allLabels });
+          judge(id, at, "unknown", content, { rules: AT.cain, buttons: own, known: allLabels, refusable: true });
           continue;
         }
         const writer = writerOf(rec);
@@ -2264,7 +2266,7 @@ export class Link {
           const [words, linkLine] = splitLinkLine(card?.text ?? content);
           judge(id, at, writer, words, { rules: AT.card, buttons: own, known: allLabels });
           if (linkLine) judge(id, at, "link", linkLine, { rules: AT.link });
-        } else if (writer === "cain") judge(id, at, writer, rec.shipping?.text ?? content, { rules: AT.cain, buttons: own, known: allLabels });
+        } else if (writer === "cain") judge(id, at, writer, rec.shipping?.text ?? content, { rules: AT.cain, buttons: own, known: allLabels, refusable: true });
         else judge(id, at, writer, content, { rules: AT.link });
         continue;
       }
@@ -2283,11 +2285,11 @@ export class Link {
           else if (there) buttons = labelsOf(there.components);
           else buttons = null;                             // can't tell what it answered
         }
-        judge(id, at, "cain", raw, { rules: AT.cain, buttons, known: allLabels, answersHim });
+        judge(id, at, "cain", raw, { rules: AT.cain, buttons, known: allLabels, answersHim, refusable: true });
         continue;
       }
       byWriter.unknown++;
-      judge(id, at, "unknown", content, { rules: AT.cain, buttons: labelsOf(m.components), known: allLabels });
+      judge(id, at, "unknown", content, { rules: AT.cain, buttons: labelsOf(m.components), known: allLabels, refusable: true });
     }
     // The specialist's cards from the same days that never went out, as the link received them.
     let unposted = 0;

@@ -5,17 +5,17 @@
 //
 // What it says, as JSON on stdout with exit 0 (the wiring's `|| true` turns any exit into 0):
 //   - nothing: the reply goes as it is;
-//   - allow, with the call's whole input and only its text changed: em dashes and
-//     "add-on" fixed in place, only when the reply goes to his DM and its input is plain
-//     (chat_id, text and reply_to; for an edit, message_id): an allow skips auto mode's own
-//     check, so a call carrying anything else (files to attach) gets "send exactly this
-//     instead" and then goes through that check. Claude Code's auto mode can refuse an
-//     updatedInput that comes without a decision; discord-send.cli.test.ts proves this one
-//     against the real CLI;
-//   - deny, with what to change: a hidden count, machine text, an em dash between two
-//     numbers, times or dates (never read as "to"), a button the card it
-//     answers lacks (or any named button while the cards can't be read), a chat that
-//     isn't his DM, or an edit of a message that isn't one of his own replies.
+//   - allow, with the call's whole input and only its text changed: "add-on" fixed in
+//     place, only when the reply goes to his DM and its input is plain (chat_id, text and
+//     reply_to; for an edit, message_id): an allow skips auto mode's own check, so a call
+//     carrying anything else (files to attach) gets "send exactly this instead" and then
+//     goes through that check. Claude Code's auto mode can refuse an updatedInput that
+//     comes without a decision; discord-send.cli.test.ts proves this one against the real
+//     CLI;
+//   - deny, with what to change: any em dash (rewritten without one: only Cain knows
+//     whether he meant a range or a break), a hidden count, machine text, a button the
+//     card it answers lacks (or any named button while the cards can't be read), a chat
+//     that isn't his DM, or an edit of a message that isn't one of his own replies.
 // The cards come first, always (decision F): the link's local route gets 1.5 s, then
 // /data/trust/cards.json while it's under 3 minutes old. So every rule runs on every send,
 // however slow the link is, and the link's DM id wins over the cached one, rewriting it.
@@ -36,14 +36,15 @@
 // worse than one unchecked reply, and discord-sent.ts re-checks what went out.
 //
 // `bun discord-send.ts --self-test` runs the installed hook command as Claude Code would,
-// on a fix, a refusal and a clean reply, and prints one line (the App runs it at start).
+// on an "add-on" fix, two refusals (an em dash, and "and 3 more") and a clean reply, and
+// prints one line (the App runs it at start).
 import { createHash, createHmac } from "node:crypto";
 import { appendFileSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendGate } from "../gate/log";
 import { answerText, REPLY_TOOL, SENDS, sentIds } from "../gate/plugin";
-import { fixedWhat, type Hit } from "../gate/rules";
+import { DASH_WHY, fixedWhat, type Hit } from "../gate/rules";
 import { type CardsView, decideSend, type Decision, type SendCall } from "../gate/send";
 
 export { SENDS };
@@ -267,8 +268,10 @@ export async function selfTest(settingsPath = SETTINGS): Promise<{ status: "ok" 
     writeFileSync(join(dir, "dm.json"), JSON.stringify({ dm: "1300000000000000500", at: Date.now() }));
     const env = { ...process.env, CAIN_GATE_TRIES: join(dir, "tries.json"), CAIN_GATE_DM: join(dir, "dm.json"),
       CAIN_GATE_LOG: join(dir, "gate.jsonl"), CAIN_CARDS: join(dir, "none.json"), CAIN_LINK: "http://127.0.0.1:9" };
+    // Each case in a session of its own, so no two refusals count toward a third try.
+    let n = 0;
     const one = async (text: string) => {
-      const input = { session_id: "self-test", hook_event_name: "PreToolUse", tool_name: "mcp__plugin_discord_discord__reply",
+      const input = { session_id: `self-test-${++n}`, hook_event_name: "PreToolUse", tool_name: "mcp__plugin_discord_discord__reply",
         tool_input: { chat_id: "1300000000000000500", text } };
       const t0 = performance.now();
       const p = Bun.spawn(["bash", "-c", cmd], { stdin: new TextEncoder().encode(JSON.stringify(input)), stdout: "pipe", stderr: "ignore", env });
@@ -276,20 +279,23 @@ export async function selfTest(settingsPath = SETTINGS): Promise<{ status: "ok" 
       await p.exited;
       return { out: out.trim(), ms: performance.now() - t0 };
     };
-    const fix = await one("Moved swim — it's at 4:30 now.");
+    const fix = await one("Restarted the add-on.");
+    const dash = await one("Moved swim — it's at 4:30 now.");
     const held = await one("Two blocks moved and 3 more.");
     const clean = await one("Moved swim to 4:30.");
-    const ms = Math.round((fix.ms + held.ms + clean.ms) / 3);
+    const ms = Math.round((fix.ms + dash.ms + held.ms + clean.ms) / 4);
     const parse = (s: string) => { try { return JSON.parse(s)?.hookSpecificOutput ?? null; } catch { return null; } };
-    const f = parse(fix.out), h = parse(held.out);
-    const fixOk = FIX_IN_PLACE ? f?.permissionDecision === "allow" && f?.updatedInput?.text === "Moved swim, it's at 4:30 now."
+    const f = parse(fix.out), d = parse(dash.out), h = parse(held.out);
+    const fixOk = FIX_IN_PLACE ? f?.permissionDecision === "allow" && f?.updatedInput?.text === "Restarted the App."
       && f?.updatedInput?.chat_id === "1300000000000000500"
-      : f?.permissionDecision === "deny" && String(f?.permissionDecisionReason).includes("Moved swim, it's at 4:30 now.");
-    if (!fixOk) return fail(`an em dash wasn't fixed (it answered "${fix.out.slice(0, 120)}").`, ms);
+      : f?.permissionDecision === "deny" && String(f?.permissionDecisionReason).includes("Restarted the App.");
+    if (!fixOk) return fail(`"add-on" wasn't fixed (it answered "${fix.out.slice(0, 120)}").`, ms);
+    if (d?.permissionDecision !== "deny" || !String(d?.permissionDecisionReason).includes(DASH_WHY))
+      return fail(`an em dash wasn't held back (it answered "${dash.out.slice(0, 120)}").`, ms);
     if (h?.permissionDecision !== "deny" || !String(h?.permissionDecisionReason).includes("and 3 more"))
       return fail(`"and 3 more" wasn't held back (it answered "${held.out.slice(0, 120)}").`, ms);
     if (clean.out !== "") return fail(`a clean reply didn't pass silently (it answered "${clean.out.slice(0, 120)}").`, ms);
-    return { status: "ok", said: `The message gate's reply hook passed its self-test: it fixes em dashes in place, holds back "and 3 more" and lets a clean reply go, in about ${ms} ms a reply.`, ms };
+    return { status: "ok", said: `The message gate's reply hook passed its self-test: it fixes "add-on" in place, holds back an em dash and "and 3 more", and lets a clean reply go, in about ${ms} ms a reply.`, ms };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 

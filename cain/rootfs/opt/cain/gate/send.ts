@@ -5,10 +5,10 @@
 // message is his own reply before the link has heard of it.
 //
 //   pass    nothing to change
-//   fix     only em dashes or "add-on": the hook sends the fixed words in its place
-//   refuse  held back, with what to change: a hidden count, machine text, an em dash
-//           between two numbers, times or dates (never read as "to"), a
-//           button the card it answers doesn't have, or a named button while which
+//   fix     only "add-on": the hook sends the fixed words in its place
+//   refuse  held back, with what to change: any em dash (only he knows whether he meant a
+//           range or a break, so he says it again without one), a hidden count, machine
+//           text, a button the card it answers doesn't have, or a named button while which
 //           buttons are up can't be told.
 //           Never released by a third try (hard): a chat the link says isn't his DM, or
 //           an edit of a message that isn't one of Cain's own replies, or whose owner
@@ -69,7 +69,7 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   if (buttons && live.some((c) => c.labels.includes("Stop"))) buttons.push("Stop");
   // A reply to a message that is neither one the link posted nor one of Cain's own answers him.
   const answersHim = call.tool === "reply" && !!call.replyTo && !!cards && !target && !(cards.sent ?? []).includes(call.replyTo);
-  const r = check(call.text, { rules: AT.cain, buttons, known, answersHim });
+  const r = check(call.text, { rules: AT.cain, buttons, known, answersHim, refusable: true });
   const hits: GateHit[] = r.hits.map((h: Hit) => ({ rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}) }));
   let hard = false;
   // Only his DM: the plugin's own allowlist holds that today; this says so in words.
@@ -104,11 +104,11 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   }
   let said: string;
   if (would === "refuse") {
-    const fixes = !hits.some((h) => h.result === "fix") ? ""
-      : hits.some((h) => h.rule === "dash" && h.result === "refuse") ? " Its other em dashes and add-ons are fixed for you when it goes."
-      : " Its em dashes and add-ons are fixed for you when it goes.";
-    // An edit held for its target isn't fixed by rewording it.
-    said = `${HELD} ${lines.join(" ")}${fixes} ${hits.some((h) => h.rule === "target") ? "Don't mention it to him." : REWRITE}`;
+    // Only "add-on" is ever fixed in Cain's words: every em dash is his to rewrite.
+    const fixes = hits.some((h) => h.result === "fix") ? " Its add-ons are fixed for you when it goes." : "";
+    // An edit held for its target isn't fixed by rewording it. Two hits with the same excerpt
+    // and reason (two em dashes close together) are said once.
+    said = `${HELD} ${[...new Set(lines)].join(" ")}${fixes} ${hits.some((h) => h.rule === "target") ? "Don't mention it to him." : REWRITE}`;
   } else if (would === "fix") said = `Send exactly this instead: ${r.fixed}`;
   else said = "Nothing to change.";
   return { would, fixed: r.fixed, hits, said, hard, chat };
