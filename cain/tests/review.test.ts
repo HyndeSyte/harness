@@ -68,7 +68,17 @@ describe("briefs", () => {
     expect(parseBrief('{"__proto__": {"x": 1}, "id": "abc-def", "topic": "t", "question": "q", "body": "b", "needs_facts": false, "consequential": false}').error).toBe(UNKNOWN_FIELD);
     expect(UNKNOWN_FIELD).not.toContain("notes");
     expect(parseBrief(JSON.stringify({ ...brief(), seats: ["Acme Corp"] })).error).not.toContain("Acme");
-    expect(Object.keys(BRIEF_FIELDS).sort()).toEqual(["body", "consequential", "id", "needs_facts", "question", "seats", "topic"]);
+    expect(Object.keys(BRIEF_FIELDS).sort()).toEqual(["body", "consequential", "head", "id", "needs_facts", "pr", "question", "seats", "topic"]);
+  });
+
+  test("a pull request's review names its pr and head (0.11.0): checked, kept on the Pi, never sent", () => {
+    const PR = "https://github.com/HyndeSyte/harness/pull/18", HEAD = "3B5ADE4053B779305B36DAADDF01AEAF06AE11F3";
+    const ok = parseBrief(JSON.stringify({ ...brief(), pr: PR, head: HEAD })).brief!;
+    expect(ok).toMatchObject({ pr: PR, head: HEAD.toLowerCase() });
+    expect(parseBrief(JSON.stringify({ ...brief(), pr: "https://github.com/someone/else/pull/1" })).error).toContain("pr must be the pull request's address");
+    expect(parseBrief(JSON.stringify({ ...brief(), head: "3b5ade4" })).error).toContain("head must be the pull request's full 40-character head sha");
+    expect(Object.keys(outbound(ok)).sort()).toEqual(["body", "consequential", "needs_facts", "question", "topic"]);
+    expect(JSON.stringify(outbound(ok))).not.toContain("3b5ade4");
   });
 
   test("a seat is handed only the allowlisted fields, never the id or seats", () => {
@@ -522,13 +532,13 @@ describe("the published lines, /data/trust/reviewed.json (Cain 0.11.0)", () => {
     t.submit(brief());
     await t.runner.tick();
     const want = { reviews: [{ id: "2026-11-08-desk-plan", line: "Reviewed: OpenAI, approve; Gemini, approve; Claude, approve with changes (not independent).",
-      finished_at: "2026-11-08T15:00:00.000Z" }] };
+      finished_at: "2026-11-08T15:00:00.000Z", pr: null, head: null }] };
     expect(published(file)).toEqual(want);
     expect(atRelay).toEqual(want);                                            // already there when he heard it
     const raw = readFileSync(file, "utf8");
     for (const never of ["Desk plan", "monitor arms", "SECRET-MODEL-TEXT", "brief", "findings", "topic", "test-model"]) expect(raw).not.toContain(never);
     expect(readdirSync(join(file, ".."))).toEqual(["reviewed.json"]);        // the temp file was renamed into place
-    expect(readReviewed(file)).toEqual(want.reviews);
+    expect(readReviewed(file, Date.parse("2026-11-09T00:00:00Z"))).toEqual(want.reviews);
   });
 
   test("rebuilt from the queue at start; only finished reviews with a line; never one blocked for privacy", async () => {
@@ -549,7 +559,7 @@ describe("the published lines, /data/trust/reviewed.json (Cain 0.11.0)", () => {
     writeFileSync(file, '{"reviews": [{"id": "gone", "line": "Reviewed: Gemini, approve.", "finished_at": "2026-11-01T00:00:00Z"}]}');
     const fresh = new Runner({ ...t.cfg, reviewedFile: file }, { seats: {}, now: () => new Date("2026-11-08T16:00:00Z"), log: () => {} });
     expect(fresh.publishReviewed()).toBe(true);
-    expect(published(file)).toEqual({ reviews: [{ id: "2026-11-08-done", line: "Reviewed: OpenAI, approve.", finished_at: "2026-11-08T15:30:00.000Z" }] });
+    expect(published(file)).toEqual({ reviews: [{ id: "2026-11-08-done", line: "Reviewed: OpenAI, approve.", finished_at: "2026-11-08T15:30:00.000Z", pr: null, head: null }] });
     expect(readFileSync(file, "utf8")).not.toContain("blocked");
   });
 
@@ -578,18 +588,24 @@ describe("the published lines, /data/trust/reviewed.json (Cain 0.11.0)", () => {
     expect(keptReviewed([{ id: "a", line: "Reviewed: Gemini, approve.", finished_at: "2026-11-30T12:00:00Z" }], now.getTime())).toEqual([]);   // 31 days back
   });
 
-  test("a write that fails is tried again at the end of the next tick, and nothing else waits on it", async () => {
+  test("a write that fails is tried again each tick, and he hears the review only once its line is there to check", async () => {
     const t = rig({ openai: spy(), gemini: spy(), claude: spy() });
     const dir = join(t.cfg.queueDir, "..");
     writeFileSync(join(dir, "blocker"), "a file where the folder would be");
     t.runner.cfg.reviewedFile = join(dir, "blocker", "reviewed.json");
     t.submit(brief());
     await t.runner.tick();
-    expect(t.relays()).toHaveLength(1);                                      // he hears it all the same
-    expect(t.records()).toHaveLength(1);
+    expect(t.relays()).toHaveLength(0);                                      // not yet: its line isn't there to check
+    expect(t.records()).toHaveLength(1);                                     // the record doesn't wait on it
+    await t.runner.tick();
+    expect(t.relays()).toHaveLength(0);
     t.runner.cfg.reviewedFile = join(dir, "trust", "reviewed.json");
     await t.runner.tick();
-    expect(readReviewed(t.runner.cfg.reviewedFile)!.map((x) => x.id)).toEqual(["2026-11-08-desk-plan"]);
+    expect(readReviewed(t.runner.cfg.reviewedFile, Date.parse("2026-11-09T00:00:00Z"))!.map((x) => x.id)).toEqual(["2026-11-08-desk-plan"]);
+    expect(t.relays()).toHaveLength(1);                                      // once, now it's there
+    expect(t.relays()[0]).toContain("Say it as: Reviewed:");
+    await t.runner.tick();
+    expect(t.relays()).toHaveLength(1);
     // Nothing published unless the runner is told where (the tests' own runners write nothing).
     const quiet = rig({ openai: spy() });
     quiet.submit(brief());
@@ -601,16 +617,21 @@ describe("the published lines, /data/trust/reviewed.json (Cain 0.11.0)", () => {
   test("the file is read whole or not at all: a missing, broken or odd file is null, odd entries left out", () => {
     const dir = mkdtempSync(join(tmpdir(), "reviewed-"));
     const file = join(dir, "reviewed.json");
-    expect(readReviewed(file)).toBeNull();
+    expect(readReviewed(file, Date.parse("2026-11-09T00:00:00Z"))).toBeNull();
     writeFileSync(file, "{half");
-    expect(readReviewed(file)).toBeNull();
+    expect(readReviewed(file, Date.parse("2026-11-09T00:00:00Z"))).toBeNull();
     writeFileSync(file, '{"reviews": "no"}');
-    expect(readReviewed(file)).toBeNull();
+    expect(readReviewed(file, Date.parse("2026-11-09T00:00:00Z"))).toBeNull();
     writeFileSync(file, JSON.stringify({ reviews: [{ id: "a", line: "Reviewed: Gemini, approve.", finished_at: "2026-11-08T15:00:00Z", topic: "x" },
       { id: "b", line: "Something else.", finished_at: "2026-11-08T15:00:00Z" }, { id: "c", line: "Reviewed: OpenAI, approve.", finished_at: "soon" }] }));
-    expect(readReviewed(file)).toEqual([{ id: "a", line: "Reviewed: Gemini, approve.", finished_at: "2026-11-08T15:00:00Z" }]);
-    writeReviewed([{ id: "d", line: "Reviewed: OpenAI, approve.", finished_at: "2026-11-08T15:00:00Z" }], file);
-    expect(readReviewed(file)).toEqual([{ id: "d", line: "Reviewed: OpenAI, approve.", finished_at: "2026-11-08T15:00:00Z" }]);
+    const NOW = Date.parse("2026-11-09T00:00:00Z");
+    expect(readReviewed(file, NOW)).toEqual([{ id: "a", line: "Reviewed: Gemini, approve.", finished_at: "2026-11-08T15:00:00Z", pr: null, head: null }]);
+    const PR = "https://github.com/HyndeSyte/harness/pull/18", HEAD = "a".repeat(40);
+    writeReviewed([{ id: "d", line: "Reviewed: OpenAI, approve.", finished_at: "2026-11-08T15:00:00Z", pr: PR, head: HEAD }], file);
+    expect(readReviewed(file, NOW)).toEqual([{ id: "d", line: "Reviewed: OpenAI, approve.", finished_at: "2026-11-08T15:00:00Z", pr: PR, head: HEAD }]);
+    // An entry the file still has from 31 days back, or one from the future, counts for nothing.
+    expect(readReviewed(file, Date.parse("2026-12-09T15:00:01Z"))).toEqual([]);
+    expect(readReviewed(file, Date.parse("2026-11-08T14:00:00Z"))).toEqual([]);
     expect(readdirSync(dir)).toEqual(["reviewed.json"]);
   });
 

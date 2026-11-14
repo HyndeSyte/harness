@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
   FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, estimate, fixFor, independent, markBlocked, outbound, recordRequest,
-  relayLine, reviewCheck, reviewedLine, safeId, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
+  relayLine, reviewCheck, safeId, sayLine, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 
@@ -134,11 +134,13 @@ export class Runner {
     try { return this.deps.stopped?.() ?? false; } catch { return true; }
   }
 
-  // ---- the Reviewed lines, for the link and the reply hook (../reviewed.ts) ----
-  // Rebuilt whole from the queue: every finished review that has a line, never one blocked
-  // for privacy, from the last 30 days, at most 200. also: a review that changed and isn't
-  // saved yet. A write that fails is tried again at the end of each tick until it lands.
+  // ---- the Reviewed lines, for the link and the reply hooks (../reviewed.ts) ----
+  // Rebuilt whole from the queue: every review that's done and has a line, with the pull
+  // request and head it was of, never one blocked for privacy, from the last 30 days, at most
+  // 200. also: a review that changed and isn't saved yet. A queue file that can't be read is
+  // left out, said once; a write that fails is tried again at the end of each tick until it lands.
   private publishOwed = false;
+  private unreadable = new Set<string>();
   publishReviewed(also?: Review): boolean {
     const path = this.cfg.reviewedFile;
     if (!path) return true;
@@ -147,10 +149,17 @@ export class Runner {
       const list: Reviewed[] = [];
       const ids = readdirSync(this.cfg.queueDir).filter((n) => n.endsWith(".json") && !n.startsWith(".")).map((n) => n.slice(0, -5));
       for (const id of new Set([...ids, ...(also ? [also.id] : [])])) {
-        const r = also?.id === id ? also : loadReview(this.cfg.queueDir, id);
-        if (!r || !FINAL.includes(r.status) || r.id_private || !safeId(r.id) || !r.finished_at) continue;
-        const line = reviewedLine(r);
-        if (line) list.push({ id: r.id, line, finished_at: r.finished_at });
+        try {
+          const r = also?.id === id ? also : loadReview(this.cfg.queueDir, id);
+          if (!r) throw new Error("it can't be read as a review");
+          if (r.status !== "done" || r.id_private || !safeId(r.id) || !r.finished_at) continue;
+          const line = sayLine(r);
+          if (line) list.push({ id: r.id, line, finished_at: r.finished_at, pr: r.brief?.pr ?? null, head: r.brief?.head ?? null });
+        } catch (e) {
+          if (this.unreadable.has(id)) continue;
+          this.unreadable.add(id);
+          this.log(`a queue file was left out of the Reviewed lines: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
+        }
       }
       writeReviewed(keptReviewed(list, this.now().getTime()), path);
       this.publishOwed = false;
@@ -315,7 +324,9 @@ export class Runner {
   }
 
   // Record first, then Cain's one line. Each happens once, even across restarts. Its
-  // Reviewed line is published before he hears it, so a Ship card naming the review finds it.
+  // Reviewed line is published before he hears it, so a Ship card naming the review finds it:
+  // while publishing fails he hears nothing yet, and the next tick tries both again (a final
+  // review is looked at on every tick until it's relayed).
   private after(r: Review) {
     if (!r.recorded && r.brief && (r.status === "done" || r.status === "incomplete")) {
       // The same gate again before anything reaches the record: a review read
@@ -328,7 +339,11 @@ export class Runner {
       r.recorded = true;
       r.record_dir = req.ops[0].path.split("/").slice(0, 2).join("/");
     }
-    if (!r.relayed) { this.publishReviewed(r); this.relay(relayLine(r)); r.relayed = true; }
+    if (!r.relayed) {
+      if (sayLine(r) && !this.publishReviewed(r)) return;
+      this.relay(relayLine(r));
+      r.relayed = true;
+    }
   }
 
   block(r: Review, why: string[]) {

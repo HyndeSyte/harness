@@ -22,18 +22,23 @@ export type Answer = { verdict: Verdict; findings: Finding[] };
 export type Brief = {
   id: string; topic: string; question: string; body: string;
   needs_facts: boolean; consequential: boolean; seats?: SeatName[];
+  pr?: string; head?: string;        // a pull request's review: its address and full head sha (Cain 0.11.0)
 };
 
 // ---- What may leave: an allowlist, not a default. ----
 // Every field a brief may have is listed with what happens to it. "text" goes to
 // the seats and passes the private-terms check first (the backstop); "flag"
 // reaches them only as true or false; "local" never leaves the Pi (the id names
-// the queue file and the record folder; seats picks who is asked). A field not
-// listed is refused, so nothing new leaks by being added to a brief.
+// the queue file and the record folder; seats picks who is asked; pr and head say
+// which pull request head a review is of, so its Reviewed line goes only on that
+// head's Ship card). A field not listed is refused, so nothing new leaks by being
+// added to a brief.
 export const BRIEF_FIELDS = {
   id: "local", topic: "text", question: "text", body: "text",
-  needs_facts: "flag", consequential: "flag", seats: "local",
+  needs_facts: "flag", consequential: "flag", seats: "local", pr: "local", head: "local",
 } as const;
+export const REVIEW_PR = /^https:\/\/github\.com\/hyndesyte\/harness\/pull\/[1-9][0-9]*$/i;
+export const REVIEW_HEAD = /^[0-9a-f]{40}$/i;
 export type Outbound = Pick<Brief, "topic" | "question" | "body" | "needs_facts" | "consequential">;
 // Fixed reasons: never a field's name or content, which could be the private part.
 export const UNKNOWN_FIELD = `a field that isn't allowed; a brief has only ${Object.keys(BRIEF_FIELDS).join(", ")}`;
@@ -66,9 +71,15 @@ export function checkBrief(j: any): { brief?: Brief; error?: string } {
     for (const s of j.seats) if (!SEATS.includes(s)) return { error: "seats has a name that isn't a seat" };
     seats = [...new Set(j.seats as SeatName[])];
   }
+  if (j.pr !== undefined && (typeof j.pr !== "string" || !REVIEW_PR.test(j.pr)))
+    return { error: "pr must be the pull request's address: https://github.com/HyndeSyte/harness/pull/<number>" };
+  if (j.head !== undefined && (typeof j.head !== "string" || !REVIEW_HEAD.test(j.head)))
+    return { error: "head must be the pull request's full 40-character head sha" };
   const brief: Brief = { id: j.id, topic: j.topic.trim(), question: j.question.trim(), body: j.body,
     needs_facts: j.needs_facts, consequential: j.consequential };
   if (seats) brief.seats = seats;
+  if (j.pr !== undefined) brief.pr = j.pr;
+  if (j.head !== undefined) brief.head = j.head.toLowerCase();
   return { brief };
 }
 
@@ -418,9 +429,9 @@ export function seatName(s: SeatRun): string {
   return s.stands_in_for ? `Claude stand-in for ${LABEL[s.stands_in_for]}` : s.seat === "openai" ? "OpenAI (Codex)" : LABEL[s.seat];
 }
 
-// The one line that says who reviewed it and how (Cain 0.11.0): verdicts.md ends with it, the
-// relay line gives it to Cain to say as it is, and /data/trust/reviewed.json carries it for
-// his Ship cards and the message gate. Every seat that answered, in the order verdicts.md
+// The one line that says who reviewed it and how (Cain 0.11.0): verdicts.md ends with it, and
+// once the review is done (sayLine) the relay line gives it to Cain to say as it is and
+// /data/trust/reviewed.json carries it for his Ship cards and the message gate. Every seat that answered, in the order verdicts.md
 // lists them, by name only (no model, no "(Codex)", no cost): "Reviewed: OpenAI, approve
 // with changes; Gemini, approve." Claude's own reading and a Claude stand-in say they aren't
 // independent. Only seat names and verdicts go into it, never model text. null when no seat
@@ -432,6 +443,13 @@ export function reviewedLine(r: Review): string | null {
   if (!done.length) return null;
   const who = (s: SeatRun) => (s.stands_in_for ? `Claude standing in for ${LABEL[s.stands_in_for]}` : LABEL[s.seat]);
   return `Reviewed: ${done.map((s) => `${who(s)}, ${human(s.verdict)}${s.seat === "claude" ? " (not independent)" : ""}`).join("; ")}.`;
+}
+
+// The line Cain may say, and that reviewed.json carries: only a review that's done. An
+// incomplete one (a consequential review short of two non-Claude families too) gives none;
+// its verdicts.md still says who answered.
+export function sayLine(r: Review): string | null {
+  return r.status === "done" ? reviewedLine(r) : null;
 }
 
 export function recordDir(r: Review): string {
@@ -501,8 +519,8 @@ export function recordRequest(r: Review): { id: string; from: "cain"; kind: "cha
 }
 
 // The line Cain hears. Built from a template: ids, counts, seat names, states and
-// fixed fix texts only; no model text ever goes into it. It ends with the Reviewed line he
-// says as it is when he reports the work (the gate refuses any other), when there is one.
+// fixed fix texts only; no model text ever goes into it. A review that's done ends with the
+// Reviewed line he says as it is when he reports the work (the gate refuses any other).
 export function relayLine(r: Review): string {
   if (r.status === "blocked: privacy")
     return r.id_private || !safeId(r.id)
@@ -520,6 +538,6 @@ export function relayLine(r: Review): string {
       ? `Review ${shownId(r)} incomplete: a consequential review needs two non-Claude families and got ${independent(r).length} within a day, so the decision waits.`
       : `Review ${shownId(r)} incomplete: no seat answered.`)
     : `Review ${shownId(r)} done: ${tally || "no verdicts"}${who ? ` (${who})` : ""}.`;
-  const line = reviewedLine(r);
+  const line = sayLine(r);
   return [head, ...(down.length ? [`${down.join("; ")}.`] : []), where, ...(line ? [`Say it as: ${line}`] : [])].join(" ");
 }
