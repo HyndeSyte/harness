@@ -32,6 +32,8 @@
       "mcp__claude_ai_GitHub__create_branch",
       "mcp__claude_ai_GitHub__merge_pull_request",
       "Read(//data/options.json)",
+      "Read(//data/.claude/channels/discord/.env)",
+      "Edit(//data/.claude/channels/discord/.env)",
       "Read(//data/link/**)",
       "Edit(//data/link/**)",
       "Edit(//data/trust/**)",

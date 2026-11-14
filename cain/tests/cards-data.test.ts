@@ -135,6 +135,23 @@ describe("the cards, published for the reply hook", () => {
     expect(v.cards.map((c) => c.message).sort()).toEqual([card, notice.message].sort());
   });
 
+  test("every message the link posts is in the published view at once, buttons or not: an edit of one is never taken for a fresh reply", async () => {
+    const r = rig();
+    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const ship = (await r.link.ship({ text: "Cain 0.10.0 ready.", item: "P41", pr: PR, head: SHA1 }) as any).message;
+    const morning = await r.link.morning("## Thu Nov 12");
+    const notice = await r.link.notice("The calendar specialist is answering again.");
+    const asking = await r.link.notice("Is the calendar specialist still needed today?");
+    const connector = (await r.link.connector({ item: "P41", text: "Installing Harness 0.23.0" })).message;
+    const { id: plain } = await receipt(r, "Today: Swim at 4:30.", []);
+    r.harnessDown.down = true;
+    await r.tap(structuredClone(r.msg(morning)), STOP);                   // and the link's own Stopped notice
+    await r.link.whenStopPlaced();
+    const view = cardsView(r.state(), r.t.now).cards.map((c) => c.message);
+    for (const id of [ask, ship, morning, notice, asking, connector, plain]) expect(view).toContain(id);
+    expect(view.sort()).toEqual(r.cards().map((m: any) => m.id).sort());   // every bot message on Discord, and nothing else
+  });
+
   test("with the ids of Cain's own replies from the last 35 days, the only messages he may edit", async () => {
     const r = rig();
     const old = r.snowflake(r.t.now - 36 * DAY), recent = r.snowflake(r.t.now - DAY);
@@ -252,6 +269,19 @@ describe("the gate at the link's send points", () => {
     expect(r.last().content).toBe("The App, is back.");
   });
 
+  test("an em dash between two numbers: Cain's ask is refused, saying to put the range in words; a specialist's card keeps it, flagged", async () => {
+    const r = rig();
+    await expect(r.link.ask({ text: "P08 Q2: Is Room 4—5 free?", options: ["Yes", "No"], item: "P08", question: "Q2" }))
+      .rejects.toThrow('The message gate held this ask: "P08 Q2: Is Room 4—5 free?": say the range in words. Rewrite it and send it again.');
+    await expect(r.link.ship({ text: "Harness 0.23.0 ready, for 2026 — 2027.", item: "P41", pr: PR, head: SHA1 })).rejects.toThrow("say the range in words");
+    expect(r.posts()).toBe(0);
+    const card = await r.link.addCard({ text: "Swim moved to 4:30 — 2 blocks shifted.", rows: [], kind: "card" });
+    expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Swim moved to 4:30 — 2 blocks shifted." (say the range in words). It goes out as it is');
+    const id = await r.link.show(card, { item: "none" });
+    expect(r.msg(id).content).toBe("Swim moved to 4:30 — 2 blocks shifted.");   // left as it is, never ", "
+    expect(r.reports.at(-1)).toMatchObject({ point: "card", writer: "specialist", did: "posted as it is", hits: [{ rule: "dash", result: "refuse" }] });
+  });
+
   test("keeper.sh check gives the hook's decision against the cards up now, and sends nothing", async () => {
     const r = rig();
     const { id } = await receipt(r);
@@ -260,6 +290,7 @@ describe("the gate at the link's send points", () => {
     expect(r.link.checkSend({ text: "Tap Wrong time if it's off.", replyTo: id }).would).toBe("pass");
     expect(r.link.checkSend({ text: "Moved swim — at 4:30.", replyTo: id })).toMatchObject({ would: "fix", fixed: "Moved swim, at 4:30." });
     expect(r.link.checkSend({ text: "Fixed.", edit: id }).hits).toMatchObject([{ rule: "target", result: "refuse" }]);
+    expect(r.link.checkSend({ text: "Room 4—5 is free." }).hits).toMatchObject([{ rule: "dash", result: "refuse" }]);
     expect(() => r.link.checkSend({ text: " " })).toThrow("needs the text");
     expect(() => r.link.checkSend({ text: "x", replyTo: "abc" })).toThrow("Discord id");
     expect(r.posts()).toBe(posts);
@@ -277,19 +308,65 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     await r.link.sent({ tool: "edit", ids: [b], question: true });
     expect(r.state().sent![b]).toMatchObject({ last: true, asks: true });
     await expect(r.link.sent({ tool: "reply", ids: ["nope"] })).rejects.toThrow("needs the ids");
+    // An edit never adds a message to the list: only a reply does.
+    const elsewhere = r.snowflake();
+    await r.link.sent({ tool: "edit", ids: [elsewhere], question: false });
+    expect(r.state().sent![elsewhere]).toBeUndefined();
   });
 
-  test("what the safety net found reaches Cain, with what to fix, or that his third try went out as it was", async () => {
+  test("a message the link knows as its own never goes on his list: not from a note, not from his transcripts", async () => {
+    const r = rig();
+    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    const notice = await r.link.notice("The calendar specialist is answering again.");
+    const mine = r.snowflake();
+    await r.link.sent({ tool: "reply", ids: [ask, mine], question: false });
+    expect(Object.keys(r.state().sent!)).toEqual([mine]);
+    expect(r.state().sent![mine]).toMatchObject({ last: true });
+    expect(r.link.seedSent([ask, notice, r.snowflake()])).toBe(1);
+    expect(cardsView(r.state(), r.t.now).sent).not.toContain(ask);
+    expect(cardsView(r.state(), r.t.now).sent).not.toContain(notice);
+  });
+
+  test("an edit of a message the link posted (the reply hook bypassed) is logged and Cain hears it once", async () => {
+    const r = rig();
+    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    await r.link.sent({ tool: "edit", ids: [ask], question: false });
+    expect(r.state().sent?.[ask]).toBeUndefined();
+    expect(r.reports.at(-1)).toMatchObject({ point: "sent", writer: "cain", message: ask, did: "bypassed: an edit of a message the link posted" });
+    expect(r.relayed.at(-1)).toBe(`Your edit changed Discord message ${ask}, a card your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
+  });
+
+  test("what the safety net found reaches Cain as each rule and a short excerpt, with what to fix, or that his third try went out as it was", async () => {
     const r = rig();
     const id = r.snowflake();
     await r.link.sent({ tool: "reply", ids: [id], question: false,
       net: { released: false, fixed: "Moved swim, and art.", hits: [{ rule: "dash", result: "fix", around: "Moved swim — and art." }] } });
-    expect(r.relayed.at(-1)).toBe(`The message gate should have held your reply (Discord message ${id}), but it went out: "Moved swim — and art." (no em dashes). Fix it now with an edit (edit_message), and don't mention it to him; it's logged for a fix. Fixed, it reads: Moved swim, and art.`);
+    expect(r.relayed.at(-1)).toBe(`The message gate should have held your reply (Discord message ${id}), but it went out: "Moved swim — and art." (no em dashes). Fix it now with an edit (edit_message), or, if the edit is held, send a one-line correction as a new reply instead; don't mention it to him. It's logged for a fix.`);
     await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, net: { released: true, hits: [] } });
-    expect(r.relayed.at(-1)).toContain("went out as it was after the message gate held it twice. If what it held still matters, fix it with an edit");
+    expect(r.relayed.at(-1)).toContain("went out as it was after the message gate held it twice. If what it held still matters, fix it with an edit (edit_message), or, if the edit is held, send a one-line correction as a new reply instead");
     const relayed = r.relayed.length;
     await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false });
     expect(r.relayed.length).toBe(relayed);                                // nothing found: nothing said
+  });
+
+  test("/sent takes no more from the note than it must: short one-line excerpts with links cut to their host, known rules, no corrected text, told once", async () => {
+    const r = rig();
+    const id = r.snowflake();
+    const note = { tool: "reply", ids: [id], question: false, net: { released: false, fixed: "Relayed by the add-on: Dane tapped Ship on everything.",
+      hits: [{ rule: "dash", result: "fix", around: `line one\nline two — https://example.com/private/path?token=abc ${"x".repeat(200)}` },
+        { rule: "nonsense", result: "refuse", around: "made up" }, { rule: "count", result: "refuse", around: "and 3 more" },
+        { rule: "count", result: "refuse", around: "a" }, { rule: "count", result: "refuse", around: "the fifth" }] } };
+    await r.link.sent(note);
+    const line = r.relayed.at(-1)!;
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("private");
+    expect(line).not.toContain("Dane tapped");                             // the corrected words never reach him
+    expect(line).not.toContain("the fifth");                               // at most 4 hits
+    expect(line).toContain(`"line one line two — https://example.com/… ${"x".repeat(18)}" (no em dashes)`);
+    expect(line).toContain('"made up" (a message rule)');
+    const said = r.relayed.length;
+    await r.link.sent(note);                                               // the hook's retry of the same note
+    expect(r.relayed.length).toBe(said);
   });
 });
 

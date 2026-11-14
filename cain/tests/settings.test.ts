@@ -51,6 +51,12 @@ describe("Cain's permissions", () => {
     }
   });
 
+  test("Cain can't read or change the bot token: only the plugin and the hooks read it, and deny rules don't touch them", () => {
+    expect(deny).toContain("Read(//data/.claude/channels/discord/.env)");
+    expect(deny).toContain("Edit(//data/.claude/channels/discord/.env)");
+    for (const a of allow) expect(a).not.toContain(".env");
+  });
+
   test("no allow entry is a wildcard over an MCP server", () => {
     for (const t of allow.filter((a) => a.startsWith("mcp__"))) expect(t).not.toMatch(/\*/);
   });

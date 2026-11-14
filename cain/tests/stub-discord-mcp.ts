@@ -1,8 +1,9 @@
 // A stand-in for the Discord plugin's MCP server, for discord-send.cli.test.ts only (not a
 // test file itself). Named in its MCP config as plugin_discord_discord, so Claude Code calls
 // its tools mcp__plugin_discord_discord__reply and __edit_message, as it calls the plugin's.
-// It writes each call it gets to STUB_LOG and answers as the plugin does ("sent (id: X)").
-// Plain JSON-RPC over stdio, one message a line.
+// It writes each call it gets to STUB_LOG and answers as the plugin does ("sent (id: X)",
+// "edited (id: X)"), a reply's id made now, as Discord makes them. Plain JSON-RPC over
+// stdio, one message a line.
 import { appendFileSync } from "node:fs";
 
 const LOG = process.env.STUB_LOG ?? "";
@@ -14,6 +15,8 @@ const TOOLS = [
     inputSchema: { type: "object", properties: { chat_id: text, message_id: text, text }, required: ["chat_id", "message_id", "text"] } },
 ];
 
+let seq = 0;
+const snowflake = () => String(((BigInt(Date.now()) - 1420070400000n) << 22n) + BigInt(++seq));
 const send = (o: unknown) => process.stdout.write(JSON.stringify(o) + "\n");
 function handle(m: any): void {
   const ok = (result: unknown) => send({ jsonrpc: "2.0", id: m.id, result });
@@ -22,8 +25,9 @@ function handle(m: any): void {
   if (m.method === "tools/list") return ok({ tools: TOOLS });
   if (m.method === "tools/call") {
     const name = String(m.params?.name ?? ""), args = m.params?.arguments ?? {};
-    if (LOG) appendFileSync(LOG, JSON.stringify({ name, arguments: args }) + "\n");
-    return ok({ content: [{ type: "text", text: name === "reply" ? "sent (id: 1300000000000000777)" : `edited (id: ${args.message_id})` }] });
+    const answer = name === "reply" ? `sent (id: ${snowflake()})` : `edited (id: ${args.message_id})`;
+    if (LOG) appendFileSync(LOG, JSON.stringify({ name, arguments: args, answer }) + "\n");
+    return ok({ content: [{ type: "text", text: answer }] });
   }
   if (m.method === "ping") return ok({});
   if (m.id !== undefined) send({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "no such method" } });

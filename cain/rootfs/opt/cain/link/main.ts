@@ -33,7 +33,8 @@
 // (core.ts), and log every hit to Cain's folder (../gate/log.ts). The cards go to
 // /data/trust/cards.json (publish.ts) shortly after each save and each sweep. A start whose
 // gate rules are newer than the last replay's replays his DM once by itself. Cain's own
-// replies are read from his transcripts at start and every 6 hours, for his edit allowlist.
+// replies (never the messages he only edited) are read from his transcripts at start and
+// every 6 hours, for his edit allowlist.
 //
 // The Ship key (wave 1, piece B; shipkey.ts) signs Dane's Ship taps once they're in main.
 // Its public half goes to /data/trust/ship.pub, where the RemoteTrigger hook checks
@@ -247,7 +248,7 @@ async function seed(): Promise<void> {
   try {
     const was = load().seeded;
     const sent = await readTranscripts(TRANSCRIPTS, was ? was - 3_600_000 : Date.now() - 35 * 86_400_000);
-    const n = link.seedSent(sent.ids);
+    const n = link.seedSent(sent.replies ?? []);
     if (n) console.log(`[cain] link: ${n} of Cain's replies added to the ones he may edit`);
   } catch (e) { console.log(`[cain] link: couldn't read Cain's transcripts for his replies: ${String(e).slice(0, 80)}`); }
   finally { setTimeout(seed, SEED_EVERY_MS); }
@@ -292,7 +293,7 @@ Bun.serve({
         case "/replied": return json(await link.replied(b.m));
         case "/look": return json(await link.look(b.m));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
-        case "/sent": return json(await link.sent(b));
+        case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/stopped": {

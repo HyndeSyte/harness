@@ -31,9 +31,14 @@ export function answerText(v: unknown): string {
   return "";
 }
 
-// The last line of a message, as he reads it, ends in a question: a lone Stop under it
-// would read as an answer.
+// A sentence in the message's last paragraph ends in a question ("Should I move swim? Say
+// yes and I'll do it."): a lone Stop under it would read as an answer.
 export function asksSomething(text: string): boolean {
-  const lines = String(text ?? "").replace(/\s+$/, "").split("\n");
-  return /\?["'”’)*_~`]*$/.test(lines[lines.length - 1] ?? "");
+  const paragraphs = String(text ?? "").replace(/\s+$/, "").split(/\n[ \t]*\n/);
+  return /\?[?!]*["'”’)*_~`]*(?=\s|$)/.test(paragraphs[paragraphs.length - 1] ?? "");
+}
+
+// Discord ids carry their own creation time.
+export function snowflakeTime(id: string): number {
+  try { return Number(BigInt(id) >> 22n) + 1420070400000; } catch { return 0; }
 }

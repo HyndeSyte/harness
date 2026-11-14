@@ -4,6 +4,7 @@
 // Stop first on the new message and then off the old, and only when Discord is quiet. While
 // stopped it comes off, and Turn back on is kept within reach instead.
 import { describe, expect, test } from "bun:test";
+import { asksSomething } from "../rootfs/opt/cain/gate/plugin";
 import { cardsView, RESUME, STILL_STOPPED, STOP } from "../rootfs/opt/cain/link/core";
 import { BOT, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
@@ -196,6 +197,67 @@ describe("moving it safely", () => {
     expect(r.buttons(holder(r)!)).toEqual(["Stop"]);
   });
 
+  test("a message Discord keeps refusing Stop on is left after three tries; the next plain message gets it, never an older one", async () => {
+    const r = rig();
+    const first = await cainSays(r, "Moved swim to 4:30.");
+    await replies(r, 4);
+    r.failing.add("PATCH");                                            // Discord refuses, but not with a 404 or a rate limit
+    const stuck = await cainSays(r, "All set.");
+    await r.link.sweep();
+    await r.link.sweep();
+    expect(patchesOf(r, stuck)).toHaveLength(3);
+    await r.link.sweep();
+    await r.link.sweep();
+    expect(patchesOf(r, stuck)).toHaveLength(3);                       // no fourth try, every minute or ever
+    expect(holder(r)).toBe(first);                                     // the old one keeps working meanwhile
+    r.failing.clear();
+    await r.link.sweep();
+    expect(patchesOf(r, stuck)).toHaveLength(3);
+    const next = await cainSays(r, "One more thing done.");
+    expect(holder(r)).toBe(next);
+    expect(r.buttons(first)).toEqual([]);
+  });
+
+  test("Stop that lands while he taps Stop comes straight off: a move, and a notice", async () => {
+    const r = rig();
+    r.spy.onCall = (method) => {                                       // his Stop lands while Discord takes the move
+      if (method !== "PATCH") return;
+      r.stop.stopped = true; r.stop.at = r.t.now; r.spy.onCall = null;
+    };
+    const reply = await cainSays(r, "Moved swim to 4:30.");
+    expect(r.buttons(reply)).toEqual([]);
+    expect(holder(r)).toBeUndefined();
+    // A notice on its way to Discord when he taps Stop: it goes in the Stop queue, and comes off once it lands.
+    const r2 = rig();
+    const old = await cainSays(r2, "Moved swim to 4:30.");
+    r2.gate.posts = true;
+    const notice = r2.link.notice("The calendar specialist is answering again.");
+    await Bun.sleep(5);
+    await r2.tap(structuredClone(r2.msg(old)), STOP);
+    r2.release();
+    const id = await notice;
+    await r2.link.whenStopPlaced();
+    expect(r2.stop.stopped).toBe(true);
+    expect(r2.buttons(id)).toEqual([]);
+    expect(r2.buttons(old)).toEqual([]);
+    expect(holder(r2)).toBeUndefined();
+  });
+
+  test("a reply or notice whose last paragraph asks anything, even mid-paragraph, never carries it", async () => {
+    const r = rig();
+    const first = await cainSays(r, "Moved swim to 4:30.");
+    await replies(r, 4);
+    const id = r.snowflake();
+    r.posted[id] = { id, content: "Should I move swim? Say yes and I'll do it.", author: { id: BOT }, components: [] };
+    await r.link.sent({ tool: "reply", ids: [id], question: asksSomething("Should I move swim? Say yes and I'll do it.") });
+    expect(r.buttons(id)).toEqual([]);
+    expect(holder(r)).not.toBe(id);
+    const n = await r.link.notice("The calendar specialist is back. Want me to hand the swim change over again? It waits until you say.");
+    expect(r.msg(n).components).toEqual([]);
+    expect(holder(r)).not.toBe(n);
+    expect(first).toBeTruthy();
+  });
+
   test("a restart finds it where it was", async () => {
     const r = rig();
     const reply = await cainSays(r, "Moved swim to 4:30.");
@@ -249,8 +311,12 @@ describe("Stop and Turn back on", () => {
     await cainSays(r, "The swim moved.");
     expect(posts()).toBe(before);                                      // out of reach, but within the hour: no notice again
     r.later(5 * MIN);
+    const early = r.his("ok");
+    await cainSays(r, "Good.", { replyTo: early.id });                 // he wrote, but the last notice is 5 minutes old
+    expect(posts()).toBe(before);
+    r.later(6 * MIN);
     const his = r.his("ok, and art?");
-    await cainSays(r, "Art stays at 5.", { replyTo: his.id });         // he wrote since
+    await cainSays(r, "Art stays at 5.", { replyTo: his.id });         // he wrote since, 10 minutes on
     expect(posts()).toBe(before + 1);
     const again = r.last().id;
     expect(r.msg(again).content).toBe(STILL_STOPPED);
@@ -269,6 +335,53 @@ describe("Stop and Turn back on", () => {
     await r.tap(structuredClone(r.last()), RESUME);
     await r.link.whenStopPlaced();
     expect(r.stop.stopped).toBe(false);
+  });
+
+  test("while stopped, a live conversation brings Still stopped down at most every 10 minutes, never every second reply", async () => {
+    const r = rig();
+    r.harnessDown.down = true;
+    const reply = await cainSays(r, "Moved swim to 4:30.");
+    await r.tap(structuredClone(r.msg(reply)), STOP);
+    await r.link.whenStopPlaced();
+    const before = r.posts();
+    for (let i = 0; i < 12; i++) {                                     // he and Cain trade a message every 30 seconds
+      r.later(30_000);
+      const his = r.his(`and ${i}?`);
+      await cainSays(r, `Answer ${i}.`, { replyTo: his.id });
+    }
+    expect(r.posts() - before).toBeLessThanOrEqual(1);                 // 6 minutes: none, or one at most
+    for (let i = 0; i < 20; i++) {
+      r.later(30_000);
+      const his = r.his(`then ${i}?`);
+      await cainSays(r, `Then ${i}.`, { replyTo: his.id });
+    }
+    expect(r.posts() - before).toBeLessThanOrEqual(2);                 // 16 minutes: one every 10 at most
+  });
+
+  test("if the Stopped notice fails to post, Turn back on is posted again on each pass until one is up, then hourly again", async () => {
+    const r = rig();
+    r.harnessDown.down = true;                                         // the link's own notice is the one that says it
+    const reply = await cainSays(r, "Moved swim to 4:30.");
+    r.failing.add(`POST /channels/${DM}/messages`);
+    await r.tap(structuredClone(r.msg(reply)), STOP);
+    await r.link.whenStopPlaced();
+    const tries = () => r.posts();
+    const first = tries();                                             // its own notice, tried once and lost
+    await cainSays(r, "Noted.");
+    expect(tries()).toBe(first);                                       // within the minute its own notice gets: nothing
+    r.later(61_000);
+    await r.link.sweep();
+    expect(tries()).toBe(first + 1);                                   // none up anywhere: tried at once
+    await r.link.sweep();
+    expect(tries()).toBe(first + 2);                                   // and again on the next pass
+    r.failing.clear();
+    await r.link.sweep();
+    expect(r.msg(r.last().id)).toMatchObject({ content: STILL_STOPPED });
+    expect(r.buttons(r.last().id)).toEqual(["Turn back on"]);
+    const up = tries();
+    for (let i = 0; i < 4; i++) await cainSays(r, `Reply ${i}.`);      // out of reach now, but one is up: the hour holds
+    await r.link.sweep();
+    expect(tries()).toBe(up);
   });
 
   test("after Turn back on, the moving Stop returns", async () => {

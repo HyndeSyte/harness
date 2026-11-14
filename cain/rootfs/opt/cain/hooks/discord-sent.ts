@@ -1,13 +1,16 @@
 // What went out, told to the link (piece D, Cain 0.10.0): a PostToolUse hook on the
 // plugin's reply and edit_message tools, wired with "async", so nothing waits on it.
 //   - Stop within reach: the link learns the ids of the message Cain just sent (each part)
-//     and whether its last line asks something, and puts the moving Stop on the newest
-//     plain message (POST /sent). The same ids make up his edit allowlist: he edits only
+//     and whether its last paragraph asks something, and puts the moving Stop on the newest
+//     plain message (POST /sent). A reply's ids make up his edit allowlist: he edits only
 //     his own replies. An edit that turns the Stop's message into a question moves it.
 //   - The safety net: what went out is read again with the rules that need nothing from the
 //     link. A hit means the reply hook was bypassed, or let a third try through: it's logged
-//     here, and the link tells Cain, with what to fix by an edit. Never through this hook's
-//     own output, which Claude Code would show him as the hook's.
+//     here, and the link tells Cain the rule and a short excerpt, and to fix it by an edit.
+//     Never through this hook's own output, which Claude Code would show him as the hook's.
+// A note the link doesn't take (no answer, or a 5xx or 429) is sent again, up to 3 times,
+// inside the hook's 15 seconds. Nothing is kept beyond that: Cain's next reply places Stop
+// again.
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { appendGate } from "../gate/log";
@@ -19,12 +22,13 @@ const LINK = process.env.CAIN_LINK ?? "http://127.0.0.1:8097";
 const ENV = process.env.CAIN_DISCORD_ENV ?? "/data/.claude/channels/discord/.env";
 const SNOWFLAKE = /^\d{15,22}$/;
 const id = (v: unknown) => (typeof v === "string" || typeof v === "number") && SNOWFLAKE.test(String(v)) ? String(v) : undefined;
-const FIXED_MAX = 600;                  // a fixed text longer than this isn't repeated to Cain
+export const POST_MS = 2_000;                        // each try at /sent gets this long
+export const AGAIN_MS = [500, 1_000, 2_000];         // the waits before each of the 3 tries again: 11.5 s at most
 
 export interface NetHit { rule: string; result: string; around: string }
 export interface SentNote {
   tool: "reply" | "edit"; ids: string[]; question: boolean; chat?: string; reply_to?: string;
-  net?: { hits: NetHit[]; released: boolean; fixed?: string };
+  net?: { hits: NetHit[]; released: boolean };
 }
 
 // What to tell the link about one call that went out, or null when nothing went out (the
@@ -44,11 +48,24 @@ export function noteOf(input: any, now: number, tries: Tries = readTries()): Sen
   // A third try the reply hook let through is always told, hits here or not (a button the
   // card lacks is one only the cards can show).
   const released = wasReleased(tries, keyOf(String(input?.session_id ?? ""), chat), text, now);
-  if (r.hits.length || released) {
-    const fixed = r.hits.some((h) => h.result === "fix") && r.fixed.length <= FIXED_MAX ? r.fixed : undefined;
-    note.net = { hits: r.hits.map((h) => ({ rule: h.rule, result: h.result, around: h.around })), released, ...(fixed ? { fixed } : {}) };
-  }
+  if (r.hits.length || released) note.net = { hits: r.hits.map((h) => ({ rule: h.rule, result: h.result, around: h.around })), released };
   return note;
+}
+
+// POST /sent until the link takes it: true once it does. A refusal (another 4xx) is final:
+// the same note would be refused again.
+export async function tellLink(note: SentNote, post: (body: string, timeoutMs: number) => Promise<Response>,
+                               wait: (ms: number) => Promise<unknown> = (ms) => Bun.sleep(ms)): Promise<boolean> {
+  const body = JSON.stringify(note);
+  for (let i = 0; i <= AGAIN_MS.length; i++) {
+    if (i) await wait(AGAIN_MS[i - 1]);
+    try {
+      const r = await post(body, POST_MS);
+      if (r.ok) return true;
+      if (r.status < 500 && r.status !== 429) return false;
+    } catch { /* no answer in time: try again */ }
+  }
+  return false;
 }
 
 function linkKey(): string {
@@ -64,8 +81,9 @@ if (import.meta.main) {
       // A let-through third try is already logged by the reply hook; a bypass is logged here.
       if (note.net && !note.net.released) await appendGate({ at: now, point: "sent", writer: "cain", message: note.ids.at(-1),
         did: "bypassed", hits: note.net.hits });
-      await fetch(`${LINK}/sent`, { method: "POST", body: JSON.stringify(note), signal: AbortSignal.timeout(10_000),
-        headers: { "content-type": "application/json", "x-harness-key": linkKey() } });
+      const key = linkKey();
+      await tellLink(note, (body, timeoutMs) => fetch(`${LINK}/sent`, { method: "POST", body, signal: AbortSignal.timeout(timeoutMs),
+        headers: { "content-type": "application/json", "x-harness-key": key } }));
     }
   } catch { /* nothing waits on this hook, and nothing it says reaches him */ }
   process.exit(0);

@@ -6,20 +6,27 @@
 // What it says, as JSON on stdout with exit 0 (the wiring's `|| true` turns any exit into 0):
 //   - nothing: the reply goes as it is;
 //   - allow, with the call's whole input and only its text changed: em dashes and
-//     "add-on" fixed in place, and only when the reply goes to his DM. Claude Code's auto
-//     mode can refuse an updatedInput that comes without a decision; discord-send.cli.test.ts
-//     proves this one against the real CLI;
-//   - deny, with what to change: a hidden count, machine text, a button the card it
-//     answers lacks (or any named button while the cards can't be read), a chat that isn't
-//     his DM, or an edit of a message that isn't one of his own replies.
-// The rules that need nothing from the link run first, so they hold however slow it is.
-// Then it asks the link's local route for the cards up now (1.5 s), or reads
-// /data/trust/cards.json while it's under 3 minutes old.
+//     "add-on" fixed in place, only when the reply goes to his DM and its input is plain
+//     (chat_id, text and reply_to; for an edit, message_id): an allow skips auto mode's own
+//     check, so a call carrying anything else (files to attach) gets "send exactly this
+//     instead" and then goes through that check. Claude Code's auto mode can refuse an
+//     updatedInput that comes without a decision; discord-send.cli.test.ts proves this one
+//     against the real CLI;
+//   - deny, with what to change: a hidden count, machine text, an em dash between two
+//     numbers that isn't a clock range, a button the card it answers lacks (or any named
+//     button while the cards can't be read), a chat that isn't his DM, or an edit of a
+//     message that isn't one of his own replies.
+// The cards come first, always (decision F): the link's local route gets 1.5 s, then
+// /data/trust/cards.json while it's under 3 minutes old. So every rule runs on every send,
+// however slow the link is, and the link's DM id wins over the cached one, rewriting it.
 //
 // The third try: after two wording refusals for one session and chat within 10 minutes,
 // the next try goes as it is, logged "passed after two refusals"; Cain hears it through
-// the link (discord-sent.ts). A pass or a fix resets the count. Never for another chat or
-// an edit of someone else's message. Counted in /data/work/gate-tries.json.
+// the link (discord-sent.ts). A pass or a fix resets the count. Never for a hard refusal
+// (another chat, an edit of a message that isn't his), while which messages are his can't
+// be told, or while his DM can't be told at all. Counted in /data/work/gate-tries.json; a
+// refusal the count can't be written for lets the reply go, logged "passed, tries not
+// counted", since otherwise every try would start at zero and the third never come.
 //
 // It fails open: an error, a crash or a timeout lets the reply go, since silencing Cain is
 // worse than one unchecked reply, and discord-sent.ts re-checks what went out.
@@ -27,11 +34,11 @@
 // `bun discord-send.ts --self-test` runs the installed hook command as Claude Code would,
 // on a fix, a refusal and a clean reply, and prints one line (the App runs it at start).
 import { createHash, createHmac } from "node:crypto";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendGate } from "../gate/log";
-import { SENDS } from "../gate/plugin";
+import { answerText, REPLY_TOOL, SENDS, sentIds } from "../gate/plugin";
 import { fixedWhat, type Hit } from "../gate/rules";
 import { type CardsView, decideSend, type Decision, type SendCall } from "../gate/send";
 
@@ -45,6 +52,7 @@ export const DM_FILE = process.env.CAIN_GATE_DM ?? "/data/work/gate-dm.json";
 export const STALE_MS = 3 * 60_000;      // a cards file older than this is the link being down
 export const LINK_MS = 1_500;            // how long the link gets to answer
 export const TRY_MS = 10 * 60_000;       // two refusals within this, and the third try goes
+const TRANSCRIPT_TAIL = 2 * 1024 * 1024; // how much of his session's transcript an edit reads back
 // Decision A: fixes go out in place. Should Claude Code ever stop applying an allowed
 // updatedInput, false makes a fix a refusal that says exactly what to send instead.
 export const FIX_IN_PLACE = true;
@@ -63,6 +71,10 @@ export function callOf(input: any): Call | null {
   return tool === "reply" ? { ...base, replyTo: id(t.reply_to) } : { ...base, target: id(t.message_id) };
 }
 
+// The only keys a call the hook may pre-approve carries.
+const PLAIN: Record<"reply" | "edit", readonly string[]> = { reply: ["chat_id", "text", "reply_to"], edit: ["chat_id", "message_id", "text"] };
+export const plainInput = (call: Call) => Object.keys(call.input).every((k) => PLAIN[call.tool].includes(k));
+
 // The cards as of now: the link's answer, else its file if it's fresh, else none.
 export async function cardsNow(ask: () => Promise<CardsView | null>, file: () => string | null, now: number):
     Promise<{ cards: CardsView | null; from: "link" | "file" | "none" }> {
@@ -74,6 +86,36 @@ export async function cardsNow(ask: () => Promise<CardsView | null>, file: () =>
   return { cards: null, from: "none" };
 }
 
+// The ids the plugin's reply tool answered with in this session, from the end of its
+// transcript (Claude Code hands every hook its path): proof that a message is Cain's own
+// reply before the PostToolUse hook's word on it reaches the link. Only a reply call's own
+// answer counts; no other text in the transcript does.
+export function repliedIn(path: unknown, maxBytes = TRANSCRIPT_TAIL): Set<string> {
+  const out = new Set<string>();
+  if (typeof path !== "string" || !path) return out;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size, from = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - from);
+    readSync(fd, buf, 0, buf.length, from);
+    const calls = new Set<string>();
+    for (const line of buf.toString("utf8").split("\n")) {
+      if (!line.includes(REPLY_TOOL) && !(calls.size && line.includes("tool_result"))) continue;
+      let o: any;
+      try { o = JSON.parse(line); } catch { continue; }
+      const content = o?.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const b of content) {
+        if (b?.type === "tool_use" && b.name === REPLY_TOOL) calls.add(String(b.id ?? ""));
+        else if (b?.type === "tool_result" && calls.has(String(b.tool_use_id ?? ""))) for (const x of sentIds(answerText(b.content))) out.add(x);
+      }
+    }
+  } catch { /* no transcript: no proof */ }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* closed */ } }
+  return out;
+}
+
 // -- small files of the hook's own: his DM's id, and the tries --------------------------
 function writeWhole(path: string, data: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -82,7 +124,8 @@ function writeWhole(path: string, data: unknown): void {
 }
 
 // His DM's channel id, as the link last said it: so a send can be checked even while the
-// link is down. Unknown means a send passes and is logged, never refused.
+// link and its file are both unavailable. Unknown means a send passes and is logged, never
+// refused; one that differs from it alone is a soft refusal.
 export function readDm(path = DM_FILE): string | null {
   try { const d = JSON.parse(readFileSync(path, "utf8"))?.dm; return id(d) ?? null; } catch { return null; }
 }
@@ -101,14 +144,15 @@ export const keyOf = (session: string, chat: string | undefined) => `${session}\
 export function readTries(path = TRIES): Tries {
   try { const t = JSON.parse(readFileSync(path, "utf8")); return t && typeof t === "object" && !Array.isArray(t) ? t : {}; } catch { return {}; }
 }
-function writeTries(t: Tries, now: number, path = TRIES): void {
+// False when the count couldn't be written.
+export function writeTries(t: Tries, now: number, path = TRIES): boolean {
   for (const [k, v] of Object.entries(t)) {                   // what's done with goes
     v.released = (v.released ?? []).filter((r) => now - r.at < TRY_MS);
     if (!v.released.length) delete v.released;
     if (v.n === 0 && !v.released) delete t[k];
     else if (now - v.first > 6 * TRY_MS && !v.released) delete t[k];
   }
-  try { writeWhole(path, t); } catch { /* counting is best effort */ }
+  try { writeWhole(path, t); return true; } catch { return false; }
 }
 
 // Whether the text was let through on a third try just now (for discord-sent.ts).
@@ -117,7 +161,16 @@ export function wasReleased(t: Tries, key: string, text: string, now: number): b
   return (t[key]?.released ?? []).some((r) => r.hash === h && now - r.at < TRY_MS);
 }
 
-export interface Out { output: Record<string, unknown> | null; did: string }
+// Whether a third try may ever let this decision's refusal go: never for a hard one (a chat
+// the link says isn't his DM), one about an edit's target (not his, or not known to be), or
+// while his DM can't be told at all (the chat is unsure). A chat that differs only from the
+// cached DM id is soft: the cache may be stale, and the plugin's own allowlist still holds.
+export function releasable(d: Decision): boolean {
+  return !d.hard && d.chat !== "unknown" && !d.hits.some((h) => h.rule === "target");
+}
+
+// counted: a refusal that holds only because it was counted toward the third try.
+export interface Out { output: Record<string, unknown> | null; did: string; counted?: boolean }
 const deny = (reason: string) => ({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } });
 const allow = (input: Record<string, unknown>, reason: string) => ({ hookSpecificOutput: {
   hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: reason, updatedInput: input } });
@@ -127,16 +180,18 @@ export function act(call: Call, d: Decision, t: Tries, now: number): Out {
   const key = keyOf(call.session, call.chat);
   const rec = t[key] && now - t[key].first <= TRY_MS ? t[key] : (t[key] = { n: 0, first: now, released: t[key]?.released });
   const refuse = (reason: string): Out => {
+    if (!releasable(d)) return { output: deny(reason), did: "refused" };
     if (rec.n >= 2) {                                          // the third try: it goes as it is
       t[key] = { n: 0, first: now, released: [...(rec.released ?? []), { hash: textHash(call.text), at: now }] };
       return { output: null, did: "passed after two refusals" };
     }
     if (rec.n === 0) rec.first = now;
     rec.n++;
-    return { output: deny(reason), did: "refused" };
+    return { output: deny(reason), did: "refused", counted: true };
   };
-  if (d.would === "refuse") return d.hard ? { output: deny(d.said), did: "refused" } : refuse(d.said);
-  if (d.would === "fix" && !(FIX_IN_PLACE && d.chat === "his")) return refuse(d.said);   // "Send exactly this instead: ..."
+  if (d.would === "refuse") return refuse(d.said);
+  // "Send exactly this instead: ..." when the fix can't go out in place.
+  if (d.would === "fix" && !(FIX_IN_PLACE && d.chat === "his" && plainInput(call))) return refuse(d.said);
   rec.n = 0;
   if (d.would === "fix")
     return { output: allow({ ...call.input, text: d.fixed }, `The message gate fixed its wording as it went: ${fixedWhat(d.hits as Hit[])}.`), did: "fixed" };
@@ -162,24 +217,19 @@ async function askLink(): Promise<CardsView | null> {
 
 // The whole hook, for one input: what it prints (nothing, or one JSON object).
 export async function run(raw: string, o: { ask?: () => Promise<CardsView | null>; file?: () => string | null; now?: number } = {}): Promise<string> {
-  const call = callOf(JSON.parse(raw));
+  const input = JSON.parse(raw);
+  const call = callOf(input);
   if (!call) return "";
   const now = o.now ?? Date.now();
   const tz = process.env.CHECKIN_TZ ?? "America/New_York";
-  const known = readDm();
-  // The rules that need no cards first: these hold even if the link never answers.
-  let d = decideSend(call, null, { dm: known, early: true, tz });
-  let from = "not asked";
-  if (d.would !== "refuse") {
-    const got = await cardsNow(o.ask ?? askLink, o.file ?? (() => { try { return readFileSync(CARDS, "utf8"); } catch { return null; } }), now);
-    from = got.from;
-    keepDm(got.cards?.dm);
-    d = decideSend(call, got.cards, { dm: known, tz });
-  }
+  const got = await cardsNow(o.ask ?? askLink, o.file ?? (() => { try { return readFileSync(CARDS, "utf8"); } catch { return null; } }), now);
+  keepDm(got.cards?.dm);
+  const d = decideSend(call, got.cards, { dm: got.cards?.dm ? null : readDm(), tz, now,
+    ...(call.tool === "edit" ? { replied: repliedIn(input?.transcript_path) } : {}) });
   const tries = readTries();
-  const out = act(call, d, tries, now);
-  writeTries(tries, now);
-  const line = entry(call, d, out, from, now);
+  let out = act(call, d, tries, now);
+  if (!writeTries(tries, now) && out.counted) out = { output: null, did: "passed, tries not counted" };
+  const line = entry(call, d, out, got.from, now);
   if (line) await appendGate(line);
   return out.output ? JSON.stringify(out.output) : "";
 }

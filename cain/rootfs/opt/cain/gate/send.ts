@@ -1,15 +1,19 @@
 // What the gate does with one of Cain's own Discord replies or edits, against the cards
 // that are up now (piece D, enforcing since Cain 0.10.0). Pure: the reply hook
 // (../hooks/discord-send.ts) and the link's dry run (keeper.sh check) both call it, so
-// they always agree.
+// they agree; only the hook also has his session's transcript, the proof that a fresh
+// message is his own reply before the link has heard of it.
 //
 //   pass    nothing to change
 //   fix     only em dashes or "add-on": the hook sends the fixed words in its place
-//   refuse  held back, with what to change: a hidden count, machine text, a button the
-//           card it answers doesn't have, or a named button while which buttons are up
-//           can't be told; never released by a third try (hard): a chat that isn't his
-//           DM, or an edit of a message that isn't one of Cain's own replies
-import { AT, check, type Hit, type Result, WHY } from "./rules";
+//   refuse  held back, with what to change: a hidden count, machine text, an em dash
+//           between two numbers that isn't a clock range, a button the card it answers
+//           doesn't have, or a named button while which buttons are up can't be told.
+//           Never released by a third try (hard): a chat the link says isn't his DM, or
+//           an edit of a message that isn't one of Cain's own replies, or whose owner
+//           can't be told right now
+import { snowflakeTime } from "./plugin";
+import { AT, check, type Hit, type Result, whyOf } from "./rules";
 
 export type Writer = "cain" | "specialist" | "link";
 
@@ -36,16 +40,20 @@ const when = (ms: number | null, tz: string) => (ms ? new Intl.DateTimeFormat("e
 
 export const HELD = "The message gate held this:";
 export const REWRITE = "Rewrite and send now; don't mention it to him.";
+// A message the link doesn't know, made this recently, can be a reply of Cain's whose
+// PostToolUse word hasn't reached the link yet (it's sent in the background).
+export const EDIT_WINDOW_MS = 10 * 60_000;
 
 // cards: the link's view now, or null when it can't be had (the link down and its file
-// missing or stale): then a named button can't be checked, and an edit waits. dm: his
-// DM's channel id when known (the view's, or the hook's cached one). early: only the
-// rules that need no cards (the hook runs them before it asks the link): a long number
-// or code in a reply is given the benefit of the doubt (it may answer him), and buttons
-// and edit targets wait for the cards.
+// missing or stale): then a named button can't be checked, and an edit waits.
+// dm: the hook's cached DM id, which counts only when the cards don't name his DM; a chat
+// that differs from it alone is a soft refusal, since the plugin's own allowlist holds
+// the chats it sends to. now: for the edit window. replied: the ids the plugin's reply tool
+// answered with in this session, from its transcript (the hook's, never the link's).
 export function decideSend(call: SendCall, cards: CardsView | null,
-                           o: { tz?: string; dm?: string | null; early?: boolean } = {}): Decision {
+                           o: { tz?: string; dm?: string | null; now?: number; replied?: ReadonlySet<string> } = {}): Decision {
   const tz = o.tz ?? "America/New_York";
+  const now = o.now ?? Date.now();
   const dm = cards?.dm ?? o.dm ?? null;
   const target = call.replyTo && cards ? cards.cards.find((c) => c.message === call.replyTo) : undefined;
   const live = (cards?.cards ?? []).filter((c) => c.live);
@@ -57,18 +65,17 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   const buttons: string[] | null = call.tool === "edit" || !call.replyTo ? [] : !cards ? null : target?.live ? [...target.labels] : [];
   if (buttons && live.some((c) => c.labels.includes("Stop"))) buttons.push("Stop");
   // A reply to a message that is neither one the link posted nor one of Cain's own answers him.
-  const answersHim = call.tool === "reply" && !!call.replyTo
-    && (o.early ? true : !!cards && !target && !(cards.sent ?? []).includes(call.replyTo));
-  const r = check(call.text, { rules: o.early ? ["dash", "app", "count", "machine"] : AT.cain, buttons, known, answersHim });
+  const answersHim = call.tool === "reply" && !!call.replyTo && !!cards && !target && !(cards.sent ?? []).includes(call.replyTo);
+  const r = check(call.text, { rules: AT.cain, buttons, known, answersHim });
   const hits: GateHit[] = r.hits.map((h: Hit) => ({ rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}) }));
   let hard = false;
   // Only his DM: the plugin's own allowlist holds that today; this says so in words.
   const chat = !call.chat || !dm ? "unknown" : call.chat === dm ? "his" : "other";
-  if (chat === "other") { hits.push({ rule: "chat", result: "refuse", around: "" }); hard = true; }
+  if (chat === "other") { hits.push({ rule: "chat", result: "refuse", around: "" }); if (cards?.dm) hard = true; }
   // An edit is for Cain's own replies only, never a card or notice the link posted.
-  if (call.tool === "edit" && !o.early) {
-    if (!cards) { hits.push({ rule: "target", result: "unsure", around: "" }); hard = true; }
-    else if (!call.target || !(cards.sent ?? []).includes(call.target)) { hits.push({ rule: "target", result: "refuse", around: "" }); hard = true; }
+  if (call.tool === "edit") {
+    const t = editTarget(call.target, cards, now, o.replied);
+    if (t !== "ok") { hits.push({ rule: "target", result: t, around: "" }); hard = true; }
   }
   const held = hits.some((h) => h.result === "refuse" || h.result === "unsure");
   const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
@@ -85,17 +92,40 @@ export function decideSend(call: SendCall, cards: CardsView | null,
       else
         lines.push(`"${h.label}" names a button, and ${call.tool === "edit" ? "an edit" : "this reply"} answers no card that has it: name one only in a reply to its card${where}.`);
     } else if (h.rule === "target") {
-      lines.push(h.result === "unsure" ? "Which messages are your own replies can't be checked right now, so an edit waits: try again in a minute."
-        : "That message isn't one of your own replies: edit only your own.");
+      lines.push(h.result === "unsure" ? "Which messages are your own replies can't be checked right now: send it as a new reply instead, or edit in a minute."
+        : "That message isn't one of your own replies: edit only your own, or say it in a new reply.");
     } else if (h.rule === "chat") {
-      lines.push("That chat isn't his DM: send only to him, in his DM.");
-    } else if (h.result === "refuse") lines.push(`"${h.around}": ${WHY[h.rule as keyof typeof WHY] ?? "change it"}.`);
+      lines.push(hard ? "That chat isn't his DM: send only to him, in his DM."
+        : "That chat isn't his DM as last seen (the link can't be asked right now): send only to him, in his DM.");
+    } else if (h.result === "refuse") lines.push(`"${h.around}": ${whyOf(h)}.`);
   }
   let said: string;
   if (would === "refuse") {
-    const fixes = hits.some((h) => h.result === "fix") ? " Its em dashes and add-ons are fixed for you when it goes." : "";
-    said = `${HELD} ${lines.join(" ")}${fixes} ${REWRITE}`;
+    const fixes = !hits.some((h) => h.result === "fix") ? ""
+      : hits.some((h) => h.rule === "dash" && h.result === "refuse") ? " Its other em dashes and add-ons are fixed for you when it goes."
+      : " Its em dashes and add-ons are fixed for you when it goes.";
+    // An edit held for its target isn't fixed by rewording it.
+    said = `${HELD} ${lines.join(" ")}${fixes} ${hits.some((h) => h.rule === "target") ? "Don't mention it to him." : REWRITE}`;
   } else if (would === "fix") said = `Send exactly this instead: ${r.fixed}`;
   else said = "Nothing to change.";
   return { would, fixed: r.fixed, hits, said, hard, chat };
+}
+
+// Whether an edit's target is one of Cain's own replies. "refuse": a message the link
+// posted (anything but "plain", even one on his list), or one neither on his list nor
+// fresh. "unsure": it can't be told now (no cards, or a fresh message the link doesn't know
+// that this session's transcript doesn't show as his reply). A fresh message the link
+// doesn't know passes only on his reply tool's own answer: the bot's other messages (a
+// post of the link's whose answer was lost, the plugin's permission prompts) never show
+// there as one.
+function editTarget(target: string | undefined, cards: CardsView | null, now: number, replied?: ReadonlySet<string>): "ok" | "refuse" | "unsure" {
+  if (!target) return "refuse";
+  if (!cards) return "unsure";
+  const known = cards.cards.find((c) => c.message === target);
+  if (known && known.kind !== "plain") return "refuse";
+  if ((cards.sent ?? []).includes(target)) return "ok";
+  if (known) return "refuse";
+  const at = snowflakeTime(target);
+  if (at > now - EDIT_WINDOW_MS && at <= now + 60_000) return replied?.has(target) ? "ok" : "unsure";
+  return "refuse";
 }

@@ -427,7 +427,9 @@ describe("Cain's transcripts", () => {
     expect([...sent.ids].sort()).toEqual(["1300000000000000777", "1300000000000000778", "1300000000000000779",
       "1300000000000000780", "1300000000000000781"]);
     expect([...sent.texts].sort()).toEqual(["A long one.", "Another.", "Moved it to 4:30.", "Moved it to 5:00.", "Never edited."]);
-    expect(await readTranscripts(join(root, "none"), 0)).toEqual({ ids: new Set(), texts: new Set() });
+    // His edit allowlist is seeded from the replies alone: a message he only edited may be one the link posted.
+    expect([...sent.replies!].sort()).toEqual(["1300000000000000777", "1300000000000000779", "1300000000000000780", "1300000000000000781"]);
+    expect(await readTranscripts(join(root, "none"), 0)).toEqual({ ids: new Set(), texts: new Set(), replies: new Set() });
   });
 
   test("a long session is read in turns, so a timer fires during the read, and a huge line is skipped", async () => {

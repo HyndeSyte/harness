@@ -79,32 +79,36 @@ const NAME = Buffer.from("plugin_discord_discord__"), RESULT = Buffer.from("tool
 const turn = () => new Promise<void>((ok) => setTimeout(ok, 0));
 
 // The ids and exact texts of what Cain sent with the plugin's reply and edit tools, from
-// his transcripts changed since a time: the tool's input text, and the ids in its answer.
-// Only lines that name the plugin's tools, or answer one of those calls, are parsed.
+// his transcripts changed since a time: the tool's input text, and the ids in its answer;
+// and apart, the ids his reply tool answered with (a message he only edited isn't his reply:
+// it may be one the link posted). Only lines that name the plugin's tools, or answer one of
+// those calls, are parsed.
 export async function readTranscripts(root: string, since: number): Promise<Sent> {
-  const ids = new Set<string>(), texts = new Set<string>();
+  const ids = new Set<string>(), texts = new Set<string>(), replies = new Set<string>();
   let dirs: string[] = [];
-  try { dirs = readdirSync(root).map((d) => join(root, d)); } catch { return { ids, texts }; }
+  try { dirs = readdirSync(root).map((d) => join(root, d)); } catch { return { ids, texts, replies }; }
   for (const dir of dirs) {
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f)); } catch { continue; }
     for (const f of files) {
       try { if (statSync(f).mtimeMs < since) continue; } catch { continue; }
-      const sends = new Set<string>();
+      const sends = new Map<string, boolean>();       // the plugin's send calls not answered yet: a reply?
       const take = (line: Buffer) => {
-        if (!line.includes(NAME) && !(sends.size && line.includes(RESULT) && [...sends].some((s) => line.includes(s)))) return;
+        if (!line.includes(NAME) && !(sends.size && line.includes(RESULT) && [...sends.keys()].some((s) => line.includes(s)))) return;
         let o: any;
         try { o = JSON.parse(line.toString("utf8")); } catch { return; }
         const content = o?.message?.content;
         if (!Array.isArray(content)) return;
         for (const b of content) {
-          if (b?.type === "tool_use" && SEND.test(String(b.name ?? ""))) {
-            sends.add(String(b.id ?? ""));
+          const m = b?.type === "tool_use" ? SEND.exec(String(b.name ?? "")) : null;
+          if (m) {
+            sends.set(String(b.id ?? ""), m[1] === "reply");
             const t = String(b.input?.text ?? "").trim();
             if (t) texts.add(t);
           } else if (b?.type === "tool_result" && sends.has(String(b.tool_use_id ?? ""))) {
+            const reply = sends.get(String(b.tool_use_id));
             sends.delete(String(b.tool_use_id));
-            for (const id of sentIds(answerText(b.content))) ids.add(id);
+            for (const id of sentIds(answerText(b.content))) { ids.add(id); if (reply) replies.add(id); }
           }
         }
       };
@@ -129,5 +133,5 @@ export async function readTranscripts(root: string, since: number): Promise<Sent
       await turn();
     }
   }
-  return { ids, texts };
+  return { ids, texts, replies };
 }

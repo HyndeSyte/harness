@@ -65,10 +65,12 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const gate = { posts: false, history: false }; // Discord is slow: posts to his DM, or reads of it, wait until release()
   const waiting: (() => void)[] = [];
   const beyond = new Set<string>();              // on Discord, but further back than the look over his DM goes
+  const spy = { onCall: null as null | ((method: string, path: string) => void) };   // runs as each call reaches Discord
   let seq = 0, lastId = "", tapped = "";
   const snowflake = (at = t.now) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(++seq));
   const rest = async (method: string, path: string, body?: any, auth = true) => {
     calls.push({ method, path, body: copy(body), auth });
+    spy.onCall?.(method, path);
     for (const f of failing) if (path.startsWith(f) || `${method} ${path}`.startsWith(f)) throw new Error("discord 500: unavailable");
     for (const f of limited) if (path.startsWith(f) || `${method} ${path}`.startsWith(f)) throw new Error("discord 429: You are being rate limited.");
     for (const [f, n] of Object.entries(limitN)) if (n > 0 && (path.startsWith(f) || `${method} ${path}`.startsWith(f))) {
@@ -162,7 +164,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return link; },
     calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN,
+    reports, replays, sent, discord, limitN, spy,
     release: () => { gate.posts = false; gate.history = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

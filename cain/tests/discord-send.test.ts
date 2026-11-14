@@ -9,9 +9,10 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendGate } from "../rootfs/opt/cain/gate/log";
-import { decideSend, type CardsView } from "../rootfs/opt/cain/gate/send";
-import { act, callOf, cardsNow, entry, readDm, keepDm, keyOf, selfTest, STALE_MS, textHash, TRY_MS, type Tries, wasReleased } from "../rootfs/opt/cain/hooks/discord-send";
-import { noteOf } from "../rootfs/opt/cain/hooks/discord-sent";
+import { asksSomething } from "../rootfs/opt/cain/gate/plugin";
+import { decideSend, EDIT_WINDOW_MS, type CardsView } from "../rootfs/opt/cain/gate/send";
+import { act, callOf, cardsNow, entry, plainInput, readDm, keepDm, keyOf, releasable, repliedIn, selfTest, STALE_MS, textHash, TRY_MS, type Tries, wasReleased } from "../rootfs/opt/cain/hooks/discord-send";
+import { AGAIN_MS, noteOf, tellLink } from "../rootfs/opt/cain/hooks/discord-sent";
 
 const HOOK = join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-send.ts");
 const SENT_HOOK = join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-sent.ts");
@@ -19,6 +20,8 @@ const SETTINGS = join(import.meta.dir, "../rootfs/opt/cain/settings.json");
 const REPLY = "mcp__plugin_discord_discord__reply", EDIT = "mcp__plugin_discord_discord__edit_message";
 const NOW = Date.UTC(2026, 10, 12, 15, 0);
 const DM = "5151000000000000001", OTHER = "5151000000000000002";
+// A Discord id made at a time, as Discord makes them.
+const flake = (at: number, n = 1) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(n));
 // A receipt whose buttons are Not mine, Wrong time, Just this once and Stop; an approval
 // with Undo up; Cain's own ask, answered; a link notice; and two replies of Cain's own.
 const RECEIPT = "1300000000000000001", UNDO_CARD = "1300000000000000002", ASK = "1300000000000000003", NOTICE = "1300000000000000004";
@@ -34,7 +37,8 @@ const reply = (text: string, reply_to?: string, chat_id = DM) => ({ session_id: 
   tool_input: { chat_id, text, ...(reply_to ? { reply_to } : {}) } });
 const edit = (text: string, message_id: string, chat_id = DM) => ({ session_id: "s1", tool_name: EDIT, hook_event_name: "PreToolUse",
   tool_input: { chat_id, message_id, text } });
-const decide = (input: any, cards: CardsView | null = CARDS, o: { dm?: string | null; early?: boolean } = {}) => decideSend(callOf(input)!, cards, o);
+const decide = (input: any, cards: CardsView | null = CARDS, o: { dm?: string | null; now?: number; replied?: Set<string> } = {}) =>
+  decideSend(callOf(input)!, cards, { now: NOW, ...o });
 
 describe("what the gate does with Cain's reply", () => {
   test("Nov 10, synthetic: tap Undo in a reply to a receipt without Undo is held, naming its buttons and the live card with Undo", () => {
@@ -91,11 +95,16 @@ describe("what the gate does with Cain's reply", () => {
     expect(decide(reply("Moved swim to 4:30."), null).would).toBe("pass");
   });
 
-  test("only his DM: another chat is held for good; an unknown DM passes, said so", () => {
+  test("only his DM: a chat the link says isn't his is held for good; one that differs only from the cached id is soft; an unknown DM passes, said so", () => {
     const other = decide(reply("Moved swim to 4:30.", undefined, OTHER));
     expect(other).toMatchObject({ would: "refuse", hard: true, chat: "other" });
-    expect(other.said).toContain("That chat isn't his DM");
-    expect(decide(reply("Moved swim to 4:30.", undefined, OTHER), null, { dm: DM }).hard).toBe(true);   // the cached id
+    expect(other.said).toContain("That chat isn't his DM: send only to him");
+    // The link's DM id wins over the cached one: a stale cache never holds a send to his DM.
+    expect(decide(reply("Moved swim to 4:30."), CARDS, { dm: OTHER })).toMatchObject({ would: "pass", chat: "his" });
+    // With no cards, the cached id is all there is: a mismatch is held, softly (the plugin's own allowlist still holds).
+    const cached = decide(reply("Moved swim to 4:30.", undefined, OTHER), null, { dm: DM });
+    expect(cached).toMatchObject({ would: "refuse", hard: false, chat: "other" });
+    expect(cached.said).toContain("isn't his DM as last seen");
     expect(decide(reply("Moved swim to 4:30."), null, { dm: null })).toMatchObject({ would: "pass", chat: "unknown" });
   });
 
@@ -103,17 +112,52 @@ describe("what the gate does with Cain's reply", () => {
     expect(decide(edit("Moved swim to 5:00.", MINE)).would).toBe("pass");
     const card = decide(edit("Fixed the time.", NOTICE));
     expect(card).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "target", result: "refuse" }] });
-    expect(card.said).toContain("isn't one of your own replies");
+    expect(card.said).toContain("isn't one of your own replies: edit only your own, or say it in a new reply.");
+    expect(card.said).not.toContain("Rewrite");                                // rewording it wouldn't help
     expect(decide(edit("Fixed the time.", RECEIPT)).hard).toBe(true);           // a specialist's card
     expect(decide(edit("Tap Undo now.", MINE)).would).toBe("refuse");
-    expect(decide(edit("Fixed the time.", MINE), null)).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "target", result: "unsure" }] });
+    const down = decide(edit("Fixed the time.", MINE), null);
+    expect(down).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "target", result: "unsure" }] });
+    expect(down.said).toBe("The message gate held this: Which messages are your own replies can't be checked right now: send it as a new reply instead, or edit in a minute. Don't mention it to him.");
   });
 
-  test("early, with no cards: a count or machine text is held at once; a long number in a reply waits for the cards", () => {
-    expect(decide(reply("Two blocks and 3 more.", RECEIPT), null, { early: true }).would).toBe("refuse");
-    expect(decide(reply("It's 123456789012345678.", HIS), null, { early: true }).would).toBe("pass");
-    expect(decide(reply("Tap Undo.", RECEIPT), null, { early: true }).would).toBe("pass");     // buttons wait for the cards
-    expect(decide(edit("Fixed.", NOTICE), null, { early: true }).would).toBe("pass");           // so does an edit's target
+  test("a message the link knows as its own is never his to edit, even on his list", () => {
+    const listed: CardsView = { ...CARDS, sent: [...CARDS.sent!, NOTICE, RECEIPT] };
+    expect(decide(edit("Fixed the time.", NOTICE), listed)).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "target", result: "refuse" }] });
+    expect(decide(edit("Fixed the time.", RECEIPT), listed).would).toBe("refuse");
+    // His reply holding the moving Stop is one the link knows as "plain": still his.
+    const plain: CardsView = { ...CARDS, cards: [...CARDS.cards, { message: MINE, kind: "plain", writer: "cain", labels: ["Stop"], live: true, item: "none", question: "plain", posted: NOW - 60_000 }] };
+    expect(decide(edit("Moved swim to 5:00.", MINE), plain).would).toBe("pass");
+  });
+
+  test("the edit window: a fresh message the link doesn't know passes once his session's transcript shows his reply tool made it", () => {
+    const fresh = flake(NOW - 30_000), old = flake(NOW - EDIT_WINDOW_MS - 60_000);
+    expect(decide(edit("Moved swim to 5:00.", fresh), CARDS, { replied: new Set([fresh]) })).toMatchObject({ would: "pass", hits: [] });
+    // Fresh but not shown as his reply (a permission prompt the plugin posted, a reply of another session): it waits.
+    const unsure = decide(edit("Moved swim to 5:00.", fresh), CARDS, { replied: new Set() });
+    expect(unsure).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "target", result: "unsure" }] });
+    expect(unsure.said).toContain("send it as a new reply instead, or edit in a minute");
+    expect(decide(edit("Moved swim to 5:00.", fresh)).would).toBe("refuse");   // no transcript at all (keeper.sh check)
+    // Older than the window and not on his list: not his.
+    expect(decide(edit("Moved swim to 5:00.", old), CARDS, { replied: new Set([old]) }).hits).toMatchObject([{ rule: "target", result: "refuse" }]);
+    // The window never covers a message the link knows, or one with no cards to tell.
+    expect(decide(edit("Fixed.", NOTICE), CARDS, { replied: new Set([NOTICE]) }).would).toBe("refuse");
+    expect(decide(edit("Moved swim to 5:00.", fresh), null, { replied: new Set([fresh]) }).hits).toMatchObject([{ rule: "target", result: "unsure" }]);
+    // And the wording rules still run on an edit that passes the window.
+    expect(decide(edit("Moved swim and 3 more.", fresh), CARDS, { replied: new Set([fresh]) }).hits).toMatchObject([{ rule: "count" }]);
+  });
+
+  test("with no cards: every rule still runs; a long number in a reply is held, since whether it answers him can't be told", () => {
+    expect(decide(reply("Two blocks and 3 more.", RECEIPT), null).would).toBe("refuse");
+    expect(decide(reply("It's 123456789012345678.", HIS), null).would).toBe("refuse");
+    expect(decide(reply("Tap Undo.", RECEIPT), null).hits).toMatchObject([{ rule: "button", result: "unsure" }]);
+    expect(decide(edit("Fixed.", NOTICE), null).hits).toMatchObject([{ rule: "target", result: "unsure" }]);
+  });
+
+  test("an em dash between two numbers is held, saying to put the range in words, and the other fixes are still made", () => {
+    const d = decide(reply("Room 4—5 is free — then lunch."));
+    expect(d).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "dash", result: "refuse" }, { rule: "dash", result: "fix" }] });
+    expect(d.said).toBe("The message gate held this: \"Room 4—5 is free — then lunch.\": say the range in words. Its other em dashes and add-ons are fixed for you when it goes. Rewrite and send now; don't mention it to him.");
   });
 
   test("only the two sends are read, with the chat, the session and the whole input", () => {
@@ -177,6 +221,53 @@ describe("what the hook answers, and the third try", () => {
     for (let i = 0; i < 5; i++) expect(act(e, decideSend(e, CARDS), t, NOW + i).did).toBe("refused");
   });
 
+  test("no third try for a hard or unsure decision, even when its wording is what's held", () => {
+    // An edit of the link's card with a hidden count (the third try once let this through).
+    const card = callOf(edit("Shipped two fixes and 3 more.", NOTICE))!;
+    const dc = decideSend(card, CARDS);
+    expect(releasable(dc)).toBe(false);
+    const t: Tries = {};
+    for (let i = 0; i < 5; i++) expect(act(card, dc, t, NOW + i)).toMatchObject({ did: "refused", output: { hookSpecificOutput: { permissionDecision: "deny" } } });
+    // An edit while which messages are his can't be told, a send to another chat, and a refusal while his DM can't be told at all.
+    const down = callOf(edit("Moved swim and 3 more.", MINE))!;
+    const other = callOf(reply("Two blocks and 3 more.", undefined, OTHER))!;
+    const unknown = callOf(reply("Two blocks and 3 more."))!;
+    for (const [c, d] of [[down, decideSend(down, null, { dm: DM })], [other, decideSend(other, CARDS)], [unknown, decideSend(unknown, null, { dm: null })]] as const) {
+      expect(releasable(d)).toBe(false);
+      const tries: Tries = {};
+      for (let i = 0; i < 5; i++) {
+        const out = act(c, d, tries, NOW + i);
+        expect(out.did).toBe("refused");
+        expect(out.counted).toBeUndefined();
+      }
+      expect(Object.values(tries).every((r) => r.n === 0)).toBe(true);   // nothing counted toward a third try
+    }
+    // A chat that differs only from the cached id is soft: the third try lets it go.
+    const stale = callOf(reply("Moved swim to 4:30.", undefined, OTHER))!;
+    const ds = decideSend(stale, null, { dm: DM });
+    expect(releasable(ds)).toBe(true);
+    const tries: Tries = {};
+    expect(act(stale, ds, tries, NOW).did).toBe("refused");
+    expect(act(stale, ds, tries, NOW + 1).did).toBe("refused");
+    expect(act(stale, ds, tries, NOW + 2).did).toBe("passed after two refusals");
+  });
+
+  test("allow only for a plain call: with anything else (files to attach), a fix says what to send instead and auto mode checks the call", () => {
+    const files = callOf({ ...reply("Moved swim — see the photo.", HIS), tool_input: { chat_id: DM, text: "Moved swim — see the photo.", reply_to: HIS, files: ["/tmp/a.png"] } })!;
+    expect(plainInput(files)).toBe(false);
+    const out = act(files, decideSend(files, CARDS), {}, NOW);
+    expect(out).toMatchObject({ did: "refused", counted: true, output: { hookSpecificOutput: { permissionDecision: "deny",
+      permissionDecisionReason: "Send exactly this instead: Moved swim, see the photo." } } });
+    // The fixed words, sent again with the file, carry nothing to fix: the hook says nothing, and auto mode decides.
+    const again = callOf({ ...reply("x", HIS), tool_input: { chat_id: DM, text: "Moved swim, see the photo.", reply_to: HIS, files: ["/tmp/a.png"] } })!;
+    expect(act(again, decideSend(again, CARDS), {}, NOW)).toEqual({ output: null, did: "passed" });
+    // An edit's plain input is chat_id, message_id and text: its fix goes in place.
+    const e = callOf(edit("Moved swim — now at 5.", MINE))!;
+    expect(plainInput(e)).toBe(true);
+    expect(act(e, decideSend(e, CARDS), {}, NOW)).toMatchObject({ did: "fixed",
+      output: { hookSpecificOutput: { permissionDecision: "allow", updatedInput: { chat_id: DM, message_id: MINE, text: "Moved swim, now at 5." } } } });
+  });
+
   test("a log line for each hit and each refusal, never for a clean reply to his DM", () => {
     const clean = call("Moved swim to 4:30.");
     const dc = decideSend(clean, CARDS);
@@ -211,6 +302,29 @@ describe("where the hook gets the cards and his DM", () => {
     expect(readDm(path)).toBe(DM);
     keepDm("not an id", path);
     expect(readDm(path)).toBe(DM);
+    keepDm(OTHER, path);                                                 // the link's word replaces a stale one
+    expect(readDm(path)).toBe(OTHER);
+  });
+
+  test("his own replies, from the end of his session's transcript: only the reply tool's own answers count", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate-transcript-"));
+    const path = join(dir, "session.jsonl");
+    const line = (o: unknown) => JSON.stringify(o);
+    const use = (id: string, name: string) => line({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: { chat_id: DM, text: "x" } }] } });
+    const result = (id: string, text: string) => line({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text }] }] } });
+    writeFileSync(path, [
+      "{half a line cut off at the start",
+      use("toolu_1", REPLY), result("toolu_1", "sent (id: 1300000000000000801)"),
+      use("toolu_2", REPLY), result("toolu_2", "sent 2 parts (ids: 1300000000000000802, 1300000000000000803)"),
+      use("toolu_3", EDIT), result("toolu_3", "edited (id: 1300000000000000804)"),             // an edit makes no reply
+      use("toolu_4", "Bash"), result("toolu_4", "sent (id: 1300000000000000805)"),             // words elsewhere aren't proof
+      line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "sent (id: 1300000000000000806)" }] } }),
+      use("toolu_5", REPLY), result("toolu_5", "reply failed after 0 of 1 chunk(s) sent: boom"),
+    ].join("\n") + "\n");
+    expect([...repliedIn(path)].sort()).toEqual(["1300000000000000801", "1300000000000000802", "1300000000000000803"]);
+    expect([...repliedIn(path, 600)]).not.toContain("1300000000000000801");   // only the end is read
+    expect(repliedIn(join(dir, "none.jsonl")).size).toBe(0);
+    expect(repliedIn(undefined).size).toBe(0);
   });
 });
 
@@ -268,10 +382,24 @@ describe("the safety net after the send (discord-sent.ts)", () => {
   test("what went out is read again with the rules that need no cards: a hit is a bypass, unless the third try let it through", () => {
     const text = "Two blocks moved — and 3 more.";
     const bypass = noteOf(sent(text, "sent (id: 1300000000000000777)"), NOW, {})!;
-    expect(bypass.net).toMatchObject({ released: false, fixed: "Two blocks moved, and 3 more.", hits: [{ rule: "dash" }, { rule: "count" }] });
+    expect(bypass.net).toEqual({ released: false, hits: [{ rule: "dash", result: "fix", around: text }, { rule: "count", result: "refuse", around: text }] });
+    // Never the corrected words, and an excerpt's link keeps only its host.
+    const link = noteOf(sent("See https://example.com/private/path?token=abc — and 3 more.", "sent (id: 1300000000000000777)"), NOW, {})!;
+    expect(JSON.stringify(link)).not.toContain("private");
+    expect(link.net!.hits[0].around).toBe("See https://example.com/… — and 3 more.");
     const t: Tries = { [keyOf("s1", DM)]: { n: 0, first: NOW, released: [{ hash: textHash(text), at: NOW - 1_000 }] } };
     expect(noteOf(sent(text, "sent (id: 1300000000000000777)"), NOW, t)!.net!.released).toBe(true);
     expect(noteOf(sent("It's 123456789012345678.", "sent (id: 1300000000000000777)", { reply_to: HIS }), NOW, {})!.net).toBeUndefined();
+  });
+
+  test("whether it asks something: any sentence of its last paragraph ending in a question", () => {
+    expect(asksSomething("Should I move swim? Say yes and I'll do it.")).toBe(true);
+    expect(noteOf(sent("Should I move swim? Say yes and I'll do it.", "sent (id: 1300000000000000777)"), NOW, {})!.question).toBe(true);
+    expect(asksSomething("Moved swim.\n\nWant art moved too?")).toBe(true);
+    expect(asksSomething("Really?! Then I'll leave it.")).toBe(true);
+    expect(asksSomething("Did it move?\n\nIt moved to 4:30.")).toBe(false);   // asked in an earlier paragraph
+    expect(asksSomething("See https://example.com/a?b=1 for it.")).toBe(false);
+    expect(asksSomething("Moved swim to 4:30.")).toBe(false);
   });
 
   test("a third try let through is told even when these rules find nothing (a button only the cards show)", () => {
@@ -279,6 +407,33 @@ describe("the safety net after the send (discord-sent.ts)", () => {
     const t: Tries = { [keyOf("s1", DM)]: { n: 0, first: NOW, released: [{ hash: textHash(text), at: NOW - 1_000 }] } };
     expect(noteOf(sent(text, "sent (id: 1300000000000000777)"), NOW, t)!.net).toEqual({ hits: [], released: true });
     expect(noteOf(sent(text, "sent (id: 1300000000000000777)"), NOW + TRY_MS + 1, t)!.net).toBeUndefined();   // only just now
+  });
+
+  test("a note the link doesn't take is sent again, up to 3 times within the hook's 15 seconds; a refusal isn't", async () => {
+    const waits: number[] = [];
+    const wait = async (ms: number) => { waits.push(ms); };
+    const note = { tool: "reply" as const, ids: ["1300000000000000777"], question: false };
+    const answers = (...xs: (number | "no answer")[]) => {
+      const tries: number[] = [];
+      return { tries, post: async (_: string, timeoutMs: number) => {
+        tries.push(timeoutMs);
+        const x = xs.shift() ?? 200;
+        if (x === "no answer") throw new Error("TimeoutError");
+        return new Response("{}", { status: x });
+      } };
+    };
+    const lost = answers("no answer", 503, 200);
+    expect(await tellLink(note, lost.post, wait)).toBe(true);
+    expect(lost.tries).toHaveLength(3);
+    expect(waits).toEqual([500, 1_000]);
+    const never = answers("no answer", "no answer", 500, 429, 200);
+    expect(await tellLink(note, never.post, wait)).toBe(false);
+    expect(never.tries).toHaveLength(4);                                 // the first try and 3 more
+    const refused = answers(400);
+    expect(await tellLink(note, refused.post, wait)).toBe(false);
+    expect(refused.tries).toHaveLength(1);
+    // Every try and every wait fit inside the hook's 15 seconds, with room to start.
+    expect(4 * never.tries[0] + AGAIN_MS.reduce((a, b) => a + b, 0)).toBeLessThan(13_000);
   });
 
   test("run as Claude Code runs it: it posts to the link's /sent with the key, prints nothing, and logs a bypass", async () => {
@@ -302,6 +457,25 @@ describe("the safety net after the send (discord-sent.ts)", () => {
       expect(readFileSync(join(dir, "gate.jsonl"), "utf8")).toContain('"did":"bypassed"');
       const bad = Bun.spawn(["bun", SENT_HOOK], { stdin: new TextEncoder().encode("not json"), stdout: "pipe", stderr: "pipe", env });
       expect([await new Response(bad.stdout).text(), await bad.exited]).toEqual(["", 0]);
+    } finally { server.stop(true); }
+  }, 30_000);
+
+  test("run as Claude Code runs it, against a link that answers 503 once: the note goes again and lands", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cain-sent-"));
+    writeFileSync(join(dir, ".env"), "DISCORD_BOT_TOKEN=not-a-real-token.for-the-retry-test\n");
+    const got: any[] = [];
+    const server = Bun.serve({ port: 0, async fetch(req) {
+      got.push(await req.json());
+      return got.length === 1 ? new Response("busy", { status: 503 }) : Response.json({ status: "ok" });
+    } });
+    try {
+      const env = { ...process.env, CAIN_LINK: `http://127.0.0.1:${server.port}`, CAIN_DISCORD_ENV: join(dir, ".env"),
+        CAIN_GATE_LOG: join(dir, "gate.jsonl"), CAIN_GATE_TRIES: join(dir, "tries.json") };
+      const p = Bun.spawn(["bun", SENT_HOOK], { stdin: new TextEncoder().encode(JSON.stringify(sent("Moved swim to 4:30.", "sent (id: 1300000000000000777)"))),
+        stdout: "pipe", stderr: "pipe", env });
+      expect(await p.exited).toBe(0);
+      expect(got).toHaveLength(2);
+      expect(got[1]).toEqual(got[0]);
     } finally { server.stop(true); }
   }, 30_000);
 });
@@ -359,13 +533,65 @@ describe("run as Claude Code runs it", () => {
     } finally { hung.stop(true); }
   }, 30_000);
 
-  test("a count or machine text is held before the link is asked", async () => {
+  test("the cards are always read first, so no check is skipped: a count is held after the link is asked", async () => {
     const link = fakeLink(() => CARDS);
     try {
       const out = await run(reply("Two blocks moved and 3 more.", RECEIPT), { ...files(), CAIN_LINK: link.url, CAIN_CARDS: join(dir, "none.json") });
       expect(out.json.permissionDecision).toBe("deny");
-      expect(link.asked).toEqual([]);
+      expect(link.asked).toEqual(["/cards true"]);
     } finally { link.server.stop(true); }
+  }, 30_000);
+
+  test("a stale cached DM id never silences him: the link's id wins and rewrites the file", async () => {
+    const link = fakeLink(() => CARDS);
+    try {
+      const f = files();
+      writeFileSync(f.CAIN_GATE_DM, JSON.stringify({ dm: OTHER, at: Date.now() - 86_400_000 }));   // the old bot's DM
+      const env = { ...f, CAIN_LINK: link.url, CAIN_CARDS: join(dir, "none.json") };
+      for (let i = 0; i < 4; i++) expect(await run(reply("Moved swim to 4:30."), env)).toMatchObject({ out: "", code: 0 });
+      expect(readDm(f.CAIN_GATE_DM)).toBe(DM);
+      expect(lines(f.CAIN_GATE_LOG)).toEqual([]);
+    } finally { link.server.stop(true); }
+  }, 30_000);
+
+  test("with the link and its file both down, a chat that differs from the cached id is held softly: the third try lets it go", async () => {
+    const f = files();
+    writeFileSync(f.CAIN_GATE_DM, JSON.stringify({ dm: OTHER, at: Date.now() }));
+    const env = { ...f, CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };
+    const input = reply("Moved swim to 4:30.");
+    expect((await run(input, env)).json.permissionDecisionReason).toContain("isn't his DM as last seen");
+    expect((await run(input, env)).json.permissionDecision).toBe("deny");
+    expect(await run(input, env)).toMatchObject({ out: "", code: 0 });
+    expect(lines(f.CAIN_GATE_LOG).map((l) => l.did)).toEqual(["refused", "refused", "passed after two refusals"]);
+  }, 30_000);
+
+  test("an edit straight after his reply passes on his session's transcript, before the link has heard of the reply", async () => {
+    const link = fakeLink(() => CARDS);                                  // its list doesn't have the new reply yet
+    try {
+      const fresh = flake(Date.now() - 5_000);
+      const transcript = join(dir, "transcript.jsonl");
+      writeFileSync(transcript, [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_9", name: REPLY, input: { chat_id: DM, text: "Moved swim." } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_9", content: [{ type: "text", text: `sent (id: ${fresh})` }] }] } }),
+      ].join("\n") + "\n");
+      const env = { ...files(), CAIN_LINK: link.url, CAIN_CARDS: join(dir, "none.json") };
+      expect(await run({ ...edit("Moved swim to 5:00.", fresh), transcript_path: transcript }, env)).toMatchObject({ out: "", code: 0 });
+      const without = await run(edit("Moved swim to 5:00.", fresh), env);
+      expect(without.json.permissionDecisionReason).toContain("can't be checked right now: send it as a new reply instead, or edit in a minute");
+    } finally { link.server.stop(true); }
+  }, 30_000);
+
+  test("a refusal the tries can't be counted for lets the reply go, logged; a fix still goes in place", async () => {
+    writeFileSync(join(dir, "tries-blocker"), "a file where the tries' folder would be");
+    const f = { ...files(), CAIN_GATE_TRIES: join(dir, "tries-blocker", "tries.json") };
+    const env = { ...f, CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };
+    writeFileSync(f.CAIN_GATE_DM, JSON.stringify({ dm: DM, at: Date.now() }));
+    expect(await run(reply("Two blocks moved and 3 more."), env)).toMatchObject({ out: "", code: 0 });
+    expect((await run(reply("Moved swim — it's at 4:30 now."), env)).json.permissionDecision).toBe("allow");
+    const link = fakeLink(() => CARDS);                                  // a hard refusal needs no count
+    try { expect((await run(reply("Moved swim to 4:30.", undefined, OTHER), { ...env, CAIN_LINK: link.url })).json.permissionDecision).toBe("deny"); }
+    finally { link.server.stop(true); }
+    expect(lines(f.CAIN_GATE_LOG).map((l) => l.did)).toEqual(["passed, tries not counted", "fixed", "refused"]);
   }, 30_000);
 
   test("with the link down: its file while fresh; then a named button is held, the text rules hold, his DM is still known", async () => {
@@ -382,16 +608,20 @@ describe("run as Claude Code runs it", () => {
     expect(unsure.json.permissionDecisionReason).toContain("can't be checked right now");
     expect((await run(reply("Moved swim to 4:30."), env)).out).toBe("");
     expect((await run(reply("Moved swim to 4:30.", undefined, OTHER), env)).json.permissionDecisionReason).toContain("isn't his DM");
-    expect((await run(edit("Fixed the time.", MINE), env)).json.permissionDecisionReason).toContain("an edit waits");
+    expect((await run(edit("Fixed the time.", MINE), env)).json.permissionDecisionReason).toContain("send it as a new reply instead, or edit in a minute");
   }, 30_000);
 
-  test("two refusals, then the third try goes as it is", async () => {
-    const env = { ...files(), CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };
+  test("two refusals, then the third try goes as it is; never while his DM can't be told at all", async () => {
+    const f = files();
+    writeFileSync(f.CAIN_GATE_DM, JSON.stringify({ dm: DM, at: Date.now() }));
+    const env = { ...f, CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };
     const input = reply("Two blocks moved and 3 more.");
     expect((await run(input, env)).json.permissionDecision).toBe("deny");
     expect((await run(input, env)).json.permissionDecision).toBe("deny");
     expect(await run(input, env)).toMatchObject({ out: "", code: 0 });
     expect(lines(env.CAIN_GATE_LOG).map((l) => l.did)).toEqual(["refused", "refused", "passed after two refusals"]);
+    const blind = { ...files(), CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };   // no DM known anywhere
+    for (let i = 0; i < 3; i++) expect((await run(input, blind)).json.permissionDecision).toBe("deny");
   }, 30_000);
 
   test("fails open: bad input, a log it can't write, or a hook that can't start lets the reply go", async () => {
