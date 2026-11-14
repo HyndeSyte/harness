@@ -2,7 +2,7 @@
 // run script, like the record keeper. Its keys come from the add-on's options in
 // its own environment only; they are read once, removed from the environment, and
 // never printed. Codex (the OpenAI seat) gets an environment with none of them.
-import { mkdirSync } from "node:fs";
+import { chmodSync, chownSync, mkdirSync, rmSync } from "node:fs";
 import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
@@ -40,10 +40,19 @@ if (import.meta.main) {
   // The Reviewed lines, rebuilt from the queue: a restart loses none (../reviewed.ts).
   runner.publishReviewed();
 
-  // The ChatGPT sign-in page, reached as <Cain page>/codex through nginx.
+  // The ChatGPT sign-in page, reached as <Cain page>/codex through nginx. On a unix socket
+  // only nginx's workers and root can open (C1): a TCP port could be taken by Cain's user while
+  // this restarts, and a page of his would be served in the panel as this one.
   const login = new CodexLogin({ home: codexHome });
   try {
-    Bun.serve({ hostname: "127.0.0.1", port: Number(env.REVIEW_PORT ?? 8096), fetch: (req) => handle(req, login) });
+    const sock = env.REVIEW_SOCK ?? "/run/cain/upstream/codex.sock";
+    if (env.REVIEW_PORT) Bun.serve({ hostname: "127.0.0.1", port: Number(env.REVIEW_PORT), fetch: (req) => handle(req, login) });
+    else {
+      try { rmSync(sock, { force: true }); } catch { /* none */ }
+      Bun.serve({ unix: sock, fetch: (req) => handle(req, login) });
+      chownSync(sock, 0, Number(env.NGINX_GID ?? 65534));
+      chmodSync(sock, 0o660);
+    }
   } catch (e) { log(`sign-in page didn't start: ${(e as Error).message}`); }
 
   const checkAt = env.REVIEW_CHECK_AT ?? "0300";

@@ -1,83 +1,155 @@
 #!/usr/bin/with-contenv bashio
 # ==============================================================================
-# Prepare /data on first start, then run the session inside tmux so the
-# terminal page can attach to it. Everything that must survive lives in /data:
-# the Claude sign-in, the Discord token and allowlist, the plugin, the work folder.
+# Cain's start. Which way he runs is decided once, here, by /opt/cain/c1/state.sh (C1):
+#   cut     the new way: as his own user, his rules managed and checked, the bot token behind
+#           the broker (projects/org-v2/c1-plan.md).
+#   fresh   the old way, as root, exactly as 0.11.0 ran, until the calendar specialist signs
+#           its requests to the link; then this start validates and cuts over (c1/cutover.sh).
+#   broken  not at all: the log says why. The link, the record keeper and the review service
+#           still run, so the laptop session can see and fix it.
+# Everything that must survive lives in /data.
 # ==============================================================================
 export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
-# Supervisor gives every App a token (SUPERVISOR_TOKEN, and the older HASSIO_TOKEN)
-# that reaches /addons/self: this App's own options, owner_user_id included. Nothing
-# started here gets it in its environment, Cain's session included. bashio keeps its
-# own unexported copy from when it loaded, so the option reads below still work.
-# That isn't a lock: the session runs as root and could still read the token (from
-# another process's /proc/<pid>/environ, or s6's copy of the environment). Keeping
-# it out for good needs the session to run as its own user, which comes later.
+# Supervisor gives every App a token (SUPERVISOR_TOKEN, and the older HASSIO_TOKEN) that
+# reaches /addons/self. Nothing started here gets it in its environment; bashio keeps its own
+# unexported copy, so the option reads below still work. From C1 on Cain's processes run as
+# his own user and can't read it from /proc or from s6's saved environment either.
 unset SUPERVISOR_TOKEN HASSIO_TOKEN
-mkdir -p /data/work
-# Cain's standing rules ship with the add-on, so an update always brings them.
-cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
-mkdir -p /data/work/.claude && cp /opt/cain/settings.json /data/work/.claude/settings.json
-if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
-  bashio::log.info "Installing the Discord channel plugin"
-  claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"
-  # Pinned (/opt/cain/discord/pin.json): the marketplace takes only a branch, so check
-  # out the pinned commit before installing. discord/upkeep.ts and the reads hook check
-  # the installed files against the pin either way.
-  pin_commit="$(jq -r .commit /opt/cain/discord/pin.json 2>/dev/null || true)"
-  market=/data/.claude/plugins/marketplaces/claude-plugins-official
-  { git -C "$market" fetch -q --depth 1 origin "$pin_commit" \
-    && git -C "$market" -c advice.detachedHead=false checkout -q --detach "$pin_commit"; } \
-    || bashio::log.warning "Could not check out the pinned Discord plugin commit"
-  claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
+umask 027
+cd /
+export TMPDIR=/run/cain/root-tmp CAIN_ROOT_TMP=/run/cain/root-tmp
+OPT=/opt/cain
+SOCK_TMUX=/run/cain/tmux/cain.sock
+
+if ! "$OPT/c1/lock.sh" run; then
+  bashio::log.error "Couldn't set up /run/cain; Cain doesn't start until that's fixed"
+  mode=none
+else
+  state="$("$OPT/c1/state.sh")"
+  case "$state" in
+    cut) mode=own ;;
+    fresh)
+      mode=old
+      if [ -f /data/link/specialist-signs ]; then
+        bashio::log.info "The calendar specialist signs its requests: validating the new way before switching"
+        if "$OPT/c1/cutover.sh"; then mode=own
+        else bashio::log.warning "Not switched yet (above); Cain runs the old way and this start's validation runs again at the next start"
+             printf '%s\n' '{"text": "The Cain App tried to switch you to your own user and it didn'"'"'t pass its checks, so you run the old way for now (the App log says why). File it as a note on P33 for the laptop session. Nothing to tell him."}' >> /data/relay.queue
+        fi
+      fi ;;
+    *) bashio::log.error "Cain's start state is damaged (/data/c1/state, /data/cain): Cain isn't started. The laptop session fixes this; nothing else to do"
+       mode=none ;;
+  esac
 fi
-# The Discord plugin's upkeep: a loud line if access.json isn't single-owner DM only or
-# the plugin isn't the pinned one, and its inbox kept to 7 days and 200 MB.
-( while true; do bun /opt/cain/discord/upkeep.ts 2>&1; sleep 60; done ) &
-bashio::log.info "Starting Cain"
-tmux -u kill-session -t cain 2>/dev/null || true   # bashio runs with errexit
-if ! tmux -u new-session -d -s cain -x 120 -y 40 /opt/cain/session.sh 2>/tmp/tmux.err; then
-  bashio::log.error "tmux could not start: $(cat /tmp/tmux.err)"
-  exit 1
+case "$mode" in
+  own) if ! "$OPT/c1/lock.sh" managed || ! "$OPT/c1/lock.sh" data; then
+         bashio::log.error "Cain's rules or file modes don't hold (above): Cain isn't started"
+         mode=none
+       fi ;;
+  old) if ! "$OPT/c1/lock.sh" old; then
+         bashio::log.error "The old way's rules couldn't be set up and checked (above): Cain isn't started"
+         mode=none
+       fi ;;
+esac
+printf '%s\n' "$mode" > /run/cain/mode.tmp && chmod 0644 /run/cain/mode.tmp && mv /run/cain/mode.tmp /run/cain/mode
+bashio::log.info "Cain's start: ${mode/own/as his own user}"
+
+# What each way of running reads where. The old way keeps 0.11.0's places; the new one the
+# places of C1's section 3.2.
+if [ "$mode" = old ]; then
+  export LINK_LEGACY_AUTH=1 LINK_ENV=/data/.claude/channels/discord/.env LINK_ACCESS=/data/.claude/channels/discord/access.json
+  export CAIN_UID=0 CAIN_TRANSCRIPT_UID=0 CAIN_TRANSCRIPTS=/data/.claude/projects
+  export CAIN_DISCORD_INBOX=/data/.claude/channels/discord/inbox CAIN_DISCORD_ACCESS=/data/.claude/channels/discord/access.json
+  TOKEN_FILE=/data/.claude/channels/discord/.env; ACCESS_FILE=/data/.claude/channels/discord/access.json
+  CRED=/data/.claude/.credentials.json
+  TMUX_CMD="tmux"
+else
+  export CAIN_GATE_LOG=/data/gate/report.jsonl CAIN_GATE_REPLAY=/data/gate/replay.json CAIN_GATE_TRIES=/data/gate/tries.json
+  export CAIN_GATE_DM=/data/gate/dm.json CAIN_GATE_REPLIED=/data/gate/replied.json
+  export CAIN_DISCORD_INBOX=/data/discord/inbox CAIN_DISCORD_ACCESS=/data/discord/access.json CAIN_TRANSCRIPTS=/data/cain/.claude/projects
+  TOKEN_FILE=/data/link/discord.env; ACCESS_FILE=/data/discord/access.json
+  CRED=/data/cain/.claude/.credentials.json
+  TMUX_CMD="$OPT/as-cain tmux -S $SOCK_TMUX"
 fi
-sleep 3
-if ! tmux -u has-session -t cain 2>/dev/null; then
-  bashio::log.error "Cain's session ended at once. Its last output:"
-  tail -n 20 /data/session.log 2>/dev/null
-  exit 1
+export TMUX_CMD
+
+if [ "$mode" = old ]; then
+  # 0.11.0's start, unchanged: the rules copied in (c1/lock.sh old did, and checked them), the
+  # plugin installed at its pin into /data/.claude if it isn't there.
+  if ! claude plugin list 2>/dev/null | grep -q "discord@claude-plugins-official"; then
+    bashio::log.info "Installing the Discord channel plugin"
+    claude plugin marketplace add anthropics/claude-plugins-official || bashio::log.warning "Marketplace add failed"
+    pin_commit="$(jq -r .commit "$OPT/discord/pin.json" 2>/dev/null || true)"
+    market=/data/.claude/plugins/marketplaces/claude-plugins-official
+    { git -C "$market" fetch -q --depth 1 origin "$pin_commit" \
+      && git -C "$market" -c advice.detachedHead=false checkout -q --detach "$pin_commit"; } \
+      || bashio::log.warning "Could not check out the pinned Discord plugin commit"
+    claude plugin install discord@claude-plugins-official --scope user || bashio::log.warning "Plugin install failed"
+  fi
 fi
-bashio::log.info "Cain is running"
-# The message gate's reply hook, checked once at each start as Claude Code runs it, from
-# the settings just installed: an em dash fixed in place, "and 3 more" held back, a clean
-# reply let through. The line says how long a reply waits on it; if it fails, Cain hears.
+
+# The Discord plugin's upkeep: a loud line if access.json isn't single-owner DM only, and its
+# inbox kept to 7 days and 200 MB.
+( while true; do bun "$OPT/discord/upkeep.ts" 2>&1; sleep 60; done ) &
+
+# The broker (the new way only): the one way to the bot, the gate on every send.
+if [ "$mode" = own ]; then
+  ( while true; do bun "$OPT/discord/broker-main.ts" 2>&1; sleep 2; done ) &
+fi
+
+start_session() {
+  if [ "$mode" = own ]; then
+    "$OPT/as-cain" env CAIN_MODE=own tmux -u -S "$SOCK_TMUX" kill-session -t cain 2>/dev/null || true
+    "$OPT/as-cain" env CAIN_MODE=own tmux -u -S "$SOCK_TMUX" new-session -d -s cain -x 120 -y 40 "$OPT/session.sh"
+  else
+    tmux -u kill-session -t cain 2>/dev/null || true   # bashio runs with errexit
+    CAIN_MODE=old tmux -u new-session -d -s cain -x 120 -y 40 "$OPT/session.sh"
+  fi
+}
+has_session() { $TMUX_CMD -u has-session -t cain 2>/dev/null; }
+
+if [ "$mode" != none ]; then
+  bashio::log.info "Starting Cain"
+  if ! start_session; then bashio::log.error "tmux could not start"; exit 1; fi
+  sleep 3
+  if ! has_session; then
+    bashio::log.error "Cain's session ended at once. Its last output:"
+    bun "$OPT/owned.ts" tail /data/session.log 20 2>/dev/null || tail -n 20 /data/session.log 2>/dev/null
+    exit 1
+  fi
+  bashio::log.info "Cain is running"
+fi
+
+# The message gate's self-test, once at each start: the old way runs the reply hook as
+# Claude Code does; the new way runs the broker's gate.
 (
   sleep 20
-  echo "[cain] gate hook self-test: $(timeout 120 bun /opt/cain/hooks/discord-send.ts --self-test --relay 2>&1 | tail -n 1)"
+  if [ "$mode" = old ]; then echo "[cain] gate hook self-test: $(timeout 120 bun "$OPT/hooks/discord-send.ts" --self-test --relay 2>&1 | tail -n 1)"
+  elif [ "$mode" = own ]; then echo "[cain] gate self-test: $(timeout 120 bun "$OPT/discord/selftest.ts" --relay 2>&1 | tail -n 1)"; fi
 ) &
-# Which connectors Cain has, by name only (addresses removed), so the tools it
-# must not use can be blocked by their exact names (/opt/cain/settings.json).
-(
-  sleep 30
-  timeout 120 claude mcp list 2>&1 | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 \
-    | while IFS= read -r line; do echo "[cain] connector: $line"; done
-) &
-# Cain's link (link/main.ts): taps, reactions and specialists' cards. What Cain must
-# hear is queued for him; checkin.sh types it in when he is idle.
-( while true; do bun /opt/cain/link/main.ts 2>&1; sleep 5; done ) &
-# The record keeper (record/main.ts): the one writer of Cain's record. Keeps a
-# copy in /data/record (so Home Assistant's backups carry it off the box),
-# applies requests in order, and runs the nightly check. Its key comes from the
-# add-on's options and goes only into its environment.
+# Which connectors Cain has, by name only (addresses removed).
+if [ "$mode" != none ]; then
+  (
+    sleep 30
+    if [ "$mode" = own ]; then out="$(timeout 120 "$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" claude mcp list 2>&1)"
+    else out="$(timeout 120 claude mcp list 2>&1)"; fi
+    printf '%s\n' "$out" | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 | while IFS= read -r line; do echo "[cain] connector: $line"; done
+  ) &
+  # The c1 check (the new way): root runs it as cain and keeps its result (c1/check.sh).
+  if [ "$mode" = own ]; then ( sleep 45; "$OPT/c1/check.sh" 2>&1 | tail -n 1 ) & fi
+fi
+# Cain's link (link/main.ts): taps, reactions and specialists' cards.
+( while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done ) &
+# The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the
+# App's options and goes only into its environment.
 (
   RECORD_TOKEN="$(bashio::config 'github_token' 2>/dev/null || true)"
   [ "$RECORD_TOKEN" = "null" ] && RECORD_TOKEN=""
   export RECORD_TOKEN
-  while true; do bun /opt/cain/record/main.ts 2>&1; sleep 10; done
+  while true; do bun "$OPT/record/main.ts" 2>&1; sleep 10; done
 ) &
-# The review runner (review/main.ts): outside-model reviews (Codex on his ChatGPT
-# plan, Gemini, Perplexity, Claude on the plan's API credit), and the ChatGPT
-# sign-in page (<Cain page>/codex). Its keys come from the add-on's options and go
-# only into its environment, under names no other tool reads (an ANTHROPIC_API_KEY
-# in Cain's own session would move Claude Code off his plan). Never printed.
+# The review runner (review/main.ts): outside-model reviews. Its keys come from the App's
+# options and go only into its environment, under names no other tool reads. Never printed.
 (
   opt() { v="$(bashio::config "$1" 2>/dev/null || true)"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
   REVIEW_GEMINI_KEY="$(opt gemini_api_key)"
@@ -91,50 +163,40 @@ bashio::log.info "Cain is running"
   export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
     REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS
   mkdir -p -m 700 /data/codex
-  while true; do bun /opt/cain/review/main.ts 2>&1; sleep 10; done
+  while true; do bun "$OPT/review/main.ts" 2>&1; sleep 10; done
 ) &
-# Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM so open work moves
-# without Dane. checkin.sh decides when, and only types into an idle session.
-(
-  while true; do /opt/cain/checkin.sh || true; sleep 5; done
-) &
-# The sign-in link is longer than a terminal line, and tmux breaks it, so a
-# click opens a cut-off link. Keep the whole link on a page of its own:
-# <Cain page>/signin. signin-url.sh joins the pieces.
-printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /tmp/signin.html
+# Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM. checkin.sh decides when, and
+# only types into an idle session (through as-cain, the new way).
+if [ "$mode" != none ]; then ( while true; do "$OPT/checkin.sh" || true; sleep 5; done ) & fi
+# The sign-in page and the yes/no status page, for the panel: root's, served by nginx only.
+printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /run/cain/www/signin.html
 (
   while true; do
-    screen=$(tmux -u capture-pane -p -J -t cain -S -400 2>/dev/null || true)
-    url=$(printf '%s\n' "$screen" | /opt/cain/signin-url.sh || true)
-    # Only while it is waiting for the code; afterwards the link is stale.
+    screen=$($TMUX_CMD -u capture-pane -p -J -t cain -S -400 2>/dev/null || true)
+    url=$(printf '%s\n' "$screen" | "$OPT/signin-url.sh" || true)
     if ! printf '%s\n' "$screen" | tail -n 30 | grep -Eqi 'paste.*code|oauth/authorize'; then
       url=''
-      printf '%s' '<!doctype html><p>No sign-in waiting.</p>' > /tmp/signin.html
+      printf '%s' '<!doctype html><p>No sign-in waiting.</p>' > /run/cain/www/signin.tmp && mv /run/cain/www/signin.tmp /run/cain/www/signin.html
     fi
-    # Yes/no facts for checking setup from outside, without showing the screen
-    # (a token may be typed there): <Cain page>/status.
     flag() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
-    # access.json spreads allowFrom over several lines.
-    paired() { tr -d ' \n' < /data/.claude/channels/discord/access.json | grep -q '"allowFrom":\["'; }
+    paired() { tr -d ' \n' < "$ACCESS_FILE" | grep -q '"allowFrom":\["'; }
     last=$(printf '%s\n' "$screen" | tail -n 30)
     state=unknown
-    # Only the bottom lines: Cain may talk about sign-in in its own replies.
     if printf '%s\n' "$last" | tail -n 12 | grep -Eqi 'run /login|token has expired|authentication_error|invalid api key|not logged in'; then state=login_needed
     elif printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
     elif printf '%s' "$last" | grep -Eqi 'do you trust|trust the files'; then state=trust_prompt
     elif printf '%s' "$last" | grep -Eqi 'select login|login method|choose the text style|dark mode'; then state=first_run_menu
     elif printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode'; then state=ready
     fi
-    printf '{"signed_in": %s, "discord_token": %s, "paired": %s, "allowlist": %s, "screen": "%s"}\n' \
-      "$(flag test -s /data/.claude/.credentials.json)" \
-      "$(flag grep -q '^DISCORD_BOT_TOKEN=.' /data/.claude/channels/discord/.env)" \
+    printf '{"signed_in": %s, "discord_token": %s, "paired": %s, "allowlist": %s, "screen": "%s", "mode": "%s"}\n' \
+      "$(flag test -s "$CRED")" \
+      "$(flag grep -q '^DISCORD_BOT_TOKEN=.' "$TOKEN_FILE")" \
       "$(flag paired)" \
-      "$(flag grep -Eq '"dmPolicy": *"allowlist"' /data/.claude/channels/discord/access.json)" \
-      "$state" > /tmp/status.tmp && mv /tmp/status.tmp /tmp/status.json || true
-    # When Claude's sign-in runs out, Cain can't answer, so the bot says so
-    # itself, once, until Cain is ready again.
+      "$(flag grep -Eq '"dmPolicy": *"allowlist"' "$ACCESS_FILE")" \
+      "$state" "$mode" > /run/cain/www/status.tmp && chmod 0640 /run/cain/www/status.tmp && chgrp nogroup /run/cain/www/status.tmp \
+      && mv /run/cain/www/status.tmp /run/cain/www/status.json || true
     if [ "$state" = login_needed ] && [ ! -f /data/alerted-login ]; then
-      if /opt/cain/alert.sh "Cain can't answer: its Claude sign-in has expired. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code in the box."; then
+      if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain can't answer: its Claude sign-in has expired. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code in the box."; then
         touch /data/alerted-login
         bashio::log.warning "Sign-in expired; told the owner in Discord"
       else
@@ -145,13 +207,37 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     fi
     if [ -n "$url" ]; then
       safe=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/"/%22/g; s/</%3C/g')
-      printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /tmp/signin.tmp && mv /tmp/signin.tmp /tmp/signin.html || true
+      printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /run/cain/www/signin.tmp && mv /run/cain/www/signin.tmp /run/cain/www/signin.html || true
     fi
+    chgrp nogroup /run/cain/www/signin.html 2>/dev/null; chmod 0640 /run/cain/www/signin.html 2>/dev/null
     sleep 2
   done
 ) &
-# Stay in the foreground while the tmux session lives.
-while tmux -u has-session -t cain 2>/dev/null; do sleep 10; done
+
+if [ "$mode" = none ]; then
+  # Nothing of Cain's runs; the services above keep going. Stay up, so the App isn't restarted
+  # over and over, and say so hourly.
+  while true; do sleep 3600; bashio::log.warning "Cain still isn't started (see the start of this log)"; done
+fi
+# Stay in the foreground while his session lives. The old way switches to the new one as soon
+# as the specialist signs (the next start validates and cuts over). The new way restarts his
+# session when its channel has been down 90 seconds (the broker says so in discord.state).
+while has_session; do
+  if [ "$mode" = old ] && [ -f /data/link/specialist-signs ]; then
+    bashio::log.info "The calendar specialist now signs its requests: restarting to switch Cain to his own user"
+    tmux -u kill-session -t cain 2>/dev/null || true
+    exit 1
+  fi
+  if [ "$mode" = own ] && [ -f /run/cain/discord.state ]; then
+    read -r st at < /run/cain/discord.state || true
+    if [ "$st" = down ] && [ -n "${at:-}" ] && [ $(( $(date +%s) - at )) -gt 90 ]; then
+      bashio::log.warning "Cain's Discord channel has been down 90 seconds: restarting his session"
+      $TMUX_CMD -u kill-session -t cain 2>/dev/null || true
+      break
+    fi
+  fi
+  sleep 10
+done
 bashio::log.warning "Cain's session ended. Its last output:"
-tail -n 20 /data/session.log 2>/dev/null
+bun "$OPT/owned.ts" tail /data/session.log 20 2>/dev/null || true
 exit 1

@@ -111,7 +111,7 @@ describe("sends: the gate decides, and fails closed", () => {
 
   test("a refusal never reaches the plugin, and says why", async () => {
     const t = rig(async () => ({ kind: "refuse", reason: "The message gate held this: an em dash." }));
-    await t.call(8, "edit_message", { chat_id: DM, message_id: MSG, text: "a — b" });
+    await t.call(8, "edit_message", { chat_id: DM, message_id: MSG, text: "a \u2014 b" });
     expect(t.toServer).toEqual([]);
     expect(t.toClient[0].result).toEqual({ content: [{ type: "text", text: "edit_message failed: The message gate held this: an em dash." }], isError: true });
   });

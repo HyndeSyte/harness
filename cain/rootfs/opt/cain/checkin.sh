@@ -5,6 +5,9 @@
 #    fires once a day, within an hour of its time.
 # Both say they come from the add-on, so Cain never mistakes a check-in for Dane.
 set -u
+# Every tmux call goes through this (C1): Cain's own user and his socket the new way (the run
+# script sets TMUX_CMD), so root is never a client of his tmux server; plain tmux the old way.
+TM="${TMUX_CMD:-tmux}"   # not TMUX: tmux reads that name itself
 export TZ="${CHECKIN_TZ:-America/New_York}"
 dir="${CHECKIN_DIR:-/data/checkins}"
 queue="${RELAY_QUEUE:-/data/relay.queue}"
@@ -33,13 +36,13 @@ send_table meanings "${MEANINGS_FILE:-/data/record/areas/family/calendar-meaning
 send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
   "${PLACES_SENT:-/data/places.sent}" "${PLACES_TRIED:-/data/places.tried}" "place book"
 
-screen=$(tmux -u capture-pane -p -J -t cain 2>/dev/null) || exit 0
+screen=$($TM -u capture-pane -p -J -t cain 2>/dev/null) || exit 0
 last=$(printf '%s\n' "$screen" | tail -n 12)
 printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode' || exit 0     # at his prompt
 printf '%s' "$last" | grep -Eqi 'esc to interrupt' && exit 0           # working: later
 
 type_in() {
-  tmux -u send-keys -t cain -l "$1" && sleep 1 && tmux -u send-keys -t cain Enter
+  $TM -u send-keys -t cain -l "$1" && sleep 1 && $TM -u send-keys -t cain Enter
 }
 
 # 1. A relayed tap or reaction, one at a time, oldest first. The link and the record

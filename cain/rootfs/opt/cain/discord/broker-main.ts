@@ -88,6 +88,19 @@ function readsOk(chat: string): string {
 let current: { sock: Socket; session: BrokerSession } | null = null;
 let n = 0;
 
+// Whether Cain's channel is connected, for the run script's watchdog (it restarts his session
+// when this has said "down" for 90 seconds): "connected <s>" or "down <s>", whole.
+const STATE_FILE = env.CAIN_DISCORD_STATE_FILE ?? "/run/cain/discord.state";
+// A broker that restarts under a connected channel leaves it dead (the bridge never reconnects):
+// say "down" from now, so the watchdog restarts his session. Before any connection: no state.
+try { if (readFileSync(STATE_FILE, "utf8").startsWith("connected")) channelState("down"); } catch { /* none yet */ }
+function channelState(what: "connected" | "down"): void {
+  if (env.CAIN_BROKER_SMOKE === "1") return;
+  try { writeFileSync(`${STATE_FILE}.tmp`, `${what} ${Math.floor(Date.now() / 1000)}
+`, { mode: 0o644 }); renameSync(`${STATE_FILE}.tmp`, STATE_FILE); }
+  catch { /* the watchdog then sees nothing new, and waits */ }
+}
+
 function lineReader(onLine: (l: string) => void, onTooLong: () => void) {
   let buf = "", skipping = false;
   return (chunk: string) => {
@@ -120,13 +133,16 @@ function connection(sock: Socket): void {
   const session = new BrokerSession({
     toClient: (l) => { if (!sock.destroyed) sock.write(l + "\n"); },
     toServer: (l) => { try { proc.stdin.write(l + "\n"); proc.stdin.flush(); } catch { /* it's gone: serverGone follows */ } },
-    close: () => { try { sock.destroy(); } catch { /* closed */ } try { proc.kill(); } catch { /* gone */ } if (current === conn) current = null; },
+    close: () => { try { sock.destroy(); } catch { /* closed */ } try { proc.kill(); } catch { /* gone */ } if (current === conn) { current = null; channelState("down"); } },
     gate: (tool, args, s) => gateSend(tool, args, s, {
       cards: async () => { const r = await linkCall("/cards"); return r.ok ? await r.json() : null; },
       cardsFile: () => text(CARDS),
       replied: () => replied,
     }),
     sent: (tool, args, result, s) => {
+      // The first start's smoke test (c1/smoke.sh): its stand-in sent nothing, so there is
+      // nothing for the link to place Stop on or add to his replies.
+      if (env.CAIN_BROKER_SMOKE === "1") return;
       const { note, madeUp } = sentNote(tool, args, result, s);
       if (!note) return;
       if (tool === "reply") addReplied(note.ids);
@@ -144,6 +160,7 @@ function connection(sock: Socket): void {
   });
   conn.session = session;
   current = conn;
+  channelState("connected");
   sock.on("data", lineReader((l) => { void session.fromClient(l); }, () => { void session.fromClient("x".repeat(MAX_LINE + 1)); }));
   sock.on("close", () => session.end());
   sock.on("error", () => { /* close follows */ });
@@ -164,6 +181,7 @@ if (import.meta.main) {
   mkdirSync(OUTBOX, { recursive: true, mode: 0o750 });
   try { chownSync(OUTBOX, 0, DISCORD_GID); } catch (e) { log(`couldn't hand the outbox to discord: ${String(e).slice(0, 80)}`); }
   if (existsSync(SOCK)) rmSync(SOCK, { force: true });
+  // No state until a first connection: a session waiting on its sign-in is never restarted.
   const server = createServer(connection);
   server.listen(SOCK, () => {
     // Root and cain only. Until this lands nobody but root can connect (umask 027).

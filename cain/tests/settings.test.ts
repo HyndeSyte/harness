@@ -1,4 +1,5 @@
-// Cain's Claude Code settings (rootfs/opt/cain/settings.json): what runs without a prompt, and what never runs.
+// Cain's Claude Code settings (rootfs/opt/cain/settings.json, installed as managed settings, C1):
+// what runs without a prompt, what never runs, and that nothing of his own can add to them.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -51,22 +52,50 @@ describe("Cain's permissions", () => {
     }
   });
 
-  test("Cain can't read or change the bot token: only the plugin and the hooks read it, and deny rules don't touch them", () => {
-    expect(deny).toContain("Read(//data/.claude/channels/discord/.env)");
-    expect(deny).toContain("Edit(//data/.claude/channels/discord/.env)");
-    for (const a of allow) expect(a).not.toContain(".env");
+  test("the keys are root's: his deny rules name them too, and nothing allowed touches them", () => {
+    for (const r of ["Read(//data/options.json)", "Read(//data/link/**)", "Read(//data/codex/**)", "Edit(//etc/claude-code/**)"]) expect(deny).toContain(r);
+    for (const a of allow) { expect(a).not.toContain(".env"); expect(a).not.toContain("/data/link"); }
   });
 
   test("no allow entry is a wildcard over an MCP server", () => {
     for (const t of allow.filter((a) => a.startsWith("mcp__"))) expect(t).not.toMatch(/\*/);
   });
 
-  test("the reply and edit tools have the message gate in front, waited for, and the safety net after, in the background", () => {
-    const hooksOf = (event: string, tool: string) => (settings.hooks[event] ?? []).filter((e: any) => e.matcher === tool).flatMap((e: any) => e.hooks);
+  test("the message gate isn't a hook of his any more: the broker runs it, where he can't reach it (C1)", () => {
+    const all = JSON.stringify(settings.hooks);
+    expect(all).not.toContain("discord-send.ts");
+    expect(all).not.toContain("discord-sent.ts");
+    expect(all).not.toContain("discord-read.ts");
+    expect(Object.keys(settings.hooks)).toEqual(["PreToolUse"]);
+    expect(settings.hooks.PreToolUse.map((e: any) => e.matcher)).toEqual(["RemoteTrigger"]);
+    expect(settings.hooks.PreToolUse[0].hooks[0]).toEqual({ type: "command", command: "bun /opt/cain/hooks/remote-trigger.ts || exit 2", timeout: 15, onFailure: "block" });
+  });
+});
+
+describe("nothing of his own adds to his rules (C1)", () => {
+  test("only these managed hooks, permission rules and plugins count", () => {
+    expect(settings.allowManagedHooksOnly).toBe(true);
+    expect(settings.allowManagedPermissionRulesOnly).toBe(true);
+    expect(settings.disableSideloadFlags).toBe(true);
+    expect(settings.strictPluginOnlyCustomization).toEqual(["mcp", "hooks"]);
+    expect(settings.syncClaudeAiPlugins).toBe(false);
+    expect(settings.permissions.disableBypassPermissionsMode).toBe("disable");
+  });
+
+  test("the one plugin, from the one marketplace, pinned in the image", () => {
+    expect(settings.enabledPlugins).toEqual({ "discord@claude-plugins-official": true });
+    expect(settings.strictKnownMarketplaces).toEqual([{ source: "github", repo: "anthropics/claude-plugins-official" }]);
+  });
+});
+
+// The old way of starting (3.12 state A) uses 0.11.0's files unchanged, hooks and all.
+describe("the old way's files are 0.11.0's", () => {
+  const legacy = JSON.parse(readFileSync(join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json"), "utf8"));
+  test("its reply and edit hooks are there", () => {
+    const hooksOf = (event: string, tool: string) => (legacy.hooks[event] ?? []).filter((e: any) => e.matcher === tool).flatMap((e: any) => e.hooks);
     for (const t of ["mcp__plugin_discord_discord__reply", "mcp__plugin_discord_discord__edit_message"]) {
       expect(hooksOf("PreToolUse", t)).toEqual([{ type: "command", command: "bun /opt/cain/hooks/discord-send.ts || true", timeout: 5 }]);
       expect(hooksOf("PostToolUse", t)).toEqual([{ type: "command", command: "bun /opt/cain/hooks/discord-sent.ts || true", timeout: 15, async: true }]);
     }
-    expect(hooksOf("PreToolUse", "mcp__plugin_discord_discord__react")).toEqual([]);   // a reaction carries no words
   });
 });

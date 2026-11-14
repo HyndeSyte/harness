@@ -75,11 +75,10 @@ RUN set -eu; seed=/opt/cain/plugin-seed; pin=/opt/cain/discord/pin.json; \
     rm -rf /root/.claude /root/.claude.json /root/.cache /root/.bun; \
     chown -R root:root "$seed" /opt/cain/discord/plugin; chmod -R a+rX,go-w "$seed" /opt/cain/discord/plugin
 
-# Cain's rules, where Claude Code reads managed policy: root's, readable by him, never his to
-# change. managed-settings.json locks out any allow rule or hook of his own.
-RUN install -d -m 0755 /etc/claude-code \
-    && install -m 0644 /opt/cain/settings.json /etc/claude-code/managed-settings.json \
-    && install -m 0644 /opt/cain/CLAUDE.md /etc/claude-code/CLAUDE.md
+# Cain's rules (/opt/cain/settings.json and CLAUDE.md) go to /etc/claude-code, where Claude
+# Code reads managed policy, at every start that runs him as his own user, checked by hash
+# (c1/lock.sh): a container Home Assistant recreates keeps only /data, and the old way of
+# starting, before the first cutover, must run without them.
 
 # No setuid or setgid program can raise him (his session also runs with no_new_privs).
 RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
