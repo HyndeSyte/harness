@@ -643,6 +643,23 @@ describe("one open ask at a time", () => {
     expect(r.relayed.some((l) => l.startsWith("Your held question P11 Q1 wasn't posted:") && l.includes("Ask it again in words that pass"))).toBe(true);
   });
 
+  test("a held ask that only waits on the review service's lines (unreadable just now) stays in line and goes out once they read", async () => {
+    const r = rig();
+    const LINE = "Reviewed: Gemini, approve.";
+    r.reviews.list = [{ id: "2026-11-11-a", line: LINE, finished_at: new Date(NOV11_8AM - 10 * MIN).toISOString(), pr: null, head: null }];
+    const a = await ask(r, "P08", "Q2");
+    expect((await r.link.ask({ text: `The plan is done. ${LINE} Start the build?`, options: ["Start", "Not now"], item: "P11", question: "Q1" })).status).toBe("held");
+    r.reviews.list = null;                                     // the lines can't be read just now
+    const posts = Object.keys(r.posted).length;
+    await r.tap(snap(r.msg(a)), r.ids(a)[0]);
+    expect(Object.keys(r.posted).length).toBe(posts);          // not posted yet
+    expect((r.state().held ?? []).length).toBe(1);             // but still in line
+    expect(r.relayed.some((l) => l.includes("wasn't posted"))).toBe(false);
+    r.reviews.list = [{ id: "2026-11-11-a", line: LINE, finished_at: new Date(NOV11_8AM - 10 * MIN).toISOString(), pr: null, head: null }];
+    await r.link.releaseHeld();
+    expect(r.last().content).toBe(`The plan is done. ${LINE} Start the build?`);
+  });
+
   test("...or when the open one's item closes or moves", async () => {
     const r = rig();
     await ask(r, "P08", "Q2");

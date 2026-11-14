@@ -430,6 +430,10 @@ describe("the checks, read one way for the landing and the Ship card", () => {
     expect(await checkRuns({ api: paged([{ total: 101, runs: many(100) }, { total: 102, runs: many(2, 101) }]) }, REPO, H1)).toBeNull();
     expect(await checkRuns({ api: paged([{ total: 101, runs: many(100) }, { total: 101, runs: many(1, 100) }]) }, REPO, H1)).toBeNull();
     expect(await checkRuns({ api: paged([{ total: 101, runs: many(100) }]) }, REPO, H1)).toBeNull();
+    // 501 runs over 6 pages that agree: read whole (up to 1,000), and judged.
+    const big = Array.from({ length: 6 }, (_, p) => ({ total: 501, runs: many(p < 5 ? 100 : 1, 1 + p * 100) }));
+    const read = await checkRuns({ api: paged(big) }, REPO, H1);
+    expect(Array.isArray(read) ? read.filter((r: any) => r.name === "pytest").length : read).toBe(501);
   });
 });
 

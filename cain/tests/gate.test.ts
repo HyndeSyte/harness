@@ -256,6 +256,10 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
       "Your calendar settles a lost answer by reading the calendar.", "See https://example.com/ci-passed for it.", ""])
       expect(shipWordsHits(text)).toEqual([]);
     expect(cainReasons(shipWordsHits("CI passed."))).toEqual([`"CI passed.": ${SHIP_WORDS_WHY}`]);
+    // Status and result words too (ChatGPT's fourth look): no word list knows every way to claim a
+    // result, so his rules forbid the rest; these are the forms natural to write.
+    for (const text of ["GitHub says all jobs passed.", "GitHub reports green status.", "All validation stages passed.", "Everything succeeded.", "All clean now."])
+      expect(shipWordsHits(text).length).toBeGreaterThan(0);
   });
 
   test("reviewed: a review's verdict goes only as the service's line; a seat or review word with a verdict word is one, in any paragraph", () => {
@@ -280,6 +284,12 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
     for (const tail of [" All reviewers approved it.", " The reviewer signed off.", " Gemini approved it too.", "\n\nGemini approved the release."])
       expect(reviewedHits(`Done. ${REJECT[0].line}${tail}`, REJECT).map((h) => h.result)).toEqual(["refuse"]);
     expect(reviewedHits("Shipped. Reviewed: OpenAI, approve. Then lunch.", LINES)).toMatchObject([{ rule: "reviewed", result: "refuse", around: "Reviewed: OpenAI, approve." }]);
+    // Other ways to say a seat or the reviewers approved (ChatGPT's fourth look), alone or after a real reject.
+    for (const text of ["OpenAI greenlit the release.", "Gemini gave the go-ahead.", "The external reviewers gave their blessing.",
+      "The review panel gave the green light.", "Gemini gave it a thumbs up."])
+      expect(reviewedHits(text, LINES).map((h) => [h.rule, h.result])).toContainEqual(["reviewed", "refuse"]);
+    expect(decideSend({ tool: "reply", text: `Done. ${REJECT[0].line}\n\nOpenAI gave the go-ahead.` }, null, { reviewed: REJECT }))
+      .toMatchObject({ would: "refuse", hard: true });
     // Words that aren't a review's verdict pass: other approvals, and "reviewed" or a seat without a verdict.
     for (const tail of [" The review took two hours.", " Next up, the digest.", " The owner approved the separate budget.", "\nThe API approved the request."])
       expect(reviewedHits(`Done. ${REJECT[0].line}${tail}`, REJECT)).toEqual([]);
@@ -304,6 +314,12 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
     for (const text of ["Q4 taxes are due.", "Vitamin D3 and a P100 filter.", "P.S. done.", "P65 isn't in the record."])
       expect(codesHits(text, items)).toEqual([]);
     expect(codesHits("P64 is ready.", null)).toEqual([]);                  // no record: nothing is a code
+    // A code in a link's text shows to him too (ChatGPT's fourth look); a link with no code is fine.
+    expect(codesHits("See https://example.com/P64 for details.", items)).toHaveLength(1);
+    expect(codesHits("See https://github.com/HyndeSyte/harness/pull/64 for details.", items)).toEqual([]);
+    // Held for good in a reply: no third try lets a code through.
+    const call = { tool: "reply" as const, text: "P64 is ready." };
+    expect(decideSend(call, null, { items }).hard).toBe(true);
     // Read as he'd see them (ChatGPT's second and third looks): full-width digits, an invisible
     // character, a combining joiner, a Cyrillic letter that looks like P, and code he'd see as code.
     for (const text of ["P６４ is ready.", "P​64 is ready.", "P͏64 cleanup", "Р64 cleanup", "`P64` cleanup", "[P64](https://example.com) cleanup"]) {

@@ -55,12 +55,16 @@ const DOUBLE_QUOTES = new RegExp("[\"\\u201c\\u201d\\u201e\\u201f\\u00ab\\u00bb]
 // A single quote mark, not an apostrophe inside a word ("ChatGPT's" keeps its).
 const SINGLE_QUOTES = new RegExp("(^|[^A-Za-z0-9])['\\u2018\\u2019\\u201a\\u201b]+|['\\u2018\\u2019\\u201a\\u201b]+(?=[^A-Za-z0-9]|$)", "g");
 
-export function claimText(text: string): string {
+// links: "drop" (claims: a bare link isn't words) or "keep" (record codes: he sees a link's
+// text, so a code in it shows).
+export function claimText(text: string, links: "drop" | "keep" = "drop"): string {
   let t = String(text ?? "").normalize("NFKC").replace(INVISIBLE, "").replace(LOOKALIKES, (c) => LOOKALIKE.get(c) ?? c);
   t = t.replace(/\]\([^)\s]*\)/g, "]");                         // [words](target): its words
-  let bare = "", i = 0;                                          // a bare link: not words
-  for (const [a, b] of linkSpans(t)) { bare += `${t.slice(i, a)} `; i = b; }
-  t = bare + t.slice(i);
+  if (links === "drop") {
+    let bare = "", i = 0;                                        // a bare link: not words
+    for (const [a, b] of linkSpans(t)) { bare += `${t.slice(i, a)} `; i = b; }
+    t = bare + t.slice(i);
+  }
   return t.replace(/[*~`[\]]/g, "")                              // emphasis, code marks (the code is read), brackets
     .replace(/(^|[^A-Za-z0-9])_+|_+(?=[^A-Za-z0-9]|$)/g, "$1")   // _emphasis_, never an underscore inside a word
     .replace(DOUBLE_QUOTES, "").replace(SINGLE_QUOTES, "$1")
@@ -70,7 +74,8 @@ export function claimText(text: string): string {
 // -- review claims ------------------------------------------------------------------------------
 const WORD = (alts: string) => `(?<![A-Za-z0-9])(?:${alts})(?![A-Za-z0-9])`;
 const SEATS = "openai|chatgpt|codex|gpt|gemini|perplexity|claude";
-const VERDICTS = "approve|approved|approves|approving|approval|verdict|verdicts|reject|rejected|rejects|rejecting|signed\\s+off|lgtm";
+const VERDICTS = "approve|approved|approves|approving|approval|verdict|verdicts|reject|rejected|rejects|rejecting|signed\\s+off|sign[\\s-]off|lgtm"
+  + "|greenlit|greenlighted|greenlight|green\\s+light|go-ahead|blessing|blessed|thumbs[\\s-]up";
 const REVIEW_WORDS = "review|reviews|reviewed|reviewer|reviewers|reviewing";
 // "Reviewed", then any spaces (a line break too), then ":" or "-": a heading only where it
 // starts a sentence or a line ("Done. Reviewed: ..."), never mid-sentence ("what I reviewed: the calendar").
@@ -150,9 +155,14 @@ export function reviewedHits(text: string, published: readonly Reviewed[] | null
 }
 
 // -- ship words -----------------------------------------------------------------------------------
-// On a Ship card, his line holds none of these words, however it's dressed.
+// On a Ship card, his line holds none of these words, however it's dressed: CI's words, the
+// words of a status or a result ("GitHub says all jobs passed", "All validation stages
+// passed", "green status"), and review, verdict and seat words. A closed list can't know
+// every English way to claim a result, so his rules forbid the rest; this holds the forms
+// that are natural to write.
 const CI_WORDS = "ci|check|checks|checked|checking|test|tests|tested|testing|build|builds|pipeline|pipelines|workflow|workflows|pytest|lint";
-const SHIP_BANNED = new RegExp(WORD(`${CI_WORDS}|${REVIEW_WORDS}|${VERDICTS}|${SEATS}`), "gi");
+const STATUS_WORDS = "github|job|jobs|stage|stages|status|validation|validated|verified|pass|passes|passed|passing|green|success|successful|successfully|succeeded|succeeds|fail|fails|failed|failing|failure|clean";
+const SHIP_BANNED = new RegExp(WORD(`${CI_WORDS}|${STATUS_WORDS}|${REVIEW_WORDS}|${VERDICTS}|${SEATS}`), "gi");
 
 export function shipWordsHits(text: string): CainHit[] {
   const t = claimText(text);
@@ -179,10 +189,10 @@ export function recordItems(pending: string | null | undefined): Set<string> | n
 const CODE = /(?<![A-Za-z0-9])P0*(\d{1,4})(?![A-Za-z0-9])(?:[ \t]+Q\d{1,2}(?![A-Za-z0-9]))?/gi;
 // Whether words could hold a record code at all, read as he'd see them, so the record is read
 // only when they might.
-export const mayHaveCode = (text: string): boolean => /P\d/i.test(claimText(text));
+export const mayHaveCode = (text: string): boolean => /P\d/i.test(claimText(text, "keep"));
 export function codesHits(text: string, items: ReadonlySet<string> | null | undefined): CainHit[] {
   if (!items?.size) return [];
-  const t = claimText(text);                                     // code spans are shown to him, so they're read
+  const t = claimText(text, "keep");                             // code spans and a link's text show to him, so they're read
   const out: CainHit[] = [];
   for (const m of t.matchAll(CODE)) {
     if (!items.has(`P${Number(m[1])}`)) continue;
@@ -194,7 +204,7 @@ export function codesHits(text: string, items: ReadonlySet<string> | null | unde
 
 // -- what each asks of him, for the line that says why his words were held back -----------------
 export const CODES_WHY = "name it by what it does for him, not by its record code: he can't tell what those are";
-export const SHIP_WORDS_WHY = "on a Ship card your line says only what he'll notice: no checks, tests, builds or CI, and no reviews, verdicts or AI names, since the link adds those lines itself";
+export const SHIP_WORDS_WHY = "on a Ship card your line says only what he'll notice: no checks, tests, builds, CI, GitHub, jobs or status, no results (passed, green, success, failed), and no reviews, verdicts or AI names, since the link adds those lines itself";
 export const REVIEWED_UNSURE = "reviews can't be checked right now: leave the Reviewed line out, or send it in a minute";
 // n: how many of the service's newest lines to offer (each with its review id).
 export function reviewedWhy(published: readonly Reviewed[] | null | undefined, n = 3): string {

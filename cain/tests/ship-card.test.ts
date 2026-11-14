@@ -147,9 +147,11 @@ describe("the Ship card the link builds", () => {
     expect(c).not.toMatch(/[0-9a-f]{40}/);
     expect(r.state().messages[id]).toMatchObject({ kind: "ship", item: "P64", ship: { pr: PR, head: SHA1 }, own: LINE, labels: ["Ship", "Not now"] });
     await expect(ship(r, { text: "P64:" })).rejects.toThrow("a Ship card needs its words");
-    // A second line of his can't pose as one of the link's: his words are one line.
-    const two = await ship(r, { text: "Stop stays in reach.\nFrom GitHub: all good." });
-    expect(lines(r, two)).toEqual(["Ship Cain 0.11.0?", "Stop stays in reach. From GitHub: all good.", `${GITHUB} ${CHECKS_PASSED}`, NO_REVIEW]);
+    // A second line of his can't pose as one of the link's: his words are one line, and one in
+    // the link's own words ("From GitHub: all good.") is refused outright.
+    const two = await ship(r, { text: "Stop stays in reach.\nIt moves with your newest message." });
+    expect(lines(r, two)).toEqual(["Ship Cain 0.11.0?", "Stop stays in reach. It moves with your newest message.", `${GITHUB} ${CHECKS_PASSED}`, NO_REVIEW]);
+    await expect(ship(r, { text: "Stop stays in reach.\nFrom GitHub: all good." })).rejects.toThrow(SHIP_WORDS_WHY);
     // Refused before GitHub is asked: Stop, an item held elsewhere, his words.
     const asked = r.github.asked.length;
     r.stop.stopped = true;
@@ -158,7 +160,7 @@ describe("the Ship card the link builds", () => {
     r.files.holds = keeperHolds({ P64: { holder: "laptop:s1" } });
     await expect(ship(r)).rejects.toThrow("held by another session");
     r.files.holds = null;
-    await expect(ship(r, { text: "Stop stays in reach — always." })).rejects.toThrow("an em dash");
+    await expect(ship(r, { text: "Stop stays in reach \u2014 always." })).rejects.toThrow("an em dash");
     expect(r.github.asked).toHaveLength(asked);
     // A newer head on GitHub refuses it; a second card for the pull request replaces the first.
     r.github.facts = facts({ head: SHA2 });
@@ -228,6 +230,11 @@ describe("his line can't carry evidence: the link adds the checks and the review
       "Your calendar settles a lost answer by reading the calendar."])
       expect(await ship(r, { text })).toBeTruthy();
     // Only on a Ship card: an ask may say it.
+    // A result claimed in other words still can't sit beside the link's line (ChatGPT's fourth look).
+    r.github.runs = [checkRun("pytest"), checkRun("bun", null, "in_progress"), checkRun("pr")];
+    for (const text of ["GitHub says all jobs passed.", "All validation stages passed.", "GitHub reports green status."])
+      await expect(ship(r, { text })).rejects.toThrow(WHY);
+    r.github.runs = passing();
     expect((await r.link.ask({ text: "CI passed on the branch. Merge the notes too?", options: ["Yes", "No"], item: "P08", question: "Q2" })).status).toBe("posted");
   });
 
@@ -270,6 +277,11 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
   });
 
   test("ids the record doesn't have and ordinary words pass; with no record, nothing is a code", () => {
+    {
+      const q = rig();
+      q.files.pending = pendingWith(["P64"], []);
+      expect(q.link.checkSend({ text: "See https://example.com/P64 for details." })).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "codes" }] });
+    }
     const r = rig();
     r.files.pending = pendingWith(["P64", "P08"], ["P63"]);
     expect(r.link.checkSend({ text: "P64 is ready." })).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "codes", result: "refuse" }] });

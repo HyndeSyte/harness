@@ -131,7 +131,7 @@ async function versionAt(d: Pick<MergeDeps, "api">, repo: string, path: string, 
 // run comes twice, and the pages add up to that total. So a judgment never rests on part of
 // the runs, or on a list that shifted while it was read. The runs, "missing" (GitHub has no
 // such commit), or null (no answer, or a list that isn't whole: then nothing is judged).
-const RUN_PAGES = 5;
+const RUN_PAGES = 10;                 // 1,000 runs of one check: past that it can't be judged, and the landing waits
 async function runsOf(d: Pick<MergeDeps, "api">, repo: string, head: string, name: string): Promise<any[] | "missing" | null> {
   const got: any[] = [];
   let total: number | null = null;

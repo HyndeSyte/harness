@@ -2857,10 +2857,20 @@ export class Link {
       this.d.save(s);
       // A held ask, one from an older version too, is checked again under today's rules before
       // it goes out (its question and every option): one that fails them is dropped, never
-      // retried as it is, and Cain asks again in words that pass.
+      // retried as it is, and Cain asks again in words that pass. One held only because the
+      // review service's lines can't be read just now waits in line for the next sweep (until
+      // its own expiry), since its words may be fine.
       try { this.recheckHeld(next); }
       catch (e) {
         if (!(e instanceof Refusal)) throw e;
+        const waiting = this.published() === null && [next.text, ...next.options].some((t) => claimsReview(t));
+        if (waiting) {
+          const s2 = this.d.load();
+          s2.held = [next, ...(s2.held ?? [])];
+          this.d.save(s2);
+          this.log("a held question waits: the review service's lines can't be read just now");
+          return;
+        }
         const what = about(next.item, next.question);
         this.d.relay(`Your held question${what ? ` ${what}` : ""} wasn't posted: ${e.message} Ask it again in words that pass, if it still matters. Nothing to tell him.`);
         return;
