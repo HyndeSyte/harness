@@ -6,18 +6,24 @@
 // Each finished review's Reviewed line is published to /data/trust/reviewed.json
 // (../reviewed.ts) before Cain hears it's done, and the file is rebuilt from the queue
 // at start, so it survives a restart.
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
   FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, estimate, fixFor, independent, markBlocked, outbound, recordRequest,
-  relayLine, reviewCheck, safeId, sayLine, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
+  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 
 export type RunnerConfig = {
   queueDir: string; spendFile: string; healthFile: string; termsFile: string; recordQueue: string; relayFile: string;
   reviewedFile?: string;             // where the Reviewed lines are published (configFromEnv); none: not published
+  // Where Cain's briefs wait (C1): review.sh, run as his user, writes there and never in the
+  // queue, so only the runner writes the files the Reviewed lines are published from.
+  // None: no inbox (the tests that queue directly).
+  inboxDir?: string;
+  inboxUid?: number;                 // whose files the inbox takes (default his user, ../owned.ts)
   caps: { gemini: number; perplexity: number; claude: number; openaiRuns: number };
   reviewLimit: number;
   timeoutS: Record<SeatName, number>;
@@ -57,7 +63,9 @@ export const SELFTEST: Brief = {
 function writeAtomic(path: string, text: string) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = join(dirname(path), `.${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
-  writeFileSync(tmp, text, { mode: 0o600 });
+  // Readable by the folder's group (C1: his user's group), so review.sh can show status and
+  // results to him; only root writes here.
+  writeFileSync(tmp, text, { mode: 0o640 });
   renameSync(tmp, path);
 }
 function readJson<T>(path: string, fallback: T): T {
@@ -172,8 +180,31 @@ export class Runner {
   }
 
   // ---- the loop ----
+  // Cain's briefs, from his inbox into the queue. Only the brief's own fields are read
+  // (parseBrief refuses any other), and the review is made here, fresh: nothing in his file
+  // can make a review look run, or put a line on a Ship card. Each file is taken once and
+  // removed, whatever it held; one that isn't a plain file of his, or isn't a brief, is
+  // refused and he hears why.
+  ingest(): void {
+    const dir = this.cfg.inboxDir;
+    if (!dir) return;
+    let names: string[];
+    try { names = readdirSync(dir).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort(); }
+    catch { return; }
+    for (const name of names) {
+      const path = join(dir, name);
+      const got = readOwned(path, this.cfg.inboxUid ?? CAIN_UID, 256 * 1024);
+      try { unlinkSync(path); } catch { /* already gone */ }
+      if (!got.ok) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken (${got.why}). Submit it again with review.sh. Nothing to tell him.`); continue; }
+      const p = parseBrief(got.text);
+      if (!p.brief) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken: not a brief: ${p.error}. Nothing to tell him.`); continue; }
+      if (existsReview(this.cfg.queueDir, p.brief.id)) { this.relay(`Review brief ${p.brief.id} wasn't taken: a review with that id already exists; use a new id. Nothing to tell him.`); continue; }
+      saveReview(this.cfg.queueDir, newReview(p.brief, this.now()));
+    }
+  }
+
   async tick(): Promise<void> {
-    try { await this.reviews(); }
+    try { this.ingest(); await this.reviews(); }
     finally { if (this.publishOwed) this.publishReviewed(); }
   }
 

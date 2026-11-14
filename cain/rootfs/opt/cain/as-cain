@@ -1,0 +1,15 @@
+#!/bin/bash
+# Runs a command as Cain's own user (C1), with nothing of root's: no capabilities, no way to
+# gain any (no_new_privs, so su or any other setuid program can't raise him), and none of
+# root's environment beyond a fixed few, so Supervisor's token and the add-on's keys never
+# reach him. Every root script that starts or talks to anything of his goes through here:
+# his session, every tmux call (a tmux server's owner can make its clients run commands, so
+# root is never one), the panel's attach, his connector check.
+#   as-cain <command> [args...]
+set -eu
+cd /data/cain 2>/dev/null || cd /
+exec setpriv --reuid=cain --regid=cain --init-groups --no-new-privs --inh-caps=-all --bounding-set=-all \
+  env -i HOME=/data/cain USER=cain LOGNAME=cain SHELL=/bin/bash \
+    PATH=/usr/local/bin:/usr/bin:/bin TERM="${TERM:-xterm-256color}" \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ="${TZ:-America/New_York}" \
+    "$@"
