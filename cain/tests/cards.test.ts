@@ -127,8 +127,8 @@ describe("asks and cards name their item, and the link refuses what isn't Cain's
     const lower = await ask(r, "p09", "q1", "Signed?");                // ids are upper-cased, as the keeper keeps them
     expect(r.msg(lower).content).toBe("P09 Q1: Signed?");
     expect(r.link.cardInfo(lower)).toMatchObject({ item: "P09", question: "Q1" });
-    await ship(r, SHA1, "Cain 0.7.0 ready. CI passed.");
-    expect(r.last().content).toBe("P41: Cain 0.7.0 ready. CI passed.");
+    await ship(r, SHA1, "Cain 0.7.0 ready.");
+    expect(r.last().content).toBe("P41: Cain 0.7.0 ready.");
   });
 
   test("no sha, job id or ISO time ever reaches his card", async () => {

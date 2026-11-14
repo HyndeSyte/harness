@@ -165,15 +165,18 @@ describe("his Ship tap lands it in main", () => {
 });
 
 describe("the link's own line on a Ship card, from GitHub", () => {
+  // Since 0.11.0 the link builds the card: its question, his line, the line from GitHub (with
+  // the checks) and the Reviewed line (ship-card.test.ts has the rest).
+  const built = (question: string, github: string) => `P41: ${question}\nCain 0.8.1 ready.\n${github}\nNo outside review.`;
   test("how much it changes and the parts that matter most; a newer head on GitHub refuses the card", async () => {
     const r = rig({ facts: true });
     r.github.facts = { head: SHA1, commits: 2, files: 9, areas: ["Cain's link", "Cain's rules", "GitHub's workflows"] };
     const id = await ship(r);
-    expect(r.msg(id).content).toBe(`${card}\nFrom GitHub: 2 commits and 9 files, including Cain's link, Cain's rules and GitHub's workflows.`);
+    expect(r.msg(id).content).toBe(built("Ship it?", "From GitHub: 2 commits and 9 files, including Cain's link, Cain's rules and GitHub's workflows. Checks passed."));
     r.github.facts = { head: SHA1, commits: 1, files: 1, areas: [] };
-    expect(r.msg(await ship(r)).content).toBe(`${card}\nFrom GitHub: 1 commit and 1 file.`);
+    expect(r.msg(await ship(r)).content).toBe(built("Ship it?", "From GitHub: 1 commit and 1 file. Checks passed."));
     r.github.facts = null;
-    expect(r.msg(await ship(r)).content).toBe(`${card}\nFrom GitHub: the pull request couldn't be read just now.`);
+    expect(r.msg(await ship(r)).content).toBe(built("Ship it?", "From GitHub: the pull request couldn't be read just now."));
     r.github.facts = { head: SHA2, commits: 3, files: 4, areas: [] };
     await expect(ship(r)).rejects.toThrow("GitHub has a newer head for that pull request");
   });
@@ -270,7 +273,7 @@ describe("review fixes (Opus, Nov 13)", () => {
     const t0 = Date.now();
     const id = await ship(r);
     expect(Date.now() - t0).toBeLessThan(2_000);
-    expect(r.msg(id).content).toBe(`${card}\nFrom GitHub: the pull request couldn't be read just now.`);
+    expect(r.msg(id).content).toBe("P41: Ship it?\nCain 0.8.1 ready.\nFrom GitHub: the pull request couldn't be read just now.\nNo outside review.");
   });
 });
 
@@ -386,6 +389,7 @@ describe("review fixes (Fable, Nov 13)", () => {
     const id = ((await r.link.ship({ text: `P41: ${"word ".repeat(600)}`, item: "P41", pr: PR, head: SHA1 })) as any).message;
     const c: string = r.msg(id).content;
     expect(c.length).toBeLessThanOrEqual(2000);
-    expect(c).toEndWith(" …\nFrom GitHub: 1 commit and 2 files, including GitHub's workflows.");
+    expect(c).toStartWith("P41: Ship it?\nword word");
+    expect(c).toEndWith(" …\nFrom GitHub: 1 commit and 2 files, including GitHub's workflows. Checks passed.\nNo outside review.");
   });
 });

@@ -1,8 +1,14 @@
 // A fake Discord, record and clock around Cain's link (link/core.ts), for the tests.
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { emptyState, Link, type Pull, State } from "../rootfs/opt/cain/link/core";
-import type { Facts, Landed } from "../rootfs/opt/cain/link/merge";
+import { ACTIONS_APP, type Facts, type Landed } from "../rootfs/opt/cain/link/merge";
+import type { Reviewed } from "../rootfs/opt/cain/reviewed";
 import { makeToken } from "../rootfs/opt/cain/ship-token";
+
+// A check run as GitHub Actions posts it, and the three required ones passed.
+export const checkRun = (name: string, conclusion: string | null = "success", status = "completed", id = 1) =>
+  ({ id, name, status, conclusion, app: { id: ACTIONS_APP } });
+export const passing = () => ["pytest", "bun", "pr"].map((n) => checkRun(n));
 
 // The link's Ship key, for the tests: its public half as the hook and GitHub read it.
 export const SHIP_KEYS = generateKeyPairSync("ed25519");
@@ -31,7 +37,7 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 }
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
-    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean } = {}) {
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number } = {}) {
   let state: State = emptyState();
   // GitHub, as the link's landings see it (merge.ts is tested on its own).
   const github = {
@@ -44,7 +50,16 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     factsHang: false,                              // GitHub never answers about a pull request's facts
     hold: false,                                   // a landing waits until go()
     readable: true,                                // main can be read (for landings over 2 hours old)
+    // A Ship card's other reads (with facts): the head's check runs (null: no answer), when the
+    // head commit was made (null: GitHub doesn't say), each of which can hang; what was asked.
+    runs: passing() as any[] | "missing" | null,
+    runsHang: false,
+    madeAt: (opts.now ?? NOV11_8AM) - HOUR as number | null,
+    madeHang: false,
+    asked: [] as string[],
   };
+  // The review service's lines, as /data/trust/reviewed.json has them (null: it can't be read).
+  const reviews = { list: [] as Reviewed[] | null };
   const landWaiting: (() => void)[] = [];
   const stop = { stopped: false, at: null as number | null, broken: false };
   const harnessDown = { down: false };                // the calendar specialist doesn't take taps
@@ -146,8 +161,11 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       return { ok: true, already: false };
     },
     landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }) => github.readable ? github.main.includes(ship.head) : null,
-    facts: opts.facts ? () => github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts) : undefined,
-    factsMs: 50,
+    facts: opts.facts ? (pr: string) => { github.asked.push(`facts ${pr}`); return github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts); } : undefined,
+    checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(copy(github.runs)); } : undefined,
+    headTime: opts.facts ? (pr: string, head: string) => { github.asked.push(`made ${head}`); return github.madeHang ? new Promise<null>(() => {}) : Promise.resolve(github.madeAt); } : undefined,
+    factsMs: opts.factsMs ?? 50,
+    reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,
     report: (x: any) => { reports.push(copy(x)); },
     transcripts: () => sent,
@@ -170,7 +188,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return link; },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy,
+    reports, replays, sent, discord, limitN, spy, reviews,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

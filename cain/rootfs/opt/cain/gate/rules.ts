@@ -33,8 +33,10 @@
 
 export const RULES = ["dash", "app", "count", "machine", "button"] as const;
 // Goes up whenever a rule changes what it catches: the link replays his DM once more by
-// itself with the new rules (1: Cain 0.9.0, report mode; 2: 0.10.0, tuned from the replay).
-export const RULES_VERSION = 2;
+// itself with the new rules (1: Cain 0.9.0, report mode; 2: 0.10.0, tuned from the replay;
+// 3: 0.11.0, Cain's own rules in gate/cain.ts: a Reviewed line only as the review service
+// gave it, and no checks or review claimed in his words on a Ship card).
+export const RULES_VERSION = 3;
 export type Rule = (typeof RULES)[number];
 export type Result = "fix" | "refuse" | "unsure";
 // Why a dash in words that are never refused stays as it is: anything but plain words round

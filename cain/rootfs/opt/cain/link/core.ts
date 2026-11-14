@@ -53,7 +53,17 @@
 //   Its notes after a tap, and the link's own words: fixed only. Every hit is logged, its
 //   excerpt with links cut to their host. The replay runs the same rules over his DM,
 //   reading only. Cain's edit allowlist holds his replies alone: never a message the link
-//   knows as its own, whatever a note or a transcript says.
+//   knows as its own, whatever a note or a transcript says. Since 0.11.0 (../gate/cain.ts),
+//   a Reviewed line in his asks, their options, the morning message and the connector
+//   notice must be one the review service gave, word for word, and his line on a Ship card
+//   may claim no checks or review: the link adds those itself.
+// - Ship cards built from GitHub and the review service (0.11.0): the question names each
+//   App and version the tap installs, a line from GitHub has the pull request's title, how
+//   much it changes, the parts that matter most and its checks (read as the landing reads
+//   them: a failed check, or one not run yet, refuses the card), and the last line is the
+//   review service's own for the review Cain names, refused if that review finished before
+//   the head commit. Cain's words say only what Dane will notice. Anything going wrong while
+//   the new lines are built gives the card as it was (never no card).
 // - Stop within reach (0.10.0): one red Stop on its own row sits on the newest plain bot
 //   message (Cain's reply, or a notice of the link's, that asks nothing), never on an ask,
 //   a Ship card, a specialist's card, the connector notice, a permission prompt or the
@@ -68,12 +78,15 @@
 //   Turn back on, the notice's own Stop is the one until it's out of reach; when the moving
 //   Stop then goes onto a newer message, the notice's comes off.
 import { createHash } from "node:crypto";
+import { cainReasons, type CainHit, mentionsReviewed, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
 import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
+import { safeId } from "../review/core";
+import type { Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
-import type { Facts, Landed } from "./merge";
+import { bumpsOf, judgeChecks, type Facts, type Landed } from "./merge";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -87,7 +100,7 @@ const EPHEMERAL = 64;
 const REMEMBER_MS = 35 * 86400_000;
 const DAY = 86400_000;
 const HOUR = 3_600_000;
-const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub's facts before it says it couldn't read them
+const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub (its facts, checks and head time, asked at once) before it says it couldn't read them
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long after his tap was cut off (a restart)
@@ -153,6 +166,7 @@ export interface Shown {
   posted?: number;
   expires?: number | null;           // when its buttons stop mattering; null: no time of its own
   ship?: { pr: string; head: string };
+  own?: string;                      // a Ship card the link built: Cain's own line on it, the rest being the link's (0.11.0)
   buttons?: boolean;                 // it has buttons on Discord, as far as the link knows
   outcome?: "answered" | "expired" | "replaced";
   why?: string;                      // for the log: what made it expire
@@ -491,7 +505,10 @@ export interface Deps {
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string) => Promise<Facts | null>;                   // what GitHub says the pull request changes
+  checkRuns?: (pr: string, head: string) => Promise<any[] | "missing" | null>;   // the head's check runs (merge.ts checkRuns)
+  headTime?: (pr: string, head: string) => Promise<number | null>; // when the head commit was made, on GitHub; null: can't tell
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
+  reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
@@ -504,7 +521,7 @@ export interface Deps {
 
 // One send point's hits, for the gate's log, and what was done: "fixed" (and posted),
 // "refused" (nothing posted), "posted as it is" (a specialist's card, never refused).
-export interface GateReport { point: string; writer: Writer | "unknown"; message?: string; hits: Hit[]; did?: string }
+export interface GateReport { point: string; writer: Writer | "unknown"; message?: string; hits: (Hit | CainHit)[]; did?: string }
 // What Cain's transcripts say he sent with his plugin: message ids (replies and edits), the
 // exact texts, and the ids of his replies alone (his edit allowlist is seeded from those).
 export interface Sent { ids: Set<string>; texts: Set<string>; replies?: Set<string> }
@@ -535,12 +552,55 @@ export const RESUME_UNSAVED = "Cain's side couldn't save that, so his Build and 
 // when that couldn't be told), and whether it was merged.
 export interface Pull { head: string | null; open: boolean | null; merged?: boolean }
 
-// The link's own line on a Ship card, from GitHub.
+// The link's own line on a Ship card, from GitHub, as it was before 0.11.0: what a card
+// shows when the new lines can't be built.
 export function factsLine(f: Facts | null): string {
   if (!f) return "From GitHub: the pull request couldn't be read just now.";
+  return `From GitHub: ${changes(f)}.`;
+}
+const changes = (f: Facts) => {
   const n = (k: number, one: string) => `${k} ${one}${k === 1 ? "" : "s"}`;
   const list = (xs: string[]) => xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`;
-  return `From GitHub: ${n(f.commits, "commit")} and ${n(f.files, "file")}${f.areas.length ? `, including ${list(f.areas)}` : ""}.`;
+  return `${n(f.commits, "commit")} and ${n(f.files, "file")}${f.areas.length ? `, including ${list(f.areas)}` : ""}`;
+};
+
+// A Ship card's question (0.11.0): what the tap installs, from the config.yaml patches.
+export function shipQuestion(f: Facts | null): string {
+  const bumps = f ? bumpsOf(f.configs) : null;
+  if (!bumps) return "Ship it?";
+  if (!bumps.length) return "Ship it? No App version changes, so nothing installs.";
+  return `Ship ${bumps.map((b) => `${b.app} ${b.version}`).join(" and ")}?`;
+}
+
+// What a Ship card says about the checks, from the head's runs (null: they couldn't be read).
+export const CHECKS_PASSED = "Checks passed.";
+export const CHECKS_RUNNING = "Checks are still running; Ship lands it once they pass.";
+export const CHECKS_UNREAD = "Checks couldn't be read just now; Ship checks them before it lands.";
+
+// The link's line from GitHub (0.11.0): the pull request's title as GitHub has it (one line,
+// quoted, cut at 120 characters), how much it changes and the parts that matter most, then
+// the checks.
+export const TITLE_MAX = 120;
+export function githubLine(f: Facts, checks: string): string {
+  const t = String(f.title ?? "").replace(/\s+/g, " ").trim();
+  const title = t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 3).trimEnd()}...`;
+  return `From GitHub: ${title ? `"${title}", ` : ""}${changes(f)}. ${checks}`;
+}
+
+// A Ship card's words: the question with the card's label, Cain's line, then the link's
+// lines. His line gives way, so the link's are never cut off.
+function shipCard(top: string, own: string, rest: string[]): string {
+  const room = LIMIT - [top, ...rest].join("\n").length - 1;
+  const mine = own.trimEnd();
+  const cut = mine.length <= room ? mine : `${mine.slice(0, Math.max(0, room - 2)).trimEnd()} …`;
+  return [top, cut, ...rest].join("\n");
+}
+
+// His line, without the card's label in front ("P41: "): the label leads the question.
+function withoutLabel(text: string, label: string): string {
+  const t = String(text ?? "").trim();
+  if (!label || !t.toUpperCase().startsWith(label.toUpperCase()) || /[A-Za-z0-9]/.test(t.charAt(label.length))) return t;
+  return t.slice(label.length).replace(/^[\s:.,-]+/, "").trim();
 }
 
 // A promise's answer, or null once ms have passed.
@@ -562,14 +622,15 @@ export const SAID_MAX = 1000;
 // Why the gate held words back, for Cain: what to change, and the buttons this has. Each
 // reason is said once, after the excerpts it covers (an em dash's for all of them); when the
 // line would run past SAID_MAX, fewer excerpts, then none, so every reason fits whole.
-function heldLine(what: string, hits: Hit[], buttons?: readonly string[]): string {
+// cain: what his own rules found (../gate/cain.ts), with the review service's lines to offer.
+function heldLine(what: string, hits: Hit[], buttons?: readonly string[], cain: CainHit[] = [], published?: readonly Reviewed[] | null): string {
   const labels = [...new Set(hits.filter((h) => h.rule === "button" && h.label).map((h) => h.label!))];
   const named = labels.length ? [`${labels.map((l) => `"${l}"`).join(", ")} ${labels.length > 1 ? "aren't among" : "isn't one of"} its buttons`
     + ` (${buttons?.length ? buttons.join(", ") : "it has none"})`] : [];
   const worded = hits.filter((h) => !(h.rule === "button" && h.label));
   let line = "";
   for (const each of [3, 1, 0]) {
-    line = `The message gate held this ${what}: ${[...reasonParts(worded, each), ...named].join("; ")}. Rewrite it and send it again.`;
+    line = `The message gate held this ${what}: ${[...reasonParts(worded, each), ...cainReasons(cain, published, each), ...named].join("; ")}. Rewrite it and send it again.`;
     if (line.length <= SAID_MAX) break;
   }
   return line;
@@ -659,15 +720,28 @@ export class Link {
     catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
   }
   // Cain's words through the link: fixed, or refused with what to change. He's a writer the
-  // gate refuses, so every em dash of his is refused, none fixed.
-  private cainWords(point: string, what: string, text: string, ctx: Context): { text: string; fixed: Hit[] } {
+  // gate refuses, so every em dash of his is refused, none fixed. His own rules too
+  // (../gate/cain.ts): a Reviewed line only as the review service gave it (reviewed), and on
+  // a Ship card no checks or review claimed (shipWords).
+  private cainWords(point: string, what: string, text: string, ctx: Context,
+                    also: { reviewed?: boolean; shipWords?: boolean } = {}): { text: string; fixed: Hit[] } {
     const w = this.words(point, "cain", text, { ...ctx, refusable: true });
-    if (w.refused.length) {
-      this.report(point, "cain", w.hits, "refused");
-      throw new Refusal(heldLine(what, w.refused, ctx.buttons ?? undefined));
+    const cain: CainHit[] = [];
+    let published: Reviewed[] | null = null;
+    try {
+      if (also.shipWords) cain.push(...shipWordsHits(text));
+      if (also.reviewed && mentionsReviewed(text)) { published = this.published(); cain.push(...reviewedHits(text, published)); }
+    } catch (e) { this.log(`the gate's own rules for Cain failed on a ${point}: ${String(e).slice(0, 80)}`); }
+    if (w.refused.length || cain.length) {
+      this.report(point, "cain", [...w.hits, ...cain], "refused");
+      throw new Refusal(heldLine(what, w.refused, ctx.buttons ?? undefined, cain, published));
     }
     this.report(point, "cain", w.hits, "fixed");
     return w;
+  }
+  // The review service's lines now; null when they can't be read.
+  private published(): Reviewed[] | null {
+    try { return this.d.reviewed?.() ?? null; } catch { return null; }
   }
   // The link's own words, and the specialist's notes after a tap: fixed only.
   private ownWords(point: string, writer: Writer, text: string, message?: string): string {
@@ -705,7 +779,8 @@ export class Link {
     const id = (v: unknown) => (v === undefined || v === null || v === "" ? undefined : String(v).trim());
     const replyTo = id(a.replyTo), target = id(a.edit);
     for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
-    const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(), { tz: this.d.tz, now: this.d.now() });
+    const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(),
+      { tz: this.d.tz, now: this.d.now(), ...(mentionsReviewed(text) ? { reviewed: this.published() } : {}) });
     return { status: "ok", ...d };
   }
 
@@ -1178,7 +1253,7 @@ export class Link {
       && (m.item ?? "none") === meta.item && (m.posted ?? 0) > now - CONNECTOR_ONCE_MS);
     if (prior) return { status: "already told", message: prior[0],
       said: "He already has the notice about Home Assistant's connector; nothing more was posted. Check Home Assistant again at each cloud job check, and go ahead once it answers." };
-    const w = this.cainWords("connector", "notice", waits, { rules: AT.cain, buttons: [CONNECTOR_LABEL], known: this.liveLabels() });
+    const w = this.cainWords("connector", "notice", waits, { rules: AT.cain, buttons: [CONNECTOR_LABEL], known: this.liveLabels() }, { reviewed: true });
     const text = withLabel(`${w.text} waits until Claude can reach Home Assistant again: its connector needs you to sign in again. `
       + "Open Claude's connector settings and reconnect Home Assistant there. It goes ahead by itself once Home Assistant answers.",
       labelOf(meta.item));
@@ -1205,8 +1280,8 @@ export class Link {
     if (!raw.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
     noMachineText(String(a.text), ...raw);
     // The gate, before the nonce is made: the same words always make the same card.
-    const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }));
-    const w = this.cainWords("ask", "ask", String(a.text), { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() });
+    const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }));
+    const w = this.cainWords("ask", "ask", String(a.text), { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
     const options = opts.map((o) => o.text);
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
     const text = withLabel(w.text, labelOf(meta.item, meta.question));   // "P08 Q2: ..."
@@ -1249,8 +1324,9 @@ export class Link {
 
   // A Ship card: Ship / Not now, for one pull request at one head. Doesn't wait its
   // turn; lasts as long as an ask, and goes when the head moves or the pull request
-  // is merged or closed.
-  async ship(a: { text: string; item?: unknown; pr?: unknown; head?: unknown; replyTo?: unknown }): Promise<AskResult> {
+  // is merged or closed. Cain's words say what Dane will notice; the link builds the rest
+  // (shipText), from GitHub and from the review he names (review: its id, or none).
+  async ship(a: { text: string; item?: unknown; pr?: unknown; head?: unknown; review?: unknown; replyTo?: unknown }): Promise<AskResult> {
     const meta = checkMeta({ item: a.item, replyTo: a.replyTo });
     const pr = String(a.pr ?? "").trim();
     const head = String(a.head ?? "").trim().toLowerCase();
@@ -1258,26 +1334,19 @@ export class Link {
     if (!m) throw new Refusal("pr must be the pull request's address: https://github.com/<owner>/<repo>/pull/<number>");
     if (!SHIP_REPOS.has(`${m[1]}/${m[2]}`.toLowerCase())) throw new Refusal("Ship cards are only for pull requests in HyndeSyte/harness");
     if (!SHA.test(head)) throw new Refusal("head must be the pull request's full 40-character head sha");
+    const review = a.review === undefined || a.review === null || String(a.review).trim() === "" ? null : String(a.review).trim();
+    if (review !== null && !safeId(review)) throw new Refusal("review must be a review's id, as review.sh submit printed it");
     if (!String(a.text ?? "").trim()) throw new Refusal("a Ship card needs its words");
     const stop = this.stopped();
     if (stop.stopped)
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(String(a.text));
     this.mayAsk(meta.item);
-    const w = this.cainWords("ship", "Ship card", String(a.text), { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() });
-    // A line of the link's own, from GitHub: what the tap would land, whatever the
-    // card's words say.
-    let words = w.text;
-    if (this.d.facts) {
-      const f = await within(this.d.facts(pr).catch(() => null), this.d.factsMs ?? FACTS_MS);
-      if (f?.head && f.head !== head)
-        throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
-      // Cain's words give way, so the line is never cut off.
-      const line = this.ownWords("ship facts", "link", factsLine(f)), room = LIMIT - line.length - 40;
-      const own = words.trimEnd();
-      words = `${own.length <= room ? own : own.slice(0, room - 2).trimEnd() + " …"}\n${line}`;
-    }
-    const text = withLabel(words, labelOf(meta.item));
+    const w = this.cainWords("ship", "Ship card", String(a.text), { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
+      { shipWords: true });
+    // Without GitHub to read (only the tests' rig has none), the card is his words alone.
+    const built = this.d.facts ? await this.shipText(meta, pr, head, review, w.text) : { text: withLabel(w.text, labelOf(meta.item)), own: undefined };
+    const text = built.text;
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
@@ -1285,11 +1354,68 @@ export class Link {
     const now = this.d.now();
     const s = this.d.load();
     this.remember(s, msg, { kind: "ship", item: meta.item, question: `ship:${m[3]}`, posted: now, expires: this.askExpiry(now),
-      ship: { pr, head }, buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
+      ship: { pr, head }, ...(built.own !== undefined ? { own: built.own } : {}), buttons: true, labels: [...options],
+      q: { q: excerpt(text), options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
     return { status: "posted", message: String(msg.id), ...(w.fixed.length ? { said: `Posted. ${fixedSaid(w.fixed)}` } : {}) };
+  }
+
+  // The Ship card's words, built by the link (0.11.0):
+  //   P64: Ship Cain 0.11.0?
+  //   <Cain's line: what Dane will notice>
+  //   From GitHub: "<title>", 4 commits and 12 files, including Cain's link. Checks passed.
+  //   Reviewed: OpenAI, approve with changes; Gemini, approve.
+  // The review service's lines are read first (they're on the Pi); then GitHub is asked for
+  // the pull request, the head's check runs and (with a review) the head commit's time, all
+  // at once and within FACTS_MS, and a part that doesn't come says so. Refused: no line for
+  // that review, its lines unreadable, a newer head on GitHub, a check that failed or hasn't
+  // run, a review that finished before the head commit. Anything else going wrong while the
+  // new lines are built gives the card as it was before: "Ship it?", his line and the line
+  // from GitHub as it was. Never no card.
+  private async shipText(meta: Meta, pr: string, head: string, review: string | null, words: string): Promise<{ text: string; own: string }> {
+    const label = labelOf(meta.item);
+    const top = (q: string) => (label ? `${label}: ${q}` : q);
+    const own = withoutLabel(words, label);
+    if (!own) throw new Refusal("a Ship card needs a line saying what he'll notice");
+    let rev: Reviewed | null = null;
+    if (review !== null) {
+      const list = this.published();
+      if (!list) throw new Refusal("reviews can't be read right now: try again in a minute, or leave --review out");
+      rev = list.find((x) => x.id === review && x.line) ?? null;
+      if (!rev) throw new Refusal(`review ${review} isn't finished, or has no answers: show the card once it's done, or leave --review out`);
+    }
+    const wait = this.d.factsMs ?? FACTS_MS;
+    const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
+      (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
+    const { facts, checkRuns, headTime } = this.d;
+    const [f, runs, made] = await Promise.all([
+      ask(() => facts!(pr)),
+      ask(checkRuns && (() => checkRuns(pr, head))),
+      ask(rev && headTime ? () => headTime(pr, head) : undefined),
+    ]);
+    if (f?.head && f.head !== head)
+      throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    try {
+      const checks = Array.isArray(runs) ? judgeChecks(runs) : null;
+      const failed = checks?.find((c) => c.state === "failed");
+      if (failed) throw new Refusal(`its ${failed.name} check didn't pass (${failed.conclusion}): fix it through Build first, then show a new Ship card`);
+      const notRun = checks?.find((c) => c.state === "missing");
+      if (notRun) throw new Refusal(`CI hasn't run ${notRun.name} on it yet: show the card once its checks have run`);
+      if (rev && made !== null && !(Date.parse(rev.finished_at) >= made))
+        throw new Refusal(`review ${rev.id} finished before the pull request's newest commit: get a review of the head as it is now`);
+      const said = !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
+      const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
+      const reviewed = rev ? `${rev.line}${made === null ? " Not checked against the newest commit." : ""}` : "No outside review.";
+      return { text: shipCard(top(shipQuestion(f)), own, [github, reviewed]), own };
+    } catch (e) {
+      if (e instanceof Refusal) throw e;
+      this.log(`couldn't build a Ship card's new lines, so it goes as it was: ${reason(e)}`);
+      let line: string;
+      try { line = factsLine(f); } catch { line = factsLine(null); }
+      return { text: shipCard(top("Ship it?"), own, [this.ownWords("ship facts", "link", line)]), own };
+    }
   }
 
   // The one morning message, with Stop. Its Stop moves to the newest morning message.
@@ -1301,7 +1427,7 @@ export class Link {
     noMachineText(String(text));
     // While stopped, its button is the one that undoes it.
     const toggle: [string, string] = this.stopped().stopped ? ["Turn back on", RESUME] : ["Stop", STOP];
-    const w = this.cainWords("morning", "morning message", String(text), { rules: AT.cain, buttons: [toggle[0]], known: this.liveLabels() });
+    const w = this.cainWords("morning", "morning message", String(text), { rules: AT.cain, buttons: [toggle[0]], known: this.liveLabels() }, { reviewed: true });
     const msg = await this.postCard(w.text, rows([[toggle]], "q:"), { nonce: stableNonce("morning", w.text, toggle[1]) });
     const s = this.d.load();
     this.remember(s, msg, { kind: "morning", item: "none", question: "morning", posted: this.d.now(), expires: null, buttons: true,
@@ -2261,15 +2387,20 @@ export class Link {
     const byWriter: Record<string, number> = { cain: 0, specialist: 0, link: 0, unknown: 0 };
     const skipped: Record<string, number> = { his: 0, permission_prompts: 0, others: 0 };
     const empty = (): Record<string, number> => ({ fix: 0, refuse: 0, unsure: 0, kept: 0 });
-    const byRule: Tally = Object.fromEntries(RULES.map((r) => [r, empty()]));
+    // The shared rules, and (0.11.0) the reviewed rule on Cain's own words (../gate/cain.ts).
+    const rules = [...RULES, "reviewed"];
+    const byRule: Tally = Object.fromEntries(rules.map((r) => [r, empty()]));
     const perWriter: Record<string, Tally> = {};
     const list: ReplayReport["list"] = [];
+    let published: Reviewed[] | null | undefined;              // read once, when a Reviewed line first needs it
     const judge = (message: string, at: number, writer: string, text: string, ctx: Context) => {
-      for (const h of gateCheck(text, ctx).hits) {
+      const hits: { rule: string; result: string; around: string; label?: string; kept?: string }[] = [...gateCheck(text, ctx).hits];
+      if (ctx.refusable && mentionsReviewed(text)) hits.push(...reviewedHits(text, published === undefined ? (published = this.published()) : published));
+      for (const h of hits) {
         list.push({ at, message, writer, rule: h.rule, result: h.result, around: h.around, ...(h.label ? { label: h.label } : {}), ...(h.kept ? { kept: h.kept } : {}) });
         const did = h.kept ? "kept" : h.result;     // a dash kept as it is, flagged, is never refused
         byRule[h.rule][did]++;
-        const w = perWriter[writer] ??= Object.fromEntries(RULES.map((r) => [r, empty()]));
+        const w = perWriter[writer] ??= Object.fromEntries(rules.map((r) => [r, empty()]));
         w[h.rule][did]++;
       }
     };
@@ -2298,8 +2429,11 @@ export class Link {
           const [words, linkLine] = splitLinkLine(card?.text ?? content);
           judge(id, at, writer, words, { rules: AT.card, buttons: own, known: allLabels });
           if (linkLine) judge(id, at, "link", linkLine, { rules: AT.link });
-        } else if (writer === "cain") judge(id, at, writer, rec.shipping?.text ?? content, { rules: AT.cain, buttons: own, known: allLabels, refusable: true });
-        else judge(id, at, writer, content, { rules: AT.link });
+        } else if (writer === "cain") {
+          // On a Ship card the link built (0.11.0), only his line is his words: the rest is the link's.
+          const words = rec.kind === "ship" && rec.own !== undefined ? rec.own : rec.shipping?.text ?? content;
+          judge(id, at, writer, words, { rules: AT.cain, buttons: own, known: allLabels, refusable: true });
+        } else judge(id, at, writer, content, { rules: AT.link });
         continue;
       }
       const raw = String(m.content ?? "");

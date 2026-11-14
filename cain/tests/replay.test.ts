@@ -335,7 +335,7 @@ describe("the replay", () => {
     expect(line).toEndWith("Nothing to tell him.");
     for (const h of rep.list) expect(h.around.length).toBeLessThanOrEqual(60);
     expect(Object.keys(rep)).toEqual(["written_at", "rules_version", "range", "messages", "hits", "list", "edited"]);
-    expect(rep.rules_version).toBe(2);
+    expect(rep.rules_version).toBe(3);
   });
 
   test("keyed and on this machine only", () => {
@@ -382,9 +382,9 @@ describe("the replay after the rules were tuned (0.10.0)", () => {
     r.link.replay(30, "rules");
     await done(r);
     expect(r.link.replayDue()).toBe(false);
-    expect(r.state().replayedRules).toBe(2);
+    expect(r.state().replayedRules).toBe(3);
     const line = r.relayed.at(-1)!;
-    expect(line).toContain("The message gate's rules changed (version 2)");
+    expect(line).toContain("The message gate's rules changed (version 3)");
     expect(line).toContain("/opt/cain/keeper.sh selftest");
     expect(line).toContain("/opt/cain/keeper.sh check --reply-to");
     expect(line).toContain(`/opt/cain/keeper.sh card on Discord message ${notice}, which carries Stop now`);
@@ -407,6 +407,27 @@ describe("the replay after the rules were tuned (0.10.0)", () => {
     await done(r);
     expect(r.relayed.at(-1)).toContain("check it end to end");
     expect(r.link.replayDue()).toBe(false);
+  });
+});
+
+describe("the replay with Cain's own rules (0.11.0)", () => {
+  test("a Reviewed line of his is judged against the service's lines; on a Ship card the link built, only his own line is his", async () => {
+    const r = rig({ facts: true });
+    r.reviews.list = [{ id: "2026-11-11-a", line: "Reviewed: Gemini, approve.", finished_at: "2026-11-11T12:00:00.000Z" }];
+    r.github.facts = { head: SHA1, commits: 1, files: 1, areas: [], title: "Harness 0.22.0 — the digest says less", configs: [] };
+    const ship = (await r.link.ship({ text: "The digest says less.", item: "P09", pr: PR, head: SHA1 }) as any).message;
+    expect(r.msg(ship).content).toContain("Harness 0.22.0 — the digest says less");   // the link's own words keep that dash
+    const good = botMessage(r, "Done. Reviewed: Gemini, approve.");
+    const made = botMessage(r, "Done. Reviewed: OpenAI, approve.");
+    for (const id of [good, made]) r.sent.ids.add(id);
+    r.link.replay(14);
+    const rep = await done(r);
+    const hits = (id: string) => rep.list.filter((h: any) => h.message === id);
+    expect(hits(good)).toEqual([]);
+    expect(hits(made)).toMatchObject([{ writer: "cain", rule: "reviewed", result: "refuse", around: "Reviewed: OpenAI, approve." }]);
+    expect(hits(ship)).toEqual([]);
+    expect(rep.hits.by_rule.reviewed).toEqual({ fix: 0, refuse: 1, unsure: 0, kept: 0 });
+    expect(rep.hits.by_writer.cain.reviewed).toEqual({ fix: 0, refuse: 1, unsure: 0, kept: 0 });
   });
 });
 

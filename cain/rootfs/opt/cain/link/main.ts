@@ -15,7 +15,8 @@
 //     POST /show {id, item, question?, reply_to?}            show a specialist's card ("posted"; "already out":
 //                                                            it only files it under his item; "expired": nothing)
 //     POST /ask {text, options, item, question?, reply_to?}  ask with buttons, one open at a time
-//     POST /ship {text, item, pr, head, reply_to?}           a Ship card for one pull request head
+//     POST /ship {text, item, pr, head, review?, reply_to?}  a Ship card for one pull request head: the link builds it
+//                                                            from GitHub and the review service's line for that review
 //     POST /answered {item, question?}  he answered an open ask in words
 //     POST /replied {m}                 what a message of his replied to
 //     POST /morning {text}              the one morning message, with Stop
@@ -45,13 +46,14 @@
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { facts, inMain, land, type MergeDeps } from "./merge";
+import { checkRuns, commitTime, facts, inMain, land, type MergeDeps } from "./merge";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
@@ -196,6 +198,11 @@ const link = new Link({
   } : undefined,
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr) : null; },
+  // A Ship card reads the head's checks as the landing does (merge.ts), and its commit's time
+  // for the review it names; and the review service's lines (/data/trust/reviewed.json).
+  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? checkRuns(github, p.repo, head) : null; },
+  headTime: async (pr, head) => { const p = pullOf(pr); return p ? commitTime(github, p.repo, head) : null; },
+  reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
@@ -288,7 +295,7 @@ Bun.serve({
         case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
         case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
           item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, replyTo: b.reply_to }));
+        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to }));
         case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
         case "/replied": return json(await link.replied(b.m));
         case "/look": return json(await link.look(b.m));

@@ -11,7 +11,7 @@ const ready = !!Bun.which("bash") && !!Bun.which("jq") && !!Bun.which("curl");
 const TOKEN = "not-a-real-token.for-the-keeper-test";
 
 describe("keeper.sh against a fake link", () => {
-  test.skipIf(!ready)("card, check, replay and connector reach /look, /check, /replay and /connector, keyed", async () => {
+  test.skipIf(!ready)("card, check, replay, connector and ship reach /look, /check, /replay, /connector and /ship, keyed", async () => {
     const dir = mkdtempSync(join(tmpdir(), "keeper-"));
     writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
     writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
@@ -39,6 +39,10 @@ describe("keeper.sh against a fake link", () => {
       await keeper("replay", "30");
       await keeper("connector", "--item", "P41", "Installing Harness 0.22.0");
       await keeper("show", "17", "--item", "none");
+      // The Ship card (0.11.0): --review goes through to /ship; left out, there's none.
+      const pr = "https://github.com/HyndeSyte/harness/pull/64", head = "a".repeat(40);
+      await keeper("ship", "--item", "P64", "--pr", pr, "--head", head, "--review", "2026-11-14-ship-cards", "Stop stays in reach.");
+      await keeper("ship", "--item", "P64", "--pr", pr, "--head", head, "Stop stays in reach.");
       expect(seen).toEqual([
         { path: "/look", keyed: true, body: { m: "1234567890123456789" } },
         { path: "/check", keyed: true, body: { text: "Tap Undo if it's wrong.", reply_to: "1234567890123456789" } },
@@ -47,7 +51,10 @@ describe("keeper.sh against a fake link", () => {
         { path: "/replay", keyed: true, body: { days: 30 } },
         { path: "/connector", keyed: true, body: { item: "P41", text: "Installing Harness 0.22.0" } },
         { path: "/show", keyed: true, body: { item: "none", id: 17 } },
+        { path: "/ship", keyed: true, body: { item: "P64", text: "Stop stays in reach.", pr, head, review: "2026-11-14-ship-cards" } },
+        { path: "/ship", keyed: true, body: { item: "P64", text: "Stop stays in reach.", pr, head } },
       ]);
+      expect(await keeper("ship", "--item", "P64", "--review")).toMatchObject({ code: 2 });   // a flag needs its value
       expect(await keeper("check", "--edit")).toMatchObject({ code: 2 }); // a flag needs its value
     } finally { server.stop(true); }
   }, 30_000);
@@ -67,5 +74,13 @@ describe("keeper.sh against a fake link", () => {
     expect(text).toContain('link="${CAIN_LINK:-http://127.0.0.1:8097}"');
     expect(text).toContain('card) url="$link/look"; ctx=harness-relay-v1 ;;');
     expect(text).toContain('dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"');
+  });
+
+  test("ship takes --review and sends it as review, only when given (read here too, for where jq is missing)", async () => {
+    const text = (await Bun.file(KEEPER).text()).replace(/\r\n/g, "\n");
+    expect(text).toContain("--item|--question|--reply-to|--pr|--head|--edit|--review)");
+    expect(text).toContain('--review) review="$2" ;;');
+    expect(text).toMatch(/ship\)\s+body=\$\(jq -nc [^\n]*--arg v "\$review" \\\n\s+"\$meta"' \+ \{text: \$t, pr: \$p, head: \$h\} \+ opt\("review"; \$v\)'\) ;;/);
+    expect(text).toContain("keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>]");
   });
 });
