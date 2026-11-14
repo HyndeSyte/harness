@@ -171,6 +171,18 @@ describe("moving it safely", () => {
     expect(holder(r)).toBe(reply);
   });
 
+  test("an outcome edit that keeps failing holds moves up for 10 minutes at most", async () => {
+    const r = rig();
+    const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
+    r.failing.add(`PATCH /channels/${DM}/messages/${ask}`);
+    await r.link.answered({ item: "P08", question: "Q2" });            // its strip keeps failing
+    const reply = await cainSays(r, "Noted.");
+    expect(holder(r)).toBeUndefined();
+    r.later(11 * MIN);
+    await r.link.sweep();
+    expect(holder(r)).toBe(reply);
+  });
+
   test("an edit that makes its message ask something moves it; a plain text edit leaves it alone", async () => {
     const r = rig();
     await replies(r, 4);

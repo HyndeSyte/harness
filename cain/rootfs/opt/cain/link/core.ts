@@ -1656,12 +1656,18 @@ export class Link {
     await this.strip(id);
   }
 
+  private pendingSince = new Map<string, number>();   // outcome edits waiting, by message: since when (this run)
   private async placeStop(): Promise<void> {
     if (!this.d.stop) return;                                  // no Stop state to follow
-    if (this.d.now() - this.limitedAt < QUIET_MS) return;      // Discord rate-limited the link just now
+    const now = this.d.now();
+    if (now - this.limitedAt < QUIET_MS) return;               // Discord rate-limited the link just now
     const s = this.d.load();
-    // A card's outcome edit goes first; the moving Stop's own strips are part of a move.
-    if (Object.values(s.messages).some((m) => m.buttons && m.outcome && m.why !== MOVED && m.why !== REPOSTED)) return;
+    // A card's outcome edit goes first; the moving Stop's own strips are part of a move. One
+    // that has failed for 10 minutes stops holding moves up (the sweep keeps trying it).
+    const pending = Object.entries(s.messages).filter(([, m]) => m.buttons && m.outcome && m.why !== MOVED && m.why !== REPOSTED).map(([id]) => id);
+    for (const id of [...this.pendingSince.keys()]) if (!pending.includes(id)) this.pendingSince.delete(id);
+    for (const id of pending) if (!this.pendingSince.has(id)) this.pendingSince.set(id, now);
+    if (pending.some((id) => now - this.pendingSince.get(id)! < 10 * 60_000)) return;
     const holder = s.stopAt && this.carries(s, s.stopAt, "Stop") ? s.stopAt : null;
     const st = this.stopped();
     if (st.stopped) {
