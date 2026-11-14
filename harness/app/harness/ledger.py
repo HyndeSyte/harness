@@ -420,8 +420,10 @@ class Ledger:
                                   ("good", "INTEGER NOT NULL DEFAULT 0")),
             # 0.19.6: the street address written on a block, so his own edit to it still shows.
             # 0.23.0: whether a block Google said it wrote, but that never existed, was written
-            # once more (family_gmail.py).
-            "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"), ("rewritten", "INTEGER NOT NULL DEFAULT 0")),
+            # once more, and whether a read ever found it there, so a later "never had" is his
+            # removal, not a write to make again (family_gmail.py).
+            "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"), ("rewritten", "INTEGER NOT NULL DEFAULT 0"),
+                             ("seen", "INTEGER NOT NULL DEFAULT 0")),
             # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
             # who sent it, the address found, the one written, and whether it was written busy.
             # 0.22.0: what a read must still find before it's told ("added" or "moved", then

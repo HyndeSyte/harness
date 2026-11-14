@@ -15,9 +15,10 @@ The mirror image of family_copy.py, and it keeps the same safety:
     good, and one someone removed, with its Family event still there, stays removed.
   * Nothing is removed, or taken as removed, on one read. It takes two good reads in a
     row, and more than a few at once is held back for a while as a sign the read is wrong.
-  * Only a block Google answers as deleted is taken as his removal. One Google has nothing by
-    that id for (it answered the write "ok", but it never existed) is a write that didn't land:
-    written once more, its receipt still waiting for the read that finds it (google_cal.gone_how).
+  * Only a block Google answers as deleted, or one a read found there once that Google later has
+    nothing for (it drops a deleted event in time), is taken as his removal. One Google answered
+    "ok" to but never had, and no read ever found, is a write that didn't land: written once more,
+    its receipt still waiting for the read that finds it (google_cal.gone_how).
   * If Family or Google can't be read, nothing happens.
 
 School days work the same way, from the `family_school` option, which names the Family
@@ -754,6 +755,8 @@ class FamilyGmail:
             if block is None:
                 absent.append((row, want))
                 continue
+            if not row["seen"]:                # there once: Google having nothing for it later is his removal
+                self._update(row, seen=1)
             if not block.plain:
                 self._set(row, "hands_off")    # someone added to it: theirs now
                 continue
@@ -798,7 +801,8 @@ class FamilyGmail:
         problem = self._cancel(address, gone, thin) or problem or failed
         if held and not problem:
             problem = (f"Blocks on Gmail from Family: {held} look cancelled, but part of Family "
-                       "couldn't be read, so I left them. Delete any that are wrong.")
+                       "couldn't be read, so I left them for now. They come off once Family reads in "
+                       "full and still doesn't have them.")
         if waiting and not problem:
             problem = self._capped(waiting)
         return problem
@@ -849,10 +853,12 @@ class FamilyGmail:
                            "what's on Gmail, so I changed nothing. I'll try again.")
             elif want is None:
                 self._set(row, "cancelled")    # gone on both sides: nothing to learn
-            elif how == "never":
-                # Google has nothing by that id: a write it answered "ok" never landed. That's no
-                # answer of his, so it's written once more, and its receipt waits for the read
-                # that finds it (meaning_live.read_back). A deleted block is answered "cancelled".
+            elif how == "never" and not row["seen"]:
+                # Google has nothing by that id, and no read ever found it: a write it answered
+                # "ok" never landed. That's no answer of his, so it's written once more, and its
+                # receipt waits for the read that finds it (meaning_live.read_back). A deleted
+                # block is answered "cancelled", and in time not at all: one a read found there
+                # once is his removal, below, and never written again.
                 problem = self._write_again(address, row, want) or problem
             else:
                 self._set(row, "removed")      # taken as his answer, and not put back
@@ -1056,7 +1062,7 @@ class FamilyGmail:
                 " ON CONFLICT(key) DO UPDATE SET event_id=excluded.event_id,"
                 " generation=excluded.generation, intent='', title=excluded.title,"
                 " start=excluded.start, end=excluded.end, state=excluded.state, missing=0,"
-                " updated_at=excluded.updated_at, place=excluded.place, rewritten=0",
+                " updated_at=excluded.updated_at, place=excluded.place, rewritten=0, seen=0",
                 (want.key, uid, generation, want.title, want.start.isoformat(),
                  want.end.isoformat(), state, now, now, want.place))
 

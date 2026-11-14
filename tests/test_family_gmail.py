@@ -1069,6 +1069,24 @@ def test_a_block_google_never_had_is_written_once_more_not_taken_as_his_answer(g
     assert len(g.google.writes()) == n + 1 and not problem(g)
 
 
+def test_a_block_read_there_once_that_google_later_never_had_is_his_removal(g):
+    """Google drops a deleted event in time, and then answers it as never had. A block a read
+    found there once is his removal then, and never written again."""
+    sit(g)
+    go(g)
+    uid = only(g)["id"]
+    go(g)                                      # read there: seen
+    assert g.ledger.db.execute("SELECT seen FROM family_gmail").fetchone()["seen"] == 1
+    del g.google.events[uid]                   # deleted, and gone from Google by now
+    n = len(g.google.writes())
+    for _ in range(4):
+        go(g)
+    assert g.google.live() == {} and len(g.google.writes()) == n
+    row = g.ledger.db.execute("SELECT state, rewritten FROM family_gmail").fetchone()
+    assert (row["state"], row["rewritten"]) == ("removed", 0)
+    assert count(g, "family_gmail_removed") == 1 and count(g, "family_gmail_rewritten") == 0
+
+
 def test_a_block_google_never_has_twice_is_said_and_not_tried_a_third_time(g):
     sit(g)
     go(g)
