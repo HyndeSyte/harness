@@ -15,11 +15,23 @@ import { parseRequest, plan, parseHolds, changedRows, noteRows, notesPath, HOLDS
 
 export type Clone = { dir: string; remote: string; branch: string; ref: string };
 
+// What git exports to the hooks it runs, naming the repository being pushed from. From a
+// linked worktree they're absolute paths, so a git -C <record clone> would act on the
+// harness repository instead of the record. Dropped here; an explicit env (send's own
+// index) still applies.
+const REPO_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"];
+
+export function gitEnv(extra: Record<string, string> = {}, from: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...from };
+  for (const k of REPO_ENV) delete env[k];
+  return { ...env, ...extra };
+}
+
 export function git(dir: string, args: string[], o: { input?: string; env?: Record<string, string> } = {}): string | null {
   try {
     return execFileSync("git", ["-C", dir, ...args], {
       encoding: "utf8", maxBuffer: 64 << 20, input: o.input,
-      env: o.env ? { ...process.env, ...o.env } : process.env,
+      env: gitEnv(o.env),
       stdio: [o.input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
     });
   } catch { return null; }

@@ -247,4 +247,29 @@ describe("the pre-push hook", () => {
     expect(push(copy.work, "claude/link-cards", [], env2).stderr.toString()).toContain("push refused: claude/link-cards");
     expect(push(copy.work, "claude/record-holds", [], env2).exitCode).toBe(0);
   }, 90_000);
+
+  test("from a linked worktree it reads the record, not the repository it's pushed from", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
+    cycle(l.cfg);
+    const origin = join(l.root, "harness.git"), main = join(l.root, "harness"), linked = join(l.root, "harness-linked");
+    sh(["git", "init", "--quiet", "--bare", "-b", "main", origin], l.root);
+    sh(["git", "clone", "--quiet", origin, main], l.root);
+    writeFileSync(join(main, "README.md"), "x\n");
+    sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], main);
+    sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "x"], main);
+    sh(["git", "worktree", "add", "--quiet", "-b", "side", linked], main);
+    // git hands its hooks GIT_DIR and the like; from a linked worktree they're absolute
+    // paths into the harness repository, which a git -C <record clone> would follow.
+    const env = cleanEnv({ CLAUDE_CODE_SESSION_ID: SA, RECORD_CLONE: l.clone, RECORD_GUARDED_REMOTE: "harness\\.git$" });
+    const push = (branch: string) => Bun.spawnSync(["git", "-c", `core.hooksPath=${TOOLS}`, "push", "--quiet", "origin", `HEAD:refs/heads/${branch}`],
+      { cwd: linked, stdout: "pipe", stderr: "pipe", env });
+    const held = push("claude/record-holds");
+    expect(held.stderr.toString()).not.toContain("push refused");
+    expect(held.exitCode).toBe(0);
+    expect(sh(["git", "branch", "--list"], origin)).toContain("claude/record-holds");
+    const other = push("claude/link-cards");
+    expect(other.exitCode).not.toBe(0);
+    expect(other.stderr.toString()).toContain("push refused: claude/link-cards isn't in any hold of this session");
+  }, 90_000);
 });
