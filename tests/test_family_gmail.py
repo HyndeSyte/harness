@@ -1087,6 +1087,36 @@ def test_a_block_read_there_once_that_google_later_never_had_is_his_removal(g):
     assert count(g, "family_gmail_removed") == 1 and count(g, "family_gmail_rewritten") == 0
 
 
+def test_a_block_kept_from_before_0_23_0_counts_as_read_there_once(g):
+    """An earlier version wrote and kept its blocks, and retired ones gone missing: as 0.23.0 first
+    opens the file, each counts as found there, so Google later having nothing for it is his
+    removal, never a write again. A block written since is unseen until a read finds it, and
+    opening the file again changes neither."""
+    from harness.ledger import Ledger
+    sit(g)
+    go(g)
+    old = only(g)["id"]
+    with g.ledger.tx() as db:                  # the file as 0.22 left it: neither column yet
+        db.execute("ALTER TABLE family_gmail DROP COLUMN seen")
+        db.execute("ALTER TABLE family_gmail DROP COLUMN rewritten")
+    Ledger(g.ledger.path, clock=g.clock).close()  # 0.23.0 opens it
+
+    def seen():
+        return dict(g.ledger.db.execute("SELECT event_id, seen FROM family_gmail").fetchall())
+    assert seen() == {old: 1}
+    sit(g, days=4, hour=13)
+    go(g)                                      # a block written since
+    assert seen()[old] == 1 and sorted(seen().values()) == [0, 1]
+    Ledger(g.ledger.path, clock=g.clock).close()  # and the file opened again
+    assert seen()[old] == 1 and sorted(seen().values()) == [0, 1]
+    del g.google.events[old]                   # deleted, and gone from Google by now
+    n = len(g.google.writes())
+    for _ in range(4):
+        go(g)
+    assert old not in g.google.events and len(g.google.writes()) == n
+    assert g.ledger.db.execute("SELECT state FROM family_gmail WHERE event_id=?", (old,)).fetchone()[0] == "removed"
+
+
 def test_a_block_google_never_has_twice_is_said_and_not_tried_a_third_time(g):
     sit(g)
     go(g)

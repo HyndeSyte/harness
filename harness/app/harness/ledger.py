@@ -421,7 +421,8 @@ class Ledger:
             # 0.19.6: the street address written on a block, so his own edit to it still shows.
             # 0.23.0: whether a block Google said it wrote, but that never existed, was written
             # once more, and whether a read ever found it there, so a later "never had" is his
-            # removal, not a write to make again (family_gmail.py).
+            # removal, not a write to make again (family_gmail.py). Each block kept from before
+            # counts as found there (below); each new one is written unseen.
             "family_gmail": (("place", "TEXT NOT NULL DEFAULT ''"), ("rewritten", "INTEGER NOT NULL DEFAULT 0"),
                              ("seen", "INTEGER NOT NULL DEFAULT 0")),
             # 0.21.0: a timed appointment from his mail is busy, at the address an email gave:
@@ -454,6 +455,7 @@ class Ledger:
             "calendar_changes": (("settle_json", "TEXT NOT NULL DEFAULT ''"),)}
         with self.tx() as db:              # all or nothing: a stop halfway leaves the file as it was
             unread = "reads" not in {r[1] for r in db.execute("PRAGMA table_info(meaning_receipts)")}
+            unseen = "seen" not in {r[1] for r in db.execute("PRAGMA table_info(family_gmail)")}
             for table, cols in added.items():
                 have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
                 for name, decl in cols:
@@ -463,6 +465,11 @@ class Ledger:
                 # Once, as 0.22.0 first opens the file: a receipt still waiting to go out was never
                 # read back, so it waits for a read like any new one, and nothing goes out unread.
                 db.execute("UPDATE meaning_receipts SET state='written' WHERE state='new'")
+            if unseen:
+                # Once, as 0.23.0 first opens the file: a block an earlier version kept was written
+                # and kept by versions that retired blocks gone missing, so each counts as found
+                # there, and Google later having nothing for it is his removal, never a write again.
+                db.execute("UPDATE family_gmail SET seen=1")
 
     def _rules_need_a_tap(self) -> None:
         """Once, on the first open by 0.5.1 or later: rules stored before his tap existed

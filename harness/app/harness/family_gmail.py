@@ -1058,7 +1058,8 @@ class FamilyGmail:
         with self.ledger.tx() as db:
             db.execute(
                 "INSERT INTO family_gmail(key, event_id, generation, intent, title, start, end,"
-                " state, missing, created_at, updated_at, place) VALUES(?,?,?,'',?,?,?,?,0,?,?,?)"
+                " state, missing, created_at, updated_at, place, rewritten, seen)"
+                " VALUES(?,?,?,'',?,?,?,?,0,?,?,?,0,0)"
                 " ON CONFLICT(key) DO UPDATE SET event_id=excluded.event_id,"
                 " generation=excluded.generation, intent='', title=excluded.title,"
                 " start=excluded.start, end=excluded.end, state=excluded.state, missing=0,"
