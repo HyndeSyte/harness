@@ -1765,7 +1765,7 @@ class CalendarChange:
         def run() -> dict:
             # A fixed address, written only where nothing is (If-None-Match), so a second try can
             # never make a second event.
-            entry = {"cal": "family", "how": "delete", "href": href, "after": ics, "etag": "",
+            entry = {"cal": "family", "how": "delete", "href": href, "after": ics, "sent": ics, "etag": "",
                      "check": {"kind": "there"}}
             self._attempt(entry)
             out = self.client.put_new(href, ics)
@@ -1940,7 +1940,9 @@ class CalendarChange:
     # until a read says whose change it is. A part half done is finished the same way, or else
     # put back through Undo's own checks, and a put-back nobody answered is read before any
     # receipt. Someone else's change is never written over. Adds have fixed ids, so a second try
-    # finds the first instead of making another. Nothing here runs while stopped.
+    # finds the first instead of making another. A read that finds a write landed hands Undo its
+    # version only when it reads as what was written, so an edit made before that read is never
+    # Undo's to put back over. Nothing here runs while stopped.
     @staticmethod
     def _due(state: dict, now: datetime) -> bool:
         return read_due(state, now)
@@ -2002,14 +2004,21 @@ class CalendarChange:
         self._settled(row, p, plan)
 
     def _landed_by_read(self, pid: str, plan: dict, rec: dict, read: dict) -> None:
-        """A write a read found landed: the event as that read found it is kept, so Undo knows it as
-        its own however the server rewrote it, and its records are kept true and its Undo recorded,
-        once, in the same transaction as the outcome."""
+        """A write a read found landed: its records are kept true and its Undo recorded, once, in the
+        same transaction as the outcome, with what Undo clears again (the days it took off, the copy
+        and block records it changed), as the usual path keeps them (_run_step). The event as that
+        read found it becomes Undo's own only when it reads as what was written, however the server
+        rewrote it (_reads_as_written). One changed since keeps what the entry had, so Undo says it
+        was changed since and leaves it."""
         entry = rec["entry"]
-        if read.get("etag"):
-            entry["etag"] = read["etag"]
-        if entry.get("cal") == "family" and entry.get("how") in ("put", "delete") and read.get("body"):
-            entry["after"] = read["body"]
+        entry["removed"] = [list(x[:3]) for x in rec.get("removed", [])]
+        if rec.get("rows"):
+            entry["rows"] = rec["rows"]
+        if self._reads_as_written(entry, read):
+            if read.get("etag"):
+                entry["etag"] = read["etag"]
+            if entry.get("cal") == "family" and entry.get("how") in ("put", "delete") and read.get("body"):
+                entry["after"] = read["body"]
         rec["status"] = "landed"
         with self.ledger.tx() as db:
             if not rec.get("applied"):
@@ -2019,6 +2028,17 @@ class CalendarChange:
             db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
                        (json.dumps(self._undo_entries(plan)), pid))
             self._save_plan(pid, plan, db)
+
+    def _reads_as_written(self, entry: dict, read: dict) -> bool:
+        """What a read found is what the write made, as far as a read can say: on Gmail, every field
+        the write gave, an add's too; on Family, every line that was sent, by what it says, so a
+        server that keeps it its own way still reads as written (caldav._as_sent). A removal found
+        gone, or a rule, has nothing more to compare."""
+        if entry.get("cal") == "gmail" and entry.get("how") != "restore":
+            return self._as_written(read.get("event") or {}, entry.get("wrote") or {})
+        if entry.get("cal") == "family" and entry.get("how") in ("put", "delete"):
+            return caldav._as_sent(read.get("body") or "", entry.get("sent") or entry.get("after") or "")
+        return True
 
     @staticmethod
     def _undo_entries(plan: dict) -> list[dict]:
@@ -2288,7 +2308,7 @@ class CalendarChange:
         if kind == "unknown":
             return "unread", {}
         cancelled = kind == "gone" or (cur or {}).get("status") == "cancelled"
-        read = {"etag": (cur or {}).get("etag")}
+        read = {"etag": (cur or {}).get("etag"), "event": cur or {}}
         how = entry["how"]
         if how == "drop":                      # an add. Google keeps a deleted one, cancelled
             if kind == "gone":

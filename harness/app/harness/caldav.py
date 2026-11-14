@@ -30,6 +30,7 @@ import hashlib
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
@@ -187,6 +188,48 @@ def _unchanged(ics: str, read: str) -> bool:
     GET can answer with different ETags for one version."""
     now, then = _content(ics), _content(read)
     return bool(then) and now == then
+
+
+_WHEN = frozenset({"DTSTART", "DTEND", "RECURRENCE-ID", "EXDATE", "RDATE"})
+
+
+def _meant(line: str) -> str:
+    """One line of an event by what it says, not how a server spells it: a time as the moment it
+    names, however its zone is written; a rule's parts in any order; text with its escapes and
+    spacing aside."""
+    prop = ical.parse_line(line)
+    if prop is None:
+        return line
+    if prop.name in _WHEN:
+        try:
+            moments = []
+            for value in prop.value.split(","):
+                when = ical.parse_when(ical.Prop(prop.name, prop.params, value), timezone.utc)
+                moments.append(when.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                               if isinstance(when, datetime) else when.isoformat())
+        except ical.Unreadable:
+            return line
+        return f"{prop.name}:{','.join(sorted(moments))}"
+    if prop.name in ("RRULE", "EXRULE"):
+        return f"{prop.name}:{';'.join(sorted(prop.value.upper().split(';')))}"
+    params = "".join(f";{k}={v}" for k, v in sorted(prop.params.items()))
+    return f"{prop.name}{params}:{' '.join(ical.unescape(prop.value).split())}"
+
+
+def _as_sent(read: str, sent: str) -> bool:
+    """A read still says everything that was sent, line for line, however the server keeps it:
+    lines of its own added, lines folded or reordered, a time written in another zone. Someone's
+    edit to anything that was sent doesn't read as sent. (A line someone only added can't be told
+    from a server's own, so that alone doesn't.) Each line counts as often as it was sent, so one
+    of two alike can't stand in for the other."""
+    want = Counter(_meant(x) for x in _content(sent))
+    return bool(want) and not want - Counter(_meant(x) for x in _content(read))
+
+
+def _uids(ics: str) -> set[str]:
+    """The ids of the events in it."""
+    lines, names = _lines(ics)
+    return {line.split(":", 1)[1] for line, name in zip(lines, names) if name == "UID" and ":" in line}
 
 
 def _names(lines) -> list[str]:

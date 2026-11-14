@@ -1,6 +1,7 @@
 """Changing events he asks for, on Family and Gmail: from his message to a read back, no tap."""
 import copy
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -1781,3 +1782,104 @@ def test_the_ask_scan_catches_each_chore(words):
 def test_the_ask_scan_leaves_its_own_words_and_facts_alone(words):
     from conftest import asks_in
     assert asks_in(words) == [], words
+
+
+# -- the D2 re-check: a read hands Undo only what was written, and keeps what Undo clears ------------
+
+def test_his_edit_before_the_read_that_settles_a_write_is_left_by_undo(r):
+    """A day taken off, its answer lost, and before the read he renames the event on his phone. The
+    read finds the day off, so it's done, but the version it found isn't what was written: Undo
+    leaves his event as it is, and says so."""
+    r.icloud.drop_response_next = True
+    r.tell(change(dates="2026-11-23"))
+    r.icloud.human_edit(PATH, "School Day", "School Day (early release)")
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
+    assert "School Day (early release)" in r.body() and "2026-11-23" not in days_of(r.body())
+
+
+def test_a_gmail_add_he_changed_before_its_read_is_left_by_undo(r):
+    """An add whose answer was lost, moved and renamed in Google Calendar before the read. It's there,
+    so it's done, but not as written: Undo leaves it."""
+    real = r.gmail.insert
+
+    def lands_lost(address, event):
+        real(address, event)
+        return caldav.Outcome("unknown")       # it landed; the answer didn't
+    r.gmail.insert = lands_lost
+    r.tell(change(calendar="gmail", op="add", title="Dentist", start="2026-11-20T09:00:00-05:00",
+                  end="2026-11-20T10:00:00-05:00"))
+    r.gmail.insert = real
+    gid = next(k for k in r.gmail.events if k.startswith("cm"))
+    r.gmail.events[gid].update(start={"dateTime": "2026-11-21T13:00:00-05:00"},
+                               end={"dateTime": "2026-11-21T14:00:00-05:00"}, summary="Dentist (bring forms)")
+    r.gmail._bump(gid)
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
+    assert r.gmail.events[gid].get("status") != "cancelled" and r.gmail.events[gid]["summary"] == "Dentist (bring forms)"
+
+
+def test_a_read_as_written_holds_on_servers_that_rewrite_and_not_after_an_edit():
+    """Which comparison tells Harness's own write from an edit, on the rewriting servers the review's
+    probes use. caldav._unchanged needs the very same lines, so a server that adds one of its own
+    fails it. Every sent line by its spelling fails on a server that keeps a moved day's times in
+    UTC. Every sent line by what it says (caldav._as_sent) holds on both, and a rename shows, even
+    of one title of two alike."""
+    def adds_a_line(ics):
+        return ics.replace("SUMMARY:", "CATEGORIES:x\r\nSUMMARY:", 1)
+
+    def utc(m):
+        moment = datetime.strptime(m.group(2), "%Y%m%dT%H%M%S").replace(tzinfo=NY).astimezone(timezone.utc)
+        return f"{m.group(1)}:{moment:%Y%m%dT%H%M%SZ}"
+
+    def utc_overrides(ics):                    # the master as sent, a line added; its moved days in UTC
+        head, sep, rest = adds_a_line(ics).partition("END:VEVENT")
+        return head + sep + re.sub(r"(RECURRENCE-ID|DTSTART|DTEND);TZID=America/New_York:(\d{8}T\d{6})", utc, rest)
+
+    key, ten = "20261123T133000Z", datetime(2026, 11, 23, 10, 0, tzinfo=NY)
+    off = ics_edit.remove_days(SERIES, [key], TZ, NOW)
+    moved = ics_edit.move_day(SERIES, key, ten, ten + timedelta(hours=4), TZ, NOW)
+    for sent in (off, moved):
+        for server in (adds_a_line, utc_overrides):
+            kept = server(sent)
+            assert caldav._as_sent(kept, sent), (sent, server)
+            assert not caldav._as_sent(kept.replace("School Day", "School Day (early release)", 1), sent)
+    assert not caldav._unchanged(adds_a_line(off), off)
+
+    def spelled(kept, sent):
+        return set(caldav._content(sent)) <= set(caldav._content(kept))
+    assert spelled(adds_a_line(moved), moved) and not spelled(utc_overrides(moved), moved)
+
+
+def test_undo_of_a_write_a_restart_cut_short_clears_what_it_recorded(r):
+    """The write lands and the process dies before its answer is handled, and a read settles it.
+    Its Undo keeps what the usual path keeps (the day it took off, the records it changed), so Undo
+    clears them too, and no digest says the day came back."""
+    real = land_then_die(r)
+    r.claude.script = [ask(change(dates="2026-11-23"))]
+    with pytest.raises(Crash):
+        r.say("no school Nov 23")
+    r.icloud.request = real
+    rows = [{"table": "family_copies", "key": "no-such-copy", "set": {"missing": 0}, "was": {"missing": 0}}]
+    plan = json.loads(r.ledger.db.execute("SELECT settle_json FROM calendar_changes").fetchone()[0])
+    plan["parts"][0]["steps"][0]["rows"] = rows        # as a step that also keeps a copy's record true
+    with r.ledger.tx() as db:
+        db.execute("UPDATE calendar_changes SET settle_json=?", (json.dumps(plan),))
+    r.start()
+    r.cc.bind(r.vault.owner_id())
+    r.advance(minutes=1)
+    r.tick()
+    [entry] = json.loads(r.ledger.db.execute("SELECT undo_json FROM calendar_changes").fetchone()[0])
+    assert [x[:2] for x in entry.get("removed", [])] == [["family", UID]] and entry.get("rows") == rows
+    r.press(r.with_button("Undo"), "Undo")
+    assert "Undone" in r.texts()[-1] and "2026-11-23" in days_of(r.body())
+    assert r.ledger.db.execute("SELECT COUNT(*) FROM calendar_removed").fetchone()[0] == 0
+    r.advance(minutes=31)
+    r.tick()
+    assert "came back" not in r.cc.digest_line()
