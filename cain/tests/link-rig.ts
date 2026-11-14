@@ -57,12 +57,14 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const discord = { marksButtonEdits: false };      // whether an edit of buttons alone marks a message edited
   const posted: Record<string, any> = {};
   const nonces: Record<string, { id: string; at: number }> = {};
-  const failing = new Set<string>();             // path prefixes that fail, like "/interactions/" or "PATCH"
+  const failing = new Set<string>();             // path prefixes that fail, like "/interactions/" or "PATCH" (a 5xx)
+  const refusing = new Set<string>();            // the same, refused by Discord (a 403)
   const limited = new Set<string>();             // the same, answered with Discord's rate limit
   const limitN: Record<string, number> = {};     // the next n calls to a path prefix are rate limited
   const lose = { posts: 0 };                     // posts Discord makes but whose answer never arrives
   const hang = { interactions: false };          // the link stops mid-tap: its answer never returns
-  const gate = { posts: false, history: false }; // Discord is slow: posts to his DM, or reads of it, wait until release()
+  // Discord is slow: posts to his DM, reads of it, or whose bot this is, wait until release()
+  const gate = { posts: false, history: false, identity: false };
   const waiting: (() => void)[] = [];
   const beyond = new Set<string>();              // on Discord, but further back than the look over his DM goes
   const spy = { onCall: null as null | ((method: string, path: string) => void) };   // runs as each call reaches Discord
@@ -72,12 +74,16 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     calls.push({ method, path, body: copy(body), auth });
     spy.onCall?.(method, path);
     for (const f of failing) if (path.startsWith(f) || `${method} ${path}`.startsWith(f)) throw new Error("discord 500: unavailable");
+    for (const f of refusing) if (path.startsWith(f) || `${method} ${path}`.startsWith(f)) throw new Error("discord 403: Missing Access");
     for (const f of limited) if (path.startsWith(f) || `${method} ${path}`.startsWith(f)) throw new Error("discord 429: You are being rate limited.");
     for (const [f, n] of Object.entries(limitN)) if (n > 0 && (path.startsWith(f) || `${method} ${path}`.startsWith(f))) {
       limitN[f] = n - 1;
       throw new Error("discord 429: You are being rate limited.");
     }
-    if (path === "/oauth2/applications/@me") return { owner: { id: OWNER } };
+    if (path === "/oauth2/applications/@me") {
+      if (gate.identity) await new Promise<void>((ok) => waiting.push(ok));
+      return { owner: { id: OWNER } };
+    }
     if (path === "/users/@me") return { id: BOT };
     if (path === "/users/@me/channels") return { id: DM };
     if (method === "POST" && path === `/channels/${DM}/messages`) {
@@ -163,9 +169,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const r = {
     get link() { return link; },
-    calls, relayed, harness, posted, logs, files, pulls, failing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
+    calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
     reports, replays, sent, discord, limitN, spy,
-    release: () => { gate.posts = false; gate.history = false; for (const ok of waiting.splice(0)) ok(); },
+    release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,
     posts: () => calls.filter((c) => c.method === "POST" && c.path === `/channels/${DM}/messages`).length,

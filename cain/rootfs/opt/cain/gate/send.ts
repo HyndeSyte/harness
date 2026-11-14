@@ -46,15 +46,17 @@ export const EDIT_WINDOW_MS = 10 * 60_000;
 
 // cards: the link's view now, or null when it can't be had (the link down and its file
 // missing or stale): then a named button can't be checked, and an edit waits.
-// dm: the hook's cached DM id, which counts only when the cards don't name his DM; a chat
+// dm: the hook's cached DM id, which counts only when there are no cards at all; a chat
 // that differs from it alone is a soft refusal, since the plugin's own allowlist holds
-// the chats it sends to. now: for the edit window. replied: the ids the plugin's reply tool
-// answered with in this session, from its transcript (the hook's, never the link's).
+// the chats it sends to. Cards that name no DM (the link hasn't asked Discord yet, say
+// after a new bot token) leave the chat unknown: the cache may be the old bot's.
+// now: for the edit window. replied: the ids the plugin's reply tool answered with in this
+// session, from its transcript (the hook's, never the link's).
 export function decideSend(call: SendCall, cards: CardsView | null,
                            o: { tz?: string; dm?: string | null; now?: number; replied?: ReadonlySet<string> } = {}): Decision {
   const tz = o.tz ?? "America/New_York";
   const now = o.now ?? Date.now();
-  const dm = cards?.dm ?? o.dm ?? null;
+  const dm = cards ? cards.dm ?? null : o.dm ?? null;
   const target = call.replyTo && cards ? cards.cards.find((c) => c.message === call.replyTo) : undefined;
   const live = (cards?.cards ?? []).filter((c) => c.live);
   // Known labels: those on live cards, and the card a reply answers even once its buttons

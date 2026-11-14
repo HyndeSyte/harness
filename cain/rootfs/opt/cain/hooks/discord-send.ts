@@ -19,14 +19,18 @@
 // The cards come first, always (decision F): the link's local route gets 1.5 s, then
 // /data/trust/cards.json while it's under 3 minutes old. So every rule runs on every send,
 // however slow the link is, and the link's DM id wins over the cached one, rewriting it.
+// The cached id counts only when no cards can be had at all: cards that name no DM (the
+// link hasn't asked Discord yet, after a new bot token) leave his DM unknown, and a send
+// goes, logged, rather than being held against the old bot's DM.
 //
 // The third try: after two wording refusals for one session and chat within 10 minutes,
 // the next try goes as it is, logged "passed after two refusals"; Cain hears it through
-// the link (discord-sent.ts). A pass or a fix resets the count. Never for a hard refusal
-// (another chat, an edit of a message that isn't his), while which messages are his can't
-// be told, or while his DM can't be told at all. Counted in /data/work/gate-tries.json; a
-// refusal the count can't be written for lets the reply go, logged "passed, tries not
-// counted", since otherwise every try would start at zero and the third never come.
+// the link (discord-sent.ts). A pass or a fix resets the count. Never for a hard refusal:
+// a chat the link says isn't his DM, or an edit of a message that isn't his reply or whose
+// owner can't be told. While his DM can't be told the third try goes too, as a clean send
+// there does. Counted in /data/work/gate-tries.json; a refusal the count can't be written
+// for lets the reply go, logged "passed, tries not counted", since otherwise every try
+// would start at zero and the third never come.
 //
 // It fails open: an error, a crash or a timeout lets the reply go, since silencing Cain is
 // worse than one unchecked reply, and discord-sent.ts re-checks what went out.
@@ -161,12 +165,14 @@ export function wasReleased(t: Tries, key: string, text: string, now: number): b
   return (t[key]?.released ?? []).some((r) => r.hash === h && now - r.at < TRY_MS);
 }
 
-// Whether a third try may ever let this decision's refusal go: never for a hard one (a chat
-// the link says isn't his DM), one about an edit's target (not his, or not known to be), or
-// while his DM can't be told at all (the chat is unsure). A chat that differs only from the
-// cached DM id is soft: the cache may be stale, and the plugin's own allowlist still holds.
+// Whether a third try may ever let this decision's refusal go: whenever it isn't hard. Hard
+// is a chat the link says isn't his DM, and any refusal of an edit's target (not his, or
+// not known to be). A chat that differs only from the cached DM id is soft: the cache may
+// be stale, and the plugin's own allowlist still holds. So is any refusal while his DM
+// can't be told, the "send exactly this instead" of a fix included: a clean send there
+// goes, so a third try does too.
 export function releasable(d: Decision): boolean {
-  return !d.hard && d.chat !== "unknown" && !d.hits.some((h) => h.rule === "target");
+  return !d.hard;
 }
 
 // counted: a refusal that holds only because it was counted toward the third try.
@@ -224,7 +230,8 @@ export async function run(raw: string, o: { ask?: () => Promise<CardsView | null
   const tz = process.env.CHECKIN_TZ ?? "America/New_York";
   const got = await cardsNow(o.ask ?? askLink, o.file ?? (() => { try { return readFileSync(CARDS, "utf8"); } catch { return null; } }), now);
   keepDm(got.cards?.dm);
-  const d = decideSend(call, got.cards, { dm: got.cards?.dm ? null : readDm(), tz, now,
+  // The cached DM id only when there are no cards at all (decideSend).
+  const d = decideSend(call, got.cards, { dm: got.cards ? null : readDm(), tz, now,
     ...(call.tool === "edit" ? { replied: repliedIn(input?.transcript_path) } : {}) });
   const tries = readTries();
   let out = act(call, d, tries, now);

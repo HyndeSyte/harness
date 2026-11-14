@@ -21,7 +21,8 @@
 //     POST /morning {text}              the one morning message, with Stop
 //     POST /stopped {}                  whether everything is stopped (Dane's Stop), and since when
 //     POST /look {m}                    a message in his DM as Discord has it now (keeper.sh card)
-//     GET  /cards                       the cards up now, no text, and the ids of Cain's own replies (the reply hook's read)
+//     GET  /cards                       the cards up now, no text, and the ids of Cain's own replies (the reply hook's read);
+//                                       with no DM id yet, it asks Discord for it first, for 0.8 s at most
 //     POST /check {text, reply_to?, edit?}  what the gate does with a reply or edit, sending nothing
 //     POST /sent {tool, ids, question, reply_to?, net?}  what Cain just sent (the PostToolUse hook): his edit
 //                                       allowlist, the moving Stop, and what the safety net found
@@ -51,7 +52,7 @@ import { Link, Protocol, PULL, type Pull, Refusal, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, inMain, land, type MergeDeps } from "./merge";
-import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
+import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -247,8 +248,7 @@ const SEED_EVERY_MS = 6 * 3_600_000;
 async function seed(): Promise<void> {
   try {
     const was = load().seeded;
-    const sent = await readTranscripts(TRANSCRIPTS, was ? was - 3_600_000 : Date.now() - 35 * 86_400_000);
-    const n = link.seedSent(sent.replies ?? []);
+    const n = await seedReplies(link, TRANSCRIPTS, was ? was - 3_600_000 : Date.now() - 35 * 86_400_000);
     if (n) console.log(`[cain] link: ${n} of Cain's replies added to the ones he may edit`);
   } catch (e) { console.log(`[cain] link: couldn't read Cain's transcripts for his replies: ${String(e).slice(0, 80)}`); }
   finally { setTimeout(seed, SEED_EVERY_MS); }
@@ -273,7 +273,7 @@ Bun.serve({
     if (LOCAL_ONLY.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
       return json({ status: "refused" }, 403);
     if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
-    if (req.method === "GET" && url.pathname === "/cards") return json(link.cardsNow());
+    if (req.method === "GET" && url.pathname === "/cards") return json(await link.cardsFor());
     if (req.method !== "POST") return json({ status: "not found" }, 404);
     const raw = await req.text();
     if (raw.length > 16384) return json({ status: "too large" }, 413);

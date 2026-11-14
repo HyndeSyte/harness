@@ -60,8 +60,10 @@
 //   PostToolUse hook (../hooks/discord-sent.ts) says what went out. It moves only when
 //   none of the newest 5 bot messages carries a Stop, Stop first on the new message and
 //   then off the old; moves wait for a quiet channel, in the same queue as his Stop taps
-//   and the notices that may carry it, so none lands with Stop once he has stopped.
-//   While stopped it comes off, and Turn back on is kept within reach instead.
+//   and the notices that may carry it, so none lands with Stop once he has stopped. Only
+//   Discord refusing a message (a 4xx) three times retires it as a holder; when Discord
+//   doesn't answer, moves back off and try again. While stopped it comes off, and Turn
+//   back on is kept within reach instead, even when the Stop state can't be read.
 import { createHash } from "node:crypto";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
@@ -101,9 +103,11 @@ const REPLAY_TRIES = 5;                  // a page Discord rate-limits is asked 
 const STOP_REACH = 5;                    // the moving Stop moves only when none of this many newest bot messages carries one
 const RESUME_REACH = 2;                  // while stopped, Turn back on is re-posted when it isn't on one of this many
 const QUIET_MS = 60_000;                 // moves wait this long after Discord rate-limited the link
-const HOLD_TRIES = 3;                    // a message Discord won't take Stop on this often is left alone
+const HOLD_TRIES = 3;                    // a message Discord refuses Stop on this often (a 4xx) is skipped
+const MOVE_WAITS_MS = [1, 2, 5, 10].map((m) => m * 60_000);   // after Discord didn't answer a move: the waits, the last one repeating
 const REPOST_GAP_MS = 10 * 60_000;       // while stopped, his writing brings Turn back on down at most this often
 const RESUME_GRACE_MS = 60_000;          // his Stop's own notice gets this long before the link posts one itself
+const NAME_WAIT_MS = 800;                // the reply hook's read of the cards waits this long for Discord to name his DM
 const MOVED = "stop moved";              // a message's Stop moved on: its buttons come off, with no line
 const REPOSTED = "moved down";           // an older Stopped notice, once a newer one carries Turn back on
 export const STILL_STOPPED = "**Still stopped.** Cain's Build and Ship jobs, Ship cards and outside reviews stay stopped, and nothing lands in main, until you tap Turn back on.";
@@ -663,6 +667,18 @@ export class Link {
 
   // The cards now, as the reply hook reads them (GET /cards).
   cardsNow(): CardsView { return cardsView(this.d.load(), this.d.now()); }
+  // The same for the route, which also learns his DM's id when it has none yet (a first
+  // start, or a new bot token after forget()): it asks Discord, waiting at most waitMs so the
+  // hook keeps to its 1.5 s. A slower answer is kept for the next send. One ask at a time.
+  private naming: Promise<void> | null = null;
+  async cardsFor(waitMs = NAME_WAIT_MS): Promise<CardsView> {
+    if (!this.d.load().dm) {
+      this.naming ??= this.identity().then(() => {}, (e) => this.log(`couldn't ask Discord whose bot this is: ${reason(e)}`))
+        .finally(() => { this.naming = null; });
+      await within(this.naming.then(() => null), waitMs);
+    }
+    return this.cardsNow();
+  }
 
   // keeper.sh check: what the gate does with a reply or an edit of Cain's, against the cards
   // up now (the reply hook's decision, less its third try and the proof from his session's
@@ -1565,11 +1581,13 @@ export class Link {
   // only when none of the newest 5 bot messages carries a Stop (the specialist's Stop rows
   // and the morning message count), Stop first on the new message and then off the old, in
   // one queue with his Stop taps, and only when Discord is quiet: no card's outcome edit
-  // waiting, no rate limit in the last minute. A strip that fails is tried again by the
-  // sweep, and an old Stop keeps working meanwhile. Each move edits buttons alone, which
-  // Discord marks "(edited)". The plugin's text edits leave a message's buttons alone
-  // (discord.js edit(text) sends only the content), so Cain editing the message that
-  // holds it changes nothing here, unless the edit makes it ask something.
+  // waiting, no rate limit in the last minute, no unanswered move still backing off. A
+  // message Discord refuses it on three times is skipped for the newest plain one within
+  // reach. A strip that fails is tried again by the sweep, and an old Stop keeps working
+  // meanwhile. Each move edits buttons alone, which Discord marks "(edited)". The plugin's
+  // text edits leave a message's buttons alone (discord.js edit(text) sends only the
+  // content), so Cain editing the message that holds it changes nothing here, unless the
+  // edit makes it ask something.
   private stopChain: Promise<void> = Promise.resolve();
   private inStopQueue(job: () => Promise<void>): Promise<void> {
     const run = this.stopChain.then(job).catch((e) => this.log(`couldn't keep Stop within reach: ${reason(e)}`));
@@ -1595,7 +1613,17 @@ export class Link {
   // him. An edit only says whether his reply asks something now: it never adds a message to
   // the list. background: the Stop's move isn't waited for (the route answers at once, so
   // the hook's retry never repeats a note the link already took).
-  private netSeen = new Map<string, number>();       // notes whose net was relayed, by digest: when (this run)
+  private netSeen = new Map<string, number>();       // lines /sent relayed, by digest: when (this run)
+  // True the first time within a minute: the hook sends a note again when its answer is lost,
+  // and each line a note brings reaches Cain once.
+  private firstTime(...parts: unknown[]): boolean {
+    const now = this.d.now();
+    for (const [k, at] of this.netSeen) if (at < now - 60_000) this.netSeen.delete(k);
+    const key = createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+    if (this.netSeen.has(key)) return false;
+    this.netSeen.set(key, now);
+    return true;
+  }
   async sent(n: any, o: { background?: boolean } = {}): Promise<{ status: "ok"; said: string }> {
     const ids: string[] = (Array.isArray(n?.ids) ? n.ids : []).map(String).filter((x: string) => SNOWFLAKE.test(x)).slice(0, 10);
     if (!ids.length) throw new Refusal("needs the ids of what went out");
@@ -1616,7 +1644,8 @@ export class Link {
     const replyTo = typeof n?.reply_to === "string" && SNOWFLAKE.test(n.reply_to) ? n.reply_to : "";
     if (replyTo && !s.messages[replyTo] && !sent[replyTo]) s.hisAt = Math.max(s.hisAt ?? 0, Math.min(now, snowflakeTime(replyTo)));
     this.d.save(s);
-    if (theirs) {
+    // A note sent again (its answer lost) is told once: the bypassed edit, and what the net found.
+    if (theirs && this.firstTime("bypassed", tool, ids)) {
       const m = s.messages[theirs];
       this.log(`Cain's edit changed a message the link posted (${m.kind ?? "legacy"}): the reply hook was bypassed`);
       try { this.d.report?.({ point: "sent", writer: "cain", message: theirs, hits: [], did: "bypassed: an edit of a message the link posted" }); }
@@ -1624,12 +1653,7 @@ export class Link {
       this.d.relay(`Your edit changed Discord message ${theirs}, ${m.kind === "notice" || m.kind === "morning" ? "a message" : "a card"} your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
     }
     const net = netOf(n?.net);
-    if (net) {
-      // The hook tries a note again when its answer is lost: what the net found is told once.
-      for (const [k, at] of this.netSeen) if (at < now - 60_000) this.netSeen.delete(k);
-      const key = createHash("sha256").update(JSON.stringify([tool, ids, net])).digest("hex");
-      if (!this.netSeen.has(key)) { this.netSeen.set(key, now); this.d.relay(netLine(tool, last, net)); }
-    }
+    if (net && this.firstTime(tool, ids, net)) this.d.relay(netLine(tool, last, net));
     const placing = this.inStopQueue(() => this.placeStop());
     if (!o.background) await placing;
     return { status: "ok", said: "Noted." };
@@ -1670,9 +1694,10 @@ export class Link {
     return [...ids].filter((id) => SNOWFLAKE.test(id)).sort((a, b) => (newerId(a, b) ? -1 : 1)).slice(0, n);
   }
 
+  // A message known gone from his DM carries nothing.
   private carries(s: State, id: string, label: string): boolean {
     const m = s.messages[id];
-    return !!m?.buttons && !m.outcome && (m.labels ?? []).includes(label);
+    return !!m?.buttons && !m.outcome && !m.gone && (m.labels ?? []).includes(label);
   }
 
   // Where the moving Stop may sit (above): Cain's reply whose newest part asks nothing, or a
@@ -1692,30 +1717,43 @@ export class Link {
   }
 
   // Stop onto a message, before the one that held it loses it. False when Discord didn't take
-  // it. A message Discord won't take it on three times (not a 404 or a rate limit: those are
-  // settled above and in placeStop) is left alone until a newer plain message comes. If he
-  // tapped Stop while Discord was answering, it comes straight off again (true: the move
-  // goes on, and the old holder loses its Stop too).
-  private holdFails = new Map<string, number>();     // tries Discord refused, by message (this run)
+  // it. Only Discord's own refusal of that message counts against it: a 4xx other than 404
+  // (gone: never a holder again) and 429 (moves wait a minute, placeStop). After three it's
+  // skipped. No answer, a timeout, a 5xx or a 401 (the bot's token, while it's being
+  // changed) is Discord's trouble, never the message's: moves back off instead, 1, 2, 5,
+  // then every 10 minutes, until one lands. If he tapped Stop while Discord was answering,
+  // it comes straight off again (true: the move goes on, and the old holder loses its Stop
+  // too).
+  private holdFails = new Map<string, number>();     // Discord's refusals of Stop, by message (this run)
+  private moveWait = { fails: 0, next: 0 };          // Discord didn't answer a move: how often, and when moves go on (this run)
+  private skipped(id: string): boolean { return (this.holdFails.get(id) ?? 0) >= HOLD_TRIES; }
   private async hold(id: string): Promise<boolean> {
     let msg: any;
     try {
       const { dm } = await this.identity();
       msg = await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { components: rows([[["Stop", STOP]]]), allowed_mentions: { parse: [] } });
     } catch (e) {
-      if (/discord 404/.test(String(e))) {                       // gone from his DM: never a holder again
+      const why = String(e);
+      if (/discord 404/.test(why)) {                             // gone from his DM: never a holder again
         const s = this.d.load();
         if (s.messages[id]) s.messages[id].gone = true;
         if (s.sent?.[id]) s.sent[id].last = false;
         this.d.save(s);
-      } else if (!/discord 429/.test(String(e))) {
+      } else if (/discord 429/.test(why)) this.log(`couldn't put Stop on a message: ${reason(e)}`);
+      else if (/discord 4\d\d/.test(why) && !/discord 401/.test(why)) {
         const n = (this.holdFails.get(id) ?? 0) + 1;
         this.holdFails.set(id, n);
-        this.log(`couldn't put Stop on a message${n >= HOLD_TRIES ? ` (${n} tries: it waits for a newer plain message)` : ""}: ${reason(e)}`);
-      } else this.log(`couldn't put Stop on a message: ${reason(e)}`);
+        this.log(`Discord refused Stop on a message${n >= HOLD_TRIES ? ` (${n} times: it's skipped)` : ""}: ${reason(e)}`);
+      } else {
+        const n = ++this.moveWait.fails;
+        const wait = MOVE_WAITS_MS[Math.min(n, MOVE_WAITS_MS.length) - 1];
+        this.moveWait.next = this.d.now() + wait;
+        this.log(`couldn't put Stop on a message, tried again in ${wait / 60_000} min: ${reason(e)}`);
+      }
       return false;
     }
     this.holdFails.delete(id);
+    this.moveWait = { fails: 0, next: 0 };
     const s = this.d.load();
     const was = s.messages[id];
     if (was) {
@@ -1755,15 +1793,21 @@ export class Link {
     const holder = s.stopAt && this.carries(s, s.stopAt, "Stop") ? s.stopAt : null;
     const st = this.stopped();
     if (st.stopped) {
+      // Turn back on stays within reach however it's stopped: his tap, a Stop that couldn't
+      // be saved, or a Stop state that can't be read (no time: it's posted at once).
       if (holder) await this.unhold(holder, MOVED);
-      if (st.at !== null || this.stopHeld) await this.keepResumeInReach(st.at ?? this.changed?.at ?? 0);
+      await this.keepResumeInReach(st.at ?? this.changed?.at ?? 0);
       return;
     }
     const holderOk = !!holder && this.plainOk(s, holder);
     const within = this.newestBot(s, STOP_REACH).some((id) => this.carries(s, id, "Stop") && (id !== holder || holderOk));
     let target = within ? null : this.newestPlain(s);
-    if (target && (this.holdFails.get(target) ?? 0) >= HOLD_TRIES) target = null;   // never back up to an older one
+    // Discord refused the newest plain message three times: the newest plain one within reach
+    // that it hasn't refused instead. None, and Stop stays where it is: nothing is posted for it.
+    if (target && this.skipped(target))
+      target = this.newestBot(s, STOP_REACH).find((id) => this.plainOk(s, id) && !this.skipped(id)) ?? null;
     if (target && target !== holder) {
+      if (now < this.moveWait.next) return;                    // Discord didn't answer the last move: waiting
       if (!(await this.hold(target))) return;
       if (holder) await this.unhold(holder, MOVED);
     } else if (holder && !holderOk) await this.unhold(holder, MOVED);   // it asks something now
@@ -1773,12 +1817,13 @@ export class Link {
   // Stopped notice carrying it is one of the newest 2 bot messages, the link's Stopped
   // notice is posted again. While one is up somewhere, at most hourly (from his Stop, or the
   // last one), or once he has written since, 10 minutes at least after the last re-post:
-  // never every few messages. While none is up anywhere (its notice failed to post), on
-  // each pass until one is, once his Stop's own notice has had a minute to land.
+  // never every few messages. While none is up anywhere (its notice failed to post, or the
+  // message is known gone), on each pass until one is, once his Stop's own notice has had a
+  // minute to land.
   private async keepResumeInReach(since: number): Promise<void> {
     const s = this.d.load(), now = this.d.now();
     if (this.newestBot(s, RESUME_REACH).some((id) => this.carries(s, id, "Turn back on"))) return;
-    const shown = Object.values(s.messages).filter((m) => m.buttons && !m.outcome && (m.labels ?? []).includes("Turn back on"));
+    const shown = Object.values(s.messages).filter((m) => m.buttons && !m.outcome && !m.gone && (m.labels ?? []).includes("Turn back on"));
     if (shown.length) {
       const last = Math.max(since, s.repostedAt ?? 0, ...shown.map((m) => m.posted ?? 0));
       const wrote = (s.hisAt ?? 0) > last && now - (s.repostedAt ?? 0) >= REPOST_GAP_MS;

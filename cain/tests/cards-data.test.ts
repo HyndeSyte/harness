@@ -3,11 +3,11 @@
 // message back from Discord; the cards are published for the reply hook without text;
 // and each send point logs what the gate's rules would have done, changing nothing.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
-import { CardsWriter, publishCards, stateFile } from "../rootfs/opt/cain/link/publish";
+import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
@@ -199,8 +199,33 @@ describe("the cards, published for the reply hook", () => {
     expect(main).toContain("const stateStore = stateFile(STATE, () => cards.soon());");
     expect(main).toContain("function save(s: State): void { stateStore.save(s); }");
     expect(main).toContain("finally { cards.soon(); setTimeout(sweepLoop, SWEEP_MS); }");
-    expect(main).toContain('url.pathname === "/cards") return json(link.cardsNow())');
+    expect(main).toContain('url.pathname === "/cards") return json(await link.cardsFor())');
     expect(main).not.toContain("publishCards(");                          // only through the writer
+  });
+
+  test("with no DM id yet (a new bot token), /cards asks Discord whose bot it is, waiting a moment at most; a slower answer is there for the next send", async () => {
+    const r = rig();
+    await r.link.notice("The calendar specialist is answering again.");  // the link knows his DM
+    expect((await r.link.cardsFor()).dm).toBe(DM);
+    r.link.forget();                                                      // the token changed
+    expect(r.link.cardsNow().dm).toBeNull();
+    const asks = () => r.calls.filter((c) => c.path === "/oauth2/applications/@me").length;
+    const before = asks();
+    expect((await r.link.cardsFor()).dm).toBe(DM);                        // Discord answered within the wait
+    expect(asks()).toBe(before + 1);
+    expect((await r.link.cardsFor()).dm).toBe(DM);
+    expect(asks()).toBe(before + 1);                                      // kept: asked once
+    // Discord slow: the hook gets the cards without it in time, and the next read has it.
+    r.link.forget();
+    r.gate.identity = true;
+    const t0 = performance.now();
+    const [a, b] = await Promise.all([r.link.cardsFor(30), r.link.cardsFor(30)]);
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    expect([a.dm, b.dm]).toEqual([null, null]);
+    expect(asks()).toBe(before + 2);                                      // one ask for both
+    r.release();
+    await Bun.sleep(5);
+    expect(r.link.cardsNow().dm).toBe(DM);
   });
 });
 
@@ -327,6 +352,32 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     expect(cardsView(r.state(), r.t.now).sent).not.toContain(notice);
   });
 
+  test("his transcripts give his edit allowlist his reply tool's answers alone, never an edit's, as the link's start seeds it", async () => {
+    const r = rig();
+    const root = mkdtempSync(join(tmpdir(), "seed-"));
+    mkdirSync(join(root, "-data-work"));
+    const use = (id: string, name: string, input: unknown) => JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } });
+    const result = (id: string, text: string) => JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text }] }] } });
+    const REPLY = "mcp__plugin_discord_discord__reply", EDIT = "mcp__plugin_discord_discord__edit_message";
+    const [reply, part1, part2, edited] = [r.snowflake(), r.snowflake(), r.snowflake(), r.snowflake()];
+    writeFileSync(join(root, "-data-work", "s.jsonl"), [
+      use("t1", REPLY, { chat_id: DM, text: "Moved swim." }), result("t1", `sent (id: ${reply})`),
+      use("t2", REPLY, { chat_id: DM, text: "A long one." }), result("t2", `sent 2 parts (ids: ${part1}, ${part2})`),
+      use("t3", EDIT, { chat_id: DM, message_id: edited, text: "Fixed." }), result("t3", `edited (id: ${edited})`),   // a message he only edited
+      use("t4", EDIT, { chat_id: DM, message_id: reply, text: "Moved swim to 5." }), result("t4", `edited (id: ${reply})`),
+    ].join("\n") + "\n");
+    const sent = await readTranscripts(root, 0);
+    expect([...sent.replies!].sort()).toEqual([reply, part1, part2].sort());
+    expect([...sent.ids]).toContain(edited);                              // the replay still reads it as his
+    expect(await seedReplies(r.link, root, 0)).toBe(3);
+    expect(Object.keys(r.state().sent!).sort()).toEqual([reply, part1, part2].sort());
+    expect(cardsView(r.state(), r.t.now).sent).not.toContain(edited);
+    // The link's start and its 6-hourly pass seed through this, and nothing else.
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    expect(main).toContain("const n = await seedReplies(link, TRANSCRIPTS,");
+    expect(main).not.toContain("seedSent(");
+  });
+
   test("an edit of a message the link posted (the reply hook bypassed) is logged and Cain hears it once", async () => {
     const r = rig();
     const ask = (await r.link.ask({ text: "P08 Q2: Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
@@ -334,6 +385,14 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     expect(r.state().sent?.[ask]).toBeUndefined();
     expect(r.reports.at(-1)).toMatchObject({ point: "sent", writer: "cain", message: ask, did: "bypassed: an edit of a message the link posted" });
     expect(r.relayed.at(-1)).toBe(`Your edit changed Discord message ${ask}, a card your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
+    // The hook sends a note again when its answer is lost: the line, and the log, come once.
+    const said = r.relayed.length, logged = r.reports.length;
+    await r.link.sent({ tool: "edit", ids: [ask], question: false });
+    expect([r.relayed.length, r.reports.length]).toEqual([said, logged]);
+    // A later edit of it, past the minute a retry takes, is told again.
+    r.later(2 * MIN);
+    await r.link.sent({ tool: "edit", ids: [ask], question: false });
+    expect(r.relayed.length).toBe(said + 1);
   });
 
   test("what the safety net found reaches Cain as each rule and a short excerpt, with what to fix, or that his third try went out as it was", async () => {

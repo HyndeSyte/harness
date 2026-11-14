@@ -5,8 +5,9 @@
 //   write about half a second later, whole through a temp file and a rename, carries the
 //   state as it is then. The sweep asks too, so it's fresh at least once a minute.
 // - /data/work/gate-replay.json: the replay's report, in Cain's own folder.
-// And what it reads for the replay: Cain's own Claude Code transcripts, for which of the
-// bot's messages he sent with the Discord plugin (one bot token posts them all). They are
+// And what it reads for the replay and his edit allowlist: Cain's own Claude Code
+// transcripts, for which of the bot's messages he sent with the Discord plugin (one bot
+// token posts them all), and which of them his reply tool made (seedReplies). They are
 // streamed in chunks and the event loop gets a turn often, so a tap is never kept waiting.
 import { createReadStream, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
@@ -134,4 +135,12 @@ export async function readTranscripts(root: string, since: number): Promise<Sent
     }
   }
   return { ids, texts, replies };
+}
+
+// His edit allowlist, seeded from his transcripts changed since a time (at the link's start,
+// then every 6 hours): the ids his reply tool answered with, never an edit's, which can be of
+// a message the link posted. How many were added.
+export async function seedReplies(link: { seedSent(ids: Iterable<string>): number }, root: string, since: number): Promise<number> {
+  const sent = await readTranscripts(root, since);
+  return link.seedSent(sent.replies ?? []);
 }

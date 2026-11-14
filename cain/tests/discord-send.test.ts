@@ -108,6 +108,15 @@ describe("what the gate does with Cain's reply", () => {
     expect(decide(reply("Moved swim to 4:30."), null, { dm: null })).toMatchObject({ would: "pass", chat: "unknown" });
   });
 
+  test("cards that name no DM (a new bot, before the link has asked Discord) leave his DM unknown: the cached id doesn't count", () => {
+    const noDm: CardsView = { ...CARDS, dm: null };
+    // The cache holds the old bot's DM: a send to his new DM isn't held against it.
+    expect(decide(reply("Moved swim to 4:30."), noDm, { dm: OTHER })).toMatchObject({ would: "pass", chat: "unknown", hits: [] });
+    expect(decide(reply("Moved swim to 4:30.", undefined, OTHER), noDm, { dm: DM })).toMatchObject({ would: "pass", chat: "unknown" });
+    // Only with no cards at all does the cache count.
+    expect(decide(reply("Moved swim to 4:30."), null, { dm: OTHER })).toMatchObject({ would: "refuse", chat: "other", hard: false });
+  });
+
   test("an edit is only for his own replies, names no button, and waits while that can't be checked", () => {
     expect(decide(edit("Moved swim to 5:00.", MINE)).would).toBe("pass");
     const card = decide(edit("Fixed the time.", NOTICE));
@@ -221,18 +230,17 @@ describe("what the hook answers, and the third try", () => {
     for (let i = 0; i < 5; i++) expect(act(e, decideSend(e, CARDS), t, NOW + i).did).toBe("refused");
   });
 
-  test("no third try for a hard or unsure decision, even when its wording is what's held", () => {
+  test("no third try for a hard decision, even when its wording is what's held", () => {
     // An edit of the link's card with a hidden count (the third try once let this through).
     const card = callOf(edit("Shipped two fixes and 3 more.", NOTICE))!;
     const dc = decideSend(card, CARDS);
     expect(releasable(dc)).toBe(false);
     const t: Tries = {};
     for (let i = 0; i < 5; i++) expect(act(card, dc, t, NOW + i)).toMatchObject({ did: "refused", output: { hookSpecificOutput: { permissionDecision: "deny" } } });
-    // An edit while which messages are his can't be told, a send to another chat, and a refusal while his DM can't be told at all.
+    // An edit while which messages are his can't be told, and a send to a chat the link says isn't his.
     const down = callOf(edit("Moved swim and 3 more.", MINE))!;
     const other = callOf(reply("Two blocks and 3 more.", undefined, OTHER))!;
-    const unknown = callOf(reply("Two blocks and 3 more."))!;
-    for (const [c, d] of [[down, decideSend(down, null, { dm: DM })], [other, decideSend(other, CARDS)], [unknown, decideSend(unknown, null, { dm: null })]] as const) {
+    for (const [c, d] of [[down, decideSend(down, null, { dm: DM })], [other, decideSend(other, CARDS)]] as const) {
       expect(releasable(d)).toBe(false);
       const tries: Tries = {};
       for (let i = 0; i < 5; i++) {
@@ -250,6 +258,27 @@ describe("what the hook answers, and the third try", () => {
     expect(act(stale, ds, tries, NOW).did).toBe("refused");
     expect(act(stale, ds, tries, NOW + 1).did).toBe("refused");
     expect(act(stale, ds, tries, NOW + 2).did).toBe("passed after two refusals");
+  });
+
+  test("while his DM can't be told, a refusal ends on the third try, as a clean send there goes; a fix says what to send, and ends the same way", () => {
+    const held = callOf(reply("Two blocks and 3 more."))!;
+    const dh = decideSend(held, null, { dm: null });
+    expect(dh).toMatchObject({ would: "refuse", chat: "unknown", hard: false });
+    expect(releasable(dh)).toBe(true);
+    const t: Tries = {};
+    expect(act(held, dh, t, NOW)).toMatchObject({ did: "refused", counted: true });
+    expect(act(held, dh, t, NOW + 1).did).toBe("refused");
+    expect(act(held, dh, t, NOW + 2)).toEqual({ output: null, did: "passed after two refusals" });
+    // A fix goes in place only to his DM: elsewhere it's "send exactly this instead", never a loop.
+    const fix = callOf(reply("Moved swim — it's at 4:30 now."))!;
+    const df = decideSend(fix, { ...CARDS, dm: null });
+    expect(df).toMatchObject({ would: "fix", chat: "unknown" });
+    const tf: Tries = {};
+    expect(act(fix, df, tf, NOW).output).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny", permissionDecisionReason: "Send exactly this instead: Moved swim, it's at 4:30 now." } });
+    expect(act(fix, df, tf, NOW + 1).did).toBe("refused");
+    expect(act(fix, df, tf, NOW + 2).did).toBe("passed after two refusals");
+    const sent = callOf(reply("Moved swim, it's at 4:30 now."))!;
+    expect(act(sent, decideSend(sent, { ...CARDS, dm: null }), {}, NOW)).toEqual({ output: null, did: "passed, his DM unknown" });
   });
 
   test("allow only for a plain call: with anything else (files to attach), a fix says what to send instead and auto mode checks the call", () => {
@@ -611,7 +640,7 @@ describe("run as Claude Code runs it", () => {
     expect((await run(edit("Fixed the time.", MINE), env)).json.permissionDecisionReason).toContain("send it as a new reply instead, or edit in a minute");
   }, 30_000);
 
-  test("two refusals, then the third try goes as it is; never while his DM can't be told at all", async () => {
+  test("two refusals, then the third try goes as it is; the same while his DM can't be told at all", async () => {
     const f = files();
     writeFileSync(f.CAIN_GATE_DM, JSON.stringify({ dm: DM, at: Date.now() }));
     const env = { ...f, CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };
@@ -621,7 +650,22 @@ describe("run as Claude Code runs it", () => {
     expect(await run(input, env)).toMatchObject({ out: "", code: 0 });
     expect(lines(env.CAIN_GATE_LOG).map((l) => l.did)).toEqual(["refused", "refused", "passed after two refusals"]);
     const blind = { ...files(), CAIN_LINK: "http://127.0.0.1:9", CAIN_CARDS: join(dir, "none.json") };   // no DM known anywhere
-    for (let i = 0; i < 3; i++) expect((await run(input, blind)).json.permissionDecision).toBe("deny");
+    expect((await run(input, blind)).json.permissionDecision).toBe("deny");
+    expect((await run(input, blind)).json.permissionDecision).toBe("deny");
+    expect(await run(input, blind)).toMatchObject({ out: "", code: 0 });
+    expect(lines(blind.CAIN_GATE_LOG)).toMatchObject([{ chat: "unknown", did: "refused" }, { did: "refused" }, { did: "passed after two refusals" }]);
+  }, 30_000);
+
+  test("after a new bot token the link names no DM yet and the cache holds the old bot's: his replies go at once, never held as another chat", async () => {
+    const link = fakeLink(() => ({ ...CARDS, dm: null }));
+    try {
+      const f = files();
+      writeFileSync(f.CAIN_GATE_DM, JSON.stringify({ dm: OTHER, at: Date.now() - 86_400_000 }));   // the old bot's DM
+      const env = { ...f, CAIN_LINK: link.url, CAIN_CARDS: join(dir, "none.json") };
+      for (let i = 0; i < 3; i++) expect(await run(reply(`Moved swim to 4:3${i}.`), env)).toMatchObject({ out: "", code: 0 });
+      expect(lines(f.CAIN_GATE_LOG).map((l) => [l.chat, l.did])).toEqual(Array(3).fill(["unknown", "passed, his DM unknown"]));
+      expect(link.asked).toEqual(Array(3).fill("/cards true"));
+    } finally { link.server.stop(true); }
   }, 30_000);
 
   test("fails open: bad input, a log it can't write, or a hook that can't start lets the reply go", async () => {
