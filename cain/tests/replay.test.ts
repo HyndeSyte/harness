@@ -350,8 +350,10 @@ describe("the replay", () => {
     }
     expect(routeAllowed("cain", "/sent")).toBe(false);
     expect(routeAllowed("root", "/sent")).toBe(true);
-    // Cain's key counts only from this machine, and only routes the caller may use are routed.
-    expect(main).toContain('loopback(ip) && sameKey(bare, cainKey()) ? "cain" : "none"');
+    // Who the caller is comes from the state contract (c1/contract.ts, tested in c1.test.ts): Cain's
+    // key counts only from this machine, and only routes the caller may use are routed.
+    expect(main).toContain("const d = linkDecides(MODE, asked);");
+    expect(main).toContain("cainKey: !relayKey && sameKey(bare, cainKey()), local");
     expect(main.indexOf("if (!routeAllowed(caller, url.pathname)) return json({ status: \"refused\" }, 403);")).toBeLessThan(main.indexOf('case "/replay"'));
     expect(main).toContain('if (token() && link.replayDue()) link.replay(30, "rules")');   // once by itself after the rules change
   });

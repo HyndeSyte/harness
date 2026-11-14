@@ -62,8 +62,8 @@ describe("keeper.sh against a fake link", () => {
   test.skipIf(!Bun.which("bash"))("selftest runs the message gate's reply hook on its own, with no key and no link", async () => {
     const hooks = join(import.meta.dir, "../rootfs/opt/cain/hooks");
     const p = Bun.spawn(["bash", KEEPER, "selftest"], { stdout: "pipe", stderr: "pipe",
-      env: { ...process.env, CAIN_HOOKS: hooks, CAIN_SETTINGS: join(import.meta.dir, "../rootfs/opt/cain/settings.json"),
-        CAIN_DISCORD_DIR: join(tmpdir(), "no-discord-here") } });
+      env: { ...process.env, CAIN_HOOKS: hooks, CAIN_SETTINGS: join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json"),
+        CAIN_DISCORD_DIR: join(tmpdir(), "no-discord-here"), CAIN_MODE_FILE: join(tmpdir(), "no-mode-here") } });
     const out = JSON.parse((await new Response(p.stdout).text()).trim());
     expect(await p.exited).toBe(0);
     expect(out).toMatchObject({ status: "ok", said: expect.stringContaining("passed its self-test") });
