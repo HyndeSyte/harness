@@ -1091,8 +1091,8 @@ class MailDates:
             text = "<b>From your mail, on your calendar:</b>\n" + "\n".join(lines) + more + "\n" + how
         else:
             text = ("<b>From your mail, written to your calendar but not confirmed:</b>\n" + "\n".join(lines)
-                    + more + "\nReads of your calendar haven't found these as written, so they may not be "
-                    "there. Nothing to do if that's fine; tap Undo these if they shouldn't be there.")
+                    + more + "\nReads of your calendar haven't found these as written. Nothing to do if "
+                    "that's fine; tap Undo these if they shouldn't be there.")
         told = "told" if confirmed else "unconfirmed"
         with self.ledger.tx() as db:
             for row, _ in items:

@@ -253,6 +253,48 @@ def end_from(ics: str, day: date, tz: str, now: datetime) -> str | None:
     return _join(lines)
 
 
+def ends_by(ics: str, day: date, tz: str) -> bool:
+    """Nothing of this series happens on or after `day`, by its own rule: its UNTIL or COUNT, its
+    days taken off, any extra days, and every moved day. A rule with neither UNTIL nor COUNT goes
+    on. Raises ical.Unreadable or Cant when the event can't be read that far."""
+    lines, default = _unfold(ics), ZoneInfo(tz)
+    at = _master(lines)
+    if at is None:
+        raise Cant("I couldn't read that event")
+    start = ical.parse_when(_start_prop(lines, at), default)
+
+    def on(when) -> date:
+        return when.astimezone(default).date() if isinstance(when, datetime) else when
+    for block in _blocks(lines):                       # a moved day, wherever it moved
+        if _override_key(lines, block, default) is not None \
+                and on(ical.parse_when(_start_prop(lines, block), default)) >= day:
+            return False
+    i = _find(lines, at, "RRULE")
+    if i is None:
+        return on(start) < day
+    rule = ical.parse_rrule(lines[i].partition(":")[2])
+    if not rule.get("UNTIL") and not rule.get("COUNT"):
+        return False
+    gone: set[str] = set()
+    for j in range(at[0] + 1, at[1]):
+        name = _name(lines[j])
+        if name not in ("RDATE", "EXDATE"):
+            continue
+        prop = _prop(lines[j])
+        for value in prop.value.split(","):
+            when = ical.parse_when(ical.Prop(name, prop.params, value), default)
+            if name == "RDATE":
+                if on(when) >= day:
+                    return False
+            else:
+                gone.add(ical._key(when))
+    for inst in ical.expand(start, rule, window_end_date=day + timedelta(days=366 * 50), default=default,
+                            exdates=gone, skip_before=day - timedelta(days=1)):
+        if on(inst) >= day:
+            return False
+    return True
+
+
 def _set_times(lines: list[str], at: tuple[int, int], start: datetime, end: datetime,
                like: ical.Prop, default: ZoneInfo) -> None:
     i = _find(lines, at, "DURATION")

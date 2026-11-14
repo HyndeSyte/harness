@@ -1,4 +1,5 @@
 """Changing events he asks for, on Family and Gmail: from his message to a read back, no tap."""
+import copy
 import json
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -63,7 +64,9 @@ def days_of(ics, **kw):
 
 
 class FakeGmail:
-    """What the planner and the undo ask of google_cal, over a dict."""
+    """What the planner and the undo ask of google_cal, over a dict. Each read hands out its own
+    copy, as a real client does: nothing the harness keeps can change under it, or change the
+    calendar, except through a write."""
     def __init__(self):
         self.events = {}
         self.log = []
@@ -80,14 +83,14 @@ class FakeGmail:
                 continue
             when = datetime.fromisoformat(e["start"]["dateTime"])
             if start <= when < end:
-                out.append(e)
+                out.append(copy.deepcopy(e))
         return out
 
     def look(self, address, uid):
         if self.down:
             return "unknown", None
         e = self.events.get(uid)
-        return ("ok", e) if e is not None else ("gone", None)
+        return ("ok", copy.deepcopy(e)) if e is not None else ("gone", None)
 
     def really_gone(self, address, uid):
         e = self.events.get(uid)
@@ -124,7 +127,7 @@ class FakeGmail:
     def insert(self, address, event):
         self.log.append(("insert", event))
         if self.answer == "ok":
-            self.events[event["id"]] = dict(event)
+            self.events[event["id"]] = copy.deepcopy(event)
             self._bump(event["id"])
         return self._out()
 
@@ -454,6 +457,7 @@ def test_a_restart_during_a_write_is_read_and_told(r):
     r.bot.sent.clear()
     r.start()
     r.cc.bind(r.vault.owner_id())
+    r.advance(minutes=1)                       # read a minute after it was sent
     r.tick()
     assert r.texts()[-1].startswith("<b>Done.</b>") and r.icloud.methods().count("PUT") == 1
 
@@ -540,12 +544,12 @@ def test_a_read_back_that_disagrees_is_said_out_loud_and_undo_stays(r):
         return real(method, url, **kw)
     r.icloud.request = drops_it
     r.tell(change(dates="2026-11-23"))
-    for _ in range(2):                         # it reads, writes once more, and reads that too
+    for _ in range(2):                         # it reads: the version its own write made, without the change
         r.advance(minutes=1)
         r.tick()
     last = r.bot.sent[-1]
     assert last[1].startswith("<b>Nothing changed.</b>") and "it didn't go through" in last[1]
-    assert last[2] is None and r.icloud.methods().count("PUT") == 2
+    assert last[2] is None and r.icloud.methods().count("PUT") == 1
 
 
 def test_a_lost_answer_isnt_called_nothing_changed(r):
@@ -1213,7 +1217,7 @@ class Crash(BaseException):
 
 def receipts(r):
     return [t for t in r.texts() if t.startswith(("<b>Done.</b>", "<b>Nothing changed.</b>",
-                                                   "<b>Only part", "<b>That stopped"))]
+                                                   "<b>Only part", "<b>That stopped", "<b>Not confirmed.</b>"))]
 
 
 def test_nothing_landed_is_written_once_more_then_read(r):
@@ -1253,7 +1257,7 @@ def test_a_read_that_cant_tell_says_so_once_after_an_hour_then_the_answer_once(r
     line = r.cc.digest_line()
     assert "Not confirmed yet, still checking: Take off the 8:30" in line and "School Day on Mon Nov 23 (Family)." in line
     r.icloud.down = False
-    r.advance(minutes=1)
+    r.advance(minutes=15)                      # past the first hour: read every 15 minutes
     r.tick()
     r.advance(minutes=1)
     r.tick()
@@ -1269,7 +1273,8 @@ def test_a_restart_mid_write_is_read_then_finished(r):
     assert r.ledger.db.execute("SELECT state FROM calendar_changes").fetchone()[0] == "sending"
     r.start()
     r.cc.bind(r.vault.owner_id())
-    r.tick()                                   # read: never landed, so written once, by itself
+    r.advance(minutes=1)
+    r.tick()                                   # read a minute on: never landed, so written once, by itself
     assert "2026-11-23" not in days_of(r.body()) and receipts(r)[-1].startswith("<b>Done.</b>")
 
 
@@ -1338,3 +1343,441 @@ def test_a_reset_drops_a_change_waiting_for_a_read_without_a_word_or_a_write(r):
     r.tick()
     assert "PUT" not in r.icloud.methods() and len(r.texts()) == said
     assert r.ledger.db.execute("SELECT state FROM calendar_changes").fetchone()[0] == "reset"
+
+
+# -- the D2 review: a read decides, and nothing it can't tell is written over (0.23.0) ----------
+
+def lost_answer_gmail_move(r):
+    """Piano on Mon Nov 9 moved to 10:00: the move lands, its answer is lost."""
+    gmail_day(r)
+    real = r.gmail.change
+
+    def lands_lost(address, uid, fields, etag):
+        real(address, uid, fields, etag)
+        return caldav.Outcome("unknown")
+    r.gmail.change = lands_lost
+    r.tell(change(calendar="gmail", op="move", title="piano", dates="2026-11-09",
+                  start="2026-11-09T10:00:00-05:00", end="2026-11-09T11:00:00-05:00"), words="move piano to 10")
+    r.gmail.change = real
+
+
+def test_a_family_change_he_undid_by_hand_before_its_read_is_left_as_it_is(r):
+    """It landed with its answer lost, and before a read could tell, a phone put the day back. The
+    same lines under a new version are someone's write: nothing is written over it, and he hears so."""
+    r.icloud.drop_response_next = True
+    r.tell(change(dates="2026-11-23"))
+    assert "2026-11-23" not in days_of(r.body())
+    r.icloud.down = True
+    for _ in range(3):
+        r.advance(minutes=1)
+        r.tick()
+    r.icloud.down = False
+    r.icloud.seed(PATH, SERIES.replace("SEQUENCE:2", "SEQUENCE:4"))      # a phone put the day back
+    puts = r.icloud.methods().count("PUT")
+    r.advance(minutes=1)
+    r.tick()
+    assert r.icloud.methods().count("PUT") == puts and "2026-11-23" in days_of(r.body())
+    [said] = receipts(r)
+    assert said.startswith("<b>Nothing changed.</b>")
+    assert "because it was changed on the calendar since, so I left it as it is." in said
+    assert r.bot.sent[-1][2] is None
+
+
+def test_a_gmail_change_he_undid_by_hand_before_its_read_is_left_as_it_is(r):
+    lost_answer_gmail_move(r)
+    assert r.gmail.events["base_1"]["start"]["dateTime"] == "2026-11-09T10:00:00-05:00"
+    r.gmail.down = True
+    for _ in range(5):
+        r.advance(minutes=1)
+        r.tick()
+    r.gmail.events["base_1"].update(start={"dateTime": "2026-11-09T08:00:00-05:00"},
+                                    end={"dateTime": "2026-11-09T09:00:00-05:00"})
+    r.gmail._bump("base_1")                    # he moved it back himself, in Google Calendar
+    r.gmail.down = False
+    r.gmail.log.clear()
+    r.advance(minutes=1)
+    r.tick()
+    assert r.gmail.log == [] and r.gmail.events["base_1"]["start"]["dateTime"] == "2026-11-09T08:00:00-05:00"
+    assert "because it was changed on the calendar since, so I left it as it is." in receipts(r)[-1]
+
+
+def test_a_write_between_the_read_and_the_second_try_is_never_written_over(r):
+    r.icloud.force_status = 503                # not written, and the answer says nothing
+    r.tell(change(dates="2026-11-23"))
+    real = r.cc._seen_as
+
+    def then_a_phone_writes(entry):
+        seen = real(entry)
+        r.icloud.human_edit(PATH, "X-APPLE-KEEP:yes", "X-APPLE-KEEP:no")      # just after the read
+        r.cc._seen_as = real
+        return seen
+    r.cc._seen_as = then_a_phone_writes
+    r.advance(minutes=1)
+    r.tick()                                   # read: as it was, but the second try finds a new version
+    assert r.icloud.methods().count("PUT") == 1 and receipts(r) == []      # not written, not called his yet
+    r.advance(minutes=1)
+    r.tick()                                   # a read says whose change it is
+    assert r.icloud.methods().count("PUT") == 1 and "X-APPLE-KEEP:no" in r.body()
+    assert "2026-11-23" in days_of(r.body())
+    assert "it was changed on the calendar since, so I left it as it is" in receipts(r)[-1]
+
+
+@pytest.mark.parametrize("whose, said", [
+    ("its own write, landing late", "<b>Done.</b>"),
+    ("a phone", "it was changed on the calendar since, so I left it as it is"),
+])
+def test_a_second_try_refused_for_its_version_is_read_before_anything_is_said(r, whose, said):
+    r.icloud.force_status = 503                # not written, and the answer says nothing
+    r.tell(change(dates="2026-11-23"))
+    if whose == "a phone":
+        r.icloud.before_write = lambda: r.icloud.human_edit(PATH, "X-APPLE-KEEP:yes", "X-APPLE-KEEP:no")
+    else:
+        late = ics_edit.remove_days(SERIES, ["20261123T133000Z"], TZ, NOW)
+        r.icloud.before_write = lambda: r.icloud.seed(PATH, late)
+    r.advance(minutes=1)
+    r.tick()                                   # the second try's write is refused for its version (412)
+    assert receipts(r) == [] and r.icloud.methods().count("PUT") == 2
+    r.advance(minutes=1)
+    r.tick()                                   # read, and only then said
+    assert said in receipts(r)[-1] and r.icloud.methods().count("PUT") == 2
+    if whose != "a phone":
+        r.press(r.with_button("Undo"), "Undo")
+        assert "Undone" in r.texts()[-1] and "2026-11-23" in days_of(r.body())
+
+
+def test_undo_after_a_read_settled_it_works_on_a_server_that_rewrites(r):
+    real = r.icloud.request
+
+    def rewrites(method, url, **kw):
+        if method == "PUT" and kw.get("body"):
+            kw["body"] = kw["body"].replace(b"SUMMARY:", b"CATEGORIES:x\r\nSUMMARY:", 1)
+        return real(method, url, **kw)
+    r.icloud.request = rewrites
+    r.icloud.drop_response_next = True         # it lands, and the answer is lost
+    r.tell(change(dates="2026-11-23"))
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    r.press(r.with_button("Undo"), "Undo")
+    assert "Undone" in r.texts()[-1] and "2026-11-23" in days_of(r.body())
+
+
+def land_then_die(r):
+    """The write lands, and the process dies before its answer is handled."""
+    real = r.icloud.request
+
+    def die_after(method, url, **kw):
+        out = real(method, url, **kw)
+        if method == "PUT":
+            raise Crash()
+        return out
+    r.icloud.request = die_after
+    return real
+
+
+def test_a_write_cut_short_is_read_a_minute_after_it_was_sent_and_kept_in_full(r):
+    """A restart right after a write: no read at once, so a late write shows first. The read that
+    finds it landed keeps every record the usual path keeps, once."""
+    real = land_then_die(r)
+    r.claude.script = [ask(change(dates="2026-11-23"))]
+    with pytest.raises(Crash):
+        r.say("no school Nov 23")
+    r.icloud.request = real
+    r.start()
+    r.cc.bind(r.vault.owner_id())
+    r.icloud.log.clear()
+    r.tick()
+    assert "GET" not in r.icloud.methods() and receipts(r) == []          # sent just now: not read yet
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>") and "PUT" not in r.icloud.methods()
+    row = r.ledger.db.execute("SELECT undo_json FROM calendar_changes").fetchone()
+    assert len(json.loads(row["undo_json"])) == 1
+    assert r.ledger.db.execute("SELECT COUNT(*) FROM calendar_removed").fetchone()[0] == 1
+    r.press(r.with_button("Undo"), "Undo")
+    assert "Undone" in r.texts()[-1] and ical.unfold(r.body()) == ical.unfold(SERIES)
+
+
+def test_undo_tries_start_over_at_each_tap(r):
+    r.tell(change(dates="2026-11-23"))
+    for _ in range(2):
+        r.icloud.force_status = 403            # the calendar turns the undo's write down
+        r.press(r.with_button("Undo"), "Undo")
+        assert r.texts()[-1].startswith("<b>Not fully undone:</b> the calendar refused it.")
+    r.press(r.with_button("Undo"), "Undo")    # a third tap, with the calendar taking writes again
+    assert "Undone" in r.texts()[-1] and "2026-11-23" in days_of(r.body())
+
+
+def two_series(r):
+    """School Day as two series, Mondays and Wednesdays, each its own event, both ended."""
+    wed = (SERIES.replace(UID, "WED").replace("BYDAY=MO,WE", "BYDAY=WE").replace("20261102T", "20261104T")
+           .replace("EXDATE;TZID=America/New_York:20261104T083000\r\n", ""))
+    mon = SERIES.replace("BYDAY=MO,WE", "BYDAY=MO").replace("EXDATE;TZID=America/New_York:20261104T083000\r\n", "")
+    r.icloud.seed(PATH, mon)
+    r.icloud.seed(FAMILY_PATH + "WED.ics", wed)
+    r.claude.script = [ask(change(op="end_series", dates="2027-03-08"))]
+    r.say("end school from march 8")
+
+
+def puts_that(r, *plan):
+    """Each PUT in turn: "ok", 503 (not written, nothing said), 403 (refused), or "lost" (written,
+    its answer lost)."""
+    real, n = r.icloud.request, {"put": 0}
+
+    def put(method, url, **kw):
+        if method == "PUT":
+            what = plan[n["put"]] if n["put"] < len(plan) else "ok"
+            n["put"] += 1
+            if what in (403, 503):
+                r.icloud.force_status = what
+            elif what == "lost":
+                r.icloud.drop_response_next = True
+        return real(method, url, **kw)
+    r.icloud.request = put
+    return n
+
+
+def test_a_put_back_whose_answer_is_lost_is_read_before_any_receipt(r):
+    two_series(r)
+    n = puts_that(r, "ok", 503, 503, "lost")   # Mondays end; Wednesdays twice not; the put-back lands unheard
+    r.approve()
+    for _ in range(3):
+        r.advance(minutes=1)
+        r.tick()
+    assert n["put"] == 4 and "2027-03-15" in days_of(r.body())          # Mondays are back as they were
+    [said] = receipts(r)
+    assert said.startswith("<b>Nothing changed.</b>") and "Partly done" not in said
+    assert "Only part of it went through on Family, so I put that part back as it was." in said
+    assert "on Family, not on Family" not in said and r.bot.sent[-1][2] is None
+
+
+def test_half_a_part_is_named_on_one_calendar_without_saying_it_twice(r):
+    two_series(r)
+    puts_that(r, "ok", 503, 503, 403)          # Mondays end; Wednesdays twice not; the put-back is refused
+    r.approve()
+    for _ in range(3):
+        r.advance(minutes=1)
+        r.tick()
+    said = receipts(r)[-1]
+    assert said.startswith("<b>That stopped partway.</b>") and "on Family, not on Family" not in said
+    assert "Partly done: End " in said and "Only part of it went through on Family, because" in said
+    assert r.with_button("Undo")
+
+
+def test_reads_that_cant_tell_back_off_and_stop_after_a_week_with_one_line(r):
+    """Each minute for the first hour, every 15 minutes until a day has passed, then hourly. A refused
+    read (the address isn't Family's) keeps the same schedule. After a week: one receipt, then quiet."""
+    r.icloud.drop_response_next = True         # it lands, and the answer is lost
+    r.tell(change(dates="2026-11-23"))
+    reads = []
+    real = r.cc._seen_as
+
+    def counted(entry):
+        reads.append(r.clock())
+        return real(entry)
+    r.cc._seen_as = counted
+    start = r.clock()
+    r.icloud.names[FAMILY_PATH] = "Other"      # every read refused: the address isn't Family's
+    for _ in range(90):
+        r.advance(minutes=1)
+        r.tick()
+    minutes = [int((t - start).total_seconds() // 60) for t in reads]
+    assert minutes == list(range(1, 61)) + [75, 90]
+    assert len([t for t in r.texts() if "I couldn't confirm yet whether" in t]) == 1
+    reads.clear()
+    r.advance(hours=22, minutes=30)            # a day on, hourly from here
+    r.tick()
+    for _ in range(4):
+        r.advance(minutes=30)
+        r.tick()
+    minutes = [int((t - start).total_seconds() // 60) for t in reads]
+    assert minutes == [1440, 1500, 1560]
+    r.icloud.names[FAMILY_PATH] = "Family"
+    r.icloud.down = True                       # now nothing answers at all: the same reads
+    r.advance(days=5, hours=20)                # six days and 22 hours since it was sent
+    r.tick()
+    assert receipts(r) == []
+    r.advance(hours=2)
+    r.tick()
+    [said] = receipts(r)
+    assert said.startswith("<b>Not confirmed.</b>") and "a week has passed, so I've stopped reading it" in said
+    assert "Reads couldn't tell whether it went through" in said
+    reads.clear()
+    sent = len(r.bot.sent)
+    r.advance(days=2)
+    r.tick()
+    assert reads == [] and len(r.bot.sent) == sent and "still checking" not in r.cc.digest_line()
+
+
+def test_reads_that_cant_tell_stop_once_the_event_is_over(r):
+    path = FAMILY_PATH + "soon.ics"
+    r.icloud.seed(path, event_on("soon", "Oil change", "20261022T150000Z", "20261022T160000Z"))
+    r.icloud.drop_response_next = True
+    r.tell(change(title="oil change", dates="2026-10-22"))
+    r.icloud.down = True
+    r.advance(hours=27)                        # past its end, Oct 22 at noon
+    r.tick()
+    [said] = receipts(r)
+    assert said.startswith("<b>Not confirmed.</b>") and "it's over now, so I've stopped reading it" in said
+    r.icloud.down = False
+    r.advance(hours=2)
+    r.tick()
+    assert len(receipts(r)) == 1
+
+
+def test_undo_leaves_a_gmail_add_he_changed_since(r):
+    r.tell(change(calendar="gmail", op="add", title="Dentist", start="2026-11-20T09:00:00-05:00",
+                  end="2026-11-20T10:00:00-05:00"))
+    gid = next(k for k in r.gmail.events if k.startswith("cm"))
+    r.gmail.events[gid].update(start={"dateTime": "2026-11-20T11:00:00-05:00"},
+                               end={"dateTime": "2026-11-20T12:00:00-05:00"})
+    r.gmail._bump(gid)                         # he moved it in Google Calendar
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
+    assert r.gmail.events[gid].get("status") != "cancelled" and r.gmail.log[-1][0] == "insert"
+
+
+def test_a_gmail_move_is_done_only_with_its_new_start_and_end(r):
+    gmail_day(r)
+    real = r.gmail.change
+
+    def start_only(address, uid, fields, etag):
+        return real(address, uid, {"start": fields["start"]}, etag)       # the end didn't take
+    r.gmail.change = start_only
+    r.tell(change(calendar="gmail", op="move", title="piano", dates="2026-11-09",
+                  start="2026-11-09T10:00:00-05:00", end="2026-11-09T11:00:00-05:00"), words="move piano to 10")
+    r.gmail.change = real
+    assert receipts(r) == []                   # not done: its end is where it was
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Nothing changed.</b>") and "it didn't go through" in receipts(r)[-1]
+
+
+def test_a_gmail_move_that_comes_back_cancelled_or_with_its_old_end_isnt_done():
+    cc = CalendarChange.__new__(CalendarChange)
+    cc.tz = TZ
+    check = {"kind": "starts", "start": "2026-11-09T10:00:00-05:00", "end": "2026-11-09T11:00:00-05:00"}
+    moved = {"start": {"dateTime": "2026-11-09T10:00:00-05:00"}, "end": {"dateTime": "2026-11-09T11:00:00-05:00"}}
+    assert cc._gmail_shows(check, moved)
+    assert not cc._gmail_shows(check, {**moved, "status": "cancelled"})
+    assert not cc._gmail_shows(check, {**moved, "end": {"dateTime": "2026-11-09T09:00:00-05:00"}})
+
+
+def test_a_family_move_is_read_back_by_the_day_it_moved_not_another_at_that_time(r):
+    """Monday the 23rd moved to Wednesday the 25th at 8:30, when that Wednesday's own day starts
+    then too: a server that drops the move isn't read as it having landed."""
+    real = r.icloud.request
+
+    def drops_it(method, url, **kw):
+        if method == "PUT":
+            kw["body"] = SERIES.encode()       # the server keeps its old text
+        return real(method, url, **kw)
+    r.icloud.request = drops_it
+    r.tell(change(op="move", dates="2026-11-23", start="2026-11-25T08:30:00-05:00",
+                  end="2026-11-25T15:00:00-05:00"), words="move monday's school to wednesday")
+    assert receipts(r) == []                   # Wednesday's own 8:30 isn't the day it moved
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Nothing changed.</b>") and "it didn't go through" in receipts(r)[-1]
+
+
+def test_a_series_end_is_read_by_its_own_rule_not_only_the_next_400_days():
+    ended = ics_edit.end_from(SERIES, date(2027, 3, 8), TZ, NOW)
+    assert ics_edit.ends_by(ended, date(2027, 3, 8), TZ)
+    assert not ics_edit.ends_by(SERIES, date(2027, 3, 8), TZ)                    # its UNTIL is in May
+    forever = SERIES.replace(";UNTIL=20270528T035959Z", "")
+    assert not ics_edit.ends_by(forever, date(2027, 3, 8), TZ)                  # no end at all
+    counted = SERIES.replace("UNTIL=20270528T035959Z", "COUNT=400")
+    assert not ics_edit.ends_by(counted, date(2027, 3, 8), TZ)                  # runs into 2030
+    assert ics_edit.ends_by(SERIES.replace("UNTIL=20270528T035959Z", "COUNT=3"), date(2026, 11, 20), TZ)
+    later = ended.replace("SUMMARY:", "RDATE;TZID=America/New_York:20290305T083000\r\nSUMMARY:", 1)
+    assert not ics_edit.ends_by(later, date(2027, 3, 8), TZ)                    # an extra day in 2029
+    moved = ics_edit.move_day(SERIES, "20261123T133000Z", datetime(2028, 6, 1, 9, 0, tzinfo=NY),
+                              datetime(2028, 6, 1, 10, 0, tzinfo=NY), TZ, NOW)
+    cut = moved.replace("UNTIL=20270528T035959Z", "UNTIL=20270307T045959Z")
+    assert not ics_edit.ends_by(cut, date(2027, 3, 8), TZ)                      # a day moved two years on
+    cc = CalendarChange.__new__(CalendarChange)
+    cc.tz = TZ
+    assert not cc._family_shows({"kind": "ends", "day": "2027-03-08"}, cut)     # past what 400 days show
+    assert cc._family_shows({"kind": "ends", "day": "2027-03-08"}, ended)
+
+
+def test_a_write_cut_short_by_the_update_before_it_kept_a_plan_is_never_made_twice(r):
+    """0.22 kept no plan: a write in flight then can't be read back. It isn't run again, by the
+    runner or here, and he's told plainly what's known."""
+    from harness import runner
+    real = land_then_die(r)
+    r.claude.script = [ask(change(op="add", title="Recital", start="2026-11-20T18:00:00-05:00",
+                                  end="2026-11-20T19:00:00-05:00"))]
+    with pytest.raises(Crash):
+        r.say("add recital nov 20 6pm to family")
+    r.icloud.request = real
+    with r.ledger.tx() as db:
+        db.execute("UPDATE calendar_changes SET settle_json=''")          # as 0.22 left it
+    r.start()
+    r.cc.bind(r.vault.owner_id())
+    r.tick()
+    said = r.texts()[-1]
+    assert said.startswith("<b>That was cut short.</b>") and "didn't write it again" in said
+    assert "confirm" not in said and "may" not in said
+    job = r.ledger.db.execute("SELECT id FROM jobs WHERE kind='message' ORDER BY created_at DESC").fetchone()
+    assert json.loads(r.ledger.receipts(job["id"])[-1]["detail"])["reason"] not in runner.RETRYABLE
+    assert r.c.runner.retry_recent_failures() == 0
+    r.tick()
+    assert len([p for p in r.icloud.events if "/hm-" in p]) == 1
+
+
+def test_an_undo_tapped_while_stopped_comes_back_as_its_own_card(r):
+    r.tell(change(dates="2026-11-23"))
+    receipt = r.with_button("Undo")
+    r.say("/stop")
+    r.press(receipt, "Undo")
+    stopped = [t for t in r.texts() if "didn't undo that" in t]
+    assert stopped and "/resume" not in stopped[-1] and "tap Undo" not in stopped[-1]
+    assert "2026-11-23" not in days_of(r.body())
+    r.say("/resume")
+    card = next(s for s in reversed(r.bot.sent) if s[2] and "you asked to undo" in s[1])
+    assert card[1].startswith("While I was stopped, you asked to undo \u201cTook off the 8:30")
+    assert [t for t, _ in card[2][0]] == ["Do it now", "Drop it"]
+    r.press(card, "Do it now")
+    assert "Undone" in r.texts()[-1] and "2026-11-23" in days_of(r.body())
+
+
+def test_a_dropped_undo_card_stays_dropped(r):
+    from harness import commands
+    r.tell(change(dates="2026-11-23"))
+    receipt = r.with_button("Undo")
+    r.say("/stop")
+    r.press(receipt, "Undo")
+    r.say("/resume")
+    card = next(s for s in reversed(r.bot.sent) if s[2] and "you asked to undo" in s[1])
+    r.press(card, "Drop it")
+    assert "Dropped. Nothing was done." in r.texts()
+    key = json.loads(r.ledger.db.execute("SELECT detail FROM events WHERE kind='stopped_dropped'")
+                     .fetchone()[0])["job"]
+    assert commands.on_stopped_choice(r.ledger, "stopped_redo", key) == "That was dropped, so nothing was done."
+    r.tick()
+    assert "2026-11-23" not in days_of(r.body())
+
+
+@pytest.mark.parametrize("words", [
+    "Check Family for it.", "Check Home Assistant's time zone.", "Look at the calendar to see whether it's there.",
+    "Make sure it's on the calendar.", "Verify it on your phone.", "Confirm it went through.",
+    "Tap Undo again.", "After you turn me back on, tap Undo here.", "Retry it in a minute.",
+    "Delete it on the calendar if needed.", "it may not be there.", "Then check the Family calendar.",
+])
+def test_the_ask_scan_catches_each_chore(words):
+    from conftest import asks_in
+    assert asks_in(words), words
+
+
+@pytest.mark.parametrize("words", [
+    "I couldn't confirm yet whether PT changed; I'm still checking.", "Undo tries what's left again.",
+    "Nothing to do if that's right; tap Undo if it's wrong.", "I'll try again at the next read.",
+    "<b>Not confirmed:</b> reads couldn't tell whether PT was added, and it's over now, so I've stopped reading it.",
+    "Every Family calendar add needs your Approve tap again.", "event id derived from the effect id; before any retry",
+    "DELETE FROM meta WHERE key=?", "the time may not be what you meant.",
+])
+def test_the_ask_scan_leaves_its_own_words_and_facts_alone(words):
+    from conftest import asks_in
+    assert asks_in(words) == [], words

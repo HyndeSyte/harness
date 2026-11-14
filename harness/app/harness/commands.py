@@ -16,7 +16,9 @@ Each command is a job of its own, so it gets a receipt like anything else.
 What he asked while stopped isn't lost and isn't his to send again (org rule R-004): each request
 not acted on is kept (note_stopped), and after /resume (Turn back on) comes back as a card of its
 own, his words in short with "Do it now" and "Drop it". Do it now runs that message as if just
-sent, with the time he sent it given to the model, so "tomorrow" still means his tomorrow.
+sent, with the time he sent it given to the model, so "tomorrow" still means his tomorrow. An Undo
+he tapped while stopped comes back the same way, with the others, as its own card: Do it now
+carries out that Undo. Drop it is final: a later Do it now on the same request does nothing.
 """
 from __future__ import annotations
 
@@ -29,6 +31,11 @@ from .ledger import Ledger, iso
 STOPPED = "stopped_requests"           # his requests not acted on while stopped: job ids, in order
 STOPPED_CARD_TTL_S = 3 * 24 * 3600
 FEW_WORDS = 60                         # his request on its card, in about this many characters
+# An Undo tapped while stopped, kept with his requests as "undo:<calendar_change|family_add>:<target>",
+# and the words its card names it by.
+UNDO = "undo:"
+UNDO_WORDS = "stopped_undo_words:"
+_UNDO_TABLES = {"calendar_change": "calendar_changes", "family_add": "family_adds"}
 
 
 def is_paused(ledger: Ledger) -> bool:
@@ -42,6 +49,29 @@ def note_stopped(ledger: Ledger, job_id: str, db) -> None:
         ledger.set_meta(STOPPED, json.dumps(ids + [job_id]), db)
 
 
+def note_stopped_undo(ledger: Ledger, kind: str, target: str, words: str, db) -> None:
+    """His Undo tap while stopped: kept with his requests, so it comes back after Turn back on as
+    its own card. `words` name what it undoes, made safe for his chat."""
+    key = f"{UNDO}{kind}:{target}"
+    ledger.set_meta(UNDO_WORDS + key, words, db)
+    note_stopped(ledger, key, db)
+
+
+def _dropped(ledger: Ledger, key: str) -> bool:
+    return ledger.db.execute("SELECT 1 FROM events WHERE kind='stopped_dropped' AND detail=? LIMIT 1",
+                             (json.dumps({"job": key}, sort_keys=True),)).fetchone() is not None
+
+
+def _undo_waiting(db, key: str) -> bool:
+    """An Undo kept while stopped that can still be done: each change it names still open."""
+    _, kind, target = key.split(":", 2)
+    table = _UNDO_TABLES.get(kind)
+    if table is None or not target.split():
+        return False
+    return all((db.execute(f"SELECT undo_state FROM {table} WHERE proposal_id=?", (pid,)).fetchone()
+                or {"undo_state": ""})["undo_state"] == "open" for pid in target.split())
+
+
 def _few_words(text: str) -> str:
     """His request, short enough for a card: whole words, his own."""
     words = " ".join(text.split("\n\n[A suggestion from Cain", 1)[0].split())
@@ -51,20 +81,26 @@ def _few_words(text: str) -> str:
 
 
 def card_stopped(ledger: Ledger, chat_id: int, db) -> int:
-    """One card per request he sent while stopped: a decision, never a chore."""
+    """One card per request he sent while stopped, and per Undo he tapped: a decision, never a chore."""
     ids = json.loads(ledger.get_meta(STOPPED) or "[]")
     n = 0
     for job_id in ids:
-        job = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
-        text = ledger.job_text(job_id)
-        if job is None or job["state"] not in ("cancelled", "failed") or not text.strip():
-            continue
+        if job_id.startswith(UNDO):
+            if not _undo_waiting(db, job_id):
+                continue
+            words = ledger.get_meta(UNDO_WORDS + job_id) or "that change"
+            text, about = f"While I was stopped, you asked to undo {words}. Do it now?", None
+        else:
+            job = db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            said = ledger.job_text(job_id)
+            if job is None or job["state"] not in ("cancelled", "failed") or not said.strip():
+                continue
+            text, about = f"While I was stopped, you asked: \u201c{_few_words(said)}\u201d. Do it now?", job_id
         redo = choices.mint(ledger, kind="stopped_redo", target=job_id, chat_id=chat_id,
                             ttl_s=STOPPED_CARD_TTL_S, db=db)
         drop = choices.mint(ledger, kind="stopped_drop", target=job_id, chat_id=chat_id,
                             ttl_s=STOPPED_CARD_TTL_S, db=db)
-        ledger.enqueue(chat_id=chat_id, kind="card", job_id=job_id, db=db,
-                       text=f"While I was stopped, you asked: \u201c{_few_words(text)}\u201d. Do it now?",
+        ledger.enqueue(chat_id=chat_id, kind="card", job_id=about, db=db, text=text,
                        buttons=[[("Do it now", choices.callback_data(redo)),
                                  ("Drop it", choices.callback_data(drop))]],
                        binds=[{"type": "choice", "nonce": redo}, {"type": "choice", "nonce": drop}])
@@ -73,8 +109,36 @@ def card_stopped(ledger: Ledger, chat_id: int, db) -> int:
     return n
 
 
-def on_stopped_choice(ledger: Ledger, kind: str, job_id: str) -> str:
-    """His tap on one of those cards. Do it now: that message runs again, as if just sent."""
+def _on_stopped_undo(ledger: Ledger, kind: str, key: str, undo: Callable[[str, str], str] | None) -> str:
+    """His tap on the card of an Undo he tapped while stopped. Do it now carries out that Undo."""
+    if _dropped(ledger, key):
+        return "That was dropped, so nothing was done."
+    if not _undo_waiting(ledger.db, key):
+        return "That isn't waiting any more, so nothing changed."
+    if kind == "stopped_drop":
+        with ledger.tx() as db:
+            ledger.event("stopped_dropped", {"job": key}, db=db)
+            db.execute("DELETE FROM meta WHERE key=?", (UNDO_WORDS + key,))
+        return "Dropped. Nothing was done."
+    if is_paused(ledger):
+        with ledger.tx() as db:
+            note_stopped(ledger, key, db)
+        return "I'm stopped again, so it waits. Its card comes back after you turn me back on."
+    _, which, target = key.split(":", 2)
+    with ledger.tx() as db:
+        ledger.event("stopped_redone", {"job": key}, db=db)
+        db.execute("DELETE FROM meta WHERE key=?", (UNDO_WORDS + key,))
+    return undo(which, target) if undo is not None else "Nothing changed."
+
+
+def on_stopped_choice(ledger: Ledger, kind: str, job_id: str,
+                      undo: Callable[[str, str], str] | None = None) -> str:
+    """His tap on one of those cards. Do it now: that message runs again, as if just sent, or the
+    Undo he tapped is carried out (`undo`: which module's, and its target). Drop it is final."""
+    if job_id.startswith(UNDO):
+        return _on_stopped_undo(ledger, kind, job_id, undo)
+    if _dropped(ledger, job_id):
+        return "That was dropped, so nothing was done."
     job = ledger.job(job_id)
     receipts = ledger.receipts(job_id) if job is not None else []
     try:

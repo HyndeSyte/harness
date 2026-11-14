@@ -702,7 +702,7 @@ class FamilyCopy:
                 "key": row["key"], "word": row["word"], "start": row["start"], "why": why}, db=db)
 
     def _left_alone(self, since: str) -> str:
-        """Which ones, so he can look, in fixed words."""
+        """Which ones, each by name and why, in fixed words: a fact, nothing for him to go and do."""
         said = []
         named = set()
         more = 0
@@ -721,7 +721,7 @@ class FamilyCopy:
             said.append(text)              # every one by name, never "and N more"
         if more:
             said.append(f"{more} whose record couldn't be read")
-        return "Left alone, check by hand: " + ", ".join(said) + "." if said else ""
+        return "Left alone, no longer kept in step: " + ", ".join(said) + "." if said else ""
 
     def _revive(self, family: caldav.Read, now: datetime, until: datetime) -> None:
         """Once, on the update that stopped leaving copies behind by mistake: any it gave up

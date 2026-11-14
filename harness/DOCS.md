@@ -51,8 +51,8 @@ with a card you approve by tapping.
 Every card with buttons, and the digest, carries a red **Stop** button: start nothing new
 until you tap **Turn back on**, which takes its place while stopped. What you ask while
 stopped isn't acted on, and comes back after **Turn back on** as one card each, with **Do it
-now** and **Drop it**. What it's doing, spend this month and canary results are on the
-Harness page.
+now** and **Drop it**, and so does an *Undo* you tap while stopped. **Drop it** is final. What
+it's doing, spend this month and canary results are on the Harness page.
 
 ## If Cain stops
 
@@ -205,18 +205,21 @@ Then send something like "add dentist Tuesday 3pm":
   (`Dr.Smith`) gets a warning on the card and never skips the tap. A time written with a UTC
   offset your zone doesn't have at that moment, or the same title and start as another add,
   also puts a warning on the card. Read it before you approve.
-- **The receipt** comes once a read of the event finds it as written (title, start, end and
-  place), with an *Undo* button, good for 7 days. A read that can't tell is tried again a minute
-  later. If three reads don't find it, or half an hour passes without one that does, you get one
-  card saying it was written but not confirmed, with the same *Undo*, and the next digest names it. Undo deletes only that event, once. If
-  someone changed the event since, Undo refuses and leaves it.
+- **The receipt** comes once a read of the event finds it there, with an *Undo* button, good for
+  7 days. If it reads differently there than what was written (title, start, end and place), the
+  receipt says so. If a read a minute or more after the write doesn't find it, it's written once
+  more at the same address, and if it's still not there you're told so plainly. Undo deletes only
+  that event, once. If someone changed the event since, Undo refuses and leaves it.
 
 If iCloud's answer is lost, it has a server error, or Harness restarts mid-write, Harness reads
-the event a minute later instead of asking you to look. If it's there, you get the receipt. If it
-isn't, it's written once more (never twice: the event has a fixed address), and if that doesn't go
-through either, you're told so plainly. If reads can't tell for an hour, one line says it isn't
-confirmed yet, and you hear once more when it's known. An undo cut short the same way is read
-too: gone is undone, and still there is deleted once more. A failed write,
+the event a minute after the write was sent instead of asking you to look. If it's there, you get
+the receipt. If it isn't, it's written once more (never twice: the event has a fixed address), and
+if that doesn't go through either, you're told so plainly. A read that can't tell is tried again
+each minute for the first hour, every 15 minutes for the rest of the day, then hourly. After an
+hour, one line says it isn't confirmed yet, and you hear once more when it's known; once the event
+is over or a week has passed, one line says it couldn't be confirmed, and the reads stop. An undo
+cut short the same way is read too: gone is undone, and still there is deleted once more, at most.
+One iCloud turns down is said plainly, with *Undo*. A failed write,
 a rejected password or a calendar whose name isn't Family is said in the thread, and stays
 in `/status` and the digest until a write succeeds. `/stop` blocks adds and undos. If adds are
 off when you ask for one, tapping *Turn on* brings that event's card back by itself.
@@ -278,11 +281,14 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
 - **Every part, or what failed.** When one part can't be done, the others still are, and the
   receipt names the part that wasn't, and why. "Done" only once the calendar reads back the change.
 - **Never "check the calendar".** When a write's answer is lost or its read back fails, Harness
-  reads every event the change touched a minute later. Landed is the usual receipt. Nothing
-  landed is written once more, only if nothing changed since. Half of an event and its copy
-  landed is finished, or put back. Reads that can't tell for an hour get one line saying it
-  isn't confirmed yet, and the receipt follows once it's known. An undo cut short by a restart
-  finishes by itself.
+  reads every event the change touched a minute after the write was sent. Landed is the usual
+  receipt. Nothing landed is written once more, only over the very version it was written over;
+  an event changed on the calendar in the meantime, even back to how it was, is left as it is,
+  and the receipt says so. Half of an event and its copy landed is finished, or put back. Reads
+  that can't tell come each minute for the first hour, every 15 minutes for the rest of the day,
+  then hourly; after an hour one line says it isn't confirmed yet, and the receipt follows once
+  it's known, or says it couldn't be confirmed once the event is over or a week has passed. An
+  undo cut short by a restart finishes by itself.
 - **A tap only when the words may not be yours, or the change is a big one**: a message that
   looks pasted (a quoted line, an email's header lines, a forward, a link, a phone number, words
   written to you), a reply to one, an edited or forwarded message, a note from Cain; a new length

@@ -38,16 +38,34 @@ def labels_of(buttons) -> list[str]:
     return out
 
 
-# A chore handed to him instead of done (org rule R-004): check something, send it again, report
-# back. The harness reads to settle what it doesn't know and retries what failed by itself. Its
-# own "I won't ask again", "I'd ask again" and "I'll try again" are about itself, not asks.
-# Python's own rule: not one of Cain's (message_rules.py mirrors those).
-ASK = re.compile(r"""(?ix)
-    \bcheck(?:ing)?\s+(?:the|that|this|these|your|it|its|whether|if|on|first|back|again|before)\b
+# A chore handed to him instead of done (org rule R-004): check, look, verify, confirm or make sure
+# of something, send, retry or tap it again, delete it "if needed", report back, or a hedge that
+# sends him to look ("it may not be there"). The harness reads to settle what it doesn't know and
+# retries what failed by itself. Its own "I won't ask again", "I'd ask again", "I'll try again" and
+# "I couldn't confirm yet" are about itself, not asks. Python's own rule: not one of Cain's
+# (message_rules.py mirrors those).
+# A chore's verb said to him: a sentence that starts with it, capitalized, or one led in by
+# "please", "then", "you can", "be sure to" and the like.
+_START = r"(?:^|(?<=[.!?:;]\s)|(?<=\n))\s*(?-i:Check|Look|Confirm|Verify|Delete|Remove|Retry|Make\s+sure)\b"
+_LEAD = (r"\b(?:please|then|be\s+sure\s+to|you\s+(?:can|could|should|may|might|must|need\s+to|have\s+to"
+         r"|'ll\s+want\s+to))\s+(?:check|look|confirm|verify|delete|remove|retry|make\s+sure)\b")
+ASK = re.compile(r"""(?imx)
+    \bcheck(?:ing)?\s+(?:the|that|this|these|your|it|its|whether|if|on|first|back|again|before|for|by\s+hand
+                       |family|gmail|google|icloud|home\s+assistant|cain|harness|outlook)\b
+  | """ + _START + r"""(?!\s+before\s+approving)
+  | """ + _LEAD + r"""
   | \bdouble[\s-]check
   | \bre-?send\b
   | \b(?:send|say|type|post)\s+(?:it|that|this|them|one)\s+again\b
   | (?<!I'd\s)(?<!won't\s)(?<!I'll\s)\b(?:ask|try)\s+(?:it\s+|that\s+|me\s+)?again\b
+  | (?<!won't\s)(?<!I'll\s)\bre-?try\s+(?:it|that|this|them|again|later|in|after|once|the|your)\b
+  | \btap\s+(?:(?:the|that|this|on)\s+)?(?:(?-i:[A-Z])\w*|it|that|this|card)(?:\s+\w+){0,3}?\s+(?:again|here)\b
+  | (?<!I'll\s)(?<!I\s)\blook\s+(?:at|for|in)\s+(?:the|your|it|family|gmail|google|icloud)\b
+  | (?<!I'll\s)(?<!I\s)\bmake\s+sure\b
+  | (?<!couldn't\s)(?<!can't\s)(?<!cannot\s)(?<!to\s)\bverify\b
+  | (?<!couldn't\s)(?<!can't\s)(?<!cannot\s)(?<!not\s)\bconfirm\s+(?:it|that|this|these|them|whether|if|the|your)\b
+  | \bif\s+(?:needed|necessary|you\s+need\s+to)\b
+  | \b(?:may|might|could)\s+not\s+(?:be\s+(?:there|on\s+(?:the|your))|have\s+(?:gone|landed|been\s+(?:added|written|made)))\b
   | \blet\s+me\s+know\b
   | \btell\s+me\s+(?:if|whether|when|what|how|once)\b
   | \breport(?:ing)?\s+back\b
@@ -60,6 +78,9 @@ ASK_ALLOWED = [
     ("Check before approving:", "a card's own warning, read before the tap it asks for: part of "
                                 "that decision, not a chore after it"),
     ("you asked to check these with", "says what his own /checkadds asked for: a tap on each change"),
+    ("Then confirm it on the card that follows", "the last step of replacing a key only he can make (a "
+                                                 "password, a service account key): his tap on the card "
+                                                 "that stores it, a decision, not a check"),
 ]
 
 

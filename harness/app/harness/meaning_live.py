@@ -497,8 +497,7 @@ class MeaningLive:
                 text = f"Added to your Gmail: {what} Nothing to do if that's right; tap a button only if it's wrong."
             else:
                 text = (f"Written to your Gmail but not confirmed: {what} A read of your calendar hasn't found it "
-                        "as written, so it may not be there. Nothing to do if that's fine; tap a button only if "
-                        "it's wrong.")
+                        "as written. Nothing to do if that's fine; tap a button only if it's wrong.")
             with self.ledger.tx() as db:
                 nonces = [(label, choices.mint(self.ledger, kind="meaning_undo",
                                                target=f"{r['id']}:{code}", chat_id=self.chat_id,

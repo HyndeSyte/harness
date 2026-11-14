@@ -513,12 +513,10 @@ def test_added_is_said_only_once_a_read_finds_it_as_written(on, monkeypatch):
     assert on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "created"
 
 
-def test_an_add_reads_never_find_gets_the_not_confirmed_line_with_its_undo(on):
+def test_an_add_that_reads_differently_there_is_said_as_that_with_its_undo(on):
     on.ask()
-    path = None
 
     def written_then_changed(*a):
-        nonlocal path
         out = real(*a)
         path = next(iter(on.icloud.family()))
         on.icloud.human_edit(path, "SUMMARY:Dentist", "SUMMARY:Dentist moved")   # not what was written
@@ -526,30 +524,87 @@ def test_an_add_reads_never_find_gets_the_not_confirmed_line_with_its_undo(on):
     real = on.fa.client.create
     on.fa.client.create = written_then_changed
     on.press(on.last(), "Approve")
-    for _ in range(family_add.READS_TO_CONFIRM):
-        on.advance(minutes=2)
-        on.tick()
     _, text, buttons, _ = on.with_button("Undo")       # it keeps its Undo
-    assert text.startswith("<b>Written to the Family calendar but not confirmed.</b>")
-    assert "Added to the Family calendar" not in text
-    assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("unconfirmed", 3)
-    assert "Written to the Family calendar but not confirmed by a read: Dentist Tue Oct 27." in on.fa.digest_line()
-    assert len([x for x in on.texts() if "not confirmed" in x]) == 1     # once
+    assert text.startswith("<b>Added to the Family calendar.</b> It reads differently there now than this, "
+                           "which is what I wrote:\nDentist")
+    assert "may not" not in text and "not confirmed" not in text
+    assert on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "created"
+    assert on.icloud.methods().count("PUT") == 1
 
 
-def test_half_an_hour_of_reads_that_cant_tell_is_not_confirmed(on, monkeypatch):
-    monkeypatch.setattr(on.fa.client, "fetch", lambda href: (caldav.Outcome("failed"), ""))
+def test_reads_after_the_write_that_cant_tell_back_off_and_stop_once_its_over(on, monkeypatch):
+    """Each minute for the first hour, then every 15 minutes: said once after an hour, and once
+    more, plainly, when it's over and the reads stop. Never "it may not be there"."""
+    asked = []
+
+    def cant_tell(href):
+        asked.append(on.clock())
+        return caldav.Outcome("failed"), ""
+    monkeypatch.setattr(on.fa.client, "fetch", cant_tell)
     on.ask()
     on.press(on.last(), "Approve")
-    on.advance(minutes=29)
-    on.tick()                                           # still can't tell, still waiting
-    assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("written", 0)
-    assert not any("not confirmed" in x for x in on.texts())
-    on.advance(minutes=2)
+    start, asked[:] = on.clock(), []
+    for _ in range(90):
+        on.advance(minutes=1)
+        on.tick()
+    minutes = [int((t - start).total_seconds() // 60) for t in asked]
+    assert minutes == list(range(1, 61)) + [75, 90]
+    assert on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "written"
+    assert [t for t in on.texts() if "I couldn't confirm yet" in t] == [
+        "I couldn't confirm yet whether Dentist on Tue Oct 27 was added; I'm still checking."]
+    on.advance(days=6, hours=6)                # past its end, Oct 27 at 4:00 PM
     on.tick()
-    _, text, buttons, _ = on.with_button("Undo")       # bounded: said, with its Undo
-    assert text.startswith("<b>Written to the Family calendar but not confirmed.</b>")
-    assert on.ledger.db.execute("SELECT state, reads FROM family_adds").fetchone()[:] == ("unconfirmed", 0)
+    assert on.texts()[-1] == ("<b>Not confirmed:</b> reads couldn't tell whether Dentist on Tue Oct 27 was "
+                              "added, and it's over now, so I've stopped reading it.")
+    assert on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "unconfirmed"
+    asked.clear()
+    on.advance(hours=3)
+    on.tick()
+    assert asked == [] and not any("may not be there" in t or "if needed" in t for t in on.texts())
+
+
+def test_an_add_answered_ok_but_not_there_is_written_once_more_then_said_plainly(on):
+    """The calendar said it was written, and a read a minute later doesn't find it: once more at
+    the same address, only where nothing is, and not there after that is said plainly."""
+    on.ask()
+
+    def written_then_gone(*a):
+        out = real(*a)
+        on.icloud.events.clear()               # a read after this finds nothing there
+        return out
+    real = on.fa.client.create
+    on.fa.client.create = written_then_gone
+    on.press(on.last(), "Approve")
+    assert not any("Added" in t for t in on.texts())
+    on.advance(minutes=1)
+    on.tick()                                  # not there: written once more, If-None-Match
+    puts = [h for m, _, h, _ in on.icloud.log if m == "PUT"]
+    assert len(puts) == 2 and all(h.get("If-None-Match") == "*" for h in puts)
+    on.advance(minutes=1)
+    on.tick()                                  # and not there again: said, plainly, with no Undo
+    _, text, buttons, _ = on.last()
+    assert text.startswith("<b>Not added.</b> That didn't go through, so nothing was added.") and buttons is None
+    assert on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "not_added"
+    assert len([m for m, *_ in on.icloud.log if m == "PUT"]) == 2
+
+
+def test_an_add_answered_ok_but_not_there_lands_on_the_one_more_write(on):
+    on.ask()
+    real = on.fa.client.create
+    first = []
+
+    def first_is_lost(*a):
+        out = real(*a)
+        if not first:
+            first.append(1)
+            on.icloud.events.clear()           # the first never shows
+        return out
+    on.fa.client.create = first_is_lost
+    on.press(on.last(), "Approve")
+    on.advance(minutes=1)
+    on.tick()
+    _, text, buttons, _ = on.with_button("Undo")
+    assert text.startswith("<b>Added to the Family calendar.</b>") and len(on.icloud.family()) == 1
 
 
 def test_a_pass_reads_back_at_most_ten_written_adds_the_longest_waiting_first(on, monkeypatch):
@@ -690,10 +745,26 @@ def test_a_read_that_cant_tell_says_so_once_after_an_hour_then_the_answer(on):
     assert still == ["I couldn't confirm yet whether Dentist on Tue Oct 27 was added; I'm still checking."]
     assert "Not confirmed yet, still checking: Dentist Tue Oct 27." in on.fa.digest_line()
     on.icloud.down = False
-    on.advance(minutes=1)
+    on.advance(minutes=15)                     # past the first hour: read every 15 minutes
     on.tick()
     assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>")
     assert on.icloud.methods().count("PUT") == 1
+
+
+def test_the_one_more_write_whose_answer_is_lost_too_is_read_a_minute_later(on):
+    """Not "Not added" seconds after the second try: its own read comes a minute after it."""
+    on.ask()
+    on.icloud.force_status = 500               # not written, and the answer says nothing
+    on.press(on.last(), "Approve")
+    on.advance(minutes=1)
+    on.icloud.force_status = 500               # nor the one more
+    on.tick()
+    said = len(on.texts())
+    on.tick()                                  # no time has passed: nothing read, nothing said
+    assert len(on.texts()) == said and on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "settling"
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1].startswith("<b>Not added.</b>") and on.icloud.methods().count("PUT") == 2
 
 
 def test_a_refused_write_is_said_with_its_status_and_no_undo(on):
@@ -736,6 +807,9 @@ def test_a_restart_during_the_write_is_read_then_written_once(on, ledger):
     on.start()
     assert on.fa._bake()["n"] == 0             # the record starts over: an outcome no answer gave
     on.bot.batches.append([])
+    on.tick()
+    assert on.icloud.methods().count("PUT") == 1         # sent just now: not read, nor written, yet
+    on.advance(minutes=1)
     on.tick()                                  # read: nothing there, so it's written once more
     assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>")
     assert on.icloud.methods().count("PUT") == 2 and len(on.icloud.family()) == 2
@@ -834,6 +908,44 @@ def test_undo_whose_delete_never_lands_twice_offers_its_undo_again(on):
     assert on.icloud.methods().count("DELETE") == 2 and len(on.icloud.family()) == 1
 
 
+def test_an_undo_refused_after_a_lost_answer_is_said_and_never_sent_each_minute(on):
+    """One more delete at most, recorded before it's sent. Refused (a 403), it's said plainly with
+    Undo offered again, and no read or delete follows each minute."""
+    card = on.add_one()
+    on.icloud.force_status = 503               # not deleted, and the answer says nothing
+    on.press(card, "Undo")
+    real = on.icloud.request
+
+    def refuse_deletes(method, url, **kw):
+        if method == "DELETE":
+            on.icloud.force_status = 403
+        return real(method, url, **kw)
+    on.icloud.request = refuse_deletes
+    for _ in range(180):                       # three hours
+        on.advance(minutes=1)
+        on.tick()
+    assert on.icloud.methods().count("DELETE") == 2 and len(on.icloud.family()) == 1
+    said = [t for t in on.texts() if t.startswith("<b>Not undone.</b>")]
+    assert said == ["<b>Not undone.</b> iCloud turned it down. Nothing was changed."]
+    fresh = on.with_button("Undo")
+    assert fresh[1] == said[0]
+    assert on.ledger.db.execute("SELECT undo_state FROM family_adds").fetchone()[0] == "open"
+    on.icloud.request = real
+    on.press(fresh, "Undo")
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar."
+
+
+def test_a_restart_finishes_an_undo_he_asked_for(on):
+    card = on.add_one()
+    with on.ledger.tx() as db:                 # his tap was taken; the restart came before the delete
+        db.execute("UPDATE family_adds SET undo_state='requested'")
+    on.start()
+    on.tick()
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar."
+    assert not on.icloud.family() and not any("restarted before it could undo" in t for t in on.texts())
+    assert card
+
+
 def test_a_rejected_password_on_undo_keeps_the_undo_offered(on):
     card = on.add_one()
     on.vault.set_key("family_app_password", "zzzz-zzzz-zzzz-zzzz", by="Owner")
@@ -862,6 +974,7 @@ def test_a_restart_during_the_undo_reads_then_finishes_it(on):
     with pytest.raises(Crash):
         on.press(card, "Undo")
     on.start()
+    on.advance(minutes=1)                      # read a minute after the delete was sent
     on.tick()                                  # read: still there as written, so deleted once more
     assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar."
     assert not on.icloud.family() and not any("don't know" in t for t in on.texts())
@@ -1255,17 +1368,34 @@ def test_stop_in_the_same_batch_as_the_tap_wins(on):
     assert commands.is_paused(on.ledger) and on.icloud.log == []
 
 
-def test_stop_blocks_an_undo_and_keeps_it_offered(on):
+def test_stop_blocks_an_undo_and_it_comes_back_as_its_own_card(on):
     card = on.add_one()
     on.say("/stop")
     on.icloud.log.clear()
     on.press(card, "Undo")
     assert on.icloud.log == [] and len(on.icloud.family()) == 1
-    fresh = on.last()
-    assert "didn't undo" in fresh[1] and fresh[2]
+    said = [t for t in on.texts() if "didn't undo" in t]
+    assert said == [family_add.STOPPED_UNDO] and "/resume" not in said[0] and "tap Undo" not in said[0]
     on.say("/resume")
-    on.press(fresh, "Undo")
+    back = next(s for s in reversed(on.bot.sent) if s[2] and "you asked to undo" in s[1])
+    assert back[1] == ("While I was stopped, you asked to undo adding Dentist on Tue Oct 27 to the Family "
+                       "calendar. Do it now?")
+    assert [t for t, _ in back[2][0]] == ["Do it now", "Drop it"]
+    on.press(back, "Do it now")
     assert "Undone" in on.texts()[-1] and not on.icloud.family()
+
+
+def test_a_dropped_stopped_request_stays_dropped(on):
+    on.say("/stop")
+    on.claude.script = [proposal()]
+    on.say("add dentist Tuesday 3pm")
+    on.say("/resume")
+    back = next(s for s in reversed(on.bot.sent) if s[2] and "While I was stopped" in s[1])
+    on.press(back, "Drop it")
+    job = json.loads(on.ledger.db.execute("SELECT detail FROM events WHERE kind='stopped_dropped'")
+                     .fetchone()[0])["job"]
+    assert commands.on_stopped_choice(on.ledger, "stopped_redo", job) == "That was dropped, so nothing was done."
+    assert on.ledger.job(job)["state"] == "cancelled" and on.icloud.log == []
 
 
 def test_the_digest_is_not_clear_while_waiting_on_a_card(on):

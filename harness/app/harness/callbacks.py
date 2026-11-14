@@ -108,10 +108,18 @@ class Callbacks:
             return self.calendar_change.on_choice(kind, target)
         if kind == "mail_dates_undo" and self.mail_dates is not None:
             return self.mail_dates.on_choice(kind, target)
-        if kind in ("stopped_redo", "stopped_drop"):
-            return commands.on_stopped_choice(self.ledger, kind, target)   # what he asked while stopped
+        if kind in ("stopped_redo", "stopped_drop"):   # what he asked while stopped
+            return commands.on_stopped_choice(self.ledger, kind, target, undo=self._undo_kept)
         if kind in ("meaning_answer", "meaning_undo", "place_skip") and self.meaning_live is not None:
             return self.meaning_live.on_choice(kind, target)   # templates only, no model words
+        return "Nothing changed."
+
+    def _undo_kept(self, which: str, target: str) -> str:
+        """An Undo he tapped while stopped, carried out at his Do it now by its own module."""
+        if which == "calendar_change" and self.calendar_change is not None:
+            return self.calendar_change.on_choice("calendar_change_undo", target)
+        if which == "family_add" and self.family_add is not None:
+            return self.family_add.on_choice("family_add_undo", target)
         return "Nothing changed."
 
     def _keep_rule(self, target: str) -> str:

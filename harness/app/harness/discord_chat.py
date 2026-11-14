@@ -40,8 +40,6 @@ PLAIN_ALERTS = ("input",)
 # The words a few older messages use for commands that don't exist here. Only what some message
 # still says: none of them asks him to send anything again (org rule R-004).
 WORDS = (
-    ("After /resume, tap", "After you turn me back on, tap"),
-    ("After /resume", "After you turn me back on"),
     ("until /resume", "until you turn me back on"),
     ("(/resume)", "(Turn back on)"),
     ("/resume", "Turn back on"),

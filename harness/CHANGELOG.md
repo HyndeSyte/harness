@@ -2,12 +2,14 @@
 
 ## 0.23.0
 
-- **Nothing asks you to check the calendar or send something again.** When a change's answer is lost, or it can't be read back, Harness reads the calendar itself a minute later. If it went through, you get the usual receipt with Undo. If it didn't, it's written once more, only if nothing changed since, and if it still didn't go through you're told so plainly. If half of it went through, the rest is finished, or that half is put back.
-- **When a read can't tell, you hear once.** After an hour, one line says it isn't confirmed yet and is still being checked, and the receipt follows once it's known. The morning digest says "not confirmed yet, still checking".
-- **An undo cut short by a restart finishes by itself,** or says it's already undone.
-- **What you send while stopped comes back after Turn back on,** one card each, with Do it now and Drop it.
-- **A failure that isn't yours is retried once by itself,** whether or not Cain is in front.
-- **A block Google said it wrote but never had is written once more,** not taken as you removing it.
+- **Nothing asks you to check the calendar or send something again.** When a change's answer is lost, or it can't be read back, Harness reads the calendar itself a minute later. If it went through, you get the usual receipt with Undo. If it didn't, it's written once more, only over the very version it was first written over, and if it still didn't go through you're told so plainly. If the event was changed on the calendar in the meantime, even back to how it was, it's left as it is and you're told so. If half of it went through, the rest is finished, or that half is put back.
+- **When a read can't tell, you hear once.** Reads come each minute for the first hour, every 15 minutes for the rest of the day, then hourly. After an hour, one line says it isn't confirmed yet and is still being checked, and the receipt follows once it's known. Once the event is over or a week has passed, one line says it couldn't be confirmed, and the reads stop. The morning digest says "not confirmed yet, still checking".
+- **A Family add iCloud answered but a read doesn't find** is written once more at the same address, so never as a second event, and if it's still not there you're told so plainly.
+- **An undo cut short by a restart finishes by itself,** Family adds included, or says it's already undone. An undo the calendar turns down says so, with Undo, and is never sent again on its own. Each Undo tap is tried afresh.
+- **Undo leaves alone what you changed since,** a Gmail add you moved included.
+- **What you send while stopped, and an Undo you tap while stopped, comes back after Turn back on,** one card each, with Do it now and Drop it. Drop it is final.
+- **A failure that isn't yours is retried once by itself,** whether or not Cain is in front. A change Harness was writing when it updated isn't written again, so it can't be made twice.
+- **A block Google said it wrote but never had is written once more,** not taken as you removing it. A block that was on your calendar and is later gone is yours removed, and stays off.
 - **A Family add whose Approve tap came back before it went in comes back as its own card.**
 
 ## 0.22.0

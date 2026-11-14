@@ -340,6 +340,9 @@ WHY = {
     "put_back": "half of it went through, so that was put back",
     "unknown": "not confirmed yet, still checking",
     "failed": "the calendar refused it",
+    "cut_short": "a restart cut it short while it was writing, so it wasn't written again",
+    "unconfirmed": "reads couldn't tell whether it went through, so I stopped reading it",
+    "family_unconfirmed": "reads couldn't tell whether it went in, so I stopped reading it",
 }
 
 
@@ -362,6 +365,8 @@ def _failed(ledger: Ledger, job, detail: dict, tz: str) -> str:
     reason = str(detail.get("reason") or detail.get("outcome") or "")
     if reason in ("calendar_unknown", "family_unknown", "unknown"):
         return f"{what} ({when}): {WHY[reason]}."   # never "check the calendar" (org rule R-004)
+    if reason in ("cut_short", "unconfirmed", "family_unconfirmed") and not detail.get("steps"):
+        return f"{what} ({when}): {WHY[reason]}."   # not known either way: never "Nothing changed"
     partway = bool(detail.get("steps"))
     if partway:
         reason = "partway"                     # some of it landed, then it stopped: the receipt said what

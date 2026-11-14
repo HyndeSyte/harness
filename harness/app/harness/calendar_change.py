@@ -26,10 +26,15 @@ named with why; the other parts still go.
   * An outcome a write can't confirm (a lost answer, a read back that fails or disagrees, a
     restart mid-request) is settled by reading, never handed to him (org rule R-004). Each
     write is recorded before it's sent, with the event as it was and what it should become, so
-    a read can tell landed from not. Landed is the usual receipt. Nothing landed is written once
-    more, only if nothing changed since. Half of a part landed is finished, or else put back.
-    What reads can't tell yet is read again each minute, said once after an hour as not
-    confirmed yet, and told once when it's known. Nothing is created twice: adds have fixed ids.
+    a read can tell landed from not. The first read comes a minute after the write was sent.
+    Landed is the usual receipt. Nothing landed means the very version it was written over:
+    only then is it written once more, guarded by that version. The same content under a new
+    version is someone's change since, left as it is and said so. Half of a part landed is
+    finished, or else put back, and a put-back whose answer is lost is read before any receipt.
+    What reads can't tell yet is read again each minute for the first hour, every 15 minutes
+    until a day has passed, then hourly; said once after an hour as not confirmed yet, told once
+    when it's known, and once the event is over or a week has passed, said once as not confirmed
+    and read no more. Nothing is created twice: adds have fixed ids.
   * Harness copies on Family are refused: Gmail is the source of those.
   * An event with invitees is refused: changing it could message them.
   * A day he took off that comes back, from any app, gets a line in the digest.
@@ -51,7 +56,7 @@ from zoneinfo import ZoneInfo
 from . import (caldav, choices, commands, effects, family_copy, family_rules, google_cal, ical, ics_edit,
                render)
 from .canonical import canonical_hash
-from .family_add import _looks_pasted
+from .family_add import GAVE_UP_WORDS, _looks_pasted, gave_up, read_due
 from .ledger import Ledger, iso
 
 log = logging.getLogger("harness.calendar_change")
@@ -76,8 +81,9 @@ _CLEARED_WHEN_OFF = (TAP_BACK, AFTER_RESET)
 _RESTORED = ("summary", "description", "location", "start", "end", "recurrence", "transparency",
              "visibility", "reminders", "extendedProperties", "colorId")
 _WORD = re.compile(r"[^\W_]+")
-# An outcome no read has settled yet (_settle): read at most this often, and once reads have
-# failed this many times over at least this long, he hears it isn't confirmed yet, once.
+# An outcome no read has settled yet (_settle): read again on family_add.read_gap's schedule, and
+# once reads have failed this many times over at least this long, he hears it isn't confirmed
+# yet, once. They stop once the event is over or a week has passed (family_add.gave_up).
 READ_AGAIN = timedelta(minutes=1)
 STILL_CHECKING_AFTER = timedelta(hours=1)
 STILL_CHECKING_PASSES = 3
@@ -85,6 +91,7 @@ STILL_CHECKING_PASSES = 3
 WORDS = {"unknown": "I couldn't confirm it yet",
          "not_landed": "it didn't go through",
          "changed": "someone changed that event since, so I left it alone",
+         "changed_since": "it was changed on the calendar since, so I left it as it is",
          "series_gone": "the series that day belongs to isn't on the calendar any more, so there's "
                         "nothing to put it back into",
          "gone": "that event isn't there any more",
@@ -94,6 +101,7 @@ WORDS = {"unknown": "I couldn't confirm it yet",
          "no_key": "the Google key isn't set on the Harness page",
          "denied": "Google says this calendar isn't shared for changes",
          "exists": "that one is already there"}
+STOPPED_UNDO = "I'm stopped, so I didn't undo that. It comes back as its own card after you turn me back on."
 RULE_WORDS = {"me": "are yours: Busy on Gmail and at work, unless you're already busy then",
               "kids": "mean you have the kids: Busy (watching kids) on Gmail and at work",
               "school": "are school days: drop-off and pickup runs on Gmail and at work",
@@ -335,8 +343,10 @@ class CalendarChange:
         self.tz = tz
         self.chat_id: int | None = None
         self.touched = False               # something landed this tick: read Family again now
-        self._recording: tuple | None = None   # the step being run: (proposal, plan, its record)
+        # The step being run: (proposal, plan, its record, the version a retry must find, or None).
+        self._recording: tuple | None = None
         self._undoing: tuple | None = None     # the undo being run: (proposal, its steps left)
+        self._putting_back: tuple | None = None    # a half-done part being put back: (proposal, plan)
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -467,8 +477,8 @@ class CalendarChange:
         zone = ZoneInfo(self.tz)
         out = []
         for p in self.ledger.db.execute(
-                "SELECT p.id, p.job_id, p.state, p.params_json, p.created_at, x.undo_state FROM proposals p"
-                " LEFT JOIN calendar_changes x ON x.proposal_id=p.id WHERE p.effect_type=? AND"
+                "SELECT p.id, p.job_id, p.state, p.params_json, p.created_at, x.undo_state, x.state AS done_state"
+                " FROM proposals p LEFT JOIN calendar_changes x ON x.proposal_id=p.id WHERE p.effect_type=? AND"
                 " p.created_at>=? AND p.job_id<>? ORDER BY p.created_at",
                 (effects.CALENDAR_CHANGE, iso(self.ledger.now() - RECENT), job_id)).fetchall():
             raw = self.ledger.get_meta(f"calendar_change_lines:{p['id']}")
@@ -485,6 +495,9 @@ class CalendarChange:
                      "failed": "only partly done" if landed else "not done",
                      "declined": "he declined it, nothing changed",
                      "expired": "the card expired, nothing changed"}.get(p["state"], "not done, nothing changed")
+            if p["done_state"] in ("unconfirmed", "settling"):
+                state = ("not confirmed: reads couldn't tell whether it went through" if p["done_state"] == "unconfirmed"
+                         else "written, not confirmed yet: being read")
             last = self.ledger.db.execute("SELECT text FROM outbox WHERE job_id=? ORDER BY id DESC LIMIT 1",
                                           (p["job_id"],)).fetchone()
             at = datetime.fromisoformat(p["created_at"]).astimezone(zone)
@@ -655,7 +668,9 @@ class CalendarChange:
     def _fail_orphans(self) -> None:
         """Writes are synchronous, so a row still "sending" belongs to a run that died mid-request.
         Each write was recorded before it was sent (_attempt), so it waits for a read like any
-        write whose answer was lost: the one in flight is read, the ones after it may still run."""
+        write whose answer was lost: the one in flight is read, the ones after it may still run.
+        Its first read comes a minute after it was sent, however soon the restart was, so a write
+        that lands late shows before anything is written again."""
         now = iso(self.ledger.now())
         for row in self.ledger.db.execute(
                 "SELECT * FROM calendar_changes WHERE state='sending'").fetchall():
@@ -667,29 +682,35 @@ class CalendarChange:
                 for rec in part["steps"]:
                     if rec["status"] == "trying":     # sent, or about to be: read it
                         rec["status"] = "unsure" if rec.get("entry") else "pending"
-            plan.update(since=now, read_at=None)
+            sent = plan.get("read_at")                 # the last write's send time (_attempt)
+            plan.update(since=plan.get("since") or sent or now, read_at=sent)
             with self.ledger.tx() as db:
                 db.execute("UPDATE calendar_changes SET state='settling', settle_json=?, updated_at=?"
                            " WHERE proposal_id=?", (json.dumps(plan), now, row["proposal_id"]))
 
     def _orphan_unplanned(self, row) -> None:
-        """Cut short while its writes were being planned: nothing was written. Or by an earlier
-        version, which kept no plan to read: what landed has its Undo, and the rest isn't known."""
+        """Cut short while its writes were being planned: nothing was written, so it may run again
+        by itself (runner.RETRYABLE). Or cut short mid-write by an earlier version, which kept no
+        plan to read: what landed has its Undo, and nothing is written again, by the runner or
+        here, since a write that did land would be made twice."""
         landed = json.loads(row["undo_json"])
         planning = _plan(row).get("planning")
+        reason = "interrupted" if planning else "partway" if landed else "cut_short"
         with self.ledger.tx() as db:
             db.execute("UPDATE calendar_changes SET state='interrupted', undo_state=?, updated_at=?"
                        " WHERE proposal_id=?", ("open" if landed else "none", iso(self.ledger.now()),
                                                 row["proposal_id"]))
             db.execute("UPDATE proposals SET state='failed' WHERE id=?", (row["proposal_id"],))
             self.ledger.transition(row["job_id"], "failed", db=db, receipt=json.dumps(
-                {"reason": "partway" if landed else "interrupted", "steps": len(landed)}))
+                {"reason": reason, "steps": len(landed)}))
             buttons, binds = self._undo_button(db, row["proposal_id"]) if landed else (None, None)
-            self._say(db, self.chat_id, row["job_id"],
-                      "<b>Nothing changed.</b> That stopped before anything was written." if planning
-                      else "<b>That stopped partway.</b> A restart cut it short, so how far it got isn't "
-                           "confirmed." + (" Undo puts back what went through." if landed else ""),
-                      buttons=buttons, binds=binds)
+            if planning:
+                words = "<b>Nothing changed.</b> That stopped before anything was written."
+            else:
+                words = ("<b>That was cut short.</b> A restart stopped it while it was writing, and the "
+                         "version before this one kept no record of its writes, so I didn't write it again."
+                         + (" Undo puts back what it recorded as written." if landed else ""))
+            self._say(db, self.chat_id, row["job_id"], words, buttons=buttons, binds=binds)
 
     def _refused(self, p, reason: str, words: str) -> None:
         with self.ledger.tx() as db:
@@ -778,23 +799,32 @@ class CalendarChange:
 
     def _attempt(self, entry: dict) -> None:
         """Just before a write is sent: what it is, and the event as it was. A restart or a lost
-        answer after this is settled by a read against both (_seen_as)."""
+        answer after this is settled by a read against both (_seen_as). Its first read comes a
+        minute after this. A retry writes only over the very version nothing landed on."""
         if self._recording is None:
             return
-        pid, plan, rec = self._recording
+        pid, plan, rec, guard = self._recording
+        if guard is not None and entry.get("was") != guard:
+            # The version moved on since the read that found nothing landed. Not called someone's
+            # edit yet: nothing is written, and a read says whose change it is (_settle).
+            raise Stopped("changed", undo=rec.get("entry"))
         plan["seq"] = plan.get("seq", 0) + 1           # the order writes were sent in, for Undo
         rec.update(status="trying", entry=dict(entry), seq=plan["seq"])
+        plan["read_at"] = iso(self.ledger.now())       # sent now: read a minute on, if it comes to that
         self._save_plan(pid, plan)
 
-    def _run_step(self, pid: str, plan: dict, rec: dict, step: Step,
-                  unsure_if: tuple[str, ...] = ("unknown",)) -> tuple[str, dict | None, Stopped | None]:
+    def _run_step(self, pid: str, plan: dict, rec: dict, step: Step, unsure_if: tuple[str, ...] = ("unknown",),
+                  guard: str | None = None) -> tuple[str, dict | None, Stopped | None]:
         """One step: "landed" and its undo entry; "unsure" (written, or maybe written, and not
-        confirmed: a read settles it); or "failed", with nothing written."""
-        self._recording = (pid, plan, rec)
+        confirmed: a read settles it); or "failed", with nothing written. `guard`: a retry's
+        version, the one nothing landed on, which the fresh read must find before it writes."""
+        self._recording = (pid, plan, rec, guard)
         try:
             entry = step.run()
         except Stopped as s:
             entry, stopped = s.undo or (rec["entry"] if rec["status"] == "trying" else None), s
+            if entry is None and guard is not None and s.kind in ("changed", "gone"):
+                entry = rec.get("entry")       # a retry that finds it moved on: a read says whose change
         except Refuse as e:
             entry, stopped = None, Stopped("failed", words=str(e))
         except (ValueError, KeyError, TypeError, ical.Unreadable) as e:
@@ -816,7 +846,7 @@ class CalendarChange:
         rec.update(status="landed" if stopped is None else "unsure", entry=full, kind="", words="", applied=True)
         with self.ledger.tx() as db:     # a crash after this still knows what to read or undo
             self._save_plan(pid, plan, db)
-            self._note_removed(db, step)
+            self._note_removed(db, step.removed)
             self._keep_rows(db, step.rows)
             if stopped is None:
                 undo = json.loads(db.execute("SELECT undo_json FROM calendar_changes WHERE proposal_id=?",
@@ -851,12 +881,13 @@ class CalendarChange:
                                   f"{render.plain(same.will)}, and {render.plain(part.will)}", "Which one?")
         return parts, notes
 
-    def _note_removed(self, db, step: Step) -> None:
+    def _note_removed(self, db, removed: list) -> None:
+        """(calendar, uid, instance, title, day): a day as a date, or as its record keeps it."""
         now = iso(self.ledger.now())
-        for calendar, uid, instance, title, day in step.removed:
+        for calendar, uid, instance, title, day in removed:
             db.execute("INSERT OR REPLACE INTO calendar_removed(calendar, uid, instance, title,"
                        " day, removed_at, told_at) VALUES(?,?,?,?,?,?,NULL)",
-                       (calendar, uid, instance, title, day.isoformat(), now))
+                       (calendar, uid, instance, title, day if isinstance(day, str) else day.isoformat(), now))
 
     # -- this add-on's own records of a copy or block it changed for him -----------------------
     _ROW_TABLES = ("family_copies", "family_gmail")
@@ -915,14 +946,30 @@ class CalendarChange:
                 self.ledger.set_meta(PROBLEM, "Calendar change: the last one didn't finish", db)
                 head = ("<b>Only part of that went through.</b>" if done
                         else "<b>That stopped partway.</b>" if any(landed for _, landed, _, _ in failed)
+                        else "<b>Not confirmed.</b>" if any(s.kind == "unconfirmed" for _, _, s, _ in failed)
                         else "<b>Nothing changed.</b>")
             lines = [head] + [part.done for part in done]
             for part, landed, s, at in failed:
                 why = _safe(s.words or WORDS.get(s.kind) or "the calendar refused it")
-                went = " and ".join(x.what for x in landed)
-                if s.kind == "put_back":         # half of it landed, and was put back
+                went = " and ".join(dict.fromkeys(x.what for x in landed))
+                # Writes on one calendar (two series of one title, say) are part of it there,
+                # never "on Family, not on Family".
+                if s.kind == "unconfirmed":      # reads never could tell, and they've stopped
+                    lines.append(f"Not confirmed: {part.will}. " + (
+                        f"Part of it went through on {at.what}; reads couldn't tell whether the rest did"
+                        if landed and went == at.what else
+                        f"It went through on {went}; reads couldn't tell whether it did on {at.what}"
+                        if landed else "Reads couldn't tell whether it went through")
+                        + f", and {why}, so I've stopped reading it.")
+                elif s.kind == "put_back" and s.words == at.what:    # part of it landed, and was put back
+                    lines.append(f"Not done: {part.will}. Only part of it went through on {at.what}, so I "
+                                 "put that part back as it was.")
+                elif s.kind == "put_back":
                     lines.append(f"Not done: {part.will}. It went through on {s.words}, not on "
                                  f"{at.what}, so I put it back as it was on {s.words}.")
+                elif landed and went == at.what:
+                    lines.append(f"Partly done: {part.will}. Only part of it went through on {at.what}, "
+                                 f"because {why}.")
                 elif landed:
                     lines.append(f"Partly done: {part.will}. It went through on {went}, not on {at.what}, "
                                  f"because {why}.")
@@ -1569,8 +1616,8 @@ class CalendarChange:
 
     def _family_shows(self, check: dict, body: str) -> bool:
         """What the write was for, as a read of the event shows it: the days gone, the series
-        ended, the new time there, the new event there. Kept as data, so a read after a restart
-        can ask it too."""
+        ended (by its own rule, not only the next 400 days of it), the occurrence it moved at its
+        new time, the new event there. Kept as data, so a read after a restart can ask it too."""
         kind = check["kind"]
         if kind == "days_off":
             days = [date.fromisoformat(d) for d in check["days"]]
@@ -1579,11 +1626,22 @@ class CalendarChange:
         if kind == "ends":
             day = date.fromisoformat(check["day"])
             start, end = self._bounds([day, day + timedelta(days=400)])
-            return not any(self._span(o.start, o.end)[0] >= day for o in self._occurrences(body, start, end))
+            if any(self._span(o.start, o.end)[0] >= day for o in self._occurrences(body, start, end)):
+                return False
+            try:
+                return ics_edit.ends_by(body, day, self.tz)
+            except (ics_edit.Cant, ical.Unreadable):
+                return True                                 # a rule this can't read: the 400 days say
         if kind == "starts":
             start, end = _when(check["start"]), _when(check["end"])
             low, high = self._span(start, end)
-            return any(_same_start(o.start, start) for o in self._occurrences(body, *self._bounds([low, high])))
+            moved = self._occurrences(body, *self._bounds([low, high]))
+            if "instance" not in check:                     # recorded before 0.23.0 kept which one
+                return any(_same_start(o.start, start) for o in moved)
+            # The occurrence it moved, by its own key (its RECURRENCE-ID, or "" for a one-off), at
+            # its new start and end: not another occurrence that happens to start then.
+            return any(o.instance == check["instance"] and (not check.get("uid") or o.uid == check["uid"])
+                       and _same_start(o.start, start) and _same_start(o.end, end) for o in moved)
         return bool(ical.parse_calendar(body)[1])           # "there": a new event
 
     def _family_write(self, href: str, etag: str, before: str, new: str, check: dict) -> dict:
@@ -1601,7 +1659,11 @@ class CalendarChange:
             raise Stopped("unknown", back.status, undo=entry)
         entry["etag"] = back.etag or entry["etag"]
         entry["after"] = body or new        # as the server keeps it, so a later undo can match it
-        if not self._family_shows(check, body):
+        try:
+            shows = self._family_shows(check, body)
+        except (ValueError, KeyError, TypeError, ical.Unreadable):
+            shows = False                   # written, and its read back can't be placed: a read settles it
+        if not shows:
             raise Stopped("unknown", undo=entry)
         return entry
 
@@ -1657,7 +1719,8 @@ class CalendarChange:
 
     def _family_move(self, f: Found, start, end) -> Step:
         href = f.raw.href
-        check = {"kind": "starts", "start": _text(start), "end": _text(end)}
+        check = {"kind": "starts", "start": _text(start), "end": _text(end), "instance": f.instance,
+                 "uid": f.series}
 
         def run() -> dict:
             body, etag = self._family_fetch(href)
@@ -1723,8 +1786,10 @@ class CalendarChange:
     # -- Gmail ---------------------------------------------------------------------------------
     def _gmail_shows(self, check: dict, event: dict) -> bool:
         kind = check["kind"]
-        if kind == "starts":
-            return _same_start(self._gmail_when(event.get("start")), _when(check["start"]))
+        if kind == "starts":                                # a move: its new start and end, not cancelled
+            return event.get("status") != "cancelled" \
+                and _same_start(self._gmail_when(event.get("start")), _when(check["start"])) \
+                and (not check.get("end") or _same_start(self._gmail_when(event.get("end")), _when(check["end"])))
         if kind == "rrule":
             return event.get("recurrence") == check["value"]
         return event.get("status") != "cancelled"           # "there": a new event
@@ -1832,7 +1897,7 @@ class CalendarChange:
             address = self._gmail_address()
             now = self._gmail_fresh(address, e)
             entry = {"cal": "gmail", "how": "change", "id": e["id"], "fields": old, "wrote": fields,
-                     "was": now.get("etag"), "check": {"kind": "starts", "start": _text(start)}}
+                     "was": now.get("etag"), "check": {"kind": "starts", "start": _text(start), "end": _text(end)}}
             self._attempt(entry)
             self._gmail_send(self.google.change(address, e["id"], fields, now.get("etag")), entry)
             return self._gmail_reread(address, e["id"], entry)
@@ -1853,10 +1918,12 @@ class CalendarChange:
             event["recurrence"] = ["RRULE:" + rule]
 
         def run() -> dict:
-            # Its id is fixed, so a second try can never make a second event.
+            # Its id is fixed, so a second try can never make a second event. All it wrote is kept,
+            # so Undo leaves it alone once he's changed any of it.
             address = self._gmail_address()
-            entry = {"cal": "gmail", "how": "drop", "id": uid, "wrote": {"summary": c["title"]},
-                     "check": {"kind": "there"}}
+            wrote = {"summary": event["summary"], "start": event["start"], "end": event["end"],
+                     "location": event.get("location", ""), "recurrence": event.get("recurrence", [])}
+            entry = {"cal": "gmail", "how": "drop", "id": uid, "wrote": wrote, "check": {"kind": "there"}}
             self._attempt(entry)
             self._gmail_send(self.google.insert(address, event), entry)
             return self._gmail_reread(address, uid, entry)
@@ -1865,16 +1932,18 @@ class CalendarChange:
 
     # -- an outcome no write confirmed, settled by reading -------------------------------------
     # Safety, in one place. A write whose outcome isn't known is read against two records kept
-    # before it was sent: the event as it was, and what the write was for (_attempt). Only "as it
-    # was" (its version, or every line the same) counts as nothing landed, and only then is it
-    # written again, once, through the same step, which reads afresh and guards its write with
-    # that version. A part half done is finished the same way, or else put back through Undo's
-    # own checks. Someone else's change is never written over. Adds have fixed ids, so a second
-    # try finds the first instead of making another. Nothing here runs while stopped.
+    # before it was sent: the event as it was, and what the write was for (_attempt). Only its
+    # very version counts as nothing landed: the same lines under a new version are someone's
+    # write since, left as it is and said so. Only then is it written again, once, through the
+    # same step, which reads afresh and writes only if that read finds the same version, guarded
+    # by it; any other version, or a write refused for its version, isn't called anyone's edit
+    # until a read says whose change it is. A part half done is finished the same way, or else
+    # put back through Undo's own checks, and a put-back nobody answered is read before any
+    # receipt. Someone else's change is never written over. Adds have fixed ids, so a second try
+    # finds the first instead of making another. Nothing here runs while stopped.
     @staticmethod
     def _due(state: dict, now: datetime) -> bool:
-        at = state.get("read_at")
-        return not at or datetime.fromisoformat(at) + READ_AGAIN <= now
+        return read_due(state, now)
 
     def _settle_pending(self) -> None:
         now = self.ledger.now()
@@ -1898,14 +1967,16 @@ class CalendarChange:
         for rec in recs:
             if rec["status"] != "unsure":
                 continue
-            seen = self._seen_as(rec["entry"])
+            seen, read = self._seen_as(rec["entry"])
             if seen == "unread":
                 unread = True
             elif seen == "landed":
-                rec["status"] = "landed"
+                self._landed_by_read(pid, plan, rec, read)
             else:
+                # "before": its very version, so nothing landed. "not_landed": the version its own
+                # write made, without the change. "gone", or "other": someone's change since.
                 rec.update(status="before" if seen == "before" else "failed",
-                           kind="" if seen == "before" else "changed")
+                           kind={"before": "", "not_landed": "", "gone": "gone"}.get(seen, "changed_since"))
                 self._unapply(rec)
         if unread:
             self._not_yet(row, plan, now)
@@ -1917,22 +1988,57 @@ class CalendarChange:
                 for part in plan["parts"]:
                     self._try_rest(pid, plan, part)
             if any(rec["status"] == "unsure" for rec in recs):
-                plan["read_at"] = iso(now)     # the second try's own answer was lost: read it next
+                # The second try's answer was lost, or it found the version moved on: read it a
+                # minute after it was sent, so a late write shows (_attempt kept when that was).
+                plan["read_at"] = plan.get("read_at") or iso(self.ledger.now())
                 self._save_plan(pid, plan)
                 return
+        waiting = False
         for part in plan["parts"]:
-            self._put_back_half(part)
+            waiting = self._put_back_half(pid, plan, part) == "wait" or waiting
+        if waiting:                            # a put-back nobody answered: read before any receipt
+            self._not_yet(row, plan, now)
+            return
         self._settled(row, p, plan)
+
+    def _landed_by_read(self, pid: str, plan: dict, rec: dict, read: dict) -> None:
+        """A write a read found landed: the event as that read found it is kept, so Undo knows it as
+        its own however the server rewrote it, and its records are kept true and its Undo recorded,
+        once, in the same transaction as the outcome."""
+        entry = rec["entry"]
+        if read.get("etag"):
+            entry["etag"] = read["etag"]
+        if entry.get("cal") == "family" and entry.get("how") in ("put", "delete") and read.get("body"):
+            entry["after"] = read["body"]
+        rec["status"] = "landed"
+        with self.ledger.tx() as db:
+            if not rec.get("applied"):
+                self._note_removed(db, rec.get("removed", []))
+                self._keep_rows(db, rec.get("rows", []))
+                rec["applied"] = True
+            db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
+                       (json.dumps(self._undo_entries(plan)), pid))
+            self._save_plan(pid, plan, db)
+
+    @staticmethod
+    def _undo_entries(plan: dict) -> list[dict]:
+        """What Undo puts back: every write known landed, in the order they were sent."""
+        return [r["entry"] for r in sorted((r for part in plan["parts"] for r in part["steps"]
+                                            if r["status"] == "landed"), key=lambda r: r.get("seq", 0))]
 
     def _try_rest(self, pid: str, plan: dict, part: dict) -> None:
         """Write again what didn't land and what never ran, in order, once. Not a part someone
-        else changed: that stays as it is, and what landed of it is put back."""
+        else changed: that stays as it is, and what landed of it is put back. A write again goes
+        only over the version the read found nothing landed on; a version moved on since, or a
+        write refused for its version, waits for a read to say whose change it is, as an add that's
+        "already there" does (it may be the first try, landed late)."""
         recs = part["steps"]
         if all(r["status"] == "landed" for r in recs) or any(r["status"] == "failed" for r in recs):
             return
         for rec in recs:
             if rec["status"] == "landed":
                 continue
+            prior = rec.get("entry") if rec["status"] == "before" else None
             try:
                 step = self._rebuild(rec)
             except Refuse as why:
@@ -1943,31 +2049,47 @@ class CalendarChange:
                 rec.update(status="failed", kind="failed", words="I couldn't read that event")
                 self._save_plan(pid, plan)
                 return
-            # An add that's "already there" may be the first try, landed late: a read says.
-            outcome, _, _ = self._run_step(pid, plan, rec, step, ("unknown", "exists", "changed")
-                                           if part.get("adds") else ("unknown",))
+            guard = prior.get("was") if prior and "was" in prior else None
+            unsure_if = ("unknown", "changed", "gone") + (("exists",) if part.get("adds") else ())
+            outcome, _, _ = self._run_step(pid, plan, rec, step, unsure_if, guard=guard)
             if outcome != "landed":
                 return
 
-    def _put_back_half(self, part: dict) -> None:
+    def _put_back_half(self, pid: str, plan: dict, part: dict) -> str:
         """A part that landed only partly goes back, through Undo's own checks: his approval was
-        for all of it, so half of it isn't left standing."""
+        for all of it, so half of it isn't left standing. "wait": a put-back nobody answered, or
+        whose read couldn't tell, is read again (by the same checks, which find it already back,
+        or write once more at most) before any receipt; "done" otherwise."""
         recs = part["steps"]
         landed = [r for r in recs if r["status"] == "landed"]
         if not landed or len(landed) == len(recs):
-            return
+            part.pop("putting_back", None)
+            return "done"
         latest: dict[str, str] = {}
-        for rec in sorted(landed, key=lambda r: r.get("seq", 0), reverse=True):
-            if self._undo_step(rec["entry"], latest) != "ok":
-                return                         # what's left stands, with its Undo
-            rec["status"] = "undone"
-            with self.ledger.tx() as db:
-                self._undo_rows(db, rec["entry"].get("rows", []))
-                for calendar, uid, instance in rec["entry"].get("removed", []):
-                    db.execute("DELETE FROM calendar_removed WHERE calendar=? AND uid=? AND instance=?",
-                               (calendar, uid, instance))
+        self._putting_back = (pid, plan)
+        try:
+            for rec in sorted(landed, key=lambda r: r.get("seq", 0), reverse=True):
+                result = self._undo_step(rec["entry"], latest)
+                if result in ("unknown", "auth", "no_credentials", "mismatch"):
+                    part["putting_back"] = True
+                    self._save_plan(pid, plan)
+                    return "wait"
+                if result != "ok":
+                    part.pop("putting_back", None)
+                    return "done"              # what's left stands, with its Undo
+                rec["status"] = "undone"
+                with self.ledger.tx() as db:
+                    self._undo_rows(db, rec["entry"].get("rows", []))
+                    for calendar, uid, instance in rec["entry"].get("removed", []):
+                        db.execute("DELETE FROM calendar_removed WHERE calendar=? AND uid=? AND instance=?",
+                                   (calendar, uid, instance))
+                    self._save_plan(pid, plan, db)
+        finally:
+            self._putting_back = None
+        part.pop("putting_back", None)
         self.touched = True
-        part["put_back"] = " and ".join(r["what"] for r in recs if r["status"] == "undone")
+        part["put_back"] = " and ".join(dict.fromkeys(r["what"] for r in recs if r["status"] == "undone"))
+        return "done"
 
     def _settled(self, row, p, plan: dict) -> None:
         """Every write known: one receipt, the same as a change that was never in doubt."""
@@ -1986,8 +2108,7 @@ class CalendarChange:
             else:
                 stopped = Stopped(recs[i]["kind"] or "not_landed", words=recs[i]["words"])
             results.append((whole, landed, stopped, steps[i]))
-        undo = [r["entry"] for r in sorted((r for part in plan["parts"] for r in part["steps"]
-                                            if r["status"] == "landed"), key=lambda r: r.get("seq", 0))]
+        undo = self._undo_entries(plan)
         self.touched = True
         with self.ledger.tx() as db:
             db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
@@ -1996,18 +2117,76 @@ class CalendarChange:
         self._finish(p, results, undo, plan.get("notes", []))
 
     def _not_yet(self, row, plan: dict, now: datetime) -> None:
-        """Reads couldn't tell: read again a minute later. After several over an hour, he hears it
-        isn't confirmed yet, once, and then once more when it's known (the receipt)."""
+        """Reads couldn't tell: read again on the schedule (family_add.read_gap). After several
+        over an hour, he hears it isn't confirmed yet, once, and then once more when it's known
+        (the receipt). Once the event is over or a week has passed, the receipt says it couldn't be
+        confirmed, and the reads stop."""
         plan.update(passes=plan.get("passes", 0) + 1, read_at=iso(now))
+        why = gave_up(plan.get("since"), self._over_at(plan), now)
+        if why:
+            self._unconfirmed(row, plan, why)
+            return
         tell = self._still_due(plan, now)
         with self.ledger.tx() as db:
             self._save_plan(row["proposal_id"], plan, db)
             if tell:
-                unsure = [part for part in plan["parts"] if any(r["status"] == "unsure" for r in part["steps"])]
+                unsure = [part for part in plan["parts"] if part.get("putting_back")
+                          or any(r["status"] == "unsure" for r in part["steps"])]
                 what = " or ".join(f"{part['name']} {'was added' if part.get('adds') else 'changed'}"
                                    for part in unsure if part.get("name")) or "that change went through"
                 self._say(db, self.chat_id, row["job_id"], f"I couldn't confirm yet whether {what}; "
                                                             "I'm still checking.")
+
+    def _unconfirmed(self, row, plan: dict, why: str) -> None:
+        """Reads never could tell, and the event is over or a week has passed: the one receipt
+        says so, with Undo for what's known to have landed, and nothing is read again."""
+        for part in plan["parts"]:
+            part.pop("putting_back", None)     # what landed of it stands, with its Undo
+            for rec in part["steps"]:
+                if rec["status"] == "unsure":
+                    rec.update(status="unconfirmed", kind="unconfirmed", words=GAVE_UP_WORDS[why])
+        p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (row["proposal_id"],)).fetchone()
+        self._settled(row, p, plan)
+
+    def _over_at(self, plan: dict, every: bool = False) -> datetime | None:
+        """When what's still being read about is over (every event the change touched, for an undo):
+        the latest end any of them has. None when one goes on (a series, a rule)."""
+        ends = []
+        for part in plan.get("parts", []):
+            if not every and not part.get("putting_back") \
+                    and not any(r["status"] == "unsure" for r in part["steps"]):
+                continue
+            for rec in part["steps"]:
+                end = self._ends(rec)
+                if end is None:
+                    return None
+                ends.append(end)
+        return max(ends) if ends else None
+
+    def _ends(self, rec: dict) -> datetime | None:
+        """When the event a write is about is over, as its record says: None for one that goes on
+        (a series, a series ended, a rule)."""
+        spec = rec.get("spec") or {}
+        fn = spec.get("fn", "")
+        if fn in ("rule", "family_end", "gmail_end"):
+            return None
+        times: list = []
+        c = spec.get("c") or {}
+        if c.get("op") == "add_series":
+            if not c.get("until"):
+                return None
+            times.append(date.fromisoformat(c["until"]))
+        elif c.get("end"):
+            times.append(_when(c["end"]))
+        for f in spec.get("found", []):
+            times.append(_when(f["end"]) if f.get("end") else date.fromisoformat(f["last"]))
+        if spec.get("end"):
+            times.append(_when(spec["end"]))
+        if not times:
+            return None
+        zone = ZoneInfo(self.tz)
+        return max(t if isinstance(t, datetime) else datetime(t.year, t.month, t.day, tzinfo=zone)
+                   + timedelta(days=1) for t in times)
 
     @staticmethod
     def _still_due(state: dict, now: datetime) -> bool:
@@ -2062,63 +2241,72 @@ class CalendarChange:
         step.removed = [(c, u, i, t, date.fromisoformat(d)) for c, u, i, t, d in rec["removed"]]
         return step
 
-    def _seen_as(self, entry: dict) -> str:
-        """A write read again: "landed" (as it was meant), "before" (as it was: nothing landed),
-        "other" (gone, or someone else's change), or "unread" (the read couldn't tell)."""
+    def _seen_as(self, entry: dict) -> tuple[str, dict]:
+        """A write read again, and what the read found ({"etag", "body"}): "landed" (as it was
+        meant); "before" (its very version: nothing landed); "not_landed" (the version its own
+        write made, without the change); "gone"; "other" (someone else's change since, the same
+        lines under a new version included); or "unread" (the read couldn't tell)."""
         try:
             if entry["cal"] == "rule":
                 now = family_rules.find(self.ledger, entry["said"])
-                return "landed" if now is not None and now.kind == entry.get("kind") else "before"
+                return ("landed" if now is not None and now.kind == entry.get("kind") else "before"), {}
             return (self._family_seen if entry["cal"] == "family" else self._gmail_seen)(entry)
         except (ValueError, KeyError, TypeError, AttributeError, ical.Unreadable):
-            return "unread"
+            return "unread", {}
 
-    def _family_seen(self, entry: dict) -> str:
+    def _family_seen(self, entry: dict) -> tuple[str, dict]:
         out, body = self.client.fetch(entry["href"])
         if out.kind not in ("ok", "gone"):
-            return "unread"
+            return "unread", {}
+        read = {"etag": out.etag or "", "body": body}
         how = entry["how"]
         if how == "delete":                    # an add: it's there, or it isn't
             if out.kind == "gone":
-                return "before"
-            return "landed" if self._family_shows(entry["check"], body) else "other"
+                return "before", read
+            return ("landed" if self._family_shows(entry["check"], body) else "other"), read
         if how == "restore":                   # a removal
             if out.kind == "gone":
-                return "landed"
-            return "before" if out.etag == entry.get("was") or caldav._unchanged(body, entry["before"]) else "other"
+                return "landed", read
+            return ("before" if out.etag == entry.get("was") else "other"), read
         if out.kind == "gone":
-            return "other"
+            return "gone", read
         # What was sent, not what a read back kept: a server that kept its old text took the
         # write, version and all, without the change.
         if self._family_shows(entry["check"], body) or caldav._unchanged(body, entry.get("sent", "")):
-            return "landed"
-        return "before" if out.etag == entry.get("was") or caldav._unchanged(body, entry["before"]) else "other"
+            return "landed", read
+        if out.etag == entry.get("was"):
+            return "before", read
+        if entry.get("etag") and out.etag == entry["etag"]:
+            return "not_landed", read          # its own write's version, read back without the change
+        return "other", read
 
-    def _gmail_seen(self, entry: dict) -> str:
+    def _gmail_seen(self, entry: dict) -> tuple[str, dict]:
         address = self.address()
         if not address or self.google is None:
-            return "unread"
+            return "unread", {}
         kind, cur = self.google.look(address, entry["id"])
         if kind == "unknown":
-            return "unread"
+            return "unread", {}
         cancelled = kind == "gone" or (cur or {}).get("status") == "cancelled"
+        read = {"etag": (cur or {}).get("etag")}
         how = entry["how"]
         if how == "drop":                      # an add. Google keeps a deleted one, cancelled
             if kind == "gone":
-                return "before"
-            return "other" if cancelled else "landed"
+                return "before", read
+            return ("other" if cancelled else "landed"), read
         if how == "restore":                   # a removal
             if cancelled:
-                return "landed"
-            start = entry["fields"].get("start")
-            same = cur.get("etag") == entry.get("was") or (start is not None and self._as_written(cur, {"start": start}))
-            return "before" if same else "other"
+                return "landed", read
+            return ("before" if cur.get("etag") == entry.get("was") else "other"), read
         if cancelled:
-            return "other"
+            return "gone", read
         if self._as_written(cur, entry.get("wrote") or {}):
-            return "landed"
-        return "before" if cur.get("etag") == entry.get("was") or self._as_written(cur, entry.get("fields") or {}) \
-            else "other"
+            return "landed", read
+        if cur.get("etag") == entry.get("was"):
+            return "before", read
+        if entry.get("etag") and cur.get("etag") == entry["etag"]:
+            return "not_landed", read          # its own write's version, read back without the change
+        return "other", read
 
     def _names(self, plan: dict) -> str:
         names = list(dict.fromkeys(part["name"] for part in plan.get("parts", []) if part.get("name")))
@@ -2135,9 +2323,22 @@ class CalendarChange:
     def on_choice(self, kind: str, target: str) -> str:
         if kind != "calendar_change_undo":
             return "Nothing changed."
+        pids = [pid for pid in target.split()       # "Undo both" names the later changes too
+                if (self.ledger.db.execute("SELECT undo_state FROM calendar_changes WHERE proposal_id=?",
+                                           (pid,)).fetchone() or {"undo_state": ""})["undo_state"] == "open"]
+        if not pids:
+            return "There's nothing to undo there."
+        if commands.is_paused(self.ledger):
+            # His tap waits with what he asked while stopped, and comes back as its own card.
+            rows = [self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()
+                    for pid in pids]
+            with self.ledger.tx() as db:
+                commands.note_stopped_undo(self.ledger, "calendar_change", " ".join(pids),
+                                           self._undo_words(rows), db)
+            return STOPPED_UNDO
         with self.ledger.tx() as db:
             done = 0
-            for pid in target.split():               # "Undo both" names the later changes too
+            for pid in pids:
                 done += db.execute("UPDATE calendar_changes SET undo_state='requested', updated_at=?"
                                    " WHERE proposal_id=? AND undo_state='open'",
                                    (iso(self.ledger.now()), pid)).rowcount
@@ -2145,13 +2346,25 @@ class CalendarChange:
                 return "There's nothing to undo there."
         return "Undoing it now."
 
+    @staticmethod
+    def _undo_words(rows: list) -> str:
+        """His Undo, as its card after Turn back on names it: what each change did, in its words."""
+        done = [part["done"] for row in rows for part in _plan(row).get("parts", []) if part.get("done")]
+        return ("\u201c" + "; ".join(done) + "\u201d") if done else "that calendar change"
+
     def _reopen(self, row, words: str) -> None:
+        """Undo offered again, as a new request: its tries start over (_undo_attempt)."""
         plan = _plan(row)
         plan.pop("undo", None)                       # its reads are over: a later undo starts afresh
         with self.ledger.tx() as db:
-            db.execute("UPDATE calendar_changes SET undo_state='open', settle_json=?, updated_at=? WHERE"
-                       " proposal_id=?", (json.dumps(plan) if plan else "", iso(self.ledger.now()),
-                                          row["proposal_id"]))
+            cur = db.execute("SELECT undo_json FROM calendar_changes WHERE proposal_id=?",
+                             (row["proposal_id"],)).fetchone()
+            steps = json.loads((cur["undo_json"] if cur else "") or "[]")
+            for step in steps:
+                step.pop("undo_tries", None)
+            db.execute("UPDATE calendar_changes SET undo_state='open', undo_json=?, settle_json=?, updated_at=?"
+                       " WHERE proposal_id=?", (json.dumps(steps), json.dumps(plan) if plan else "",
+                                                iso(self.ledger.now()), row["proposal_id"]))
             buttons, binds = self._undo_button(db, row["proposal_id"])
             self._say(db, self.chat_id, row["job_id"], words, buttons=buttons, binds=binds)
 
@@ -2160,7 +2373,13 @@ class CalendarChange:
         left as it is, so an undo cut short or with a lost answer is simply run again: by itself,
         a minute later, writing at most once more for each event (_undo_attempt)."""
         if paused:
-            self._reopen(row, "I'm stopped, so I didn't undo that. After /resume, tap Undo here.")
+            # His tap waits with what he asked while stopped, and comes back as its own card.
+            with self.ledger.tx() as db:
+                db.execute("UPDATE calendar_changes SET undo_state='open', updated_at=? WHERE proposal_id=?",
+                           (iso(self.ledger.now()), row["proposal_id"]))
+                commands.note_stopped_undo(self.ledger, "calendar_change", row["proposal_id"],
+                                           self._undo_words([row]), db)
+                self._say(db, self.chat_id, row["job_id"], STOPPED_UNDO)
             return
         with self.ledger.tx() as db:
             db.execute("UPDATE calendar_changes SET undo_state='undoing', updated_at=? WHERE proposal_id=?",
@@ -2221,12 +2440,21 @@ class CalendarChange:
                           "Undo tries what's left again.")
 
     def _undo_not_yet(self, row) -> None:
-        """An undo whose reads or answer couldn't say how far it got: run again a minute later,
-        reading first (no Undo button meanwhile: it's still his tap being carried out)."""
+        """An undo whose reads or answer couldn't say how far it got: run again on the schedule,
+        reading first (no Undo button meanwhile: it's still his tap being carried out). Once the
+        events are over or a week has passed, he hears it couldn't be confirmed, with Undo, and the
+        reads stop."""
         now = self.ledger.now()
         plan = _plan(row)
         state = plan.setdefault("undo", {})
         state.update(since=state.get("since") or iso(now), read_at=iso(now), passes=state.get("passes", 0) + 1)
+        why = gave_up(state.get("since"), self._over_at(plan, every=True), now)
+        if why:
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(PROBLEM, "Calendar change: an undo couldn't be confirmed", db)
+            self._reopen(row, f"<b>Not confirmed:</b> reads couldn't tell whether {self._names(plan)} went back, "
+                              f"and {GAVE_UP_WORDS[why]}, so I've stopped reading it.")
+            return
         tell = self._still_due(state, now)
         with self.ledger.tx() as db:
             db.execute("UPDATE calendar_changes SET undo_state='settling', settle_json=?, updated_at=? WHERE"
@@ -2237,7 +2465,15 @@ class CalendarChange:
 
     def _undo_attempt(self, step: dict) -> bool:
         """Just before an undo's write: the first, and at most one more. Kept with the step, so a
-        restart doesn't make it a third."""
+        restart doesn't make it a third. A put-back of half a part counts its own the same way."""
+        if self._putting_back is not None:
+            pid, plan = self._putting_back
+            tries = step.get("put_back_tries", 0)
+            if tries >= 2:
+                return False
+            step["put_back_tries"] = tries + 1
+            self._save_plan(pid, plan)
+            return True
         if self._undoing is None:
             return True
         pid, left = self._undoing
@@ -2419,6 +2655,12 @@ class CalendarChange:
         for key, value in wrote.items():
             if key in ("start", "end"):
                 if not _same_start(self._gmail_when(now.get(key)), self._gmail_when(value)):
+                    return False
+            elif key in ("summary", "description", "location"):     # none and empty are the same
+                if (now.get(key) or "") != (value or ""):
+                    return False
+            elif key == "recurrence":
+                if list(now.get(key) or []) != list(value or []):
                     return False
             elif now.get(key) != value:
                 return False
