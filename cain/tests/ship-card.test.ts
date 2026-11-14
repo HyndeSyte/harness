@@ -133,7 +133,7 @@ describe("the Ship card the link builds", () => {
     r.files.holds = keeperHolds({ P64: { holder: "laptop:s1" } });
     await expect(ship(r)).rejects.toThrow("held by another session");
     r.files.holds = null;
-    await expect(ship(r, { text: "Stop stays in reach — always." })).rejects.toThrow("an em dash");
+    await expect(ship(r, { text: "Stop stays in reach \u2014 always." })).rejects.toThrow("an em dash");
     expect(r.github.asked).toHaveLength(asked);
     // A newer head on GitHub refuses it; a second card for the pull request replaces the first.
     r.github.facts = facts({ head: SHA2 });

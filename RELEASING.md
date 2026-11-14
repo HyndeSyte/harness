@@ -69,20 +69,34 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
    that expose a private email). Message: `<App> <version>: <what, in a line>`.
 6. Push the branch and open a pull request into `main`. The description follows the
    template's four sections: what changed, how it was tested, what is not verified, and
-   anything Dane must do (for example a new option to switch on).
+   anything Dane must do (for example a new option to switch on). Its title is quoted
+   on Dane's Ship card as GitHub has it: `<App> <version>: <what he'll notice>`, in plain
+   words, with no em dashes, shas or ids.
 7. Wait for the `pytest`, `bun` and `pr` checks on the pull request to pass. Fix until
    they do.
 8. Never merge, never push `main`, never force-push. GitHub refuses it anyway: shipping
    is Dane's tap.
 9. A laptop session hands its finished pull request to Cain: it passes its record item
-   to `cain` with a note naming the pull request, its full head sha, that CI passed,
-   and how it was reviewed. The record keeper tells Cain at once, and Cain shows Dane
-   the Ship card.
+   to `cain` with a note naming the pull request and its full head sha. The record
+   keeper tells Cain at once. Cain gets an outside review of the diff through his review
+   service (only a service review's line goes on the card, whatever other reviews it
+   had), then shows Dane the Ship card.
 
 ## Ship (only after Dane's go)
 
 Dane's go is his tap on Cain's Ship card for that one pull request, at the one head
-commit the card was for (its full head sha). On that tap Cain's link lands it itself
+commit the card was for (its full head sha). The link builds that card itself
+(`cain/rootfs/opt/cain/link/core.ts`), so what it says comes from code: its question
+names each App and version the tap installs (from the `version:` lines the pull
+request's `config.yaml` patches add); a line from GitHub gives the pull request's title,
+its commit and file counts, the parts that matter most, and its checks, read the way the
+landing reads them (a check that failed or hasn't run yet refuses the card); and its last
+line is the review service's own Reviewed line for the review Cain names, refused if
+that review finished before the head commit ("No outside review." when he names none).
+Cain's own line says only what Dane will notice, and checks or review claims in it are
+refused.
+
+On that tap Cain's link lands it itself
 (`cain/rootfs/opt/cain/link/merge.ts`), with the deploy key only it holds:
 
 - it checks the pull request is open, into `main`, from a branch of this repository and

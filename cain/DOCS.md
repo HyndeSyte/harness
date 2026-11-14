@@ -61,8 +61,9 @@ the App.
 ## Words that reach you
 
 Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing hidden
-behind "and 3 more", no commit or job ids or ISO times, and no button named that the
-message (or the card Cain's reply answers) doesn't have. "add-on" is fixed as it goes
+behind "and 3 more", no commit or job ids or ISO times, no button named that the
+message (or the card Cain's reply answers) doesn't have, and a "Reviewed:" line from
+Cain only as the review service gave it, word for word. "add-on" is fixed as it goes
 out. Every em dash of Cain's is held back for him to rewrite, never fixed: only he
 knows whether he meant a break (a comma or a new sentence) or a range ("to" or
 "through"), and a comma in its place can turn a range into a list. Anything else is
@@ -128,10 +129,14 @@ connector needs you to sign in again do you get one message, with a button that 
 Claude's connector settings. If your Ship tap ran out meanwhile (2 hours), a new Ship
 card comes once Home Assistant answers.
 
-A Ship card has a line of the App's own, from GitHub: how many commits and files the
-change has, and whether it touches the parts that matter most (Cain's link, his hooks,
-permissions or rules, Ship and Stop, GitHub's workflows, an App's image, the release
-rules), whatever Cain's own words on the card say.
+A Ship card is built by the App, not by Cain. Its question says what your tap installs
+("Ship Cain 0.11.0?", or that nothing installs). A line from GitHub gives the change's
+title, how many commits and files it has, whether it touches the parts that matter most
+(Cain's link, his hooks, permissions or rules, Ship and Stop, GitHub's workflows, an
+App's image, the release rules), and whether its checks passed; a change whose checks
+failed gets no card. The last line is the outside review's verdicts as the review
+service recorded them, for a review of the change as it is now, or "No outside review."
+Cain's own line says only what you'll notice.
 
 Both keys are kept by the App and left out of Home Assistant's backups. Cain's tools
 are barred from them, and once his session runs as its own user (the next step) he

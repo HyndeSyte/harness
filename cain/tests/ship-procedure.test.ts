@@ -22,6 +22,18 @@ describe("RELEASING.md", () => {
     expect(ship).toContain("install nothing, change nothing");
   });
 
+  test("the Ship card's words come from code (0.11.0), and a handed-over pull request is reviewed by the service first", () => {
+    const flat = ship.replace(/\s+/g, " ");
+    for (const must of ["The link builds that card itself", "names each App and version the tap installs", "read the way the landing reads them",
+      "a check that failed or hasn't run yet refuses the card", "the review service's own Reviewed line for the review Cain names",
+      "refused if that review finished before the head commit", "\"No outside review.\"", "Cain's own line says only what Dane will notice"])
+      expect(flat).toContain(must);
+    const build = section(releasing, "## Build (a branch and a pull request)").replace(/\s+/g, " ");
+    expect(build).toContain("gets an outside review of the diff through his review service");
+    expect(build).not.toContain("that CI passed, and how it was reviewed");
+    expect(build).toContain("Its title is quoted on Dane's Ship card as GitHub has it");
+  });
+
   test("a section says what happens when the connector lapses, with no report-back tap", () => {
     const lapse = section(releasing, "## If Home Assistant's connector lapses");
     for (const must of ["before he\nshows a Ship card", "again before he starts a Ship run", "each 15-minute cloud job check",
@@ -74,6 +86,31 @@ describe("Cain's rules", () => {
 
   test("after a restart, before he has written, his DM's chat id is read from the published cards", () => {
     expect(rules.replace(/\s+/g, " ")).toContain("After a restart, before he has written, his DM's chat id is `dm` in /data/trust/cards.json: use it to tell him what he should hear (the install line after a Ship) instead of waiting for his next message.");
+  });
+
+  test("Ship cards built from code (0.11.0): the card names its review, his line says only what he'll notice, the link builds the rest", () => {
+    const build = jobs.slice(jobs.indexOf("- Build finished with a pull request"));
+    const flat = build.replace(/\s+/g, " ");
+    expect(build).toContain('`/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he\'ll notice, in one line>"`');
+    for (const must of ["through the review service", "Your line says only what he'll notice", "the question (which Apps and versions the tap installs)",
+      "whether its checks passed", "that review's Reviewed line", "Leave CI, checks and review claims out of your words: the link refuses them",
+      "a check failed or hasn't run yet", "a review that finished before the head commit", "A new head needs a new review of it and a new Ship card"])
+      expect(flat).toContain(must);
+    expect(flat.indexOf("through the review service")).toBeLessThan(flat.indexOf("keeper.sh ship --item"));
+    expect(jobs).not.toContain("CI passed. Reviewed:");
+    // Step 5: a handed-over pull request gets a review from the service before its card.
+    expect(jobs.split("5. A laptop session hands you")[1].replace(/\s+/g, " ")).toContain("get an outside review of its diff through the review service "
+      + "before the Ship card, even if it was reviewed elsewhere: only a service review's line goes on the card");
+  });
+
+  test("a Reviewed line is the relay's, word for word, and the gate refuses any other", () => {
+    const reviews = section(rules, "## Outside reviews").replace(/\s+/g, " ");
+    expect(reviews).toContain('end with its Reviewed line exactly as the relay gave it ("Say it as: Reviewed: OpenAI, approve with changes; Gemini, approve."), '
+      + "word for word. The gate refuses any other Reviewed line");
+    const gate = section(rules, "## The message gate").replace(/\s+/g, " ");
+    for (const must of ["a Reviewed line only as the review service gave it", "A Reviewed line goes out only as the review service gave it",
+      "On a Ship card your line may claim no checks or review: the link adds those"])
+      expect(gate).toContain(must);
   });
 
   test("Stop: within reach of his newest message, never on a card that asks something, and off while stopped", () => {
