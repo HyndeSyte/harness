@@ -22,7 +22,10 @@ if ! there "$STATE"; then
     if ! there "$DATA/cain" && ! there "$DATA/gate"; then echo fresh; else echo broken; fi
     exit 0
   fi
-  if rootfile "$J" && [ "$(bun "$OPT/c1/tools.ts" journal-check "$J" 2>/dev/null)" != bad ]; then echo switching; else echo broken; fi
+  # Only a journal whose check answered with one of its steps is a switch under way; anything
+  # else, the check failing to answer included, is damaged.
+  step=""; rootfile "$J" && step="$(bun "$OPT/c1/tools.ts" journal-check "$J" 2>/dev/null)"
+  case "$step" in begin|locked|staged|scrubbed|validated|commit|committed) echo switching ;; *) echo broken ;; esac
   exit 0
 fi
 if ! rootfile "$STATE" || [ ! -r "$STATE" ]; then echo broken; exit 0; fi

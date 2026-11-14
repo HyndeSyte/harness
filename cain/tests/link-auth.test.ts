@@ -59,10 +59,10 @@ describe("the request log: each id runs once, across restarts", () => {
     expect(new RequestLog(path).get("f".repeat(32), NOW + 1000)).toEqual({ at: NOW + 5, state: "done", status: 200, body: '{"id":4}' });
   });
 
-  test("kept 48 hours, longer than the specialist retries, then gone", () => {
+  test("kept 8 days, longer than the specialist retries an operation (7 days), then gone", () => {
     const log = new RequestLog(null);
     log.put("f".repeat(32), { at: NOW, state: "done", status: 200, body: "{}" });
-    expect(KEEP_MS).toBe(48 * 3_600_000);
+    expect(KEEP_MS).toBe(8 * 24 * 3_600_000);
     expect(log.get("f".repeat(32), NOW + KEEP_MS - 1)).not.toBeNull();
     expect(log.get("f".repeat(32), NOW + KEEP_MS + 1)).toBeNull();
   });

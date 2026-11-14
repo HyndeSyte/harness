@@ -2,12 +2,12 @@
 // limit, who may call the link in each state, what uid 1000 may read, the backup's manifest,
 // the secret values searched for, and the keys (the old relay key signs nothing).
 import { describe, expect, test } from "bun:test";
-import { chmodSync, lutimesSync, mkdirSync, mkdtempSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, lutimesSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { type LinkMode, linkDecides, RUNS } from "../rootfs/opt/cain/c1/contract";
-import { holding, journalStep, manifest, mayRetry, readableFiles, secretValues } from "../rootfs/opt/cain/c1/tools";
+import { filesUnder, holding, journalStep, manifest, mayRetry, readableFiles, secretValues } from "../rootfs/opt/cain/c1/tools";
 import { checkRequest, CAIN_ROUTES, SIG_CONTEXT, signRequest } from "../rootfs/opt/cain/link/auth";
 
 const posix = process.platform !== "win32";
@@ -110,12 +110,47 @@ describe("the secret values searched for", () => {
     expect(v).toContain("z".repeat(40));
     expect(v).not.toContain("America/New_York");
     expect(v.some((x) => x.startsWith("-----"))).toBe(false);
+    expect(v).toContain(createHmac("sha256", "test-bot-token-1234567890").update("harness-link-sign-v2").digest("hex"));   // K_sign
+    expect(v).not.toContain(createHmac("sha256", "test-bot-token-1234567890").update("harness-handover-v1").digest("hex"));   // his by design
+  });
+  test("fail closed: a source that can't be read or parsed stops the search, it never shrinks it (C1-4)", () => {
+    const base = () => {
+      const d = mkdtempSync(join(tmpdir(), "c1-secrets-"));
+      mkdirSync(join(d, "link"));
+      writeFileSync(join(d, "link/discord.env"), "DISCORD_BOT_TOKEN=test-bot-token-1234567890\n");
+      writeFileSync(join(d, "options.json"), JSON.stringify({ github_token: "ghp_abcdefghijklmnopqrstuvwxyz0123" }));
+      return d;
+    };
+    let d = base();
+    writeFileSync(join(d, "options.json"), '{"github_token": "ghp_abcdefghijklmnopqrstuvwxyz0123"');   // cut short
+    expect(() => secretValues(d, join(d, "no-s6"))).toThrow(/options.json/);
+    d = base();
+    rmSync(join(d, "options.json"));
+    expect(() => secretValues(d, join(d, "no-s6"))).toThrow(/options.json/);
+    d = base();
+    rmSync(join(d, "link/discord.env"));
+    expect(() => secretValues(d, join(d, "no-s6"))).toThrow(/bot token/);
+    d = base();
+    mkdirSync(join(d, "codex")); writeFileSync(join(d, "codex/auth.json"), "{oops");
+    expect(() => secretValues(d, join(d, "no-s6"))).toThrow(/codex/);
   });
   test("a file holding one is found, one without isn't", () => {
     const d = mkdtempSync(join(tmpdir(), "c1-scan-"));
     writeFileSync(join(d, "a.jsonl"), `{"x": "before ${"s3cret-value-abcdefgh"} after"}\n`);
     writeFileSync(join(d, "b.jsonl"), "nothing here\n");
     expect(holding(["s3cret-value-abcdefgh", ""], [join(d, "a.jsonl"), join(d, "b.jsonl")])).toEqual([join(d, "a.jsonl")]);
+  });
+});
+
+describe.skipIf(!posix || process.getuid?.() === 0)("a folder that can't be listed stops the check (C1-4; POSIX, not as root)", () => {
+  test("readable and the scan's own listing both throw, never skip it", () => {
+    const d = mkdtempSync(join(tmpdir(), "c1-eacces-"));
+    chmodSync(d, 0o755);
+    mkdirSync(join(d, "nested")); writeFileSync(join(d, "nested/secret"), "x"); chmodSync(join(d, "nested"), 0o000);
+    try {
+      expect(() => readableFiles([d])).toThrow();
+      expect(() => filesUnder([d])).toThrow();
+    } finally { chmodSync(join(d, "nested"), 0o755); }
   });
 });
 

@@ -86,22 +86,40 @@ export function mayRetry(body: string, now = Date.now()): boolean {
   return times.length < 3 || now - Math.max(...times) >= 6 * 3_600_000;
 }
 
-// The secret values: the bot token and the key derived from it, the App's options, the link's
-// Ship and deploy keys (each line of their bodies), the ChatGPT sign-in, the Supervisor token.
+// The secret values: the bot token and both keys derived from it that aren't his (the old relay
+// key and the signing key), the App's options, the link's Ship and deploy keys (each line of
+// their bodies), the ChatGPT sign-in, the Supervisor token. Fail closed (C1 code review, C1-4):
+// the options and the bot token are required, and any source that exists but can't be read or
+// parsed throws, so a scan is never given fewer values than there are. Only a source that doesn't
+// exist is absent. His own keys (handover, cain.key) are his by design, so they aren't searched.
+const readIfThere = (p: string): string | null => {
+  try { return readFileSync(p, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; throw new Error(`${p} exists but can't be read (${e?.code ?? e})`); }
+};
 export function secretValues(d = process.env.C1_DATA ?? "/data", s6 = "/run/s6/container_environment"): string[] {
   const out = new Set<string>();
   const add = (v: unknown) => { if (typeof v === "string" && v.trim().length >= 16 && !v.includes("\n")) out.add(v.trim()); };
-  const t = tokenIn(join(d, "link/discord.env")) || tokenIn(join(d, ".claude/channels/discord/.env"));
-  if (t) { add(t); add(createHmac("sha256", t).update("harness-relay-v1").digest("hex")); }
-  try {
-    const o = JSON.parse(text(join(d, "options.json")) || "{}");
-    for (const k of ["github_token", "gemini_api_key", "perplexity_api_key", "anthropic_api_key"]) add(o[k]);
-  } catch { /* none */ }
+  const envFile = readIfThere(join(d, "link/discord.env")) ?? readIfThere(join(d, ".claude/channels/discord/.env"));
+  const t = envFile?.match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? "";
+  if (!t) throw new Error("no bot token to search for (link/discord.env or the old .env)");
+  add(t);
+  add(createHmac("sha256", t).update("harness-relay-v1").digest("hex"));
+  add(createHmac("sha256", t).update("harness-link-sign-v2").digest("hex"));
+  const optionsText = readIfThere(join(d, "options.json"));
+  if (optionsText === null) throw new Error("no options.json to read the App's keys from");
+  let o: any;
+  try { o = JSON.parse(optionsText); } catch { throw new Error("options.json doesn't parse"); }
+  if (!o || typeof o !== "object") throw new Error("options.json isn't an object");
+  for (const k of ["github_token", "gemini_api_key", "perplexity_api_key", "anthropic_api_key"]) add(o[k]);
   for (const f of ["link/ship.key", "link/deploy_key"])
-    for (const l of text(join(d, f)).split("\n")) if (!l.startsWith("-----") && l.trim().length >= 40) add(l);
+    for (const l of (readIfThere(join(d, f)) ?? "").split("\n")) if (!l.startsWith("-----") && l.trim().length >= 40) add(l);
   const walk = (v: unknown): void => { if (typeof v === "string") { if (v.length >= 32 && !/\s/.test(v)) add(v); } else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x); };
-  try { for (const f of readdirSync(join(d, "codex"))) if (f.endsWith(".json")) try { walk(JSON.parse(text(join(d, "codex", f)))); } catch { /* not JSON */ } } catch { /* none */ }
-  for (const k of ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"]) add(text(join(s6, k)));
+  let codex: string[] = [];
+  try { codex = readdirSync(join(d, "codex")); } catch (e: any) { if (e?.code !== "ENOENT") throw new Error(`codex/ can't be listed (${e?.code ?? e})`); }
+  for (const f of codex) if (f.endsWith(".json")) {
+    const body = readIfThere(join(d, "codex", f)) ?? "";
+    try { walk(JSON.parse(body)); } catch { throw new Error(`codex/${f} doesn't parse`); }
+  }
+  for (const k of ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"]) add(readIfThere(join(s6, k)) ?? "");
   return [...out];
 }
 
@@ -117,24 +135,27 @@ export function readableFiles(roots: string[]): string[] {
   // A dir's own path reaches it only if he can search every folder above it.
   const reachable = (p: string): boolean => {
     for (let q = dirname(p); ; q = dirname(q)) {
-      try { if (!may(lstatSync(q), 1)) return false; } catch { return false; }
+      let st: Stats;
+      try { st = lstatSync(q); } catch (e: any) { if (e?.code === "ENOENT") return false; throw e; }
+      if (!may(st, 1)) return false;
       if (q === dirname(q)) return true;
     }
   };
+  // A folder that can't be listed, or an entry that can't be looked at, stops the whole check
+  // (C1-4): only an entry gone between the listing and the look is skipped.
   const walk = (dir: string, reach: boolean) => {
-    let names: string[];
-    try { names = readdirSync(dir); } catch { return; }
+    const names = readdirSync(dir);
     for (const n of names) {
       const p = join(dir, n);
       let st: Stats;
-      try { st = lstatSync(p); } catch { continue; }
+      try { st = lstatSync(p); } catch (e: any) { if (e?.code === "ENOENT") continue; throw e; }
       if (st.isDirectory()) walk(p, reach && may(st, 1) !== 0);
       else if (st.isFile() && reach && may(st, 4) && !(NOT_HIS && st.uid === UID)) out.push(p);
     }
   };
   for (const r of roots) {
     let st: Stats;
-    try { st = lstatSync(r); } catch { continue; }
+    try { st = lstatSync(r); } catch (e: any) { if (e?.code === "ENOENT") continue; throw e; }
     if (st.isDirectory()) walk(r, reachable(r) && may(st, 1) !== 0);
     else if (st.isFile() && reachable(r) && may(st, 4) && !(NOT_HIS && st.uid === UID)) out.push(r);
   }
@@ -145,7 +166,7 @@ export function filesUnder(roots: string[]): string[] {
   const out: string[] = [];
   const walk = (p: string) => {
     let st: Stats;
-    try { st = lstatSync(p); } catch { return; }
+    try { st = lstatSync(p); } catch (e: any) { if (e?.code === "ENOENT") return; throw e; }
     if (st.isDirectory()) { for (const n of readdirSync(p)) walk(join(p, n)); }
     else if (st.isFile()) out.push(p);
   };

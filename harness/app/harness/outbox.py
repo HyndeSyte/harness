@@ -27,6 +27,9 @@ log = logging.getLogger("harness.outbox")
 
 SPACING_S = 1.1        # about one message per second
 DELAYED_AFTER_S = 600  # a reply this late says so
+# Cain's link remembers each operation 8 days (link/auth.ts KEEP_MS), so a row is never retried
+# past 7: a retry it had forgotten could be taken for a new message (C1 code review, C1-8).
+MAX_AGE_S = 7 * 24 * 3600
 
 
 def _backoff(attempts: int) -> float:
@@ -61,6 +64,13 @@ class Outbox:
             buttons = [[tuple(b) for b in r] for r in buttons]
         text = row["text"]
         written = datetime.fromisoformat(row["created_at"])
+        if (self.ledger.now() - written).total_seconds() > MAX_AGE_S:
+            with self.ledger.tx() as db:
+                db.execute("UPDATE outbox SET state='dead', last_error=? WHERE id=?",
+                           ("unsent after 7 days: dropped, never retried as new", row["id"]))
+                self.ledger.event("delivery_expired", {"outbox": row["id"], "kind": row["kind"]}, db=db)
+            log.warning("message %s unsent after 7 days: dropped", row["id"])
+            return False
         if (self.ledger.now() - written).total_seconds() > DELAYED_AFTER_S and \
                 row["kind"] != "digest":
             # He should know this isn't fresh: say when it was written.

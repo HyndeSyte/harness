@@ -49,6 +49,11 @@
   "allowManagedPermissionRulesOnly": true,
   "disableSideloadFlags": true,
   "strictPluginOnlyCustomization": ["mcp", "hooks"],
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [
+    { "serverCommand": ["/usr/local/bin/bun", "/opt/cain/discord/bridge.ts"] },
+    { "serverUrl": "https://*/*" }
+  ],
   "strictKnownMarketplaces": [
     { "source": "github", "repo": "anthropics/claude-plugins-official" }
   ],

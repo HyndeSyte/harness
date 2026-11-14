@@ -36,10 +36,17 @@ prepare() {
   chmod 0644 /needles
 }
 
-# Nothing of the planted secrets is readable by uid 1000 anywhere a process writes.
+# Nothing of the planted secrets is readable by uid 1000 anywhere a process writes. Its search
+# first proves it can see: a control file it can read, holding a planted value, must be found
+# (else the check itself is blind), and is then removed.
+secret_hits() { setpriv --reuid=1000 --regid=1000 --init-groups grep -rlFa -D skip -f /needles $D /run /tmp /var/tmp /etc /root /home 2>/dev/null; }
 secret_free() {
-  local hits
-  hits="$(setpriv --reuid=1000 --regid=1000 --init-groups grep -rlFa -D skip -f /needles $D /run /tmp /var/tmp /etc /root /home 2>/dev/null)"
+  local hits control=/tmp/c1-control-$$
+  printf 'control %s\n' "$GH" > "$control"; chmod 0644 "$control"
+  hits="$(secret_hits)"
+  rm -f "$control"
+  printf '%s\n' "$hits" | grep -qx "$control" || fail "the secret check didn't find its own control file: it can't be trusted"
+  hits="$(printf '%s\n' "$hits" | grep -vx "$control" | grep -v '^$')"
   [ -z "$hits" ] || fail "uid 1000 can read a secret: $(printf '%s' "$hits" | head -n 3 | tr '\n' ' ')"
 }
 
@@ -138,7 +145,22 @@ final)
   printf '%s\n' "$GH" > $D/trust/oops.json; chmod 0644 $D/trust/oops.json
   if "$OPT/c1/lock.sh" verify 2>/dev/null; then fail "verify missed a secret in a file he can read"; fi
   rm -f $D/trust/oops.json
-  note "final checks held"
+  # His session can't gain another plugin, or the tools of one (C1 code review C1-3): an install
+  # of another of the marketplace's plugins into his plugins folder fails, and a new session of
+  # his still loads the Discord plugin alone.
+  mkt="$OPT/plugin-seed/marketplaces/claude-plugins-official/.claude-plugin/marketplace.json"
+  other="$(jq -r '.plugins[].name' "$mkt" 2>/dev/null | grep -vx discord | head -n 1)"
+  [ -n "$other" ] || fail "no other plugin in the seed's marketplace to try"
+  as_him=("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" CLAUDE_CODE_PLUGIN_CACHE_DIR="$OPT/plugin-root" DISABLE_AUTOUPDATER=1)
+  if "${as_him[@]}" timeout 120 claude plugin install "$other@claude-plugins-official" > /fp/install.log 2>&1; then
+    fail "his session installed $other: $(tail -n 3 /fp/install.log | tr '\n' ' ')"
+  fi
+  "${as_him[@]}" ANTHROPIC_API_KEY=sk-ant-api03-ci-only-not-a-real-key timeout 120 claude -p --output-format stream-json --verbose --max-turns 1 "ok" > /fp/after.jsonl 2> /fp/after.err || true
+  "$OPT/c1/seed-loaded.sh" /fp/after.jsonl || fail "after the install try, his session didn't load the seed's plugin"
+  loaded="$(jq -c 'select(.type == "system" and .subtype == "init") | [.plugins[]? | {name, path}]' /fp/after.jsonl | head -n 1)"
+  extra="$(jq -r --arg s "$OPT/plugin-seed/" 'select(.type == "system" and .subtype == "init") | .plugins[]? | select(((.path // "") | startswith($s)) | not) | "\(.name) \(.path)"' /fp/after.jsonl)"
+  [ -z "$extra" ] || fail "his session loaded a plugin from outside the image's seed: $extra"
+  note "final checks held ($other couldn't be installed; loaded: $loaded)"
   ;;
 legacy-here)
   # The old root session ran in this container (the run script put it on record): the switch

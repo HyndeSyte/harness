@@ -48,7 +48,7 @@
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { CAIN_ROUTES, type Caller, checkRequest, RequestLog, routeAllowed, sameKey, SIG_CONTEXT, SIG_HEADER, signResponse, writeSynced } from "./auth";
+import { CAIN_ROUTES, type Caller, checkRequest, RequestLog, routeAllowed, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
 import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
@@ -286,14 +286,19 @@ async function route(req: Request, url: URL, caller: Caller, raw: string, reqId?
   return handle(url, b, reqId);
 }
 
-// The specialist's signed requests: each id handled once, its answer kept 48 hours and signed
-// back, with K_sign = HMAC(bot token, "harness-link-sign-v2"). The old relay key,
+// The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept
+// and signed back, with K_sign = HMAC(bot token, "harness-link-sign-v2"). The old relay key,
 // HMAC(bot token, "harness-relay-v1"), authorizes nothing of the specialist's in any state, and
 // no signature made with it verifies, so one captured from an old Harness signs nothing (C1
 // plan 3.9).
 const requests = new RequestLog(`${DIR}/requests.json`);
+if (requests.damagedSince) console.log(`[cain] link: ERROR: its record of the specialist's operations is damaged; no new one is taken until it can't matter (8 days)`);
+const ops = new SignedOps(requests);
+// A body larger than any route takes is refused before it's read, signed or not (C1-7).
+const MAX_BODY = 16_384;
 // Recorded, durably, at the specialist's first signed request: until then the run script keeps
 // every process of Cain's user stopped (3.12), so an old Harness's bare key never meets one.
+// Only a write that succeeded counts: one that didn't is tried again at the next (C1-6).
 const SIGNS = `${DIR}/specialist-signs`;
 let specialistSigns = existsSync(SIGNS);
 // Who may call, by state (c1/contract.ts): old in the old way, own in the new one, stopped
@@ -306,17 +311,20 @@ const SPECIALIST_FILE = process.env.CAIN_SPECIALIST_STATE ?? "/run/cain/speciali
 const specialist = { signed_at: 0, old_key_since: 0, old_key_last: 0 };
 let oldKeyRelayed = 0;
 function saveSpecialist(): void {
-  try { writeFileSync(`${SPECIALIST_FILE}.tmp`, JSON.stringify(specialist), { mode: 0o600 }); renameSync(`${SPECIALIST_FILE}.tmp`, SPECIALIST_FILE); }
+  const view = { ...specialist, signs_recorded: specialistSigns, signs_error: specialistMarker.error || null,
+    history_damaged_since: requests.damagedSince || null };
+  try { writeFileSync(`${SPECIALIST_FILE}.tmp`, JSON.stringify(view), { mode: 0o600 }); renameSync(`${SPECIALIST_FILE}.tmp`, SPECIALIST_FILE); }
   catch { /* the status page shows nothing new */ }
 }
+const specialistMarker = { error: "" };
 function signedNow(): void {
   const first = !specialist.signed_at;
   specialist.signed_at = Date.now(); specialist.old_key_since = 0;
-  if (first) saveSpecialist();
   if (!specialistSigns) {
-    specialistSigns = true;
-    try { writeSynced(SIGNS, String(Date.now())); } catch (e) { console.log(`[cain] link: couldn't record that the specialist signs: ${String(e).slice(0, 80)}`); }
+    try { writeSynced(SIGNS, String(Date.now())); specialistSigns = true; specialistMarker.error = ""; }
+    catch (e) { specialistMarker.error = String(e).slice(0, 80); console.log(`[cain] link: couldn't record that the specialist signs (tried again at its next request): ${specialistMarker.error}`); }
   }
+  if (first || specialistMarker.error) saveSpecialist();
 }
 // An old key from the specialist: 503 and nothing done. In the old way that's the calendar App
 // not updated yet (the run script tells Cain after 30 minutes); after the switch it means the
@@ -334,10 +342,11 @@ function oldKeySeen(): void {
 
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
-  port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
+  port: PORT, hostname: "0.0.0.0", idleTimeout: 30, maxRequestBodySize: MAX_BODY,
   async fetch(req, server) {
     const url = new URL(req.url);
-    const raw = req.method === "POST" ? await req.text() : "";
+    const raw = req.method === "POST" ? await boundedText(req, MAX_BODY) : "";
+    if (raw === null) return json({ status: "too large" }, 413);
     const target = url.pathname + url.search;
     const signKey = key(SIG_CONTEXT);
     const id = checkRequest(req.headers.get(SIG_HEADER), signKey, req.method, target, raw);
@@ -349,22 +358,11 @@ Bun.serve({
         const res = url.pathname === "/health" ? health(true) : await route(req, url, "specialist", raw);
         return signed(res.status, await res.text());
       }
-      // Each operation once: done, the stored answer; received but never done (the link
-      // stopped mid-way), reconciled, never simply repeated: a card is found by the request id
-      // stored on it (addCard), an answer to a tap isn't sent again, and buttons and relays
-      // only set state or add a line.
-      const stored = requests.get(id);
-      if (stored?.state === "done") return signed(stored.status ?? 200, stored.body ?? "{}");
-      if (stored?.state === "received" && url.pathname === "/answer") {
-        const body = JSON.stringify({ status: "ok", said: "already handled before a restart" });
-        requests.put(id, { at: Date.now(), state: "done", status: 200, body });
-        return signed(200, body);
-      }
-      requests.put(id, { at: Date.now(), state: "received" });
-      const res = await route(req, url, "specialist", raw, id);
-      const body = await res.text();
-      requests.put(id, { at: Date.now(), state: "done", status: res.status, body });
-      return signed(res.status, body);
+      // Each operation once (SignedOps): done, its stored answer; still running, the first's
+      // answer; received but never done, reconciled, never simply repeated.
+      const a = await ops.run(id, url.pathname, async () => { const res = await route(req, url, "specialist", raw, id); return { status: res.status, body: await res.text() }; });
+      if (a.status === 503 && requests.damagedSince) saveSpecialist();
+      return signed(a.status, a.body);
     }
     const ip = server.requestIP(req)?.address ?? "";
     const bare = req.headers.get("x-harness-key") ?? "";
@@ -386,10 +384,12 @@ Bun.serve({
 // Root's own: the broker reads the cards and says what Cain sent. The folder is root's.
 try { rmSync(LINK_SOCK, { force: true }); } catch { /* none */ }
 Bun.serve({
-  unix: LINK_SOCK, idleTimeout: 30,
+  unix: LINK_SOCK, idleTimeout: 30, maxRequestBodySize: MAX_BODY,
   async fetch(req) {
     const url = new URL(req.url);
-    return route(req, url, "root", req.method === "POST" ? await req.text() : "");
+    const raw = req.method === "POST" ? await boundedText(req, MAX_BODY) : "";
+    if (raw === null) return json({ status: "too large" }, 413);
+    return route(req, url, "root", raw);
   },
 });
 try { chmodSync(LINK_SOCK, 0o600); } catch (e) { console.log(`[cain] link: couldn't close its root socket to others: ${String(e).slice(0, 80)}`); }

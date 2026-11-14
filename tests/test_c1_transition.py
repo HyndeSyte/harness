@@ -183,3 +183,27 @@ def test_old_harness_waits_through_503s_and_new_harness_delivers_each_card_once(
     texts = [t for _, t in link.cards.values()]
     assert any(t.endswith("four") and "Delayed" not in t for t in texts)   # made on its first try
     assert sum("Delayed" in t for t in texts) == 3
+
+
+def test_a_card_unsent_after_seven_days_is_dropped_never_retried_as_new(ledger, clock):
+    """Cain's link remembers an operation 8 days (link/auth.ts KEEP_MS); the outbox stops after
+    7, so a retry is never mistaken for a new card (C1 code review, C1-8). Before then it keeps
+    trying, as it always has."""
+    from harness.outbox import MAX_AGE_S, Outbox
+    from fakes import FakeBot, chat_error
+    assert MAX_AGE_S == 7 * 24 * 3600
+    bot = FakeBot()
+    bot.fail_sends = [chat_error(503, "down")] * 1000
+    rid = enqueue(ledger, "an old card")
+    ob = Outbox(ledger, bot, sleep=lambda s: None)
+    assert ob.flush() == 0
+    clock.advance(seconds=MAX_AGE_S - 3600)
+    assert ob.flush() == 0 and ledger.outbox_row(rid)["state"] == "queued"     # still tried
+    clock.advance(seconds=7200)
+    tries = len(bot.fail_sends)
+    assert ob.flush() == 0
+    row = ledger.outbox_row(rid)
+    assert row["state"] == "dead" and "7 days" in row["last_error"]
+    assert len(bot.fail_sends) == tries                                         # not tried again
+    kinds = [r["kind"] for r in ledger.db.execute("SELECT kind FROM events").fetchall()]
+    assert "delivery_expired" in kinds

@@ -73,7 +73,11 @@ RUN set -eu; seed=/opt/cain/plugin-seed; pin=/opt/cain/discord/pin.json; \
     (cd /opt/cain/discord/plugin && bun install --frozen-lockfile --production --no-summary); \
     install -m 0644 /opt/cain/discord/seed-mcp.json "$plugin/.mcp.json"; \
     rm -rf /root/.claude /root/.claude.json /root/.cache /root/.bun; \
-    chown -R root:root "$seed" /opt/cain/discord/plugin; chmod -R a+rX,go-w "$seed" /opt/cain/discord/plugin
+    chown -R root:root "$seed" /opt/cain/discord/plugin; chmod -R a+rX,go-w "$seed" /opt/cain/discord/plugin; \
+    install -d -m 0755 -o root -g root /opt/cain/plugin-root
+# /opt/cain/plugin-root: his session's plugins folder (CLAUDE_CODE_PLUGIN_CACHE_DIR), root's and
+# empty, so no plugin can be installed into it: his session loads the seed's Discord plugin and
+# nothing else (with the managed MCP allowlist in settings.json, C1 code review C1-3).
 
 # Cain's rules (/opt/cain/settings.json and CLAUDE.md) go to /etc/claude-code, where Claude
 # Code reads managed policy, at every start that runs him as his own user, checked by hash
