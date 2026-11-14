@@ -67,21 +67,29 @@ export function claimText(text: string): string {
 // -- review claims ------------------------------------------------------------------------------
 const WORD = (alts: string) => `(?<![A-Za-z0-9])(?:${alts})(?![A-Za-z0-9])`;
 const SEATS = "openai|chatgpt|codex|gpt|gemini|perplexity|claude";
-const VERDICTS = "approve|approved|approves|approval|verdict|verdicts|reject|rejected|rejects|signed[ \\t]+off|lgtm";
-const HEADING = new RegExp("(?<![A-Za-z0-9])reviewed[ \\t]*[:\\-\\u2013\\u2014]", "gi");
+const VERDICTS = "approve|approved|approves|approval|verdict|verdicts|reject|rejected|rejects|signed\\s+off|lgtm";
+const REVIEW_WORDS = "review|reviews|reviewed|reviewer|reviewers";
+// "Reviewed", then any spaces (a line break too), then ":" or "-": a heading only where it
+// starts a sentence or a line ("Done. Reviewed: ..."), never mid-sentence ("what I reviewed: the calendar").
+const HEADING = new RegExp("(?<![A-Za-z0-9])reviewed\\s*[:\\-\\u2013\\u2014]", "gi");
 const SEAT = new RegExp(WORD(SEATS), "i");
 const VERDICT = new RegExp(WORD(VERDICTS), "i");
+const REVIEW = new RegExp(WORD(REVIEW_WORDS), "i");
 const BY_SEAT = new RegExp(`(?<![A-Za-z0-9])reviewed\\s+by\\s+(?:the\\s+)?${WORD(SEATS)}`, "i");
 
 interface Claim { at: number; end: number; said: string; heading: boolean }
 // A "Reviewed" heading's claim runs to the full stop that ends its sentence, or its line's end.
 function headings(t: string): Claim[] {
-  return [...t.matchAll(HEADING)].map((m) => {
+  const out: Claim[] = [];
+  for (const m of t.matchAll(HEADING)) {
     const at = m.index!;
-    const stop = /\.(?=\s|$)|\n/.exec(t.slice(at));
-    const end = stop ? at + stop.index + (stop[0] === "." ? 1 : 0) : t.length;
-    return { at, end, said: t.slice(at, end).trim(), heading: true };
-  });
+    const before = t.slice(0, at).replace(/[ \t]+$/, "");
+    if (before && !/[\n.!?;:(•>#\-*]$/.test(before)) continue;      // mid-sentence: not a heading
+    const stop = /\.(?=\s|$)|\n/.exec(t.slice(at + m[0].length));
+    const end = stop ? at + m[0].length + stop.index + (stop[0] === "." ? 1 : 0) : t.length;
+    out.push({ at, end, said: t.slice(at, end).trim(), heading: true });
+  }
+  return out;
 }
 // Sentences end at a full stop, "!" or "?" before a space or the end, at ";", and at a line's end.
 function sentences(t: string): [number, number][] {
@@ -96,12 +104,18 @@ function sentences(t: string): [number, number][] {
   add(from, t.length);
   return out;
 }
-// Every claim in words already read as he'd see them (claimText), in order.
-function claimsIn(t: string): Claim[] {
+// Every claim in words already read as he'd see them (claimText), in order. A claim is a
+// "Reviewed" heading, "reviewed by" a seat, or a sentence with both a review word and a
+// verdict word ("All reviewers approved it"). broad (his Ship card line and a pull request's
+// title, where no review talk belongs): a seat's name with a verdict word counts too
+// ("OpenAI approved it"). In his other words that alone isn't one, so "the Gemini API
+// rejected the request" still goes out.
+function claimsIn(t: string, broad = false): Claim[] {
   const out = headings(t);
   for (const [a, b] of sentences(t)) {
     const s = t.slice(a, b);
-    if ((SEAT.test(s) && VERDICT.test(s)) || BY_SEAT.test(s)) out.push({ at: a, end: b, said: s, heading: false });
+    if (BY_SEAT.test(s) || (VERDICT.test(s) && (REVIEW.test(s) || (broad && SEAT.test(s)))))
+      out.push({ at: a, end: b, said: s, heading: false });
   }
   return out.sort((x, y) => x.at - y.at);
 }
@@ -115,19 +129,33 @@ const canon = (s: string) => s.replace(/\s+/g, " ").trim()
 const excerpt = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 60);
 
 // published: the review service's lines; null (or not given) when they can't be read. Each
-// claim that isn't a line the service gave is a hit, once, with itself as its excerpt.
+// claim that isn't a line the service gave is a hit, once, with itself as its excerpt. After
+// a line the service gave, the rest of its paragraph may claim nothing more about a review.
 export function reviewedHits(text: string, published: readonly Reviewed[] | null | undefined): CainHit[] {
   const t = claimText(text);
   const heads = headings(t);
   if (!heads.length && !claimsIn(t).length) return [];
   let rest = t;
+  const tails: [number, number][] = [];
   if (published) {
     const real = new Set(published.map((p) => canon(claimText(p.line))));
     // A line the service gave is taken out; whatever claim is left, around it too, is a hit.
-    for (const c of heads) if (real.has(canon(c.said))) rest = rest.slice(0, c.at) + " ".repeat(c.end - c.at) + rest.slice(c.end);
+    for (const c of heads) if (real.has(canon(c.said))) {
+      rest = rest.slice(0, c.at) + " ".repeat(c.end - c.at) + rest.slice(c.end);
+      const blank = /\n[ \t]*\n/.exec(t.slice(c.end));
+      tails.push([c.end, blank ? c.end + blank.index : t.length]);
+    }
   }
+  const claims = claimsIn(rest);
+  // After a line the service gave, the rest of its paragraph may give no other verdict ("All
+  // reviewers approved it", "Gemini, approve too", "The reviewer signed off").
+  for (const [a, b] of tails) for (const [x, y] of sentences(rest.slice(a, b))) {
+    const s = rest.slice(a + x, a + y);
+    if (VERDICT.test(s)) claims.push({ at: a + x, end: a + y, said: s, heading: false });
+  }
+  claims.sort((p, q) => p.at - q.at);
   const out: CainHit[] = [];
-  for (const c of claimsIn(rest)) {
+  for (const c of claims) {
     if (out.some((h) => h.at < c.end && c.at < h.end)) continue;
     out.push({ rule: "reviewed", result: published ? "refuse" : "unsure", at: c.at, end: c.end, around: excerpt(rest.slice(c.at, c.end)) });
   }
@@ -135,22 +163,23 @@ export function reviewedHits(text: string, published: readonly Reviewed[] | null
 }
 
 // -- ship words -----------------------------------------------------------------------------------
-const CI = "ci|checks?|tests?|tested|builds?|pipelines?";
-const RESULT = "pass|passes|passed|passing|green|succeeded|succeeds|fail|fails|failed|failing|red";
-const SMALL = "is|are|was|were|has|have|had|been|all|both|now|still|already|just|and|fully|the|every|each|went|turned|came|back|of";
-const GAP = `[ \\t:,\\-]+(?:(?:${SMALL})[ \\t:,\\-]+){0,3}`;
-const CI_CLAIMS = [new RegExp(`${WORD(CI)}${GAP}${WORD(RESULT)}`, "gi"), new RegExp(`${WORD(RESULT)}${GAP}${WORD(CI)}`, "gi")];
+// On a Ship card, and in a pull request's title there, nothing but the link's own lines may
+// speak of checks or a review: a sentence with a CI word and a result word anywhere in it
+// counts ("The checks on this commit are green", "Passed all checks"), as does any review
+// claim (broad) or the word "reviewed" at all.
+const CI = new RegExp(WORD("ci|checks?|tests?|tested|builds?|pipelines?|workflows?"), "i");
+const RESULT = new RegExp(WORD("pass|passes|passed|passing|green|succeeded|succeeds|success|successful|fail|fails|failed|failing|failure|red|broken"), "i");
 const REVIEWED_WORD = new RegExp(WORD("reviewed"), "gi");
 
 function ciClaimSpans(t: string): [number, number][] {
-  return CI_CLAIMS.flatMap((re) => [...t.matchAll(re)].map((m): [number, number] => [m.index!, m.index! + m[0].length]));
+  return sentences(t).filter(([a, b]) => { const s = t.slice(a, b); return CI.test(s) && RESULT.test(s); });
 }
-// Whether words claim checks passed or failed, or anything about a review (a title from GitHub).
+// Whether words claim checks passed or failed.
 export function claimsChecks(text: string): boolean { return ciClaimSpans(claimText(text)).length > 0; }
 
 export function shipWordsHits(text: string): CainHit[] {
   const t = claimText(text);
-  const spans: [number, number][] = [...claimsIn(t).map((c): [number, number] => [c.at, c.end]),
+  const spans: [number, number][] = [...claimsIn(t, true).map((c): [number, number] => [c.at, c.end]),
     ...[...t.matchAll(REVIEWED_WORD)].map((m): [number, number] => [m.index!, m.index! + m[0].length]), ...ciClaimSpans(t)];
   const out: CainHit[] = [];
   for (const [at, end] of spans.sort((a, b) => a[0] - b[0])) {
@@ -173,9 +202,14 @@ export function recordItems(pending: string | null | undefined): Set<string> | n
   return out.size ? out : null;
 }
 const CODE = /(?<![A-Za-z0-9])P0*(\d{1,4})(?![A-Za-z0-9])(?:[ \t]+Q\d{1,2}(?![A-Za-z0-9]))?/gi;
+// Codes are read as he'd see them too: compatibility forms folded (full-width digits) and
+// invisible characters dropped, before anything is matched.
+const codeText = (text: string): string => String(text ?? "").normalize("NFKC").replace(INVISIBLE, "");
+// Whether words could hold a record code at all, so the record is read only when they might.
+export const mayHaveCode = (text: string): boolean => /P\d/i.test(codeText(text));
 export function codesHits(text: string, items: ReadonlySet<string> | null | undefined): CainHit[] {
   if (!items?.size) return [];
-  const t = String(text ?? "");
+  const t = codeText(text);
   const seen = hidden(t);                                        // code spans and links aren't read
   const out: CainHit[] = [];
   for (const m of seen.matchAll(CODE)) {

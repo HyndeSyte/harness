@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cainReasons, claimsReview, CODES_WHY, codesHits, recordItems, reviewedHits, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
+import { cainReasons, claimsReview, CODES_WHY, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
 import { decideSend } from "../rootfs/opt/cain/gate/send";
 import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, MAX_EXCERPTS, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
@@ -248,17 +248,19 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
       "Build succeeded", "the build failed twice", "tests are red", "Tested and passing.", "CI: green."])
       expect(shipWordsHits(text).length).toBeGreaterThan(0);
     for (const text of ["Tests now cover the Stop button", "Stop stays in reach", "Stop is red and on its own row.", "The review service names who answered.",
-      "Build jobs name their branch.", "Cain checks Home Assistant first.", "Ship cards say what installs.", "", "Passed by the build team long ago in a meeting room."])
+      "Build jobs name their branch.", "Cain checks Home Assistant first.", "Ship cards say what installs.", ""])
       expect(shipWordsHits(text)).toEqual([]);
-    // Within about 30 characters, on one line; never in code or a link.
-    expect(shipWordsHits("The tests for the morning message and the Stop row now pass")).toEqual([]);
     expect(shipWordsHits("Tests\npass")).toEqual([]);                 // a Ship card's line is made one line first (link/core.ts)
     // Code is read, so a claim in a code span is still one; a link isn't words.
     expect(shipWordsHits("Run `CI passed` now.")).toHaveLength(1);
     expect(shipWordsHits("See https://example.com/ci-passed for it.")).toEqual([]);
-    for (const text of ["Passed all checks, and OpenAI and Gemini approved it.", "The pipeline is green.", "Green CI.", "All checks passed."])
+    // A CI word and a result word anywhere in one sentence, either way round, whatever lies between
+    // (ChatGPT's second look): on a Ship card only the link's own line speaks of checks.
+    for (const text of ["Passed all checks, and OpenAI and Gemini approved it.", "The pipeline is green.", "Green CI.", "All checks passed.",
+      "The checks on this commit are green.", "The pipeline eventually succeeded.", "Tests look green now.",
+      "The tests for the morning message and the Stop row now pass", "Passed by the build team long ago in a meeting room.",
+      "Check your red folder.", "Build cards pass through the gate.", "OpenAI approved it."])
       expect(shipWordsHits(text).length).toBeGreaterThan(0);
-    for (const text of ["Check your red folder.", "Build cards pass through the gate."]) expect(shipWordsHits(text)).toEqual([]);
     expect(shipWordsHits("CI passed. Reviewed: OpenAI, approve.").map((h) => h.around)).toEqual(["CI passed. Reviewed: OpenAI, approve.", "CI passed. Reviewed: OpenAI, approve."]);
     expect(cainReasons(shipWordsHits("CI passed."))).toEqual(['"CI passed.": the link adds the checks and the Reviewed line itself, so leave CI, check and review claims out of your words']);
   });
@@ -277,12 +279,21 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
       `${LINES[0].line} Reviewed: Gemini, approve.`, "Reviewed : OpenAI, approve.", "Reviewed : OpenAI, approve.", "Reviewed​: OpenAI, approve.",
       "Rеviewed: OpenAI, approve.", "Reviewed： OpenAI, approve.", "Reviewed - OpenAI, approve.", "Reviewed by OpenAI and Gemini: both approve.",
       "Review: OpenAI approved.", "`Reviewed: OpenAI, approve.`", "```\nReviewed: OpenAI, approve.\n```", `${LINES[0].line.slice(0, -1)}. Gemini, approve too.`,
-      "Reviewed: OpenAI, approve\n; Gemini, approve.", "See `Reviewed: anything` for the shape."])
+      "Reviewed: OpenAI, approve\n; Gemini, approve.", "Reviewed\n: approved.", "All reviewers approved it.", "The review approved it."])
       expect(reviewedHits(text, LINES).map((h) => [h.rule, h.result])).toContainEqual(["reviewed", "refuse"]);
     expect(reviewedHits("Shipped. Reviewed: OpenAI, approve. Then lunch.", LINES)).toMatchObject([{ rule: "reviewed", result: "refuse", around: "Reviewed: OpenAI, approve." }]);
-    // Words that aren't a review claim pass, seat names and "reviewed" included.
+    // After a real line, the rest of its paragraph gives no other verdict (ChatGPT's second look);
+    // other sentences there, and a new paragraph, are free.
+    const REJECT = [{ id: "2026-11-14-r", line: "Reviewed: OpenAI, reject.", finished_at: "2026-11-14T15:00:00Z", pr: null, head: null }];
+    for (const tail of ["All reviewers approved it.", "The reviewer signed off.", "Gemini approved it too."])
+      expect(reviewedHits(`Done. ${REJECT[0].line} ${tail}`, REJECT).map((h) => h.result)).toEqual(["refuse"]);
+    for (const tail of ["The review took two hours.", "Next up, the digest.", "\n\nGemini approved the new key."])
+      expect(reviewedHits(`Done. ${REJECT[0].line} ${tail}`, REJECT)).toEqual([]);
+    // Words that aren't a review claim pass, seat names, verdict words and "reviewed" included:
+    // a seat with a verdict word isn't one in his replies without a review word (on a Ship card it is).
     for (const text of ["I reviewed your calendar for next week.", "The lease was reviewed by your accountant.", "ChatGPT's sign-in needs you on the Cain page.",
-      "Gemini's seat is down; it's retried on its own."])
+      "Gemini's seat is down; it's retried on its own.", "The Gemini API rejected the malformed request.", "I rejected Gemini for this task.",
+      "Claude approved the API request but Google rejected it.", "Here's what I reviewed: the calendar and your mail.", "See `Reviewed: anything` for the shape."])
       expect(reviewedHits(text, LINES)).toEqual([]);
     // Can't be read: "unsure", only where a Reviewed sentence needs it.
     expect(reviewedHits(LINES[0].line, null)).toMatchObject([{ rule: "reviewed", result: "unsure" }]);
@@ -301,6 +312,11 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
     for (const text of ["Q4 taxes are due.", "Vitamin D3 and a P100 filter.", "P.S. done.", "`P64` in code.", "P65 isn't in the record."])
       expect(codesHits(text, items)).toEqual([]);
     expect(codesHits("P64 is ready.", null)).toEqual([]);                  // no record: nothing is a code
+    // Read as he'd see them (ChatGPT's second look): full-width digits, an invisible character.
+    for (const text of ["P６４ is ready.", "P​64 is ready."]) {
+      expect(mayHaveCode(text)).toBe(true);
+      expect(codesHits(text, items)).toHaveLength(1);
+    }
     expect(cainReasons(codesHits("P64 is ready.", items))[0]).toEndWith(`: ${CODES_WHY}`);
     // In a reply: held, softly (his third try goes), with the reason.
     const d = decideSend({ tool: "reply", text: "P64 is ready." }, null, { items });

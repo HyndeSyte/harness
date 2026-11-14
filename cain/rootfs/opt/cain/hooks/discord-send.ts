@@ -45,7 +45,7 @@ import { createHash, createHmac } from "node:crypto";
 import { appendFileSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { claimsReview, recordItems } from "../gate/cain";
+import { claimsReview, mayHaveCode, recordItems } from "../gate/cain";
 import { appendGate } from "../gate/log";
 import { answerText, REPLY_TOOL, SENDS, sentIds } from "../gate/plugin";
 import { DASH_WHY, fixedWhat, type Hit } from "../gate/rules";
@@ -245,7 +245,7 @@ export async function run(raw: string, o: { ask?: () => Promise<CardsView | null
   const d = decideSend(call, got.cards, { dm: got.cards ? null : readDm(), tz, now,
     ...(call.tool === "edit" ? { replied: repliedIn(input?.transcript_path) } : {}),
     ...(claimsReview(call.text) ? { reviewed: readReviewed() } : {}),
-    ...(/P\d/i.test(call.text) ? { items: readItems() } : {}) });
+    ...(mayHaveCode(call.text) ? { items: readItems() } : {}) });
   const tries = readTries();
   let out = act(call, d, tries, now);
   if (!writeTries(tries, now) && out.counted) out = { output: null, did: "passed, tries not counted" };
