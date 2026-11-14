@@ -216,20 +216,59 @@ def _meant(line: str) -> str:
     return f"{prop.name}{params}:{' '.join(ical.unescape(prop.value).split())}"
 
 
+def _said_by_events(ics: str) -> Counter:
+    """What the events in it say, each line by what it says (_meant) and each alarm as one whole,
+    counted, without what servers manage: the stamps and X- lines _unchanged leaves out too, and an
+    alarm marked X-APPLE-DEFAULT-ALARM, which a server adds of its own."""
+    lines, names = _lines(ics)
+    out: Counter = Counter()
+    inside, alarm, default = False, None, False
+    for line, name in zip(lines, names):
+        upper = line.upper()
+        if upper in ("BEGIN:VEVENT", "END:VEVENT"):
+            inside, alarm = upper == "BEGIN:VEVENT", None
+        elif not inside:
+            continue
+        elif upper == "BEGIN:VALARM":
+            alarm, default = [], False
+        elif upper == "END:VALARM":
+            if alarm is not None and not default:
+                out["VALARM:" + "|".join(sorted(alarm))] += 1
+            alarm = None
+        elif name == "X-APPLE-DEFAULT-ALARM":
+            default = default or line.split(":", 1)[-1].strip().upper() == "TRUE"
+        elif name in _STAMPS or name.startswith("X-"):
+            continue
+        elif alarm is not None:
+            alarm.append(_meant(line))
+        else:
+            out[_meant(line)] += 1
+    return out
+
+
 def _as_sent(read: str, sent: str) -> bool:
-    """A read still says everything that was sent, line for line, however the server keeps it:
-    lines of its own added, lines folded or reordered, a time written in another zone. Someone's
-    edit to anything that was sent doesn't read as sent. (A line someone only added can't be told
-    from a server's own, so that alone doesn't.) Each line counts as often as it was sent, so one
-    of two alike can't stand in for the other."""
-    want = Counter(_meant(x) for x in _content(sent))
-    return bool(want) and not want - Counter(_meant(x) for x in _content(read))
+    """A read says what was sent and nothing more, however the server keeps it: lines folded or
+    reordered, a time written in another zone, and the lines servers manage (stamps, X- lines, a
+    default alarm it adds) aside. Anything else added or changed since, a note, an alert, a place, a
+    guest or a link, is someone's edit, so it doesn't read as sent. Each line counts as often as it
+    was sent, so one of two alike can't stand in for the other."""
+    want = _said_by_events(sent)
+    return bool(want) and _said_by_events(read) == want
 
 
 def _uids(ics: str) -> set[str]:
-    """The ids of the events in it."""
+    """The ids of the events in it: an alarm's own id inside one isn't."""
     lines, names = _lines(ics)
-    return {line.split(":", 1)[1] for line, name in zip(lines, names) if name == "UID" and ":" in line}
+    out: set[str] = set()
+    within: list[str] = []
+    for line, name in zip(lines, names):
+        if name == "BEGIN":
+            within.append(line.split(":", 1)[-1].strip().upper())
+        elif name == "END":
+            within = within[:-1]
+        elif name == "UID" and within[-1:] == ["VEVENT"] and ":" in line:
+            out.add(line.split(":", 1)[1])
+    return out
 
 
 def _names(lines) -> list[str]:

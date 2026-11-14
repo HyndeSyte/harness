@@ -2031,8 +2031,9 @@ class CalendarChange:
 
     def _reads_as_written(self, entry: dict, read: dict) -> bool:
         """What a read found is what the write made, as far as a read can say: on Gmail, every field
-        the write gave, an add's too; on Family, every line that was sent, by what it says, so a
-        server that keeps it its own way still reads as written (caldav._as_sent). A removal found
+        the write gave, an add's too; on Family, what was sent and nothing more, by what it says,
+        with the lines servers manage aside, so a server that keeps it its own way still reads as
+        written and a note or an alert someone added doesn't (caldav._as_sent). A removal found
         gone, or a rule, has nothing more to compare."""
         if entry.get("cal") == "gmail" and entry.get("how") != "restore":
             return self._as_written(read.get("event") or {}, entry.get("wrote") or {})

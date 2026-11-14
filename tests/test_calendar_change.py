@@ -166,6 +166,30 @@ def r(ledger, tmp_path, clock):
     return rig
 
 
+# What iCloud adds of its own when it stores an event: its X-APPLE lines, stamps, and a default alarm
+# marked as one. A server manages all of these, so none is anyone's edit (caldav._as_sent).
+ICLOUD_OWN = ("X-APPLE-CREATOR-IDENTITY:com.apple.calendar\r\nLAST-MODIFIED:20261105T150001Z\r\n"
+              "BEGIN:VALARM\r\nX-WR-ALARMUID:00000000-0000-4000-8000-00000000A1A1\r\n"
+              "TRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\nACTION:NONE\r\nX-APPLE-DEFAULT-ALARM:TRUE\r\n"
+              "END:VALARM\r\n")
+
+
+def icloud_keeps(ics: str) -> str:
+    """An event as a server that adds lines of its own stores it: once, before the first event ends."""
+    return ics if ICLOUD_OWN in ics else ics.replace("END:VEVENT", ICLOUD_OWN + "END:VEVENT", 1)
+
+
+def rewriting(r):
+    """From here on, each event written is stored as icloud_keeps has it."""
+    real = r.icloud.request
+
+    def put(method, url, **kw):
+        if method == "PUT" and kw.get("body"):
+            kw["body"] = icloud_keeps(kw["body"].decode()).encode()
+        return real(method, url, **kw)
+    r.icloud.request = put
+
+
 # -- the text of an event ---------------------------------------------------------------------
 
 NOW = datetime(2026, 11, 5, 15, 0, tzinfo=timezone.utc)
@@ -637,13 +661,7 @@ def test_a_trip_can_move_to_new_days(r):
 
 
 def test_undo_of_two_steps_on_one_event_survives_a_server_that_rewrites(r):
-    real = r.icloud.request
-
-    def rewrites(method, url, **kw):
-        if method == "PUT" and kw.get("body"):
-            kw["body"] = kw["body"].replace(b"SUMMARY:", b"CATEGORIES:x\r\nSUMMARY:", 1)
-        return real(method, url, **kw)
-    r.icloud.request = rewrites
+    rewriting(r)
     r.tell(change(dates="2026-11-23"), change(op="end_series", dates="2027-03-08"))
     r.approve()                                # ending a series is tapped
     r.press(r.with_button("Undo"), "Undo")
@@ -1115,13 +1133,7 @@ def test_a_gmail_day_comes_back_when_its_series_is_there(r):
 
 def test_undo_matches_what_the_server_kept_not_what_was_sent(r):
     """A later change undone leaves the event as the server kept it after the first."""
-    real = r.icloud.request
-
-    def rewrites(method, url, **kw):
-        if method == "PUT" and kw.get("body"):
-            kw["body"] = kw["body"].replace(b"SUMMARY:", b"CATEGORIES:x\r\nSUMMARY:", 1)
-        return real(method, url, **kw)
-    r.icloud.request = rewrites
+    rewriting(r)
     r.tell(change(op="add_series", title="Harness Test", start="2026-12-01T19:00:00-05:00",
                   end="2026-12-01T20:00:00-05:00", days="TU", until="2026-12-29"))
     r.tell(change(title="harness test", dates="2026-12-08"))
@@ -1447,13 +1459,7 @@ def test_a_second_try_refused_for_its_version_is_read_before_anything_is_said(r,
 
 
 def test_undo_after_a_read_settled_it_works_on_a_server_that_rewrites(r):
-    real = r.icloud.request
-
-    def rewrites(method, url, **kw):
-        if method == "PUT" and kw.get("body"):
-            kw["body"] = kw["body"].replace(b"SUMMARY:", b"CATEGORIES:x\r\nSUMMARY:", 1)
-        return real(method, url, **kw)
-    r.icloud.request = rewrites
+    rewriting(r)
     r.icloud.drop_response_next = True         # it lands, and the answer is lost
     r.tell(change(dates="2026-11-23"))
     r.advance(minutes=1)
@@ -1801,6 +1807,29 @@ def test_his_edit_before_the_read_that_settles_a_write_is_left_by_undo(r):
     assert "School Day (early release)" in r.body() and "2026-11-23" not in days_of(r.body())
 
 
+@pytest.mark.parametrize("old, new, his", [
+    ("SUMMARY:", "DESCRIPTION:Bring the permission slip\r\nSUMMARY:", "DESCRIPTION:Bring the permission slip"),
+    ("END:VEVENT", "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT1H\r\nEND:VALARM\r\nEND:VEVENT", "TRIGGER:-PT1H"),
+    ("END:VEVENT", ICLOUD_OWN + "END:VEVENT", ""),
+], ids=["a note", "an alert", "the server's own lines"])
+def test_a_note_or_an_alert_he_adds_before_the_read_is_left_by_undo(r, old, new, his):
+    """A day taken off, its answer lost, and before the read he adds a note or an alert. It's done,
+    but not as written: Undo leaves his event as it is. Lines a server manages, a default alarm
+    among them, are no one's edit: Undo puts the day back."""
+    r.icloud.drop_response_next = True
+    r.tell(change(dates="2026-11-23"))
+    r.icloud.human_edit(PATH, old, new)
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    r.press(r.with_button("Undo"), "Undo")
+    if not his:
+        assert "Undone" in r.texts()[-1] and "2026-11-23" in days_of(r.body())
+        return
+    assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
+    assert his in r.body() and "2026-11-23" not in days_of(r.body())
+
+
 def test_a_gmail_add_he_changed_before_its_read_is_left_by_undo(r):
     """An add whose answer was lost, moved and renamed in Google Calendar before the read. It's there,
     so it's done, but not as written: Undo leaves it."""
@@ -1826,35 +1855,43 @@ def test_a_gmail_add_he_changed_before_its_read_is_left_by_undo(r):
 
 
 def test_a_read_as_written_holds_on_servers_that_rewrite_and_not_after_an_edit():
-    """Which comparison tells Harness's own write from an edit, on the rewriting servers the review's
-    probes use. caldav._unchanged needs the very same lines, so a server that adds one of its own
-    fails it. Every sent line by its spelling fails on a server that keeps a moved day's times in
-    UTC. Every sent line by what it says (caldav._as_sent) holds on both, and a rename shows, even
-    of one title of two alike."""
-    def adds_a_line(ics):
-        return ics.replace("SUMMARY:", "CATEGORIES:x\r\nSUMMARY:", 1)
-
+    """Which comparison tells Harness's own write from an edit. A server stores an event its own way:
+    lines it manages (X-APPLE lines, stamps, a default alarm), and a moved day's times in UTC.
+    caldav._unchanged fails on the default alarm; every sent line by its spelling fails on the UTC
+    times. caldav._as_sent (what was sent and nothing more, by what it says, server-managed lines
+    aside) holds on both, and shows a rename, even of one title of two alike, and a note, an alert,
+    a place, a guest or a link someone adds."""
     def utc(m):
         moment = datetime.strptime(m.group(2), "%Y%m%dT%H%M%S").replace(tzinfo=NY).astimezone(timezone.utc)
         return f"{m.group(1)}:{moment:%Y%m%dT%H%M%SZ}"
 
-    def utc_overrides(ics):                    # the master as sent, a line added; its moved days in UTC
-        head, sep, rest = adds_a_line(ics).partition("END:VEVENT")
+    def utc_overrides(ics):                    # its own lines in the master; its moved days in UTC
+        head, sep, rest = icloud_keeps(ics).partition("END:VEVENT")
         return head + sep + re.sub(r"(RECURRENCE-ID|DTSTART|DTEND);TZID=America/New_York:(\d{8}T\d{6})", utc, rest)
 
+    edits = [lambda k: k.replace("School Day", "School Day (early release)", 1),
+             lambda k: k.replace("SUMMARY:", "DESCRIPTION:Bring the permission slip\r\nSUMMARY:", 1),
+             lambda k: k.replace("END:VEVENT", "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT1H\r\nEND:VALARM\r\n"
+                                               "END:VEVENT", 1),
+             lambda k: k.replace("SUMMARY:", "LOCATION:Gym\r\nSUMMARY:", 1),
+             lambda k: k.replace("SUMMARY:", "ATTENDEE:mailto:guest@example.com\r\nSUMMARY:", 1),
+             lambda k: k.replace("SUMMARY:", "URL:https://example.com/day\r\nSUMMARY:", 1)]
     key, ten = "20261123T133000Z", datetime(2026, 11, 23, 10, 0, tzinfo=NY)
     off = ics_edit.remove_days(SERIES, [key], TZ, NOW)
     moved = ics_edit.move_day(SERIES, key, ten, ten + timedelta(hours=4), TZ, NOW)
     for sent in (off, moved):
-        for server in (adds_a_line, utc_overrides):
+        for server in (icloud_keeps, utc_overrides):
             kept = server(sent)
             assert caldav._as_sent(kept, sent), (sent, server)
-            assert not caldav._as_sent(kept.replace("School Day", "School Day (early release)", 1), sent)
-    assert not caldav._unchanged(adds_a_line(off), off)
+            assert not any(caldav._as_sent(edit(kept), sent) for edit in edits)
+    assert not caldav._unchanged(icloud_keeps(off), off)
 
     def spelled(kept, sent):
         return set(caldav._content(sent)) <= set(caldav._content(kept))
-    assert spelled(adds_a_line(moved), moved) and not spelled(utc_overrides(moved), moved)
+    assert spelled(icloud_keeps(moved), moved) and not spelled(utc_overrides(moved), moved)
+    own_alarm_with_its_id = icloud_keeps(off).replace("BEGIN:VALARM\r\nX-WR-ALARMUID",
+                                                      "BEGIN:VALARM\r\nUID:ALARM-1\r\nX-WR-ALARMUID", 1)
+    assert caldav._uids(own_alarm_with_its_id) == {UID} and caldav._as_sent(own_alarm_with_its_id, off)
 
 
 def test_undo_of_a_write_a_restart_cut_short_clears_what_it_recorded(r):
