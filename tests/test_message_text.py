@@ -236,20 +236,32 @@ def test_a_link_in_an_excerpt_is_its_scheme_and_host_alone():
     assert message_rules.link_host("https://a@b@Example.COM:8443/x#frag") == cut
     assert message_rules.link_host("http://example.com") == "http://example.com"
     assert message_rules.link_host("https://[::1]:80/x") == "https://[::1]/\u2026"
+    # A browser reads a backslash as "/": the authority ends there, and what follows is path.
+    assert message_rules.link_host("https://public.example\\@secret-token/private") == "https://public.example/\u2026"
+    assert message_rules.link_host("https://h\\SECRET") == "https://h/\u2026"
     for bad in ("https://", "https://user:secret@", "https://exa%mple.com/x", "https://b\xfccher.example/x",
-                "https://example.com:port/x", "https://example.com,", "https://h\\SECRET"):
+                "https://example.com:port/x", "https://example.com,", "https://\\SECRET@example.com/x"):
         assert message_rules.link_host(bad) == "a link", bad
     for tail in ("__", "~~", "!!", '"x"', "'x'", "[x]", "x)", "x.", "x,"):
         assert message_rules.link_host("https://example.com/private?token=" + tail) == cut, tail
     assert message_rules.hosts_only("See https://user:p(ss)@example.com/private?key=abc now.") == "See " + cut + " now."
     assert message_rules.hosts_only("See https://en.wikipedia.org/wiki/Foo_(bar)?token=X now.") == "See https://en.wikipedia.org/\u2026 now."
     assert message_rules.hosts_only("See HTTPS://user:pw@Host.example/x?key=1 now.") == "See https://host.example/\u2026 now."
-    for text in ("Call https://user:secret@example.com:8443/reset?token=abc today.",
-                 "Call HTTPS://user:p(se)cret@example.com:8443/reset?token=abc__ today."):
+    for text, whole in (("Call https://user:secret@example.com:8443/reset?token=abc today.", cut + " today."),
+                        ("Call HTTPS://user:p(se)cret@example.com:8443/reset?token=abc__ today.", cut + " to")):
         for start in range(len(text)):
             for stop in (start + 1, start + 9, len(text)):
                 assert not re.search(r"user|secret|se\)|8443|reset|token|abc", message_rules.hosts_only(text, start, stop))
-        assert message_rules.around(text, 30, 40).startswith(cut + " to")
+        assert message_rules.around(text, 30, 40) == whole
+    # Any scheme, or none ("www.", a domain with a path), to a space or a line break alone.
+    for text, whole in (("See https://example.com/cb?next=<SECRET> now.", "See " + cut + " now."),
+                        ("Open wss://h.example/x?token=SECRET now.", "Open wss://h.example/… now."),
+                        ("Open www.example.com/reset?token=SECRET now.", "Open www.example.com/… now."),
+                        ("Open example.com/reset?token=SECRET now.", "Open example.com/… now."),
+                        ("Open b\xfccher.example/x?token=SECRET now.", "Open a link now."),
+                        ("Lanes 1.5/2 and 4:30/5:00 now.", "Lanes 1.5/2 and 4:30/5:00 now.")):
+        assert message_rules.hosts_only(text) == whole, text
+        assert message_rules.around(text, 0, len(text)) == whole, text
 
 
 def test_the_port_reads_javascripts_spaces():
@@ -263,12 +275,27 @@ def test_the_port_reads_javascripts_spaces():
     assert message_rules.around("\x85a\ufeff", 1, 2) == "\x85a"                 # trim() keeps U+0085, takes U+FEFF
 
 
+def test_cains_em_dashes_are_refused_and_the_others_kept_or_fixed():
+    """refusable=True (Cain's words): every em dash refused, none fixed. Otherwise markdown round the
+    dash doesn't hide its numbers, lower-case "may" and the like are words, and a dash right after
+    a link stays (rules.ts, gate.test.ts)."""
+    for text in ("Swim is **5** \u2014 **6 PM**.", "Swim takes 30 min \u2014 1 hr.", "Week 1 \u2014 Week 3 are booked.",
+                 "Moved swim \u2014 it's at 4:30 now."):
+        r = message_rules.check(text, refusable=True)
+        assert [(h.rule, h.result, h.kept) for h in r.hits] == [("dash", "refuse", "")] and r.fixed == text, text
+    assert [h.kept for h in message_rules.check("Swim is **5** \u2014 **6 PM**.").hits] == ["range"]
+    assert [h.kept for h in message_rules.check("See https://example.com/a \u2014 then reply.").hits] == ["link"]
+    assert message_rules.check("We march \u2014 5 of us.").fixed == "We march, 5 of us."
+    assert message_rules.check("Restarted the add-on \u2014 all set.", refusable=True).fixed == "Restarted the App \u2014 all set."
+
+
 @pytest.mark.parametrize("case", cases()["cases"], ids=lambda c: c["name"])
 def test_each_shared_case(case):
     ctx = case.get("context", {})
     r = message_rules.check(case["text"], rules=ctx.get("rules"),
                             buttons=ctx["buttons"] if "buttons" in ctx else (),
-                            known=ctx.get("known", ()), answers_him=ctx.get("answers_him", False))
+                            known=ctx.get("known", ()), answers_him=ctx.get("answers_him", False),
+                            refusable=ctx.get("refusable", False))
     assert {k: r.rules(k) for k in ("fix", "refuse", "unsure")} == \
         {k: sorted(case.get(k, [])) for k in ("fix", "refuse", "unsure")}
     assert r.fixed == case.get("fixed", case["text"])

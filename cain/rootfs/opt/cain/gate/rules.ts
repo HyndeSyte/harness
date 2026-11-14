@@ -5,13 +5,17 @@
 // replay reads his DM with them. tests/message_rules.py is a port for the calendar
 // specialist's tests, kept equal to this file by cain/tests/gate-cases.json.
 //
-//   dash     an em dash                    fix: ", " (removed at a line's start or end,
-//                                          or before a stop), never " to ", and never
-//                                          inside code or a link. One with a number right
-//            on both sides (a digit, a clock time, a day or a month by name, noon or
-//            midnight: "2026" and "2027", "6 PM" and "8", "Monday" and "Friday") could
-//            be a range or a list: refuse, to be said without it (a writer that's never
-//            refused keeps it as it is, flagged)
+//   dash     an em dash, never inside code or a link. In words of a writer the gate
+//            refuses (Context.refusable: Cain's replies and edits, his asks and their
+//            options, Ship cards, morning message and connector notice), every one:
+//                                          refuse: rewrite it without one, since only he
+//                                          knows whether he meant a range or a break.
+//            In words that are never refused (the specialist's cards and notes, the
+//            link's own)                   fix: ", " (removed at a line's start or end,
+//                                          or before a stop), never " to ". One with a
+//            number right on both sides (a digit, a clock time, a day or a month by name,
+//            noon or midnight, past markdown: "2026" and "2027", "**6 PM**" and "8",
+//            "Monday" and "Friday"), or right after a link, stays as it is, flagged
 //   app      "the add-on", "Cain's add-on", "Harness add-on", "Settings > Add-ons" and
 //            the like (also "addon" and the specialist's escaped "add\-on"; plural and
 //            possessive)                   fix: "App", "Apps", "App's". A bare "add-on"
@@ -34,7 +38,9 @@ export const RULES = ["dash", "app", "count", "machine", "button"] as const;
 export const RULES_VERSION = 2;
 export type Rule = (typeof RULES)[number];
 export type Result = "fix" | "refuse" | "unsure";
-export interface Hit { rule: Rule; result: Result; at: number; end: number; around: string; label?: string }
+// Why a dash in words that are never refused stays as it is: a number on both sides, or a link right before it.
+export type Kept = "range" | "link";
+export interface Hit { rule: Rule; result: Result; at: number; end: number; around: string; label?: string; kept?: Kept }
 export interface Report { hits: Hit[]; fixed: string }
 export interface Context {
   rules?: readonly Rule[];               // the rules this send point applies (default: all)
@@ -42,6 +48,7 @@ export interface Context {
                                          // null: which buttons are up can't be told
   known?: readonly string[];             // labels on live cards, on top of the static list
   answersHim?: boolean;                  // a reply to a message of his: a long number he asked for, or code, passes
+  refusable?: boolean;                   // a writer the gate refuses (Cain): every em dash is refused, none fixed
 }
 
 // Both Apps' own button labels, so "Undo" is known as a button even when no card with
@@ -86,19 +93,32 @@ export function around(text: string, at: number, end: number, n = 60): string {
 }
 
 // A link as its scheme and host alone, with "/…" when anything else was cut: never a user
-// name, password, port, path, query or fragment ("https://github.com/…"). A link runs to the
-// next space or angle bracket, parentheses included (a user name can hold them), and its
-// scheme may be in any case. Its host is what follows the authority's last "@", less any
-// port; one that isn't a plain name or address is "a link". Nothing after the host comes
-// back, not even a sentence's own marks.
-const LINK = /https?:\/\/[^\s<>]+/gi;
+// name, password, port, path, query or fragment ("https://github.com/…"). A link has any
+// scheme (letters, digits, "+", "." and "-" before "://": "https://", "wss://", in any case),
+// or none and starts with "www." or is a domain with a path ("example.com/reset?token=…").
+// It runs to the next space or line break, whatever stands between ("<", ">" and brackets
+// included; the zero-width U+FEFF too, which hides in text). Its authority runs to the first
+// "/", "?", "#" or "\" (a browser reads "\" as "/"); its host is what follows the authority's
+// last "@", less any port; one that isn't a plain name or address is "a link". Nothing after
+// the host comes back, not even a sentence's own marks.
+const GAP = "\\t-\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";   // what ends a link
+// A character of a domain's name: a letter, a digit, "-", "_", or anything past ASCII but a space.
+const LABEL = `[^${GAP}\\x00-\\x2c\\x2e\\x2f\\x3a-\\x40\\x5b-\\x5e\\x60\\x7b-\\x7f]`;
+const SCHEMED = `(?<![A-Za-z0-9+.\\-])[A-Za-z0-9+.\\-]+:\\/\\/[^${GAP}]+`;
+// One with no scheme never starts right after a letter, a digit, "-", "_", "." or "@" of
+// ASCII (a name going on); after anything else (a space, a bracket, a quote of any kind, ":"
+// or "/") it may. A user name before an "@" comes with it.
+const BARE = `(?<![A-Za-z0-9_\\-.@])(?:[^${GAP}\\/?#\\\\]*@)?`
+  + `(?:[Ww][Ww][Ww]\\.|(?:${LABEL}+\\.)+(?:[A-Za-z]|[^${GAP}\\x00-\\x7f])${LABEL}+(?::\\d*)?(?=[\\/\\\\]|[?#][^${GAP}]))[^${GAP}]*`;
+const LINK = new RegExp(`${SCHEMED}|${BARE}`, "g");
 const HOST = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(?::\d*)?$/;
 export function linkHost(link: string): string {
-  const m = /^(https?:\/\/)([^/?#]*)/i.exec(link);
-  const auth = m?.[2] ?? "";
-  const h = m ? HOST.exec(auth.slice(auth.lastIndexOf("@") + 1)) : null;
-  if (!m || !h) return "a link";
-  return `${m[1].toLowerCase()}${h[1].toLowerCase()}${link.length > m[1].length + h[1].length ? "/…" : ""}`;
+  const s = String(link ?? "");
+  const m = /^([A-Za-z0-9+.\-]+:\/\/)?([^/?#\\]*)/.exec(s)!;
+  const scheme = m[1] ?? "", auth = m[2];
+  const h = HOST.exec(auth.slice(auth.lastIndexOf("@") + 1));
+  if (!h) return "a link";
+  return `${scheme.toLowerCase()}${h[1].toLowerCase()}${s.length > scheme.length + h[1].length ? "/…" : ""}`;
 }
 
 // text[from, to) with each link as linkHost has it. A link that runs past either end of the
@@ -120,36 +140,50 @@ export function hostsOnly(text: string, from = 0, to = text.length): string {
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // -- dash ----------------------------------------------------------------------------
-// An em dash is never read as "to": rewriting one into a range changed what messages said,
-// round after round. One with a number right on both sides is held instead, since ", "
-// could make a range a list and " to " a list a range. A number here is a digit; before the
-// dash also a clock time ending in AM or PM, an ordinal or a percentage; after it also a
-// currency sign and its digits; and on either side a day or a month by name (full or
-// short, any case, with or without a period), noon or midnight: "2026" and "2027", "6 PM"
-// and "8", "Monday" and "Friday", "Nov 12" and "Nov 14", "noon" and "1 PM". Every other em
-// dash gets ", " or goes. The spaces around it, any but a new line (the Unicode ones too), go
-// with it, and so does another dash with only spaces between.
+// In Cain's words (Context.refusable) every em dash is refused, none fixed in place: ", "
+// still turned ranges into lists wherever the numbers sat behind markdown, units or words
+// (a dash between bold "5" and "6 PM", "30 min" and "1 hr", "Week 1" and "Week 3"), and only
+// he knows whether he meant a range or a break, so he says it again without one.
+// In words that are never refused an em dash is never read as "to". One with a number right
+// on both sides stays as it is, flagged, since ", " could make a range a list and " to " a
+// list a range; so does one right after a link (or in one), where a comma would run into it.
+// A number here is a digit; before the dash also a clock time ending in AM or PM, an ordinal
+// or a percentage; after it also a currency sign and its digits; and on either side a day or
+// a month by name (full or short, any case, with or without a period, though lower-case
+// "may", "march", "sat", "sun" and "wed" are words), noon or midnight: "2026" and "2027",
+// "6 PM" and "8", "Monday" and "Friday", "Nov 12" and "Nov 14", "noon" and "1 PM". Every
+// other em dash gets ", " or goes. The spaces around it, any but a new line (the Unicode ones
+// too), go with it, and so does another dash with only spaces between.
 const DASH = new RegExp("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*\\u2014+)+[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*", "g");
 const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
 const CLOCK = `(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})`;
-const NAMES = "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)\\.?";
+// Any case, spelled out letter by letter, so lower case alone can be told apart.
+const anyCase = (s: string) => s.replace(/[a-z]/g, (c) => `[${c.toUpperCase()}${c}]`);
+const NAMES = "(?!(?:may|march|sat|sun|wed)(?![A-Za-z]))" + anyCase("(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)") + "\\.?";
 // Past what can stand between a number and the dash: on the left, closing brackets, quotes,
-// "!" and "."; on the right, opening brackets and quotes; on both, spaces, zero-width
-// characters and a line break, so a dash at a line's end or start between numbers counts too.
-const PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
-const PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
-const NUMBER_BEFORE = new RegExp(`(?:\\d(?:st|nd|rd|th|%)?|(?<![\\d:.])${CLOCK}|(?<![A-Za-z])${NAMES})${PAST_LEFT}$`, "i");
-const NUMBER_AFTER = new RegExp(`^${PAST_RIGHT}(?:[$€£]?\\d|${NAMES}(?![A-Za-z]))`, "i");
+// "!" and "."; on the right, opening brackets and quotes; on both, markdown's "*", "_", "~"
+// and "`", spaces, zero-width characters and a line break, so numbers in bold and a dash at a
+// line's end or start between numbers count too.
+const PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
+const PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*";
+const NUMBER_BEFORE = new RegExp(`(?:\\d(?:[Ss][Tt]|[Nn][Dd]|[Rr][Dd]|[Tt][Hh]|%)?|(?<![\\d:.])${CLOCK}|(?<![A-Za-z])${NAMES})${PAST_LEFT}$`);
+const NUMBER_AFTER = new RegExp(`^${PAST_RIGHT}(?:[$€£]?\\d|${NAMES}(?![A-Za-z]))`);
 
-// Each em dash and what goes in its place; null: it stays, and the writer says it without it.
-function dashes(text: string, seen: string): { at: number; end: number; put: string | null }[] {
-  const out: { at: number; end: number; put: string | null }[] = [];
+// Each em dash and what goes in its place; null: it stays (refused, or kept and flagged).
+interface Dash { at: number; end: number; put: string | null; kept?: Kept }
+function dashes(text: string, seen: string, refusable: boolean): Dash[] {
+  const out: Dash[] = [];
+  // The links a comma could run into: any but a masked link's target, which its brackets close.
+  const links = refusable ? [] : [...text.matchAll(LINK)].filter((m) => text.slice(Math.max(0, m.index! - 2), m.index!) !== "](")
+    .map((m) => [m.index!, m.index! + m[0].length]);
   for (const m of seen.matchAll(DASH)) {
     const at = m.index!, end = at + m[0].length;
+    if (refusable) { out.push({ at, end, put: null }); continue; }
+    if (links.some(([a, b]) => a < at && b >= at)) { out.push({ at, end, put: null, kept: "link" }); continue; }
+    if (NUMBER_BEFORE.test(text.slice(0, at)) && NUMBER_AFTER.test(text.slice(end))) { out.push({ at, end, put: null, kept: "range" }); continue; }
     const before = at === 0 ? "\n" : text[at - 1], after = end >= text.length ? "\n" : text[end];
-    let put: string | null = ", ";
-    if (NUMBER_BEFORE.test(text.slice(0, at)) && NUMBER_AFTER.test(text.slice(end))) put = null;   // a range or a list
-    else if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
+    let put = ", ";
+    if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
     else if (/[,;:]/.test(before)) put = " ";
     out.push({ at, end, put });
   }
@@ -226,13 +260,13 @@ export function check(text: string, ctx: Context = {}): Report {
   // The machine rule reads code too, except in a reply to his own message (what he asked for).
   const seen = hidden(t), targetsOnly = hidden(t, ctx.answersHim ? "code" : true);
   const hits: Hit[] = [];
-  const add = (rule: Rule, result: Result, at: number, end: number, label?: string) => {
+  const add = (rule: Rule, result: Result, at: number, end: number, label?: string, kept?: Kept) => {
     if (hits.some((h) => h.rule === rule && overlaps(h, { at, end }))) return;
-    hits.push({ rule, result, at, end, around: around(t, at, end), ...(label ? { label } : {}) });
+    hits.push({ rule, result, at, end, around: around(t, at, end), ...(label ? { label } : {}), ...(kept ? { kept } : {}) });
   };
   const edits: { at: number; end: number; put: string }[] = [];
-  if (on.has("dash")) for (const e of dashes(t, seen)) {
-    if (e.put === null) { add("dash", "refuse", e.at, e.end); continue; }
+  if (on.has("dash")) for (const e of dashes(t, seen, !!ctx.refusable)) {
+    if (e.put === null) { add("dash", "refuse", e.at, e.end, undefined, e.kept); continue; }
     add("dash", "fix", e.at, e.end);
     edits.push({ at: e.at, end: e.end, put: e.put });
   }
@@ -272,7 +306,9 @@ export function verdict(r: Report): "pass" | "fix" | "refuse" | "unsure" {
 
 // Which rules each send point applies (the design's table). The specialist's cards get
 // no machine rule: their numbers come from his calendar titles, and CI keeps the
-// templates clean. Tap notes and the link's own words only get the two fixes.
+// templates clean. Tap notes and the link's own words only get the two fixes. Cain's own
+// words are checked as a writer the gate refuses (Context.refusable): every em dash in them
+// is refused.
 export const AT: Record<string, readonly Rule[]> = {
   cain: RULES,                                          // his replies and edits, asks, Ship cards, the morning message
   card: ["dash", "app", "count", "button"],             // the specialist's cards
@@ -288,11 +324,15 @@ export const WHY: Record<Rule, string> = {
   machine: "no shas, job ids, ISO times or Discord ids; say it as people say it",
   button: "name only a button the message has",
 };
-// The same for one hit: an em dash that's held stands between two numbers, times or dates,
-// and may or may not be a range.
+// The same for one hit. An em dash of Cain's is refused, every one: what to put instead.
+export const DASH_WHY = 'an em dash; rewrite it without one, using a comma or a new sentence for a break, "to" or "through" for a range';
+// One kept in words that are never refused (flagged to Cain on a specialist's card): it
+// stands between two numbers, times or dates, and may or may not be a range; or a comma in
+// its place would run into the link before it.
 export const RANGE_WHY = "say it without the dash, as a range in words if it is one";
-export function whyOf(h: { rule: string; result?: string }): string {
-  if (h.rule === "dash" && h.result === "refuse") return RANGE_WHY;
+export const LINK_WHY = "say it without the dash; a comma there would run into the link";
+export function whyOf(h: { rule: string; result?: string; kept?: string }): string {
+  if (h.rule === "dash" && h.result === "refuse") return h.kept === "range" ? RANGE_WHY : h.kept === "link" ? LINK_WHY : DASH_WHY;
   return WHY[h.rule as Rule] ?? "a message rule";
 }
 

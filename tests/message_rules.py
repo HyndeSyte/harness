@@ -4,13 +4,15 @@ cain/tests/gate-cases.json (test_message_text.py runs them here, cain/tests/gate
 runs them there). Nothing in harness/app imports this: what he sees is kept clean by the
 tests that use it.
 
-  dash     an em dash                         fix: ", " (removed at a line's start or end, or
-                                              before a stop), never " to ", and never inside
-                                              code or a link. One with a number right on both
-                                              sides (a digit, a clock time, a day or a month
-                                              by name, noon or midnight: "2026" and "2027",
-                                              "6 PM" and "8", "Monday" and "Friday") is
-                                              refused: said without it
+  dash     an em dash, never inside code or a link. A writer the gate refuses (refusable=True:
+           Cain's own words): every one       refuse: rewrite it without one.
+           Words that are never refused       fix: ", " (removed at a line's start or end, or
+                                              before a stop), never " to ". One with a number
+                                              right on both sides (a digit, a clock time, a day
+                                              or a month by name, noon or midnight, past
+                                              markdown: "2026" and "2027", "**6 PM**" and "8",
+                                              "Monday" and "Friday"), or right after a link,
+                                              stays as it is, flagged (kept)
   app      "the add-on", "Cain's add-on", "Settings > Add-ons" and the like, also "addon" and
            the escaped "add\\-on"             fix: "App", "Apps", "App's". A bare "add-on" (a
                                               browser add-on in a calendar title) is left alone.
@@ -68,6 +70,7 @@ class Hit:
     end: int
     around: str
     label: str = ""
+    kept: str = ""                # a dash in words never refused that stays: "range" or "link"
 
 
 @dataclass
@@ -103,9 +106,17 @@ def hidden(text: str, only_targets: bool | str = False) -> str:
     return "".join(t)
 
 
-# A link runs to the next space or angle bracket, parentheses included (a user name can hold
-# them), and its scheme may be in any case (rules.ts LINK).
-_LINK = re.compile(r"https?://[^" + _SC + r"<>]+", re.I | A)
+# A link has any scheme ("https://", "wss://", in any case), or none and starts with "www." or is
+# a domain with a path; it runs to the next space or line break, whatever stands between ("<",
+# ">" and brackets included; the zero-width U+FEFF too). Its authority runs to the first "/",
+# "?", "#" or backslash (rules.ts GAP, LABEL, SCHEMED, BARE, LINK).
+_GAP = "\\t-\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000"
+_LABEL = "[^" + _GAP + "\\x00-\\x2c\\x2e\\x2f\\x3a-\\x40\\x5b-\\x5e\\x60\\x7b-\\x7f]"
+_SCHEMED = "(?<![A-Za-z0-9+.\\-])[A-Za-z0-9+.\\-]+:\\/\\/[^" + _GAP + "]+"
+_BARE = ("(?<![A-Za-z0-9_\\-.@])(?:[^" + _GAP + "\\/?#\\\\]*@)?"
+         + "(?:[Ww][Ww][Ww]\\.|(?:" + _LABEL + "+\\.)+(?:[A-Za-z]|[^" + _GAP + "\\x00-\\x7f])" + _LABEL
+         + "+(?::\\d*)?(?=[\\/\\\\]|[?#][^" + _GAP + "]))[^" + _GAP + "]*")
+_LINK = re.compile(_SCHEMED + "|" + _BARE, A)
 
 
 def around(text: str, at: int, end: int, n: int = 60) -> str:
@@ -123,15 +134,17 @@ _HOST = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)
 
 def link_host(link: str) -> str:
     """A link as its scheme and host alone, with "/\u2026" when anything else was cut: never a user
-    name, password, port, path, query or fragment. Its host is what follows the authority's last
-    "@", less any port; one that isn't a plain name or address is "a link". Nothing after the
-    host comes back (rules.ts linkHost)."""
-    m = re.match(r"(https?://)([^/?#]*)", link, re.I | A)
-    auth = m.group(2) if m else ""
-    h = _HOST.match(auth[auth.rfind("@") + 1:]) if m else None
-    if not m or not h:
+    name, password, port, path, query or fragment. Its authority runs to the first "/", "?", "#"
+    or backslash; its host is what follows the authority's last "@", less any port; one that
+    isn't a plain name or address is "a link". Nothing after the host comes back (rules.ts
+    linkHost)."""
+    s = str(link or "")
+    m = re.match(r"([A-Za-z0-9+.\-]+://)?([^/?#\\]*)", s, A)
+    scheme, auth = m.group(1) or "", m.group(2)
+    h = _HOST.match(auth[auth.rfind("@") + 1:])
+    if not h:
         return "a link"
-    return m.group(1).lower() + h.group(1).lower() + ("/\u2026" if len(link) > len(m.group(1)) + len(h.group(1)) else "")
+    return scheme.lower() + h.group(1).lower() + ("/\u2026" if len(s) > len(scheme) + len(h.group(1)) else "")
 
 
 def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
@@ -152,39 +165,63 @@ def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
     return "".join(out)
 
 
-# An em dash is never read as "to" (rules.ts dashes). One with a number right on both sides is
-# refused: a digit; before the dash also a clock time ending in AM or PM, an ordinal or a
-# percentage; after it also a currency sign and its digits; on either side a day or a month by
-# name (full or short, any case, with or without a period), noon or midnight. Every other one
-# gets ", " or goes. The spaces around it, any but a new line, go with it, and so does another dash
-# with only spaces between.
+# In Cain's words (refusable) every em dash is refused, none fixed in place (rules.ts dashes). In
+# words that are never refused it's never read as "to": one with a number right on both sides
+# stays as it is, flagged, and so does one right after a link (or in one). A number: a digit;
+# before the dash also a clock time ending in AM or PM, an ordinal or a percentage; after it also
+# a currency sign and its digits; on either side a day or a month by name (full or short, any
+# case, with or without a period, though lower-case "may", "march", "sat", "sun" and "wed" are
+# words), noon or midnight, past markdown's "*", "_", "~" and "`" too. Every other one gets ", " or
+# goes. The spaces around it, any but a new line, go with it, and so does another dash with only
+# spaces between.
 _DASH = re.compile("(?:[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*\u2014+)+[\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff]*")
 _MERIDIEM = _S + r"?[AaPp]\.?[Mm]\.?"
 _CLOCK = r"(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")"
-_NAMES = r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|noon|midnight)\.?"
+
+
+def _any_case(s: str) -> str:
+    """Any case, spelled out letter by letter, so lower case alone can be told apart (rules.ts anyCase)."""
+    return re.sub("[a-z]", lambda m: "[" + m.group(0).upper() + m.group(0) + "]", s)
+
+
+_NAMES = ("(?!(?:may|march|sat|sun|wed)(?![A-Za-z]))" + _any_case(
+    "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun|january|february"
+    "|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov"
+    "|dec|noon|midnight)") + r"\.?")
 # Past what can stand between a number and the dash (rules.ts PAST_LEFT, PAST_RIGHT).
-_PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
-_PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
-_NUMBER_BEFORE = re.compile(r"(?:\d(?:st|nd|rd|th|%)?|(?<![\d:.])" + _CLOCK + r"|(?<![A-Za-z])" + _NAMES + ")" + _PAST_LEFT
-                            + r"\Z", re.I | A)
-_NUMBER_AFTER = re.compile("^" + _PAST_RIGHT + "(?:[$\\u20ac\\u00a3]?\\d|" + _NAMES + r"(?![A-Za-z]))", re.I | A)
+_PAST_LEFT = "[)\\]}\"'\\u2018\\u2019\\u201c\\u201d!.*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
+_PAST_RIGHT = "[(\\[{\"'\\u2018\\u2019\\u201c\\u201d*_~`\\t\\v\\f \\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000\\ufeff\\u200b-\\u200d\\u2060\\ufeff\\n\\r\\u2028\\u2029]*"
+_NUMBER_BEFORE = re.compile(r"(?:\d(?:[Ss][Tt]|[Nn][Dd]|[Rr][Dd]|[Tt][Hh]|%)?|(?<![\d:.])" + _CLOCK + r"|(?<![A-Za-z])" + _NAMES
+                            + ")" + _PAST_LEFT + r"\Z", A)
+_NUMBER_AFTER = re.compile("^" + _PAST_RIGHT + "(?:[$\\u20ac\\u00a3]?\\d|" + _NAMES + r"(?![A-Za-z]))", A)
 
 
-def _dashes(text: str, seen: str) -> list[tuple[int, int, str | None]]:
-    """Each em dash and what goes in its place; None: it stays, and the writer says it without it."""
-    out = []
+def _dashes(text: str, seen: str, refusable: bool) -> list[tuple[int, int, str | None, str]]:
+    """Each em dash, what goes in its place (None: it stays, refused or kept and flagged), and why
+    one is kept."""
+    out: list[tuple[int, int, str | None, str]] = []
+    # The links a comma could run into: any but a masked link's target, which its brackets close.
+    links = [] if refusable else [(m.start(), m.end()) for m in _LINK.finditer(text)
+                                  if text[max(0, m.start() - 2):m.start()] != "]("]
     for m in _DASH.finditer(seen):
         at, end = m.start(), m.end()
+        if refusable:
+            out.append((at, end, None, ""))
+            continue
+        if any(a < at <= b for a, b in links):
+            out.append((at, end, None, "link"))
+            continue
+        if _NUMBER_BEFORE.search(text[:at]) and _NUMBER_AFTER.search(text[end:]):
+            out.append((at, end, None, "range"))
+            continue
         before = "\n" if at == 0 else text[at - 1]
         after = "\n" if end >= len(text) else text[end]
-        put: str | None = ", "
-        if _NUMBER_BEFORE.search(text[:at]) and _NUMBER_AFTER.search(text[end:]):
-            put = None                    # a range or a list: said without the dash
-        elif before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
+        put = ", "
+        if before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
             put = ""
         elif re.match(r"[,;:]", before):
             put = " "
-        out.append((at, end, put))
+        out.append((at, end, put, ""))
     return out
 
 
@@ -262,24 +299,25 @@ def _overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
     return a[0] < b[1] and b[0] < a[1]
 
 
-def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = False) -> Report:
-    """buttons: the labels on this message; None when which buttons are up can't be told."""
+def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = False, refusable: bool = False) -> Report:
+    """buttons: the labels on this message; None when which buttons are up can't be told.
+    refusable: a writer the gate refuses (Cain), whose every em dash is refused."""
     t = str(text or "")
     on = set(RULES if rules is None else rules)
     # The machine rule reads code too, except in a reply to his own message.
     seen, targets_only = hidden(t), hidden(t, "code" if answers_him else True)
     hits: list[Hit] = []
 
-    def add(rule: str, result: str, at: int, end: int, label: str = "") -> None:
+    def add(rule: str, result: str, at: int, end: int, label: str = "", kept: str = "") -> None:
         if any(h.rule == rule and _overlaps((h.at, h.end), (at, end)) for h in hits):
             return
-        hits.append(Hit(rule, result, at, end, around(t, at, end), label))
+        hits.append(Hit(rule, result, at, end, around(t, at, end), label, kept))
 
     edits: list[tuple[int, int, str]] = []
     if "dash" in on:
-        for at, end, put in _dashes(t, seen):
+        for at, end, put, kept in _dashes(t, seen, refusable):
             if put is None:
-                add("dash", "refuse", at, end)
+                add("dash", "refuse", at, end, kept=kept)
                 continue
             add("dash", "fix", at, end)
             edits.append((at, end, put))
