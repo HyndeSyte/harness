@@ -100,11 +100,17 @@ switch)
       bun "$OPT/c1/tools.ts" may-retry $D/c1/failed || break
     done
   else rc="state:$state"; fi
-  # Checked in this same container, whatever happened: no planted secret readable by uid
-  # 1000; no process of his left after a switch that went on past validation; before the
-  # commit, the old tree as it was.
-  secret_free
+  # Checked in this same container, whatever happened: no planted secret readable by uid 1000
+  # once the switch has locked /data (from "locked" on, the only time a process of his can
+  # run: before it, 0.11.0's layout is open to others by design and nothing of his runs; an
+  # undo leaves the modes locked, so after one it holds too); no process of his left after a
+  # switch that went on past validation; before the commit, the old tree as it was.
   at="$(bun "$OPT/c1/tools.ts" journal-check $D/c1/journal 2>/dev/null || true)"
+  case "$at" in
+    locked|staged|scrubbed|validated|commit|committed) secret_free ;;
+    *) if [ "$rc" != 137 ] && [ -f $D/c1/failed ]; then secret_free; fi ;;   # undone: still locked
+  esac
+  [ ! -f $D/c1/state ] || secret_free
   case "$at:${2:-}" in validated:*|commit:*|committed:*|*:quiesce-1|*:j-validated-0) [ -z "$(uid_procs)" ] || fail "a process of uid 1000 or 1001 outlived the validation: $(uid_procs | head -n 2)" ;; esac
   if [ "$rc" != 0 ] && ! grep -q '^commit ' $D/c1/journal 2>/dev/null && [ ! -f $D/c1/state ]; then
     diff <(old_print) /fp/old.txt >/dev/null || fail "the old tree changed before the commit: $(diff <(old_print) /fp/old.txt | head -n 4 | tr '\n' ' ')"
