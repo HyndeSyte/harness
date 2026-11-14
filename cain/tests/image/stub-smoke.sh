@@ -20,6 +20,13 @@ broker=$!
 trap 'kill "$broker" 2>/dev/null' EXIT
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
 [ -S "$SOCK" ] || { echo "[c1] smoke: its broker didn't start" >&2; exit 1; }
+# The seed's plugin loads in a real Claude Code session of his, as the real smoke test checks
+# (c1/seed-loaded.sh). CI has no sign-in: a made-up key lets the session start and say what it
+# loaded; its one model call then fails, which this doesn't need.
+"$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 ANTHROPIC_API_KEY=sk-ant-api03-ci-only-not-a-real-key \
+  timeout 120 claude -p --output-format stream-json --verbose --max-turns 1 "ok" > "$G/session.jsonl" 2> "$G/session.err"
+"$OPT/c1/seed-loaded.sh" "$G/session.jsonl" \
+  || { echo "[c1] smoke: the seed's plugin didn't load: $(head -c 600 "$G/session.jsonl" | tr '\n' ' ') $(tail -n 3 "$G/session.err" | tr '\n' ' ' | cut -c1-300)" >&2; exit 1; }
 if [ "${SMOKE_DETACH:-}" = 1 ]; then
   "$OPT/as-cain" bash -c '(setsid sleep 900 </dev/null >/dev/null 2>&1 &) ; exit 0'
 fi

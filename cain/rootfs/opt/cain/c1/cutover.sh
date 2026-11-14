@@ -190,9 +190,9 @@ if [ "$state" = fresh ]; then
   # before anything of uid 1000 runs.
   "${T[@]}" login-check "$D/link/discord.env" || abort "the plugin's server didn't reach Discord with the token"
   quiesce 1001 || abort "the plugin's login check left a process behind"
-  listing="$("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 timeout 120 claude plugin list 2>&1)"
-  printf '%s\n' "$listing" | grep -q 'discord@claude-plugins-official' \
-    || abort "the seed's discord plugin isn't listed: $(printf '%s' "$listing" | tail -n 3 | tr '\n' ' ' | cut -c1-200)"
+  # The channel smoke test: a session of his loads the seed's plugin (its start event lists it,
+  # loaded from the seed: a seed plugin registers at session start, so `claude plugin list`
+  # wouldn't show it), and its reply goes through the bridge, the broker and the gate.
   "$OPT/c1/smoke.sh" || abort "the channel smoke test didn't pass"
   kp validate-1
   # Whatever the validation started is ended, not trusted to have ended: every process of uid

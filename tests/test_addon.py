@@ -690,7 +690,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")
     assert "http://0fcc2575-harness:8098" in link
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    assert "bun /opt/cain/link/main.ts" in run
+    assert 'bun "$OPT/link/main.ts"' in run
     assert not re.search(r"^ports", (CAIN / "config.yaml").read_text(), re.M)
 
 

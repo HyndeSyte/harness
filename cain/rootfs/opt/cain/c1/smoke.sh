@@ -27,10 +27,14 @@ broker=$!
 trap 'kill "$broker" 2>/dev/null' EXIT
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
 [ -S "$SOCK" ] || { log "its broker didn't start"; exit 1; }
-out="$("$OPT/as-cain" env CAIN_DISCORD_SOCK="$SOCK" CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 \
-  timeout 240 claude -p --permission-mode auto --channels plugin:discord@claude-plugins-official \
-  "This is an automated start-up check of your Discord channel, not a message from anyone. Call the Discord reply tool exactly once, with chat_id $dm and the text: ok. Then stop. Do nothing else." 2>&1)"
+# Its output, a line of JSON per event, goes to a file of root's (the shell opens it): the start
+# event says which plugins loaded and from where (c1/seed-loaded.sh).
+"$OPT/as-cain" env CAIN_DISCORD_SOCK="$SOCK" CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 \
+  timeout 240 claude -p --output-format stream-json --verbose --permission-mode auto --channels plugin:discord@claude-plugins-official \
+  "This is an automated start-up check of your Discord channel, not a message from anyone. Call the Discord reply tool exactly once, with chat_id $dm and the text: ok. Then stop. Do nothing else." \
+  > "$G/session.jsonl" 2> "$G/session.err"
 code=$?
+"$OPT/c1/seed-loaded.sh" "$G/session.jsonl" || { log "the seed's plugin didn't load (claude exited $code): $(tail -n 3 "$G/session.err" | tr '\n' ' ' | cut -c1-300)"; exit 1; }
 if grep -q '"name":"reply"' "$LOG" 2>/dev/null; then log "passed"; exit 0; fi
-log "the stand-in got no reply (claude exited $code): $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ' | cut -c1-300)"
+log "the stand-in got no reply (claude exited $code): $(tail -n 3 "$G/session.err" | tr '\n' ' ' | cut -c1-300)"
 exit 1
