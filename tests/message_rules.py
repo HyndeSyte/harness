@@ -45,6 +45,18 @@ AT = {"cain": RULES, "card": ("dash", "app", "count", "button"), "answer": ("das
 
 HIDE = "\u0000"
 A = re.ASCII                      # JavaScript's \b, \d and \w are ASCII-only
+# JavaScript's \s takes Unicode's spaces even without the u flag (U+00A0, and U+202F, which
+# clocks print before AM and PM), where Python's ASCII \s is only " \t\n\r\f\v": so the port
+# spells it out. _SC goes inside a class, _S is \s, _NS is \S, and _SPACES is what
+# JavaScript's trim() takes off.
+_SC = r"\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+_S, _NS = "[" + _SC + "]", "[^" + _SC + "]"
+_SPACES = "\t\n\v\f\r \u00a0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+
+def _js(pattern: str) -> str:
+    """A pattern with \\s (outside a class) as JavaScript reads it."""
+    return pattern.replace(r"\s", _S)
 
 
 @dataclass(frozen=True)
@@ -81,75 +93,85 @@ def hidden(text: str, only_targets: bool | str = False) -> str:
         for m in re.finditer(pattern, text, A):
             cover(m.start() + offset, m.end())
 
-    each(r"\]\([^)\s]*\)", 1)
+    each(r"\]\([^)" + _SC + r"]*\)", 1)
     if only_targets is not True:
-        each(r"```[\s\S]*?```")
+        each("```(?:" + _S + "|" + _NS + ")*?```")
         each(r"`[^`\n]+`")
     if only_targets is False:
-        each(r"<?https?://[^\s<>()]+>?")
+        each(r"<?https?://[^" + _SC + r"<>()]+>?")
     return "".join(t)
 
 
-_LINK = re.compile(r"https?://[^\s<>()]+", A)
+_LINK = re.compile(r"https?://[^" + _SC + r"<>()]+", A)
 
 
 def around(text: str, at: int, end: int, n: int = 60) -> str:
-    """Up to n characters around a hit, on one line; a link keeps only its host (rules.ts)."""
+    """Up to n characters around a hit, on one line; a link keeps only its scheme and host
+    (rules.ts)."""
     pad = max(0, (n - min(end - at, n)) // 2)
     start = max(0, at - pad)
     stop = min(len(text), start + n)
     start = max(0, stop - n)
-    for m in _LINK.finditer(text):        # a window that starts inside a link shows its host
-        if m.start() < start < m.end():
-            start = m.start()
-            break
-    return re.sub(r"\s+", " ", hosts_only(text, start, stop)).strip()[:n]
+    return re.sub(_S + "+", " ", hosts_only(text, start, stop)).strip(_SPACES)[:n]
+
+
+_TRAIL = re.compile("[.,;:!?'\"\u2019\u201d*_~\\]]+\\Z")
+_HOST = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(:\d*)?\Z", A)
+
+
+def link_host(link: str) -> str:
+    """A link as its scheme and host alone, with "/\u2026" when anything else was cut: never a user
+    name, password, port, path, query or fragment. One whose host isn't a plain name or address
+    is "a link". A sentence's own marks after it stay (rules.ts linkHost)."""
+    m = _TRAIL.search(link)
+    trail = m.group(0) if m else ""
+    url = link[:len(link) - len(trail)]
+    m = re.match(r"(https?://)([^/?#\\]*)", url)
+    auth = m.group(2) if m else ""
+    at = auth.rfind("@")
+    h = _HOST.match(auth[at + 1:]) if m else None
+    if not m or not h:
+        return "a link" + trail
+    cut = at >= 0 or h.group(2) is not None or len(url) > m.end()
+    return m.group(1) + h.group(1).lower() + ("/\u2026" if cut else "") + trail
 
 
 def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
-    """text[start:stop] with every link's path and query cut to "/\u2026" (rules.ts hostsOnly)."""
+    """text[start:stop] with each link as link_host has it. A link that runs past either end of
+    the window still comes out whole, as its host (rules.ts hostsOnly)."""
     t = str(text or "")
     stop = len(t) if stop is None else min(stop, len(t))
-    cut = []
-    for m in _LINK.finditer(t):
-        host = len(re.match(r"https?://[^/?#]*", m.group(0), A).group(0))
-        if len(m.group(0)) > host:
-            cut.append((m.start() + host, m.end()))
     out, i = [], start
-    while i < stop:
-        c = next((c for c in cut if c[0] <= i < c[1]), None)
-        if c is None:
-            out.append(t[i])
-            i += 1
-        else:
-            out.append("/\u2026")
-            i = c[1]
+    for m in _LINK.finditer(t):
+        a, b = m.start(), m.end()
+        if b <= i:
+            continue
+        if a >= stop:
+            break
+        out.append(t[i:max(i, a)] + link_host(m.group(0)))
+        i = b
+    out.append(t[i:max(i, stop)])
     return "".join(out)
 
 
 # " to " only in a confirmed clock range (rules.ts clockRange): a clock time on both sides (a
-# colon, or AM or PM); a bare hour, then a time with AM or PM, the hour starting the text or a
-# line, or after punctuation or one of from, between, at, by, around, about, until, till; or
-# a clock time, then a bare hour at the end of the text or a line, or before punctuation. Any
-# other em dash with a digit right on both sides is refused; every other one gets ", " or goes.
-_MERIDIEM = r"\s?[AaPp]\.?[Mm]\.?"
+# colon, or AM or PM); or a bare hour, then a time with AM or PM, the hour starting the text or
+# a line, or right after one of from, between, at, by, around, about, until, till, a colon
+# after a word, or an opening bracket. Never after a period or a comma, and a bare number on
+# the right is never an hour. Any other em dash with a digit right on both sides is refused;
+# every other one gets ", " or goes.
+_MERIDIEM = _S + r"?[AaPp]\.?[Mm]\.?"
 _CLOCK = r"(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")"
 _CLOCK_END = re.compile(r"(?<![\d:.])" + _CLOCK + r"\Z", A)
 _CLOCK_START = re.compile(r"^" + _CLOCK + r"(?![A-Za-z0-9:])", A)
 _MERIDIEM_START = re.compile(r"^\d{1,2}(?::\d{2})?" + _MERIDIEM + r"(?![A-Za-z0-9])", A)
 _WHEN = r"(?:[Ff]rom|[Bb]etween|[Aa]t|[Bb]y|[Aa]round|[Aa]bout|[Uu]ntil|[Tt]ill)"
-# A period after a month's short name is a date's ("Nov. 12"), not a stop.
-_STOP_DOT = r"(?<!Jan)(?<!Feb)(?<!Mar)(?<!Apr)(?<!Jun)(?<!Jul)(?<!Aug)(?<!Sep)(?<!Sept)(?<!Oct)(?<!Nov)(?<!Dec)\."
-_HOUR_LEFT = re.compile(r"(?:^|\n[ \t]*|(?:[,;:!?)\]\u2022]|" + _STOP_DOT + r")[ \t]+|[(\[]|(?<![A-Za-z])" + _WHEN
-                        + r"[ \t]+)\d{1,2}\Z", A)
-_HOUR_RIGHT = re.compile(r"^\d{1,2}(?=[ \t]*(?:\Z|\n|[;!?)\]]|[.,](?!\d)))", A)
+_HOUR_LEFT = re.compile(r"(?:(?:^|\n)[ \t]*|(?<![A-Za-z])" + _WHEN + r"[ \t]+|(?<!\d):[ \t]*|[(\[][ \t]*)\d{1,2}\Z", A)
 
 
 def _clock_range(left: str, right: str) -> bool:
-    lt = bool(_CLOCK_END.search(left))
-    return ((lt and bool(_CLOCK_START.search(right)))
-            or (bool(_MERIDIEM_START.search(right)) and bool(_HOUR_LEFT.search(left)))
-            or (lt and bool(_HOUR_RIGHT.search(right))))
+    return ((bool(_CLOCK_END.search(left)) and bool(_CLOCK_START.search(right)))
+            or (bool(_MERIDIEM_START.search(right)) and bool(_HOUR_LEFT.search(left))))
 
 
 def _dashes(text: str, seen: str) -> list[tuple[int, int, str | None]]:
@@ -174,7 +196,7 @@ def _dashes(text: str, seen: str) -> list[tuple[int, int, str | None]]:
 
 # Only the words that make it one of these two Apps: "your add-on order" is something else.
 _OWNERS = "the|cain['\u2019]s|cain|harness['\u2019]s|harness['\u2019]|harness"
-_APP = re.compile(r"(?:\b(?:" + _OWNERS + r")|>)[*_~]*\s+[*_~]*(add\\?-?ons?(?:['\u2019]s?)?)(?![A-Za-z0-9])",
+_APP = re.compile(_js(r"(?:\b(?:" + _OWNERS + r")|>)[*_~]*\s+[*_~]*(add\\?-?ons?(?:['\u2019]s?)?)(?![A-Za-z0-9])"),
                   re.I | A)
 
 
@@ -193,17 +215,17 @@ def _apps(seen: str) -> list[tuple[int, int, str]]:
     return out
 
 
-_NUM = (r"(?:\d+|a\s+few|a\s+couple(?:\s+of)?|several|two|three|four|five|six|seven|eight|nine|ten"
-        r"|a\s+dozen)")
+_NUM = _js(r"(?:\d+|a\s+few|a\s+couple(?:\s+of)?|several|two|three|four|five|six|seven|eight|nine|ten"
+           r"|a\s+dozen)")
 _UNIT = r"(?:minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|seconds?|secs?|times?|tries)"
 # Not "questions": "two more questions after this" is how he's told a few asks follow.
 _ITEMS = (r"(?:changes|events|blocks|cards|items|messages|notes|places|things|ones"
           r"|appointments|receipts)")
 _COUNTS = (
-    re.compile(r"\band\s+" + _NUM + r"\s+(?:more|others?)\b(?!\s+" + _UNIT + r"\b)", re.I | A),
-    re.compile(r"\+\s?\d+\s+more\b", re.I | A),
-    re.compile(r"\\?\(\s*\+\s?\d+\s*\\?\)", A),
-    re.compile(r"\b" + _NUM + r"\s+more\s+" + _ITEMS + r"\b", re.I | A),
+    re.compile(_js(r"\band\s+") + _NUM + _js(r"\s+(?:more|others?)\b(?!\s+") + _UNIT + r"\b)", re.I | A),
+    re.compile(_js(r"\+\s?\d+\s+more\b"), re.I | A),
+    re.compile(_js(r"\\?\(\s*\+\s?\d+\s*\\?\)"), A),
+    re.compile(r"\b" + _NUM + _js(r"\s+more\s+") + _ITEMS + r"\b", re.I | A),
 )
 _MACHINE = (   # (pattern, a Discord-id-like digit run)
     (re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])", A), False),
@@ -211,7 +233,7 @@ _MACHINE = (   # (pattern, a Discord-id-like digit run)
     (re.compile(r"\b\d{4}\\?-\d{2}\\?-\d{2}T\d{2}:\d{2}", A), False),
     (re.compile(r"(?<!\d)\d{17,20}(?!\d)", A), True),
 )
-_JOB = re.compile(r"\bjob\s+(?:id\s+)?#?([0-9a-f]{6,})\b", re.I | A)
+_JOB = re.compile(_js(r"\bjob\s+(?:id\s+)?#?([0-9a-f]{6,})\b"), re.I | A)
 
 _Q = "[\"\u201c\u201d'\u2018\u2019*_]*"
 _VERB = "(?:[Tt]ap|[Tt]apping|[Pp]ress|[Pp]ressing|[Hh]it|[Cc]lick|[Cc]hoose|[Pp]ick|[Ss]elect)"
@@ -229,9 +251,9 @@ WITH_LABELS = (
 def _named(seen: str, label: str) -> list[tuple[int, int]]:
     L = re.escape(label)
     forms = (
-        r"(?<![A-Za-z])" + _VERB + r"\s+(?:(?:on\s+)?the\s+|on\s+)?" + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",
-        r"(?<![A-Za-z0-9])" + _Q + "(" + L + ")" + _Q + r"\s+[Bb]uttons?\b",
-    ) + ((r"(?<![A-Za-z])[Ww]ith\s+(?:the\s+)?" + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",)
+        r"(?<![A-Za-z])" + _VERB + _js(r"\s+(?:(?:on\s+)?the\s+|on\s+)?") + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",
+        r"(?<![A-Za-z0-9])" + _Q + "(" + L + ")" + _Q + _js(r"\s+[Bb]uttons?\b"),
+    ) + ((_js(r"(?<![A-Za-z])[Ww]ith\s+(?:the\s+)?") + _Q + "(" + L + ")" + _Q + r"(?![A-Za-z0-9])",)
          if label in WITH_LABELS else ())
     out: list[tuple[int, int]] = []
     for form in forms:
@@ -286,7 +308,7 @@ def check(text: str, *, rules=None, buttons=(), known=(), answers_him: bool = Fa
                 add("machine", "refuse", m.start(), m.end())
     if "button" in on:
         has = None if buttons is None else set(buttons)
-        labels = list(dict.fromkeys(x for x in (str(l).strip() for l in (*STATIC_LABELS, *known)) if x))
+        labels = list(dict.fromkeys(x for x in (str(l).strip(_SPACES) for l in (*STATIC_LABELS, *known)) if x))
         labels = sorted(labels, key=lambda l: -len(l))
         taken: list[tuple[int, int]] = []
         for label in labels:

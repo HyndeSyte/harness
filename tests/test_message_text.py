@@ -228,6 +228,32 @@ def test_the_port_has_the_same_labels_as_cains_rules():
         assert f'"{label}"' in rules_ts, label
 
 
+def test_a_link_in_an_excerpt_is_its_scheme_and_host_alone():
+    """No user name, password, port, path, query or fragment; one that can't be read is "a link"
+    (rules.ts linkHost, gate.test.ts)."""
+    assert message_rules.link_host("https://user:secret@example.com/private?key=abc") == "https://example.com/\u2026"
+    assert message_rules.link_host("https://a@b@Example.COM:8443/x#frag") == "https://example.com/\u2026"
+    assert message_rules.link_host("http://example.com") == "http://example.com"
+    assert message_rules.link_host("https://[::1]:80/x") == "https://[::1]/\u2026"
+    assert message_rules.link_host("https://example.com/a?b=1,") == "https://example.com/\u2026,"
+    for bad in ("https://", "https://user:secret@", "https://exa%mple.com/x", "https://b\xfccher.example/x",
+                "https://example.com:port/x"):
+        assert message_rules.link_host(bad) == "a link", bad
+    text = "Call https://user:secret@example.com:8443/reset?token=abc today."
+    for start in range(len(text)):
+        for stop in (start + 1, start + 9, len(text)):
+            assert not re.search("user|secret|8443|reset|token", message_rules.hosts_only(text, start, stop))
+    assert message_rules.around(text, 30, 40) == "https://example.com/\u2026 today."
+
+
+def test_the_port_reads_javascripts_spaces():
+    """JavaScript's \\s takes U+00A0, U+202F and the other Unicode spaces even without the u flag."""
+    assert message_rules.check("6\u202fPM \u2014 8\u202fPM").fixed == "6\u202fPM to 8\u202fPM"
+    assert message_rules.check("Two blocks and\xa03 more.").rules("refuse") == ["count"]
+    assert message_rules.check("Two blocks and\u200b3 more.").hits == []      # U+200B isn't a space in either
+    assert message_rules.around("\x85a\ufeff", 1, 2) == "\x85a"                 # trim() keeps U+0085, takes U+FEFF
+
+
 @pytest.mark.parametrize("case", cases()["cases"], ids=lambda c: c["name"])
 def test_each_shared_case(case):
     ctx = case.get("context", {})

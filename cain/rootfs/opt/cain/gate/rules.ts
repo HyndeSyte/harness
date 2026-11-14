@@ -75,36 +75,47 @@ export function hidden(text: string, onlyTargets: boolean | "code" = false): str
 }
 
 // Up to n characters of the text around a hit, on one line. A link in it keeps only its
-// host: a path or query can carry an id or a token, and excerpts go to the gate's log, the
-// safety net's note and lines for Cain.
+// scheme and host: the rest can carry an id, a token or a password, and excerpts go to the
+// gate's log, the safety net's note and lines for Cain.
 export function around(text: string, at: number, end: number, n = 60): string {
   const pad = Math.max(0, Math.floor((n - Math.min(end - at, n)) / 2));
   let from = Math.max(0, at - pad);
   const to = Math.min(text.length, from + n);
   from = Math.max(0, to - n);
-  for (const m of text.matchAll(LINK)) {                  // a window that starts inside a link shows its host
-    if (m.index! < from && from < m.index! + m[0].length) { from = m.index!; break; }
-  }
   return hostsOnly(text, from, to).replace(/\s+/g, " ").trim().slice(0, n);
 }
 
-// text[from, to) with every link's path and query cut to "/…" ("https://github.com/…").
+// A link as its scheme and host alone, with "/…" when anything else was cut: never a user
+// name, password, port, path, query or fragment ("https://github.com/…"). One whose host
+// isn't a plain name or address is "a link". A sentence's own marks after it stay.
 const LINK = /https?:\/\/[^\s<>()]+/g;
+const TRAIL = /[.,;:!?'"’”*_~\]]+$/;
+const HOST = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?)(:\d*)?$/;
+export function linkHost(link: string): string {
+  const trail = TRAIL.exec(link)?.[0] ?? "";
+  const url = link.slice(0, link.length - trail.length);
+  const m = /^(https?:\/\/)([^/?#\\]*)/.exec(url);
+  const auth = m?.[2] ?? "", at = auth.lastIndexOf("@");
+  const h = m ? HOST.exec(auth.slice(at + 1)) : null;
+  if (!m || !h) return `a link${trail}`;
+  const cut = at >= 0 || h[2] !== undefined || url.length > m[0].length;
+  return `${m[1]}${h[1].toLowerCase()}${cut ? "/…" : ""}${trail}`;
+}
+
+// text[from, to) with each link as linkHost has it. A link that runs past either end of the
+// window still comes out whole, as its host: never a piece of what follows the host.
 export function hostsOnly(text: string, from = 0, to = text.length): string {
   const t = String(text ?? "");
-  const cut: [number, number][] = [];
+  const stop = Math.min(to, t.length);
+  let out = "", i = from;
   for (const m of t.matchAll(LINK)) {
-    const host = /^https?:\/\/[^/?#]*/.exec(m[0])![0].length;
-    if (m[0].length > host) cut.push([m.index! + host, m.index! + m[0].length]);
+    const a = m.index!, b = a + m[0].length;
+    if (b <= i) continue;
+    if (a >= stop) break;
+    out += t.slice(i, Math.max(i, a)) + linkHost(m[0]);
+    i = b;
   }
-  let out = "";
-  for (let i = from; i < Math.min(to, t.length); i++) {
-    const c = cut.find(([a, b]) => i >= a && i < b);
-    if (!c) { out += t[i]; continue; }
-    out += "/…";
-    i = c[1] - 1;
-  }
-  return out;
+  return out + t.slice(i, Math.max(i, stop));
 }
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -113,10 +124,11 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // " to " only in a confirmed clock range:
 //   - a clock time on both sides (a colon, or AM or PM): 9:30 to 10:15, 6 PM to 8 PM;
 //   - a bare hour, then a time with AM or PM, the hour starting the text or a line, or
-//     after punctuation or one of from, between, at, by, around, about, until, till:
-//     "6 to 8 PM", "from 6 to 8 PM" (never "Nov 12 to 4:30 PM" or "Room 4 to 5:30");
-//   - a clock time, then a bare hour at the end of the text or a line, or before
-//     punctuation: "6 PM to 8." (never "6 PM to 8 people").
+//     right after one of from, between, at, by, around, about, until, till, a colon after
+//     a word, or an opening bracket: "6 to 8 PM", "from 6 to 8 PM", "Swim: 5 to 6 PM",
+//     "(5 to 6 PM)". Never after a period or a comma ("Sat. 5", "Thursday, 12" are dates,
+//     "No. 5" a number), and a bare number on the right is never an hour: after "6 PM",
+//     "3, maybe 4 people" gets a comma, as does any dash without a digit right on both sides.
 // Any other em dash with a digit right on both sides is held: ", " would make a range a
 // list ("2026, 2027"). Every other em dash gets ", " or goes.
 const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
@@ -125,13 +137,9 @@ const CLOCK_END = new RegExp(`(?<![\\d:.])${CLOCK}$`);
 const CLOCK_START = new RegExp(`^${CLOCK}(?![A-Za-z0-9:])`);
 const MERIDIEM_START = new RegExp(`^\\d{1,2}(?::\\d{2})?${MERIDIEM}(?![A-Za-z0-9])`);
 const WHEN = "(?:[Ff]rom|[Bb]etween|[Aa]t|[Bb]y|[Aa]round|[Aa]bout|[Uu]ntil|[Tt]ill)";
-// A period after a month's short name is a date's ("Nov. 12"), not a stop.
-const STOP_DOT = "(?<!Jan)(?<!Feb)(?<!Mar)(?<!Apr)(?<!Jun)(?<!Jul)(?<!Aug)(?<!Sep)(?<!Sept)(?<!Oct)(?<!Nov)(?<!Dec)\\.";
-const HOUR_LEFT = new RegExp(`(?:^|\\n[ \\t]*|(?:[,;:!?)\\]•]|${STOP_DOT})[ \\t]+|[(\\[]|(?<![A-Za-z])${WHEN}[ \\t]+)\\d{1,2}$`);
-const HOUR_RIGHT = /^\d{1,2}(?=[ \t]*(?:$|\n|[;!?)\]]|[.,](?!\d)))/;
+const HOUR_LEFT = new RegExp(`(?:(?:^|\\n)[ \\t]*|(?<![A-Za-z])${WHEN}[ \\t]+|(?<!\\d):[ \\t]*|[(\\[][ \\t]*)\\d{1,2}$`);
 function clockRange(left: string, right: string): boolean {
-  const l = CLOCK_END.test(left);
-  return (l && CLOCK_START.test(right)) || (MERIDIEM_START.test(right) && HOUR_LEFT.test(left)) || (l && HOUR_RIGHT.test(right));
+  return (CLOCK_END.test(left) && CLOCK_START.test(right)) || (MERIDIEM_START.test(right) && HOUR_LEFT.test(left));
 }
 
 // Each em dash and what goes in its place; null: it stays, and the writer says it in words.
