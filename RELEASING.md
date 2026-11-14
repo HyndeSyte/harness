@@ -90,10 +90,11 @@ commit the card was for (its full head sha). The link builds that card itself
 names each App and version the tap installs (each App's `config.yaml` read at that very
 head and at the pull request's base; "Ship it?" when any of it can't be read); a line
 from GitHub gives the pull request's title (as plain words, left out if it claims checks
-or a review), its commit and file counts, the parts that matter most, and its checks,
-read the way the landing reads them, every page of them (a check that failed or hasn't
-run yet refuses the card; a pull request already merged at that head says "Already in
-main."); and its last line is the review service's own Reviewed line for the review Cain
+or a review, or carries a record code), its commit and file counts, the parts that matter
+most, and its checks, read the way the landing reads them, each required check's latest
+runs in one whole answer (a check that failed or hasn't run yet refuses the card; a pull
+request already merged at that head, once main is seen to have it, says "Already in main,
+so Ship only installs it."); and its last line is the review service's own Reviewed line for the review Cain
 names, which must be a review of that very pull request and head ("No outside review
 attached." when he names none). Cain's own line says only what Dane will notice, on one
 line, and checks or review claims in it are refused. No card shows a record code like

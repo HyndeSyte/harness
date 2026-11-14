@@ -617,6 +617,17 @@ describe("one open ask at a time", () => {
     expect(r.relayed[1]).toBe(`Your held question P11 Q1 is now in front of Dane (Discord message ${r.last().id}): "Signed?" Nothing to tell him.`);
   });
 
+  test("an ask held since before 0.11.0 loses the label it was stored with when it goes out", async () => {
+    const r = rig();
+    const a = await ask(r, "P08", "Q2");
+    expect((await r.link.ask({ text: "Signed?", options: ["Signed", "Not signed"], item: "P11", question: "Q1" })).status).toBe("held");
+    const s = r.state();
+    s.held![0].text = "P11 Q1: Signed?";                     // as an older link stored it
+    r.setState(s);
+    await r.tap(snap(r.msg(a)), r.ids(a)[0]);
+    expect(r.last().content).toBe("Signed?");
+  });
+
   test("...or when the open one's item closes or moves", async () => {
     const r = rig();
     await ask(r, "P08", "Q2");

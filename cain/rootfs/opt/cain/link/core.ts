@@ -79,7 +79,7 @@
 //   Turn back on, the notice's own Stop is the one until it's out of reach; when the moving
 //   Stop then goes onto a newer message, the notice's comes off.
 import { createHash } from "node:crypto";
-import { cainReasons, type CainHit, claimsChecks, claimsReview, codesHits, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
+import { cainReasons, type CainHit, claimsReview, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
 import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, linkSpans, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
@@ -395,8 +395,19 @@ const sameAsk = (a: { item?: string; question?: string }, b: { item?: string; qu
 // A card used to start with words naming what it's about ("P08 Q2: "). He can't tell what
 // those are (0.11.0), so no card shows one: the item and question stay as data (binding,
 // replacing, holds, expiry, replied), and one Cain wrote at the start of his words is taken off.
-const LEADING_LABEL = /^\s*P\d{1,4}(?:[ \t]+Q\d{1,2})?[ \t]*:[ \t]*/i;
-export const unlabeled = (text: string): string => String(text ?? "").replace(LEADING_LABEL, "");
+// Only the card's own label is taken off ("P08 Q2: " on P08's second question), so words
+// that merely start like one ("P100: filter swap" on another item) stay as they are.
+const LEADING_LABEL = /^\s*P0*(\d{1,4})(?:[ \t]+Q0*(\d{1,2}))?[ \t]*:[ \t]*/i;
+const numberOf = (id: string | undefined, letter: "P" | "Q"): number | null =>
+  id && new RegExp(`^${letter}\\d{1,4}$`, "i").test(id) ? Number(id.slice(1)) : null;
+export function unlabeled(text: string, item?: string, question?: string): string {
+  const t = String(text ?? "");
+  const m = LEADING_LABEL.exec(t);
+  if (!m || numberOf(item, "P") !== Number(m[1])) return t;
+  const q = numberOf(question, "Q");
+  if (m[2] !== undefined && q !== null && q !== Number(m[2])) return t;
+  return t.slice(m[0].length);
+}
 
 // What he sees has no machine text in it (Timing and truth, in CLAUDE.md).
 function noMachineText(...texts: string[]): void {
@@ -575,7 +586,9 @@ export function shipQuestion(f: Facts | null): string {
 export const CHECKS_PASSED = "Checks passed.";
 export const CHECKS_RUNNING = "Checks are still running; Ship lands it if they pass within 2 hours of the tap.";
 export const CHECKS_UNREAD = "Checks couldn't be read just now; Ship checks them before it lands.";
-export const IN_MAIN = "Already in main.";
+export const IN_MAIN = "Already in main, so Ship only installs it.";
+// Merged on GitHub, but whether main has this very head couldn't be read: the landing checks.
+export const MERGED_UNREAD = "Merged on GitHub; Ship checks main has it before anything installs.";
 // The last line when Cain names no review: none is attached, which isn't to say none happened.
 export const NO_REVIEW = "No outside review attached.";
 
@@ -591,7 +604,7 @@ export function titleOf(raw: unknown): string {
     .replace(/\*+|~~|`+/g, "").replace(/(^|[^A-Za-z0-9])_+|_+(?=[^A-Za-z0-9]|$)/g, "$1")
     .replace(/^#+\s*/, "").replace(/\s+/g, " ").trim();
   if (/(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/i.test(t) || /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(t) || linkSpans(t).length
-      || claimsChecks(t) || claimsReview(t)) return "";
+      || shipWordsHits(t).length) return "";
   return t.length <= TITLE_MAX ? t : `${t.slice(0, TITLE_MAX - 3).trimEnd()}...`;
 }
 const DOUBLE_QUOTE = new RegExp("[\"\\u201c\\u201d\\u201e\\u201f]", "g");
@@ -740,7 +753,7 @@ export class Link {
     try {
       if (also.shipWords) cain.push(...shipWordsHits(text));
       if (also.reviewed && claimsReview(text)) { published = this.published(); cain.push(...reviewedHits(text, published)); }
-      if (/P\d/i.test(text)) cain.push(...codesHits(text, this.itemIds()));
+      if (mayHaveCode(text)) cain.push(...codesHits(text, this.itemIds()));
     } catch (e) { this.log(`the gate's own rules for Cain failed on a ${point}: ${String(e).slice(0, 80)}`); }
     if (w.refused.length || cain.length) {
       this.report(point, "cain", [...w.hits, ...cain], "refused");
@@ -797,7 +810,7 @@ export class Link {
     for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
     const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(),
       { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
-        ...(/P\d/i.test(text) ? { items: this.itemIds() } : {}) });
+        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}) });
     return { status: "ok", ...d };
   }
 
@@ -1292,7 +1305,7 @@ export class Link {
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
     const meta = checkMeta(a);
     const raw = (a.options ?? []).map((o) => String(o).trim()).filter(Boolean).slice(0, 5);
-    const asked = unlabeled(String(a.text ?? "")).trim();
+    const asked = unlabeled(String(a.text ?? ""), meta.item, meta.question).trim();
     if (!asked) throw new Refusal("an ask needs its question");
     if (!raw.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
     noMachineText(asked, ...raw);
@@ -1325,8 +1338,9 @@ export class Link {
 
   private async postAsk(e: Ask): Promise<string> {
     const nonce = e.nonce ?? stableNonce("ask", e.item, e.question, e.text, e.options.join("\u0001"), e.replyTo ?? "");
-    // Checked when it was asked; one held since before 0.10.0 gets the fixes now.
-    const text = this.words("ask", "cain", e.text, { rules: ["dash", "app"] }).text;
+    // Checked when it was asked; one held since before 0.10.0 gets the fixes now, and one held
+    // since before 0.11.0 loses the label it was stored with ("P08 Q2: ").
+    const text = this.words("ask", "cain", unlabeled(e.text, e.item, e.question), { rules: ["dash", "app"] }).text;
     const options = e.options.map((o) => this.words("ask option", "cain", o, { rules: ["dash", "app"] }).text);
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
       { replyTo: e.replyTo, nonce });
@@ -1355,7 +1369,7 @@ export class Link {
     if (review !== null && !safeId(review)) throw new Refusal("review must be a review's id, as review.sh submit printed it");
     // His words as one line, without a "P64: " in front: a second line of his can't pose as
     // one of the link's, and he can't tell what a record code is.
-    const said = unlabeled(String(a.text ?? "")).replace(/\s*[\r\n]+\s*/g, " ").trim();
+    const said = unlabeled(String(a.text ?? ""), meta.item).replace(/\s*[\r\n]+\s*/g, " ").trim();
     if (!said) throw new Refusal("a Ship card needs its words");
     const stop = this.stopped();
     if (stop.stopped)
@@ -1416,16 +1430,25 @@ export class Link {
     const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    // Merged on GitHub at this head: the landing asks nothing of its checks, only that main has
+    // the head (a squash or a rebase would leave it out). So the card asks main too, the way the
+    // landing does, and says "Already in main" only when main has it.
+    const merged = f?.merged === true && f.head === head;
+    const inMain = merged && this.d.landed ? await within(this.d.landed({ pr, head }).catch(() => null), wait) : null;
+    if (merged && inMain === false)
+      throw new Refusal("GitHub says it's merged, but main doesn't have that head (a squash or a rebase?), so a Ship tap can't install it");
     try {
-      const inMain = f?.merged === true && f.head === head;
-      if (!inMain && runs === "missing") throw new Refusal("GitHub doesn't have that commit: show the card for its head as it is now");
-      const checks = !inMain && Array.isArray(runs) ? judgeChecks(runs) : null;
+      if (!merged && runs === "missing") throw new Refusal("GitHub doesn't have that commit: show the card for its head as it is now");
+      const checks = !merged && Array.isArray(runs) ? judgeChecks(runs) : null;
       const failed = checks?.find((c) => c.state === "failed");
       if (failed) throw new Refusal(`its ${failed.name} check didn't pass (${failed.conclusion}): fix it through Build first, then show a new Ship card`);
       const notRun = checks?.find((c) => c.state === "missing");
       if (notRun) throw new Refusal(`CI hasn't run ${notRun.name} on it yet: show the card once its checks have run`);
-      const said = inMain ? IN_MAIN : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
-      const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
+      const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
+        : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
+      // A title carrying a record code is left out like one that makes claims.
+      const shown = f && f.title && codesHits(f.title, this.itemIds()).length ? { ...f, title: "" } : f;
+      const github = this.ownWords("ship facts", "link", shown ? githubLine(shown, said) : factsLine(null));
       return { text: shipCard(shipQuestion(f), own, [github, rev ? rev.line : NO_REVIEW]), own };
     } catch (e) {
       if (e instanceof Refusal) throw e;

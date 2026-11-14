@@ -7,7 +7,7 @@
 // record code. Anything going wrong while the new lines are built gives the card as it was.
 import { describe, expect, test } from "bun:test";
 import { CODES_WHY } from "../rootfs/opt/cain/gate/cain";
-import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, NO_REVIEW, titleOf } from "../rootfs/opt/cain/link/core";
+import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, titleOf, unlabeled } from "../rootfs/opt/cain/link/core";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
 
 const DAY = 86_400_000;
@@ -99,12 +99,21 @@ describe("the Ship card the link builds", () => {
     expect(r.github.asked).toContain(`runs ${SHA1}`);                            // the head the card names
   });
 
-  test("a pull request merged at this head is in main already: its checks don't refuse it (a new card after a token ran out)", async () => {
+  test("a pull request merged at this head, and main has it: its checks don't refuse it (a new card after a token ran out)", async () => {
     const r = shipRig({ facts: facts({ merged: true }) });
+    r.github.main.push(SHA1);
     for (const runs of [[], [checkRun("pytest"), checkRun("bun", "skipped"), checkRun("pr")], "missing", null] as any[]) {
       r.github.runs = runs;
       expect(lines(r, await ship(r))[2]).toBe(`${GITHUB} ${IN_MAIN}`);
     }
+    expect(IN_MAIN).toBe("Already in main, so Ship only installs it.");
+    // Merged on GitHub but not in main (a squash or a rebase): refused, as the landing would.
+    r.github.main.length = 0;
+    await expect(ship(r, { text: "Other words." })).rejects.toThrow("GitHub says it's merged, but main doesn't have that head");
+    // Main can't be read just now: no claim it's there; the landing checks.
+    r.github.readable = false;
+    expect(lines(r, await ship(r))[2]).toBe(`${GITHUB} ${MERGED_UNREAD}`);
+    r.github.readable = true;
     // Merged at another head: GitHub has a newer one, and the card is refused as before.
     r.github.facts = facts({ merged: true, head: SHA2 });
     await expect(ship(r, { text: "Other words." })).rejects.toThrow("GitHub has a newer head for that pull request");
@@ -223,13 +232,14 @@ describe("his line can't carry evidence: the link adds the checks and the review
     const r = shipRig();
     for (const text of ["CI passed.", "All checks are green.", "Reviewed by OpenAI and Gemini.", "Cain 0.11.0 ready. CI passed. Reviewed: OpenAI, approve.",
       "The tests all passed.", "Build succeeded.", "Tests failed once, fixed now.", "The check is red, but it's fine.",
-      "Passed all checks, and OpenAI and Gemini approved it.", "The pipeline is green.", "Green CI.", "`CI passed`", "CI\npassed.", "All checks\npassed."]) {
+      "Passed all checks, and OpenAI and Gemini approved it.", "The pipeline is green.", "Green CI.", "`CI passed`", "CI\npassed.", "All checks\npassed.",
+      "The checks on this commit are green.", "The pipeline eventually succeeded.", "Tests look green now.", "OpenAI approved it."]) {
       await expect(ship(r, { text })).rejects.toThrow(WHY);
     }
     expect(r.posts()).toBe(0);
     expect(r.reports.filter((x) => x.point === "ship").every((x) => x.did === "refused" && x.hits.some((h: any) => h.rule === "ship words"))).toBe(true);
     for (const text of [LINE, "Stop stays in reach.", "The red Stop moves down with your newest message.", "Build jobs name their branch.",
-      "Build cards pass through the gate.", "Check your red folder."])
+      "Tests now cover the Stop row."])
       expect(await ship(r, { text })).toBeTruthy();
     // Only on a Ship card: an ask may say it.
     expect((await r.link.ask({ text: "CI passed on the branch. Merge the notes too?", options: ["Yes", "No"], item: "P08", question: "Q2" })).status).toBe("posted");
@@ -256,6 +266,20 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
     await expect(r.link.morning("## Thu Nov 12\n### 🟢 Moving\n• P08 is moving.")).rejects.toThrow(CODES_WHY);
     expect(r.posts()).toBe(posts);
     expect(r.reports.at(-1)).toMatchObject({ point: "morning", writer: "cain", did: "refused", hits: [{ rule: "codes", result: "refuse" }] });
+    // Read as he'd see them: full-width digits and an invisible character don't hide one.
+    for (const text of ["P６４ is ready: Stop stays in reach.", "P​64 is ready: Stop stays in reach."])
+      await expect(ship(r, { text })).rejects.toThrow(CODES_WHY);
+    // A title from GitHub with a code the record has is left out, like one that makes claims.
+    r.github.facts = facts({ title: "P64 Q2 cleanup" });
+    expect(lines(r, await ship(r))[2]).toBe(`From GitHub: 4 commits and 12 files, including Cain's link and Cain's rules. ${CHECKS_PASSED}`);
+  });
+
+  test("only the card's own label is taken off its words: other words that start like one stay", () => {
+    expect(unlabeled("P64: Stop stays in reach.", "P64")).toBe("Stop stays in reach.");
+    expect(unlabeled("p064 q2: Filed?", "P64", "Q2")).toBe("Filed?");
+    expect(unlabeled("P100: filter swap is due.", "P64")).toBe("P100: filter swap is due.");
+    expect(unlabeled("P64 Q3: Filed?", "P64", "Q2")).toBe("P64 Q3: Filed?");
+    expect(unlabeled("P64: anything", "none")).toBe("P64: anything");
   });
 
   test("ids the record doesn't have and ordinary words pass; with no record, nothing is a code", () => {

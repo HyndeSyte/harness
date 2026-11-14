@@ -126,20 +126,22 @@ async function versionAt(d: Pick<MergeDeps, "api">, repo: string, path: string, 
 }
 
 // A commit's check runs as GitHub has them, read one way for the landing and the Ship card
-// (0.11.0): every page of them, so a pinned run on a later page is never read as not run.
-// The runs, "missing" (GitHub has no such commit), or null (no answer, for any page).
-const RUN_PAGES = 10;
+// (0.11.0): for each required check, by its name, its latest runs, each in one answer whose
+// count GitHub says and whose list agree, so a judgment never rests on part of them or on a
+// list that shifted between pages. The runs, "missing" (GitHub has no such commit), or null
+// (no answer, or an answer whose count and list disagree: then nothing is judged).
 export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<any[] | "missing" | null> {
+  const each = await Promise.all(CHECKS.map((name) =>
+    read(d, `/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`)));
+  if (each.some((r) => r === "missing")) return "missing";
   const all: any[] = [];
-  for (let page = 1; page <= RUN_PAGES; page++) {
-    const r = await read(d, `/repos/${repo}/commits/${head}/check-runs?per_page=100&page=${page}`);
-    if (r === "missing") return page === 1 ? "missing" : null;
+  for (const r of each) {
     if (!r || !Array.isArray(r.check_runs)) return null;
-    all.push(...r.check_runs);
     const total = Number(r.total_count);
-    if (r.check_runs.length < 100 || (Number.isFinite(total) && all.length >= total)) return all;
+    if (!Number.isInteger(total) || total !== r.check_runs.length) return null;
+    all.push(...r.check_runs);
   }
-  return null;                       // more runs than RUN_PAGES pages: not all read, so none judged
+  return all;
 }
 
 // Each required check's newest run from GitHub Actions: passed (success only), still

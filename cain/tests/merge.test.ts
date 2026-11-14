@@ -40,7 +40,11 @@ function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; 
     api: async (path) => {
       if (state.apiDown) throw new Error("timeout");
       if (path === `/repos/${REPO}/pulls/13`) return { status: 200, body: pull };
-      if (path.startsWith(`/repos/${REPO}/commits/${H1}/check-runs`)) return { status: 200, body: { total_count: runs.length, check_runs: runs } };
+      if (path.startsWith(`/repos/${REPO}/commits/${H1}/check-runs`)) {
+        const name = new URL(`http://x${path}`).searchParams.get("check_name");
+        const mine = name ? runs.filter((r: any) => r?.name === name) : runs;
+        return { status: 200, body: { total_count: mine.length, check_runs: mine } };
+      }
       return { status: 404, body: null };
     },
     git: async (args, o) => {
@@ -229,7 +233,11 @@ describe("landing, with real git", () => {
     const d: MergeDeps = {
       api: async (path) => path.endsWith("/pulls/13")
         ? { status: 200, body: { state: "open", merged: false, base: { ref: "main" }, head: { sha: h1, repo: { full_name: REPO } } } }
-        : path.includes("/check-runs") ? { status: 200, body: { check_runs: runs } } : { status: 404, body: null },
+        : path.includes("/check-runs") ? (() => {
+          const name = new URL(`http://x${path}`).searchParams.get("check_name");
+          const mine = runs.filter((r) => r.name === name);
+          return { status: 200, body: { total_count: mine.length, check_runs: mine } };
+        })() : { status: 404, body: null },
       git: async (args) => {
         const p = Bun.spawn(["git", "-C", link, ...args], { stdout: "pipe", stderr: "pipe", env });
         const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
@@ -354,11 +362,11 @@ describe("what GitHub says", () => {
     for (const status of [403, 429]) {
       let calls = 0;
       expect(await checkRuns({ api: async () => { calls++; return { status, body: { message: "API rate limit exceeded" } }; } }, REPO, H1)).toBeNull();
-      expect(calls).toBe(1);
+      expect(calls).toBe(3);                                   // one question per required check, none asked twice
     }
     let calls = 0;
     expect(await checkRuns({ api: async () => { calls++; return { status: 502, body: null }; } }, REPO, H1)).toBeNull();
-    expect(calls).toBe(2);
+    expect(calls).toBe(6);                                     // each asked once more
   });
 });
 
@@ -376,32 +384,34 @@ describe("the checks, read one way for the landing and the Ship card", () => {
     expect(judgeChecks([run("pytest", "failure", "completed", ACTIONS_APP, 1), run("pytest", "success", "completed", ACTIONS_APP, 2)])[0].state).toBe("passed");
   });
 
-  test("the runs from the head's check runs, as the landing reads them: missing, no answer, or the list", async () => {
+  test("the runs, one answer per required check by its name, as the landing reads them: missing, no answer, or the list", async () => {
     const seen: string[] = [];
-    const runs = [run("pytest", "success")];
-    const api = async (path: string) => { seen.push(path); return path.includes(H1) ? { status: 200, body: { check_runs: runs } } : { status: 404, body: null }; };
-    expect(await checkRuns({ api }, REPO, H1)).toEqual(runs);
-    expect(seen[0]).toBe(`/repos/${REPO}/commits/${H1}/check-runs?per_page=100&page=1`);
+    const byName: Record<string, any[]> = { pytest: [run("pytest", "success")], bun: [run("bun", "success")], pr: [] };
+    const api = async (path: string) => {
+      seen.push(path);
+      if (!path.includes(H1)) return { status: 404, body: null };
+      const name = new URL(`http://x${path}`).searchParams.get("check_name")!;
+      return { status: 200, body: { total_count: byName[name].length, check_runs: byName[name] } };
+    };
+    expect(await checkRuns({ api }, REPO, H1)).toEqual([...byName.pytest, ...byName.bun]);
+    expect([...seen].sort()).toEqual(["bun", "pr", "pytest"].map((n) => `/repos/${REPO}/commits/${H1}/check-runs?check_name=${n}&filter=latest&per_page=100`));
     expect(await checkRuns({ api }, REPO, H2)).toBe("missing");
     expect(await checkRuns({ api: async () => ({ status: 200, body: { message: "odd" } }) }, REPO, H1)).toBeNull();
     expect(await checkRuns({ api: async () => { throw new Error("timeout"); } }, REPO, H1)).toBeNull();
   });
 
-  test("every page of the runs is read, so a pinned run on a later page is never read as not run; part of them is none", async () => {
-    const other = (i: number) => run(`lint-${i}`, "success", "completed", ACTIONS_APP, 100 + i);
-    const pages = [Array.from({ length: 100 }, (_, i) => other(i)), [run("pytest", "success"), run("bun", "success"), run("pr", "success")]];
-    const api = async (path: string) => {
-      const page = Number(new URL(`http://x${path}`).searchParams.get("page"));
-      return { status: 200, body: { total_count: 103, check_runs: pages[page - 1] ?? [] } };
+  test("an answer whose count and list disagree is never judged, so part of the runs can't read as passed", async () => {
+    const one = (name: string, total: number | undefined, list: any[]) => async (path: string) => {
+      const n = new URL(`http://x${path}`).searchParams.get("check_name")!;
+      return { status: 200, body: n === name ? { total_count: total, check_runs: list } : { total_count: 1, check_runs: [run(n, "success")] } };
     };
-    const got = await checkRuns({ api }, REPO, H1);
-    expect(Array.isArray(got) ? got.length : got).toBe(103);
-    expect(judgeChecks(got as any[]).map((c) => c.state)).toEqual(["passed", "passed", "passed"]);
-    // A page that doesn't come: nothing is judged from part of the list.
-    const broken = async (path: string) => path.endsWith("page=1") ? { status: 200, body: { total_count: 103, check_runs: pages[0] } } : { status: 500, body: null };
-    expect(await checkRuns({ api: broken }, REPO, H1)).toBeNull();
-    // More runs than the link reads: none judged, never "passed" from part of them.
-    expect(await checkRuns({ api: async () => ({ status: 200, body: { total_count: 5000, check_runs: pages[0] } }) }, REPO, H1)).toBeNull();
+    // GitHub says 300 pytest runs and sends 1 (a short page): none judged, never "passed".
+    expect(await checkRuns({ api: one("pytest", 300, [run("pytest", "success")]) }, REPO, H1)).toBeNull();
+    // No count, or one that isn't a whole number: the same.
+    expect(await checkRuns({ api: one("pytest", undefined, [run("pytest", "success")]) }, REPO, H1)).toBeNull();
+    // Whole answers: judged as the landing judges them, a failed newest run included.
+    const whole = await checkRuns({ api: one("pytest", 2, [run("pytest", "success", "completed", ACTIONS_APP, 1), run("pytest", "failure", "completed", ACTIONS_APP, 2)]) }, REPO, H1);
+    expect(judgeChecks(whole as any[]).map((c) => c.state)).toEqual(["failed", "passed", "passed"]);
   });
 });
 

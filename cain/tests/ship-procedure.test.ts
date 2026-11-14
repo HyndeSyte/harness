@@ -25,7 +25,7 @@ describe("RELEASING.md", () => {
   test("the Ship card's words come from code (0.11.0), and a handed-over pull request is reviewed by the service first", () => {
     const flat = ship.replace(/\s+/g, " ");
     for (const must of ["The link builds that card itself", "names each App and version the tap installs", "read at that very head and at the pull request's base",
-      "read the way the landing reads them", "a check that failed or hasn't run yet refuses the card", "\"Already in main.\"",
+      "read the way the landing reads them", "a check that failed or hasn't run yet refuses the card", "\"Already in main, so Ship only installs it.\"", "each required check's latest runs in one whole answer",
       "the review service's own Reviewed line for the review Cain names", "must be a review of that very pull request and head",
       "\"No outside review attached.\"", "Cain's own line says only what Dane will notice", "No card shows a record code"])
       expect(flat).toContain(must);

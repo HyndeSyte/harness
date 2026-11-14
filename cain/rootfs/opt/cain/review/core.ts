@@ -99,8 +99,11 @@ export function safeId(id: unknown): id is string {
   return typeof id === "string" && ID.test(id) && !/[\\/]|\.\./.test(id);
 }
 
+// The brief's fingerprint, in its record: what was asked, and (0.11.0) the pull request and
+// head it was asked about, so two reviews of the same words about different heads differ.
 export function digest(b: Brief): string {
-  const canon = JSON.stringify({ topic: b.topic, question: b.question, body: b.body, needs_facts: b.needs_facts, consequential: b.consequential });
+  const canon = JSON.stringify({ topic: b.topic, question: b.question, body: b.body, needs_facts: b.needs_facts, consequential: b.consequential,
+    ...(b.pr ? { pr: b.pr } : {}), ...(b.head ? { head: b.head } : {}) });
   return "sha256:" + createHash("sha256").update(canon).digest("hex");
 }
 
