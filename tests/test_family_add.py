@@ -994,6 +994,77 @@ def test_a_refused_second_undo_whose_read_cant_tell_keeps_reading(on, ending):
     assert not any("Nothing was changed" in t for t in on.texts())
 
 
+def test_a_one_more_delete_that_never_went_out_isnt_spent(on):
+    """The delete's answer says nothing, and at the one more try iCloud can't be reached, so no
+    delete goes out: that isn't the one more. Once iCloud answers, it's sent, and it's undone."""
+    card = on.add_one()
+    on.icloud.force_status = 503               # not deleted, and the answer says nothing
+    on.press(card, "Undo")
+    on.icloud.down = True                      # the one more try can't even read it
+    on.advance(minutes=1)
+    on.tick()
+    on.icloud.down = False
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1] == "<b>Undone.</b> That event is off the Family calendar." and not on.icloud.family()
+    assert on.icloud.methods().count("DELETE") == 2 and not any("didn't go through" in t for t in on.texts())
+
+
+@pytest.mark.parametrize("how", ["its answer lost", "turned down"])
+def test_a_later_read_of_an_undo_finds_it_changed_since_and_leaves_it(on, how):
+    """The one more delete's answer says nothing, or it's turned down and the read after it can't
+    get through. Before a later read he renames the event: that read leaves it, and says so, never
+    "still there" with Undo."""
+    card = on.add_one()
+    on.icloud.force_status = 503               # the first delete: not applied, and the answer says nothing
+    on.press(card, "Undo")
+    real = on.icloud.request
+
+    def one_more(method, url, **kw):
+        if method != "DELETE":
+            return real(method, url, **kw)
+        on.icloud.force_status = 503 if how == "its answer lost" else 403
+        out = real(method, url, **kw)
+        on.icloud.down = how == "turned down"  # and the read after a refusal can't get through
+        return out
+    on.icloud.request = one_more
+    on.advance(minutes=1)
+    on.tick()
+    on.icloud.request, on.icloud.down = real, False
+    on.icloud.human_edit(path_of(on), "SUMMARY:Dentist", "SUMMARY:Dentist moved")
+    on.advance(minutes=1)
+    on.tick()
+    assert on.texts()[-1] == family_add.CHANGED and on.last()[2] is None
+    assert "Dentist moved" in on.icloud.family()[path_of(on)][1] and on.icloud.methods().count("DELETE") == 2
+    assert on.ledger.db.execute("SELECT undo_state FROM family_adds").fetchone()[0] == "changed"
+
+
+@pytest.mark.parametrize("body", [b"", b"<html><body>Service temporarily busy</body></html>"],
+                         ids=["empty", "a web page"])
+@pytest.mark.parametrize("lost", [False, True], ids=["first read", "read after a lost answer"])
+def test_a_read_with_no_event_in_it_says_nothing_yet(on, body, lost):
+    """A 200 whose body has no event in it (empty, or a web page) isn't another event: it says
+    nothing yet, and the next read says where the add is."""
+    from harness.net import HttpResponse
+    on.ask(start="2027-03-02T15:00:00-05:00", end="2027-03-02T16:00:00-05:00")
+    real, bad = on.icloud.request, []
+
+    def once(method, url, **kw):
+        if method == "GET" and url.endswith(".ics") and not bad:
+            bad.append(url)
+            return HttpResponse(200, {"etag": '"x"'}, body)
+        return real(method, url, **kw)
+    on.icloud.request = once
+    on.icloud.drop_response_next = lost
+    on.press(on.last(), "Approve")
+    for _ in range(3):
+        on.advance(minutes=1)
+        on.tick()
+    assert bad and not any("Not added" in t for t in on.texts())
+    assert on.texts()[-1].startswith("<b>Added to the Family calendar.</b>") and on.with_button("Undo")
+    assert on.ledger.db.execute("SELECT state FROM family_adds").fetchone()[0] == "created"
+
+
 def test_a_restart_finishes_an_undo_he_asked_for(on):
     card = on.add_one()
     with on.ledger.tx() as db:                 # his tap was taken; the restart came before the delete

@@ -991,10 +991,11 @@ class FamilyAdd:
             else:
                 self._not_added(row, params, blocked)
             return
-        if out.kind != "ok":
+        uids = caldav._uids(ics) if out.kind == "ok" else set()
+        if not uids:                           # no answer, or one with no event in it: says nothing yet
             self._not_yet(row, state, "added")
             return
-        if caldav._uids(ics) != {row["uid"]}:
+        if row["uid"] not in uids:
             self._not_ours(row, params)
             return
         now = iso(moment)
@@ -1263,7 +1264,8 @@ class FamilyAdd:
             self._read_back(self.ledger.db.execute("SELECT * FROM family_adds WHERE proposal_id=?",
                                                    (row["proposal_id"],)).fetchone(), seen=(out, ics))
             return
-        if out.kind == "ok" and caldav._uids(ics) != {row["uid"]}:
+        uids = caldav._uids(ics) if out.kind == "ok" else set()
+        if uids and row["uid"] not in uids:
             self._not_ours(row, params)                # another event there, under another id
             return
         if out.kind != "gone":
@@ -1282,34 +1284,34 @@ class FamilyAdd:
     def _settle_undo(self, row) -> None:
         """An undo whose delete no answer settled: gone is undone; still there as written is
         deleted once more (client.undo reads it first), then read. The one more is recorded before
-        it's sent, so it's never a second, let alone one a minute. No answer that says (iCloud out
-        of reach, a server error, a lost answer) is read again on the schedule: the first delete may
-        have landed, and later passes only read. An answer that turns the one more down (the
-        password, the address, a 4xx) says nothing about the first either, so it's read before
-        anything is said: gone is undone; still there as written was turned down, said plainly with
-        Undo offered again; a read that can't tell is read again on the schedule."""
+        it's sent, so it's never a second, let alone one a minute, and only as its delete goes out,
+        so a try that fails at its own read spends nothing. No answer that says (iCloud out of
+        reach, a server error, a lost answer) is read again on the schedule: the first delete may
+        have landed. An answer that turns the one more down (the password, the address, a 4xx) says
+        nothing about the first either, so it's read before anything is said: gone is undone; still
+        there as written was turned down, said plainly with Undo offered again; a read that can't
+        tell is read again on the schedule. Every read checks the event is still as written:
+        changed since is left alone and said so, never "still there"."""
         state = _settling(row)
         now = iso(self.ledger.now())
+        href = self.client.href_for(row["uid"])
         refused = ""
         if state.get("retried"):
-            out, _ = self.client.fetch(self.client.href_for(row["uid"]))
-            kind = "ok" if out.kind == "gone" else "still" if out.kind == "ok" else "unread"
+            kind = self._where(row, *self.client.fetch(href), there="still")
         else:
-            state["retried"] = True
-            with self.ledger.tx() as db:
-                db.execute("UPDATE family_adds SET settle_json=? WHERE proposal_id=?",
-                           (json.dumps(state), row["proposal_id"]))
-            out = self.client.undo(row["uid"], row["etag"])   # reads it first; deletes only as written
+            def one_more() -> None:            # counted as it goes out, so a try that never sends spends nothing
+                state["retried"] = True
+                with self.ledger.tx() as db:
+                    db.execute("UPDATE family_adds SET settle_json=? WHERE proposal_id=?",
+                               (json.dumps(state), row["proposal_id"]))
+            out = self.client.undo(row["uid"], row["etag"], sending=one_more)   # reads it first
             if out.kind == "ok":
-                back, _ = self.client.fetch(self.client.href_for(row["uid"]))
+                back, _ = self.client.fetch(href)
                 kind = "ok" if back.kind == "gone" else "unread"
             elif _turned_down(out):
                 with self.ledger.tx() as db:
                     self._set_problem(db, out.kind)
-                back, body = self.client.fetch(self.client.href_for(row["uid"]))
-                kind = ("ok" if back.kind == "gone" else "unread" if back.kind != "ok"
-                        else "refused" if caldav._is_ours(body, row["uid"]) and back.etag == row["etag"]
-                        else "changed")
+                kind = self._where(row, *self.client.fetch(href), there="refused")
                 refused = _still_there(out)
             else:
                 kind = {"gone": "ok", "changed": "changed"}.get(out.kind, "unread")
@@ -1329,6 +1331,16 @@ class FamilyAdd:
             again = kind in ("still", "refused")
             buttons, binds = self._undo_button(db, row["proposal_id"]) if again else (None, None)
             self._say(db, self.chat_id, row["job_id"], final[1], buttons=buttons, binds=binds)
+
+    @staticmethod
+    def _where(row, out: caldav.Outcome, body: str, *, there: str) -> str:
+        """Where an undo's event stands, by a read: gone ("ok"); still there as it was written, ours
+        with the same version (`there`); changed since; or "unread" when the read can't tell."""
+        if out.kind == "gone":
+            return "ok"
+        if out.kind != "ok":
+            return "unread"
+        return there if caldav._is_ours(body, row["uid"]) and out.etag == row["etag"] else "changed"
 
     # -- output ---------------------------------------------------------------------------
     def _set_problem(self, db, kind: str) -> None:
