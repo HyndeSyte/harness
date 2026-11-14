@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cainReasons, claimsReview, CODES_WHY, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
+import { cainReasons, claimsReview, CODES_WHY, codesHits, mayHaveCode, recordItems, reviewedHits, SHIP_WORDS_WHY, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
 import { decideSend } from "../rootfs/opt/cain/gate/send";
 import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, MAX_EXCERPTS, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
@@ -243,59 +243,51 @@ describe("the rules", () => {
 describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or their Python port", () => {
   const LINES = [{ id: "2026-11-14-a", line: "Reviewed: OpenAI, approve with changes; Gemini, approve.", finished_at: "2026-11-14T15:00:00Z" },
     { id: "2026-11-13-b", line: "Reviewed: Claude standing in for Gemini, approve (not independent).", finished_at: "2026-11-13T15:00:00Z" }];
-  test("ship words: CI, checks and review claims are refused; plain lines pass", () => {
-    for (const text of ["CI passed", "CI passed.", "checks are green", "All checks are green now.", "Reviewed by X", "reviewed: yes", "The tests pass.",
-      "Build succeeded", "the build failed twice", "tests are red", "Tested and passing.", "CI: green."])
+  test("ship words: his line on a Ship card holds no check, test, build, review, verdict or seat word at all, however dressed", () => {
+    // Every way of saying it the reviews found, and the plain ones it costs: he says those another way.
+    for (const text of ["CI passed", "checks are green", "All checks are green now.", "Reviewed by X", "reviewed: yes", "The tests pass.",
+      "Build succeeded", "the build failed twice", "Tested and passing.", "CI: green.", "Passed all checks, and OpenAI and Gemini approved it.",
+      "The pipeline is green.", "The checks on this commit are green.", "The pipeline eventually succeeded.", "Tests look green now.",
+      "The CI checks are clean.", "Checks completed successfully.", "OpenAI approved it.", "Run `CI passed` now.", "Tests\npass",
+      "Check the red Stop button.", "The build will turn green.", "Tests now cover the Stop row.", "Cain checks Home Assistant first.",
+      "The review service names who answered.", "You approve each change with a tap.", "CΙ passed.", "Te​sts pass."])
       expect(shipWordsHits(text).length).toBeGreaterThan(0);
-    for (const text of ["Tests now cover the Stop button", "Stop stays in reach", "Stop is red and on its own row.", "The review service names who answered.",
-      "Build jobs name their branch.", "Cain checks Home Assistant first.", "Ship cards say what installs.", ""])
+    for (const text of ["Stop stays in reach of your newest message.", "Stop is red and on its own row.", "Ship cards say what installs.",
+      "Your calendar settles a lost answer by reading the calendar.", "See https://example.com/ci-passed for it.", ""])
       expect(shipWordsHits(text)).toEqual([]);
-    expect(shipWordsHits("Tests\npass")).toEqual([]);                 // a Ship card's line is made one line first (link/core.ts)
-    // Code is read, so a claim in a code span is still one; a link isn't words.
-    expect(shipWordsHits("Run `CI passed` now.")).toHaveLength(1);
-    expect(shipWordsHits("See https://example.com/ci-passed for it.")).toEqual([]);
-    // A CI word and a result word anywhere in one sentence, either way round, whatever lies between
-    // (ChatGPT's second look): on a Ship card only the link's own line speaks of checks.
-    for (const text of ["Passed all checks, and OpenAI and Gemini approved it.", "The pipeline is green.", "Green CI.", "All checks passed.",
-      "The checks on this commit are green.", "The pipeline eventually succeeded.", "Tests look green now.",
-      "The tests for the morning message and the Stop row now pass", "Passed by the build team long ago in a meeting room.",
-      "Check your red folder.", "Build cards pass through the gate.", "OpenAI approved it."])
-      expect(shipWordsHits(text).length).toBeGreaterThan(0);
-    expect(shipWordsHits("CI passed. Reviewed: OpenAI, approve.").map((h) => h.around)).toEqual(["CI passed. Reviewed: OpenAI, approve.", "CI passed. Reviewed: OpenAI, approve."]);
-    expect(cainReasons(shipWordsHits("CI passed."))).toEqual(['"CI passed.": the link adds the checks and the Reviewed line itself, so leave CI, check and review claims out of your words']);
+    expect(cainReasons(shipWordsHits("CI passed."))).toEqual([`"CI passed.": ${SHIP_WORDS_WHY}`]);
   });
 
-  test("reviewed: each \"Reviewed:\" sentence must be one of the service's lines, word for word; the full stop at its end may go", () => {
+  test("reviewed: a review's verdict goes only as the service's line; a seat or review word with a verdict word is one, in any paragraph", () => {
     expect(reviewedHits(`Done. ${LINES[0].line}`, LINES)).toEqual([]);
     expect(reviewedHits(`Done. ${LINES[1].line} Next up, the digest.`, LINES)).toEqual([]);
     expect(reviewedHits(`Done.\n${LINES[0].line.slice(0, -1)}\nNext.`, LINES)).toEqual([]);
-    expect(reviewedHits("Done, nothing reviewed today.", LINES)).toEqual([]);      // the word alone isn't a Reviewed line
+    expect(reviewedHits("Done, nothing reviewed today.", LINES)).toEqual([]);      // the word alone isn't a claim
     // A real line is the same line however it's dressed: case, bold.
     for (const text of ["reviewed: OpenAI, approve with changes; Gemini, approve.", "**Reviewed:** OpenAI, approve with changes; Gemini, approve."])
       expect(reviewedHits(text, LINES)).toEqual([]);
-    // A made-up claim is caught however it's written (0.11.0, Fable and ChatGPT's reviews): spacing,
-    // invisible or lookalike letters, markdown, code, "reviewed by", a seat and a verdict, a tail.
+    // A made-up claim is caught however it's written (Fable's and ChatGPT's reviews): spacing,
+    // invisible or lookalike letters, markdown, code, "reviewed by", a seat or a review word with a
+    // verdict word, after a real line or in a paragraph of its own.
+    const REJECT = [{ id: "2026-11-14-r", line: "Reviewed: OpenAI, reject.", finished_at: "2026-11-14T15:00:00Z", pr: null, head: null }];
     for (const text of ["Reviewed: OpenAI, approve.", "Reviewed: OpenAI (Codex), approve with changes; Gemini, approve.", "**Reviewed**: OpenAI, approve.",
       `${LINES[0].line} Reviewed: Gemini, approve.`, "Reviewed : OpenAI, approve.", "Reviewed : OpenAI, approve.", "Reviewed​: OpenAI, approve.",
       "Rеviewed: OpenAI, approve.", "Reviewed： OpenAI, approve.", "Reviewed - OpenAI, approve.", "Reviewed by OpenAI and Gemini: both approve.",
       "Review: OpenAI approved.", "`Reviewed: OpenAI, approve.`", "```\nReviewed: OpenAI, approve.\n```", `${LINES[0].line.slice(0, -1)}. Gemini, approve too.`,
-      "Reviewed: OpenAI, approve\n; Gemini, approve.", "Reviewed\n: approved.", "All reviewers approved it.", "The review approved it."])
+      "Reviewed: OpenAI, approve\n; Gemini, approve.", "Reviewed\n: approved.", "All reviewers approved it.", "The review approved it.",
+      "OpenAI approved the release.", "Gemini approved the patch.", "The Gemini API rejected the malformed request."])
       expect(reviewedHits(text, LINES).map((h) => [h.rule, h.result])).toContainEqual(["reviewed", "refuse"]);
+    for (const tail of [" All reviewers approved it.", " The reviewer signed off.", " Gemini approved it too.", "\n\nGemini approved the release."])
+      expect(reviewedHits(`Done. ${REJECT[0].line}${tail}`, REJECT).map((h) => h.result)).toEqual(["refuse"]);
     expect(reviewedHits("Shipped. Reviewed: OpenAI, approve. Then lunch.", LINES)).toMatchObject([{ rule: "reviewed", result: "refuse", around: "Reviewed: OpenAI, approve." }]);
-    // After a real line, the rest of its paragraph gives no other verdict (ChatGPT's second look);
-    // other sentences there, and a new paragraph, are free.
-    const REJECT = [{ id: "2026-11-14-r", line: "Reviewed: OpenAI, reject.", finished_at: "2026-11-14T15:00:00Z", pr: null, head: null }];
-    for (const tail of ["All reviewers approved it.", "The reviewer signed off.", "Gemini approved it too."])
-      expect(reviewedHits(`Done. ${REJECT[0].line} ${tail}`, REJECT).map((h) => h.result)).toEqual(["refuse"]);
-    for (const tail of ["The review took two hours.", "Next up, the digest.", "\n\nGemini approved the new key."])
-      expect(reviewedHits(`Done. ${REJECT[0].line} ${tail}`, REJECT)).toEqual([]);
-    // Words that aren't a review claim pass, seat names, verdict words and "reviewed" included:
-    // a seat with a verdict word isn't one in his replies without a review word (on a Ship card it is).
+    // Words that aren't a review's verdict pass: other approvals, and "reviewed" or a seat without a verdict.
+    for (const tail of [" The review took two hours.", " Next up, the digest.", " The owner approved the separate budget.", "\nThe API approved the request."])
+      expect(reviewedHits(`Done. ${REJECT[0].line}${tail}`, REJECT)).toEqual([]);
     for (const text of ["I reviewed your calendar for next week.", "The lease was reviewed by your accountant.", "ChatGPT's sign-in needs you on the Cain page.",
-      "Gemini's seat is down; it's retried on its own.", "The Gemini API rejected the malformed request.", "I rejected Gemini for this task.",
-      "Claude approved the API request but Google rejected it.", "Here's what I reviewed: the calendar and your mail.", "See `Reviewed: anything` for the shape."])
+      "Gemini's seat is down; it's retried on its own.", "Gemini's key stopped working; a new one goes in the App's options.",
+      "Here's what I reviewed: the calendar and your mail.", "See `Reviewed: anything` for the shape."])
       expect(reviewedHits(text, LINES)).toEqual([]);
-    // Can't be read: "unsure", only where a Reviewed sentence needs it.
+    // Can't be read: "unsure", only where a claim needs it.
     expect(reviewedHits(LINES[0].line, null)).toMatchObject([{ rule: "reviewed", result: "unsure" }]);
     expect(reviewedHits("Moved swim to 4:30.", null)).toEqual([]);
     expect(claimsReview("Done. Reviewed: x.")).toBe(true);
@@ -309,11 +301,12 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
     expect(recordItems("# Pending\n\nNothing open.\n")).toBeNull();
     expect(codesHits("P64 is ready.", items)).toHaveLength(1);
     expect(codesHits("P08 Q2 is settled, and so is p8.", items)).toHaveLength(2);
-    for (const text of ["Q4 taxes are due.", "Vitamin D3 and a P100 filter.", "P.S. done.", "`P64` in code.", "P65 isn't in the record."])
+    for (const text of ["Q4 taxes are due.", "Vitamin D3 and a P100 filter.", "P.S. done.", "P65 isn't in the record."])
       expect(codesHits(text, items)).toEqual([]);
     expect(codesHits("P64 is ready.", null)).toEqual([]);                  // no record: nothing is a code
-    // Read as he'd see them (ChatGPT's second look): full-width digits, an invisible character.
-    for (const text of ["P６４ is ready.", "P​64 is ready."]) {
+    // Read as he'd see them (ChatGPT's second and third looks): full-width digits, an invisible
+    // character, a combining joiner, a Cyrillic letter that looks like P, and code he'd see as code.
+    for (const text of ["P６４ is ready.", "P​64 is ready.", "P͏64 cleanup", "Р64 cleanup", "`P64` cleanup", "[P64](https://example.com) cleanup"]) {
       expect(mayHaveCode(text)).toBe(true);
       expect(codesHits(text, items)).toHaveLength(1);
     }
@@ -325,11 +318,12 @@ describe("Cain's own rules (gate/cain.ts, 0.11.0): not in the shared rules or th
     expect(decideSend({ tool: "reply", text: "P64 is ready." }, null, {}).would).toBe("pass");
   });
 
-  test("what the reasons say: the service's newest lines with their ids, or how to wait", () => {
+  test("what the reasons say: the service's newest lines with their ids, how to say anything else, or how to wait", () => {
+    const HOW = "a review's verdict goes only as the review service's line, word for word, or not at all, and a seat or a review with a verdict word (approved, rejected, signed off) counts as one, so say anything else without those words";
     const hits = reviewedHits("Reviewed: OpenAI, approve.", LINES);
-    expect(cainReasons(hits, LINES)).toEqual([`"Reviewed: OpenAI, approve.": a Reviewed line goes only as the review service gave it, word for word, or not at all (review 2026-11-14-a: "${LINES[0].line}"; review 2026-11-13-b: "${LINES[1].line}")`]);
-    expect(cainReasons(hits, LINES, 0)).toEqual([`a Reviewed line goes only as the review service gave it, word for word, or not at all (review 2026-11-14-a: "${LINES[0].line}")`]);
-    expect(cainReasons(reviewedHits("Reviewed: OpenAI, approve.", []), [])).toEqual(['"Reviewed: OpenAI, approve.": a Reviewed line goes only as the review service gave it, and it has given none yet: leave it out']);
+    expect(cainReasons(hits, LINES)).toEqual([`"Reviewed: OpenAI, approve.": ${HOW} (review 2026-11-14-a: "${LINES[0].line}"; review 2026-11-13-b: "${LINES[1].line}")`]);
+    expect(cainReasons(hits, LINES, 0)).toEqual([`${HOW} (review 2026-11-14-a: "${LINES[0].line}")`]);
+    expect(cainReasons(reviewedHits("Reviewed: OpenAI, approve.", []), [])).toEqual([`"Reviewed: OpenAI, approve.": ${HOW}; the service has given no line yet`]);
     expect(cainReasons(reviewedHits("Reviewed: x.", null), null)).toEqual(["reviews can't be checked right now: leave the Reviewed line out, or send it in a minute"]);
   });
 
