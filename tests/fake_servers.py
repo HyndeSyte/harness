@@ -44,9 +44,10 @@ class LinkState:
     """Cain's link (cain/rootfs/opt/cain/link/main.ts): holds the cards Cain shows."""
 
     def __init__(self, token):
-        from harness.cain_relay import key_for
-        self.key = key_for(token)
+        from harness.cain_relay import sign_key_for
+        self.key = sign_key_for(token)   # K_sign, not the old relay key (C1 plan 3.9)
         self.lock = threading.Lock()
+        self.ids = []                    # each signed request's id, in order
         self.next_card = 1
         self.cards = {}                  # id -> {"text", "rows", "kind"}
         self.answers = []                # (callback, text)
@@ -63,7 +64,7 @@ class LinkHandler(_Base):
     def _ok(self, text=""):
         from harness.cain_relay import _mac
         st: LinkState = self.server.state
-        m = re.match(r"^id=([0-9a-f]{32}),t=(d+),s=([0-9a-f]{64})$", self.headers.get("x-harness-sig") or "")
+        m = re.match(r"^id=([0-9a-f]{32}),t=([0-9]+),s=([0-9a-f]{64})$", self.headers.get("x-harness-sig") or "")
         want = m and _mac(st.key, ["request", self.command.upper(), self.path, m.group(1), m.group(2), text])
         if not m or not hmac.compare_digest(m.group(3), want):
             st.bad_keys += 1
@@ -71,6 +72,7 @@ class LinkHandler(_Base):
             self._json(403, {"status": "refused"})
             return False
         self._rid = m.group(1)
+        st.ids.append(self._rid)
         return True
 
     def _json(self, status, obj):

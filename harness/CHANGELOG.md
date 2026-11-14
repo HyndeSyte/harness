@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.0
+
+- The calendar App now signs everything it sends to Cain's App, with a key of its own, and takes an answer only when Cain's App signed it. Nothing changes for you.
+- A card that waits through an outage goes out once, even when its first try got through but the answer didn't.
+- Install it together with Cain 0.12.0, Cain first. Until it's in, its cards wait at Cain's App; none is lost.
+
 ## 0.23.0
 
 - **Nothing asks you to check the calendar or send something again.** When a change's answer is lost, or it can't be read back, Harness reads the calendar itself a minute later. If it went through, you get the usual receipt with Undo, and Undo puts all of it back, even after a restart cut the write short. If it didn't, it's written once more, only over the very version it was first written over, and if it still didn't go through you're told so plainly. If the event was changed on the calendar in the meantime, even back to how it was, it's left as it is and you're told so. If half of it went through, the rest is finished, or that half is put back.

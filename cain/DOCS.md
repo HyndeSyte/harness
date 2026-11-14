@@ -171,6 +171,21 @@ A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.
 
+## Cain's own user (since 0.12.0)
+
+Cain's Claude Code session runs as its own user, `cain`, not as root. The App's keys, the
+Discord bot's token and the Supervisor's token stay root's; the Discord plugin's server runs
+as a third user, `discord`, behind a broker that checks every send (the message gate). His
+rules are Claude Code's managed settings, under `/etc/claude-code`, installed from the image
+and checked at every start. The whole design, and its review, is in the record:
+`projects/org-v2/c1-plan.md`.
+
+The move happens once, at the first start after the calendar App signs its requests (the
+calendar App 0.24.0): the App restarts itself, checks the new setup on the Pi, and only then
+switches (`/opt/cain/c1/cutover.sh`, with its journal in `/data/c1`). Until then Cain runs as
+0.11.0 did. After the move there is no way back to root but restoring the backup taken before
+the update. `/data/trust/c1check.json` holds the check that runs as `cain` at every start.
+
 ## Your record: one hand on each item (since 0.6.0)
 
 The record keeper (`/opt/cain/record/main.ts`) is the record's only writer. Every

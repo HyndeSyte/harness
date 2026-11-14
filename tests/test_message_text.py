@@ -347,7 +347,7 @@ def test_a_message_that_breaks_a_rule_fails_the_test_that_sent_it(request):
     sent = []
 
     class Link:
-        def card(self, text, rows, kind, expires=None):
+        def card(self, text, rows, kind, expires=None, op=None):
             sent.append((text, rows))
             return 1
 

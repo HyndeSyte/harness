@@ -130,10 +130,21 @@ for 2 hours, without which Cain can't start the job.
    `Home Assistant connector: needs signing in again` (or `no answer`). main keeps
    the commit; only the install waits (If Home Assistant's connector lapses, below).
 3. In Home Assistant: check for App updates, then update only the App(s) the pull
-   request changed, with a backup taken first. Nothing else in Home Assistant: no
-   options, no other Apps, no services. Never read Cain's App info (`ha_get_app`): it
-   holds his GitHub token.
+   request changed, with a backup taken first. When it changed both, Cain first, then
+   Harness (since Cain 0.12.0 and Harness 0.24.0: Cain's link answers the old Harness
+   with 503, so its cards wait, none lost, until Harness signs). An App already at its
+   new version is skipped. Nothing else in Home Assistant: no options, no other Apps,
+   no services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
 4. Confirm the new version is running from the update result and the App's log.
+
+The job is a cloud session, not a process on the Pi: Home Assistant's Supervisor does
+each update, so replacing Cain's container doesn't stop the job before Harness. If the
+job ends between the two anyway, Cain's App tells Cain after 30 minutes, and a new Ship
+card for the same pull request and head installs what's missing.
+
+Before a Ship card for a release that changes how an App starts (Cain 0.12.0: the move to
+his own user), the laptop session confirms from Home Assistant's backup entities that the
+last automatic backup succeeded within 24 hours: the way back has to exist first.
 
 ## If Home Assistant's connector lapses
 

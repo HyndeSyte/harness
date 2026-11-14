@@ -68,7 +68,10 @@ class Outbox:
             text = render.fit(f"<i>Delayed: written {when}.</i>\n" + text)
         binds = json.loads(row["binds_json"]) if row["binds_json"] else []
         try:
-            mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
+            # One operation, one id at the link across every retry, though the text may gain its
+            # "Delayed" line: the row and when it was written (unique even if the database is new).
+            mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds),
+                                op=f"outbox-{row['id']}-{row['created_at']}")
         except ChatError as e:
             self._failed(row, e)
             return False
@@ -110,8 +113,10 @@ class Outbox:
         return max(ends).isoformat() if ends else None
 
     def _deliver(self, chat_id: int, text: str, buttons, kind: str | None = None,
-                 expires: str | None = None) -> int:
+                 expires: str | None = None, op: str | None = None) -> int:
         lapse = {"expires": expires} if expires else {}
+        if op:
+            lapse["op"] = op
         try:
             return self.api.send_message(chat_id, text, buttons, kind=kind, **lapse)
         except ChatError as e:
@@ -119,6 +124,9 @@ class Outbox:
             # a bug there. Deliver it plainly rather than not at all.
             if e.code == 400 and "parse" in e.description.lower():
                 self.ledger.event("html_fallback", {"error": e.description[:100]})
+                # The plain retry is its own operation: the first one's refusal is its answer.
+                if op:
+                    lapse["op"] = op + "-plain"
                 return self.api.send_message(chat_id, _plain(text), buttons, html=False, kind=kind, **lapse)
             raise
 

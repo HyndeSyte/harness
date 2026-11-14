@@ -1,6 +1,8 @@
 // Who may call the link (C1). Three kinds of caller, and each opens only its own routes:
-//   - the calendar specialist (the Harness App, over the Apps' network): HMAC(bot token,
-//     "harness-relay-v1"), which only the two Apps' root sides can compute;
+//   - the calendar specialist (the Harness App, over the Apps' network): it signs with
+//     K_sign = HMAC(bot token, "harness-link-sign-v2"), which only the two Apps' root sides can
+//     compute. The old relay key, HMAC(bot token, "harness-relay-v1"), which Harness 0.23.0 sent
+//     as a header, authorizes nothing of the specialist's and signs nothing (C1 plan 3.9);
 //   - Cain (his scripts, on this machine): a key of his own, made at each start into
 //     /run/cain/keys/cain.key, that opens nothing of the specialist's;
 //   - root's own services (the broker): the link's unix socket, which only root can open.
@@ -19,6 +21,18 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, wr
 import { dirname } from "node:path";
 
 export const SIG_HEADER = "x-harness-sig";
+export const SIG_CONTEXT = "harness-link-sign-v2";
+
+// A small file written whole and durably: a temp file, fsync, rename, fsync of the folder.
+export function writeSynced(path: string, body: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp`;
+  const fd = openSync(tmp, "w", 0o600);
+  try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, path);
+  const d = openSync(dirname(path), "r");
+  try { fsyncSync(d); } finally { closeSync(d); }
+}
 export const SIG_WINDOW_MS = 60_000;
 export const KEEP_MS = 48 * 3_600_000;           // longer than the specialist retries an operation
 

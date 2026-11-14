@@ -1,5 +1,5 @@
 #!/bin/bash
-# The channel smoke test (C1 plan 3.12, step 2): a real Claude Code session as cain, with the
+# The channel smoke test (C1 plan 3.12, step 5): a real Claude Code session as cain, with the
 # seeded plugin, its bridge, and a broker of its own whose server is a stand-in that sends
 # nothing anywhere. The session must call the reply tool through the broker's gate, and the
 # stand-in must receive it. One small Claude call on his plan; nothing reaches Discord.
@@ -11,7 +11,13 @@ log() { echo "[c1] smoke: $*" >&2; }
 rm -f "$LOG"
 dm="$(jq -r '.dm // empty' /data/trust/cards.json 2>/dev/null)"
 [ -n "$dm" ] || dm="1000000000000000001"
+# The gate's own files go to a scratch folder of root's: the switch hasn't committed, so nothing
+# of the old layout (the gate's log and tries in /data/work) may change, and /data/gate isn't
+# made yet.
+G=/run/cain/root-tmp/smoke-gate
+rm -rf "$G"; mkdir -p -m 0700 "$G"
 CAIN_DISCORD_SOCK="$SOCK" CAIN_BROKER_SMOKE=1 SMOKE_LOG="$LOG" \
+  CAIN_GATE_LOG="$G/report.jsonl" CAIN_GATE_TRIES="$G/tries.json" CAIN_GATE_DM="$G/dm.json" CAIN_GATE_REPLIED="$G/replied.json" \
   CAIN_DISCORD_SERVER_CMD='["/usr/local/bin/bun","'"$OPT"'/c1/smoke-server.ts"]' \
   bun "$OPT/discord/broker-main.ts" > /run/cain/root-tmp/smoke-broker.log 2>&1 &
 broker=$!

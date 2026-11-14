@@ -3,7 +3,11 @@
 #   lock.sh run       /run/cain's folders, Cain's keys, s6's saved environment root's only,
 #                     the App's options 0600. Every start, every state.
 #   lock.sh managed   his rules into /etc/claude-code, read back and checked by hash.
-#   lock.sh data      the owners and modes of section 3.2 for /data (after cutover).
+#   lock.sh data      the owners and modes of section 3.2 for /data (after the switch); any
+#                     other entry of /data is closed to everyone but root.
+#   lock.sh verify    what uid 1000 can read under /data and /run/cain is exactly what section
+#                     3.2 gives him; nothing of root's he can read where anything writes holds a
+#                     secret value; no setuid or setgid file there (every start of the new way).
 #   lock.sh old       the old way's rules: /etc/claude-code removed, 0.11.0's settings and
 #                     CLAUDE.md in /data/work, checked by hash.
 # Any check that doesn't hold exits non-zero with why; the caller doesn't start Cain then.
@@ -47,6 +51,13 @@ managed)
   ;;
 data)
   chown root:root "$D" && chmod 0711 "$D" || die "/data"
+  # What section 3.2 opens to him by name; any other entry is root's alone.
+  his="cain work trust record record-queue record-outcomes record-holds.json review-inbox review-queue
+review-spend.json review-health.json review-useful.jsonl review-private-terms.txt jobs gate session.log"
+  for e in "$D"/* "$D"/.[!.]* "$D"/..?*; do
+    { [ -e "$e" ] && [ ! -L "$e" ]; } || continue
+    case " $(echo $his) " in *" ${e##*/} "*) ;; *) chmod go-rwx "$e" || die "$e" ;; esac
+  done
   own() { [ -e "$1" ] || return 0; chown "$2" "$1" && chmod "$3" "$1" || die "$1"; }
   own "$D/options.json" root:root 0600
   own "$D/cain" cain:cain 0700
@@ -80,6 +91,19 @@ data)
       && find "$D/record" -type d -exec chmod g+s {} + || die "/data/record"
   fi
   ;;
+verify)
+  T=(bun "$OPT/c1/tools.ts"); tmp="${CAIN_ROOT_TMP:-/run/cain/root-tmp}"
+  trap 'rm -f "$tmp"/verify-*' EXIT
+  "${T[@]}" readable "$tmp/verify-list" "$D" /run/cain || die "couldn't list what uid 1000 can read"
+  bad="$("${T[@]}" allowed "$tmp/verify-list")" || die "uid 1000 can read a file section 3.2 doesn't give him: ${bad:-?}"
+  # His own files hold only what he could read already; root's files he can read are searched.
+  "${T[@]}" secrets "$tmp/verify-needles" && [ -s "$tmp/verify-needles" ] || die "couldn't list the secret values"
+  C1_NOT_HIS=1 "${T[@]}" readable "$tmp/verify-list" "$D" /run /tmp /var/tmp /etc /root /home \
+    && "${T[@]}" scan "$tmp/verify-needles" "$tmp/verify-list" "$tmp/verify-hits" || die "couldn't search what uid 1000 can read"
+  [ ! -s "$tmp/verify-hits" ] || die "uid 1000 can read a secret value in $(tr '\0' '\n' < "$tmp/verify-hits" | head -n 1)"
+  suid="$(find "$D" /run /tmp /var/tmp -xdev -type f -perm /6000 2>/dev/null | head -n 1)"
+  [ -z "$suid" ] || die "a setuid or setgid file: $suid"
+  ;;
 old)
   rm -rf /etc/claude-code
   [ ! -e /etc/claude-code ] || die "/etc/claude-code is still there"
@@ -90,5 +114,5 @@ old)
   [ "$(sha "$D/work/.claude/settings.json")" = "$(sha "$OPT/legacy/settings.json")" ] || die "the old settings aren't 0.11.0's"
   grep -q 'hooks/discord-send.ts' "$D/work/.claude/settings.json" || die "the old settings have no reply hook"
   ;;
-*) echo "usage: lock.sh run | managed | data | old" >&2; exit 2 ;;
+*) echo "usage: lock.sh run | managed | data | verify | old" >&2; exit 2 ;;
 esac

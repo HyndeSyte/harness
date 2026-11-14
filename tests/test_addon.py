@@ -301,9 +301,11 @@ def test_cain_signin_link_is_rejoined(tmp_path):
                    "%2Fcallback&state=abc123")
 
 
-def test_cain_signin_page_is_served_from_tmp():
+def test_cain_signin_page_is_served_from_roots_folder_for_nginx():
+    # C1: root's pages live in /run/cain/www (root:nogroup), never at a fixed name in /tmp.
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
-    assert "location = /signin" in nginx and "alias /tmp/signin.html;" in nginx
+    assert "location = /signin" in nginx and "alias /run/cain/www/signin.html;" in nginx
+    assert "/tmp/" not in nginx
 
 
 def test_cain_page_shows_signin_over_the_terminal_with_relative_paths():
@@ -336,13 +338,13 @@ def test_cain_status_gives_facts_not_the_screen():
     # /status lets setup be checked from outside; the screen may hold a token, so
     # only yes/no facts and a fixed state word leave the add-on.
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    status = run.split("printf '{\"signed_in\"")[1].split("> /tmp/status.tmp")[0]
+    status = run.split("printf '{\"signed_in\"")[1].split("> /run/cain/www/status.tmp")[0]
     assert "$screen" not in status and "$last" not in status
     assert status.count("$(flag ") == 4 and '"$state"' in status
     states = {line.split("state=")[1].split(";")[0].strip() for line in run.splitlines() if "state=" in line and "then state=" in line}
     assert states == {"login_needed", "waiting_for_code", "trust_prompt", "first_run_menu", "ready"}
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
-    assert "location = /status {" in nginx and "alias /tmp/status.json;" in nginx
+    assert "location = /status {" in nginx and "alias /run/cain/www/status.json;" in nginx
 
 
 def test_cain_tells_the_owner_once_when_its_signin_expires():
@@ -820,12 +822,12 @@ def test_cain_review_keys_never_reach_logs_or_cain():
 def test_cain_chatgpt_signin_is_on_the_ingress_page():
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     block = nginx.split("location /codex {")[1].split("}")[0]
-    assert "proxy_pass http://127.0.0.1:8096;" in block
+    assert "proxy_pass http://unix:/run/cain/upstream/codex.sock;" in block       # C1: no port he could take
     assert nginx.count("listen ") == 1 and "allow 172.30.32.2;" in nginx      # still Ingress only
     page = (CAIN / "rootfs/opt/cain/index.html").read_text()
     assert 'href="codex"' in page and 'href="/codex' not in page
     main = (CAIN / "rootfs/opt/cain/review/main.ts").read_text(encoding="utf-8")
-    assert 'hostname: "127.0.0.1"' in main and "8096" in main
+    assert '"/run/cain/upstream/codex.sock"' in main
     signin = (CAIN / "rootfs/opt/cain/review/signin.ts").read_text(encoding="utf-8")
     assert '"login", "--device-auth"' in signin and 'cli_auth_credentials_store = "file"' in signin
 

@@ -2,8 +2,10 @@
 // REST calls, the sweep that posts cards Cain hasn't shown in time and takes buttons
 // off cards that stopped mattering, and a small local HTTP API.
 //
-// HTTP on port 8097, keyed with HMAC-SHA256(bot token, "harness-relay-v1"):
-//   from the calendar specialist (the Harness add-on, over the add-ons' network):
+// HTTP on port 8097. Who may call, by Cain's state (c1/contract.ts, auth.ts):
+//   from the calendar specialist (the Harness App, over the Apps' network), signed both ways
+//   with K_sign = HMAC-SHA256(bot token, "harness-link-sign-v2"); its old bare header (the
+//   relay key, HMAC-SHA256(bot token, "harness-relay-v1")) gets 503 and nothing done:
 //     POST /card {text, rows, kind, expires?}  hold a card for Cain to show (direct kinds go out now;
 //                                       one with buttons goes out by itself if he hasn't shown it in about 2 minutes)
 //     POST /buttons {card, rows}        change a card's buttons (after a tap)
@@ -45,8 +47,9 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { CAIN_ROUTES, type Caller, checkRequest, RequestLog, routeAllowed, sameKey, SIG_HEADER, signResponse } from "./auth";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { CAIN_ROUTES, type Caller, checkRequest, RequestLog, routeAllowed, sameKey, SIG_CONTEXT, SIG_HEADER, signResponse, writeSynced } from "./auth";
+import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
@@ -283,16 +286,51 @@ async function route(req: Request, url: URL, caller: Caller, raw: string, reqId?
   return handle(url, b, reqId);
 }
 
-// The specialist's signed requests: each id handled once, its answer kept 10 minutes and
-// signed back. Its old bare-key header counts only until its first signed request (Harness
-// 0.24.0 signs); from then on, never again (the marker survives restarts).
+// The specialist's signed requests: each id handled once, its answer kept 48 hours and signed
+// back, with K_sign = HMAC(bot token, "harness-link-sign-v2"). The old relay key,
+// HMAC(bot token, "harness-relay-v1"), authorizes nothing of the specialist's in any state, and
+// no signature made with it verifies, so one captured from an old Harness signs nothing (C1
+// plan 3.9).
 const requests = new RequestLog(`${DIR}/requests.json`);
-// Recorded at the specialist's first signed request: until then the run script keeps every
-// process of Cain's user stopped (3.12), so an old Harness's bare key never meets one.
+// Recorded, durably, at the specialist's first signed request: until then the run script keeps
+// every process of Cain's user stopped (3.12), so an old Harness's bare key never meets one.
 const SIGNS = `${DIR}/specialist-signs`;
 let specialistSigns = existsSync(SIGNS);
-const LEGACY_AUTH = process.env.LINK_LEGACY_AUTH === "1";
+// Who may call, by state (c1/contract.ts): old in the old way, own in the new one, stopped
+// while Cain isn't started. The run script sets it.
+const MODE: LinkMode = (["old", "own", "stopped"] as const).includes(process.env.LINK_MODE as LinkMode) ? process.env.LINK_MODE as LinkMode : "own";
 const health = (known: boolean) => json(healthBody(known, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
+// The specialist's state, for the status page and the alarm: when it last signed, and since
+// when it has sent the old key (Harness 0.23.0's header) instead. Root's file.
+const SPECIALIST_FILE = process.env.CAIN_SPECIALIST_STATE ?? "/run/cain/specialist.json";
+const specialist = { signed_at: 0, old_key_since: 0, old_key_last: 0 };
+let oldKeyRelayed = 0;
+function saveSpecialist(): void {
+  try { writeFileSync(`${SPECIALIST_FILE}.tmp`, JSON.stringify(specialist), { mode: 0o600 }); renameSync(`${SPECIALIST_FILE}.tmp`, SPECIALIST_FILE); }
+  catch { /* the status page shows nothing new */ }
+}
+function signedNow(): void {
+  const first = !specialist.signed_at;
+  specialist.signed_at = Date.now(); specialist.old_key_since = 0;
+  if (first) saveSpecialist();
+  if (!specialistSigns) {
+    specialistSigns = true;
+    try { writeSynced(SIGNS, String(Date.now())); } catch (e) { console.log(`[cain] link: couldn't record that the specialist signs: ${String(e).slice(0, 80)}`); }
+  }
+}
+// An old key from the specialist: 503 and nothing done. In the old way that's the calendar App
+// not updated yet (the run script tells Cain after 30 minutes); after the switch it means the
+// calendar App went back to 0.23.0, so Cain hears at once, at most hourly.
+function oldKeySeen(): void {
+  const now = Date.now();
+  if (!specialist.old_key_since) specialist.old_key_since = now;
+  specialist.old_key_last = now;
+  saveSpecialist();
+  if (MODE !== "old" && now - oldKeyRelayed > 3_600_000) {
+    oldKeyRelayed = now;
+    link.relayLine("The calendar App is sending its old key again, so it went back to an older version (a restore, most likely). Its cards wait at the link, none lost. Show him a new Ship card for the pull request that last updated the calendar App, so his tap installs it again, and file a note on P33 for the laptop session.");
+  }
+}
 
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
@@ -301,15 +339,12 @@ Bun.serve({
     const url = new URL(req.url);
     const raw = req.method === "POST" ? await req.text() : "";
     const target = url.pathname + url.search;
-    const relay = key("harness-relay-v1");
-    const id = checkRequest(req.headers.get(SIG_HEADER), relay, req.method, target, raw);
+    const signKey = key(SIGN_CONTEXT);
+    const id = checkRequest(req.headers.get(SIG_HEADER), signKey, req.method, target, raw);
     if (id) {
-      if (!specialistSigns) {
-        specialistSigns = true;
-        try { writeFileSync(SIGNS, String(Date.now()), { mode: 0o600 }); } catch (e) { console.log(`[cain] link: couldn't record that the specialist signs: ${String(e).slice(0, 80)}`); }
-      }
+      signedNow();
       const signed = (status: number, body: string) => new Response(body, { status,
-        headers: { "content-type": "application/json", [SIG_HEADER]: signResponse(relay, id, status, body) } });
+        headers: { "content-type": "application/json", [SIG_HEADER]: signResponse(signKey, id, status, body) } });
       if (req.method !== "POST") {
         const res = url.pathname === "/health" ? health(true) : await route(req, url, "specialist", raw);
         return signed(res.status, await res.text());
@@ -333,25 +368,19 @@ Bun.serve({
     }
     const ip = server.requestIP(req)?.address ?? "";
     const bare = req.headers.get("x-harness-key") ?? "";
-    // The old way of starting (3.12 state A: Cain runs as root, as 0.11.0 did, and no process
-    // of his user exists): the old rules, the relay key for every route, Cain's from this
-    // machine only. The run script sets this only then.
-    if (LEGACY_AUTH && sameKey(bare, relay)) {
-      if (req.method === "GET" && url.pathname === "/health") return health(true);
-      if ((CAIN_ROUTES.has(url.pathname) || url.pathname === "/sent") && !loopback(ip)) return json({ status: "refused" }, 403);
-      return route(req, url, CAIN_ROUTES.has(url.pathname) ? "cain" : url.pathname === "/sent" ? "root" : "specialist", raw);
-    }
-    // From 0.12.0 on, the specialist's bare key is never taken: 503 and nothing done, so an
-    // old Harness keeps its card and retries until it signs (its outbox drops only refusals
-    // that will never change).
-    if (sameKey(bare, relay)) {
-      if (req.method === "GET" && url.pathname === "/health") return health(false);
-      return json({ status: "upgrading", said: "the link takes only signed requests now" }, 503);
-    }
-    const caller: Caller = loopback(ip) && sameKey(bare, cainKey()) ? "cain" : "none";
-    if (req.method === "GET" && url.pathname === "/health") return health(caller !== "none");
-    if (caller === "none") return json({ status: "refused" }, 403);
-    return route(req, url, caller, raw);
+    const local = loopback(ip);
+    const relayKey = sameKey(bare, key("harness-relay-v1"));
+    const asked = { signed: false, relayKey, cainKey: !relayKey && sameKey(bare, cainKey()), local, path: url.pathname };
+    // The old key from anywhere but this machine is the specialist's: never taken (503, nothing
+    // done, so an old Harness keeps its card and retries), counted for the alarm.
+    if (relayKey && !local) oldKeySeen();
+    if (req.method === "GET" && url.pathname === "/health")
+      return health((relayKey && local && MODE === "old") || (asked.cainKey && local && MODE === "own"));
+    const d = linkDecides(MODE, asked);
+    if ("refuse" in d) return d.refuse === 503
+      ? json({ status: "upgrading", said: "the link takes only signed requests now" }, 503)
+      : json({ status: "refused" }, 403);
+    return route(req, url, d.caller as Caller, raw);
   },
 });
 // Root's own: the broker reads the cards and says what Cain sent. The folder is root's.

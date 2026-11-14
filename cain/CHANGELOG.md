@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.0
+
+- Cain now runs as his own user on the Pi instead of as its administrator. The App's keys (GitHub, the review services', the Discord bot's and the Supervisor's) are out of his reach, and the checks on his messages and your Stop live where he can't change them.
+- His Discord replies go through the App, which checks each one before it goes. Discord's "Permission" prompts no longer come to you.
+- The calendar App (0.24.0, in the same update) signs what it sends Cain's App with a key Cain can't work out, so nothing can pose as it.
+- The first start after the calendar App's update moves him over by itself: the App restarts once, checks the new setup on the Pi (the Discord login, and a test message that goes nowhere), and only then switches. If a check fails he keeps running as before and tries again later; nothing for you to do. If the move ever stops part way, the App tells you once, with the fix.
+- How it was checked: the design went through six rounds of outside review, and tests interrupt the move at every step and check that nothing secret is ever readable by Cain's user.
+
 ## 0.11.0
 
 - Ship cards now say what your tap installs ("Ship Cain 0.11.0?", or that nothing installs), then one line from Cain on what you'll notice.
