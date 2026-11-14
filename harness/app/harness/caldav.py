@@ -193,67 +193,101 @@ def _unchanged(ics: str, read: str) -> bool:
 _WHEN = frozenset({"DTSTART", "DTEND", "RECURRENCE-ID", "EXDATE", "RDATE"})
 
 
-def _meant(line: str) -> str:
+def _meant(line: str, repeats: bool = False) -> str:
     """One line of an event by what it says, not how a server spells it: a time as the moment it
     names, however its zone is written; a rule's parts in any order; text with its escapes and
-    spacing aside."""
+    spacing aside. In an event that repeats by a rule, a time's form counts too (its zone, UTC or
+    floating), since that decides where its later days fall."""
     prop = ical.parse_line(line)
     if prop is None:
         return line
     if prop.name in _WHEN:
+        values = prop.value.split(",")
         try:
             moments = []
-            for value in prop.value.split(","):
+            for value in values:
                 when = ical.parse_when(ical.Prop(prop.name, prop.params, value), timezone.utc)
                 moments.append(when.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                                if isinstance(when, datetime) else when.isoformat())
         except ical.Unreadable:
             return line
-        return f"{prop.name}:{','.join(sorted(moments))}"
+        form = ""
+        if repeats:
+            form = (";DATE" if not any("T" in v for v in values) else ";UTC" if all(v.strip().endswith("Z")
+                    for v in values) else f";TZID={prop.params['TZID']}" if prop.params.get("TZID") else ";FLOATING")
+        return f"{prop.name}{form}:{','.join(sorted(moments))}"
     if prop.name in ("RRULE", "EXRULE"):
         return f"{prop.name}:{';'.join(sorted(prop.value.upper().split(';')))}"
     params = "".join(f";{k}={v}" for k, v in sorted(prop.params.items()))
     return f"{prop.name}{params}:{' '.join(ical.unescape(prop.value).split())}"
 
 
-def _said_by_events(ics: str) -> Counter:
-    """What the events in it say, each line by what it says (_meant) and each alarm as one whole,
-    counted, without what servers manage: the stamps and X- lines _unchanged leaves out too, and an
-    alarm marked X-APPLE-DEFAULT-ALARM, which a server adds of its own."""
+def _set_by_someone(name: str) -> bool:
+    """A line someone sets, not one a server manages: not a stamp, and not an X- line, except an
+    X-APPLE-TRAVEL- one, which is travel time he set."""
+    return name not in _STAMPS and (not name.startswith("X-") or name.startswith("X-APPLE-TRAVEL-"))
+
+
+def _events_said(ics: str) -> dict[tuple, tuple[Counter, Counter]]:
+    """Each event in it, by its id and which day of a series it is, with what it says: each line by
+    what it says (_meant) and each alarm as one whole, counted, the lines servers manage left out;
+    and apart, those of its alarms marked X-APPLE-DEFAULT-ALARM, which a server may add."""
     lines, names = _lines(ics)
-    out: Counter = Counter()
-    inside, alarm, default = False, None, False
+    found: list[tuple[list, list]] = []
+    props = alarm = None
+    default = False
     for line, name in zip(lines, names):
         upper = line.upper()
-        if upper in ("BEGIN:VEVENT", "END:VEVENT"):
-            inside, alarm = upper == "BEGIN:VEVENT", None
-        elif not inside:
+        if upper == "BEGIN:VEVENT":
+            props, alarm = [], None
+            found.append((props, []))
+        elif upper == "END:VEVENT":
+            props = alarm = None
+        elif props is None:
             continue
         elif upper == "BEGIN:VALARM":
             alarm, default = [], False
         elif upper == "END:VALARM":
-            if alarm is not None and not default:
-                out["VALARM:" + "|".join(sorted(alarm))] += 1
+            if alarm is not None:
+                found[-1][1].append((alarm, default))
             alarm = None
-        elif name == "X-APPLE-DEFAULT-ALARM":
+        elif alarm is not None and name == "X-APPLE-DEFAULT-ALARM":
             default = default or line.split(":", 1)[-1].strip().upper() == "TRUE"
-        elif name in _STAMPS or name.startswith("X-"):
-            continue
-        elif alarm is not None:
-            alarm.append(_meant(line))
-        else:
-            out[_meant(line)] += 1
+        elif _set_by_someone(name):
+            (alarm if alarm is not None else props).append((line, name))
+    out: dict[tuple, tuple[Counter, Counter]] = {}
+    for props, alarms in found:
+        repeats = any(name in ("RRULE", "EXRULE") for _, name in props)
+        said = Counter(_meant(line, repeats) for line, _ in props)
+        defaults: Counter = Counter()
+        for alarm_lines, marked in alarms:
+            whole = "VALARM:" + "|".join(sorted(_meant(line) for line, _ in alarm_lines))
+            said[whole] += 1
+            if marked:
+                defaults[whole] += 1
+        key = (next((line.split(":", 1)[1] for line, name in props if name == "UID" and ":" in line), ""),
+               next((_meant(line) for line, name in props if name == "RECURRENCE-ID"), ""))
+        while key in out:                      # one named twice stays twice
+            key += ("again",)
+        out[key] = (said, defaults)
     return out
 
 
 def _as_sent(read: str, sent: str) -> bool:
-    """A read says what was sent and nothing more, however the server keeps it: lines folded or
-    reordered, a time written in another zone, and the lines servers manage (stamps, X- lines, a
-    default alarm it adds) aside. Anything else added or changed since, a note, an alert, a place, a
-    guest or a link, is someone's edit, so it doesn't read as sent. Each line counts as often as it
-    was sent, so one of two alike can't stand in for the other."""
-    want = _said_by_events(sent)
-    return bool(want) and _said_by_events(read) == want
+    """A read says what was sent and nothing more, event by event, however the server keeps it:
+    lines folded or reordered, a one-off's time written in another zone, the lines servers manage
+    (stamps, X- lines) aside, and an alarm marked X-APPLE-DEFAULT-ALARM that wasn't sent, which the
+    server added. Anything else added, changed or taken away since, a note, an alert or its removal,
+    travel time, a place, a guest or a link, is someone's edit, so it doesn't read as sent. Each
+    line counts as often as it was sent, so one of two alike can't stand in for the other."""
+    want, have = _events_said(sent), _events_said(read)
+    if not want or set(want) != set(have):
+        return False
+    for key, (said, _) in want.items():
+        kept, marked = have[key]
+        if kept - (marked - said) != said:     # a default alarm the server added, and nothing else
+            return False
+    return True
 
 
 def _uids(ics: str) -> set[str]:
@@ -686,8 +720,10 @@ class FamilyCalDav:
     def href_for(self, uid: str) -> str:
         return f"{self.credentials()[2]}{uid}.ics"
 
-    def undo(self, uid: str, etag: str | None, data: str = "") -> Outcome:
-        """Delete this one event, if it is still exactly what the harness wrote."""
+    def undo(self, uid: str, etag: str | None, data: str = "",
+             sending: Callable[[], None] | None = None) -> Outcome:
+        """Delete this one event, if it is still exactly what the harness wrote. `sending` is called
+        just before the delete goes out, and only then, so a caller can count the deletes it sends."""
         ready = self._auth()
         if ready is None:
             return Outcome("no_credentials")
@@ -711,6 +747,8 @@ class FamilyCalDav:
             return Outcome("changed", r.status)
         if not (current or etag):
             return Outcome("failed", r.status)   # nothing to guard the delete with
+        if sending is not None:
+            sending()
         try:
             r = self._call(auth, "DELETE", href, {"If-Match": current or etag})
         except TransportError as e:

@@ -1919,10 +1919,12 @@ class CalendarChange:
 
         def run() -> dict:
             # Its id is fixed, so a second try can never make a second event. All it wrote is kept,
-            # so Undo leaves it alone once he's changed any of it.
+            # and what it left empty (a note, guests, attachments), so Undo leaves it alone once he's
+            # changed or added to any of it.
             address = self._gmail_address()
             wrote = {"summary": event["summary"], "start": event["start"], "end": event["end"],
-                     "location": event.get("location", ""), "recurrence": event.get("recurrence", [])}
+                     "location": event.get("location", ""), "recurrence": event.get("recurrence", []),
+                     "description": "", "attendees": [], "attachments": []}
             entry = {"cal": "gmail", "how": "drop", "id": uid, "wrote": wrote, "check": {"kind": "there"}}
             self._attempt(entry)
             self._gmail_send(self.google.insert(address, event), entry)
@@ -2031,10 +2033,10 @@ class CalendarChange:
 
     def _reads_as_written(self, entry: dict, read: dict) -> bool:
         """What a read found is what the write made, as far as a read can say: on Gmail, every field
-        the write gave, an add's too; on Family, what was sent and nothing more, by what it says,
-        with the lines servers manage aside, so a server that keeps it its own way still reads as
-        written and a note or an alert someone added doesn't (caldav._as_sent). A removal found
-        gone, or a rule, has nothing more to compare."""
+        the write gave, and for an add what it left empty too; on Family, what was sent and nothing
+        more, by what it says, with the lines servers manage aside, so a server that keeps it its own
+        way still reads as written and a note or an alert someone added or took away doesn't
+        (caldav._as_sent). A removal found gone, or a rule, has nothing more to compare."""
         if entry.get("cal") == "gmail" and entry.get("how") != "restore":
             return self._as_written(read.get("event") or {}, entry.get("wrote") or {})
         if entry.get("cal") == "family" and entry.get("how") in ("put", "delete"):
@@ -2680,7 +2682,7 @@ class CalendarChange:
             elif key in ("summary", "description", "location"):     # none and empty are the same
                 if (now.get(key) or "") != (value or ""):
                     return False
-            elif key == "recurrence":
+            elif key in ("recurrence", "attendees", "attachments"):
                 if list(now.get(key) or []) != list(value or []):
                     return False
             elif now.get(key) != value:

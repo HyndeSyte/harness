@@ -174,6 +174,14 @@ ICLOUD_OWN = ("X-APPLE-CREATOR-IDENTITY:com.apple.calendar\r\nLAST-MODIFIED:2026
               "END:VALARM\r\n")
 
 
+# As an iPhone writes his alerts: a default 15-minute one, and "none", both marked as defaults.
+OWN_ALERT = "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n"
+DEFAULT_15 = ("BEGIN:VALARM\r\nX-WR-ALARMUID:00000000-0000-4000-8000-00000000B2B2\r\nTRIGGER:-PT15M\r\n"
+              "ACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nX-APPLE-DEFAULT-ALARM:TRUE\r\nEND:VALARM\r\n")
+NO_ALERT = ("BEGIN:VALARM\r\nX-WR-ALARMUID:00000000-0000-4000-8000-00000000C3C3\r\n"
+            "TRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\nACTION:NONE\r\nX-APPLE-DEFAULT-ALARM:TRUE\r\nEND:VALARM\r\n")
+
+
 def icloud_keeps(ics: str) -> str:
     """An event as a server that adds lines of its own stores it: once, before the first event ends."""
     return ics if ICLOUD_OWN in ics else ics.replace("END:VEVENT", ICLOUD_OWN + "END:VEVENT", 1)
@@ -1875,7 +1883,10 @@ def test_a_read_as_written_holds_on_servers_that_rewrite_and_not_after_an_edit()
                                                "END:VEVENT", 1),
              lambda k: k.replace("SUMMARY:", "LOCATION:Gym\r\nSUMMARY:", 1),
              lambda k: k.replace("SUMMARY:", "ATTENDEE:mailto:guest@example.com\r\nSUMMARY:", 1),
-             lambda k: k.replace("SUMMARY:", "URL:https://example.com/day\r\nSUMMARY:", 1)]
+             lambda k: k.replace("SUMMARY:", "URL:https://example.com/day\r\nSUMMARY:", 1),
+             lambda k: k.replace(OWN_ALERT, "", 1),                       # his alert, taken away
+             lambda k: k.replace("TRIGGER:-PT15M", "TRIGGER:-PT1H", 1),   # or an hour before instead
+             lambda k: k.replace("SUMMARY:", "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT30M\r\nSUMMARY:", 1)]
     key, ten = "20261123T133000Z", datetime(2026, 11, 23, 10, 0, tzinfo=NY)
     off = ics_edit.remove_days(SERIES, [key], TZ, NOW)
     moved = ics_edit.move_day(SERIES, key, ten, ten + timedelta(hours=4), TZ, NOW)
@@ -1892,6 +1903,80 @@ def test_a_read_as_written_holds_on_servers_that_rewrite_and_not_after_an_edit()
     own_alarm_with_its_id = icloud_keeps(off).replace("BEGIN:VALARM\r\nX-WR-ALARMUID",
                                                       "BEGIN:VALARM\r\nUID:ALARM-1\r\nX-WR-ALARMUID", 1)
     assert caldav._uids(own_alarm_with_its_id) == {UID} and caldav._as_sent(own_alarm_with_its_id, off)
+    title = "SUMMARY:\U0001f3eb School Day"
+    head, tail = moved.rsplit(title, 1)
+    sent_two = head + title + " moved" + tail                    # the series, and its moved day by its own name
+    swapped = moved.replace(title, title + " moved", 1)          # the two names swapped: each event counts alone
+    assert not caldav._as_sent(swapped, sent_two) and caldav._as_sent(icloud_keeps(sent_two), sent_two)
+
+
+def test_a_sent_default_alert_and_travel_time_count_as_his():
+    """What was sent counts, whatever marks it: a default-marked alert he sets to none or takes away,
+    or travel time he changes or takes away, doesn't read as sent. A default alert the server adds of
+    its own, one that wasn't sent, does."""
+    travel = "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT30M\r\n"
+    series = SERIES.replace(OWN_ALERT, DEFAULT_15).replace("SUMMARY:", travel + "SUMMARY:", 1)
+    sent = ics_edit.remove_days(series, ["20261123T133000Z"], TZ, NOW)
+    assert DEFAULT_15 in sent and travel in sent
+    assert caldav._as_sent(icloud_keeps(sent), sent)
+    for edit in (lambda s: s.replace(DEFAULT_15, NO_ALERT), lambda s: s.replace(DEFAULT_15, ""),
+                 lambda s: s.replace("PT30M", "PT1H"), lambda s: s.replace(travel, "")):
+        assert not caldav._as_sent(edit(sent), sent)
+
+
+def test_a_repeating_events_time_keeps_its_form_and_a_one_offs_is_its_moment():
+    """A weekly 8:30 in New York kept as 13:30 UTC starts at the same moment, but its later days move
+    an hour at the next clock change: a repeating event's times keep their form (zone, UTC or
+    floating). A one-off's time is only its moment."""
+    off = ics_edit.remove_days(SERIES, ["20261123T133000Z"], TZ, NOW)
+    start = "DTSTART;TZID=America/New_York:20261102T083000"
+    assert not caldav._as_sent(off.replace(start, "DTSTART:20261102T133000Z"), off)
+    assert not caldav._as_sent(off.replace(start, "DTSTART:20261102T083000"), off)
+    zoned = (ONE.replace("DTSTART:20261201T150000Z", "DTSTART;TZID=America/New_York:20261201T100000")
+             .replace("DTEND:20261201T160000Z", "DTEND;TZID=America/New_York:20261201T110000"))
+    assert caldav._as_sent(zoned, ONE) and caldav._as_sent(ONE, zoned)
+
+
+@pytest.mark.parametrize("edit", [lambda b: b.replace(DEFAULT_15, NO_ALERT), lambda b: b.replace(DEFAULT_15, "")],
+                         ids=["set to none", "taken away"])
+def test_his_default_alert_changed_before_the_read_is_left_by_undo(r, edit):
+    """The series carries a default-marked 15-minute alert, as an iPhone writes it. A day is taken
+    off, its answer lost, and before the read he sets the alert to none, or takes it away. That's his
+    change: Undo leaves it, and the 15-minute alert doesn't come back."""
+    r.icloud.seed(PATH, SERIES.replace(OWN_ALERT, DEFAULT_15))
+    r.icloud.drop_response_next = True
+    r.tell(change(dates="2026-11-23"))
+    r.icloud.seed(PATH, edit(r.body()))
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
+    assert "TRIGGER:-PT15M" not in r.body() and "2026-11-23" not in days_of(r.body())
+
+
+@pytest.mark.parametrize("lost", [True, False], ids=["before its read", "after its receipt"])
+def test_undo_leaves_a_gmail_add_he_added_a_note_or_guest_to(r, lost):
+    """An add he added a note and a guest to, before its read or after its receipt, with its time
+    and title as written: it's his now, so Undo leaves it."""
+    real = r.gmail.insert
+
+    def lands_lost(address, event):
+        real(address, event)
+        return caldav.Outcome("unknown")       # it landed; the answer didn't
+    r.gmail.insert = lands_lost if lost else real
+    r.tell(change(calendar="gmail", op="add", title="Dentist", start="2026-11-20T09:00:00-05:00",
+                  end="2026-11-20T10:00:00-05:00"))
+    r.gmail.insert = real
+    gid = next(k for k in r.gmail.events if k.startswith("cm"))
+    r.gmail.events[gid].update(description="Bring the x-rays", attendees=[{"email": "guest@example.com"}])
+    r.gmail._bump(gid)
+    r.advance(minutes=1)
+    r.tick()
+    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    r.press(r.with_button("Undo"), "Undo")
+    assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
+    assert r.gmail.events[gid].get("status") != "cancelled"
 
 
 def test_undo_of_a_write_a_restart_cut_short_clears_what_it_recorded(r):
