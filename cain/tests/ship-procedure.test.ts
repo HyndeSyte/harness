@@ -59,14 +59,21 @@ describe("Cain's rules", () => {
   });
 
   test("the message gate: it acts, buttons named only from the card that has them, look first, the replay filed", () => {
-    const gate = section(rules, "## The message gate");
+    const gate = section(rules, "## The message gate").replace(/\s+/g, " ");
     for (const must of ["They act", "/data/work/gate-report.jsonl", "\"The message gate held this:\"", "don't mention the gate to him",
-      "third try goes as it is", "Send only\n  to his DM, and edit only your own replies", "A specialist's card is never refused",
+      "third try goes as it is", "Send only to his DM, and edit only your own replies", "is refused every time, and no third try lets it through",
+      "An edit straight after your reply is fine", "an edit is held too: send it as a new reply instead, or edit in a minute",
+      "If the edit is held, send a one-line correction as a new reply instead", "say the range in words", "A specialist's card is never refused",
       "Name a button to him only in a reply to the card that has it", "/opt/cain/keeper.sh card <message id>", "/opt/cain/keeper.sh check",
       "/opt/cain/keeper.sh selftest", "/data/work/gate-replay.json", "projects/org-v2/gate-replay-<YYYY-MM-DD>.md", "through the record keeper",
       "check the gate end to end", "Nothing to tell him"])
       expect(gate).toContain(must);
     expect(gate).not.toContain("only report");
+    expect(gate).not.toContain("anything else is refused every time");   // the edit that waits isn't refused for good
+  });
+
+  test("after a restart, before he has written, his DM's chat id is read from the published cards", () => {
+    expect(rules.replace(/\s+/g, " ")).toContain("After a restart, before he has written, his DM's chat id is `dm` in /data/trust/cards.json: use it to tell him what he should hear (the install line after a Ship) instead of waiting for his next message.");
   });
 
   test("Stop: within reach of his newest message, never on a card that asks something, and off while stopped", () => {

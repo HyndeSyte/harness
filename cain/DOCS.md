@@ -63,7 +63,9 @@ the App.
 Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing hidden
 behind "and 3 more", no commit or job ids or ISO times, and no button named that the
 message (or the card Cain's reply answers) doesn't have. Em dashes and "add-on" are
-fixed as they go out. Anything else is held back for Cain to rewrite before you see it.
+fixed as they go out; one between two numbers that isn't a time range is held for Cain
+to say in words, since a comma could turn a range into a list. Anything else is held
+back for Cain to rewrite before you see it.
 If he's held back twice within 10 minutes, his third try goes out as it is, so the
 rules can never silence him, and he hears so. The calendar specialist's cards are
 never held back, since a held approval or Undo would be lost to you: their wording is
@@ -91,7 +93,7 @@ last 5 messages has a Stop (the morning message and the calendar specialist's ca
 their own), and Discord shows "(edited)" on the messages it moves between. While
 everything is stopped it comes off, and Turn back on stays near the bottom instead: on
 the morning message and the stopped notice, which is posted again when it's out of
-reach, at most once an hour or after you write.
+reach, at most once an hour, or 10 minutes after the last one once you write.
 
 ## Ship
 
