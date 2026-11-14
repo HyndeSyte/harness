@@ -197,7 +197,9 @@ export function holding(needles: string[], files: string[]): string[] {
 async function loginCheck(tokenFile: string): Promise<boolean> {
   const token = tokenIn(tokenFile);
   if (!token) { console.error("[c1] no bot token to check with"); return false; }
-  const plugin = process.env.CAIN_DISCORD_PLUGIN ?? "/opt/cain/discord/plugin";
+  // The login check's own path setting (the CI image test points it at a stand-in), so the
+  // broker's pinned plugin path (CAIN_DISCORD_PLUGIN) is never moved with it.
+  const plugin = process.env.C1_LOGIN_PLUGIN ?? "/opt/cain/discord/plugin";
   const proc = Bun.spawn(["setpriv", "--reuid=discord", "--regid=discord", "--init-groups", "--no-new-privs",
     "--inh-caps=-all", "--bounding-set=-all", "/usr/local/bin/bun", join(plugin, "server.ts")], {
     cwd: plugin, stdin: "pipe", stdout: "ignore", stderr: "pipe",

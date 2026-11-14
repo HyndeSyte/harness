@@ -31,7 +31,7 @@ prepare() {
   # server that says it connected) and the channel smoke test (the real broker and bridge
   # with the stand-in server, driven by a fake client in place of Claude Code).
   cp /t/stub-smoke.sh "$OPT/c1/smoke.sh" && chmod 0755 "$OPT/c1/smoke.sh"
-  export CAIN_DISCORD_PLUGIN="/t/stub-plugin${STUB_LOGIN_FAIL:+-fail}"
+  export C1_LOGIN_PLUGIN="/t/stub-plugin${STUB_LOGIN_FAIL:+-fail}"
   printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$BOT" "$GH" "$GEM" "$CODEX" "$PEMLINE" "$(relay)" > /needles
   chmod 0644 /needles
 }
