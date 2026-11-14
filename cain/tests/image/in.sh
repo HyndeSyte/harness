@@ -99,6 +99,7 @@ switch)
       [ "$("$OPT/c1/state.sh")" = fresh ] || break
       bun "$OPT/c1/tools.ts" may-retry $D/c1/failed || break
     done
+  elif [ "$state" = cut ]; then rc=0         # already switched (a kill came after the state file)
   else rc="state:$state"; fi
   # Checked in this same container, whatever happened: no planted secret readable by uid 1000
   # once the switch has locked /data (from "locked" on, the only time a process of his can
