@@ -163,10 +163,15 @@ describe("what the gate does with Cain's reply", () => {
     expect(decide(edit("Fixed.", NOTICE), null).hits).toMatchObject([{ rule: "target", result: "unsure" }]);
   });
 
-  test("an em dash between two numbers is held, saying to put the range in words, and the other fixes are still made", () => {
+  test("an em dash between two numbers, or a time and a number, is held, saying to say it without the dash, and the other fixes are still made", () => {
     const d = decide(reply("Room 4—5 is free — then lunch."));
     expect(d).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "dash", result: "refuse" }, { rule: "dash", result: "fix" }] });
-    expect(d.said).toBe("The message gate held this: \"Room 4—5 is free — then lunch.\": say the range in words. Its other em dashes and add-ons are fixed for you when it goes. Rewrite and send now; don't mention it to him.");
+    expect(d.said).toBe("The message gate held this: \"Room 4—5 is free — then lunch.\": say it without the dash, as a range in words if it is one. Its other em dashes and add-ons are fixed for you when it goes. Rewrite and send now; don't mention it to him.");
+    // A time and a number: held, and the reason doesn't call it a range.
+    const party = decide(reply("Party is 6 PM — 8."));
+    expect(party).toMatchObject({ would: "refuse", hard: false, hits: [{ rule: "dash", result: "refuse" }] });
+    expect(party.said).toBe("The message gate held this: \"Party is 6 PM — 8.\": say it without the dash, as a range in words if it is one. Rewrite and send now; don't mention it to him.");
+    expect(decide(reply("Swim moved to 4:30 — that works."))).toMatchObject({ would: "fix", fixed: "Swim moved to 4:30, that works." });
   });
 
   test("only the two sends are read, with the chat, the session and the whole input", () => {

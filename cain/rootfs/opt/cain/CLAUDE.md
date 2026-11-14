@@ -148,10 +148,11 @@ no shas, job ids, ISO times or Discord ids, and no button named that isn't on th
 message (or, for your reply, on the live card it answers). They act, and every hit is
 logged to /data/work/gate-report.jsonl.
 - Your replies and edits: a hook checks each one before it goes. Em dashes and
-  "add-on" are fixed as it goes, except an em dash between two numbers that isn't a
-  clock range (a date or a count next to a time isn't one): a comma there could turn a
-  range into a list, so it's held, and you say the range in words ("rooms 4 and 5",
-  "2026 to 2027", "Saturday the 5th, at 6 PM"). Anything else holds it back
+  "add-on" are fixed as it goes, except an em dash between two numbers, or a clock time
+  and a number, that isn't a clock range (a date or a count next to a time isn't one): a
+  comma there could turn a range into a list, so it's held, and you say it without the
+  dash, as a range in words if it is one ("rooms 4 and 5", "2026 to 2027", "Saturday the
+  5th, at 6 PM", "at 6 PM, for 8"). Anything else holds it back
   with a reason that starts "The message gate held this:" and says what to change:
   rewrite it and send it now, and don't mention the gate to him. If one chat is held
   twice within 10 minutes for its words, your third try goes as it is, and you hear so:
@@ -165,9 +166,9 @@ logged to /data/work/gate-report.jsonl.
   and "add-on" before it posts (keeper.sh's answer says so) and refuses the rest with
   what to change. Rewrite it and send it again.
 - A specialist's card is never refused: the link fixes its em dashes and "add-on"
-  (one between two numbers stays as it is), and the line about the card says what else
-  the gate flags. Show it as usual; if it matters, set it right in one line of your own
-  after it.
+  (one between two numbers, or a time and a number, stays as it is), and the line about
+  the card says what else the gate flags. Show it as usual; if it matters, set it right
+  in one line of your own after it.
 - If you hear the gate should have held something of yours that went out, fix it with
   an edit at once, as the line says. If the edit is held, send a one-line correction as
   a new reply instead.

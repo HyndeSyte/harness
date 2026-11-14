@@ -46,9 +46,10 @@
 // - The gate (piece D, ../gate/rules.ts), enforcing since 0.10.0. Cain's words through the
 //   link (asks and their options, Ship cards, the morning message, the connector notice):
 //   em dashes and "add-on" fixed before anything is posted, and the answer says so; a
-//   hidden count, machine text, an em dash between two numbers that isn't a clock range,
-//   or a button the card lacks refused. The specialist's cards: fixed and posted, never
-//   refused (a refused card would be lost to him); Cain hears once what the gate flagged.
+//   hidden count, machine text, an em dash between two numbers (or a time and a number)
+//   that isn't a clock range, or a button the card lacks refused. The specialist's cards:
+//   fixed and posted, never refused (a refused card would be lost to him); Cain hears
+//   once what the gate flagged.
 //   Its notes after a tap, and the link's own words: fixed only. Every hit is logged, its
 //   excerpt with links cut to their host. The replay runs the same rules over his DM,
 //   reading only. Cain's edit allowlist holds his replies alone: never a message the link

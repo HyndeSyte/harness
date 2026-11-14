@@ -7,9 +7,10 @@ tests that use it.
   dash     an em dash                         fix: ", " (removed at a line's start or end, or
                                               before a stop; " to " only in a confirmed clock
                                               range), never inside code or a link. One with a
-                                              digit right on both sides that isn't a confirmed
-                                              range (between "2026" and "2027") is refused:
-                                              said in words
+                                              number right after it, and a number or a clock
+                                              time right before it, that isn't a confirmed
+                                              range ("2026" and "2027", "6 PM" and "8") is
+                                              refused: said without it
   app      "the add-on", "Cain's add-on", "Settings > Add-ons" and the like, also "addon" and
            the escaped "add\\-on"             fix: "App", "Apps", "App's". A bare "add-on" (a
                                               browser add-on in a calendar title) is left alone.
@@ -158,8 +159,8 @@ def hosts_only(text: str, start: int = 0, stop: int | None = None) -> str:
 # colon, or AM or PM); or a bare hour, then a time with AM or PM, the hour starting the text or
 # a line, or right after one of from, between, at, by, around, about, until, till, a colon
 # after a word, or an opening bracket. Never after a period or a comma, and a bare number on
-# the right is never an hour. Any other em dash with a digit right on both sides is refused;
-# every other one gets ", " or goes.
+# the right is never an hour. Any other em dash with a number right after it, and a number or
+# a clock time right before it, is refused; every other one gets ", " or goes.
 _MERIDIEM = _S + r"?[AaPp]\.?[Mm]\.?"
 _CLOCK = r"(?:\d{1,2}:\d{2}(?:" + _MERIDIEM + r")?|\d{1,2}" + _MERIDIEM + r")"
 _CLOCK_END = re.compile(r"(?<![\d:.])" + _CLOCK + r"\Z", A)
@@ -175,17 +176,18 @@ def _clock_range(left: str, right: str) -> bool:
 
 
 def _dashes(text: str, seen: str) -> list[tuple[int, int, str | None]]:
-    """Each em dash and what goes in its place; None: it stays, and the writer says it in words."""
+    """Each em dash and what goes in its place; None: it stays, and the writer says it without it."""
     out = []
     for m in re.finditer("[ \t]*\u2014+[ \t]*", seen):
         at, end = m.start(), m.end()
+        left, right = text[:at], text[end:]
         before = "\n" if at == 0 else text[at - 1]
         after = "\n" if end >= len(text) else text[end]
         put: str | None = ", "
-        if _clock_range(text[:at], text[end:]):
+        if _clock_range(left, right):
             put = " to "                  # "9:30 to 10:15", never "Room 4 to 5:30"
-        elif re.match(r"\d", before, A) and re.match(r"\d", after, A):
-            put = None                    # a range or a list
+        elif re.match(r"\d", after, A) and (re.match(r"\d", before, A) or _CLOCK_END.search(left)):
+            put = None                    # a range or a list: "2026, 2027", "6 PM, 8"
         elif before == "\n" or after == "\n" or re.match(r"[,.;:!?)]", after):
             put = ""
         elif re.match(r"[,;:]", before):

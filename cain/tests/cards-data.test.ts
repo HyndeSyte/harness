@@ -294,17 +294,24 @@ describe("the gate at the link's send points", () => {
     expect(r.last().content).toBe("The App, is back.");
   });
 
-  test("an em dash between two numbers: Cain's ask is refused, saying to put the range in words; a specialist's card keeps it, flagged", async () => {
+  test("an em dash between two numbers, or a time and a number: Cain's ask is refused, saying to say it without the dash; a specialist's card keeps it, flagged", async () => {
     const r = rig();
     await expect(r.link.ask({ text: "P08 Q2: Is Room 4—5 free?", options: ["Yes", "No"], item: "P08", question: "Q2" }))
-      .rejects.toThrow('The message gate held this ask: "P08 Q2: Is Room 4—5 free?": say the range in words. Rewrite it and send it again.');
-    await expect(r.link.ship({ text: "Harness 0.23.0 ready, for 2026 — 2027.", item: "P41", pr: PR, head: SHA1 })).rejects.toThrow("say the range in words");
+      .rejects.toThrow('The message gate held this ask: "P08 Q2: Is Room 4—5 free?": say it without the dash, as a range in words if it is one. Rewrite it and send it again.');
+    await expect(r.link.ship({ text: "Harness 0.23.0 ready, for 2026 — 2027.", item: "P41", pr: PR, head: SHA1 })).rejects.toThrow("say it without the dash");
+    await expect(r.link.ask({ text: "P08 Q2: Party at 6 PM — 8 people, fine?", options: ["Yes", "No"], item: "P08", question: "Q2" })).rejects.toThrow("say it without the dash");
     expect(r.posts()).toBe(0);
     const card = await r.link.addCard({ text: "Swim moved to 4:30 — 2 blocks shifted.", rows: [], kind: "card" });
-    expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Swim moved to 4:30 — 2 blocks shifted." (say the range in words). It goes out as it is');
+    expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Swim moved to 4:30 — 2 blocks shifted." (say it without the dash, as a range in words if it is one). It goes out as it is');
     const id = await r.link.show(card, { item: "none" });
     expect(r.msg(id).content).toBe("Swim moved to 4:30 — 2 blocks shifted.");   // left as it is, never ", "
     expect(r.reports.at(-1)).toMatchObject({ point: "card", writer: "specialist", did: "posted as it is", hits: [{ rule: "dash", result: "refuse" }] });
+    const party = await r.link.show(await r.link.addCard({ text: "Party is 6 PM — 8.", rows: [], kind: "card" }), { item: "none" });
+    expect(r.msg(party).content).toBe("Party is 6 PM — 8.");                    // a time and a number: kept, flagged
+    expect(r.reports.at(-1)).toMatchObject({ point: "card", did: "posted as it is", hits: [{ rule: "dash", result: "refuse" }] });
+    await r.link.notice("Back at 6 PM — 8 at the latest.");                    // the link's own words: kept, flagged
+    expect(r.last().content).toBe("Back at 6 PM — 8 at the latest.");
+    expect(r.reports.at(-1)).toMatchObject({ point: "notice", writer: "link", hits: [{ rule: "dash", result: "refuse" }] });
   });
 
   test("keeper.sh check gives the hook's decision against the cards up now, and sends nothing", async () => {

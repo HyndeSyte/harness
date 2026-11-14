@@ -63,12 +63,13 @@ the App.
 Rules in the App check what reaches you: no em dashes, Apps not add-ons, nothing hidden
 behind "and 3 more", no commit or job ids or ISO times, and no button named that the
 message (or the card Cain's reply answers) doesn't have. Em dashes and "add-on" are
-fixed as they go out; one between two numbers that isn't a time range is held for Cain
-to say in words, since a comma could turn a range into a list. A time range is two
-times ("9:30 to 10:15"), or an hour then a time with AM or PM, the hour starting the
-line or following from, between, at, by, around, about, until, till, a colon or a
-bracket ("from 6 to 8 PM"); a date or a count next to a time isn't one. Anything else
-is held back for Cain to rewrite before you see it.
+fixed as they go out; one between two numbers, or between a time and a number, that
+isn't a time range is held for Cain to say without it, since a comma could turn a range
+into a list ("6 PM, 8"). A time range is two times ("9:30 to 10:15"), or an hour then a
+time with AM or PM, the hour starting the line or following from, between, at, by,
+around, about, until, till, a colon or a bracket ("from 6 to 8 PM"); a date or a count
+next to a time isn't one. Anything else is held back for Cain to rewrite before you see
+it.
 If he's held back twice within 10 minutes, his third try goes out as it is, so the
 rules can never silence him, and he hears so. The calendar specialist's cards are
 never held back, since a held approval or Undo would be lost to you: their wording is

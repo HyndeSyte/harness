@@ -66,14 +66,17 @@ describe("the rules", () => {
     expect(r.fixed).toBe("See `a — b` and [the page](https://example.com/x—y), then the App.");
   });
 
-  test("an em dash between two numbers that isn't a clock range is held, and the reason says to say the range in words", () => {
+  test("an em dash between two numbers, or a time and a number, that isn't a clock range is held, and the reason doesn't call it a range", () => {
     for (const text of ["From 2026 — 2027 it runs.", "Room 4—5 is free.", "Swim moved to 4:30 — 2 blocks shifted.", "Nov 12 — 4:30 PM swim is set.", "Room 4 — 5:30 start.",
-      "Sat. 5 — 6 PM", "No. 5 — 6 PM", "Thursday, 12 — 4:30 PM swim is set.", "Dec 3, 12 — 1 PM lunch", "1. 12 — 1 PM", "Swim is 9:30 — 11."]) {
+      "Sat. 5 — 6 PM", "No. 5 — 6 PM", "Thursday, 12 — 4:30 PM swim is set.", "Dec 3, 12 — 1 PM lunch", "1. 12 — 1 PM", "Swim is 9:30 — 11.",
+      "Party is 6 PM — 8.", "At 6 PM — 3, maybe 4 people will arrive.", "Gate 8 — 6:30 PM start", "Dinner at 6 p.m. — 8 guests.", "Done by 6 PM — 3 events moved."]) {
       const r = check(text);
       expect(r.hits).toMatchObject([{ rule: "dash", result: "refuse" }]);
-      expect(r.fixed).toBe(text);                                     // never ", ": a range would read as a list
+      expect(r.fixed).toBe(text);                                     // never ", " or " to ": either could change what it says
       expect(whyOf(r.hits[0])).toBe(RANGE_WHY);
     }
+    expect(RANGE_WHY).toBe("say it without the dash, as a range in words if it is one");
+    expect(check("Swim moved to 4:30 — that works.").fixed).toBe("Swim moved to 4:30, that works.");   // a time against words
     expect(whyOf({ rule: "dash", result: "fix" })).toBe("no em dashes");
     expect(whyOf({ rule: "nonsense", result: "refuse" })).toBe("a message rule");
   });

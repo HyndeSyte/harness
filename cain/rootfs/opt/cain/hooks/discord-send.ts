@@ -13,9 +13,9 @@
 //     updatedInput that comes without a decision; discord-send.cli.test.ts proves this one
 //     against the real CLI;
 //   - deny, with what to change: a hidden count, machine text, an em dash between two
-//     numbers that isn't a clock range, a button the card it answers lacks (or any named
-//     button while the cards can't be read), a chat that isn't his DM, or an edit of a
-//     message that isn't one of his own replies.
+//     numbers (or a time and a number) that isn't a clock range, a button the card it
+//     answers lacks (or any named button while the cards can't be read), a chat that
+//     isn't his DM, or an edit of a message that isn't one of his own replies.
 // The cards come first, always (decision F): the link's local route gets 1.5 s, then
 // /data/trust/cards.json while it's under 3 minutes old. So every rule runs on every send,
 // however slow the link is, and the link's DM id wins over the cached one, rewriting it.

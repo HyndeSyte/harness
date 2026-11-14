@@ -8,10 +8,10 @@
 //   dash     an em dash                    fix: ", " (removed at a line's start or end,
 //                                          or before a stop; " to " only in a confirmed
 //                                          clock range), never inside code or a link.
-//            One with a digit right on both sides that isn't a confirmed clock range
-//            (between "2026" and "2027", or "Room 4" and "5") could be a range or a
-//            list: refuse, to be said in words (a writer that's never refused keeps it
-//            as it is, flagged)
+//            One with a number right after it, and a number or a clock time right
+//            before it, that isn't a confirmed clock range ("2026" and "2027", "Room 4"
+//            and "5", "6 PM" and "8") could be a range or a list: refuse, to be said
+//            without it (a writer that's never refused keeps it as it is, flagged)
 //   app      "the add-on", "Cain's add-on", "Harness add-on", "Settings > Add-ons" and
 //            the like (also "addon" and the specialist's escaped "add\-on"; plural and
 //            possessive)                   fix: "App", "Apps", "App's". A bare "add-on"
@@ -127,10 +127,11 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 //     right after one of from, between, at, by, around, about, until, till, a colon after
 //     a word, or an opening bracket: "6 to 8 PM", "from 6 to 8 PM", "Swim: 5 to 6 PM",
 //     "(5 to 6 PM)". Never after a period or a comma ("Sat. 5", "Thursday, 12" are dates,
-//     "No. 5" a number), and a bare number on the right is never an hour: after "6 PM",
-//     "3, maybe 4 people" gets a comma, as does any dash without a digit right on both sides.
-// Any other em dash with a digit right on both sides is held: ", " would make a range a
-// list ("2026, 2027"). Every other em dash gets ", " or goes.
+//     "No. 5" a number), and a bare number on the right is never an hour.
+// Any other em dash with a number right after it, and a number or a clock time right
+// before it, is held: ", " could make a range a list ("2026, 2027", "6 PM, 8"), and " to "
+// a list a range ("6 PM to 3, maybe 4 people"). Every other em dash gets ", " or goes: a
+// clock time against words is no range ("Swim moved to 4:30, that works").
 const MERIDIEM = "\\s?[AaPp]\\.?[Mm]\\.?";
 const CLOCK = `(?:\\d{1,2}:\\d{2}(?:${MERIDIEM})?|\\d{1,2}${MERIDIEM})`;
 const CLOCK_END = new RegExp(`(?<![\\d:.])${CLOCK}$`);
@@ -142,15 +143,16 @@ function clockRange(left: string, right: string): boolean {
   return (CLOCK_END.test(left) && CLOCK_START.test(right)) || (MERIDIEM_START.test(right) && HOUR_LEFT.test(left));
 }
 
-// Each em dash and what goes in its place; null: it stays, and the writer says it in words.
+// Each em dash and what goes in its place; null: it stays, and the writer says it without it.
 function dashes(text: string, seen: string): { at: number; end: number; put: string | null }[] {
   const out: { at: number; end: number; put: string | null }[] = [];
   for (const m of seen.matchAll(/[ \t]*—+[ \t]*/g)) {
     const at = m.index!, end = at + m[0].length;
+    const left = text.slice(0, at), right = text.slice(end);
     const before = at === 0 ? "\n" : text[at - 1], after = end >= text.length ? "\n" : text[end];
     let put: string | null = ", ";
-    if (clockRange(text.slice(0, at), text.slice(end))) put = " to ";             // 9:30 to 10:15
-    else if (/\d/.test(before) && /\d/.test(after)) put = null;                   // a range or a list
+    if (clockRange(left, right)) put = " to ";                                    // 9:30 to 10:15
+    else if (/\d/.test(after) && (/\d/.test(before) || CLOCK_END.test(left))) put = null;   // a range or a list
     else if (before === "\n" || after === "\n" || /[,.;:!?)]/.test(after)) put = "";
     else if (/[,;:]/.test(before)) put = " ";
     out.push({ at, end, put });
@@ -290,8 +292,9 @@ export const WHY: Record<Rule, string> = {
   machine: "no shas, job ids, ISO times or Discord ids; say it as people say it",
   button: "name only a button the message has",
 };
-// The same for one hit: an em dash that's held is one between two numbers.
-export const RANGE_WHY = "say the range in words";
+// The same for one hit: an em dash that's held stands between two numbers, or a time and a
+// number, and may or may not be a range.
+export const RANGE_WHY = "say it without the dash, as a range in words if it is one";
 export function whyOf(h: { rule: string; result?: string }): string {
   if (h.rule === "dash" && h.result === "refuse") return RANGE_WHY;
   return WHY[h.rule as Rule] ?? "a message rule";
