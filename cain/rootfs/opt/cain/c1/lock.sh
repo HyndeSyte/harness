@@ -68,7 +68,7 @@ review-spend.json review-health.json review-useful.jsonl review-private-terms.tx
   own "$D/.claude" root:root 0700
   own "$D/.claude.json" root:root 0600
   own "$D/trust" root:root 0755
-  own "$D/discord" root:discord 0750
+  own "$D/discord" root:discord 0751   # he may pass through to the inbox, nothing else
   own "$D/discord/access.json" root:discord 0640
   own "$D/discord/inbox" discord:cain 2750
   for q in record-queue review-inbox jobs; do install -d -m 2770 -o root -g cain "$D/$q"; done

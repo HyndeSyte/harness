@@ -5,8 +5,8 @@
 // One connection at a time: a new one replaces the old, whose server is stopped.
 import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
-import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { pinProblem } from "./pin";
 import { appendGate } from "../gate/log";
 import { checkAccess, ownerDm } from "../hooks/discord-read";
 import { tellLink } from "../hooks/discord-sent";
@@ -18,8 +18,6 @@ const SOCK = env.CAIN_DISCORD_SOCK ?? "/run/cain/discord.sock";
 const TOKEN_FILE = env.CAIN_DISCORD_TOKEN_FILE ?? "/data/link/discord.env";
 const STATE = env.CAIN_DISCORD_STATE ?? "/data/discord";
 const PLUGIN = env.CAIN_DISCORD_PLUGIN ?? "/opt/cain/discord/plugin";
-const SEED = env.CAIN_DISCORD_SEED ?? "/opt/cain/plugin-seed";
-const PIN = env.CAIN_DISCORD_PIN ?? join(import.meta.dir, "pin.json");
 const OUTBOX = env.CAIN_DISCORD_OUTBOX ?? "/run/cain/outbox";
 const LINK_SOCK = env.CAIN_LINK_SOCK ?? "/run/cain/link.sock";
 const LINK_STATE = env.CAIN_LINK_STATE ?? "/data/link/state.json";
@@ -38,20 +36,8 @@ function token(): string {
   return text(TOKEN_FILE)?.match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? "";
 }
 
-// The pinned plugin, file for file: the server's copy whole, the seed's copy but its .mcp.json
-// (which runs the bridge). "" when both match.
-export function pinProblem(pinPath = PIN, plugin = PLUGIN, seed = SEED): string {
-  let pin: { files: Record<string, string>; version: string };
-  try { pin = JSON.parse(readFileSync(pinPath, "utf8")); } catch { return "the plugin pin can't be read"; }
-  const sha = (p: string) => { try { return createHash("sha256").update(readFileSync(p)).digest("hex"); } catch { return ""; } };
-  for (const [file, want] of Object.entries(pin.files)) if (sha(join(plugin, file)) !== want) return `the server's ${file} isn't the pinned one`;
-  if (seed) {
-    const cache = join(seed, "cache", "claude-plugins-official", "discord", pin.version);
-    for (const [file, want] of Object.entries(pin.files))
-      if (file !== ".mcp.json" && sha(join(cache, file)) !== want) return `the seed's ${file} isn't the pinned one`;
-  }
-  return "";
-}
+// The pinned plugin, file for file (pin.ts, which the upkeep shares).
+export { pinProblem };
 
 // His replies, by id: what he may edit. The newest 2000, kept on disk for restarts.
 const replied = new Set<string>();

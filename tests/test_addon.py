@@ -151,7 +151,7 @@ def test_cain_writes_the_record_only_through_the_keeper(tmp_path):
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "/opt/cain/record.sh submit" in rules and "only through the record keeper" in rules
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    assert "bun /opt/cain/record/main.ts" in run and "bashio::config 'github_token'" in run
+    assert 'bun "$OPT/record/main.ts"' in run and "bashio::config 'github_token'" in run
     printed = [l for l in run.splitlines() if "RECORD_TOKEN" in l and re.search(r"echo|printf|log\.", l)]
     assert not printed   # the token is never printed
     bash, jq = shutil.which("bash"), shutil.which("jq")
@@ -238,7 +238,12 @@ def test_cain_terminal_is_reachable_only_through_ingress():
     assert "allow 172.30.32.2;" in nginx and "deny all;" in nginx
     assert nginx.count("listen ") == 1 and "listen 8099 " in nginx
     term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
-    assert "--interface 127.0.0.1" in term
+    # C1: ttyd listens on a unix socket only nginx's workers and root can open, never a port
+    # Cain's own user could take while it's down; it attaches as the session's own user.
+    assert "--interface /run/cain/upstream/ttyd.sock --socket-owner root:nogroup" in term
+    assert "proxy_pass http://unix:/run/cain/upstream/ttyd.sock;" in nginx
+    attach = (CAIN / "rootfs/opt/cain/terminal-attach.sh").read_text()
+    assert "/opt/cain/as-cain bash -c" in attach and "attach-session -E -t cain" in attach
 
 
 def test_cain_start_survives_bashio_errexit():
@@ -354,7 +359,7 @@ def test_cain_tells_the_owner_once_when_its_signin_expires():
     alert = (CAIN / "rootfs/opt/cain/alert.sh").read_text()
     code = "\n".join(l for l in alert.splitlines() if not l.strip().startswith("#"))
     # The token is only written to a private header file, then dropped.
-    assert code.count("$token") == 2 and "umask 077" in code and "unset token" in code
+    assert len(re.findall(r"\$token\b", code)) == 2 and "umask 077" in code and "unset token" in code
     assert code.index("unset token") < code.index("curl ")
     assert '-H "@$hdr"' in code and "set -x" not in code
     assert " jq " in (CAIN / "Dockerfile").read_text()
@@ -383,8 +388,10 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "/opt/cain/keeper.sh handover" in rules and "never change a calendar yourself" in rules
     assert "exec /opt/cain/keeper.sh handover" in (CAIN / "rootfs/opt/cain/handover.sh").read_text()
-    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    assert "cp /opt/cain/settings.json /data/work/.claude/settings.json" in run
+    # C1: his rules are managed files (lock.sh managed), and the old way gets 0.11.0's own.
+    lock = (CAIN / "rootfs/opt/cain/c1/lock.sh").read_text()
+    assert 'install -m 0644 -o root -g root "$OPT/settings.json" /etc/claude-code/managed-settings.json' in lock
+    assert 'install -m 0644 "$OPT/legacy/settings.json" "$D/work/.claude/settings.json"' in lock
 
 
 def test_keeper_sends_cards_with_their_item_question_and_thread(tmp_path):
@@ -652,7 +659,7 @@ def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
 
 def test_cain_checks_in_on_his_own_record():
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    assert "/opt/cain/checkin.sh" in run
+    assert '"$OPT/checkin.sh"' in run
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "## Check-ins" in rules and "state/PENDING.md" in rules
     assert "never his go on anything" in rules
@@ -665,9 +672,12 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     from harness import cain_relay
     link = (CAIN / "rootfs/opt/cain/link/main.ts").read_text(encoding="utf-8")
     auth = (CAIN / "rootfs/opt/cain/link/auth.ts").read_text(encoding="utf-8")
-    # The specialist signs with the relay key (C1): the link checks it, and signs its answers.
-    assert f'const relay = key("{cain_relay.KEY_CONTEXT.decode()}");' in link
-    assert "checkRequest(req.headers.get(SIG_HEADER), relay" in link and "signResponse(relay, id" in link
+    # The specialist signs with K_sign, not the old relay key (C1 plan 3.9): the link checks it,
+    # signs its answers with it, and only recognizes the old key to refuse it (503).
+    assert f'SIG_CONTEXT = "{cain_relay.SIGN_CONTEXT.decode()}"' in auth
+    assert "const signKey = key(SIG_CONTEXT);" in link
+    assert "checkRequest(req.headers.get(SIG_HEADER), signKey" in link and "signResponse(signKey, id" in link
+    assert f'sameKey(bare, key("{cain_relay.KEY_CONTEXT.decode()}"))' in link
     assert "timingSafeEqual" in auth and f'SIG_HEADER = "{cain_relay.SIG_HEADER}"' in auth
     assert f"?? {cain_relay.PORT})" in link and cain_relay.HOST == "0fcc2575-cain"
     # The specialist's routes only: it can't show its own cards, ask, put up a Ship card, or
@@ -785,7 +795,7 @@ def test_cain_installs_codex_pinned_and_checked():
 
 def test_cain_runs_the_review_runner_with_keys_only_in_its_environment():
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    assert "bun /opt/cain/review/main.ts" in run
+    assert 'bun "$OPT/review/main.ts"' in run
     block = run.split("# The review runner")[1].split(") &")[0]
     for opt in ("gemini_api_key", "perplexity_api_key", "anthropic_api_key", "review_limit_usd",
                 "gemini_monthly_usd", "perplexity_monthly_usd", "anthropic_monthly_usd", "codex_monthly_runs"):

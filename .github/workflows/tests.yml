@@ -32,3 +32,12 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests
+      # C1's image test: Cain's real image (amd64 here; the Pi is arm64, where the first start
+      # checks the real Discord login and a real Claude session before it switches), the
+      # switch to his own user run on a fake /data and interrupted at every point.
+      - name: Build Cain's image
+        run: >-
+          docker build -q -t cain-c1-test --build-arg BUILD_ARCH=amd64
+          --build-arg BUILD_FROM="$(sed -n 's/^  amd64: //p' cain/build.yaml)" cain
+      - name: The switch to his own user, in the image (cain/tests/image/c1.sh)
+        run: bash cain/tests/image/c1.sh cain-c1-test

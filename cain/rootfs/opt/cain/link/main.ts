@@ -339,7 +339,7 @@ Bun.serve({
     const url = new URL(req.url);
     const raw = req.method === "POST" ? await req.text() : "";
     const target = url.pathname + url.search;
-    const signKey = key(SIGN_CONTEXT);
+    const signKey = key(SIG_CONTEXT);
     const id = checkRequest(req.headers.get(SIG_HEADER), signKey, req.method, target, raw);
     if (id) {
       signedNow();

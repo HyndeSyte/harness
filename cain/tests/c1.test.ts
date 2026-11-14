@@ -125,9 +125,9 @@ describe.skipIf(!posix)("what uid 1000 can read, by owners and modes (POSIX)", (
     chmodSync(d, 0o755);
     mkdirSync(join(d, "open")); chmodSync(join(d, "open"), 0o755);
     mkdirSync(join(d, "closed")); chmodSync(join(d, "closed"), 0o700);
-    writeFileSync(join(d, "open/yes")); chmodSync(join(d, "open/yes"), 0o644);
-    writeFileSync(join(d, "open/no")); chmodSync(join(d, "open/no"), 0o600);
-    writeFileSync(join(d, "closed/hidden")); chmodSync(join(d, "closed/hidden"), 0o644);
+    writeFileSync(join(d, "open/yes"), "x"); chmodSync(join(d, "open/yes"), 0o644);
+    writeFileSync(join(d, "open/no"), "x"); chmodSync(join(d, "open/no"), 0o600);
+    writeFileSync(join(d, "closed/hidden"), "x"); chmodSync(join(d, "closed/hidden"), 0o644);
     const got = readableFiles([d]);
     expect(got).toContain(join(d, "open/yes"));
     expect(got).not.toContain(join(d, "open/no"));

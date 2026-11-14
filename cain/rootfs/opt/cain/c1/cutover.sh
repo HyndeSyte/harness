@@ -47,7 +47,7 @@ cid() { "${T[@]}" container-id; }
 quiesce() {
   local u p ids st left
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    for u in "$@"; do setpriv --reuid="$u" --regid="$u" --clear-groups kill -9 -1 2>/dev/null; done
+    for u in "$@"; do setpriv --reuid="$u" --regid="$u" --clear-groups bash -c 'kill -9 -1' 2>/dev/null; done
     left=""
     for p in /proc/[0-9]*; do
       st="$(awk '/^State:/{print $2; exit}' "$p/status" 2>/dev/null)"
@@ -68,6 +68,9 @@ quiesce() {
 abort() {
   log "not switched: $*"
   kp abort-0
+  # What the validation started is ended first, so nothing of his user is left working on
+  # what's being removed (the container is replaced anyway before the old way runs).
+  quiesce 1000 1001 >/dev/null 2>&1 || true
   rm -rf /etc/claude-code "$D/cain" "$D/discord" "$C/quarantine" "$C/before"
   rm -f "$D/link/discord.env" "$D/link/discord.env.tmp"
   kp abort-1
@@ -136,7 +139,7 @@ if [ "$state" = fresh ]; then
   chown -R root:root "$D/cain" && chmod -R go-rwx "$D/cain" || abort "couldn't keep the staged home root's"
   grep -m1 '^DISCORD_BOT_TOKEN=' "$D/.claude/channels/discord/.env" > "$D/link/discord.env.tmp" \
     && chmod 0600 "$D/link/discord.env.tmp" && mv "$D/link/discord.env.tmp" "$D/link/discord.env" || abort "couldn't copy the token"
-  install -d -m 0750 -o root -g discord "$D/discord" || abort "couldn't make /data/discord"
+  install -d -m 0751 -o root -g discord "$D/discord" || abort "couldn't make /data/discord"
   install -m 0640 -o root -g discord "$D/.claude/channels/discord/access.json" "$D/discord/access.json" || abort "no access.json to copy"
   install -d -m 0700 -o root -g root "$D/discord/inbox" || abort "couldn't make the inbox"
   if [ -d "$D/.claude/channels/discord/inbox" ]; then

@@ -13,10 +13,13 @@ dm="$(jq -r '.dm // empty' /data/trust/cards.json 2>/dev/null)"
 [ -n "$dm" ] || dm="1000000000000000001"
 # The gate's own files go to a scratch folder of root's: the switch hasn't committed, so nothing
 # of the old layout (the gate's log and tries in /data/work) may change, and /data/gate isn't
-# made yet.
+# made yet. The link isn't running during the switch, so the gate's view of his DM comes from a
+# fresh synthetic cards file here (the link's own file is older than the gate trusts by now):
+# his DM, no cards up. The stand-in server sends nothing anywhere.
 G=/run/cain/root-tmp/smoke-gate
 rm -rf "$G"; mkdir -p -m 0700 "$G"
-CAIN_DISCORD_SOCK="$SOCK" CAIN_BROKER_SMOKE=1 SMOKE_LOG="$LOG" \
+jq -cn --arg dm "$dm" --argjson at "$(date +%s%3N)" '{written_at: $at, owner: "", dm: $dm, cards: [], sent: []}' > "$G/cards.json"
+CAIN_DISCORD_SOCK="$SOCK" CAIN_BROKER_SMOKE=1 SMOKE_LOG="$LOG" CAIN_CARDS="$G/cards.json" CAIN_LINK_SOCK="$G/no-link.sock" \
   CAIN_GATE_LOG="$G/report.jsonl" CAIN_GATE_TRIES="$G/tries.json" CAIN_GATE_DM="$G/dm.json" CAIN_GATE_REPLIED="$G/replied.json" \
   CAIN_DISCORD_SERVER_CMD='["/usr/local/bin/bun","'"$OPT"'/c1/smoke-server.ts"]' \
   bun "$OPT/discord/broker-main.ts" > /run/cain/root-tmp/smoke-broker.log 2>&1 &
