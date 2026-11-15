@@ -600,7 +600,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
 
   test("a prompt or settings file checked out with CRLF or laid out again still matches its pinned hash", async () => {
     const { q, id } = oneJob();
-    writeFileSync(q.files.prompt, readFileSync(q.files.prompt, "utf8").replace(/\n/g, "\r\n"));
+    writeFileSync(q.files.prompt, readFileSync(q.files.prompt, "utf8").replace(/\r\n/g, "\n").replace(/\n/g, "\r\n"));
     writeFileSync(q.files.settings, JSON.stringify(JSON.parse(readFileSync(q.files.settings, "utf8"))));
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
   });
