@@ -89,6 +89,9 @@ template)
   printf '| Item |\n' > $D/record/state/PENDING.md
   install -d -m 0700 $D/link $D/codex
   printf 'ready\n' > $D/link/specialist-signs; chmod 0600 $D/link/specialist-signs
+  # The old way's listing of his claude.ai connectors went through (the run script); CI has no
+  # sign-in, so it named none.
+  install -d -m 0700 $D/c1 && printf 'listed\n' > $D/c1/connectors-before && chmod 0600 $D/c1/connectors-before
   printf -- '-----BEGIN PRIVATE KEY-----\n%s\n-----END PRIVATE KEY-----\n' "$PEMLINE" > $D/link/ship.key; chmod 0600 $D/link/ship.key
   printf '{"tokens": {"access_token": "%s"}}\n' "$CODEX" > $D/codex/auth.json; chmod 0600 $D/codex/auth.json
   : > $D/session.log; : > $D/relay.queue
@@ -166,10 +169,11 @@ final)
 plant-connector)
   # The old way recorded a claude.ai connector of his (the run script's connector check): CI has
   # no sign-in, so it can't load under his new rules, and the switch must undo itself.
-  install -d -m 0700 $D/c1 && printf 'claude.ai Gmail
-' > $D/c1/connectors-before && chmod 0600 $D/c1/connectors-before
+  install -d -m 0700 $D/c1 && printf 'listed\nclaude.ai Gmail\n' > $D/c1/connectors-before && chmod 0600 $D/c1/connectors-before
   ;;
-unplant-connector) rm -f $D/c1/connectors-before ;;
+unplant-connector) printf 'listed\n' > $D/c1/connectors-before ;;
+unlist-connectors) rm -f $D/c1/connectors-before ;;
+journal-there) [ -e $D/c1/journal ] && echo yes || echo no ;;
 legacy-here)
   # The old root session ran in this container (the run script put it on record): the switch
   # mustn't begin here.
@@ -180,5 +184,5 @@ legacy-here)
   [ ! -e $D/c1/journal ] || fail "a journal was begun in the old session's container"
   echo "rc=$rc"
   ;;
-*) fail "usage: in.sh points|template|switch [point]|final|legacy-here" ;;
+*) fail "usage: in.sh points|template|switch [point]|final|plant-connector|unplant-connector|unlist-connectors|journal-there|legacy-here" ;;
 esac

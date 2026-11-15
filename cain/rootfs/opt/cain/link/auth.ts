@@ -15,10 +15,11 @@
 // (received) and after (done, with its answer), durably, for KEEP_MS, longer than the
 // specialist ever retries one. A repeat of a done id gets the stored answer and nothing is done
 // again; a copy that arrives while the first runs waits for it; one received but never done (the
-// link stopped mid-way) is reconciled, never simply repeated. So a request someone holds and
-// forwards late runs at most once, and an answer the specialist can't verify is no answer.
+// link stopped mid-way, or failed) runs again only where that is safe, and otherwise gets an
+// explicit unknown. So a request someone holds and forwards late runs at most once, and an
+// answer the specialist can't verify is no answer.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { closeSync, copyFileSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const SIG_HEADER = "x-harness-sig";
@@ -78,42 +79,64 @@ const validStored = (s: any): s is Stored => s && typeof s === "object" && Numbe
   && (s.state === "received" || (s.state === "done" && Number.isInteger(s.status) && typeof s.body === "string"));
 
 // What the link did with each signed request, by id, kept on disk for KEEP_MS (longer than the
-// specialist retries an operation), each change synced; the copy before the last change is kept
-// beside it. Only a log that doesn't exist yet is empty: one that can't be read or doesn't hold
-// valid entries, with no valid copy beside it, is "damaged", and the link then takes no signed
-// operation that does anything until KEEP_MS has passed since (C1 code review, C1-5).
+// specialist retries an operation), in two copies, each written whole and synced, each with the
+// generation it holds: the second copy first, then the first, so the second is never behind the
+// first, and whichever valid copy is newer holds every change that finished (a change cut off
+// between the two is one whose operation never went on past it). So one damaged copy loses
+// nothing (C1 re-check R1). Only no copy at all is an empty log: neither copy valid is "damaged",
+// and the link then takes no signed operation that does anything until KEEP_MS has passed since
+// (C1 code review, C1-5).
+interface Loaded { gen: number; ops: Map<string, Stored> }
 export class RequestLog {
   private map = new Map<string, Stored>();
+  private gen = 0;
   damagedSince = 0;
+  // Found damaged at this load, not at an earlier one (so it's told once).
+  damagedNow = false;
+  // Which copy it was loaded from, when the other was damaged or behind ("" when both agreed).
+  recoveredFrom = "";
   constructor(private path: string | null, now = Date.now()) {
     if (!path) return;
-    const load = (p: string): Map<string, Stored> | "absent" | "bad" => {
+    const load = (p: string): Loaded | "absent" | "bad" => {
       let text: string;
       try { text = readFileSync(p, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? "absent" : "bad"; }
       try {
         const o = JSON.parse(text);
-        if (!o || typeof o !== "object" || Array.isArray(o)) return "bad";
+        if (!o || typeof o !== "object" || Array.isArray(o) || !Number.isSafeInteger(o.gen) || o.gen < 1) return "bad";
+        if (!o.ops || typeof o.ops !== "object" || Array.isArray(o.ops)) return "bad";
         const m = new Map<string, Stored>();
-        for (const [id, s] of Object.entries(o)) { if (!/^[0-9a-f]{32}$/.test(id) || !validStored(s)) return "bad"; m.set(id, s); }
-        return m;
+        for (const [id, st] of Object.entries(o.ops)) { if (!/^[0-9a-f]{32}$/.test(id) || !validStored(st)) return "bad"; m.set(id, st as Stored); }
+        return { gen: o.gen, ops: m };
       } catch { return "bad"; }
     };
-    const main = load(path);
-    if (main instanceof Map) { this.map = main; return; }
-    const prev = load(`${path}.prev`);
-    if (prev instanceof Map) { this.map = prev; return; }
-    if (main === "absent" && prev === "absent") return;
+    const first = load(path), second = load(`${path}.2`);
+    const good = [first, second].filter((x): x is Loaded => typeof x === "object");
+    if (good.length) {
+      const best = good.reduce((x, y) => (y.gen > x.gen ? y : x));
+      this.map = best.ops; this.gen = best.gen;
+      if (first !== best && (typeof first !== "object" || first.gen !== best.gen)) this.recoveredFrom = "the second copy";
+      else if (second !== best && (typeof second !== "object" || second.gen !== best.gen)) this.recoveredFrom = "the first copy";
+      // A damage marker beside a valid log is from a window that ended (the fresh log was written
+      // before the marker could be removed).
+      try { rmSync(`${path}.damaged`, { force: true }); } catch { /* none */ }
+      return;
+    }
+    if (first === "absent" && second === "absent") return;
     // Damaged: remembered as such (a marker beside it), so a restart doesn't forget it either.
     const marker = `${path}.damaged`;
     let since = now;
     try { const t = Number(readFileSync(marker, "utf8")); if (Number.isFinite(t) && t > 0) since = t; } catch { /* first time */ }
     this.damagedSince = since;
+    this.damagedNow = since === now;
     try { writeSynced(marker, String(since)); } catch { /* still damaged in memory */ }
   }
-  // Damaged and not yet past KEEP_MS: every entry the lost log held may still matter.
+  // Damaged and not yet past KEEP_MS: every entry the lost log held may still matter. Past it, a
+  // fresh log is written before the damage is forgotten, so a restart can't take the old damage
+  // for new; until that write goes through, it stays damaged.
   damaged(now = Date.now()): boolean {
     if (!this.damagedSince) return false;
     if (now - this.damagedSince <= KEEP_MS) return true;
+    try { this.map.clear(); this.save(); } catch { return true; }
     this.damagedSince = 0;
     try { rmSync(`${this.path}.damaged`, { force: true }); } catch { /* gone */ }
     return false;
@@ -125,28 +148,35 @@ export class RequestLog {
   put(id: string, s: Stored): void {
     for (const [k, v] of this.map) if (s.at - v.at > KEEP_MS) this.map.delete(k);
     this.map.set(id, s);
+    this.save();
+  }
+  private save(): void {
     if (!this.path) return;
-    mkdirSync(dirname(this.path), { recursive: true });
-    try { copyFileSync(this.path, `${this.path}.prev`); } catch { /* the first one */ }
-    const tmp = `${this.path}.tmp`;
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeSync(fd, JSON.stringify(Object.fromEntries(this.map))); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, this.path);
-    try { const dir = openSync(dirname(this.path), "r"); try { fsyncSync(dir); } finally { closeSync(dir); } } catch { /* not every platform syncs a folder */ }
+    this.gen += 1;
+    const body = JSON.stringify({ gen: this.gen, ops: Object.fromEntries(this.map) });
+    writeSynced(`${this.path}.2`, body);
+    writeSynced(this.path, body);
   }
 }
 
 export interface Answer { status: number; body: string }
 
+// The routes whose operation may simply run again when the link stopped part way through it
+// (received, never done): a card is made at most once per request id (Link.addCard) and posted
+// at most once (its posting mark and a look in his DM first). Any other route's interrupted
+// operation gets an explicit unknown outcome instead, never a second run (C1 re-check R2).
+export const RERUN_SAFE = new Set(["/card"]);
+
 // Each signed operation once (C1 code review, C1-1 and C1-2): a repeat of a done one gets its
 // stored answer; a copy that arrives while the first is still running waits for the first's
-// answer rather than running again; one received but never done (the link stopped mid-way) is
-// reconciled by its route: an answer to a tap can't be checked against Discord, so it gets an
-// explicit unknown outcome (never a success, never sent twice); the others run again, each
-// idempotent or deduplicated by the request id they carry (a card by the id stored on it).
+// answer rather than running again; one received but never done (the link stopped mid-way, or
+// it failed) runs again only on a route that is safe to (RERUN_SAFE), and otherwise gets an
+// explicit unknown outcome, never a success and never a second run. A server error (5xx, or a
+// throw) is no outcome: whether it did anything isn't known, so it stays received and its retry
+// is reconciled the same way, never answered with the old error for good (C1 re-check R3).
 export class SignedOps {
   private inflight = new Map<string, Promise<Answer>>();
-  constructor(private log: RequestLog, private now = () => Date.now()) {}
+  constructor(private log: RequestLog, private now = () => Date.now(), private rerun: Set<string> = RERUN_SAFE) {}
   async run(id: string, path: string, act: () => Promise<Answer>): Promise<Answer> {
     const done = this.log.get(id, this.now());
     if (done?.state === "done") return { status: done.status ?? 200, body: done.body ?? "{}" };
@@ -155,14 +185,16 @@ export class SignedOps {
     if (this.log.damaged(this.now()))
       return { status: 503, body: JSON.stringify({ status: "history damaged", said: "the link's record of what it has done is damaged, so it takes no new operation for now" }) };
     const p = (async (): Promise<Answer> => {
-      if (done?.state === "received" && path === "/answer") {
-        const a = { status: 409, body: JSON.stringify({ status: "unknown", said: "the link stopped before it confirmed this note went out; it isn't sent again" }) };
+      if (done?.state === "received" && !this.rerun.has(path)) {
+        const a = { status: 409, body: JSON.stringify({ status: "unknown", said: "the link couldn't confirm this operation finished (it stopped part way, or failed); it isn't done again" }) };
         this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body });
         return a;
       }
       this.log.put(id, { at: this.now(), state: "received" });
-      const a = await act();
-      this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body });
+      let a: Answer;
+      try { a = await act(); }
+      catch (e) { a = { status: 500, body: JSON.stringify({ status: "error", said: String(e).slice(0, 200) }) }; }
+      if (a.status < 500) this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body });
       return a;
     })();
     this.inflight.set(id, p);

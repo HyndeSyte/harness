@@ -207,3 +207,21 @@ def test_a_card_unsent_after_seven_days_is_dropped_never_retried_as_new(ledger, 
     assert len(bot.fail_sends) == tries                                         # not tried again
     kinds = [r["kind"] for r in ledger.db.execute("SELECT kind FROM events").fetchall()]
     assert "delivery_expired" in kinds
+
+
+def test_a_card_dropped_after_seven_days_is_on_the_next_digest(ledger, clock):
+    """Not only an event in the database: the digest Cain reads each morning (it is his to tell
+    him) counts it by when it was dropped, though it was written a week before (C1 re-check)."""
+    from harness import daily
+    from harness.config import Config
+    from harness.outbox import MAX_AGE_S, Outbox
+    from fakes import FakeBot, chat_error
+    bot = FakeBot()
+    bot.fail_sends = [chat_error(503, "down")] * 1000
+    enqueue(ledger, "an old card")
+    ob = Outbox(ledger, bot, sleep=lambda s: None)
+    config = Config(owner_user_id=OWNER, stage="S1")
+    assert "couldn't be delivered" not in daily.gather(ledger, config, paused=False).text
+    clock.advance(seconds=MAX_AGE_S + 3600)
+    ob.flush()
+    assert "1 message(s) couldn't be delivered" in daily.gather(ledger, config, paused=False).text

@@ -845,4 +845,30 @@ describe("one request, one card", () => {
     const other = await r.link.addCard({ text: "A card for him", rows: [], kind: "card", req: "e".repeat(32) });
     expect(other).not.toBe(first);
   });
+
+  // C1 re-check R2 and R3: a card's request may run again after the link stopped or failed part
+  // way, so a notice that goes out at once must still go out, and only once.
+  test("a notice that goes out at once, cut off after the link kept it (Discord down), goes out once when the request comes again", async () => {
+    const r = rig();
+    const turnBackOn = [{ type: 1, components: [{ type: 2, style: 2, label: "Turn back on", custom_id: RESUME }] }];
+    r.failing.add(`POST /channels/${DM}/messages`);
+    await expect(r.link.addCard({ text: "Stopped.", rows: turnBackOn, kind: "stopped", req: "d".repeat(32) })).rejects.toThrow("discord 500");
+    expect(r.cards().length).toBe(0);
+    r.failing.clear();
+    const id = await r.link.addCard({ text: "Stopped.", rows: turnBackOn, kind: "stopped", req: "d".repeat(32) });
+    expect(r.cards().length).toBe(1);
+    expect(r.state().cards[String(id)].shown).toBeTruthy();
+    expect(await r.link.addCard({ text: "Stopped.", rows: turnBackOn, kind: "stopped", req: "d".repeat(32) })).toBe(id);
+    expect(r.cards().length).toBe(1);
+  });
+
+  test("one Discord posted but whose answer was lost: the request again finds it in his DM and posts nothing more", async () => {
+    const r = rig();
+    r.lose.posts = 1;
+    await expect(r.link.addCard({ text: "Something needs a look.", rows: [], kind: "alert", req: "c".repeat(32) })).rejects.toThrow();
+    expect(r.cards().length).toBe(1);                                 // it's on Discord
+    const id = await r.link.addCard({ text: "Something needs a look.", rows: [], kind: "alert", req: "c".repeat(32) });
+    expect(r.cards().length).toBe(1);
+    expect(r.state().cards[String(id)].shown).toBeTruthy();
+  });
 });

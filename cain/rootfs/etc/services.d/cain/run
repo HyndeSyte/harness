@@ -169,21 +169,26 @@ fi
   if [ "$mode" = old ]; then echo "[cain] gate hook self-test: $(timeout 120 bun "$OPT/hooks/discord-send.ts" --self-test --relay 2>&1 | tail -n 1)"
   elif [ "$mode" = own ]; then echo "[cain] gate self-test: $(timeout 120 bun "$OPT/discord/selftest.ts" --relay 2>&1 | tail -n 1)"; fi
 ) &
-# Which connectors Cain has, by name only (addresses removed).
+# Which connectors Cain has, by name only (addresses removed). The old way also keeps the names
+# of his claude.ai connectors (root's file, /data/c1/connectors-before): its first line says a
+# listing went through, and each listing's names are added to the last's, so a moment when
+# claude.ai didn't answer can't empty it. The switch waits for that line, then checks every
+# name still loads under his new rules before it commits (c1/cutover.sh). A listing that fails
+# records nothing; the old way lists again every 10 minutes until one goes through.
+list_connectors() {
+  local out lrc=0 names
+  if [ "$mode" = own ]; then out="$(timeout 120 "$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" claude mcp list 2>&1)" || lrc=$?
+  else out="$(timeout 120 claude mcp list 2>&1)" || lrc=$?; fi
+  # (|| true: under pipefail, a listing longer than 40 lines would end it at head.)
+  printf '%s\n' "$out" | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 | while IFS= read -r line; do echo "[cain] connector: $line"; done || true
+  [ "$mode" = old ] || return 0
+  if [ "$lrc" != 0 ]; then echo "[cain] connector: the listing failed ($lrc), so it isn't kept for the switch; it's tried again in 10 minutes"; return 0; fi
+  names="$( { printf '%s\n' "$out" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p'; tail -n +2 /data/c1/connectors-before 2>/dev/null || true; } | grep -v '^$' | sort -u || true)"
+  { echo listed; [ -z "$names" ] || printf '%s\n' "$names"; } > /data/c1/connectors-before.tmp && chmod 0600 /data/c1/connectors-before.tmp \
+    && mv /data/c1/connectors-before.tmp /data/c1/connectors-before || echo "[cain] connector: couldn't keep the listing for the switch"
+}
 if [ "$mode" != none ]; then
-  (
-    sleep 30
-    if [ "$mode" = own ]; then out="$(timeout 120 "$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" claude mcp list 2>&1 || true)"
-    else out="$(timeout 120 claude mcp list 2>&1 || true)"; fi
-    printf '%s\n' "$out" | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 | while IFS= read -r line; do echo "[cain] connector: $line"; done
-    # The old way keeps the names of his claude.ai connectors (root's file): the switch checks
-    # every one still loads under his new rules before it commits (c1/cutover.sh).
-    if [ "$mode" = old ]; then
-      names="$(printf '%s\n' "$out" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u)"
-      if [ -n "$names" ]; then printf '%s\n' "$names" > /data/c1/connectors-before.tmp && chmod 0600 /data/c1/connectors-before.tmp \
-        && mv /data/c1/connectors-before.tmp /data/c1/connectors-before || true; fi
-    fi
-  ) &
+  ( sleep 30; list_connectors ) &
   # The c1 check (the new way): root runs it as cain and keeps its result (c1/check.sh).
   if [ "$mode" = own ]; then ( sleep 45; "$OPT/c1/check.sh" 2>&1 | tail -n 1 ) & fi
 fi
@@ -289,9 +294,15 @@ fi
 #     nothing of the old root session survives into the switch), every 10 minutes until it does;
 #   - 30 minutes after this App first ran the old way with no signed request, tells Cain once
 #     that the calendar App's update didn't happen, with the fix.
-asked=0
+asked=0; listed_at=$(date +%s)
 while has_session; do
-  if [ "$mode" = old ] && [ -f /data/link/specialist-signs ]; then
+  # The old way: no listing of his connectors went through yet, so it lists again (above).
+  if [ "$mode" = old ] && [ "$(head -n 1 /data/c1/connectors-before 2>/dev/null || true)" != listed ] \
+     && [ $(( $(date +%s) - listed_at )) -ge 600 ]; then
+    listed_at=$(date +%s); ( list_connectors ) &
+  fi
+  if [ "$mode" = old ] && [ -f /data/link/specialist-signs ] \
+     && [ "$(head -n 1 /data/c1/connectors-before 2>/dev/null || true)" = listed ]; then
     if [ $(( $(date +%s) - asked )) -ge 600 ] && bun "$OPT/c1/tools.ts" may-retry /data/c1/failed; then
       asked=$(date +%s)
       bashio::log.info "The calendar specialist now signs its requests: asking the Supervisor to restart this App, so Cain switches to his own user in a new container"

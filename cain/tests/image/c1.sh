@@ -10,7 +10,8 @@
 #     restart) until it settles, and checked: cut over, the secrets quarantined, his folders
 #     his, the start's own checks passing and catching a planted root file (in.sh final);
 #   - and the named cases: kills inside an undo, a detached process of his, a failed smoke
-#     test, a failed Discord login, three failures in a row, and the old session's container.
+#     test, a failed Discord login, a connector that wouldn't load, his connectors not listed
+#     yet, three failures in a row, and the old session's container.
 # The real Discord login and a real Claude Code session aren't here (CI has neither sign-in):
 # stand-ins take their place (stub-plugin, fake-claude.ts), and the first start on the Pi does
 # them for real.
@@ -83,6 +84,18 @@ step -- unplant-connector
 settle; finish
 echo "a connector that wouldn't load undid the switch"
 
+# His connectors not listed the old way yet (the listing failed, or hasn't run): the switch
+# waits (rc 1) and begins nothing; once a listing went through, it switches.
+fresh
+step -- unlist-connectors
+rc="$(step -- switch | rc_of)"
+[ "$rc" = 1 ] || die "a switch before his connectors were listed gave rc=$rc, not 1"
+[ "$(step -- journal-there)" = no ] || die "a switch before his connectors were listed began a journal"
+grep -q "his connectors haven't been listed" "$fp/switch.log" || die "the wait didn't say it was the listing"
+step -- unplant-connector
+settle; finish
+echo "the switch waits for his connectors to be listed"
+
 # Three failures in a row: the next start doesn't try (6 hours), and nothing is begun.
 fresh
 for i in 1 2 3; do
@@ -91,7 +104,7 @@ for i in 1 2 3; do
 done
 rc="$(step -- switch | rc_of)"
 [ "$rc" = 1 ] || die "a fourth try within 6 hours gave rc=$rc, not 1"
-[ ! -e "$d/c1/journal" ] || die "a fourth try began a journal"
+[ "$(step -- journal-there)" = no ] || die "a fourth try began a journal"
 sudo rm -rf "$d" "$fp"; ran=$((ran + 1))
 echo "three failures wait 6 hours"
 

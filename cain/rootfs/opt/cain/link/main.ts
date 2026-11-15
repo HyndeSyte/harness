@@ -292,7 +292,8 @@ async function route(req: Request, url: URL, caller: Caller, raw: string, reqId?
 // no signature made with it verifies, so one captured from an old Harness signs nothing (C1
 // plan 3.9).
 const requests = new RequestLog(`${DIR}/requests.json`);
-if (requests.damagedSince) console.log(`[cain] link: ERROR: its record of the specialist's operations is damaged; no new one is taken until it can't matter (8 days)`);
+if (requests.damagedSince) console.log(`[cain] link: ERROR: its record of the specialist's operations is damaged (both copies); no new one is taken until it can't matter (8 days)`);
+else if (requests.recoveredFrom) console.log(`[cain] link: its record of the specialist's operations was read from ${requests.recoveredFrom} (the other was damaged or a step behind); nothing lost`);
 const ops = new SignedOps(requests);
 // A body larger than any route takes is refused before it's read, signed or not (C1-7).
 const MAX_BODY = 16_384;
@@ -432,6 +433,8 @@ async function handle(url: URL, b: any, reqId?: string): Promise<Response> {
     return json({ status: "not found" }, 404);
 }
 console.log(`[cain] link listening on ${PORT} and ${LINK_SOCK}`);
+if (requests.damagedNow)
+  link.relayLine("The link's record of what the calendar specialist asked of it is damaged on disk (both copies), so for 8 days it takes nothing new from the specialist: what the specialist sends meanwhile waits, and is dropped after 7 days, so nothing can go out twice. Tell Dane in one line that his calendar cards are paused by a storage problem on the Pi, and file a note on P33 for the laptop session.");
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
 if (!deployKey)

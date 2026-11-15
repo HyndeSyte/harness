@@ -3,13 +3,13 @@
 // The bot token goes only into that process's environment, through the spawn call itself:
 // never into a command line, which any user can read in /proc.
 // One connection at a time: a new one replaces the old, whose server is stopped.
-import { chmodSync, chownSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync, renameSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { pinProblem } from "./pin";
 import { appendGate } from "../gate/log";
 import { checkAccess, ownerDm } from "../hooks/discord-read";
-import { tellLink } from "../hooks/discord-sent";
+import { SentSpool } from "./spool";
 import { BrokerSession, fileOutbox, MAX_LINE } from "./broker";
 import { gateSend, sentNote } from "./gate-call";
 
@@ -53,40 +53,10 @@ async function linkCall(path: string, init: RequestInit = {}, timeoutMs = 1_500)
   return fetch(`http://link${path}`, { ...init, unix: LINK_SOCK, signal: AbortSignal.timeout(timeoutMs) } as RequestInit);
 }
 
-// What went out, told to the link durably: each note is written to the spool (synced) before it's
-// sent, and a note the link didn't take is sent again every 30 seconds and at the next start, so a
-// broker that dies between Discord's answer and the link's never loses what Stop's place and his
-// edit allowlist depend on (C1 code review). The link takes the same note twice harmlessly.
+// What went out, told to the link durably, nothing dropped quietly (discord/spool.ts).
 const SENT_SPOOL = env.CAIN_SENT_SPOOL ?? "/data/gate/sent-spool.jsonl";
-function spoolAdd(note: unknown): void {
-  try {
-    const fd = openSync(SENT_SPOOL, "a", 0o640);
-    try { writeSync(fd, JSON.stringify(note) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
-  } catch (e) { log(`couldn't keep a note of what went out for the link: ${String(e).slice(0, 80)}`); }
-}
-let flushing = false;
-async function spoolFlush(): Promise<void> {
-  if (flushing) return;
-  flushing = true;
-  try {
-    let lines: string[];
-    try { lines = readFileSync(SENT_SPOOL, "utf8").split("\n").filter(Boolean); } catch { return; }
-    const left: string[] = [];
-    for (const l of lines) {
-      let note: any;
-      try { note = JSON.parse(l); } catch { continue; }            // a torn last line: dropped
-      const ok = await tellLink(note, (body, timeoutMs) => linkCall("/sent", { method: "POST", body, headers: { "content-type": "application/json" } }, timeoutMs));
-      if (!ok) left.push(l);
-    }
-    // Notes added while this ran stay: only the lines read here are replaced.
-    let now: string[] = [];
-    try { now = readFileSync(SENT_SPOOL, "utf8").split("\n").filter(Boolean); } catch { /* gone */ }
-    const rest = [...left, ...now.slice(lines.length)];
-    writeFileSync(`${SENT_SPOOL}.tmp`, rest.length ? rest.join("\n") + "\n" : "", { mode: 0o640 });
-    renameSync(`${SENT_SPOOL}.tmp`, SENT_SPOOL);
-  } catch (e) { log(`couldn't tell the link what went out: ${String(e).slice(0, 80)}`); }
-  finally { flushing = false; }
-}
+const spool = new SentSpool(SENT_SPOOL,
+  (body, timeoutMs) => linkCall("/sent", { method: "POST", body, headers: { "content-type": "application/json" } }, timeoutMs), log);
 
 function dmNow(): string {
   try { const c = JSON.parse(text(CARDS) ?? ""); if (typeof c?.dm === "string" && /^\d{15,22}$/.test(c.dm)) return c.dm; } catch { /* below */ }
@@ -173,8 +143,8 @@ function connection(sock: Socket): void {
       const now = Date.now();
       if (note.net && !note.net.released) void appendGate({ at: now, point: "sent", writer: "cain", message: note.ids.at(-1), did: "bypassed", hits: note.net.hits });
       if (madeUp.length) void appendGate({ at: now, point: "sent", writer: "cain", message: note.ids.at(-1), did: "bypassed", hits: madeUp });
-      spoolAdd(note);
-      void spoolFlush();
+      spool.add(note);
+      void spool.flush();
     },
     readsOk,
     outbox: fileOutbox(OUTBOX, { gid: DISCORD_GID }),
@@ -204,7 +174,7 @@ function connection(sock: Socket): void {
 
 if (import.meta.main) {
   // Notes a crash left unsent go now, and any the link didn't take every 30 seconds after.
-  if (env.CAIN_BROKER_SMOKE !== "1") { void spoolFlush(); setInterval(() => void spoolFlush(), 30_000); }
+  if (env.CAIN_BROKER_SMOKE !== "1") { void spool.flush(); setInterval(() => void spool.flush(), 30_000); }
   mkdirSync(OUTBOX, { recursive: true, mode: 0o750 });
   try { chownSync(OUTBOX, 0, DISCORD_GID); } catch (e) { log(`couldn't hand the outbox to discord: ${String(e).slice(0, 80)}`); }
   if (existsSync(SOCK)) rmSync(SOCK, { force: true });

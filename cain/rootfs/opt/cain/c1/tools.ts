@@ -30,8 +30,12 @@ import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, read
 import { dirname, join } from "node:path";
 import { readableAllowed } from "./contract";
 
-const text = (p: string) => { try { return readFileSync(p, "utf8"); } catch { return ""; } };
-export const tokenIn = (p: string) => text(p).match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? "";
+// A file the switch needs: any error reading it, its absence included, is a failure, so no
+// list or search input can ever read as an empty one (C1 re-check R4).
+const need = (p: string) => readFileSync(p, "utf8");
+// A file that may not be there yet: only its absence is empty; any other error is a failure.
+const maybe = (p: string) => { try { return readFileSync(p, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return ""; throw e; } };
+export const tokenIn = (p: string) => need(p).match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? "";
 
 function fsyncDir(p: string): void {
   const d = openSync(p, "r");
@@ -73,9 +77,9 @@ export function journalStep(body: string): string {
 }
 
 export function containerId(): string {
-  const boot = text("/proc/sys/kernel/random/boot_id").trim();
+  const boot = need("/proc/sys/kernel/random/boot_id").trim();
   // Field 22 of /proc/1/stat, counted after the command's closing parenthesis (it may hold spaces).
-  const stat = text("/proc/1/stat");
+  const stat = need("/proc/1/stat");
   const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? "";
   if (!/^[0-9a-f-]{36}$/.test(boot) || !/^\d+$/.test(start)) throw new Error("no container identity");
   return `${boot}:${start}`;
@@ -238,7 +242,14 @@ async function loginCheck(tokenFile: string): Promise<boolean> {
   return found;
 }
 
-const nulList = (p: string) => text(p).split("\0").filter(Boolean);
+// A list a step wrote (readable): it must be there, and an empty one is only a file with nothing
+// in it. The secret values searched for must be there too, and hold at least one.
+const nulList = (p: string) => need(p).split("\0").filter(Boolean);
+const needles = (p: string) => {
+  const n = need(p).split("\n").filter((x) => x.length > 0);
+  if (!n.length) throw new Error(`no secret values to search for in ${p}`);
+  return n;
+};
 const writeList = (p: string, l: string[]) => { const fd = openSync(p, "w", 0o600); try { writeSync(fd, l.map((x) => x + "\0").join("")); } finally { closeSync(fd); } };
 
 if (import.meta.main) {
@@ -255,20 +266,20 @@ if (import.meta.main) {
     } else if (cmd === "journal-add" && a && b) {
       appendDurably(a, b);
     } else if (cmd === "journal-check" && a) {
-      console.log(journalStep(text(a)));
+      console.log(journalStep(need(a)));
     } else if (cmd === "container-id") {
       console.log(containerId());
     } else if (cmd === "may-retry" && a) {
-      process.exit(mayRetry(text(a)) ? 0 : 1);
+      process.exit(mayRetry(maybe(a)) ? 0 : 1);
     } else if (cmd === "secrets" && a) {
       const fd = openSync(a, "w", 0o600);
       try { writeSync(fd, secretValues().join("\n") + "\n"); } finally { closeSync(fd); }
     } else if (cmd === "readable" && a && b) {
       writeList(a, readableFiles([b, ...rest]));
     } else if (cmd === "scan" && a && b && rest[0]) {
-      writeList(rest[0], holding(text(a).split("\n"), nulList(b)));
+      writeList(rest[0], holding(needles(a), nulList(b)));
     } else if (cmd === "scan-tree" && a && b && rest.length) {
-      writeList(b, holding(text(a).split("\n"), filesUnder(rest)));
+      writeList(b, holding(needles(a), filesUnder(rest)));
     } else if (cmd === "allowed" && a) {
       const bad = nulList(a).find((p) => !readableAllowed(p));
       if (bad) { console.log(bad); process.exit(1); }

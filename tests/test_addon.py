@@ -308,6 +308,57 @@ def test_cain_start_decides_every_switch_outcome_under_errexit(tmp_path):
         assert out.stdout.strip().startswith(expect), (rc, out.stdout, out.stderr[-300:])
 
 
+def test_the_old_way_keeps_his_connectors_only_from_a_listing_that_went_through(tmp_path):
+    """C1 re-check: the switch checks every claude.ai connector of his still loads under his new
+    rules. The old way keeps their names only from a listing that went through, its first line
+    saying so (without it the switch waits); each listing's names join the last's, so a moment
+    when claude.ai didn't answer can't empty it; and a long listing doesn't end it under
+    pipefail. The start's loop lists again until one goes through, and asks for the restart
+    that switches only once one has."""
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        import pytest
+        pytest.skip("no bash")
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    start = run.index("list_connectors() {")
+    fn = run[start:run.index("\n}\n", start) + 3]
+    data = tmp_path / "data"
+    (data / "c1").mkdir(parents=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "claude").write_text('#!/bin/bash\ncat "$STUB_OUT"; exit "$STUB_RC"\n')
+    (bindir / "claude").chmod(0o755)
+    (tmp_path / "list.sh").write_text("set -o errexit -o nounset -o pipefail\nmode=old\nOPT=/nowhere\n"
+                                      + fn.replace("/data/", f"{data.as_posix()}/") + "\nlist_connectors\n")
+    base = data / "c1/connectors-before"
+
+    def listing(lines, rc=0):
+        (tmp_path / "out").write_text("\n".join(lines) + "\n")
+        env = {**os.environ, "STUB_OUT": (tmp_path / "out").as_posix(), "STUB_RC": str(rc),
+               "PATH": f"{bindir.as_posix()}:{os.environ.get('PATH', '')}"}
+        out = subprocess.run(["bash", (tmp_path / "list.sh").as_posix()], capture_output=True, text=True, env=env)
+        assert out.returncode == 0, out.stderr[-500:]
+        return out.stdout
+
+    assert "isn't kept for the switch" in listing(["claude.ai Gmail: https://x - Connected"], rc=1)
+    assert not base.exists()
+    listing(["Checking MCP server health...", "",
+             "claude.ai Gmail: https://mcp-proxy.anthropic.com/v1/mcp/a - Connected",
+             "claude.ai Google Calendar: https://mcp-proxy.anthropic.com/v1/mcp/b - Connected",
+             "plugin:discord:discord: bun run start - Connected"])
+    names = ["listed", "claude.ai Gmail", "claude.ai Google Calendar"]
+    assert base.read_text().splitlines() == names
+    listing(["Checking MCP server health..."])                       # claude.ai didn't answer
+    assert base.read_text().splitlines() == names
+    listing([f"server{i}: cmd - Connected" for i in range(60)] + ["claude.ai Home: https://x - Connected"])
+    assert base.read_text().splitlines() == names + ["claude.ai Home"]
+    loop = run[run.index("asked=0; listed_at="):run.index('bashio::log.warning "Cain\'s session ended.')]
+    assert '( list_connectors ) &' in loop and loop.index("list_connectors") < loop.index("bashio::addon.restart")
+    ask = loop[loop.index('if [ "$mode" = old ] && [ -f /data/link/specialist-signs ]'):loop.index("bashio::addon.restart")]
+    assert '[ "$(head -n 1 /data/c1/connectors-before 2>/dev/null || true)" = listed ]' in ask
+
+
 def test_cain_scripts_unset_the_supervisor_token_before_starting_anything():
     # Supervisor's token reaches /addons/self: this App's own options, owner_user_id
     # included. Both service scripts unset it before they start anything, so nothing

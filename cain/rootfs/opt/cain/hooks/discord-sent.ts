@@ -76,16 +76,23 @@ export function madeUpReviews(text: string, read: () => Reviewed[] | null = () =
 // the same note would be refused again.
 export async function tellLink(note: SentNote, post: (body: string, timeoutMs: number) => Promise<Response>,
                                wait: (ms: number) => Promise<unknown> = (ms) => Bun.sleep(ms)): Promise<boolean> {
+  return (await tellLinkOutcome(note, post, wait)) === "ok";
+}
+
+// The same, saying how it went: taken, refused for good (a 4xx other than 429: sending it
+// again changes nothing), or unanswered (no answer, or a 5xx or 429, after every try).
+export async function tellLinkOutcome(note: object, post: (body: string, timeoutMs: number) => Promise<Response>,
+                                      wait: (ms: number) => Promise<unknown> = (ms) => Bun.sleep(ms)): Promise<"ok" | "refused" | "unanswered"> {
   const body = JSON.stringify(note);
   for (let i = 0; i <= AGAIN_MS.length; i++) {
     if (i) await wait(AGAIN_MS[i - 1]);
     try {
       const r = await post(body, POST_MS);
-      if (r.ok) return true;
-      if (r.status < 500 && r.status !== 429) return false;
+      if (r.ok) return "ok";
+      if (r.status < 500 && r.status !== 429) return "refused";
     } catch { /* no answer in time: try again */ }
   }
-  return false;
+  return "unanswered";
 }
 
 function linkKey(): string {

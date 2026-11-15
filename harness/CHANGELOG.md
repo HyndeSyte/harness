@@ -4,6 +4,7 @@
 
 - The calendar App now signs everything it sends to Cain's App, with a key of its own, and takes an answer only when Cain's App signed it. Nothing changes for you.
 - A card that waits through an outage goes out once, even when its first try got through but the answer didn't.
+- A message that can't reach Cain's App for 7 days is dropped rather than risk it going out twice, and the morning digest counts it.
 - Install it together with Cain 0.12.0, Cain first. Until it's in, its cards wait at Cain's App; none is lost.
 
 ## 0.23.0

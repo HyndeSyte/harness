@@ -484,6 +484,23 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
   });
 });
 
+describe("the broker's record of what went out (C1 re-check R5)", () => {
+  test("a problem with it reaches Cain, at most every 6 hours", async () => {
+    const r = rig();
+    const told = () => r.relayed.filter((x) => x.startsWith("The Discord broker says")).length;
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false });
+    expect(told()).toBe(0);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the broker couldn't keep its record of a message that went out (ENOSPC)" });
+    expect(told()).toBe(1);
+    expect(r.relayed.at(-1)).toContain("ENOSPC");
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the same again" });
+    expect(told()).toBe(1);
+    r.later(7 * HOUR);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the same again" });
+    expect(told()).toBe(2);
+  });
+});
+
 describe("the notice that Home Assistant's connector needs signing in again", () => {
   test("one notice, whose only button opens Claude's connector settings, asking nothing back", async () => {
     const r = rig();

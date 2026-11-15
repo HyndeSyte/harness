@@ -2,7 +2,7 @@
 // limit, who may call the link in each state, what uid 1000 may read, the backup's manifest,
 // the secret values searched for, and the keys (the old relay key signs nothing).
 import { describe, expect, test } from "bun:test";
-import { chmodSync, lutimesSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lutimesSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHmac } from "node:crypto";
@@ -139,6 +139,58 @@ describe("the secret values searched for", () => {
     writeFileSync(join(d, "a.jsonl"), `{"x": "before ${"s3cret-value-abcdefgh"} after"}\n`);
     writeFileSync(join(d, "b.jsonl"), "nothing here\n");
     expect(holding(["s3cret-value-abcdefgh", ""], [join(d, "a.jsonl"), join(d, "b.jsonl")])).toEqual([join(d, "a.jsonl")]);
+  });
+});
+
+// The switch's own inputs, files one step writes and the next reads (cutover.sh, lock.sh): one
+// that's missing or can't be read fails the step, never reads as an empty list or as nothing to
+// search for (C1 re-check R4).
+describe("the switch's own inputs: a missing one fails the step, never reads as empty", () => {
+  const TOOLS = join(import.meta.dir, "../rootfs/opt/cain/c1/tools.ts");
+  const run = (...args: string[]) => Bun.spawnSync(["bun", TOOLS, ...args], { stdout: "pipe", stderr: "pipe" });
+  const setup = () => {
+    const d = mkdtempSync(join(tmpdir(), "c1-inputs-"));
+    writeFileSync(join(d, "secret.txt"), "it has s3cret-value-abcdefgh in it");
+    writeFileSync(join(d, "list"), join(d, "secret.txt") + "\0");
+    writeFileSync(join(d, "needles"), "s3cret-value-abcdefgh\n");
+    writeFileSync(join(d, "empty"), "\n");
+    writeFileSync(join(d, "none"), "");
+    return d;
+  };
+  test("the search: found when its inputs are there; a failure, with no answer written, when one is missing or holds nothing to search for", () => {
+    const d = setup();
+    expect(run("scan", join(d, "needles"), join(d, "list"), join(d, "hits")).exitCode).toBe(0);
+    expect(readFileSync(join(d, "hits"), "utf8")).toBe(join(d, "secret.txt") + "\0");
+    for (const [needles, list] of [[join(d, "gone"), join(d, "list")], [join(d, "needles"), join(d, "gone")], [join(d, "empty"), join(d, "list")]]) {
+      rmSync(join(d, "hits"), { force: true });
+      expect(run("scan", needles, list, join(d, "hits")).exitCode).not.toBe(0);
+      expect(existsSync(join(d, "hits"))).toBe(false);
+    }
+    expect(run("scan-tree", join(d, "gone"), join(d, "hits"), d).exitCode).not.toBe(0);
+    expect(run("scan-tree", join(d, "empty"), join(d, "hits"), d).exitCode).not.toBe(0);
+    expect(existsSync(join(d, "hits"))).toBe(false);
+  });
+  test("what he may read: a missing list fails; an empty one (nothing he can read) passes", () => {
+    const d = setup();
+    expect(run("allowed", join(d, "gone")).exitCode).not.toBe(0);
+    expect(run("only", join(d, "gone"), "/data/cain").exitCode).not.toBe(0);
+    expect(run("allowed", join(d, "none")).exitCode).toBe(0);
+    expect(run("only", join(d, "none"), "/data/cain").exitCode).toBe(0);
+  });
+  test("a journal that can't be read answers no step; no failures file yet is no failures", () => {
+    const d = setup();
+    const j = run("journal-check", join(d, "gone"));
+    expect([j.exitCode !== 0, j.stdout.toString()]).toEqual([true, ""]);
+    expect(run("may-retry", join(d, "gone")).exitCode).toBe(0);
+  });
+  test("every use of them in the switch and the lock stops it on a failure", () => {
+    const dir = join(import.meta.dir, "../rootfs/opt/cain/c1");
+    for (const f of ["cutover.sh", "lock.sh"]) {
+      const lines = readFileSync(join(dir, f), "utf8").replace(/\\\n\s*/g, " ").split("\n");
+      const uses = lines.filter((l) => /"\$\{T\[@\]\}" (scan|scan-tree|allowed|only|readable|secrets) /.test(l) && !/^\s*secrets\(\)/.test(l));
+      expect(uses.length).toBeGreaterThan(f === "cutover.sh" ? 8 : 2);
+      for (const l of uses) expect([f, l.trim(), /\|\| (abort|stop|die)\b/.test(l)]).toEqual([f, l.trim(), true]);
+    }
   });
 });
 

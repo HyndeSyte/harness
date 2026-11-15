@@ -111,6 +111,10 @@ if [ "$state" = fresh ]; then
   done
   "${T[@]}" may-retry "$FAILED" || { log "the switch failed 3 times; it's tried again 6 hours after the last"; exit 1; }
   [ -d "$D/.claude" ] && [ -d "$D/work" ] && [ -f "$D/.claude/channels/discord/.env" ] || { log "no old layout to switch from"; exit 1; }
+  # His claude.ai connectors as the old way listed them (the run script): without a listing that
+  # went through, the switch couldn't check he keeps them all, so it waits for one (C1 re-check).
+  [ -f "$C/connectors-before" ] && [ "$(head -n 1 "$C/connectors-before")" = listed ] \
+    || { log "his connectors haven't been listed the old way yet: the switch waits for a listing that goes through"; exit 1; }
   install -d -m 0700 -o root -g root "$C" && chmod 0700 "$C" || stop "no /data/c1"
 
   # 1. Begin.
@@ -197,11 +201,10 @@ if [ "$state" = fresh ]; then
   # His claude.ai connectors (his mail, his calendars) must all still load under his new rules
   # (the managed MCP allowlist): the old way kept their names (the run script's connector check),
   # and one missing undoes the switch rather than leave him without it.
-  if [ -s "$C/connectors-before" ]; then
-    listed="$("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 timeout 180 claude mcp list 2>/dev/null || true)"
-    missing="$(printf '%s\n' "$listed" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u | comm -13 - "$C/connectors-before")"
-    [ -z "$missing" ] || abort "his connectors wouldn't all load under his new rules (missing: $(printf '%s' "$missing" | tr '\n' ',' | cut -c1-200))"
-  fi
+  # A listing as him that fails lists none, so every one recorded counts as missing.
+  listed="$("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 timeout 180 claude mcp list 2>/dev/null || true)"
+  missing="$(printf '%s\n' "$listed" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u | comm -13 - <(tail -n +2 "$C/connectors-before"))"
+  [ -z "$missing" ] || abort "his connectors wouldn't all load under his new rules (missing: $(printf '%s' "$missing" | tr '\n' ',' | cut -c1-200))"
   kp validate-1
   # Whatever the validation started is ended, not trusted to have ended: every process of uid
   # 1000 and 1001, checked gone, before the journal moves on.
