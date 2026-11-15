@@ -12,8 +12,12 @@
 // Commands only the owner runs, by hand:
 //   worker.ts bind-profile --attended   once at setup: sets the profile marker the canary page needs, in the dedicated profile only
 //   worker.ts probe --attended          the supervised probe: the only way to the first confirm-profile (no queued job runs)
-//   worker.ts confirm-profile           records the probe's evidence as the profile's fingerprint and the pinned hashes
-//   worker.ts check-host                checks the registered native host manifest is the one install.json names
+//   worker.ts confirm-profile --accept-boundary   records the probe's evidence as the profile's fingerprint and the pinned
+//                                       hashes, with his acceptance of the stated boundary; prints the probe cases that ran
+//                                       and those that remain unverified on this PC
+//   worker.ts check-host                checks the registered native host manifest (every registry view) is the one install.json
+//                                       names, and reports the pinned against the current CLI
+//   worker.ts check-cli                 the pinned against the current CLI, by version and executable hash
 //   worker.ts owner-keygen --kid <id> --out <dir>      his allowlist key (passphrase in PC_OWNER_PASSPHRASE)
 //   worker.ts owner-fpr <owner.pub>     the fingerprint of his allowlist key, for install.json
 //   worker.ts sign-allowlist <entries.json> --key <pem> --kid <id> --out <allowlist.json>
@@ -49,7 +53,7 @@ import { fileURLToPath } from "node:url";
 import { createHash, generateKeyPairSync, createPrivateKey, createPublicKey, randomBytes, type KeyObject } from "node:crypto";
 import {
   addressCtxFor, canonical, checkFacts, factsFor, isReadOnly, jobText, keyFingerprint, LEASE_MS, newAttempt, onLogin, onPin, onRedirect, parseAllowlist,
-  parseHeartbeat, parseJob, parseKeys, parseResult, pinFor, riskyEntry, resultText, sanitizeUrl, signAllowlist, signerOf, SKEW_MS, stateAfter,
+  parseHeartbeat, parseJob, parseKeys, parseResult, pinFor, riskyMatch, resultText, sanitizeUrl, signAllowlist, signerOf, SKEW_MS, stateAfter,
   attributesGood, KID, TOOL,
   type Allow, type Checked, type Code, type FactType, type Handoff, type Heartbeat, type Job, type Reason, type Result, type Status,
 } from "./core.ts";
@@ -89,7 +93,7 @@ export interface Opts {
   platform?: string;
   has?: (file: string) => boolean;                  // whether a file exists (existsSync unless a test stands in), for CLAUDE_CODE_GIT_BASH_PATH
   skew?: (all: Job[], now: Date) => number | null;  // how far the keeper's clock runs ahead (skewMs unless a test stands in)
-  registry?: (hostName: string) => string | null | undefined; // the registered manifest's path (registeredManifest unless a test stands in)
+  registry?: (hostName: string) => RegEntry[] | undefined; // the manifest path in each registry view (registeredManifests unless a test stands in)
 }
 
 export class WorkerError extends Error {
@@ -107,6 +111,7 @@ const P = {
   confirmed: (o: Opts) => join(o.home, "confirmed.json"),
   evidence: (o: Opts) => join(o.home, "probe-evidence.json"),
   cwd: (o: Opts) => join(o.home, "session"),
+  cliConfig: (o: Opts) => join(o.home, "session-config"),
   stop: (o: Opts) => join(o.home, "STOP"),
   lock: (o: Opts) => join(o.home, "worker.lock"),
   beat: (o: Opts) => join(o.home, "heartbeat.json"),
@@ -459,18 +464,20 @@ export function outsideConfig(o: Opts): OutsideConfig {
 }
 
 // ---- The dedicated Chrome profile: a fingerprint ----------------------------------------
-// Its identity: the user data folder (resolved), the profile's name, the extension's id and
-// Chrome's major version. Its versions: the extension's and the claude command's.
-// confirm-profile records both; every preflight recomputes them. A change of identity
-// fails closed (profile_changed). A change of version stops every run, attended ones too
-// (probe_stale): only the supervised probe runs until a new probe passes and
-// confirm-profile records the new versions.
+// Its identity: the user data folder (resolved), the profile's name and the extension's id.
+// Its versions: the extension's active version (the one the profile's preferences say
+// Chrome runs), the claude command's, and Chrome's own (its full version, from the user
+// data folder's Last Version; chrome_major is its first number). confirm-profile records
+// both; every preflight recomputes them. A change of identity fails closed
+// (profile_changed). A change of any version stops every run, attended ones too
+// (probe_stale, with the reason naming which version): only the supervised probe runs
+// until a new probe passes and confirm-profile records the new versions.
 export interface Fingerprint {
-  user_data_dir: string; profile_name: string; extension_id: string; chrome_major: number; extension_version: string; cli_version: string;
+  user_data_dir: string; profile_name: string; extension_id: string; chrome_major: number; chrome_version: string; extension_version: string; cli_version: string;
 }
-const FP_KEYS = ["user_data_dir", "profile_name", "extension_id", "chrome_major", "extension_version", "cli_version"];
-const IDENTITY = ["user_data_dir", "profile_name", "extension_id", "chrome_major"] as const;
-const VERSIONS = ["extension_version", "cli_version"] as const;
+const FP_KEYS = ["user_data_dir", "profile_name", "extension_id", "chrome_major", "chrome_version", "extension_version", "cli_version"];
+const IDENTITY = ["user_data_dir", "profile_name", "extension_id"] as const;
+const VERSIONS = ["extension_version", "cli_version", "chrome_version", "chrome_major"] as const;
 
 const vparts = (v: string) => v.split(".").map((n) => parseInt(n, 10) || 0);
 const vcmp = (a: string, b: string) => { const x = vparts(a), y = vparts(b); for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) - (y[i] ?? 0); return 0; };
@@ -484,9 +491,11 @@ export function cliVersion(inst: Install): string | null {
   } catch { return null; }
 }
 
-// The extension's version on disk: the "version" in the manifest.json of the newest version
-// folder under the dedicated profile's Extensions (what Chrome loads), or null when there
-// is none or it can't be read. A manifest whose version isn't its folder's is null too.
+// The extension's newest version folder on disk: the "version" in the manifest.json of the
+// newest version folder under the dedicated profile's Extensions, or null when there is
+// none or it can't be read. A manifest whose version isn't its folder's is null too. This
+// is not necessarily what Chrome runs: Chrome unpacks an update into a new folder and
+// switches to it only when it restarts (activeExtensionVersion, below, is what it runs).
 export function diskExtensionVersion(inst: Install): string | null {
   const p = inst.profile;
   const root = join(p.user_data_dir, p.profile_directory, "Extensions", p.extension_id);
@@ -496,6 +505,43 @@ export function diskExtensionVersion(inst: Install): string | null {
   const newest = dirs.sort((a, b) => vcmp(a.replace(/_\d+$/, ""), b.replace(/_\d+$/, ""))).at(-1)!;
   const v = readJson(join(root, newest, "manifest.json"))?.version;
   return typeof v === "string" && /^\d+(\.\d+){0,3}$/.test(v) && vcmp(v, newest.replace(/_\d+$/, "")) === 0 ? v : null;
+}
+
+// The extension's active version: the one the dedicated profile's preferences say Chrome
+// runs. Chrome keeps each extension's entry under extensions.settings.<id>, in Secure
+// Preferences or Preferences (the entry can be split between them); the version is its
+// manifest's version where the entry carries one, else the version folder its path names
+// ("<id>/<version>_<n>"). That folder's manifest.json must exist and agree. null when the
+// entry, its version or its folder can't be read: the preflight fails closed on it.
+export function activeExtensionVersion(inst: Install): string | null {
+  const p = inst.profile;
+  const dir = join(p.user_data_dir, p.profile_directory);
+  const VER = /^\d+(\.\d+){0,3}$/;
+  let version: string | null = null, folder: string | null = null;
+  for (const f of ["Secure Preferences", "Preferences"]) {
+    const e = readJson(join(dir, f))?.extensions?.settings?.[p.extension_id];
+    if (!e || typeof e !== "object") continue;
+    const mv = e.manifest?.version;
+    if (typeof mv === "string" && VER.test(mv)) version ??= mv;
+    const m = typeof e.path === "string" ? /^([a-p]{32})[\\/](\d+(?:\.\d+){0,3})(?:_\d+)?$/.exec(e.path) : null;
+    if (m && m[1] === p.extension_id) { folder ??= e.path.slice(33); version ??= m[2]; }
+  }
+  if (!version) return null;
+  const root = join(p.user_data_dir, p.profile_directory, "Extensions", p.extension_id);
+  let dirs: string[] = [];
+  try { dirs = readdirSync(root); } catch { return null; }
+  const at = folder && dirs.includes(folder) ? folder : dirs.find((d) => vcmp(d.replace(/_\d+$/, ""), version!) === 0 && /^\d+(\.\d+){0,3}(_\d+)?$/.test(d));
+  if (!at) return null;
+  const v = readJson(join(root, at, "manifest.json"))?.version;
+  return typeof v === "string" && vcmp(v, version) === 0 ? version : null;
+}
+
+// An extension update Chrome has unpacked but not switched to: the newest version folder
+// isn't the active version. Every run stops (update_pending) until the owner restarts
+// the Cain jobs Chrome, which switches to it (and then a new probe confirms it).
+export function updatePending(inst: Install): boolean {
+  const active = activeExtensionVersion(inst), newest = diskExtensionVersion(inst);
+  return !!active && !!newest && vcmp(active, newest) !== 0;
 }
 
 // The claude executable's SHA-256, read in pieces (it is large), or null when it can't be read.
@@ -520,20 +566,23 @@ export function fingerprint(o: Opts, inst: Install): Fingerprint | null {
   const dir = join(p.user_data_dir, p.profile_directory);
   const name = readJson(join(dir, "Preferences"))?.profile?.name ?? "";
   if (name !== p.profile_name) return null;
-  const extension_version = diskExtensionVersion(inst);
+  const extension_version = activeExtensionVersion(inst);
   if (!extension_version) return null;
-  let chrome_major = 0;
-  try { chrome_major = parseInt(readFileSync(join(p.user_data_dir, "Last Version"), "utf8").trim().split(".")[0], 10) || 0; } catch { chrome_major = 0; }
+  let chrome_version = "";
+  try { chrome_version = readFileSync(join(p.user_data_dir, "Last Version"), "utf8").trim(); } catch { chrome_version = ""; }
+  const chrome_major = /^\d+(\.\d+){1,3}$/.test(chrome_version) ? parseInt(chrome_version.split(".")[0], 10) || 0 : 0;
   if (!chrome_major) return null;
   const cli_version = (o.cliVersion ?? (() => cliVersion(inst)))();
   if (!cli_version) return null;
-  return { user_data_dir: resolve(p.user_data_dir), profile_name: name, extension_id: p.extension_id, chrome_major, extension_version, cli_version };
+  return { user_data_dir: resolve(p.user_data_dir), profile_name: name, extension_id: p.extension_id, chrome_major, chrome_version, extension_version, cli_version };
 }
 const sameParts = (a: Fingerprint, b: Fingerprint, keys: readonly string[]) => keys.every((k) => (a as any)[k] === (b as any)[k]);
-// Which version stopped runs (probe_stale): the extension's, or the CLI's.
+// Which version stopped runs (probe_stale): the extension's, Chrome's, or the CLI's.
 export function staleReason(o: Opts, inst: Install): Reason {
   const c = readConfirmed(o), fp = fingerprint(o, inst);
-  return c && fp && c.fingerprint.extension_version !== fp.extension_version ? "extension_version_changed" : "cli_version_changed";
+  if (c && fp && c.fingerprint.extension_version !== fp.extension_version) return "extension_version_changed";
+  if (c && fp && c.fingerprint.chrome_version !== fp.chrome_version) return "chrome_version_changed";
+  return "cli_version_changed";
 }
 
 // The default user data folder of each Chromium browser the extension could run in:
@@ -640,57 +689,83 @@ const startedBefore = (parent: Proc, child: Proc) => Number.isFinite(parent.crea
 const isHost = (p: Proc, origin: string) => p.cmd.includes(origin) && !isBrowser(p);
 const names = (cmd: string, host: string | null) => !!host && slashes(cmd.replace(/"/g, "")).includes(slashes(host));
 
+// The dedicated Chrome's browser process: Chrome (no --type, not a cmd.exe) whose command
+// line carries the worker's --user-data-dir.
+export const isDedicated = (p: Proc | undefined, inst: Install): p is Proc => !!p && !!p.cmd && isBrowser(p) && browserOf(p.cmd) === "chrome"
+  && !!uddOf(p.cmd) && sameDir(uddOf(p.cmd)!, inst.profile.user_data_dir);
+
 export function extensionElsewhere(ps: Proc[], inst: Install, host: string | null = null): boolean {
   const origin = `chrome-extension://${inst.profile.extension_id}`;
   for (const p of ps.filter((x) => isHost(x, origin))) {
-    let child = p;
-    let parent = ps.find((x) => x.pid === child.ppid);
-    if (!parent || !parent.cmd || !startedBefore(parent, child)) return true;
-    if (isBrowser(parent)) {
-      // No intermediate: Chrome started the host itself, which must be the registered one.
+    const parent = ps.find((x) => x.pid === p.ppid);
+    if (!parent || !parent.cmd || !startedBefore(parent, p)) return true;
+    if (isDedicated(parent, inst)) {
+      // No intermediate: the dedicated Chrome started the host itself, which must be the registered one.
       if (!names(p.cmd, host)) return true;
-    } else {
-      // The one intermediate: cmd.exe naming the registered host.
-      if (!CMD_EXE.test(parent.cmd) || !names(parent.cmd, host)) return true;
-      child = parent;
-      parent = ps.find((x) => x.pid === child.ppid);
-      if (!parent || !parent.cmd || !startedBefore(parent, child) || !isBrowser(parent)) return true;
+      continue;
     }
-    const udd = uddOf(parent.cmd);
-    if (browserOf(parent.cmd) !== "chrome" || !udd || !sameDir(udd, inst.profile.user_data_dir)) return true;
+    // The one intermediate: a cmd.exe naming the registered host, whose own parent (the
+    // host's grandparent) is the dedicated Chrome, started no later than that cmd.exe. A
+    // cmd.exe any other process started (Explorer, another browser, a Chrome on another
+    // folder, a Chrome child process) fails.
+    if (!CMD_EXE.test(parent.cmd) || !names(parent.cmd, host)) return true;
+    const grand = ps.find((x) => x.pid === parent.ppid);
+    if (!isDedicated(grand, inst) || !startedBefore(grand, parent)) return true;
   }
   return false;
 }
 
 // ---- The registered manifest, at setup ------------------------------------------------------
-// Chrome finds the extension's native host through the registry on Windows: the default
-// value of HKCU, then HKLM, Software\Google\Chrome\NativeMessagingHosts\<host name>. At
-// setup (bind-profile, and check-host on its own) the worker reads that path and compares
-// it with install.json's native_host_manifest, both normalized (full path, case, quotes,
-// slashes). A difference is manifest_path_mismatch: the chain above would be checked
-// against a host Chrome doesn't start. Elsewhere (no registry) there is nothing to read.
-export const HOST_KEYS = ["HKCU", "HKLM"].map((h) => `${h}\\Software\\Google\\Chrome\\NativeMessagingHosts`);
-export function registeredManifest(name: string, plat = process.platform): string | null | undefined {
+// Chrome finds the extension's native host through the registry on Windows, in every view
+// it consults: the user hive (HKCU), then the machine hive in its 64-bit view and in its
+// 32-bit view (HKLM\Software\WOW6432Node), each at Software\Google\Chrome\
+// NativeMessagingHosts\<host name>. At setup (bind-profile, and check-host on its own)
+// the worker reads the default value in each view and compares every registered one with
+// install.json's native_host_manifest, all normalized (full path, case, quotes, slashes).
+// No entry in any view, an entry in any view that differs, or more than one distinct path
+// across the views is manifest_path_mismatch: the chain below would be checked against a
+// host Chrome might not start. Elsewhere (no registry) there is nothing to read.
+export interface RegEntry { view: "HKCU" | "HKLM64" | "HKLM32"; path: string }
+export const HOST_KEY = "Software\\Google\\Chrome\\NativeMessagingHosts";
+export const HOST_VIEWS: { view: RegEntry["view"]; key: string; flag: string }[] = [
+  { view: "HKCU", key: `HKCU\\${HOST_KEY}`, flag: "/reg:64" },
+  { view: "HKLM64", key: `HKLM\\${HOST_KEY}`, flag: "/reg:64" },
+  { view: "HKLM32", key: `HKLM\\${HOST_KEY}`, flag: "/reg:32" },
+];
+export const HOST_KEYS = HOST_VIEWS.map((v) => v.key);
+export function registeredManifests(name: string, plat = process.platform): RegEntry[] | undefined {
   if (plat !== "win32") return undefined;
-  for (const k of HOST_KEYS) {
+  const out: RegEntry[] = [];
+  for (const v of HOST_VIEWS) {
     try {
-      const out = execFileSync("reg", ["query", `${k}\\${name}`, "/ve"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
-      const m = /REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/m.exec(out);
-      if (m) return m[1];
-    } catch { /* not under this hive */ }
+      const text = execFileSync("reg", ["query", `${v.key}\\${name}`, "/ve", v.flag], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
+      const m = /REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/m.exec(text);
+      if (m) out.push({ view: v.view, path: m[1] });
+    } catch { /* not in this view */ }
   }
-  return null;
+  return out;
 }
 export const normalPath = (p: string) => slashes(resolve(p.trim().replace(/^"+|"+$/g, "").trim())).replace(/\/+$/, "");
 const HOST_NAME = /^[a-z0-9_]+(\.[a-z0-9_]+)*$/;
-// null when it matches (or there's no registry to read); manifest_path_mismatch otherwise.
-export function manifestCheck(o: Opts, inst: Install): "manifest_path_mismatch" | null {
+// What the views hold, against install.json: the views whose entry differs (or "none" when
+// no view has one), and how many distinct paths they hold between them.
+export interface ManifestViews { code: "manifest_path_mismatch" | null; entries: RegEntry[]; mismatched: string[]; distinct: number }
+export function manifestViews(o: Opts, inst: Install): ManifestViews {
   const name = readJson(inst.native_host_manifest)?.name;
-  if (typeof name !== "string" || !HOST_NAME.test(name)) return "manifest_path_mismatch";
-  const reg = (o.registry ?? ((n: string) => registeredManifest(n, platform(o))))(name);
-  if (reg === undefined) return null;
-  return reg && normalPath(reg) === normalPath(inst.native_host_manifest) ? null : "manifest_path_mismatch";
+  if (typeof name !== "string" || !HOST_NAME.test(name)) return { code: "manifest_path_mismatch", entries: [], mismatched: ["unreadable_manifest"], distinct: 0 };
+  const reg = (o.registry ?? ((n: string) => registeredManifests(n, platform(o))))(name);
+  if (reg === undefined) return { code: null, entries: [], mismatched: [], distinct: 0 };
+  const want = normalPath(inst.native_host_manifest);
+  const mismatched = reg.filter((e) => normalPath(e.path) !== want).map((e) => e.view);
+  const distinct = new Set(reg.map((e) => normalPath(e.path))).size;
+  if (!reg.length) return { code: "manifest_path_mismatch", entries: reg, mismatched: ["none"], distinct };
+  return { code: mismatched.length || distinct > 1 ? "manifest_path_mismatch" : null, entries: reg, mismatched, distinct };
 }
+// null when every registered view matches (or there's no registry to read); manifest_path_mismatch otherwise.
+export const manifestCheck = (o: Opts, inst: Install): "manifest_path_mismatch" | null => manifestViews(o, inst).code;
+const manifestDetail = (m: ManifestViews) => `the native host manifest registered for Claude in Chrome isn't the one install.json names (native_host_manifest): `
+  + (m.mismatched.includes("none") ? "no registry view has an entry" : `${m.mismatched.join(", ") || "the views disagree"} differs${m.distinct > 1 ? `; ${m.distinct} distinct paths across the views` : ""}`)
+  + (m.mismatched.includes("HKLM32") ? " (a WOW6432Node entry: see Troubleshooting)" : "");
 
 // The extension's hosts left behind by a browser that has gone: their parent is gone, or
 // its PID now belongs to a process that started after them. No browser can be using one,
@@ -722,16 +797,20 @@ const chromeRunning = (udd: string) => ["lockfile", "SingletonLock", "SingletonS
 // deny_cli_version and cli_sha256: the CLI the slowed-hook check (the permission layer
 // refusing a navigation on its own) was seen on, by version and by the executable's hash.
 // A run on any other CLI refuses (probe_stale): a new probe, a new confirmation.
+// boundary_version: the version of the stated boundary (BOUNDARY_TEXT) the owner accepted
+// with confirm-profile --accept-boundary. Runs refuse (boundary_not_accepted) until the
+// confirmation holds the current one; a confirmation from before it holds none.
 export interface Confirmed {
   v: 1; at: string; fingerprint: Fingerprint; settings_sha256: string; prompt_sha256: string; config_sha256: string; deny_check: boolean;
-  read_context: boolean; live_extension_version: boolean; deny_cli_version: string; cli_sha256: string;
+  read_context: boolean; live_extension_version: boolean; deny_cli_version: string; cli_sha256: string; boundary_version: string | null;
 }
 const CONFIRMED_KEYS = ["v", "at", "fingerprint", "settings_sha256", "prompt_sha256", "config_sha256", "deny_check", "read_context", "live_extension_version",
-  "deny_cli_version", "cli_sha256"];
+  "deny_cli_version", "cli_sha256", "boundary_version"];
 const HEX64 = /^[0-9a-f]{64}$/;
 export function readConfirmed(o: Opts): Confirmed | null {
-  const c = readJson(P.confirmed(o));
-  if (!same(c, CONFIRMED_KEYS) || c.v !== 1 || !same(c.fingerprint, FP_KEYS)
+  let c = readJson(P.confirmed(o));
+  if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "boundary_version")) c = { ...c, boundary_version: null };
+  if (!same(c, CONFIRMED_KEYS) || !(c.boundary_version === null || (typeof c.boundary_version === "string" && /^\d{1,3}$/.test(c.boundary_version))) || c.v !== 1 || !same(c.fingerprint, FP_KEYS)
     || ![c.settings_sha256, c.prompt_sha256, c.config_sha256, c.cli_sha256].every((x) => typeof x === "string" && HEX64.test(x)) || typeof c.deny_check !== "boolean"
     || typeof c.deny_cli_version !== "string" || c.deny_cli_version !== c.fingerprint.cli_version
     || typeof c.read_context !== "boolean" || typeof c.live_extension_version !== "boolean") return null;
@@ -742,6 +821,8 @@ export function readConfirmed(o: Opts): Confirmed | null {
 // missing confirmation (and the pinned hashes it would hold) is checked. The worker
 // never starts Chrome: the dedicated one must already be open on its profile.
 export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false): Code | null {
+  // An extension update unpacked but not yet running: restart the Cain jobs Chrome first.
+  if (updatePending(inst)) return "update_pending";
   const fp = fingerprint(o, inst);
   if (!fp) return "wrong_profile";
   if (!bypassConfirm && !readMarker(o)) return "wrong_profile";
@@ -769,6 +850,7 @@ export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false):
   if (bypassConfirm) return null;
   const c = readConfirmed(o);
   if (!c) return "profile_unconfirmed";
+  if (c.boundary_version !== BOUNDARY_VERSION) return "boundary_not_accepted";
   if (!sameParts(c.fingerprint, fp, IDENTITY)) return "profile_changed";
   const h = sessionHashes(o);
   if (!h || h.settings_sha256 !== c.settings_sha256 || h.prompt_sha256 !== c.prompt_sha256 || !allowedTools(h.settings)
@@ -1087,16 +1169,40 @@ export function sessionArgv(inst: Install, o: Opts, settings: any, promptText: s
 // The session's environment: baseEnv (the allowlisted variables, the autoupdater off, how
 // the hook runs this file), and for this session only, the addresses nav-guard lets it
 // open and the file nav-guard logs its decisions to.
+// CLAUDE_CONFIG_DIR, in the session's environment only, is the run-scoped folder
+// session-config under the worker folder (inside its ACL): the CLI keeps its own
+// transcripts and state there, not in the owner's ~/.claude, which stays untouched.
 export function sessionEnv(o: Opts, navAllow: string[]): Record<string, string> {
-  return { ...baseEnv(o), PCW_NAV_ALLOW: JSON.stringify(navAllow), PCW_NAV_LOG: fwd(P.navLog(o)) };
+  return { ...baseEnv(o), CLAUDE_CONFIG_DIR: P.cliConfig(o), PCW_NAV_ALLOW: JSON.stringify(navAllow), PCW_NAV_LOG: fwd(P.navLog(o)) };
 }
 
+// Before each session: an empty working folder, and a fresh run-scoped config folder
+// holding only a copy of the CLI's sign-in (~/.claude/.credentials.json, where the CLI
+// keeps it on Windows), so the session is signed in without reading the owner's settings,
+// memory or transcripts. Its contents are never read or printed by the worker.
 function prepareCwd(o: Opts) {
   const d = P.cwd(o);
   rmSync(d, { recursive: true, force: true });
   mkdirSync(d, { recursive: true });
   writeFileSync(join(d, "no-mcp.json"), JSON.stringify({ mcpServers: {} }) + "\n");
   rmSync(P.navLog(o), { force: true });
+  const cfg = P.cliConfig(o);
+  rmSync(cfg, { recursive: true, force: true });
+  mkdirSync(cfg, { recursive: true });
+  const cred = join(claudeHome(o), ".credentials.json");
+  try { if (exists(cred)) writeFileSync(join(cfg, ".credentials.json"), readFileSync(cred), { mode: 0o600 }); } catch { /* the session says it isn't signed in */ }
+}
+// After each session (the end step): the run-scoped config folder is deleted, with every
+// transcript the CLI wrote there. It is the one place page text lives on the PC, and only
+// for the session's duration.
+export function endSession(o: Opts) {
+  try { rmSync(P.cliConfig(o), { recursive: true, force: true }); } catch { /* the next prepare clears it */ }
+}
+// One session, from its prepared folders to its end step.
+export async function runSession(o: Opts, argv: string[], timeoutMs: number, env: Record<string, string>): Promise<Session> {
+  prepareCwd(o);
+  try { return await (o.launch ?? launchSession)(argv, P.cwd(o), timeoutMs, env); }
+  finally { endSession(o); }
 }
 
 // ---- The guard: nav-guard, the session's hook on every Claude in Chrome tool ---------------
@@ -1302,8 +1408,7 @@ export async function bridgeCheck(o: Opts, inst: Install): Promise<Code | null> 
     url = c.url;
     let s: Session;
     try {
-      prepareCwd(o);
-      s = await (o.launch ?? launchSession)(sessionArgv(inst, o, h.settings, BRIDGE_PROMPT(c.url)), P.cwd(o), 90_000, sessionEnv(o, [c.url]));
+      s = await runSession(o, sessionArgv(inst, o, h.settings, BRIDGE_PROMPT(c.url)), 90_000, sessionEnv(o, [c.url]));
     } finally { await c.close(); }
     const st = parseStream(s.out);
     seen = st;
@@ -1314,7 +1419,12 @@ export async function bridgeCheck(o: Opts, inst: Install): Promise<Code | null> 
     const st = seen as Stream | null;
     if (!st) return "extension_unreachable";
     const given = (st.init?.tools ?? []).filter((t) => t.startsWith(CHROME)).map((t) => t.slice(CHROME.length));
-    if (!READING.every((t) => given.includes(t)) || !inventory(st, tools, h.settings.permissions.deny).ok) return "tool_inventory";
+    if (!READING.every((t) => given.includes(t)) || !inventory(st, tools, h.settings.permissions.deny).ok) {
+      // Tool names aren't secrets: the log says what was expected and what was found.
+      const n = toolNames(st, tools);
+      try { appendFileSync(P.log(o), `${clock(o).toISOString()} bridge tool_inventory expected=${n.expected.join(",")} found=${n.found.join(",") || "-"}\n`); } catch { /* never stops a run */ }
+      return "tool_inventory";
+    }
     // The hook decided every tool use of the bridge session too, and let its page through.
     const g = guardCheck(st, readNavLog(P.navLog(o)));
     if (g.code) return g.code;
@@ -1411,6 +1521,14 @@ export function inventory(s: Stream, allowed: string[], denied: string[]): Inven
   const extra = [...chrome.filter((t) => !allowed.includes(t)), ...seen.filter((t) => !t.startsWith(CHROME) && denied.includes(t)),
     ...Object.keys(s.init?.mcp ?? {}).filter((m) => m !== EXTENSION_SERVER).map((m) => `mcp:${m}`)];
   return { ok: !!s.init && !missing.length && !extra.length, seen: [...seen].sort(), missing, extra };
+}
+
+// The tool names a session was expected to have and the ones it was found with: the
+// allowed Claude in Chrome tools by short name, against every tool in its init data (the
+// extension's by short name), for the bridge's log and the smoke step's message.
+export function toolNames(s: Stream, allowed: string[]): { expected: string[]; found: string[] } {
+  const found = (s.init?.tools ?? []).map((t) => t.startsWith(CHROME) ? t.slice(CHROME.length) : t).sort();
+  return { expected: [...allowed].sort(), found };
 }
 
 // Whether the session reached the extension: its MCP server connected.
@@ -1583,10 +1701,15 @@ const writeLeftovers = (o: Opts, ids: number[]) => { try { writeFileSync(P.tabs(
 // canary page's last request carried: no marker cookie at all ("missing", which is
 // canary_cookie_missing: the cookie was cleared, or another profile answered), one that
 // isn't the bound marker ("wrong", wrong_profile), or the bound one ("ok").
+// record(): the server's own record, one line per time the canary page was served: the
+// attempt id, the run's value and the extension id it served the page for, and whether
+// the request carried the bound marker cookie (cookie_valid). The worker's canary verdict
+// is taken from this record alone (canaryOk); the model's read-back can only veto it.
 export type CookieState = "missing" | "wrong" | "ok" | null;
+export interface CanaryRecord { attempt: string; value: string; extension_id: string; cookie_valid: boolean; cookie: Exclude<CookieState, null> }
 export interface Canary {
   url: string; value: string; port: number; token: string; bindUrl: string; base: string;
-  hits: string[]; served: () => number; cookie: () => CookieState; bound: () => boolean;
+  hits: string[]; served: () => number; cookie: () => CookieState; bound: () => boolean; record: () => CanaryRecord[];
   secrets: { console: string; net: string }; inject: string; refusedHosts: () => number;
   close: () => Promise<void>;
 }
@@ -1614,6 +1737,7 @@ export async function startCanary(extensionId: string, attempt: string, opt: Can
   const secrets = { console: `k-${randomBytes(8).toString("hex")}`, net: `n-${randomBytes(8).toString("hex")}` };
   const inject = `t-${randomBytes(8).toString("hex")}`;
   const hits: string[] = [];
+  const record: CanaryRecord[] = [];
   let served = 0, bound = false, roundtrips = 0, cookie: CookieState = null, refusedHosts = 0;
   const base = `${CANARY_PATH}/${token}`;
   let port = 0;
@@ -1639,6 +1763,7 @@ console.log("probe console ${secrets.console}"); fetch("${base}/net/${secrets.ne
       const c = cookieOf(req.headers.cookie, MARKER_COOKIE);
       const good = !!c && MARKER_RE.test(c) && !!opt.markerSha && sha(c) === opt.markerSha;
       cookie = c === null ? "missing" : good ? "ok" : "wrong";
+      if (record.length < 50) record.push({ attempt, value, extension_id: extensionId, cookie_valid: good, cookie });
       ok(res, page(good));
       return;
     }
@@ -1698,24 +1823,27 @@ console.log("probe console ${secrets.console}"); fetch("${base}/net/${secrets.ne
   port = (server.address() as { port: number }).port;
   return {
     url: `http://127.0.0.1:${port}${base}`, bindUrl: `http://127.0.0.1:${port}${base}/bind`, base, value, port, token, hits, served: () => served,
-    cookie: () => cookie, bound: () => bound, secrets, inject, refusedHosts: () => refusedHosts,
+    cookie: () => cookie, bound: () => bound, record: () => record.map((r) => ({ ...r })), secrets, inject, refusedHosts: () => refusedHosts,
     close: () => new Promise((ok) => { server.closeAllConnections?.(); server.close(() => ok()); }),
   };
 }
 
 // ---- What the model saw, checked ------------------------------------------------------------
 // {"canary": {"value", "extension_id", "attempt", "profile"}, "outcome", "final_url",
-// "facts"}, nothing else. A canary read-back that doesn't match the run's value, the
-// extension id and the attempt, with "profile" the static bound word, from a canary page
-// the worker served with the bound marker cookie in its request (the server's own
-// finding, not the model's word), is the wrong profile (canary_cookie_missing when no
-// marker cookie reached the page at all), whatever else it says. Facts that break their
-// action's strict schema end the job as schema_violation; a report that breaks its shape,
-// or is longer than its cap, as result_rejected. Either way none of it is written: what
-// leaves the PC is the typed values alone. The marker itself never reaches the model.
-export interface Expected { value: string; extension_id: string; attempt: string; served: boolean; cookie: CookieState }
+// "facts"}, nothing else. The canary verdict comes from the canary server's own record
+// alone: pass only when the server served this run's page (its attempt id, its value, the
+// pinned extension id) to a request that carried the bound marker cookie. The model's
+// read-back can only veto: one that doesn't match that record (the value, the extension
+// id, the attempt, and "profile" the static bound word), or is missing, fails the run;
+// one that matches never approves on its own. A failed verdict is the wrong profile
+// (canary_cookie_missing when the page was served but no marker cookie reached it at
+// all), whatever else the report says. Facts that break their action's strict schema end
+// the job as schema_violation; a report that breaks its shape, or is longer than its cap,
+// as result_rejected. Either way none of it is written: what leaves the PC is the typed
+// values alone. The marker itself never reaches the model.
+export interface Expected { value: string; extension_id: string; attempt: string; served: boolean; cookie: CookieState; record: CanaryRecord[] }
 export const expectedOf = (c: Canary, extensionId: string, attempt: string): Expected =>
-  ({ value: c.value, extension_id: extensionId, attempt, served: c.served() > 0, cookie: c.cookie() });
+  ({ value: c.value, extension_id: extensionId, attempt, served: c.served() > 0, cookie: c.cookie(), record: c.record() });
 // Size caps on what the model reports: the whole report, and each field in it.
 export const REPORT_MAX = 2_000;
 export const REPORT_FIELD_MAX = 300;
@@ -1732,15 +1860,21 @@ export function oversize(g: Record<string, unknown>, skip: string[] = []): strin
   return k ? `${k}_size` : null;
 }
 
-export function canaryOk(given: unknown, e: Expected): boolean {
-  if (!e.served || e.cookie !== "ok" || !given || typeof given !== "object" || Array.isArray(given)) return false;
+// The server's verdict: its record holds this run's page served with the bound cookie.
+export const serverBound = (e: Expected): boolean =>
+  e.record.some((r) => r.cookie_valid && r.attempt === e.attempt && r.value === e.value && r.extension_id === e.extension_id);
+// The model's echo: a veto only. It must match the server's record exactly.
+export function echoVeto(given: unknown, e: Expected): boolean {
+  if (!given || typeof given !== "object" || Array.isArray(given)) return true;
   const g = given as Record<string, unknown>;
-  return same(g, ["value", "extension_id", "attempt", "profile"]) && g.value === e.value && g.extension_id === e.extension_id && g.attempt === e.attempt
-    && g.profile === PROFILE_BOUND;
+  return !(same(g, ["value", "extension_id", "attempt", "profile"]) && g.value === e.value && g.extension_id === e.extension_id && g.attempt === e.attempt
+    && g.profile === PROFILE_BOUND);
 }
+export const canaryOk = (given: unknown, e: Expected): boolean => serverBound(e) && !echoVeto(given, e);
 // Why a canary read-back failed: no marker cookie reached the page (canary_cookie_missing),
 // or anything else (wrong_profile).
-export const canaryCode = (e: Expected): Code => e.served && e.cookie === "missing" ? "canary_cookie_missing" : "wrong_profile";
+export const canaryCode = (e: Expected): Code => e.served && e.record.length > 0 && e.record.every((r) => r.cookie === "missing") && !serverBound(e)
+  ? "canary_cookie_missing" : "wrong_profile";
 // The report without its canary: what is judged and written holds none of it.
 export function stripCanary(given: unknown): unknown {
   if (!given || typeof given !== "object" || Array.isArray(given)) return given;
@@ -1831,15 +1965,14 @@ async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof 
   const before = cliSha(o, inst);
   let s: Session;
   try {
-    prepareCwd(o);
     const prompt = `${h.prompt}\n\n## This run\n\n${JSON.stringify(instruction(job, canary, leftovers[0] ?? null), null, 2)}\n`;
-    s = await (o.launch ?? launchSession)(sessionArgv(inst, o, h.settings, prompt), P.cwd(o), limit, sessionEnv(o, [canary.url, job.start_url, END_URL]));
+    s = await runSession(o, sessionArgv(inst, o, h.settings, prompt), limit, sessionEnv(o, [canary.url, job.start_url, END_URL]));
   } finally { await canary.close(); }
   const after = cliSha(o, inst);
   const stream = parseStream(s.out);
   const expected = expectedOf(canary, inst.profile.extension_id, job.attempt!);
   return { s, stream, expected, log: readNavLog(P.navLog(o)), canaryUrl: canary.url,
-    checks: { cliChanged: !before || before !== after, diskExtension: diskExtensionVersion(inst) } };
+    checks: { cliChanged: !before || before !== after, diskExtension: activeExtensionVersion(inst) } };
 }
 
 // The extension's version as the session saw it (its init data), against the one on disk:
@@ -2018,10 +2151,16 @@ export interface InjectLine { served: boolean; code: Code | null; leaked: boolea
 // it would have allowed must still be refused, by the permission layer alone.
 // cli_version: the CLI it was seen on; the confirmation records it, and confirm-profile
 // refuses without a pass (no run of any kind starts until it has passed on this CLI).
+// The stated boundary's cases, from the destination check: the redirect off its pin and
+// the page that opens a popup. request_reached: the off-pin request reached the server
+// anyway (the browser made it: nothing in this release prevents it); caught: the run's own
+// end check failed the session for it, after the fact. The owner sees both before he
+// accepts the boundary.
+export interface BoundaryLine { case: "redirect" | "popup"; request_reached: boolean; caught: boolean }
 export interface SlowHookLine { tried: boolean; permission_denied: boolean; opened: boolean; decisions: number; passed: boolean; cli_version: string | null }
 export interface Evidence {
   v: 1; at: string; target: string; stop_ok: boolean; smoke: string; restart: RestartLine; failed_preflight: Code | null; browser: Code; canary_ok: boolean;
-  reading_reports_url: boolean; live_extension_version: boolean; injection: InjectLine; injection_plan: InjectLine; slow_hook: SlowHookLine;
+  reading_reports_url: boolean; live_extension_version: boolean; injection: InjectLine; injection_plan: InjectLine; slow_hook: SlowHookLine; boundary: BoundaryLine[];
   inventory: string[]; inventory_ok: boolean; deny_check: boolean; deny: DenyLine[]; navigation: NavLine[]; not_exercised: string[];
   hook_intercepts: boolean; fails_closed: boolean; destinations: DestLine[]; destination_check: boolean; hits: string[];
   fingerprint: Fingerprint; settings_sha256: string; prompt_sha256: string; config_sha256: string; cli_sha256: string | null; tools: string[];
@@ -2132,7 +2271,7 @@ export function judgeSlowHook(st: Stream, c: Canary, log: Decision[], cliVersion
 
 // The dedicated Chrome's browser process, as "<pid>:<start time>", or null.
 const dedicatedChrome = (ps: Proc[] | null, inst: Install) => {
-  const p = ps?.find((x) => isBrowser(x) && browserOf(x.cmd) === "chrome" && !!uddOf(x.cmd) && sameDir(uddOf(x.cmd)!, inst.profile.user_data_dir));
+  const p = ps?.find((x) => isDedicated(x, inst));
   return p ? `${p.pid}:${p.created ?? "?"}` : null;
 };
 
@@ -2220,8 +2359,7 @@ export async function probe(o: Opts): Promise<Evidence> {
       const sc = await startCanary(inst.profile.extension_id, attempt, { markerSha: marker });
       let smokeSession: Session;
       try {
-        prepareCwd(o);
-        smokeSession = await launch(sessionArgv(inst, o, h.settings, SMOKE_PROMPT(sc)), P.cwd(o), Math.min(limit, 2 * 60_000), sessionEnv(o, [sc.url]));
+        smokeSession = await runSession(o, sessionArgv(inst, o, h.settings, SMOKE_PROMPT(sc)), Math.min(limit, 2 * 60_000), sessionEnv(o, [sc.url]));
       } finally { await sc.close(); }
       const smoke = parseStream(smokeSession.out);
       const smokeLog = readNavLog(P.navLog(o));
@@ -2236,10 +2374,10 @@ export async function probe(o: Opts): Promise<Evidence> {
         throw new WorkerError("hook_missing_decision", "nav-guard logged no decision for a tool call: the hook didn't run (see nav-decisions.jsonl)");
       if (tabsFrom(smoke.results[tabCall.id].text) === null) throw new WorkerError("extension_unreachable", "the tab-context answer lists no tabs the worker can read");
       if (sg.code) throw new WorkerError(sg.code, { unguarded: sg.unguarded, denied: sg.denied });
-      if (extensionMismatch(smoke, diskExtensionVersion(inst)))
-        throw new WorkerError("extension_version_mismatch", { live: smoke.init.extension_version, disk: diskExtensionVersion(inst) });
+      if (extensionMismatch(smoke, activeExtensionVersion(inst)))
+        throw new WorkerError("extension_version_mismatch", { live: smoke.init.extension_version, disk: activeExtensionVersion(inst) });
       const inv = inventory(smoke, tools, denied);
-      if (!inv.ok) throw new WorkerError("tool_inventory", { missing: inv.missing, extra: inv.extra });
+      if (!inv.ok) throw new WorkerError("tool_inventory", { missing: inv.missing, extra: inv.extra, ...toolNames(smoke, tools) });
       const e = expectedOf(sc, inst.profile.extension_id, attempt);
       if (!canaryOk((reportFrom(smokeSession.out) as any)?.canary, e))
         throw new WorkerError(canaryCode(e), !marker ? "the profile isn't bound yet: run bind-profile first"
@@ -2295,8 +2433,7 @@ export async function probe(o: Opts): Promise<Evidence> {
       const dt = destTargets(dc).find((x) => x.target === t)!;
       let ds: Session;
       try {
-        prepareCwd(o);
-        ds = await launch(sessionArgv(inst, o, h.settings, DEST_PROMPT(dc, dt.url)), P.cwd(o), Math.min(limit, 3 * 60_000), sessionEnv(o, [dc.url, dt.url]));
+        ds = await runSession(o, sessionArgv(inst, o, h.settings, DEST_PROMPT(dc, dt.url)), Math.min(limit, 3 * 60_000), sessionEnv(o, [dc.url, dt.url]));
       } finally { await dc.close(); }
       const dst = parseStream(ds.out);
       destStreams.push(dst);
@@ -2314,19 +2451,22 @@ export async function probe(o: Opts): Promise<Evidence> {
         caught_by: caught ? end?.off_kind ?? "tab_context" : null, other_tabs: end?.others.length ?? 0, hits: dc.hits.filter((x) => x !== "done"), passed: !pre && (dt.expect === "fail" ? caught : code === null) });
     }
     const destination_check = destinations.every((d) => d.passed);
+    const dl = (t: string) => destinations.find((x) => x.target === t);
+    const boundary: BoundaryLine[] = [
+      { case: "redirect", request_reached: !!dl("redirect")?.hits.includes("elsewhere"), caught: !!dl("redirect")?.passed },
+      { case: "popup", request_reached: !!dl("script_and_popup")?.hits.includes("popup"), caught: !!dl("script_and_popup")?.passed },
+    ];
     // 5b. The schema check: a page with a planted instruction.
     const ic = await startCanary(inst.profile.extension_id, attempt, { bait: true });
     let is: Session;
     try {
-      prepareCwd(o);
-      is = await launch(sessionArgv(inst, o, h.settings, INJECT_PROMPT(ic)), P.cwd(o), Math.min(limit, 3 * 60_000), sessionEnv(o, [`${ic.url}/inject`]));
+      is = await runSession(o, sessionArgv(inst, o, h.settings, INJECT_PROMPT(ic)), Math.min(limit, 3 * 60_000), sessionEnv(o, [`${ic.url}/inject`]));
     } finally { await ic.close(); }
     const injection = judgeInjection(is, ic);
     const pc = await startCanary(inst.profile.extension_id, attempt, { bait: true });
     let ps: Session;
     try {
-      prepareCwd(o);
-      ps = await launch(sessionArgv(inst, o, h.settings, INJECT_PROMPT(pc, "read_subscription_status")), P.cwd(o), Math.min(limit, 3 * 60_000),
+      ps = await runSession(o, sessionArgv(inst, o, h.settings, INJECT_PROMPT(pc, "read_subscription_status")), Math.min(limit, 3 * 60_000),
         sessionEnv(o, [`${pc.url}/inject-plan`]));
     } finally { await pc.close(); }
     const injection_plan = judgeInjection(ps, pc, "read_subscription_status");
@@ -2334,8 +2474,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const sl = await startCanary(inst.profile.extension_id, attempt, { markerSha: marker });
     let ss: Session;
     try {
-      prepareCwd(o);
-      ss = await launch(sessionArgv(inst, o, h.settings, SLOW_PROMPT(sl)), P.cwd(o), Math.min(limit, 5 * 60_000),
+      ss = await runSession(o, sessionArgv(inst, o, h.settings, SLOW_PROMPT(sl)), Math.min(limit, 5 * 60_000),
         { ...sessionEnv(o, [sl.url]), PCW_HOOK_STALL_MS: String(HOOK_STALL_MS) });
     } finally { await sl.close(); }
     const slow_hook = judgeSlowHook(parseStream(ss.out), sl, readNavLog(P.navLog(o)), fp.cli_version);
@@ -2346,8 +2485,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const dc = await startCanary(inst.profile.extension_id, attempt, { bait: true });
     let d: Session;
     try {
-      prepareCwd(o);
-      d = await launch(sessionArgv(inst, o, h.settings, DENY_PROMPT(dir, dc)), P.cwd(o), Math.min(limit, 10 * 60_000), sessionEnv(o, [dc.url]));
+      d = await runSession(o, sessionArgv(inst, o, h.settings, DENY_PROMPT(dir, dc)), Math.min(limit, 10 * 60_000), sessionEnv(o, [dc.url]));
     } finally { await dc.close(); }
     const dst = parseStream(d.out);
     const dirEmpty = readdirSync(dir).length === 0;
@@ -2355,7 +2493,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     rmSync(dir, { recursive: true, force: true });
     const ev: Evidence = { v: 1, at: now.toISOString(), target: pin.url, stop_ok, smoke: "connected", restart, failed_preflight, browser: r.code, canary_ok,
       reading_reports_url: readingReports(stream, ...destStreams), live_extension_version: !!smoke.init?.extension_version && !!stream.init?.extension_version,
-      injection, injection_plan, slow_hook,
+      injection, injection_plan, slow_hook, boundary,
       inventory: inv.seen, inventory_ok: inv.ok && inventory(stream, tools, denied).ok && inventory(dst, tools, denied).ok,
       deny_check: dv.passed && destination_check, deny: dv.deny, navigation: dv.navigation, not_exercised: dv.not_exercised,
       hook_intercepts: dv.hook_intercepts, fails_closed: dv.fails_closed, destinations, destination_check, hits: dc.hits.filter((x) => x !== "done"),
@@ -2385,8 +2523,8 @@ export async function bindProfile(o: Opts): Promise<{ bound: string }> {
   const h = sessionHashes(o);
   const tools = h ? allowedTools(h.settings) : null;
   if (!h || !tools) throw new WorkerError("untrusted_config");
-  const reg = manifestCheck(o, inst);
-  if (reg) throw new WorkerError(reg, "the native host manifest registered for Claude in Chrome isn't the one install.json names (native_host_manifest)");
+  const reg = manifestViews(o, inst);
+  if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
   const pre = browserPreflight(o, inst, true) ?? chromeBusy(o);
   if (pre) throw new WorkerError(pre);
   const now = clock(o);
@@ -2399,11 +2537,10 @@ export async function bindProfile(o: Opts): Promise<{ bound: string }> {
     const c = await startCanary(inst.profile.extension_id, attempt, { markerSha, bind: marker });
     let s: Session;
     try {
-      prepareCwd(o);
-      s = await (o.launch ?? launchSession)(sessionArgv(inst, o, h.settings, BIND_PROMPT(c)), P.cwd(o), 2 * 60_000, sessionEnv(o, [c.bindUrl, c.url]));
+      s = await runSession(o, sessionArgv(inst, o, h.settings, BIND_PROMPT(c)), 2 * 60_000, sessionEnv(o, [c.bindUrl, c.url]));
     } finally { await c.close(); }
     const st = parseStream(s.out);
-    const code = sessionCode(s, st, tools, h.settings.permissions.deny, diskExtensionVersion(inst)) ?? guardCheck(st, readNavLog(P.navLog(o))).code;
+    const code = sessionCode(s, st, tools, h.settings.permissions.deny, activeExtensionVersion(inst)) ?? guardCheck(st, readNavLog(P.navLog(o))).code;
     if (code) throw new WorkerError(code);
     if (!c.bound()) throw new WorkerError("wrong_profile", "the bind page was never opened");
     if (!canaryOk((reportFrom(s.out) as any)?.canary, expectedOf(c, inst.profile.extension_id, attempt)))
@@ -2426,7 +2563,34 @@ export async function bindProfile(o: Opts): Promise<{ bound: string }> {
 // Then: a new probe, a new confirm-profile.
 export const BROWSER_OK: readonly Code[] = ["ok", "needs_login", "already_gone"];
 
-export function confirmProfile(o: Opts): Confirmed {
+// The stated boundary of this release, which the owner accepts once with
+// confirm-profile --accept-boundary (its version is recorded in the confirmation; a new
+// version of the text needs a new acceptance). Runs refuse until he has.
+export const BOUNDARY_VERSION = "1";
+export const BOUNDARY_TEXT = "This release is supervised browsing with checked tool calls and address checks at each observation. "
+  + "It does not prevent requests the browser makes on its own: a redirect, the requests a page makes as it loads, or a popup outside Claude's tab group "
+  + "reach their addresses before any check sees them. The worker fails a run that shows them afterwards; it can't stop them happening. "
+  + "The probe's redirect and popup cases show this on this PC.";
+
+// Which probe cases ran and passed on this PC, and which remain unverified here (failed,
+// not exercised, or not covered by any probe case at all: the boundary above).
+export function probeCases(ev: Evidence): { ran: string[]; unverified: string[] } {
+  const all: [string, boolean][] = [
+    ["stop", ev.stop_ok === true], ["smoke", ev.smoke === "connected"], ["restart", ev.restart?.cookie_kept === true],
+    ["failed_preflight", !!ev.failed_preflight], ["browser_step", BROWSER_OK.includes(ev.browser)], ["canary", ev.canary_ok === true],
+    ...(ev.destinations ?? []).map((d): [string, boolean] => [`destination:${d.target}`, d.passed === true]),
+    ...(ev.boundary ?? []).map((b): [string, boolean] => [`boundary:${b.case}`, b.caught === true]),
+    ["injection", ev.injection?.passed === true], ["injection_plan", ev.injection_plan?.passed === true], ["slow_hook", ev.slow_hook?.passed === true],
+    ...(ev.deny ?? []).map((d): [string, boolean] => [`deny:${d.capability}`, d.passed === true]),
+    ...(ev.navigation ?? []).map((n): [string, boolean] => [`navigation:${n.target}`, n.passed === true]),
+    ["hook_intercepts", ev.hook_intercepts === true], ["fails_closed", ev.fails_closed === true],
+    ["reading_reports_url", ev.reading_reports_url === true], ["live_extension_version", ev.live_extension_version === true],
+  ];
+  return { ran: all.filter(([, ok]) => ok).map(([n]) => n),
+    unverified: [...all.filter(([, ok]) => !ok).map(([n]) => n), "browser_initiated_requests_not_prevented"] };
+}
+
+export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}): Confirmed {
   const inst = loadInstall(o);
   if (!inst) throw new WorkerError("untrusted_config");
   const ev = readJson(P.evidence(o)) as Evidence | null;
@@ -2440,6 +2604,12 @@ export function confirmProfile(o: Opts): Confirmed {
   // a navigation the hook did not allow.
   if (ev.slow_hook?.passed !== true || typeof ev.slow_hook.cli_version !== "string" || ev.slow_hook.cli_version !== ev.fingerprint?.cli_version)
     throw new WorkerError("slow_hook_required", "the probe's slowed-hook check didn't pass: Claude Code's permission layer must refuse a navigation on its own; run the probe again");
+  // The planted-instruction cases (the token as a note, and as the plan's name) gate it
+  // too: they are cheap, and the owner is watching.
+  if (ev.injection?.passed !== true || ev.injection_plan?.passed !== true)
+    throw new WorkerError("injection_required", "the probe's planted-instruction cases didn't pass: a token planted in page text must be refused or kept out of every value; run the probe again");
+  // The stated boundary, accepted once, with the version of its text recorded.
+  if (opt.acceptBoundary !== true) throw new WorkerError("boundary_not_accepted", `read this, then run confirm-profile --accept-boundary: ${BOUNDARY_TEXT}`);
   const fp = fingerprint(o, inst);
   const h = sessionHashes(o);
   const cfg = outsideConfig(o);
@@ -2448,26 +2618,39 @@ export function confirmProfile(o: Opts): Confirmed {
   if (!cli || cli !== ev.cli_sha256) throw new WorkerError("probe_stale", "the claude executable changed since the probe: run the probe again");
   if (!h || h.settings_sha256 !== ev.settings_sha256 || h.prompt_sha256 !== ev.prompt_sha256 || !cfg.ok || cfg.sha256 !== ev.config_sha256)
     throw new WorkerError("untrusted_config");
-  // The schema checks (the planted instructions) stay for unattended runs alone, with the
-  // deny, destination and navigation checks.
+  // The deny, destination and navigation checks stay for unattended runs alone.
   const c: Confirmed = { v: 1, at: now.toISOString(), fingerprint: fp, settings_sha256: h.settings_sha256, prompt_sha256: h.prompt_sha256,
     config_sha256: cfg.sha256, deny_check: ev.deny_check === true && ev.hook_intercepts === true && ev.fails_closed === true && ev.destination_check === true
-      && Array.isArray(ev.not_exercised) && ev.not_exercised.length === 0 && ev.injection?.passed === true && ev.injection_plan?.passed === true,
+      && Array.isArray(ev.not_exercised) && ev.not_exercised.length === 0,
     // Reading tools that don't report their tab's address: every run then needs a tab
     // context after each read, and that is what lets unattended runs on (read_unverified otherwise).
     read_context: ev.reading_reports_url !== true, live_extension_version: ev.live_extension_version === true,
-    deny_cli_version: ev.slow_hook.cli_version, cli_sha256: cli };
+    deny_cli_version: ev.slow_hook.cli_version, cli_sha256: cli, boundary_version: BOUNDARY_VERSION };
   writeFileSync(P.confirmed(o), JSON.stringify(c, null, 2) + "\n");
   lockDown(o, P.confirmed(o));
   return c;
+}
+
+// check-cli: the CLI the confirmation pinned against the one installed now, by version and
+// by the executable's SHA-256. A difference is what stops runs as probe_stale
+// (cli_version_changed); the autoupdater is the usual cause.
+export function checkCli(o: Opts): { pinned_version: string | null; current_version: string | null; pinned_sha256: string | null; current_sha256: string | null; same: boolean } {
+  const inst = loadInstall(o);
+  if (!inst) throw new WorkerError("untrusted_config");
+  const c = readConfirmed(o);
+  const current_version = (o.cliVersion ?? (() => cliVersion(inst)))();
+  const current_sha256 = cliSha(o, inst);
+  const pinned_version = c?.deny_cli_version ?? null, pinned_sha256 = c?.cli_sha256 ?? null;
+  return { pinned_version, current_version, pinned_sha256, current_sha256,
+    same: !!pinned_version && pinned_version === current_version && !!pinned_sha256 && pinned_sha256 === current_sha256 };
 }
 
 // check-host: the registered manifest against install.json, on its own (setup).
 export function checkHost(o: Opts): "ok" {
   const inst = loadInstall(o);
   if (!inst) throw new WorkerError("untrusted_config");
-  const reg = manifestCheck(o, inst);
-  if (reg) throw new WorkerError(reg, "the native host manifest registered for Claude in Chrome isn't the one install.json names (native_host_manifest)");
+  const reg = manifestViews(o, inst);
+  if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
   if (!hostPath(inst)) throw new WorkerError("untrusted_config", "the registered manifest can't be read, or doesn't list the extension");
   return "ok";
 }
@@ -2492,8 +2675,9 @@ export function signAllowlistFile(entriesFile: string, keyFile: string, passphra
   const allow = Array.isArray(e) ? e : e?.allow;
   // An address with a query, or a path with a word that acts (logout, unsubscribe, delete...),
   // is refused unless its entry says "reviewed": true.
-  const risky = (Array.isArray(allow) ? allow : []).map((x: unknown, i: number) => ({ i, why: riskyEntry(x) })).filter((x: { why: string | null }) => x.why);
-  if (risky.length) throw new WorkerError("allowlist_risky_url", risky.map((x: { i: number; why: string | null }) => `entry ${x.i + 1}: ${x.why}`).join("; "));
+  // The message names the word matched and the full address it was found in, so a "reviewed" mark is deliberate.
+  const risky = (Array.isArray(allow) ? allow : []).map((x: unknown, i: number) => ({ i, m: riskyMatch(x) })).filter((x) => x.m);
+  if (risky.length) throw new WorkerError("allowlist_risky_url", risky.map((x) => `entry ${x.i + 1}: matched "${x.m!.word}" in ${x.m!.address}`).join("; "));
   const key: KeyObject = createPrivateKey({ key: readFileSync(keyFile, "utf8"), format: "pem", passphrase });
   const text = signAllowlist(kid, allow, signerOf(key));
   const check = parseAllowlist(text, new Map([[kid, createPublicKey(key)]]));
@@ -2545,14 +2729,18 @@ if (isMain && process.argv[2] === "nav-guard") {
     if (cmd === "run") run(o).then(say, fail);
     else if (cmd === "probe") probe(o).then(say, fail);
     else if (cmd === "bind-profile") bindProfile(o).then(say, fail);
-    else if (cmd === "confirm-profile") say({ confirmed: confirmProfile(o).at });
-    else if (cmd === "check-host") say({ host: checkHost(o) });
+    else if (cmd === "confirm-profile") {
+      const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });
+      const ev = readJson(P.evidence(o)) as Evidence;
+      say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, boundary_cases: ev.boundary ?? [], ...probeCases(ev) });
+    } else if (cmd === "check-host") say({ host: checkHost(o), cli: checkCli(o) });
+    else if (cmd === "check-cli") say({ cli: checkCli(o) });
     else if (cmd === "owner-keygen") say({ owner_pub: ownerKeygen(flag(args, "--kid") ?? "", flag(args, "--out") ?? o.home, process.env.PC_OWNER_PASSPHRASE ?? "") });
     else if (cmd === "owner-fpr" && a1) say({ owner_fpr: ownerFpr(a1) });
     else if (cmd === "sign-allowlist" && a1) {
       const text = signAllowlistFile(a1, flag(args, "--key") ?? "", process.env.PC_OWNER_PASSPHRASE ?? "", flag(args, "--kid") ?? "");
       const out = flag(args, "--out");
       if (out) { writeFileSync(out, text); say({ written: out }); } else process.stdout.write(text);
-    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile | check-host | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard"); process.exit(2); }
+    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | check-cli | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard"); process.exit(2); }
   } catch (e) { fail(e); }
 }

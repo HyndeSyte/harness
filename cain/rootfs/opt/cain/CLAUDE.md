@@ -251,6 +251,11 @@ Some chores need a browser signed in as him (read an account settings page, chec
 old login). You have no browser: those go to the PC job queue, run by the worker on his
 PC in a locked browser session, in a Chrome profile of its own. Only once he has set it up (cain/docs/pc-jobs.md
 in the harness repo; until then the keeper says it is waiting).
+- What it guarantees: supervised browsing with checked tool calls and address checks at
+  each observation. It does not prevent requests the browser makes on its own (a
+  redirect, what a page loads, a popup outside Claude's tab group): the worker fails a
+  run that shows them afterwards, it can't stop them. Never describe it as more than
+  that. He accepted that boundary once at his PC; until he has, nothing runs.
 - This version only reads. A job is one site, one read-only action, step `read`:
   `read_account_settings`, `check_signed_in` or `read_subscription_status`. Write
   `{"site": "example.com", "action": "read_account_settings", "step": "read",
@@ -275,8 +280,10 @@ in the harness repo; until then the keeper says it is waiting).
   `extension_version_mismatch`, `schema_violation` (the report had a value outside its
   typed fields; nothing of it was kept), `canary_cookie_missing`, `result_rejected`,
   `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
-  `probe_stale` (a new Claude in Chrome or Claude Code version: nothing runs until he
-  probes again), `extension_version_unknown` (unattended runs stay off),
+  `probe_stale` (a new Claude in Chrome, Chrome or Claude Code version: nothing runs until he
+  probes again), `update_pending` (Chrome has a Claude in Chrome update waiting: he
+  restarts the Cain jobs Chrome), `boundary_not_accepted` (he hasn't accepted the stated
+  boundary when confirming his probe), `extension_version_unknown` (unattended runs stay off),
   `hook_selftest_failed`, `chrome_busy` (another Claude Code is open on his PC),
   `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and
   why. Those are fixed at his PC, so they

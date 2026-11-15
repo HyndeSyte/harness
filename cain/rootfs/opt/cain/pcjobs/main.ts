@@ -98,12 +98,18 @@ export function readHeartbeat(dir: string): Heartbeat | null {
 
 // When a version stopped runs, the one line Cain tells Dane, naming what to run at the PC
 // (cain/docs/pc-jobs.md, "Supported versions"). null when there's nothing for him to do.
-export const REPROBE = "worker.ts probe --attended, then worker.ts confirm-profile";
+export const REPROBE = "worker.ts probe --attended, then worker.ts confirm-profile --accept-boundary";
 export function heartbeatNotice(h: Heartbeat | null): string | null {
+  if (h?.code === "update_pending")
+    return "The PC stopped taking jobs because Chrome has a Claude in Chrome update waiting. At the PC: restart the Cain jobs Chrome; the next run then asks for a new probe.";
+  if (h?.code === "boundary_not_accepted")
+    return `The PC isn't taking jobs until you accept its stated boundary. At the PC: run ${REPROBE}.`;
   if (!h?.reason) return null;
   if (h.reason === "extension_version_changed")
     return `The PC stopped taking jobs because Claude in Chrome updated. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   if (h.reason === "cli_version_changed") return `The PC stopped taking jobs because Claude Code updated. At the PC: run ${REPROBE}.`;
+  if (h.reason === "chrome_version_changed")
+    return `The PC stopped taking jobs because Chrome updated. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   return `The PC runs jobs only while you watch: Claude Code doesn't report Claude in Chrome's version, so unattended runs stay off. At the PC: run ${REPROBE} after the next Claude Code update.`;
 }
 

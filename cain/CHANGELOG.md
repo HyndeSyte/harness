@@ -27,6 +27,12 @@
 - At setup the PC checks the extension's helper is registered where your install file says (a new `check-host` command, and bind-profile), and accepts Chrome starting the helper directly.
 - Every run first checks the four reading tools by name and that the reading tools still report page addresses the way the probe saw. When Claude Code doesn't report the extension's version, a run you watch uses the version in the extension's own files instead.
 - Signing your allowlist refuses addresses with a query or words like logout, unsubscribe, delete or cancel, unless you mark the entry as reviewed.
+- Plain words on what it promises: supervised browsing, every tool call checked, every address the browser shows checked each time. It can't stop a browser from following a redirect or opening a popup on its own; it fails the run afterwards. You accept that once when you confirm the probe (`confirm-profile --accept-boundary`), and the probe shows you a redirect and a popup doing it.
+- The profile check now rests on what the PC's own check page saw, not on what the browser session says it read.
+- Confirming the probe also needs its planted-trick checks to pass, and it lists which checks ran on your PC and which remain unproven there.
+- Stricter setup checks: the extension's helper must be registered the same way in every place Chrome looks (including the 32-bit one), and its helper must come from your dedicated Chrome itself.
+- A new Chrome version also asks for a new probe, and a Claude in Chrome update Chrome hasn't switched to yet says "restart the Cain jobs Chrome" plainly. `check-cli` shows which Claude Code the PC was confirmed on against the one installed now.
+- Claude Code's own records of a run stay in a folder of the worker's that is deleted after each run; your own Claude Code folder is left alone.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
 
 ## 0.11.0

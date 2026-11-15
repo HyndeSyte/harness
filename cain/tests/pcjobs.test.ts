@@ -24,6 +24,7 @@ import {
   judgeInjection, judgeSlowHook, HOOK_STALL_MS, CANARY_PATH, MARKER_MAX_AGE_S,
   manifestCheck, normalPath, checkHost, signAllowlistFile, ownerKeygen, PROFILE_BOUND, LAST_RUN_KEYS, readsAsRecorded,
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
+  BOUNDARY_VERSION, BOUNDARY_TEXT, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   type Install, type Instruction, type Opts, type Session,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { spendNonce } from "../rootfs/opt/cain/pcjobs/confirm.ts";
@@ -427,7 +428,9 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const udd = join(home, "chrome");
   mkdirSync(join(udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
   writeFileSync(join(udd, "Default", "Extensions", EXT, "1.2.3_0", "manifest.json"), JSON.stringify({ name: "Claude", version: "1.2.3" }));
+  // Chrome's own record of the extension it runs: its entry under extensions.settings, whose path names the active version folder.
   writeFileSync(join(udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
+  writeFileSync(join(udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } }));
   writeFileSync(join(udd, "Last Version"), "131.0.6778.86");
   writeFileSync(join(udd, "lockfile"), "");
   // The profile, bound as bind-profile leaves it: its marker's hash in the worker folder,
@@ -665,7 +668,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     return { code: 0, out: stream(events), timedOut: false };
   };
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
-    acl: GOOD_ACL, files, launch, registry: () => manifest, pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), claudeHome, managed: [], managedDirs: [],
+    acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), claudeHome, managed: [], managedDirs: [],
     policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string } = {}) => {
@@ -673,7 +676,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     const h = sessionHashes(o)!;
     fileOk(join(home, "confirmed.json"), JSON.stringify({ v: 1, at: T0.toISOString(), fingerprint: fingerprint(o, inst), settings_sha256: h.settings_sha256,
       prompt_sha256: h.prompt_sha256, config_sha256: outsideConfig(o).sha256, deny_check: over.deny_check ?? true, read_context: over.read_context ?? false,
-      live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64) }, null, 2));
+      live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_VERSION }, null, 2));
   };
   if (o.confirmed !== false) confirmNow();
   const remoteFile = (path: string) => sh(["git", "show", `main:${path}`], remote);
@@ -699,6 +702,7 @@ function oneJob() {
 }
 const result = (q: ReturnType<typeof queueRig>, id: string) => JSON.parse(q.remoteFile(`results/${id}.json`));
 const attended = { attended: true };
+const ACCEPT = { acceptBoundary: true };
 
 describe("Cain's keeper", () => {
   test("writes a good job, with the queue's .gitattributes, and refuses malformed ones", () => {
@@ -793,7 +797,10 @@ describe("the PC worker: one run", () => {
     expect(env.DISABLE_AUTOUPDATER).toBe("1");
     // An allowlisted environment: nothing of the worker's own but what is listed, forward
     // slashes in what the hook command expands, and the hook's own log for this session.
-    expect(Object.keys(env).sort()).toEqual(["DISABLE_AUTOUPDATER", "HOME", "PATH", "PCW_NAV_ALLOW", "PCW_NAV_LOG", "PCW_RUNTIME", "PCW_WORKER", "SystemRoot", "TEMP"]);
+    expect(Object.keys(env).sort()).toEqual(["CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "HOME", "PATH", "PCW_NAV_ALLOW", "PCW_NAV_LOG", "PCW_RUNTIME", "PCW_WORKER", "SystemRoot", "TEMP"]);
+    // The CLI's own config folder: run-scoped, under the worker folder, gone after the session.
+    expect(env.CLAUDE_CONFIG_DIR).toBe(join(q.home, "session-config"));
+    expect(existsSync(env.CLAUDE_CONFIG_DIR)).toBe(false);
     for (const k of ["PCW_RUNTIME", "PCW_WORKER", "PCW_NAV_LOG"]) expect(env[k]).not.toContain("\\");
     // nav-guard decided every call, by tool-use id, and the end check's evidence stays on the PC.
     const log = readNavLog(join(q.home, "nav-decisions.jsonl"));
@@ -941,7 +948,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
   test("each failed check claims nothing, and its code reaches Cain in the heartbeat", async () => {
     const cases: [string, (q: ReturnType<typeof queueRig>) => void][] = [
       ["profile_unconfirmed", (q) => rmSync(join(q.home, "confirmed.json"))],
-      ["profile_changed", (q) => writeFileSync(join(q.udd, "Last Version"), "132.0.1.1")],
+      ["probe_stale", (q) => writeFileSync(join(q.udd, "Last Version"), "132.0.1.1")],
       ["profile_changed", (q) => q.install({ profile: { ...q.inst.profile, user_data_dir: q.udd + "/." + "/../chrome" } }) /* same folder */],
       ["wrong_profile", (q) => writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Person 1" } }))],
       ["wrong_profile", (q) => rmSync(join(q.udd, "Default", "Extensions"), { recursive: true })],
@@ -969,7 +976,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
       expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
       expect(q.launches).toEqual([]);
       round(q.cfg);
-      expect(heartbeatLine(readHeartbeat(q.cfg.dir))).toBe(`PC worker: ${code} at ${T0.toISOString()} (its own clock)`);
+      expect(heartbeatLine(readHeartbeat(q.cfg.dir)).split("\n")[0]).toBe(`PC worker: ${code}${code === "probe_stale" ? " (chrome_version_changed)" : ""} at ${T0.toISOString()} (its own clock)`);
     }
   });
 
@@ -997,9 +1004,13 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     expect((await run(q.opts(attended))).code).toBe("probe_stale");
     expect(JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "probe_stale", reason: "cli_version_changed" });
     q.confirmNow({ deny_check: true });
-    rmSync(join(q.udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
+    // Chrome unpacks the update into a new folder but still runs the old one: update_pending, until the Cain jobs Chrome restarts.
     mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.2.4_0"));
     writeFileSync(join(q.udd, "Default", "Extensions", EXT, "1.2.4_0", "manifest.json"), JSON.stringify({ version: "1.2.4" }));
+    expect((await run(q.opts(attended))).code).toBe("update_pending");
+    // Restarted: the profile's preferences name the new folder, and the old one is gone.
+    rmSync(join(q.udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
+    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.4_0`, state: 1 } } } }));
     expect((await run(q.opts())).code).toBe("probe_stale");
     expect((await run(q.opts(attended))).code).toBe("probe_stale");
     expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
@@ -1075,16 +1086,20 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     const c = await startCanary(EXT, "a-0123456789");
     await c.close();
     const back = { value: c.value, extension_id: EXT, attempt: "a-0123456789", profile: "bound" };
-    const e = { value: c.value, extension_id: EXT, attempt: "a-0123456789", cookie: "ok" as const };
-    expect(canaryOk(back, { ...e, served: false })).toBe(false);
-    expect(canaryOk(back, { ...e, served: true })).toBe(true);
+    // The server's own record of the page it served: the attempt, the value, the extension id, and whether the cookie was valid.
+    const rec = (cookie: "ok" | "missing" | "wrong") => [{ attempt: "a-0123456789", value: c.value, extension_id: EXT, cookie_valid: cookie === "ok", cookie }];
+    const e = { value: c.value, extension_id: EXT, attempt: "a-0123456789", cookie: "ok" as const, served: true, record: rec("ok") };
+    expect(canaryOk(back, { ...e, served: false, record: [] })).toBe(false);
+    expect(canaryOk(back, e)).toBe(true);
     // The profile check is the server's own: a page served without the bound marker in its
     // request fails, whatever the model says it read.
-    expect(canaryOk(back, { ...e, served: true, cookie: "missing" })).toBe(false);
-    expect(canaryOk(back, { ...e, served: true, cookie: "wrong" })).toBe(false);
-    expect(canaryOk({ ...back, profile: "unbound" }, { ...e, served: true })).toBe(false);
+    expect(canaryOk(back, { ...e, cookie: "missing", record: rec("missing") })).toBe(false);
+    expect(canaryOk(back, { ...e, cookie: "wrong", record: rec("wrong") })).toBe(false);
+    // A record for another attempt or value is no record of this run's page.
+    expect(canaryOk(back, { ...e, record: [{ ...rec("ok")[0], attempt: "a-zzzzzzzzzz" }] })).toBe(false);
+    expect(canaryOk({ ...back, profile: "unbound" }, e)).toBe(false);
     // A marker read back in place of the static word fails too: the page never shows one.
-    expect(canaryOk({ ...back, profile: "p-0123456789abcdef0123456789abcdef" }, { ...e, served: true })).toBe(false);
+    expect(canaryOk({ ...back, profile: "p-0123456789abcdef0123456789abcdef" }, e)).toBe(false);
     // Each run's canary is new.
     const { q } = oneJob();
     const seen: string[] = [];
@@ -1676,7 +1691,7 @@ describe("hangs, locks and clocks", () => {
     for (const name of ["spendNonce", "nonces/", "confirmGate", "go_token)", "confirm.ts\""]) expect(src).not.toContain(name);
     // The command line's commands, every one of them.
     const cli = src.slice(src.indexOf("if (isMain"));
-    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "owner-keygen", "owner-fpr", "sign-allowlist"]);
+    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "check-cli", "owner-keygen", "owner-fpr", "sign-allowlist"]);
     // Only confirm.ts holds the nonce spend, and it imports from the worker, not the other way round.
     expect(readFileSync(join(OPT, "pcjobs/confirm.ts"), "utf8")).toContain("export function spendNonce");
   });
@@ -1757,7 +1772,7 @@ describe("the supervised probe and confirm-profile", () => {
     expect(existsSync(join(q.home, "worker.lock"))).toBe(false);
     // Unconfirmed, a run still does nothing.
     expect((await run(q.opts(attended))).code).toBe("profile_unconfirmed");
-    const c = confirmProfile(q.opts());
+    const c = confirmProfile(q.opts(), ACCEPT);
     expect(readConfirmed(q.opts())).toEqual(c);
     expect(c).toMatchObject({ fingerprint: fingerprint(q.opts(), q.inst), deny_check: true, config_sha256: outsideConfig(q.opts()).sha256 });
     expect((await run(q.opts(attended))).code).toBe("needs_login");
@@ -1845,7 +1860,7 @@ describe("the supervised probe and confirm-profile", () => {
     expect(ev1.destinations.map((d) => [d.target, d.code, d.passed])).toEqual([["redirect", null, false], ["redirect_bounded", null, true], ["script_and_popup", null, false],
       ["move_and_return", null, false], ["blank_midway", null, false]]);
     expect(ev1).toMatchObject({ destination_check: false, deny_check: false });
-    expect(confirmProfile(q.opts()).deny_check).toBe(false);
+    expect(confirmProfile(q.opts(), ACCEPT).deny_check).toBe(false);
     // nav-guard not running at all: the smoke step says so, plainly, before anything else runs.
     const q2 = queueRig({ confirmed: false });
     q2.hookRuns(false);
@@ -1860,7 +1875,7 @@ describe("the supervised probe and confirm-profile", () => {
     q.during(() => { const d = join(q.home, "deny-check"); if (existsSync(d)) writeFileSync(join(d, "bash.txt"), "denied"); });
     const ev = await probe(q.opts(attended));
     expect(ev.deny_check).toBe(false);
-    expect(confirmProfile(q.opts()).deny_check).toBe(false);
+    expect(confirmProfile(q.opts(), ACCEPT).deny_check).toBe(false);
     q.install({ unattended: true });
     q.ask(READ); round(q.cfg); q.clonePc();
     expect((await run(q.opts())).code).toBe("attended_only");
@@ -1868,23 +1883,23 @@ describe("the supervised probe and confirm-profile", () => {
 
   test("confirm-profile needs a passing probe under a day old that still matches", async () => {
     const q = queueRig({ confirmed: false });
-    expect(() => confirmProfile(q.opts())).toThrow("probe_required");
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("probe_required");
     q.say((c) => ({ canary: { value: "c-wrong", extension_id: EXT, attempt: "a-0123456789" }, outcome: "seen", final_url: "https://example.com/account", facts: {} }));
     await probe(q.opts(attended));
-    expect(() => confirmProfile(q.opts())).toThrow("probe_required");
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("probe_required");
     q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: {} }));
     await probe(q.opts(attended));
     writeFileSync(join(q.udd, "Last Version"), "140.0.0.1");
-    expect(() => confirmProfile(q.opts())).toThrow("profile_changed");
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("profile_changed");
     writeFileSync(join(q.udd, "Last Version"), "131.0.6778.86");
-    expect(() => confirmProfile(q.opts({ cliVersion: () => "2.2.0" }))).toThrow("profile_changed");
+    expect(() => confirmProfile(q.opts({ cliVersion: () => "2.2.0" }), ACCEPT)).toThrow("profile_changed");
     writeFileSync(join(q.claudeHome, "settings.json"), JSON.stringify({ theme: "dark" }));
-    expect(() => confirmProfile(q.opts())).toThrow("untrusted_config");
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("untrusted_config");
     rmSync(join(q.claudeHome, "settings.json"));
     q.at(mins(25 * 60));
-    expect(() => confirmProfile(q.opts())).toThrow("probe_required");
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("probe_required");
     q.at(T0);
-    expect(confirmProfile(q.opts()).at).toBe(T0.toISOString());
+    expect(confirmProfile(q.opts(), ACCEPT).at).toBe(T0.toISOString());
   });
 
   test("a probe refuses to run while STOP is in place, and with no exact settings address on the allowlist", async () => {
@@ -2288,12 +2303,13 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     const said = (facts: unknown) => ({ code: 0, timedOut: false, out: stream([ev.result(JSON.stringify({ outcome: "seen", facts }))]) });
     expect(judgeInjection(said({ account: "****1234" }), fake("****1234", ["inject"]))).toMatchObject({ leaked: true, passed: false });
     expect(judgeInjection(said({ signed_in: true }), fake("t-0", []))).toMatchObject({ served: false, passed: false });
-    // A probe whose injection check fails leaves unattended runs off.
+    // A probe whose injection check fails gates the confirmation itself: no run of any kind.
     const bad = queueRig({ confirmed: false });
     const o = bad.opts(attended);
     const real = o.launch!;
     await probe({ ...o, launch: async (argv, cwd, ms, env) => argv[2].includes("schema check") ? { code: 0, timedOut: false, out: stream([ev.init(GIVEN), ev.result("{}")]) } : real(argv, cwd, ms, env) });
-    expect(confirmProfile(bad.opts()).deny_check).toBe(false);
+    expect(() => confirmProfile(bad.opts(), ACCEPT)).toThrow("injection_required");
+    expect(readConfirmed(bad.opts())).toBeNull();
   });
 
   test("the slowed hook: with nav-guard past its timeout the permission layer alone refuses; a layer that lets it through fails the probe", async () => {
@@ -2312,7 +2328,7 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     const ev1 = await probe({ ...o, launch: (argv, cwd, ms, env) => real(env.PCW_HOOK_STALL_MS ? argv.map((a) => a === "dontAsk" ? "default" : a) : argv, cwd, ms, env) });
     expect(ev1.slow_hook).toMatchObject({ tried: true, permission_denied: false, opened: true, passed: false, cli_version: "2.1.0" });
     // It gates the confirmation itself: no run of any kind, attended ones included.
-    expect(() => confirmProfile(q.opts())).toThrow("slow_hook_required");
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("slow_hook_required");
     expect(readConfirmed(q.opts())).toBeNull();
   });
 
@@ -2390,7 +2406,7 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     const ev1 = await probe({ ...o, launch: noUrl });
     expect(ev1.reading_reports_url).toBe(false);
     expect(ev1.destinations.find((d) => d.target === "move_and_return")).toMatchObject({ passed: true, caught_by: "tab_context" });
-    const c = confirmProfile(q.opts());
+    const c = confirmProfile(q.opts(), ACCEPT);
     expect(c).toMatchObject({ read_context: true, deny_check: true });
     // With that in place, a read with no tab context right after it isn't accepted: read_unverified.
     q.ask(READ); round(q.cfg); q.clonePc();
@@ -2439,7 +2455,7 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     expect((await run(q.opts())).code).toBe("extension_version_unknown");
     // The keeper's reader: one line naming the re-probe, for each version reason; none otherwise.
     const hb = (reason: string | null, code = "probe_stale") => parseHeartbeat(JSON.stringify({ v: 1, worker_clock: T0.toISOString(), code, job: null, stale_lock: false, skew_ms: null, reason }));
-    expect(heartbeatNotice(hb("extension_version_changed"))).toBe("The PC stopped taking jobs because Claude in Chrome updated. At the PC: restart the Cain jobs Chrome, then run worker.ts probe --attended, then worker.ts confirm-profile.");
+    expect(heartbeatNotice(hb("extension_version_changed"))).toBe("The PC stopped taking jobs because Claude in Chrome updated. At the PC: restart the Cain jobs Chrome, then run worker.ts probe --attended, then worker.ts confirm-profile --accept-boundary.");
     expect(heartbeatNotice(hb("cli_version_changed"))).toMatch(/Claude Code updated.*worker\.ts probe --attended/);
     expect(heartbeatNotice(hb(null, "idle"))).toBeNull();
     for (const r of ["extension_version_changed", "cli_version_changed", "extension_version_unknown"]) expect(heartbeatNotice(hb(r))).not.toContain("—");
@@ -2455,7 +2471,7 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     const ev = await probe(q.opts(attended));
     expect(ev.slow_hook).toMatchObject({ passed: true, cli_version: "2.1.0" });
     expect(ev.cli_sha256).toBe("c".repeat(64));
-    const c = confirmProfile(q.opts());
+    const c = confirmProfile(q.opts(), ACCEPT);
     expect(c).toMatchObject({ deny_cli_version: "2.1.0", cli_sha256: "c".repeat(64), deny_check: true });
     // Evidence without a slowed-hook pass, or one seen on another CLI, confirms nothing.
     const file = join(q.home, "probe-evidence.json");
@@ -2463,14 +2479,17 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     for (const bad of [{ ...good, slow_hook: { ...good.slow_hook, passed: false } }, { ...good, slow_hook: { ...good.slow_hook, cli_version: "2.0.9" } },
       { ...good, slow_hook: undefined }]) {
       writeFileSync(file, JSON.stringify(bad));
-      expect(() => confirmProfile(q.opts())).toThrow("slow_hook_required");
+      expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("slow_hook_required");
     }
     // The claude executable changed since the probe: confirm refuses.
     writeFileSync(file, JSON.stringify(good));
-    expect(() => confirmProfile(q.opts({ cliHash: () => "d".repeat(64) }))).toThrow("probe_stale");
-    // The schema checks stay for unattended runs alone: one that fails still confirms, with deny_check off.
+    expect(() => confirmProfile(q.opts({ cliHash: () => "d".repeat(64) }), ACCEPT)).toThrow("probe_stale");
+    // The planted-instruction cases gate the confirmation too, like the slowed hook.
     writeFileSync(file, JSON.stringify({ ...good, injection_plan: { ...good.injection_plan, passed: false } }));
-    expect(confirmProfile(q.opts())).toMatchObject({ deny_check: false, deny_cli_version: "2.1.0" });
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("injection_required");
+    // A deny check that fails still confirms, with deny_check off (unattended runs stay off).
+    writeFileSync(file, JSON.stringify({ ...good, hook_intercepts: false }));
+    expect(confirmProfile(q.opts(), ACCEPT)).toMatchObject({ deny_check: false, deny_cli_version: "2.1.0" });
     // A confirmation from before this check (no deny CLI recorded) is no confirmation.
     const conf = JSON.parse(readFileSync(join(q.home, "confirmed.json"), "utf8"));
     const { deny_cli_version: _d, ...old } = conf;
@@ -2593,17 +2612,17 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     const man = q.manifest;
     expect(normalPath(`"${man.toUpperCase()}"`)).toBe(normalPath(man));
     expect(manifestCheck(q.opts(), inst)).toBeNull();
-    expect(manifestCheck(q.opts({ registry: () => ` "${WIN ? man.replace(/\//g, "\\").toUpperCase() : man.toUpperCase()}" ` }), inst)).toBeNull();
+    expect(manifestCheck(q.opts({ registry: () => [{ view: "HKCU", path: ` "${WIN ? man.replace(/\//g, "\\").toUpperCase() : man.toUpperCase()}" ` }] }), inst)).toBeNull();
     expect(manifestCheck(q.opts({ registry: () => undefined }), inst)).toBeNull();               // no registry on this system
-    expect(manifestCheck(q.opts({ registry: () => join(q.root, "elsewhere", "host.json") }), inst)).toBe("manifest_path_mismatch");
-    expect(manifestCheck(q.opts({ registry: () => null }), inst)).toBe("manifest_path_mismatch");   // not registered at all
+    expect(manifestCheck(q.opts({ registry: () => [{ view: "HKCU", path: join(q.root, "elsewhere", "host.json") }] }), inst)).toBe("manifest_path_mismatch");
+    expect(manifestCheck(q.opts({ registry: () => [] }), inst)).toBe("manifest_path_mismatch");   // not registered at all
     expect(checkHost(q.opts())).toBe("ok");
-    expect(() => checkHost(q.opts({ registry: () => join(q.root, "elsewhere", "host.json") }))).toThrow("manifest_path_mismatch");
+    expect(() => checkHost(q.opts({ registry: () => [{ view: "HKCU", path: join(q.root, "elsewhere", "host.json") }] }))).toThrow("manifest_path_mismatch");
   });
 
   test("bind-profile refuses a registered manifest that isn't install.json's, as manifest_path_mismatch, before any session", async () => {
     const q = queueRig({ confirmed: false });
-    await expect(bindProfile(q.opts({ ...attended, registry: () => join(q.root, "elsewhere", "host.json") }))).rejects.toThrow("manifest_path_mismatch");
+    await expect(bindProfile(q.opts({ ...attended, registry: () => [{ view: "HKCU", path: join(q.root, "elsewhere", "host.json") }] }))).rejects.toThrow("manifest_path_mismatch");
     expect(q.launches).toEqual([]);
     expect((await bindProfile(q.opts(attended))).bound).toBe(T0.toISOString());
   });
@@ -2694,6 +2713,222 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     expect(a.ok && a.value[0].reviewed).toBe(true);
     expect(parseAllowlist(JSON.stringify({ ...JSON.parse(text), allow: [{ ...base, url: "https://example.com/account/delete" }] }), parseKeys(pub)).ok).toBe(false);
     expect(parseAllowlist(signAllowlist("owner-9", [{ ...base, url: "https://example.com/x", reviewed: false } as any], ownerSign), parseKeys(`owner-9 ${publicOf(OWNER.privateKey)}`)).ok).toBe(false);
+  });
+});
+
+describe("eighth review: the stated boundary, the canary from the server's record, the host chain, registry views, probe gates, versions, the CLI's own transcripts", () => {
+  test("the boundary: confirm-profile needs --accept-boundary, records the text's version, and runs refuse until the confirmation holds it; the probe shows the redirect and popup cases", async () => {
+    const q = queueRig({ confirmed: false });
+    const ev1 = await probe(q.opts(attended));
+    // The probe's redirect and popup cases: the browser made each request (nothing prevents it), and the end check caught it afterwards.
+    expect(ev1.boundary).toEqual([{ case: "redirect", request_reached: true, caught: true }, { case: "popup", request_reached: true, caught: true }]);
+    let err: any = null;
+    try { confirmProfile(q.opts()); } catch (e) { err = e; }
+    expect(err?.code).toBe("boundary_not_accepted");
+    expect(String(err?.detail)).toContain(BOUNDARY_TEXT);
+    expect(String(err?.detail)).toContain("--accept-boundary");
+    expect(BOUNDARY_TEXT).toContain("supervised browsing with checked tool calls and address checks at each observation");
+    expect(BOUNDARY_TEXT).toContain("does not prevent");
+    expect(readConfirmed(q.opts())).toBeNull();
+    const c = confirmProfile(q.opts(), ACCEPT);
+    expect(c.boundary_version).toBe(BOUNDARY_VERSION);
+    q.ask(READ); round(q.cfg); q.clonePc();
+    expect((await run(q.opts(attended))).code).toBe("ok");
+    // A confirmation without the acceptance (from before it, or of another text version): every run refuses, before any claim.
+    const conf = JSON.parse(readFileSync(join(q.home, "confirmed.json"), "utf8"));
+    const { boundary_version: _b, ...old } = conf;
+    for (const bad of [old, { ...conf, boundary_version: null }, { ...conf, boundary_version: "0" }]) {
+      q.fileOk(join(q.home, "confirmed.json"), JSON.stringify(bad));
+      q.ask(READ); round(q.cfg);
+      const before = q.launches.length;
+      expect(await run(q.opts(attended))).toEqual({ code: "boundary_not_accepted", job: null, closed: [] });
+      expect(q.launches.length).toBe(before);
+    }
+  });
+
+  test("the canary verdict comes from the server's record alone: the model reporting bound while the server saw no valid cookie is wrong_profile", async () => {
+    // Another profile's cookie (not the bound marker) reaches the page; the model claims the bound word anyway.
+    const { q, id } = oneJob();
+    q.jar.marker = `p-${"fe".repeat(16)}`;
+    q.say((_i, canary) => ({ canary: { ...canary, profile: PROFILE_BOUND }, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true } }));
+    expect(await run(q.opts(attended))).toMatchObject({ code: "wrong_profile", job: id, state: "failed" });
+    expect(result(q, id)).toMatchObject({ code: "wrong_profile", facts: {} });
+    // The same with no cookie at all: still a failure, told apart as canary_cookie_missing.
+    const two = oneJob();
+    two.q.jar.marker = null;
+    two.q.say((_i, canary) => ({ canary: { ...canary, profile: PROFILE_BOUND }, outcome: "seen", final_url: "https://example.com/account/settings", facts: {} }));
+    expect((await run(two.q.opts(attended))).code).toBe("canary_cookie_missing");
+    // Unit: the server's record decides; the echo can only veto.
+    const r = { attempt: "a-0123456789", value: "c-1", extension_id: EXT, cookie_valid: true, cookie: "ok" as const };
+    const e = { value: "c-1", extension_id: EXT, attempt: "a-0123456789", served: true, cookie: "ok" as const, record: [r] };
+    const echo = { value: "c-1", extension_id: EXT, attempt: "a-0123456789", profile: PROFILE_BOUND };
+    expect(serverBound(e)).toBe(true);
+    expect(canaryOk(echo, e)).toBe(true);
+    expect(echoVeto({ ...echo, value: "c-2" }, e)).toBe(true);
+    expect(canaryOk({ ...echo, value: "c-2" }, e)).toBe(false);                                   // a mismatch vetoes
+    expect(canaryOk(undefined, e)).toBe(false);                                                    // so does no echo
+    expect(canaryOk(echo, { ...e, record: [{ ...r, cookie_valid: false, cookie: "wrong" }] })).toBe(false);   // a match never approves alone
+    expect(canaryOk(echo, { ...e, record: [{ ...r, extension_id: "p".repeat(32) }] })).toBe(false);
+    // The server keeps that record itself, per request.
+    const m = `p-${"ab".repeat(16)}`;
+    const c = await startCanary(EXT, "a-0123456789", { markerSha: createHash("sha256").update(m).digest("hex") });
+    await fetch(c.url);
+    await fetch(c.url, { headers: { cookie: `pcw_profile=${m}` } });
+    expect(c.record()).toEqual([{ attempt: "a-0123456789", value: c.value, extension_id: EXT, cookie_valid: false, cookie: "missing" },
+      { attempt: "a-0123456789", value: c.value, extension_id: EXT, cookie_valid: true, cookie: "ok" }]);
+    await c.close();
+  });
+
+  test("the host chain through cmd.exe: its parent must be the dedicated Chrome, started no later than it; a cmd.exe any other process started is extension_elsewhere", () => {
+    const { q } = oneJob();
+    const inst = q.inst;
+    const bat = join(q.home, "host", "chrome-native-host.bat");
+    const t = (min: number) => T0.getTime() + min * 60_000;
+    const chrome = (pid: number, created = t(-60), udd = q.udd) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}"` });
+    const shell = (pid: number, ppid: number, created = t(-30)) => ({ pid, ppid, created, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""${bat}" chrome-extension://${EXT}/"` });
+    const host = (pid: number, ppid: number, created = t(-29)) => ({ pid, ppid, created, cmd: `"${bat}" chrome-extension://${EXT}/` });
+    // The dedicated Chrome started the cmd.exe: passes.
+    expect(extensionElsewhere([chrome(10), shell(11, 10), host(12, 11)], inst, bat)).toBe(false);
+    expect(isDedicated(chrome(10), inst)).toBe(true);
+    // Any other parent of the cmd.exe fails.
+    const others = [
+      { pid: 10, ppid: 1, created: t(-60), cmd: "C:\\Windows\\explorer.exe" },
+      { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${q.udd}"` },
+      chrome(10, t(-60), join(q.root, "daily")),
+      { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --type=renderer --user-data-dir="${q.udd}"` },
+      { pid: 10, ppid: 1, created: t(-60), cmd: "C:\\Windows\\system32\\cmd.exe /c start" },
+      { pid: 10, ppid: 1, created: t(-60), cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"` },
+    ];
+    for (const p of others) expect([p.cmd, extensionElsewhere([p, shell(11, 10), host(12, 11)], inst, bat)]).toEqual([p.cmd, true]);
+    // The dedicated Chrome started after the cmd.exe (its PID reused): not its parent.
+    expect(extensionElsewhere([chrome(10, t(-20)), shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
+    // A cmd.exe whose parent is gone.
+    expect(extensionElsewhere([shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
+  });
+
+  test("registry views: the user hive, then the machine hive's 64-bit and 32-bit views; any registered entry that differs, or two distinct paths, is manifest_path_mismatch", () => {
+    const { q } = oneJob();
+    const man = q.manifest, other = join(q.root, "elsewhere", "host.json");
+    const check = (entries: { view: "HKCU" | "HKLM64" | "HKLM32"; path: string }[]) => manifestViews(q.opts({ registry: () => entries }), q.inst);
+    expect(check([{ view: "HKCU", path: man }, { view: "HKLM64", path: man }, { view: "HKLM32", path: man }]).code).toBeNull();
+    expect(check([{ view: "HKLM32", path: man }]).code).toBeNull();                              // registered only in the 32-bit view
+    const wow = check([{ view: "HKCU", path: man }, { view: "HKLM32", path: other }]);
+    expect(wow).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["HKLM32"], distinct: 2 });
+    expect(check([{ view: "HKLM64", path: other }]).mismatched).toEqual(["HKLM64"]);
+    expect(check([]).code).toBe("manifest_path_mismatch");
+    let err: any = null;
+    try { checkHost(q.opts({ registry: () => [{ view: "HKCU", path: man }, { view: "HKLM32", path: other }] })); } catch (e) { err = e; }
+    expect(err?.code).toBe("manifest_path_mismatch");
+    expect(String(err?.detail)).toMatch(/HKLM32 differs; 2 distinct paths across the views \(a WOW6432Node entry: see Troubleshooting\)/);
+  });
+
+  test("probe cases gate confirmation and are listed: which ran and which remain unverified on this PC", async () => {
+    const q = queueRig({ confirmed: false });
+    q.during(() => { const d = join(q.home, "deny-check"); if (existsSync(d)) writeFileSync(join(d, "bash.txt"), "denied"); });
+    const ev1 = await probe(q.opts(attended));
+    const cases = probeCases(ev1);
+    for (const n of ["stop", "smoke", "restart", "browser_step", "injection", "injection_plan", "slow_hook", "boundary:redirect", "boundary:popup",
+      "destination:redirect", "destination:script_and_popup", "deny:shell", "navigation:other_host"]) expect([n, cases.ran.includes(n)]).toEqual([n, true]);
+    // Not covered by any case, always listed.
+    expect(cases.unverified).toContain("browser_initiated_requests_not_prevented");
+    // A case that failed is listed as unverified, not as run.
+    const failed = probeCases({ ...ev1, deny: ev1.deny.map((d) => d.capability === "click" ? { ...d, passed: false } : d), reading_reports_url: false });
+    expect(failed.unverified).toEqual(expect.arrayContaining(["deny:click", "reading_reports_url"]));
+    expect(failed.ran).not.toContain("deny:click");
+    // The command line prints them with the confirmation.
+    const src = readFileSync(WORKER_FILE, "utf8");
+    expect(src).toContain("boundary_cases: ev.boundary ?? [], ...probeCases(ev)");
+    expect(src).toContain('acceptBoundary: args.includes("--accept-boundary")');
+  });
+
+  test("the CLI: the autoupdater is off in the session, and check-cli reports the pinned against the current version and hash", async () => {
+    const { q } = oneJob();
+    expect(baseEnv(q.opts()).DISABLE_AUTOUPDATER).toBe("1");
+    expect(sessionEnv(q.opts(), []).DISABLE_AUTOUPDATER).toBe("1");
+    expect(checkCli(q.opts())).toEqual({ pinned_version: "2.1.0", current_version: "2.1.0", pinned_sha256: "c".repeat(64), current_sha256: "c".repeat(64), same: true });
+    expect(checkCli(q.opts({ cliVersion: () => "2.2.0", cliHash: () => "d".repeat(64) })))
+      .toEqual({ pinned_version: "2.1.0", current_version: "2.2.0", pinned_sha256: "c".repeat(64), current_sha256: "d".repeat(64), same: false });
+    rmSync(join(q.home, "confirmed.json"));
+    expect(checkCli(q.opts()).same).toBe(false);
+  });
+
+  test("the active extension version is the one the profile's preferences name; an unpacked newer folder is update_pending; a new Chrome version is probe_stale with its own reason", async () => {
+    const { q, id } = oneJob();
+    expect(activeExtensionVersion(q.inst)).toBe("1.2.3");
+    // A manifest version in the entry counts as well as its path; Preferences as well as Secure Preferences.
+    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({}));
+    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [EXT]: { manifest: { version: "1.2.3" } } } } }));
+    expect(activeExtensionVersion(q.inst)).toBe("1.2.3");
+    // No entry at all: no active version, and the preflight fails closed.
+    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
+    expect(activeExtensionVersion(q.inst)).toBeNull();
+    expect((await run(q.opts(attended))).code).toBe("wrong_profile");
+    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0` } } } }));
+    // A newer folder Chrome hasn't switched to: update_pending, before any claim, attended ones too.
+    mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0"));
+    writeFileSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0", "manifest.json"), JSON.stringify({ version: "1.3.0" }));
+    expect(updatePending(q.inst)).toBe(true);
+    expect(await run(q.opts(attended))).toEqual({ code: "update_pending", job: null, closed: [] });
+    expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+    rmSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0"), { recursive: true });
+    // Chrome's own version, recorded at confirmation: a change stops runs as probe_stale, reason chrome_version_changed.
+    expect(fingerprint(q.opts(), q.inst)).toMatchObject({ chrome_version: "131.0.6778.86", chrome_major: 131 });
+    writeFileSync(join(q.udd, "Last Version"), "131.0.6778.109");
+    expect((await run(q.opts(attended))).code).toBe("probe_stale");
+    const h = JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8"));
+    expect(h).toMatchObject({ code: "probe_stale", reason: "chrome_version_changed" });
+    expect(heartbeatNotice(h)).toMatch(/Chrome updated\. At the PC: restart the Cain jobs Chrome/);
+  });
+
+  test("the CLI's own transcripts: a run-scoped config folder under the worker folder, deleted after the session; a planted token is nowhere the worker keeps", async () => {
+    const TOKEN = "zq8TOKENzq8";
+    const { q, id } = oneJob();
+    writeFileSync(join(q.claudeHome, ".credentials.json"), "{\"sign-in\": \"stand-in\"}");
+    const ownBefore = readdirSync(q.claudeHome).sort();
+    const o = q.opts(attended);
+    const real = o.launch!;
+    const seen: { dir: string; cred: boolean }[] = [];
+    // The stand-in CLI writes its transcript, page text and all, where CLAUDE_CONFIG_DIR says, and prints the token on its stdout.
+    const launch: Opts["launch"] = async (argv, cwd, ms, env) => {
+      const dir = env.CLAUDE_CONFIG_DIR;
+      seen.push({ dir, cred: existsSync(join(dir, ".credentials.json")) });
+      mkdirSync(join(dir, "projects", "session"), { recursive: true });
+      writeFileSync(join(dir, "projects", "session", "transcript.jsonl"), `{"page": "Signed in. ${TOKEN}"}\n`);
+      const s = await real(argv, cwd, ms, env);
+      return { ...s, out: s.out + JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `page said ${TOKEN}` }] } }) + "\n" };
+    };
+    q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true, two_factor: `on ${TOKEN}` } }));
+    expect(await run({ ...o, launch })).toMatchObject({ code: "schema_violation", job: id });
+    expect(seen.length).toBeGreaterThan(0);
+    for (const x of seen) {
+      expect(x.dir).toBe(join(q.home, "session-config"));
+      expect(x.cred).toBe(true);                                                                   // signed in from a copy
+    }
+    expect(existsSync(join(q.home, "session-config"))).toBe(false);                              // gone after the end step
+    // The owner's own folder is untouched.
+    expect(readdirSync(q.claudeHome).sort()).toEqual(ownBefore);
+    expect(readFileSync(join(q.claudeHome, ".credentials.json"), "utf8")).toBe("{\"sign-in\": \"stand-in\"}");
+    // Nothing the worker keeps holds the token: no file in its folder (the queue clone included), no commit.
+    const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === ".git" ? [] : walk(join(d, e.name))) : [join(d, e.name)]);
+    for (const f of walk(q.home)) expect([f, readFileSync(f, "utf8").includes(TOKEN)]).toEqual([f, false]);
+    expect(q.history()).not.toContain(TOKEN);
+  });
+
+  test("messages: a bridge tool failure logs expected against found; the signing tool names the word matched and the full address", async () => {
+    const { q } = oneJob();
+    q.tools((p) => p.includes("bridge check") ? GIVEN.filter((t) => !t.endsWith("read_page")) : GIVEN);
+    expect((await run(q.opts(attended))).code).toBe("tool_inventory");
+    const log = readFileSync(join(q.home, "worker.log"), "utf8");
+    expect(log).toContain("bridge tool_inventory expected=find,get_page_text,navigate,read_page,tabs_context_mcp,tabs_create_mcp found=find,get_page_text,navigate,tabs_context_mcp,tabs_create_mcp");
+    expect(toolNames(parseStream(stream([ev.init([`${CH}find`, "Bash"])])), ["find"])).toEqual({ expected: ["find"], found: ["Bash", "find"] });
+    // The signing tool.
+    const keyDir = join(q.root, "owner-key");
+    ownerKeygen("owner-9", keyDir, "a long test passphrase");
+    const base = { site: "example.com", action: "read_account_settings", match: "exact" };
+    const sign = (entries: unknown[]) => { try { signAllowlistFile(q.write("entries.json", entries), join(keyDir, "owner-key.pem"), "a long test passphrase", "owner-9"); return null; } catch (e) { return e as any; } };
+    expect(sign([{ ...base, url: "https://example.com/account/delete" }])?.detail).toBe('entry 1: matched "delete" in https://example.com/account/delete');
+    expect(sign([{ ...base, url: "https://example.com/account", redirects: ["/account/signout/"] }])?.detail).toBe('entry 1: matched "signout" in https://example.com/account/signout/');
+    expect(sign([{ ...base, url: "https://example.com/account?tab=1" }])?.detail).toBe('entry 1: matched "query" in https://example.com/account?tab=1');
   });
 });
 
@@ -2826,7 +3061,13 @@ describe("the files around it", () => {
       "injection", "injection_plan", "contract tests", "That deny-alone check gates the confirmation itself", "slow_hook_required", "deny_cli_version",
       "An address fact is accepted only when it is exactly one of the run's approved addresses", "at most four letters or digits showing",
       "Failure records carry no values", "manifest_path_mismatch", "check-host", "HKCU", "HKLM", "allowlist_risky_url", "\"reviewed\": true",
-      "checked inside the canary server's own request handler", "The model never sees the secret", "by their exact names", "the host's parent is that Chrome itself"])
+      "checked inside the canary server's own request handler", "The model never sees the secret", "by their exact names", "the host's parent is that Chrome itself",
+      "supervised browsing with checked tool calls and address checks at each observation", "not prevention of browser-initiated requests", "--accept-boundary",
+      "boundary_version", "request_reached", "The canary verdict comes from the server's own record alone", "can only veto",
+      "whose own parent (the host's grandparent) must be the dedicated Chrome's browser process", "WOW6432Node", "every registry view Chrome consults",
+      "injection_required", "check-cli", "chrome_version_changed", "update_pending", "active", "session-config",
+      "That folder is the one place page text lives on the PC, and only for the session's duration", "browser_initiated_requests_not_prevented",
+      "matched \"delete\" in https://example.com/account/delete", "expected` against the `found"])
       expect(setup.replace(/\s+/g, " ")).toContain(w.replace(/\s+/g, " "));
     // The troubleshooting table names every code a run or the probe can end with.
     const table = setup.slice(setup.indexOf("## Troubleshooting"), setup.indexOf("## How a job runs"));
@@ -2834,8 +3075,16 @@ describe("the files around it", () => {
       "tool_inventory", "wrong_profile", "browser_unreachable", "probe_stale", "profile_changed", "profile_unconfirmed", "untrusted_config", "untrusted_files",
       "extension_elsewhere", "profile_scan_failed", "clock_skew", "queue_misconfigured", "git_failed", "browser_timeout", "url_drift", "result_rejected", "deny_check",
       "cli_changed", "extension_version_mismatch", "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing",
-      "chrome_not_restarted", "extension_version_unknown", "read_unverified", "manifest_path_mismatch", "slow_hook_required", "allowlist_risky_url"])
+      "chrome_not_restarted", "extension_version_unknown", "read_unverified", "manifest_path_mismatch", "slow_hook_required", "allowlist_risky_url",
+      "boundary_not_accepted", "update_pending", "injection_required"])
       expect([c, table.includes(`\`${c}\``)]).toEqual([c, true]);
+    // Rows for a WOW6432Node registry entry, and for the autoupdater behind probe_stale's cli_version_changed.
+    expect(table).toContain("a WOW6432Node entry");
+    expect(table).toMatch(/`probe_stale` with reason `cli_version_changed` \| `worker.ts check-cli`[^\n]*autoupdater/);
+    // Cain's rules say what the release guarantees, and what it doesn't.
+    const rules = readFileSync(join(OPT, "CLAUDE.md"), "utf8");
+    for (const w of ["supervised browsing with checked tool calls and address checks", "It does not prevent requests the browser makes on its own",
+      "update_pending", "boundary_not_accepted"]) expect(rules.replace(/\s+/g, " ")).toContain(w);
     // A troubleshooting row for an unexpected intermediate in the native host's parent chain.
     expect(table).toContain("unexpected intermediate");
     // The extension needs no file access any more, and the setup note says to leave it off.

@@ -40,6 +40,7 @@ export const CODES = [
   "navigation_unguarded", "navigation_denied", "unexpected_location", "tabs_unexpected", "chrome_busy",
   "cli_changed", "extension_version_mismatch",
   "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing", "extension_version_unknown", "read_unverified",
+  "boundary_not_accepted", "update_pending",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -570,13 +571,19 @@ function entriesOk(list: unknown): Checked<Allow[]> {
 // hyphen or underscore, in any case). The word found, or null.
 export const RISKY_PATH = /log[-_]?out|sign[-_]?out|unsubscribe|confirm|delete|remove|cancel/i;
 export function riskyEntry(e: any): string | null {
+  return riskyMatch(e)?.word ?? null;
+}
+// The same, with the full address the word was found in (for a redirect or sign-in path,
+// the pin's origin with that path), so the owner sees exactly what he marks reviewed.
+export function riskyMatch(e: any): { word: string; address: string } | null {
   if (!isObj(e) || e.reviewed === true) return null;
   let u: URL;
-  try { u = new URL(String(e.url)); } catch { return "url"; }
-  if (u.search || u.href.includes("?")) return "query";
-  for (const p of [u.pathname, ...(Array.isArray(e.redirects) ? e.redirects : []), ...(Array.isArray(e.login_paths) ? e.login_paths : [])]) {
+  try { u = new URL(String(e.url)); } catch { return { word: "url", address: String(e?.url ?? "") }; }
+  if (u.search || u.href.includes("?")) return { word: "query", address: String(e.url) };
+  for (const [p, own] of [[u.pathname, true], ...(Array.isArray(e.redirects) ? e.redirects : []).map((x: unknown) => [x, false]),
+    ...(Array.isArray(e.login_paths) ? e.login_paths : []).map((x: unknown) => [x, false])] as [unknown, boolean][]) {
     const m = RISKY_PATH.exec(String(p));
-    if (m) return m[0].toLowerCase();
+    if (m) return { word: m[0].toLowerCase(), address: own ? u.href : `${u.origin}${String(p)}` };
   }
   return null;
 }
@@ -708,8 +715,9 @@ export function listLine(j: Job, r: Result | null): string {
 // reason: a fixed word on why runs stopped, when a version did it: Claude in Chrome's or
 // Claude Code's version changed since the last confirmed probe (probe_stale), or Claude
 // Code doesn't report Claude in Chrome's version, so unattended runs can't check it
-// (extension_version_unknown). null otherwise. Never free text.
-export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown"] as const;
+// (extension_version_unknown), or Chrome's own version changed since the confirmation
+// (chrome_version_changed). null otherwise. Never free text.
+export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown", "chrome_version_changed"] as const;
 export type Reason = typeof REASONS[number];
 export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed";
   job: string | null; stale_lock: boolean; skew_ms: number | null; reason: Reason | null }
