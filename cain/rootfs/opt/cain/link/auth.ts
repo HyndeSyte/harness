@@ -25,14 +25,23 @@ import { dirname } from "node:path";
 export const SIG_HEADER = "x-harness-sig";
 export const SIG_CONTEXT = "harness-link-sign-v2";
 
+// A folder synced, so a file renamed or made in it lasts a power loss (Linux needs this for the
+// name itself). Any error is the caller's (C1 re-check F2): a write whose name may not last isn't
+// durable. Windows can't open a folder to sync it, and doesn't need to; it's skipped there only.
+export function syncFolder(dir: string): void {
+  if (process.platform === "win32") return;
+  const d = openSync(dir, "r");
+  try { fsyncSync(d); } finally { closeSync(d); }
+}
+
 // A small file written whole and durably: a temp file, fsync, rename, fsync of the folder.
-export function writeSynced(path: string, body: string): void {
+export function writeSynced(path: string, body: string, sync: (dir: string) => void = syncFolder): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
   const fd = openSync(tmp, "w", 0o600);
   try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, path);
-  try { const d = openSync(dirname(path), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* not every platform syncs a folder */ }
+  sync(dirname(path));
 }
 export const SIG_WINDOW_MS = 60_000;
 // Longer than the specialist retries an operation: Harness 0.24.0 gives up on an outbox row after
@@ -95,7 +104,7 @@ export class RequestLog {
   damagedNow = false;
   // Which copy it was loaded from, when the other was damaged or behind ("" when both agreed).
   recoveredFrom = "";
-  constructor(private path: string | null, now = Date.now()) {
+  constructor(private path: string | null, now = Date.now(), private write: (path: string, body: string) => void = writeSynced) {
     if (!path) return;
     const load = (p: string): Loaded | "absent" | "bad" => {
       let text: string;
@@ -154,8 +163,8 @@ export class RequestLog {
     if (!this.path) return;
     this.gen += 1;
     const body = JSON.stringify({ gen: this.gen, ops: Object.fromEntries(this.map) });
-    writeSynced(`${this.path}.2`, body);
-    writeSynced(this.path, body);
+    this.write(`${this.path}.2`, body);
+    this.write(this.path, body);
   }
 }
 
@@ -173,7 +182,9 @@ export const RERUN_SAFE = new Set(["/card"]);
 // it failed) runs again only on a route that is safe to (RERUN_SAFE), and otherwise gets an
 // explicit unknown outcome, never a success and never a second run. A server error (5xx, or a
 // throw) is no outcome: whether it did anything isn't known, so it stays received and its retry
-// is reconciled the same way, never answered with the old error for good (C1 re-check R3).
+// is reconciled the same way, never answered with the old error for good (C1 re-check R3). An
+// operation whose "received" couldn't be recorded durably isn't done at all (503, retried: C1
+// re-check F2); one whose "done" couldn't be is answered all the same, and stays received.
 export class SignedOps {
   private inflight = new Map<string, Promise<Answer>>();
   constructor(private log: RequestLog, private now = () => Date.now(), private rerun: Set<string> = RERUN_SAFE) {}
@@ -187,14 +198,15 @@ export class SignedOps {
     const p = (async (): Promise<Answer> => {
       if (done?.state === "received" && !this.rerun.has(path)) {
         const a = { status: 409, body: JSON.stringify({ status: "unknown", said: "the link couldn't confirm this operation finished (it stopped part way, or failed); it isn't done again" }) };
-        this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body });
+        try { this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body }); } catch { /* still received: the same answer next time */ }
         return a;
       }
-      this.log.put(id, { at: this.now(), state: "received" });
+      try { this.log.put(id, { at: this.now(), state: "received" }); }
+      catch (e) { return { status: 503, body: JSON.stringify({ status: "not recorded", said: `the link couldn't record this operation durably, so it did nothing (${String(e).slice(0, 80)})` }) }; }
       let a: Answer;
       try { a = await act(); }
       catch (e) { a = { status: 500, body: JSON.stringify({ status: "error", said: String(e).slice(0, 200) }) }; }
-      if (a.status < 500) this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body });
+      if (a.status < 500) { try { this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body }); } catch { /* stays received: reconciled if it comes again */ } }
       return a;
     })();
     this.inflight.set(id, p);

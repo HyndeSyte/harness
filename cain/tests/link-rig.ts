@@ -61,6 +61,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const landWaiting: (() => void)[] = [];
   const stop = { stopped: false, at: null as number | null, broken: false };
   const harnessDown = { down: false };                // the calendar specialist doesn't take taps
+  const relayFail = { n: 0 };                         // Cain's next n lines fail to queue (a disk error)
   const t = { now: opts.now ?? NOV11_8AM };
   const files: { pending: string | null; holds: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null };
   const pulls: Record<string, Pull> = {};
@@ -141,7 +142,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const deps = {
     rest, load: () => copy(state), save: (s: State) => { state = copy(s); }, now: () => t.now,
-    relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
+    relay: (x: string) => { if (relayFail.n > 0) { relayFail.n--; throw new Error("relay queue: EIO"); } relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
     record: () => ({ ...files }), pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
     stop: {
@@ -184,7 +185,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const r = {
     get link() { return link; },
-    calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
+    calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github, relayFail,
     reports, replays, sent, discord, limitN, spy, reviews,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },

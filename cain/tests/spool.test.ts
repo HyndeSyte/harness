@@ -4,7 +4,7 @@
 // sent, a line that can't be read or a note the link refused is kept aside, and the link hears
 // that something went wrong with the next note it takes.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SentSpool } from "../rootfs/opt/cain/discord/spool";
@@ -109,6 +109,43 @@ describe("nothing dropped quietly (C1 re-check R5)", () => {
     expect(logs.some((x) => /dropped/.test(x))).toBe(true);
     await s.flush();
     expect(l.got).toEqual([]);
+  });
+
+  test("a held note goes into the spool once the disk takes it again, so a restart while the link is down doesn't lose it", async () => {
+    const d = mkdtempSync(join(tmpdir(), "spool-"));
+    const p = join(d, "later", "sent-spool.jsonl");           // its folder isn't there yet: the disk refuses
+    const l = link({ down: true });
+    const s = new SentSpool(p, l.post, () => {}, noWait);
+    s.add(note("881"));
+    await s.flush();                                           // the link down, the disk still refusing
+    expect(s.heldCount).toBe(1);
+    mkdirSync(join(d, "later"));                               // the disk takes writes again; the link is still down
+    await s.flush();
+    expect([s.heldCount, lines(p).length]).toEqual([0, 1]);
+    l.mode.down = false;
+    await new SentSpool(p, l.post, () => {}, noWait).flush();     // a new broker, after a restart
+    expect(l.got.map((n) => n.ids[0])).toEqual(["881"]);
+  });
+
+  test("if the spool can't be read again after sending, it's left as it is: a note added meanwhile survives", async () => {
+    const p = spoolAt();
+    let reads = 0;
+    const read = (path: string) => { reads++; if (reads === 2) throw new Error("EIO"); return readFileSync(path, "utf8"); };
+    let release!: () => void;
+    const slow = new Promise<void>((r) => { release = r; });
+    const got: string[] = [], logs: string[] = [];
+    const post = async (body: string) => { await slow; got.push(JSON.parse(body).ids[0]); return new Response("{}", { status: 200 }); };
+    const s = new SentSpool(p, post, (x) => logs.push(x), noWait, read);
+    s.add(note("991"));
+    const f = s.flush();
+    s.add(note("992"));                                        // while the flush waits on the link
+    release();
+    await f;
+    expect(lines(p).map((x) => JSON.parse(x).ids[0])).toEqual(["991", "992"]);   // nothing replaced
+    expect(logs.some((x) => /left as it is/.test(x))).toBe(true);
+    await s.flush();
+    expect(lines(p)).toEqual([]);
+    expect(got).toEqual(["991", "991", "992"]);                // 991 told again: harmless
   });
 
   test("notes added while a flush waits on the link stay for the next", async () => {

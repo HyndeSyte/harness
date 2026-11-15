@@ -150,6 +150,7 @@ export interface Card {
   told?: boolean;                    // Cain was told it couldn't go out by itself
   lapseTold?: boolean;               // Cain was told it expired before it reached him
   req?: string;                      // the specialist's signed request that made it (C1): one request, one card
+  announce?: string;                 // Cain's line about it, kept until it went (C1 re-check F1)
 }
 // A card's post that began and never heard back: when (at), its buttons then (rows, as a
 // digest), who made it (the link by itself, or Cain's show) and the item it went under.
@@ -980,6 +981,7 @@ export class Link {
       if (had) {
         const [hid, card] = had;
         if (DIRECT_KINDS.has(card.kind) && !card.shown && !card.outcome) await this.deliverDirect(Number(hid), card.kind);
+        this.announce(Number(hid));
         return Number(hid);
       }
     }
@@ -1003,20 +1005,37 @@ export class Link {
     const expires = toMs(c.expires);
     if (expires === null && c.expires != null && c.expires !== "")
       this.log(`card ${id}: its expiry isn't a time (${String(c.expires).slice(0, 40)}), so it has none`);
-    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due, ...(c.req ? { req: c.req } : {}) };
-    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
-    this.d.save(s);
+    // Cain's line about it, kept with the card in the same save and cleared once it went, so a
+    // request that comes again after the link stopped or failed in between tells him then.
     const flagged = w.refused.length ? flaggedLine(w.refused) : "";
+    let announce = "";
     if (DIRECT_KINDS.has(kind)) {
-      await this.deliverDirect(id, kind);
-      if (flagged) this.d.relay(`The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`);
+      if (flagged) announce = `The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`;
     } else {
       const ask = due !== null ? "It has buttons: show it now, or it goes out by itself in about 2 minutes."
         : "Show it now if it matters today, or fold it into the morning message.";
       const flag = flagged ? ` The message gate flags its words: ${flagged}. It goes out as it is; if it matters, set it right in one line of your own after it.` : "";
-      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(text, 120)}". ${buttonsLine(labelsOf(comps))}${flag} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
+      announce = `The calendar specialist has a card for Dane (card ${id}): "${excerpt(text, 120)}". ${buttonsLine(labelsOf(comps))}${flag} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`;
     }
+    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due, ...(c.req ? { req: c.req } : {}), ...(announce ? { announce } : {}) };
+    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
+    this.d.save(s);
+    if (DIRECT_KINDS.has(kind)) await this.deliverDirect(id, kind);
+    this.announce(id);
     return id;
+  }
+
+  // Tells Cain the line kept on a card, then clears it (C1 re-check F1). A card with buttons
+  // already out by itself needs no "show it" line: he heard it went out. Should the link stop
+  // between telling him and clearing it, he's told twice: harmless, since a card is posted once
+  // however often it's shown ("already out").
+  private announce(id: number): void {
+    const card = this.d.load().cards[String(id)];
+    if (!card?.announce) return;
+    if (!card.shown || DIRECT_KINDS.has(card.kind)) this.d.relay(card.announce);
+    const s = this.d.load();
+    const c = s.cards[String(id)];
+    if (c) { delete c.announce; this.d.save(s); }
   }
 
   // A notice that goes out at once (Stop, Turn back on, an alert), under no item.

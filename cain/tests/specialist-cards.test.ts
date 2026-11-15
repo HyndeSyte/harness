@@ -862,6 +862,29 @@ describe("one request, one card", () => {
     expect(r.cards().length).toBe(1);
   });
 
+  test("a card kept whose line to Cain failed: the request again tells him, once, and a card with buttons already out isn't told again", async () => {
+    const r = rig();
+    const told = (n: number) => r.relayed.filter((x) => x.includes(`has a card for Dane (card ${n})`)).length;
+    r.relayFail.n = 1;
+    await expect(r.link.addCard({ text: "A note for him", rows: [], kind: "card", req: "b".repeat(32) })).rejects.toThrow("relay queue");
+    const id = Number(Object.keys(r.state().cards).at(-1));
+    expect([told(id), r.state().cards[String(id)].announce !== undefined]).toEqual([0, true]);
+    expect(await r.link.addCard({ text: "A note for him", rows: [], kind: "card", req: "b".repeat(32) })).toBe(id);
+    expect([told(id), r.state().cards[String(id)].announce]).toEqual([1, undefined]);
+    await r.link.addCard({ text: "A note for him", rows: [], kind: "card", req: "b".repeat(32) });
+    expect(told(id)).toBe(1);
+    // With buttons, out by itself before the request came again: he heard it went out.
+    const rows = [{ type: 1, components: [{ type: 2, style: 2, label: "Undo", custom_id: "k:c:u9" }] }];
+    r.relayFail.n = 1;
+    await expect(r.link.addCard({ text: "Moved Swim.", rows, kind: "card", req: "9".repeat(32) })).rejects.toThrow("relay queue");
+    const b = Number(Object.keys(r.state().cards).at(-1));
+    r.later(3 * MIN);
+    await r.link.sweep();
+    expect(r.state().cards[String(b)].shown).toBeTruthy();
+    await r.link.addCard({ text: "Moved Swim.", rows, kind: "card", req: "9".repeat(32) });
+    expect([told(b), r.state().cards[String(b)].announce]).toEqual([0, undefined]);
+  });
+
   test("one Discord posted but whose answer was lost: the request again finds it in his DM and posts nothing more", async () => {
     const r = rig();
     r.lose.posts = 1;

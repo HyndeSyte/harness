@@ -9,7 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { boundedText, KEEP_MS, RERUN_SAFE, RequestLog, SignedOps } from "../rootfs/opt/cain/link/auth";
+import { boundedText, KEEP_MS, RERUN_SAFE, RequestLog, SignedOps, writeSynced } from "../rootfs/opt/cain/link/auth";
 
 const ID = "a".repeat(32);
 const dir = () => mkdtempSync(join(tmpdir(), "link-ops-"));
@@ -86,6 +86,25 @@ describe("each signed operation once", () => {
       const again = await ops.run(ID, "/answer", async () => { runs++; return { status: 200, body: "{}" }; });
       expect([again.status, JSON.parse(again.body).status, runs]).toEqual([409, "unknown", 0]);
     }
+  });
+
+  test("a \"received\" that couldn't be made durable (the folder's sync failed) does nothing: 503, and the route never runs", async () => {
+    const f = join(dir(), "requests.json");
+    let failing = true;
+    const write = (p: string, b: string) => writeSynced(p, b, () => { if (failing) throw new Error("EIO: the folder's sync failed"); });
+    const ops = new SignedOps(new RequestLog(f, Date.now(), write));
+    let runs = 0;
+    const act = async () => { runs++; return { status: 200, body: '{"id":5}' }; };
+    const a = await ops.run(ID, "/card", act);
+    expect([a.status, JSON.parse(a.body).status, runs]).toEqual([503, "not recorded", 0]);
+    failing = false;
+    expect(await ops.run(ID, "/card", act)).toEqual({ status: 200, body: '{"id":5}' });
+    expect(runs).toBe(1);
+  });
+
+  test("the folder's sync failing is the writer's error, never swallowed", () => {
+    const f = join(dir(), "x.json");
+    expect(() => writeSynced(f, "{}", () => { throw new Error("EIO") })).toThrow("EIO");
   });
 
   test("a refusal is an outcome: kept, and its retry gets it without running again", async () => {
