@@ -92,6 +92,6 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.12.0" \
+    io.hass.version="0.13.0" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"

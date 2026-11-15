@@ -69,6 +69,16 @@
           { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15, "onFailure": "block" }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 1", "timeout": 15 },
+          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 2", "timeout": 15 },
+          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 3", "timeout": 15 }
+        ]
+      }
     ]
   }
 }

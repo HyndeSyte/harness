@@ -412,7 +412,7 @@ export function unlabeled(text: string, item?: string, question?: string): strin
   return t.slice(m[0].length);
 }
 
-// What he sees has no machine text in it (Timing and truth, in CLAUDE.md).
+// What he sees has no machine text in it (the registry's S-014).
 function noMachineText(...texts: string[]): void {
   for (const t of texts) for (const [re, what] of MACHINE)
     if (re.test(t)) throw new Refusal(`his card can't show ${what}: write it as people say it, or leave it out`);

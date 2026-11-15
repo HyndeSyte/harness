@@ -66,9 +66,20 @@ describe("Cain's permissions", () => {
     expect(all).not.toContain("discord-send.ts");
     expect(all).not.toContain("discord-sent.ts");
     expect(all).not.toContain("discord-read.ts");
-    expect(Object.keys(settings.hooks)).toEqual(["PreToolUse"]);
+    expect(Object.keys(settings.hooks)).toEqual(["PreToolUse", "SessionStart"]);
     expect(settings.hooks.PreToolUse.map((e: any) => e.matcher)).toEqual(["RemoteTrigger"]);
     expect(settings.hooks.PreToolUse[0].hooks[0]).toEqual({ type: "command", command: "bun /opt/cain/hooks/remote-trigger.ts || exit 2", timeout: 15, onFailure: "block" });
+  });
+});
+
+// His standards (the registry) reach his session at every start and after every compaction,
+// in parts under Claude Code's cut for a hook's added context (org-v2 DESIGN 4.F).
+describe("his standards load at every start and after every compaction", () => {
+  test("one SessionStart hook per part, on start, resume, clear and compact", () => {
+    expect(settings.hooks.SessionStart).toEqual([{
+      matcher: "startup|resume|clear|compact",
+      hooks: [1, 2, 3].map((n) => ({ type: "command", command: `bun /opt/cain/standards/load.ts cain --part ${n}`, timeout: 15 })),
+    }]);
   });
 });
 

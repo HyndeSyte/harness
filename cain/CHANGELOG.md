@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.0
+
+- Your standards are now one list Cain carries everywhere. They used to live in four places, several of them twice and some in conflict; now one list holds them, sorted into rules the code enforces, steps checked as work changes hands, and judgment. Cain reloads them at every start and every time his conversation is compacted, so a rule no longer fades in a long day.
+- The laptop sessions that build Cain read the same list, and when one ends with work unfinished, that work goes on Cain's open list by itself, so nothing in flight lives only in a laptop session.
+- When you correct something, it's written down the same turn and becomes a check in the next update, not another paragraph.
+
 ## 0.12.0
 
 - Cain now runs as his own user on the Pi instead of as its administrator. The App's keys (GitHub, the review services', the Discord bot's and the Supervisor's) are out of his reach, and the checks on his messages and your Stop live where he can't change them.

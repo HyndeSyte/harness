@@ -684,10 +684,16 @@ def test_cains_cards_are_exact_and_his_words_true():
                  "never pass his Discord work to a laptop session", "(P43)", '"Got it"', "in a `note`",
                  "as a `note` on its item", "read its notes"):
         assert must in holds, must
-    timing = rules.split("## Timing and truth")[1].split("\n## ")[0]
-    for must in ("happens before it", '"asked", "sent", "started" or "done" only once', "ISO timestamps",
-                 "job, session, card, request or commit ids"):
-        assert must in timing, must
+    # Timing and truth live in his standards now (the registry, 0.13.0), which reach Cain's
+    # session at every start and after every compaction, and CLAUDE.md points to them.
+    assert "/opt/cain/standards/registry.md" in rules and "## Timing and truth" not in rules
+    registry = (CAIN / "rootfs/opt/cain/standards/registry.md").read_text(encoding="utf-8")
+    entry = lambda sid: registry.split(f"## {sid} ")[1].split("\n## ")[0]
+    for must in ("happens before it", '"Asked", "sent", "started" and "done" are said only once the source confirms',
+                 '"done" only after the read-back'):
+        assert must in entry("S-034"), must
+    for must in ("ISO timestamp", "a job, session, card or request id", "commit sha", "as people say them"):
+        assert must in entry("S-014"), must
     assert "starting with\n  its item and question id" in rules
     assert "—" not in rules
 
