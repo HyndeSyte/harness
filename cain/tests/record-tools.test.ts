@@ -329,6 +329,25 @@ describe("session-end", () => {
     expect(notes(l).lastIndexOf("Verify after his tap")).toBeGreaterThan(notes(l).lastIndexOf("Merge"));
   }, 90_000);
 
+  test("everything done after steps were open is said; the same steps open again after that are a new note", () => {
+    const l = held();
+    const e = ender(l);
+    e.steps(["Verify after his tap", "pending"]);
+    expect(e.end().out).toBe("Open steps (1): submitted to the record");
+    expect(cycle(l.cfg).ok).toBe(true);
+    e.steps(["Verify after his tap", "completed"]);
+    expect(e.end().out).toBe("That nothing is left open: submitted to the record");
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(e.end()).toEqual({ code: 0, out: "", err: "" });                 // still nothing open: nothing new
+    e.steps(["Verify after his tap", "pending"]);
+    expect(e.end().out).toBe("Open steps (1): submitted to the record");
+    expect(cycle(l.cfg).ok).toBe(true);
+    const n = notes(l);
+    expect(n.split("with these steps open: Verify after his tap.").length - 1).toBe(2);
+    expect(n.split("with nothing left open on its task list.").length - 1).toBe(1);
+    expect(n.lastIndexOf("with these steps open")).toBeGreaterThan(n.indexOf("with nothing left open"));
+  }, 90_000);
+
   test("a session that holds no item files nothing", () => {
     const l = laptop();
     const e = ender(l, SB);
@@ -337,19 +356,22 @@ describe("session-end", () => {
     expect(l.inboxNames()).toHaveLength(0);
   }, 60_000);
 
-  test("a transcript that can't be read is said on the item it holds; a second end while one is filing adds nothing", () => {
+  test("a transcript that can't be read is said on the item it holds; an end waits its turn while another end of the session files", async () => {
     const l = held();
-    const end = () => l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: join(l.root, "gone.jsonl") }) });
+    const input = JSON.stringify({ session_id: SA, transcript_path: join(l.root, "gone.jsonl") });
     const memo = join(l.clone, ".git", "record-holds");
     mkdirSync(memo, { recursive: true });
     writeFileSync(join(memo, `${SA}.ending`), "1");                       // another end of it, filing now
-    expect(end()).toEqual({ code: 0, out: "", err: "" });
-    expect(l.inboxNames()).toHaveLength(0);
-    rmSync(join(memo, `${SA}.ending`));
-    expect(end()).toEqual({ code: 0, out: "That the session ended unread: submitted to the record", err: "" });
+    const p = Bun.spawn([process.execPath, join(TOOLS, "session-end.ts"), "--hook"], { cwd: l.root, env: cleanEnv({ RECORD_CLONE: l.clone }),
+      stdout: "pipe", stderr: "pipe", stdin: Buffer.from(input) });
+    await Bun.sleep(1_500);
+    expect(l.inboxNames()).toHaveLength(0);                                 // still waiting its turn
+    rmSync(join(memo, `${SA}.ending`));                                     // the other end is done
+    expect(await p.exited).toBe(0);
+    expect((await new Response(p.stdout).text()).trim()).toBe("That the session ended unread: submitted to the record");
     expect(cycle(l.cfg).ok).toBe(true);
     expect(notes(l)).toContain("its task list couldn't be read, so what it left open isn't known.");
-    expect(end()).toEqual({ code: 0, out: "", err: "" });                 // said once
+    expect(l.tool("session-end.ts", ["--hook"], { input })).toEqual({ code: 0, out: "", err: "" });   // said once
   }, 60_000);
 
   test("two ends of one session at once file one note: the same request, which the keeper applies once", async () => {
@@ -368,6 +390,46 @@ describe("session-end", () => {
     expect(notes(l).split("with these steps open: Verify after his tap.").length - 1).toBe(1);
   }, 90_000);
 
+  test("two ends of one session at once with different steps both file, in turn: the journal's last entry is the record's newest note", async () => {
+    const l = held();
+    const [t1, t2] = [join(l.root, "t1.jsonl"), join(l.root, "t2.jsonl")];
+    writeFileSync(t1, plan(["Verify after his tap", "pending"]));
+    writeFileSync(t2, plan(["Merge", "pending"]));
+    const env = cleanEnv({ RECORD_CLONE: l.clone });
+    const start = (t: string) => Bun.spawn([process.execPath, join(TOOLS, "session-end.ts"), "--hook"], { cwd: l.root, env, stdout: "pipe", stderr: "pipe",
+      stdin: Buffer.from(JSON.stringify({ session_id: SA, transcript_path: t })) });
+    const [p1, p2] = [start(t1), start(t2)];
+    await Promise.all([p1.exited, p2.exited]);
+    expect(cycle(l.cfg).ok).toBe(true);
+    const n = notes(l);
+    expect(n).toContain("with these steps open: Verify after his tap.");
+    expect(n).toContain("with these steps open: Merge.");
+    const journal = readFileSync(join(l.clone, ".git", "record-holds", `${SA}.journal`), "utf8").trim().split("\n").map((x) => JSON.parse(x));
+    expect(journal.map((e) => e.n)).toEqual([1, 2]);
+    const newest = n.lastIndexOf("Merge") > n.lastIndexOf("Verify after his tap") ? "Merge" : "Verify after his tap";
+    expect(JSON.parse(journal[1].raw).ops[0].text).toContain(newest);
+  }, 90_000);
+
+  test("a filing journaled but not in the outbox (its end stopped in between) is put back and sent at the next end", () => {
+    const l = held();
+    const e = ender(l);
+    e.steps(["Verify after his tap", "pending"]);
+    const dry = JSON.parse(l.tool("session-end.ts", ["--session", SA, "--transcript", join(l.root, `transcript-${SA}.jsonl`), "--dry"]).out);
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(memo, { recursive: true });
+    const key = /-\d{6}-([0-9a-f]{16})$/.exec(dry.id)![1];
+    writeFileSync(join(memo, `${SA}.journal`), JSON.stringify({ n: 1, key, at: Date.now(), kind: "open", id: dry.id, raw: JSON.stringify(dry, null, 1) + "\n" }) + "\n");
+    expect(e.end()).toEqual({ code: 0, out: "Submitted 1 to the record from a laptop session's end", err: "" });   // the same state: nothing new, but the journaled filing goes
+    expect(l.inboxNames()).toEqual([`inbox/${dry.id}.json`]);
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+    // Settled, it leaves a mark: never put back from the journal again, however old the keeper's log.
+    expect(e.end()).toEqual({ code: 0, out: "", err: "" });
+    expect(readdirSync(join(memo, "outbox", "done"))).toEqual([dry.id]);
+    expect(e.end()).toEqual({ code: 0, out: "", err: "" });
+    expect(l.inboxNames()).toHaveLength(0);
+  }, 60_000);
+
   test("filings made offline wait in the outbox and go in the order they were made; a sent one leaves once the keeper has it", () => {
     const l = held();
     const e = ender(l);
@@ -379,7 +441,7 @@ describe("session-end", () => {
     expect(e.end().out).toBe("Open steps (1): waiting here, to go at the next session's start or end");
     const queued = waiting(l);
     expect(queued).toHaveLength(2);
-    for (const n of queued) expect(n).toMatch(/^\d{8}T\d{6}\.\d{3}Z-laptop-end-.*\.json$/);
+    expect(queued.map((n) => /^laptop-end-.+-(\d{6})-[0-9a-f]{16}\.json$/.exec(n)?.[1])).toEqual(["000001", "000002"]);
     const raw = readFileSync(box(l, queued[0]), "utf8");
     // Queued three days ago: the day before it's sent again counts from when it's sent.
     const old = (Date.now() - 3 * 86_400_000) / 1000;
@@ -387,7 +449,7 @@ describe("session-end", () => {
     renameSync(away, l.remote);
     expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "Submitted 2 to the record from a laptop session's end", err: "" });
     const inbox = l.inboxNames();
-    expect(inbox.map((n) => JSON.parse(sh(["git", "show", `main:${n}`], l.remote)).id.slice(-2))).toEqual(["-1", "-2"]);   // made first, goes first
+    expect(inbox.map((n) => /-(\d{6})-[0-9a-f]{16}$/.exec(JSON.parse(sh(["git", "show", `main:${n}`], l.remote)).id)?.[1])).toEqual(["000001", "000002"]);   // made first, goes first
     expect(waiting(l)).toEqual(queued.map((n) => n.replace(/\.json$/, ".sent")));
     expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });                                   // no word yet: waits, not resent
     expect(l.inboxNames()).toHaveLength(2);

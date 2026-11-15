@@ -2,10 +2,10 @@
 // (cain/tools/session-end.ts, org-v2 DESIGN 4.F, the registry's S-051): its task list replayed
 // from its transcript, filed as a note on each item it holds, once, and never lost on the way.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, utimesSync } from "node:fs";
+import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claim, clean, fate, filedKey, filingId, madeAt, nextFiling, requestFor, stepsOf } from "../tools/session-end";
+import { claim, clean, decide, fate, filedKey, filingId, outcomeOf, readJournal, requestFor, stepsOf, type Entry } from "../tools/session-end";
 
 const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
 const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
@@ -55,8 +55,9 @@ describe("the task list as the session left it", () => {
 describe("what it files", () => {
   const open = [{ content: "Verify after his tap", status: "pending" }, { content: "Clean | up", status: "in_progress" }];
   const at = new Date("2026-11-15T03:00:00Z");
-  test("nothing open, or no item held: nothing filed", () => {
+  test("nothing open, or no item held: nothing filed; nothing left open after a filing that had something open is said", () => {
     expect(requestFor([], ["P33"], "open")).toBeNull();
+    expect(requestFor([], ["P33"], "open", at, true).ops[0].text).toBe("The laptop session ended (2026-11-15) with nothing left open on its task list. Its hold lapses in a day; take the item to carry it on.");
     expect(requestFor([{ content: "Review the renewal figures for Friday", status: "pending" }, ...open], [], "open", at)).toBeNull();
     expect(requestFor([], [], "unread", at)).toBeNull();
   });
@@ -86,28 +87,34 @@ describe("once only", () => {
     expect(filedKey(["P33"], [], "unread")).not.toBe(filedKey(["P33"], [], "unplanned"));
     const long = "x".repeat(130);
     expect(filedKey(["P33"], [{ content: `${long} one`, status: "pending" }])).not.toBe(filedKey(["P33"], [{ content: `${long} two`, status: "pending" }]));
-    const id = filingId("0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e", filedKey(["P33"], [a]));
-    expect(id).toMatch(/^laptop-end-0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e-[0-9a-f]{16}-1$/);
-    expect(filingId("0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e", filedKey(["P33"], [a]), 9999).length).toBeLessThanOrEqual(80);
+    const id = filingId("0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e", 1, filedKey(["P33"], [a]));
+    expect(id).toMatch(/^laptop-end-0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e-000001-[0-9a-f]{16}$/);
+    expect(id.length).toBeLessThanOrEqual(80);
+    // Names sort in the order the session's filings were made, whatever the clock or the state.
+    expect([filingId("s", 10, "0000"), filingId("s", 2, "ffff"), filingId("s", 1, "9999")].sort()).toEqual([filingId("s", 1, "9999"), filingId("s", 2, "ffff"), filingId("s", 10, "0000")]);
   });
 
-  test("each change is filing n + 1; the same steps again are the same filing; going back to earlier steps is a new one", () => {
-    const [kA, kB] = [filedKey(["P33"], [a]), filedKey(["P33"], [b])];
-    let last = "";
-    const seen: number[] = [];
-    for (const k of [kA, kA, kB, kA]) {
-      const { n, same } = nextFiling(last, k);
-      if (!same) last = `${k} ${n}`;
-      seen.push(n);
-    }
-    expect(seen).toEqual([1, 1, 2, 3]);
-    expect(nextFiling("garbled", kA)).toEqual({ n: 1, same: false });
+  test("the journal decides: the same state as its last entry is nothing new; any other is entry n + 1, a filing on held items", () => {
+    const [kA, kB, kE] = [filedKey(["P33"], [a]), filedKey(["P33"], [b]), filedKey(["P33"], [])];
+    const e = (n: number, key: string, kind: Entry["kind"], filed = true): Entry => ({ n, key, at: n, kind, ...(filed ? { id: `i${n}`, raw: "{}" } : {}) });
+    expect(decide([], kA, ["P33"], [a], "open")).toEqual({ n: 1, same: false, file: true, wasOpen: false });
+    expect(decide([e(1, kA, "open")], kA, ["P33"], [a], "open").same).toBe(true);
+    expect(decide([e(1, kA, "open")], kB, ["P33"], [b], "open")).toEqual({ n: 2, same: false, file: true, wasOpen: true });
+    expect(decide([e(1, kA, "open"), e(2, kB, "open")], kA, ["P33"], [a], "open").n).toBe(3);                     // A, B, A: a new filing
+    // Nothing left open after something was: said; said once; then A again is new.
+    expect(decide([e(1, kA, "open")], kE, ["P33"], [], "open")).toEqual({ n: 2, same: false, file: true, wasOpen: true });
+    expect(decide([e(1, kA, "open"), e(2, kE, "empty")], kE, ["P33"], [], "open").same).toBe(true);
+    expect(decide([e(1, kA, "open"), e(2, kE, "empty")], kA, ["P33"], [a], "open")).toEqual({ n: 3, same: false, file: true, wasOpen: false });
+    // Nothing open, never anything filed: a state, not a filing. No item held: a state, not a filing.
+    expect(decide([], kE, ["P33"], [], "open")).toEqual({ n: 1, same: false, file: false, wasOpen: false });
+    expect(decide([e(1, kA, "open")], filedKey([], [a]), [], [a], "open")).toEqual({ n: 2, same: false, file: false, wasOpen: true });
   });
 
-  test("filings are named by when they were made, so names sort in that order", () => {
-    const t = Date.parse("2026-11-15T05:03:00.120Z");
-    expect(madeAt(t)).toBe("20261115T050300.120Z");
-    expect([madeAt(t + 1), madeAt(t), madeAt(t + 1000)].sort()).toEqual([madeAt(t), madeAt(t + 1), madeAt(t + 1000)]);
+  test("a journal's line cut off mid-write is passed over; the rest is read", () => {
+    const p = join(mkdtempSync(join(tmpdir(), "journal-")), "s.journal");
+    writeFileSync(p, JSON.stringify({ n: 1, key: "k1", at: 1, kind: "open", id: "i1", raw: "{}" }) + "\n" + '{"n": 2, "key": "k2", "at"');
+    expect(readJournal(p).map((x) => x.n)).toEqual([1]);
+    expect(readJournal(join(p, "none"))).toEqual([]);
   });
 
   test("a lock is made new, refused while it's fresh, and taken over once it's 2 minutes old", () => {
@@ -123,9 +130,11 @@ describe("once only", () => {
 
 describe("what becomes of a filing in the outbox", () => {
   const day = 86_400_000;
-  test("done leaves it; waiting keeps it; refused, rejected or a conflict moves it aside; never sent is sent; sent a day with no word goes again", () => {
-    expect(fate(["rejected", "done"], true, 0)).toBe("filed");             // a second copy refused as a used id
+  test("done leaves it; else its newest word: waiting keeps it, a refusal moves it aside; never sent is sent; sent a day with no word goes again", () => {
+    expect(fate(["rejected", "done"], true, 0)).toBe("filed");
     expect(fate(["waiting"], true, 3 * day)).toBe("waiting");
+    expect(fate(["waiting", "rejected"], true, 0)).toBe("refused");       // held behind a job, then refused
+    expect(outcomeOf([{ state: "waiting" }, { state: "rejected", reason: "an id that was already used" }]).map((o) => o.state)).toEqual(["waiting"]);
     for (const s of ["rejected", "conflict", "refused"]) expect(fate([s], true, 0)).toBe("refused");
     expect(fate([], false, 0)).toBe("send");
     expect(fate([], true, day / 2)).toBe("wait");

@@ -18,24 +18,28 @@
 // masked; never the chat itself), or, when the transcript can't be read or kept no task list,
 // that it ended without one.
 //
-// Once only, in order, and never lost. Each change in what a session left open is one filing,
-// numbered in turn for the session (the same open steps again add nothing; going back to an
-// earlier set is a new filing), and its id comes from the session, that number and what it
-// holds: two ends of the same change file the same request, and the record keeper, which
-// refuses an id it has seen, applies it once. Every filing goes into an outbox in the record
-// clone's .git folder first (written whole and synced, then moved in), named by when it was
-// made, and leaves it in that order, under the same name in the record's inbox, which the keeper
-// works through by name. It stays until the keeper has logged it: kept after it's sent until the
-// keeper says done, and sent again, as itself, if a day passes with no word. A filing the record
-// refuses or would refuse, an outbox file that can't be read, or one cut off while it was
-// written is moved aside with why, never deleted, and named at every session's start until a
-// session deals with it. The locks between two ends, and between two flushes, are best effort;
-// the id is what makes a second harmless. What it says of a filing is that filing's own fate:
-// submitted (in the record's inbox), filed (the keeper said done), or waiting here.
+// Once only, in order, and never lost. Each session keeps one journal (append-only, synced),
+// the one truth of what it left open at each end: every end whose state differs from the last
+// entry's (the items held, the open steps, or why it can't tell) is entry n + 1, the same state
+// again is nothing new, and going back to an earlier state is a new entry. An entry on held items
+// is a filing (and an end with nothing left open is one when the last filing had something
+// open); its id is the session, n and the state, so a second end of the same change files the
+// same request, which the record keeper, refusing an id it has seen, applies once. Ends of one
+// session take turns (the second waits for the first). The filing is journaled first, then put
+// in an outbox in the record clone's .git folder (written whole and synced, then moved in); one
+// the journal has but the outbox and the keeper don't is put back from the journal. The outbox
+// is only a delivery queue: named by session and n, it leaves in that order, under the same
+// name in the record's inbox, which the keeper works through by name. It stays until the keeper
+// has logged it: kept after it's sent until the keeper says done, and sent again, as itself, if
+// a day passes with no word. A filing the record refuses or would refuse, an outbox file that
+// can't be read, or one cut off while it was written is moved aside with why, never deleted,
+// and named at every session's start until a session deals with it. What it says of a filing
+// is that filing's own fate: submitted (in the record's inbox), filed (the keeper said done),
+// waiting here, or kept aside.
 // It never holds up the session's end: any failure is one line.
 import { createHash } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { TOKEN_SHAPES } from "../rootfs/opt/cain/c1/tools.ts";
 import { type Clone, args, check, clone, fetch, git, holdsAt, outcomes, send, sessionOf } from "./record-lib.ts";
 
@@ -100,39 +104,76 @@ export type Why = "open" | "unread" | "unplanned";
 // What a filing holds: why, the items held and the open steps' whole words, in any order.
 export const filedKey = (held: string[], open: Step[], why: Why = "open") =>
   createHash("sha1").update(JSON.stringify([why, [...held].sort(), open.map((s) => clean(s.content, 10_000)).sort()])).digest("hex").slice(0, 16);
-export const filingId = (session: string, key: string, n = 1) => `laptop-end-${session}-${key}-${n}`.slice(0, 80);
+// A filing's id, and its name in the outbox and the record's inbox: the session, then n (so
+// names sort in the order the session's filings were made, whatever the clock), then the state.
+export const filingId = (session: string, n: number, key: string) => `laptop-end-${session}-${String(n).padStart(6, "0")}-${key}`;
 
-// This session's last filing, as "<key> <n>": the same key again is nothing new; another is
-// filing n + 1.
-export function nextFiling(last: string, key: string): { n: number; same: boolean } {
-  const [k, n] = last.trim().split(/\s+/);
-  const was = Number.isInteger(Number(n)) && Number(n) > 0 ? Number(n) : 0;
-  return k === key ? { n: was || 1, same: true } : { n: was + 1, same: false };
+// One journal entry: n, the state's key, when, what kind of end, and for a filing its id and
+// the request as sent.
+export interface Entry { n: number; key: string; at: number; kind: "open" | "empty" | Why; id?: string; raw?: string }
+
+export function readJournal(path: string): Entry[] {
+  let text = "";
+  try { text = readFileSync(path, "utf8"); } catch { return []; }
+  const out: Entry[] = [];
+  for (const l of text.split("\n")) {
+    if (!l.trim()) continue;
+    try { const e = JSON.parse(l); if (Number.isInteger(e?.n) && typeof e?.key === "string") out.push(e); } catch { /* a line cut off */ }
+  }
+  return out;
 }
 
-// The record request, or null when there's nothing to file: only on items the session holds.
-export function requestFor(open: Step[], held: string[], why: Why = "open", at = new Date()): any | null {
-  if (!held.length || (why === "open" && !open.length)) return null;
+// What this end is, given the journal: the same state as its last entry (nothing new), or entry
+// n + 1, a filing when it has held items and something to say.
+export function decide(journal: Entry[], key: string, held: string[], open: Step[], why: Why): { n: number; same: boolean; file: boolean; wasOpen: boolean } {
+  const last = journal.at(-1);
+  if (last && last.key === key) return { n: last.n, same: true, file: false, wasOpen: false };
+  const n = journal.reduce((m, e) => Math.max(m, e.n), 0) + 1;
+  const filed = [...journal].reverse().find((e) => e.id);
+  const wasOpen = !!filed && filed.kind !== "empty";
+  return { n, same: false, file: held.length > 0 && (why !== "open" || open.length > 0 || wasOpen), wasOpen };
+}
+
+// A folder's entries made durable where the system allows it (not on Windows).
+function syncDir(dir: string): void {
+  try { const fd = openSync(dir, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } } catch { /* not here */ }
+}
+
+function appendEntry(path: string, e: Entry): void {
+  const fd = openSync(path, "a");
+  try { writeSync(fd, JSON.stringify(e) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+  syncDir(dirname(path));
+}
+
+// The record request, or null when there's nothing to file: only on items the session holds,
+// and an end with nothing left open only when its last filing had something open (wasOpen), so
+// the record's newest note on the item is true.
+export function requestFor(open: Step[], held: string[], why: Why = "open", at = new Date(), wasOpen = false): any | null {
+  if (!held.length || (why === "open" && !open.length && !wasOpen)) return null;
   const day = at.toISOString().slice(0, 10);
-  const said = why === "open" ? `with these steps open: ${open.map((s) => clean(s.content, 120)).join("; ")}.`
+  const said = why === "open" ? (open.length ? `with these steps open: ${open.map((s) => clean(s.content, 120)).join("; ")}.` : "with nothing left open on its task list.")
     : why === "unread" ? "and its task list couldn't be read, so what it left open isn't known."
     : "and kept no task list, so what it left open isn't known.";
   const ops = held.map((item) => ({ op: "note", item, text: clean(`The laptop session ended (${day}) ${said} Its hold lapses in a day; take the item to carry it on.`, 1900) }));
-  const what = why === "open" ? `with ${open.length} step(s) open` : why === "unread" ? "and its task list couldn't be read" : "with no task list";
+  const what = why === "open" ? (open.length ? `with ${open.length} step(s) open` : "with nothing left open") : why === "unread" ? "and its task list couldn't be read" : "with no task list";
   return { kind: "change", summary: clean(`A laptop session ended ${what} on ${held.join(", ")}`, 200), ops };
 }
 
-// What becomes of a filing in the outbox, from what the keeper has logged for its id: filed
-// (done: it leaves the outbox), waiting (the keeper holds it behind one of Cain's jobs), refused
-// (moved aside, with why), send (never sent), resend (sent a day ago, no word), or wait.
+// What becomes of a filing in the outbox, from what the keeper has logged for its id, oldest
+// first: filed (done: it leaves the outbox), else by its newest word: waiting (the keeper holds
+// it behind one of Cain's jobs), refused (moved aside, with why); with no word, send (never
+// sent), resend (sent a day ago) or wait. A second copy's refusal as a used id isn't a word
+// about the filing: the first copy's is (outcomeOf drops those).
 export type Fate = "filed" | "waiting" | "refused" | "send" | "resend" | "wait";
 export function fate(states: string[], sent: boolean, sentAgoMs: number): Fate {
   if (states.includes("done")) return "filed";
-  if (states.includes("waiting")) return "waiting";
-  if (states.some((s) => s === "rejected" || s === "conflict" || s === "refused")) return "refused";
+  const last = states.at(-1);
+  if (last === "rejected" || last === "conflict" || last === "refused") return "refused";
+  if (last === "waiting") return "waiting";
   if (!sent) return "send";
   return sentAgoMs > 86_400_000 ? "resend" : "wait";
 }
+export const outcomeOf = (logged: any[]) => logged.filter((o) => !/already used/.test(String(o?.reason ?? o?.line ?? "")));
 
 // The folder for the outbox and each session's last filing: beside record-holds' memo, in the
 // clone's .git folder.
@@ -147,6 +188,7 @@ function writeWhole(path: string, body: string): void {
   const fd = openSync(part, "w");
   try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(part, path);
+  syncDir(dirname(path));
 }
 
 // Best effort: one holder at a time; a lock left by a process that died goes after 2 minutes.
@@ -158,17 +200,19 @@ export function claim(lock: string, now = Date.now()): boolean {
   try { writeFileSync(lock, String(process.pid), { flag: "wx" }); return true; } catch { return false; }
 }
 
-// When a filing was made, as the start of its name in the outbox and in the record's inbox, so
-// names sort as the filings were made.
-export const madeAt = (at: number) => new Date(at).toISOString().replace(/[-:]/g, "").replace("Z", "") + "Z";
-
-// Puts one filing in the outbox, named by when it was made. Returns its name.
-export function enqueue(dir: string, id: string, raw: string, at = Date.now()): string {
+// Puts one filing in the outbox, by its id. Returns its name.
+export function enqueue(dir: string, id: string, raw: string): string {
   mkdirSync(join(dir, "outbox"), { recursive: true });
-  const name = `${madeAt(at)}-${id}.json`;
+  const name = `${id}.json`;
   writeWhole(join(dir, "outbox", name), raw);
   return name;
 }
+
+// Whether the outbox has seen a filing: waiting, sent, kept aside, or done (a filing the keeper
+// said done leaves an empty mark in outbox/done, so it's never put back from the journal, however
+// old the keeper's log of it).
+export const inOutbox = (dir: string, id: string) =>
+  [`${id}.json`, `${id}.sent`, `refused/${id}.json`, `unreadable/${id}.json`, `done/${id}`].some((n) => existsSync(join(dir, "outbox", n)));
 
 // A filing moved aside, with why: kept, never deleted, until a session deals with it.
 function aside(dir: string, kind: "refused" | "unreadable", name: string, why: string): void {
@@ -220,9 +264,15 @@ function flushing(rec: Clone, dir: string, box: string, now: number): Flushed {
     const sent = n.endsWith(".sent");
     let ago = 0;
     try { ago = now - statSync(path).mtimeMs; } catch { continue; }
-    const logged = outcomes(rec, req.id) as any[];
+    const logged = outcomeOf(outcomes(rec, req.id) as any[]);
     const f = fate(logged.map((o) => String(o.state)), sent, ago);
-    if (f === "filed") { rmSync(path, { force: true }); fates.set(req.id, "filed"); continue; }
+    if (f === "filed") {
+      mkdirSync(join(box, "done"), { recursive: true });
+      writeFileSync(join(box, "done", req.id), "");
+      rmSync(path, { force: true });
+      fates.set(req.id, "filed");
+      continue;
+    }
     if (f === "refused") {
       const last = logged.filter((o) => o.state !== "done").at(-1);
       aside(dir, "refused", n, `the record said ${last?.state ?? "no"}: ${last?.reason ?? last?.line ?? ""}`.trim());
@@ -291,24 +341,41 @@ if (import.meta.main) {
   const me = `laptop:${session}`;
   const held = Object.entries(holdsAt(rec)).filter(([, h]: [string, any]) => h?.holder === me).map(([item]) => item).sort();
   const why: Why = lines === null ? "unread" : !planned ? "unplanned" : "open";
-  const req = requestFor(open, held, why);
-  const key = req ? filedKey(held, open, why) : "";
-  let last = "";
-  try { last = readFileSync(join(dir, `${session}.ended`), "utf8"); } catch { /* nothing filed yet */ }
-  const { n, same } = nextFiling(last, key);
-  if (!req || same) say(...flush(rec, dir).lines);    // nothing new: what waits still goes
-  req.from = me;
-  req.id = filingId(session!, key, n);
-  const raw = JSON.stringify(req, null, 1) + "\n";
-  if (a.dry === true) say(raw);
+  const key = filedKey(held, open, why);
+  const journalPath = join(dir, `${session}.journal`);
+  if (a.dry === true) {                                // what this end would file, changing nothing
+    const d = decide(readJournal(journalPath), key, held, open, why);
+    const r = d.file ? requestFor(open, held, why, new Date(), d.wasOpen) : null;
+    if (r) { r.from = me; r.id = filingId(session!, d.n, key); }
+    say(r ? JSON.stringify(r, null, 1) : "");
+  }
+  // Ends of one session take turns: a second waits for the first, then reads what it wrote.
   mkdirSync(dir, { recursive: true });
-  if (!claim(join(dir, `${session}.ending`))) say("");
+  const waitFrom = Date.now();
+  while (!claim(join(dir, `${session}.ending`))) {
+    if (Date.now() - waitFrom > 20_000) say("Open steps not filed: another end of this session held the lock for 20 seconds");
+    await Bun.sleep(250);
+  }
   lock = join(dir, `${session}.ending`);
-  enqueue(dir, req.id, raw);                           // first, so even a refusal is kept
-  writeWhole(join(dir, `${session}.ended`), `${key} ${n}`);
+  const journal = readJournal(journalPath);
+  // A filing journaled but neither in the outbox nor logged by the keeper (its end stopped in
+  // between) is put back from the journal.
+  const lastFiled = [...journal].reverse().find((e) => e.id && e.raw);
+  if (lastFiled && !inOutbox(dir, lastFiled.id!) && !outcomes(rec, lastFiled.id!).length) enqueue(dir, lastFiled.id!, lastFiled.raw!);
+  const d = decide(journal, key, held, open, why);
+  if (d.same || !d.file) {
+    if (!d.same) appendEntry(journalPath, { n: d.n, key, at: Date.now(), kind: why === "open" ? (open.length ? "open" : "empty") : why });
+    say(...flush(rec, dir).lines);                     // nothing to file: what waits still goes
+  }
+  const req = requestFor(open, held, why, new Date(), d.wasOpen);
+  req.from = me;
+  req.id = filingId(session!, d.n, key);
+  const raw = JSON.stringify(req, null, 1) + "\n";
+  appendEntry(journalPath, { n: d.n, key, at: Date.now(), kind: why === "open" ? (open.length ? "open" : "empty") : why, id: req.id, raw });
+  enqueue(dir, req.id, raw);                           // after the journal: a stop in between is put back
   const done = flush(rec, dir);
   const mine = done.fates.get(req.id);
-  const what = why === "open" ? `Open steps (${open.length})` : `That the session ended ${why === "unread" ? "unread" : "with no task list"}`;
+  const what = why === "open" ? (open.length ? `Open steps (${open.length})` : "That nothing is left open") : `That the session ended ${why === "unread" ? "unread" : "with no task list"}`;
   say(...done.lines.filter((l) => !l.startsWith("Submitted ")),
     mine === "submitted" ? `${what}: submitted to the record`
       : mine === "filed" ? `${what}: filed in the record`

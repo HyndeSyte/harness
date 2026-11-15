@@ -257,7 +257,7 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - applies: all
 - home: role:Cain; item:P33
 - source: record core requirement 26 (Nov 10); laptop correction Nov 12
-- checked-at: the record's holds (work that outlives a turn holds its item); the laptop's SessionEnd hook (cain/tools/session-end.ts), which notes on each held item the steps left open, each change once, in order, and never lost (an outbox, settled at the next session's start)
+- checked-at: the record's holds (work that outlives a turn holds its item); the laptop's SessionEnd hook (cain/tools/session-end.ts), which notes on each held item the steps left open, each change once, in order, and never lost (a journal per session, and an outbox settled at the next session's start)
 - rule: Every thread (a session, a job, a branch, a scheduled task) has a home in the record's open list before the turn ends, and the home is true about how it ends. He is never the forcing function, and nothing waits on an opaque timer.
 
 ## S-060 Owner only
