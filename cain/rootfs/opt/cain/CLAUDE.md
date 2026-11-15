@@ -283,16 +283,21 @@ in the harness repo; until then the keeper says it is waiting).
   `probe_stale` (a new Claude in Chrome, Chrome or Claude Code version: nothing runs until he
   probes again), `update_pending` (Chrome has a Claude in Chrome update waiting: he
   restarts the Cain jobs Chrome), `boundary_not_accepted` (he hasn't accepted the stated
-  boundary when confirming his probe), `extension_version_unknown` (unattended runs stay off),
+  boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
+  Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
+  transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
+  `extra_extension` (another extension is on in the Cain jobs profile),
+  `unattended_unsupported` (his install file asks for unattended runs),
   `hook_selftest_failed`, `chrome_busy` (another Claude Code is open on his PC),
   `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and
   why. Those are fixed at his PC, so they
   go on his "At his PC" list, never in the morning message.
-- When a version stopped the PC, `pcjobs.sh worker` (and `list`) prints a second line,
-  "For Dane: ...", naming what to run at the PC. That line is what goes on his "At his
+- When a version or one of those setup problems stopped the PC, `pcjobs.sh worker` (and
+  `list`) prints a second line, "For Dane: ...", naming what to do at the PC. That line is what goes on his "At his
   PC" list, in those words.
-- This version runs jobs only while he is at the PC and starts a run himself, until his
-  setup allows unattended runs. A job past its expiry is closed by your keeper without
+- This version runs jobs only while he is at the PC and starts a run himself. It has no
+  unattended runs at all: they are refused in code, and wait for a later version that
+  adds request-level blocking. Never offer to schedule PC jobs. A job past its expiry is closed by your keeper without
   running; that isn't a failure of his.
 - Before any job runs, he does a supervised probe at his PC (his setup note says how);
   nothing in the queue runs during it.

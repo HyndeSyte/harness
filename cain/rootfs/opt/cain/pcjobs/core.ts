@@ -41,6 +41,8 @@ export const CODES = [
   "cli_changed", "extension_version_mismatch",
   "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing", "extension_version_unknown", "read_unverified",
   "boundary_not_accepted", "update_pending",
+  "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
+  "unattended_unsupported",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -573,17 +575,17 @@ export const RISKY_PATH = /log[-_]?out|sign[-_]?out|unsubscribe|confirm|delete|r
 export function riskyEntry(e: any): string | null {
   return riskyMatch(e)?.word ?? null;
 }
-// The same, with the full address the word was found in (for a redirect or sign-in path,
-// the pin's origin with that path), so the owner sees exactly what he marks reviewed.
-export function riskyMatch(e: any): { word: string; address: string } | null {
+// The same, with the host of the address the word was found in (never its path, query,
+// fragment or userinfo, which can carry a secret), so the owner can find the entry.
+export function riskyMatch(e: any): { word: string; host: string } | null {
   if (!isObj(e) || e.reviewed === true) return null;
   let u: URL;
-  try { u = new URL(String(e.url)); } catch { return { word: "url", address: String(e?.url ?? "") }; }
-  if (u.search || u.href.includes("?")) return { word: "query", address: String(e.url) };
-  for (const [p, own] of [[u.pathname, true], ...(Array.isArray(e.redirects) ? e.redirects : []).map((x: unknown) => [x, false]),
-    ...(Array.isArray(e.login_paths) ? e.login_paths : []).map((x: unknown) => [x, false])] as [unknown, boolean][]) {
+  try { u = new URL(String(e.url)); } catch { return { word: "url", host: "unparsed" }; }
+  const host = u.hostname || "none";
+  if (u.search || u.href.includes("?")) return { word: "query", host };
+  for (const p of [u.pathname, ...(Array.isArray(e.redirects) ? e.redirects : []), ...(Array.isArray(e.login_paths) ? e.login_paths : [])] as unknown[]) {
     const m = RISKY_PATH.exec(String(p));
-    if (m) return { word: m[0].toLowerCase(), address: own ? u.href : `${u.origin}${String(p)}` };
+    if (m) return { word: m[0].toLowerCase(), host };
   }
   return null;
 }

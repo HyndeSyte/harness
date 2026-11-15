@@ -6,7 +6,7 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   attributesGood, checkFacts, confirmGate, confirmWhy, jobClaimFor, jobFromAsk, jobText, keyFingerprint, makeJobToken, normalUrl, onLogin,
@@ -25,6 +25,7 @@ import {
   manifestCheck, normalPath, checkHost, signAllowlistFile, ownerKeygen, PROFILE_BOUND, LAST_RUN_KEYS, readsAsRecorded,
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_VERSION, BOUNDARY_TEXT, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
+  browserPreflight, hostChain, extensionPrefs, sweepSession, signedIn, startSweep, SESSION_LEFTOVERS,
   type Install, type Instruction, type Opts, type Session,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { spendNonce } from "../rootfs/opt/cain/pcjobs/confirm.ts";
@@ -416,8 +417,10 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const pc = join(home, "queue");
   mkdirSync(home, { recursive: true });
   if (!WIN) chmodSync(home, 0o755);
-  const claudeHome = join(root, "claude-home");
+  // The worker's own Claude Code folder, signed in once at setup (a stand-in credential file).
+  const claudeHome = join(home, "claude-config");
   mkdirSync(claudeHome, { recursive: true });
+  writeFileSync(join(claudeHome, ".credentials.json"), "{\"sign-in\": \"worker stand-in\"}");
   const fileOk = (f: string, text: string) => { writeFileSync(f, text); if (!WIN) chmodSync(f, 0o644); };
   const allow = (entries: Allow[]) => fileOk(join(home, "allowlist.json"), signAllowlist("owner-1", entries, ownerSign));
   fileOk(join(home, "owner.pub"), `${OWNER_PUB}\n`);
@@ -668,7 +671,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     return { code: 0, out: stream(events), timedOut: false };
   };
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
-    acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), claudeHome, managed: [], managedDirs: [],
+    acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), managed: [], managedDirs: [],
     policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string } = {}) => {
@@ -798,9 +801,11 @@ describe("the PC worker: one run", () => {
     // An allowlisted environment: nothing of the worker's own but what is listed, forward
     // slashes in what the hook command expands, and the hook's own log for this session.
     expect(Object.keys(env).sort()).toEqual(["CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "HOME", "PATH", "PCW_NAV_ALLOW", "PCW_NAV_LOG", "PCW_RUNTIME", "PCW_WORKER", "SystemRoot", "TEMP"]);
-    // The CLI's own config folder: run-scoped, under the worker folder, gone after the session.
-    expect(env.CLAUDE_CONFIG_DIR).toBe(join(q.home, "session-config"));
-    expect(existsSync(env.CLAUDE_CONFIG_DIR)).toBe(false);
+    // The CLI's own config folder: the worker's own, under the worker folder, signed in once at setup.
+    expect(env.CLAUDE_CONFIG_DIR).toBe(join(q.home, "claude-config"));
+    // It stays (its sign-in persists); nothing a session left there does.
+    expect(existsSync(join(env.CLAUDE_CONFIG_DIR, ".credentials.json"))).toBe(true);
+    expect(SESSION_LEFTOVERS.filter((n) => existsSync(join(env.CLAUDE_CONFIG_DIR, n)))).toEqual([]);
     for (const k of ["PCW_RUNTIME", "PCW_WORKER", "PCW_NAV_LOG"]) expect(env[k]).not.toContain("\\");
     // nav-guard decided every call, by tool-use id, and the end check's evidence stays on the PC.
     const log = readNavLog(join(q.home, "nav-decisions.jsonl"));
@@ -832,16 +837,30 @@ describe("the PC worker: one run", () => {
     expect(cainSees !== "bad" && cainSees?.tools).toContain("navigate");
   });
 
-  test("unattended, it does nothing until the owner allows it, and only after a probe whose deny check passed", async () => {
+  test("unattended runs are impossible in this version: a run without --attended does nothing, and an install file asking for them is refused like the confirm path", async () => {
     const { q, id } = oneJob();
     expect(await run(q.opts())).toEqual({ code: "attended_only", job: null, closed: [] });
     expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+    // Even with a passing deny check on record, unattended: true is refused, attended or not.
     q.install({ unattended: true });
-    q.confirmNow({ deny_check: false });
-    expect((await run(q.opts())).code).toBe("attended_only");
     q.confirmNow({ deny_check: true });
-    expect(await run(q.opts())).toMatchObject({ code: "ok", job: id });
-    expect(result(q, id).attended).toBe(false);
+    expect(await run(q.opts())).toEqual({ code: "unattended_unsupported", job: null, closed: [] });
+    expect(await run(q.opts(attended))).toEqual({ code: "unattended_unsupported", job: null, closed: [] });
+    expect(JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "unattended_unsupported" });
+    expect(heartbeatNotice(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8")))).toMatch(/doesn't allow\. At the PC: set unattended to false/);
+    await expect(probe(q.opts(attended))).rejects.toMatchObject({ code: "unattended_unsupported" });
+    await expect(bindProfile(q.opts(attended))).rejects.toMatchObject({ code: "unattended_unsupported" });
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("unattended_unsupported");
+    expect(() => checkCli(q.opts())).toThrow("unattended_unsupported");
+    expect(browserPreflight(q.opts(attended), { ...q.inst, unattended: true })).toBe("unattended_unsupported");
+    expect(q.launches).toEqual([]);
+    // The confirm path's flag is refused too (untrusted_config, as before).
+    q.install({ confirm_path: true as any });
+    expect((await run(q.opts(attended))).code).toBe("untrusted_config");
+    // Back to false: the attended run goes on.
+    q.install();
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(result(q, id).attended).toBe(true);
   });
 
   test("the kill switch: a STOP file, and the worker exits without claiming, pushing or starting a session", async () => {
@@ -998,9 +1017,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
 
   test("a new extension or CLI version stops every ordinary run, attended ones too (probe_stale), until a new probe is confirmed", async () => {
     const { q, id } = oneJob();
-    q.install({ unattended: true });
     q.confirmNow({ deny_check: true, cli: "2.0.9" });
-    expect((await run(q.opts())).code).toBe("probe_stale");
     expect((await run(q.opts(attended))).code).toBe("probe_stale");
     expect(JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "probe_stale", reason: "cli_version_changed" });
     q.confirmNow({ deny_check: true });
@@ -1011,7 +1028,6 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     // Restarted: the profile's preferences name the new folder, and the old one is gone.
     rmSync(join(q.udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
     writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.4_0`, state: 1 } } } }));
-    expect((await run(q.opts())).code).toBe("probe_stale");
     expect((await run(q.opts(attended))).code).toBe("probe_stale");
     expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
     expect(q.launches).toEqual([]);
@@ -1587,7 +1603,7 @@ describe("hangs, locks and clocks", () => {
     expect(gone).toBe(true);
     // A session that finishes is read whole.
     const ok = await launchSession([process.execPath, "-e", "console.log(JSON.stringify({result: 'x'}))"], dir, 30_000, process.env as Record<string, string>);
-    expect(ok).toEqual({ code: 0, out: '{"result":"x"}\n', timedOut: false });
+    expect(ok).toEqual({ code: 0, out: '{"result":"x"}\n', timedOut: false, stopped: false });
   });
 
   test("a lock left by a dead process, or older than a lease, is cleared and the heartbeat says so; a live one means busy", async () => {
@@ -1714,26 +1730,27 @@ describe("the supervised probe and confirm-profile", () => {
     q.allow([{ ...PIN, login_paths: ["/login"] }, { site: "example.com", action: "read_account_settings", url: "https://example.com/settings", match: "exact", login_paths: ["/login"] }]);
     const ev = await probe(q.opts(attended));
     expect(target).toBe("https://example.com/settings");
-    expect(ev).toMatchObject({ stop_ok: true, smoke: "connected", failed_preflight: "wrong_profile", browser: "needs_login", canary_ok: true,
+    expect(ev).toMatchObject({ stop_ok: true, smoke: "connected", failed_preflight: "extension_entry_missing", signin: { sessions: 2, signed_in: true, credential_kept: true, passed: true }, browser: "needs_login", canary_ok: true,
       inventory_ok: true, deny_check: true, target: "https://example.com/settings", fingerprint: fingerprint(q.opts(), q.inst), hits: [] });
     expect(ev.fingerprint).toMatchObject({ cli_version: "2.1.0", extension_version: "1.2.3" });
     expect(ev.inventory).toContain(`${CH}read_page`);
-    // Smoke, the owner's Chrome restart and smoke again, then the browser step, the five
-    // destination checks, the schema check, the slowed-hook check, and the deny check.
-    expect(q.launches.length).toBe(12);
+    // Smoke twice back to back (the worker's own sign-in holds), the owner's Chrome restart and smoke again, then the browser step,
+    // the five destination checks, the schema check, the slowed-hook check, and the deny check.
+    expect(q.launches.length).toBe(13);
     expect(q.launches[0][2]).toContain("connection check");
-    expect(q.asked).toEqual([expect.stringContaining("Restart the Cain jobs Chrome now")]);
     expect(q.launches[1][2]).toContain("connection check");
-    expect(q.launches[2][2]).toContain("## This run");
-    for (const i of [3, 4, 5, 6, 7]) expect(q.launches[i][2]).toContain("destination check");
-    expect(q.launches[8][2]).toContain("schema check");
-    expect(q.launches[8][2]).toContain("/inject\n");
+    expect(q.asked).toEqual([expect.stringContaining("Restart the Cain jobs Chrome now")]);
+    expect(q.launches[2][2]).toContain("connection check");
+    expect(q.launches[3][2]).toContain("## This run");
+    for (const i of [4, 5, 6, 7, 8]) expect(q.launches[i][2]).toContain("destination check");
     expect(q.launches[9][2]).toContain("schema check");
-    expect(q.launches[9][2]).toContain("/inject-plan\n");
-    expect(q.launches[10][2]).toContain("hook slowed on purpose");
-    expect(q.envs[10].PCW_HOOK_STALL_MS).toBe(String(HOOK_STALL_MS));
+    expect(q.launches[9][2]).toContain("/inject\n");
+    expect(q.launches[10][2]).toContain("schema check");
+    expect(q.launches[10][2]).toContain("/inject-plan\n");
+    expect(q.launches[11][2]).toContain("hook slowed on purpose");
+    expect(q.envs[11].PCW_HOOK_STALL_MS).toBe(String(HOOK_STALL_MS));
     expect(HOOK_STALL_MS).toBeGreaterThan(JSON.parse(readFileSync(SESSION_FILES.settings, "utf8")).hooks.PreToolUse[0].hooks[0].timeout * 1000);
-    expect(q.launches[11][2]).toContain("permission check");
+    expect(q.launches[12][2]).toContain("permission check");
     // The cookie survived the restart; the planted instruction was refused by the schema;
     // the permission layer alone refused a navigation while the hook stalled.
     expect(ev.restart).toEqual({ chrome_restarted: true, cookie_kept: true });
@@ -1757,7 +1774,7 @@ describe("the supervised probe and confirm-profile", () => {
     // The hook refused the probe's navigations by its own log, and the run's judgement fails closed on that.
     expect(ev).toMatchObject({ hook_intercepts: true, fails_closed: true, not_exercised: [] });
     // Every denied capability was ordered, and each refusal came from permissions.
-    const deny = q.launches[11][2];
+    const deny = q.launches[12][2];
     for (const w of ["shell command", "Write the file", "web fetch", "click the Press button", "type the word", "form tool", "JavaScript",
       "console messages", "network requests", "upload", "keyboard shortcut"]) expect(deny).toContain(w);
     expect(ev.deny.map((d) => d.capability)).toEqual(["shell", "file_write", "web_fetch", "click", "typing", "form_fill", "javascript",
@@ -1870,13 +1887,12 @@ describe("the supervised probe and confirm-profile", () => {
     expect(q2.launches.length).toBe(1);
   });
 
-  test("a deny check that fails is recorded, and unattended runs stay off", async () => {
+  test("a deny check that fails is recorded (kept for the later version that adds request-level blocking), and runs stay attended", async () => {
     const q = queueRig({ confirmed: false });
     q.during(() => { const d = join(q.home, "deny-check"); if (existsSync(d)) writeFileSync(join(d, "bash.txt"), "denied"); });
     const ev = await probe(q.opts(attended));
     expect(ev.deny_check).toBe(false);
     expect(confirmProfile(q.opts(), ACCEPT).deny_check).toBe(false);
-    q.install({ unattended: true });
     q.ask(READ); round(q.cfg); q.clonePc();
     expect((await run(q.opts())).code).toBe("attended_only");
   });
@@ -2159,15 +2175,18 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
     expect(extensionElsewhere([{ ...chrome(10), cmd: "" }, shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
     // An Edge or Brave parent is never the dedicated Chrome.
     expect(extensionElsewhere([{ ...chrome(10), cmd: `"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" --user-data-dir="${q.udd}"` }, shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
-    // Orphans: a host whose browser is gone, or whose parent PID now belongs to a newer process. The preflight ends them, then checks again.
+    // Orphans: a host whose browser is gone, or whose parent PID now belongs to a newer process: host_parent_gone, and nothing is ended.
     expect(orphanHosts([shell(11, 10), host(12, 11)], inst).map((p) => p.pid)).toEqual([11]);
     expect(orphanHosts([chrome(10, t(-5)), shell(11, 10), host(12, 11)], inst).map((p) => p.pid)).toEqual([11]);
     expect(orphanHosts(good, inst)).toEqual([]);
-    let ps: { pid: number; ppid?: number; created?: number | null; cmd: string }[] = [q.dedicated(), shell(11, 10), host(12, 11)];
+    let ps: { pid: number; ppid?: number; created?: number | null; cmd: string }[] = [shell(11, 10), host(12, 11)];
     const killed: number[] = [];
-    const out = await run(q.opts({ ...attended, procs: () => ps, killPid: (pid) => { killed.push(pid); ps = ps.filter((p) => p.pid !== pid && p.ppid !== pid); } }));
-    expect(killed).toEqual([11]);
-    expect(out).toMatchObject({ code: "ok", job: id });
+    const out = await run(q.opts({ ...attended, procs: () => [q.dedicated(), ...ps], killPid: (pid) => { killed.push(pid); } }));
+    expect(killed).toEqual([]);
+    expect(out).toMatchObject({ code: "host_parent_gone", job: null });
+    // Once the dedicated Chrome is restarted (its hosts end with it), the run goes on.
+    ps = [];
+    expect(await run(q.opts({ ...attended, procs: () => [q.dedicated(), ...ps] }))).toMatchObject({ code: "ok", job: id });
     // A manifest that can't be read, or doesn't list the extension: the chain can't be checked, untrusted_config.
     writeFileSync(q.manifest, JSON.stringify({ name: "x", path: "host.bat", allowed_origins: ["chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/"] }));
     q.ask(READ); round(q.cfg);
@@ -2437,22 +2456,15 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     expect((await run(q.opts({ ...attended, selfTest: undefined }))).code).toBe("ok");
   });
 
-  test("versions: no extension version in the init data stops unattended runs (attended ones go on unchecked); the heartbeat's reason becomes Cain's one line", async () => {
+  test("versions: with no extension version in the init data an attended run goes on, checked against the profile's own files; the heartbeat's reason becomes Cain's one line", async () => {
     const { q, id } = oneJob();
-    q.install({ unattended: true });
     q.extVersion(null);
-    expect(await run(q.opts())).toEqual({ code: "extension_version_unknown", job: null, closed: [] });
-    expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
-    const beat = JSON.parse(q.remoteFile("worker/heartbeat.json"));
-    expect(beat).toMatchObject({ code: "extension_version_unknown", reason: "extension_version_unknown" });
-    expect(heartbeatLine(readHeartbeat(q.pc))).toMatch(/For Dane: .*doesn't report Claude in Chrome's version.*worker\.ts probe --attended, then worker\.ts confirm-profile/);
-    // Attended, it runs, without the runtime version check.
+    // Attended (the only kind in this version), it runs, with the manifest's version standing in.
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
-    // A probe that saw no live version: confirm-profile records it, and unattended stays off at preflight.
-    q.ask(READ); round(q.cfg);
-    q.extVersion("1.2.3");
-    q.confirmNow({ live: false });
-    expect((await run(q.opts())).code).toBe("extension_version_unknown");
+    // A heartbeat from an earlier version that stopped on it still reads, with Cain's line.
+    const unknown = parseHeartbeat(JSON.stringify({ v: 1, worker_clock: T0.toISOString(), code: "extension_version_unknown", job: null, stale_lock: false, skew_ms: null,
+      reason: "extension_version_unknown" }));
+    expect(heartbeatLine(unknown)).toMatch(/For Dane: .*doesn't report Claude in Chrome's version.*worker\.ts probe --attended, then worker\.ts confirm-profile/);
     // The keeper's reader: one line naming the re-probe, for each version reason; none otherwise.
     const hb = (reason: string | null, code = "probe_stale") => parseHeartbeat(JSON.stringify({ v: 1, worker_clock: T0.toISOString(), code, job: null, stale_lock: false, skew_ms: null, reason }));
     expect(heartbeatNotice(hb("extension_version_changed"))).toBe("The PC stopped taking jobs because Claude in Chrome updated. At the PC: restart the Cain jobs Chrome, then run worker.ts probe --attended, then worker.ts confirm-profile --accept-boundary.");
@@ -2616,7 +2628,7 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     expect(manifestCheck(q.opts({ registry: () => undefined }), inst)).toBeNull();               // no registry on this system
     expect(manifestCheck(q.opts({ registry: () => [{ view: "HKCU", path: join(q.root, "elsewhere", "host.json") }] }), inst)).toBe("manifest_path_mismatch");
     expect(manifestCheck(q.opts({ registry: () => [] }), inst)).toBe("manifest_path_mismatch");   // not registered at all
-    expect(checkHost(q.opts())).toBe("ok");
+    expect(checkHost(q.opts()).host).toBe("ok");
     expect(() => checkHost(q.opts({ registry: () => [{ view: "HKCU", path: join(q.root, "elsewhere", "host.json") }] }))).toThrow("manifest_path_mismatch");
   });
 
@@ -2845,9 +2857,10 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     const { q } = oneJob();
     expect(baseEnv(q.opts()).DISABLE_AUTOUPDATER).toBe("1");
     expect(sessionEnv(q.opts(), []).DISABLE_AUTOUPDATER).toBe("1");
-    expect(checkCli(q.opts())).toEqual({ pinned_version: "2.1.0", current_version: "2.1.0", pinned_sha256: "c".repeat(64), current_sha256: "c".repeat(64), same: true });
+    expect(checkCli(q.opts())).toEqual({ pinned_version: "2.1.0", current_version: "2.1.0", pinned_sha256: "c".repeat(64), current_sha256: "c".repeat(64), same: true,
+      signed_in: true, transcripts: { found: [], swept: true } });
     expect(checkCli(q.opts({ cliVersion: () => "2.2.0", cliHash: () => "d".repeat(64) })))
-      .toEqual({ pinned_version: "2.1.0", current_version: "2.2.0", pinned_sha256: "c".repeat(64), current_sha256: "d".repeat(64), same: false });
+      .toMatchObject({ pinned_version: "2.1.0", current_version: "2.2.0", pinned_sha256: "c".repeat(64), current_sha256: "d".repeat(64), same: false });
     rmSync(join(q.home, "confirmed.json"));
     expect(checkCli(q.opts()).same).toBe(false);
   });
@@ -2862,7 +2875,7 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     // No entry at all: no active version, and the preflight fails closed.
     writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
     expect(activeExtensionVersion(q.inst)).toBeNull();
-    expect((await run(q.opts(attended))).code).toBe("wrong_profile");
+    expect((await run(q.opts(attended))).code).toBe("extension_entry_missing");
     writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0` } } } }));
     // A newer folder Chrome hasn't switched to: update_pending, before any claim, attended ones too.
     mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0"));
@@ -2880,41 +2893,47 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     expect(heartbeatNotice(h)).toMatch(/Chrome updated\. At the PC: restart the Cain jobs Chrome/);
   });
 
-  test("the CLI's own transcripts: a run-scoped config folder under the worker folder, deleted after the session; a planted token is nowhere the worker keeps", async () => {
+  test("the CLI's own transcripts: in the worker's own Claude Code folder, deleted after the session; a planted token is nowhere the worker keeps", async () => {
     const TOKEN = "zq8TOKENzq8";
     const { q, id } = oneJob();
-    writeFileSync(join(q.claudeHome, ".credentials.json"), "{\"sign-in\": \"stand-in\"}");
-    const ownBefore = readdirSync(q.claudeHome).sort();
+    // The owner's own Claude Code folder, signed in: the worker never points a session at it, reads it or copies it.
+    const own = join(q.root, "owner-claude");
+    mkdirSync(own, { recursive: true });
+    writeFileSync(join(own, ".credentials.json"), "{\"sign-in\": \"the owner's own\"}");
+    const ownBefore = readdirSync(own).sort();
     const o = q.opts(attended);
     const real = o.launch!;
-    const seen: { dir: string; cred: boolean }[] = [];
+    const seen: { dir: string; cred: string | null }[] = [];
     // The stand-in CLI writes its transcript, page text and all, where CLAUDE_CONFIG_DIR says, and prints the token on its stdout.
-    const launch: Opts["launch"] = async (argv, cwd, ms, env) => {
+    const launch: Opts["launch"] = async (argv, cwd, ms, env, stop) => {
       const dir = env.CLAUDE_CONFIG_DIR;
-      seen.push({ dir, cred: existsSync(join(dir, ".credentials.json")) });
+      seen.push({ dir, cred: existsSync(join(dir, ".credentials.json")) ? readFileSync(join(dir, ".credentials.json"), "utf8") : null });
       mkdirSync(join(dir, "projects", "session"), { recursive: true });
       writeFileSync(join(dir, "projects", "session", "transcript.jsonl"), `{"page": "Signed in. ${TOKEN}"}\n`);
-      const s = await real(argv, cwd, ms, env);
+      writeFileSync(join(dir, "history.jsonl"), `{"display": "${TOKEN}"}\n`);
+      const s = await real(argv, cwd, ms, env, stop);
       return { ...s, out: s.out + JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `page said ${TOKEN}` }] } }) + "\n" };
     };
     q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true, two_factor: `on ${TOKEN}` } }));
     expect(await run({ ...o, launch })).toMatchObject({ code: "schema_violation", job: id });
     expect(seen.length).toBeGreaterThan(0);
     for (const x of seen) {
-      expect(x.dir).toBe(join(q.home, "session-config"));
-      expect(x.cred).toBe(true);                                                                   // signed in from a copy
+      expect(x.dir).toBe(join(q.home, "claude-config"));
+      expect(x.cred).toBe("{\"sign-in\": \"worker stand-in\"}");                                  // the worker's own sign-in, never a copy of the owner's
     }
-    expect(existsSync(join(q.home, "session-config"))).toBe(false);                              // gone after the end step
+    // The session's leftovers are gone after the end step; the worker's sign-in stays.
+    expect(SESSION_LEFTOVERS.filter((n) => existsSync(join(q.home, "claude-config", n)))).toEqual([]);
+    expect(signedIn(o)).toBe(true);
     // The owner's own folder is untouched.
-    expect(readdirSync(q.claudeHome).sort()).toEqual(ownBefore);
-    expect(readFileSync(join(q.claudeHome, ".credentials.json"), "utf8")).toBe("{\"sign-in\": \"stand-in\"}");
+    expect(readdirSync(own).sort()).toEqual(ownBefore);
+    expect(readFileSync(join(own, ".credentials.json"), "utf8")).toBe("{\"sign-in\": \"the owner's own\"}");
     // Nothing the worker keeps holds the token: no file in its folder (the queue clone included), no commit.
     const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === ".git" ? [] : walk(join(d, e.name))) : [join(d, e.name)]);
     for (const f of walk(q.home)) expect([f, readFileSync(f, "utf8").includes(TOKEN)]).toEqual([f, false]);
     expect(q.history()).not.toContain(TOKEN);
   });
 
-  test("messages: a bridge tool failure logs expected against found; the signing tool names the word matched and the full address", async () => {
+  test("messages: a bridge tool failure logs expected against found; the signing tool names the entry, the word matched and the host", async () => {
     const { q } = oneJob();
     q.tools((p) => p.includes("bridge check") ? GIVEN.filter((t) => !t.endsWith("read_page")) : GIVEN);
     expect((await run(q.opts(attended))).code).toBe("tool_inventory");
@@ -2926,9 +2945,253 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     ownerKeygen("owner-9", keyDir, "a long test passphrase");
     const base = { site: "example.com", action: "read_account_settings", match: "exact" };
     const sign = (entries: unknown[]) => { try { signAllowlistFile(q.write("entries.json", entries), join(keyDir, "owner-key.pem"), "a long test passphrase", "owner-9"); return null; } catch (e) { return e as any; } };
-    expect(sign([{ ...base, url: "https://example.com/account/delete" }])?.detail).toBe('entry 1: matched "delete" in https://example.com/account/delete');
-    expect(sign([{ ...base, url: "https://example.com/account", redirects: ["/account/signout/"] }])?.detail).toBe('entry 1: matched "signout" in https://example.com/account/signout/');
-    expect(sign([{ ...base, url: "https://example.com/account?tab=1" }])?.detail).toBe('entry 1: matched "query" in https://example.com/account?tab=1');
+    expect(sign([{ ...base, url: "https://example.com/account/delete" }])?.detail).toBe('entry 1: matched "delete" on host example.com');
+    expect(sign([{ ...base, url: "https://example.com/account", redirects: ["/account/signout/"] }])?.detail).toBe('entry 1: matched "signout" on host example.com');
+    expect(sign([{ ...base, url: "https://example.com/account?tab=1" }])?.detail).toBe('entry 1: matched "query" on host example.com');
+  });
+});
+
+describe("ninth review: the worker's own sign-in, transcript cleanup, the signing tool's redaction, the profile's extensions, the host's parent, attended only", () => {
+  // A stand-in CLI that leaves a transcript where CLAUDE_CONFIG_DIR says, then runs the stand-in browser session.
+  const leaving = (q: ReturnType<typeof queueRig>, after?: (env: Record<string, string>, stop?: string) => void): Opts["launch"] => async (argv, cwd, ms, env, stop) => {
+    mkdirSync(join(env.CLAUDE_CONFIG_DIR, "projects", "session"), { recursive: true });
+    writeFileSync(join(env.CLAUDE_CONFIG_DIR, "projects", "session", "t.jsonl"), "{\"page\": \"text\"}\n");
+    after?.(env, stop);
+    return q.opts().launch!(argv, cwd, ms, env, stop);
+  };
+  const leftovers = (q: ReturnType<typeof queueRig>) => SESSION_LEFTOVERS.filter((n) => existsSync(join(q.home, "claude-config", n)));
+
+  test("no sign-in in the worker's own folder: every run, the probe and bind-profile refuse with their own code, before any session", async () => {
+    const { q, id } = oneJob();
+    rmSync(join(q.home, "claude-config", ".credentials.json"));
+    expect(signedIn(q.opts())).toBe(false);
+    expect(await run(q.opts(attended))).toEqual({ code: "worker_signin_missing", job: null, closed: [] });
+    expect(heartbeatNotice(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8")))).toMatch(/isn't signed in\. At the PC: run the setup step that signs in claude-config/);
+    await expect(probe(q.opts(attended))).rejects.toMatchObject({ code: "worker_signin_missing" });
+    await expect(bindProfile(q.opts(attended))).rejects.toMatchObject({ code: "worker_signin_missing", detail: expect.stringContaining("CLAUDE_CONFIG_DIR") });
+    expect(checkCli(q.opts()).signed_in).toBe(false);
+    // An empty credential file is no sign-in either.
+    writeFileSync(join(q.home, "claude-config", ".credentials.json"), "");
+    expect((await run(q.opts(attended))).code).toBe("worker_signin_missing");
+    expect(q.launches).toEqual([]);
+    expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+    // Signed in: the run goes on.
+    writeFileSync(join(q.home, "claude-config", ".credentials.json"), "{\"sign-in\": \"again\"}");
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+  });
+
+  test("the probe runs two sessions back to back and then checks the worker's own sign-in is still there; confirm-profile needs that", async () => {
+    const q = queueRig({ confirmed: false });
+    // A CLI that loses its sign-in after a session (as one sharing the owner's would on his logout): the probe stops.
+    let n = 0;
+    const o = q.opts({ ...attended, launch: async (argv, cwd, ms, env, stop) => {
+      const s = await q.opts().launch!(argv, cwd, ms, env, stop);
+      if (++n === 2) rmSync(join(env.CLAUDE_CONFIG_DIR, ".credentials.json"));
+      return s;
+    } });
+    await expect(probe(o)).rejects.toMatchObject({ code: "worker_signin_missing", detail: expect.stringContaining("after two sessions") });
+    writeFileSync(join(q.home, "claude-config", ".credentials.json"), "{\"sign-in\": \"again\"}");
+    const ev = await probe(q.opts(attended));
+    expect(ev.signin).toEqual({ sessions: 2, signed_in: true, credential_kept: true, passed: true });
+    expect(probeCases(ev).ran).toContain("signin");
+    // Evidence without it doesn't confirm.
+    const file = join(q.home, "probe-evidence.json");
+    writeFileSync(file, JSON.stringify({ ...ev, signin: { ...ev.signin, passed: false } }));
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("probe_required");
+    writeFileSync(file, JSON.stringify(ev));
+    expect(confirmProfile(q.opts(), ACCEPT).v).toBe(1);
+  });
+
+  test("transcripts are deleted after every session: a normal end, a timeout, a STOP; a delete that keeps failing fails the run loudly with its own code", async () => {
+    const { q, id } = oneJob();
+    // A timeout kill.
+    q.say(() => "timeout");
+    expect((await run(q.opts({ ...attended, launch: leaving(q) }))).code).toBe("browser_timeout");
+    expect(leftovers(q)).toEqual([]);
+    // STOP while the session runs: the session is ended (stopped), the run fails with its own code, and the end step still deletes.
+    q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true } }));
+    q.ask(READ); round(q.cfg);
+    const stopping: Opts["launch"] = async (argv, cwd, ms, env, stop) => {
+      const s = await leaving(q, (_e, f) => writeFileSync(f!, ""))(argv, cwd, ms, env, stop);
+      return { ...s, stopped: true };
+    };
+    const r = await run(q.opts({ ...attended, launch: stopping }));
+    expect(r.code).toBe("session_stopped");
+    expect(leftovers(q)).toEqual([]);
+    rmSync(join(q.home, "STOP"));
+    // A delete that fails twice, then works: retried, and the run goes on.
+    q.ask(READ); round(q.cfg);
+    let fails = 2;
+    const flaky = (f: string) => { if (fails-- > 0) throw new Error("EBUSY"); rmSync(f, { recursive: true, force: true }); };
+    expect((await run(q.opts({ ...attended, launch: leaving(q), remove: flaky }))).code).toBe("ok");
+    expect(leftovers(q)).toEqual([]);
+    // A delete that never works: session_cleanup_failed, the job failed with that code, the heartbeat says so.
+    const id2 = q.ask(READ); round(q.cfg);
+    const stuck = () => { throw new Error("EBUSY"); };
+    let calls = 0;
+    // Left only by the run's own session (the bridge check's session leaves nothing here), so the claim is made first.
+    const onlyRun: Opts["launch"] = (argv, cwd, ms, env, stop) => (argv[2].includes("## This run") ? leaving(q) : q.opts().launch!)(argv, cwd, ms, env, stop);
+    const o = q.opts({ ...attended, launch: onlyRun, remove: (f) => { calls++; stuck(); void f; } });
+    const out = await run(o);
+    expect(out.code).toBe("session_cleanup_failed");
+    expect(out.job).toBeTruthy();
+    expect(calls).toBeGreaterThanOrEqual(5);
+    expect(result(q, out.job!)).toMatchObject({ status: "failed", code: "session_cleanup_failed" });
+    expect(JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8")).code).toBe("session_cleanup_failed");
+    expect(heartbeatNotice(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8")))).toMatch(/couldn't delete a session's transcripts/);
+    // The next start finds them still there and refuses before claiming anything, until they are gone.
+    q.ask(READ); round(q.cfg);
+    expect(await run(q.opts({ ...attended, remove: stuck }))).toEqual({ code: "session_cleanup_failed", job: null, closed: [] });
+    await expect(probe(q.opts({ ...attended, remove: stuck }))).rejects.toMatchObject({ code: "session_cleanup_failed" });
+    expect(id && id2).toBeTruthy();
+  });
+
+  test("a worker killed mid-run: the next start sweeps and logs it, check-cli reports and sweeps, and an exit handler deletes on the way out", async () => {
+    const { q, id } = oneJob();
+    // Leftovers as a worker killed outright leaves them.
+    mkdirSync(join(q.home, "claude-config", "projects", "old"), { recursive: true });
+    writeFileSync(join(q.home, "claude-config", "projects", "old", "t.jsonl"), "x");
+    writeFileSync(join(q.home, "claude-config", "history.jsonl"), "x");
+    expect(checkCli(q.opts()).transcripts).toEqual({ found: ["projects", "history.jsonl"], swept: true });
+    expect(leftovers(q)).toEqual([]);
+    mkdirSync(join(q.home, "claude-config", "projects", "old"), { recursive: true });
+    expect(startSweep(q.opts())).toEqual({ swept: true, code: null });
+    mkdirSync(join(q.home, "claude-config", "todos"), { recursive: true });
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toMatch(/ ok j-\S+ transcripts_swept/);
+    expect(sweepSession(q.opts())).toEqual({ found: [], ok: true });
+    // The exit handler: a worker that exits in the middle of a session (here, the stand-in CLI ends the worker's process) deletes on its way out.
+    const script = join(q.root, "exit-midrun.ts");
+    writeFileSync(script, `import { runSession } from ${JSON.stringify(join(OPT, "pcjobs", "worker.ts"))};
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const home = process.argv[2];
+await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
+  mkdirSync(join(env.CLAUDE_CONFIG_DIR, "projects", "s"), { recursive: true });
+  writeFileSync(join(env.CLAUDE_CONFIG_DIR, "projects", "s", "t.jsonl"), "page text");
+  process.exit(3);
+} }, ["claude"], 1000, { CLAUDE_CONFIG_DIR: join(home, "claude-config") });
+`);
+    const p = Bun.spawnSync([process.execPath, script, q.home], { cwd: q.root, env: cleanEnv(), stdout: "pipe", stderr: "pipe" });
+    expect(p.exitCode).toBe(3);
+    expect(leftovers(q)).toEqual([]);
+    expect(signedIn(q.opts())).toBe(true);
+  });
+
+  test("launchSession ends a session when STOP appears", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcjobs-stop-"));
+    const stop = join(dir, "STOP");
+    setTimeout(() => writeFileSync(stop, ""), 300);
+    const t = Date.now();
+    const s = await launchSession([process.execPath, "-e", "setTimeout(() => {}, 60000)"], dir, 60_000, process.env as Record<string, string>, stop);
+    expect(s).toMatchObject({ stopped: true, timedOut: false });
+    expect(Date.now() - t).toBeLessThan(20_000);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("the signing tool's refusal prints the entry, the word and the host only; nothing of a refused address is written anywhere", () => {
+    const q = queueRig();
+    const keyDir = join(q.home, "owner-key");
+    ownerKeygen("owner-9", keyDir, "a long test passphrase");
+    const SECRETS = ["hunter2pw", "tok3nSECRET", "fragSECRET", "pathSECRET", "rediSECRET"];
+    const entries = join(q.root, "entries.json");
+    writeFileSync(entries, JSON.stringify([
+      { site: "example.com", action: "read_account_settings", match: "exact", url: "https://alice:hunter2pw@example.com/account/pathSECRET/logout?t=tok3nSECRET#fragSECRET" },
+      { site: "example.com", action: "read_account_settings", match: "exact", url: "https://example.com/account", redirects: ["/rediSECRET/signout"] },
+      { site: "example.com", action: "read_account_settings", match: "exact", url: "not a url pathSECRET" },
+    ]));
+    const before = new Set(readdirSync(q.home));
+    const out = join(q.home, "allowlist-new.json");
+    const p = Bun.spawnSync([process.execPath, join(OPT, "pcjobs/worker.ts"), "sign-allowlist", entries, "--key", join(keyDir, "owner-key.pem"), "--kid", "owner-9",
+      "--out", out, "--home", q.home], { cwd: q.root, env: { ...cleanEnv(), PC_OWNER_PASSPHRASE: "a long test passphrase" }, stdout: "pipe", stderr: "pipe" });
+    const said = p.stdout.toString() + p.stderr.toString();
+    expect(p.exitCode).toBe(1);
+    expect(JSON.parse(p.stdout.toString())).toEqual({ error: "allowlist_risky_url",
+      detail: 'entry 1: matched "query" on host example.com; entry 2: matched "signout" on host example.com; entry 3: matched "url" on host unparsed' });
+    for (const x of [...SECRETS, "alice", "/account"]) expect([x, said.includes(x)]).toEqual([x, false]);
+    // Nothing written: no output file, no new file, and no file under the worker folder holds any of it.
+    expect(existsSync(out)).toBe(false);
+    expect(readdirSync(q.home).filter((f) => !before.has(f))).toEqual([]);
+    const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]);
+    for (const f of walk(q.home)) {
+      const text = readFileSync(f).toString("latin1");
+      for (const x of SECRETS) expect([f, x, text.includes(x)]).toEqual([f, x, false]);
+    }
+  });
+
+  test("the extension's entry: read from Secure Preferences or Preferences, whichever holds it; in neither is extension_entry_missing, not wrong_profile", async () => {
+    const { q, id } = oneJob();
+    const prefs = (x: object) => writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" }, ...x }));
+    const secure = (x: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify(x));
+    expect(checkHost(q.opts())).toMatchObject({ extension_entry: { files: ["Secure Preferences"], key: `extensions.settings.${EXT}` } });
+    // Only in Preferences: read there, and the run goes on.
+    secure({});
+    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } });
+    expect(checkHost(q.opts())).toMatchObject({ extension_entry: { files: ["Preferences"], key: `extensions.settings.${EXT}` } });
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    // Split between both: both named.
+    secure({ extensions: { settings: { [EXT]: { state: 1 } } } });
+    expect(extensionPrefs(q.inst).files).toEqual(["Secure Preferences", "Preferences"]);
+    // In neither: its own code, from the run and from check-host.
+    secure({ extensions: { settings: {} } });
+    prefs({});
+    q.ask(READ); round(q.cfg);
+    expect((await run(q.opts(attended))).code).toBe("extension_entry_missing");
+    expect(() => checkHost(q.opts())).toThrow("extension_entry_missing");
+    // A profile whose name isn't the confirmed one is still wrong_profile.
+    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } });
+    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Daily" }, extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0` } } } }));
+    expect((await run(q.opts(attended))).code).toBe("wrong_profile");
+  });
+
+  test("any other enabled extension in the dedicated profile fails the preflight (extra_extension); disabled and Chrome's own component ones don't; the confirmation lists them", async () => {
+    const { q, id } = oneJob();
+    const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", COMPONENT = "cccccccccccccccccccccccccccccccc";
+    const secure = (others: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"),
+      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 }, ...others } } }));
+    // Enabled, in Preferences only: read from the same source.
+    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [OTHER]: { state: 1, manifest: { name: "Helper" } } } } }));
+    expect((await run(q.opts(attended))).code).toBe("extra_extension");
+    let err: any = null;
+    try { checkHost(q.opts()); } catch (e) { err = e; }
+    expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [OTHER] } });
+    expect(heartbeatNotice(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8")))).toMatch(/another extension turned on/);
+    // Turned off (disable reasons, or state 0): fine. A component extension: fine.
+    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
+    secure({ [OTHER]: { state: 1, disable_reasons: [1] }, [COMPONENT]: { location: 5, state: 1 } });
+    expect(extensionPrefs(q.inst).others).toEqual([]);
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    secure({ [OTHER]: { state: 0 } });
+    expect(extensionPrefs(q.inst).others).toEqual([]);
+    secure({ [OTHER]: { disable_reasons: 0 } });
+    expect(extensionPrefs(q.inst).others).toEqual([OTHER]);
+    // What check-host and confirm-profile print: every extension found, with whether it is on.
+    secure({ [OTHER]: { state: 1, disable_reasons: [1], manifest: { name: "Helper" } } });
+    expect(checkHost(q.opts()).extensions).toEqual([
+      { id: EXT, name: null, enabled: true, component: false },
+      { id: OTHER, name: "Helper", enabled: false, component: false },
+    ]);
+  });
+
+  test("a native host whose parent is gone, or whose parent's PID was reused, is host_parent_gone; the chain is checked by PID and start time", () => {
+    const inst = queueRig().inst;
+    const bat = join(dirname(inst.native_host_manifest), "chrome-native-host.bat");
+    const t = (min: number) => T0.getTime() + min * 60_000;
+    const chrome = (pid: number, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${inst.profile.user_data_dir}"` });
+    const shell = (pid: number, ppid: number, created = t(-30)) => ({ pid, ppid, created, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""${bat}" chrome-extension://${EXT}/ --parent-window=0"` });
+    const host = (pid: number, ppid: number, created = t(-29)) => ({ pid, ppid, created, cmd: `"${bat}" chrome-extension://${EXT}/ --parent-window=0` });
+    expect(hostChain([chrome(10), shell(11, 10), host(12, 11)], inst, bat)).toBeNull();
+    expect(hostChain([chrome(10), host(12, 10)], inst, bat)).toBeNull();
+    // The parent gone: no process with its PID.
+    expect(hostChain([chrome(10), host(12, 99)], inst, bat)).toBe("host_parent_gone");
+    expect(hostChain([shell(11, 10), host(12, 11)], inst, bat)).toBe("host_parent_gone");               // the cmd.exe's own Chrome gone
+    // The PID reused: its process started after the child, or in the same tick as another image.
+    expect(hostChain([chrome(10, t(-10)), shell(11, 10), host(12, 11)], inst, bat)).toBe("host_parent_gone");
+    expect(hostChain([chrome(10), { pid: 11, ppid: 1, created: t(-29), cmd: "C:\\Windows\\notepad.exe" }, host(12, 11)], inst, bat)).toBe("host_parent_gone");
+    // A parent that started first and is of another kind is still extension_elsewhere, and a start time that can't be read fails closed there.
+    expect(hostChain([chrome(10), { pid: 11, ppid: 1, created: t(-40), cmd: "C:\\Windows\\explorer.exe" }, host(12, 11)], inst, bat)).toBe("extension_elsewhere");
+    expect(hostChain([chrome(10), shell(11, 10), { ...host(12, 11), created: null }], inst, bat)).toBe("extension_elsewhere");
+    expect(extensionElsewhere([chrome(10, t(-10)), shell(11, 10), host(12, 11)], inst, bat)).toBe(true);
   });
 });
 
@@ -3044,7 +3307,7 @@ describe("the files around it", () => {
       "refused until the confirm path ships", "owner.pub", "owner_fpr", "*.json text eol=lf", "BatchMode", "never sleep", "sync",
       "untrusted_config", "untrusted_files", "profile_changed", "extension_elsewhere", "browser_timeout", "clock_skew", "attended_only",
       "not a required check", "rulesets", "icacls", "diagnostics", "confirm_path", "deny check",
-      "Not enforced", "Task Scheduler", "Run only when user is logged on", "--setting-sources", "DISABLE_AUTOUPDATER", "S-1-5-18", "S-1-5-32-544",
+      "Not enforced", "Task Scheduler", "No scheduled runs in this version", "--setting-sources", "DISABLE_AUTOUPDATER", "S-1-5-18", "S-1-5-32-544",
       "/inheritance:r", "/inheritance:d", "On specific sites", "http://127.0.0.1", "logout", "alternatives", "nav-guard", "probe_stale",
       "extension_unreachable", "tool_inventory", "profile_scan_failed", "Supported versions", "must be open",
       "restricted browser tools against owner-approved addresses", "navigation_unguarded", "navigation_denied", "unexpected_location",
@@ -3065,9 +3328,11 @@ describe("the files around it", () => {
       "supervised browsing with checked tool calls and address checks at each observation", "not prevention of browser-initiated requests", "--accept-boundary",
       "boundary_version", "request_reached", "The canary verdict comes from the server's own record alone", "can only veto",
       "whose own parent (the host's grandparent) must be the dedicated Chrome's browser process", "WOW6432Node", "every registry view Chrome consults",
-      "injection_required", "check-cli", "chrome_version_changed", "update_pending", "active", "session-config",
-      "That folder is the one place page text lives on the PC, and only for the session's duration", "browser_initiated_requests_not_prevented",
-      "matched \"delete\" in https://example.com/account/delete", "expected` against the `found"])
+      "injection_required", "check-cli", "chrome_version_changed", "update_pending", "active", "claude-config", "Your own `~/.claude` is never read, copied or written by the worker or its sessions", "worker_signin_missing",
+      "A worker killed outright mid-session", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension",
+      "host_parent_gone", "unattended_unsupported", "request-level blocking", "two sessions back to back",
+      "that folder is the one place page text lives on the PC, and only from a session's start to its end step", "browser_initiated_requests_not_prevented",
+      "matched \"delete\" on host example.com", "path, query, fragment and userinfo are never printed", "expected` against the `found"])
       expect(setup.replace(/\s+/g, " ")).toContain(w.replace(/\s+/g, " "));
     // The troubleshooting table names every code a run or the probe can end with.
     const table = setup.slice(setup.indexOf("## Troubleshooting"), setup.indexOf("## How a job runs"));
@@ -3076,7 +3341,8 @@ describe("the files around it", () => {
       "extension_elsewhere", "profile_scan_failed", "clock_skew", "queue_misconfigured", "git_failed", "browser_timeout", "url_drift", "result_rejected", "deny_check",
       "cli_changed", "extension_version_mismatch", "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing",
       "chrome_not_restarted", "extension_version_unknown", "read_unverified", "manifest_path_mismatch", "slow_hook_required", "allowlist_risky_url",
-      "boundary_not_accepted", "update_pending", "injection_required"])
+      "boundary_not_accepted", "update_pending", "injection_required", "worker_signin_missing", "session_cleanup_failed", "session_stopped",
+      "extension_entry_missing", "extra_extension", "host_parent_gone", "unattended_unsupported"])
       expect([c, table.includes(`\`${c}\``)]).toEqual([c, true]);
     // Rows for a WOW6432Node registry entry, and for the autoupdater behind probe_stale's cli_version_changed.
     expect(table).toContain("a WOW6432Node entry");
@@ -3084,9 +3350,14 @@ describe("the files around it", () => {
     // Cain's rules say what the release guarantees, and what it doesn't.
     const rules = readFileSync(join(OPT, "CLAUDE.md"), "utf8");
     for (const w of ["supervised browsing with checked tool calls and address checks", "It does not prevent requests the browser makes on its own",
-      "update_pending", "boundary_not_accepted"]) expect(rules.replace(/\s+/g, " ")).toContain(w);
+      "update_pending", "boundary_not_accepted", "worker_signin_missing", "host_parent_gone", "no unattended runs at all", "request-level blocking"]) expect(rules.replace(/\s+/g, " ")).toContain(w);
     // A troubleshooting row for an unexpected intermediate in the native host's parent chain.
     expect(table).toContain("unexpected intermediate");
+    // A row for the owner's own CLI logged out after a run, which this design should make impossible.
+    expect(table).toMatch(/\| Your own `claude` is logged out after a run \|[^\n]*This design should make that impossible/);
+    // The Task Scheduler step is no longer a setup step.
+    const steps = setup.slice(setup.indexOf("## Set up once, at your PC"), setup.indexOf("**No scheduled runs in this version.**"));
+    expect(steps).not.toContain("Task Scheduler");
     // The extension needs no file access any more, and the setup note says to leave it off.
     expect(setup).toContain("Leave **Allow access to file URLs** off");
     expect(prompt + setup).not.toContain("—");

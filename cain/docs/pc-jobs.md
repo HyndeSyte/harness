@@ -36,8 +36,8 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   install config, which this version only accepts as `false`. The nonce spend lives in
   `pcjobs/confirm.ts`, which `worker.ts` doesn't import; a test holds every worker
   command to that.
-- **The whole session is pinned, in code.** Windows Task Scheduler (or you, by hand)
-  runs the worker, and the worker starts the session itself, straight from an argument
+- **The whole session is pinned, in code.** You run the worker, by hand and watching
+  (this version has no unattended runs, below), and the worker starts the session itself, straight from an argument
   list and never through a shell (on Windows `claude` must be `claude.exe`, not a
   `.cmd` or `.ps1` wrapper): the `claude` command in print mode with `--chrome`, the
   pinned settings file `cain/docs/pc-worker/session-settings.json` (`--settings`) and no
@@ -49,23 +49,46 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   one (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOMEDRIVE`, `HOMEPATH`, `SystemRoot`,
   `SystemDrive`, `TEMP`, `TMP`, `PATH`, `PATHEXT`, `COMSPEC`, and a few like `WINDIR`
   and `USERNAME`), `DISABLE_AUTOUPDATER=1` set by the worker itself whatever your own
-  environment says, and how the hook runs the worker; nothing else of yours, no API key:
-  sign the `claude` command in once with its own login. Of Claude Code's own variables
+  environment says, and how the hook runs the worker; nothing else of yours, no API key.
+  Of Claude Code's own variables
   only `CLAUDE_CODE_GIT_BASH_PATH` passes, and only when it is an absolute path to a
   `bash.exe` that exists. The worker fails closed (`untrusted_config`) if its own
   environment sets `CLAUDE_CONFIG_DIR`, an API base address (`ANTHROPIC_BASE_URL` and the
   like), any other `CLAUDE_CODE_*` variable, or a `CLAUDE_CODE_GIT_BASH_PATH` it can't
   vouch for (so don't start it from inside a Claude Code session), and hashes the
-  session's environment into the confirmation. The worker itself then sets
-  `CLAUDE_CONFIG_DIR` **in the session's environment only**, to a run-scoped folder
-  `session-config` under the worker folder (inside its ACL): the `claude` command keeps
-  its own transcripts and state there, never in your `~/.claude`, which stays untouched.
-  The worker makes the folder fresh before each session, with only a copy of the
-  command's sign-in (`~/.claude/.credentials.json`, never read or printed by the worker),
-  and deletes it after the session's end step. **That folder is the one place page text
-  lives on the PC, and only for the session's duration.** The worker persists nothing of
-  the command's stdout or stderr; a test plants a token in the page, the transcript and
-  the command's output and finds it in no file of the worker folder and no commit.
+  session's environment into the confirmation.
+- **The worker has its own Claude Code sign-in, never a copy of yours.** The worker sets
+  `CLAUDE_CONFIG_DIR` **in the session's environment only**, to its own Claude Code
+  folder, `claude-config` under the worker folder (inside its ACL, and kept out of
+  Windows Search: the worker marks it `attrib +I` where it can, and setup step 9 does it
+  too). That folder persists: you sign it in once at setup (setup step 9, with
+  `CLAUDE_CONFIG_DIR` pointing at it in a terminal of your own), and every session uses
+  that sign-in. **Your own `~/.claude` is never read, copied or written by the worker or
+  its sessions**, so nothing a run does can sign out, refresh or replace your own
+  `claude`'s sign-in. A run, the probe and `bind-profile` refuse with their own code
+  (`worker_signin_missing`) while `claude-config` holds no credential file (the worker
+  checks it is there and not empty; it never reads it). The probe runs two sessions back
+  to back and then checks the worker's own sign-in is still there (`signin` in its
+  evidence; `confirm-profile` needs it).
+- **Transcripts are deleted after every session.** The `claude` command writes its
+  transcripts (page text and all) and history into `claude-config` (`projects`,
+  `history.jsonl` and the like). The worker deletes them after every session, in a
+  finally path: a normal end, a failed run, a timeout kill, and a `STOP` the session was
+  ended for (the worker checks for `STOP` every second while a session runs and ends it,
+  `session_stopped`) all go through it. The delete retries (Windows can hold a file a
+  moment after its process ends); one that still fails is `session_cleanup_failed`, the
+  job fails with that code and the heartbeat says so, never a silent pass. If the worker
+  itself is ended mid-session (Ctrl+C, its window closed), an exit handler deletes them
+  on the way out. **A worker killed outright mid-session (Task Manager's End task, a
+  power cut) runs nothing on its way out: that session's transcript stays in
+  `claude-config` until the worker next starts.** Every worker start, the probe,
+  `bind-profile` and `check-cli` sweep those leftovers first (a start that found any logs
+  `transcripts_swept` in `worker.log`; `check-cli` names what it found and whether the
+  sweep worked), and a run won't start while any remain. So **that folder is the one
+  place page text lives on the PC, and only from a session's start to its end step (or,
+  after a crash, to the next start).** The worker persists nothing of the command's
+  stdout or stderr; a test plants a token in the page, the transcript and the command's
+  output and finds it in no file of the worker folder and no commit.
 - **Two permission layers, each refusing on its own.** The first is Claude Code's own:
   the pinned settings and the command line allow exactly the four reading tools, deny
   every other built-in and extension tool by name, and run in `dontAsk` mode, which
@@ -101,25 +124,34 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   the one the dedicated profile's preferences say Chrome runs (its entry under
   `extensions.settings` in `Secure Preferences` or `Preferences`: the entry's manifest
   version, or the version folder its `path` names), whose folder's `manifest.json` must
-  agree (no entry, or a manifest whose version isn't its folder's, counts as none, and the
-  run is `wrong_profile`). Chrome unpacks an update into a newer version folder and
+  agree (a manifest whose version isn't its folder's counts as none, and the run is
+  `wrong_profile`). An entry in neither file is its own code, `extension_entry_missing`
+  (a right profile that doesn't list the extension, not a wrong one), and `check-host`
+  prints which file and key path it read the entry from (`extension_entry`). **No other
+  extension may be on in the dedicated profile:** any enabled extension besides the
+  pinned one in the same preferences (Chrome's own component extensions aside) stops runs
+  (`extra_extension`); `check-host` and `confirm-profile` list every extension found
+  there, with whether it is on. Chrome unpacks an update into a newer version folder and
   switches to it only when it restarts: while the newest folder isn't the active version,
-  every run stops (`update_pending`) until you restart the Cain jobs Chrome. **Where the init data doesn't carry it, unattended runs fail
-  closed** (`extension_version_unknown`, before any claim); attended runs go on, with the
-  manifest's version standing in: it must be the confirmed version at the preflight
+  every run stops (`update_pending`) until you restart the Cain jobs Chrome. Where the
+  init data doesn't carry it, a run (every run is attended in this version) goes on with
+  the manifest's version standing in: it must be the confirmed version at the preflight
   (`probe_stale` otherwise) and still be it after the session
   (`extension_version_mismatch` otherwise). A version the probe hasn't confirmed stops every run
   anyway (`probe_stale`, below). A new extension version on disk also needs a restart
   of the dedicated Chrome (Chrome runs the old one until then) before the probe. When a
   version stops runs, the heartbeat carries a fixed reason (`extension_version_changed`,
-  `cli_version_changed`, `chrome_version_changed`, `extension_version_unknown`), and Cain's
+  `cli_version_changed`, `chrome_version_changed`, and `extension_version_unknown` from
+  earlier versions), and Cain's
   reader turns it into one line for you naming what to run at the PC. Chrome's own full
   version (from the user data folder's `Last Version`) is recorded at confirmation, and
   any change of it is `probe_stale` with reason `chrome_version_changed`.
 - **Settings from anywhere else, checked every run.** Claude Code still reads managed
   settings whatever the flags say, so before every run the worker also reads your user
-  settings (`~/.claude/settings.json`), the session folder's project and local settings,
-  the managed settings files and your user memory file (`~/.claude/CLAUDE.md`). It fails
+  settings as the session sees them (`claude-config/settings.json` and
+  `settings.local.json`: with `CLAUDE_CONFIG_DIR` set, that is the session's user
+  folder, not your `~/.claude`), the session folder's project and local settings, the
+  managed settings files and the user memory file there (`claude-config/CLAUDE.md`). It fails
   closed (`untrusted_config`) if any of those settings holds hooks, permission allow
   rules or a permission-skipping default mode or can't be read as JSON; if the memory
   file isn't empty; if a `CLAUDE.md`, `CLAUDE.local.md` or `.claude/CLAUDE.md` sits in
@@ -221,8 +253,7 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   reading tool's address or a tab context) and whether any reading tool reported one
   (`reading_reports_url`). If none did, `confirm-profile` records it (`read_context`) and
   from then on every run needs a tab context right after each reading call before the
-  read is accepted (`read_unverified` otherwise); unattended runs are allowed only with
-  that in place and `move_and_return` caught.
+  read is accepted (`read_unverified` otherwise).
 - **Tabs.** The run's tab is the one the tab context lists at the canary page; its id is
   recorded there. Any other tab in a tab context of the run (a popup opened into Claude's
   tab group, a tab you left there) fails the run (`tabs_unexpected`). The reading tools
@@ -267,7 +298,11 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   `chrome-extension://<id>/`) must descend from the Chrome running on the dedicated
   folder, checked link by link: each parent must have started no later than its child (an
   equal start time passes, as Windows' timer is coarse; a reused process id that started
-  later can't pass for a parent); the host's parent is that Chrome itself (how Chrome
+  later can't pass for a parent: a host whose parent is gone, or whose parent's process id
+  now belongs to a process started after it (or, in the same tick, to something that is
+  neither a browser nor `cmd.exe`), is `host_parent_gone`, by process id and start time
+  together, never by id alone; the worker ends nothing for it, and restarting the Cain
+  jobs Chrome is the remedy); the host's parent is that Chrome itself (how Chrome
   usually starts an `.exe` host), or there is exactly one intermediate, the `cmd.exe`
   Chrome starts a `.bat` host through, **whose own parent (the host's grandparent) must
   be the dedicated Chrome's browser process** (the one whose command line carries the
@@ -277,7 +312,7 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   points to (`native_host_manifest`, setup step 8) must be named on the command line of
   the process Chrome started (the host itself, or that `cmd.exe`); a process in the chain whose command line Windows won't show, or whose start
   time can't be read, is never a pass. Anything else is `extension_elsewhere`. Hosts of
-  the extension whose browser is gone (orphans) are ended at the preflight first.
+  the extension whose browser is gone (orphans) are `host_parent_gone`, not ended.
 - **One Claude Code at a time, and a live bridge.** Before a claim, any other Claude
   Code process on the PC (a session of yours, or one left over) is `chrome_busy`: the
   extension would serve it instead, and the worker's lock can't see it (the extension's
@@ -303,9 +338,10 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   signing tool (`sign-allowlist`) refuses an entry whose address has a query, or whose
   path (the pin's, a redirect's or a sign-in path's) has `logout`, `signout`,
   `unsubscribe`, `confirm`, `delete`, `remove` or `cancel` in it (`allowlist_risky_url`,
-  naming the entry, the word it matched and the full address, like
-  `entry 1: matched "delete" in https://example.com/account/delete`, so a reviewed mark
-  is deliberate), unless the entry says `"reviewed": true`, which is signed with the
+  naming the entry, the word it matched and the address's host only, like
+  `entry 1: matched "delete" on host example.com`: an address can carry a secret, so its
+  path, query, fragment and userinfo are never printed, and nothing of a refused address
+  is written anywhere), unless the entry says `"reviewed": true`, which is signed with the
   rest. That is a check on your typing, not a guarantee: an address can act without
   saying so.
 - **Enforced in code, and verified only by the probe.** In code, on every run: the job's
@@ -318,10 +354,11 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   the profile marker's cookie (checked by the canary server), the parent chain of the
   extension's host, the CLI's hash and version against the ones the deny-alone check
   was seen on, the extension's version (live where the session reports it, else its
-  manifest in the dedicated profile; unattended runs stopped where the session doesn't
-  report it), each fact against its action's strict schema, failure records without
-  values, the canary verdict from the server's record, the run-scoped CLI config folder
-  deleted after each session, the boundary's acceptance, and a confirmation only after
+  manifest in the dedicated profile), the extension's entry in the profile's preferences
+  and no other extension on there, the worker's own sign-in, each fact against its action's strict schema, failure records without
+  values, the canary verdict from the server's record, the session's transcripts
+  deleted after each session (and swept at every start), attended runs only (an install
+  file asking for unattended ones is refused), the boundary's acceptance, and a confirmation only after
   the deny-alone and planted-instruction checks passed. At setup: the registered native
   host manifest in every registry view against `install.json` (`manifest_path_mismatch`),
   and risky allowlist addresses at signing. Only the
@@ -338,11 +375,15 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   `browser_initiated_requests_not_prevented`: no case can verify what this release
   doesn't do). **Not enforced at all:** requests the browser makes on its own (the
   boundary above).
-- **Not enforced until your PC's probe passes.** Whether Claude Code honors the deny
-  rules and the hook with Claude in Chrome on your PC can't be checked from here. The
-  supervised probe checks it (below). Until its deny check has passed and you have set
-  `"unattended": true` in your install config, the worker does nothing unattended
-  (`attended_only`): v1 runs attended, with you watching (`worker.ts run --attended`).
+- **Attended only, in code.** Whether Claude Code honors the deny rules and the hook
+  with Claude in Chrome on your PC can't be checked from here; the supervised probe
+  checks it (below). Even so, **this version has no unattended runs at all**: a run
+  without `--attended` does nothing (`attended_only`), and an install config with
+  `"unattended": true` is refused outright, by every command, the way `confirm_path` is
+  (`unattended_unsupported`). Unattended runs wait for a later version that adds
+  request-level blocking (stopping a browser-initiated request before it leaves, which
+  this one can't: the boundary above). The probe still runs its deny check and records
+  its evidence (`deny_check`), since that version will need it.
   **A new Claude in Chrome or `claude` version stops every run, attended ones too**
   (`probe_stale`): only the supervised probe runs until it has passed on the new
   versions and `confirm-profile` has recorded them.
@@ -415,7 +456,8 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
    passphrase-protected and stays outside the worker folder. The signing tool refuses an
    address with a query, or a pin, redirect or sign-in path with `logout`, `signout`,
    `unsubscribe`, `confirm`, `delete`, `remove` or `cancel` in it
-   (`allowlist_risky_url`, naming the entry, the word it matched and the full address); if you have looked at such an address and
+   (`allowlist_risky_url`, naming the entry, the word it matched and the host only, never
+   the path, query, fragment or sign-in part, and writing nothing); if you have looked at such an address and
    it only shows a page, add `"reviewed": true` to that entry (signed with the rest).
 6. **Cain's public Ship key.** The line "Ship key (public): ..." in Cain's App log, as
    `link-1 <key>` in `C:/pc-worker/ship.pub`. Nothing uses it yet; the confirm path will.
@@ -423,7 +465,8 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
    `chrome.exe --user-data-dir=C:/pc-worker/chrome --profile-directory=Default`. Name
    its profile **Cain jobs**, sign in there only to the sites the jobs need (never your
    daily profile, nothing financial, not your main mail), and install Claude in Chrome
-   **only in this profile**. Turn off sync in this profile (chrome://settings/syncSetup),
+   **only in this profile, and no other extension in it**: any other enabled extension
+   there stops runs (`extra_extension`; remove it, or turn it off). Turn off sync in this profile (chrome://settings/syncSetup),
    so the extension and its settings never reach another profile; every run scans your
    other browser folders (the default ones of Chrome, Edge, Brave and Chromium, and the
    folder of any of them running) and fails closed
@@ -476,21 +519,32 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
    (its folder, profile directory, name **Cain jobs**, and the extension's id from
    chrome://extensions with Developer mode on), and any other Chrome folders to scan
    (`other_user_data_dirs`). Leave
-   `unattended` and `diagnostics` false and `confirm_path` false. The worker never writes
-   this file.
-9. **Power, settings and environment.** Windows power settings: the PC should
-   never sleep while plugged in, and the lock screen doesn't put the PC to sleep. Your user
-   settings and memory file: no hooks, no permission allow rules and no
-   permission-skipping mode in `~/.claude/settings.json`, and `~/.claude/CLAUDE.md`
-   empty or absent (the worker reads these, but the session itself runs on a run-scoped
-   `CLAUDE_CONFIG_DIR` of its own, and never writes to `~/.claude`). No `managed-settings.d` folder under `C:/Program Files/ClaudeCode`
+   `unattended` and `diagnostics` false and `confirm_path` false: this version refuses
+   `"unattended": true` outright (`unattended_unsupported`), like `confirm_path`. The
+   worker never writes this file.
+9. **Power, settings, environment, and the worker's own sign-in.** Windows power
+   settings: the PC should never sleep while plugged in, and the lock screen doesn't put
+   the PC to sleep.
+   **The worker's own sign-in (new in this version).** The worker's sessions use their
+   own Claude Code folder, `C:/pc-worker/claude-config`, never your `~/.claude`. Sign it
+   in once, in a terminal of your own (PowerShell, not elevated):
+   `$env:CLAUDE_CONFIG_DIR = "C:\pc-worker\claude-config"; claude`, then `/login` and
+   sign in, then `/exit`, and close that terminal (so `CLAUDE_CONFIG_DIR` doesn't linger
+   in it: the worker refuses to start with it set). Then keep it out of Windows Search:
+   `attrib +I C:\pc-worker\claude-config /S /D` (the worker also does it where it can).
+   Check with `worker.ts check-cli --home C:/pc-worker`: `signed_in` must be true. Until
+   it is, every run, the probe and `bind-profile` stop with `worker_signin_missing`.
+   Signing your own `claude` in or out later doesn't touch it, and it doesn't touch
+   yours. Nothing in that folder may hold hooks, permission allow rules or a
+   permission-skipping mode (`claude-config/settings.json`), and its `CLAUDE.md` stays
+   empty or absent: the worker reads those (they are what the session sees as its user
+   settings), and your own `~/.claude` not at all. No `managed-settings.d` folder under `C:/Program Files/ClaudeCode`
    or `C:/ProgramData/ClaudeCode`, and no `SOFTWARE\Policies\ClaudeCode` key in the
    registry. No `CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL` or `CLAUDE_CODE_*` in your
    environment, except `CLAUDE_CODE_GIT_BASH_PATH` if Git Bash isn't where `claude` looks
    for it: then the full path of `bash.exe` (`C:\Program Files\Git\bin\bash.exe`), which
-   must exist. Sign the `claude` command in once, in a terminal of your own (`claude`,
-   then its login): the session gets no API key from your environment. The worker fails
-   closed (`untrusted_config`) otherwise.
+   must exist. The session gets no API key from your environment: its sign-in is the
+   worker's own, above. The worker fails closed (`untrusted_config`) otherwise.
    **The hook on Windows.** Claude Code runs hooks through Git Bash on Windows (install
    Git for Windows if `claude` asks for it). The hook command is
    `"$PCW_RUNTIME" "$PCW_WORKER" nav-guard`: both variables are set by the worker with
@@ -533,6 +587,9 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
       extension version than the one on disk), or
       `tool_inventory` (the tools and MCP servers the session was actually given, with
       the missing and extra names);
+    - runs the smoke step a second time straight after the first, then checks the
+      worker's own sign-in is still in `claude-config` (`signin`: two sessions back to
+      back, each signed in, the credential kept; `worker_signin_missing` otherwise);
     - **asks you to restart the Cain jobs Chrome** (close every window of it, open it
       again on its profile, press Enter in the terminal), checks its browser process
       changed (`chrome_not_restarted` otherwise), and runs the smoke step again: the
@@ -594,7 +651,7 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
       file field, a key listener) calls back to the worker if used, and the console line
       and network request carry secrets that must not come out: any of that fails it.
     It saves `probe-evidence.json`: the time, the target, STOP, the smoke step, the
-    restart (`restart`), whether reading tools reported their tab's address
+    worker's own sign-in across sessions (`signin`), the restart (`restart`), whether reading tools reported their tab's address
     (`reading_reports_url`), whether the init data carried the extension's version
     (`live_extension_version`), the schema checks (`injection`, `injection_plan`), the
     slowed-hook check (`slow_hook`), the boundary's cases (`boundary`), the `claude` executable's hash (`cli_sha256`), the failed preflight's code, the browser step's code, whether the canary came back, the
@@ -609,7 +666,7 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
     within a day. Without `--accept-boundary` it refuses (`boundary_not_accepted`) and
     prints the boundary's text: read it first (the top of this note says the same). It
     records that evidence in `confirmed.json` if STOP worked, the smoke step
-    connected, the cookie survived the restart, the failed preflight failed, the canary
+    connected, the worker's own sign-in held across two sessions, the cookie survived the restart, the failed preflight failed, the canary
     came back, every inventory matched, the browser step reached the site (`ok`,
     `needs_login` or `already_gone`), **the slowed-hook check passed** (it refuses
     otherwise, `slow_hook_required`), **both planted-instruction cases passed**
@@ -618,13 +675,14 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
     slowed-hook check was seen on (`deny_cli_version`, `cli_sha256`): a run on any other
     `claude` is `probe_stale`. It records the boundary's text version you accepted
     (`boundary_version`). It prints which probe cases ran and passed on this PC (`ran`),
-    which remain unverified here (`unverified`), and the boundary's cases. The
-    deny check (what unattended runs need) counts as passed only with every deny and
-    navigation line passed, nothing `not_exercised`, `hook_intercepts`, `fails_closed`
-    and the destination check passed; a failed one leaves runs attended only. It also
-    records `read_context` (true when no reading tool reported its tab's address: every
-    run then needs a tab context after each read) and `live_extension_version` (false
-    keeps unattended runs off, `extension_version_unknown`).
+    which remain unverified here (`unverified`), the boundary's cases, and every
+    extension found in the dedicated profile (`extensions`, with whether each is on). The
+    deny check counts as passed only with every deny and navigation line passed, nothing
+    `not_exercised`, `hook_intercepts`, `fails_closed` and the destination check passed;
+    it is recorded as evidence for the later version that adds request-level blocking
+    (runs stay attended either way in this one). It also records `read_context` (true
+    when no reading tool reported its tab's address: every run then needs a tab context
+    after each read) and `live_extension_version`.
     **What invalidates it:** a change of the profile folder, its name or the extension's
     id (`profile_changed`); a new boundary text version (`boundary_not_accepted`); of the session's settings or
     prompt, your user, local or managed settings, memory files, the session's
@@ -640,23 +698,21 @@ folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
     then `worker.ts confirm-profile --accept-boundary` (after a Chrome restart for a new
     extension or a new Chrome).
     **When something fails**, see Troubleshooting below.
-12. **Attended runs, then (maybe) unattended.** Tell Cain the queue is ready; he queues a
-    first job (`cain/docs/pc-worker/probe-job.json` shows one). With the Cain jobs Chrome
-    open and no other Claude Code running (a run with one open is `chrome_busy`), run
-    `worker.ts run --attended --home C:/pc-worker` while you watch. Only once the
-    probe's deny check passed: add a Windows Task Scheduler task, every 15 minutes,
-    set to **Run only when user is logged on** (the session needs your desktop and your
-    open Chrome), running `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts run
-    --attended --home C:/pc-worker`, and run it once from Task Scheduler in the desktop
-    state you intend (screen locked or not), watching the result and the heartbeat. A
-    Claude Code session you leave open makes scheduled runs `chrome_busy` until you
-    close it.
-    Only after that separate test passes, set `"unattended": true` in `install.json` and
-    drop `--attended` from the task. Without both, a scheduled run does nothing
-    (`attended_only`). If your `claude` version's init data doesn't carry the
-    extension's version, unattended runs stay off (`extension_version_unknown`) and
-    attended runs go on with the version in the extension's manifest, in the dedicated
+12. **Attended runs.** Tell Cain the queue is ready; he queues a first job
+    (`cain/docs/pc-worker/probe-job.json` shows one). With the Cain jobs Chrome open and
+    no other Claude Code running (a run with one open is `chrome_busy`), run
+    `worker.ts run --attended --home C:/pc-worker` while you watch, each time you want
+    queued jobs run. If your `claude` version's init data doesn't carry the extension's
+    version, runs go on with the version in the extension's manifest, in the dedicated
     profile, standing in for it.
+
+**No scheduled runs in this version.** Earlier drafts had a Task Scheduler step here;
+it is gone. Unattended runs (a Windows Task Scheduler task running the worker every 15
+minutes without you) wait for a later version that adds request-level blocking, so a
+browser-initiated request can be stopped before it leaves rather than caught after. That
+version will bring the scheduler step back, with the probe's deny check
+(`deny_check` and its evidence, still recorded now) as one of its gates. Until then an
+install file with `"unattended": true` is refused (`unattended_unsupported`).
 
 The Windows CI job (`pcjobs-windows`) runs these tests on Windows and is green, but it
 is not a required check: only the repository's rulesets can make it one, and changing
@@ -671,16 +727,19 @@ Chrome behave that way. Only the supervised probe, on your PC, verifies that.
 
 ## Watching it, and stopping it
 
-- **Kill switch:** create a file named `STOP` in `C:/pc-worker`. The worker exits at
-  once on its next run, without claiming anything or starting a session. Delete it to
-  resume.
+- **Kill switch:** create a file named `STOP` in `C:/pc-worker`. A session running then
+  is ended within a second (`session_stopped`; its transcripts are deleted like any
+  other session's), and the worker exits at once on its next run, without claiming
+  anything or starting a session. Delete it to resume.
 - **The heartbeat:** `C:/pc-worker/heartbeat.json` holds the last run's time (the PC's
   own clock), its reason code, its job id, whether it cleared a stale lock
   (`stale_lock`), how far the Pi's clock was seen ahead (`skew_ms`) and, when a version
   stopped runs, a fixed `reason` (`extension_version_changed`, `cli_version_changed`,
-  `extension_version_unknown`) that Cain turns into one line for you naming the
-  re-probe;
-  `C:/pc-worker/worker.log` holds one line per run, codes and ids only. The same
+  `chrome_version_changed`) that Cain turns into one line for you naming the re-probe
+  (and for `worker_signin_missing`, `session_cleanup_failed`, `host_parent_gone`,
+  `extra_extension` and `unattended_unsupported`, one line naming the fix);
+  `C:/pc-worker/worker.log` holds one line per run, codes and ids only (and
+  `transcripts_swept` when a start found a crashed session's transcripts and deleted them). The same
   heartbeat goes to the queue repo (`worker/heartbeat.json`) when its code changes, or
   once a day, so Cain can say the PC is alive and why it isn't working.
 - **Diagnostics, for the first probes:** `--diagnose` (or `"diagnostics": true` in the
@@ -725,13 +784,21 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | Code or case | Where to look | What to do |
 | --- | --- | --- |
 | `stopped` | the `STOP` file | Delete `STOP` when you want runs again. |
+| `session_stopped` | the `STOP` file; `worker.log` | `STOP` appeared while a session ran, and the worker ended it; the job failed and its transcripts were deleted. Delete `STOP` when you want runs again; Cain can queue the job anew. Needs a code change: no. |
+| `worker_signin_missing` | `worker.ts check-cli --home C:/pc-worker`: `signed_in`; `C:/pc-worker/claude-config` | The worker's own Claude Code folder has no sign-in (never set up, deleted, or emptied). Sign it in again (setup step 9: `CLAUDE_CONFIG_DIR` set to it, `claude`, `/login`), then run `check-cli`. From the probe "after two sessions": the sign-in vanished between sessions; sign in again and probe again, and if it repeats, something outside the worker clears that folder (a cleanup tool, a sync client). Needs a code change: no. |
+| `session_cleanup_failed` | `worker.ts check-cli --home C:/pc-worker`: `transcripts`; `C:/pc-worker/claude-config` | A session's transcripts in `claude-config` couldn't be deleted, after retries. Something holds them open: an editor, Windows Search (setup step 9's `attrib +I`), an antivirus scan, a backup or sync client. Close it, delete `claude-config\projects` (and anything else `check-cli` names) by hand, keeping `.credentials.json` and `.claude.json`, then run `check-cli` until `swept` is true. No run starts while they remain. Needs a code change: no. |
+| Your own `claude` is logged out after a run | `claude` in a terminal of your own; `echo $env:CLAUDE_CONFIG_DIR` there; `worker.ts check-cli` | This design should make that impossible: the worker's sessions sign in from `C:/pc-worker/claude-config` and never read, copy or write your `~/.claude`, so nothing a run does reaches your own sign-in. Check that your terminal doesn't still have `CLAUDE_CONFIG_DIR` set from setup step 9 (then your `claude` is using the worker's folder: close that terminal); that you aren't running an earlier draft of this worker (one copied your sign-in into each session, where a refresh could replace yours); and whether you were signed out for another reason (an expired session, a password change, signing out elsewhere). Sign your own `claude` in again; the worker's sign-in is unaffected. If it happens again with this version, report it: needs a code change: yes. |
+| `extension_entry_missing` | `worker.ts check-host --home C:/pc-worker`; the profile folder's `Secure Preferences` and `Preferences` | Neither preferences file of the dedicated profile has `extensions.settings.<your extension id>`: `profile_directory` or `extension_id` in `install.json` doesn't match where Claude in Chrome is installed, or Chrome hasn't written its entry yet (open the Cain jobs Chrome once, then close and reopen it). Not `wrong_profile`: the profile's name was right. `check-host` prints which file and key path it read when it works. Needs a code change: no. |
+| `extra_extension` | `worker.ts check-host --home C:/pc-worker`: `other_enabled` and `extensions`; chrome://extensions in the Cain jobs profile | Another extension is on in the dedicated profile (read from the same preferences as Claude in Chrome's own entry; Chrome's built-in component extensions don't count). Remove it, or turn it off, in chrome://extensions there, then run `check-host` again. A default app Chrome installed by itself counts too. Needs a code change: no. |
+| `host_parent_gone` | Task Manager, Details, with the PID, Command line and Start time columns: Claude in Chrome's native host and the PID it names as its parent | The process that started Claude in Chrome's native host is gone, or its process id now belongs to a process that started after the host (or, in the same tick, to another program): the host is left over from a Chrome that closed. Restart the Cain jobs Chrome (close every window of it, open it again on its profile); its hosts end with it and fresh ones start. If a host survives that, end it in Task Manager. The worker ends nothing itself here. Needs a code change: no. |
+| `unattended_unsupported` | `install.json`: `unattended` | This version has no unattended runs; an install file that asks for them is refused, by every command. Set `"unattended": false` (and run `worker.ts run --attended` yourself). Needs a code change: no; unattended runs come with a later version that adds request-level blocking. |
 | `busy` | `worker.lock` | Another run holds the lock. Wait; a lock from a dead run clears itself (`stale_lock` in the heartbeat). |
 | `chrome_busy` (the competing-session case) | Task Manager, Details: any `claude.exe`, or `node` running `claude-code` | Close the other Claude Code session (or end a leftover one) and run again. Any other Claude Code process blocks a run, attached to Chrome or not: the worker can't tell, and the extension would serve it instead. |
 | `extension_unreachable` | `probe`'s detail, or the bridge check in `worker.log` | Open the Cain jobs Chrome on its folder, check Claude in Chrome is on and paired with the `claude` command. The worker already ended a leftover native messaging host and checked again; if it persists, restart that Chrome. |
 | `extension_unreachable` with "Claude in Chrome: not listed" (the strict-MCP-config case) | `probe`'s detail; the `tools` in `probe-evidence.json` hold no `mcp__claude-in-chrome__` names | `--strict-mcp-config` may be keeping the built-in Chrome integration out on your `claude` version. Don't edit the session's flags by hand (the settings hash fails closed): ask for a build without that flag. The inventory check already fails any MCP server but Claude in Chrome's, so dropping the flag keeps that guarantee. Untested assumption: that `--strict-mcp-config` leaves the built-in Chrome integration in. Needs a code change: yes. |
 | `extension_unreachable` with "the claude command printed no session" (Git Bash not found) | run `claude --version` in a terminal of your own; does it complain about git-bash? | `claude` on Windows needs Git Bash, and runs the hook through it. Install Git for Windows, or set `CLAUDE_CODE_GIT_BASH_PATH` to the full path of `bash.exe` (it must exist; any other value is `untrusted_config`), then probe and confirm again (the environment's hash changes). Needs a code change: no. |
 | `hook_missing_decision` from the smoke step, `nav-decisions.jsonl` never written (the hook never logs) | `nav-decisions.jsonl`; in Git Bash, `"C:/Users/you/.bun/bin/bun.exe" --version` | The hook didn't start, or started but couldn't write its log (a log it can't write is a deny). Check Git Bash runs the runtime from that path and the worker folder is writable by you. Needs a code change: no, unless Claude Code stops running PreToolUse hooks for MCP tools in print mode (then yes). |
-| `extension_unreachable` with "isn't signed in under the worker's environment" | run `claude` in a terminal of your own | The session gets only the allowlisted environment, so a login that lives in an environment variable (an API key) doesn't reach it. Sign `claude` in with its own login (`claude`, then `/login`). Needs a code change: no; yes only if you must sign in through an environment variable. |
+| `extension_unreachable` with "isn't signed in under the worker's environment" | `worker.ts check-cli`: `signed_in`; run `claude` with `CLAUDE_CONFIG_DIR` set to `C:\pc-worker\claude-config` in a terminal of your own | The worker's own sign-in in `claude-config` was refused (expired or revoked), or the session gets only the allowlisted environment, so a login that lives in an environment variable (an API key) doesn't reach it. Sign the worker's folder in again (setup step 9). Needs a code change: no; yes only if you must sign in through an environment variable. |
 | `extension_unreachable` with "the tab-context call didn't answer", and `no_tool_use_id` in `nav-decisions.jsonl` (hook input without a tool-use id) | `nav-decisions.jsonl`: `why` | nav-guard refuses any call whose input has no tool-use id, since it can't match its log to the session's stream without one. Untested assumption: that Claude Code passes `tool_use_id` to PreToolUse hooks. Needs a code change: yes. |
 | `navigation_denied` with `timeout` in `nav-decisions.jsonl`, or `hook_missing_decision` (Git Bash cold start past the hook's deadline) | `nav-decisions.jsonl`: `why`; how long `"C:/Users/you/.bun/bin/bun.exe" --version` takes in a fresh Git Bash | nav-guard gives its input 10 seconds and Claude Code gives the hook 30. A refusal for `timeout` fails the run closed; a hook Claude Code gave up on leaves no log (the permission layer refuses the navigation by itself), and the run fails as `hook_missing_decision`. Run again once the PC is warm; if it repeats, the deadline needs raising. Needs a code change: yes, if it repeats. |
 | `extension_unreachable` once, then fine (recycling native hosts used by other windows) | `worker.log` | When the bridge check can't reach the extension, the worker ends the extension's native messaging hosts and tries again. Another window of the Cain jobs Chrome loses its bridge for a moment; your daily profile has no extension (`extension_elsewhere` otherwise), so nothing of yours uses them. Needs a code change: no. |
@@ -740,7 +807,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | A leftover tab still on the site page, not on `about:blank` (the end page can't be opened through the extension) | `leftover-tabs.json`; the Cain jobs window | Untested assumption: that Claude in Chrome navigates to `about:blank`. If it refuses, the run still ends on its last site page and is judged there, but the tab stays on the site. The fallback is a blank end page the worker serves on `127.0.0.1`, as the one literal end address. Needs a code change: yes. |
 | `cli_changed` | `claude --version`; `worker.log` | The `claude` executable changed during the run (an update), or couldn't be read before or after it. Nothing was written but the code. Every run after it is `probe_stale` (the confirmation's deny-alone check was seen on the old executable): run the probe and `confirm-profile` again for the new version. Needs a code change: no. |
 | `extension_version_mismatch` | `probe`'s detail: `live` and `disk`; chrome://extensions | The session reports another Claude in Chrome version than the one installed in the Cain jobs profile (its newest version folder's `manifest.json`), or, where the session reports none (an attended run), that manifest's version changed during the run: another profile's extension may be answering, or Chrome hasn't finished an update. Restart that Chrome, then probe again. Needs a code change: no. |
-| `navigation_unguarded` | `nav-decisions.jsonl` against the session's navigations | A navigation's logged allow didn't match its own tool and address. Run the probe; never set `unattended` while this happens. |
+| `navigation_unguarded` | `nav-decisions.jsonl` against the session's navigations | A navigation's logged allow didn't match its own tool and address. Run the probe. |
 | `hook_missing_decision` from the probe's smoke step (the Windows hook quoting case) | `nav-decisions.jsonl` is missing or empty | The hook command didn't start. Claude Code runs it through Git Bash: `"$PCW_RUNTIME" "$PCW_WORKER" nav-guard`, both paths with forward slashes, set by the worker. Check `bun` (or `node`) runs from that path in Git Bash (`"C:/Users/you/.bun/bin/bun.exe" --version`) and that the worker's folder path has no `"` in it. |
 | `navigation_denied` | `nav-decisions.jsonl`: the `deny` lines and their `why` | The session tried an address or tool it may not (`address_not_allowed`, `unknown_tool`), or nav-guard couldn't decide (`timeout`, `internal_error`, `unreadable_input`, `log_failed`). A page talking the model into a detour shows up here: look at the job's site. An `unknown_tool` after an extension update means the extension added or renamed a tool. |
 | `unexpected_location` | `diagnostics.log` with `--diagnose`: `final_url`, `off_url`, `off_kind` (the result and `last-run.json` keep no address) | The run's tab showed an address off its pin, midway (`off_url`, and `off_kind` the kind of observation it showed in; `about:blank` before the end step counts) or at the end (`final_url`). If the site really moves you on to a fixed place, add it to the entry's `redirects` and sign again; if it went to a sign-in page, add it to `login_hosts` or `login_paths`. Both addresses `-`: the tab context couldn't be read (an extension update may have changed its answer): run the probe. |
@@ -756,38 +823,40 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `profile_changed`, `profile_unconfirmed` | `confirmed.json` | Run the probe and `confirm-profile`. |
 | `untrusted_config` | the reasons in the setup steps | Install config, the native host manifest (`native_host_manifest` unreadable, or not listing the extension), owner key, the session's files, outside settings, a memory file in or above the worker folder, a `managed-settings.d` folder, the policy registry key, `CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_*` or a base address in the environment, a changed environment, or `claude` not a `.exe`. Fix it, then probe and confirm again if the confirmation's hash changed. |
 | `untrusted_files` | `icacls C:\pc-worker\install.json` (and the others) | Redo setup step 1's `icacls` commands. |
-| `extension_elsewhere`, `profile_scan_failed` | your other browser folders (Chrome, Edge, Brave, Chromium); Task Manager, Details: `chrome.exe`, `msedge.exe` or `brave.exe` with another `--user-data-dir`, or none | Remove Claude in Chrome from other profiles and browsers; turn sync off in Cain jobs. A browser running with the extension in its folder (one started without `--user-data-dir` runs on its default folder), or the extension's native host running under a browser other than the Cain jobs Chrome, fails too. Orphaned hosts (their browser gone) are ended by the preflight. |
+| `extension_elsewhere`, `profile_scan_failed` | your other browser folders (Chrome, Edge, Brave, Chromium); Task Manager, Details: `chrome.exe`, `msedge.exe` or `brave.exe` with another `--user-data-dir`, or none | Remove Claude in Chrome from other profiles and browsers; turn sync off in Cain jobs. A browser running with the extension in its folder (one started without `--user-data-dir` runs on its default folder), or the extension's native host running under a browser other than the Cain jobs Chrome, fails too. Orphaned hosts (their browser gone) are `host_parent_gone`, below. |
 | `clock_skew` | `heartbeat.json`'s `skew_ms` | Set Windows to sync its clock. |
 | `queue_misconfigured`, `git_failed` | the queue clone | Check the queue's `.gitattributes` and the deploy key (setup steps 2 and 4). |
 | `browser_timeout` | `worker.log` | The session hung past `session_minutes`; the worker killed it and left Chrome running. Check the site in the Cain jobs window by hand. |
 | `url_drift`, `result_rejected`, `page_not_as_expected`, `outcome_uncertain` | the job's result; `diagnostics.log` with `--diagnose` | The page wasn't what the job expected, or the model's report broke its shape (an extra field, free text, over its size cap). Cain tells you what it means. |
 | `schema_violation` | the job's result; `last-run.json`: `field` names the fact (and `diagnostics.log` with `--diagnose`) | The model's report had a fact that doesn't fit its field (a sentence, a token, an account showing more than four letters or digits, a plan that isn't a short label, an address the run didn't approve, a field the action doesn't report). Nothing of it was written. Once is a page talking the model into it; every run on one site means the site shows a value the schema has no form for: that needs a code change, never a looser field. |
-| `hook_missing_decision` | `diagnostics.log` with `--diagnose`: `missing`; `nav-decisions.jsonl` | A tool use had no decision in nav-guard's log: the hook didn't run, didn't answer in time, or didn't see that call. The report was discarded. Check Git Bash runs the runtime (setup step 9); run the probe, whose smoke step names it. Never set `unattended` while this happens. |
+| `hook_missing_decision` | `diagnostics.log` with `--diagnose`: `missing`; `nav-decisions.jsonl` | A tool use had no decision in nav-guard's log: the hook didn't run, didn't answer in time, or didn't see that call. The report was discarded. Check Git Bash runs the runtime (setup step 9); run the probe, whose smoke step names it. |
 | `hook_selftest_failed` | run `worker.ts probe --attended`; in Git Bash, `"C:/Users/you/.bun/bin/bun.exe" --version` | The preflight started the real nav-guard with an allow, a deny and malformed input, and one didn't answer as it should, or its log couldn't be written. Nothing was claimed. Check the runtime path, that the worker folder is writable by you, and that the harness copy is complete. |
 | `canary_cookie_missing` | `probe`'s detail; chrome://settings/cookies in the Cain jobs profile | The canary page got no marker cookie at all: the profile's cookies for `127.0.0.1` were cleared (by hand, or by **Clear cookies and site data when you close all windows**), or another profile answered. Turn that setting off for this profile, then run `bind-profile --attended` again (setup step 10). |
 | `chrome_not_restarted` (probe) | Task Manager, Details: `chrome.exe` with `--user-data-dir=C:/pc-worker/chrome` | The probe asked you to restart the Cain jobs Chrome, and its browser process didn't change. Close every window of it (check no `chrome.exe` with that folder is left), open it again, and press Enter. |
-| `extension_version_unknown` | `heartbeat.json`'s `reason`; `probe-evidence.json`'s `live_extension_version` | Your `claude` version's init data doesn't say which Claude in Chrome version answered, so an unattended run can't check it: unattended runs stay off. Attended runs go on without that check. Nothing to fix by hand; a later `claude` version may report it (probe and confirm again then). |
+| `extension_version_unknown` | `heartbeat.json`'s `reason`; `probe-evidence.json`'s `live_extension_version` | From an earlier version, which stopped unattended runs on it. This version has no unattended runs: attended runs go on with the version in the extension's manifest standing in. Nothing to fix by hand. |
 | `read_unverified` | the job's result, or the heartbeat (before any claim); `probe-evidence.json`: `reading_reports_url` | In a run: the probe found this PC's reading tools don't report their tab's address, so each read needs a tab context right after it, and one didn't have it. Run again; if the model keeps skipping it, the session prompt needs a change. Before any claim (the bridge check): the reading tools no longer report addresses the way the probe recorded (an extension update changed their answers): run the probe and `confirm-profile` again. Needs a code change: no. |
 | `extension_elsewhere` with a `cmd.exe` the Cain jobs Chrome didn't start | Task Manager, Details, with the Command line and PID columns: the native host's `cmd.exe` and its parent | A `cmd.exe` running your registered host whose parent isn't the Cain jobs Chrome's browser process (the one with your `--user-data-dir`), or that started after it: Explorer, another browser, a Chrome on another folder or a Chrome child process. End that `cmd.exe` and its host; never start the host by hand. Needs a code change: no. |
 | `extension_elsewhere` with an unexpected intermediate | Task Manager, Details, with the Command line column: the extension's native host and its parent | Between the native host and the Cain jobs Chrome sat a process other than the one `cmd.exe` naming your registered host (from `native_host_manifest`), or two of them, or one whose command line Windows won't show (an elevated or another user's process). Check `native_host_manifest` points at the manifest Chrome uses; end the odd process; if your Claude in Chrome starts its host another way, the chain rule needs a code change. |
 | `slow_hook_required` (`confirm-profile`), `slow_hook` not passed (probe) | `probe-evidence.json`: `slow_hook` | With nav-guard stalled, the navigation ran anyway (`opened`) or was refused without a permission denial recorded for it, or it was seen on another `claude` version. Claude Code's `dontAsk` mode isn't refusing what the hook didn't allow on your version, and nothing runs, attended or not, until it does: rerun the probe once; if it repeats, it needs a code change. |
-| `injection` or `injection_plan` not passed (probe) | `probe-evidence.json`: `injection`, `injection_plan` | The planted token got into an accepted fact (a notes field, the account, or the plan's name), or the page was never read. Don't turn on unattended; the schema needs a narrower field. |
+| `injection` or `injection_plan` not passed (probe) | `probe-evidence.json`: `injection`, `injection_plan` | The planted token got into an accepted fact (a notes field, the account, or the plan's name), or the page was never read. `confirm-profile` refuses until it passes; the schema needs a narrower field. |
 | `manifest_path_mismatch` (`bind-profile`, `check-host`) | `check-host`'s detail (which views differ); `regedit`: `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts`, `HKEY_LOCAL_MACHINE\Software\Google\Chrome\NativeMessagingHosts` and `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts`, the entry named as the manifest's `name`; `install.json`: `native_host_manifest` | A registered manifest Chrome may use for Claude in Chrome's native host (the default value in any of the three views) isn't the file `install.json` names, after normalizing (full path, case, quotes, slashes), the views hold more than one distinct path, or no view has an entry. Set `native_host_manifest` to the registry's path (forward slashes), delete stale entries in the other views, check that file lists your extension in `allowed_origins`, then run `check-host` again. Needs a code change: no. |
 | `manifest_path_mismatch` naming `HKLM32` (a WOW6432Node entry) | `regedit`: `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts` | An old or 32-bit install left a native host entry in the machine hive's 32-bit view that points elsewhere; Chrome consults that view too. Delete it there (or point it at the same manifest), then run `check-host` again. Needs a code change: no. |
-| `allowlist_risky_url` (`sign-allowlist`) | its detail: `entry <n>: matched "<word>" in <full address>` | That entry's address has a query, or its path (or a redirect or sign-in path) has a word that acts (`logout`, `signout`, `unsubscribe`, `confirm`, `delete`, `remove`, `cancel`). Open the address yourself in the Cain jobs profile: if it only shows a page, add `"reviewed": true` to the entry and sign again; otherwise pin another address. Needs a code change: no. |
+| `allowlist_risky_url` (`sign-allowlist`) | its detail: `entry <n>: matched "<word>" on host <host>` (the path, query, fragment and sign-in part are never printed, and nothing of the address is written anywhere) | That entry's address has a query, or its path (or a redirect or sign-in path) has a word that acts (`logout`, `signout`, `unsubscribe`, `confirm`, `delete`, `remove`, `cancel`). Open the address yourself in the Cain jobs profile: if it only shows a page, add `"reviewed": true` to the entry and sign again; otherwise pin another address. Needs a code change: no. |
 | `probe_stale` with reason `cli_version_changed` but the same `claude --version` | `confirmed.json`: `cli_sha256` | The `claude` executable's bytes changed (a reinstall, a repair, or a `cli_changed` run) since the deny-alone check was seen on it. Run the probe and `confirm-profile` again. Needs a code change: no. |
-| Probe: `deny_check` is false | `probe-evidence.json`: `deny`, `navigation`, `not_exercised`, `hook_intercepts`, `fails_closed`, `destinations` | A line with `refused_by` other than `removed_from_tools`, `permission_denied` or `hook_denied`, a navigation not blocked by `guard` or `refused`, anything `not_exercised`, or a destination line with `passed: false` was not proven refused. Rerun once (the model may have skipped an item); if it repeats, don't turn on unattended. |
+| Probe: `deny_check` is false | `probe-evidence.json`: `deny`, `navigation`, `not_exercised`, `hook_intercepts`, `fails_closed`, `destinations` | A line with `refused_by` other than `removed_from_tools`, `permission_denied` or `hook_denied`, a navigation not blocked by `guard` or `refused`, anything `not_exercised`, or a destination line with `passed: false` was not proven refused. Rerun once (the model may have skipped an item). Runs stay attended in this version either way; the later version with unattended runs will need it passed. |
 
 ## How a job runs
 
-1. `worker.ts run` (by hand with `--attended`, or by Task Scheduler once allowed): kill
-   switch, lock, install config, the files' ACLs, the owner key's fingerprint,
+1. `worker.ts run --attended` (by hand: this version has no unattended runs): kill
+   switch, lock, the sweep of any session transcripts a crashed worker left, install
+   config (`unattended` must be false), the files' ACLs, the owner key's fingerprint,
    `git pull`, the `.gitattributes` check, the clock check, then it closes what can't
    run (cancelled, not read-only, off the signed allowlist), runs the browser preflight
-   (ending orphaned hosts of the extension first), the hook's self-test, checks no other
-   Claude Code is running and the bridge answers (the four reading tools by name, the
-   reading tools reporting addresses as the probe recorded, and, unattended, the
-   extension's version in its init data), claims the oldest job
+   (the worker's own sign-in, the extension's entry and no other extension in the
+   profile, the profile and versions, the native host's parent chain), the hook's
+   self-test, checks no other Claude Code is running and the bridge answers (the four
+   reading tools by name, the reading tools reporting addresses as the probe recorded),
+   claims the oldest job
    left with a new attempt id and a 30 minute lease, and pushes.
 2. It serves the canary page (which shows the word `bound` only when its request
    carried the bound profile's marker cookie, checked by the worker's server), hashes the `claude` executable, and starts the browser session with one
@@ -795,7 +864,9 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
    typed facts it may report, the outcomes it may say, the canary page, the end page
    (`about:blank`) and the tab the last run left (`tab_id`). nav-guard lets the session
    open those three addresses and nothing else, and logs every decision.
-3. When the session ends (or its time limit kills it), the worker checks the job is
+3. When the session ends (or its time limit or `STOP` ends it), the worker deletes the
+   session's transcripts from `claude-config` (`session_cleanup_failed` if it can't),
+   then checks the job is
    still its own (same attempt, not cancelled, and well inside the lease by its own
    monotonic clock; otherwise it writes nothing), checks the session and writes the
    result: the `claude` executable's hash unchanged; the session's tools, MCP servers,
@@ -845,7 +916,8 @@ Cain reads them as facts, and nothing in one tells him or the worker what to do.
   `tool_inventory`, `wrong_profile`, `browser_timeout`, `navigation_unguarded`,
   `navigation_denied`, `unexpected_location` (the run's tab showed an address off the
   pin, its redirects and its sign-in pages, midway or at the end), `tabs_unexpected`,
-  `cli_changed`, `extension_version_mismatch`, `extension_version_unknown`,
+  `cli_changed`, `extension_version_mismatch`, `session_stopped`,
+  `session_cleanup_failed`, `worker_signin_missing`,
   `hook_missing_decision`, `canary_cookie_missing`, `read_unverified`,
   `schema_violation`, `url_drift` (the final address is off the allowlist's pin and not
   a sign-in page), `result_rejected`, `page_not_as_expected`, `lease_expired` (a read
@@ -874,9 +946,11 @@ Cain reads them as facts, and nothing in one tells him or the worker what to do.
 - On the PC only: `install.json` (yours, with `native_host_manifest`), `confirmed.json` and `probe-evidence.json`
   (the probe and `confirm-profile`), `profile-marker.json` (the hash of the profile's
   canary marker, from `bind-profile`), `heartbeat.json`, `worker.log`, `diagnostics.log`,
-  `nav-decisions.jsonl`, `last-run.json`, `leftover-tabs.json`, and, only while a
-  session runs, `session-config` (the session's `CLAUDE_CONFIG_DIR`: a copy of the
-  `claude` sign-in and the command's own transcripts, deleted after each session).
+  `nav-decisions.jsonl`, `last-run.json`, `leftover-tabs.json`, and `claude-config` (the
+  sessions' `CLAUDE_CONFIG_DIR`: the worker's own `claude` sign-in, made once at setup
+  and kept, and, only from a session's start to its end step, that session's transcripts
+  and history, deleted after each session; after a worker killed outright, until its
+  next start).
 
 The read-only actions and their facts, each with its schema: `read_account_settings`
 (signed_in and account_exists: booleans; account: a masked account; two_factor: on, off

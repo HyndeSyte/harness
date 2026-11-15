@@ -6,9 +6,10 @@
 // that and writes the result. Every check is here, in code, not left to the model.
 //
 // Commands (cain/docs/pc-jobs.md):
-//   worker.ts run [--attended] [--diagnose]   one run: preflight, claim at most one job, run its browser step, write its result.
-//                                             Windows Task Scheduler runs it every 15 minutes. Without --attended it does
-//                                             nothing (attended_only) until the owner has allowed unattended runs.
+//   worker.ts run --attended [--diagnose]   one run: preflight, claim at most one job, run its browser step, write its result.
+//                                             The owner starts it, watching. Without --attended it does nothing
+//                                             (attended_only): this version has no unattended runs, and an install.json
+//                                             asking for them is refused (unattended_unsupported).
 // Commands only the owner runs, by hand:
 //   worker.ts bind-profile --attended   once at setup: sets the profile marker the canary page needs, in the dedicated profile only
 //   worker.ts probe --attended          the supervised probe: the only way to the first confirm-profile (no queued job runs)
@@ -17,7 +18,9 @@
 //                                       and those that remain unverified on this PC
 //   worker.ts check-host                checks the registered native host manifest (every registry view) is the one install.json
 //                                       names, and reports the pinned against the current CLI
-//   worker.ts check-cli                 the pinned against the current CLI, by version and executable hash
+//   worker.ts check-cli                 the pinned against the current CLI, by version and executable hash; whether the
+//                                       worker's own Claude Code folder (claude-config) is signed in; sweeps and names
+//                                       any session transcripts left there
 //   worker.ts owner-keygen --kid <id> --out <dir>      his allowlist key (passphrase in PC_OWNER_PASSPHRASE)
 //   worker.ts owner-fpr <owner.pub>     the fingerprint of his allowlist key, for install.json
 //   worker.ts sign-allowlist <entries.json> --key <pem> --kid <id> --out <allowlist.json>
@@ -31,7 +34,8 @@
 // queue/ (the clone, its remote on the PC's deploy key), allowlist.json, owner.pub,
 // ship.pub, confirmed.json and probe-evidence.json (the profile confirmation),
 // profile-marker.json (the hash of the profile's canary marker, from bind-profile), session/
-// (the session's empty working folder), and the worker's own STOP (the kill switch),
+// (the session's empty working folder), claude-config/ (the worker's own Claude Code folder:
+// its sign-in, made once at setup, and a session's transcripts only until its end step), and the worker's own STOP (the kill switch),
 // worker.lock, heartbeat.json, worker.log, nav-decisions.jsonl (the hook's decisions for
 // the last session), last-run.json (the last run's end check), leftover-tabs.json and,
 // only when asked, diagnostics.log. The per-run canary is served over HTTP on
@@ -60,8 +64,9 @@ import {
 import { publicOf } from "../link/shipkey.ts";
 
 // ---- Options, paths, errors -----------------------------------------------------------
-export interface Session { code: number | null; out: string; timedOut: boolean }
-export type Launch = (argv: string[], cwd: string, timeoutMs: number, env: Record<string, string>) => Promise<Session>;
+// stopped: the owner's STOP file appeared while the session ran, and the worker ended it.
+export interface Session { code: number | null; out: string; timedOut: boolean; stopped?: boolean }
+export type Launch = (argv: string[], cwd: string, timeoutMs: number, env: Record<string, string>, stopFile?: string) => Promise<Session>;
 
 export interface Opts {
   home: string;
@@ -83,7 +88,8 @@ export interface Opts {
   procStart?: (pid: number) => string | null;       // a process's start time (procStart unless a test stands in)
   cliVersion?: () => string | null;                 // the claude command's version (cliVersion unless a test stands in)
   cliHash?: () => string | null;                    // the claude executable's SHA-256 (fileSha of install.json's claude unless a test stands in)
-  claudeHome?: string;                              // the user's Claude Code folder (~/.claude; CLAUDE_CONFIG_DIR is refused)
+  remove?: (path: string) => void;                  // deletes one path of a session's leftovers (rmSync unless a test stands in)
+  noIndex?: (dir: string) => void;                  // Windows: keeps a folder out of Windows Search (attrib +I unless a test stands in)
   managed?: string[];                               // the managed settings files (managedSettings unless a test stands in)
   managedDirs?: string[];                           // the managed settings drop-in folders (managedDropins unless a test stands in)
   policyKeys?: () => string[];                      // Windows: the Claude Code policy registry keys that exist (policyKeys unless a test stands in)
@@ -111,7 +117,7 @@ const P = {
   confirmed: (o: Opts) => join(o.home, "confirmed.json"),
   evidence: (o: Opts) => join(o.home, "probe-evidence.json"),
   cwd: (o: Opts) => join(o.home, "session"),
-  cliConfig: (o: Opts) => join(o.home, "session-config"),
+  cliConfig: (o: Opts) => join(o.home, "claude-config"),
   stop: (o: Opts) => join(o.home, "STOP"),
   lock: (o: Opts) => join(o.home, "worker.lock"),
   beat: (o: Opts) => join(o.home, "heartbeat.json"),
@@ -152,7 +158,8 @@ export const LOCK_STALE_MS = LEASE_MS + SKEW_MS;
 //   owner_fpr: his allowlist key's fingerprint (worker.ts owner-fpr owner.pub); owner.pub must match it.
 //   claude: the path of the claude command (claude.exe on Windows).
 //   session_minutes: the browser step's hard time limit (at most MAX_SESSION_MS).
-//   unattended: false until he has watched a probe whose deny check passed (see below).
+//   unattended: always false in this version (unattended_unsupported otherwise): runs are
+//            attended, started by the owner, until the version that adds request-level blocking.
 //   confirm_path: always false in this version: the confirm path's code can't be reached.
 //   diagnostics: false; true turns on the local diagnostic capture for the first probes.
 //   profile: the dedicated Chrome profile (user_data_dir, profile_directory, profile_name,
@@ -182,6 +189,23 @@ export function parseInstall(x: any): Install | null {
   return x as Install;
 }
 export const loadInstall = (o: Opts) => parseInstall(readJson(P.install(o)));
+// Unattended runs are impossible in this version, in code: an install file that asks for
+// them is refused (unattended_unsupported), the way the confirm path is, until the version
+// that adds request-level blocking. The probe's deny check and its evidence stay, for that
+// version. Anything else wrong with the file is untrusted_config.
+export function installOf(o: Opts): Install | "untrusted_config" | "unattended_unsupported" {
+  const inst = loadInstall(o);
+  if (!inst) return "untrusted_config";
+  return inst.unattended ? "unattended_unsupported" : inst;
+}
+export function mustInstall(o: Opts): Install {
+  const inst = installOf(o);
+  if (typeof inst === "string") throw new WorkerError(inst, inst === "unattended_unsupported" ? UNATTENDED_HINT : undefined);
+  return inst;
+}
+export const UNATTENDED_HINT = "unattended runs aren't supported in this version: set \"unattended\": false in install.json and start runs yourself (worker.ts run --attended)";
+// Failures of the session's own folders, which end a run (or its preflight) with their own code.
+export const SESSION_FAILURES: string[] = ["session_cleanup_failed", "worker_signin_missing"];
 
 // ---- Who can write the trusted files --------------------------------------------------
 // The allowlist, owner.pub, install.json, confirmed.json and the worker folder itself.
@@ -348,10 +372,11 @@ export const END_URL = "about:blank";
 // user, project or local), and Claude Code still reads managed settings whatever the
 // flags say. So before every run the worker reads what could reach a session, and fails
 // closed (untrusted_config, with the reason in outsideConfig's why) when:
-//   - a settings file (the user's, the session folder's project and local ones, the
+//   - a settings file (the user's, which is claude-config's own settings.json, the session folder's project and local ones, the
 //     managed ones) can't be read as JSON, or holds hooks, permission allow rules or a
 //     permission-skipping default mode;
-//   - the user's memory file (~/.claude/CLAUDE.md) isn't empty, or a CLAUDE.md,
+//   - the worker's own Claude Code folder (claude-config, below) holds a memory file
+//     (CLAUDE.md) that isn't empty, or a CLAUDE.md,
 //     CLAUDE.local.md or .claude/CLAUDE.md sits in the session folder or any folder
 //     above it, the worker folder included (ancestor_memory);
 //   - a managed settings drop-in folder (managed-settings.d) exists (managed_dropin), or,
@@ -360,7 +385,9 @@ export const END_URL = "about:blank";
 //     (ANTHROPIC_BASE_URL and the like) or any CLAUDE_CODE_* variable (environment).
 // It hashes what it found (each file's bytes, or that it isn't there) and the session's
 // effective environment into the confirmation, so any later change is untrusted_config too.
-export const claudeHome = (o: Opts) => o.claudeHome ?? join(homedir(), ".claude");
+// The CLI's user folder for every session is the worker's own (claude-config, below), so
+// the owner's own ~/.claude is never read, copied or written by the worker or its sessions.
+export const claudeHome = (o: Opts) => P.cliConfig(o);
 const envOf = (o: Opts) => o.env ?? process.env;
 
 export function managedSettings(plat = process.platform): string[] {
@@ -536,6 +563,41 @@ export function activeExtensionVersion(inst: Install): string | null {
   return typeof v === "string" && vcmp(v, version) === 0 ? version : null;
 }
 
+// The extension's entry, and every other extension, in the dedicated profile's preferences:
+// extensions.settings in Secure Preferences and in Preferences, whichever holds it (an
+// entry can be split between them, and the two are merged per id). files names the file(s)
+// the pinned entry was read from, key its key path; no file holding it is
+// extension_entry_missing at preflight (a profile that is right but doesn't list the
+// extension, separate from wrong_profile). others: every enabled extension besides the
+// pinned one (an entry with no disable reasons and not turned off), Chrome's own component
+// extensions (location 5 or 10) aside; any is extra_extension at preflight.
+export const PREF_FILES = ["Secure Preferences", "Preferences"];
+export interface ExtensionLine { id: string; name: string | null; enabled: boolean; component: boolean }
+export interface ExtensionPrefs { files: string[]; key: string; extensions: ExtensionLine[]; others: string[] }
+export function extensionPrefs(inst: Install): ExtensionPrefs {
+  const p = inst.profile;
+  const dir = join(p.user_data_dir, p.profile_directory);
+  const merged: Record<string, any> = {};
+  const files: string[] = [];
+  for (const f of PREF_FILES) {
+    const table = readJson(join(dir, f))?.extensions?.settings;
+    if (!table || typeof table !== "object" || Array.isArray(table)) continue;
+    for (const [id, e] of Object.entries(table)) {
+      if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+      merged[id] = { ...(e as object), ...(merged[id] ?? {}) };
+      if (id === p.extension_id) files.push(f);
+    }
+  }
+  const extensions = Object.keys(merged).sort().map((id): ExtensionLine => {
+    const e = merged[id];
+    const reasons = Array.isArray(e.disable_reasons) ? e.disable_reasons.length > 0 : typeof e.disable_reasons === "number" ? e.disable_reasons !== 0 : false;
+    const name = typeof e.manifest?.name === "string" && /^[\w .,()'&+-]{1,60}$/.test(e.manifest.name) ? e.manifest.name : null;
+    return { id, name, enabled: !reasons && e.state !== 0, component: e.location === 5 || e.location === 10 };
+  });
+  return { files, key: `extensions.settings.${p.extension_id}`, extensions,
+    others: extensions.filter((x) => x.id !== p.extension_id && x.enabled && !x.component).map((x) => x.id) };
+}
+
 // An extension update Chrome has unpacked but not switched to: the newest version folder
 // isn't the active version. Every run stops (update_pending) until the owner restarts
 // the Cain jobs Chrome, which switches to it (and then a new probe confirms it).
@@ -654,8 +716,8 @@ export function profileScan(o: Opts, inst: Install, running: string[] = []): "el
 // command line carries chrome-extension://<id>/) must descend from the Chrome running on
 // the dedicated folder, checked link by link:
 //   - each parent must have started no later than its child (equal start times count:
-//     Windows' timer is coarse); a parent whose PID was reused after the child started is
-//     not its parent;
+//     Windows' timer is coarse); a parent that is gone, or whose PID was reused after the
+//     child started, is host_parent_gone (hostChain, below), not a pass;
 //   - the host's parent is that Chrome itself (how Chrome usually starts an .exe host), or
 //     there is exactly one intermediate, the cmd.exe Chrome starts a .bat or .cmd host
 //     through; either way the host executable the registered manifest names must be on the
@@ -694,26 +756,45 @@ const names = (cmd: string, host: string | null) => !!host && slashes(cmd.replac
 export const isDedicated = (p: Proc | undefined, inst: Install): p is Proc => !!p && !!p.cmd && isBrowser(p) && browserOf(p.cmd) === "chrome"
   && !!uddOf(p.cmd) && sameDir(uddOf(p.cmd)!, inst.profile.user_data_dir);
 
-export function extensionElsewhere(ps: Proc[], inst: Install, host: string | null = null): boolean {
+// A parent gone, or its PID reused, is host_parent_gone, not extension_elsewhere: the
+// process that started the host isn't there any more (no process has its PID), or the PID
+// now belongs to a process that started after the host, or to another image started in the
+// same tick (Windows' timer is coarse: a PID taken over by something that is neither a
+// browser nor cmd.exe). The worker ends nothing for it: the remedy is restarting the
+// dedicated Chrome, which ends its hosts and starts fresh ones. The chain is checked by PID
+// and start time together, never by PID alone.
+const created = (p: Proc) => (Number.isFinite(p.created) ? p.created! : null);
+function parentGone(parent: Proc | undefined, child: Proc): boolean {
+  if (!parent) return true;
+  const a = created(parent), b = created(child);
+  if (a === null || b === null) return false;        // can't tell: the chain check fails it closed as extension_elsewhere
+  if (a > b) return true;
+  return a === b && !!parent.cmd && !isBrowser(parent) && !browserOf(parent.cmd) && !CMD_EXE.test(parent.cmd);
+}
+export function hostChain(ps: Proc[], inst: Install, host: string | null = null): "host_parent_gone" | "extension_elsewhere" | null {
   const origin = `chrome-extension://${inst.profile.extension_id}`;
+  let elsewhere = false;
   for (const p of ps.filter((x) => isHost(x, origin))) {
     const parent = ps.find((x) => x.pid === p.ppid);
-    if (!parent || !parent.cmd || !startedBefore(parent, p)) return true;
+    if (parentGone(parent, p)) return "host_parent_gone";
+    if (!parent || !parent.cmd || !startedBefore(parent, p)) { elsewhere = true; continue; }
     if (isDedicated(parent, inst)) {
       // No intermediate: the dedicated Chrome started the host itself, which must be the registered one.
-      if (!names(p.cmd, host)) return true;
+      if (!names(p.cmd, host)) elsewhere = true;
       continue;
     }
     // The one intermediate: a cmd.exe naming the registered host, whose own parent (the
     // host's grandparent) is the dedicated Chrome, started no later than that cmd.exe. A
     // cmd.exe any other process started (Explorer, another browser, a Chrome on another
     // folder, a Chrome child process) fails.
-    if (!CMD_EXE.test(parent.cmd) || !names(parent.cmd, host)) return true;
+    if (!CMD_EXE.test(parent.cmd) || !names(parent.cmd, host)) { elsewhere = true; continue; }
     const grand = ps.find((x) => x.pid === parent.ppid);
-    if (!isDedicated(grand, inst) || !startedBefore(grand, parent)) return true;
+    if (parentGone(grand, parent)) return "host_parent_gone";
+    if (!isDedicated(grand, inst) || !startedBefore(grand!, parent)) elsewhere = true;
   }
-  return false;
+  return elsewhere ? "extension_elsewhere" : null;
 }
+export const extensionElsewhere = (ps: Proc[], inst: Install, host: string | null = null): boolean => hostChain(ps, inst, host) !== null;
 
 // ---- The registered manifest, at setup ------------------------------------------------------
 // Chrome finds the extension's native host through the registry on Windows, in every view
@@ -768,8 +849,9 @@ const manifestDetail = (m: ManifestViews) => `the native host manifest registere
   + (m.mismatched.includes("HKLM32") ? " (a WOW6432Node entry: see Troubleshooting)" : "");
 
 // The extension's hosts left behind by a browser that has gone: their parent is gone, or
-// its PID now belongs to a process that started after them. No browser can be using one,
-// so the preflight ends them (and what runs under them) before it checks the chain.
+// its PID now belongs to a process that started after them. The preflight fails on them
+// (host_parent_gone, from hostChain) and ends nothing: restarting the dedicated Chrome is
+// the remedy.
 export function orphanHosts(ps: Proc[], inst: Install): Proc[] {
   const origin = `chrome-extension://${inst.profile.extension_id}`;
   return ps.filter((p) => {
@@ -821,6 +903,13 @@ export function readConfirmed(o: Opts): Confirmed | null {
 // missing confirmation (and the pinned hashes it would hold) is checked. The worker
 // never starts Chrome: the dedicated one must already be open on its profile.
 export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false): Code | null {
+  if (inst.unattended) return "unattended_unsupported";
+  // The worker's own Claude Code sign-in, made once at setup.
+  if (!signedIn(o)) return "worker_signin_missing";
+  // The extension's entry in the profile's preferences, and no other enabled extension there.
+  const prefs = extensionPrefs(inst);
+  if (!prefs.files.length) return "extension_entry_missing";
+  if (prefs.others.length) return "extra_extension";
   // An extension update unpacked but not yet running: restart the Cain jobs Chrome first.
   if (updatePending(inst)) return "update_pending";
   const fp = fingerprint(o, inst);
@@ -829,15 +918,10 @@ export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false):
   const host = hostPath(inst);
   if (!host) return "untrusted_config";              // the registered host's manifest can't be read, or doesn't list the extension
   const read = () => (o.procs ?? (() => listProcs(platform(o))))();
-  let ps = read();
+  const ps = read();
   if (!ps) return "chrome_busy";                     // a process list that can't be read: the worker can't tell
-  const orphans = orphanHosts(ps, inst);
-  if (orphans.length) {
-    for (const p of orphans) (o.killPid ?? ((pid: number) => killTree(pid)))(p.pid);
-    ps = read();
-    if (!ps) return "chrome_busy";
-  }
-  if (extensionElsewhere(ps, inst, host)) return "extension_elsewhere";
+  const chain = hostChain(ps, inst, host);
+  if (chain) return chain;
   const scan = profileScan(o, inst, runningDirs(ps, inst, o.browserDefaults ?? browserDefaults(platform(o), envOf(o))));
   if (scan === "elsewhere") return "extension_elsewhere";
   if (scan === "unreadable") return "profile_scan_failed";
@@ -859,10 +943,8 @@ export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false):
   // The CLI the permission layer was seen refusing on, by version and by its executable's
   // hash: any other CLI (an update, or the change a run saw as cli_changed) needs a new probe.
   if (fp.cli_version !== c.deny_cli_version || cliSha(o, inst) !== c.cli_sha256) return "probe_stale";
-  // Unattended needs the probe to have seen the extension's live version in the init data:
-  // without it, no run can check it at runtime.
-  if (!o.attended && inst.unattended && c.deny_check && !c.live_extension_version) return "extension_version_unknown";
-  if (!o.attended && !(inst.unattended && c.deny_check)) return "attended_only";
+  // Every run is attended in this version: the owner starts it (run --attended).
+  if (!o.attended) return "attended_only";
   return null;
 }
 
@@ -917,9 +999,10 @@ function lock(o: Opts, now: Date): { got: boolean; stale: boolean } {
 }
 const unlock = (o: Opts) => rmSync(P.lock(o), { force: true });
 
-interface RunState { stale: boolean; skew: number | null; reason?: Reason | null }
+interface RunState { stale: boolean; skew: number | null; reason?: Reason | null; warnings?: string[] }
 
-function beat(o: Opts, code: Heartbeat["code"], job: string | null, now: Date, st: RunState, warnings: string[] = []): Heartbeat {
+function beat(o: Opts, code: Heartbeat["code"], job: string | null, now: Date, st: RunState, more: string[] = []): Heartbeat {
+  const warnings = [...(st.warnings ?? []), ...more];
   const reason = code === "probe_stale" || code === "extension_version_unknown" ? st.reason ?? null : null;
   const h: Heartbeat = { v: 1, worker_clock: now.toISOString(), code, job, stale_lock: st.stale, skew_ms: st.skew, reason };
   try {
@@ -1094,8 +1177,11 @@ export async function next(o: Opts): Promise<NextOut> {
   if (!l.got) return quit("busy");
   let keep = false;
   try {
-    const inst = loadInstall(o);
-    if (!inst) return quit("untrusted_config");
+    const sw = startSweep(o);
+    if (sw.code) return quit(sw.code);
+    if (sw.swept) st.warnings = ["transcripts_swept"];
+    const inst = installOf(o);
+    if (typeof inst === "string") return quit(inst);
     if (!filesTrusted(o)) return quit("untrusted_files");
     const keys = ownerKeys(o, inst);
     if (!keys) return quit("untrusted_config");
@@ -1143,6 +1229,7 @@ export async function next(o: Opts): Promise<NextOut> {
     return { claim: run ? { job: run, inst, allow: allow.ok ? allow.value : [], claimedAt: mono(o), st } : null, closed, code };
   } catch (e) {
     if (e instanceof WorkerError && e.code === "git_failed") return quit("git_failed");
+    if (e instanceof WorkerError && SESSION_FAILURES.includes(e.code)) return quit(e.code as Code);
     throw e;
   } finally {
     if (!keep) unlock(o);
@@ -1169,40 +1256,107 @@ export function sessionArgv(inst: Install, o: Opts, settings: any, promptText: s
 // The session's environment: baseEnv (the allowlisted variables, the autoupdater off, how
 // the hook runs this file), and for this session only, the addresses nav-guard lets it
 // open and the file nav-guard logs its decisions to.
-// CLAUDE_CONFIG_DIR, in the session's environment only, is the run-scoped folder
-// session-config under the worker folder (inside its ACL): the CLI keeps its own
-// transcripts and state there, not in the owner's ~/.claude, which stays untouched.
+// CLAUDE_CONFIG_DIR, in the session's environment only, is the worker's own Claude Code
+// folder (claude-config, below): the session signs in, keeps its state and writes its
+// transcripts there, never in the owner's ~/.claude.
 export function sessionEnv(o: Opts, navAllow: string[]): Record<string, string> {
   return { ...baseEnv(o), CLAUDE_CONFIG_DIR: P.cliConfig(o), PCW_NAV_ALLOW: JSON.stringify(navAllow), PCW_NAV_LOG: fwd(P.navLog(o)) };
 }
 
-// Before each session: an empty working folder, and a fresh run-scoped config folder
-// holding only a copy of the CLI's sign-in (~/.claude/.credentials.json, where the CLI
-// keeps it on Windows), so the session is signed in without reading the owner's settings,
-// memory or transcripts. Its contents are never read or printed by the worker.
+// ---- The worker's own Claude Code sign-in, and its transcripts ---------------------------------
+// claude-config, under the worker folder (inside its ACL), is the worker's own Claude Code
+// folder. It persists: the owner signs it in once at setup, in a terminal of his own, with
+// CLAUDE_CONFIG_DIR pointing at it (the setup note's step), and every session uses that
+// sign-in. The owner's own ~/.claude is never read or copied, so a session can't sign out,
+// refresh or otherwise touch his own CLI's sign-in.
+//   - A run, the probe and bind-profile refuse (worker_signin_missing) while the folder has
+//     no credential file. The worker checks the file is there and not empty; it never
+//     reads it.
+//   - What a session leaves there (its transcripts, page text and all, under projects/,
+//     its history and the rest of SESSION_LEFTOVERS) is deleted after every session, in a
+//     finally path: a normal end, a failed run, a timeout kill and a STOP the session was
+//     ended for all go through it. An exit handler does the same if the worker itself is
+//     ended mid-run (Ctrl+C, a closed window), and every worker start, probe, bind-profile
+//     and check-cli sweeps what a worker killed outright (Task Manager's End task) left.
+//     The delete retries (Windows can hold a file a moment after its process ends); one
+//     that still fails is session_cleanup_failed, never a silent pass.
+//   - On Windows the worker keeps the folder out of Windows Search (attrib +I), where it can.
+export const CREDENTIAL = ".credentials.json";
+export const SESSION_LEFTOVERS = ["projects", "transcripts", "todos", "history.jsonl", "file-history", "session-env", "shell-snapshots", "debug",
+  "paste-cache", "statsig"];
+export function signedIn(o: Opts): boolean {
+  try { return statSync(join(P.cliConfig(o), CREDENTIAL)).size > 0; } catch { return false; }
+}
+// Windows: the folder out of Windows Search's index (attrib +I on it and what it holds).
+// Best effort: a folder the worker can't mark still works, and the setup note marks it too.
+export function noIndex(dir: string, plat = process.platform) {
+  if (plat !== "win32") return;
+  try { execFileSync("attrib", ["+I", dir], { stdio: "ignore", timeout: 30_000, windowsHide: true }); } catch { /* the setup step covers it */ }
+}
+const prepareConfig = (o: Opts) => {
+  mkdirSync(P.cliConfig(o), { recursive: true });
+  (o.noIndex ?? ((d: string) => noIndex(d, platform(o))))(P.cliConfig(o));
+};
+// What a session left in the worker's Claude Code folder, by name.
+export const sessionLeftovers = (o: Opts) => SESSION_LEFTOVERS.filter((n) => exists(join(P.cliConfig(o), n)));
+// Deletes them, each retried; found names what was there, ok whether all of it is gone.
+export function sweepSession(o: Opts, tries = 5): { found: string[]; ok: boolean } {
+  const found = sessionLeftovers(o);
+  const rm = o.remove ?? ((f: string) => rmSync(f, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }));
+  const wait = o.sleep ?? sleepSync;
+  for (const n of found) {
+    const f = join(P.cliConfig(o), n);
+    for (let i = 0; i < tries && exists(f); i++) {
+      try { rm(f); } catch { /* tried again below */ }
+      if (exists(f) && i < tries - 1) wait(200 * (i + 1));
+    }
+  }
+  return { found, ok: sessionLeftovers(o).length === 0 };
+}
+// The sweep at a worker's start: leftovers from a worker killed mid-run. Their names go to
+// worker.log (transcripts_swept); a sweep that fails is session_cleanup_failed.
+export function startSweep(o: Opts): { swept: boolean; code: "session_cleanup_failed" | null } {
+  const sw = sweepSession(o);
+  return { swept: sw.found.length > 0, code: sw.ok ? null : "session_cleanup_failed" };
+}
+
+// Before each session: an empty working folder and the worker's own Claude Code folder,
+// signed in and holding nothing of an earlier session.
 function prepareCwd(o: Opts) {
   const d = P.cwd(o);
   rmSync(d, { recursive: true, force: true });
   mkdirSync(d, { recursive: true });
   writeFileSync(join(d, "no-mcp.json"), JSON.stringify({ mcpServers: {} }) + "\n");
   rmSync(P.navLog(o), { force: true });
-  const cfg = P.cliConfig(o);
-  rmSync(cfg, { recursive: true, force: true });
-  mkdirSync(cfg, { recursive: true });
-  const cred = join(claudeHome(o), ".credentials.json");
-  try { if (exists(cred)) writeFileSync(join(cfg, ".credentials.json"), readFileSync(cred), { mode: 0o600 }); } catch { /* the session says it isn't signed in */ }
+  prepareConfig(o);
+  if (!signedIn(o)) throw new WorkerError("worker_signin_missing", SIGNIN_HINT);
+  if (!sweepSession(o).ok) throw new WorkerError("session_cleanup_failed", CLEANUP_HINT);
 }
-// After each session (the end step): the run-scoped config folder is deleted, with every
-// transcript the CLI wrote there. It is the one place page text lives on the PC, and only
-// for the session's duration.
+export const SIGNIN_HINT = "the worker's own Claude Code folder (claude-config) has no sign-in: run the setup step that signs it in once (CLAUDE_CONFIG_DIR set to it, then claude, then /login)";
+export const CLEANUP_HINT = "a session's transcripts in claude-config couldn't be deleted: close what holds them (an editor, a search indexer, an antivirus scan), then delete claude-config\\projects by hand";
+// After each session (the end step): what the session left in the worker's Claude Code
+// folder is deleted, transcripts and all. It is the one place page text lives on the PC,
+// and only for the session's duration. A delete that fails is session_cleanup_failed.
 export function endSession(o: Opts) {
-  try { rmSync(P.cliConfig(o), { recursive: true, force: true }); } catch { /* the next prepare clears it */ }
+  if (!sweepSession(o).ok) throw new WorkerError("session_cleanup_failed", CLEANUP_HINT);
+}
+// The exit handler, while a session runs: a worker ended mid-run (Ctrl+C, its window
+// closed, a termination signal) deletes the session's leftovers before it goes. A worker
+// killed outright runs nothing; the next start's sweep covers that.
+const EXIT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const;
+function onExitSweep(o: Opts): () => void {
+  const sweep = () => { try { sweepSession(o, 3); } catch { /* the next start sweeps */ } };
+  const onSignal = () => { sweep(); process.exit(130); };
+  process.on("exit", sweep);
+  for (const sig of EXIT_SIGNALS) try { process.on(sig, onSignal); } catch { /* a signal this platform lacks */ }
+  return () => { process.off("exit", sweep); for (const sig of EXIT_SIGNALS) try { process.off(sig, onSignal); } catch { /* none */ } };
 }
 // One session, from its prepared folders to its end step.
 export async function runSession(o: Opts, argv: string[], timeoutMs: number, env: Record<string, string>): Promise<Session> {
   prepareCwd(o);
-  try { return await (o.launch ?? launchSession)(argv, P.cwd(o), timeoutMs, env); }
-  finally { endSession(o); }
+  const off = onExitSweep(o);
+  try { return await (o.launch ?? launchSession)(argv, P.cwd(o), timeoutMs, env, P.stop(o)); }
+  finally { try { endSession(o); } finally { off(); } }
 }
 
 // ---- The guard: nav-guard, the session's hook on every Claude in Chrome tool ---------------
@@ -1449,14 +1603,18 @@ export function killTree(pid: number, plat = process.platform) {
   } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
 }
 
-export const launchSession: Launch = (argv, cwd, timeoutMs, env) => new Promise((done) => {
-  let out = "", timedOut = false;
+// The owner's STOP file, checked every second while the session runs: it ends the session
+// at once (stopped), and the run's end step deletes what the session left.
+export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile) => new Promise((done) => {
+  let out = "", timedOut = false, stopped = false;
   // Straight from the argument list: never a shell, so nothing in it is ever parsed as a command.
   const child = spawn(argv[0], argv.slice(1), { cwd, env, shell: false, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
   const timer = setTimeout(() => { timedOut = true; if (child.pid) killTree(child.pid); }, timeoutMs);
+  const watch = stopFile ? setInterval(() => { if (!stopped && existsSync(stopFile)) { stopped = true; if (child.pid) killTree(child.pid); } }, 1_000) : undefined;
+  const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); };
   child.stdout?.on("data", (d) => { if (out.length < 2_000_000) out += d.toString(); });
-  child.on("error", () => { clearTimeout(timer); done({ code: null, out: "", timedOut }); });
-  child.on("close", (code) => { clearTimeout(timer); if (child.pid && !timedOut && process.platform !== "win32") { try { process.kill(-child.pid, "SIGKILL"); } catch { /* none left */ } } done({ code, out, timedOut }); });
+  child.on("error", () => { end(); done({ code: null, out: "", timedOut, stopped }); });
+  child.on("close", (code) => { end(); if (child.pid && !timedOut && !stopped && process.platform !== "win32") { try { process.kill(-child.pid, "SIGKILL"); } catch { /* none left */ } } done({ code, out, timedOut, stopped }); });
 });
 
 // ---- What the session did: print mode's event stream -----------------------------------------
@@ -1991,6 +2149,7 @@ export function extensionMismatch(st: Stream, disk: string | null): boolean {
 // profile, read after the session, must still be it: extension_version_mismatch otherwise.
 export function sessionCode(s: Session, stream: Stream, tools: string[], denied: string[], disk: string | null = null, needLive = false,
   confirmed: string | null = null): Code | null {
+  if (s.stopped) return "session_stopped";
   if (s.timedOut) return "browser_timeout";
   if (!stream.init || !extensionConnected(stream)) return "extension_unreachable";
   if (needLive && !stream.init.extension_version) return "extension_version_unknown";
@@ -2080,6 +2239,19 @@ export async function run(o: Opts): Promise<RunOut> {
     v.given = stripCanary(v.given);
     beat(o, final.code, mine.id, now, c.st, warnings);
     return { code: final.code, job: mine.id, closed: n.closed, state: stateAfter(mine, final), ...(warnings.length ? { warnings } : {}) };
+  } catch (e) {
+    // The session's own folders failed it (its transcripts couldn't be deleted, or the
+    // worker's sign-in went missing): the job fails with that code, loudly, and the
+    // heartbeat says so. No session output is judged or kept.
+    if (!(e instanceof WorkerError) || !SESSION_FAILURES.includes(e.code)) throw e;
+    const code = e.code as Code, now = clock(o), mine = stillOurs(o, c, now);
+    if (mine && mine !== "cancelled") {
+      close(o, mine, result(mine, "failed", code, now, { tools: allowedTools(sessionHashes(o)?.settings) ?? [], attended: !!o.attended }));
+      commitPush(o, `result ${mine.id}: failed (${code})`);
+      try { writeFileSync(P.lastRun(o), JSON.stringify(lastRunOf(now, mine.id, code, null), null, 2) + "\n"); } catch { /* never stops a run */ }
+    }
+    beat(o, code, c.job.id, now, c.st);
+    return { code, job: c.job.id, closed: n.closed };
   } finally {
     unlock(o);
   }
@@ -2158,8 +2330,11 @@ export interface InjectLine { served: boolean; code: Code | null; leaked: boolea
 // accepts the boundary.
 export interface BoundaryLine { case: "redirect" | "popup"; request_reached: boolean; caught: boolean }
 export interface SlowHookLine { tried: boolean; permission_denied: boolean; opened: boolean; decisions: number; passed: boolean; cli_version: string | null }
+// The worker's own sign-in across sessions: two sessions back to back, each signed in, and
+// the credential still in claude-config after both (and after their end steps).
+export interface SigninLine { sessions: number; signed_in: boolean; credential_kept: boolean; passed: boolean }
 export interface Evidence {
-  v: 1; at: string; target: string; stop_ok: boolean; smoke: string; restart: RestartLine; failed_preflight: Code | null; browser: Code; canary_ok: boolean;
+  v: 1; at: string; target: string; stop_ok: boolean; smoke: string; signin: SigninLine; restart: RestartLine; failed_preflight: Code | null; browser: Code; canary_ok: boolean;
   reading_reports_url: boolean; live_extension_version: boolean; injection: InjectLine; injection_plan: InjectLine; slow_hook: SlowHookLine; boundary: BoundaryLine[];
   inventory: string[]; inventory_ok: boolean; deny_check: boolean; deny: DenyLine[]; navigation: NavLine[]; not_exercised: string[];
   hook_intercepts: boolean; fails_closed: boolean; destinations: DestLine[]; destination_check: boolean; hits: string[];
@@ -2329,8 +2504,7 @@ export async function probe(o: Opts): Promise<Evidence> {
   if (!o.attended) throw new WorkerError("attended_required");
   const now = clock(o);
   if (existsSync(P.stop(o))) throw new WorkerError("stopped");
-  const inst = loadInstall(o);
-  if (!inst) throw new WorkerError("untrusted_config");
+  const inst = mustInstall(o);
   if (!filesTrusted(o)) throw new WorkerError("untrusted_files");
   const keys = ownerKeys(o, inst);
   if (!keys) throw new WorkerError("untrusted_config");
@@ -2347,6 +2521,9 @@ export async function probe(o: Opts): Promise<Evidence> {
   const l = lock(o, now);
   if (!l.got) throw new WorkerError("busy");
   try {
+    // Leftovers of a worker killed mid-session go first; then the worker's own sign-in.
+    if (startSweep(o).code) throw new WorkerError("session_cleanup_failed", CLEANUP_HINT);
+    if (!signedIn(o)) throw new WorkerError("worker_signin_missing", SIGNIN_HINT);
     // 1. STOP.
     writeFileSync(P.stop(o), "probe\n");
     let stop_ok = false;
@@ -2388,6 +2565,12 @@ export async function probe(o: Opts): Promise<Evidence> {
       return smoke;
     };
     const smoke = await smokeOnce();
+    // 2a. The worker's own sign-in holds across sessions: a second session straight after
+    // the first (each refuses when not signed in), then the credential must still be there.
+    await smokeOnce();
+    const signin: SigninLine = { sessions: 2, signed_in: true, credential_kept: signedIn(o), passed: false };
+    signin.passed = signin.credential_kept;
+    if (!signin.passed) throw new WorkerError("worker_signin_missing", "the worker's own sign-in was gone after two sessions: sign claude-config in again (the setup step), then probe again");
     const inv = inventory(smoke, tools, denied);
     // 2b. The cookie survives a restart of the dedicated Chrome: the owner restarts it, and a
     // second smoke call must still see the bound marker.
@@ -2491,7 +2674,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const dirEmpty = readdirSync(dir).length === 0;
     const dv = judgeDeny(d, dst, dc, dirEmpty, readNavLog(P.navLog(o)));
     rmSync(dir, { recursive: true, force: true });
-    const ev: Evidence = { v: 1, at: now.toISOString(), target: pin.url, stop_ok, smoke: "connected", restart, failed_preflight, browser: r.code, canary_ok,
+    const ev: Evidence = { v: 1, at: now.toISOString(), target: pin.url, stop_ok, smoke: "connected", signin, restart, failed_preflight, browser: r.code, canary_ok,
       reading_reports_url: readingReports(stream, ...destStreams), live_extension_version: !!smoke.init?.extension_version && !!stream.init?.extension_version,
       injection, injection_plan, slow_hook, boundary,
       inventory: inv.seen, inventory_ok: inv.ok && inventory(stream, tools, denied).ok && inventory(dst, tools, denied).ok,
@@ -2516,8 +2699,7 @@ export async function probe(o: Opts): Promise<Evidence> {
 export async function bindProfile(o: Opts): Promise<{ bound: string }> {
   if (!o.attended) throw new WorkerError("attended_required");
   if (existsSync(P.stop(o))) throw new WorkerError("stopped");
-  const inst = loadInstall(o);
-  if (!inst) throw new WorkerError("untrusted_config");
+  const inst = mustInstall(o);
   if (!filesTrusted(o)) throw new WorkerError("untrusted_files");
   if (!ownerKeys(o, inst)) throw new WorkerError("untrusted_config");
   const h = sessionHashes(o);
@@ -2525,8 +2707,9 @@ export async function bindProfile(o: Opts): Promise<{ bound: string }> {
   if (!h || !tools) throw new WorkerError("untrusted_config");
   const reg = manifestViews(o, inst);
   if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
+  if (startSweep(o).code) throw new WorkerError("session_cleanup_failed", CLEANUP_HINT);
   const pre = browserPreflight(o, inst, true) ?? chromeBusy(o);
-  if (pre) throw new WorkerError(pre);
+  if (pre) throw new WorkerError(pre, pre === "worker_signin_missing" ? SIGNIN_HINT : undefined);
   const now = clock(o);
   const l = lock(o, now);
   if (!l.got) throw new WorkerError("busy");
@@ -2576,7 +2759,7 @@ export const BOUNDARY_TEXT = "This release is supervised browsing with checked t
 // not exercised, or not covered by any probe case at all: the boundary above).
 export function probeCases(ev: Evidence): { ran: string[]; unverified: string[] } {
   const all: [string, boolean][] = [
-    ["stop", ev.stop_ok === true], ["smoke", ev.smoke === "connected"], ["restart", ev.restart?.cookie_kept === true],
+    ["stop", ev.stop_ok === true], ["smoke", ev.smoke === "connected"], ["signin", ev.signin?.passed === true], ["restart", ev.restart?.cookie_kept === true],
     ["failed_preflight", !!ev.failed_preflight], ["browser_step", BROWSER_OK.includes(ev.browser)], ["canary", ev.canary_ok === true],
     ...(ev.destinations ?? []).map((d): [string, boolean] => [`destination:${d.target}`, d.passed === true]),
     ...(ev.boundary ?? []).map((b): [string, boolean] => [`boundary:${b.case}`, b.caught === true]),
@@ -2591,12 +2774,11 @@ export function probeCases(ev: Evidence): { ran: string[]; unverified: string[] 
 }
 
 export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}): Confirmed {
-  const inst = loadInstall(o);
-  if (!inst) throw new WorkerError("untrusted_config");
+  const inst = mustInstall(o);
   const ev = readJson(P.evidence(o)) as Evidence | null;
   const now = clock(o);
   if (!ev || ev.v !== 1 || !ev.stop_ok || ev.smoke !== "connected" || !ev.failed_preflight || !ev.canary_ok || ev.inventory_ok !== true
-    || ev.restart?.chrome_restarted !== true || ev.restart?.cookie_kept !== true
+    || ev.restart?.chrome_restarted !== true || ev.restart?.cookie_kept !== true || ev.signin?.passed !== true
     || !BROWSER_OK.includes(ev.browser) || !(now.getTime() - Date.parse(ev.at) < 24 * 3_600_000))
     throw new WorkerError("probe_required");
   // The slowed-hook check gates the confirmation itself: no run of any kind (attended ones
@@ -2634,25 +2816,39 @@ export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}):
 // check-cli: the CLI the confirmation pinned against the one installed now, by version and
 // by the executable's SHA-256. A difference is what stops runs as probe_stale
 // (cli_version_changed); the autoupdater is the usual cause.
-export function checkCli(o: Opts): { pinned_version: string | null; current_version: string | null; pinned_sha256: string | null; current_sha256: string | null; same: boolean } {
-  const inst = loadInstall(o);
-  if (!inst) throw new WorkerError("untrusted_config");
+export interface CliCheck {
+  pinned_version: string | null; current_version: string | null; pinned_sha256: string | null; current_sha256: string | null; same: boolean;
+  signed_in: boolean; transcripts: { found: string[]; swept: boolean };
+}
+// It also says whether the worker's own Claude Code folder is signed in, and sweeps (and
+// names) any session leftovers there: a worker killed mid-run leaves them.
+export function checkCli(o: Opts): CliCheck {
+  const inst = mustInstall(o);
+  const sw = sweepSession(o);
   const c = readConfirmed(o);
   const current_version = (o.cliVersion ?? (() => cliVersion(inst)))();
   const current_sha256 = cliSha(o, inst);
   const pinned_version = c?.deny_cli_version ?? null, pinned_sha256 = c?.cli_sha256 ?? null;
   return { pinned_version, current_version, pinned_sha256, current_sha256,
-    same: !!pinned_version && pinned_version === current_version && !!pinned_sha256 && pinned_sha256 === current_sha256 };
+    same: !!pinned_version && pinned_version === current_version && !!pinned_sha256 && pinned_sha256 === current_sha256,
+    signed_in: signedIn(o), transcripts: { found: sw.found, swept: sw.ok } };
 }
 
-// check-host: the registered manifest against install.json, on its own (setup).
-export function checkHost(o: Opts): "ok" {
-  const inst = loadInstall(o);
-  if (!inst) throw new WorkerError("untrusted_config");
+// check-host: the registered manifest against install.json, on its own (setup), and the
+// extension's entry in the profile's preferences: which file(s) and key path it was read
+// from, and every extension found there.
+export interface HostCheck { host: "ok"; extension_entry: { files: string[]; key: string }; extensions: ExtensionLine[] }
+export function checkHost(o: Opts): HostCheck {
+  const inst = mustInstall(o);
   const reg = manifestViews(o, inst);
   if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
   if (!hostPath(inst)) throw new WorkerError("untrusted_config", "the registered manifest can't be read, or doesn't list the extension");
-  return "ok";
+  const prefs = extensionPrefs(inst);
+  if (!prefs.files.length)
+    throw new WorkerError("extension_entry_missing", `neither Secure Preferences nor Preferences of the dedicated profile has ${prefs.key}: check profile_directory and extension_id in install.json`);
+  if (prefs.others.length)
+    throw new WorkerError("extra_extension", { other_enabled: prefs.others, extensions: prefs.extensions });
+  return { host: "ok", extension_entry: { files: prefs.files, key: prefs.key }, extensions: prefs.extensions };
 }
 
 export function ownerKeygen(kid: string, out: string, passphrase: string): string {
@@ -2675,9 +2871,12 @@ export function signAllowlistFile(entriesFile: string, keyFile: string, passphra
   const allow = Array.isArray(e) ? e : e?.allow;
   // An address with a query, or a path with a word that acts (logout, unsubscribe, delete...),
   // is refused unless its entry says "reviewed": true.
-  // The message names the word matched and the full address it was found in, so a "reviewed" mark is deliberate.
+  // The message names the entry, the word matched and the address's host, nothing more:
+  // an address may carry a secret (a token in its query, a password in its userinfo), so its
+  // path, query, fragment and userinfo are never printed, and nothing of a refused address
+  // is written anywhere (the signing tool writes nothing at all when it refuses).
   const risky = (Array.isArray(allow) ? allow : []).map((x: unknown, i: number) => ({ i, m: riskyMatch(x) })).filter((x) => x.m);
-  if (risky.length) throw new WorkerError("allowlist_risky_url", risky.map((x) => `entry ${x.i + 1}: matched "${x.m!.word}" in ${x.m!.address}`).join("; "));
+  if (risky.length) throw new WorkerError("allowlist_risky_url", risky.map((x) => `entry ${x.i + 1}: matched "${x.m!.word}" on host ${x.m!.host}`).join("; "));
   const key: KeyObject = createPrivateKey({ key: readFileSync(keyFile, "utf8"), format: "pem", passphrase });
   const text = signAllowlist(kid, allow, signerOf(key));
   const check = parseAllowlist(text, new Map([[kid, createPublicKey(key)]]));
@@ -2732,8 +2931,9 @@ if (isMain && process.argv[2] === "nav-guard") {
     else if (cmd === "confirm-profile") {
       const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });
       const ev = readJson(P.evidence(o)) as Evidence;
-      say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, boundary_cases: ev.boundary ?? [], ...probeCases(ev) });
-    } else if (cmd === "check-host") say({ host: checkHost(o), cli: checkCli(o) });
+      say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, boundary_cases: ev.boundary ?? [], ...probeCases(ev),
+        extensions: extensionPrefs(mustInstall(o)).extensions });
+    } else if (cmd === "check-host") say({ ...checkHost(o), cli: checkCli(o) });
     else if (cmd === "check-cli") say({ cli: checkCli(o) });
     else if (cmd === "owner-keygen") say({ owner_pub: ownerKeygen(flag(args, "--kid") ?? "", flag(args, "--out") ?? o.home, process.env.PC_OWNER_PASSPHRASE ?? "") });
     else if (cmd === "owner-fpr" && a1) say({ owner_fpr: ownerFpr(a1) });

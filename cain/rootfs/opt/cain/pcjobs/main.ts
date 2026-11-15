@@ -102,6 +102,16 @@ export const REPROBE = "worker.ts probe --attended, then worker.ts confirm-profi
 export function heartbeatNotice(h: Heartbeat | null): string | null {
   if (h?.code === "update_pending")
     return "The PC stopped taking jobs because Chrome has a Claude in Chrome update waiting. At the PC: restart the Cain jobs Chrome; the next run then asks for a new probe.";
+  if (h?.code === "worker_signin_missing")
+    return "The PC isn't taking jobs because the worker's own Claude Code isn't signed in. At the PC: run the setup step that signs in claude-config, then start a run.";
+  if (h?.code === "session_cleanup_failed")
+    return "The PC stopped taking jobs because it couldn't delete a session's transcripts. At the PC: run worker.ts check-cli and follow its Troubleshooting row.";
+  if (h?.code === "host_parent_gone")
+    return "The PC isn't taking jobs because Claude in Chrome's helper lost its Chrome. At the PC: restart the Cain jobs Chrome.";
+  if (h?.code === "extra_extension")
+    return "The PC isn't taking jobs because the Cain jobs Chrome has another extension turned on. At the PC: remove it there (worker.ts check-host lists them).";
+  if (h?.code === "unattended_unsupported")
+    return "The PC isn't taking jobs because its install file asks for unattended runs, which this version doesn't allow. At the PC: set unattended to false.";
   if (h?.code === "boundary_not_accepted")
     return `The PC isn't taking jobs until you accept its stated boundary. At the PC: run ${REPROBE}.`;
   if (!h?.reason) return null;
