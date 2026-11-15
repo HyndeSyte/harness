@@ -387,10 +387,10 @@ create, update or run any other routine.
    id. If the review calls for fixes, they go with the branch (`/opt/cain/record.sh holds`):
    - The pass brought it: the branch is yours with the item, so run Build on it with the
      fixes, as for your own pull request.
-   - A laptop session kept it (it holds it under another item; a hold lapses after a day
-     without a word, so that session is live): pass the item back to that session with the
-     findings in a note, in one request. It passes the item to you again with the new head,
-     and you hear at once.
+   - A laptop session kept it (it holds it under another item): pass the item back to that
+     session with the findings in a note, in one request. It passes the item to you again
+     with the new head, and you hear at once. If that session goes quiet, its holds lapse
+     after a day; then take the item with its branch and fix it through Build.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 ## Stop
@@ -525,7 +525,8 @@ writers clash. Your GitHub write tools are switched off on purpose. To change fi
      the item's holder, who reads it before its next write.
    An open row nobody holds is yours; ids are upper-cased (P08, not p08).
    `/opt/cain/record.sh holds` prints who holds what, as the keeper last pushed it;
-   `/opt/cain/record.sh notes <item>` an item's notes (and marks them read),
+   `/opt/cain/record.sh notes <item>` an item's notes (all of them, with no time, marks
+   them read),
    `/opt/cain/record.sh unread` the items with notes you haven't read, and
    `/opt/cain/record.sh notes -` the notes on all your items (add a time to see only those
    after it).

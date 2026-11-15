@@ -950,6 +950,88 @@ def test_a_first_checkin_counts_only_notes_from_then_on(tmp_path):
         _notes_env_done()
 
 
+def test_a_read_marks_notes_read_only_when_all_of_that_file_was_shown(tmp_path):
+    # A read that failed, or one cut by a time, leaves the item unread (outside review, round 16).
+    import json
+    import os
+    import shutil
+    import subprocess
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    rec = tmp_path / "record"
+    (rec / "state" / "notes").mkdir(parents=True)
+    _write_notes(rec, "P41", [("2026-11-15T10:00:00.000Z", "laptop:9f2c", "dane: the handoff")])
+    (rec / "state" / "holds.json").write_text(json.dumps({}))
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(rec), *a], check=True, capture_output=True, text=True).stdout.strip()
+
+    g("init", "-q")
+    g("add", "-A")
+    g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "notes")
+    g("update-ref", "refs/remotes/origin/main", "HEAD")             # as the keeper's copy has it
+    _notes_env(tmp_path, rec, "2026-11-14T00:00:00.000Z")
+
+    def run(*a):
+        return subprocess.run([shutil.which("bash"), str(tmp_path / "record.sh"), *a], env=dict(os.environ),
+                              capture_output=True, text=True, encoding="utf-8", check=True, timeout=20).stdout
+
+    try:
+        assert run("unread", "2026-11-14T00:00:00Z").startswith("P41 |")
+        # Cut by a time, it shows none of the notes and marks nothing.
+        assert run("notes", "P41", "2099-01-01") == ""
+        assert run("unread", "2026-11-14T00:00:00Z").startswith("P41 |")
+        # The notes object can't be read and the copy here isn't that file: shown or not, nothing marked.
+        blob = g("rev-parse", "origin/main:state/notes/P41.md")
+        obj = rec / ".git" / "objects" / blob[:2] / blob[2:]
+        saved = obj.read_bytes()
+        obj.chmod(0o644)
+        obj.unlink()
+        (rec / "state" / "notes" / "P41.md").write_text("changed here\n", newline="\n")
+        run("notes", "P41")
+        obj.write_bytes(saved)
+        assert run("unread", "2026-11-14T00:00:00Z").startswith("P41 |")
+        # All of that file, read by its id: marked, and it drops off.
+        assert "the handoff" in run("notes", "P41")
+        assert run("unread", "2026-11-14T00:00:00Z") == ""
+    finally:
+        _notes_env_done()
+
+
+def test_only_cains_own_reads_mark_notes_read(tmp_path):
+    # Once he runs as his own user, root reading his notes (a check, a look by hand) marks nothing and
+    # makes no folder of root's in his home; his own read does. With no NOTES_READ_DIR, as in production.
+    import os
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        import pytest
+        pytest.skip("no bash")
+    rec = tmp_path / "record"
+    (rec / "state" / "notes").mkdir(parents=True)
+    _write_notes(rec, "P41", [("2026-11-15T10:00:00.000Z", "laptop:9f2c", "dane: the handoff")])
+    home = tmp_path / "cain"
+    home.mkdir()
+    stub = tmp_path / "idbin"
+    stub.mkdir()
+    (stub / "id").write_text('#!/bin/bash\necho "$STUB_UID"\n', newline="\n")
+    (stub / "id").chmod(0o755)
+    record_sh = _record_sh(tmp_path)
+
+    def read_as(uid):
+        env = {k: v for k, v in os.environ.items() if k != "NOTES_READ_DIR"}
+        env.update(PATH=f"{stub}{os.pathsep}{os.environ['PATH']}", STUB_UID=uid, RECORD_DIR=str(rec),
+                   CAIN_HOME_DIR=str(home))
+        return subprocess.run([shutil.which("bash"), str(record_sh), "notes", "P41"], env=env, capture_output=True,
+                              text=True, encoding="utf-8", check=True, timeout=20).stdout
+
+    assert "the handoff" in read_as("0")
+    assert not (home / "notes-read").exists()
+    assert "the handoff" in read_as("1000")
+    assert len((home / "notes-read" / "P41").read_text().strip()) == 40
+
+
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
     assert _checkin(tmp_path, "0712", IDLE + "\n  esc to interrupt") == ""
     assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed

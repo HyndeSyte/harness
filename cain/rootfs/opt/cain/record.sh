@@ -9,7 +9,8 @@
 #                               (| when | from | note |). With no item (or -): every item's notes
 #                               but those someone other than Cain holds, each line led by its item.
 #                               <since>: only notes after that time (any ISO form or offset).
-#                               Cain reading one item's notes marks them read (see unread).
+#                               Cain reading all of one item's notes (no <since>) marks them
+#                               read (see unread).
 #   record.sh unread [<since>]  the items whose notes changed since Cain last read them with
 #                               `notes <item>`, each as its newest note led by the item; an item
 #                               he has never read counts only notes after <since>. The check-in
@@ -23,12 +24,13 @@ outcomes="${RECORD_OUTCOMES:-/data/record-outcomes}"
 ref="origin/${RECORD_BRANCH:-main}"
 upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 # Where his reads are marked: his own home once he runs as his own user (C1), else /data.
-reads="${NOTES_READ_DIR:-$([ -d /data/cain ] && echo /data/cain/notes-read || echo /data/notes-read)}"
+home="${CAIN_HOME_DIR:-/data/cain}"
+reads="${NOTES_READ_DIR:-$([ -d "$home" ] && echo "$home/notes-read" || echo /data/notes-read)}"
 # An item's notes file as the keeper pushed it (or the copy here): its id, then its text by that
 # id, so what is marked read is exactly what was shown.
 notes_id() {
   git -C "$dir" rev-parse -q --verify "$ref:state/notes/$1.md" 2>/dev/null \
-    || { [ -f "$dir/state/notes/$1.md" ] && git hash-object "$dir/state/notes/$1.md" 2>/dev/null; }
+    || { [ -f "$dir/state/notes/$1.md" ] && git hash-object --no-filters "$dir/state/notes/$1.md" 2>/dev/null; }
 }
 notes_text() { git -C "$dir" cat-file blob "$2" 2>/dev/null || cat "$dir/state/notes/$1.md" 2>/dev/null; }
 # Its rows, each led by $2, only those after $1 (an empty $1: all).
@@ -49,7 +51,7 @@ his_items() {
 # Only Cain's own reads count: root reading after the switch marks nothing (and makes no folder of
 # root's in his home). A marker that can't be written leaves the item unread: named again, never lost.
 mark_read() {
-  [ "$(id -u)" = 0 ] && [ -d /data/cain ] && [ -z "${NOTES_READ_DIR:-}" ] && return 0
+  [ "$(id -u)" = 0 ] && [ -d "$home" ] && [ -z "${NOTES_READ_DIR:-}" ] && return 0
   mkdir -p "$reads" 2>/dev/null || return 0
   local t="$reads/.$1.$$"
   { printf '%s\n' "$2" > "$t" && mv -f "$t" "$reads/$1"; } 2>/dev/null || rm -f "$t" 2>/dev/null
@@ -77,8 +79,17 @@ case "${1:-}" in
       item=$(upper "$item")
       case "$item" in [!A-Z0-9]*|*[!A-Z0-9._-]*) echo "not an item id: $2" >&2; exit 2 ;; esac
       id=$(notes_id "$item") || exit 0
-      notes_text "$item" "$id" | note_rows "$since" ""
-      mark_read "$item" "$id"
+      # Read means all of that file was shown: by its id from git, or else the copy here, only
+      # when it is that same file. A read that failed, or one cut by a time, marks nothing.
+      git -C "$dir" cat-file blob "$id" 2>/dev/null | note_rows "$since" ""
+      if [ "${PIPESTATUS[0]}" != 0 ]; then
+        f="$dir/state/notes/$item.md"
+        same=$([ -f "$f" ] && git hash-object --no-filters "$f" 2>/dev/null) || same=""
+        cat "$f" 2>/dev/null | note_rows "$since" ""
+        [ "$same" = "$id" ] || exit 0
+      fi
+      [ -z "$since" ] && mark_read "$item" "$id"
+      exit 0
     else
       # Items someone other than Cain holds are theirs to read.
       items=$(his_items) || exit 1

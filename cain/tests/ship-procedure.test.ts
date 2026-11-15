@@ -112,6 +112,9 @@ describe("Cain's rules", () => {
       + "- A laptop session kept it");
     expect(step5).toContain("pass the item back to that session with the findings in a note, in one request. It passes the item "
       + "to you again with the new head, and you hear at once.");
+    // A hold doesn't prove its session will run again: the way on when it goes quiet.
+    expect(step5).toContain("If that session goes quiet, its holds lapse after a day; then take the item with its branch and fix it through Build.");
+    expect(step5).not.toContain("so that session is live");
   });
 
   test("a Reviewed line is the relay's, word for word, and the gate refuses any other", () => {
