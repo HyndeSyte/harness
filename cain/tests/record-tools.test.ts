@@ -428,6 +428,16 @@ describe("session-end", () => {
     expect(notes(l)).toContain("with these steps open: Verify after his tap.");
   }, 60_000);
 
+  test("a journal entry that reads but isn't one (a filing with its number as text) is said at a start, never passed over", () => {
+    const l = held();
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(memo, { recursive: true });
+    writeFileSync(join(memo, `${SA}.journal`), JSON.stringify({ n: 1, key: "k1", at: 1, kind: "open" }) + "\n"
+      + JSON.stringify({ n: "2", key: "k2", at: 2, kind: "open", id: "laptop-end-x", raw: "{}" }) + "\n");
+    const said = l.tool("session-end.ts", ["--flush"]);
+    expect(said.out).toContain(`A laptop session's journal has damaged lines (2), kept as they are: ${join(memo, `${SA}.journal`)}`);
+  }, 60_000);
+
   test("a journal that can't be read is said at every start, never passed over in silence", () => {
     const l = held();
     const memo = join(l.clone, ".git", "record-holds");

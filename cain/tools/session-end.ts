@@ -141,11 +141,20 @@ export function journalOf(path: string): { entries: Entry[]; damaged: number[] }
       if (!last && parsed[i + 1]?.torn !== true) damaged.push(i + 1);
       return;
     }
-    if (Number.isInteger(p?.n) && typeof p?.key === "string") entries.push(p);
+    if (isEntry(p)) entries.push(p);
+    else if (p?.torn !== true) damaged.push(i + 1);   // read, but not an entry: damage too
   });
   return { entries, damaged };
 }
 export const readJournal = (path: string): Entry[] => journalOf(path).entries;
+
+// A whole entry: every field of the kind it should be (a filing has its id and request both).
+export function isEntry(p: any): p is Entry {
+  return !!p && typeof p === "object" && Number.isInteger(p.n) && p.n >= 1 && typeof p.key === "string" && p.key.length > 0
+    && typeof p.at === "number" && ["open", "empty", "unread", "unplanned"].includes(p.kind)
+    && (p.id === undefined) === (p.raw === undefined) && (p.id === undefined || (typeof p.id === "string" && typeof p.raw === "string"))
+    && (p.mark === undefined || (Number.isInteger(p.mark) && p.mark >= 0));
+}
 
 // What this end is, given the journal: the same state as its last entry (nothing new), or entry
 // n + 1, a filing when it has held items and something to say.
@@ -179,22 +188,26 @@ export function appendEntry(path: string, e: Entry): void {
   syncDir(dirname(path));
 }
 
-// A transcript, a line at a time, in chunks: a long session's runs to hundreds of megabytes.
-export function eachLine(path: string, fn: (line: string) => void): void {
+// A transcript, a line at a time, in chunks (a long session's runs to hundreds of megabytes), up
+// to limit bytes when given: what's added after a snapshot's mark isn't read into it. A line cut
+// at the limit is still being written, and isn't part of the snapshot.
+export function eachLine(path: string, fn: (line: string) => void, limit = Infinity): void {
   const fd = openSync(path, "r");
   try {
     const buf = Buffer.alloc(4 << 20);
     const dec = new StringDecoder("utf8");
     let rest = "";
+    let left = limit;
     for (;;) {
-      const n = readSync(fd, buf, 0, buf.length, null);
+      if (left <= 0) { rest = ""; break; }
+      const n = readSync(fd, buf, 0, Math.min(buf.length, left), null);
       if (n <= 0) break;
+      left -= n;
       const lines = (rest + dec.write(buf.subarray(0, n))).split("\n");
       rest = lines.pop() ?? "";
       for (const l of lines) fn(l);
     }
-    rest += dec.end();
-    if (rest) fn(rest);
+    if (left > 0) { rest += dec.end(); if (rest) fn(rest); }      // read to its end: its last line is whole
   } finally { closeSync(fd); }
 }
 
@@ -289,7 +302,7 @@ export function fileSnapshot(dir: string, s: Snapshot): { id: string | null; sam
   const key = filedKey(s.held, s.open, s.why);
   const journal = readJournal(journalPath);
   const lastMark = journal.at(-1)?.mark;
-  if (s.mark !== undefined && lastMark !== undefined && s.mark < lastMark) return { id: null, same: true };
+  if (lastMark !== undefined && (s.mark === undefined || s.mark < lastMark)) return { id: null, same: true };   // older, or of unknown order: the known state stands
   const d = decide(journal, key, s.held, s.open, s.why);
   if (d.same) return { id: null, same: true };
   const kind: Entry["kind"] = s.why === "open" ? (s.open.length ? "open" : "empty") : s.why;
@@ -523,8 +536,8 @@ if (import.meta.main) {
   let mark: number | undefined;
   const kept: string[] = [];
   try {
-    mark = statSync(a.transcript ?? input.transcript_path).size;   // how much of it this end has seen: its order
-    eachLine(a.transcript ?? input.transcript_path, (l) => { if (l.includes("update_plan") || l.includes("TodoWrite") || l.includes("is_error")) kept.push(l); });
+    mark = statSync(a.transcript ?? input.transcript_path).size;   // how much of it this end reads: its order
+    eachLine(a.transcript ?? input.transcript_path, (l) => { if (l.includes("update_plan") || l.includes("TodoWrite") || l.includes("is_error")) kept.push(l); }, mark);
   } catch { read = false; mark = undefined; }
   const { steps, planned } = stepsOf(kept);
   const open = steps.filter((s) => s.status !== "completed");

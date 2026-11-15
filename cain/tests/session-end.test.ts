@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendEntry, claim, clean, decide, fate, filedKey, filingId, fileSnapshot, journalOf, outcomeOf, readJournal, requestFor, stepsOf, type Entry } from "../tools/session-end";
+import { appendEntry, claim, clean, decide, eachLine, fate, filedKey, filingId, fileSnapshot, journalOf, outcomeOf, readJournal, requestFor, stepsOf, type Entry } from "../tools/session-end";
 
 const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
 const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
@@ -145,6 +145,27 @@ describe("once only", () => {
     expect(readJournal(join(d, "s1.journal")).map((x) => [x.n, x.mark])).toEqual([[1, 100], [2, 200]]);
   });
 
+  test("a snapshot of unknown order (its transcript couldn't be read) never supersedes a known, newer state", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [a]), at: 1_000, kind: "open", id: "x", raw: "{}", mark: 100 }) + "\n");
+    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [], why: "unread", at: 9_000 })).toEqual({ id: null, same: true });
+    expect(readJournal(join(d, "s1.journal"))).toHaveLength(1);
+  });
+
+  test("a transcript is read only up to the snapshot's mark: what's added after isn't read into it", () => {
+    const d = mkdtempSync(join(tmpdir(), "transcript-"));
+    const p = join(d, "t.jsonl");
+    writeFileSync(p, use("mcp__ccd_turn__update_plan", plan(["A", "pending"])) + "\n");
+    const mark = readFileSync(p).length;                                     // the end takes its mark
+    writeFileSync(p, use("mcp__ccd_turn__update_plan", plan(["C", "pending"])) + "\n", { flag: "a" });   // the session goes on
+    const seen: string[] = [];
+    eachLine(p, (l) => seen.push(l), mark);                                  // then reads
+    expect(stepsOf(seen).steps.map((s) => s.content)).toEqual(["A"]);
+    const all: string[] = [];
+    eachLine(p, (l) => all.push(l));
+    expect(stepsOf(all).steps.map((s) => s.content)).toEqual(["C"]);
+  });
+
   test("a journal's damaged lines are told from a crash's: a cut-off last line or a line marked torn is expected, any other is damage", () => {
     const d = mkdtempSync(join(tmpdir(), "journal-"));
     const ok = (n: number) => JSON.stringify({ n, key: `k${n}`, at: n, kind: "open" });
@@ -155,6 +176,11 @@ describe("once only", () => {
     writeFileSync(join(d, "c.journal"), [ok(1), "not json at all", ok(2), ""].join("\n"));              // damage in the middle
     expect(journalOf(join(d, "c.journal")).damaged).toEqual([2]);
     expect(journalOf(join(d, "c.journal")).entries.map((x) => x.n)).toEqual([1, 2]);
+    // Read, but not an entry: a number as text, a filing without its request, a kind it doesn't know.
+    writeFileSync(join(d, "e.journal"), [ok(1), JSON.stringify({ n: "2", key: "k2", at: 2, kind: "open", id: "i2", raw: "{}" }),
+      JSON.stringify({ n: 3, key: "k3", at: 3, kind: "open", id: "i3" }), JSON.stringify({ n: 4, key: "k4", at: 4, kind: "maybe" }), ok(5), ""].join("\n"));
+    expect(journalOf(join(d, "e.journal")).damaged).toEqual([2, 3, 4]);
+    expect(journalOf(join(d, "e.journal")).entries.map((x) => x.n)).toEqual([1, 5]);
   });
 
   test("a lock is made new, refused while it's fresh, and taken over once it's 2 minutes old", () => {
