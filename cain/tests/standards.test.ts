@@ -67,7 +67,7 @@ describe("the registry as a whole", () => {
   });
 
   test("nothing private in a public repository, and no em dash", () => {
-    expect(text).not.toMatch(/—/);
+    expect(text).not.toMatch(/\u2014/);
     expect(text).not.toMatch(/[\w.+-]+@[\w-]+\.[\w.]+/);                 // a mail address
     expect(text).not.toMatch(/\+?\d[\d\s().-]{8,}\d/);                     // a phone number
     expect(text).not.toMatch(/https?:\/\//);                               // a link out
