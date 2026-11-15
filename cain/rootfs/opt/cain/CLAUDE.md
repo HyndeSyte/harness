@@ -269,10 +269,11 @@ in the harness repo; until then the keeper says it is waiting).
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
-  their own codes (`browser_unreachable`, `wrong_profile`, `url_drift`,
-  `result_rejected`, `browser_timeout` and more); a heartbeat code such as
-  `profile_unconfirmed`, `profile_changed`, `attended_only`, `untrusted_config` or
-  `stopped` means the PC isn't taking jobs, and why. Those are fixed at his PC, so they
+  their own codes (`browser_unreachable`, `extension_unreachable`, `tool_inventory`,
+  `wrong_profile`, `url_drift`, `result_rejected`, `browser_timeout` and more); a
+  heartbeat code such as `profile_unconfirmed`, `profile_changed`, `probe_stale`,
+  `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and
+  why. Those are fixed at his PC, so they
   go on his "At his PC" list, never in the morning message.
 - This version runs jobs only while he is at the PC and starts a run himself, until his
   setup allows unattended runs. A job past its expiry is closed by your keeper without

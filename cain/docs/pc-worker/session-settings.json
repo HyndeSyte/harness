@@ -39,5 +39,18 @@
       "mcp__claude-in-chrome__read_network_requests",
       "mcp__claude-in-chrome__resize_window"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__claude-in-chrome__navigate|mcp__claude-in-chrome__tabs_create_mcp",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PCW_RUNTIME\" \"$PCW_WORKER\" nav-guard"
+          }
+        ]
+      }
+    ]
   }
 }

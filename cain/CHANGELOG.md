@@ -7,8 +7,9 @@
 - This version only reads pages, and that is enforced: the PC refuses anything but a fixed set of read-only actions, at the exact addresses your own signed allowlist names. Anything irreversible is refused until the tap card for it comes.
 - Results are a few checked facts and a reason code, never page text. Jobs that need you say so plainly: signed out, a captcha, a mail to confirm. One whose outcome is unclear is marked in doubt and never retried without asking you.
 - A STOP file on the PC halts it at once, and Cain can see when the PC last checked in and why it isn't taking jobs.
-- Before anything runs, you do a supervised probe at your PC that also checks the browser session can't use a shell, files or the web. Runs stay attended, started by you, until that check passes and you allow more.
-- The PC refuses to run if its Chrome profile, the extension, Chrome's version or the session's settings changed since you confirmed them, or if the extension shows up in another Chrome profile. A hung run is stopped after a set time.
+- Before anything runs, you do a supervised probe at your PC. It first checks the browser session can reach Claude in Chrome in the right profile and was given only the reading tools, then orders it to try every denied action (a shell, files, the web, clicking, typing, forms, scripts, console and network reads, uploads, shortcuts, and opening other addresses) and checks each one was refused. Runs stay attended, started by you, until that check passes and you allow more.
+- The browser session can open only the job's own address and a check page the PC serves for each run; anything else is refused before the browser sees it. Addresses are compared exactly, so a different path or a query counts as a different page.
+- The PC refuses to run if its Chrome profile, Chrome's version, the session's settings, or your own Claude settings changed since you confirmed them, or if the extension shows up in another Chrome profile. A new Claude in Chrome or Claude Code version sends runs back to attended until you probe again. A hung run is stopped after a set time, leaving Chrome open.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
 
 ## 0.11.0

@@ -35,6 +35,7 @@ export const CODES = [
   "token_refused", "preview_mismatch", "nonce_spent",
   "browser_unreachable", "wrong_profile", "profile_unconfirmed", "profile_changed", "extension_elsewhere",
   "untrusted_config", "untrusted_files", "clock_skew", "attended_only", "browser_timeout",
+  "extension_unreachable", "tool_inventory", "profile_scan_failed", "probe_stale",
   "url_drift", "result_rejected", "page_not_as_expected", "outcome_uncertain", "lease_expired",
 ] as const;
 export type State = typeof STATES[number];
@@ -438,16 +439,21 @@ export function confirmGate(job: Job, live: unknown): Code | null {
 }
 
 // ---- The PC's allowlist, signed by Dane --------------------------------------------
-// {"v": 1, "kid": "<his key id>", "allow": [{site, action, url, match, login_hosts?, login_paths?}], "sig": "<base64url>"}
+// {"v": 1, "kid": "<his key id>", "allow": [{site, action, url, match, login_hosts?, login_paths?, alternatives?}], "sig": "<base64url>"}
 // Each entry pins one read-only action on one site to an exact address or an address
 // prefix (match "exact" or "prefix"). A real site sends a signed-out visitor to its
 // sign-in page, often on another host (accounts.example.com) or path (/login): those
 // listed in login_hosts (a host, or a host and everything under it with a leading ".")
 // and login_paths (a path, or a path prefix ending in "*") count as needs_login, not as
-// url_drift. The signature is his Ed25519 key's, over the canonical bytes of {v, kid,
-// allow}; the worker checks it against owner.pub on the PC, and owner.pub against the
-// fingerprint pinned in his install config.
-export interface Allow { site: string; action: string; url: string; match: "exact" | "prefix"; login_hosts?: string[]; login_paths?: string[] }
+// url_drift. Addresses keep URL semantics: only the host's case and a default port are
+// normalized, so path case, a query and a trailing slash all make a different address,
+// unless the entry says `"alternatives": true` (then path case, a trailing slash and a
+// query are ignored for that entry). The signature is his Ed25519 key's, over the
+// canonical bytes of {v, kid, allow}; the worker checks it against owner.pub on the PC,
+// and owner.pub against the fingerprint pinned in his install config.
+export interface Allow {
+  site: string; action: string; url: string; match: "exact" | "prefix"; login_hosts?: string[]; login_paths?: string[]; alternatives?: true;
+}
 
 export const allowBody = (kid: string, allow: Allow[]) => canonical({ v: 1, kid, allow });
 
@@ -458,6 +464,7 @@ export function signAllowlist(kid: string, allow: Allow[], sign: (data: Buffer) 
 const LOGIN_HOST = /^\.?(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
 const LOGIN_PATH = /^\/[A-Za-z0-9._~%\/-]{0,100}\*?$/;
 const listOf = (x: unknown, re: RegExp) => x === undefined || (Array.isArray(x) && x.length <= 8 && x.every((v) => typeof v === "string" && re.test(v)));
+const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives"];
 
 function entriesOk(list: unknown): Checked<Allow[]> {
   if (!Array.isArray(list)) return no("allow is a list");
@@ -465,14 +472,16 @@ function entriesOk(list: unknown): Checked<Allow[]> {
   for (const e of list) {
     const keys = isObj(e) ? Object.keys(e) : [];
     if (!isObj(e) || !["site", "action", "url", "match"].every((k) => keys.includes(k))
-      || keys.some((k) => !["site", "action", "url", "match", "login_hosts", "login_paths"].includes(k))
+      || keys.some((k) => !ENTRY_KEYS.includes(k))
       || typeof e.site !== "string" || !SITE.test(e.site)
       || typeof e.action !== "string" || !Object.hasOwn(READ_ACTIONS, e.action) || !plainOnSite(e.url, e.site)
-      || (e.match !== "exact" && e.match !== "prefix") || !listOf(e.login_hosts, LOGIN_HOST) || !listOf(e.login_paths, LOGIN_PATH))
-      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), and optionally login_hosts and login_paths}");
+      || (e.match !== "exact" && e.match !== "prefix") || !listOf(e.login_hosts, LOGIN_HOST) || !listOf(e.login_paths, LOGIN_PATH)
+      || (e.alternatives !== undefined && e.alternatives !== true))
+      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), and optionally login_hosts, login_paths and alternatives (true)}");
     const a: Allow = { site: e.site, action: e.action, url: e.url, match: e.match };
     if (e.login_hosts !== undefined) a.login_hosts = e.login_hosts;
     if (e.login_paths !== undefined) a.login_paths = e.login_paths;
+    if (e.alternatives === true) a.alternatives = true;
     out.push(a);
   }
   return { ok: true, value: out };
@@ -493,38 +502,50 @@ export function parseAllowlist(text: string, ownerKeys: Map<string, KeyObject>):
   return e;
 }
 
-// An address as it is compared: scheme, host and path, the path in lower case and
-// without a trailing slash (sites differ on both and mean the same page).
-export function normalUrl(url: string): string {
-  const s = sanitizeUrl(url);
-  if (!s) return "";
-  const u = new URL(s);
+// An address as it is compared, with URL semantics: https only, no login; the host in
+// lower case and a default port dropped (the URL parser does both); the path and query
+// exactly as given; the fragment dropped (it never reaches the site). With loose (an
+// entry's "alternatives"), the path in lower case, without a trailing slash, and no query.
+// "" when it isn't such an address.
+export function normalUrl(url: unknown, loose = false): string {
+  if (typeof url !== "string" || url.length > 2_000 || !LINE.test(url)) return "";
+  let u: URL;
+  try { u = new URL(url); } catch { return ""; }
+  if (u.protocol !== "https:" || !u.hostname || u.username || u.password) return "";
+  const host = `${u.hostname.toLowerCase()}${u.port ? `:${u.port}` : ""}`;
+  if (!loose) return `https://${host}${u.pathname}${u.search}`;
   let path = u.pathname.toLowerCase();
   while (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
-  return `https://${u.hostname}${path === "/" ? "" : path}`;
+  return `https://${host}${path === "/" ? "" : path}`;
 }
 
-// An address on an entry's pin.
-export function onPin(url: string, a: Allow): boolean {
-  const u = normalUrl(url), p = normalUrl(a.url);
+// An address on an entry's pin. Exact: the same address. Prefix: the pin's path, or a
+// path under it at a "/" boundary, and the same query (none, as pins carry none).
+export function onPin(url: unknown, a: Allow): boolean {
+  const loose = a.alternatives === true;
+  const u = normalUrl(url, loose), p = normalUrl(a.url, loose);
   if (!u || !p) return false;
-  if (a.match === "exact") return u === p;
-  return u === p || u.startsWith(`${p}/`);
+  if (a.match === "exact" || u === p) return u === p;
+  const uu = new URL(u), pp = new URL(p);
+  if (uu.host !== pp.host || uu.search !== pp.search) return false;
+  const base = pp.pathname.endsWith("/") ? pp.pathname : `${pp.pathname}/`;
+  return uu.pathname.startsWith(base);
 }
 
-// An address on one of the entry's sign-in pages: needs_login, not url_drift.
-export function onLogin(url: string, a: Allow): boolean {
+// An address on one of the entry's sign-in pages: needs_login, not url_drift. A sign-in
+// page's query (?next=...) doesn't matter; its path compares exactly (path case and a
+// trailing slash count), unless the entry allows alternatives.
+export function onLogin(url: unknown, a: Allow): boolean {
   const s = sanitizeUrl(url);
-  if (!s) return false;
+  if (!s || normalUrl(url) === "") return false;
   const u = new URL(s);
   const host = u.hostname;
   if ((a.login_hosts ?? []).some((h) => h.startsWith(".") ? host === h.slice(1) || host.endsWith(h) : host === h)) return true;
-  if (!onSite(s, a.site)) return false;
-  const path = normalUrl(s).slice(`https://${host}`.length) || "/";
-  return (a.login_paths ?? []).some((p) => {
-    const q = p.toLowerCase();
-    return q.endsWith("*") ? path.startsWith(q.slice(0, -1)) : path === (q.length > 1 ? q.replace(/\/+$/, "") : q);
-  });
+  if (!onSite(url, a.site)) return false;
+  const loose = a.alternatives === true;
+  const fold = (p: string) => { let x = loose ? p.toLowerCase() : p; while (loose && x.length > 1 && x.endsWith("/")) x = x.slice(0, -1); return x; };
+  const path = fold(u.pathname);
+  return (a.login_paths ?? []).some((p) => p.endsWith("*") ? path.startsWith(fold(p.slice(0, -1)) || "/") : path === fold(p));
 }
 
 export function pinFor(job: Job, list: Allow[]): Allow | null {
