@@ -42,7 +42,7 @@ export const CODES = [
   "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing", "extension_version_unknown", "read_unverified",
   "boundary_not_accepted", "update_pending",
   "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
-  "unattended_unsupported",
+  "unattended_unsupported", "worker_folder_denied", "prefs_disagree",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];

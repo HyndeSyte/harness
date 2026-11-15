@@ -277,7 +277,8 @@ in the harness repo; until then the keeper says it is waiting).
   their own codes (`browser_unreachable`, `extension_unreachable`, `tool_inventory`,
   `wrong_profile`, `url_drift`, `unexpected_location`, `tabs_unexpected`,
   `navigation_unguarded`, `navigation_denied`, `hook_missing_decision`, `cli_changed`,
-  `extension_version_mismatch`, `schema_violation` (the report had a value outside its
+  `extension_version_mismatch`, `worker_folder_denied` (the session tried to read the
+  worker's own folder or its sign-in file; it was refused and the run failed), `schema_violation` (the report had a value outside its
   typed fields; nothing of it was kept), `canary_cookie_missing`, `result_rejected`,
   `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
   `probe_stale` (a new Claude in Chrome, Chrome or Claude Code version: nothing runs until he
@@ -287,6 +288,8 @@ in the harness repo; until then the keeper says it is waiting).
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
   `extra_extension` (another extension is on in the Cain jobs profile),
+  `prefs_disagree` (Chrome's two preference files disagree about an extension: he
+  restarts the Cain jobs Chrome),
   `unattended_unsupported` (his install file asks for unattended runs),
   `hook_selftest_failed`, `chrome_busy` (another Claude Code is open on his PC),
   `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and

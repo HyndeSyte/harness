@@ -38,6 +38,12 @@
 - The PC reads Claude in Chrome's entry from either of Chrome's two preferences files, says which in `check-host`, and stops with its own reason when neither has it. Any other extension turned on in the Cain jobs profile stops runs too; `check-host` and confirming the probe list the extensions found.
 - A Claude in Chrome helper left behind by a Chrome that closed gets its own reason, and the fix is restarting the Cain jobs Chrome.
 - Unattended runs are off in code in this version: an install file asking for them is refused. The Task Scheduler step is gone from setup until a later version that can block requests before they leave.
+- The worker's own sign-in sits in its folder on the PC, so that folder is now walled off twice: the four browser tools the session has (tab list, page text, find, page structure) can't read files at all, and both the worker folder and its Claude Code folder are also denied by path to Claude Code and to the PC's guard. Any attempt fails the run with its own reason. The probe plants a page asking to read and send the sign-in file, by path and by name, and confirming needs every attempt refused.
+- After every session the worker's Claude Code folder is emptied of everything but its sign-in, its settings file and its empty memory file, whatever Claude Code named it. The probe checks nothing else is left there after its two test sessions.
+- When Chrome's two preference files disagree about an extension, the PC stops with its own reason instead of guessing; the secure file wins otherwise.
+- Stricter extension rule: only Chrome's own built-in extensions are exempt, extensions installed by policy or from outside count, and only one you turned off yourself counts as off. `check-host` and the probe show each extension's raw fields.
+- Fewer false alarms from Windows' coarse clock when the PC checks Claude in Chrome's helper belongs to your Chrome; the probe logs those times across its Chrome restart.
+- Setup now has the Cain jobs profile block pop-ups and redirects, and the PC warns (without stopping) if they're allowed.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
 
 ## 0.11.0

@@ -110,6 +110,8 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
     return "The PC isn't taking jobs because Claude in Chrome's helper lost its Chrome. At the PC: restart the Cain jobs Chrome.";
   if (h?.code === "extra_extension")
     return "The PC isn't taking jobs because the Cain jobs Chrome has another extension turned on. At the PC: remove it there (worker.ts check-host lists them).";
+  if (h?.code === "prefs_disagree")
+    return "The PC isn't taking jobs because Chrome's two preference files disagree about an extension in the Cain jobs profile. At the PC: restart the Cain jobs Chrome, then run worker.ts check-host.";
   if (h?.code === "unattended_unsupported")
     return "The PC isn't taking jobs because its install file asks for unattended runs, which this version doesn't allow. At the PC: set unattended to false.";
   if (h?.code === "boundary_not_accepted")

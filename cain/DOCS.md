@@ -310,8 +310,9 @@ in it; the record's inbox (your page, laptop sessions) is read every minute.
 Chores that need a browser signed in as you go to a small job queue in a private repo
 of their own (`pc_jobs_repo`, default `HyndeSyte/pc-jobs`), run by the worker on your
 PC in a locked browser session, in a Chrome profile named Cain jobs. Runs are attended
-(you start them, watching) until a supervised probe's deny check has passed on your PC
-and you allow unattended runs. A new Claude in Chrome or Claude Code version stops
+(you start them, watching): this version refuses unattended runs. The session gets four
+reading tools of Claude in Chrome and nothing that reads files, and the worker's own
+folder (with its Claude Code sign-in) is denied to it by path besides. A new Claude in Chrome or Claude Code version stops
 every run until you probe again. Cain's PC job keeper is the queue's one
 writer of jobs and holds `pc_jobs_token`, so his session never does. With no token it
 waits and does nothing. This version is read-only by enforcement: the PC worker runs
