@@ -13,7 +13,7 @@
 //          GitHub's HyndeSyte/harness)
 //
 // Dane pushing by hand from a terminal has no session id: git push --no-verify skips it.
-import { clone, fetch, holdsAt, sessionOf } from "./record-lib.ts";
+import { clone, fetch, holdsRead, sessionOf } from "./record-lib.ts";
 
 const refuse = (why: string): never => { console.error(`push refused: ${why}`); process.exit(1); };
 const url = process.argv[3] ?? "";
@@ -27,7 +27,9 @@ if ("error" in c) refuse(`who holds what couldn't be read: ${c.error}`);
 const rec = c as Exclude<typeof c, { error: string }>;
 if (!fetch(rec)) refuse("who holds what couldn't be read: fetching the record failed");
 
-const holds = holdsAt(rec);
+const read = holdsRead(rec);
+if (!read) refuse("who holds what couldn't be read: the record's holds couldn't be read");
+const holds = read!;
 const me = `laptop:${session}`;
 const mine = new Set(Object.values(holds).filter((h) => h.holder === me).flatMap((h) => h.branches));
 const problems: string[] = [];

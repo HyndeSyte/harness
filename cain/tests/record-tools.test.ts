@@ -38,6 +38,18 @@ function laptop() {
 }
 
 describe("record-send", () => {
+  test("holds that can't be read stop a send: the notes on the session's items can't be checked", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    cycle(l.cfg);
+    sh(["git", "fetch", "-q", "origin"], l.clone);
+    const back = holdsGone(l.clone);
+    writeFileSync(join(l.root, "req.json"), JSON.stringify({ kind: "change", summary: "A note on P33", ops: [{ op: "note", item: "P33", text: "x" }] }));
+    expect(l.tool("record-send.ts", [join(l.root, "req.json")], { session: SA })).toEqual({ code: 1, out: "not sent: the record's holds couldn't be read, so notes on this session's items couldn't be checked", err: "" });
+    expect(l.inboxNames()).toEqual([]);
+    back();
+  }, 60_000);
+
   test("stamps who sent it, puts it in the inbox, waits for the keeper and prints what happened", async () => {
     const l = laptop();
     writeFileSync(join(l.root, "req.json"), JSON.stringify({ from: "cain", kind: "change", summary: "Take P33 for the collision fix",
@@ -274,6 +286,18 @@ describe("the pre-push hook", () => {
     expect(push(copy.work, "claude/link-cards", [], env2).stderr.toString()).toContain("push refused: claude/link-cards");
     expect(push(copy.work, "claude/record-holds", [], env2).exitCode).toBe(0);
   }, 90_000);
+
+  test("holds that can't be read refuse a push as unreadable, never as a branch the session doesn't hold", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
+    cycle(l.cfg);
+    sh(["git", "fetch", "-q", "origin"], l.clone);
+    const hook = () => l.tool("record-prepush.ts", ["origin", "https://github.com/HyndeSyte/harness.git"], { session: SA, input: pushLine("claude/record-holds") });
+    const back = holdsGone(l.clone);
+    expect(hook()).toEqual({ code: 1, out: "", err: "push refused: who holds what couldn't be read: the record's holds couldn't be read" });
+    back();
+    expect(hook().code).toBe(0);
+  }, 60_000);
 
   test("from a linked worktree it reads the record, not the repository it's pushed from", () => {
     const l = laptop();

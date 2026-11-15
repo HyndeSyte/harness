@@ -16,7 +16,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { clean, openRow, rowHash, PENDING_PATH, type Outcome } from "../rootfs/opt/cain/record/core.ts";
-import { args, check, clone, fetch, freshNotes, holdsAt, itemsOf, memo, noteLines, send, sessionOf, treeAt, waitFor } from "./record-lib.ts";
+import { args, check, clone, fetch, freshNotes, holdsRead, itemsOf, memo, noteLines, send, sessionOf, treeAt, waitFor } from "./record-lib.ts";
 
 const a = args(process.argv.slice(2), ["record", "session", "wait", "row"]);
 const stop = (line: string, code: number): never => { console.log(line); process.exit(code); };
@@ -53,7 +53,9 @@ if (r.state !== "ok" && r.state !== "waiting") stop(`not sent: ${r.line}`, 1);
 // shown here once, and this request held back so it can be weighed first.
 const m = memo(rec, session!);
 const looked = m.read();
-const fresh = freshNotes(rec, `laptop:${session}`, holdsAt(rec), itemsOf(req, treeAt(rec)), looked);
+const holds = holdsRead(rec);   // can't be read: the notes on its items can't be checked, so it isn't sent
+if (!holds) stop("not sent: the record's holds couldn't be read, so notes on this session's items couldn't be checked", 1);
+const fresh = freshNotes(rec, `laptop:${session}`, holds!, itemsOf(req, treeAt(rec)), looked);
 if (fresh.length) {
   m.write(looked);
   stop([...noteLines(fresh), `not sent: read the notes above first, then send it again if it still stands`].join("\n"), 1);
