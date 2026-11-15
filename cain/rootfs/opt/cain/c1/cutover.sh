@@ -201,10 +201,14 @@ if [ "$state" = fresh ]; then
   # His claude.ai connectors (his mail, his calendars) must all still load under his new rules
   # (the managed MCP allowlist): the old way kept their names (the run script's connector check),
   # and one missing undoes the switch rather than leave him without it.
-  # A listing as him that fails lists none, so every one recorded counts as missing.
-  listed="$("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 timeout 180 claude mcp list 2>/dev/null || true)"
-  missing="$(printf '%s\n' "$listed" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u | comm -13 - <(tail -n +2 "$C/connectors-before"))"
-  [ -z "$missing" ] || abort "his connectors wouldn't all load under his new rules (missing: $(printf '%s' "$missing" | tr '\n' ',' | cut -c1-200))"
+  # One the allowlist refuses isn't listed at all, and a listing as him that fails lists none,
+  # so either way each name recorded and not listed counts as missing. None recorded: nothing
+  # to check (and no listing to wait for: it takes a while, as it asks every server).
+  if [ -n "$(tail -n +2 "$C/connectors-before")" ]; then
+    listed="$("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 timeout 180 claude mcp list 2>/dev/null || true)"
+    missing="$(printf '%s\n' "$listed" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u | comm -13 - <(tail -n +2 "$C/connectors-before"))"
+    [ -z "$missing" ] || abort "his connectors wouldn't all load under his new rules (missing: $(printf '%s' "$missing" | tr '\n' ',' | cut -c1-200))"
+  fi
   kp validate-1
   # Whatever the validation started is ended, not trusted to have ended: every process of uid
   # 1000 and 1001, checked gone, before the journal moves on.
