@@ -88,8 +88,8 @@ import { freshReviewed, type Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import { judgeChecks, type Facts, type Landed } from "./merge";
-import { checkTextProblem, isFresh, maxCheckDays, ONE_OFF_SUMMARY, oneOffHit, parseChecks, repeatsCheck, staleAfter,
-  type Checks } from "../record/core";
+import { checkTextProblem, inStep, isFresh, MAX_ONE_OFF_REASON, maxCheckDays, ONE_OFF_SUMMARY, oneOffHit, oneOffLoose, parseChecks,
+  repeatsCheck, staleAfter, type Checks } from "../record/core";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -385,6 +385,9 @@ export const CHECK_WAIT_MS = 30_000;
 const CHECK_POLL_MS = 500;
 export const STATUS_CHANGED = "Status changed, re-check needed";
 const STATUS_TAP = "Its status changed since it was checked, so nothing was done.";
+// How long a tap's fresh read of the ledger and the keeper's outcome may take before the tap
+// is rejected (Discord wants its answer within 3 seconds).
+export const TAP_READ_MS = 1_500;
 // "Nov 13", in the zone.
 const shortDay = (ms: number, tz = "America/New_York") =>
   new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
@@ -534,6 +537,8 @@ export interface Deps {
   outcome?: (id: string) => { state: string; reason?: string } | null;   // the record keeper's outcome for one of those, once it has one
   maxCheckDays?: number;                                           // the App's source_check_max_days (default 7)
   sleep?: (ms: number) => Promise<void>;                           // waiting on the keeper's outcome (the tests' clock)
+  waitTimeout?: (w: { id: string; at: string; waited_ms: number }) => void;   // a check the keeper didn't answer in time, for its audit
+  tune?: (r: { at: string; kind: string; item: string; said: string }) => void;   // a source-check or one-off refusal, logged for tuning the rules
   pull?: (pr: string) => Promise<Pull | null>;                     // a pull request now; null: can't tell
   tz?: string;                                                     // the check-ins' zone
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
@@ -651,7 +656,10 @@ export function clockTime(ms: number, tz = "America/New_York"): string {
   return new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(new Date(ms));
 }
 
-export type AskResult = { status: "posted"; message: string; said?: string } | { status: "held"; said: string };
+export type AskResult = { status: "posted"; message: string; said?: string } | { status: "held"; said: string }
+  // A one-off whose words overlap an open row's Item: nothing posted until Cain names the item
+  // (with a check) or sends it again with a reason (0.12.0).
+  | { status: "needs reason"; said: string };
 
 // The most a refusal says over the link's HTTP answer (main.ts cuts its words there).
 export const SAID_MAX = 1000;
@@ -987,20 +995,24 @@ export class Link {
     const id = item.toUpperCase();
     const e = this.ledger()[id];
     const raw = given === undefined || given === null ? "" : String(given);
+    if (e?.pending_rewrite)
+      this.refuse("check", id, `This item's row is pending a rewrite: a whole-file write of it was refused (${clip(e.pending_rewrite, 200)}). Write the row cleanly, one fact per row, then ask with a new --checked.`);
     if (raw.trim()) {
       const t = raw.trim();
       const why = checkTextProblem(t);
-      if (why) throw new Refusal(why);
+      if (why) this.refuse("check", id, why);
       // The same check again while it still counts (a card refused for its words, sent again):
       // the accepted one stands. A repeat can't make a stale row fresh.
       if (repeatsCheck(e?.checked, t) && this.freshRef(id)) return null;
       if (repeatsCheck(e?.checked, t))
-        throw new Refusal("that source check repeats the row's last one (the same words, no later time); check again and say what you found this time, where and when");
+        this.refuse("check", id, `that source check repeats the row's last one ("${clip(e!.checked!, 120)}": the same words, no later time); check again and say what you found this time, where and when`);
       return { text: t, row: e?.id ?? null, version: e ? e.version : 0 };
     }
     if (this.freshRef(id)) return null;
     const since = e?.changed ? Date.parse(e.changed) : NaN;
     const until = staleAfter(e, this.maxDays());
+    if (e && e.checked !== undefined && !inStep(e, this.files().pending, id))
+      throw new Refusal("This item's row was changed outside the record keeper since its check; the keeper gives it a new version on its next round. Check it at its source again and add --checked.");
     if (e?.checked !== undefined && e.checked_version === e.version && Number.isFinite(until))
       throw new Refusal(`The source check on this item went stale after ${shortDay(until, this.d.tz)} (older than ${this.maxDays()} days); add --checked with what you checked, where and when.`);
     throw new Refusal(Number.isFinite(since) && e?.checked
@@ -1011,22 +1023,44 @@ export class Link {
   private ledger(): Checks { return ledgerOf(this.files().checks); }
   private maxDays(): number { return maxCheckDays(this.d.maxCheckDays); }
 
-  // Whether a posted card's check still holds: the keeper accepted it (no outcome but done),
-  // the row is still the version it checked, and the row's check is fresh (by age too).
-  private refValid(item: string, ref: Ref): boolean {
-    const e = this.ledger()[item.toUpperCase()];
-    if (ref.req) {
-      const o = this.d.outcome?.(ref.req);
-      if (o && o.state !== "done") return false;
-    }
-    return !!e && e.id === ref.row && e.version === ref.version && isFresh(e, this.d.now(), this.maxDays());
+  // A refusal of a source check or a one-off: quoted as said, and logged for tuning the rules.
+  private refuse(kind: string, item: string, said: string): never {
+    try { this.d.tune?.({ at: new Date(this.d.now()).toISOString(), kind, item, said: clip(said, 600) }); } catch { /* the refusal stands */ }
+    throw new Refusal(said);
+  }
+
+  // Whether a posted ask or Ship card for an item still rests on an accepted check, from a fresh
+  // read of the keeper's local ledger and its outcome file (never the table's order): "ok" when
+  // the check's outcome is done, the row's hidden id and version are the card's, the row's cells
+  // are as the keeper last wrote them, and its check is fresh and unexpired; "changed" when any
+  // of that is known to be otherwise (a card with no check counts so); "unknown" when a read
+  // failed or took longer than TAP_READ_MS. A tap is honoured only on "ok"; the sweep takes
+  // buttons off only on "changed".
+  private checkState(item: string, ref: Ref | undefined): "ok" | "changed" | "unknown" {
+    if (!ref || !ref.req) return "changed";
+    const t0 = Date.now();
+    let f: RecordFiles | undefined, o: { state: string } | null | undefined;
+    try {
+      f = this.d.record?.();
+      o = this.d.outcome?.(ref.req);
+    } catch { return "unknown"; }
+    if (Date.now() - t0 > TAP_READ_MS || !f || typeof f.checks !== "string") return "unknown";
+    try { JSON.parse(f.checks); } catch { return "unknown"; }
+    if (!o) return "unknown";
+    if (o.state !== "done") return "changed";
+    const id = item.toUpperCase(), e = parseChecks(f.checks)[id];
+    if (!e || e.id !== ref.row || e.version !== ref.version) return "changed";
+    if (e.hash && typeof f.pending !== "string") return "unknown";   // the row's cells can't be compared
+    if (!inStep(e, f.pending, id) || !isFresh(e, this.d.now(), this.maxDays())) return "changed";
+    return "ok";
   }
 
   // The accepted source check an ask or Ship card for the item rests on now, or null: the
-  // keeper's own fresh check, from its ledger alone.
+  // keeper's own fresh check, from its ledger alone, of the row as it stands.
   private freshRef(item: string): Ref | null {
-    const e = this.ledger()[item.toUpperCase()];
-    if (!e || !isFresh(e, this.d.now(), this.maxDays())) return null;
+    const id = item.toUpperCase();
+    const e = this.ledger()[id];
+    if (!e || !isFresh(e, this.d.now(), this.maxDays()) || !inStep(e, this.files().pending, id)) return null;
     return { row: e.id, version: e.version, ...(e.checked_req ? { req: e.checked_req } : {}) };
   }
 
@@ -1051,9 +1085,14 @@ export class Link {
     const until = this.d.now() + CHECK_WAIT_MS;
     let o = this.d.outcome?.(req) ?? null;
     while (!o && this.d.now() < until) { await sleep(CHECK_POLL_MS); o = this.d.outcome?.(req) ?? null; }
-    if (!o) throw new Refusal(`Nothing was posted: the record keeper didn't accept your source check within ${CHECK_WAIT_MS / 1000} seconds. Ask again in a minute; if it has landed by then, no new --checked is needed.`);
+    if (!o) {
+      const waited = CHECK_WAIT_MS;
+      this.log(`source check ${req}: no answer from the record keeper within ${waited} ms; nothing posted`);
+      try { this.d.waitTimeout?.({ id: req, at: new Date(this.d.now()).toISOString(), waited_ms: waited }); } catch { /* logged above */ }
+      this.refuse("wait", id, `Nothing was posted: the record keeper didn't accept your source check within ${CHECK_WAIT_MS / 1000} seconds (its local round is slow; the push to GitHub doesn't count). Ask again in a minute; if it has landed by then, no new --checked is needed.`);
+    }
     if (o.state !== "done")
-      throw new Refusal(`Nothing was posted: the record keeper said ${o.state} to your source check${o.reason ? ` (${clip(o.reason, 200)})` : ""}. Check it at its source again and ask with a new --checked.`);
+      this.refuse("keeper", id, `Nothing was posted: the record keeper said ${o.state} to your source check${o.reason ? ` (${clip(o.reason, 300)})` : ""}. Check it at its source again and ask with a new --checked.`);
     const e = this.ledger()[id];
     if (!e || e.checked_req !== req || !isFresh(e, this.d.now(), this.maxDays()))
       throw new StaleCheck("Nothing was posted: the record keeper took your source check, but the row changed right after it; check it at its source again and ask with a new --checked if it still needs him.");
@@ -1061,20 +1100,33 @@ export class Link {
   }
 
   // A one-off ask (--item none) can't stand in for an item's ask: one whose text holds an
-  // open row's item code or its whole Item phrase is refused, naming it. Anything looser is
-  // the keeper's weekly audit. Every one-off goes into the request log, with its declaration
-  // that it is about no open item.
-  private oneOff(text: string): void {
-    const hit = oneOffHit(this.files().pending, text);
-    if (hit) throw new Refusal(`This one-off names an open item, ${hit[0]} ("${clip(hit[1], 60)}"): ask it with --item ${hit[0]} and a --checked source check, or reword it if it's about something else.`);
+  // open row's item code or its whole Item phrase is refused, quoting what matched. One whose
+  // words overlap an open row's Item more loosely is held (nothing posted) until Cain either
+  // asks it under that item with a check, or sends it again with a one-line reason it is about
+  // no open item (--reason), which the keeper logs with it. Every one-off goes into the request
+  // log, with its declaration that it is about no open item. Returns the hold, or null to post.
+  private oneOff(text: string, reason: unknown): AskResult | null {
+    const pending = this.files().pending;
+    const hit = oneOffHit(pending, text);
+    if (hit) this.refuse("one-off", hit[0], `This one-off names an open item, ${hit[0]} ("${clip(hit[1], 60)}"), matching "${clip(hit[2], 60)}": ask it with --item ${hit[0]} and a --checked source check, or reword it if it's about something else.`);
+    const why = reason === undefined || reason === null ? "" : String(reason).replace(/\s+/g, " ").trim();
+    if (why.length > MAX_ONE_OFF_REASON) this.refuse("one-off", "none", `The one-off's --reason is over ${MAX_ONE_OFF_REASON} characters; say why in one short line.`);
+    const loose = oneOffLoose(pending, text);
+    if (loose.length && !why) {
+      const h = loose[0];
+      const said = `Held, not posted: this one-off's words overlap an open item, ${h.id} ("${clip(h.item, 60)}"), sharing ${h.shared.map((w) => `"${w}"`).join(", ")}. Either ask it with --item ${h.id} and a --checked source check, or send it again with --reason "<one line on why it is about no open item>", which the record keeper logs.`;
+      try { this.d.tune?.({ at: new Date(this.d.now()).toISOString(), kind: "one-off hold", item: h.id, said }); } catch { /* the hold stands */ }
+      return { status: "needs reason", said };
+    }
     const now = this.d.now(), flat = text.replace(/\s+/g, " ").replace(/\|/g, "/").trim();
     try {
       if (!this.d.submitRecord) throw new Error("the record keeper can't be reached from the link");
       this.d.submitRecord({ id: `link-oneoff-${now}`, from: "cain", kind: "change", summary: clip(`${ONE_OFF_SUMMARY}${flat}`, 200),
-        ops: [{ op: "one-off", text: clip(flat, 300), not_about_item: true }] });
+        ops: [{ op: "one-off", text: clip(flat, 300), not_about_item: true, ...(loose.length ? { reason: why.replace(/\|/g, "/") } : {}) }] });
     } catch (e) {
       throw new Refusal(`Nothing was posted: the one-off ask's log line couldn't be handed to the record keeper (${String(e).slice(0, 80)}); try again in a minute.`);
     }
+    return null;
   }
 
   // Right before an ask or Ship card for an item goes up: the row's version is read again,
@@ -1433,7 +1485,7 @@ export class Link {
     return null;
   }
 
-  async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown; checked?: unknown }): Promise<AskResult> {
+  async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown; checked?: unknown; reason?: unknown }): Promise<AskResult> {
     const meta = checkMeta(a);
     const raw = (a.options ?? []).map((o) => String(o).trim()).filter(Boolean).slice(0, 5);
     const asked = unlabeled(String(a.text ?? ""), meta.item, meta.question).trim();
@@ -1447,7 +1499,7 @@ export class Link {
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
     const text = w.text;                 // no "P08 Q2: ": the item and question are data
     this.mayAsk(meta.item);
-    if (meta.item === "none") this.oneOff(text);
+    if (meta.item === "none") { const hold = this.oneOff(text, a.reason); if (hold) return hold; }
     await this.acceptedCheck(meta.item, this.sourceCheck(meta.item, a.checked));
     this.refNow(meta.item);
     return this.serial(async () => {
@@ -1738,7 +1790,11 @@ export class Link {
       if (closedItems(f.pending).has(item.toUpperCase())) return "item closed";
       const holds = parseHolds(f.holds);
       if (holds && heldElsewhere(holds, item)) return "held elsewhere";
-      if ((m.kind === "ask" || m.kind === "ship") && m.checked && !this.refValid(item, m.checked)) return "status changed";
+      if (m.kind === "ask" || m.kind === "ship") {
+        const c = this.checkState(item, m.checked);
+        if (c === "changed") return "status changed";
+        if (c === "unknown") return "status unreadable";
+      }
     }
     return "";
   }
@@ -1797,6 +1853,14 @@ export class Link {
     }
     if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
+      // The ledger or the keeper's outcome couldn't be read in time: the tap is rejected with
+      // the status-changed reason, and the card keeps its buttons for the sweep to judge.
+      if (why === "status unreadable") {
+        await this.answer(it, ACK);
+        await this.ephemeral(it, STATUS_TAP);
+        this.log("tap refused: the source check couldn't be confirmed from the ledger in time");
+        return "refused: status unreadable";
+      }
       if (why) {
         rec.outcome = why === "answered" ? "answered" : "expired"; rec.why = why;
         this.d.save(s);
@@ -2911,7 +2975,7 @@ export class Link {
       else if (pulls.has(id)) why = pulls.get(id)!;
       else if (item && closed.has(item.toUpperCase())) why = "item closed";
       else if (item && holds && heldElsewhere(holds, item)) why = "held elsewhere";
-      else if (item && (m.kind === "ask" || m.kind === "ship") && m.checked && !this.refValid(item, m.checked)) why = "status changed";
+      else if (item && (m.kind === "ask" || m.kind === "ship") && this.checkState(item, m.checked) === "changed") why = "status changed";
       else { const k = rivalKey(m); if (k && newest.get(k) !== id) why = "replaced"; }
       if (!why) continue;
       m.outcome = why === "replaced" ? "replaced" : "expired"; m.why = why;

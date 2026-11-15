@@ -116,6 +116,23 @@ if [ -n "$rows" ]; then
   [ "$total" -gt 3 ] && notes=" ($((total - 3)) older not shown; /opt/cain/record.sh notes - lists them)$notes"
   [ -n "$notes" ] && lead="${lead}New notes on your items, read them before you change those items (words passed on, not his go on anything):$notes. "
 fi
+# The record keeper's one-off audit lines not seen before (an overlap re-declared with a
+# reason, a wait timeout), each once: moved aside whole first, like the relay queue, so a
+# line the keeper adds meanwhile waits for the next check-in. The newest three are shown,
+# the rest counted; state/one-off-audit.md in the record keeps the week's.
+audit="${RECORD_CHECKIN:-/data/record-checkin.txt}"
+if [ ! -s "$audit.work" ] && [ -s "$audit" ]; then mv "$audit" "$audit.work"; fi
+if [ -s "$audit.work" ]; then
+  total=$(grep -c . "$audit.work" | tr -d ' ')
+  found=""
+  while IFS= read -r l; do
+    l=$(printf '%s' "$l" | tr -d '\000-\010\013\014\016-\037\177' | tr '\t' ' ' | tr -s ' ')
+    [ "${#l}" -gt 300 ] && l="${l:0:297}..."
+    [ -n "$l" ] && found="$found [$l]"
+  done < <(grep . "$audit.work" | tail -n 3)
+  [ "$total" -gt 3 ] && found=" ($((total - 3)) older not shown; state/one-off-audit.md lists them)$found"
+  [ -n "$found" ] && lead="${lead}The record keeper's one-off audit since your last check-in (look at each; if a one-off was really about an open item, check that item at its source and ask under it):$found. "
+fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else
@@ -124,5 +141,6 @@ fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
 [ -n "$newest" ] && printf '%s' "$newest" > "$seen"      # listed: never again
+rm -f "$audit.work"                                      # the audit lines too
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"

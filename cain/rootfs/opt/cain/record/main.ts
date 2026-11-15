@@ -13,15 +13,41 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
-  maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, type OneOff,
+  maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, type OneOff, type WaitTimeout,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; relay: string;
   branch: string; token?: string; hygieneAt: string; tz: string; now?: () => Date;
   holds?: string;   // the keeper's own copy of the holds; default /data/record-holds.json (next to the queue)
-  maxCheckDays?: number;   // the App's source_check_max_days (default 7): shown on the Checked cells
+  maxCheckDays?: number;   // the App's source_check_max_days (default 7): a check's stale_after, and the Checked cells
+  clockSynced?: () => boolean;   // whether the system clock is synchronized (default: clockSynced below; the tests inject it)
+  checkin?: string;        // where new audit lines wait for Cain's next check-in (default /data/record-checkin.txt, next to the queue)
+  waits?: string;          // the link's wait timeouts (default /data/record-waits.jsonl, next to the queue)
+  beforePush?: () => void; // the tests' hook: runs right before the push
 };
+
+// Whether the system clock is synchronized, from the keeper's own box: timedatectl's
+// NTPSynchronized when it answers, systemd-timesyncd's flag file, or else the kernel's own
+// flag (adjtimex, read only: what timedatectl reads too; an App's container shares the host's
+// kernel). Anything that can't be read counts as not synchronized.
+export function clockSynced(): boolean {
+  try {
+    const p = Bun.spawnSync(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], { stdout: "pipe", stderr: "pipe" });
+    const v = p.stdout.toString().trim();
+    if (p.exitCode === 0 && (v === "yes" || v === "no")) return v === "yes";
+  } catch { /* not installed */ }
+  if (existsSync("/run/systemd/timesync/synchronized")) return true;
+  try {
+    const { dlopen, FFIType, ptr } = require("bun:ffi");
+    const lib = dlopen("libc.so.6", { adjtimex: { args: [FFIType.ptr], returns: FFIType.i32 } });
+    const buf = new Uint8Array(256);   // struct timex: modes is 0, so nothing is set
+    const state = lib.symbols.adjtimex(ptr(buf));
+    const status = new DataView(buf.buffer).getInt32(40, true);   // 64-bit Linux: after modes and four longs
+    lib.close();
+    return state >= 0 && state !== 5 && (status & 0x40) === 0;   // not TIME_ERROR, STA_UNSYNC clear
+  } catch { return false; }
+}
 
 const MAX_RAW = 1_000_000;
 const MAX_NOTE = 2_000;
@@ -309,6 +335,7 @@ function report(cfg: Config, o: Outcome, local: boolean, req: Request | undefine
 export function cycle(cfg: Config): { applied: number; ok: boolean } {
   const clock = () => cfg.now?.() ?? new Date();
   for (let attempt = 0; attempt < 3; attempt++) {
+    const started = performance.now();   // the round's own time (not the record's clock), for round_ms
     let items: Pending[] = [];
     const outcomes: (Outcome | null)[] = [];
     const settled: { o: Outcome; req: Request; local: boolean }[] = [];   // takes that stopped waiting
@@ -335,7 +362,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
         return git(cfg, ["rev-parse", "--short", "HEAD"]);
       };
       const undo = () => { git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects", "reviews"]); };
-      const ctx = (at: Date) => ({ at, holds: st.holds, downtime: st.downtime, tz: cfg.tz, maxCheckDays: maxCheckDays(cfg.maxCheckDays) });
+      let synced = false;
+      try { synced = (cfg.clockSynced ?? clockSynced)() === true; } catch { synced = false; }
+      const ctx = (at: Date) => ({ at, holds: st.holds, downtime: st.downtime, tz: cfg.tz, maxCheckDays: maxCheckDays(cfg.maxCheckDays), clockSynced: synced });
       const outcomeOf = (req: Request, at: Date) => ({ id: req.id, from: clean(req.from, 80), kind: req.kind, summary: clean(req.summary, 200), at: at.toISOString() });
       // A planned change: its files, then its holds. A failed write, the holds' included,
       // undoes this request only; the others stand.
@@ -355,15 +384,25 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
         if (p.holdsChanged) st.holds = p.holds;
         return { ...base, state: "done" };
       };
+      // The keeper's own files written alongside a refusal (the ledger's pending rewrite).
+      const side = (writes: Map<string, string | null>) => {
+        if ([...writes.keys()].some((path) => !linkFree(cfg, path))) return;
+        try { for (const [path, content] of writes) if (content !== null) { mkdirSync(dirname(join(cfg.dir, path)), { recursive: true }); writeFileSync(join(cfg.dir, path), content); } }
+        catch (e) { undo(); log(`couldn't write the ledger with a refusal: ${(e as Error).message}`); }
+      };
       const decide = (req: Request, local: boolean, base: Omit<Outcome, "state">): Outcome => {
         const p = plan(req, t, ctx(new Date(base.at)));
         if (p.state === "ok") {
           for (const w of p.warnings ?? []) log(`warning: ${req.id}: ${clean(w, 200)}`);
           const o = apply(p, base);
+          if (o.state === "done" && p.declared) { log(`one-off ${req.id} re-declared: ${clean(p.declared, 300)}`); o.declared = p.declared; }
           return o.state === "done" && p.errors?.length ? { ...o, reason: clean(p.errors.join("; "), 600) } : o;
         }
         if (p.state === "waiting") st.waiting.push({ req, since: base.at, local });
-        return { ...base, state: p.state, reason: clean(p.reason) };
+        if (p.writes) side(p.writes);
+        // Refusals of source checks and one-offs, in the keeper's log too, for tuning the rules.
+        if (req.ops?.some((o) => o.op === "check" || o.op === "one-off")) log(`refused for tuning: ${req.id}: ${clean(p.reason, 400)}`);
+        return { ...base, state: p.state, reason: clean(p.reason, 600) };
       };
       // Takes waiting behind one of Cain's jobs, planned again now; in the order they came.
       const settle = () => {
@@ -398,6 +437,16 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
         republish(`Holds: ${who} ended after a day without a word from the holder`);
       }
       if (st.waiting.length) settle();
+      // The ledger kept in step: rows changed outside the keeper get a new version, and checks
+      // past their stale_after are aged out (only while the clock is synchronized).
+      try {
+        const u = upkeep(t, { at: now, tz: cfg.tz, maxCheckDays: maxCheckDays(cfg.maxCheckDays), clockSynced: synced });
+        if (u && [...u.writes.keys()].every((path) => linkFree(cfg, path))) {
+          for (const [path, content] of u.writes) writeFileSync(join(cfg.dir, path), content);
+          const what = [...(u.bumped.length ? [`${u.bumped.join(", ")} changed outside the keeper`] : []), ...(u.aged.length ? [`${u.aged.join(", ")} aged out`] : [])];
+          commit(`Source checks: ${what.join("; ")}`);
+        }
+      } catch (e) { undo(); log(`couldn't keep the ledger in step (${(e as Error).message}); trying again next round`); }
       // The record's copy is the keeper's: put back if anyone else changed it.
       const published = publishedHolds(cfg);
       if (published === null ? Object.keys(st.holds).length > 0 : published !== holdsText(st.holds))
@@ -424,8 +473,17 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
         // A hold that ended or moved may let a waiting take through, before anything newer.
         if (o.state === "done" && st.waiting.length) settle();
       }
-      // The one-off audit: the past week's one-offs matched loosely against the open rows.
+      // The one-off audit: the past week's one-offs matched loosely against the open rows, and
+      // the link's wait timeouts.
       if (items.length) audit(cfg, clock(), commit);
+      // The link's own requests (a source check, a one-off) have their outcome now, once the
+      // local commit and the ledger are written: the link waits on this, never on the push
+      // below. round_ms is this round's local work, up to here. Cain's other requests still
+      // hear done only once GitHub has them (report, after the push).
+      const round_ms = Math.round(performance.now() - started);
+      const waited = waitsBy(cfg);
+      const linkOwn = (req?: Request) => !!req?.ops?.some((o) => o.op === "check" || o.op === "one-off");
+      items.forEach((it, i) => { const o = outcomes[i]; if (o && it.local && linkOwn(it.req)) local(cfg, o, round_ms, waited); });
       if (commits === 0) {
         // Nothing to push: a good round all the same. Cain's requests that were
         // already applied are let go, with their status file if it was never written.
@@ -439,6 +497,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
       return { applied: 0, ok: false };
     }
     try {
+      cfg.beforePush?.();
       git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
     } catch (e) {
       // A lost race, or a push GitHub refused. Confirm before deciding.
@@ -466,20 +525,57 @@ function audit(cfg: Config, now: Date, commit: (msg: string) => string | undefin
     const oneOffs: OneOff[] = [];
     for (const o of logbook(cfg).values())
       if (o.id.startsWith("link-oneoff-") && o.state === "done" && o.summary.startsWith(ONE_OFF_SUMMARY))
-        oneOffs.push({ id: o.id, at: o.at, text: o.summary.slice(ONE_OFF_SUMMARY.length) });
+        oneOffs.push({ id: o.id, at: o.at, text: o.summary.slice(ONE_OFF_SUMMARY.length), ...(o.declared ? { declared: o.declared } : {}) });
+    const waits: WaitTimeout[] = [...waitsBy(cfg).values()].map((w) => ({ ...w, round_ms: roundOf(cfg, w.id) }));
     const p = join(cfg.dir, PENDING_PATH), f = join(cfg.dir, ONE_OFF_AUDIT_PATH);
     const pending = existsSync(p) ? readFileSync(p, "utf8") : null;
     const was = existsSync(f) ? readFileSync(f, "utf8") : null;
-    if (!oneOffs.length && was === null) return;
-    const a = oneOffAudit(oneOffs, pending, now, cfg.tz);
+    if (!oneOffs.length && !waits.length && was === null) return;
+    const a = oneOffAudit(oneOffs, pending, now, cfg.tz, waits);
     if (a.text === was) return;
-    for (const h of a.hits) log(`one-off audit: ${clean(h, 300)}`);
+    // Lines not in the file before reach Cain at his next check-in (checkin.sh reads them).
+    const fresh = a.hits.filter((h) => !(was ?? "").includes(`- ${h}\n`));
+    for (const h of fresh) log(`one-off audit: ${clean(h, 300)}`);
+    if (fresh.length) appendFileSync(checkinFile(cfg), fresh.map((h) => clean(h, 400)).join("\n") + "\n");
     mkdirSync(dirname(f), { recursive: true });
     writeFileSync(f, a.text);
     commit(`One-off audit: ${a.hits.length} to look over`);
   } catch (e) {
     log(`one-off audit didn't finish: ${(e as Error).message}`);
   }
+}
+
+const checkinFile = (cfg: Config) => cfg.checkin ?? join(dirname(cfg.queue), "record-checkin.txt");
+const waitsFile = (cfg: Config) => cfg.waits ?? join(dirname(cfg.queue), "record-waits.jsonl");
+
+// The link's wait timeouts (one JSON line each: id, at, waited_ms), by request id. The audit
+// counts the past week's.
+function waitsBy(cfg: Config): Map<string, Omit<WaitTimeout, "round_ms">> {
+  const out = new Map<string, Omit<WaitTimeout, "round_ms">>();
+  const f = waitsFile(cfg);
+  if (!existsSync(f)) return out;
+  for (const line of readFileSync(f, "utf8").split("\n")) {
+    try {
+      const w = JSON.parse(line);
+      if (typeof w?.id === "string" && typeof w.at === "string" && !Number.isNaN(Date.parse(w.at)) && Number.isFinite(w.waited_ms))
+        out.set(w.id, { id: clean(w.id, 80), at: w.at, waited_ms: Number(w.waited_ms) });
+    } catch { /* skip */ }
+  }
+  return out;
+}
+// The keeper's local time for a request's round, from its outcome file (null: none yet).
+function roundOf(cfg: Config, id: string): number | null {
+  try { const o = JSON.parse(readFileSync(outcomeFile(cfg, id), "utf8")); return Number.isFinite(o?.round_ms) ? o.round_ms : null; }
+  catch { return null; }
+}
+// One of Cain's own requests, settled locally: its outcome file, before the push. A request
+// the link gave up waiting on is logged with this round's time.
+function local(cfg: Config, o: Outcome, round_ms: number, waited: Map<string, Omit<WaitTimeout, "round_ms">>) {
+  o.round_ms = round_ms;
+  mkdirSync(cfg.outcomes, { recursive: true });
+  writeFileSync(outcomeFile(cfg, o.id), JSON.stringify(o));
+  const w = waited.get(o.id);
+  if (w) log(`wait timeout: ${o.id} was refused by the link after ${w.waited_ms} ms; its round's local work took ${round_ms} ms (${o.state})`);
 }
 
 // A round that finished: its state saved (so it counts as the keeper working), and
@@ -580,6 +676,8 @@ if (import.meta.main) {
     tz: process.env.CHECKIN_TZ ?? "America/New_York",
     holds: process.env.RECORD_HOLDS ?? "/data/record-holds.json",
     maxCheckDays: maxCheckDays(process.env.SOURCE_CHECK_MAX_DAYS),
+    checkin: process.env.RECORD_CHECKIN ?? "/data/record-checkin.txt",
+    waits: process.env.RECORD_WAITS ?? "/data/record-waits.jsonl",
   };
   delete process.env.RECORD_TOKEN;   // kept only in cfg, handed to git per call
   if (!cfg.token) {

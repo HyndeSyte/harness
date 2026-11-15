@@ -28,8 +28,9 @@ export type Op =
   // ledger id and version as the link read them (null and 0: the ledger didn't know it).
   | { op: "check"; item: string; text: string; row: string | null; version: number }
   // A one-off ask to him, for the request log, with the link's declaration that it is about
-  // no open item (not_about_item, always true).
-  | { op: "one-off"; text: string; not_about_item: true };
+  // no open item (not_about_item, always true). reason: Cain's one line on why, when its words
+  // overlap an open row's Item (the link holds it until he gives one); logged with it.
+  | { op: "one-off"; text: string; not_about_item: true; reason?: string };
 
 export type Request = {
   id: string;          // unique; the receipt Dane or Cain can look up
@@ -46,6 +47,8 @@ export type Outcome = {
   // running jobs; a second line with the same id says how it ended.
   state: "done" | "conflict" | "rejected" | "refused" | "waiting" | "relayed";
   reason?: string; at: string; commit?: string;
+  declared?: string;   // a one-off re-declared with Cain's reason: that reason, and the overlap it answers
+  round_ms?: number;   // Cain's own requests: the keeper's local work for the round, up to this outcome (not the push)
 };
 
 // One hold per item. holder: "cain" or "laptop:<session id>". for: his words, or
@@ -65,6 +68,11 @@ export const CHECKS_PATH = "state/checks.json";
 export const MAX_CHECK_TEXT = 300;            // characters in one source check
 export const ONE_OFF_AUDIT_PATH = "state/one-off-audit.md";
 export const DEFAULT_MAX_CHECK_DAYS = 7;      // the App's source_check_max_days, when unset
+export const MAX_ONE_OFF_REASON = 200;        // characters in a one-off's reason
+// A row's Next step holds the current step and its latest source check; dated history goes in
+// a note on the item. 800 characters is about four times the longest current step plus a
+// check (a check is at most 300) and keeps a full open list of 50 rows well under MAX_BYTES.
+export const MAX_NEXT_STEP = 800;
 
 // Where requests may write. log/ and inbox/ belong to the keeper itself; code,
 // workflows and the repo's own settings are never written through requests.
@@ -164,6 +172,12 @@ export function parseRequest(raw: string): { req?: Request; error?: string } {
       const why = cellProblem(o.text);
       if (why) return { req, error: `one-off: ${why}` };
       if (o.not_about_item !== true) return { req, error: "one-off: needs not_about_item: true, the declaration that it is about no open item" };
+      if (o.reason !== undefined) {
+        if (typeof o.reason !== "string" || !o.reason.trim()) return { req, error: "one-off: reason, when given, is one line on why it is about no open item" };
+        if (o.reason.length > MAX_ONE_OFF_REASON) return { req, error: `one-off: reason over ${MAX_ONE_OFF_REASON} characters` };
+        const r = cellProblem(o.reason);
+        if (r) return { req, error: `one-off: reason: ${r}` };
+      }
       continue;
     }
     if (typeof o.path !== "string") return { req, error: "op without a path" };
@@ -443,9 +457,20 @@ export function itemKnown(text: string | null, id: string): boolean {
 //               included) bumps that row.
 //   changed     when the version last went up (shown in refusals only, never compared).
 //   checked     the latest source check, in plain words, with checked_version (the version
-//               it checked), checked_at (the keeper's time for it), checked_req and by.
-// A check is fresh while checked_version is the row's version and it is no older than the
-// App's source_check_max_days (7 by default) by checked_at. The check op carries the id and
+//               it checked), checked_at (the keeper's time for it), stale_after (checked_at
+//               plus the App's source_check_max_days, by the keeper's clock), checked_req
+//               and by.
+//   hash        the row's versioned cells as the keeper last wrote them (sha1, normalized).
+//               A row whose cells no longer match it was changed outside the keeper (by an
+//               earlier keeper after a rollback, or by hand): its check doesn't count, and the
+//               next write of the list bumps its version.
+//   aged        when the keeper's clock passed stale_after (the keeper ages checks itself).
+//   pending_rewrite  set when a whole-file write that changed this row was refused for it
+//               (it bundled two statuses): what was refused. Its check doesn't count, and no
+//               new check is taken, until a write changes the row cleanly.
+// A check is fresh while checked_version is the row's version, it isn't aged, pending a
+// rewrite or out of step with the row's cells, and it is no older than stale_after (the
+// App's source_check_max_days, 7 by default, from checked_at). The check op carries the id and
 // version the link read; the keeper takes it only while both are still current (an
 // unledgered row: id null, version 0, and still unledgered), and the op never bumps its
 // own row. A row with no ledger entry starts at version 1 with no check, whatever its
@@ -453,8 +478,9 @@ export function itemKnown(text: string | null, id: string): boolean {
 // the ledger: regenerated on every write of the open list, added the first time, and never
 // read back as input.
 export type CheckEntry = {
-  id: string; version: number; changed: string;
+  id: string; version: number; changed: string; hash?: string;
   checked?: string; checked_at?: string; checked_version?: number; checked_req?: string; by?: string;
+  stale_after?: string; aged?: string; pending_rewrite?: string;
 };
 export type Checks = Record<string, CheckEntry>;
 export const CHECKED_COLUMN = "Checked";
@@ -472,11 +498,15 @@ export function parseChecks(text: string | null): Checks {
     if (!v || typeof v !== "object" || typeof v.id !== "string" || !ROW_ID.test(v.id)) continue;
     if (!Number.isInteger(v.version) || v.version < 1 || typeof v.changed !== "string") continue;
     const e: CheckEntry = { id: v.id, version: v.version, changed: v.changed };
+    if (typeof v.hash === "string" && /^[0-9a-f]{40}$/.test(v.hash)) e.hash = v.hash;
     if (typeof v.checked === "string" && typeof v.checked_at === "string" && Number.isInteger(v.checked_version)) {
       e.checked = v.checked; e.checked_at = v.checked_at; e.checked_version = v.checked_version;
       if (typeof v.checked_req === "string") e.checked_req = v.checked_req;
       if (typeof v.by === "string") e.by = v.by;
+      if (typeof v.stale_after === "string" && !Number.isNaN(Date.parse(v.stale_after))) e.stale_after = v.stale_after;
+      if (typeof v.aged === "string") e.aged = v.aged;
     }
+    if (typeof v.pending_rewrite === "string" && v.pending_rewrite) e.pending_rewrite = v.pending_rewrite;
     out[k] = e;
   }
   return out;
@@ -485,9 +515,11 @@ export function checksText(c: Checks): string {
   const out: Record<string, CheckEntry> = {};
   for (const k of Object.keys(c).sort()) {
     const e = c[k];
-    out[k] = { id: e.id, version: e.version, changed: e.changed,
+    out[k] = { id: e.id, version: e.version, changed: e.changed, ...(e.hash ? { hash: e.hash } : {}),
       ...(e.checked !== undefined ? { checked: e.checked, checked_at: e.checked_at, checked_version: e.checked_version,
-        ...(e.checked_req ? { checked_req: e.checked_req } : {}), ...(e.by ? { by: e.by } : {}) } : {}) };
+        ...(e.stale_after ? { stale_after: e.stale_after } : {}), ...(e.aged ? { aged: e.aged } : {}),
+        ...(e.checked_req ? { checked_req: e.checked_req } : {}), ...(e.by ? { by: e.by } : {}) } : {}),
+      ...(e.pending_rewrite ? { pending_rewrite: e.pending_rewrite } : {}) };
   }
   return JSON.stringify(out, null, 2) + "\n";
 }
@@ -496,12 +528,14 @@ export function maxCheckDays(v: unknown): number {
   const n = typeof v === "number" ? v : Number(String(v ?? "").trim() || NaN);
   return Number.isInteger(n) && n >= 1 && n <= 90 ? n : DEFAULT_MAX_CHECK_DAYS;
 }
-// When a check stops counting by age: its keeper time plus the limit (NaN: no time).
+// When a check stops counting by age: the keeper's stale_after for it, or (an entry written
+// before it had one) its keeper time plus the limit. NaN: no time.
 export const staleAfter = (e: CheckEntry | undefined, maxDays = DEFAULT_MAX_CHECK_DAYS): number =>
-  e?.checked_at ? Date.parse(e.checked_at) + maxDays * DAY_MS : NaN;
-// Of the row's version (with no clock), and, given a time, no older than the limit.
+  e?.stale_after ? Date.parse(e.stale_after) : e?.checked_at ? Date.parse(e.checked_at) + maxDays * DAY_MS : NaN;
+// Of the row's version, not aged out by the keeper and not pending a rewrite (with no clock),
+// and, given a time, no older than the limit.
 export function isFresh(e: CheckEntry | undefined, now?: number, maxDays = DEFAULT_MAX_CHECK_DAYS): boolean {
-  if (!e || e.checked === undefined || e.checked_version !== e.version) return false;
+  if (!e || e.checked === undefined || e.checked_version !== e.version || e.aged || e.pending_rewrite) return false;
   if (now === undefined) return true;
   const until = staleAfter(e, maxDays);
   return Number.isFinite(until) && now <= until;
@@ -541,20 +575,57 @@ export function newRowId(seed: string): string {
   return "r" + createHash("sha1").update(seed, "utf8").digest("hex").slice(0, 12);
 }
 
+// A row's versioned cells, as one hash (sha1 of the normalized cells in column order).
+const cellsHash = (r: Record<string, string>) =>
+  createHash("sha1").update(Object.keys(r).sort().map((k) => `${k}\u0000${r[k]}`).join("\u0001"), "utf8").digest("hex");
+// The hash of one open row's versioned cells as the list stands (null: no such row).
+export function rowContentHash(text: string | null | undefined, code: string): string | null {
+  const r = versionedCells(text ?? null).get(code);
+  return r ? cellsHash(r) : null;
+}
+// Whether the ledger's entry for a row is in step with the row as the list stands: same
+// cells as the keeper last wrote them. An entry with no hash (none yet) is taken as in step.
+export function inStep(e: CheckEntry | undefined, text: string | null | undefined, code: string): boolean {
+  if (!e) return false;
+  if (!e.hash) return true;
+  return rowContentHash(text, code) === e.hash;
+}
+
 // The ledger after a write of the open list: committed is the list as it stands in the
 // record, after the list as it will be written, matched by item code. New rows (and rows
 // the ledger never knew) get a new id at version 1; a row whose versioned cells changed
 // goes up one; a row that left the open table leaves the ledger.
+// A row whose cells no longer match the hash the keeper last wrote (changed outside the
+// keeper) goes up one too, even when this write leaves it as it is. A row that changes drops
+// any pending rewrite: the write that changed it was clean (bundled writes are refused whole).
+// The id seed holds the request and its time, so a code that comes back after leaving the
+// open table (closed, or deleted) never gets the id it had.
 export function reconcile(ledger: Checks, committed: string | null, after: string | null, iso: string, seed: string): Checks {
   const A = versionedCells(committed), B = versionedCells(after);
   const out: Checks = {};
   for (const [code, now] of B) {
-    const e = ledger[code], was = A.get(code);
-    if (!e || !was) out[code] = { id: newRowId(`${seed}\u0000${code}\u0000${iso}`), version: 1, changed: iso };
-    else if (!sameCells(was, now)) out[code] = { ...e, version: e.version + 1, changed: iso };
-    else out[code] = e;
+    const e = ledger[code], was = A.get(code), hash = cellsHash(now);
+    if (!e || !was) out[code] = { id: newRowId(`${seed}\u0000${code}\u0000${iso}`), version: 1, changed: iso, hash };
+    else if (!sameCells(was, now) || (e.hash && e.hash !== cellsHash(was))) {
+      const { pending_rewrite: _, ...rest } = e;
+      out[code] = { ...rest, version: e.version + 1, changed: iso, hash };
+    } else out[code] = { ...e, hash };
   }
   return out;
+}
+
+// The keeper ages checks by its own clock (only while it is synchronized): a check past its
+// stale_after is marked aged, so it never counts again, whatever clock reads it later.
+export function ageChecks(ledger: Checks, now: Date, maxDays = DEFAULT_MAX_CHECK_DAYS): { ledger: Checks; aged: string[] } {
+  const out: Checks = {}, aged: string[] = [];
+  for (const [code, e] of Object.entries(ledger)) {
+    const until = staleAfter(e, maxDays);
+    if (e.checked !== undefined && !e.aged && Number.isFinite(until) && now.getTime() > until) {
+      out[code] = { ...e, aged: now.toISOString() };
+      aged.push(code);
+    } else out[code] = e;
+  }
+  return { ledger: out, aged };
 }
 
 // What the Checked cell shows: fresh or stale (by version), the check's day with its year
@@ -562,6 +633,7 @@ export function reconcile(ledger: Checks, committed: string | null, after: strin
 // goes stale by age, then what was checked. The cell is made on writes, so "stale after"
 // is shown for whoever reads it later.
 export function checkedCell(e: CheckEntry | undefined, tz = "America/New_York", maxDays = DEFAULT_MAX_CHECK_DAYS): string {
+  if (e?.pending_rewrite) return "pending rewrite: a whole-file write of this row was refused; write it cleanly, then check it again";
   if (!e || e.checked === undefined || !e.checked_at) return "";
   const at = new Date(e.checked_at), ch = new Date(e.changed);
   if (Number.isNaN(at.getTime())) return "";
@@ -668,10 +740,10 @@ export function checkTextProblem(text: unknown): string | null {
   const vague = VAGUE.exec(t);
   if (vague) return `a source check can't rest on "${vague[0]}": check it at its source now and name that source (a mail's sender domain and date, a page or portal, a file path, a command, or a message)`;
   if (!WHEN.test(t)) return "a source check says when it was checked (\"read at 9:40 this morning\", \"Nov 15\")";
-  const mail = MAIL.test(t), domain = DOMAIN.test(t);
+  const mail = MAIL.exec(t), domain = DOMAIN.test(t);
   const named = PAGE.test(t) || domain || FILE_PATH.test(t) || COMMAND.test(t) || MESSAGE.test(t);
   if (mail && !domain && !named)
-    return "a source check of a mail names its sender's domain and its date (\"the receipt from county.gov dated Nov 14, read at 9:40\")";
+    return `a source check of a mail ("${mail[0]}") names its sender's domain and its date ("the receipt from county.gov dated Nov 14, read at 9:40")`;
   if (!named) return "a source check names a concrete source: a mail (its sender's domain and date), a page or portal by name, a file path, a command, or a message";
   return null;
 }
@@ -728,50 +800,72 @@ export function bundledStatus(item: string): { refuse?: [string, string]; warn?:
   return words >= 2 ? { warn: `${words} status words, but not two claims about different subjects` } : {};
 }
 
-// In a whole-file write of the open list, the bundled-status rule is scoped to the row: a
-// row whose Item changed (or is new) and bundles two statuses is put back as it stands in
-// the record (or, when new, left out), the other rows land, and the writer hears one line
-// per row naming it and its two clauses. before and after are without the Checked column.
-export function dropBundled(before: string | null, after: string): { text: string; errors: string[]; warnings: string[] } {
+// A Next step cell over MAX_NEXT_STEP characters is refused, unless the row already had one
+// at least as long (an over-long row may shrink, never grow). The answer says where history
+// goes: a note on the item.
+export function nextStepProblem(id: string, before: string | undefined, after: string | undefined): string | null {
+  const n = norm(after ?? "").length;
+  if (n <= MAX_NEXT_STEP || n <= norm(before ?? "").length) return null;
+  return `${id}'s Next step is ${n} characters, over ${MAX_NEXT_STEP} ("${clean(norm(after ?? "").slice(0, 50), 50)}..."): keep the current step and its latest source check there, and move the dated history into a note on the item (the note op)`;
+}
+
+// In a whole-file write of the open list (a put, or an append to it), every row that is new
+// or changed is held to the row rules: an Item that bundles two statuses, or a Next step that
+// grows past MAX_NEXT_STEP. Any such row refuses the whole write, which is atomic: the answer
+// names each row and what it matched (its two clauses), so the writer fixes them and sends the
+// complete file again. bundled: the codes refused for bundling, for the ledger's pending
+// rewrite. before and after are without the Checked column.
+export function rowRules(before: string | null, after: string): { errors: string[]; warnings: string[]; bundled: { id: string; why: string }[] } {
   const d = parsePending(after);
-  const errors: string[] = [], warnings: string[] = [];
-  if (!d.open) return { text: after, errors, warnings };
-  const was = new Map<string, { line: string; item: string }>();
+  const errors: string[] = [], warnings: string[] = [], bundled: { id: string; why: string }[] = [];
+  if (!d.open) return { errors, warnings, bundled };
+  const was = new Map<string, { item: string; next: string }>();
   if (before !== null) {
     const b = parsePending(before);
     if (b.open) {
-      const at = columns(b).indexOf("Item");
+      const cols = columns(b), it = cols.indexOf("Item"), nx = cols.indexOf("Next step");
       for (let i = b.open.body; i < b.open.end; i++) {
         const cs = cells(b.lines[i]);
-        if (cs[0] && !was.has(cs[0])) was.set(cs[0], { line: b.lines[i].replace(/\r$/, ""), item: norm(at >= 0 ? cs[at] ?? "" : "") });
+        if (cs[0] && !was.has(cs[0])) was.set(cs[0], { item: norm(it >= 0 ? cs[it] ?? "" : ""), next: nx >= 0 ? cs[nx] ?? "" : "" });
       }
     }
   }
-  const at = columns(d).indexOf("Item");
-  if (at < 0) return { text: after, errors, warnings };
-  const keep: string[] = [];
-  for (let i = 0; i < d.lines.length; i++) {
-    if (i < d.open.body || i >= d.open.end) { keep.push(d.lines[i]); continue; }
-    const cs = cells(d.lines[i]), id = cs[0], item = cs[at] ?? "";
-    const old = id ? was.get(id) : undefined;
-    if (!id || (old && old.item === norm(item))) { keep.push(d.lines[i]); continue; }
-    const b = bundledStatus(item);
-    if (b.warn) warnings.push(`${id}'s Item may hold two statuses (${b.warn}); let through`);
-    if (!b.refuse) { keep.push(d.lines[i]); continue; }
-    errors.push(`${id} wasn't written: its Item bundles two statuses ("${clean(b.refuse[0], 60)}" and "${clean(b.refuse[1], 60)}"); one row holds one fact, so give each its own row`);
-    if (old) keep.push(old.line + (d.lines[i].endsWith("\r") ? "\r" : ""));
+  const cols = columns(d), at = cols.indexOf("Item"), nx = cols.indexOf("Next step");
+  for (let i = d.open.body; i < d.open.end; i++) {
+    const cs = cells(d.lines[i]), id = cs[0];
+    if (!id) continue;
+    const old = was.get(id);
+    if (at >= 0 && !(old && old.item === norm(cs[at] ?? ""))) {
+      const b = bundledStatus(cs[at] ?? "");
+      if (b.warn) warnings.push(`${id}'s Item may hold two statuses (${b.warn}); let through`);
+      if (b.refuse) {
+        const why = `its Item bundles two statuses ("${clean(b.refuse[0], 60)}" and "${clean(b.refuse[1], 60)}")`;
+        errors.push(`${id}: ${why}`);
+        bundled.push({ id, why });
+      }
+    }
+    if (nx >= 0) {
+      const long = nextStepProblem(id, old?.next, cs[nx]);
+      if (long) errors.push(long);
+    }
   }
-  return { text: keep.join("\n"), errors, warnings };
+  return { errors, warnings, bundled };
 }
+export const wholeFileRefusal = (r: { errors: string[]; bundled: unknown[] }) =>
+  `${PENDING_PATH} wasn't written (a whole-file write lands whole or not at all): ${r.errors.join("; ")}.${r.bundled.length ? " One row holds one fact, so give each status its own row." : ""} Fix each row named and send the complete file again`;
 
 // ---- One-off asks (--item none): about no open item ----
 //
-// The link refuses a one-off only when its text holds an open row's item code or the
-// row's whole Item phrase. Anything looser is an audit, not a refusal: on each round that
-// applies requests, the keeper matches the past week's one-offs against the open rows by
-// shared distinctive words and writes the hits to its log and to state/one-off-audit.md,
-// which Cain reads. The guard is limited: wording that shares no code, phrase or
-// distinctive word with a row passes both.
+// The link refuses a one-off when its text holds an open row's item code or the row's whole
+// Item phrase. A looser overlap (shared distinctive words) is held, not refused: the link
+// posts nothing and tells Cain to either ask it under the item with a source check, or send
+// it again with a one-line reason it is about no open item, which the keeper logs with it
+// (the request log's "declared"); the keeper refuses an overlapping one-off without one too.
+// On each round that applies requests, the keeper matches the past week's one-offs against
+// the open rows the same way and keeps state/one-off-audit.md (with the week's wait
+// timeouts); hits not seen before go to its log and to a file the next check-in reads to
+// Cain. The guard is limited: wording that shares no code, phrase or distinctive word with a
+// row passes all of it.
 
 // The open rows' Item cells, by ID.
 export function openItems(text: string | null | undefined): Map<string, string> {
@@ -789,13 +883,15 @@ export function openItems(text: string | null | undefined): Map<string, string> 
 }
 const phraseOf = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-// The open row a one-off's text names outright: its item code, or its whole Item phrase.
-export function oneOffHit(pending: string | null | undefined, text: string): [string, string] | null {
+// The open row a one-off's text names outright: its item code, or its whole Item phrase,
+// with the words that matched.
+export function oneOffHit(pending: string | null | undefined, text: string): [string, string, string] | null {
   const said = ` ${phraseOf(text)} `;
   for (const [id, item] of openItems(pending)) {
-    if (new RegExp(`(?<![A-Za-z0-9])${escapeRe(id)}(?![A-Za-z0-9])`, "i").test(text)) return [id, item];
+    const code = new RegExp(`(?<![A-Za-z0-9])${escapeRe(id)}(?![A-Za-z0-9])`, "i").exec(text);
+    if (code) return [id, item, code[0]];
     const p = phraseOf(item);
-    if (p && said.includes(` ${p} `)) return [id, item];
+    if (p && said.includes(` ${p} `)) return [id, item, p];
   }
   return null;
 }
@@ -817,21 +913,29 @@ export function oneOffLoose(pending: string | null | undefined, text: string): {
   }
   return out;
 }
-export type OneOff = { id: string; at: string; text: string };
+export type OneOff = { id: string; at: string; text: string; declared?: string };
+// A refusal the link gave because the keeper's outcome didn't arrive in time, with the
+// keeper's local time for that request's round once it had one (null: none yet).
+export type WaitTimeout = { id: string; at: string; waited_ms: number; round_ms: number | null };
 export const ONE_OFF_SUMMARY = "One-off ask to him: ";
 // The audit file: one line for the past seven days, then each hit. Same input, same text.
-export function oneOffAudit(oneOffs: OneOff[], pending: string | null, now: Date, tz = "America/New_York"): { text: string; hits: string[] } {
+export function oneOffAudit(oneOffs: OneOff[], pending: string | null, now: Date, tz = "America/New_York", waits: WaitTimeout[] = []): { text: string; hits: string[] } {
   const from = now.getTime() - 7 * DAY_MS;
   const day = (d: Date) => new Intl.DateTimeFormat("en-US", { year: "numeric", month: "short", day: "numeric", timeZone: tz }).format(d);
-  const recent = oneOffs.filter((o) => { const t = Date.parse(o.at); return t > from && t <= now.getTime(); }).sort((a, b) => a.at.localeCompare(b.at));
+  const inWeek = (at: string) => { const t = Date.parse(at); return t > from && t <= now.getTime(); };
+  const recent = oneOffs.filter((o) => inWeek(o.at)).sort((a, b) => a.at.localeCompare(b.at));
   const hits: string[] = [];
   for (const o of recent) for (const h of oneOffLoose(pending, o.text))
-    hits.push(`${day(new Date(o.at))} (${o.id}): "${clean(o.text, 120)}" may be about ${h.id} ("${clean(h.item, 60)}"), shared words: ${h.shared.join(", ")}`);
-  const line = `Week to ${day(now)}: ${hits.length} possible match${hits.length === 1 ? "" : "es"} in ${recent.length} one-off${recent.length === 1 ? "" : "s"}.`;
+    hits.push(`${day(new Date(o.at))} (${o.id}): "${clean(o.text, 120)}" may be about ${h.id} ("${clean(h.item, 60)}"), shared words: ${h.shared.map((w) => `"${w}"`).join(", ")}${o.declared ? `; re-declared about no open item: "${clean(o.declared, 120)}"` : ""}`);
+  const timed = waits.filter((w) => inWeek(w.at)).sort((a, b) => a.at.localeCompare(b.at));
+  for (const w of timed)
+    hits.push(`${day(new Date(w.at))} (${w.id}): the link gave up waiting after ${Math.round(w.waited_ms / 1000)} seconds and posted nothing; the keeper's local round for it ${w.round_ms === null ? "hadn't finished when this was written" : `took ${Math.round(w.round_ms / 100) / 10} seconds`}`);
+  const line = `Week to ${day(now)}: ${hits.length - timed.length} possible match${hits.length - timed.length === 1 ? "" : "es"} in ${recent.length} one-off${recent.length === 1 ? "" : "s"}; ${timed.length} wait timeout${timed.length === 1 ? "" : "s"}.`;
   const text = ["# One-off audit", "",
-    "The keeper's looser match of the past week's one-off asks against the open rows. A hit is not a refusal: look at each,",
-    "and if a one-off was about an open item, check that item at its source and ask under it. The guard is limited: a",
-    "one-off sharing no item code, Item phrase or distinctive word with a row isn't caught.", "",
+    "The keeper's looser match of the past week's one-off asks against the open rows, and the asks the link refused because",
+    "the keeper's answer didn't come in time. Look at each: if a one-off was about an open item, check that item at its",
+    "source and ask under it. New lines reach Cain at his next check-in. The guard is limited: a one-off sharing no item",
+    "code, Item phrase or distinctive word with a row isn't caught.", "",
     line, ...(hits.length ? ["", ...hits.map((h) => `- ${h}`)] : []), ""].join("\n");
   return { text, hits };
 }
@@ -949,12 +1053,46 @@ export type PlanContext = {
   holds?: Holds;          // the keeper's own copy
   downtime?: Downtime;    // keeper downtime, which doesn't count toward a hold's idle day
   tz?: string;            // for the dates written in the open list
-  maxCheckDays?: number;  // the App's source_check_max_days: shown on the Checked cell
+  maxCheckDays?: number;  // the App's source_check_max_days: a check's stale_after, and the Checked cell
+  clockSynced?: boolean;  // the keeper's clock is synchronized: only then is a check taken
 };
 export type Plan =
-  // errors: rows a whole-file write left out (bundled statuses), one line each, for the writer.
-  | { state: "ok"; writes: Map<string, string | null>; holds: Holds; holdsChanged: boolean; warnings?: string[]; errors?: string[] }
-  | { state: "conflict" | "rejected" | "refused" | "waiting"; reason: string };
+  // declared: a one-off's reason and the overlap it answers, for the request log.
+  | { state: "ok"; writes: Map<string, string | null>; holds: Holds; holdsChanged: boolean; warnings?: string[]; errors?: string[]; declared?: string }
+  // writes: on a refused whole-file write, the keeper's own files only (the ledger's pending
+  // rewrite on the refused rows, and their Checked cells), written with the refusal.
+  | { state: "conflict" | "rejected" | "refused" | "waiting"; reason: string; writes?: Map<string, string | null> };
+
+// One cell of an open row as the list stands (undefined: no such row or column).
+function rowCell(text: string | null, id: string, col: string): string | undefined {
+  if (text === null) return undefined;
+  const d = parsePending(text);
+  if (!d.open) return undefined;
+  const i = findRow(d, id);
+  if (typeof i !== "number") return undefined;
+  const c = columns(d).indexOf(col);
+  return c < 0 ? undefined : cells(d.lines[i])[c] ?? "";
+}
+
+// The ledger kept in step with the list between requests: rows changed outside the keeper
+// (their cells no longer match the hash it wrote) go up a version, and, while the clock is
+// synchronized, checks past their stale_after are aged out. Returns the files to write, or
+// null when nothing changes. Only once a ledger exists.
+export function upkeep(tree: Tree, ctx: { at: Date; tz?: string; maxCheckDays?: number; clockSynced?: boolean }): { writes: Map<string, string>; bumped: string[]; aged: string[] } | null {
+  const raw = tree.read(CHECKS_PATH), list = tree.read(PENDING_PATH);
+  if (raw === null || list === null) return null;
+  let ledger = parseChecks(raw);
+  const iso = ctx.at.toISOString();
+  const bumped = Object.keys(ledger).filter((k) => ledger[k].hash && !inStep(ledger[k], list, k) && rowContentHash(list, k) !== null);
+  if (bumped.length) ledger = reconcile(ledger, list, list, iso, "upkeep");
+  let aged: string[] = [];
+  if (ctx.clockSynced === true) ({ ledger, aged } = ageChecks(ledger, ctx.at, ctx.maxCheckDays));
+  if (!bumped.length && !aged.length) return null;
+  const writes = new Map<string, string>([[CHECKS_PATH, checksText(ledger)]]);
+  const shown = projectChecked(list, ledger, ctx.tz, ctx.maxCheckDays);
+  if (shown !== list) writes.set(PENDING_PATH, shown);
+  return { writes, bumped, aged };
+}
 
 // Checks a change against the record and returns the files to write, or why not.
 // "conflict" means the record moved on since the writer read it: Cain redoes it.
@@ -978,9 +1116,29 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
   // The keeper's ledger of row versions and source checks, as this request leaves it.
   let ledger = parseChecks(tree.read(CHECKS_PATH));
   let checked = false;                 // a check op went through: the ledger and the Checked cells change
+  let declared: string | undefined;    // a one-off's reason, for the request log
   const refused = (reason: string): Plan => ({ state: "refused", reason });
   const rejected = (reason: string): Plan => ({ state: "rejected", reason });
   const conflict = (reason: string): Plan => ({ state: "conflict", reason });
+  // A whole-file write of the open list refused by the row rules: nothing of it lands, and each
+  // existing row refused for bundling has its check marked pending a rewrite in the ledger
+  // (its Checked cell says so), so no ask rests on it until the row is written cleanly and
+  // checked again. Those keeper files are written with the refusal.
+  const bundledRefusal = (r: { errors: string[]; bundled: { id: string; why: string }[] }): Plan => {
+    const reason = wholeFileRefusal(r);
+    const committed = tree.read(PENDING_PATH), raw = tree.read(CHECKS_PATH);
+    let marked = false;
+    const L = { ...ledger };
+    for (const b of r.bundled) if (L[b.id] && rowContentHash(committed, b.id) !== null) {
+      L[b.id] = { ...L[b.id], pending_rewrite: clean(`request ${req.id}, ${iso}: ${b.why}`, 300) };
+      marked = true;
+    }
+    if (!marked || committed === null || raw === null) return { state: "rejected", reason };
+    const side = new Map<string, string | null>([[CHECKS_PATH, checksText(L)]]);
+    const shown = projectChecked(committed, L, ctx.tz, ctx.maxCheckDays);
+    if (shown !== committed) side.set(PENDING_PATH, shown);
+    return { state: "rejected", reason, writes: side };
+  };
   const heldBy = (id: string) => `${id} is held by ${holds[id].holder}${holds[id].job ? ` (a job: ${holds[id].job})` : ""}`;
   // Any change to the open list is checked row by row: a row someone else holds is
   // theirs, and an open row nobody holds is Cain's, so anyone else takes it before
@@ -1060,9 +1218,16 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
 
     if (o.op === "one-off") {
       // A one-off ask to him, kept in the request log with its declaration that it is about
-      // no open item; it writes nothing. One that names an open row outright is rejected.
-      const hit = oneOffHit(current(PENDING_PATH), o.text);
-      if (hit) return rejected(`one-off: names an open item, ${hit[0]} ("${clean(hit[1], 60)}"); ask it under that item with a source check`);
+      // no open item; it writes nothing. One that names an open row outright is rejected; one
+      // that overlaps a row's Item more loosely needs Cain's one-line reason, logged with it.
+      const list = current(PENDING_PATH);
+      const hit = oneOffHit(list, o.text);
+      if (hit) return rejected(`one-off: names an open item, ${hit[0]} ("${clean(hit[1], 60)}"), matching "${clean(hit[2], 60)}"; ask it under that item with a source check`);
+      const loose = oneOffLoose(list, o.text);
+      const overlap = loose.map((h) => `${h.id}: ${h.shared.map((w) => `"${w}"`).join(", ")}`).join("; ");
+      if (loose.length && !o.reason?.trim())
+        return rejected(`one-off: its words overlap an open item (${overlap}); ask it under that item with a source check, or send it again with a one-line reason it is about no open item`);
+      if (loose.length) declared = clean(`${o.reason!.trim()} (overlaps ${overlap})`, 400);
       explicit = true;
       continue;
     }
@@ -1072,7 +1237,11 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       // version in the ledger), and never one repeated word for word from the row's last.
       // It changes no content, so it never bumps its own row.
       const id = o.item, h = holds[id];
+      // Only Cain's link sends source checks (it hands them over for his asks and Ship cards).
+      if (sender !== "cain") return rejected(`check ${id}: only Cain's link sends source checks`);
       if (h && h.holder !== sender) return refused(heldBy(id));
+      // Checks are dated and aged by the keeper's own clock, so only once it is synchronized.
+      if (ctx.clockSynced !== true) return rejected(`check ${id}: the keeper's clock isn't synchronized yet, so no source check can be dated; try again in a few minutes`);
       const bad = checkTextProblem(o.text);
       if (bad) return rejected(`check ${id}: ${bad}`);
       const list = current(PENDING_PATH);
@@ -1080,12 +1249,18 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       const at = findRow(parsePending(list), id);
       if (typeof at !== "number") return "conflict" in at ? rejected(at.conflict) : rejected(at.rejected);
       const e = ledger[id];
+      if (e?.pending_rewrite) return rejected(`check ${id}: the row is pending a rewrite (${clean(e.pending_rewrite, 200)}); write it cleanly first, then check it again`);
+      if (e && !inStep(e, list, id)) return rejected(`check ${id}: the row was changed outside the record keeper since it was ledgered; its new version comes with the keeper's next round, so check again then`);
       const haveRow = e?.id ?? null, haveVersion = e?.version ?? 0;
       if (haveRow !== o.row || haveVersion !== o.version)
         return rejected(`check ${id}: the row changed since the check was read (it checked ${o.row === null ? "the row before the ledger knew it" : `version ${o.version}`}, the row is now ${e ? `version ${e.version}${e.id !== o.row ? " of a new row" : ""}` : "not in the ledger"}); check again`);
-      if (repeatsCheck(e?.checked, o.text.trim())) return rejected(`check ${id}: repeats the row's last check (the same words, no later time); say what was checked this time, where and when`);
-      const entry: CheckEntry = e ?? { id: newRowId(`${req.id}\u0000${id}\u0000${iso}`), version: 1, changed: iso };
-      ledger = { ...ledger, [id]: { ...entry, checked: o.text.trim(), checked_at: iso, checked_version: entry.version, checked_req: req.id, by: sender } };
+      if (repeatsCheck(e?.checked, o.text.trim())) return rejected(`check ${id}: repeats the row's last check ("${clean(e!.checked, 120)}": the same words, no later time); say what was checked this time, where and when`);
+      // A row the ledger didn't know yet gets its id from this request alone, so the same check
+      // applied again after a lost push gives the row the same id.
+      const entry: CheckEntry = e ?? { id: newRowId(`${req.id}\u0000${id}`), version: 1, changed: iso };
+      const { aged: _aged, ...kept } = entry;
+      const until = new Date(ctx.at.getTime() + maxCheckDays(ctx.maxCheckDays) * DAY_MS).toISOString();
+      ledger = { ...ledger, [id]: { ...kept, checked: o.text.trim(), checked_at: iso, checked_version: entry.version, stale_after: until, checked_req: req.id, by: sender } };
       checked = true;
       if (h?.holder === sender) touched.add(id);
       continue;
@@ -1102,6 +1277,12 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       if (b.warn) warnings.push(`${id}'s Item may hold two statuses (${b.warn}); let through`);
       const before = current(PENDING_PATH);
       if (before === null) return rejected(`${PENDING_PATH} doesn't exist`);
+      // The Next step holds the current step and its latest check, never the history.
+      const next = o.op === "row-add" ? o.cells["Next step"] : o.op === "row" ? o.set["Next step"] : undefined;
+      if (typeof next === "string") {
+        const long = nextStepProblem(id, o.op === "row" ? rowCell(before, id, "Next step") : undefined, next);
+        if (long) return rejected(long);
+      }
       const e = o.op === "row" ? editRow(before, id, o.base, o.set)
         : o.op === "row-add" ? addRow(before, id, o.cells, shortDate(at, ctx.tz))
         : closeRow(before, id, o.evidence, shortDate(at, ctx.tz));
@@ -1143,12 +1324,13 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
         if (why) return rejected(`${p}: ${why}`);
       }
       if (p === PENDING_PATH) {
-        // Matched by item code: each open row needs one, once. A row that bundles two
-        // statuses stays out (or as it was); the other rows land.
+        // Matched by item code: each open row needs one, once. A new or changed row that
+        // breaks a row rule refuses the whole write.
         const bad = openTableProblem(content);
         if (bad) return rejected(bad);
-        const b = dropBundled(stripChecked(before), content);
-        content = b.text; errors.push(...b.errors); warnings.push(...b.warnings);
+        const r = rowRules(stripChecked(before), content);
+        if (r.errors.length) return bundledRefusal(r);
+        warnings.push(...r.warnings);
       }
       writes.set(p, content);
     } else if (o.op === "append") {
@@ -1159,8 +1341,9 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       if (p === PENDING_PATH) {
         const bad = openTableProblem(content);
         if (bad) return rejected(bad);
-        const b = dropBundled(stripChecked(before), stripChecked(content)!);
-        content = b.text; errors.push(...b.errors); warnings.push(...b.warnings);
+        const r = rowRules(stripChecked(before), stripChecked(content)!);
+        if (r.errors.length) return bundledRefusal(r);
+        warnings.push(...r.warnings);
       }
       writes.set(p, content);
     } else if (o.op === "remove") {
@@ -1207,7 +1390,7 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
   // The holder's word on its own row renews its hold.
   for (const id of touched) if (holds[id]?.holder === sender) holds[id].renewed = iso;
   return { state: "ok", writes, holds, holdsChanged: holdsText(holds) !== holdsText(ctx.holds ?? {}),
-    ...(warnings.length ? { warnings } : {}), ...(errors.length ? { errors } : {}) };
+    ...(warnings.length ? { warnings } : {}), ...(errors.length ? { errors } : {}), ...(declared ? { declared } : {}) };
 }
 
 export function frontMatter(text: string): { id?: string; title?: string; sources: string[]; replaces: string[]; aliases: string[] } {

@@ -63,9 +63,10 @@ the App.
   row in your record ("fresh, Nov 15, 2026 9:40 AM, stale after Nov 22: the county.gov
   receipt in your mail"). A check counts for 7 days (`source_check_max_days`, below). If
   the row changes after the card went up, its buttons come off: "Status changed, re-check
-  needed". A one-off question isn't about an item and needs none, but the App refuses one
-  that names one of your open items outright. The App proves a check was recorded, not
-  that it was true.
+  needed", and a tap that comes before that does nothing. A one-off question isn't about an
+  item and needs none, but the App refuses one that names one of your open items outright,
+  and holds one that only sounds like one until Cain says why it isn't. The App proves a
+  check was recorded, not that the source was read.
 - Tapping an old card does nothing, and says so.
 - The card shows what you tapped. When a tap needs words from Cain, they come as a reply
   to that card.
@@ -251,8 +252,8 @@ and `remove`:
 | `row` | `item`, `base`, `set` | Changes cells of one open row. `base` is the row's hash as read: sha1 of the row's line, without the line ending (`record.sh rowsha <item>` on the Pi, `record-send.ts --row <item>` on a laptop). A changed row is a conflict; changes to other rows don't matter. `set` covers `Item`, `Who`, `Next step`, `Waits for`, `Done when`. |
 | `row-add` | `item`, `cells` | Adds a row at the end of the open table, `Since` today. Needs `Item`. Refuses an ID in use, or one used before in Done. Anyone may add a row. |
 | `row-close` | `item`, `evidence` | Moves the row to the top of Done as `\| <ID> <Item>: <evidence> \| <date> \|`. |
-| `check` | `item`, `text`, `row`, `version` | A source check on an open row, sent by Cain's link when Cain asks with `--checked`. `row` and `version` are the row's ledger id and version as the link read them (`null` and `0` for a row the ledger didn't know). Taken only while they are still current; otherwise rejected, naming what moved. `text`: one line, up to 300 characters, no `\|`, saying when and naming a concrete source (see Source checks); a repeat of the row's last check is rejected. Never bumps the row's version. |
-| `one-off` | `text`, `not_about_item` | A one-off ask Cain's link put to him (`--item none`), kept in `log/requests/`. `not_about_item` must be `true`: the link's declaration that it is about no open item. Rejected when `text` holds an open row's item code or its whole Item phrase. Writes nothing. |
+| `check` | `item`, `text`, `row`, `version` | A source check on an open row, sent by Cain's link (from `cain` only) when Cain asks with `--checked`. `row` and `version` are the row's ledger id and version as the link read them (`null` and `0` for a row the ledger didn't know). Taken only while they are still current, the row isn't pending a rewrite, and the keeper's clock is synchronized; otherwise rejected, naming what moved. `text`: one line, up to 300 characters, no `\|`, saying when and naming a concrete source (see Source checks); a repeat of the row's last check is rejected, quoting it. Never bumps the row's version. |
+| `one-off` | `text`, `not_about_item`, `reason?` | A one-off ask Cain's link put to him (`--item none`), kept in `log/requests/`. `not_about_item` must be `true`: the link's declaration that it is about no open item. Rejected when `text` holds an open row's item code or its whole Item phrase (quoting what matched). When its words overlap an open row's Item more loosely (shared distinctive words), it needs `reason`, Cain's one line (up to 200 characters) on why it is about no open item, logged with it as `declared`; without one it is rejected, quoting the shared words. Writes nothing. |
 | `note` | `item`, `text` | Anyone, holder or not, on any item the record knows (held, open, or done). Appended with its time and sender to `state/notes/<item>.md`, so it never conflicts and is never refused for a hold. `text` is one line, 1 to 2,000 characters. |
 
 - Cells never hold `|` or a new line. A row that already holds an escaped `\|` is
@@ -276,10 +277,13 @@ and `remove`:
   line naming it.
 - One row holds one fact: a `row-add`, or a `row` that sets `Item`, is refused when
   the new Item cell makes two completed-status claims about different subjects, naming
-  both clauses. In a whole-file write the refusal is scoped to the row: a new or changed
-  row that bundles is left out (a changed row stays as it was), the other rows land, and
-  the writer hears one line per row naming it and its two clauses (all rows bundled and
-  nothing else changed: rejected, with the same lines). A claim is a status word from a closed set (filed, sent, done, paid,
+  both clauses. A whole-file write (`put` or `append`) lands whole or not at all: if any
+  new or changed row bundles two statuses, the whole write is refused and the answer names
+  each such row and its two clauses, so the writer fixes them and sends the complete file
+  again. A row already in the open list that was refused that way has its check marked
+  `pending_rewrite` in the ledger (its Checked cell says "pending rewrite"): asks and Ship
+  cards on it are refused with that reason, and no new check is taken, until a write changes
+  the row cleanly and it is checked again. A claim is a status word from a closed set (filed, sent, done, paid,
   issued, installed, confirmed, received, renewed, submitted, signed, mailed, delivered,
   cancelled, refunded, and "not" or "un" forms) that follows a noun-phrase subject in
   its clause and is not itself followed by a noun: "land-use packet not filed" and
@@ -290,6 +294,12 @@ and `remove`:
   log. The coverage is limited (a word list, not a reader): a row it passes may still
   hold two things. Rows already in the record aren't rewritten; only new writes are
   checked.
+- A row's `Next step` holds the current step and its latest source check; dated history
+  goes in a note on the item (the `note` op). A `row-add`, a `row`, or a whole-file write
+  whose new or changed Next step is over 800 characters is refused, saying so (a whole-file
+  write lands whole or not at all, as above). A row already over 800 may shrink, never grow.
+  800 is about four times a long step plus its check (a check is at most 300), and keeps a
+  full open list well under the 60 KB file limit.
 
 ### Source checks: verified before he's asked
 
@@ -308,16 +318,31 @@ and `remove`:
   is bumped, so codes swapped between two rows in one write invalidate both checks. The
   `check` op never bumps its row.
 - `changed`: when the version last went up (for the refusal's wording only).
-- `checked`, `checked_version`, `checked_at`, `checked_req`, `by`: the latest source check,
-  the version it checked, and the keeper's time for it.
+- `checked`, `checked_version`, `checked_at`, `stale_after`, `checked_req`, `by`: the latest
+  source check, the version it checked, the keeper's time for it, and when it stops counting
+  (`checked_at` plus `source_check_max_days`, by the keeper's own clock).
+- `hash`: the row's content as the keeper last wrote it. A row whose cells no longer match
+  (changed outside the keeper: by hand, or by an earlier keeper after a rollback) doesn't
+  rest a card, and the keeper's next round gives it a new version ("Source checks: P44
+  changed outside the keeper").
+- `aged`: set by the keeper when its clock passes `stale_after`, so the check never counts
+  again whatever clock reads it later ("Source checks: P44 aged out").
+- `pending_rewrite`: set when a whole-file write that changed the row was refused for it
+  (above). Cleared when a write changes the row.
 
 `Since` carries no status meaning: it is the day the row was added, never read for
 freshness, and a row from before the ledger starts at version 1 with no check whatever it
 says.
 
-A check is fresh while `checked_version` is the row's `version` and it is no older than
-`source_check_max_days` (7 by default) by `checked_at`. Past that it is stale and the link
-refuses to rest a card on it.
+A check is fresh while `checked_version` is the row's `version`, the row's cells match
+`hash`, it isn't `aged` or pending a rewrite, and `stale_after` hasn't passed. Otherwise it
+is stale and the link refuses to rest a card on it.
+
+The keeper dates and ages checks by its own clock only, never the link's, and only while
+that clock is synchronized: it reads `timedatectl`'s NTPSynchronized, systemd-timesyncd's
+flag file, or else the kernel's own flag (`adjtimex`, read only; the App's container shares
+the host's kernel). Until one of them says synchronized, every `check` is rejected ("the
+keeper's clock isn't synchronized yet") and nothing ages.
 
 The open table's `Checked` column is a projection of the ledger: made again on every write
 of the open list (row ops and whole-file puts alike), added the first time it's missing,
@@ -343,36 +368,84 @@ What Cain's link enforces:
   check went stale by age.
 - A check passed now goes into the keeper's local queue as a `check` request from cain
   carrying the row's id and version as read (so it shows in `log/requests/`), and the
-  link waits up to 30 seconds for the keeper's outcome. Only an accepted check, that the
-  ledger shows on the row's current version, lets the card go. If the keeper rejects it,
-  fails, or doesn't answer in time, nothing is posted and Cain is told why in one line. A
-  check still pending then may land later: a later ask finds it in the ledger, but the
-  pending copy never posts a card. If the link can't hand the check to the queue at all,
-  nothing is posted either.
+  link waits up to 30 seconds for the keeper's outcome. The wait measures the keeper's
+  local work only: it writes the outcome (with `round_ms`, the round's local time) once its
+  local commit and ledger write are made, and the push to GitHub runs after, so a slow push
+  never refuses a question. The ledger the link reads is the keeper's local copy
+  (`/data/record`). Only an accepted check, that the ledger shows on the row's current
+  version, lets the card go. If the keeper rejects it, fails, or doesn't answer in time,
+  nothing is posted and Cain is told why in one line. A timeout is logged with its request
+  id in `/data/record-waits.jsonl`; the keeper logs the round's time for it and counts the
+  week's timeouts in `state/one-off-audit.md`. A check still pending then may land later: a
+  later ask finds it in the ledger, but the pending copy never posts a card. If the link
+  can't hand the check to the queue at all, nothing is posted either. (A round still starts
+  with a fetch from GitHub, so a GitHub outage at that moment still refuses, safely.)
 - Right before posting, the link reads the row's version again and refuses (or, for a
   held ask, drops it and tells Cain) when the check no longer counts.
 - A posted, unanswered ask or Ship card for an item loses its buttons when the row's
-  version changes, its check ages out, or the keeper's outcome for its check reads
-  anything but done: the link edits it to say "Status changed, re-check needed" and tells
-  Cain. A tap on one before that is refused with the same reason.
-- A one-off (`--item none`) is refused only when its text holds an open row's item code
-  or the row's whole Item phrase, naming the item. Every one-off is written to the request
-  log as a `one-off` request declaring it is about no open item. Looser overlaps are an
-  audit, not a refusal: on each round that applies requests, the keeper matches the past
-  week's one-offs against the open rows (two of a row's distinctive words, or its only
-  one), writes each hit to its log, and keeps `state/one-off-audit.md`: one line for the
-  week, then each hit, which Cain reads at his check-ins. The guard is limited: a one-off
-  that shares no code, phrase or distinctive word with a row passes both.
+  version changes, its check ages out or goes pending a rewrite, or the keeper's outcome
+  for its check reads anything but done: the link edits it to say "Status changed,
+  re-check needed" and tells Cain.
+- A tap on an ask or Ship card is honoured only after a fresh read of the keeper's local
+  ledger and its outcome file confirms the check's outcome is done, the row's hidden id and
+  version are the card's, its cells match, and the check is unexpired. Any read failure, or
+  a read slower than 1.5 seconds, rejects the tap with the status-changed reason ("Its
+  status changed since it was checked, so nothing was done."); the card keeps its buttons
+  for the sweep to judge. Where the row sits in the table is never used.
+- A one-off (`--item none`) is refused when its text holds an open row's item code or the
+  row's whole Item phrase, quoting what matched. One whose words overlap an open row's Item
+  more loosely (two of the row's distinctive words, or its only one) is held: nothing is
+  posted, and Cain hears in one line to either ask it under that item with `--checked`, or
+  send it again with `--reason "<one line on why it is about no open item>"`. Re-declared
+  that way it posts, and the keeper logs the reason with it (`declared` in
+  `log/requests/`). Every one-off is written to the request log as a `one-off` request
+  declaring it is about no open item. On each round that applies requests, the keeper
+  matches the past week's one-offs against the open rows the same way and keeps
+  `state/one-off-audit.md` (each hit, with its reason, and the week's wait timeouts); lines
+  it hasn't surfaced before go to its log and to `/data/record-checkin.txt`, which the next
+  check-in reads to Cain, once. The guard is limited: a one-off that shares no code, phrase
+  or distinctive word with a row passes all of it.
+- Every refusal quotes what it matched: the vague source word, the repeated check, the two
+  bundled clauses, the overlapping words. The link logs its refusals of checks and
+  one-offs to `/data/work/source-check-refusals.jsonl`, and the keeper its own to its log
+  ("refused for tuning"), for tuning the rules.
 
-Device smoke test and rollback. Right after installing a version with source checks, Cain
-runs one checked ask about an item he holds, end to end against the real record, and
-reports the result to you in one line. It passes only when he sees committed in the
-record: the `check` request done in `log/requests/`, `state/checks.json` with that row's
-entry and his check (the first ledgering write), and the open table's `Checked` column
-with that check. If it fails, the remedy is one step: in Home Assistant, restore this App
-from the backup taken just before the install (every install takes one first), which
+What is mechanical and what rests on Cain's word. Mechanical, in code: no ask or Ship card
+about an item posts, and no tap on one counts, without a `check` the keeper accepted for
+the row's current version, by its synchronized clock, within the age limit; the check text
+names a concrete source and a time in the right shape and isn't a repeat; rows are versioned
+by content, matched by code, with hidden ids; whole-file writes are atomic; one-offs that
+name or sound like an open item are refused or held. Resting on Cain's recorded attestation:
+that he actually read the source he names, that what he read says what the row and the
+question imply, and that a one-off's reason is true. The gate proves a check was recorded,
+not that the source was read.
+
+Device smoke test. Right after installing a version with source checks, Cain runs two
+paths against the real record and reports the result to you in one line:
+
+1. A checked ask about an item he holds, with a concrete source: it posts, and your tap on
+   it is accepted (the link relays it to him). It says it is the smoke test; any answer
+   does.
+2. The same kind of ask with a deliberately vague source ("from memory"): nothing posts,
+   and keeper.sh's refusal line arrives quoting the vague word.
+3. The Ship path the same way, on a harmless card: a checked Ship card for the pull request
+   that brought this version (already in main), where your tap on "Not now" is accepted and
+   nothing ships; and the same card with a deliberately vague source, which posts nothing.
+
+It passes only when he sees committed in the record the `check` request done in
+`log/requests/`, `state/checks.json` with that row's entry and his check, and the open
+table's `Checked` column showing it, and reports the commit hashes of those three (the log
+entry, the ledger write and the table change), so you can spot-check them on GitHub.
+
+Rollback. If the smoke test fails, the remedy is one step: in Home Assistant, restore this
+App from the backup taken just before the install (every install takes one first), which
 brings back its previous version. There is no switch that lets cards through without a
-check.
+check. The previous version's record keeper (as of 0.11.0) ignores state/checks.json, the
+`Checked` column and `state/one-off-audit.md` without error (tested): it reads and edits the
+open list with the column in it, leaves the ledger and audit files alone, and rejects any
+`check` or `one-off` request still queued from this version as malformed, harmlessly. Nothing
+else needs reverting. Installed again later, this version sees from each row's `hash` which
+rows the old keeper changed and gives them new versions, so no old check rests a card.
 
 ### Notes: his words always land
 

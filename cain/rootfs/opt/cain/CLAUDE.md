@@ -114,28 +114,36 @@ specialist (the Harness add-on) does.
   path, a command, or a message. It goes into the record, never to him, so dates, ISO
   times, shas and record codes are fine in it. A vague source (memory, earlier, "I
   recall", "I remember") is refused, and so is a repeat of the row's last check (the same
-  words with no later time): check again and say what you found this time. The gate
-  proves a check was recorded, not that it was true: it is on you that it was.
+  words with no later time): check again and say what you found this time. Every refusal
+  quotes what it matched, and is logged for tuning. The gate proves a check was recorded,
+  not that the source was read: that part rests on your word, so read it every time.
 - The link refuses an ask or Ship card for an item without a check of its row as it
   stands now: any change to the row's cells but Since and Checked (its Item and Done when
   too) makes a new version that needs a new check, and a check older than the App's
-  `source_check_max_days` (7 days unless he changed it) no longer counts. Since means
-  nothing about status. The link hands your check to the record keeper and waits up to 30
-  seconds: only once the keeper has accepted it, for the row as it stands, does the card
-  go out. If the keeper turns it down, fails or doesn't answer in time, nothing is posted
-  and keeper.sh tells you why in one line; ask again (a check that landed meanwhile counts,
-  so no new `--checked` is needed then). A later ask on the same item, while the row
-  hasn't changed and the check is fresh, needs none. If the source already answers the
-  question, don't ask it: record what you found.
+  `source_check_max_days` (7 days unless he changed it, by the record keeper's clock) no
+  longer counts. Since means nothing about status. The link hands your check to the record
+  keeper and waits up to 30 seconds for its local work (not the push to GitHub): only once
+  the keeper has accepted it, for the row as it stands, does the card go out. If the keeper
+  turns it down, fails or doesn't answer in time, nothing is posted and keeper.sh tells you
+  why in one line; ask again (a check that landed meanwhile counts, so no new `--checked`
+  is needed then). Until the box's clock is synchronized the keeper takes no check: wait a
+  few minutes. A later ask on the same item, while the row hasn't changed and the check is
+  fresh, needs none. If the source already answers the question, don't ask it: record what
+  you found.
 - When the row changes after an ask or Ship card for it went up (or its check ages out),
-  the link takes its buttons off ("Status changed, re-check needed") and tells you; a tap
-  on it does nothing. A held ask whose row changes is dropped unasked, and you're told.
+  the link takes its buttons off ("Status changed, re-check needed") and tells you. His tap
+  counts only once the link has read the record keeper's ledger again and found the check
+  still good for the row as it stands; if it can't read it, the tap does nothing and he's
+  told the status changed. A held ask whose row changes is dropped unasked, and you're told.
   Check again and ask again if it still needs him.
 - A one-off (`--item none`) needs no check, but only for something that is no open item:
   the link refuses one that holds an open row's item code or its whole Item phrase, and
-  logs every one-off as declared about no open item. Anything looser is up to you: the
-  record keeper matches the past week's one-offs against the open rows by shared words
-  and keeps state/one-off-audit.md. Read it at each morning check-in; for a hit that was
+  logs every one-off as declared about no open item. One whose words overlap an open row's
+  Item answers "needs reason" and posts nothing: if it is about that item, ask it under the
+  item with `--checked`; if it truly isn't, send it again with `--reason "<one line on why
+  it is about no open item>"`, which the record keeper logs with it. The keeper's audit
+  lines (those re-declared ones, and asks refused because it didn't answer in time) reach
+  you at your next check-in; state/one-off-audit.md keeps the week's. For one that was
   really about an item, check that item at its source and ask under it. The guard is
   limited, so keep to it yourself.
 - A card says exactly what it is. Its item (`--item`, its PENDING id, or `none` for a
@@ -425,14 +433,24 @@ create, update or run any other routine.
    id. Its branch is yours now, with the item.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
-Right after an install that brings source checks (0.12.0), run the device smoke test:
-one checked ask about an item you hold, end to end. It passes only when you see committed
-in the record: the `check` request done in log/requests/, state/checks.json with that
-row's entry and your check (the first ledgering write), and the open table's Checked
-column showing it. Then tell him the result in one line. If any is missing, say so in that
-line with the remedy, one step he takes: restore this App from the backup Home Assistant
-took just before the install, which brings back its previous version. Nothing lets cards
-through without a check.
+Right after an install that brings source checks (0.12.0), run the device smoke test, on
+an item you hold, two paths and two outcomes:
+1. A checked ask with a concrete source, whose text says it is a quick test and any answer
+   does: it must post, and his tap on it must come back relayed.
+2. The same ask with a deliberately vague source (`--checked "from memory"`): nothing may
+   post, and keeper.sh's refusal line must arrive quoting the vague word.
+3. The Ship path the same way, on a harmless card: a checked Ship card for the pull request
+   that brought this version (already in main), with a line saying it is a test and to tap
+   Not now; his Not now must come back relayed, and nothing ships. Then the same card with
+   a deliberately vague source: nothing may post.
+It passes only when you also see committed in the record: the `check` request done in
+log/requests/, state/checks.json with that row's entry and your check, and the open
+table's Checked column showing it. Tell him the result in one line with the commit hashes
+of those three (the log entry, the ledger write and the table change), so he can spot-check
+them on GitHub. If any part fails, say so in that line with the remedy, one step he takes:
+restore this App from the backup Home Assistant took just before the install, which brings
+back its previous version (its record keeper ignores the ledger's files, so nothing else
+needs undoing). Nothing lets cards through without a check.
 
 ## Stop
 His Stop button stops what would start next: the calendar specialist, your Build and
@@ -551,7 +569,14 @@ writers clash. Your GitHub write tools are switched off on purpose. To change fi
      it to Done, dated.
    One row holds one fact: a row-add or row op whose Item claims two statuses about two
    things ("license filed Nov 3; permit not filed") is rejected, naming both; give each
-   its own row. The rule catches only the plain cases, so keep to it yourself.
+   its own row. A put of the whole open list lands whole or not at all: any new or changed
+   row that bundles two statuses refuses all of it, naming each row and its two clauses,
+   and an existing row refused that way is pending a rewrite (no ask on it) until you write
+   it cleanly and check it again. Fix the rows and send the complete file again. The rule
+   catches only the plain cases, so keep to it yourself.
+   A row's Next step holds the current step and its latest source check; dated history goes in a note on the item.
+   A Next step over 800 characters is refused (one already over may shrink, never grow):
+   move the history into a `note` op.
    The Checked column is the keeper's: made from state/checks.json on every write of the
    open list, never read from what you send. Source checks reach it only through
    `--checked` on an ask or Ship card (the link sends a `check` op for you).

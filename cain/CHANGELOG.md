@@ -3,13 +3,14 @@
 ## 0.12.0
 
 - Cain checks a thing where it lives (your mail, a portal, GitHub) before he asks you about it, and the App now holds him to it: a question or Ship card about one of your open items goes out only once the record has accepted his check of that item as it stands now.
-- A check must name a real source (a mail with its sender and date, a page, a file, a command or a message), never "from memory". The App proves a check was recorded, not that it was true.
-- A check counts for 7 days. New option, source_check_max_days, if you want a different limit; nothing to set up.
-- If the item changes after the card went up, its buttons come off and it says "Status changed, re-check needed", so you never answer a question about something that moved on.
+- A check must name a real source (a mail with its sender and date, a page, a file, a command or a message), never "from memory". The App proves a check was recorded, not that the source was read: that part is on Cain's word.
+- A check counts for 7 days, by the record's own clock, and only once the box's clock is set right. New option, source_check_max_days, if you want a different limit; nothing to set up.
+- If the item changes after the card went up, its buttons come off and it says "Status changed, re-check needed". Your tap counts only after the App looks at the record again and finds the check still good; if it can't look, the tap does nothing and says so.
 - What he checked shows on the item's row in your record, with the date it goes stale.
-- A one-off question that names one of your open items is held back; looser look-alikes are listed weekly for Cain to review.
-- A row in your open list holds one thing: a row that says two different things are done or not done stays out, and the rest of the change still saves.
-- Right after this install Cain runs one test question end to end and tells you in a line whether it worked. If not, restore the App from the backup taken before the install.
+- A one-off question that names one of your open items is held back; one that only sounds like one waits until Cain names the item or says why it isn't, and that reason is kept.
+- A change to your whole open list saves whole or not at all: a row that says two different things are done or not done stops all of it, and Cain fixes and resends.
+- A row's next step stays short (the current step and its latest check); older history goes in a note on the item.
+- Right after this install Cain runs a short test: one question that should go out and one that shouldn't, and the same for a harmless Ship card. Tap any answer on the test question, and Not now on the test Ship card. He tells you in a line whether it worked. If not, restore the App from the backup taken before the install; nothing else needs undoing.
 
 ## 0.11.0
 

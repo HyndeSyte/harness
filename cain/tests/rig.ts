@@ -57,15 +57,18 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
   for (const [p, t] of Object.entries(files)) put(p, t);
   g("add", "-A"); g("commit", "--quiet", "-m", "seed"); g("push", "--quiet", "origin", "HEAD:main");
   let now = T0, n = 0;
+  const synced = { ok: true };
   const cfg: Config = {
     remote, dir: join(root, "pi/record"), queue: join(root, "pi/queue"), outcomes: join(root, "pi/outcomes"),
     relay: join(root, "pi/relay.queue"), branch: "main", hygieneAt: "0230", tz: "America/New_York",
     now: () => now, holds: join(root, "pi/record-holds.json"),
+    // The clock counts as synchronized unless a test says otherwise (synced.ok = false).
+    clockSynced: () => synced.ok, checkin: join(root, "pi/record-checkin.txt"), waits: join(root, "pi/record-waits.jsonl"),
   };
   mkdirSync(cfg.queue, { recursive: true });
   const pull = () => g("pull", "--quiet", "--ff-only", "origin", "main");
   const r = {
-    root, remote, seed, cfg, g, pull,
+    root, remote, seed, cfg, g, pull, synced,
     at(d: Date) { now = d; },
     // The clock moves to d with the keeper running all along (its last round a minute
     // before), so none of it counts as keeper downtime.

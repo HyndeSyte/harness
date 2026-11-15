@@ -5,8 +5,8 @@
 // source_check_max_days. The link posts an ask or a Ship card for an item only once the
 // keeper accepted such a check (a pending one never posts), re-reads the version right before
 // posting, takes the buttons off a posted card once the row moves on, refuses a one-off that
-// names an open item outright, and leaves looser matches to the keeper's weekly audit. The
-// keeper also keeps a row that claims two statuses out of the record, row by row.
+// names an open item outright, and holds looser matches until re-declared (round3 tests). The
+// keeper also refuses a whole-file write with a row that claims two statuses, whole.
 import { describe, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -29,9 +29,13 @@ const ledger = (o: Record<string, { version: number; checked_version?: number; c
   for (const [k, v] of Object.entries(o)) out[k] = {
     id: rowId(k), version: v.version, changed: new Date(v.changed ?? NOV11_8AM - DAYS(2)).toISOString(),
     ...(v.checked_version !== undefined ? { checked: v.checked ?? CHECKED, checked_at: new Date(v.checked_at ?? NOV11_8AM - HOUR).toISOString(),
-      checked_version: v.checked_version, ...(v.checked_req ? { checked_req: v.checked_req } : {}) } : {}) };
+      checked_version: v.checked_version, checked_req: v.checked_req ?? seedReq(k) } : {}) };
   return JSON.stringify(out);
 };
+// The request that carried a seeded check, and its outcome (done) as the keeper wrote it: a tap
+// is honoured only once that outcome reads done.
+const seedReq = (item: string) => `link-check-${item.toLowerCase()}-seed`;
+const seeded = (r: { outcomes: Record<string, { state: string }> }, ...items: string[]) => { for (const i of items) r.outcomes[seedReq(i)] = { state: "done" }; };
 
 // ---- the record keeper ----
 const tree = (files: Record<string, string>): Tree => ({ sha: (p) => (p in files ? "x".repeat(40) : null), read: (p) => files[p] ?? null });
@@ -42,7 +46,7 @@ function record(files: Record<string, string> = { [P]: PENDING }, start = T0, ma
   const r = {
     files,
     run(ops: any[], from = "cain") {
-      const p = plan(req(ops, `cain-test-${++n}`, from), tree(files), { at: new Date(at), tz: "America/New_York", maxCheckDays });
+      const p = plan(req(ops, `cain-test-${++n}`, from), tree(files), { at: new Date(at), tz: "America/New_York", maxCheckDays, clockSynced: true });
       if (p.state === "ok") for (const [k, v] of p.writes) { if (v === null) delete files[k]; else files[k] = v; }
       return p;
     },
@@ -235,7 +239,7 @@ describe("the keeper's ledger: row versions and stable ids", () => {
     k.ok([k.check("P44", CHECKED)]);
     const p = k.run([k.check("P44", `  ${CHECKED.toUpperCase()} `)]);
     expect(p.state).toBe("rejected");
-    if (p.state !== "ok") expect(p.reason).toContain("repeats the row's last check (the same words, no later time)");
+    if (p.state !== "ok") expect(p.reason).toContain(`repeats the row's last check ("${CHECKED}": the same words, no later time)`);
     k.later(HOUR);
     expect(k.run([k.check("P44", CHECKED.replace("9:40", "10:40"))]).state).toBe("ok");
     expect(k.run([{ ...k.check("P44", "looked into it"), item: "P44" }]).state).not.toBe("ok");
@@ -272,7 +276,7 @@ describe("the keeper's ledger: row versions and stable ids", () => {
     expect(parseRequest(raw({ op: "one-off", text: "Lunch at noon?" })).error).toBe("one-off: needs not_about_item: true, the declaration that it is about no open item");
     expect(parseRequest(raw({ op: "one-off", text: "Lunch at noon?", not_about_item: true })).error).toBeUndefined();
     expect(plan(req([{ op: "one-off", text: "Is p44 sorted?", not_about_item: true }]), tree({ [P]: PENDING }), { at: T0 }))
-      .toEqual({ state: "rejected", reason: `one-off: names an open item, P44 ("Calendar specialist fails his plain commands"); ask it under that item with a source check` });
+      .toEqual({ state: "rejected", reason: `one-off: names an open item, P44 ("Calendar specialist fails his plain commands"), matching "p44"; ask it under that item with a source check` });
   });
 });
 
@@ -339,47 +343,47 @@ describe("whole-file writes: matched by item code", () => {
   });
 });
 
-describe("one row holds one fact, row by row in a whole-file write", () => {
-  test("the bundled row stays out (or as it was), the ordinary edit lands, and the writer hears each row and its two clauses", () => {
+describe("one row holds one fact: a whole-file write lands whole or not at all", () => {
+  test("any new or changed row that bundles two statuses refuses the whole write, naming each row and its two clauses", () => {
     const k = record();
     const t = k.files[P];
     const content = t
       .replace("Hold the Build until P33 lifts", "First in the build queue")                                     // ordinary edit
       .replace("| Calendar: each add-on watches the other |", "| Lease signed, deposit paid on Nov 2 |")          // an existing row, bundled
       .replace("\n\n## Done", "\n| P45 | Business license filed Nov 3; land-use packet not filed | Cain | | | | Nov 11 |\n\n## Done");   // a new row, bundled
-    const p = k.ok([{ op: "put", path: P, content, base: "x".repeat(40) }]);
-    expect(p.errors).toEqual([
-      `P11 wasn't written: its Item bundles two statuses ("Lease signed" and "deposit paid on Nov 2"); one row holds one fact, so give each its own row`,
-      `P45 wasn't written: its Item bundles two statuses ("Business license filed Nov 3" and "land-use packet not filed"); one row holds one fact, so give each its own row`,
-    ]);
-    expect(k.row("P44")).toContain("| First in the build queue |");
-    expect(k.row("P11")).toContain("| Calendar: each add-on watches the other |");
+    const p = k.run([{ op: "put", path: P, content, base: "x".repeat(40) }]);
+    expect(p.state).toBe("rejected");
+    if (p.state !== "ok") expect(p.reason).toBe(`${P} wasn't written (a whole-file write lands whole or not at all): `
+      + `P11: its Item bundles two statuses ("Lease signed" and "deposit paid on Nov 2"); `
+      + `P45: its Item bundles two statuses ("Business license filed Nov 3" and "land-use packet not filed"). `
+      + "One row holds one fact, so give each status its own row. Fix each row named and send the complete file again");
+    // Nothing of it landed, the ordinary edit included.
+    expect(k.row("P44")).toContain("| Hold the Build until P33 lifts |");
     expect(openRow(k.files[P], "P45")).toBeNull();
-    // Only bundled rows, and nothing else changed: rejected, with the rows named.
-    const only = k.files[P].replace("\n\n## Done", "\n| P45 | Tax return filed. Refund received | Cain | | | | Nov 11 |\n\n## Done");
-    const q = k.run([{ op: "put", path: P, content: only, base: "x".repeat(40) }]);
-    expect(q.state).toBe("rejected");
-    if (q.state !== "ok") expect(q.reason).toContain(`P45 wasn't written: its Item bundles two statuses ("Tax return filed" and "Refund received")`);
+    // Fixed and sent whole again: it lands.
+    k.ok([{ op: "put", path: P, content: content.replace("Lease signed, deposit paid on Nov 2", "Lease signed").replace("Business license filed Nov 3; land-use packet not filed", "Business license filed Nov 3"), base: "x".repeat(40) }]);
+    expect(k.row("P44")).toContain("| First in the build queue |");
+    expect(openRow(k.files[P], "P45")).toContain("| Business license filed Nov 3 |");
   });
 
-  test("on the keeper: the change is done, and Cain hears which rows were left out", () => {
+  test("on the keeper: rejected whole, and Cain hears each row", () => {
     const k = keeperRig();
     const content = PENDING.replace("Hold the Build until P33 lifts", "First in the build queue")
       .replace("\n\n## Done", "\n| P45 | Vendor invoice paid; contractor deposit unpaid | Cain | | | | Nov 11 |\n\n## Done");
     k.cain({ id: "cain-put-1", ops: [{ op: "put", path: P, content, base: k.g("rev-parse", `HEAD:${P}`).trim() }] });
     expect(cycle(k.cfg).ok).toBe(true);
-    expect(k.outcome("cain-put-1")).toMatchObject({ state: "done" });
-    expect(k.reason("cain-put-1")).toContain("P45 wasn't written");
-    expect(openRow(k.upstream(P), "P44")).toContain("| First in the build queue |");
+    expect(k.outcome("cain-put-1")).toMatchObject({ state: "rejected" });
+    expect(k.reason("cain-put-1")).toContain(`P45: its Item bundles two statuses ("Vendor invoice paid" and "contractor deposit unpaid")`);
+    expect(openRow(k.upstream(P), "P44")).toContain("| Hold the Build until P33 lifts |");
     expect(openRow(k.upstream(P), "P45")).toBeNull();
-    expect(k.relayed()).toContain(`Your record change cain-put-1 ("s") was applied, but: P45 wasn't written`);
+    expect(k.relayed()).toContain(`Your record change cain-put-1 ("s") was not applied: rejected, ${P} wasn't written (a whole-file write lands whole or not at all): P45: its Item bundles two statuses`);
   });
 });
 
 describe("the one-off audit (a looser match, limited)", () => {
   const pending = pendingWith(["P08"], []).replace("| P08 | Something |", "| P08 | Business-license packet for the county |");
   test("outright: the item code or the whole Item phrase; looser: two distinctive words", () => {
-    expect(oneOffHit(pending, "Is p08 sorted?")).toEqual(["P08", "Business-license packet for the county"]);
+    expect(oneOffHit(pending, "Is p08 sorted?")).toEqual(["P08", "Business-license packet for the county", "p08"]);
     expect(oneOffHit(pending, "Did the business-license packet for the county go in?")?.[0]).toBe("P08");
     expect(oneOffHit(pending, "Is the county business-license packet in?")).toBeNull();
     expect(oneOffHit(pending, "Lunch at noon?")).toBeNull();
@@ -394,20 +398,28 @@ describe("the one-off audit (a looser match, limited)", () => {
       { id: "link-oneoff-2", at: T0.toISOString(), text: "Lunch at noon?" },
       { id: "link-oneoff-0", at: new Date(T0.getTime() - DAYS(8)).toISOString(), text: "County packet business?" },
     ], pending, now);
-    expect(a.hits).toEqual([`Nov 11, 2026 (link-oneoff-1): "Is the county business-license packet in?" may be about P08 ("Business-license packet for the county"), shared words: business, license, packet, county`]);
-    expect(a.text).toContain("Week to Nov 11, 2026: 1 possible match in 2 one-offs.");
+    expect(a.hits).toEqual([`Nov 11, 2026 (link-oneoff-1): "Is the county business-license packet in?" may be about P08 ("Business-license packet for the county"), shared words: "business", "license", "packet", "county"`]);
+    expect(a.text).toContain("Week to Nov 11, 2026: 1 possible match in 2 one-offs; 0 wait timeouts.");
     expect(a.text).toContain("The guard is limited");
   });
 
-  test("on the keeper: each round writes hits to its log and to state/one-off-audit.md", () => {
+  test("on the keeper: an overlapping one-off needs its reason; each round writes hits to its log, state/one-off-audit.md and the next check-in", () => {
     const k = keeperRig();
-    k.cain({ id: "link-oneoff-1", summary: "One-off ask to him: Is the specialist's plain-command fix in?",
+    k.cain({ id: "link-oneoff-0", summary: "One-off ask to him: Is the specialist's plain-command fix in?",
       ops: [{ op: "one-off", text: "Is the specialist's plain-command fix in?", not_about_item: true }] });
+    k.cain({ id: "link-oneoff-1", summary: "One-off ask to him: Is the specialist's plain-command fix in?",
+      ops: [{ op: "one-off", text: "Is the specialist's plain-command fix in?", not_about_item: true, reason: "his question about the phone app, not the calendar item" }] });
     expect(cycle(k.cfg).ok).toBe(true);
-    expect(k.outcome("link-oneoff-1")).toMatchObject({ state: "done" });
+    expect(k.outcome("link-oneoff-0")).toMatchObject({ state: "rejected" });
+    expect(k.reason("link-oneoff-0")).toBe(`one-off: its words overlap an open item (P44: "specialist", "plain", "command"); ask it under that item with a source check, or send it again with a one-line reason it is about no open item`);
+    expect(k.outcome("link-oneoff-1")).toMatchObject({ state: "done", declared: `his question about the phone app, not the calendar item (overlaps P44: "specialist", "plain", "command")` });
+    expect(k.log().find((o) => o.id === "link-oneoff-1")!.declared).toContain("his question about the phone app");
     const audit = k.upstream(ONE_OFF_AUDIT_PATH)!;
-    expect(audit).toContain("Week to Nov 11, 2026: 1 possible match in 1 one-off.");
+    expect(audit).toContain("Week to Nov 11, 2026: 1 possible match in 1 one-off; 0 wait timeouts.");
     expect(audit).toContain(`(link-oneoff-1): "Is the specialist's plain-command fix in?" may be about P44`);
+    expect(audit).toContain(`re-declared about no open item: "his question about the phone app, not the calendar item`);
+    // The new hit waits for Cain's next check-in, once.
+    expect(readFileSync(k.cfg.checkin!, "utf8")).toContain(`(link-oneoff-1): "Is the specialist's plain-command fix in?" may be about P44`);
     expect(k.subjects(3)).toContain("One-off audit: 1 to look over");
     // No request writes it.
     expect(plan(req([{ op: "put", path: ONE_OFF_AUDIT_PATH, content: "x\n", base: "new" }]), tree({ [P]: PENDING }), { at: T0 }))
@@ -603,7 +615,7 @@ describe("the link asks only on an accepted check of the row as it stands", () =
     await expect(ask("his inbox at 9:40")).rejects.toThrow("names its sender's domain and its date");
     await expect(ask("his mail\nthis morning")).rejects.toThrow("one line");
     await expect(ask("his mail | the portal at 9")).rejects.toThrow("can't hold |");
-    await expect(ask(CHECKED)).rejects.toThrow("repeats the row's last one (the same words, no later time)");
+    await expect(ask(CHECKED)).rejects.toThrow(`repeats the row's last one ("${CHECKED}": the same words, no later time)`);
     expect(r.posts()).toBe(0);
     expect((await ask("county portal at 2026-11-11T09:40, receipt for P08")).status).toBe("posted");
   });
@@ -623,6 +635,7 @@ describe("posted asks and Ship cards lose their buttons when the row moves on", 
   test("the sweep takes an ask's buttons off ('Status changed, re-check needed') and tells Cain", async () => {
     const r = linkRig({ unchecked: true, pending: pendingWith(["P08"], []) });
     r.files.checks = ledger({ P08: { version: 1, checked_version: 1 } });
+    seeded(r, "P08");
     const id = (await r.link.ask({ text: "Is the packet filed?", options: opts, item: "P08", question: "Q2" }) as any).message;
     await r.link.sweep();
     expect(r.buttons(id)).toEqual(opts);                       // nothing moved: it stays
@@ -636,6 +649,7 @@ describe("posted asks and Ship cards lose their buttons when the row moves on", 
   test("a tap on one before the sweep is refused with that reason", async () => {
     const r = linkRig({ unchecked: true, pending: pendingWith(["P08"], []) });
     r.files.checks = ledger({ P08: { version: 1, checked_version: 1 } });
+    seeded(r, "P08");
     const id = (await r.link.ask({ text: "Is the packet filed?", options: opts, item: "P08", question: "Q2" }) as any).message;
     r.files.checks = ledger({ P08: { version: 2, checked_version: 1, changed: NOV11_8AM } });
     expect(await r.tap(structuredClone(r.msg(id)), r.ids(id)[0])).toBe("dead: status changed");
@@ -671,16 +685,23 @@ describe("posted asks and Ship cards lose their buttons when the row moves on", 
 
 describe("one-off asks", () => {
   const pending = pendingWith(["P08"], []).replace("| P08 | Something |", "| P08 | Business-license packet for the county |");
-  test("refused only when it names an open item outright (its whole Item phrase); a looser overlap goes out, declared and logged", async () => {
+  test("refused when it names an open item outright (its whole Item phrase); a looser overlap is held until he gives a reason, then goes out, declared and logged", async () => {
     const r = linkRig({ unchecked: true, pending });
     await expect(r.link.ask({ text: "Did the business-license packet for the county go in?", options: ["Yes", "No"], item: "none" }))
-      .rejects.toThrow(`This one-off names an open item, P08 ("Business-license packet for the county"): ask it with --item P08 and a --checked source check`);
+      .rejects.toThrow(`This one-off names an open item, P08 ("Business-license packet for the county"), matching "business license packet for the county": ask it with --item P08 and a --checked source check`);
     expect(r.posts()).toBe(0);
     expect(r.submitted).toEqual([]);
-    // Two shared words: no longer refused; the keeper's audit looks at it.
-    expect((await r.link.ask({ text: "Is the county business-license packet in?", options: ["Yes", "No"], item: "none" })).status).toBe("posted");
+    // Shared distinctive words: held, not refused, until he names the item or gives a reason.
+    const held = await r.link.ask({ text: "Is the county business-license packet in?", options: ["Yes", "No"], item: "none" });
+    expect(held).toEqual({ status: "needs reason", said: `Held, not posted: this one-off's words overlap an open item, P08 ("Business-license packet for the county"), sharing "business", "license", "packet", "county". Either ask it with --item P08 and a --checked source check, or send it again with --reason "<one line on why it is about no open item>", which the record keeper logs.` });
+    expect(r.posts()).toBe(0);
+    expect(r.submitted).toEqual([]);
+    expect((await r.link.ask({ text: "Is the county business-license packet in?", options: ["Yes", "No"], item: "none", reason: "his neighbor's packet, not his" })).status).toBe("posted");
     expect(r.submitted).toEqual([{ id: `link-oneoff-${NOV11_8AM}`, from: "cain", kind: "change", summary: "One-off ask to him: Is the county business-license packet in?",
-      ops: [{ op: "one-off", text: "Is the county business-license packet in?", not_about_item: true }] }]);
+      ops: [{ op: "one-off", text: "Is the county business-license packet in?", not_about_item: true, reason: "his neighbor's packet, not his" }] }]);
+    // No overlap at all: posted with no reason needed.
+    await r.link.answered({ item: "none" });
+    expect((await r.link.ask({ text: "Lunch at noon?", options: ["Yes", "No"], item: "none" })).status).toBe("posted");
   });
 });
 
@@ -731,7 +752,9 @@ describe("end to end: the link and the record keeper on a real git repo", () => 
       expect((await ask("Q3", "the specialist's log again, read at 8:20")).status).toBe("posted");
       // A one-off goes into the request log, and the keeper's audit flags its overlap with P44.
       await l.link.answered({ item: "P44", question: "Q3" });
-      expect((await l.link.ask({ text: "Is the specialist's plain-command fix in?", options: ["Yes", "No"], item: "none" })).status).toBe("posted");
+      expect((await l.link.ask({ text: "Is the specialist's plain-command fix in?", options: ["Yes", "No"], item: "none" })).status).toBe("needs reason");
+      expect((await l.link.ask({ text: "Is the specialist's plain-command fix in?", options: ["Yes", "No"], item: "none",
+        reason: "his question about the phone app" })).status).toBe("posted");
       run();
       expect(k.log().filter((o) => o.summary === "One-off ask to him: Is the specialist's plain-command fix in?").map((o) => o.state)).toEqual(["done"]);
       expect(k.upstream(ONE_OFF_AUDIT_PATH)).toContain("may be about P44");

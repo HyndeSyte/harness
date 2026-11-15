@@ -15,7 +15,7 @@
 #   when the item has more than one; --reply-to <message id> makes it a Discord reply.
 #   keeper.sh show <card id> --item P08 [--question Q2] [--reply-to <id>]
 #                                        show a specialist's card to Dane, unchanged
-#   keeper.sh ask --item P08 [--question Q2] [--reply-to <id>] [--checked "what, where, when"] "question" "opt" ...
+#   keeper.sh ask --item P08 [--question Q2] [--reply-to <id>] [--checked "what, where, when"] [--reason "why"] "question" "opt" ...
 #                                        ask with up to 5 buttons, one ask open at a time
 #                                        ("held" means it goes out when the open one closes);
 #                                        his tap comes back relayed
@@ -33,7 +33,11 @@
 #                                        keeper and the link waits for its answer (up to 30 seconds).
 #                                        --item none needs none, but is refused when it holds an open
 #                                        item's code or whole Item phrase, and is written to the
-#                                        request log as about no open item.
+#                                        request log as about no open item. One whose words overlap
+#                                        an open item's more loosely answers "needs reason" and posts
+#                                        nothing: ask it under that item with --checked, or send it
+#                                        again with --reason "<one line on why it is about no open
+#                                        item>", which the record keeper logs with it.
 #   keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] [--checked "..."] "text"
 #                                        the Ship card (Ship / Not now) for that one head: the text says
 #                                        what he'll notice, in one line; the link adds the question, a line
@@ -72,18 +76,18 @@ esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review="" checked=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" checked="" reason=""
 case "$cmd" in
   show|ask|ship|answered|check|connector)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        --item|--question|--reply-to|--pr|--head|--edit|--review|--checked)
+        --item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason)
           [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
           case "$1" in
             --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
             --pr) pr="$2" ;; --head) head="$2" ;; --edit) edit="$2" ;; --review) review="$2" ;;
-            --checked) checked="$2" ;;
+            --checked) checked="$2" ;; --reason) reason="$2" ;;
           esac
           shift 2 ;;
         *) rest+=("$1"); shift ;;
@@ -139,7 +143,7 @@ case "$cmd" in
               "$meta"' + {id: ($i | tonumber? // 0)}') ;;
   ask)      text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" --arg it "$item" --arg q "$question" --arg r "$reply_to" \
-              --arg c "$checked" "$meta"' + {text: $t, options: $ARGS.positional} + opt("checked"; $c)' --args "$@") ;;
+              --arg c "$checked" --arg w "$reason" "$meta"' + {text: $t, options: $ARGS.positional} + opt("checked"; $c) + opt("reason"; $w)' --args "$@") ;;
   ship)     body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg q "" --arg r "$reply_to" --arg p "$pr" --arg h "$head" --arg v "$review" \
               --arg c "$checked" "$meta"' + {text: $t, pr: $p, head: $h} + opt("review"; $v) + opt("checked"; $c)') ;;
   answered) body=$(jq -nc --arg it "$item" --arg q "$question" --arg r "" "$meta") ;;

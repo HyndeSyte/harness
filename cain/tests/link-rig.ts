@@ -70,6 +70,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // would: the row gets a ledger id at version 1 the first time, and the check is taken while
   // the row is the version it read.
   const keeper = { auto: true, n: 0, onWait: null as null | (() => void), waits: 0 };
+  // Reads of the record keeper's files that fail (a tap's fresh read included); refusals logged for
+  // tuning; and the checks the keeper didn't answer in time.
+  const fails = { record: false, outcome: false };
+  const tuned: any[] = [], waited: any[] = [];
   const autoKeep = (req: any) => {
     if (!keeper.auto) return;
     for (const o of req.ops ?? []) {
@@ -163,8 +167,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     rest, load: () => copy(state), save: (s: State) => { state = copy(s); }, now: () => t.now,
     relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
-    record: () => ({ ...files }), submitRecord: (req: any) => { submitted.push(copy(req)); autoKeep(req); },
-    outcome: (id: string) => outcomes[id] ?? null, maxCheckDays: opts.maxCheckDays,
+    record: () => { if (fails.record) throw new Error("EIO"); return { ...files }; },
+    submitRecord: (req: any) => { submitted.push(copy(req)); autoKeep(req); },
+    outcome: (id: string) => { if (fails.outcome) throw new Error("EIO"); return outcomes[id] ?? null; }, maxCheckDays: opts.maxCheckDays,
+    tune: (x: any) => { tuned.push(x); }, waitTimeout: (w: any) => { waited.push(w); },
     sleep: async (ms: number) => { keeper.waits++; t.now += ms; keeper.onWait?.(); }, pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
     stop: {
       read: () => { if (stop.broken) throw new Error("unreadable"); return { stopped: stop.stopped, at: stop.at }; },
@@ -217,7 +223,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return checking(link); },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper,
+    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

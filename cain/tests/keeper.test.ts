@@ -87,9 +87,11 @@ describe("keeper.sh against a fake link", () => {
 
   test("ship takes --review and sends it as review, only when given (read here too, for where jq is missing)", async () => {
     const text = (await Bun.file(KEEPER).text()).replace(/\r\n/g, "\n");
-    expect(text).toContain("--item|--question|--reply-to|--pr|--head|--edit|--review|--checked)");
+    expect(text).toContain("--item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason)");
     expect(text).toContain('--review) review="$2" ;;');
-    expect(text).toContain('--checked) checked="$2" ;;');
+    expect(text).toContain('--checked) checked="$2" ;; --reason) reason="$2" ;;');
+    // A one-off's reason goes with an ask, only when given.
+    expect(text).toContain(`--arg w "$reason" "$meta"' + {text: $t, options: $ARGS.positional} + opt("checked"; $c) + opt("reason"; $w)'`);
     expect(text).toMatch(/ship\)\s+body=\$\(jq -nc [^\n]*--arg v "\$review" \\\n\s+--arg c "\$checked" "\$meta"' \+ \{text: \$t, pr: \$p, head: \$h\} \+ opt\("review"; \$v\) \+ opt\("checked"; \$c\)'\) ;;/);
     expect(text).toContain("keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] [--checked");
   });

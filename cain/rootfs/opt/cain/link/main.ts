@@ -69,6 +69,8 @@ const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper'
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
 const RECORD_QUEUE = process.env.RECORD_QUEUE ?? "/data/record-queue";   // the keeper's local queue (source checks, one-offs)
 const RECORD_OUTCOMES = process.env.RECORD_OUTCOMES ?? "/data/record-outcomes";   // the keeper's outcome per request of Cain's
+const RECORD_WAITS = process.env.RECORD_WAITS ?? "/data/record-waits.jsonl";   // checks the keeper didn't answer in time, for its audit
+const TUNING = process.env.SOURCE_CHECK_TUNING ?? "/data/work/source-check-refusals.jsonl";   // refusals, for tuning the rules
 // The App's source_check_max_days option: how old a source check may be (by the keeper's
 // time for it) before an ask or Ship card can't rest on it. 7 when unset.
 const MAX_CHECK_DAYS = Number(process.env.SOURCE_CHECK_MAX_DAYS ?? "") || undefined;
@@ -207,6 +209,8 @@ const link = new Link({
     catch { return null; }
   },
   maxCheckDays: MAX_CHECK_DAYS,
+  waitTimeout: (w) => appendFileSync(RECORD_WAITS, JSON.stringify(w) + "\n"),
+  tune: (r) => { mkdirSync(TUNING.replace(/\/[^/]*$/, ""), { recursive: true }); appendFileSync(TUNING, JSON.stringify(r) + "\n"); },
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
@@ -313,7 +317,7 @@ Bun.serve({
         case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
         case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
         case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
-          item: b.item, question: b.question, replyTo: b.reply_to, checked: b.checked }));
+          item: b.item, question: b.question, replyTo: b.reply_to, checked: b.checked, reason: b.reason }));
         case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to, checked: b.checked }));
         case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
         case "/replied": return json(await link.replied(b.m));
