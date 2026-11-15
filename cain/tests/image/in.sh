@@ -202,8 +202,11 @@ final)
   ! grep -q "did not load\|didn't load" /fp/standards.jsonl || fail "a part of his standards didn't load as his own user"
   # A start-up hook that takes a moment doesn't cost his session the Discord plugin. Unless it
   # loads its plugins at once (the managed settings' CLAUDE_CODE_SYNC_PLUGIN_INSTALL), this Claude
-  # Code starts the session from an early cache-only load that hasn't taken in the seed's plugins
-  # yet, and the session has no Discord plugin: shown both ways, so the check can't pass for nothing.
+  # Code can start the session from an early cache-only load that hasn't taken in the seed's
+  # plugins yet, with no Discord plugin. That is a race: on a Windows laptop a hook that sleeps 1 s
+  # lost the plugin 6 times of 6, while here a slow hook alone may not; his standards' hooks lost it
+  # in about one session of a run's sixty before the setting came in. So the session without the
+  # setting is a data point in the note, not a check.
   ms=/etc/claude-code/managed-settings.json
   cp -p "$ms" /fp/managed.orig
   slow() {   # <jq filter on his managed settings> <name>: whether a session with a slow start-up hook loaded the seed's plugin
@@ -213,9 +216,8 @@ final)
     "$OPT/c1/seed-loaded.sh" "/fp/slow-$2.jsonl" 2> "/fp/slow-$2.why"
   }
   slow . with || fail "with a slow start-up hook, his session didn't load the seed's plugin: $(cat /fp/slow-with.why)"
-  ! slow 'del(.env.CLAUDE_CODE_SYNC_PLUGIN_INSTALL)' without \
-    || fail "without loading plugins at once, a slow start-up hook still left the seed's plugin in: this check can't tell any more (has Claude Code changed? then the setting may no longer be needed)"
-  note "final checks held ($other couldn't be installed; loaded: $loaded; his standards: 3 parts; a slow start-up hook leaves the plugin in)"
+  if slow 'del(.env.CLAUDE_CODE_SYNC_PLUGIN_INSTALL)' without; then without=kept; else without=lost; fi
+  note "final checks held ($other couldn't be installed; loaded: $loaded; his standards: 3 parts; a slow start-up hook leaves the plugin in; without loading plugins at once, it was $without)"
   ;;
 plant-connector)
   # The old way recorded a claude.ai connector of his (the run script's connector check): CI has
