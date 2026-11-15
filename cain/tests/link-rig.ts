@@ -37,7 +37,7 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 }
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
-    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; unchecked?: boolean; warnOnly?: boolean } = {}) {
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; unchecked?: boolean; maxCheckDays?: number } = {}) {
   let state: State = emptyState();
   // GitHub, as the link's landings see it (merge.ts is tested on its own).
   const github = {
@@ -65,10 +65,11 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const files: { pending: string | null; holds: string | null; checks?: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null, checks: null };
   const submitted: any[] = [];                    // requests the link handed the record keeper (source checks, one-offs)
   const outcomes: Record<string, { state: string; reason?: string }> = {};   // the keeper's outcome per request, once settled
-  // Unless the test drives the keeper itself (unchecked), a check is applied at once, as the
-  // keeper would: the row gets a ledger id at version 1 the first time, and the check is
-  // taken while the row is the version it read.
-  const keeper = { auto: !opts.unchecked, n: 0 };
+  // Unless the test drives the keeper itself (keeper.auto = false, then keeper.onWait runs
+  // each time the link waits on an outcome), a check is applied at once, as the keeper
+  // would: the row gets a ledger id at version 1 the first time, and the check is taken while
+  // the row is the version it read.
+  const keeper = { auto: true, n: 0, onWait: null as null | (() => void), waits: 0 };
   const autoKeep = (req: any) => {
     if (!keeper.auto) return;
     for (const o of req.ops ?? []) {
@@ -163,7 +164,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
     record: () => ({ ...files }), submitRecord: (req: any) => { submitted.push(copy(req)); autoKeep(req); },
-    outcome: (id: string) => outcomes[id] ?? null, warnOnly: !!opts.warnOnly, pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
+    outcome: (id: string) => outcomes[id] ?? null, maxCheckDays: opts.maxCheckDays,
+    sleep: async (ms: number) => { keeper.waits++; t.now += ms; keeper.onWait?.(); }, pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
     stop: {
       read: () => { if (stop.broken) throw new Error("unreadable"); return { stopped: stop.stopped, at: stop.at }; },
       write: (stopped: boolean, at: number) => { stop.stopped = stopped; stop.at = at; },
@@ -193,7 +195,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // Asks and Ship cards for an item need a source check (0.12.0). Tests about other things
   // pass one by default, as Cain does; unchecked: true leaves it to the test.
   let sources = 0;
-  const SOURCE = () => `rig: checked at its source just now (${++sources})`;
+  const SOURCE = () => `rig: the example.org portal page, read just now (${++sources})`;
   const checking = (l: Link) => opts.unchecked ? l : new Proxy(l, { get(target, prop, recv) {
     const v = Reflect.get(target, prop, recv);
     if ((prop === "ask" || prop === "ship") && typeof v === "function")

@@ -20,16 +20,20 @@
 #                                        ("held" means it goes out when the open one closes);
 #                                        his tap comes back relayed
 #   --checked (ask and ship, for an item): the source check behind it: one line, at most 300
-#                                        characters, no |, saying what was checked, where and when
-#                                        ("the county's receipt in his Gmail, read at 9:40 this
-#                                        morning"). Dates in any form, ISO times, shas, job ids and
-#                                        record codes are fine in it: it goes to the record, never to
-#                                        him. Not word for word the row's last check. The link refuses
-#                                        an ask or Ship card for an item without a check of the row's
-#                                        current version (any change to its cells but Since and
-#                                        Checked makes a new one); one passed here goes to the keeper.
-#                                        --item none needs none, but is refused when its words match
-#                                        an open item's, and is written to the request log.
+#                                        characters, no |, saying when and naming a concrete source:
+#                                        a mail (sender domain and date), a page or portal, a file
+#                                        path, a command or a message ("the receipt from county.gov
+#                                        dated Nov 14, read at 9:40 this morning"). Not "memory",
+#                                        "earlier" or "I recall", and not a repeat of the row's last
+#                                        check. Dates, ISO times, shas, job ids and record codes are
+#                                        fine in it: it goes to the record, never to him. The link
+#                                        posts an ask or Ship card for an item only on a check of the
+#                                        row's current version, no older than source_check_max_days,
+#                                        that the record keeper accepted: one passed here goes to the
+#                                        keeper and the link waits for its answer (up to 30 seconds).
+#                                        --item none needs none, but is refused when it holds an open
+#                                        item's code or whole Item phrase, and is written to the
+#                                        request log as about no open item.
 #   keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] [--checked "..."] "text"
 #                                        the Ship card (Ship / Not now) for that one head: the text says
 #                                        what he'll notice, in one line; the link adds the question, a line

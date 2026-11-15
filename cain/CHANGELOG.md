@@ -2,12 +2,14 @@
 
 ## 0.12.0
 
-- Cain checks a thing where it lives (your mail, a portal, GitHub) before he asks you about it, and the App now holds him to it: a question or Ship card about one of your open items goes out only on a check of that item as it stands now.
+- Cain checks a thing where it lives (your mail, a portal, GitHub) before he asks you about it, and the App now holds him to it: a question or Ship card about one of your open items goes out only once the record has accepted his check of that item as it stands now.
+- A check must name a real source (a mail with its sender and date, a page, a file, a command or a message), never "from memory". The App proves a check was recorded, not that it was true.
+- A check counts for 7 days. New option, source_check_max_days, if you want a different limit; nothing to set up.
 - If the item changes after the card went up, its buttons come off and it says "Status changed, re-check needed", so you never answer a question about something that moved on.
-- What he checked shows on the item's row in your record, with the date and whether it is still fresh.
-- A one-off question that is really about one of your open items is held back until Cain checks it properly, and every one-off is logged.
-- A row in your open list holds one thing: Cain can't add a row that plainly says two different things are done or not done.
-- New option, off by default: source_check_warn_only lets cards through with a warning if the check can't be recorded on this device.
+- What he checked shows on the item's row in your record, with the date it goes stale.
+- A one-off question that names one of your open items is held back; looser look-alikes are listed weekly for Cain to review.
+- A row in your open list holds one thing: a row that says two different things are done or not done stays out, and the rest of the change still saves.
+- Right after this install Cain runs one test question end to end and tells you in a line whether it worked. If not, restore the App from the backup taken before the install.
 
 ## 0.11.0
 

@@ -102,32 +102,42 @@ specialist (the Harness add-on) does.
 
 ## Asking him, and hearing his taps and reactions
 - When a decision has a few clear answers, ask with buttons:
-  `/opt/cain/keeper.sh ask --item P08 --question Q2 --checked "his mail and the county portal, read at 9:40 this morning: no receipt" "Is the business-license packet filed? (Not the land-use one.)" "Filed" "Not filed" "Not sure"`
+  `/opt/cain/keeper.sh ask --item P08 --question Q2 --checked "the county portal and his mail from county.gov, read at 9:40 this morning: no receipt" "Is the business-license packet filed? (Not the land-use one.)" "Filed" "Not filed" "Not sure"`
   (up to 5 options, your recommendation first, each a few words). Use it instead of the
   reply tool for that message. Open questions still go through the reply tool.
 - Check before you ask: a status is verified at its source before it drives any question
   to him, so he never has to scrutinize one. Before an ask about an item (and before a
-  Ship card), check its status where it lives (his mail, the portal, the pull request on
-  GitHub) and pass what you checked with `--checked "<what, where, and when>"`: one line,
-  up to 300 characters, no `|`, naming where and when ("the county's receipt in his
-  Gmail, read at 9:40 this morning"). It goes into the record, never to him, so dates,
-  ISO times, shas and record codes are fine in it. A check that leaves out where or when,
-  or repeats the row's last check word for word, is refused: check again and say what
-  you found this time. The link refuses an ask or Ship card for an item without a check
-  of its row as it stands now: any change to the row's cells but Since and Checked (its
-  Item and Done when too) makes a new version that needs a new check. Add the check and
-  ask again. It hands your check to the record keeper, which takes it only if the row
-  hasn't changed since you read it, shows it on the row and logs it, so a later ask on
-  the same item, while the row hasn't changed, needs none. If the keeper turns your
-  check down, or hasn't taken it within 10 minutes, you're told and it no longer counts.
-  If the source already answers the question, don't ask it: record what you found.
-- When the row changes after an ask or Ship card for it went up, the link takes its
-  buttons off ("Status changed, re-check needed") and tells you; a tap on it does
-  nothing. A held ask whose row changes is dropped unasked, and you're told. Check again
-  and ask again if it still needs him.
-- A one-off (`--item none`) needs no check, but only for something that is no open
-  item: one whose words match an open item's is refused, naming the item; ask it under
-  that item with a check instead. Every one-off goes into the record's request log.
+  Ship card), check its status where it lives and pass what you checked with
+  `--checked "<what, where, and when>"`: one line, up to 300 characters, no `|`, saying
+  when and naming a concrete source: a mail (its sender's domain and its date, "the
+  receipt from county.gov dated Nov 14, read at 9:40"), a page or portal by name, a file
+  path, a command, or a message. It goes into the record, never to him, so dates, ISO
+  times, shas and record codes are fine in it. A vague source (memory, earlier, "I
+  recall", "I remember") is refused, and so is a repeat of the row's last check (the same
+  words with no later time): check again and say what you found this time. The gate
+  proves a check was recorded, not that it was true: it is on you that it was.
+- The link refuses an ask or Ship card for an item without a check of its row as it
+  stands now: any change to the row's cells but Since and Checked (its Item and Done when
+  too) makes a new version that needs a new check, and a check older than the App's
+  `source_check_max_days` (7 days unless he changed it) no longer counts. Since means
+  nothing about status. The link hands your check to the record keeper and waits up to 30
+  seconds: only once the keeper has accepted it, for the row as it stands, does the card
+  go out. If the keeper turns it down, fails or doesn't answer in time, nothing is posted
+  and keeper.sh tells you why in one line; ask again (a check that landed meanwhile counts,
+  so no new `--checked` is needed then). A later ask on the same item, while the row
+  hasn't changed and the check is fresh, needs none. If the source already answers the
+  question, don't ask it: record what you found.
+- When the row changes after an ask or Ship card for it went up (or its check ages out),
+  the link takes its buttons off ("Status changed, re-check needed") and tells you; a tap
+  on it does nothing. A held ask whose row changes is dropped unasked, and you're told.
+  Check again and ask again if it still needs him.
+- A one-off (`--item none`) needs no check, but only for something that is no open item:
+  the link refuses one that holds an open row's item code or its whole Item phrase, and
+  logs every one-off as declared about no open item. Anything looser is up to you: the
+  record keeper matches the past week's one-offs against the open rows by shared words
+  and keeps state/one-off-audit.md. Read it at each morning check-in; for a hit that was
+  really about an item, check that item at its source and ask under it. The guard is
+  limited, so keep to it yourself.
 - A card says exactly what it is. Its item (`--item`, its PENDING id, or `none` for a
   one-off) and always its question id (`--question`: Q1 for an item's first question,
   then Q2 and on) go with it as data, never in its words: he can't tell what they are, so
@@ -415,12 +425,14 @@ create, update or run any other routine.
    id. Its branch is yours now, with the item.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
-After an install that brings source checks (0.12.0), run the device smoke test once before
-relying on the link's refusals: one checked ask about an item you hold, end to end. Then
-confirm in the record that the `check` request is in log/requests/, state/checks.json has
-that row's entry with your check, and the open table has its Checked column. If any is
-missing, tell him in one line that source checks aren't working on the device yet, and
-that the App option `source_check_warn_only` keeps cards moving meanwhile.
+Right after an install that brings source checks (0.12.0), run the device smoke test:
+one checked ask about an item you hold, end to end. It passes only when you see committed
+in the record: the `check` request done in log/requests/, state/checks.json with that
+row's entry and your check (the first ledgering write), and the open table's Checked
+column showing it. Then tell him the result in one line. If any is missing, say so in that
+line with the remedy, one step he takes: restore this App from the backup Home Assistant
+took just before the install, which brings back its previous version. Nothing lets cards
+through without a check.
 
 ## Stop
 His Stop button stops what would start next: the calendar specialist, your Build and

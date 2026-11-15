@@ -62,14 +62,12 @@ bashio::log.info "Cain is running"
 ) &
 # Cain's link (link/main.ts): taps, reactions and specialists' cards. What Cain must
 # hear is queued for him; checkin.sh types it in when he is idle.
-# source_check_warn_only (off by default): a source check or one-off the link can't hand
-# the record keeper warns in the log and lets the card through, instead of refusing it.
-(
-  SOURCE_CHECK_WARN_ONLY="$(bashio::config 'source_check_warn_only' 2>/dev/null || true)"
-  [ "$SOURCE_CHECK_WARN_ONLY" = "true" ] || SOURCE_CHECK_WARN_ONLY=false
-  export SOURCE_CHECK_WARN_ONLY
-  while true; do bun /opt/cain/link/main.ts 2>&1; sleep 5; done
-) &
+# source_check_max_days (7 by default): how old a source check may be before an ask or
+# Ship card can't rest on it. The link and the record keeper both read it.
+SOURCE_CHECK_MAX_DAYS="$(bashio::config 'source_check_max_days' 2>/dev/null || true)"
+case "$SOURCE_CHECK_MAX_DAYS" in ''|null|*[!0-9]*) SOURCE_CHECK_MAX_DAYS=7 ;; esac
+export SOURCE_CHECK_MAX_DAYS
+( while true; do bun /opt/cain/link/main.ts 2>&1; sleep 5; done ) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Keeps a
 # copy in /data/record (so Home Assistant's backups carry it off the box),
 # applies requests in order, and runs the nightly check. Its key comes from the

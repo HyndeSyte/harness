@@ -69,9 +69,9 @@ const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper'
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
 const RECORD_QUEUE = process.env.RECORD_QUEUE ?? "/data/record-queue";   // the keeper's local queue (source checks, one-offs)
 const RECORD_OUTCOMES = process.env.RECORD_OUTCOMES ?? "/data/record-outcomes";   // the keeper's outcome per request of Cain's
-// The App's source_check_warn_only option: a request the link can't hand the keeper warns
-// in the log and lets the card through, instead of refusing it.
-const WARN_ONLY = process.env.SOURCE_CHECK_WARN_ONLY === "true";
+// The App's source_check_max_days option: how old a source check may be (by the keeper's
+// time for it) before an ask or Ship card can't rest on it. 7 when unset.
+const MAX_CHECK_DAYS = Number(process.env.SOURCE_CHECK_MAX_DAYS ?? "") || undefined;
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
@@ -192,7 +192,8 @@ const link = new Link({
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`) }),
-  // A source check, handed to the record keeper through its local queue as record.sh does.
+  // A source check or a one-off's log line, handed to the record keeper through its local
+  // queue as record.sh does; the link waits for a check's outcome before posting.
   submitRecord: (req) => {
     mkdirSync(RECORD_QUEUE, { recursive: true });
     const name = `${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}-${String(req.id).replace(/[^A-Za-z0-9._:-]/g, "_")}.json`;
@@ -205,7 +206,7 @@ const link = new Link({
     try { const o = JSON.parse(t); return o && typeof o.state === "string" ? { state: o.state, reason: typeof o.reason === "string" ? o.reason : undefined } : null; }
     catch { return null; }
   },
-  warnOnly: WARN_ONLY,
+  maxCheckDays: MAX_CHECK_DAYS,
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },

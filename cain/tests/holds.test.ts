@@ -291,7 +291,7 @@ describe("row edits", () => {
     w.run(B, [{ op: "release", item: "P11" }]);
     expect(put(edit(PENDING, "Hold the Build until P33 lifts", "First in the build queue")).state).toBe("ok");
     expect(put(edit(w.files[P], "Cain keeps this current.", "Cain keeps this current, row by row.")).state).toBe("ok");
-    expect(put(edit(w.files[P], "|---|---|\n", "|---|---|\n| P12 Discord status on the Harness page: shipped | Nov 11 |\n")).state).toBe("ok");
+    expect(put(edit(w.files[P], "| Item | Date |\n|---|---|\n", "| Item | Date |\n|---|---|\n| P12 Discord status on the Harness page: shipped | Nov 11 |\n")).state).toBe("ok");
     expect(w.run("cain", [{ op: "append", path: P, text: "| P10 Taps reach Cain: tested | Nov 11 |" }]).state).toBe("ok");
     // The holder's own whole-file put of its row lands.
     expect(w.run(A, [{ op: "put", path: P, content: edit(w.files[P], "The laptop session holds all harness work", "PR A open"), base: w.sha() }]).state).toBe("ok");

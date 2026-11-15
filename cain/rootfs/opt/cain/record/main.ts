@@ -13,12 +13,14 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
+  maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, type OneOff,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; relay: string;
   branch: string; token?: string; hygieneAt: string; tz: string; now?: () => Date;
   holds?: string;   // the keeper's own copy of the holds; default /data/record-holds.json (next to the queue)
+  maxCheckDays?: number;   // the App's source_check_max_days (default 7): shown on the Checked cells
 };
 
 const MAX_RAW = 1_000_000;
@@ -279,8 +281,13 @@ function report(cfg: Config, o: Outcome, local: boolean, req: Request | undefine
   // Status files are for Cain's own requests, so an inbox file can't overwrite one.
   if (local) writeFileSync(outcomeFile(cfg, o.id), JSON.stringify(o));
   log(`${o.id} from ${o.from}: ${o.state}${o.reason ? ` (${o.reason})` : ""}`);
-  if (o.state === "done" && req) {
-    for (const line of passLines(req, o)) relay(cfg, line);
+  if (o.state === "done") {
+    if (req) for (const line of passLines(req, o)) relay(cfg, line);
+    // Applied, with rows left out (a whole-file write with a bundled row): the writer hears which.
+    if (!o.reason) { /* nothing more */ }
+    else if (local) relay(cfg, `Your record change ${o.id} ("${o.summary}") was applied, but: ${o.reason}. Fix those rows and send them again.`);
+    else if (o.from === "page") relay(cfg, `A change Dane made on his page (${o.id}, "${o.summary}") was saved, but: ${o.reason}. Apply what he meant yourself, one fact per row.`);
+    else log(`inbox request ${o.id} from ${o.from} left rows out; recorded in log/requests`);
   } else if (o.state === "relayed" && req?.note) {
     const about = req.note.about ? ` about ${clean(req.note.about, 120)}` : "";
     const text = clean(req.note.text, MAX_NOTE);
@@ -328,7 +335,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
         return git(cfg, ["rev-parse", "--short", "HEAD"]);
       };
       const undo = () => { git(cfg, ["checkout", "--quiet", "--", "."]); git(cfg, ["clean", "-qfd", "--", "areas", "state", "archive", "rules", "projects", "reviews"]); };
-      const ctx = (at: Date) => ({ at, holds: st.holds, downtime: st.downtime, tz: cfg.tz });
+      const ctx = (at: Date) => ({ at, holds: st.holds, downtime: st.downtime, tz: cfg.tz, maxCheckDays: maxCheckDays(cfg.maxCheckDays) });
       const outcomeOf = (req: Request, at: Date) => ({ id: req.id, from: clean(req.from, 80), kind: req.kind, summary: clean(req.summary, 200), at: at.toISOString() });
       // A planned change: its files, then its holds. A failed write, the holds' included,
       // undoes this request only; the others stand.
@@ -350,7 +357,11 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
       };
       const decide = (req: Request, local: boolean, base: Omit<Outcome, "state">): Outcome => {
         const p = plan(req, t, ctx(new Date(base.at)));
-        if (p.state === "ok") { for (const w of p.warnings ?? []) log(`warning: ${req.id}: ${clean(w, 200)}`); return apply(p, base); }
+        if (p.state === "ok") {
+          for (const w of p.warnings ?? []) log(`warning: ${req.id}: ${clean(w, 200)}`);
+          const o = apply(p, base);
+          return o.state === "done" && p.errors?.length ? { ...o, reason: clean(p.errors.join("; "), 600) } : o;
+        }
         if (p.state === "waiting") st.waiting.push({ req, since: base.at, local });
         return { ...base, state: p.state, reason: clean(p.reason) };
       };
@@ -413,6 +424,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
         // A hold that ended or moved may let a waiting take through, before anything newer.
         if (o.state === "done" && st.waiting.length) settle();
       }
+      // The one-off audit: the past week's one-offs matched loosely against the open rows.
+      if (items.length) audit(cfg, clock(), commit);
       if (commits === 0) {
         // Nothing to push: a good round all the same. Cain's requests that were
         // already applied are let go, with their status file if it was never written.
@@ -443,6 +456,30 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
   }
   log("gave up this round after three tries; will try again");
   return { applied: 0, ok: false };
+}
+
+// The past week's one-off asks (from log/requests) against the open rows, loosely: hits go
+// to the keeper's log and to state/one-off-audit.md, which Cain reads. Written only when it
+// changes. A failure here never stops the round.
+function audit(cfg: Config, now: Date, commit: (msg: string) => string | undefined) {
+  try {
+    const oneOffs: OneOff[] = [];
+    for (const o of logbook(cfg).values())
+      if (o.id.startsWith("link-oneoff-") && o.state === "done" && o.summary.startsWith(ONE_OFF_SUMMARY))
+        oneOffs.push({ id: o.id, at: o.at, text: o.summary.slice(ONE_OFF_SUMMARY.length) });
+    const p = join(cfg.dir, PENDING_PATH), f = join(cfg.dir, ONE_OFF_AUDIT_PATH);
+    const pending = existsSync(p) ? readFileSync(p, "utf8") : null;
+    const was = existsSync(f) ? readFileSync(f, "utf8") : null;
+    if (!oneOffs.length && was === null) return;
+    const a = oneOffAudit(oneOffs, pending, now, cfg.tz);
+    if (a.text === was) return;
+    for (const h of a.hits) log(`one-off audit: ${clean(h, 300)}`);
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, a.text);
+    commit(`One-off audit: ${a.hits.length} to look over`);
+  } catch (e) {
+    log(`one-off audit didn't finish: ${(e as Error).message}`);
+  }
 }
 
 // A round that finished: its state saved (so it counts as the keeper working), and
@@ -542,6 +579,7 @@ if (import.meta.main) {
     hygieneAt: process.env.RECORD_CHECK_AT ?? "0230",
     tz: process.env.CHECKIN_TZ ?? "America/New_York",
     holds: process.env.RECORD_HOLDS ?? "/data/record-holds.json",
+    maxCheckDays: maxCheckDays(process.env.SOURCE_CHECK_MAX_DAYS),
   };
   delete process.env.RECORD_TOKEN;   // kept only in cfg, handed to git per call
   if (!cfg.token) {
