@@ -130,15 +130,15 @@ describe("once only", () => {
 
   test("a snapshot that had read less of the transcript than the journal's last entry is older and passed over, whatever the clock says", () => {
     const d = mkdtempSync(join(tmpdir(), "journal-"));
-    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [b]), at: 1_000, kind: "open", id: "x", raw: JSON.stringify({ id: "x" }), mark: 200 }) + "\n");
+    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [b]), at: 1_000, kind: "open", id: "x", raw: JSON.stringify({ id: "x" }), mark: 200, rmark: 5 }) + "\n");
     // An older end, delayed, with a later clock: passed over.
-    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [a], why: "open", at: 5_000, mark: 100 })).toEqual({ id: null, same: true });
+    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [a], why: "open", at: 5_000, mark: 100, rmark: 5 })).toEqual({ id: null, same: true });
     expect(readJournal(join(d, "s1.journal"))).toHaveLength(1);
   });
 
   test("the same state seen later moves the most-seen mark on: a delayed older snapshot can't then become the newest (A@100, A@300, then B@200)", () => {
     const d = mkdtempSync(join(tmpdir(), "journal-"));
-    const snap = (open: typeof a[], mark: number) => ({ session: "s1", held: ["P33"], open, why: "open" as const, at: mark, mark });
+    const snap = (open: typeof a[], mark: number) => ({ session: "s1", held: ["P33"], open, why: "open" as const, at: mark, mark, rmark: 5 });
     expect(fileSnapshot(d, snap([a], 100)).id).toMatch(/-000001-/);
     expect(fileSnapshot(d, snap([a], 300))).toEqual({ id: null, same: true });
     expect(fileSnapshot(d, snap([b], 200))).toEqual({ id: null, same: true });                        // delayed, older: passed over
@@ -158,10 +158,31 @@ describe("once only", () => {
     expect(fileSnapshot(d, snap(["P33"], 13)).id).toMatch(/-000003-/);                 // the record moved on: newer, filed
   });
 
+  test("a snapshot without what its end read from the record is refused whole, never passed over as older: the journal is untouched", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    const p = join(d, "s1.journal");
+    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [a], why: "open", at: 1, mark: 150, rmark: 12 }).id).toMatch(/-000001-/);
+    const before = readFileSync(p, "utf8");
+    // The same transcript, a changed set of items, and how far the record had come not known.
+    expect(() => fileSnapshot(d, { session: "s1", held: ["P44"], open: [a], why: "open", at: 2, mark: 150 })).toThrow();
+    expect(() => fileSnapshot(d, { session: "s1", held: null, open: [a], why: "open", at: 3, mark: 150 })).toThrow();
+    expect(readFileSync(p, "utf8")).toBe(before);
+  });
+
+  test("ends whose transcripts couldn't be read are ordered by the record: a delayed one that read older holds can't replace a newer one", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    const snap = (held: string[], rmark: number) => ({ session: "s1", held, open: [], why: "unread" as const, at: 1, rmark });
+    expect(fileSnapshot(d, snap(["P33"], 10)).id).toMatch(/-000001-/);
+    expect(fileSnapshot(d, snap(["P44"], 12)).id).toMatch(/-000002-/);
+    expect(fileSnapshot(d, snap(["P33"], 11))).toEqual({ id: null, same: true });     // delayed, older: passed over
+    expect(readJournal(join(d, "s1.journal")).at(-1)!.key).toBe(filedKey(["P44"], [], "unread"));
+    expect(fileSnapshot(d, snap(["P33"], 13)).id).toMatch(/-000003-/);
+  });
+
   test("a newer snapshot taken after the clock moved back is filed: the transcript, not the clock, says it's newer", () => {
     const d = mkdtempSync(join(tmpdir(), "journal-"));
-    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [a]), at: 2_000, kind: "open", id: "x", raw: JSON.stringify({ id: "x" }), mark: 100 }) + "\n");
-    const r = fileSnapshot(d, { session: "s1", held: ["P33"], open: [b], why: "open", at: 1_000, mark: 200 });
+    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [a]), at: 2_000, kind: "open", id: "x", raw: JSON.stringify({ id: "x" }), mark: 100, rmark: 5 }) + "\n");
+    const r = fileSnapshot(d, { session: "s1", held: ["P33"], open: [b], why: "open", at: 1_000, mark: 200, rmark: 5 });
     expect(r.same).toBe(false);
     expect(r.id).toMatch(/-000002-/);
     expect(readJournal(join(d, "s1.journal")).map((x) => [x.n, x.mark])).toEqual([[1, 100], [2, 200]]);
@@ -169,8 +190,8 @@ describe("once only", () => {
 
   test("a snapshot of unknown order (its transcript couldn't be read) never supersedes a known, newer state", () => {
     const d = mkdtempSync(join(tmpdir(), "journal-"));
-    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [a]), at: 1_000, kind: "open", id: "x", raw: JSON.stringify({ id: "x" }), mark: 100 }) + "\n");
-    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [], why: "unread", at: 9_000 })).toEqual({ id: null, same: true });
+    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [a]), at: 1_000, kind: "open", id: "x", raw: JSON.stringify({ id: "x" }), mark: 100, rmark: 5 }) + "\n");
+    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [], why: "unread", at: 9_000, rmark: 6 })).toEqual({ id: null, same: true });
     const j = readJournal(join(d, "s1.journal"));
     expect(j.map((e) => [e.n, e.key === filedKey(["P33"], [a]), e.seen ?? null])).toEqual([[1, true, null], [1, true, "unread"]]);   // noted, not a new state
   });
@@ -214,6 +235,8 @@ describe("once only", () => {
     writeFileSync(join(d, "f.journal"), [ok(1), JSON.stringify({ n: 2, key: "k2", at: 2, kind: "open", id: "", raw: "" }),
       JSON.stringify({ n: 3, key: "k3", at: 3, kind: "open", id: "i3", raw: JSON.stringify({ id: "other" }) }), ""].join("\n"));
     expect(journalOf(join(d, "f.journal")).damaged).toEqual([2, 3]);
+    writeFileSync(join(d, "m.journal"), [ok(1), JSON.stringify({ n: 2, key: "k2", at: 2, kind: "open", mark: 5 }), ""].join("\n"));   // a mark, no rmark
+    expect(journalOf(join(d, "m.journal")).damaged).toEqual([2]);
     writeFileSync(join(d, "c.journal"), [ok(1), "not json at all", ok(2), ""].join("\n"));              // damage in the middle
     expect(journalOf(join(d, "c.journal")).damaged).toEqual([2]);
     expect(journalOf(join(d, "c.journal")).entries.map((x) => x.n)).toEqual([1, 2]);

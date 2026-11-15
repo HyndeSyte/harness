@@ -5,6 +5,8 @@ import { chmodSync, copyFileSync, mkdirSync, readdirSync, readFileSync, renameSy
 import { join, resolve } from "node:path";
 import { openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
 import { cycle } from "../rootfs/opt/cain/record/main.ts";
+import { type Clone, clone } from "../tools/record-lib.ts";
+import { recordAt, recordSeen, seenAt } from "../tools/session-end.ts";
 import { A, B, PENDING, SA, SB, cleanEnv, rig, sh } from "./rig.ts";
 
 const TOOLS = resolve(import.meta.dir, "../tools");
@@ -447,6 +449,64 @@ describe("session-end", () => {
     const said = l.tool("session-end.ts", ["--flush"]).out;
     expect(said).toContain(`A laptop session's journal has damaged lines (2), kept as they are: ${join(memo, `${SA}.journal`)}`);
     expect(said).toContain(`A laptop session's journal has damaged lines (1), kept as they are: ${join(memo, `${SB}.journal`)}`);
+  }, 60_000);
+
+  test("an end reads the holds and how far the record had come at one commit: another end's fetch in between can't mix two", () => {
+    const l = held();
+    l.inbox(["2.json", { id: "lap-take-2", from: A, ops: [take("P44", "chat: y")] }]);
+    expect(cycle(l.cfg).ok).toBe(true);                                    // the record moves on; this clone hasn't fetched it
+    const rec = clone(l.clone) as Clone;
+    const count = (r: string) => Number(sh(["git", "rev-list", "--count", r], l.clone));
+    const at = recordAt(rec)!;                                              // this end's commit
+    sh(["git", "fetch", "-q", "origin"], l.clone);                         // another end fetches meanwhile
+    expect(count("origin/main")).toBeGreaterThan(count(at));
+    expect(seenAt(rec, at, SA)).toEqual({ held: ["P33"], rmark: count(at) });
+    expect(recordSeen(rec, SA)).toEqual({ held: ["P33", "P44"], rmark: count("origin/main") });
+  }, 60_000);
+
+  test("an end that can't read the record keeps its snapshot, said at every start, and the first start that can files it on the items held then", () => {
+    const l = held();
+    const e = ender(l);
+    e.steps(["Verify after his tap", "pending"]);
+    expect(e.end().out).toBe("Open steps (1): submitted to the record");
+    expect(cycle(l.cfg).ok).toBe(true);
+    // The session takes a second item; its next end can't read the record (its main names a
+    // commit this clone doesn't have, and the remote can't be reached).
+    l.inbox(["2.json", { id: "lap-take-2", from: A, ops: [take("P44", "chat: y")] }]);
+    expect(cycle(l.cfg).ok).toBe(true);
+    const url = sh(["git", "remote", "get-url", "origin"], l.clone);
+    sh(["git", "remote", "set-url", "origin", join(l.root, "gone")], l.clone);
+    writeFileSync(join(l.clone, ".git", "refs", "remotes", "origin", "main"), "1".repeat(40) + "\n");
+    e.steps(["Verify after his tap", "pending"], ["Merge", "pending"]);
+    const pendingDir = join(l.clone, ".git", "record-holds", "pending");
+    expect(e.end().out).toMatch(/^Open steps \(2\): waiting here: the record couldn't be read, so the items held aren't known yet; kept for the next session's start or end that can read it: /);
+    const kept = readdirSync(pendingDir);
+    expect(kept).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(pendingDir, kept[0]), "utf8")).held).toBeNull();
+    expect(l.tool("session-end.ts", ["--flush"]).out).toContain(`An end's snapshot waits: the record couldn't be read, so the items it held aren't known yet: ${join(pendingDir, kept[0])}`);
+    expect(readdirSync(pendingDir)).toEqual(kept);
+    // The record can be read again: the next start files it, on both items.
+    sh(["git", "remote", "set-url", "origin", url], l.clone);
+    rmSync(join(l.clone, ".git", "refs", "remotes", "origin", "main"));
+    sh(["git", "fetch", "-q", "origin"], l.clone);
+    expect(l.tool("session-end.ts", ["--flush"]).out).toBe("Submitted 1 to the record from a laptop session's end");
+    expect(readdirSync(pendingDir)).toEqual([]);
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Verify after his tap; Merge.");
+    expect(sh(["git", "show", "main:state/notes/P44.md"], l.remote)).toContain("with these steps open: Verify after his tap; Merge.");
+  }, 90_000);
+
+  test("an end in a clone that can't be used as the record keeps its snapshot in the clone, and it's filed once the clone can be used", () => {
+    const l = held();
+    const e = ender(l);
+    sh(["git", "update-ref", "-d", "refs/remotes/origin/main"], l.clone);   // the clone lost its upstream
+    e.steps(["Verify after his tap", "pending"]);
+    expect(e.end().out).toMatch(/^Open steps \(1\): waiting here: the record couldn't be read \(.+ isn't a clone of the record on a branch with an upstream \(main\)\), so the items held aren't known yet; kept for the next session's start or end that can read it: /);
+    expect(l.tool("record-holds.ts", ["--hook"], { input: JSON.stringify({ session_id: SA }) }).out).toMatch(/^Record holds not checked: /);   // said at every start
+    sh(["git", "fetch", "-q", "origin"], l.clone);
+    expect(l.tool("session-end.ts", ["--flush"]).out).toBe("Submitted 1 to the record from a laptop session's end");
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
   }, 60_000);
 
   test("a journal that can't be read is said at every start, never passed over in silence", () => {

@@ -46,7 +46,10 @@
 // that can't be read is never taken for an empty one, and is named at every flush too. Which of
 // two snapshots of a session is newer is read from what they saw, not a clock: its transcript
 // only grows, so the one that had read more of it is the newer; with the same transcript, the
-// one that saw more of the record (whose holds it read; the record only moves on) is.
+// one that saw more of the record is (the record's main only moves on). An end reads the holds
+// and how far the record had come from one commit, so another end's fetch can't pair one
+// commit's holds with another's progress; an end that can't read the record keeps its snapshot,
+// said at every flush, for the first start or end that can, which reads them then.
 // It never holds up the session's end: any failure is one line.
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
@@ -120,8 +123,10 @@ export const filedKey = (held: string[], open: Step[], why: Why = "open") =>
 // names sort in the order the session's filings were made, whatever the clock), then the state.
 export const filingId = (session: string, n: number, key: string) => `laptop-end-${session}-${String(n).padStart(6, "0")}-${key}`;
 
-// One journal entry: n, the state's key, when, what kind of end, and for a filing its id and
-// the request as sent.
+// One journal entry: n, the state's key, when, what kind of end, for a filing its id and the
+// request as sent, and what its end saw (mark: how much of the transcript it read; rmark: how far
+// the record had come; a mark never without an rmark). An entry with seen notes an end of unknown
+// order: it repeats the state that stands.
 export interface Entry { n: number; key: string; at: number; kind: "open" | "empty" | Why; id?: string; raw?: string; mark?: number; rmark?: number; seen?: "unread" }
 
 // A journal's entries, and its damaged lines: a line that can't be read that is neither its last
@@ -154,7 +159,7 @@ export function isEntry(p: any): p is Entry {
   return !!p && typeof p === "object" && Number.isInteger(p.n) && p.n >= 1 && typeof p.key === "string" && p.key.length > 0
     && typeof p.at === "number" && ["open", "empty", "unread", "unplanned"].includes(p.kind)
     && (p.id === undefined) === (p.raw === undefined) && (p.id === undefined || (typeof p.id === "string" && p.id.length > 0 && typeof p.raw === "string" && idOf(p.raw) === p.id))
-    && (p.mark === undefined || (Number.isInteger(p.mark) && p.mark >= 0)) && (p.rmark === undefined || (Number.isInteger(p.rmark) && p.rmark >= 0))
+    && (p.mark === undefined || (Number.isInteger(p.mark) && p.mark >= 0 && p.rmark !== undefined)) && (p.rmark === undefined || (Number.isInteger(p.rmark) && p.rmark >= 0))
     && (p.seen === undefined || p.seen === "unread");
 }
 const idOf = (raw: string) => { try { return JSON.parse(raw)?.id; } catch { return undefined; } };
@@ -255,6 +260,28 @@ export function memoDir(c: Clone): string {
   const gitDir = git(c.dir, ["rev-parse", "--git-dir"])?.trim() ?? ".git";
   return join(isAbsolute(gitDir) ? gitDir : join(c.dir, gitDir), "record-holds");
 }
+// The same folder in a clone that can't be used as the record (it lost its upstream, say), where
+// an end's snapshot waits for a flush that can; null when the folder isn't a git clone at all.
+function memoDirOf(dir: string): string | null {
+  const gitDir = git(dir, ["rev-parse", "--git-dir"])?.trim();
+  return gitDir ? join(isAbsolute(gitDir) ? gitDir : join(dir, gitDir), "record-holds") : null;
+}
+
+// The commit of the record's main the clone last fetched, or null when it can't be read.
+export function recordAt(rec: Clone): string | null {
+  const at = git(rec.dir, ["rev-parse", "--verify", "--quiet", `${rec.ref}^{commit}`])?.trim() ?? "";
+  return /^([0-9a-f]{40}|[0-9a-f]{64})$/.test(at) ? at : null;
+}
+// What an end reads from the record, all at that one commit: the items the session held, and how
+// far the record had come (its commits; its main only moves on, so more is later). Null when the
+// commit can't be read.
+export function seenAt(rec: Clone, at: string, session: string): { held: string[]; rmark: number } | null {
+  const commits = Number(git(rec.dir, ["rev-list", "--count", at])?.trim());
+  if (!Number.isInteger(commits) || commits < 1) return null;
+  const held = Object.entries(holdsAt({ ...rec, ref: at })).filter(([, h]: [string, any]) => h?.holder === `laptop:${session}`).map(([item]) => item).sort();
+  return { held, rmark: commits };
+}
+export const recordSeen = (rec: Clone, session: string) => { const at = recordAt(rec); return at ? seenAt(rec, at, session) : null; };
 
 // A file whole or not at all: written beside and synced, then moved in (a rename replaces it at once).
 function writeWhole(path: string, body: string): void {
@@ -299,41 +326,46 @@ function aside(dir: string, kind: "refused" | "unreadable", name: string, why: s
 
 // What one end saw: the session, the items it held, its open steps and why, how much of the
 // transcript it had read (mark) and how far the record it read the holds from had come (rmark:
-// its commits), which together order the session's snapshots, and when (dating the note).
-export interface Snapshot { session: string; held: string[]; open: Step[]; why: Why; at: number; mark?: number; rmark?: number }
+// its commits), which together order the session's snapshots, and when (dating the note). The
+// items held are null when its end couldn't read the record: the flush that files it reads them,
+// and how far the record had come, then, from one commit as an end does.
+export interface Snapshot { session: string; held: string[] | null; open: Step[]; why: Why; at: number; mark?: number; rmark?: number }
 
-// The order of what a snapshot saw: transcript first, then the record.
+// The order of what a snapshot saw: transcript first (none read is least), then the record.
 type Seen = [number, number];
 const seenOf = (x: { mark?: number; rmark?: number }): Seen => [x.mark ?? -1, x.rmark ?? -1];
 const after = (a: Seen, b: Seen) => a[0] > b[0] || (a[0] === b[0] && a[1] > b[1]);
 
 // Journals one end's snapshot and, if it's a filing, puts it in the outbox. The caller holds the
-// session's lock. A snapshot that had read less of the transcript than the journal's last entry
-// is older (a transcript only grows) and is passed over, so the record's newest note is the
-// session's newest state; a clock never decides it. Throws when the journal can't be read.
+// session's lock. A snapshot that saw less than the journal has (its transcript first, then the
+// record) is older and is passed over, so the record's newest note is the session's newest state;
+// a clock never decides it. Throws when the journal can't be read, or when the snapshot lacks what
+// it read from the record (the items held and how far it had come): its caller keeps it.
 export function fileSnapshot(dir: string, s: Snapshot): { id: string | null; same: boolean } {
+  if (s.held === null || !Number.isInteger(s.rmark)) throw new Error("a snapshot is filed with the holds it read and how far the record had come");
+  const held = s.held;
   const journalPath = join(dir, `${s.session}.journal`);
-  const key = filedKey(s.held, s.open, s.why);
+  const key = filedKey(held, s.open, s.why);
   const journal = readJournal(journalPath);
   const last = journal.at(-1);
   // The most seen: transcript first, then the record (whose holds a snapshot read).
-  const high = journal.reduce<Seen>((m, e) => (e.mark !== undefined && after(seenOf(e), m) ? seenOf(e) : m), [-1, -1]);
+  const high = journal.reduce<Seen>((m, e) => (after(seenOf(e), m) ? seenOf(e) : m), [-1, -1]);
   if (last && high[0] >= 0 && s.mark === undefined) {
     // Of unknown order (its transcript couldn't be read): noted, and the known state stands.
     appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, seen: "unread" });
     return { id: null, same: true };
   }
-  if (high[0] >= 0 && after(high, seenOf(s))) return { id: null, same: true };   // older than what's been seen
-  const d = decide(journal, key, s.held, s.open, s.why);
-  const seen = { ...(s.mark !== undefined ? { mark: s.mark } : {}), ...(s.rmark !== undefined ? { rmark: s.rmark } : {}) };
+  if (after(high, seenOf(s))) return { id: null, same: true };   // older than what's been seen
+  const d = decide(journal, key, held, s.open, s.why);
+  const seen = { ...(s.mark !== undefined ? { mark: s.mark } : {}), rmark: s.rmark };
   if (d.same) {
     // The same state seen later: the most seen moves on, so a delayed older snapshot can't pass it.
-    if (last && s.mark !== undefined && after(seenOf(s), high)) appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, ...seen });
+    if (last && after(seenOf(s), high)) appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, ...seen });
     return { id: null, same: true };
   }
   const kind: Entry["kind"] = s.why === "open" ? (s.open.length ? "open" : "empty") : s.why;
   if (!d.file) { appendEntry(journalPath, { n: d.n, key, at: s.at, kind, ...seen }); return { id: null, same: false }; }
-  const req = requestFor(s.open, s.held, s.why, new Date(s.at), d.wasOpen);
+  const req = requestFor(s.open, held, s.why, new Date(s.at), d.wasOpen);
   req.from = `laptop:${s.session}`;
   req.id = filingId(s.session, d.n, key);
   const raw = JSON.stringify(req, null, 1) + "\n";
@@ -352,8 +384,11 @@ export function writePending(dir: string, s: Snapshot): string {
 }
 
 // Files the snapshots ends left, oldest first, each under its session's lock (one held now waits
-// for the next flush). One that can't be read is kept aside.
-function takePending(dir: string): void {
+// for the next flush). One that can't be read is kept aside. One whose end couldn't read the
+// record is filed with what it says now (the items held and how far it had come, from one
+// commit), or, while it still can't be read, waits, said. Returns what it said, and of which.
+function takePending(rec: Clone, dir: string): { lines: string[]; named: Set<string> } {
+  const lines: string[] = [], named = new Set<string>();
   // A snapshot cut off while it was written (its end stopped before moving it in): once 2 minutes
   // old, whole it's moved in, cut off it's kept aside.
   let parts: string[] = [];
@@ -362,29 +397,42 @@ function takePending(dir: string): void {
     const path = join(dir, "pending", p);
     try { if (Date.now() - statSync(path).mtimeMs < 120_000) continue; } catch { continue; }
     let ok = false;
-    try { const s = JSON.parse(readFileSync(path, "utf8")); ok = typeof s?.session === "string" && Array.isArray(s?.held) && Array.isArray(s?.open); } catch { /* cut off */ }
+    try { const s = JSON.parse(readFileSync(path, "utf8")); ok = typeof s?.session === "string" && (Array.isArray(s?.held) || s?.held === null) && Array.isArray(s?.open); } catch { /* cut off */ }
     const whole = p.replace(/\.\d+\.part$/, "");
     if (ok && whole.endsWith(".json")) { try { renameSync(path, join(dir, "pending", whole)); } catch { /* taken */ } continue; }
     mkdirSync(join(dir, "outbox", "unreadable"), { recursive: true });
     try { renameSync(path, join(dir, "outbox", "unreadable", `pending-${whole.replace(/\.json$/, "")}.json`)); writeFileSync(join(dir, "outbox", "unreadable", `pending-${whole.replace(/\.json$/, "")}.why`), "an end's snapshot was cut off while it was written\n"); } catch { /* taken */ }
   }
   let names: string[] = [];
-  try { names = readdirSync(join(dir, "pending")).filter((n) => n.endsWith(".json")).sort((a, b) => a.split("-").at(-2)!.localeCompare(b.split("-").at(-2)!)); } catch { return; }
+  try { names = readdirSync(join(dir, "pending")).filter((n) => n.endsWith(".json")).sort((a, b) => a.split("-").at(-2)!.localeCompare(b.split("-").at(-2)!)); } catch { return { lines, named }; }
   for (const n of names) {
     const path = join(dir, "pending", n);
     let s: Snapshot | null = null;
     try { s = JSON.parse(readFileSync(path, "utf8")); } catch { /* below */ }
-    if (!s || typeof s.session !== "string" || !Array.isArray(s.held) || !Array.isArray(s.open)) {
+    if (!s || typeof s.session !== "string" || !(Array.isArray(s.held) || s.held === null) || !Array.isArray(s.open)) {
       mkdirSync(join(dir, "outbox", "unreadable"), { recursive: true });
       try { renameSync(path, join(dir, "outbox", "unreadable", `pending-${n}`)); writeFileSync(join(dir, "outbox", "unreadable", `pending-${n.replace(/\.json$/, "")}.why`), "an end's snapshot couldn't be read\n"); } catch { /* taken */ }
       continue;
     }
     const lock = join(dir, `${s.session}.ending`);
     if (!claim(lock)) continue;
-    try { fileSnapshot(dir, s); rmSync(path, { force: true }); }
+    try {
+      if (s.held === null || !Number.isInteger(s.rmark)) {                // its end couldn't read the record
+        const seen = recordSeen(rec, s.session);
+        if (!seen) {
+          lines.push(`An end's snapshot waits: the record couldn't be read, so the items it held aren't known yet: ${path}. It's filed at the first session start or end that can read the record.`);
+          named.add(n);
+          continue;
+        }
+        s = { ...s, held: seen.held, rmark: seen.rmark };
+      }
+      fileSnapshot(dir, s);
+      rmSync(path, { force: true });
+    }
     catch { /* its journal can't be read: kept, and said by its session's end */ }
     finally { rmSync(lock, { force: true }); }
   }
+  return { lines, named };
 }
 
 // Every journaled filing the outbox has no trace of: done by the keeper's log (marked), refused
@@ -446,14 +494,14 @@ export function flush(rec: Clone, dir: string, now = Date.now()): Flushed {
   mkdirSync(join(dir, "outbox"), { recursive: true });
   if (!claim(lock, now)) return { lines: [], fates: new Map() };          // another flush is at it
   try {
-    takePending(dir);
+    const taken = takePending(rec, dir);
     const unsettled = reconcile(rec, dir);
     const out = flushing(rec, dir, join(dir, "outbox"), now);
-    out.lines.push(...unsettled);
+    out.lines.push(...unsettled, ...taken.lines);
     // An end's snapshot still waiting after ten minutes (its session's journal can't be read, or
     // its lock is held) is named, so it's never silent.
     let stuck: string[] = [];
-    try { stuck = readdirSync(join(dir, "pending")).filter((n) => n.endsWith(".json") && now - statSync(join(dir, "pending", n)).mtimeMs > 600_000); } catch { /* none */ }
+    try { stuck = readdirSync(join(dir, "pending")).filter((n) => n.endsWith(".json") && !taken.named.has(n) && now - statSync(join(dir, "pending", n)).mtimeMs > 600_000); } catch { /* none */ }
     for (const n of stuck.sort()) out.lines.push(`An end's snapshot is still waiting to be filed: ${join(dir, "pending", n)}. Its session's journal may not be readable; file what it held another way, or drop it; then delete it.`);
     return out;
   } finally { rmSync(lock, { force: true }); }
@@ -543,20 +591,22 @@ if (import.meta.main) {
     if (text) console.log(text);
     process.exit(0);
   };
-  const c = clone(a.record ?? process.env.RECORD_CLONE);
-  if ("error" in c) say("");
-  const rec = c as Exclude<typeof c, { error: string }>;
-  const dir = memoDir(rec);
+  const where = a.record ?? process.env.RECORD_CLONE;
+  if (!where) say("");                                 // the record tools aren't set up on this machine
+  const c = clone(where);
+  const rec = "error" in c ? null : c;
   if (a.flush === true) {
+    if (!rec) say("");                                 // a clone it can't use is said by the start's holds check
+    const dir = memoDir(rec!);
     if (!waiting(dir)) say("");                        // at every start: nothing waiting, no network
-    fetch(rec);
-    say(...flush(rec, dir).lines);
+    fetch(rec!);
+    say(...flush(rec!, dir).lines);
   }
   let input: any = {};
   if (a.hook === true) { try { input = JSON.parse(await Bun.stdin.text()); } catch { /* none */ } }
   const session = sessionOf(a.session ?? input.session_id);
   if (!session) say("");
-  fetch(rec);                                          // offline: the holds as last fetched, and the outbox
+  if (rec) fetch(rec);                                 // offline: the holds as last fetched, and the outbox
   let read = true;
   let mark: number | undefined;
   const kept: string[] = [];
@@ -566,42 +616,51 @@ if (import.meta.main) {
   } catch { read = false; mark = undefined; }
   const { steps, planned } = stepsOf(kept);
   const open = steps.filter((s) => s.status !== "completed");
-  const held = Object.entries(holdsAt(rec)).filter(([, h]: [string, any]) => h?.holder === `laptop:${session}`).map(([item]) => item).sort();
-  const commits = Number(git(rec.dir, ["rev-list", "--count", rec.ref])?.trim());   // how far the record had come: its order
-  const rmark = Number.isInteger(commits) && commits > 0 ? commits : undefined;
   const why: Why = !read ? "unread" : !planned ? "unplanned" : "open";
-  const snap: Snapshot = { session: session!, held, open, why, at: Date.now(), ...(mark !== undefined ? { mark } : {}), ...(rmark !== undefined ? { rmark } : {}) };
-  mkdirSync(dir, { recursive: true });
+  const seen = rec ? recordSeen(rec, session!) : null;    // the holds and how far the record had come, from one commit
+  const snap: Snapshot = { session: session!, held: seen?.held ?? null, open, why, at: Date.now(), ...(mark !== undefined ? { mark } : {}), ...(seen ? { rmark: seen.rmark } : {}) };
+  const what = why === "open" ? (open.length ? `Open steps (${open.length})` : "That nothing is left open") : `That the session ended ${why === "unread" ? "unread" : "with no task list"}`;
+  const dir = rec ? memoDir(rec) : memoDirOf(where!);
+  if (!dir) say(`${what}: not filed: ${(c as { error: string }).error}`);
+  mkdirSync(dir!, { recursive: true });
   if (a.dry === true) {                                // what this end would file, changing nothing
-    const key = filedKey(held, open, why);
-    const d = decide(readJournal(join(dir, `${session}.journal`)), key, held, open, why);
-    const r = d.file ? requestFor(open, held, why, new Date(snap.at), d.wasOpen) : null;
+    if (!seen) say(`${what}: the record couldn't be read, so the items held aren't known`);
+    const key = filedKey(seen!.held, open, why);
+    const d = decide(readJournal(join(dir!, `${session}.journal`)), key, seen!.held, open, why);
+    const r = d.file ? requestFor(open, seen!.held, why, new Date(snap.at), d.wasOpen) : null;
     if (r) { r.from = `laptop:${session}`; r.id = filingId(session!, d.n, key); }
     say(r ? JSON.stringify(r, null, 1) : "");
   }
   // Ends of one session take turns. Its snapshot is kept first, so one that can't get its turn
   // in time is filed by the next flush, at any session's start or end.
-  const pending = writePending(dir, snap);
+  const pending = writePending(dir!, snap);
+  if (!seen) {
+    // The record couldn't be read, so the items held aren't known: the snapshot waits, said at
+    // every flush, for the first start or end that can read the record, which reads them then.
+    const lines = rec ? flush(rec, dir!).lines.filter((l) => !l.includes(pending)) : [];
+    say(...lines, existsSync(pending)
+      ? `${what}: waiting here: the record couldn't be read${rec ? "" : ` (${(c as { error: string }).error})`}, so the items held aren't known yet; kept for the next session's start or end that can read it: ${pending}`
+      : "");
+  }
   const waitMs = Number(process.env.SESSION_END_WAIT_MS ?? 20_000);
   const waitFrom = Date.now();
-  while (!claim(join(dir, `${session}.ending`))) {
+  while (!claim(join(dir!, `${session}.ending`))) {
     if (Date.now() - waitFrom > waitMs) say("Open steps not filed yet: another end of this session is filing; they go at the next session's start or end");
     await Bun.sleep(250);
   }
-  lock = join(dir, `${session}.ending`);
-  if (!existsSync(pending)) say(...flush(rec, dir).lines);   // a flush filed it meanwhile
+  lock = join(dir!, `${session}.ending`);
+  if (!existsSync(pending)) say(...flush(rec!, dir!).lines);   // a flush filed it meanwhile
   let r: { id: string | null; same: boolean };
-  try { r = fileSnapshot(dir, snap); }
+  try { r = fileSnapshot(dir!, snap); }
   catch (e) {
     say(`Open steps not filed: this session's journal couldn't be read (${(e as NodeJS.ErrnoException)?.code ?? e}); its snapshot is kept for the next start: ${pending}`);
   }
   rmSync(pending, { force: true });
   rmSync(lock, { force: true });                       // its turn is over: a flush may take others' snapshots
   lock = "";
-  const done = flush(rec, dir);
+  const done = flush(rec!, dir!);
   if (!r!.id) say(...done.lines);                      // nothing new to file: what waits still goes
   const mine = done.fates.get(r!.id!);
-  const what = why === "open" ? (open.length ? `Open steps (${open.length})` : "That nothing is left open") : `That the session ended ${why === "unread" ? "unread" : "with no task list"}`;
   say(...done.lines.filter((l) => !l.startsWith("Submitted ")),
     mine === "submitted" ? `${what}: submitted to the record`
       : mine === "filed" ? `${what}: filed in the record`
