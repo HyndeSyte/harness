@@ -190,18 +190,22 @@ def test_cain_gets_a_rows_base_and_the_holds_from_record_sh(tmp_path):
     text = "# Pending\n\n## Open\n\n| ID | Item | Who | Next step | Waits for | Done when | Since |\n|---|---|---|---|---|---|---|\n"
     text += "\n".join(rows) + "\n\n## Done\n\n| Item | Date |\n|---|---|\n| P33 old: a done row that starts with the same id | Nov 1 |\n"
     (rec / "state" / "PENDING.md").write_bytes(text.replace("\n", "\r\n").encode())
-    env = {"PATH": __import__("os").environ["PATH"], "RECORD_DIR": str(rec)}
+    env = {"PATH": __import__("os").environ["PATH"], "RECORD_DIR": str(rec), "NOTES_READ_DIR": str(tmp_path / "reads")}
     run_ = lambda *a: subprocess.run([bash, str(CAIN / "rootfs/opt/cain/record.sh"), *a], env=env, capture_output=True, text=True, timeout=20)
     for line in rows:
         assert run_("rowsha", line.split("|")[1].strip()).stdout.strip() == hashlib.sha1(line.encode()).hexdigest()
     assert run_("rowsha", "P99").returncode == 1
-    assert run_("holds").stdout.strip() == "{}"   # nothing pushed yet: nobody holds anything
+    # Holds and notes are only ever the record's, its main as the keeper's copy has it.
+    assert run_("holds").returncode == 3          # no record here yet: said, never taken for no holds
+    _as_the_keeper_pushed_it(rec)
+    assert run_("holds").stdout.strip() == "{}"   # a record with no holds file: nobody holds anything
     # Notes on an item, oldest first, one table row each; only those after a time if given.
     (rec / "state" / "notes").mkdir()
     notes = ["| 2026-11-11T13:00:00.000Z | laptop:abc | Dane, other chat: rebase PR #3 after the fix |",
              "| 2026-11-11T14:00:00.000Z | cain | Dane in Discord: hold the ship until the drill |"]
     (rec / "state" / "notes" / "P33.md").write_bytes(("# Notes on P33\n\nWords about P33.\n\n| When | From | Note |\n|---|---|---|\n"
                                                       + "\n".join(notes) + "\n").replace("\n", "\r\n").encode())
+    _as_the_keeper_pushed_it(rec)
     assert run_("notes", "P33").stdout.splitlines() == notes
     assert run_("notes", "p33").stdout.splitlines() == notes      # ids are one case
     assert run_("notes", "P33", "2026-11-11T13:00:00.000Z").stdout.splitlines() == notes[1:]
@@ -217,6 +221,7 @@ def test_cain_gets_a_rows_base_and_the_holds_from_record_sh(tmp_path):
         (rec / "state" / "holds.json").write_text(json.dumps({
             "P33": {"holder": "cain", "for": "x", "branches": [], "taken": "2026-11-11T12:00:00.000Z", "renewed": "2026-11-11T12:00:00.000Z"},
             "P44": {"holder": "laptop:abc", "for": "x", "branches": [], "taken": "2026-11-11T12:00:00.000Z", "renewed": "2026-11-11T12:00:00.000Z"}}))
+        _as_the_keeper_pushed_it(rec)
         assert run_("notes").stdout.splitlines() == ["P11 | 2026-11-11T16:00:00.000Z | page | for Cain |"] + ["P33 " + n for n in notes]
         assert run_("notes", "-", "2026-11-11T13:30:00Z").stdout.splitlines() == ["P11 | 2026-11-11T16:00:00.000Z | page | for Cain |", "P33 " + notes[1]]
 
