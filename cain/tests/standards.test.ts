@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HOME_KINDS, KINDS, PART_MAX, PARTS, parse, parts, problems, REGISTRY, ROLES } from "../rootfs/opt/cain/standards/load";
+import { HOME_KINDS, incomingOf, KINDS, PART_MAX, PARTS, parse, parts, problems, REGISTRY, ROLES } from "../rootfs/opt/cain/standards/load";
 
 const REPO = join(import.meta.dir, "../..");
 const LOAD = join(import.meta.dir, "../rootfs/opt/cain/standards/load.ts");
@@ -117,18 +117,35 @@ describe("each role's text reaches its sessions whole", () => {
     });
   }
 
-  test("his newer corrections come after the entries and win over them; too many for the room left say how many more", () => {
-    const one = parts(entries, "cain", { incoming: ["2026-11-15: never say Cain is idle when a job runs (truth)"], incomingPath: "/data/record/rules/incoming.md" });
+  test("his newer corrections come after the entries and win over them, each whole or counted with where to read it, never cut short", () => {
+    const path = "/data/record/rules/incoming.md";
+    const one = parts(entries, "cain", { incoming: ["2026-11-15: never say Cain is idle when a job runs (truth)"], incomingPath: path });
     const last = one.at(-1)!;
-    expect(last).toContain("His newer corrections (/data/record/rules/incoming.md), not in this list yet. They win over it until they're folded in:\n- 2026-11-15: never say Cain is idle");
+    expect(last).toContain(`His newer corrections (${path}), not in this list yet. They win over it until they're folded in:\n- 2026-11-15: never say Cain is idle`);
     expect(one.join("\n").indexOf("His newer corrections")).toBeGreaterThan(one.join("\n").indexOf(line(entries.filter((e) => e.applies?.includes("all")).at(-1)!)));
-    const many = parts(entries, "cain", { incoming: Array.from({ length: 40 }, (_, i) => `correction ${i}: ${"x".repeat(300)}`) });
+    // A long one, its restriction at the end: whole.
+    const long = `2026-11-15: ${"a careful rule ".repeat(55)}and never on Sundays.`;
+    expect(long.length).toBeGreaterThan(800);
+    expect(parts(entries, "cain", { incoming: [long], incomingPath: path }).at(-1)).toContain(`- ${long}`);
+    // Too many for the room: whole ones, then how many more and where; never past PARTS or the cut.
+    const many = parts(entries, "cain", { incoming: Array.from({ length: 40 }, (_, i) => `correction ${i}: ${"x".repeat(300)}`), incomingPath: path });
     expect(many.length).toBeLessThanOrEqual(PARTS);
     for (const p of many) expect(p.length).toBeLessThanOrEqual(PART_MAX);
-    expect(many.at(-1)).toMatch(/\(\d+ more there: read them now\.\)$/);
+    expect(many.at(-1)).toMatch(/\(\d+ more there, too long to show here: read them whole there now\.\)$/);
+    for (const l of many.at(-1)!.split("\n").filter((x) => x.startsWith("- correction"))) expect(l.length).toBe(2 + "correction 0: ".length + 300 + (l.match(/correction (\d+)/)![1].length - 1));
+    // One too long for any room: said, with where.
+    expect(parts(entries, "cain", { incoming: ["x".repeat(9_000)], incomingPath: path }).at(-1))
+      .toEndWith(`His newer corrections are in ${path}, not in this list yet, too long to show here: read them whole there now. They win over it until they're folded in.`);
+    // A file that couldn't be read is said.
+    expect(parts(entries, "cain", { incomingError: "EACCES", incomingPath: path }).at(-1))
+      .toEndWith(`His newer corrections couldn't be read (EACCES): read ${path} yourself now. They win over this list until they're folded in.`);
   });
 
-  test("the hook's answer: SessionStart's added context, nothing for a part past the end, and a laptop's jobs hook leaves it to the laptop's own", () => {
+  test("a correction is any list line of the file", () => {
+    expect(incomingOf("# Dane's corrections\n\nOne line each.\n- 2026-11-15: one\n* two\n+ three\n12. four\n-not one\n")).toEqual(["2026-11-15: one", "two", "three", "four"]);
+  });
+
+  test("the hook's answer: SessionStart's added context, nothing for a part past the end, and the jobs' parts only in a cloud session", () => {
     const run = (env: Record<string, string>, ...a: string[]) =>
       Bun.spawnSync(["bun", LOAD, ...a], { stdout: "pipe", env: { ...process.env, STANDARDS_INCOMING: "none", ...env } });
     const one = JSON.parse(run({}, "cain", "--part", "1").stdout.toString());
@@ -138,10 +155,20 @@ describe("each role's text reaches its sessions whole", () => {
     expect([past.exitCode, past.stdout.toString()]).toEqual([0, ""]);
     expect(run({}, "everyone").exitCode).toBe(2);
     expect(run({}, "specialist").exitCode).toBe(2);
-    const { RECORD_CLONE, ...noClone } = process.env;
-    const job = Bun.spawnSync(["bun", LOAD, "jobs", "--part", "1"], { stdout: "pipe", env: { ...noClone, STANDARDS_INCOMING: "none" } });
-    expect(job.stdout.toString()).toContain("Dane's standards, part 1 of ");
-    expect(run({ RECORD_CLONE: "/elsewhere" }, "jobs", "--part", "1").stdout.toString()).toBe("");
+    expect(run({ CLAUDE_CODE_REMOTE: "true" }, "jobs", "--part", "1").stdout.toString()).toContain("Dane's standards, part 1 of ");
+    const { CLAUDE_CODE_REMOTE, ...local } = process.env;
+    const laptop = Bun.spawnSync(["bun", LOAD, "jobs", "--part", "1"], { stdout: "pipe", env: { ...local, STANDARDS_INCOMING: "none" } });
+    expect(laptop.stdout.toString()).toBe("");
+  });
+
+  test("a file of his newer corrections that can't be read is said in the last part; none written yet is nothing", () => {
+    const d = mkdtempSync(join(tmpdir(), "incoming-"));
+    const lastOf = (incoming: string) => {
+      const p = Bun.spawnSync(["bun", LOAD, "cain", "--part", String(PARTS)], { stdout: "pipe", env: { ...process.env, STANDARDS_INCOMING: incoming } });
+      return JSON.parse(p.stdout.toString()).hookSpecificOutput.additionalContext as string;
+    };
+    expect(lastOf(d)).toContain(`His newer corrections couldn't be read (EISDIR): read ${d} yourself now.`);   // a folder, not a file
+    expect(lastOf(join(d, "none-yet.md"))).not.toContain("His newer corrections");
   });
 });
 

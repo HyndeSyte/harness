@@ -2,7 +2,10 @@
 // org-v2 DESIGN 4.F, the registry's S-051): its task list replayed from its transcript, then
 // filed as a note on each item it holds, or as a line for Cain to fold in when it holds none.
 import { describe, expect, test } from "bun:test";
-import { clean, fileAgain, filedKey, requestFor, stepsOf } from "../tools/session-end";
+import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { claim, clean, fileAgain, filedKey, requestFor, stepsOf } from "../tools/session-end";
 
 const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
 const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
@@ -60,9 +63,10 @@ describe("what it files", () => {
     expect(r.ops.map((o: any) => [o.op, o.item])).toEqual([["note", "P33"], ["note", "P40"]]);
     expect(r.ops[0].text).toBe("The laptop session ended (2026-11-15) with these steps open: Verify after his tap; Clean up. Its hold lapses in a day; take the item to carry it on.");
   });
-  test("holding nothing: one line for Cain to fold into the open list, the steps alone (never the chat)", () => {
-    const r = requestFor("abc", open, [], "open", at);
-    expect(r.ops).toEqual([{ op: "append", path: "state/laptop-open.md", text: "- 2026-11-15 laptop session abc: Verify after his tap; Clean up\n" }]);
+  test("holding nothing: one line for Cain to fold into the open list, how many steps, never their words", () => {
+    const r = requestFor("abc", [{ content: "Review the renewal figures for Friday", status: "pending" }, ...open], [], "open", at);
+    expect(r.ops).toEqual([{ op: "append", path: "state/laptop-open.md", text: "- 2026-11-15 laptop session abc: 3 open step(s), their words kept on the laptop (resume the session there to see them)\n" }]);
+    expect(JSON.stringify(r)).not.toContain("renewal");
   });
   test("a transcript that can't be read, or no task list, is said on the items it holds; holding none, there's nothing to say", () => {
     expect(requestFor("s1", [], ["P33"], "unread", at).ops[0].text).toStartWith("The laptop session ended (2026-11-15) and its task list couldn't be read, so what it left open isn't known.");
@@ -74,6 +78,18 @@ describe("what it files", () => {
     expect(clean(`Rotate ${key} in the vault`, 200)).toBe("Rotate [a key, masked] in the vault");
     const r = requestFor("s1", [{ content: `Rotate ${key}`, status: "pending" }], ["P33"], "open", at);
     expect(JSON.stringify(r)).not.toContain(key);
+  });
+});
+
+describe("one at a time", () => {
+  test("a lock is made new, refused while it's fresh, and taken over by one process once it's 2 minutes old", () => {
+    const lock = join(mkdtempSync(join(tmpdir(), "claim-")), "s.ending");
+    expect(claim(lock)).toBe(true);
+    expect(claim(lock)).toBe(false);
+    const old = (Date.now() - 3 * 60_000) / 1000;
+    utimesSync(lock, old, old);
+    expect(claim(lock)).toBe(true);                       // taken over
+    expect(claim(lock)).toBe(false);                      // and now fresh again
   });
 });
 

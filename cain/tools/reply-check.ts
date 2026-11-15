@@ -1,31 +1,39 @@
 // What a laptop session showed him this turn, checked when the turn ends (the registry's S-010,
-// S-013 and S-014 on the laptop, where nothing holds a reply back before it shows). A Claude Code
-// Stop hook in the laptop's user settings:
+// S-013 and S-014 on the laptop). Nothing holds a laptop reply back before it shows, so this is a
+// correction after the fact: words he can't read keep the session going once, to say those lines
+// again plainly. A Claude Code Stop hook in the laptop's user settings:
 //
 //   bun cain/tools/reply-check.ts --hook     (the hook's input: transcript_path, stop_hook_active)
 //
 // It reads the turn's words as he saw them (the session's text since his last message, and the
 // recap, question and buttons of its wrap-up box or question card) with the message gate's own
-// rules (an em dash, "add-on", a hidden count, machine text) and the codes he can't read: an
-// item id the record has (and its question id), a registry or rule number, a build piece's code,
-// "wave 1", a commit's short id. Words he can't read keep the session going once, with what they
-// were and how to say them, so it sends him the lines again without them. Clean words, a turn
-// already kept going by it, or anything that can't be read: nothing, so it never blocks for good.
+// rules (an em dash, "add-on", a hidden count, machine text) and the codes it can tell apart from
+// ordinary words: an item id his record has (and its question id), a number of the registry's
+// entries or of the record's rule files, "wave" and a number, a commit's short id. A build
+// piece's letter and number (C1, D3) is left to the standards themselves: the same letters are
+// vitamins, vertebrae and part numbers. Clean words, a turn it already kept going, or anything
+// that can't be read: nothing, so it never blocks for good.
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { codesHits, recordItems } from "../rootfs/opt/cain/gate/cain.ts";
 import { check, WHY } from "../rootfs/opt/cain/gate/rules.ts";
-import { clone, treeAt } from "./record-lib.ts";
+import { clone, git, treeAt } from "./record-lib.ts";
 
 const LAPTOP_RULES = ["dash", "app", "count", "machine"] as const;
+const REGISTRY = join(import.meta.dir, "../rootfs/opt/cain/standards/registry.md");
 
-// The codes only the laptop's words carry: registry and rule numbers, build pieces, waves, and a
-// commit's short id (a run of hex with a digit and a letter in it).
-const LAPTOP_CODES: [RegExp, string][] = [
-  [/(?<![A-Za-z0-9])[SR]-\d{3}(?![0-9])/g, "a registry or rule number"],
-  [/(?<![A-Za-z0-9/._-])[CDF]\d{1,2}(?![A-Za-z0-9])/g, "a build piece's code"],
-  [/\bwave \d\b/gi, "a build wave"],
-  [/(?<![0-9A-Za-z])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,12}(?![0-9A-Za-z])/g, "a commit's id"],
-];
+// The numbers that are codes here: the registry's entries (S-062) and the record's rule files
+// (R-004), each only as it exists, so "R-134a" or "S-300" pass.
+export function knownNumbers(registry: string | null, ruleFiles: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const m of (registry ?? "").matchAll(/^## (S-\d{3}) /gm)) out.add(m[1]);
+  for (const f of ruleFiles) { const m = /(?:^|\/)(R-\d{3})-/.exec(f); if (m) out.add(m[1]); }
+  return out;
+}
+
+const WAVE = /\bwave \d\b/gi;
+const COMMIT = /(?<![0-9A-Za-z])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,12}(?![0-9A-Za-z])/g;
+const NUMBER = /(?<![A-Za-z0-9])[SR]-\d{3}(?![A-Za-z0-9])/g;
 
 // The words of this turn as he saw them: everything shown after his last message.
 export function turnWords(lines: string[]): string[] {
@@ -58,13 +66,15 @@ export function turnWords(lines: string[]): string[] {
 }
 
 // What in those words he can't read, each as a short excerpt with why.
-export function unreadable(words: string[], items: ReadonlySet<string> | null): string[] {
+export function unreadable(words: string[], items: ReadonlySet<string> | null, numbers: ReadonlySet<string> = new Set()): string[] {
   const out: string[] = [];
   for (const w of words) {
     for (const h of check(w, { rules: [...LAPTOP_RULES], refusable: true }).hits) out.push(`"${h.around}" (${WHY[h.rule]})`);
     for (const h of codesHits(w, items)) out.push(`"${h.around}" (a record code he can't read)`);
     const seen = w.replace(/\]\([^)]*\)/g, "]()");                     // a link's target isn't shown
-    for (const [re, what] of LAPTOP_CODES) for (const m of seen.matchAll(re)) out.push(`"${m[0]}" (${what})`);
+    for (const m of seen.matchAll(NUMBER)) if (numbers.has(m[0])) out.push(`"${m[0]}" (a registry or rule number)`);
+    for (const m of seen.matchAll(WAVE)) out.push(`"${m[0]}" (a build wave)`);
+    for (const m of seen.matchAll(COMMIT)) out.push(`"${m[0]}" (a commit's id)`);
   }
   return [...new Set(out)];
 }
@@ -76,12 +86,19 @@ if (import.meta.main) {
     if (input?.stop_hook_active === true) pass();
     const words = turnWords(readFileSync(String(input?.transcript_path ?? ""), "utf8").split("\n"));
     let items: Set<string> | null = null;
+    let rules: string[] = [];
     const c = clone(process.env.RECORD_CLONE);
-    if (!("error" in c)) items = recordItems(treeAt(c).read("state/PENDING.md"));
-    const found = unreadable(words, items);
+    if (!("error" in c)) {
+      items = recordItems(treeAt(c).read("state/PENDING.md"));
+      rules = (git(c.dir, ["ls-tree", "--name-only", c.ref, "rules/"]) ?? "").split("\n").filter(Boolean);
+    }
+    let registry: string | null = null;
+    try { registry = readFileSync(REGISTRY, "utf8"); } catch { /* none beside it */ }
+    const found = unreadable(words, items, knownNumbers(registry, rules));
     if (!found.length) pass();
     const reason = `What you showed him this turn has words he can't read: ${found.slice(0, 8).join("; ")}${found.length > 8 ? `; and ${found.length - 8} more of the same kinds` : ""}. `
-      + "Send him the lines that held them again, said plainly: things named by what they do for him, no codes or ids, no em dashes. Say nothing about this check.";
+      + "Send him the lines that held them again, said plainly: things named by what they do for him, no codes or ids, no em dashes. "
+      + "If one is an ordinary word where it stands (a part number, a vitamin), leave it and add nothing. Say nothing about this check.";
     console.log(JSON.stringify({ decision: "block", reason }));
   } catch { /* never blocks for good */ }
   pass();

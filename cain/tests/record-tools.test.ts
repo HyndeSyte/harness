@@ -1,7 +1,7 @@
 // The laptop's record tools (cain/tools/), run as a laptop session would run them,
 // against a keeper on a real git repo standing in for GitHub.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
 import { cycle } from "../rootfs/opt/cain/record/main.ts";
@@ -315,4 +315,36 @@ describe("session-end", () => {
     expect(sh(["git", "show", "main:state/notes/P33.md"], l.remote)).toContain("its task list couldn't be read, so what it left open isn't known.");
     expect(end()).toEqual({ code: 0, out: "", err: "" });                 // said once
   }, 60_000);
+
+  test("a filing that can't be sent waits in the outbox and goes at the next start, once", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
+    cycle(l.cfg);
+    sh(["git", "fetch", "-q", "origin"], l.clone);                          // the hold, as last fetched
+    const transcript = join(l.root, "transcript.jsonl");
+    writeFileSync(transcript, JSON.stringify({ type: "assistant", message: { role: "assistant",
+      content: [{ type: "tool_use", name: "mcp__ccd_turn__update_plan", input: { items: [{ content: "Verify after his tap", status: "pending" }] } }] } }) + "\n");
+    const away = `${l.remote}-away`;
+    renameSync(l.remote, away);                                             // the record can't be reached
+    const ended = l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: transcript }) });
+    expect(ended.code).toBe(0);
+    expect(ended.out).toStartWith("Open steps not sent yet (");
+    expect(ended.out).toEndWith("): they go at the next session's start");
+    expect(readdirSync(join(l.clone, ".git", "record-holds", "outbox"))).toHaveLength(1);
+    renameSync(away, l.remote);
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "Filed 1 left from a session's end", err: "" });
+    expect(l.inboxNames()).toHaveLength(1);
+    expect(readdirSync(join(l.clone, ".git", "record-holds", "outbox"))).toHaveLength(0);
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(sh(["git", "show", "main:state/notes/P33.md"], l.remote)).toContain("with these steps open: Verify after his tap.");
+    // One the keeper already has, back in the outbox (its send's answer was lost): gone, not sent again.
+    const [logged] = sh(["git", "log", "--format=%s", "-n", "20", "main"], l.remote).split("\n").filter((s) => s.includes("sent again"));
+    const id = /\((laptop-[^,]+), sent again\)/.exec(logged)![1];
+    writeFileSync(join(l.clone, ".git", "record-holds", "outbox", `${id}.json`), JSON.stringify({ id, summary: "s", kind: "change", ops: [] }));
+    sh(["git", "fetch", "-q", "origin"], l.clone);
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });
+    expect(readdirSync(join(l.clone, ".git", "record-holds", "outbox"))).toHaveLength(0);
+    expect(l.inboxNames()).toHaveLength(0);
+  }, 90_000);
 });

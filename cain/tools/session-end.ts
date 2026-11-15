@@ -5,6 +5,7 @@
 //
 //   bun cain/tools/session-end.ts --hook     (the hook's input: session_id, transcript_path)
 //   bun cain/tools/session-end.ts --session <id> --transcript <path> [--record <clone>] [--dry]
+//   bun cain/tools/session-end.ts --flush    (a SessionStart hook: sends what an end couldn't)
 //
 // Give the hook a timeout of 30 (seconds): Claude Code allows a SessionEnd hook 1.5 seconds
 // unless its timeout says more, and fetching and sending the record takes longer.
@@ -14,14 +15,18 @@
 //   - on each item the session holds, a note: the steps still open; or, when the transcript
 //     can't be read or kept no task list, that it ended without one;
 //   - when it holds none, one line appended to state/laptop-open.md, which Cain's check-in
-//     names until he has folded it into the open list.
-// Only the steps' words go, with anything shaped like a key masked; never the chat itself.
-// A session's process can end more than once (an idle stop, a /clear, a resume): the same
-// filing is made once, and made again only if the record refused it or never logged it within
-// a day. The record clone's .git folder keeps each session's last filing. One end at a time.
-// It never holds up the session's end: any failure is one line.
+//     names until he has folded it into the open list: how many steps, never their words (a
+//     session that holds no item isn't the harness's work, so what it was about stays on the
+//     laptop, in the session, to resume there).
+// On a held item only the steps' words go, with anything shaped like a key masked; never the
+// chat itself. A session's process can end more than once (an idle stop, a /clear, a resume):
+// the same filing is made once, and made again only if the record refused it or never logged it
+// within a day. A filing that couldn't be sent waits in an outbox and goes at the next session's
+// start or end, as the same request: the record keeper refuses an id it has seen, so a resend
+// never files twice. The record clone's .git folder keeps all of it. One end at a time. It never
+// holds up the session's end: any failure is one line.
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { TOKEN_SHAPES } from "../rootfs/opt/cain/c1/tools.ts";
 import { type Clone, args, check, clone, fetch, git, holdsAt, outcomes, send, sessionOf } from "./record-lib.ts";
@@ -97,7 +102,7 @@ export function requestFor(session: string, open: Step[], held: string[], why: "
     : "and kept no task list, so what it left open isn't known.";
   const ops = held.length
     ? held.map((item) => ({ op: "note", item, text: clean(`The laptop session ended (${day}) ${said} Its hold lapses in a day; take the item to carry it on.`, 1900) }))
-    : [{ op: "append", path: "state/laptop-open.md", text: `- ${day} laptop session ${session}: ${clean(list, 1500)}\n` }];
+    : [{ op: "append", path: "state/laptop-open.md", text: `- ${day} laptop session ${session}: ${open.length} open step(s), their words kept on the laptop (resume the session there to see them)\n` }];
   const what = why === "open" ? `with ${open.length} step(s) open` : why === "unread" ? "and its task list couldn't be read" : "with no task list";
   return { kind: "change", summary: clean(`A laptop session ended ${what}${held.length ? ` on ${held.join(", ")}` : ", on no item"}`, 200), ops };
 }
@@ -110,10 +115,47 @@ export function fileAgain(states: string[], sentAt: number, now = Date.now()): b
   return now - sentAt > 86_400_000;
 }
 
-// Where a session's last filing is kept: beside record-holds' memo, in the clone's .git folder.
+// Where a session's last filing and the outbox are kept: beside record-holds' memo, in the
+// clone's .git folder.
 function memoDir(c: Clone): string {
   const gitDir = git(c.dir, ["rev-parse", "--git-dir"])?.trim() ?? ".git";
   return join(isAbsolute(gitDir) ? gitDir : join(c.dir, gitDir), "record-holds");
+}
+
+// A lock only one process holds: made new, or taken over once it's 2 minutes old by moving the
+// old one aside first (a rename only one process can make).
+export function claim(lock: string, now = Date.now()): boolean {
+  try { writeFileSync(lock, String(process.pid), { flag: "wx" }); return true; } catch { /* held, or left */ }
+  try { if (now - statSync(lock).mtimeMs < 120_000) return false; } catch { /* gone meanwhile */ }
+  const aside = `${lock}.${process.pid}.${randomBytes(3).toString("hex")}`;
+  try { renameSync(lock, aside); } catch { return false; }          // another took it first
+  rmSync(aside, { force: true });
+  try { writeFileSync(lock, String(process.pid), { flag: "wx" }); return true; } catch { return false; }
+}
+
+// Sends what waits in the outbox: a request the keeper has logged is gone from it already; any
+// other goes again, as itself. Returns how many went.
+export function flush(rec: Clone, dir: string): number {
+  const box = join(dir, "outbox");
+  let names: string[] = [];
+  try { names = readdirSync(box).filter((n) => n.endsWith(".json")).sort(); } catch { return 0; }
+  if (!names.length || !claim(join(dir, "outbox.lock"))) return 0;
+  let sent = 0;
+  try {
+    for (const n of names) {
+      let raw = "";
+      try { raw = readFileSync(join(box, n), "utf8"); } catch { continue; }
+      let id = "", summary = "";
+      try { ({ id, summary } = JSON.parse(raw)); } catch { rmSync(join(box, n), { force: true }); continue; }
+      if (outcomes(rec, id).length) { rmSync(join(box, n), { force: true }); continue; }
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+      const s = send(rec, `${stamp}-${n.replace(/\.json$/, "")}-again.json`, raw, `Inbox: ${summary} (${id}, sent again)`);
+      if ("error" in s) break;
+      rmSync(join(box, n), { force: true });
+      sent++;
+    }
+  } finally { rmSync(join(dir, "outbox.lock"), { force: true }); }
+  return sent;
 }
 
 if (import.meta.main) {
@@ -124,6 +166,14 @@ if (import.meta.main) {
     if (line) console.log(line);
     process.exit(0);
   };
+  if (a.flush === true) {
+    const c = clone(a.record ?? process.env.RECORD_CLONE);
+    if ("error" in c) say("");
+    const rec = c as Exclude<typeof c, { error: string }>;
+    fetch(rec);
+    const n = flush(rec, memoDir(rec));
+    say(n ? `Filed ${n} left from a session's end` : "");
+  }
   let input: any = {};
   if (a.hook === true) { try { input = JSON.parse(await Bun.stdin.text()); } catch { /* none */ } }
   const session = sessionOf(a.session ?? input.session_id);
@@ -136,7 +186,7 @@ if (import.meta.main) {
   const c = clone(a.record ?? process.env.RECORD_CLONE);
   if ("error" in c) say(open.length ? `Open steps not filed: ${c.error}` : "");
   const rec = c as Exclude<typeof c, { error: string }>;
-  if (!fetch(rec)) say(open.length ? "Open steps not filed: couldn't fetch the record" : "");
+  fetch(rec);                                          // offline: the holds as last fetched, and the outbox
   const me = `laptop:${session}`;
   const held = Object.entries(holdsAt(rec)).filter(([, h]: [string, any]) => h?.holder === me).map(([item]) => item).sort();
   const why = lines === null ? "unread" : !planned ? "unplanned" : "open";
@@ -150,15 +200,10 @@ if (import.meta.main) {
   if (a.dry === true) say(raw);
   // One end of this session files at a time; a lock left by one that died goes after 2 minutes.
   const dir = memoDir(rec);
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(join(dir, "outbox"), { recursive: true });
+  if (!claim(join(dir, `${session}.ending`))) say("");
   lock = join(dir, `${session}.ending`);
-  try { writeFileSync(lock, String(process.pid), { flag: "wx" }); }
-  catch {
-    let age = 0;
-    try { age = Date.now() - statSync(lock).mtimeMs; } catch { /* gone meanwhile */ }
-    if (age < 120_000) { lock = ""; say(""); }
-    writeFileSync(lock, String(process.pid));
-  }
+  flush(rec, dir);                                     // what an earlier end couldn't send
   const key = why === "open" ? filedKey(held, open) : `${why}:${held.join(",")}`;
   const ended = join(dir, `${session}.ended`);
   try {
@@ -167,8 +212,11 @@ if (import.meta.main) {
   } catch { /* nothing filed yet */ }
   const r = check(raw, rec);
   if (r.state !== "ok" && r.state !== "waiting") say(`Open steps not filed: ${r.line}`);
-  const s = send(rec, `${stamp}-${session}-${rand}.json`, raw, `Inbox: ${req.summary} (${req.id})`);
-  if ("error" in s) say(`Open steps not filed: ${s.error}`);
+  const box = join(dir, "outbox", `${req.id}.json`);
+  writeFileSync(box, raw);                             // kept until it's sent
   try { writeFileSync(ended, `${key} ${req.id} ${Date.now()}`); } catch { /* filed again next time */ }
+  const s = send(rec, `${stamp}-${session}-${rand}.json`, raw, `Inbox: ${req.summary} (${req.id})`);
+  if ("error" in s) say(`Open steps not sent yet (${s.error}): they go at the next session's start`);
+  rmSync(box, { force: true });
   say(why === "open" ? `Open steps filed in the record (${open.length})` : `Filed that the session ended ${why === "unread" ? "unread" : "with no task list"}`);
 }

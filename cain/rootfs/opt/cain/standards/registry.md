@@ -11,15 +11,17 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
   repo, through its project settings (`load.ts jobs`). A part that can't load tells the
   session so, and the session reads this file itself. The calendar specialist is code: what
   applies to it alone is an invariant or a procedure, held by its own tests.
-- **Three kinds.** An *invariant* is enforced by code: it names a test by its name, or a
-  gate rule with its shared cases, in a suite CI runs, that fails if the code stops
-  enforcing it. A *procedure* is checked at a named step where the work hands off. A
+- **Three kinds.** An *invariant* is enforced by code: it names the test that checks it,
+  by its name in a suite CI runs, or the gate rule with its shared cases (CI checks the name
+  is there; that the test fails without the code is shown when the entry is made, as each
+  fix's test is). A *procedure* is checked at a named step where the work hands off. A
   *principle* is judgment, said short. CI holds the number of principles to prose-baseline,
   so a correction becomes the smallest test or gate that would have caught its kind, or
   sharpens the entry it belongs to, and a new principle is a visible change.
-- **Applies** names who carries it: `all`, `cain`, `laptop` (laptop sessions),
-  `specialist` (the calendar specialist, the Harness App, through its code), `jobs` (cloud
-  Build and Ship jobs).
+- **Applies** names who carries it: `all` (every model session: Cain, the laptop's, the
+  cloud jobs), `cain`, `laptop` (laptop sessions), `jobs` (cloud Build and Ship jobs), and
+  `specialist` (the calendar specialist, the Harness App: code, so it carries only the
+  entries that name it, each held by its tests).
 - **Home** is where each lives in the org: a role, a journey, a design section, or an open
   item in the record. CI fails an entry without one. **Source** points to Dane's own words
   in the private record (this repo is public, so no names, family, health or employer
@@ -69,7 +71,7 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - home: role:Cain; design:org-v2 DESIGN 4.D
 - source: laptop correction, Nov 14 (record projects/org-v2/c1-plan-reviews.md, and P33)
 - enforced-by: cain/tests/gate.test.ts "codes: a record code he can't tell the meaning of"; cain/tests/reply-check.test.ts "words he can't read keep the session going once"
-- rule: Nothing he reads carries a record or build code (an item or question id, a build piece's letter, "wave 1"). Each thing is named by what it does for him. Codes are fine in records, branches, briefs and notes between agents. Cain's gate holds them; on the laptop, a Stop hook reads what each turn showed him and has the session say those lines again without them.
+- rule: Nothing he reads carries a record or build code (an item or question id, a build piece's letter, "wave 1"). Each thing is named by what it does for him. Codes are fine in records, branches, briefs and notes between agents. Cain's gate holds them before they're sent. On the laptop nothing holds a reply back before it shows, so a Stop hook corrects after the fact: the codes it can tell from ordinary words (the record's items, the registry's and rule files' numbers, commit ids) have the session say those lines again plainly. A build piece's letter and number is left to this standard: the same letters are vitamins and part numbers.
 
 ## S-014 No machine text
 - kind: invariant
@@ -255,7 +257,7 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - applies: all
 - home: role:Cain; item:P33
 - source: record core requirement 26 (Nov 10); laptop correction Nov 12
-- checked-at: the record's holds (a session that builds holds its item); the laptop's SessionEnd hook (cain/tools/session-end.ts); Cain's check-in, which names state/laptop-open.md until he has folded it in
+- checked-at: the record's holds (a session that builds holds its item); the laptop's SessionEnd hook (cain/tools/session-end.ts); Cain's check-in, which names state/laptop-open.md until he has folded it in; a filing that couldn't be sent goes at the next session's start
 - rule: Every thread (a session, a job, a branch, a scheduled task) has a home in the record's open list before the turn ends, and the home is true about how it ends. He is never the forcing function, and nothing waits on an opaque timer.
 
 ## S-060 Owner only

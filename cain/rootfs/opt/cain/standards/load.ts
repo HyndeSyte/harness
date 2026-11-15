@@ -73,9 +73,10 @@ export function problems(text: string): string[] {
 
 export const appliesTo = (e: Entry, role: string) => !!e.applies && (e.applies.includes("all") || e.applies.includes(role));
 
-// His corrections the registry doesn't hold yet: the "- " lines of the record's rules/incoming.md.
-export const incomingOf = (text: string) =>
-  text.replace(/\r\n/g, "\n").split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2).trim()).filter(Boolean);
+// His corrections the registry doesn't hold yet: the list lines of the record's rules/incoming.md
+// ("- ", "* ", "+ " or "1. ").
+export const incomingOf = (text: string) => text.replace(/\r\n/g, "\n").split("\n")
+  .map((l) => /^(?:[-*+]|\d+\.)\s+(.*\S)\s*$/.exec(l)?.[1] ?? "").filter(Boolean);
 
 export const INCOMING: Record<string, string | undefined> = {
   cain: "/data/record/rules/incoming.md",
@@ -88,8 +89,9 @@ const WINS = "What wins: safety boundaries in code first; then his newest word (
 
 // The text for a role, in parts of at most PART_MAX characters, split between entries; his
 // newer corrections after them: in the last part, or one of their own while there are fewer
-// than PARTS, as many as fit, then how many more and where. They never make a part past PARTS.
-export function parts(entries: Entry[], role: string, o: { incoming?: string[]; incomingPath?: string; version?: string } = {}): string[] {
+// than PARTS, each whole or not at all, then how many more and where; never cut short, and never
+// a part past PARTS. A file of them that couldn't be read is said, with where to read it.
+export function parts(entries: Entry[], role: string, o: { incoming?: string[]; incomingPath?: string; incomingError?: string; version?: string } = {}): string[] {
   const mine = entries.filter((e) => appliesTo(e, role));
   const v = o.version ? `, version ${o.version}` : "";
   const head = (n: number) => n === 1
@@ -102,19 +104,23 @@ export function parts(entries: Entry[], role: string, o: { incoming?: string[]; 
     cur += `\n\n${item}`;
   };
   for (const e of mine) add(`${e.id} ${e.title} (${e.kind}): ${e.rule}`);
-  if (o.incoming?.length) {
-    const where = o.incomingPath ? ` (${o.incomingPath})` : "";
+  const file = o.incomingPath ?? "the record's rules/incoming.md";
+  let block = "";
+  if (o.incomingError) block = `His newer corrections couldn't be read (${o.incomingError}): read ${file} yourself now. They win over this list until they're folded in.`;
+  else if (o.incoming?.length) {
     // Room: what's left of this part when it's the last there can be, else a part of its own.
-    const room = (out.length + 1 >= PARTS ? PART_MAX - cur.length - 2 : PART_MAX - head(PARTS).length - 2) - 60;
-    let block = `His newer corrections${where}, not in this list yet. They win over it until they're folded in:`;
-    let shown = 0;
+    const room = (out.length + 1 >= PARTS ? PART_MAX - cur.length - 2 : PART_MAX - head(PARTS).length - 2) - 100;
+    block = `His newer corrections (${file}), not in this list yet. They win over it until they're folded in:`;
+    let left = 0;
     for (const c of o.incoming) {
-      const line = `\n- ${c.length > 600 ? `${c.slice(0, 597)}...` : c}`;
-      if (block.length + line.length > room) break;
-      block += line; shown++;
+      const line = `\n- ${c}`;
+      if (block.length + line.length > room) { left++; continue; }   // whole, or not at all
+      block += line;
     }
-    if (!shown) block = `His newer corrections are in ${o.incomingPath ?? "the record's rules/incoming.md"}, not in this list yet: read them now. They win over it until they're folded in.`;
-    else if (shown < o.incoming.length) block += `\n(${o.incoming.length - shown} more there: read them now.)`;
+    if (left === o.incoming.length) block = `His newer corrections are in ${file}, not in this list yet, too long to show here: read them whole there now. They win over it until they're folded in.`;
+    else if (left) block += `\n(${left} more there, too long to show here: read them whole there now.)`;
+  }
+  if (block) {
     if (out.length + 1 >= PARTS) cur += `\n\n${block}`;
     else add(block);
   }
@@ -137,9 +143,9 @@ if (import.meta.main) {
       : JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text } }));
     process.exit(0);
   };
-  // A laptop session started inside this repo carries the laptop's own parts (its user
-  // settings); the project's parts are for cloud jobs.
-  if (role === "jobs" && process.env.RECORD_CLONE) say("");
+  // The project's parts are for cloud jobs (Claude Code marks their sessions CLAUDE_CODE_REMOTE);
+  // a laptop session started inside this repo carries the laptop's own (its user settings).
+  if (role === "jobs" && process.env.CLAUDE_CODE_REMOTE !== "true") say("");
   let all: string[] = [];
   try {
     const text = readFileSync(REGISTRY, "utf8");
@@ -147,8 +153,12 @@ if (import.meta.main) {
     if (bad.length) throw new Error(`registry.md isn't well formed: ${bad[0]}`);
     const path = process.env.STANDARDS_INCOMING ?? INCOMING[role];
     let incoming: string[] = [];
-    if (path && path !== "none") { try { incoming = incomingOf(readFileSync(path, "utf8")); } catch { /* none written yet */ } }
-    all = parts(parse(text), role, { incoming, incomingPath: path, version: version(text) });
+    let incomingError = "";
+    if (path && path !== "none") {
+      try { incoming = incomingOf(readFileSync(path, "utf8")); }
+      catch (e) { if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") incomingError = String((e as NodeJS.ErrnoException)?.code ?? e); }
+    }
+    all = parts(parse(text), role, { incoming, incomingPath: path, incomingError, version: version(text) });
   } catch (e) {
     say(n > 1 ? "" : `Dane's standards didn't load (${String((e as Error)?.message ?? e).slice(0, 200)}). Read ${REGISTRY} yourself now, before you act: the entries that apply to all and to ${role}. That they didn't load is a defect to report.`);
   }
