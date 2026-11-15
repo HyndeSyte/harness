@@ -27,12 +27,21 @@ upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 home="${CAIN_HOME_DIR:-/data/cain}"
 reads="${NOTES_READ_DIR:-$([ -d "$home" ] && echo "$home/notes-read" || echo /data/notes-read)}"
 # An item's notes file as the keeper pushed it (or the copy here): its id, then its text by that
-# id, so what is marked read is exactly what was shown.
+# id, so what is shown, and marked read, is exactly that file.
 notes_id() {
   git -C "$dir" rev-parse -q --verify "$ref:state/notes/$1.md" 2>/dev/null \
     || { [ -f "$dir/state/notes/$1.md" ] && git hash-object --no-filters "$dir/state/notes/$1.md" 2>/dev/null; }
 }
-notes_text() { git -C "$dir" cat-file blob "$2" 2>/dev/null || cat "$dir/state/notes/$1.md" 2>/dev/null; }
+# Sets text to the bytes of item $1's notes file whose id is $2: from git by that id, or else the
+# copy here only when it hashes to that id (the x keeps its last newlines through the $(...)).
+# Taken once, so what is checked is what is shown. Fails, with text empty, when neither is that file.
+take_text() {
+  if text=$(git -C "$dir" cat-file blob "$2" 2>/dev/null && printf x); then text="${text%x}"; return 0; fi   # that object
+  text=$(cat "$dir/state/notes/$1.md" 2>/dev/null && printf x) || { text=""; return 1; }
+  text="${text%x}"
+  [ "$(printf '%s' "$text" | git hash-object --no-filters --stdin 2>/dev/null)" = "$2" ] || { text=""; return 1; }
+}
+unreadable() { printf '%s\n' "$1 | ? | ? | its notes couldn't be read as the record has them |"; }
 # Its rows, each led by $2, only those after $1 (an empty $1: all). Fails if any step of it does.
 note_rows() (
   set -o pipefail
@@ -80,24 +89,21 @@ case "${1:-}" in
       item=$(upper "$item")
       case "$item" in [!A-Z0-9]*|*[!A-Z0-9._-]*) echo "not an item id: $2" >&2; exit 2 ;; esac
       id=$(notes_id "$item") || exit 0
-      # Read means all of that file was shown. Its text is taken once (by its id from git, or else
-      # the copy here; the x keeps its last newlines), checked to be that file, and shown whole;
-      # only when every step of that succeeded is it marked. A read that failed anywhere, or one
-      # cut by a time, marks nothing.
-      text=$(git -C "$dir" cat-file blob "$id" 2>/dev/null && printf x) \
-        || text=$(cat "$dir/state/notes/$item.md" 2>/dev/null && printf x) || text="x"
-      text="${text%x}"
-      same=$(printf '%s' "$text" | git hash-object --no-filters --stdin 2>/dev/null) || same=""
+      # Read means all of that file was shown: taken once and checked (take_text), then shown
+      # whole, and marked only when every step of that succeeded. A read that failed anywhere, or
+      # one cut by a time, marks nothing; notes that aren't the record's file aren't shown at all.
+      take_text "$item" "$id" || { echo "The notes on $item couldn't be read as the record has them; nothing is marked read." >&2; exit 1; }
       printf '%s' "$text" | note_rows "$since" ""
       shown=("${PIPESTATUS[@]}")
-      [ "${shown[0]}" = 0 ] && [ "${shown[1]}" = 0 ] && [ "$same" = "$id" ] && [ -z "$since" ] && mark_read "$item" "$id"
+      { [ "${shown[0]}" = 0 ] && [ "${shown[1]}" = 0 ]; } || exit 1
+      [ -z "$since" ] && mark_read "$item" "$id"
       exit 0
     else
       # Items someone other than Cain holds are theirs to read.
       items=$(his_items) || exit 1
       for i in $items; do
         id=$(notes_id "$i") || continue
-        notes_text "$i" "$id" | note_rows "$since" "$i "
+        if take_text "$i" "$id"; then printf '%s' "$text" | note_rows "$since" "$i "; else unreadable "$i"; fi
       done
     fi ;;
   unread)
@@ -114,9 +120,13 @@ case "${1:-}" in
       else
         after="$since"
       fi
-      # Notes that can't be read are named all the same, so the item stays on the list.
-      last=$(set -o pipefail; notes_text "$i" "$id" | note_rows "$after" "$i ") || last="$i | ? | ? | its notes couldn't be read here |"
-      [ -n "$last" ] && printf '%s\n' "${last##*$'\n'}"
+      # Notes that can't be read as the record has them are named all the same, never shown from a
+      # copy that isn't that file, so the item stays on the list.
+      if take_text "$i" "$id" && last=$(printf '%s' "$text" | note_rows "$after" "$i "); then
+        [ -n "$last" ] && printf '%s\n' "${last##*$'\n'}"
+      else
+        unreadable "$i"
+      fi
     done ;;
   submit)
     src="${2:?file}"

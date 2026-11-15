@@ -474,7 +474,14 @@ describe("session-end", () => {
     writeFileSync(busy, "1");                                            // another flush is at it
     const p = Bun.spawn([process.execPath, join(TOOLS, "session-end.ts"), "--hook"], { cwd: l.root, env: cleanEnv({ RECORD_CLONE: l.clone }),
       stdout: "pipe", stderr: "pipe", stdin: Buffer.from(JSON.stringify({ session_id: SA, transcript_path: transcript })) });
-    await Bun.sleep(1500);
+    // Held until the end has put its filing in the outbox (so its own flush is next, and finds the
+    // outbox busy), and a moment more: proof of contention, not a guess at how long it takes.
+    const box = join(dir, "outbox");
+    mkdirSync(box, { recursive: true });
+    for (let t = 0; t < 200 && !(readdirSync(box, { withFileTypes: true }).some((e) => e.name.endsWith(".json"))); t++) await Bun.sleep(100);
+    expect(readdirSync(box).some((n) => n.endsWith(".json"))).toBe(true);
+    await Bun.sleep(1000);
+    expect(p.exitCode).toBeNull();                                       // still waiting its turn
     rmSync(busy, { force: true });                                       // that flush is done
     await p.exited;
     const out = await new Response(p.stdout).text();
