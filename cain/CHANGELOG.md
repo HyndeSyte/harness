@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.0
+
+- Cain checks a thing where it lives (your mail, a portal, GitHub) before he asks you about it, and the App now holds him to it: a question or Ship card about one of your open items goes out only when that check was made since the item last changed.
+- What he checked shows on the item's row in your record, with the day, so you can see why he asked.
+- A row in your open list holds one thing: Cain can't add a row that says two things are done or not done at once.
+- Nothing changes in how you answer. One-off questions are as before.
+
 ## 0.11.0
 
 - Ship cards now say what your tap installs ("Ship Cain 0.11.0?", or that nothing installs), then one line from Cain on what you'll notice.

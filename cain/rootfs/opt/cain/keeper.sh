@@ -15,11 +15,16 @@
 #   when the item has more than one; --reply-to <message id> makes it a Discord reply.
 #   keeper.sh show <card id> --item P08 [--question Q2] [--reply-to <id>]
 #                                        show a specialist's card to Dane, unchanged
-#   keeper.sh ask --item P08 [--question Q2] [--reply-to <id>] "question" "opt" ...
+#   keeper.sh ask --item P08 [--question Q2] [--reply-to <id>] [--checked "what, where, when"] "question" "opt" ...
 #                                        ask with up to 5 buttons, one ask open at a time
 #                                        ("held" means it goes out when the open one closes);
 #                                        his tap comes back relayed
-#   keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] "text"
+#   --checked (ask and ship, for an item): the source check behind it, one line in plain
+#                                        words ("his Gmail shows the county's receipt, read at 9:40
+#                                        this morning"). The link refuses an ask or Ship card for an
+#                                        item whose row has no source check newer than its last status
+#                                        change; one passed here is recorded on the row by the keeper.
+#   keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] [--checked "..."] "text"
 #                                        the Ship card (Ship / Not now) for that one head: the text says
 #                                        what he'll notice, in one line; the link adds the question, a line
 #                                        from GitHub and that review's Reviewed line (none: "No outside review.")
@@ -57,17 +62,18 @@ esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" checked=""
 case "$cmd" in
   show|ask|ship|answered|check|connector)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        --item|--question|--reply-to|--pr|--head|--edit|--review)
+        --item|--question|--reply-to|--pr|--head|--edit|--review|--checked)
           [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
           case "$1" in
             --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
             --pr) pr="$2" ;; --head) head="$2" ;; --edit) edit="$2" ;; --review) review="$2" ;;
+            --checked) checked="$2" ;;
           esac
           shift 2 ;;
         *) rest+=("$1"); shift ;;
@@ -123,9 +129,9 @@ case "$cmd" in
               "$meta"' + {id: ($i | tonumber? // 0)}') ;;
   ask)      text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" --arg it "$item" --arg q "$question" --arg r "$reply_to" \
-              "$meta"' + {text: $t, options: $ARGS.positional}' --args "$@") ;;
+              --arg c "$checked" "$meta"' + {text: $t, options: $ARGS.positional} + opt("checked"; $c)' --args "$@") ;;
   ship)     body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg q "" --arg r "$reply_to" --arg p "$pr" --arg h "$head" --arg v "$review" \
-              "$meta"' + {text: $t, pr: $p, head: $h} + opt("review"; $v)') ;;
+              --arg c "$checked" "$meta"' + {text: $t, pr: $p, head: $h} + opt("review"; $v) + opt("checked"; $c)') ;;
   answered) body=$(jq -nc --arg it "$item" --arg q "$question" --arg r "" "$meta") ;;
   replied)  body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   stopped)  body='{}' ;;

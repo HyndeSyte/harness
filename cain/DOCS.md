@@ -53,6 +53,11 @@ the App.
   until the next morning check-in (7:10 AM, at least two hours away); a Ship card also
   goes when its pull request changes or closes. One for a change that's already in main
   stays: your tap on it starts the install.
+- Cain's questions about an open item, and his Ship cards, rest on a check at the
+  source (your mail, a portal, GitHub) made since that item's row last changed. The App
+  refuses the card otherwise, and the check shows on the item's row in your record
+  ("Nov 15: the county's receipt in your mail, read at 9:40"). A one-off question isn't
+  about an item and needs none.
 - Tapping an old card does nothing, and says so.
 - The card shows what you tapped. When a tap needs words from Cain, they come as a reply
   to that card.
@@ -238,6 +243,7 @@ and `remove`:
 | `row` | `item`, `base`, `set` | Changes cells of one open row. `base` is the row's hash as read: sha1 of the row's line, without the line ending (`record.sh rowsha <item>` on the Pi, `record-send.ts --row <item>` on a laptop). A changed row is a conflict; changes to other rows don't matter. `set` covers `Item`, `Who`, `Next step`, `Waits for`, `Done when`. |
 | `row-add` | `item`, `cells` | Adds a row at the end of the open table, `Since` today. Needs `Item`. Refuses an ID in use, or one used before in Done. Anyone may add a row. |
 | `row-close` | `item`, `evidence` | Moves the row to the top of Done as `\| <ID> <Item>: <evidence> \| <date> \|`. |
+| `check` | `item`, `text` | A source check on an open row: what was checked, where and when, one line up to 300 characters. Cain's link sends it when Cain asks with `--checked`. Sets the row's `Checked` cell (`Nov 15: <text>`; the column is added to the open table the first time) and the item's entry in `state/checks.json`. Never counts as a status change. |
 | `note` | `item`, `text` | Anyone, holder or not, on any item the record knows (held, open, or done). Appended with its time and sender to `state/notes/<item>.md`, so it never conflicts and is never refused for a hold. `text` is one line, 1 to 2,000 characters. |
 
 - Cells never hold `|` or a new line. A row that already holds an escaped `\|` is
@@ -253,7 +259,31 @@ and `remove`:
   hold.
 - A change that changes nothing is rejected: "changes nothing".
 - Paths are plain names: a `.` or `..` segment, an empty one, or one with a space at
-  either end is refused, as is anything under `state/holds.json` or `state/notes`.
+  either end is refused, as is anything under `state/holds.json`, `state/checks.json`
+  or `state/notes`.
+- One row holds one fact: a `row-add`, or a `row` that sets `Item`, is refused when
+  the new Item cell bundles two status claims, naming both. A claim is a status word
+  from a closed set (filed, sent, done, paid, issued, installed, confirmed, received,
+  renewed, submitted, signed, mailed, delivered, cancelled, refunded, and "not" or "un"
+  forms) with a subject before it in its clause ("land-use packet not filed") or a date
+  after it ("filed Nov 3"). Clauses split at `, ; : ( )`, a full stop before a capital,
+  "and", "but", "while", "though", " - " and " / ". A bare "filed and sent" makes no
+  claim. Rows already in the record aren't rewritten; only new writes are checked.
+
+### Source checks: verified before he's asked
+
+`state/checks.json` is the keeper's own, per open item: `changed`, when its Who, Next
+step or Waits for last changed or it was added (stamped on every write of the open
+list, whatever the op or put), and the latest source check (`checked`, `checked_at`,
+`by`). A row that leaves the open table leaves it. Cain's link refuses an ask or a Ship
+card for an item (anything but `--item none`) unless its newest check, passed now with
+`--checked` or already there, is newer than `changed` (or, for a row from before the
+ledger, its `Since` date): one line, "No source check on this item since its row
+changed on Nov 13; add --checked ...". A check passed now goes into the keeper's local
+queue as a `check` request from cain (so it shows in `log/requests/`), and the link
+counts it until the keeper's ledger has it. A held ask whose row changes after its
+check is dropped unasked, and Cain is told. The check is one line in plain words: the
+link refuses ISO times, shas, job ids, record codes like P08, `|` and new lines in it.
 
 ### Notes: his words always land
 

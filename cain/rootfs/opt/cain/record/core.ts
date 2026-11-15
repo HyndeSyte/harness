@@ -23,7 +23,8 @@ export type Op =
   | { op: "row"; item: string; base: string; set: Partial<Record<RowField, string>> }  // base: rowHash of the row as read
   | { op: "row-add"; item: string; cells: Partial<Record<RowField, string>> }
   | { op: "row-close"; item: string; evidence: string }
-  | { op: "note"; item: string; text: string };                       // anyone, any item: kept for its holder
+  | { op: "note"; item: string; text: string }                        // anyone, any item: kept for its holder
+  | { op: "check"; item: string; text: string };                      // a source check on an open row (state/checks.json)
 
 export type Request = {
   id: string;          // unique; the receipt Dane or Cain can look up
@@ -55,15 +56,18 @@ export const PENDING_PATH = "state/PENDING.md";
 export const HOLD_IDLE_MS = 24 * 3_600_000;   // a day without a word from the holder
 export const notesPath = (item: string) => `state/notes/${item}.md`;
 export const MAX_NOTE_TEXT = 2_000;           // characters in one note
+export const CHECKS_PATH = "state/checks.json";
+export const MAX_CHECK_TEXT = 300;            // characters in one source check
 
 // Where requests may write. log/ and inbox/ belong to the keeper itself; code,
 // workflows and the repo's own settings are never written through requests.
 // reviews/ holds outside-model reviews (written by the review runner, as Cain).
 // state/holds.json is the keeper's own; requests change it only with take, pass and
 // release. state/notes/ is the keeper's too: written only by the note op, so a note
-// never conflicts with anything.
+// never conflicts with anything. So is state/checks.json: the source checks and status
+// changes per item (Source checks, below), written only by the keeper.
 const WRITABLE = /^(areas|state|archive|rules|projects|reviews)\/[A-Za-z0-9._ \/&()-]+$/;
-const KEEPERS = /^state\/(holds\.json|notes)(\/|$)/i;
+const KEEPERS = /^state\/(holds\.json|checks\.json|notes)(\/|$)/i;
 const APPEND_ONLY = /(^|\/)decisions\.md$/i;
 
 // Text that ends up in Cain's terminal: one line, no control characters, short.
@@ -139,7 +143,7 @@ export function parseRequest(raw: string): { req?: Request; error?: string } {
   if (!Array.isArray(j.ops) || j.ops.length === 0 || j.ops.length > 50) return { req, error: "change needs 1 to 50 ops" };
   for (const o of j.ops) {
     if (!o || typeof o !== "object") return { req, error: "an op must be an object" };
-    if (["take", "pass", "release", "renew", "row", "row-add", "row-close", "note"].includes(o.op)) {
+    if (["take", "pass", "release", "renew", "row", "row-add", "row-close", "note", "check"].includes(o.op)) {
       if (typeof o.item !== "string" || !ITEM.test(o.item)) return { req, error: `${o.op}: needs an item id, like P33` };
       o.item = o.item.toUpperCase();   // p33 and P33 are one item, with one hold
       const why = itemOpProblem(o);
@@ -174,11 +178,17 @@ function itemOpProblem(o: any): string | null {
       if (typeof o.base !== "string" || !/^[0-9a-f]{40}$/.test(o.base)) return `row ${o.item}: needs base, the row's hash as read`;
       return cellsProblem(o, "set", []);
     case "row-add":
-      return cellsProblem(o, "cells", ["Item"]);
+      return cellsProblem(o, "cells", ["Item"]);   // the bundled-status rule is the plan's (it names the claims)
     case "row-close": {
       if (typeof o.evidence !== "string" || !o.evidence.trim()) return `row-close ${o.item}: needs evidence`;
       const why = cellProblem(o.evidence);
       return why ? `row-close ${o.item} evidence: ${why}` : null;
+    }
+    case "check": {
+      if (typeof o.text !== "string" || !o.text.trim()) return `check ${o.item}: needs text (what was checked, where and when)`;
+      if (o.text.length > MAX_CHECK_TEXT) return `check ${o.item}: over ${MAX_CHECK_TEXT} characters`;
+      const why = cellProblem(o.text);
+      return why ? `check ${o.item}: ${why}` : null;
     }
     case "note": {
       if (typeof o.text !== "string" || !o.text.trim()) return `note ${o.item}: needs text`;
@@ -398,6 +408,119 @@ export function itemKnown(text: string | null, id: string): boolean {
   return false;
 }
 
+// ---- Source checks (state/checks.json, and the open table's Checked cell) ----
+//
+// Before Cain asks him about an item, or offers a Ship card for it, its status is checked
+// at its source (his mail, the portal, GitHub), and that check is newer than the row's
+// last status change; the link refuses otherwise. The keeper keeps, per open item:
+//   changed     when its Who, Next step or Waits for last changed, or it was added
+//               (stamped by the keeper on every write of the open list, whatever the op);
+//   checked     the latest source check, in plain words, with checked_at (when the keeper
+//               took it) and by (who sent it).
+// A row with no changed stamp (one from before this ledger) counts from its Since date.
+// The check also shows on the row, in a Checked column the keeper adds to the open table
+// the first time ("Nov 15: <what was checked, where and when>"); only the check op writes
+// it. A row that leaves the open table leaves the ledger.
+export type CheckEntry = { changed?: string; checked?: string; checked_at?: string; by?: string };
+export type Checks = Record<string, CheckEntry>;
+export const CHECKED_COLUMN = "Checked";
+const STATUS_COLUMNS = ["Who", "Next step", "Waits for"];
+
+export function parseChecks(text: string | null): Checks {
+  if (!text) return {};
+  try {
+    const j = JSON.parse(text);
+    if (!j || typeof j !== "object" || Array.isArray(j)) return {};
+    const out: Checks = {};
+    for (const [k, v] of Object.entries(j)) if (v && typeof v === "object" && !Array.isArray(v)) out[k] = v as CheckEntry;
+    return out;
+  } catch { return {}; }
+}
+export function checksText(c: Checks): string {
+  const out: Checks = {};
+  for (const k of Object.keys(c).sort()) {
+    const e = c[k], o: CheckEntry = {};
+    for (const f of ["changed", "checked", "checked_at", "by"] as const) if (typeof e[f] === "string") o[f] = e[f];
+    out[k] = o;
+  }
+  return JSON.stringify(out, null, 2) + "\n";
+}
+
+// Each open row's cells by column name.
+function rowsByName(text: string | null): Map<string, Record<string, string>> {
+  const out = new Map<string, Record<string, string>>();
+  if (text === null) return out;
+  const d = parsePending(text);
+  if (!d.open) return out;
+  const cols = columns(d);
+  for (let i = d.open.body; i < d.open.end; i++) {
+    const cs = cells(d.lines[i]);
+    if (!cs[0] || out.has(cs[0])) continue;
+    const r: Record<string, string> = {};
+    cols.forEach((c, j) => { r[c] = cs[j] ?? ""; });
+    out.set(cs[0], r);
+  }
+  return out;
+}
+
+// The open rows whose status (Who, Next step, Waits for) differs between two versions,
+// and the rows that are new.
+export function statusChanged(before: string | null, after: string | null): string[] {
+  const a = rowsByName(before), b = rowsByName(after);
+  return [...b.keys()].filter((id) => {
+    const x = a.get(id), y = b.get(id)!;
+    return !x || STATUS_COLUMNS.some((c) => (x[c] ?? "") !== (y[c] ?? ""));
+  });
+}
+
+// The row's Checked cell set, adding the column to the open table the first time.
+export function setChecked(text: string, id: string, cell: string): Edit {
+  const d = parsePending(text);
+  const i = findRow(d, id);
+  if (typeof i !== "number") return i;
+  const esc = escaped(d.lines[i], id);
+  if (esc) return esc;
+  let cols = columns(d);
+  if (!cols.includes(CHECKED_COLUMN)) {
+    const h = d.open!.head, cr = (l: string) => l.endsWith("\r");
+    d.lines[h] = renderRow([...cols, CHECKED_COLUMN], cr(d.lines[h]));
+    d.lines[h + 1] = "|" + [...cols, CHECKED_COLUMN].map(() => "---").join("|") + "|" + (cr(d.lines[h + 1]) ? "\r" : "");
+    cols = [...cols, CHECKED_COLUMN];
+  }
+  const cs = cells(d.lines[i]);
+  while (cs.length < cols.length) cs.push("");
+  cs[cols.indexOf(CHECKED_COLUMN)] = cell.trim();
+  d.lines[i] = renderRow(cs, d.lines[i].endsWith("\r"));
+  return { text: d.lines.join("\n") };
+}
+
+// One row holds one fact. An Item cell bundles statuses when two or more of its clauses
+// each make a status claim: a word from a closed set (filed, sent, done, paid, issued,
+// installed, confirmed, received, renewed, submitted, signed, mailed, delivered,
+// cancelled, refunded, and their "not" or "un" forms) with a subject before it in its
+// clause ("business license filed", "permit not sent") or a date after it ("filed Nov 3").
+// Clauses split at , ; : ( ), at a full stop before a capital, and at "and", "but", "while", "though", " - " and " / ".
+// A bare word with neither ("filed and sent") makes no claim: the rule is conservative,
+// so a row it lets through may still hold two things, but one it refuses always does.
+// Returns the first two claims, or null.
+const STATUS = "filed|sent|done|paid|unpaid|issued|installed|confirmed|unconfirmed|received|renewed|submitted|signed|unsigned|mailed|delivered|cancell?ed|refunded";
+const FILLER = new Set(["not", "yet", "was", "were", "is", "are", "be", "been", "has", "have", "had", "already", "also", "still", "never", "now", "the", "a", "an", "all", "fully"]);
+const MONTH = "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december";
+const DATE_AFTER = new RegExp(`^\\s*(?:on\\s+|by\\s+|in\\s+)?(?:(?:${MONTH})\\.?\\s+\\d{1,2}|\\d{1,2}\\/\\d{1,2}|\\d{4}-\\d\\d-\\d\\d|today|yesterday|mon|tue|wed|thu|fri|sat|sun)(?![A-Za-z])`, "i");
+export function bundledStatus(item: string): [string, string] | null {
+  const claims: string[] = [];
+  const clauses = String(item ?? "").split(/[,;:()\[\]]|\.\s+(?=[A-Z])|\s+[-\u2013\u2014]\s+|\s+\/\s+|\s+(?:and|but|while|whereas|though|although)\s+/i);
+  for (const raw of clauses) {
+    const c = raw.trim();
+    const m = new RegExp(`(?<![A-Za-z])(?:not\\s+(?:yet\\s+)?)?(${STATUS})(?![A-Za-z])`, "i").exec(c);
+    if (!m) continue;
+    const subject = c.slice(0, m.index).split(/[^A-Za-z0-9'&-]+/).filter((w) => w && !FILLER.has(w.toLowerCase()));
+    if (subject.length || DATE_AFTER.test(c.slice(m.index + m[0].length))) claims.push(c);
+    if (claims.length === 2) return [claims[0], claims[1]];
+  }
+  return null;
+}
+
 // ---- Notes: words about an item for whoever holds it (state/notes/<item>.md) ----
 
 export type Note = { when: string; from: string; text: string };
@@ -613,9 +736,34 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       continue;
     }
 
+    if (o.op === "check") {
+      // A source check: on the row's Checked cell, and in the keeper's ledger with when it
+      // came. It changes no status, so it never counts as the row's status change.
+      const id = o.item, h = holds[id];
+      if (h && h.holder !== sender) return refused(heldBy(id));
+      const before = current(PENDING_PATH);
+      if (before === null) return rejected(`${PENDING_PATH} doesn't exist`);
+      const e = setChecked(before, id, `${shortDate(at, ctx.tz)}: ${o.text.trim()}`);
+      if ("conflict" in e) return conflict(e.conflict);
+      if ("rejected" in e) return rejected(e.rejected);
+      const why = rowsOk(before, e.text);
+      if (why) return refused(why);
+      if (Buffer.byteLength(e.text) > MAX_BYTES) return rejected(`${PENDING_PATH}: over ${MAX_BYTES / 1000} KB; split it into topics`);
+      writes.set(PENDING_PATH, e.text);
+      const ledger = parseChecks(current(CHECKS_PATH));
+      ledger[id] = { ...ledger[id], checked: clean(o.text, MAX_CHECK_TEXT), checked_at: iso, by: sender };
+      writes.set(CHECKS_PATH, checksText(ledger));
+      if (h?.holder === sender) touched.add(id);
+      continue;
+    }
+
     if (o.op === "row" || o.op === "row-add" || o.op === "row-close") {
       const id = o.item, h = holds[id];
       if (h && h.holder !== sender) return refused(heldBy(id));
+      // One row holds one fact: a new Item cell that bundles two statuses is refused.
+      const item = o.op === "row-add" ? o.cells.Item : o.op === "row" ? o.set.Item : undefined;
+      const two = typeof item === "string" ? bundledStatus(item) : null;
+      if (two) return rejected(`${id}'s Item bundles two statuses ("${clean(two[0], 60)}" and "${clean(two[1], 60)}"); one row holds one fact, so give each its own row`);
       const before = current(PENDING_PATH);
       if (before === null) return rejected(`${PENDING_PATH} doesn't exist`);
       const e = o.op === "row" ? editRow(before, id, o.base, o.set)
@@ -686,6 +834,20 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
   // A change that changes nothing would be logged as done for nothing.
   if (!explicit && ![...writes].some(([p, c]) => c !== tree.read(p))) return rejected("changes nothing");
   if (wait) return { state: "waiting", reason: wait };
+  // The keeper's own log of status changes: a row whose Who, Next step or Waits for
+  // changed (or that is new) is stamped now, and a row that left the open table leaves
+  // the ledger. Whatever op or put changed it.
+  if (writes.has(PENDING_PATH)) {
+    const was = tree.read(PENDING_PATH), now = writes.get(PENDING_PATH) ?? null;
+    const moved = statusChanged(was, now), gone = [...openRows(was).keys()].filter((id) => !openRows(now).has(id));
+    if (moved.length || gone.length) {
+      const ledger = parseChecks(current(CHECKS_PATH));
+      for (const id of moved) ledger[id] = { ...ledger[id], changed: iso };
+      for (const id of gone) delete ledger[id];
+      const text = checksText(ledger);
+      if (text !== (current(CHECKS_PATH) ?? checksText({}))) writes.set(CHECKS_PATH, text);
+    }
+  }
   // The holder's word on its own row renews its hold.
   for (const id of touched) if (holds[id]?.holder === sender) holds[id].renewed = iso;
   return { state: "ok", writes, holds, holdsChanged: holdsText(holds) !== holdsText(ctx.holds ?? {}) };

@@ -45,7 +45,7 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
@@ -67,6 +67,7 @@ const QUEUE = process.env.RELAY_QUEUE ?? "/data/relay.queue";
 const PORT = Number(process.env.RELAY_PORT ?? 8097);
 const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper's copy
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
+const RECORD_QUEUE = process.env.RECORD_QUEUE ?? "/data/record-queue";   // the keeper's local queue (source checks)
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
@@ -186,7 +187,14 @@ const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
-  record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
+  record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`) }),
+  // A source check, handed to the record keeper through its local queue as record.sh does.
+  submitRecord: (req) => {
+    mkdirSync(RECORD_QUEUE, { recursive: true });
+    const name = `${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}-${String(req.id).replace(/[^A-Za-z0-9._:-]/g, "_")}.json`;
+    writeFileSync(`${RECORD_QUEUE}/.${name}`, JSON.stringify(req));
+    renameSync(`${RECORD_QUEUE}/.${name}`, `${RECORD_QUEUE}/${name}`);
+  },
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
@@ -293,8 +301,8 @@ Bun.serve({
         case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
         case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
         case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
-          item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to }));
+          item: b.item, question: b.question, replyTo: b.reply_to, checked: b.checked }));
+        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to, checked: b.checked }));
         case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
         case "/replied": return json(await link.replied(b.m));
         case "/look": return json(await link.look(b.m));

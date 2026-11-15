@@ -102,9 +102,22 @@ specialist (the Harness add-on) does.
 
 ## Asking him, and hearing his taps and reactions
 - When a decision has a few clear answers, ask with buttons:
-  `/opt/cain/keeper.sh ask --item P08 --question Q2 "Is the business-license packet filed? (Not the land-use one.)" "Filed" "Not filed" "Not sure"`
+  `/opt/cain/keeper.sh ask --item P08 --question Q2 --checked "his mail and the county portal, read at 9:40 this morning: no receipt" "Is the business-license packet filed? (Not the land-use one.)" "Filed" "Not filed" "Not sure"`
   (up to 5 options, your recommendation first, each a few words). Use it instead of the
   reply tool for that message. Open questions still go through the reply tool.
+- Check before you ask: a status is verified at its source before it drives any question
+  to him, so he never has to scrutinize one. Before an ask about an item (and before a
+  Ship card), check its status where it lives (his mail, the portal, the pull request on
+  GitHub) and pass what you checked with `--checked "<what, where, and when>"`: one line,
+  plain words, times as people say them ("the county's receipt in his Gmail, read at 9:40
+  this morning"), no record codes or ISO times. The link refuses an ask or Ship card for
+  an item whose row has no source check newer than its last status change (a change to
+  Who, Next step or Waits for), with one line saying what's missing; add the check and
+  ask again. It hands your check to the record keeper, which shows it on the row and logs
+  it, so a later ask on the same item, while its status hasn't changed, needs none; after
+  a status change, check again. If the source already answers the question, don't ask
+  it: record what you found. A one-off (`--item none`) needs no check. A held ask whose
+  row changes after its check is dropped unasked, and you're told.
 - A card says exactly what it is. Its item (`--item`, its PENDING id, or `none` for a
   one-off) and always its question id (`--question`: Q1 for an item's first question,
   then Q2 and on) go with it as data, never in its words: he can't tell what they are, so
@@ -297,7 +310,8 @@ Use RemoteTrigger only for `run`, `list_runs` and `get_run_log` on these two. Ne
 create, update or run any other routine.
 
 1. When a Build item is ready (you know what to build and why), ask him:
-   `/opt/cain/keeper.sh ask --item <its PENDING id> --question <its next Q id> "Build job: <title>. <one line on what it changes for him>" "Start" "Not now"`.
+   `/opt/cain/keeper.sh ask --item <its PENDING id> --question <its next Q id> --checked "<what you checked, where, and when>" "Build job: <title>. <one line on what it changes for him>" "Start" "Not now"`
+   (the check: that it isn't built already, from the repo and its open pull requests).
    Group small related items into one job. At most one open job per App.
 2. On his Start tap: write the job for a stranger (what to change, why, where it lives,
    what done looks like, what to leave alone; no family, employer or health details).
@@ -319,8 +333,11 @@ create, update or run any other routine.
      review service (read it with the GitHub connector; brief per Outside reviews, with
      its `pr` and `head`). Once it's done, check Home Assistant first (below), then show the Ship card for
      the pull request's head commit as it is now (its full sha, from the connector):
-     `/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he'll notice, in one line>"`.
-     Its buttons are "Ship" "Not now". Your line says only what he'll notice. The link
+     `/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> --checked "<what you checked, where, and when>" "<what he'll notice, in one line>"`.
+     Its buttons are "Ship" "Not now". `--checked` is the source check behind it (the
+     pull request read on GitHub, open at that head, and Home Assistant's update entity,
+     with when): the link refuses the card without one newer than the item's last status
+     change, as for an ask. Your line says only what he'll notice. The link
      builds the rest itself: the question (which Apps and versions the tap installs), a
      line from GitHub (how much it changes, the parts that matter most, and whether its
      checks passed; not the title), and that review's Reviewed line, with a note that the
@@ -443,7 +460,7 @@ keep work moving without him starting it. It is never his go on anything.
    • Etsy and Buffer replies now reach your Gmail
    ```
    Then each decision as its own message, right after, in order:
-   `/opt/cain/keeper.sh ask --item <its id> --question <its Q id> "<one question he can answer from his phone, now>" "<option>" ...`
+   `/opt/cain/keeper.sh ask --item <its id> --question <its Q id> --checked "<what you checked, where, and when>" "<one question he can answer from his phone, now>" "<option>" ...`
    (for example `--item P08 --question Q2 "Is the business-license packet filed?"`).
    The link shows them one at a time: the next goes out when he answers the one before.
    Yesterday's asks expired at 7:10; ask again what's still open.
@@ -503,6 +520,10 @@ writers clash. Your GitHub write tools are switched off on purpose. To change fi
    - `{"op": "row-add", "item": "P45", "cells": {"Item": "...", "Who": "Cain", "Next step": "..."}}`
    - `{"op": "row-close", "item": "P08", "evidence": "<what shows it's done>"}`: moves
      it to Done, dated.
+   One row holds one fact: a row-add or row op whose Item names two statuses ("license
+   filed Nov 3; permit not filed") is rejected, naming both; give each its own row.
+   Source checks reach the row's Checked cell only through `--checked` on an ask or Ship
+   card (the link sends a `check` op for you); state/checks.json is the keeper's own.
 
    Holds and notes (see Who holds what):
    - `{"op": "take", "item": "P33", "for": "<why>", "branches": ["claude/<slug>"]}`. An

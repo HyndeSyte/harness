@@ -204,6 +204,9 @@ export interface State {
   stopAt?: string;                   // the message holding the moving Stop
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
+  // Source checks the link handed the record keeper, by item, until its ledger shows them
+  // (when the link took each): an ask right after one counts it before the keeper's next round.
+  checks?: Record<string, { text: string; at: number }>;
 }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
@@ -329,7 +332,7 @@ export function nextCheckin(ms: number, tz = "America/New_York", at = "0710"): n
 }
 
 // -- what Cain's record says: PENDING.md from the keeper's copy, and the holds ----------
-export interface RecordFiles { pending: string | null; holds: string | null }   // null: no such file
+export interface RecordFiles { pending: string | null; holds: string | null; checks?: string | null }   // null: no such file
 export type Holds = Record<string, { holder?: string; branches?: string[] }>;
 
 // The holds, from the record keeper's own file (/data/record-holds.json): written
@@ -366,6 +369,50 @@ export function closedItems(pending: string | null): Set<string> {
   for (const id of open) done.delete(id);
   return done;
 }
+
+// The record keeper's source checks (record/core.ts, state/checks.json), by item.
+type LedgerEntry = { changed?: string; checked?: string; checked_at?: string };
+const CHECK_MAX = 300;
+function ledgerOf(text: string | null | undefined): Record<string, LedgerEntry> {
+  if (!text) return {};
+  try {
+    const j = JSON.parse(text);
+    return j && typeof j === "object" && !Array.isArray(j) ? j : {};
+  } catch { return {}; }
+}
+const clip = (t: string, n: number) => (t.length > n ? t.slice(0, n - 1) + "…" : t);
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+// How far the zone is ahead of UTC at that moment.
+function zoneOffset(ms: number, tz: string): number {
+  const p: Record<string, string> = {};
+  for (const x of new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "numeric",
+    day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" }).formatToParts(ms)) p[x.type] = x.value;
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - Math.floor(ms / 1000) * 1000;
+}
+// When an open row's Since (or Opened) date began in the zone ("Nov 9": this year's, or
+// last year's when this year's is still ahead); null when there's no such row or date.
+export function sinceOf(pending: string | null | undefined, item: string, now: number, tz = "America/New_York"): number | null {
+  if (!pending) return null;
+  let section = "", cols: string[] | null = null;
+  for (const line of pending.split(/\r?\n/)) {
+    if (/^##\s/.test(line)) { section = line.replace(/^##\s+/, "").trim().toLowerCase(); cols = null; continue; }
+    if (section !== "open" || !line.startsWith("|")) continue;
+    const cs = line.replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim());
+    if (!cols) { cols = cs; continue; }
+    if (cs[0]?.toUpperCase() !== item.toUpperCase()) continue;
+    const at = cols.findIndex((c) => /^(since|opened)$/i.test(c));
+    const m = at >= 0 ? /^([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})$/.exec(cs[at] ?? "") : null;
+    const month = m ? MONTHS.indexOf(m[1].toLowerCase()) : -1;
+    if (!m || month < 0) return null;
+    const year = Number(new Intl.DateTimeFormat("en-US", { timeZone: tz, year: "numeric" }).format(now));
+    const start = (y: number) => { const g = Date.UTC(y, month, Number(m[2])); return g - zoneOffset(g, tz); };
+    return start(year) > now ? start(year - 1) : start(year);
+  }
+  return null;
+}
+// "Nov 13", in the zone.
+const shortDay = (ms: number, tz = "America/New_York") =>
+  new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
 
 export class Refusal extends Error {}
 
@@ -505,7 +552,8 @@ export interface Deps {
   toHarness: (path: string, body: unknown) => Promise<boolean>;     // a tap on its card
   paired: () => string;                                            // who Cain is paired with
   log?: (line: string) => void;
-  record?: () => RecordFiles;                                      // PENDING.md and the keeper's holds
+  record?: () => RecordFiles;                                      // PENDING.md, the keeper's holds and its source checks
+  submitRecord?: (req: Record<string, unknown>) => void;           // a request into the record keeper's local queue (a source check)
   pull?: (pr: string) => Promise<Pull | null>;                     // a pull request now; null: can't tell
   tz?: string;                                                     // the check-ins' zone
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
@@ -946,6 +994,69 @@ export class Link {
     if (closedItems(f.pending).has(item.toUpperCase())) throw new Refusal(`${item} is closed in PENDING.md`);
   }
 
+  // A status is checked at its source before it drives a question to him (his rule of
+  // Nov 13): an ask or Ship card for an item goes out only when the item's row carries a
+  // source check newer than its last status change (the record keeper's ledger,
+  // state/checks.json: changed, or the row's Since date before the ledger knew it), passed
+  // now (checked: what was checked, where and when, in plain words) or already on record.
+  // Returns the check passed now, to hand the keeper once the rest is checked, or null.
+  private sourceCheck(item: string, given: unknown): string | null {
+    if (item === "none") return null;
+    const raw = given === undefined || given === null ? "" : String(given);
+    if (raw.trim()) {
+      const t = raw.trim();
+      if (/[\r\n\u2028\u2029]/.test(t)) throw new Refusal("a source check is one line: what was checked, where and when");
+      if (t.length > CHECK_MAX) throw new Refusal(`a source check is at most ${CHECK_MAX} characters`);
+      if (t.includes("|")) throw new Refusal("a source check can't hold |");
+      for (const [re, what] of MACHINE)
+        if (re.test(t)) throw new Refusal(`a source check can't hold ${what}: say when as people say it ("this morning at 9", "Nov 13")`);
+      if (/(?<![A-Za-z0-9])P0*\d{1,4}(?![A-Za-z0-9])/i.test(t))
+        throw new Refusal("a source check can't hold a record code like P08: say what was checked in plain words");
+      return t;
+    }
+    const fresh = this.freshCheck(item, this.d.load());
+    if (fresh.ok) return null;
+    throw new Refusal(fresh.since !== null
+      ? `No source check on this item since its row changed on ${shortDay(fresh.since, this.d.tz)}; add --checked with what you checked, where and when.`
+      : "No source check on this item yet; add --checked with what you checked, where and when.");
+  }
+
+  // Whether the item's newest source check (the keeper's, or one the link handed it) is
+  // newer than its row's last status change; since: that change, when known.
+  private freshCheck(item: string, s: State): { ok: boolean; since: number | null } {
+    const f = this.files();
+    const e = ledgerOf(f.checks)[item.toUpperCase()];
+    const stamp = e?.changed ? Date.parse(e.changed) : NaN;
+    const since = Number.isFinite(stamp) ? stamp : sinceOf(f.pending, item, this.d.now(), this.d.tz);
+    const kept = e?.checked_at ? Date.parse(e.checked_at) : NaN;
+    const at = Math.max(Number.isFinite(kept) ? kept : -Infinity, s.checks?.[item.toUpperCase()]?.at ?? -Infinity);
+    return { ok: at > -Infinity && (since === null || at > since), since };
+  }
+
+  // A check passed now goes to the record keeper (on the row and in its log), and is kept
+  // here until the keeper's ledger has it. Refused when it can't be handed over.
+  private recordCheck(item: string, text: string | null): void {
+    if (text === null || item === "none") return;
+    const now = this.d.now(), id = item.toUpperCase();
+    if (!this.d.submitRecord) throw new Refusal("the record keeper can't be reached from the link, so the source check can't be recorded; try again in a minute");
+    try {
+      this.d.submitRecord({ id: `link-check-${id.toLowerCase().replace(/[^a-z0-9._-]/g, "_")}-${now}`, from: "cain", kind: "change",
+        summary: clip(`Source check on ${id} before asking him: ${text}`, 200), ops: [{ op: "check", item: id, text }] });
+    } catch (e) {
+      throw new Refusal(`the source check couldn't be handed to the record keeper (${String(e).slice(0, 80)}); try again in a minute`);
+    }
+    const s = this.d.load();
+    const kept = ledgerOf(this.files().checks);
+    const checks: Record<string, { text: string; at: number }> = {};
+    for (const [k, v] of Object.entries(s.checks ?? {})) {
+      const t = kept[k]?.checked_at ? Date.parse(kept[k].checked_at!) : NaN;
+      if (!(Number.isFinite(t) && t >= v.at) && now - v.at < DAY) checks[k] = v;   // the keeper has it, or it's a day old: gone
+    }
+    checks[id] = { text, at: now };
+    s.checks = checks;
+    this.d.save(s);
+  }
+
   // Live cards with the same key as this one: the newest keeps its buttons and the others
   // are replaced, so a card filed under its key after it went up (one that went out by
   // itself) never outlives a newer one. With `only`, just cards of that kind take part
@@ -1293,7 +1404,7 @@ export class Link {
     return null;
   }
 
-  async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
+  async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown; checked?: unknown }): Promise<AskResult> {
     const meta = checkMeta(a);
     const raw = (a.options ?? []).map((o) => String(o).trim()).filter(Boolean).slice(0, 5);
     const asked = unlabeled(String(a.text ?? ""), meta.item, meta.question).trim();
@@ -1307,6 +1418,8 @@ export class Link {
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
     const text = w.text;                 // no "P08 Q2: ": the item and question are data
     this.mayAsk(meta.item);
+    const check = this.sourceCheck(meta.item, a.checked);
+    this.recordCheck(meta.item, check);
     return this.serial(async () => {
       const now = this.d.now();
       const s = this.d.load();
@@ -1355,7 +1468,7 @@ export class Link {
   // turn; lasts as long as an ask, and goes when the head moves or the pull request
   // is merged or closed. Cain's words say what Dane will notice; the link builds the rest
   // (shipText), from GitHub and from the review he names (review: its id, or none).
-  async ship(a: { text: string; item?: unknown; pr?: unknown; head?: unknown; review?: unknown; replyTo?: unknown }): Promise<AskResult> {
+  async ship(a: { text: string; item?: unknown; pr?: unknown; head?: unknown; review?: unknown; replyTo?: unknown; checked?: unknown }): Promise<AskResult> {
     const meta = checkMeta({ item: a.item, replyTo: a.replyTo });
     const pr = String(a.pr ?? "").trim();
     const head = String(a.head ?? "").trim().toLowerCase();
@@ -1374,11 +1487,13 @@ export class Link {
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(said);
     this.mayAsk(meta.item);
+    const check = this.sourceCheck(meta.item, a.checked);
     const w = this.cainWords("ship", "Ship card", said, { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
     const built = this.d.facts ? await this.shipText(pr, head, review, w.text) : { text: w.text, own: undefined };
     const text = built.text;
+    this.recordCheck(meta.item, check);
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
@@ -2847,6 +2962,7 @@ export class Link {
       if (h.expires <= now) lines.push(`Your held question ${what} was never shown: it expired at the morning check-in. Ask again if it still matters.`);
       else if (item && closed.has(item.toUpperCase())) lines.push(`Your held question ${what} was dropped unasked: ${item} is closed in PENDING.md.`);
       else if (item && holds && heldElsewhere(holds, item)) lines.push(`Your held question ${what} was dropped unasked: ${item} is now held by another session. Don't ask him about it or say who has it.`);
+      else if (item && !this.freshCheck(item, s).ok) lines.push(`Your held question ${what} was dropped unasked: its row changed after your source check. Check it at its source again, and ask again with --checked if it still needs him.`);
       else keep.push(h);
     }
     if (lines.length) { s.held = keep; this.d.save(s); for (const l of lines) this.d.relay(`${l} Nothing to tell him.`); }

@@ -94,7 +94,8 @@ describe("Cain's rules", () => {
   test("Ship cards built from code (0.11.0): the card names its review, his line says only what he'll notice, the link builds the rest", () => {
     const build = jobs.slice(jobs.indexOf("- Build finished with a pull request"));
     const flat = build.replace(/\s+/g, " ");
-    expect(build).toContain('`/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he\'ll notice, in one line>"`');
+    expect(build).toContain('`/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> --checked "<what you checked, where, and when>" "<what he\'ll notice, in one line>"`');
+    expect(flat).toContain("the link refuses the card without one newer than the item's last status change");
     for (const must of ["through the review service", "Your line says only what he'll notice", "the question (which Apps and versions the tap installs)",
       "whether its checks passed", "that review's Reviewed line", "Your line holds no check, test, build or CI words, no GitHub, job, status or result words (passed, green, success), and no review, verdict or AI names: the link refuses them",
       "a check failed or hasn't run yet", "a review of another head", "A new head needs a new review of it and a new Ship card"])

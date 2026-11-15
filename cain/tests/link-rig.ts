@@ -37,7 +37,7 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 }
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
-    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number } = {}) {
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; unchecked?: boolean } = {}) {
   let state: State = emptyState();
   // GitHub, as the link's landings see it (merge.ts is tested on its own).
   const github = {
@@ -62,7 +62,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const stop = { stopped: false, at: null as number | null, broken: false };
   const harnessDown = { down: false };                // the calendar specialist doesn't take taps
   const t = { now: opts.now ?? NOV11_8AM };
-  const files: { pending: string | null; holds: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null };
+  const files: { pending: string | null; holds: string | null; checks?: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null, checks: null };
+  const submitted: any[] = [];                    // requests the link handed the record keeper (source checks)
   const pulls: Record<string, Pull> = {};
   const calls: any[] = [], relayed: string[] = [], harness: any[] = [], logs: string[] = [];
   const reports: any[] = [], replays: any[] = [];          // the gate's report log, and the replay's reports
@@ -143,7 +144,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     rest, load: () => copy(state), save: (s: State) => { state = copy(s); }, now: () => t.now,
     relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
-    record: () => ({ ...files }), pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
+    record: () => ({ ...files }), submitRecord: (req: any) => { submitted.push(copy(req)); }, pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
     stop: {
       read: () => { if (stop.broken) throw new Error("unreadable"); return { stopped: stop.stopped, at: stop.at }; },
       write: (stopped: boolean, at: number) => { stop.stopped = stopped; stop.at = at; },
@@ -170,6 +171,15 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     replayPauseMs: 0,
   };
   let link = new Link(deps);
+  // Asks and Ship cards for an item need a source check (0.12.0). Tests about other things
+  // pass one by default, as Cain does; unchecked: true leaves it to the test.
+  const SOURCE = "rig: checked at its source just now";
+  const checking = (l: Link) => opts.unchecked ? l : new Proxy(l, { get(target, prop, recv) {
+    const v = Reflect.get(target, prop, recv);
+    if ((prop === "ask" || prop === "ship") && typeof v === "function")
+      return (a: any) => v.call(target, a && a.checked === undefined ? { ...a, checked: SOURCE } : a);
+    return typeof v === "function" ? v.bind(target) : v;
+  } });
   const tap = (msg: any, custom_id: string, over: any = {}) => {
     tapped = String(msg.id);
     return link.onInteraction({ type: 3, id: "11", token: "t", application_id: BOT, channel_id: DM, user: { id: OWNER },
@@ -183,9 +193,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     return msg;
   };
   const r = {
-    get link() { return link; },
+    get link() { return checking(link); },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy, reviews,
+    reports, replays, sent, discord, limitN, spy, reviews, submitted,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,
