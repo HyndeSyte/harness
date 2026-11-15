@@ -108,7 +108,10 @@ seen="${NOTES_SEEN:-/data/notes.seen}"          # not in $dir: that's cleared of
 [ -s "$seen" ] || date -u +%Y-%m-%dT%H:%M:%S.%3NZ > "$seen" 2>/dev/null
 args=(unread)
 since=$(cat "$seen" 2>/dev/null) && [ -n "$since" ] && args+=("$since")
-rows=$("${RECORD_SH:-/opt/cain/record.sh}" "${args[@]}" 2>/dev/null | grep '|' | sort -t'|' -k2,2)
+out=$("${RECORD_SH:-/opt/cain/record.sh}" "${args[@]}" 2>/dev/null); got=$?
+rows=$(printf '%s\n' "$out" | grep '|' | sort -t'|' -k2,2)
+# The record's notes couldn't be read (record.sh's exit 3): said, so no list here is taken for none.
+[ "$got" = 3 ] && lead="${lead}Your record's notes couldn't be read just now, so any unread ones aren't named here: run /opt/cain/record.sh unread before you change an item. "
 if [ -n "$rows" ]; then
   total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
   named=$(printf '%s\n' "$rows" | head -n 30)

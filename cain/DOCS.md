@@ -302,6 +302,10 @@ Words about P33 for whoever holds it, oldest first, filed by the record keeper f
   of showing it succeeded. A read that failed anywhere or was cut by a time marks nothing, and
   only his own reads count: root's, after the switch, don't. An unread item whose notes can't
   be read is still listed, with a line that says so.
+- Notes are only ever the record's: the files in its main as the keeper's copy has it, by the
+  ids in its tree. A notes file here that the record doesn't have is never shown or read, and
+  with no readable main, `notes` and `unread` read nothing and exit 3; the check-in then says
+  the notes couldn't be read, so no list is taken for none.
 - `/opt/cain/record.sh unread [<since>]` lists the items whose notes changed in any way
   since he last read them, each as its newest note; an item he has never read counts only
   notes after `<since>`. Each check-in names these items, the 30 oldest at a time, until he

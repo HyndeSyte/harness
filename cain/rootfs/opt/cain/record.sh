@@ -15,6 +15,8 @@
 #                               `notes <item>`, each as its newest note led by the item; an item
 #                               he has never read counts only notes after <since>. The check-in
 #                               names these until he reads them.
+#                               Notes are only ever the record's (its main as this copy has it);
+#                               when that can't be read, notes and unread say so and exit 3.
 #   record.sh submit <file>     queue a request (JSON, see CLAUDE.md); prints its id
 #   record.sh status <id>       done / conflict / rejected / refused / relayed, or "waiting"
 set -u
@@ -26,15 +28,18 @@ upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 # Where his reads are marked: his own home once he runs as his own user (C1), else /data.
 home="${CAIN_HOME_DIR:-/data/cain}"
 reads="${NOTES_READ_DIR:-$([ -d "$home" ] && echo "$home/notes-read" || echo /data/notes-read)}"
-# An item's notes file as the keeper pushed it (or the copy here): its id, then its text by that
-# id, so what is shown, and marked read, is exactly that file.
-notes_id() {
-  git -C "$dir" rev-parse -q --verify "$ref:state/notes/$1.md" 2>/dev/null \
-    || { [ -f "$dir/state/notes/$1.md" ] && git hash-object --no-filters "$dir/state/notes/$1.md" 2>/dev/null; }
-}
-# Sets text to the bytes of item $1's notes file whose id is $2: from git by that id, or else the
-# copy here only when it hashes to that id (the x keeps its last newlines through the $(...)).
-# Taken once, so what is checked is what is shown. Fails, with text empty, when neither is that file.
+# Notes are only ever the record's: what the keeper pushed (its main, as this copy fetched it).
+# A copy here that git doesn't have is never taken for one, and with no readable main, nothing is
+# read: the command says so, with exit 3, instead of reading files here.
+record_ok() { git -C "$dir" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1; }
+cant_read() { echo "The record's notes couldn't be read: this copy of the record, its $ref or its holds, can't be read." >&2; exit 3; }
+# An item's notes file in the record: its id from the record's tree (nothing when it has none),
+# then its text by that id, so what is shown, and marked read, is exactly that file.
+notes_id() { git -C "$dir" rev-parse -q --verify "$ref:state/notes/$1.md" 2>/dev/null; }
+# Sets text to the bytes of item $1's notes file whose id is $2 (from the record's tree): from git
+# by that id, or else the copy here only when it hashes to that id (the x keeps its last newlines
+# through the $(...)). Taken once, so what is checked is what is shown. Fails, with text empty,
+# when neither is that file.
 take_text() {
   if text=$(git -C "$dir" cat-file blob "$2" 2>/dev/null && printf x); then text="${text%x}"; return 0; fi   # that object
   text=$(cat "$dir/state/notes/$1.md" 2>/dev/null && printf x) || { text=""; return 1; }
@@ -49,13 +54,16 @@ note_rows() (
       w = $2; gsub(/^[ \t]+|[ \t]+$/, "", w); if (since == "" || w > since) print lead $0 }'
 )
 iso() { date -u -d "$1" +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null; }
-# Cain's items with notes: every notes file but those on items someone other than Cain holds.
+# Cain's items with notes in the record: every notes file in its tree but those on items someone
+# other than Cain holds (a record with no holds file holds nothing for anyone). Fails when the
+# record or its holds can't be read.
 his_items() {
-  local others
-  others=$({ git -C "$dir" show "$ref:state/holds.json" 2>/dev/null || cat "$dir/state/holds.json" 2>/dev/null || echo '{}'; } \
+  local others list
+  record_ok || return 1
+  others=$({ git -C "$dir" show "$ref:state/holds.json" 2>/dev/null || echo '{}'; } \
     | jq -r 'to_entries[] | select(.value.holder != "cain") | .key') || { echo "couldn't read the holds" >&2; return 1; }
-  { git -C "$dir" ls-tree --name-only "$ref" state/notes/ 2>/dev/null || ls "$dir/state/notes" 2>/dev/null; } \
-    | sed -n 's#^\(state/notes/\)\{0,1\}\([A-Z0-9][A-Z0-9._-]*\)\.md$#\2#p' \
+  list=$(git -C "$dir" ls-tree --name-only "$ref" state/notes/ 2>/dev/null) || return 1
+  printf '%s\n' "$list" | sed -n 's#^state/notes/\([A-Z0-9][A-Z0-9._-]*\)\.md$#\1#p' \
     | while IFS= read -r i; do printf '%s\n' "$others" | grep -qxF "$i" || printf '%s\n' "$i"; done
 }
 # Only Cain's own reads count: root reading after the switch marks nothing (and makes no folder of
@@ -88,7 +96,8 @@ case "${1:-}" in
     if [ -n "$item" ] && [ "$item" != "-" ]; then
       item=$(upper "$item")
       case "$item" in [!A-Z0-9]*|*[!A-Z0-9._-]*) echo "not an item id: $2" >&2; exit 2 ;; esac
-      id=$(notes_id "$item") || exit 0
+      record_ok || cant_read
+      id=$(notes_id "$item") || exit 0                     # the record has no notes on it
       # Read means all of that file was shown: taken once and checked (take_text), then shown
       # whole, and marked only when every step of that succeeded. A read that failed anywhere, or
       # one cut by a time, marks nothing; notes that aren't the record's file aren't shown at all.
@@ -100,16 +109,20 @@ case "${1:-}" in
       exit 0
     else
       # Items someone other than Cain holds are theirs to read.
-      items=$(his_items) || exit 1
+      items=$(his_items) || cant_read
       for i in $items; do
         id=$(notes_id "$i") || continue
-        if take_text "$i" "$id"; then printf '%s' "$text" | note_rows "$since" "$i "; else unreadable "$i"; fi
+        if take_text "$i" "$id" && rows=$(printf '%s' "$text" | note_rows "$since" "$i "); then
+          [ -n "$rows" ] && printf '%s\n' "$rows"
+        else
+          unreadable "$i"
+        fi
       done
     fi ;;
   unread)
     since="${2:-}"
     if [ -n "$since" ]; then since=$(iso "$since") || { echo "not a time: $2" >&2; exit 2; }; fi
-    items=$(his_items) || exit 1
+    items=$(his_items) || cant_read
     for i in $items; do
       id=$(notes_id "$i") || continue
       if [ -f "$reads/$i" ]; then

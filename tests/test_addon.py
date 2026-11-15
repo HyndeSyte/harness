@@ -835,15 +835,17 @@ def _cain_reads(tmp_path, *items):
 
 
 def _as_the_keeper_pushed_it(rec):
-    # The record as the keeper's copy has it: a git clone whose origin/main holds these files.
+    # The record as the keeper's copy has it: a git clone whose origin/main holds these files, as
+    # they are now (called again after a change, as the keeper pushes each one).
     import subprocess
 
     def g(*a):
         subprocess.run(["git", "-C", str(rec), *a], check=True, capture_output=True, text=True)
 
-    g("init", "-q")
+    if not (rec / ".git").exists():
+        g("init", "-q")
     g("add", "-A")
-    g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "the record")
+    g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "the record")
     g("update-ref", "refs/remotes/origin/main", "HEAD")
 
 
@@ -863,7 +865,9 @@ def test_checkin_names_each_item_with_unread_notes_until_he_reads_them(tmp_path)
 
     def notes(item, rows):
         _write_notes(rec, item, rows)
+        _as_the_keeper_pushed_it(rec)
 
+    (rec / "state" / "holds.json").write_text(json.dumps({"P33": {"holder": "laptop:9f2c", "branches": []}}))
     notes("P41", [("2026-11-09T14:02:11.000Z", "laptop:9f2c", "dane: the turkey card should say Friday"),
                   ("2026-11-10T09:15:40.000Z", "laptop:9f2c", "dane: hold off on the farm packet"),
                   ("2026-11-11T16:40:02.000Z", "laptop:9f2c", "dane: STOP, do not ship P41 until he looks at the "
@@ -871,7 +875,6 @@ def test_checkin_names_each_item_with_unread_notes_until_he_reads_them(tmp_path)
     notes("P50", [("2026-11-11T08:00:00.000Z", "claude-code", "dane: use «the blue one»")])
     notes("P60", [("2026-11-09T08:00:00.000Z", "laptop:9f2c", "dane: from before reads were marked")])
     notes("P33", [("2026-11-11T17:00:00.000Z", "cain", "dane: for the laptop session")])   # a laptop holds P33
-    (rec / "state" / "holds.json").write_text(json.dumps({"P33": {"holder": "laptop:9f2c", "branches": []}}))
     seen = _notes_env(tmp_path, rec, "2026-11-10T00:00:00.000Z")
     sent = tmp_path / "sent.txt"
     try:
@@ -956,6 +959,7 @@ def test_a_first_checkin_counts_only_notes_from_then_on(tmp_path):
     (rec / "state" / "notes").mkdir(parents=True)
     _write_notes(rec, "P41", [("2026-11-09T14:02:11.000Z", "laptop:9f2c", "dane: an old note")])
     (rec / "state" / "holds.json").write_text(json.dumps({}))
+    _as_the_keeper_pushed_it(rec)
     seen = _notes_env(tmp_path, rec, None)
     try:
         assert "Unread notes" not in _checkin(tmp_path, "0712", IDLE)
@@ -1070,6 +1074,7 @@ def test_only_cains_own_reads_mark_notes_read(tmp_path):
     rec = tmp_path / "record"
     (rec / "state" / "notes").mkdir(parents=True)
     _write_notes(rec, "P41", [("2026-11-15T10:00:00.000Z", "laptop:9f2c", "dane: the handoff")])
+    _as_the_keeper_pushed_it(rec)
     home = tmp_path / "cain"
     home.mkdir()
     stub = tmp_path / "idbin"
@@ -1089,6 +1094,56 @@ def test_only_cains_own_reads_mark_notes_read(tmp_path):
     assert not (home / "notes-read").exists()
     assert "the handoff" in read_as("1000")
     assert len((home / "notes-read" / "P41").read_text().strip()) == 40
+
+
+def test_notes_are_only_ever_the_records(tmp_path):
+    # Outside review, round 19: a file here the record doesn't have can't vouch for itself, and with
+    # no readable record nothing here is read; the commands say so (exit 3), and so does the check-in.
+    import json
+    import os
+    import shutil
+    import subprocess
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    rec = tmp_path / "record"
+    (rec / "state" / "notes").mkdir(parents=True)
+    _write_notes(rec, "P50", [("2026-11-15T09:00:00.000Z", "laptop:9f2c", "dane: a real note")])
+    (rec / "state" / "holds.json").write_text(json.dumps({}))
+    _as_the_keeper_pushed_it(rec)
+    _notes_env(tmp_path, rec, "2026-11-14T00:00:00.000Z")
+
+    def run(*a, path=None):
+        env = dict(os.environ, PATH=path) if path else dict(os.environ)
+        return subprocess.run([shutil.which("bash"), str(tmp_path / "record.sh"), *a], env=env,
+                              capture_output=True, text=True, encoding="utf-8", timeout=20)
+
+    try:
+        # A notes file here that the record's tree doesn't have: never shown, read or named.
+        _write_notes(rec, "P41", [("2026-11-15T10:00:00.000Z", "laptop:x", "dane: a handoff no one filed")])
+        r = run("notes", "P41")
+        assert (r.returncode, r.stdout) == (0, "")                       # the record has no notes on P41
+        assert not (tmp_path / "reads" / "P41").exists()
+        assert "no one filed" not in run("unread", "2026-11-14T00:00:00Z").stdout
+        r = run("notes", "-")
+        assert "a real note" in r.stdout and "no one filed" not in r.stdout
+        # Showing fails for an item the record has (round 19, low): notes - names it all the same.
+        bad = tmp_path / "badawk"
+        bad.mkdir()
+        (bad / "awk").write_text("#!/bin/bash\nexit 42\n", newline="\n")
+        (bad / "awk").chmod(0o755)
+        r = run("notes", "-", path=f"{bad}{os.pathsep}{os.environ['PATH']}")
+        assert r.stdout == "P50 | ? | ? | its notes couldn't be read as the record has them |\n"
+        # No readable record (its main gone): nothing here is read, and each command says so.
+        subprocess.run(["git", "-C", str(rec), "update-ref", "-d", "refs/remotes/origin/main"], check=True)
+        for args in (("notes", "P50"), ("notes", "-"), ("unread", "2026-11-14T00:00:00Z")):
+            r = run(*args)
+            assert r.returncode == 3 and r.stdout == "" and "couldn't be read" in r.stderr, (args, r)
+        # The check-in says so too, so an empty list isn't taken for no unread notes.
+        line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2]
+        assert "Your record's notes couldn't be read just now" in line and "Unread notes" not in line
+    finally:
+        _notes_env_done()
 
 
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
