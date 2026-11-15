@@ -70,10 +70,14 @@ export class SentSpool {
     if (this.flushing) return;
     this.flushing = true;
     try {
-      // First what the spool couldn't keep.
+      // First what the spool couldn't keep. One the link refused for good is kept aside if it
+      // can be; if not, it goes (the link would only refuse it again), said as an error.
       for (let i = 0; i < this.held.length;) {
-        if ((await this.send(this.held[i])) === "unanswered") i++;
-        else this.held.splice(i, 1);
+        const out = await this.send(this.held[i]);
+        if (out === "unanswered") { i++; continue; }
+        if (out === "refused" && !this.aside(this.held[i], "a note the link refused"))
+          this.trouble("a note the link refused couldn't be kept aside either, so it was dropped (the link would only refuse it again)");
+        this.held.splice(i, 1);
       }
       let lines: string[];
       try { lines = readFileSync(this.path, "utf8").split("\n").filter(Boolean); }

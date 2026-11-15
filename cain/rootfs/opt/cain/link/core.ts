@@ -1866,7 +1866,7 @@ export class Link {
     const spoolProblem = typeof n?.spool_problem === "string" ? n.spool_problem.replace(/\s+/g, " ").trim().slice(0, 300) : "";
     if (spoolProblem && now - this.spoolToldAt > 6 * 3_600_000) {
       this.spoolToldAt = now;
-      this.d.relay(`The Discord broker says ${spoolProblem}. Nothing to tell him the first time. If it happens again, the Pi's storage needs a look: tell Dane in one line, and file a note on P33 for the laptop session.`);
+      this.d.relay(`The Discord broker says ${spoolProblem}. Nothing to tell him the first time. If it happens again, the Pi's storage needs a look: tell Dane in one line, and keep it in PENDING until it's fixed.`);
     }
     const placing = this.inStopQueue(() => this.placeStop());
     if (!o.background) await placing;

@@ -434,7 +434,7 @@ async function handle(url: URL, b: any, reqId?: string): Promise<Response> {
 }
 console.log(`[cain] link listening on ${PORT} and ${LINK_SOCK}`);
 if (requests.damagedNow)
-  link.relayLine("The link's record of what the calendar specialist asked of it is damaged on disk (both copies), so for 8 days it takes nothing new from the specialist: what the specialist sends meanwhile waits, and is dropped after 7 days, so nothing can go out twice. Tell Dane in one line that his calendar cards are paused by a storage problem on the Pi, and file a note on P33 for the laptop session.");
+  link.relayLine("The link's record of what the calendar specialist asked of it is damaged on disk (both copies), so for 8 days it takes nothing new from the specialist: what the specialist sends meanwhile waits, and is dropped after 7 days, so nothing can go out twice. Tell Dane in one line that his calendar cards are paused by a storage problem on the Pi, and keep it in PENDING until it's fixed.");
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
 if (!deployKey)

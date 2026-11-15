@@ -97,6 +97,20 @@ describe("nothing dropped quietly (C1 re-check R5)", () => {
     expect(l.got.map((n) => [n.ids[0], /refused/.test(n.spool_problem ?? "")])).toEqual([["556", true]]);
   });
 
+  test("a held note the link refused is kept aside too, and never sent again", async () => {
+    const d = mkdtempSync(join(tmpdir(), "spool-"));
+    writeFileSync(join(d, "not-a-folder"), "x");
+    const p = join(d, "not-a-folder", "sent-spool.jsonl");          // nothing can be written there, .bad included
+    const l = link({ refuse: "777" }), logs: string[] = [];
+    const s = new SentSpool(p, l.post, (x) => logs.push(x), noWait);
+    s.add(note("777"));
+    await s.flush();
+    expect(s.heldCount).toBe(0);
+    expect(logs.some((x) => /dropped/.test(x))).toBe(true);
+    await s.flush();
+    expect(l.got).toEqual([]);
+  });
+
   test("notes added while a flush waits on the link stay for the next", async () => {
     const p = spoolAt();
     let release!: () => void;
