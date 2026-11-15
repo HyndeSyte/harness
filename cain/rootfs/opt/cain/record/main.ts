@@ -350,7 +350,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean } {
       };
       const decide = (req: Request, local: boolean, base: Omit<Outcome, "state">): Outcome => {
         const p = plan(req, t, ctx(new Date(base.at)));
-        if (p.state === "ok") return apply(p, base);
+        if (p.state === "ok") { for (const w of p.warnings ?? []) log(`warning: ${req.id}: ${clean(w, 200)}`); return apply(p, base); }
         if (p.state === "waiting") st.waiting.push({ req, since: base.at, local });
         return { ...base, state: p.state, reason: clean(p.reason) };
       };

@@ -88,6 +88,7 @@ import { freshReviewed, type Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import { judgeChecks, type Facts, type Landed } from "./merge";
+import { checkTextProblem, sameCheckText } from "../record/core";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -167,6 +168,7 @@ export interface Shown {
   posted?: number;
   expires?: number | null;           // when its buttons stop mattering; null: no time of its own
   ship?: { pr: string; head: string };
+  checked?: Ref;                     // an ask or Ship card for an item: the source check it rests on (0.12.0)
   own?: string;                      // a Ship card the link built: Cain's own line on it, the rest being the link's (0.11.0)
   buttons?: boolean;                 // it has buttons on Discord, as far as the link knows
   outcome?: "answered" | "expired" | "replaced";
@@ -184,6 +186,7 @@ export interface Shown {
 export interface Ask {               // Cain's question waiting behind the open one
   text: string; options: string[]; item: string; question: string; replyTo?: string; at: number; expires: number;
   nonce?: string;                    // the same on every try, so Discord never posts it twice
+  ref?: Ref; warned?: boolean;       // warn-only: its check couldn't be handed over, so it rests on the row as read (0.12.0)
 }
 export interface State {
   owner?: string; dm?: string; bot?: string; next: number;
@@ -204,13 +207,18 @@ export interface State {
   stopAt?: string;                   // the message holding the moving Stop
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
-  // Source checks the link handed the record keeper, by item, until its ledger shows them
-  // (when the link took each): an ask right after one counts it before the keeper's next round.
-  checks?: Record<string, { text: string; at: number }>;
+  // Source checks the link handed the record keeper, by item, while their requests are
+  // pending: each counts only while its request is pending, the row is still the version
+  // it read (row, version), and CHECK_PENDING_MS hasn't passed (0.12.0).
+  checks?: Record<string, PendingCheck>;
 }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
 export interface SentRec { at: number; last?: boolean; asks?: boolean }
+// A source check's reference (0.12.0): the row's ledger id and version it checked (null and
+// 0: a row the ledger didn't know yet), and the request that carried it, when one did.
+export interface Ref { row: string | null; version: number; req?: string }
+export interface PendingCheck extends Ref { text: string; at: number; req: string }
 
 export function emptyState(): State {
   // Card ids start from the clock, so a fresh state never reuses an id the
@@ -295,7 +303,7 @@ export function cardsView(s: State, now: number): CardsView {
 }
 
 // The link's outcome and landing lines, taken off the end of a card's words.
-const OUTCOME = /\n\n(?:You answered(?::| in a message)[^\n]*|Answered|Expired|Replaced by a newer card|Turned back on since\.|Stopped again since\.|You tapped Ship[^\n]*|Shipped: [^\n]*|Not shipped: [^\n]*)$/;
+const OUTCOME = /\n\n(?:You answered(?::| in a message)[^\n]*|Answered|Expired|Replaced by a newer card|Status changed, re-check needed|Turned back on since\.|Stopped again since\.|You tapped Ship[^\n]*|Shipped: [^\n]*|Not shipped: [^\n]*)$/;
 export function withoutOutcome(content: string): string {
   return String(content ?? "").replace(OUTCOME, "");
 }
@@ -370,9 +378,9 @@ export function closedItems(pending: string | null): Set<string> {
   return done;
 }
 
-// The record keeper's source checks (record/core.ts, state/checks.json), by item.
-type LedgerEntry = { changed?: string; checked?: string; checked_at?: string };
-const CHECK_MAX = 300;
+// The record keeper's ledger (record/core.ts, state/checks.json), by item: each open row's
+// hidden id and version, and its latest source check with the version it checked.
+type LedgerEntry = { id?: string; version?: number; changed?: string; checked?: string; checked_version?: number; checked_req?: string };
 function ledgerOf(text: string | null | undefined): Record<string, LedgerEntry> {
   if (!text) return {};
   try {
@@ -381,40 +389,51 @@ function ledgerOf(text: string | null | undefined): Record<string, LedgerEntry> 
   } catch { return {}; }
 }
 const clip = (t: string, n: number) => (t.length > n ? t.slice(0, n - 1) + "…" : t);
-const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-// How far the zone is ahead of UTC at that moment.
-function zoneOffset(ms: number, tz: string): number {
-  const p: Record<string, string> = {};
-  for (const x of new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "numeric",
-    day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" }).formatToParts(ms)) p[x.type] = x.value;
-  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) - Math.floor(ms / 1000) * 1000;
-}
-// When an open row's Since (or Opened) date began in the zone ("Nov 9": this year's, or
-// last year's when this year's is still ahead); null when there's no such row or date.
-export function sinceOf(pending: string | null | undefined, item: string, now: number, tz = "America/New_York"): number | null {
-  if (!pending) return null;
+// How long a check handed to the record keeper counts before its ledger shows it.
+export const CHECK_PENDING_MS = 10 * 60_000;
+export const STATUS_CHANGED = "Status changed, re-check needed";
+const STATUS_TAP = "Its status changed since it was checked, so nothing was done.";
+// "Nov 13", in the zone.
+const shortDay = (ms: number, tz = "America/New_York") =>
+  new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
+
+// The open rows' Item cells, by ID (for a one-off that reads as one of them).
+function openItems(pending: string | null | undefined): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!pending) return out;
   let section = "", cols: string[] | null = null;
   for (const line of pending.split(/\r?\n/)) {
     if (/^##\s/.test(line)) { section = line.replace(/^##\s+/, "").trim().toLowerCase(); cols = null; continue; }
     if (section !== "open" || !line.startsWith("|")) continue;
     const cs = line.replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim());
     if (!cols) { cols = cs; continue; }
-    if (cs[0]?.toUpperCase() !== item.toUpperCase()) continue;
-    const at = cols.findIndex((c) => /^(since|opened)$/i.test(c));
-    const m = at >= 0 ? /^([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})$/.exec(cs[at] ?? "") : null;
-    const month = m ? MONTHS.indexOf(m[1].toLowerCase()) : -1;
-    if (!m || month < 0) return null;
-    const year = Number(new Intl.DateTimeFormat("en-US", { timeZone: tz, year: "numeric" }).format(now));
-    const start = (y: number) => { const g = Date.UTC(y, month, Number(m[2])); return g - zoneOffset(g, tz); };
-    return start(year) > now ? start(year - 1) : start(year);
+    if (cs.every((c) => /^:?-+:?$/.test(c))) continue;
+    const at = cols.findIndex((c) => /^item$/i.test(c));
+    if (cs[0] && at >= 0 && cs[at]) out.set(cs[0].toUpperCase(), cs[at]);
+  }
+  return out;
+}
+const COMMON = new Set(("about after again also back been before being both build cain check checked could dane does done each else even "
+  + "every fix from have here into item just like make more much must need needs next none only open other over same should some "
+  + "still such than that their them then there these they this those through today tomorrow under until want week were what when "
+  + "where which while will with would your filed sent paid issued installed confirmed received renewed submitted signed mailed "
+  + "delivered cancelled canceled refunded").split(" "));
+const stem = (w: string) => w.replace(/'s$/, "").replace(/(?<=[a-z]{3})s$/, "");
+const wordsOf = (t: string) => t.toLowerCase().split(/[^a-z0-9']+/).filter(Boolean).map(stem);
+// The open item a one-off ask's words match: the Item cell's distinctive words (four
+// letters or more, not common ones), two of them in the ask, or the only one it has.
+export function oneOffItem(pending: string | null | undefined, text: string): [string, string] | null {
+  const asked = new Set(wordsOf(text));
+  for (const [id, item] of openItems(pending)) {
+    const own = [...new Set(wordsOf(item).filter((w) => w.length >= 4 && !COMMON.has(w) && !/^\d+$/.test(w)))];
+    if (!own.length) continue;
+    if (own.filter((w) => asked.has(w)).length >= Math.min(2, own.length)) return [id, item];
   }
   return null;
 }
-// "Nov 13", in the zone.
-const shortDay = (ms: number, tz = "America/New_York") =>
-  new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
 
 export class Refusal extends Error {}
+class StaleCheck extends Refusal {}
 
 export interface Meta { item: string; question: string; replyTo?: string }
 
@@ -498,6 +517,7 @@ function outcomeLine(m: Shown | undefined): string {
   if (m.outcome === "replaced" && m.why === TURNED_ON) return "Turned back on since.";
   if (m.outcome === "replaced" && m.why === STOPPED_AGAIN) return "Stopped again since.";
   if (m.outcome === "replaced") return REPLACED;
+  if (m.why === "status changed") return STATUS_CHANGED;
   return EXPIRED;
 }
 const TURNED_ON = "turned back on since";
@@ -553,7 +573,9 @@ export interface Deps {
   paired: () => string;                                            // who Cain is paired with
   log?: (line: string) => void;
   record?: () => RecordFiles;                                      // PENDING.md, the keeper's holds and its source checks
-  submitRecord?: (req: Record<string, unknown>) => void;           // a request into the record keeper's local queue (a source check)
+  submitRecord?: (req: Record<string, unknown>) => void;           // a request into the record keeper's local queue (a source check, a one-off's log line)
+  outcome?: (id: string) => { state: string; reason?: string } | null;   // the record keeper's outcome for one of those, once it has one
+  warnOnly?: boolean;                                              // the App's source_check_warn_only: a failed handoff warns instead of refusing
   pull?: (pr: string) => Promise<Pull | null>;                     // a pull request now; null: can't tell
   tz?: string;                                                     // the check-ins' zone
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
@@ -995,66 +1017,133 @@ export class Link {
   }
 
   // A status is checked at its source before it drives a question to him (his rule of
-  // Nov 13): an ask or Ship card for an item goes out only when the item's row carries a
-  // source check newer than its last status change (the record keeper's ledger,
-  // state/checks.json: changed, or the row's Since date before the ledger knew it), passed
-  // now (checked: what was checked, where and when, in plain words) or already on record.
-  // Returns the check passed now, to hand the keeper once the rest is checked, or null.
-  private sourceCheck(item: string, given: unknown): string | null {
+  // Nov 13). An ask or Ship card for an item goes out only on a source check of the row as
+  // it stands: the record keeper's ledger (state/checks.json) gives each open row a hidden
+  // id and a version that goes up when its content changes, and a check counts only while
+  // the version it checked is the row's version. Freshness never goes by the clock.
+  // given: a check passed now (what was checked, where and when). Returns the check to hand
+  // the keeper, with the row's id and version as read, or null when one on record counts.
+  private sourceCheck(item: string, given: unknown): { text: string; row: string | null; version: number } | null {
     if (item === "none") return null;
+    this.settleChecks();
+    const id = item.toUpperCase();
+    const e = this.ledger()[id];
     const raw = given === undefined || given === null ? "" : String(given);
     if (raw.trim()) {
       const t = raw.trim();
-      if (/[\r\n\u2028\u2029]/.test(t)) throw new Refusal("a source check is one line: what was checked, where and when");
-      if (t.length > CHECK_MAX) throw new Refusal(`a source check is at most ${CHECK_MAX} characters`);
-      if (t.includes("|")) throw new Refusal("a source check can't hold |");
-      for (const [re, what] of MACHINE)
-        if (re.test(t)) throw new Refusal(`a source check can't hold ${what}: say when as people say it ("this morning at 9", "Nov 13")`);
-      if (/(?<![A-Za-z0-9])P0*\d{1,4}(?![A-Za-z0-9])/i.test(t))
-        throw new Refusal("a source check can't hold a record code like P08: say what was checked in plain words");
-      return t;
+      const why = checkTextProblem(t);
+      if (why) throw new Refusal(why);
+      if (sameCheckText(e?.checked, t) || sameCheckText(this.d.load().checks?.[id]?.text, t))
+        throw new Refusal("that source check repeats the row's last one word for word; check again and say what you found this time, where and when");
+      const row = typeof e?.id === "string" ? e.id : null;
+      return { text: t, row, version: row === null ? 0 : Number(e?.version ?? 0) };
     }
-    const fresh = this.freshCheck(item, this.d.load());
-    if (fresh.ok) return null;
-    throw new Refusal(fresh.since !== null
-      ? `No source check on this item since its row changed on ${shortDay(fresh.since, this.d.tz)}; add --checked with what you checked, where and when.`
+    if (this.freshRef(id, this.d.load())) return null;
+    const since = e?.changed ? Date.parse(e.changed) : NaN;
+    throw new Refusal(Number.isFinite(since) && e?.checked
+      ? `No source check on this item since its row changed on ${shortDay(since, this.d.tz)}; add --checked with what you checked, where and when.`
       : "No source check on this item yet; add --checked with what you checked, where and when.");
   }
 
-  // Whether the item's newest source check (the keeper's, or one the link handed it) is
-  // newer than its row's last status change; since: that change, when known.
-  private freshCheck(item: string, s: State): { ok: boolean; since: number | null } {
-    const f = this.files();
-    const e = ledgerOf(f.checks)[item.toUpperCase()];
-    const stamp = e?.changed ? Date.parse(e.changed) : NaN;
-    const since = Number.isFinite(stamp) ? stamp : sinceOf(f.pending, item, this.d.now(), this.d.tz);
-    const kept = e?.checked_at ? Date.parse(e.checked_at) : NaN;
-    const at = Math.max(Number.isFinite(kept) ? kept : -Infinity, s.checks?.[item.toUpperCase()]?.at ?? -Infinity);
-    return { ok: at > -Infinity && (since === null || at > since), since };
+  private ledger(): Record<string, LedgerEntry> { return ledgerOf(this.files().checks); }
+
+  // The row as the ledger has it now: its id and version (null and 0 when it has none).
+  private rowNow(id: string): { row: string | null; version: number } {
+    const e = this.ledger()[id.toUpperCase()];
+    return typeof e?.id === "string" ? { row: e.id, version: Number(e.version ?? 0) } : { row: null, version: 0 };
+  }
+
+  // Whether a reference still holds: the row is the version it checked, or the check it
+  // carried is the keeper's own fresh check of the row (made from a row it didn't know yet).
+  private refValid(item: string, ref: Ref): boolean {
+    const e = this.ledger()[item.toUpperCase()];
+    const now = typeof e?.id === "string" ? { row: e.id, version: Number(e.version ?? 0) } : { row: null, version: 0 };
+    if (ref.req) {
+      const o = this.d.outcome?.(ref.req);
+      if (o && o.state !== "done") return false;
+    }
+    if (now.row === ref.row && now.version === ref.version) return true;
+    return !!ref.req && !!e && e.checked_req === ref.req && e.checked_version === e.version;
+  }
+
+  // The source check an ask or Ship card for the item rests on now, or null: the keeper's
+  // fresh check, or one the link handed it that still counts.
+  private freshRef(item: string, s: State): Ref | null {
+    const id = item.toUpperCase();
+    const e = this.ledger()[id];
+    if (typeof e?.id === "string" && e.checked !== undefined && e.checked_version === e.version)
+      return { row: e.id, version: Number(e.version), ...(e.checked_req ? { req: e.checked_req } : {}) };
+    const p = s.checks?.[id];
+    if (!p || this.d.now() - p.at >= CHECK_PENDING_MS || this.d.outcome?.(p.req)) return null;
+    const now = this.rowNow(id);
+    return now.row === p.row && now.version === p.version ? { row: p.row, version: p.version, req: p.req } : null;
+  }
+
+  // The checks the link handed the keeper: one it settled leaves (Cain hears when it was
+  // turned down), and one it hasn't settled in CHECK_PENDING_MS no longer counts.
+  private settleChecks(): void {
+    const s = this.d.load();
+    if (!s.checks || !Object.keys(s.checks).length) return;
+    const now = this.d.now(), lines: string[] = [], before = Object.keys(s.checks).length;
+    for (const [id, p] of Object.entries(s.checks)) {
+      const o = this.d.outcome?.(p.req) ?? null;
+      if (o?.state === "done") delete s.checks[id];
+      else if (o) { delete s.checks[id]; lines.push(`Your source check on ${id} wasn't recorded: the record keeper said ${o.state}${o.reason ? `, ${clip(o.reason, 200)}` : ""}. It doesn't count: check it at its source again and pass a new --checked before asking about it.`); }
+      else if (now - p.at >= CHECK_PENDING_MS) { delete s.checks[id]; lines.push(`Your source check on ${id} wasn't recorded within ${CHECK_PENDING_MS / 60_000} minutes, so it no longer counts: check it at its source again and pass a new --checked before asking about it.`); }
+    }
+    if (Object.keys(s.checks).length === before) return;
+    this.d.save(s);
+    for (const l of lines) this.d.relay(`${l} Nothing to tell him.`);
+  }
+
+  // A request into the record keeper's queue. False when it couldn't be handed over and
+  // the App's warn-only switch let the card through; otherwise a failure refuses it.
+  private handOver(req: Record<string, unknown>, what: string): boolean {
+    try {
+      if (!this.d.submitRecord) throw new Error("the record keeper can't be reached from the link");
+      this.d.submitRecord(req);
+      return true;
+    } catch (e) {
+      if (this.d.warnOnly) { this.log(`warning: ${what} couldn't be handed to the record keeper (${String(e).slice(0, 80)}); let through (source_check_warn_only)`); return false; }
+      throw new Refusal(`${what} couldn't be handed to the record keeper (${String(e).slice(0, 80)}); try again in a minute`);
+    }
   }
 
   // A check passed now goes to the record keeper (on the row and in its log), and is kept
-  // here until the keeper's ledger has it. Refused when it can't be handed over.
-  private recordCheck(item: string, text: string | null): void {
-    if (text === null || item === "none") return;
+  // here while its request is pending. Returns its reference, or (warn-only, when it
+  // couldn't be handed over) the row as read, marked warned.
+  private recordCheck(item: string, c: { text: string; row: string | null; version: number } | null): { ref: Ref; warned: boolean } | null {
+    if (c === null || item === "none") return null;
     const now = this.d.now(), id = item.toUpperCase();
-    if (!this.d.submitRecord) throw new Refusal("the record keeper can't be reached from the link, so the source check can't be recorded; try again in a minute");
-    try {
-      this.d.submitRecord({ id: `link-check-${id.toLowerCase().replace(/[^a-z0-9._-]/g, "_")}-${now}`, from: "cain", kind: "change",
-        summary: clip(`Source check on ${id} before asking him: ${text}`, 200), ops: [{ op: "check", item: id, text }] });
-    } catch (e) {
-      throw new Refusal(`the source check couldn't be handed to the record keeper (${String(e).slice(0, 80)}); try again in a minute`);
-    }
+    const req = `link-check-${id.toLowerCase().replace(/[^a-z0-9._-]/g, "_")}-${now}`;
+    const ok = this.handOver({ id: req, from: "cain", kind: "change",
+      summary: clip(`Source check on ${id} before asking him: ${c.text}`, 200),
+      ops: [{ op: "check", item: id, text: c.text, row: c.row, version: c.version }] }, "the source check");
+    if (!ok) return { ref: { row: c.row, version: c.version }, warned: true };
     const s = this.d.load();
-    const kept = ledgerOf(this.files().checks);
-    const checks: Record<string, { text: string; at: number }> = {};
-    for (const [k, v] of Object.entries(s.checks ?? {})) {
-      const t = kept[k]?.checked_at ? Date.parse(kept[k].checked_at!) : NaN;
-      if (!(Number.isFinite(t) && t >= v.at) && now - v.at < DAY) checks[k] = v;   // the keeper has it, or it's a day old: gone
-    }
-    checks[id] = { text, at: now };
-    s.checks = checks;
+    s.checks = { ...(s.checks ?? {}), [id]: { text: c.text, at: now, row: c.row, version: c.version, req } };
     this.d.save(s);
+    return { ref: { row: c.row, version: c.version, req }, warned: false };
+  }
+
+  // A one-off ask (--item none) can't stand in for an item's ask: one whose words match an
+  // open row's Item is refused, naming it. Every one-off goes into the request log.
+  private oneOff(text: string): void {
+    const hit = oneOffItem(this.files().pending, text);
+    if (hit) throw new Refusal(`This one-off reads as being about ${hit[0]} ("${clip(hit[1], 60)}"): ask it with --item ${hit[0]} and a --checked source check, or reword it if it's about something else.`);
+    const now = this.d.now(), flat = text.replace(/\s+/g, " ").replace(/\|/g, "/").trim();
+    this.handOver({ id: `link-oneoff-${now}`, from: "cain", kind: "change", summary: clip(`One-off ask to him: ${flat}`, 200),
+      ops: [{ op: "one-off", text: clip(flat, 300) }] }, "the one-off ask's log line");
+  }
+
+  // Right before an ask or Ship card for an item goes up: the row's version is read again,
+  // and the card rests on the check that counts now (or, warn-only, the row as read).
+  private refNow(item: string, given?: { ref: Ref; warned: boolean } | null): Ref | null {
+    if (item === "none") return null;
+    const fresh = this.freshRef(item, this.d.load());
+    if (fresh) return fresh;
+    if (given?.warned && this.refValid(item, given.ref)) return given.ref;
+    throw new StaleCheck("its row changed after your source check (or the check no longer counts); check it at its source again, and ask again with --checked if it still needs him.");
   }
 
   // Live cards with the same key as this one: the newest keeps its buttons and the others
@@ -1418,14 +1507,14 @@ export class Link {
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
     const text = w.text;                 // no "P08 Q2: ": the item and question are data
     this.mayAsk(meta.item);
-    const check = this.sourceCheck(meta.item, a.checked);
-    this.recordCheck(meta.item, check);
+    if (meta.item === "none") this.oneOff(text);
+    const recorded = this.recordCheck(meta.item, this.sourceCheck(meta.item, a.checked));
     return this.serial(async () => {
       const now = this.d.now();
       const s = this.d.load();
       const key = keyOf(meta.item, meta.question);
       const entry: Ask = { text, options, item: meta.item, question: meta.question, replyTo: meta.replyTo,
-        at: now, expires: this.askExpiry(now),
+        at: now, expires: this.askExpiry(now), ...(recorded?.warned ? { ref: recorded.ref, warned: true } : {}),
         nonce: stableNonce("ask", meta.item, meta.question, text, options.join("\u0001"), meta.replyTo ?? "") };
       const open = this.openAsk(s, now);
       if (open && !(key && keyFor(open[1]) === key)) {
@@ -1448,6 +1537,7 @@ export class Link {
   }
 
   private async postAsk(e: Ask): Promise<string> {
+    const checked = this.refNow(e.item, e.ref ? { ref: e.ref, warned: !!e.warned } : null);
     const nonce = e.nonce ?? stableNonce("ask", e.item, e.question, e.text, e.options.join("\u0001"), e.replyTo ?? "");
     // Checked when it was asked; one held since before 0.10.0 gets the fixes now, and one held
     // since before 0.11.0 loses the label it was stored with ("P08 Q2: ").
@@ -1457,7 +1547,7 @@ export class Link {
       { replyTo: e.replyTo, nonce });
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
-      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
+      ...(checked ? { checked } : {}), buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -1493,7 +1583,8 @@ export class Link {
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
     const built = this.d.facts ? await this.shipText(pr, head, review, w.text) : { text: w.text, own: undefined };
     const text = built.text;
-    this.recordCheck(meta.item, check);
+    const recorded = this.recordCheck(meta.item, check);
+    const checked = this.refNow(meta.item, recorded);
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
@@ -1501,7 +1592,7 @@ export class Link {
     const now = this.d.now();
     const s = this.d.load();
     this.remember(s, msg, { kind: "ship", item: meta.item, question: `ship:${m[3]}`, posted: now, expires: this.askExpiry(now),
-      ship: { pr, head }, ...(built.own !== undefined ? { own: built.own } : {}), buttons: true, labels: [...options],
+      ship: { pr, head }, ...(checked ? { checked } : {}), ...(built.own !== undefined ? { own: built.own } : {}), buttons: true, labels: [...options],
       q: { q: excerpt(text), options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
@@ -1705,6 +1796,7 @@ export class Link {
       if (closedItems(f.pending).has(item.toUpperCase())) return "item closed";
       const holds = parseHolds(f.holds);
       if (holds && heldElsewhere(holds, item)) return "held elsewhere";
+      if ((m.kind === "ask" || m.kind === "ship") && m.checked && !this.refValid(item, m.checked)) return "status changed";
     }
     return "";
   }
@@ -2202,7 +2294,7 @@ export class Link {
     if (ok) { r.digest = digest(shown, []); r.off = this.d.now(); }
     if (!r.labels) r.labels = labelsOf(it.message?.components);
     this.d.save(s);
-    await this.ephemeral(it, EXPIRED_TAP);
+    await this.ephemeral(it, why === "status changed" ? STATUS_TAP : EXPIRED_TAP);
     this.log(`tap on a card that stopped mattering (${why}): answered in place`);
     return `dead: ${why}`;
   }
@@ -2877,6 +2969,7 @@ export class Link {
       else if (pulls.has(id)) why = pulls.get(id)!;
       else if (item && closed.has(item.toUpperCase())) why = "item closed";
       else if (item && holds && heldElsewhere(holds, item)) why = "held elsewhere";
+      else if (item && (m.kind === "ask" || m.kind === "ship") && m.checked && !this.refValid(item, m.checked)) why = "status changed";
       else { const k = rivalKey(m); if (k && newest.get(k) !== id) why = "replaced"; }
       if (!why) continue;
       m.outcome = why === "replaced" ? "replaced" : "expired"; m.why = why;
@@ -2890,6 +2983,7 @@ export class Link {
         "merged or closed": "the pull request was merged or closed.",
         "item closed": `${m.item} is closed in PENDING.md.`,
         "held elsewhere": `${m.item} is now held by another session. Don't ask him about it or say who has it.`,
+        "status changed": `${m.item}'s row changed after the source check it rested on, so its buttons came off ("${STATUS_CHANGED}"). Check it at its source again, and ask again with --checked if it still needs him.`,
       };
       if ((m.kind !== "ask" && m.kind !== "ship") || !because[why]) continue;
       const what = m.kind === "ship" ? `Ship card for ${m.ship?.pr}` : `question ${about(m.item, m.question) || `"${excerpt(m.q?.q ?? "", 60)}"`}`;
@@ -2950,6 +3044,7 @@ export class Link {
   // Held asks that can no longer go out: expired before their turn (at the morning
   // check-in), or their item closed or moved to someone else meanwhile.
   private dropStaleHeld(): string[] {
+    this.settleChecks();
     const s = this.d.load();
     const now = this.d.now();
     const f = this.files();
@@ -2962,7 +3057,7 @@ export class Link {
       if (h.expires <= now) lines.push(`Your held question ${what} was never shown: it expired at the morning check-in. Ask again if it still matters.`);
       else if (item && closed.has(item.toUpperCase())) lines.push(`Your held question ${what} was dropped unasked: ${item} is closed in PENDING.md.`);
       else if (item && holds && heldElsewhere(holds, item)) lines.push(`Your held question ${what} was dropped unasked: ${item} is now held by another session. Don't ask him about it or say who has it.`);
-      else if (item && !this.freshCheck(item, s).ok) lines.push(`Your held question ${what} was dropped unasked: its row changed after your source check. Check it at its source again, and ask again with --checked if it still needs him.`);
+      else if (item && !this.freshRef(item, s) && !(h.warned && h.ref && this.refValid(item, h.ref))) lines.push(`Your held question ${what} was dropped unasked: its row changed after your source check. Check it at its source again, and ask again with --checked if it still needs him.`);
       else keep.push(h);
     }
     if (lines.length) { s.held = keep; this.d.save(s); for (const l of lines) this.d.relay(`${l} Nothing to tell him.`); }
@@ -3002,6 +3097,11 @@ export class Link {
       let id: string;
       try { id = await this.postAsk(next); }
       catch (e) {
+        if (e instanceof StaleCheck) {
+          const what = about(next.item, next.question);
+          this.d.relay(`Your held question${what ? ` ${what}` : ""} was dropped unasked: ${e.message} Nothing to tell him.`);
+          return;
+        }
         const s2 = this.d.load();
         s2.held = [next, ...(s2.held ?? [])];
         this.d.save(s2);

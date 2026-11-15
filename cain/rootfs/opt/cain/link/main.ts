@@ -67,7 +67,11 @@ const QUEUE = process.env.RELAY_QUEUE ?? "/data/relay.queue";
 const PORT = Number(process.env.RELAY_PORT ?? 8097);
 const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper's copy
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
-const RECORD_QUEUE = process.env.RECORD_QUEUE ?? "/data/record-queue";   // the keeper's local queue (source checks)
+const RECORD_QUEUE = process.env.RECORD_QUEUE ?? "/data/record-queue";   // the keeper's local queue (source checks, one-offs)
+const RECORD_OUTCOMES = process.env.RECORD_OUTCOMES ?? "/data/record-outcomes";   // the keeper's outcome per request of Cain's
+// The App's source_check_warn_only option: a request the link can't hand the keeper warns
+// in the log and lets the card through, instead of refusing it.
+const WARN_ONLY = process.env.SOURCE_CHECK_WARN_ONLY === "true";
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
@@ -195,6 +199,13 @@ const link = new Link({
     writeFileSync(`${RECORD_QUEUE}/.${name}`, JSON.stringify(req));
     renameSync(`${RECORD_QUEUE}/.${name}`, `${RECORD_QUEUE}/${name}`);
   },
+  outcome: (id) => {
+    const t = readOr(`${RECORD_OUTCOMES}/${id.replace(/[^A-Za-z0-9._:-]/g, "_")}.json`);
+    if (t === null) return null;
+    try { const o = JSON.parse(t); return o && typeof o.state === "string" ? { state: o.state, reason: typeof o.reason === "string" ? o.reason : undefined } : null; }
+    catch { return null; }
+  },
+  warnOnly: WARN_ONLY,
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },

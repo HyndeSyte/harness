@@ -2,10 +2,12 @@
 
 ## 0.12.0
 
-- Cain checks a thing where it lives (your mail, a portal, GitHub) before he asks you about it, and the App now holds him to it: a question or Ship card about one of your open items goes out only when that check was made since the item last changed.
-- What he checked shows on the item's row in your record, with the day, so you can see why he asked.
-- A row in your open list holds one thing: Cain can't add a row that says two things are done or not done at once.
-- Nothing changes in how you answer. One-off questions are as before.
+- Cain checks a thing where it lives (your mail, a portal, GitHub) before he asks you about it, and the App now holds him to it: a question or Ship card about one of your open items goes out only on a check of that item as it stands now.
+- If the item changes after the card went up, its buttons come off and it says "Status changed, re-check needed", so you never answer a question about something that moved on.
+- What he checked shows on the item's row in your record, with the date and whether it is still fresh.
+- A one-off question that is really about one of your open items is held back until Cain checks it properly, and every one-off is logged.
+- A row in your open list holds one thing: Cain can't add a row that plainly says two different things are done or not done.
+- New option, off by default: source_check_warn_only lets cards through with a warning if the check can't be recorded on this device.
 
 ## 0.11.0
 

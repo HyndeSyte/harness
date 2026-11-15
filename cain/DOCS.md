@@ -54,10 +54,12 @@ the App.
   goes when its pull request changes or closes. One for a change that's already in main
   stays: your tap on it starts the install.
 - Cain's questions about an open item, and his Ship cards, rest on a check at the
-  source (your mail, a portal, GitHub) made since that item's row last changed. The App
-  refuses the card otherwise, and the check shows on the item's row in your record
-  ("Nov 15: the county's receipt in your mail, read at 9:40"). A one-off question isn't
-  about an item and needs none.
+  source (your mail, a portal, GitHub) of that item's row as it stands. The App refuses
+  the card otherwise, and the check shows on the item's row in your record ("fresh, Nov
+  15, 2026: the county's receipt in your mail, read at 9:40"). If the row changes after
+  the card went up, its buttons come off: "Status changed, re-check needed". A one-off
+  question isn't about an item and needs none, but the App refuses one that reads like
+  one of your open items.
 - Tapping an old card does nothing, and says so.
 - The card shows what you tapped. When a tap needs words from Cain, they come as a reply
   to that card.
@@ -243,7 +245,8 @@ and `remove`:
 | `row` | `item`, `base`, `set` | Changes cells of one open row. `base` is the row's hash as read: sha1 of the row's line, without the line ending (`record.sh rowsha <item>` on the Pi, `record-send.ts --row <item>` on a laptop). A changed row is a conflict; changes to other rows don't matter. `set` covers `Item`, `Who`, `Next step`, `Waits for`, `Done when`. |
 | `row-add` | `item`, `cells` | Adds a row at the end of the open table, `Since` today. Needs `Item`. Refuses an ID in use, or one used before in Done. Anyone may add a row. |
 | `row-close` | `item`, `evidence` | Moves the row to the top of Done as `\| <ID> <Item>: <evidence> \| <date> \|`. |
-| `check` | `item`, `text` | A source check on an open row: what was checked, where and when, one line up to 300 characters. Cain's link sends it when Cain asks with `--checked`. Sets the row's `Checked` cell (`Nov 15: <text>`; the column is added to the open table the first time) and the item's entry in `state/checks.json`. Never counts as a status change. |
+| `check` | `item`, `text`, `row`, `version` | A source check on an open row, sent by Cain's link when Cain asks with `--checked`. `row` and `version` are the row's ledger id and version as the link read them (`null` and `0` for a row the ledger didn't know). Taken only while they are still current; otherwise rejected, naming what moved. `text`: one line, up to 300 characters, no `\|`, saying where and when (dates, ISO times, shas, job ids and codes are fine); one repeated word for word from the row's last check is rejected. Never bumps the row's version. |
+| `one-off` | `text` | A one-off ask Cain's link put to him (`--item none`), kept in `log/requests/`. Writes nothing. |
 | `note` | `item`, `text` | Anyone, holder or not, on any item the record knows (held, open, or done). Appended with its time and sender to `state/notes/<item>.md`, so it never conflicts and is never refused for a hold. `text` is one line, 1 to 2,000 characters. |
 
 - Cells never hold `|` or a new line. A row that already holds an escaped `\|` is
@@ -262,28 +265,74 @@ and `remove`:
   either end is refused, as is anything under `state/holds.json`, `state/checks.json`
   or `state/notes`.
 - One row holds one fact: a `row-add`, or a `row` that sets `Item`, is refused when
-  the new Item cell bundles two status claims, naming both. A claim is a status word
-  from a closed set (filed, sent, done, paid, issued, installed, confirmed, received,
-  renewed, submitted, signed, mailed, delivered, cancelled, refunded, and "not" or "un"
-  forms) with a subject before it in its clause ("land-use packet not filed") or a date
-  after it ("filed Nov 3"). Clauses split at `, ; : ( )`, a full stop before a capital,
-  "and", "but", "while", "though", " - " and " / ". A bare "filed and sent" makes no
-  claim. Rows already in the record aren't rewritten; only new writes are checked.
+  the new Item cell makes two completed-status claims about different subjects, naming
+  both clauses. A claim is a status word from a closed set (filed, sent, done, paid,
+  issued, installed, confirmed, received, renewed, submitted, signed, mailed, delivered,
+  cancelled, refunded, and "not" or "un" forms) that follows a noun-phrase subject in
+  its clause and is not itself followed by a noun: "land-use packet not filed" and
+  "license filed Nov 3" claim; "a signed lease", "landlord signed lease copy" and "filed
+  and sent" don't. Clauses split at `, ; : ( )`, a full stop before a capital, "and",
+  "but", "while", "though", " - " and " / ". Anything else passes; an Item with two or
+  more status words that isn't refused is let through with a warning in the keeper's
+  log. The coverage is limited (a word list, not a reader): a row it passes may still
+  hold two things. Rows already in the record aren't rewritten; only new writes are
+  checked.
 
 ### Source checks: verified before he's asked
 
-`state/checks.json` is the keeper's own, per open item: `changed`, when its Who, Next
-step or Waits for last changed or it was added (stamped on every write of the open
-list, whatever the op or put), and the latest source check (`checked`, `checked_at`,
-`by`). A row that leaves the open table leaves it. Cain's link refuses an ask or a Ship
-card for an item (anything but `--item none`) unless its newest check, passed now with
-`--checked` or already there, is newer than `changed` (or, for a row from before the
-ledger, its `Since` date): one line, "No source check on this item since its row
-changed on Nov 13; add --checked ...". A check passed now goes into the keeper's local
-queue as a `check` request from cain (so it shows in `log/requests/`), and the link
-counts it until the keeper's ledger has it. A held ask whose row changes after its
-check is dropped unasked, and Cain is told. The check is one line in plain words: the
-link refuses ISO times, shas, job ids, record codes like P08, `|` and new lines in it.
+`state/checks.json` is the keeper's own ledger, per open row (keyed by its ID):
+
+- `id`: a hidden stable id the keeper gives the row the first time it writes the open
+  list with it in. It survives Item edits and reordering and is never shown to him. A
+  row that leaves the open table leaves the ledger, so one deleted and added again under
+  the same ID gets a new id.
+- `version`: 1 for a new id (a row from before the ledger too: never counted from its
+  `Since` date), and one more each time the row's content changes. Content is every cell
+  but `Since` and `Checked`, compared trimmed with runs of spaces made one, against the
+  row as committed. A `put` that changes no cell bumps nothing; one that changes one row
+  bumps only it. The `check` op never bumps its row.
+- `changed`: when the version last went up (for the refusal's wording only).
+- `checked`, `checked_version`, `checked_at`, `checked_req`, `by`: the latest source check
+  and the version it checked.
+
+A check is fresh while `checked_version` is the row's `version`. Freshness goes by
+version, never by the clock: equal timestamps and clock steps don't change it.
+
+The open table's `Checked` column is a projection of the ledger: made again on every write
+of the open list (row ops and whole-file puts alike), added the first time it's missing,
+and never read back from what a writer sends. Each cell says fresh or stale, the check's
+day with its year (and the time, when the check and the row's last change fall on the same
+day), then what was checked: "fresh, Nov 15, 2026 9:40 AM: the county's receipt in his
+Gmail".
+
+What Cain's link enforces:
+
+- An ask or a Ship card for an item (anything but `--item none`) needs a fresh check:
+  passed now with `--checked`, or already in the ledger. Otherwise one line: "No source
+  check on this item since its row changed on Nov 13; add --checked ...".
+- A check passed now goes into the keeper's local queue as a `check` request from cain
+  carrying the row's id and version as read (so it shows in `log/requests/`). Until the
+  keeper settles it, the link's own copy counts only while that request is pending, the
+  row is still that version, and 10 minutes haven't passed. When the keeper rejects it
+  (the row moved on) or fails, or the 10 minutes pass, the copy is dropped and Cain is
+  told.
+- Right before posting, the link reads the row's version again and refuses (or, for a
+  held ask, drops it and tells Cain) when the check no longer counts.
+- A posted, unanswered ask or Ship card for an item loses its buttons when the row's
+  version changes: the link edits it to say "Status changed, re-check needed" and tells
+  Cain. A tap on one before that is refused with the same reason.
+- A one-off (`--item none`) whose words match an open row's Item (two of its distinctive
+  words, or its only one) is refused, naming the item. Every one-off is written to the
+  request log (a `one-off` request).
+- If the link can't hand a request to the keeper's queue, the card is refused, unless the
+  App option `source_check_warn_only` is on: then the link logs a warning and lets it
+  through (it still needs a check passed now; it rests on the row's version as read).
+
+After installing, Cain runs a device smoke test before relying on refusals: one checked
+ask end to end against the real record, then he confirms the `check` request is in
+`log/requests/`, `state/checks.json` has the row's entry with that check, and the open
+table has its `Checked` column. Until that passes, a refusal may be the device, not the
+rule; `source_check_warn_only` keeps cards moving while it's sorted out.
 
 ### Notes: his words always land
 
