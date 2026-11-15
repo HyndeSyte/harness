@@ -33,8 +33,11 @@ export const CARDS_DELAY_MS = 500;
 // answer is recorded, and one damaged copy loses nothing. Both damaged is never taken quietly for
 // a fresh store: the loss is recorded first, durably (state.json.lost, its time), and only then
 // are they moved aside (state.json.damaged-<time>), so no crash between the two can make it look
-// fresh; if the loss can't be recorded, nothing is moved and load() throws (C1 re-check B1). A
-// marker that can't be read, or doesn't hold a time, counts as a loss now. lost() says so, across
+// fresh; if the loss can't be recorded, nothing is moved and load() throws (C1 re-check B1). Each
+// loss records its own time, later than any before it, even with an earlier one still on record:
+// a second loss covers the cards made since the first (and a start killed before the copies moved
+// only moves the time on, which is safe). A marker that can't be read, or doesn't hold a time,
+// counts as a loss now. lost() says so, across
 // restarts, for as long as the link remembers a signed request (KEEP_MS): the link tells Cain, and
 // a card's request id isn't trusted to find its card meanwhile. A save tells onSave (the cards
 // writer) and writes nothing else.
@@ -68,7 +71,9 @@ export function stateFile(path: string, onSave: () => void = () => {},
         return best;
       }
       if (a === "absent" && b === "absent") return emptyState();
-      if (!lostAt) { const t = now(); write(`${path}.lost`, String(t)); lostAt = t; }
+      const t = Math.max(now(), lostAt + 1);
+      write(`${path}.lost`, String(t));
+      lostAt = t;
       foundNow = true;
       for (const p of [path, `${path}.2`]) { try { renameSync(p, `${p}.damaged-${lostAt}`); } catch { /* absent */ } }
       return emptyState();

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
-import { KEEP_MS, writeSynced } from "../rootfs/opt/cain/link/auth";
+import { KEEP_MS, RequestLog, SignedOps, writeSynced } from "../rootfs/opt/cain/link/auth";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
 // Transcripts are read only if they are files of Cain's user (C1); here, the test's own.
@@ -244,14 +244,15 @@ describe("the cards, published for the reply hook", () => {
     const later = stateFile(p);
     later.load();
     expect([later.lost() > 0, later.lostNow(), existsSync(`${p}.lost`)]).toEqual([true, true, true]);
-    // Killed after the marker, before the copies moved: the next start finds both, keeps the
-    // marker's time, moves them, and says it found them.
+    // Killed after the marker, before the copies moved: the next start finds both, records the
+    // loss again at its own time (later: safe), moves them, and says it found them.
     ({ dir, p } = damaged());
     const t0 = Date.now() - 60_000;
     writeFileSync(`${p}.lost`, String(t0));
     const resumed = stateFile(p);
     resumed.load();
-    expect([resumed.lost(), resumed.lostNow(), readdirSync(dir).filter((f) => f.includes(`.damaged-${t0}`)).length]).toEqual([t0, true, 2]);
+    const t1 = resumed.lost();
+    expect([t1 > t0, resumed.lostNow(), readdirSync(dir).filter((f) => f.includes(`.damaged-${t1}`)).length]).toEqual([true, true, 2]);
     // A marker that doesn't hold a time, or can't be read, counts as a loss now.
     ({ dir, p } = damaged());
     writeFileSync(`${p}.lost`, "garbage");
@@ -259,6 +260,34 @@ describe("the cards, published for the reply hook", () => {
     ({ dir, p } = damaged());
     mkdirSync(`${p}.lost`);
     expect(stateFile(p).lost() > 0).toBe(true);
+  });
+
+  test("a second loss before the first's window ends covers the cards made in between: their answers are the explicit unknown", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    let t = 1_800_000_000_000;
+    const damage = () => { writeFileSync(p, "{oops"); writeFileSync(`${p}.2`, "{oops"); };
+    const clock = () => t;
+    stateFile(p, () => {}, undefined, clock).save(rig().state());
+    damage();
+    let store = stateFile(p, () => {}, undefined, clock);
+    store.load();                                                        // the first loss
+    expect(store.lost()).toBe(1_800_000_000_000);
+    const ops = (st: { lost(): number }) => new SignedOps(new RequestLog(join(dir, "requests.json"), t), clock, undefined,
+      (path, s) => path === "/card" && s.status === 200 && st.lost() > 0 && s.at <= st.lost());
+    t += 12 * HOUR;
+    store.save(store.load());                                            // the link goes on
+    const CARD = "e".repeat(32);
+    let runs = 0;
+    const act = async () => { runs++; return { status: 200, body: '{"id":99}' }; };
+    expect((await ops(store).run(CARD, "/card", act)).status).toBe(200);  // a card made after the first loss
+    t += 12 * HOUR;
+    damage();
+    store = stateFile(p, () => {}, undefined, clock);
+    store.load();                                                        // the second, within the first's 8 days
+    expect(store.lost()).toBe(t);
+    const a = await ops(store).run(CARD, "/card", act);
+    expect([a.status, JSON.parse(a.body).status, runs]).toEqual([409, "unknown", 1]);
   });
 
   test("a save that couldn't be made durable throws, and the next read takes the newer copy, not a stale first one", () => {
