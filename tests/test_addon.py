@@ -973,28 +973,54 @@ def test_a_read_marks_notes_read_only_when_all_of_that_file_was_shown(tmp_path):
     g("update-ref", "refs/remotes/origin/main", "HEAD")             # as the keeper's copy has it
     _notes_env(tmp_path, rec, "2026-11-14T00:00:00.000Z")
 
-    def run(*a):
-        return subprocess.run([shutil.which("bash"), str(tmp_path / "record.sh"), *a], env=dict(os.environ),
+    def run(*a, path=None):
+        env = dict(os.environ, PATH=path) if path else dict(os.environ)
+        return subprocess.run([shutil.which("bash"), str(tmp_path / "record.sh"), *a], env=env,
                               capture_output=True, text=True, encoding="utf-8", check=True, timeout=20).stdout
 
+    def unread():
+        return run("unread", "2026-11-14T00:00:00Z")
+
     try:
-        assert run("unread", "2026-11-14T00:00:00Z").startswith("P41 |")
+        assert unread().startswith("P41 |")
         # Cut by a time, it shows none of the notes and marks nothing.
         assert run("notes", "P41", "2099-01-01") == ""
-        assert run("unread", "2026-11-14T00:00:00Z").startswith("P41 |")
+        assert unread().startswith("P41 |")
+        # Git gives the notes but showing them fails (round 17): nothing shown, nothing marked.
+        bad = tmp_path / "badawk"
+        bad.mkdir()
+        (bad / "awk").write_text("#!/bin/bash\nexit 42\n", newline="\n")
+        (bad / "awk").chmod(0o755)
+        assert run("notes", "P41", path=f"{bad}{os.pathsep}{os.environ['PATH']}") == ""
+        assert unread().startswith("P41 |")
         # The notes object can't be read and the copy here isn't that file: shown or not, nothing marked.
         blob = g("rev-parse", "origin/main:state/notes/P41.md")
         obj = rec / ".git" / "objects" / blob[:2] / blob[2:]
         saved = obj.read_bytes()
+        mine = (rec / "state" / "notes" / "P41.md").read_bytes()
         obj.chmod(0o644)
         obj.unlink()
         (rec / "state" / "notes" / "P41.md").write_text("changed here\n", newline="\n")
         run("notes", "P41")
         obj.write_bytes(saved)
-        assert run("unread", "2026-11-14T00:00:00Z").startswith("P41 |")
-        # All of that file, read by its id: marked, and it drops off.
+        assert unread().startswith("P41 |")
+        # The object still gone but the copy here is that same file: all of it shown, so marked.
+        (rec / "state" / "notes" / "P41.md").write_bytes(mine)
+        obj.unlink()
         assert "the handoff" in run("notes", "P41")
-        assert run("unread", "2026-11-14T00:00:00Z") == ""
+        obj.write_bytes(saved)
+        assert unread() == ""
+        # A new note brings it back; all of that file, read by its id from git, marks it again.
+        _write_notes(rec, "P41", [("2026-11-15T11:00:00.000Z", "laptop:9f2c", "dane: one more")])
+        g("add", "-A")
+        g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "more")
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
+        assert "one more" in unread()
+        # Unread notes that can't be shown here are named all the same, so the item stays on the list.
+        assert run("unread", "2026-11-14T00:00:00Z", path=f"{bad}{os.pathsep}{os.environ['PATH']}") \
+            == "P41 | ? | ? | its notes couldn't be read here |\n"
+        assert "one more" in run("notes", "P41")
+        assert unread() == ""
     finally:
         _notes_env_done()
 

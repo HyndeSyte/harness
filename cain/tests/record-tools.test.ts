@@ -461,6 +461,29 @@ describe("session-end", () => {
     expect(n.lastIndexOf("Merge")).toBeGreaterThan(n.lastIndexOf("Verify after his tap"));
   }, 90_000);
 
+  test("an end whose flush finds another at the outbox waits its turn, so its own filing goes from this end", async () => {
+    // CI, Nov 15: two ends at once, and the first end's flush had read the outbox before the
+    // second's filing was in it; the second, finding the outbox busy, left its filing for the
+    // next session's start. Held here on purpose: the outbox is busy until the end has waited.
+    const l = held();
+    const transcript = join(l.root, "transcript.jsonl");
+    writeFileSync(transcript, plan(["Merge", "pending"]));
+    const dir = join(l.clone, ".git", "record-holds");
+    mkdirSync(dir, { recursive: true });
+    const busy = join(dir, "outbox.lock");
+    writeFileSync(busy, "1");                                            // another flush is at it
+    const p = Bun.spawn([process.execPath, join(TOOLS, "session-end.ts"), "--hook"], { cwd: l.root, env: cleanEnv({ RECORD_CLONE: l.clone }),
+      stdout: "pipe", stderr: "pipe", stdin: Buffer.from(JSON.stringify({ session_id: SA, transcript_path: transcript })) });
+    await Bun.sleep(1500);
+    rmSync(busy, { force: true });                                       // that flush is done
+    await p.exited;
+    const out = await new Response(p.stdout).text();
+    expect(out).toContain("submitted to the record");
+    expect(out).not.toContain("waiting here");
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Merge.");
+  }, 90_000);
+
   test("an end's snapshot cut off before it was moved in is taken up by a start alone: whole, filed; cut off, kept aside", () => {
     const l = held();
     const memo = join(l.clone, ".git", "record-holds");

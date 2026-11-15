@@ -487,14 +487,14 @@ export function waiting(dir: string): boolean {
   return false;
 }
 
-export interface Flushed { lines: string[]; fates: Map<string, "submitted" | "filed" | "waiting here" | "aside"> }
+export interface Flushed { lines: string[]; fates: Map<string, "submitted" | "filed" | "waiting here" | "aside">; busy?: true }
 
 // Works the outbox, oldest filing first: sends what wasn't, settles what the keeper has logged,
 // moves aside what it refused or would refuse, or what can't be read. One flush at a time.
 export function flush(rec: Clone, dir: string, now = Date.now()): Flushed {
   const lock = join(dir, "outbox.lock");
   mkdirSync(join(dir, "outbox"), { recursive: true });
-  if (!claim(lock, now)) return { lines: [], fates: new Map() };          // another flush is at it
+  if (!claim(lock, now)) return { lines: [], fates: new Map(), busy: true };   // another flush is at it
   try {
     const taken = takePending(rec, dir);
     const unsettled = reconcile(rec, dir);
@@ -660,7 +660,11 @@ if (import.meta.main) {
   rmSync(pending, { force: true });
   rmSync(lock, { force: true });                       // its turn is over: a flush may take others' snapshots
   lock = "";
-  const done = flush(rec!, dir!);
+  // Its own filing goes now: while another end's flush is at the outbox, wait for it, within the
+  // same budget, so the second of two ends at once doesn't leave its filing for the next start
+  // (CI, Nov 15: the first end's flush had read the outbox before the second's filing was in it).
+  let done = flush(rec!, dir!);
+  while (done.busy && Date.now() - waitFrom <= waitMs) { await Bun.sleep(250); done = flush(rec!, dir!); }
   if (!r!.id) say(...done.lines);                      // nothing new to file: what waits still goes
   const mine = done.fates.get(r!.id!);
   say(...done.lines.filter((l) => !l.startsWith("Submitted ")),

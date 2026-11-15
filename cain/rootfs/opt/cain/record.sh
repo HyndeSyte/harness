@@ -33,11 +33,12 @@ notes_id() {
     || { [ -f "$dir/state/notes/$1.md" ] && git hash-object --no-filters "$dir/state/notes/$1.md" 2>/dev/null; }
 }
 notes_text() { git -C "$dir" cat-file blob "$2" 2>/dev/null || cat "$dir/state/notes/$1.md" 2>/dev/null; }
-# Its rows, each led by $2, only those after $1 (an empty $1: all).
-note_rows() {
+# Its rows, each led by $2, only those after $1 (an empty $1: all). Fails if any step of it does.
+note_rows() (
+  set -o pipefail
   tr -d '\r' | awk -F'|' -v since="$1" -v lead="$2" '/^\|[ \t]*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ {
       w = $2; gsub(/^[ \t]+|[ \t]+$/, "", w); if (since == "" || w > since) print lead $0 }'
-}
+)
 iso() { date -u -d "$1" +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null; }
 # Cain's items with notes: every notes file but those on items someone other than Cain holds.
 his_items() {
@@ -79,16 +80,17 @@ case "${1:-}" in
       item=$(upper "$item")
       case "$item" in [!A-Z0-9]*|*[!A-Z0-9._-]*) echo "not an item id: $2" >&2; exit 2 ;; esac
       id=$(notes_id "$item") || exit 0
-      # Read means all of that file was shown: by its id from git, or else the copy here, only
-      # when it is that same file. A read that failed, or one cut by a time, marks nothing.
-      git -C "$dir" cat-file blob "$id" 2>/dev/null | note_rows "$since" ""
-      if [ "${PIPESTATUS[0]}" != 0 ]; then
-        f="$dir/state/notes/$item.md"
-        same=$([ -f "$f" ] && git hash-object --no-filters "$f" 2>/dev/null) || same=""
-        cat "$f" 2>/dev/null | note_rows "$since" ""
-        [ "$same" = "$id" ] || exit 0
-      fi
-      [ -z "$since" ] && mark_read "$item" "$id"
+      # Read means all of that file was shown. Its text is taken once (by its id from git, or else
+      # the copy here; the x keeps its last newlines), checked to be that file, and shown whole;
+      # only when every step of that succeeded is it marked. A read that failed anywhere, or one
+      # cut by a time, marks nothing.
+      text=$(git -C "$dir" cat-file blob "$id" 2>/dev/null && printf x) \
+        || text=$(cat "$dir/state/notes/$item.md" 2>/dev/null && printf x) || text="x"
+      text="${text%x}"
+      same=$(printf '%s' "$text" | git hash-object --no-filters --stdin 2>/dev/null) || same=""
+      printf '%s' "$text" | note_rows "$since" ""
+      shown=("${PIPESTATUS[@]}")
+      [ "${shown[0]}" = 0 ] && [ "${shown[1]}" = 0 ] && [ "$same" = "$id" ] && [ -z "$since" ] && mark_read "$item" "$id"
       exit 0
     else
       # Items someone other than Cain holds are theirs to read.
@@ -108,10 +110,13 @@ case "${1:-}" in
         # Read before: unread again once the file changed in any way (a note with an old or
         # equal time included), so its newest note shows whatever its time.
         [ "$(head -n 1 "$reads/$i" 2>/dev/null)" = "$id" ] && continue
-        notes_text "$i" "$id" | note_rows "" "$i " | tail -n 1
+        after=""
       else
-        notes_text "$i" "$id" | note_rows "$since" "$i " | tail -n 1
+        after="$since"
       fi
+      # Notes that can't be read are named all the same, so the item stays on the list.
+      last=$(set -o pipefail; notes_text "$i" "$id" | note_rows "$after" "$i ") || last="$i | ? | ? | its notes couldn't be read here |"
+      [ -n "$last" ] && printf '%s\n' "${last##*$'\n'}"
     done ;;
   submit)
     src="${2:?file}"
