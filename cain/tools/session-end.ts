@@ -50,6 +50,7 @@ export function stepsOf(lines: string[]): { steps: Step[]; planned: boolean } {
   const calls: { id: string; name: string; input: any }[] = [];
   const failed = new Set<string>();
   for (const l of lines) {
+    if (!l.includes("update_plan") && !l.includes("TodoWrite") && !l.includes("is_error")) continue;   // a long transcript: only these lines matter
     let o: any;
     try { o = JSON.parse(l); } catch { continue; }
     const content = o?.message?.content;

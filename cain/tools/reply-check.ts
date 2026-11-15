@@ -13,7 +13,7 @@
 // piece's letter and number (C1, D3) is left to the standards themselves: the same letters are
 // vitamins, vertebrae and part numbers. Clean words, a turn it already kept going, or anything
 // that can't be read: nothing, so it never blocks for good.
-import { readFileSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { codesHits, recordItems } from "../rootfs/opt/cain/gate/cain.ts";
 import { check, WHY } from "../rootfs/opt/cain/gate/rules.ts";
@@ -29,6 +29,21 @@ export function knownNumbers(registry: string | null, ruleFiles: string[]): Set<
   for (const m of (registry ?? "").matchAll(/^## (S-\d{3}) /gm)) out.add(m[1]);
   for (const f of ruleFiles) { const m = /(?:^|\/)(R-\d{3})-/.exec(f); if (m) out.add(m[1]); }
   return out;
+}
+
+// The end of a transcript, where this turn is: its last TAIL bytes, from the first whole line
+// (a long session's transcript runs to hundreds of megabytes, and this runs at every turn's end).
+export const TAIL = 16 * 1024 * 1024;
+export function tailLines(path: string, max = TAIL): string[] {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const from = Math.max(0, size - max);
+    const buf = Buffer.alloc(size - from);
+    readSync(fd, buf, 0, buf.length, from);
+    const lines = buf.toString("utf8").split("\n");
+    return from > 0 ? lines.slice(1) : lines;
+  } finally { closeSync(fd); }
 }
 
 const WAVE = /\bwave \d\b/gi;
@@ -84,7 +99,7 @@ if (import.meta.main) {
   try {
     const input = JSON.parse(await Bun.stdin.text());
     if (input?.stop_hook_active === true) pass();
-    const words = turnWords(readFileSync(String(input?.transcript_path ?? ""), "utf8").split("\n"));
+    const words = turnWords(tailLines(String(input?.transcript_path ?? "")));
     let items: Set<string> | null = null;
     let rules: string[] = [];
     const c = clone(process.env.RECORD_CLONE);

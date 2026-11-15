@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { knownNumbers, turnWords, unreadable } from "../tools/reply-check";
+import { knownNumbers, tailLines, turnWords, unreadable } from "../tools/reply-check";
 
 const TOOL = join(import.meta.dir, "../tools/reply-check.ts");
 const DASH = String.fromCharCode(0x2014);
@@ -26,6 +26,20 @@ describe("the words of this turn, as he saw them", () => {
       used("AskUserQuestion", { questions: [{ question: "Which one?", options: [{ label: "A", description: "the first" }] }] }),
     ]);
     expect(words).toEqual(["Looking.", "The fix is in.", "Ship it?", "Yes", "Which one?", "A", "the first"]);
+  });
+});
+
+describe("a long session's transcript", () => {
+  test("only its end is read, from the first whole line, and this turn is found there", () => {
+    const d = mkdtempSync(join(tmpdir(), "reply-tail-"));
+    const filler = JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "y".repeat(1_000) }] } });
+    const rows = [his("Long ago"), said("P33 then"), ...Array.from({ length: 300 }, () => filler), his("Status?"), said("All done.")];
+    writeFileSync(join(d, "t.jsonl"), rows.join("\n") + "\n");
+    const tail = tailLines(join(d, "t.jsonl"), 50_000);
+    expect(tail.length).toBeLessThan(rows.length);
+    expect(() => tail.forEach((l) => l && JSON.parse(l))).not.toThrow();               // no line cut in half
+    expect(turnWords(tail)).toEqual(["All done."]);
+    expect(turnWords(tailLines(join(d, "t.jsonl")))).toEqual(["All done."]);            // a small one, whole
   });
 });
 
