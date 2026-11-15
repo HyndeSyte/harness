@@ -121,7 +121,7 @@ export const filingId = (session: string, n: number, key: string) => `laptop-end
 
 // One journal entry: n, the state's key, when, what kind of end, and for a filing its id and
 // the request as sent.
-export interface Entry { n: number; key: string; at: number; kind: "open" | "empty" | Why; id?: string; raw?: string; mark?: number }
+export interface Entry { n: number; key: string; at: number; kind: "open" | "empty" | Why; id?: string; raw?: string; mark?: number; seen?: "unread" }
 
 // A journal's entries, and its damaged lines: a line that can't be read that is neither its last
 // (a crash cut it off; the next append marks it torn) nor marked torn. No journal yet is empty;
@@ -137,8 +137,8 @@ export function journalOf(path: string): { entries: Entry[]; damaged: number[] }
   parsed.forEach((p, i) => {
     if (p === null) return;
     if (p === undefined) {
-      const last = lines.slice(i + 1).every((l) => !l.trim());
-      if (!last && parsed[i + 1]?.torn !== true) damaged.push(i + 1);
+      const tail = i === lines.length - 1;             // no newline after it: a crash cut it off
+      if (!tail && parsed[i + 1]?.torn !== true) damaged.push(i + 1);
       return;
     }
     if (isEntry(p)) entries.push(p);
@@ -152,9 +152,10 @@ export const readJournal = (path: string): Entry[] => journalOf(path).entries;
 export function isEntry(p: any): p is Entry {
   return !!p && typeof p === "object" && Number.isInteger(p.n) && p.n >= 1 && typeof p.key === "string" && p.key.length > 0
     && typeof p.at === "number" && ["open", "empty", "unread", "unplanned"].includes(p.kind)
-    && (p.id === undefined) === (p.raw === undefined) && (p.id === undefined || (typeof p.id === "string" && typeof p.raw === "string"))
-    && (p.mark === undefined || (Number.isInteger(p.mark) && p.mark >= 0));
+    && (p.id === undefined) === (p.raw === undefined) && (p.id === undefined || (typeof p.id === "string" && p.id.length > 0 && typeof p.raw === "string" && idOf(p.raw) === p.id))
+    && (p.mark === undefined || (Number.isInteger(p.mark) && p.mark >= 0)) && (p.seen === undefined || p.seen === "unread");
 }
+const idOf = (raw: string) => { try { return JSON.parse(raw)?.id; } catch { return undefined; } };
 
 // What this end is, given the journal: the same state as its last entry (nothing new), or entry
 // n + 1, a filing when it has held items and something to say.
@@ -199,7 +200,12 @@ export function eachLine(path: string, fn: (line: string) => void, limit = Infin
     let rest = "";
     let left = limit;
     for (;;) {
-      if (left <= 0) { rest = ""; break; }
+      if (left <= 0) {                                 // at the mark: a final record without its newline counts if it's whole
+        rest += dec.end();
+        try { if (rest.trim()) { JSON.parse(rest); fn(rest); } } catch { /* still being written */ }
+        rest = "";
+        break;
+      }
       const n = readSync(fd, buf, 0, Math.min(buf.length, left), null);
       if (n <= 0) break;
       left -= n;
@@ -301,10 +307,20 @@ export function fileSnapshot(dir: string, s: Snapshot): { id: string | null; sam
   const journalPath = join(dir, `${s.session}.journal`);
   const key = filedKey(s.held, s.open, s.why);
   const journal = readJournal(journalPath);
-  const lastMark = journal.at(-1)?.mark;
-  if (lastMark !== undefined && (s.mark === undefined || s.mark < lastMark)) return { id: null, same: true };   // older, or of unknown order: the known state stands
+  const last = journal.at(-1);
+  const high = journal.reduce((m, e) => (e.mark !== undefined && e.mark > m ? e.mark : m), -1);   // the most of the transcript seen
+  if (last && high >= 0 && s.mark === undefined) {
+    // Of unknown order (its transcript couldn't be read): noted, and the known state stands.
+    appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, seen: "unread" });
+    return { id: null, same: true };
+  }
+  if (high >= 0 && s.mark! < high) return { id: null, same: true };   // older than what's been seen
   const d = decide(journal, key, s.held, s.open, s.why);
-  if (d.same) return { id: null, same: true };
+  if (d.same) {
+    // The same state seen later: the most seen moves on, so a delayed older snapshot can't pass it.
+    if (last && s.mark !== undefined && s.mark > high) appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, mark: s.mark });
+    return { id: null, same: true };
+  }
   const kind: Entry["kind"] = s.why === "open" ? (s.open.length ? "open" : "empty") : s.why;
   const mark = s.mark !== undefined ? { mark: s.mark } : {};
   if (!d.file) { appendEntry(journalPath, { n: d.n, key, at: s.at, kind, ...mark }); return { id: null, same: false }; }

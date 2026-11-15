@@ -438,6 +438,17 @@ describe("session-end", () => {
     expect(said.out).toContain(`A laptop session's journal has damaged lines (2), kept as they are: ${join(memo, `${SA}.journal`)}`);
   }, 60_000);
 
+  test("a damaged last journal line that was ended, or a filing with no id, is said at a start, never taken for a crash's tail", () => {
+    const l = held();
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(memo, { recursive: true });
+    writeFileSync(join(memo, `${SA}.journal`), JSON.stringify({ n: 1, key: "k1", at: 1, kind: "open" }) + "\nnot json\n");
+    writeFileSync(join(memo, `${SB}.journal`), JSON.stringify({ n: 1, key: "k1", at: 1, kind: "open", id: "", raw: "" }) + "\n");
+    const said = l.tool("session-end.ts", ["--flush"]).out;
+    expect(said).toContain(`A laptop session's journal has damaged lines (2), kept as they are: ${join(memo, `${SA}.journal`)}`);
+    expect(said).toContain(`A laptop session's journal has damaged lines (1), kept as they are: ${join(memo, `${SB}.journal`)}`);
+  }, 60_000);
+
   test("a journal that can't be read is said at every start, never passed over in silence", () => {
     const l = held();
     const memo = join(l.clone, ".git", "record-holds");
