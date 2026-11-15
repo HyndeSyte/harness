@@ -170,8 +170,12 @@ if (import.meta.main) {
     const c = clone(a.record ?? process.env.RECORD_CLONE);
     if ("error" in c) say("");
     const rec = c as Exclude<typeof c, { error: string }>;
+    const dir = memoDir(rec);
+    let waiting = 0;
+    try { waiting = readdirSync(join(dir, "outbox")).filter((n) => n.endsWith(".json")).length; } catch { /* none */ }
+    if (!waiting) say("");                             // at every start: nothing to send, no network
     fetch(rec);
-    const n = flush(rec, memoDir(rec));
+    const n = flush(rec, dir);
     say(n ? `Filed ${n} left from a session's end` : "");
   }
   let input: any = {};
