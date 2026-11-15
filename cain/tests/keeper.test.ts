@@ -83,4 +83,38 @@ describe("keeper.sh against a fake link", () => {
     expect(text).toMatch(/ship\)\s+body=\$\(jq -nc [^\n]*--arg v "\$review" \\\n\s+"\$meta"' \+ \{text: \$t, pr: \$p, head: \$h\} \+ opt\("review"; \$v\)'\) ;;/);
     expect(text).toContain("keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>]");
   });
+
+  test.skipIf(!ready)("handover passes the message it rests on, and no command prints usage, handing nothing over", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-"));
+    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
+    const key = createHmac("sha256", TOKEN).update("harness-handover-v1").digest("hex");
+    const seen: { path: string; keyed: boolean; body: any }[] = [];
+    const server = Bun.serve({ port: 0, async fetch(req) {
+      seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body: JSON.parse(await req.text()) });
+      return Response.json({ status: "card" });
+    } });
+    const env = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_DISCORD_DIR: dir };
+    const keeper = async (...args: string[]) => {
+      const p = Bun.spawn(["bash", KEEPER, ...args], { env, stdout: "pipe", stderr: "pipe" });
+      const out = (await new Response(p.stdout).text()).trim();
+      return { code: await p.exited, out };
+    };
+    try {
+      await keeper("handover", "--message", "1439000000000000002", "Wednesday drop-off at 8:15 from now on");
+      await keeper("handover", "Dentist Thu Nov 12 2 PM, from the office's email");
+      await keeper("handover");
+      expect(seen).toEqual([
+        { path: "/handover", keyed: true, body: { suggestion: "Wednesday drop-off at 8:15 from now on", paired: "4242", message: "1439000000000000002" } },
+        { path: "/handover", keyed: true, body: { suggestion: "Dentist Thu Nov 12 2 PM, from the office's email", paired: "4242" } },
+        { path: "/handover", keyed: true, body: { suggestion: "", paired: "4242" } },
+      ]);
+      const none = await keeper();
+      expect(none.code).toBe(2);
+      expect(none.out).toContain("keeper.sh handover [--message <id>] [suggestion]");
+      expect(await keeper("handover", "--message")).toMatchObject({ code: 2 });          // a flag needs its value
+      expect(await keeper("handover", "--message", "P31")).toMatchObject({ code: 2 });   // digits only
+      expect(seen.length).toBe(3);                                                        // none of those handed over
+    } finally { server.stop(true); }
+  }, 30_000);
 });

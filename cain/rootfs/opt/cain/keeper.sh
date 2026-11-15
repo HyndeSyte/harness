@@ -1,7 +1,10 @@
 #!/bin/bash
 # Cain's tools for his specialists and for talking to Dane with buttons. Prints JSON.
-#   keeper.sh handover [suggestion]      hand his calendar request to the calendar specialist
-#                                        (it reads his message itself); answers with card ids
+#   keeper.sh handover [--message <id>] [suggestion]
+#                                        hand his calendar request to the calendar specialist
+#                                        (it reads his message itself); answers with card ids.
+#                                        --message: the id in the tag of the message it rests on
+#                                        (its last 30 minutes); without it, his newest message
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
@@ -44,12 +47,16 @@ set -u
 # Moved only for the tests.
 dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
 link="${CAIN_LINK:-http://127.0.0.1:8097}"
+harness="${CAIN_HARNESS:-http://0fcc2575-harness:8098}"
 hooks="${CAIN_HOOKS:-/opt/cain/hooks}"
-cmd="${1:-handover}"; shift || true
+usage() { sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+# No command prints this usage: it never hands anything over.
+if [ $# -eq 0 ] || [ "$1" = help ] || [ "$1" = --help ] || [ "$1" = -h ]; then usage; exit 2; fi
+cmd="$1"; shift
 # Needs no key and no link: it runs the hook itself.
 if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 case "$cmd" in
-  handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
+  handover|digest|meanings|places) url="$harness/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
@@ -57,7 +64,21 @@ esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" message=""
+case "$cmd" in
+  handover)
+    rest=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --message)
+          [ $# -ge 2 ] || { echo '{"status":"error","said":"--message needs a value"}'; exit 2; }
+          case "$2" in ''|*[!0-9]*) echo '{"status":"error","said":"--message takes a Discord message id, digits only"}'; exit 2 ;; esac
+          message="$2"; shift 2 ;;
+        *) rest+=("$1"); shift ;;
+      esac
+    done
+    set -- ${rest[@]+"${rest[@]}"} ;;
+esac
 case "$cmd" in
   show|ask|ship|answered|check|connector)
     rest=()
@@ -92,7 +113,8 @@ trap 'rm -f "$hdr"' EXIT
 printf 'X-Harness-Key: %s\nContent-Type: application/json\n' "$key" > "$hdr"
 unset key
 case "$cmd" in
-  handover) body=$(jq -nc --arg s "${1:-}" --arg p "$owner" '{suggestion: $s, paired: $p}') ;;
+  handover) body=$(jq -nc --arg s "${1:-}" --arg p "$owner" --arg m "$message" \
+              '{suggestion: $s, paired: $p} + (if $m == "" then {} else {message: $m} end)') ;;
   digest)   body='{}' ;;
   meanings)
     # The whole table each time: the specialist stores only what's new.

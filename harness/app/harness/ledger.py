@@ -361,6 +361,7 @@ TRANSITIONS = {
     "approved": {"executed", "failed", "proposed"},
     "failed": {"received"},          # a retry of a failure that wasn't his doing (runner)
     "needs_clarification": {"received"},   # a note from Cain for the question it asked (controller)
+    "answered": {"received"},        # a note from Cain for a request answered to Cain alone (controller)
     "no_action": {"received"},       # an add he asked for while adds were off, once his tap turns them on (family_add)
     "cancelled": {"received"},       # a request he sent while stopped, at his tap on its card (commands)
 }
@@ -434,7 +435,10 @@ class Ledger:
             "mail_dates": (("sender", "TEXT NOT NULL DEFAULT ''"), ("place", "TEXT NOT NULL DEFAULT ''"),
                            ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0"),
                            ("told", "TEXT NOT NULL DEFAULT ''"), ("reads", "INTEGER NOT NULL DEFAULT 0"),
-                           ("wrote_at", "TEXT NOT NULL DEFAULT ''"), ("told_batch", "TEXT NOT NULL DEFAULT ''")),
+                           ("wrote_at", "TEXT NOT NULL DEFAULT ''"), ("told_batch", "TEXT NOT NULL DEFAULT ''"),
+                           # 0.24.0: whose it is (mail_dates.whose): "family" and "unclear" ask on a
+                           # card and never go on his Gmail calendar by themselves.
+                           ("cal", "TEXT NOT NULL DEFAULT ''")),
             # 0.21.1: an input that stops is told (inputs.py). Its outage: the last failure's
             # kind, the first failure, how many failures and refusals were seen, what he was told
             # and by which message, whether a digest named it, when one he knew about came back,
@@ -606,6 +610,35 @@ class Ledger:
     # -- jobs -----------------------------------------------------------
     def job(self, job_id: str) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+
+    def made_job(self, chat_id: int, text: str, *, kind: str, db, reply_to: int | None = None,
+                 created_at: str | None = None, engine: str | None = None,
+                 started_at: str | None = None) -> str:
+        """A request the harness makes itself, under an id no Discord message can have: one part of
+        a message (part_job), or a date from his mail he sent to Family (controller). Born running,
+        so it goes on to proposed like any request; never run on a model."""
+        n = db.execute("SELECT COUNT(*) FROM jobs WHERE chat_id=? AND message_id<0", (chat_id,)).fetchone()[0]
+        new = str(uuid.uuid4())
+        now = iso(self.now())
+        db.execute("INSERT INTO jobs(id, bot_id, chat_id, message_id, kind, state, text_hash,"
+                   " reply_to_message_id, created_at, updated_at, engine, started_at)"
+                   " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (new, self.bot_id(), chat_id, -(n + 1), kind, "running", canonical_hash(text),
+                    reply_to, created_at or now, now, engine, started_at))
+        db.execute("INSERT INTO job_text(job_id, text) VALUES(?, ?)", (new, text))
+        return new
+
+    def part_job(self, job_id: str, *, db) -> str:
+        """Another request for one part of a message (runner._split): its own proposal, card and
+        receipt, with his words and their flags."""
+        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        new = self.made_job(job["chat_id"], self.job_text(job_id), kind="message_part", db=db,
+                            reply_to=job["reply_to_message_id"], created_at=job["created_at"],
+                            engine=job["engine"], started_at=job["started_at"])
+        flags = self.get_meta(f"job_flags:{job_id}")
+        if flags:
+            self.set_meta(f"job_flags:{new}", flags, db)
+        return new
 
     def job_text(self, job_id: str) -> str:
         row = self.db.execute("SELECT text FROM job_text WHERE job_id=?",

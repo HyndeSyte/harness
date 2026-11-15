@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.0
+
+- When you send a few messages in a row, Cain can tell the calendar specialist which one your calendar request is in, so it acts on that one and not on your newest.
+- A slip in Cain's tools can no longer pass a calendar request on by accident: run with nothing, the tool only lists what it does.
+
 ## 0.11.0
 
 - Ship cards now say what your tap installs ("Ship Cain 0.11.0?", or that nothing installs), then one line from Cain on what you'll notice.

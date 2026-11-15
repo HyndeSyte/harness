@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import queue
+import re
 import time
 from concurrent.futures import Executor
 from dataclasses import replace
@@ -29,7 +30,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import (callbacks, choices, commands, daily, ingress_filter, integrity,
+from . import (callbacks, choices, commands, daily, effects, ingress_filter, integrity,
                policy, render, rules, watch)
 from .chat import Decision, Incoming
 from .config import Config
@@ -44,15 +45,42 @@ from .vault import LABELS, Vault
 log = logging.getLogger("harness.controller")
 
 SETTINGS_TTL_S = 15 * 60
-FRESH_S = 120              # a handed-over message must be this new
+FRESH_S = 120              # a handed-over message must be this new, or the handover itself
+NAMED_FRESH_S = 30 * 60    # a message Cain names, or one his suggestion rests on, this new
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
 PROBE_S = 5                # the watch's check of Cain and its message: short, never a stuck loop
 HEARD_FLOOR_S = 1_420_070_400   # 2015-01-01: an older "last heard from Discord" is nonsense
 
 
-def _note(suggestion: str) -> str:
-    """Cain's own words with a request of his, fenced so they're never taken for his."""
-    return "\n\n[A suggestion from Cain, his assistant. These are not his words: " + suggestion + "]"
+NOTE_HEAD = "\n\n[A suggestion from Cain"        # every fence starts so (calendar_change._his_words)
+_NOTE_WORD = re.compile(r"[a-z0-9]+")
+_NOTE_SKIP = frozenset("""a an and are as at be by for from he his i in is it its me my of off on or
+    our so that the this to was we with you your him has have had not no but than then there they
+    them do does did will would can could should cain dane owner asked asks says said wants change
+    calendar please""".split())
+
+
+def _note_words(text: str) -> set[str]:
+    return {w for w in _NOTE_WORD.findall(text.casefold()) if len(w) > 1 and w not in _NOTE_SKIP}
+
+
+def echoes_message(suggestion: str, message: str) -> bool:
+    """Cain's suggestion passes on what this message of his says (Nov 15: Cain spelled out his
+    Wednesday change, and it was read as Cain's own idea): most of its words are in his message.
+    Some must be: a suggestion that only adds facts is Cain's."""
+    said, his = _note_words(suggestion), _note_words(message)
+    shared = said & his
+    return len(shared) >= 2 and len(shared) * 2 >= len(said)
+
+
+def _note(suggestion: str, *, echoes: bool = False) -> str:
+    """Cain's own words with a request of his, fenced so they're never taken for his. When they
+    pass on what his message says, the fence says so: the request is his, and the details are
+    Cain's reading of it."""
+    if echoes:
+        return (NOTE_HEAD + ", his assistant, passing on what he asks in this message. Act on his "
+                "message; these words only spell it out: " + suggestion + "]")
+    return NOTE_HEAD + ", his assistant. These are not his words: " + suggestion + "]"
 
 
 def family_line(st: dict, tz: ZoneInfo) -> str:
@@ -139,6 +167,8 @@ class Controller:
                              sleep=self.sleep, monotonic=self.monotonic,
                              budgets_ok=self._budget_ok, family_add=self.family_add,
                              calendar_change=self.calendar_change)
+        if self.mail_dates is not None:
+            self.mail_dates.to_family = self._mail_to_family if self.calendar_change is not None else None
         self.canary = daily.Canary(self.ledger, self.config, self.engines, self.executor,
                                    sleep=self.sleep, monotonic=self.monotonic,
                                    budget_ok=self._budget_ok)
@@ -154,6 +184,29 @@ class Controller:
                                              calendar_change=self.calendar_change,
                                              mail_dates=self.mail_dates,
                                              meaning_live=self.meaning_live)
+
+    def _mail_to_family(self, title: str, day, start) -> bool:
+        """A date from his mail he tapped Add to Family on (mail_dates.py): one add on Family, as a
+        calendar change his tap already approved, so its receipt and Undo come as for any other.
+        A timed one is an hour long. True once it's handed over, or once it can't ever be."""
+        if start is not None:
+            first, last = start.isoformat(), (start + timedelta(hours=1)).isoformat()
+        else:
+            first = last = day.isoformat()
+        change = {"calendar": "family", "op": "add", "title": title, "dates": "", "start": first,
+                  "end": last, "days": "", "until": "", "location": "", "kind": "", "every": ""}
+        d = effects.REGISTRY[effects.CALENDAR_CHANGE]
+        try:
+            params = d.validate({"changes": [change]})
+        except effects.ParamError as e:
+            log.warning("mail date for Family couldn't be offered: %s", str(e)[:80])
+            return True
+        owner = self.config.owner_user_id
+        with self.ledger.tx() as db:
+            job_id = self.ledger.made_job(owner, f"From his mail, for the Family calendar: {title}, "
+                                                 f"{day:%a %b} {day.day}", kind="mail_family", db=db)
+        self.runner._offer(self.ledger.job(job_id), d, params, {"source": "mail", "tapped": True}, [], None)
+        return True
 
     def _check_adds(self) -> str:
         words = self.family_add.check_adds()
@@ -427,8 +480,12 @@ class Controller:
         self.callbacks.handle(inc)
 
     def _handover(self, h) -> None:
-        """Cain says he asked for a calendar change. Read the DM and act on his newest
-        message, if it is fresh. Never on Cain's words."""
+        """Cain says he asked for a calendar change. Read the DM and act on his own words, never
+        on Cain's: the message Cain names (keeper.sh handover --message), if it's his and from the
+        last 30 minutes, or else his newest message, if it's from the last 2 minutes. A message
+        older than 2 minutes, named or carrying Cain's suggestion, is still acted on, with any
+        change on a card: his Approve tap is his go (Nov 15: a handover that spelled the event out
+        was refused as stale)."""
         owner = self.config.owner_user_id
         if h.paired and h.paired != str(owner):
             self.notes["discord_owner"] = ("Cain is paired with a different Discord account than "
@@ -436,29 +493,50 @@ class Controller:
             h.finish("refused", "The specialist won't act: you're paired with a different "
                                 "Discord account than the bot's owner.")
             return
+        if time.monotonic() - h.arrived > FRESH_S:      # the window runs from the handover
+            h.finish("stale", "That handover waited here over 2 minutes before it could be read, "
+                              "so nothing was done with it. Nothing changed. Hand it over again.")
+            return
         try:
-            msgs = self.discord.api.history(self.discord.dm(), 20)
+            msgs = self.discord.api.history(self.discord.dm(), 50 if h.message else 20)
         except DiscordError as e:
             h.finish("error", f"The specialist couldn't read the DM ({e.code}). Nothing changed.")
             return
         mine = [m for m in msgs if str((m.get("author") or {}).get("id")) == str(owner)]
-        if not mine:
+        if h.message:
+            m = next((x for x in msgs if str(x.get("id")) == h.message), None)
+            if m is None or m not in mine:
+                h.finish("nothing", "The message you named isn't one of his in the DM's last 50, so "
+                                    "nothing was done. Nothing changed.")
+                return
+        elif not mine:
             h.finish("nothing", "There's no message from him to act on.")
             return
-        m = mine[0]                                          # Discord lists newest first
+        else:
+            m = mine[0]                                      # Discord lists newest first
         try:
             age = (self.ledger.now() - datetime.fromisoformat(m["timestamp"])).total_seconds()
         except (KeyError, ValueError, TypeError):
-            age = FRESH_S + 1
+            age = NAMED_FRESH_S + 1
         h.age = max(0.0, age)
-        if age > FRESH_S:
-            h.finish("stale", "His newest message is over 2 minutes old, so nothing was done "
-                              "with it. Nothing changed.")
+        limit = NAMED_FRESH_S if (h.message or h.suggestion) else FRESH_S
+        if age > limit:
+            h.finish("stale", (
+                "The message you named is over 30 minutes old" if h.message else
+                "His newest message is over 30 minutes old" if h.suggestion else
+                "His newest message is over 2 minutes old")
+                + ", so nothing was done with it. Nothing changed."
+                + ("" if h.message else " Name the message it rests on with --message <its id>."))
             return
         text, flags, reply_to = self._discord_words(m, msgs, owner)
+        if age > FRESH_S:
+            flags.append("late")                             # his tap is the go, not the handover
+        note = ""
         if h.suggestion:
-            flags.append("suggestion")
-            text += _note(h.suggestion)
+            echoes = echoes_message(h.suggestion, text)
+            flags.append("cain_detail" if echoes else "suggestion")
+            note = _note(h.suggestion, echoes=echoes)
+            text += note
         if not text.strip():
             h.finish("nothing", "His message has no words to act on.")
             return
@@ -476,6 +554,8 @@ class Controller:
             if flags:
                 self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flags))))
         else:
+            # The message acted on is the key: a later handover for the same message finds its
+            # request, never the answer to whatever he said last.
             row = self.ledger.db.execute(
                 "SELECT id FROM jobs WHERE bot_id=? AND chat_id=? AND message_id=?",
                 (self.ledger.bot_id(), owner, int(m["id"]))).fetchone()
@@ -483,34 +563,45 @@ class Controller:
                 h.finish("error", "That couldn't be recorded. Nothing changed.")
                 return
             job_id = row["id"]
-            if h.suggestion:
-                self._note_for_question(job_id, h.suggestion, flags)
+            if note:
+                self._note_for_question(job_id, note, flags)
         h.job = render.short(job_id)                       # for the log only
         self._handover_jobs.setdefault(job_id, []).append(h)
 
     def _note_for_question(self, job_id: str, note: str, flags: list[str]) -> None:
-        """A note from Cain for a request of his that's waiting on its question reaches it: the
-        request runs again with the note, fenced as Cain's (Nov 11: a second handover with the
-        missing fact got the same question back). A note it already has changes nothing, and
-        any change resting on it still gets his tap."""
+        """A note from Cain for a request of his that's waiting on its question, or that was
+        answered "not a change", reaches it: the request runs again with the note, fenced as
+        Cain's (Nov 11: a second handover with the missing fact got the same question back; Nov
+        15: a later handover got the same cached answer). A note it already has changes nothing,
+        and any change resting on it still gets his tap."""
         job = self.ledger.job(job_id)
-        if job is None or job["state"] != "needs_clarification":
+        if job is None or job["state"] not in ("needs_clarification", "no_action", "answered"):
             return
+        if job["state"] != "needs_clarification" and not self._answered_to_cain(job_id):
+            return                       # a card he saw (a rule, a refusal) isn't sent again
         text = self.ledger.job_text(job_id)
-        if _note(note) in text:
+        if note in text:
             return
         flagged = json.loads(self.ledger.get_meta(f"job_flags:{job_id}") or "[]")
         last = self.ledger.db.execute("SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id=?",
                                       (job_id,)).fetchone()[0]
         with self.ledger.tx() as db:
-            db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + _note(note), job_id))
+            db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, job_id))
             self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flagged + flags))), db)
             self.ledger.transition(job_id, "received", db=db)
             self.ledger.event("job_note", {"job": job_id}, db=db)
             # Kept in the ledger, so every later answer about it, after a restart too, starts here.
             self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
-        log.info("handover: a note for job %s, which was waiting on its question: it runs again",
-                 render.short(job_id))
+        log.info("handover: a note for job %s, which was %s: it runs again",
+                 render.short(job_id), job["state"])
+
+    def _answered_to_cain(self, job_id: str) -> bool:
+        """Its last answer went to Cain alone, so running it again shows him nothing twice."""
+        receipts = self.ledger.receipts(job_id)
+        try:
+            return bool(receipts) and bool(json.loads(receipts[-1]["detail"] or "{}").get("said_to_cain"))
+        except ValueError:
+            return False
 
     def _discord_words(self, m: dict, msgs: list[dict], owner: int):
         """His words, the signs they may not be his own, and our card he replied to."""
@@ -597,20 +688,24 @@ class Controller:
                     h.finish("error", "Lost track of that. Nothing changed.")
                 del self._handover_jobs[job_id]
                 continue
-            if job["state"] in ("received", "running", "approved"):
+            # A message split into one card per change (runner._split) answers once all are out.
+            parts = json.loads(self.ledger.get_meta(f"job_parts:{job_id}") or "[]")
+            states = [job["state"]] + [(self.ledger.job(j) or {"state": "failed"})["state"] for j in parts]
+            if any(st in ("received", "running", "approved") for st in states):
                 continue
             # A request that ran again for a note answers with what it said this time.
+            ids = [job_id] + parts
             rows = self.ledger.db.execute(
-                "SELECT kind, text, state, message_id FROM outbox WHERE job_id=? AND kind!='notice'"
-                " AND id>? ORDER BY id",
-                (job_id, int(self.ledger.get_meta(f"job_rerun_after:{job_id}") or 0))).fetchall()
+                f"SELECT kind, text, state, message_id FROM outbox WHERE job_id IN ({','.join('?' * len(ids))})"
+                " AND kind!='notice' AND id>? ORDER BY id",
+                (*ids, int(self.ledger.get_meta(f"job_rerun_after:{job_id}") or 0))).fetchall()
             if any(r["state"] not in ("sent", "dead") for r in rows):
                 continue                                      # not with Cain yet
             sent = [r for r in rows if r["state"] == "sent"]
             said = [render.plain(r["text"]) for r in sent]
             receipts = self.ledger.receipts(job_id)
             to_cain = ""
-            if receipts:
+            if receipts and job["state"] in ("answered", "no_action", "needs_clarification"):
                 try:
                     to_cain = json.loads(receipts[-1]["detail"] or "{}").get("said_to_cain", "")
                 except ValueError:
@@ -618,6 +713,8 @@ class Controller:
             status = {"answered": "not a change" if to_cain else "card",
                       "no_action": "not a change",
                       "proposed": "waiting for his tap"}.get(job["state"], job["state"])
+            if parts and "proposed" in states:
+                status = "waiting for his tap"
             words = to_cain or "\n\n".join(said) or "Done."
             cards = [int(r["message_id"]) for r in sent if r["message_id"]]
             for h in waiting:

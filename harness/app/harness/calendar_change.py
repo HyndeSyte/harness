@@ -421,6 +421,15 @@ class CalendarChange:
                  len(parts), len(checks))
         return Preview([p.will for p in parts], checks)
 
+    def preview_quiet(self, job, params: dict) -> Preview | None:
+        """preview for one change of several already found clear together (runner._split): what it
+        will do and what to check, saying nothing and moving no job. None: it can't be read alone."""
+        try:
+            parts, _ = self._plan_all(params, "preview")
+        except (Refuse, ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
+            return None
+        return Preview([p.will for p in parts], self._checks(job, parts))
+
     def _checks(self, job, parts: list[Part]) -> list[str]:
         """What a request found clear still can't do on its words alone. Not judging what he
         meant: the shape of the change. A length the model worked out and he never gave; three

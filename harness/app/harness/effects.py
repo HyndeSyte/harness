@@ -293,6 +293,49 @@ def _one_change(c: Any) -> None:
             raise ChangeRefusal("one day of a series can't run longer than 24 hours")
 
 
+_NEEDS = {"remove": ("dates",), "end_series": ("dates", "days"), "move": ("dates", "start", "end"),
+          "add": ("start", "end"), "add_series": ("start", "end", "days", "until", "every"),
+          "rule": ("kind",)}
+
+
+def repair(output) -> dict | None:
+    """A calendar change whose shape is off only in ways that can't change what it does: a field
+    its op doesn't use filled in, a field left out or null, a key that isn't one. Those are made
+    empty or dropped, and the result is parsed again like any reply. Its meaning (calendar, op,
+    title, days and times its op uses) is never touched, so a reply that needs more than that
+    stays refused (Nov 15: a message with two changes failed twice on the reply's shape). None:
+    nothing to repair."""
+    if not isinstance(output, dict) or output.get("type") != "proposal" \
+            or output.get("effect_type") != CALENDAR_CHANGE:
+        return None
+    params = output.get("params")
+    changes = params.get("changes") if isinstance(params, dict) else None
+    if not isinstance(changes, list) or not changes:
+        return None
+    fixed = []
+    for c in changes:
+        if not isinstance(c, dict) or not isinstance(c.get("op"), str) or c["op"] not in _NEEDS:
+            return None
+        keep = set(_NEEDS[c["op"]]) | {"calendar", "op", "title", "location"}
+        one = {}
+        for key in sorted(_CHANGE_KEYS | {"kind", "every"}):
+            v = c.get(key)
+            if v is None or key not in keep:
+                v = ""
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and key == "every":
+                v = str(int(v))
+            if not isinstance(v, str):
+                return None
+            one[key] = v.strip()
+        fixed.append(one)
+    out = {k: output[k] for k in ("type", "effect_type", "summary") if k in output}
+    out.setdefault("summary", "calendar change")
+    if not isinstance(out["summary"], str) or not out["summary"].strip():
+        out["summary"] = "calendar change"
+    out["params"] = {"changes": fixed}
+    return out if out != output else None
+
+
 def _changes_shape(p: dict) -> str | None:
     if not p["changes"]:
         raise ChangeRefusal("I couldn't tell what to change")

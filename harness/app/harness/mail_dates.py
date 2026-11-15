@@ -23,6 +23,12 @@ does, say it was written but not confirmed, with the Undo all the same. An entry
 told again, and the Undo on either message takes it off. An entry he has changed in any way is
 his, and is left alone.
 
+Whose it is decides the calendar (his rule R-007): a date from the kids' school, a teacher, a
+coach or the kids' doctor is the family's, so it never goes on his Gmail calendar. Each one gets
+its own card naming the Family calendar, with Add to Family and Skip; his tap puts it there as a
+calendar change (calendar_change.py), with its receipt and Undo. When the mail only hints at the
+family (who sent it, not what it's about), the card asks which, with both calendars as buttons.
+
 Google's own email about a failed run of the work holds script becomes a digest line.
 """
 from __future__ import annotations
@@ -99,6 +105,15 @@ RULES = "4"                           # what's found under older rules is found 
 AGAIN_EVERY = timedelta(hours=1)      # the look-up of emails behind appointments already written
 _MSGID = re.compile(r"<[!#-\[\]-~]{1,250}>")   # a Message-ID safe to search for: no quote, no backslash
 SCRIPT_SENDER = "apps-scripts-notifications@google.com"
+# Mail about the kids: their school, a teacher, a coach, their doctor. Its dates are the family's.
+_FAMILY = re.compile(
+    r"\b(schools?|teachers?|classroom|homeroom|principal|pta|pto|kindergarten|pre-?k|preschool|"
+    r"daycare|elementary|middle school|high school|students?|field trip|report card|"
+    r"parent[- ]teacher|conferences? with|coach(es|ing)?|practices?|team|league|tournament|recital|"
+    r"rehearsal|scouts?|camp|pediatric\w*|paediatric\w*|kids?|children'?s?|child'?s|your child|"
+    r"trimester|semester|grade \d+|\d+(st|nd|rd|th) grade|k12|k-12)\b", re.I)
+FAMILY_CAL, UNCLEAR, GMAIL_CAL = "family", "unclear", "gmail"
+ASK_TTL_S = 7 * 86400
 _SPACE = re.compile(r"\s+")
 
 
@@ -178,8 +193,22 @@ class Found:
     place: str = ""                       # an appointment's street address, when the email gave one
 
 
+def whose(sender: str, subject: str, what: str) -> str:
+    """Which calendar a date from his mail belongs on: "family" when what it's about is the kids'
+    (their school, a teacher, a coach, their doctor), "unclear" when only who sent it says so (a
+    school's address on a note about something else), else "" (his own, on Gmail)."""
+    if _FAMILY.search(subject or "") or _FAMILY.search(what or ""):
+        return FAMILY_CAL
+    who = sender or ""
+    if _FAMILY.search(who) or _FAMILY.search(re.sub(r"[._@-]", " ", parseaddr(who)[1])):
+        return UNCLEAR
+    return ""
+
+
 def picked(sender: str, subject: str) -> bool:
-    return bool(_PICK.search(subject or "")) or bool(_PICK.search(sender or ""))
+    """Mail about the kids (their school, a teacher, a coach) is picked too: its dates are the
+    family's, and a permission slip names none of the words above."""
+    return any(rx.search(text or "") for rx in (_PICK, _FAMILY) for text in (subject, sender))
 
 
 def parse_items(output: dict | None, today: date) -> list[Found]:
@@ -462,6 +491,9 @@ class MailDates:
         self._listed = False
         self._warned: tuple[str, datetime] | None = None   # the last failure logged: its kind, when
         self._read_at: float | None = None                  # the last read of what waits to be told
+        # Puts one date on Family as a calendar change, at his tap (controller._mail_to_family):
+        # True once it's handed over. None: Family can't be written from here.
+        self.to_family: Callable | None = None
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -483,6 +515,8 @@ class MailDates:
                 self._start_again()
             if not paused and self.writes_on():
                 self._retime()
+                self._ask_calendar()
+                self._send_to_family()
                 self._write_found()
                 self._real_appointments()
             self._read_back()
@@ -654,9 +688,10 @@ class MailDates:
                                    " AND place=''", (f.place, mid, f.kind, f.day.isoformat()))
                     continue
                 db.execute("INSERT OR IGNORE INTO mail_dates(key, message_id, what, day, kind, state,"
-                           " event_id, batch, created_at, sender, place) VALUES(?,?,?,?,?,'found',?,?,?,?,?)",
+                           " event_id, batch, created_at, sender, place, cal) VALUES(?,?,?,?,?,'found',?,?,?,?,?,?)",
                            (key, m.message_id or f"uid:{m.uid}", f.what, f.day.isoformat(), f.kind,
-                            note_id(key), MOVED if f.moved else None, now, sender_of(m.sender), f.place))
+                            note_id(key), MOVED if f.moved else None, now, sender_of(m.sender), f.place,
+                            whose(m.sender, m.subject, f.what)))
                 if f.at:
                     db.execute("UPDATE mail_dates SET at=? WHERE key=? AND at IS NULL", (f.at, key))
                 # Read again (a new rule), what's already here learns who sent it and where.
@@ -766,7 +801,8 @@ class MailDates:
         if not address or not self.google.configured():
             return
         today = self.ledger.now().astimezone(ZoneInfo(self.tz)).date()
-        rows = self.ledger.db.execute("SELECT * FROM mail_dates WHERE state='found' ORDER BY day").fetchall()
+        rows = self.ledger.db.execute("SELECT * FROM mail_dates WHERE state='found' AND cal NOT IN (?,?)"
+                                      " ORDER BY day", (FAMILY_CAL, UNCLEAR)).fetchall()
         if not rows:
             return
         room = MAX_WRITES_PER_DAY - self._writes_today()
@@ -1088,9 +1124,9 @@ class MailDates:
               ("The rest are free, nothing at work. " if len(busy) < len(landed) + len(moved) else "") + \
               "One with a time has your usual reminder; the rest have none."
         if confirmed:
-            text = "<b>From your mail, on your calendar:</b>\n" + "\n".join(lines) + more + "\n" + how
+            text = "<b>From your mail, on your Gmail calendar:</b>\n" + "\n".join(lines) + more + "\n" + how
         else:
-            text = ("<b>From your mail, written to your calendar but not confirmed:</b>\n" + "\n".join(lines)
+            text = ("<b>From your mail, written to your Gmail calendar but not confirmed:</b>\n" + "\n".join(lines)
                     + more + "\nReads of your calendar haven't found these as written. Nothing to do if "
                     "that's fine; tap Undo these if they shouldn't be there.")
         told = "told" if confirmed else "unconfirmed"
@@ -1114,13 +1150,84 @@ class MailDates:
 
     # -- undo --------------------------------------------------------------------------------
     def on_choice(self, kind: str, target: str) -> str:
-        """Undo these, from the message that first told an entry or the one that last did."""
+        """Undo these, from the message that first told an entry or the one that last did; or
+        where a date from his mail goes, from its card."""
+        if kind in ("mail_dates_family", "mail_dates_gmail", "mail_dates_skip"):
+            return self._where_chosen(kind, target)
         if kind != "mail_dates_undo":
             return "Nothing changed."
         with self.ledger.tx() as db:
             n = db.execute("UPDATE mail_dates SET state='undo' WHERE (batch=? OR told_batch=?) AND state='live'",
                            (target, target)).rowcount
         return "Taking those off your calendar." if n else "Those are already off."
+
+    # -- the family's dates: on Family, never his Gmail (R-007) -------------------------------
+    def _ask_calendar(self) -> None:
+        """One card per date that's the family's, or might be, naming the calendar. Only once it
+        is told is it marked asked: no card, no mark."""
+        if self.chat_id is None:
+            return
+        today = self.ledger.now().astimezone(ZoneInfo(self.tz)).date()
+        for row in self.ledger.db.execute("SELECT * FROM mail_dates WHERE state='found' AND cal IN (?,?)"
+                                          " ORDER BY day", (FAMILY_CAL, UNCLEAR)).fetchall():
+            day = date.fromisoformat(row["day"])
+            if day < today or non_event(row["what"]) or self._already(row):
+                self._set(row["key"], "skipped")
+                continue
+            f = Found(row["what"], day, row["kind"], at=_at(row))
+            named = f"{f.day:%a %b} {f.day.day}{_clock(f.at)}: {render.escape(title(f))}"
+            if row["cal"] == FAMILY_CAL:
+                text = (f"<b>From your mail, for the Family calendar:</b>\n{named}\nIt's from the kids' "
+                        "school, a teacher, a coach or their doctor, so it goes on Family, not your "
+                        "Gmail. Tap Add to Family to put it there, or Skip.")
+                options = (("Add to Family", "mail_dates_family"), ("Skip", "mail_dates_skip"))
+            else:
+                text = (f"<b>From your mail, which calendar?</b>\n{named}\nThe sender may be the kids' "
+                        "school or a coach, but the email doesn't say whose it is. Tap Family or My "
+                        "Gmail to put it there, or Skip.")
+                options = (("Family", "mail_dates_family"), ("My Gmail", "mail_dates_gmail"),
+                           ("Skip", "mail_dates_skip"))
+            with self.ledger.tx() as db:
+                buttons = []
+                for label, kind in options:
+                    nonce = choices.mint(self.ledger, kind=kind, target=row["key"], chat_id=self.chat_id,
+                                         ttl_s=ASK_TTL_S, db=db)
+                    buttons.append((label, choices.callback_data(nonce), nonce))
+                db.execute("UPDATE mail_dates SET state='ask' WHERE key=? AND state='found'", (row["key"],))
+                self.ledger.enqueue(chat_id=self.chat_id, kind="reply", text=render.fit(text),
+                                    buttons=[[(label, data) for label, data, _ in buttons]],
+                                    binds=[{"type": "choice", "nonce": n} for _, _, n in buttons], db=db)
+            log.info("mail date for %s: %s %s, asked", "Family" if row["cal"] == FAMILY_CAL else "which calendar",
+                     row["day"], title(f))
+
+    def _where_chosen(self, kind: str, key: str) -> str:
+        row = self.ledger.db.execute("SELECT * FROM mail_dates WHERE key=?", (key,)).fetchone()
+        if row is None or row["state"] != "ask":
+            return "That one's already settled."
+        f = Found(row["what"], date.fromisoformat(row["day"]), row["kind"], at=_at(row))
+        named = f"{title(f)}, {f.day:%a %b} {f.day.day}"
+        if kind == "mail_dates_skip":
+            self._set(key, "skipped")
+            return f"Skipped: {named}. It goes on no calendar."
+        if kind == "mail_dates_gmail":
+            with self.ledger.tx() as db:      # written like any of his own, with its receipt
+                db.execute("UPDATE mail_dates SET cal=?, state='found' WHERE key=?", (GMAIL_CAL, key))
+            return f"Thanks. I'll put {named} on your Gmail calendar."
+        if self.to_family is None:
+            return "Nothing changed: the Family calendar can't be written from here."
+        self._set(key, "to_family")
+        return f"Thanks. I'll put {named} on the Family calendar."
+
+    def _send_to_family(self) -> None:
+        """Each date he sent to Family, handed over as a calendar change: its receipt and Undo
+        come from there."""
+        if self.to_family is None:
+            return
+        for row in self.ledger.db.execute("SELECT * FROM mail_dates WHERE state='to_family'").fetchall():
+            f = Found(row["what"], date.fromisoformat(row["day"]), row["kind"], at=_at(row))
+            start = self._start_at(row, f.day) if f.at else None
+            if self.to_family(title(f), f.day, start):
+                self._set(row["key"], "family")
 
     def _undo_requested(self) -> None:
         address = self.address()

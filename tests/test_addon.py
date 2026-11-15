@@ -369,7 +369,8 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     assert code.index("unset key") < code.index("curl ")
     # To the specialist: requests and the digest. To Cain's own link, on this machine only:
     # showing a card, asking with buttons, the morning message.
-    assert f'url="http://0fcc2575-harness:{handover.PORT}/$cmd"' in code
+    assert f'harness="${{CAIN_HARNESS:-http://0fcc2575-harness:{handover.PORT}}}"' in code
+    assert 'url="$harness/$cmd"' in code
     assert 'link="${CAIN_LINK:-http://127.0.0.1:8097}"' in code and 'url="$link/$cmd"; ctx=harness-relay-v1' in code
     assert 'card) url="$link/look"; ctx=harness-relay-v1' in code
     for route in ("handover", "digest"):

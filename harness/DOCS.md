@@ -306,10 +306,36 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   written to you), a reply to one, an edited or forwarded message, a note from Cain; a new length
   you didn't give, three or more events off at once, or ending a series. The card says what will
   happen, in plain words; your tap's reply says it again.
+- **One card per change.** When a message with two or more changes needs your tap, each change
+  comes on its own card, so you can take one and not the other. One that's clear on its own goes
+  through with its own receipt. Two clear changes still land together in one receipt.
+
+### When Cain hands a request over
+
+Cain doesn't pass your words on: Harness reads your DM itself.
+
+- **The message it rests on.** Cain names the message your request is in, and Harness acts on
+  that one if it's yours and from the last 30 minutes, whatever you sent after it. Without one,
+  it's your newest message, from the last 2 minutes. The same message handed over again finds
+  the same request, never the answer to something else you said.
+- **Cain's details.** When Cain adds what it found (a date in an email) or spells out what you
+  asked, Harness works from it with your message, and the change comes on a card: your Approve
+  tap is the go. A message older than 2 minutes is still acted on that way. A handover that
+  waited over 2 minutes before Harness could read it is turned down, and Cain hands it over again.
+- **No card asks you to repeat yourself.** When Cain passed words with a request and Harness still
+  needs to know something, the question goes to Cain, who has them. If Cain's words answer it, the
+  request runs again with them and the card follows.
+- **"What does that mean?"** When you ask what one of its cards or messages meant, Harness reads
+  its own recent cards and answers in words. A question about what something means is never taken
+  for a change.
+- **A reply that doesn't fit.** If the model's answer is off only in ways that can't change what it
+  does (a field filled in that the change doesn't use), it's tidied and the change comes on a card.
+  Otherwise it runs once more by itself, told what didn't fit. If it fails twice, the message says
+  it's logged for a fix and nothing more happens with it on its own.
 
 ## Dates from your mail
 
-With the `mail_dates` option on, dates in your mail go on your Gmail calendar. Deadlines, last
+With the `mail_dates` option on, dates in your mail go on your calendar. Deadlines, last
 days, renewals and the like are free all-day entries with no reminder, so nothing reaches work. An
 appointment the email gives a time for is a real appointment: it's busy, so work and Family see it,
 at its time with your usual reminder, and at the street address that email gave, or that another
@@ -320,6 +346,14 @@ left alone. What lands or moves is told in one message with *Undo these* once a 
 finds it as written. If three reads don't find one, or half an hour passes without one that does,
 the message says it was written but not confirmed, still with *Undo these*, and the next digest
 names it. An entry that moves is told again, and *Undo these* on either message takes it off.
+
+**The kids' dates go on Family, never your Gmail.** A date from the kids' school, a teacher, a
+coach or the kids' doctor gets its own card naming the Family calendar, with *Add to Family* and
+*Skip*. Your tap puts it on Family as a calendar change, with its receipt and *Undo* (the
+`calendar_changes` option has to be on for that write). When only who sent it hints at the family
+(a school's address on a note about something else), the card asks which calendar, with *Family*,
+*My Gmail* and *Skip*. Everything else is yours and goes on your Gmail calendar as before, and its
+message says so: "From your mail, on your Gmail calendar".
 
 ## Copies from your Gmail calendar
 

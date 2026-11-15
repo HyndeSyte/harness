@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from concurrent.futures import Executor, Future
 from datetime import datetime, timedelta
@@ -29,6 +30,8 @@ from . import approvals, commands, effects, policy, prompts, render, rules, sche
 from .config import Config
 from .engines import CallOutcome, Engine, EngineError, EngineResult, call_with_retries
 from .ledger import Ledger, iso
+
+NOTE_HEAD = "\n\n[A suggestion from Cain"     # controller._note's fence
 
 log = logging.getLogger("harness.runner")
 
@@ -65,7 +68,26 @@ PROVENANCE = {
     "attachment": "your message had an attachment.",
     "foreign_reply": "it replied to a message that isn't yours or mine.",
     "suggestion": "it rests on something Cain suggested, not only your own words.",
+    "cain_detail": "Cain spelled out the details for you.",
+    "late": "it was handed over a while after you sent it.",
+    "repaired": "my first reading of your message needed tidying before it fit.",
 }
+
+# Flags that mean Cain's words came with the request: a question for him goes to Cain first, who
+# has them, never to a card asking him to say again what Cain already passed on (Nov 15).
+CAIN_NOTE = frozenset({"suggestion", "cain_detail"})
+
+# A question about what something means, one of the cards it posted included (P31: what a skating
+# receipt meant, what a due date meant). It's answered in words, never taken for a change.
+MEANING = re.compile(
+    r"\bwhat (?:does|did|do|is|was) (?:this|that|it|the|your|you)\b[^?]{0,80}\bmean\b|"
+    r"\bwhat do you mean\b|\bmeaning of\b|\bwhat(?:'s| is| was) (?:this|that) (?:card|message|receipt|notice|about)\b|"
+    r"\bwhy did (?:i|you) get (?:this|that)\b", re.I)
+# Words that point at something it posted: the cards are put in front of the model then.
+CARD_WORDS = re.compile(r"\b(?:cards?|receipts?|notices?|that message|this message|your message|"
+                        r"you (?:sent|posted|said)|it says|says due|due date)\b", re.I)
+CARDS_BACK = timedelta(hours=24)
+MAX_CARDS = 6
 
 
 # A failure he didn't cause is never handed back to him as "send it again", with Cain in front or
@@ -158,10 +180,14 @@ class Runner:
         system = prompts.system_prompt(now=now, tz=self.config.timezone, rules=fired,
                                        stage_at_least=self.config.stage_at_least,
                                        family_add=family, calendar_change=change)
+        shape = self.ledger.get_meta(f"job_shape:{job['id']}")
+        if shape:
+            system += prompts.shape_note(shape)
         if self.family_add is not None:
             self.family_add.note_message(text)
         sent = self._sent(job, now)
-        user = prompts.user_content(text, earlier=self._earlier(job), sent=sent)
+        cards = self.cards_for(job, text)
+        user = prompts.user_content(text, earlier=self._earlier(job), sent=sent, cards=cards)
         out_schema = prompts.output_schema(self.config.stage_at_least, family_add=family,
                                            calendar_change=change)
         with self.ledger.tx() as db:
@@ -181,7 +207,7 @@ class Runner:
             # In the worker: what his calendar says about the events he names is a Google read.
             # It counts against the job's own deadline, so retries never outlive the job
             # (Nov 8: a message with Cain's context ran past 10 minutes and was cut off).
-            with_calendar = prompts.user_content(text, earlier=earlier, recent=recent,
+            with_calendar = prompts.user_content(text, earlier=earlier, recent=recent, cards=cards,
                                                  calendar=cc.context_for(text, now), sent=sent) if cc else user
             spent = self.monotonic() - t0
             if spent > 20:
@@ -191,6 +217,28 @@ class Runner:
                                      monotonic=self.monotonic)
         self._futures[job["id"]] = self.executor.submit(call)
         return True
+
+    def cards_for(self, job, text: str) -> list[str]:
+        """Its own recent cards, as he read them, when his message points at one: the one he
+        replied to first, then the newest. It posted them, so it can say what one meant instead
+        of asking him to say it again (P31)."""
+        replied = self.ledger.outbound(job["chat_id"], job["reply_to_message_id"]) \
+            if job["reply_to_message_id"] else None
+        words = text.split(NOTE_HEAD, 1)[0]
+        if replied is None and not MEANING.search(words) and not CARD_WORDS.search(words):
+            return []
+        out = []
+        if replied is not None:
+            out.append("(the one he replied to) " + render.plain(replied["text"])[:600])
+        for r in self.ledger.db.execute(
+                "SELECT text, created_at FROM outbound WHERE bot_id=? AND chat_id=? AND created_at>=?"
+                " AND (job_id IS NULL OR job_id<>?) ORDER BY created_at DESC LIMIT ?",
+                (self.ledger.bot_id(), job["chat_id"], iso(self.ledger.now() - CARDS_BACK), job["id"],
+                 MAX_CARDS)).fetchall():
+            said = render.plain(r["text"])[:600]
+            if replied is None or said != render.plain(replied["text"])[:600]:
+                out.append(said)
+        return out[:MAX_CARDS]
 
     def _sent(self, job, now: datetime) -> str:
         """When he sent a message that runs well after it came in, in words the model reads."""
@@ -283,8 +331,18 @@ class Runner:
                 self.family_add.refuse_in_words(job, {"engine": engine, "model": res.model,
                                                       "usd": round(res.usd, 5)}, str(e))
                 return
-            self._fail(job, "bad_output", engine, result=res, detail=str(e)[:120])
-            return
+            repaired = effects.repair(res.output)
+            try:
+                out = schema.parse_output(repaired, stage_at_least=self.config.stage_at_least) \
+                    if repaired is not None else None
+            except schema.OutputError:
+                out = None
+            if out is None:
+                self._fail(job, "bad_output", engine, result=res, detail=str(e)[:120])
+                return
+            log.info("job %s: the reply's shape was repaired (%s)", job_id, str(e)[:80])
+            # Whatever was set right, a change from it waits for his tap.
+            self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(self._flags(job) | {"repaired"})))
         receipt = {"engine": engine, "model": res.model, "usd": round(res.usd, 5),
                    "tokens": [res.input_tokens, res.output_tokens], "rules": fired,
                    "type": out.type}
@@ -303,7 +361,25 @@ class Runner:
             self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
             self._reply(db, job, text, kind="answer", raw=True)
 
+    def _flags(self, job) -> set[str]:
+        raw = self.ledger.get_meta(f"job_flags:{job['id']}")
+        try:
+            return set(json.loads(raw)) if raw else set()
+        except ValueError:
+            return set()
+
+    def _meaning_question(self, job) -> bool:
+        return bool(MEANING.search(self.ledger.job_text(job["id"]).split(NOTE_HEAD, 1)[0]))
+
     def _on_clarify(self, job, body, receipt, fired):
+        if self.answers_to_cain and (self._flags(job) & CAIN_NOTE or self._meaning_question(job)):
+            # Cain passed words with it, or he asked what something means: the question goes to
+            # Cain, who has them, never to a card asking him to repeat himself (Nov 15, P31).
+            self._to_cain(job, "needs_clarification", receipt,
+                          "No card went to him. The specialist still needs this: " + body["question"]
+                          + " If what you passed or found answers it, hand it over again with that"
+                          " as the suggestion; if not, ask him in your own words.")
+            return
         text = render.answer(job["id"], body["question"], **self._footer_args(fired))
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "needs_clarification",
@@ -347,6 +423,18 @@ class Runner:
             self._reply(db, job, rules.card_text(row), raw=True, buttons=buttons, binds=binds)
 
     def _on_proposal(self, job, body, receipt, fired):
+        if self._meaning_question(job):
+            # Asking what something means is never a change (P31): nothing is offered.
+            receipt["reason"] = "meaning_question"
+            if self.answers_to_cain:
+                self._to_cain(job, "no_action", receipt, "Not a calendar change: he asked what "
+                              "something means. Nothing was offered or changed. Answer him in words.")
+                return
+            with self.ledger.tx() as db:
+                self.ledger.transition(job["id"], "no_action", receipt=json.dumps(receipt), db=db)
+                self._reply(db, job, "That reads as a question about what something means, so I "
+                                     "didn't change anything.")
+            return
         # From S2 for calendar_hold: before that the schema has no such shape
         # and effects.lookup refuses it. family_event_add has its own switch.
         d = effects.lookup(body["effect_type"], self.config.stage_at_least)
@@ -380,6 +468,15 @@ class Runner:
         else:
             warnings = []
         warnings = list(warnings) + self._provenance(job)
+        if change and warnings and len(params["changes"]) > 1:
+            self._split(job, d, params, receipt)
+            return
+        self._offer(job, d, params, receipt, warnings, lines)
+
+    def _offer(self, job, d, params, receipt, warnings, lines) -> None:
+        """The proposal, and the card that tells him about it, or its run with no tap."""
+        family = d.name == effects.FAMILY_ADD
+        change = d.name == effects.CALENDAR_CHANGE
         # One transaction: the proposal and the card that tells him about it
         # are written together, so a crash can't leave a job with no words.
         with self.ledger.tx() as db:
@@ -419,6 +516,28 @@ class Runner:
                                 job_id=job["id"], buttons=render.proposal_buttons(nonce),
                                 binds=[{"type": "approval", "nonce": nonce}], db=db)
 
+    def _split(self, job, d, params, receipt) -> None:
+        """A message with several changes that needs his tap: each change on its own card, so he
+        can take one and not the other, and one that's clear on its own goes through with its
+        receipt (Nov 15: a drop-off removal and a term schedule change in one message). The first
+        stays with his message's request; each other one is a part of it (ledger.part_job)."""
+        cc = self.calendar_change
+        pasted = self.family_add is not None and self.family_add._pasted_recently()
+        parts = []
+        for c in params["changes"]:
+            sub = {"changes": [c]}
+            seen = cc.preview_quiet(job, sub)
+            warnings = list(cc.warnings(job, sub, pasted_recently=pasted)) + (seen.checks if seen else [])
+            parts.append((sub, warnings + self._provenance(job), seen.lines if seen else None))
+        log.info("job %s: %d changes, each on its own card or receipt", job["id"], len(parts))
+        others = []
+        with self.ledger.tx() as db:
+            for _ in parts[1:]:
+                others.append(self.ledger.part_job(job["id"], db=db))
+            self.ledger.set_meta(f"job_parts:{job['id']}", json.dumps(others), db)
+        for (sub, warnings, lines), jid in zip(parts, [job["id"]] + others):
+            self._offer(self.ledger.job(jid), d, sub, dict(receipt, part=True), warnings, lines)
+
     # -- failure and time ------------------------------------------------------------
     def _fail(self, job, reason: str, engine: str | None, *, result: EngineResult | None = None,
               attempts: int = 0, detail: str = "") -> None:
@@ -444,15 +563,26 @@ class Runner:
             self.ledger.transition(job["id"], "failed", receipt=json.dumps(receipt), db=db)
             if retry:
                 self.ledger.set_meta(f"job_retried:{job['id']}", self.ledger.now().isoformat(), db)
+                if reason == "bad_output" and receipt.get("detail"):
+                    # The second try is told what didn't fit, so it answers in shape.
+                    self.ledger.set_meta(f"job_shape:{job['id']}", str(receipt["detail"])[:120], db)
                 self.ledger.transition(job["id"], "received", db=db)
                 self.ledger.event("job_retry", {"job": job["id"], "reason": reason}, db=db)
                 self._reply(db, job, f"That didn't finish ({reason_text(reason, engine)}), "
-                                     "so I'm running it once more.", kind="notice")
+                                     "so I'm running it once more by itself, from your message. Its "
+                                     "answer comes here; nothing for you to do.", kind="notice")
             else:
-                again = " It failed twice, so it's logged for a fix." \
-                    if self.ledger.get_meta(f"job_retried:{job['id']}") else ""
                 self._reply(db, job, f"I couldn't finish that: {reason_text(reason, engine)}. "
-                                     f"Nothing was done.{again}")
+                                     f"Nothing was done. {self._next_after_fail(job, reason)}")
+
+    def _next_after_fail(self, job, reason: str) -> str:
+        """What happens next, never only that it failed (Nov 15)."""
+        if self.ledger.get_meta(f"job_retried:{job['id']}"):
+            return ("It failed twice, so it's logged for a fix, and nothing more happens with it on "
+                    "its own." + (" Cain has been told." if self.answers_to_cain else ""))
+        if reason in RETRYABLE:
+            return "It's too old to run again by itself, so nothing more happens with it."
+        return "Nothing more happens with it until that's fixed."
 
     def _may_retry(self, job, reason: str) -> bool:
         """Once per message, only for failures that aren't his doing, whoever is in front:

@@ -2,10 +2,14 @@
 
 Cain is the conversation; the keeper writes calendars. When he asks Cain for a
 calendar change, Cain calls this endpoint and passes nothing he said: the
-keeper reads the DM itself (controller._handover) and acts only on his newest
-message, from the last 2 minutes. If Cain wants to pass a suggestion of its own
-(a date it found in an email, say), it may, and then any change gets a card to
-tap: Cain's words never change a calendar by themselves.
+keeper reads the DM itself (controller._handover) and acts only on his own
+words. Cain may name the message it rests on (keeper.sh handover --message <id>):
+then it's that message, if it's his and from the last 30 minutes, whatever he
+sent after it (Nov 15: three messages in a minute, and the handover for the
+second read the third). Without one, it's his newest message, from the last 2
+minutes. If Cain wants to pass a suggestion of its own (a date it found in an
+email, say), it may, and then any change gets a card to tap: Cain's words never
+change a calendar by themselves.
 
 - Local only: the add-ons' own network on the Pi, port 8098, never published
   to the LAN (no "ports:" in config.yaml).
@@ -56,6 +60,12 @@ BIG = ("/meanings", "/places")
 STUCK_S = 10 * 60
 
 
+def _message_id(value) -> str:
+    """A Discord message id, digits only, or nothing: anything else isn't one."""
+    text = str(value or "").strip()
+    return text if text.isdigit() and len(text) <= 24 else ""
+
+
 def key_for(token: str) -> str:
     return hmac.new(token.encode(), KEY_CONTEXT, hashlib.sha256).hexdigest()
 
@@ -67,6 +77,7 @@ class Handover:
     rows: list = field(default_factory=list)   # /meanings, /places: already checked
     press: dict = field(default_factory=dict)
     paired: str = ""                     # the Discord user Cain is paired with
+    message: str = ""                    # the Discord message of his it rests on, when Cain names one
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
@@ -167,6 +178,7 @@ def _handler(inbox: Inbox, wait_s: float):
             h = Handover(kind=self.path.strip("/"), rows=rows,
                          suggestion=str(body.get("suggestion") or "")[:MAX_SUGGESTION].strip(),
                          paired=str(body.get("paired") or "").strip(),
+                         message=_message_id(body.get("message")),
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
             inbox.submit(h)

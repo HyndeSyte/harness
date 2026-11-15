@@ -106,7 +106,7 @@ class Callbacks:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
         if kind == "calendar_change_undo" and self.calendar_change is not None:
             return self.calendar_change.on_choice(kind, target)
-        if kind == "mail_dates_undo" and self.mail_dates is not None:
+        if kind.startswith("mail_dates_") and self.mail_dates is not None:
             return self.mail_dates.on_choice(kind, target)
         if kind in ("stopped_redo", "stopped_drop"):   # what he asked while stopped
             return commands.on_stopped_choice(self.ledger, kind, target, undo=self._undo_kept)

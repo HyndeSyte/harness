@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.24.0
+
+- **Cain's handover acts on the message you meant.** When you send a few messages in a row, Cain names the one your calendar request is in, and Harness acts on that one (from the last 30 minutes), not on whatever you sent last. The same message handed over again gets its own answer, never the answer to another message.
+- **Details Cain spells out are used, with your tap.** A request where Cain passes on the event (a date from an email, or what you asked, spelled out) is no longer turned down as too old after 2 minutes. It comes on a card, and your Approve is the go.
+- **No card asks you to say it again.** When Cain passed details and something is still unclear, the question goes to Cain first.
+- **Two changes in one message, a card each,** when they need your tap, so you can approve one and not the other.
+- **A reply that didn't fit is tidied or run once more by itself,** and if it fails twice the message says what happens next.
+- **"What does that card mean?" gets an answer.** Harness reads its own recent cards and explains, and never takes the question for a change.
+- **The kids' dates from your mail go on Family, never your Gmail.** School, teacher, coach and the kids' doctor mail get a card naming the Family calendar, with Add to Family and Skip. When it isn't clear whose it is, the card asks, with both calendars as buttons. Your own dates still go on Gmail, and the message now says "on your Gmail calendar".
+
 ## 0.23.0
 
 - **Nothing asks you to check the calendar or send something again.** When a change's answer is lost, or it can't be read back, Harness reads the calendar itself a minute later. If it went through, you get the usual receipt with Undo, and Undo puts all of it back, even after a restart cut the write short. If it didn't, it's written once more, only over the very version it was first written over, and if it still didn't go through you're told so plainly. If the event was changed on the calendar in the meantime, even back to how it was, it's left as it is and you're told so. If half of it went through, the rest is finished, or that half is put back.

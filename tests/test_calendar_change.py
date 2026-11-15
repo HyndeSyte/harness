@@ -457,12 +457,17 @@ def test_off_says_so_and_changes_nothing(r):
     assert r.body() == before and "off" in r.texts()[-1]
 
 
-def test_several_changes_land_in_one_receipt(r):
+def test_several_changes_that_need_a_tap_come_one_card_each(r):
+    """0.24.0 (Nov 15): two changes in one message, one needing his tap. The clear one lands with
+    its receipt; the series ended comes on its own card, so he can take one and not the other."""
     r.tell(change(dates="2026-11-23"), change(op="end_series", dates="2027-03-08"))
-    r.approve()                                # ending a series is tapped
+    assert "2026-11-23" not in days_of(r.body()) and "2027-03-08" in days_of(r.body())
+    approvals = [s for s in r.bot.sent if s[2] and any(t == "Approve" for row in s[2] for t, _ in row)]
+    assert len(approvals) == 1 and "2026-11-23" not in approvals[0][1] and "Nov 23" not in approvals[0][1]
+    r.press(approvals[0], "Approve")                # ending a series is tapped
     days = days_of(r.body())
     assert "2026-11-23" not in days and "2027-03-08" not in days and "2027-03-03" in days
-    assert len([s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)]) == 1
+    assert len([s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)]) == 2
 
 
 def test_an_added_series_is_an_ordinary_event_and_undo_takes_it_off(r):
