@@ -11,7 +11,11 @@
 - The browser session can open only the job's own address and a check page the PC serves for each run; anything else, and any browser tool the PC doesn't know, is refused before the browser sees it. If that check can't decide, it refuses. Addresses are compared exactly, so a different path or a query counts as a different page.
 - After each run the PC checks where the browser really ended and which tabs it had: a page that wandered off, a redirect your allowlist doesn't name, or an extra tab fails the run. Your allowlist can name a site's own redirects.
 - The PC refuses to run if its Chrome profile, Chrome's version, the session's settings, your own Claude settings or the session's environment changed since you confirmed them, if the extension shows up in another Chrome profile, or if another Claude Code is open on the PC. A new Claude in Chrome or Claude Code version stops every run, even ones you start, until you probe again. A hung run is stopped after a set time, leaving Chrome open.
-- The run's tab stays open on a blank page (the browser tools it has can't close tabs); the next run reuses it. Cain's docs have a troubleshooting table for every reason a run stops.
+- The PC now checks every address the browser showed during a run, not only where it ended: a page that slips off to somewhere else and comes back before the end fails the run.
+- The check page each run opens only works in your dedicated Chrome profile: you bind that profile once at setup, and a run answered from any other profile fails. A Chrome running with Claude in Chrome from another profile stops runs too.
+- A run fails if Claude Code changes while it runs, or if the Claude in Chrome version the browser reports isn't the one installed in the profile.
+- What leaves the PC is capped in size and limited to a few typed facts, never page text.
+- The run's tab stays open on a blank page (about:blank; the browser tools it has can't close tabs); the next run reuses it. Cain's docs have a troubleshooting table for every reason a run stops, and for each thing only your PC can show.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
 
 ## 0.11.0

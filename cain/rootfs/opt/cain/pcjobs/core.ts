@@ -38,6 +38,7 @@ export const CODES = [
   "extension_unreachable", "tool_inventory", "profile_scan_failed", "probe_stale",
   "url_drift", "result_rejected", "page_not_as_expected", "outcome_uncertain", "lease_expired",
   "navigation_unguarded", "navigation_denied", "unexpected_location", "tabs_unexpected", "chrome_busy",
+  "cli_changed", "extension_version_mismatch",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -260,8 +261,11 @@ export function parseJob(text: string): Checked<Job> {
 }
 
 // A result file's text, checked for shape, its facts typed for the job's action.
+// Size caps on a result: the whole file, and each fact in it (final_url has its own, 300).
+export const RESULT_MAX = 3_000;
+export const FACT_MAX = 240;
 export function parseResult(text: string, action?: string): Checked<Result> {
-  if (text.length > 3_000) return no("a result file is at most 3000 bytes");
+  if (text.length > RESULT_MAX) return no("a result file is at most 3000 bytes");
   let r: any;
   try { r = JSON.parse(text); } catch { return no("it isn't JSON"); }
   if (!isObj(r)) return no("it isn't a JSON object");
@@ -278,7 +282,9 @@ export function parseResult(text: string, action?: string): Checked<Result> {
   if (action !== undefined) {
     const f = checkFacts(action, r.facts);
     if (!f.ok) return f;
-  } else if (!isObj(r.facts) || Object.keys(r.facts).length > MAX_FACTS) return no("facts is an object of named values");
+  } else if (!isObj(r.facts) || Object.keys(r.facts).length > MAX_FACTS
+    || !Object.entries(r.facts).every(([k, v]) => k.length <= 40 && (typeof v === "boolean" || (typeof v === "string" && v.length <= FACT_MAX))))
+    return no("facts is an object of named values");
   if (!Array.isArray(r.tools) || r.tools.length > 16 || !r.tools.every((t: unknown) => typeof t === "string" && TOOL.test(t)))
     return no("tools is a short list of tool names");
   if (typeof r.attended !== "boolean") return no("attended is true or false");

@@ -48,7 +48,7 @@
           {
             "type": "command",
             "command": "\"$PCW_RUNTIME\" \"$PCW_WORKER\" nav-guard",
-            "timeout": 15
+            "timeout": 30
           }
         ]
       }

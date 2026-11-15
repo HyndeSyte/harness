@@ -2,7 +2,8 @@
 // repo standing in for GitHub, the PC worker against the same repo, and pcjobs.sh.
 // Runs on Linux and on Windows (the pcjobs-windows job in tests.yml).
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -17,7 +18,8 @@ import { heartbeatLine, readHeartbeat, readJobs, readResult, round, type Config 
 import {
   allowedTools, canaryOk, confirmProfile, fingerprint, inventory, launchSession, navGuard, next, outsideConfig, parseInstall, parseStream, probe,
   hookMain, navDecide, guardCheck, endCheck, tabsFrom, envProblem, baseEnv, sessionEnv, chromeBusy, claudeSessions, readNavLog, allowedEnd,
-  BRIDGE_PROMPT, GUARD_MATCHER, HOOK_COMMAND, DENY_MESSAGE,
+  BRIDGE_PROMPT, GUARD_MATCHER, HOOK_COMMAND, HOOK_MS, DENY_MESSAGE, READING, NAVIGATING, DENIED_CHROME, END_URL, WINDOWS_ENV, WORKER_FILE,
+  bindProfile, reportedUrl, extensionElsewhere,
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   type Install, type Instruction, type Opts, type Session,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
@@ -335,13 +337,14 @@ const GOOD_ACL = () => [`USER|${ME}`, `Allow|${SYSTEM_SID}|FullControl|False`, `
   `Allow|${ME}|FullControl|False`, "Allow|S-1-5-32-545|ReadAndExecute, Synchronize|False"];
 
 // What the model reads back from the canary page.
-interface Read { value: string; extension_id: string; attempt: string }
+interface Read { value: string; extension_id: string; attempt: string; profile: string }
 type Say = (ins: Instruction, canary: Read) => unknown;
 
 // Print mode's event stream, as the stand-in session writes it.
 const CH = "mcp__claude-in-chrome__";
 const ev = {
-  init: (tools: string[], status = "connected") => ({ type: "system", subtype: "init", tools, mcp_servers: [{ name: "claude-in-chrome", status }], claude_code_version: "2.1.0" }),
+  init: (tools: string[], status = "connected", version: string | null = null) => ({ type: "system", subtype: "init", tools,
+    mcp_servers: [{ name: "claude-in-chrome", status, ...(version ? { version } : {}) }], claude_code_version: "2.1.0" }),
   use: (id: string, name: string, input: unknown = {}) => ({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } }),
   res: (id: string, error: boolean, text: string) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: error, content: text }] } }),
   result: (text: string, denials: (string | { tool: string; id: string })[] = []) => ({ type: "result", subtype: "success", result: text,
@@ -352,10 +355,19 @@ interface Browser { group: { id: number; url: string }[]; events: unknown[]; use
 // The worker's own environment in these tests: what a clean Windows or POSIX shell has, and nothing of Claude Code's.
 const TEST_ENV: Record<string, string> = { PATH: "/usr/bin", HOME: "/home/owner", SystemRoot: "C:\\Windows", TEMP: "C:\\Temp" };
 const stream = (events: unknown[]) => events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+// The stand-in profile's cookie for 127.0.0.1 (the profile marker), as Chrome keeps it.
+// blocked: a profile that keeps no cookies (so a bind there never sticks).
+const jar: { marker: string | null; blocked: boolean } = { marker: null, blocked: false };
+async function bget(url: string): Promise<Response> {
+  const res = await fetch(url, { headers: jar.marker ? { cookie: `pcw_profile=${jar.marker}` } : {} });
+  const set = /pcw_profile=([^;]+)/.exec(res.headers.get("set-cookie") ?? "");
+  if (set && !jar.blocked) jar.marker = set[1];
+  return res;
+}
 async function readCanary(url: string): Promise<Read> {
-  const page = await (await fetch(url)).text();
+  const page = await (await bget(url)).text();
   const get = (id: string) => new RegExp(`id="${id}">([^<]+)<`).exec(page)![1];
-  return { value: get("canary"), extension_id: get("extension"), attempt: get("attempt") };
+  return { value: get("canary"), extension_id: get("extension"), attempt: get("attempt"), profile: get("profile") };
 }
 // The stand-in's way of opening an address, as the extension would: refused by the
 // navigation guard unless the run allows it; otherwise its request reaches the worker.
@@ -404,6 +416,15 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   writeFileSync(join(udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
   writeFileSync(join(udd, "Last Version"), "131.0.6778.86");
   writeFileSync(join(udd, "lockfile"), "");
+  // The profile, bound as bind-profile leaves it: its marker's hash in the worker folder,
+  // the marker itself in the stand-in profile's cookie.
+  const bind = () => {
+    const m = `p-${"0123456789abcdef".repeat(2)}`;
+    jar.marker = m;
+    jar.blocked = false;
+    fileOk(join(home, "profile-marker.json"), JSON.stringify({ v: 1, at: T0.toISOString(), sha256: createHash("sha256").update(m).digest("hex") }));
+  };
+  bind();
   const inst: Install = { v: 1, owner_fpr: OWNER_FPR, claude: "C:/Users/owner/.local/bin/claude.exe", session_minutes: 15, unattended: false, confirm_path: false,
     diagnostics: false, profile: { user_data_dir: udd, profile_directory: "Default", profile_name: "Cain jobs", extension_id: EXT },
     other_user_data_dirs: [] };
@@ -441,31 +462,37 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const settingsAllow = () => JSON.parse(readFileSync(files.settings, "utf8")).permissions.allow as string[];
   let tools = (_prompt: string) => [...settingsAllow(), "TodoWrite"];
   let status = "connected";
+  let extVersion: string | null = null;
   let hookRuns = true;
   let bridgeFails = 0;
   const group: { id: number; url: string }[] = [];
   let tabSeq = 100;
   const launches: string[][] = [];
+  const pending = new Map<number, string>();
   const envs: Record<string, string>[] = [];
   const launch = async (argv: string[], _cwd: string, _ms: number, env: Record<string, string>): Promise<Session> => {
     launches.push(argv);
     envs.push(env);
     during();
     const prompt = argv[2];
-    const events: unknown[] = [ev.init(tools(prompt), status)];
+    const events: unknown[] = [ev.init(tools(prompt), status, extVersion)];
     let n = 0;
-    const visit = async (tab: { id: number; url: string }, url: string) => {
+    // A page's script move: within 100 ms it happens as the page loads; later, it happens
+    // once the model has spent time on the page (after its next reading call).
+    const visit = async (tab: { id: number; url: string }, url: string, depth = 0): Promise<string> => {
       tab.url = url;
+      pending.delete(tab.id);
       if (!url.startsWith("http://127.0.0.1:")) { await open(url); return ""; }
-      const res = await fetch(url).catch(() => null);
+      const res = await bget(url).catch(() => null);
       if (!res) return "";
       tab.url = res.url;
       const html = await res.text();
       const rel = (x: string) => new URL(x, res.url).href;
       const pop = /window\.open\("([^"]+)"\)/.exec(html)?.[1];
-      if (pop) { const t = { id: ++tabSeq, url: rel(pop) }; group.push(t); await fetch(t.url).catch(() => null); }
-      const moved = /location\.replace\("([^"]+)"\)/.exec(html)?.[1];
-      if (moved) { tab.url = rel(moved); await fetch(tab.url).catch(() => null); }
+      if (pop) { const t = { id: ++tabSeq, url: rel(pop) }; group.push(t); await bget(t.url).catch(() => null); }
+      const moved = /setTimeout\(\(\) => location\.replace\("([^"]+)"\), (\d+)\)/.exec(html);
+      if (moved && Number(moved[2]) <= 100 && depth < 3) await visit(tab, rel(moved[1]), depth + 1);
+      else if (moved) pending.set(tab.id, rel(moved[1]));
       return "navigated";
     };
     const b: Browser = {
@@ -490,6 +517,12 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
         } else if (name === `${CH}navigate`) {
           const t = group.find((x) => x.id === input.tabId) ?? group[0];
           if (t) text = land ? (t.url = land, "") : await visit(t, input.url);
+        } else if ([`${CH}get_page_text`, `${CH}find`, `${CH}read_page`].includes(name)) {
+          // A reading tool's answer names its tab's address on a header line, as the extension's do.
+          const t = group.find((x) => x.id === input.tabId) ?? group[0];
+          text = `Title: t\nURL: ${t?.url ?? ""}\n\nPage text.`;
+          const later = t ? pending.get(t.id) : undefined;
+          if (t && later) await visit(t, later);
         }
         events.push(ev.res(id, false, text));
         return { id, ok: true, text };
@@ -519,6 +552,16 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
       events.push(ev.result(`I read the page.\n${typeof r === "string" ? r : JSON.stringify(r)}`));
       return { code: 0, out: stream(events), timedOut: false };
     }
+    if (prompt.includes("profile binding")) {
+      const bindUrl = /first tab it lists to (\S+) and wait/.exec(prompt)![1];
+      const url = /navigate to (\S+) and read/.exec(prompt)![1];
+      const tab = await first();
+      await b.use("navigate", { tabId: tab.id, url: bindUrl });
+      await b.use("navigate", { tabId: tab.id, url });
+      const canary = await readCanary(url);
+      events.push(ev.result(JSON.stringify({ canary })));
+      return { code: 0, out: stream(events), timedOut: false };
+    }
     if (prompt.includes("connection check")) {
       const url = /first tab it lists to (\S+) and read/.exec(prompt)![1];
       const tab = await first();
@@ -535,7 +578,9 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
       await b.use("navigate", { tabId: tab.id, url: canaryUrl });
       await b.use("tabs_context_mcp");
       await b.use("navigate", { tabId: tab.id, url: target });
+      await b.use("tabs_context_mcp");
       await b.use("find", { tabId: tab.id, query: "check" });
+      await b.use("get_page_text", { tabId: tab.id });
       await b.use("tabs_context_mcp");
       events.push(ev.result("done"));
       return { code: 0, out: stream(events), timedOut: false };
@@ -554,7 +599,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     return { code: 0, out: stream(events), timedOut: false };
   };
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
-    acl: GOOD_ACL, files, launch, pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", claudeHome, managed: [], managedDirs: [],
+    acl: GOOD_ACL, files, launch, pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), claudeHome, managed: [], managedDirs: [],
     policyKeys: () => [], env: TEST_ENV, procs: () => [], killPid: () => {}, ...over });
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts> } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
@@ -568,9 +613,9 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const history = () => sh(["git", "log", "-p", "--all"], remote);
   const write = (name: string, x: unknown) => { const f = join(root, name); writeFileSync(f, typeof x === "string" ? x : JSON.stringify(x)); return f; };
   return { root, remote, cfg, ask, cancel, outcome, clonePc, opts, allow, install, inst, udd, files, confirmNow, remoteFile, remoteHas, history,
-    plant, write, home, pc, launches, envs, fileOk, claudeHome,
+    plant, write, home, pc, launches, envs, fileOk, claudeHome, bind, jar,
     say: (f: Say) => { say = f; }, during: (f: () => void) => { during = f; }, denyExtra: (f: typeof denyExtra) => { denyExtra = f; },
-    tools: (f: (prompt: string) => string[]) => { tools = f; }, status: (x: string) => { status = x; },
+    tools: (f: (prompt: string) => string[]) => { tools = f; }, status: (x: string) => { status = x; }, extVersion: (x: string | null) => { extVersion = x; },
     runExtra: (f: typeof runExtra) => { runExtra = f; }, hookRuns: (x: boolean) => { hookRuns = x; }, bridgeFails: (x: number) => { bridgeFails = x; }, group,
     at: (d: Date) => { now = d; }, tick: (ms: number) => { monoNow += ms; } };
 }
@@ -950,9 +995,12 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     // A page the worker never served can't be read back: a guessed value is the wrong profile.
     const c = await startCanary(EXT, "a-0123456789");
     await c.close();
-    const back = { value: c.value, extension_id: EXT, attempt: "a-0123456789" };
+    const back = { value: c.value, extension_id: EXT, attempt: "a-0123456789", profile: "p-0123456789abcdef0123456789abcdef" };
     expect(canaryOk(back, { ...back, served: false })).toBe(false);
     expect(canaryOk(back, { ...back, served: true })).toBe(true);
+    // A page served without the profile's marker can't be read back right, whatever the model says.
+    expect(canaryOk(back, { ...back, served: true, profile: null })).toBe(false);
+    expect(canaryOk({ ...back, profile: "none" }, { ...back, served: true, profile: null })).toBe(false);
     // Each run's canary is new.
     const { q } = oneJob();
     const seen: string[] = [];
@@ -1097,7 +1145,7 @@ describe("the PC worker: what the model saw", () => {
     expect(navDecide(call("navigate", "https://example.com/account/settings"), allow)).toEqual({ id: "toolu_1", tool: "navigate", url: "https://example.com/account/settings", decision: "allow", why: "run_address" });
     // The session's settings pin exactly this hook: a catch-all matcher on the prefix, this command, a timeout past nav-guard's own deadline.
     const settings = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
-    expect(settings.hooks.PreToolUse).toEqual([{ matcher: GUARD_MATCHER, hooks: [{ type: "command", command: HOOK_COMMAND, timeout: 15 }] }]);
+    expect(settings.hooks.PreToolUse).toEqual([{ matcher: GUARD_MATCHER, hooks: [{ type: "command", command: HOOK_COMMAND, timeout: 30 }] }]);
     expect(GUARD_MATCHER).toBe("mcp__claude-in-chrome__.*");
     expect(HOOK_COMMAND).toBe('"$PCW_RUNTIME" "$PCW_WORKER" nav-guard');
   });
@@ -1255,7 +1303,7 @@ describe("where a run ends, and its tabs", () => {
     {
       // Two leftovers recorded: the run takes over the first, the second is still there and reported.
       const { q, id } = oneJob();
-      q.group.push({ id: 501, url: "http://127.0.0.1:1/old/done" }, { id: 502, url: "http://127.0.0.1:1/old2/done" });
+      q.group.push({ id: 501, url: "about:blank" }, { id: 502, url: "about:blank" });
       writeFileSync(join(q.home, "leftover-tabs.json"), JSON.stringify({ ids: [501, 502] }));
       expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id, warnings: ["leftover_tab"] });
       expect(JSON.parse(readFileSync(join(q.home, "leftover-tabs.json"), "utf8")).ids).toEqual([501, 502]);
@@ -1269,16 +1317,16 @@ describe("where a run ends, and its tabs", () => {
     // Unit: the end check on its own.
     const ctx = (id: string, tabs: unknown) => [ev.use(id, `${CH}tabs_context_mcp`), ev.res(id, false, typeof tabs === "string" ? tabs : JSON.stringify({ availableTabs: tabs }))];
     const nav = (id: string, url: string) => [ev.use(id, `${CH}navigate`, { url }), ev.res(id, false, "ok")];
-    const C = "http://127.0.0.1:9/t", D = "http://127.0.0.1:9/t/done", PINU = "https://example.com/account/settings";
+    const C = "http://127.0.0.1:9/t", D = "about:blank", PINU = "https://example.com/account/settings";
     const st = (...e: unknown[][]) => parseStream(stream([ev.init([]), ...e.flat()]));
     const ok = (u: string) => u === PINU;
-    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }]), ctx("b", [{ tabId: 1, url: PINU }]), nav("c", D), ctx("d", [{ tabId: 1, url: D }])), C, D, ok, []))
+    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }]), ctx("b", [{ tabId: 1, url: PINU }]), nav("c", D), ctx("d", [{ tabId: 1, url: D }])), C, ok, []))
       .toMatchObject({ code: null, tab_id: 1, final_url: PINU, others: [], leftovers: [1] });
-    expect(endCheck(st(ctx("b", [{ tabId: 1, url: PINU }])), C, D, ok, []).code).toBe("unexpected_location");           // the canary never seen in a tab
-    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }])), C, D, ok, []).code).toBe("unexpected_location");               // no context after it on the site
-    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }]), ctx("b", "Tabs: one")), C, D, ok, []).code).toBe("unexpected_location");   // unreadable
-    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }]), ctx("b", [{ tabId: 1, url: PINU }, { tabId: 2, url: PINU }])), C, D, ok, [])).toMatchObject({ code: "tabs_unexpected", others: [2] });
-    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }, { tabId: 2, url: "x" }]), ctx("b", [{ tabId: 1, url: PINU }, { tabId: 2, url: "x" }])), C, D, ok, [2]))
+    expect(endCheck(st(ctx("b", [{ tabId: 1, url: PINU }])), C, ok, []).code).toBe("unexpected_location");           // the canary never seen in a tab
+    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }])), C, ok, []).code).toBe("unexpected_location");               // no context after it on the site
+    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }]), ctx("b", "Tabs: one")), C, ok, []).code).toBe("unexpected_location");   // unreadable
+    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }]), ctx("b", [{ tabId: 1, url: PINU }, { tabId: 2, url: PINU }])), C, ok, [])).toMatchObject({ code: "tabs_unexpected", others: [2] });
+    expect(endCheck(st(ctx("a", [{ tabId: 1, url: C }, { tabId: 2, url: "x" }]), ctx("b", [{ tabId: 1, url: PINU }, { tabId: 2, url: "x" }])), C, ok, [2]))
       .toMatchObject({ code: null, leftovers: [1, 2] });
     expect(tabsFrom('Tab Context:\n{"availableTabs":[{"tabId":5,"title":"x","url":"https://a.example/"}],"tabGroupId":3}')).toEqual([{ id: 5, url: "https://a.example/" }]);
     expect(tabsFrom('{"availableTabs":[{"title":"x"}]}')).toBeNull();
@@ -1496,7 +1544,7 @@ describe("hangs, locks and clocks", () => {
     for (const name of ["spendNonce", "nonces/", "confirmGate", "go_token)", "confirm.ts\""]) expect(src).not.toContain(name);
     // The command line's commands, every one of them.
     const cli = src.slice(src.indexOf("if (isMain"));
-    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "confirm-profile", "owner-keygen", "owner-fpr", "sign-allowlist"]);
+    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "owner-keygen", "owner-fpr", "sign-allowlist"]);
     // Only confirm.ts holds the nonce spend, and it imports from the worker, not the other way round.
     expect(readFileSync(join(OPT, "pcjobs/confirm.ts"), "utf8")).toContain("export function spendNonce");
   });
@@ -1523,23 +1571,26 @@ describe("the supervised probe and confirm-profile", () => {
       inventory_ok: true, deny_check: true, target: "https://example.com/settings", fingerprint: fingerprint(q.opts(), q.inst), hits: [] });
     expect(ev.fingerprint).toMatchObject({ cli_version: "2.1.0", extension_version: "1.2.3" });
     expect(ev.inventory).toContain(`${CH}read_page`);
-    // Smoke first, then the browser step, the three destination checks, then the deny check.
-    expect(q.launches.length).toBe(6);
+    // Smoke first, then the browser step, the four destination checks, then the deny check.
+    expect(q.launches.length).toBe(7);
     expect(q.launches[0][2]).toContain("connection check");
     expect(q.launches[1][2]).toContain("## This run");
-    for (const i of [2, 3, 4]) expect(q.launches[i][2]).toContain("destination check");
-    expect(q.launches[5][2]).toContain("permission check");
-    // Destinations: a redirect off its pin and a page that moves its tab by script and opens
-    // a popup both fail the run's own end check, with what it saw; a bounded redirect passes it.
+    for (const i of [2, 3, 4, 5]) expect(q.launches[i][2]).toContain("destination check");
+    expect(q.launches[6][2]).toContain("permission check");
+    // Destinations: a redirect off its pin, a page that moves its tab by script and opens a
+    // popup, and a page that leaves its pin, is read there and comes back before the end all
+    // fail the run's own end check, with what it saw; a bounded redirect passes it.
     expect(ev.destination_check).toBe(true);
     expect(ev.destinations).toEqual([
-      { target: "redirect", expect: "fail", code: "unexpected_location", final_path: "/<token>/elsewhere", other_tabs: 0, hits: ["elsewhere"], passed: true },
-      { target: "redirect_bounded", expect: "pass", code: null, final_path: "/<token>/ok/landing", other_tabs: 0, hits: ["ok/landing"], passed: true },
-      { target: "script_and_popup", expect: "fail", code: "tabs_unexpected", final_path: "/<token>/moved", other_tabs: 1, hits: ["popup", "moved"], passed: true }]);
+      { target: "redirect", expect: "fail", code: "unexpected_location", final_path: "/<token>/elsewhere", off_path: "/<token>/elsewhere", other_tabs: 0, hits: ["elsewhere"], passed: true },
+      { target: "redirect_bounded", expect: "pass", code: null, final_path: "/<token>/ok/landing", off_path: null, other_tabs: 0, hits: ["ok/landing"], passed: true },
+      { target: "script_and_popup", expect: "fail", code: "tabs_unexpected", final_path: "/<token>/moved", off_path: "/<token>/moved", other_tabs: 1, hits: ["popup", "moved"], passed: true },
+      // Back on its pin by the end: only the address seen midway catches it.
+      { target: "move_and_return", expect: "fail", code: "unexpected_location", final_path: "/<token>/roundtrip", off_path: "/<token>/away", other_tabs: 0, hits: ["away"], passed: true }]);
     // The hook refused the probe's navigations by its own log, and the run's judgement fails closed on that.
     expect(ev).toMatchObject({ hook_intercepts: true, fails_closed: true, not_exercised: [] });
     // Every denied capability was ordered, and each refusal came from permissions.
-    const deny = q.launches[5][2];
+    const deny = q.launches[6][2];
     for (const w of ["shell command", "Write the file", "web fetch", "click the Press button", "type the word", "form tool", "JavaScript",
       "console messages", "network requests", "upload", "keyboard shortcut"]) expect(deny).toContain(w);
     expect(ev.deny.map((d) => d.capability)).toEqual(["shell", "file_write", "web_fetch", "click", "typing", "form_fill", "javascript",
@@ -1636,10 +1687,11 @@ describe("the supervised probe and confirm-profile", () => {
       const s = await real(argv, cwd, ms, env);
       if (!argv[2].includes("destination check")) return s;
       const target = /navigate to exactly: (\S+)/.exec(argv[2])![1];
-      return { ...s, out: s.out.replace(/http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]+\/(elsewhere|moved)/g, target).replace(/,\{\\"tabId\\":\d+,\\"title\\":\\"t\\",\\"url\\":\\"[^"\\]+\/popup\\"\}/g, "") };
+      return { ...s, out: s.out.replace(/http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]+\/(elsewhere|moved|away)/g, target).replace(/,\{\\"tabId\\":\d+,\\"title\\":\\"t\\",\\"url\\":\\"[^"\\]+\/popup\\"\}/g, "") };
     };
     const ev1 = await probe({ ...o, launch: blind });
-    expect(ev1.destinations.map((d) => [d.target, d.code, d.passed])).toEqual([["redirect", null, false], ["redirect_bounded", null, true], ["script_and_popup", null, false]]);
+    expect(ev1.destinations.map((d) => [d.target, d.code, d.passed])).toEqual([["redirect", null, false], ["redirect_bounded", null, true], ["script_and_popup", null, false],
+      ["move_and_return", null, false]]);
     expect(ev1).toMatchObject({ destination_check: false, deny_check: false });
     expect(confirmProfile(q.opts()).deny_check).toBe(false);
     // nav-guard not running at all: the smoke step says so, plainly, before anything else runs.
@@ -1690,6 +1742,301 @@ describe("the supervised probe and confirm-profile", () => {
     rmSync(join(q.home, "STOP"));
     q.allow([PIN]);
     await expect(probe(q.opts(attended))).rejects.toThrow("no_probe_target");
+  });
+});
+
+describe("fifth review: addresses midway, the environment, the hook in Git Bash, the bound profile, pinned tools, versions", () => {
+  test("mid-run destinations: a tab that leaves its pin, is read there and comes back before the end is unexpected_location, caught where it was seen", async () => {
+    const back = "https://example.com/account/settings";
+    // Seen by a reading tool's own answer (the address on its header line).
+    {
+      const { q, id } = oneJob();
+      q.runExtra(async (b) => {
+        const t = b.group.find((x) => x.url.startsWith("https://"))!;
+        t.url = "https://evil.example/collect";
+        await b.use("get_page_text", { tabId: t.id });
+        t.url = back;
+      });
+      expect(await run(q.opts(attended))).toMatchObject({ code: "unexpected_location", job: id, state: "failed" });
+      // Nothing of it is written: no facts, and an address off the job's site isn't kept.
+      expect(result(q, id)).toMatchObject({ status: "failed", code: "unexpected_location", final_url: null, facts: {} });
+      const last = JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"));
+      expect(last.final_url).toBe(back);                      // the end alone would have passed
+      expect(last.off_url).toBe("https://evil.example/collect");
+      expect(last.off_at).toMatch(/^toolu_/);
+    }
+    // Seen in a tab context; on the job's site but off the pin, its address is kept (scheme, host and path).
+    {
+      const { q, id } = oneJob();
+      q.runExtra(async (b) => {
+        const t = b.group.find((x) => x.url.startsWith("https://"))!;
+        t.url = "https://example.com/billing?card=1";
+        await b.use("tabs_context_mcp");
+        t.url = back;
+      });
+      expect(await run(q.opts(attended))).toMatchObject({ code: "unexpected_location", job: id });
+      expect(result(q, id).final_url).toBe("https://example.com/billing");
+    }
+    // A sign-in page of the entry on the way, and back: allowed.
+    {
+      const { q, id } = oneJob();
+      q.runExtra(async (b) => {
+        const t = b.group.find((x) => x.url.startsWith("https://"))!;
+        t.url = "https://accounts.example.com/signin";
+        await b.use("tabs_context_mcp");
+        await b.use("find", { tabId: t.id, query: "x" });
+        t.url = back;
+      });
+      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    }
+    // Unit: what counts as a reported address, and which tab's.
+    expect(reportedUrl("Title: Settings\nURL: https://example.com/account\n\nText")).toBe("https://example.com/account");
+    expect(reportedUrl(JSON.stringify({ url: "https://example.com/a", title: "x" }))).toBe("https://example.com/a");
+    expect(reportedUrl("a\nb\nc\nd\ne\nf\nURL: https://evil.example/")).toBeNull();       // page text further down isn't the tab's address
+    expect(reportedUrl("no address here")).toBeNull();
+    const ctx = (id: string, tabs: unknown) => [ev.use(id, `${CH}tabs_context_mcp`), ev.res(id, false, JSON.stringify({ availableTabs: tabs }))];
+    const read = (id: string, tabId: number, url: string) => [ev.use(id, `${CH}get_page_text`, { tabId }), ev.res(id, false, `URL: ${url}\n\ntext`)];
+    const st = (...e: unknown[][]) => parseStream(stream([ev.init([]), ...e.flat()]));
+    const C = "http://127.0.0.1:9/t", PINU = "https://example.com/account/settings", ok = (u: string) => u === PINU;
+    // Before the canary the tab may be anywhere (a new tab, or the last run's blank page).
+    expect(endCheck(st(ctx("a", [{ tabId: 1, url: "chrome://newtab/" }]), ctx("b", [{ tabId: 1, url: C }]), ctx("c", [{ tabId: 1, url: PINU }])), C, ok, []).code).toBeNull();
+    expect(endCheck(st(ctx("b", [{ tabId: 1, url: C }]), read("r", 1, "https://evil.example/"), ctx("c", [{ tabId: 1, url: PINU }])), C, ok, []))
+      .toMatchObject({ code: "unexpected_location", off_url: "https://evil.example/", off_at: "r", final_url: PINU });
+    expect(endCheck(st(ctx("b", [{ tabId: 1, url: C }]), read("r", 2, "https://evil.example/"), ctx("c", [{ tabId: 1, url: PINU }])), C, ok, []).code).toBeNull();   // another tab's read
+    expect(endCheck(st(ctx("b", [{ tabId: 1, url: C }]), ctx("c", [{ tabId: 1, url: PINU }]),
+      [ev.use("n", `${CH}navigate`, { url: END_URL }), ev.res("n", false, "ok")], ctx("d", [{ tabId: 1, url: END_URL }])), C, ok, [])).toMatchObject({ code: null, final_url: PINU });   // the end page
+  });
+
+  test("the end page is about:blank: one literal, allowed and logged like any run address, and where a reused tab starts", async () => {
+    expect(END_URL).toBe("about:blank");
+    const allow = JSON.stringify(["http://127.0.0.1:9/t", END_URL]);
+    const call = (url: string) => JSON.stringify({ tool_use_id: "toolu_9", tool_name: `${CH}navigate`, tool_input: { url } });
+    expect(navDecide(call("about:blank"), allow)).toMatchObject({ decision: "allow", why: "end_page", url: "about:blank" });
+    expect(navDecide(call("about:blank#x"), allow)).toMatchObject({ decision: "deny", why: "address_not_allowed" });
+    expect(navDecide(call("about:srcdoc"), allow).decision).toBe("deny");
+    const { q, id } = oneJob();
+    let seen: Instruction | null = null;
+    q.say((ins, canary) => { seen = ins; return { canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: {} }; });
+    expect((await run(q.opts(attended))).code).toBe("ok");
+    expect(seen!.done_url).toBe("about:blank");
+    expect(readNavLog(join(q.home, "nav-decisions.jsonl")).filter((d) => d.url === "about:blank")).toMatchObject([{ decision: "allow", why: "end_page" }]);
+    // The run's tab is left there, and the next run takes it over from about:blank.
+    const tab = JSON.parse(readFileSync(join(q.home, "leftover-tabs.json"), "utf8")).ids[0];
+    expect(q.group.find((t) => t.id === tab)!.url).toBe("about:blank");
+    q.ask(READ); round(q.cfg);
+    q.say((ins, canary) => { seen = ins; return { canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: {} }; });
+    expect((await run(q.opts(attended))).code).toBe("ok");
+    expect(seen!.tab_id).toBe(tab);
+    expect(id).toBeTruthy();
+  });
+
+  test("the Windows environment: the variables the CLI and Git Bash need pass through; a checked CLAUDE_CODE_GIT_BASH_PATH is allowed; other overrides are refused", async () => {
+    const { q, id } = oneJob();
+    const bash = join(q.root, "Git", "bin", "bash.exe");
+    mkdirSync(join(q.root, "Git", "bin"), { recursive: true });
+    writeFileSync(bash, "");
+    const win: Record<string, string> = { USERPROFILE: "C:\\Users\\owner", APPDATA: "C:\\Users\\owner\\AppData\\Roaming", LOCALAPPDATA: "C:\\Users\\owner\\AppData\\Local",
+      HOMEDRIVE: "C:", HOMEPATH: "\\Users\\owner", SystemRoot: "C:\\Windows", SystemDrive: "C:", TEMP: "C:\\Users\\owner\\AppData\\Local\\Temp",
+      TMP: "C:\\Users\\owner\\AppData\\Local\\Temp", Path: "C:\\Windows\\system32;C:\\Program Files\\Git\\cmd", PATHEXT: ".COM;.EXE;.BAT;.CMD", ComSpec: "C:\\Windows\\system32\\cmd.exe" };
+    expect(Object.keys(win).map((k) => k.toUpperCase()).sort()).toEqual([...WINDOWS_ENV].sort());
+    const env = { ...win, CLAUDE_CODE_GIT_BASH_PATH: bash, DISABLE_AUTOUPDATER: "0", NODE_OPTIONS: "--require x" };
+    expect(envProblem(env)).toBeNull();
+    const base = baseEnv(q.opts({ env }));
+    for (const [k, v] of Object.entries(win)) expect([k, base[k]]).toEqual([k, v]);
+    expect(base.CLAUDE_CODE_GIT_BASH_PATH).toBe(bash);
+    expect(base.DISABLE_AUTOUPDATER).toBe("1");                 // set explicitly, whatever the worker's own says
+    expect(base.NODE_OPTIONS).toBeUndefined();
+    // Confirmed with that environment, a run passes it to the session as it is.
+    q.confirmNow({ o: { env } });
+    expect((await run(q.opts({ ...attended, env }))).code).toBe("ok");
+    const sent = q.envs.at(-1)!;
+    for (const k of [...Object.keys(win), "CLAUDE_CODE_GIT_BASH_PATH"]) expect(sent[k]).toBe((env as any)[k]);
+    expect(sent.DISABLE_AUTOUPDATER).toBe("1");
+    // A Git Bash path the worker can't vouch for is refused, as is every other override.
+    for (const v of ["bash.exe", "Git\\bin\\bash.exe", join(q.root, "Git", "bin", "sh.exe"), join(q.root, "missing", "bash.exe"), `${bash}"`])
+      expect([v, envProblem({ CLAUDE_CODE_GIT_BASH_PATH: v })]).toEqual([v, "CLAUDE_CODE_GIT_BASH_PATH"]);
+    expect(envProblem({ CLAUDE_CODE_GIT_BASH_PATH: "C:\\Program Files\\Git\\bin\\bash.exe" }, () => true)).toBeNull();
+    for (const [k, v] of [["CLAUDE_CODE_USE_BEDROCK", "1"], ["CLAUDE_CONFIG_DIR", "C:/x"], ["ANTHROPIC_BASE_URL", "https://p.example"], ["CLAUDE_CODE_SHELL", bash]])
+      expect(envProblem({ ...win, [k]: v })).toBe(k);
+    expect(baseEnv(q.opts({ env: { ...win, CLAUDE_CODE_GIT_BASH_PATH: "bash.exe" } })).CLAUDE_CODE_GIT_BASH_PATH).toBeUndefined();
+    expect(id).toBeTruthy();
+  });
+
+  test("the real hook command line, run through bash (Git Bash on Windows) with a PreToolUse payload: an allow, a deny and malformed input", () => {
+    // Claude Code runs a hook's command through a shell: Git Bash on Windows (the bash on
+    // a Windows PATH may be WSL's, so its own path), bash elsewhere.
+    const bash = WIN ? ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files\\Git\\usr\\bin\\bash.exe"].find(existsSync) : "/bin/bash";
+    expect(bash).toBeTruthy();
+    const home = mkdtempSync(join(tmpdir(), "pcjobs-hook-"));
+    const o: Opts = { home, env: process.env };
+    const env = sessionEnv(o, ["https://example.com/account/settings", END_URL]);
+    expect(env.PCW_WORKER).toBe(WORKER_FILE.replace(/\\/g, "/"));
+    const hook = (input: string) => spawnSync(bash!, ["-c", HOOK_COMMAND], { input, env, encoding: "utf8", timeout: 90_000 });
+    const payload = (id: string, url: string) => JSON.stringify({ session_id: "s1", hook_event_name: "PreToolUse", tool_use_id: id,
+      tool_name: `${CH}navigate`, tool_input: { url, tabId: 5 } });
+    const allowed = hook(payload("toolu_ok1", "https://example.com/account/settings"));
+    expect([allowed.status, allowed.stdout]).toEqual([0, ""]);
+    const denied = hook(payload("toolu_no1", "https://evil.example/"));
+    expect(denied.status).toBe(2);
+    expect(JSON.parse(denied.stdout).hookSpecificOutput).toMatchObject({ hookEventName: "PreToolUse", permissionDecision: "deny" });
+    expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecisionReason).toContain("address_not_allowed");
+    const bad = hook("{not json");
+    expect(bad.status).toBe(2);
+    expect(JSON.parse(bad.stdout).hookSpecificOutput).toMatchObject({ permissionDecision: "deny" });
+    expect(JSON.parse(bad.stdout).hookSpecificOutput.permissionDecisionReason).toContain("unreadable_input");
+    // Each decision is in the log the worker reads, by tool-use id.
+    expect(readNavLog(join(home, "nav-decisions.jsonl")).map((d) => [d.id, d.decision, d.why]))
+      .toEqual([["toolu_ok1", "allow", "run_address"], ["toolu_no1", "deny", "address_not_allowed"], [null, "deny", "unreadable_input"]]);
+    // Cold-start headroom: nav-guard's own deadline is several seconds, and the settings timeout sits above it.
+    const settings = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
+    expect(HOOK_MS).toBeGreaterThanOrEqual(8_000);
+    expect(settings.hooks.PreToolUse[0].hooks[0].timeout * 1000).toBeGreaterThan(HOOK_MS + 5_000);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("the canary is bound to the dedicated profile: without its marker the run is wrong_profile; bind-profile sets it in that profile only", async () => {
+    // Another profile: no marker cookie, so the page shows none.
+    {
+      const { q, id } = oneJob();
+      q.jar.marker = null;
+      expect(await run(q.opts(attended))).toMatchObject({ code: "wrong_profile", job: id, state: "failed" });
+    }
+    // A cookie that isn't the bound marker.
+    {
+      const { q } = oneJob();
+      q.jar.marker = `p-${"f".repeat(32)}`;
+      expect((await run(q.opts(attended))).code).toBe("wrong_profile");
+    }
+    // The model claiming the marker the page never showed it.
+    {
+      const { q } = oneJob();
+      const m = q.jar.marker;
+      q.jar.marker = null;
+      q.say((_i, c) => ({ canary: { ...c, profile: m }, outcome: "seen", final_url: "https://example.com/account/settings", facts: {} }));
+      expect((await run(q.opts(attended))).code).toBe("wrong_profile");
+    }
+    // Not bound at all: the preflight stops before any claim.
+    const { q, id } = oneJob();
+    rmSync(join(q.home, "profile-marker.json"));
+    q.jar.marker = null;
+    expect(await run(q.opts(attended))).toEqual({ code: "wrong_profile", job: null, closed: [] });
+    expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+    // bind-profile: attended only; in a profile that keeps no cookie it binds nothing.
+    await expect(bindProfile(q.opts())).rejects.toThrow("attended_required");
+    q.jar.blocked = true;
+    await expect(bindProfile(q.opts(attended))).rejects.toThrow("wrong_profile");
+    expect(existsSync(join(q.home, "profile-marker.json"))).toBe(false);
+    // In the dedicated profile it sets a fresh marker there and keeps only its hash; runs then pass.
+    q.jar.blocked = false;
+    expect(await bindProfile(q.opts(attended))).toEqual({ bound: T0.toISOString() });
+    expect(q.jar.marker).toMatch(/^p-[0-9a-f]{32}$/);
+    const kept = readFileSync(join(q.home, "profile-marker.json"), "utf8");
+    expect(kept).not.toContain(q.jar.marker!);
+    expect(JSON.parse(kept).sha256).toBe(createHash("sha256").update(q.jar.marker!).digest("hex"));
+    expect(q.launches.at(-1)![2]).toContain("profile binding");
+    expect(existsSync(join(q.home, "worker.lock"))).toBe(false);
+    expect((await run(q.opts(attended))).code).toBe("ok");
+  });
+
+  test("Chrome running with the extension from another user data folder fails the preflight (extension_elsewhere)", async () => {
+    const chrome = (pid: number, dir?: string) => ({ pid, ppid: 1, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"${dir ? ` --user-data-dir="${dir}"` : ""}` });
+    const shell = (pid: number, ppid: number) => ({ pid, ppid, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""C:\\Users\\o\\.claude\\chrome\\chrome-native-host.bat" chrome-extension://${EXT}/ --parent-window=0"` });
+    const host = (pid: number, ppid: number) => ({ pid, ppid, cmd: `"C:\\Users\\o\\.claude\\chrome\\chrome-native-host.bat" chrome-extension://${EXT}/ --parent-window=0` });
+    const { q, id } = oneJob();
+    const inst = q.inst;
+    // The dedicated Chrome's own host, under it: fine.
+    expect(extensionElsewhere([chrome(10, q.udd), shell(11, 10), host(12, 11)], inst)).toBe(false);
+    // A host under the daily Chrome (no --user-data-dir), under another folder, or under no Chrome found: elsewhere.
+    expect(extensionElsewhere([chrome(10, q.udd), chrome(20), shell(21, 20), host(22, 21)], inst)).toBe(true);
+    expect(extensionElsewhere([chrome(20, join(q.root, "other")), host(22, 20)], inst)).toBe(true);
+    expect(extensionElsewhere([host(22, 999)], inst)).toBe(true);
+    // Another extension's host doesn't count.
+    expect(extensionElsewhere([chrome(20), { pid: 22, ppid: 20, cmd: "host.exe chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/" }], inst)).toBe(false);
+    expect(await run(q.opts({ ...attended, procs: () => [chrome(10, q.udd), chrome(20), shell(21, 20), host(22, 21)] })))
+      .toEqual({ code: "extension_elsewhere", job: null, closed: [] });
+    // A running Chrome on a folder the scan didn't know, with the extension installed there: added to the scan.
+    const other = join(q.root, "running-elsewhere");
+    mkdirSync(join(other, "Default", "Extensions", EXT, "1.0.0_0"), { recursive: true });
+    expect((await run(q.opts({ ...attended, procs: () => [chrome(10, q.udd), chrome(30, other)] }))).code).toBe("extension_elsewhere");
+    expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+    expect((await run(q.opts({ ...attended, procs: () => [chrome(10, q.udd), shell(11, 10), host(12, 11)] }))).code).toBe("ok");
+  });
+
+  test("the reading tools are pinned by exact name; console, network and script tools are never among them", () => {
+    expect(READING).toEqual(["tabs_context_mcp", "read_page", "get_page_text", "find"]);
+    expect(NAVIGATING).toEqual(["navigate", "tabs_create_mcp"]);
+    const settings = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
+    expect([...settings.permissions.allow].sort()).toEqual([...READING, ...NAVIGATING].map((t) => CH + t).sort());
+    const call = (tool: string) => JSON.stringify({ tool_use_id: "toolu_1", tool_name: CH + tool, tool_input: {} });
+    for (const t of ["read_console_messages", "read_network_requests", "javascript_tool"]) {
+      expect(DENIED_CHROME).toContain(t);
+      expect(settings.permissions.deny).toContain(CH + t);
+      expect(READING).not.toContain(t);
+      expect(NAVIGATING).not.toContain(t);
+      expect(navDecide(call(t), "[]")).toMatchObject({ decision: "deny", why: "unknown_tool" });
+      const widened = { ...settings, permissions: { ...settings.permissions, allow: [...settings.permissions.allow, CH + t] } };
+      expect(allowedTools(widened)).toBeNull();
+    }
+    // A name that only starts like a reading tool is not one.
+    expect(navDecide(call("read_page_and_console"), "[]")).toMatchObject({ decision: "deny", why: "unknown_tool" });
+    expect(navDecide(call("find"), "[]")).toMatchObject({ decision: "allow", why: "reads" });
+  });
+
+  test("size caps: a report field or a whole report over its cap is result_rejected; a result's facts and file are capped too", async () => {
+    {
+      const { q, id } = oneJob();
+      q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { account: "x".repeat(301) } }));
+      expect(await run(q.opts({ ...attended, diagnose: true }))).toMatchObject({ code: "result_rejected", job: id });
+      expect(readFileSync(join(q.home, "diagnostics.log"), "utf8")).toContain("field=facts_size");
+      expect(q.history()).not.toContain("x".repeat(301));
+    }
+    {
+      const { q } = oneJob();
+      q.say((_i, canary) => ({ canary, outcome: "seen", final_url: `https://example.com/account/settings?${"q".repeat(400)}`, facts: {} }));
+      expect((await run(q.opts({ ...attended, diagnose: true }))).code).toBe("result_rejected");
+      expect(readFileSync(join(q.home, "diagnostics.log"), "utf8")).toContain("field=final_url_size");
+    }
+    {
+      const { q } = oneJob();
+      q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings",
+        facts: Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`f${i}`, "y".repeat(250)])) }));
+      expect((await run(q.opts({ ...attended, diagnose: true }))).code).toBe("result_rejected");
+      expect(readFileSync(join(q.home, "diagnostics.log"), "utf8")).toContain("field=report_size");
+    }
+    expect(why(parseResult(JSON.stringify(res({ status: "failed", code: "result_rejected", facts: { a: "z".repeat(241) } }))))).toMatch(/named values/);
+    expect(why(parseResult(JSON.stringify(res({ status: "failed", code: "result_rejected", facts: { a: "z".repeat(240) } }))))).toBe("ok");
+    expect(why(parseResult(" ".repeat(3001)))).toMatch(/at most 3000 bytes/);
+  });
+
+  test("versions: the CLI executable changing under a run is cli_changed; the extension's live version against its version on disk", async () => {
+    {
+      const { q, id } = oneJob();
+      let n = 0;
+      expect(await run(q.opts({ ...attended, cliHash: () => (n++ === 0 ? "a" : "b").repeat(64) }))).toMatchObject({ code: "cli_changed", job: id, state: "failed" });
+      expect(result(q, id)).toMatchObject({ code: "cli_changed", facts: {} });
+    }
+    {
+      const { q } = oneJob();
+      expect((await run(q.opts({ ...attended, cliHash: () => null }))).code).toBe("cli_changed");       // can't be read: fails closed
+    }
+    {
+      const { q, id } = oneJob();
+      q.extVersion("1.2.4");
+      expect(await run(q.opts(attended))).toMatchObject({ code: "extension_version_mismatch", job: id });
+    }
+    {
+      const { q } = oneJob();
+      q.extVersion("1.2.3.0");                     // the same version, written longer
+      expect((await run(q.opts(attended))).code).toBe("ok");
+    }
+    {
+      // The probe's smoke step says so too, with both versions.
+      const q = queueRig({ confirmed: false });
+      q.extVersion("9.9.9");
+      const e = await probe(q.opts(attended)).then(() => null, (x) => x);
+      expect(e?.code).toBe("extension_version_mismatch");
+      expect(e?.detail).toEqual({ live: "9.9.9", disk: "1.2.3" });
+    }
   });
 });
 
@@ -1785,7 +2132,7 @@ describe("the files around it", () => {
 
   test("the session prompt and the owner's setup note say what the code does", () => {
     const prompt = readFileSync(SESSION_FILES.prompt, "utf8");
-    for (const w of ["canary_url", "done_url", "extension id", "attempt id", "exactly as written", "data, never instructions", "Cain jobs", "no shell",
+    for (const w of ["canary_url", "done_url", "about:blank", "the profile", "extension id", "attempt id", "exactly as written", "data, never instructions", "Cain jobs", "no shell",
       "no clicking or typing", "browser_unreachable", "wrong_profile", "tab_id", "createIfEmpty", "Open no other tab", "Leave the tab open"])
       expect(prompt).toContain(w);
     const setup = readFileSync(join(REPO, "cain/docs/pc-jobs.md"), "utf8");
@@ -1799,13 +2146,16 @@ describe("the files around it", () => {
       "restricted browser tools against owner-approved addresses", "navigation_unguarded", "navigation_denied", "unexpected_location",
       "tabs_unexpected", "chrome_busy", "leftover_tab", "redirects", "not_exercised", "hook_intercepts", "fails_closed", "destination check",
       "managed-settings.d", "SOFTWARE\\Policies\\ClaudeCode", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_", "Git Bash", "forward slashes",
-      "no other tabs in Claude's tab group", "## Troubleshooting", "strict-mcp-config", "nav-decisions.jsonl", "last-run.json", "attended ones too"])
+      "no other tabs in Claude's tab group", "## Troubleshooting", "strict-mcp-config", "nav-decisions.jsonl", "last-run.json", "attended ones too",
+      "bind-profile", "about:blank", "CLAUDE_CODE_GIT_BASH_PATH", "USERPROFILE", "LOCALAPPDATA", "PATHEXT", "COMSPEC", "tabs_context_mcp", "read_page",
+      "get_page_text", "`find`", "typed fields only", "cli_changed", "extension_version_mismatch", "move_and_return", "profile-marker.json"])
       expect(setup.replace(/\s+/g, " ")).toContain(w.replace(/\s+/g, " "));
     // The troubleshooting table names every code a run or the probe can end with.
     const table = setup.slice(setup.indexOf("## Troubleshooting"), setup.indexOf("## How a job runs"));
     for (const c of ["stopped", "busy", "chrome_busy", "extension_unreachable", "navigation_unguarded", "navigation_denied", "unexpected_location", "tabs_unexpected",
       "tool_inventory", "wrong_profile", "browser_unreachable", "probe_stale", "profile_changed", "profile_unconfirmed", "untrusted_config", "untrusted_files",
-      "extension_elsewhere", "profile_scan_failed", "clock_skew", "queue_misconfigured", "git_failed", "browser_timeout", "url_drift", "result_rejected", "deny_check"])
+      "extension_elsewhere", "profile_scan_failed", "clock_skew", "queue_misconfigured", "git_failed", "browser_timeout", "url_drift", "result_rejected", "deny_check",
+      "cli_changed", "extension_version_mismatch"])
       expect([c, table.includes(`\`${c}\``)]).toEqual([c, true]);
     // The extension needs no file access any more, and the setup note says to leave it off.
     expect(setup).toContain("Leave **Allow access to file URLs** off");

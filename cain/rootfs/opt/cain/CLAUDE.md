@@ -271,8 +271,8 @@ in the harness repo; until then the keeper says it is waiting).
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
   their own codes (`browser_unreachable`, `extension_unreachable`, `tool_inventory`,
   `wrong_profile`, `url_drift`, `unexpected_location`, `tabs_unexpected`,
-  `navigation_unguarded`, `navigation_denied`, `result_rejected`, `browser_timeout` and
-  more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
+  `navigation_unguarded`, `navigation_denied`, `cli_changed`,
+  `extension_version_mismatch`, `result_rejected`, `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
   `probe_stale` (a new Claude in Chrome or Claude Code version: nothing runs until he
   probes again), `chrome_busy` (another Claude Code is open on his PC),
   `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and
