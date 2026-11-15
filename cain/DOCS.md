@@ -296,6 +296,14 @@ Words about P33 for whoever holds it, oldest first, filed by the record keeper f
     Items nobody holds are Cain's, so their notes are his to read.
   - `<since>`: only notes after that time, in any ISO form or offset
     (`2026-11-11T08:20:00-05:00` is 13:20 UTC).
+- Reading one item's notes marks them read: the notes file's id as he was shown it, kept
+  in his own home (`/data/cain/notes-read/<item>`). Only his own reads count.
+- `/opt/cain/record.sh unread [<since>]` lists the items whose notes changed in any way
+  since he last read them, each as its newest note; an item he has never read counts only
+  notes after `<since>`. Each check-in names these items, the 30 oldest at a time, until he
+  reads them, and quotes the newest three. `/data/notes.seen` is the `<since>` it passes:
+  the time before which notes counted as read before reads were marked, set to the first
+  check-in's time when there is none, and never moved after that.
 - A laptop session's per-turn hook (`record-holds.ts --hook`) shows each new note on
   its held items once; on an item it has just come to hold, all of its notes.
   `record-send.ts` shows any it hasn't seen on the items a request touches and holds

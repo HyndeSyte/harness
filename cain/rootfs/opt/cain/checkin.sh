@@ -95,22 +95,24 @@ if [ -f "$holds" ]; then
     && { [ -z "$held" ] || lead="Held by others, skip these: $held. "; } \
     || lead="The holds file can't be read right now: before working an item, check it isn't held by others. "
 fi
-# Next to them, the notes others left on Cain's items (every item no one else holds),
-# only those after the newest one a check-in already listed, so none comes twice. The
-# keeper's notes lead each row with its item:  P41 | <when> | <from> | <the note> |
-# Every item with a new note is named, in the order of its newest note, so none is lost
-# when many land at once: a note only counted is gone once the next check-in moves past it
-# (Nov 15, a handoff behind 25 newer notes). The newest three are quoted too, each on one
-# line and shortened, as words passed on, never as his go.
+# Next to them, the items with notes Cain hasn't read (record.sh unread: every item no one else
+# holds whose notes changed since he last read them with `record.sh notes <item>`), each as its
+# newest note:  P41 | <when> | <from> | <the note> |
+# An item stays named at every check-in until he reads it, so no note is lost to a busy slot, a
+# long list or one he passed over (Nov 15: a handoff only counted behind 25 newer notes sat most
+# of a day). The 30 oldest are named at a time and the rest counted, to come next; the newest
+# three named are quoted, each on one line and shortened, as words passed on, never as his go.
+# notes.seen holds the time before which notes counted as read, from before reads were marked:
+# kept as it is, and set to now the first time there is none.
 seen="${NOTES_SEEN:-/data/notes.seen}"          # not in $dir: that's cleared of week-old files
-args=(notes -)
+[ -s "$seen" ] || date -u +%Y-%m-%dT%H:%M:%S.%3NZ > "$seen" 2>/dev/null
+args=(unread)
 since=$(cat "$seen" 2>/dev/null) && [ -n "$since" ] && args+=("$since")
 rows=$("${RECORD_SH:-/opt/cain/record.sh}" "${args[@]}" 2>/dev/null | grep '|' | sort -t'|' -k2,2)
-newest=""
 if [ -n "$rows" ]; then
-  newest=$(printf '%s\n' "$rows" | tail -n 1 | cut -d'|' -f2 | tr -d ' ')
-  items=$(printf '%s\n' "$rows" | awk -F'|' '{ i = $1; gsub(/[^A-Za-z0-9._-]/, "", i); if (i != "") last[i] = NR }
-            END { for (i in last) print last[i], i }' | sort -n | awk '{ printf "%s%s", (NR > 1 ? ", " : ""), $2 }')
+  total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  named=$(printf '%s\n' "$rows" | head -n 30)
+  items=$(printf '%s\n' "$named" | awk -F'|' '{ i = $1; gsub(/[^A-Za-z0-9._-]/, "", i); if (i != "") printf "%s%s", (n++ ? ", " : ""), i }')
   notes=""
   while IFS= read -r row; do
     item=$(printf '%s' "${row%%|*}" | tr -cd 'A-Za-z0-9._-')
@@ -118,9 +120,10 @@ if [ -n "$rows" ]; then
              | tr '\t' ' ' | sed 's/«/"/g; s/»/"/g' | tr -s ' ' | sed 's/^ //; s/ $//')
     [ "${#text}" -gt 200 ] && text="${text:0:197}..."
     [ -n "$item" ] && [ -n "$text" ] && notes="$notes $item: «$text»"
-  done < <(printf '%s\n' "$rows" | tail -n 3)
+  done < <(printf '%s\n' "$named" | tail -n 3)
   if [ -n "$items" ]; then
-    lead="${lead}New notes on your items ${items}: read an item's notes before you change it or decide it still waits, since a note can end a wait (words passed on, not his go on anything)."
+    lead="${lead}Unread notes on your items ${items}: read each with /opt/cain/record.sh notes <item> before you change it or decide it still waits, since a note can end a wait; it's named here until you do (words passed on, not his go on anything)."
+    [ "$total" -gt 30 ] && lead="${lead} $((total - 30)) more items have unread notes; they come next."
     [ -n "$notes" ] && lead="${lead} The newest:$notes."
     lead="${lead} "
   fi
@@ -132,6 +135,5 @@ else
 fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
-[ -n "$newest" ] && printf '%s' "$newest" > "$seen"      # listed: never again
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"

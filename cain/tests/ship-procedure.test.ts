@@ -106,9 +106,12 @@ describe("Cain's rules", () => {
       + "before the Ship card, even if it was reviewed elsewhere: only a service review's line goes on the card");
     // Fixes go back with the item, so the fixed head comes back the way it first came: Cain hears
     // at once (Nov 15, a re-handoff as a note waited most of a day for a check-in).
-    expect(jobs.split("5. A laptop session hands you")[1].replace(/\s+/g, " ")).toContain("If the review calls for fixes and a laptop "
-      + "session still holds the branch, pass the item back to that session with the findings in a note, in one request: "
-      + "it passes the item to you again with the new head, and you hear at once");
+    const step5 = jobs.split("5. A laptop session hands you")[1].replace(/\s+/g, " ");
+    expect(step5).toContain("If the review calls for fixes, they go with the branch (`/opt/cain/record.sh holds`): "
+      + "- The pass brought it: the branch is yours with the item, so run Build on it with the fixes, as for your own pull request. "
+      + "- A laptop session kept it");
+    expect(step5).toContain("pass the item back to that session with the findings in a note, in one request. It passes the item "
+      + "to you again with the new head, and you hear at once.");
   });
 
   test("a Reviewed line is the relay's, word for word, and the gate refuses any other", () => {

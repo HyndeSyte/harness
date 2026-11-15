@@ -99,6 +99,38 @@ describe("the keeper's holds", () => {
     expect(said).toContain("/opt/cain/record.sh notes P33");
   }, 30_000);
 
+  test("fixes go back with the item and come back by a pass: laptop, Cain, laptop, Cain, and he hears each time it's his", () => {
+    // Nov 15: a review that needed fixes left the item with Cain and the branch with the laptop
+    // session (it kept the branch under another item), so the fixed head came back as a note,
+    // which waited for a check-in. Passed back with the findings, it comes back by a pass.
+    const r = rig();
+    r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [
+      take("P33", "chat: wave 1", { branches: ["claude/c1-own-user"] }), take("P44", "chat: the piece for Cain")] }]);
+    cycle(r.cfg);
+    r.inbox(["2.json", { id: "lap-pass-1", from: A, ops: [
+      { op: "note", item: "P44", text: "Ready: pull request 20 at head dc6a7ce" }, { op: "pass", item: "P44", to: "cain" }] }]);
+    cycle(r.cfg);
+    expect(r.holds().P44).toMatchObject({ holder: "cain", branches: [] });
+    expect(r.holds().P33).toMatchObject({ holder: A, branches: ["claude/c1-own-user"] });   // the laptop kept the branch
+    expect(r.relayed()).toContain(`${A} passed P44 to you (request lap-pass-1): it's yours now. Its note: «Ready: pull request 20 at head dc6a7ce»`);
+    // His review calls for fixes: the findings go back with the item, in one request, and he isn't told of his own pass.
+    const heard = r.relayed().length;
+    r.cain({ id: "cain-pass-back", ops: [
+      { op: "note", item: "P44", text: "Review: fix the scrub and the nonce, then pass it back" }, { op: "pass", item: "P44", to: A }] });
+    cycle(r.cfg);
+    expect(r.outcome("cain-pass-back")).toMatchObject({ state: "done" });
+    expect(r.holds().P44).toMatchObject({ holder: A, branches: [] });
+    expect(noteRows(r.upstream("state/notes/P44.md")).map((n) => [n.from, n.text])).toEqual([
+      [A, "Ready: pull request 20 at head dc6a7ce"], ["cain", "Review: fix the scrub and the nonce, then pass it back"]]);
+    expect(r.relayed().slice(heard)).not.toContain("passed");
+    // The fixed head comes back by a pass: he hears at once, not at a check-in.
+    r.inbox(["3.json", { id: "lap-pass-2", from: A, ops: [
+      { op: "note", item: "P44", text: "Fixed: pull request 20 at head d47fd11" }, { op: "pass", item: "P44", to: "cain" }] }]);
+    cycle(r.cfg);
+    expect(r.holds().P44).toMatchObject({ holder: "cain" });
+    expect(r.relayed().slice(heard)).toContain(`${A} passed P44 to you (request lap-pass-2): it's yours now. Its note: «Fixed: pull request 20 at head d47fd11»`);
+  }, 30_000);
+
   test("Cain hears nothing about a pass that isn't to him, or one he made", () => {
     const r = rig();
     r.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
