@@ -20,6 +20,13 @@
 - The check page's cookie lasts years and is locked down; the probe has you restart that Chrome once to prove it survives, and a cleared cookie says so plainly.
 - If Claude Code doesn't report which Claude in Chrome version answered, runs only happen while you watch. When a new version stops the PC, Cain tells you in one line what to run at the PC.
 - The run's tab stays open on a blank page (about:blank; the browser tools it has can't close tabs); the next run reuses it. Cain's docs have a troubleshooting table for every reason a run stops, and for each thing only your PC can show.
+- Nothing runs at all, not even a run you start, until the probe has shown Claude Code refusing on its own a page the PC's guard didn't allow. That proof is tied to the exact Claude Code it was seen on: any change to it means probing again.
+- Fewer ways for a page to sneak words out: a plan is one word from a fixed list (anything else counts as "other"), a masked account shows at most four letters or digits, and an address in a report must be one your allowlist approved. The probe also tries to pass a token off as a plan name and checks it is refused.
+- A failed run leaves only its reason code behind: no address and no values in the result, the heartbeat or the PC's last-run file. Only your own trouble log, off unless you turn it on, keeps the addresses, on the PC.
+- The check page never shows the profile's secret any more: the PC checks the cookie itself and the page only says "bound".
+- At setup the PC checks the extension's helper is registered where your install file says (a new `check-host` command, and bind-profile), and accepts Chrome starting the helper directly.
+- Every run first checks the four reading tools by name and that the reading tools still report page addresses the way the probe saw. When Claude Code doesn't report the extension's version, a run you watch uses the version in the extension's own files instead.
+- Signing your allowlist refuses addresses with a query or words like logout, unsubscribe, delete or cancel, unless you mark the entry as reviewed.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
 
 ## 0.11.0

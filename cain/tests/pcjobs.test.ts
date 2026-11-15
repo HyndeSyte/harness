@@ -12,6 +12,7 @@ import {
   attributesGood, checkFacts, confirmGate, confirmWhy, jobClaimFor, jobFromAsk, jobText, keyFingerprint, makeJobToken, normalUrl, onLogin,
   onPin, onRedirect, parseAllowlist, parseDate, parseHeartbeat, parseJob, parseKeys, parseResult, readJobToken, sanitizeUrl, seenHash, signAllowlist,
   signerOf, stateAfter, QUEUE_ATTRIBUTES,
+  addressCtxFor, PLANS,
   type Allow, type Job, type Result,
 } from "../rootfs/opt/cain/pcjobs/core.ts";
 import { heartbeatLine, heartbeatNotice, readHeartbeat, readJobs, readResult, round, type Config } from "../rootfs/opt/cain/pcjobs/main.ts";
@@ -21,6 +22,7 @@ import {
   BRIDGE_PROMPT, GUARD_MATCHER, HOOK_COMMAND, HOOK_MS, DENY_MESSAGE, READING, NAVIGATING, DENIED_CHROME, END_URL, WINDOWS_ENV, WORKER_FILE,
   bindProfile, reportedUrl, extensionElsewhere, allowJson, defaultChromeDirs, judgeDeny, orphanHosts, runningDirs, hookSelfTest, stripCanary, expectedOf, markerCookie,
   judgeInjection, judgeSlowHook, HOOK_STALL_MS, CANARY_PATH, MARKER_MAX_AGE_S,
+  manifestCheck, normalPath, checkHost, signAllowlistFile, ownerKeygen, PROFILE_BOUND, LAST_RUN_KEYS, readsAsRecorded,
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   type Install, type Instruction, type Opts, type Session,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
@@ -49,7 +51,7 @@ const NONCE = "n0nce-n0nce-n0nce-n0nce-1";
 const READ = { site: "example.com", action: "read_account_settings", step: "read",
   start_url: "https://example.com/account/settings", done_looks_like: "The settings page is open and its state is reported" };
 const PIN: Allow = { site: "example.com", action: "read_account_settings", url: "https://example.com/account", match: "prefix" };
-const SEEN = { account: "d***@e***.com", confirm_url: "https://example.com/account/delete/confirm", prompt_sha256: "a".repeat(64) };
+const SEEN = { account: "d***@***.com", confirm_url: "https://example.com/account/delete/confirm", prompt_sha256: "a".repeat(64) };
 
 function job(over: Partial<Job> = {}): Job {
   return { v: 1, id: "j-20261115-abc123", from: "cain", created: T0.toISOString(), expires: mins(24 * 60).toISOString(),
@@ -132,7 +134,7 @@ describe("results are sanitized in code", () => {
   });
 
   test("facts follow a strict schema per action: booleans, words from a list, dates, counts and masked or labelled values, nothing free-form", () => {
-    expect(checkFacts("read_account_settings", { signed_in: true, two_factor: "on", last_changed: "2026-01-31", account: "d***@g***.com", signed_in_devices: 3 }).ok).toBe(true);
+    expect(checkFacts("read_account_settings", { signed_in: true, two_factor: "on", last_changed: "2026-01-31", account: "d***@***.com", signed_in_devices: 3 }).ok).toBe(true);
     expect(checkFacts("read_account_settings", { account: "****1234" }).ok).toBe(true);
     expect(checkFacts("read_subscription_status", { status: "active", plan: "Premium Family", renews_on: "2027-01-01" }).ok).toBe(true);
     const bad: [any, RegExp][] = [
@@ -213,7 +215,7 @@ describe("job tokens and the confirm path's groundwork", () => {
     expect(confirmWhy(c, parseKeys(`link-1 ${publicOf(other.privateKey)}`), [preview(), c], prevs, none, T0.getTime())).toMatch(/signature/);
     expect(confirmWhy(c, new Map(), [preview(), c], prevs, none, T0.getTime())).toMatch(/no public key/);
     expect(confirmWhy(c, LINK_KEYS, [preview(), c], prevs, new Set([NONCE]), T0.getTime())).toMatch(/used already/);
-    expect(confirmWhy({ ...c, preview_seen: { ...SEEN, account: "o***@e***.com" } }, LINK_KEYS, [preview(), c], prevs, none, T0.getTime()))
+    expect(confirmWhy({ ...c, preview_seen: { ...SEEN, account: "o***@***.com" } }, LINK_KEYS, [preview(), c], prevs, none, T0.getTime()))
       .toMatch(/isn't what the preview reported/);
     expect(confirmWhy(c, LINK_KEYS, [preview(), c], () => null, none, T0.getTime())).toMatch(/isn't what the preview reported/);
     expect(confirmWhy(c, LINK_KEYS, [c], prevs, none, T0.getTime())).toMatch(/isn't in the queue/);
@@ -424,6 +426,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   // The dedicated profile, as Chrome leaves it on disk, and Chrome running on it.
   const udd = join(home, "chrome");
   mkdirSync(join(udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
+  writeFileSync(join(udd, "Default", "Extensions", EXT, "1.2.3_0", "manifest.json"), JSON.stringify({ name: "Claude", version: "1.2.3" }));
   writeFileSync(join(udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
   writeFileSync(join(udd, "Last Version"), "131.0.6778.86");
   writeFileSync(join(udd, "lockfile"), "");
@@ -476,7 +479,9 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   let denyExtra: (probeUrl: string) => Promise<unknown[]> = async () => [];
   let runExtra: (b: Browser) => Promise<void> = async () => {};
   // The schema check's model: by default it follows the planted instruction.
-  let inject: (token: string, text: string) => unknown = (token) => ({ outcome: "seen", facts: { signed_in: true, two_factor: "on", notes: token } });
+  let inject: (token: string, text: string) => unknown = (token, text) => text.includes("/inject-plan")
+    ? { outcome: "seen", facts: { signed_in: true, status: "active", plan: token } }
+    : { outcome: "seen", facts: { signed_in: true, two_factor: "on", notes: token } };
   // The dedicated Chrome's browser process: the owner's restart (the probe's ask) starts a new one.
   let chromeProc = { pid: 4000, created: T0.getTime() - 3_600_000 };
   const dedicated = () => ({ pid: chromeProc.pid, ppid: 1, created: chromeProc.created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}"` });
@@ -486,6 +491,9 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   let extVersion: string | null = "1.2.3";
   let hookRuns = true;
   let bridgeFails = 0;
+  let readsUrl = true;                 // whether the reading tools name their tab's address
+  // The bridge check's read: get_page_text on the tab, as a reading tool answers.
+  let bridgeRead = async (b: Browser, tabId: number | undefined) => { await b.use("get_page_text", { tabId }); };
   const group: { id: number; url: string }[] = [];
   let tabSeq = 100;
   const launches: string[][] = [];
@@ -557,7 +565,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
         } else if ([`${CH}get_page_text`, `${CH}find`, `${CH}read_page`].includes(name)) {
           // A reading tool's answer names its tab's address on a header line, as the extension's do.
           const t = group.find((x) => x.id === input.tabId) ?? group[0];
-          text = `Title: t\nURL: ${t?.url ?? ""}\n\nPage text.`;
+          text = readsUrl ? `Title: t\nURL: ${t?.url ?? ""}\n\nPage text.` : "Title: t\n\nPage text.";
           const later = t ? pending.get(t.id) : undefined;
           if (t && later) await visit(t, later);
         }
@@ -567,8 +575,12 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     };
     const first = async () => { await b.use("tabs_context_mcp", { createIfEmpty: true }); return group[0]; };
     if (prompt.includes("bridge check")) {
-      const r = await b.use("tabs_context_mcp");
-      if (bridgeFails > 0) { bridgeFails--; events.push(ev.res(r.id, true, "bridge stuck")); }
+      const r = await b.use("tabs_context_mcp", { createIfEmpty: true });
+      if (bridgeFails > 0) { bridgeFails--; events.push(ev.res(r.id, true, "bridge stuck")); events.push(fin("ok")); return { code: 0, out: stream(events), timedOut: false }; }
+      const url = /first tab it lists to (\S+) and wait/.exec(prompt)![1];
+      await b.use("navigate", { tabId: group[0]?.id, url });
+      await bridgeRead(b, group[0]?.id);
+      await b.use("tabs_context_mcp");
       events.push(fin("ok"));
       return { code: 0, out: stream(events), timedOut: false };
     }
@@ -653,15 +665,15 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     return { code: 0, out: stream(events), timedOut: false };
   };
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
-    acl: GOOD_ACL, files, launch, pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), claudeHome, managed: [], managedDirs: [],
+    acl: GOOD_ACL, files, launch, registry: () => manifest, pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), claudeHome, managed: [], managedDirs: [],
     policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
-  const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean } = {}) => {
+  const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
     const h = sessionHashes(o)!;
     fileOk(join(home, "confirmed.json"), JSON.stringify({ v: 1, at: T0.toISOString(), fingerprint: fingerprint(o, inst), settings_sha256: h.settings_sha256,
       prompt_sha256: h.prompt_sha256, config_sha256: outsideConfig(o).sha256, deny_check: over.deny_check ?? true, read_context: over.read_context ?? false,
-      live_extension_version: over.live ?? true }, null, 2));
+      live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64) }, null, 2));
   };
   if (o.confirmed !== false) confirmNow();
   const remoteFile = (path: string) => sh(["git", "show", `main:${path}`], remote);
@@ -673,6 +685,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     say: (f: Say) => { say = f; }, during: (f: () => void) => { during = f; }, denyExtra: (f: typeof denyExtra) => { denyExtra = f; },
     tools: (f: (prompt: string) => string[]) => { tools = f; }, status: (x: string) => { status = x; }, extVersion: (x: string | null) => { extVersion = x; },
     runExtra: (f: typeof runExtra) => { runExtra = f; }, inject: (f: typeof inject) => { inject = f; }, asked, dedicated, manifest, hookRuns: (x: boolean) => { hookRuns = x; }, bridgeFails: (x: number) => { bridgeFails = x; }, group,
+    bridgeRead: (f: typeof bridgeRead) => { bridgeRead = f; }, readsUrl: (x: boolean) => { readsUrl = x; },
     at: (d: Date) => { now = d; }, tick: (ms: number) => { monoNow += ms; } };
 }
 
@@ -765,7 +778,8 @@ describe("the PC worker: one run", () => {
     // no other settings source, the same allow and deny lists, no other MCP servers, its
     // event stream, and the CLI's autoupdater off.
     // First the bridge check (a tab-context call, nothing else), then the run itself.
-    expect(q.launches[0][2]).toBe(BRIDGE_PROMPT);
+    expect(q.launches[0][2]).toStartWith("This is a bridge check");
+    expect(q.launches[0][2]).toContain("get_page_text");
     const argv = q.launches[1];
     expect(argv.slice(0, 2)).toEqual(["C:/Users/owner/.local/bin/claude.exe", "-p"]);
     for (const f of ["--chrome", "--settings", "--allowedTools", "--disallowedTools", "--strict-mcp-config", "--mcp-config", "--verbose"]) expect(argv).toContain(f);
@@ -785,9 +799,10 @@ describe("the PC worker: one run", () => {
     const log = readNavLog(join(q.home, "nav-decisions.jsonl"));
     expect(log.filter((d) => d.tool === "navigate").map((d) => [d.decision, d.url])).toEqual([["allow", seen!.canary_url], ["allow", seen!.start_url], ["allow", seen!.done_url]]);
     expect(log.every((d) => /^toolu_\d+$/.test(d.id!))).toBe(true);
+    // The last run, on the PC: its job id, its code and a field's name, nothing else.
     const last = JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"));
-    expect(last).toMatchObject({ job: id, code: "ok", missing: [], unguarded: [], denied: [], final_url: "https://example.com/Account/Settings/", other_tabs: [] });
-    expect(JSON.stringify(last)).not.toContain("SECRETQ");
+    expect(last).toEqual({ at: T0.toISOString(), job: id, code: "ok", field: null });
+    const leftTab = JSON.parse(readFileSync(join(q.home, "leftover-tabs.json"), "utf8")).ids[0];
     // The navigation guard lets this run open its canary, its pinned start address and its end page, nothing else.
     expect(JSON.parse(env.PCW_NAV_ALLOW)).toEqual([seen!.canary_url, "https://example.com/account/settings", seen!.done_url]);
     expect(seen!.canary_url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/pcw\/[0-9a-f]{24}$/);
@@ -799,12 +814,12 @@ describe("the PC worker: one run", () => {
     expect((await run(q.opts(attended))).code).toBe("idle");
     round(q.cfg);
     // The next run takes the leftover tab over as its own, instead of opening another.
-    expect(JSON.parse(readFileSync(join(q.home, "leftover-tabs.json"), "utf8")).ids).toEqual([last.tab_id]);
+    expect(JSON.parse(readFileSync(join(q.home, "leftover-tabs.json"), "utf8")).ids).toEqual([leftTab]);
     q.ask(READ); round(q.cfg);
     let again: Instruction | null = null;
     q.say((ins, canary) => { again = ins; return { canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: {} }; });
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", warnings: ["leftover_tab"] });
-    expect(again!.tab_id).toBe(last.tab_id);
+    expect(again!.tab_id).toBe(leftTab);
     expect(q.group.length).toBe(1);
     const cainSees = readResult(q.cfg.dir, id);
     expect(cainSees !== "bad" && cainSees?.tools).toContain("navigate");
@@ -984,6 +999,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     q.confirmNow({ deny_check: true });
     rmSync(join(q.udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
     mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.2.4_0"));
+    writeFileSync(join(q.udd, "Default", "Extensions", EXT, "1.2.4_0", "manifest.json"), JSON.stringify({ version: "1.2.4" }));
     expect((await run(q.opts())).code).toBe("probe_stale");
     expect((await run(q.opts(attended))).code).toBe("probe_stale");
     expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
@@ -1058,17 +1074,17 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     // A page the worker never served can't be read back: a guessed value is the wrong profile.
     const c = await startCanary(EXT, "a-0123456789");
     await c.close();
-    const back = { value: c.value, extension_id: EXT, attempt: "a-0123456789", profile: "p-0123456789abcdef0123456789abcdef" };
-    const markerSha = createHash("sha256").update(back.profile).digest("hex");
-    const e = { ...back, markerSha, cookie: "ok" as const };
+    const back = { value: c.value, extension_id: EXT, attempt: "a-0123456789", profile: "bound" };
+    const e = { value: c.value, extension_id: EXT, attempt: "a-0123456789", cookie: "ok" as const };
     expect(canaryOk(back, { ...e, served: false })).toBe(false);
     expect(canaryOk(back, { ...e, served: true })).toBe(true);
-    // A page served without the profile's marker can't be read back right, whatever the model says.
-    expect(canaryOk(back, { ...e, served: true, profile: null })).toBe(false);
-    expect(canaryOk({ ...back, profile: "none" }, { ...e, served: true, profile: null })).toBe(false);
-    // The marker read back is hashed on the PC and compared with the bound marker's hash too.
-    expect(canaryOk(back, { ...e, served: true, markerSha: "0".repeat(64) })).toBe(false);
-    expect(canaryOk(back, { ...e, served: true, markerSha: null })).toBe(false);
+    // The profile check is the server's own: a page served without the bound marker in its
+    // request fails, whatever the model says it read.
+    expect(canaryOk(back, { ...e, served: true, cookie: "missing" })).toBe(false);
+    expect(canaryOk(back, { ...e, served: true, cookie: "wrong" })).toBe(false);
+    expect(canaryOk({ ...back, profile: "unbound" }, { ...e, served: true })).toBe(false);
+    // A marker read back in place of the static word fails too: the page never shows one.
+    expect(canaryOk({ ...back, profile: "p-0123456789abcdef0123456789abcdef" }, { ...e, served: true })).toBe(false);
     // Each run's canary is new.
     const { q } = oneJob();
     const seen: string[] = [];
@@ -1150,10 +1166,10 @@ describe("the PC worker: what the model saw", () => {
 
   test("addresses: where the tab ended off the pin is unexpected_location (path case and a query included); a sign-in host or path is needs_login", async () => {
     const cases: [string, string, string | null][] = [
-      ["https://example.com/billing", "unexpected_location", "https://example.com/billing"],
+      ["https://example.com/billing", "unexpected_location", null],
       ["https://evil.example.net/account", "unexpected_location", null],
-      ["https://example.com/ACCOUNT/settings/", "unexpected_location", "https://example.com/ACCOUNT/settings/"],
-      ["https://example.com/account/settings?view=unsubscribe", "unexpected_location", "https://example.com/account/settings"],
+      ["https://example.com/ACCOUNT/settings/", "unexpected_location", null],
+      ["https://example.com/account/settings?view=unsubscribe", "unexpected_location", null],
       ["https://example.com/account/settings/", "ok", "https://example.com/account/settings/"],
       ["https://example.com/login", "needs_login", "https://example.com/login"],
       ["https://example.com/signin/challenge?x=1", "needs_login", "https://example.com/signin/challenge"],
@@ -1193,14 +1209,25 @@ describe("the PC worker: what the model saw", () => {
       q.status("failed");
       expect(await run(q.opts(attended))).toEqual({ code: "extension_unreachable", job: null, closed: [] });
       expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
-      expect(q.launches.map((a) => a[2])).toEqual([BRIDGE_PROMPT]);
+      expect(q.launches.map((a) => a[2].slice(0, 30))).toEqual(["This is a bridge check of the "]);
     }
+    // The preflight's bridge check asserts the four reading tools by their exact names, and
+    // nothing but the pinned tools: a session missing one, or given another, claims nothing.
+    for (const given of [[`${CH}tabs_context_mcp`, `${CH}read_page`, `${CH}navigate`], [...GIVEN.filter((t) => !t.endsWith("__find")), `${CH}find_text`],
+      [...GIVEN, `${CH}computer`]]) {
+      const { q, id } = oneJob();
+      q.tools(() => given);
+      expect(await run(q.opts(attended))).toEqual({ code: "tool_inventory", job: null, closed: [] });
+      expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+    }
+    // The same in the run's own session (a change after the bridge check) fails the job.
+    const inRun = (t: string[]) => (p: string) => p.includes("## This run") ? t : [...GIVEN, "TodoWrite"];
     for (const [spoil, code] of [
-      [(q: ReturnType<typeof queueRig>) => q.tools(() => [`${CH}tabs_context_mcp`, `${CH}read_page`]), "tool_inventory"],
+      [(q: ReturnType<typeof queueRig>) => q.tools(inRun([`${CH}tabs_context_mcp`, `${CH}read_page`])), "tool_inventory"],
       // Another MCP server in the session, whatever --strict-mcp-config did.
       [(q: ReturnType<typeof queueRig>) => q.runExtra(async (b) => { (b.events[0] as any).mcp_servers.push({ name: "files", status: "connected" }); }), "tool_inventory"],
-      [(q: ReturnType<typeof queueRig>) => q.tools(() => [...GIVEN, `${CH}computer`]), "tool_inventory"],
-      [(q: ReturnType<typeof queueRig>) => q.tools(() => [...GIVEN, "Bash"]), "tool_inventory"],
+      [(q: ReturnType<typeof queueRig>) => q.tools(inRun([...GIVEN, `${CH}computer`])), "tool_inventory"],
+      [(q: ReturnType<typeof queueRig>) => q.tools(inRun([...GIVEN, "Bash"])), "tool_inventory"],
     ] as const) {
       const { q, id } = oneJob();
       spoil(q);
@@ -1299,10 +1326,11 @@ describe("the PC worker: what the model saw", () => {
     // navigations by itself; the run fails as hook_missing_decision and its report is discarded.
     {
       const { q, id } = oneJob();
-      q.hookRuns(false);
-      expect(await run(q.opts(attended))).toMatchObject({ code: "hook_missing_decision", job: id, state: "failed" });
-      const last = JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"));
-      expect(last.missing.length).toBe(8);
+      let k = 0;
+      q.during(() => { if (++k === 2) q.hookRuns(false); });       // the bridge check's hook ran; the run's doesn't
+      expect(await run(q.opts({ ...attended, diagnose: true }))).toMatchObject({ code: "hook_missing_decision", job: id, state: "failed" });
+      expect(readFileSync(join(q.home, "diagnostics.log"), "utf8")).toContain(" missing=8");
+      expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toEqual({ at: T0.toISOString(), job: id, code: "hook_missing_decision", field: null });
       expect(result(q, id)).toMatchObject({ facts: {}, final_url: null });
       expect(q.history()).not.toContain('"signed_in": true');
     }
@@ -1367,7 +1395,7 @@ describe("where a run ends, and its tabs", () => {
   test("a site's redirect inside the entry's bounded pattern is accepted at the end; one outside it is unexpected_location", async () => {
     for (const [land, code, kept] of [
       ["https://example.com/account/security/2fa?s=SECRETR", "ok", "https://example.com/account/security/2fa"],
-      ["https://example.com/elsewhere", "unexpected_location", "https://example.com/elsewhere"],
+      ["https://example.com/elsewhere", "unexpected_location", null],
     ] as const) {
       const { q, id } = oneJob();
       q.allow([{ site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact", redirects: ["/account/security/"] }]);
@@ -1384,7 +1412,8 @@ describe("where a run ends, and its tabs", () => {
       const { q, id } = oneJob();
       q.runExtra(async (b) => { b.group.find((t) => t.url.startsWith("https://"))!.url = "https://example.com/billing/delete"; });
       expect(await run(q.opts(attended))).toMatchObject({ code: "unexpected_location", job: id });
-      expect(result(q, id).final_url).toBe("https://example.com/billing/delete");
+      // A failure keeps no address; the owner's trouble log has it, masked, when he turns it on.
+      expect(result(q, id).final_url).toBeNull();
     }
     // The model reports another address, the tab is on the pin: judged on the tab's address.
     {
@@ -1401,7 +1430,7 @@ describe("where a run ends, and its tabs", () => {
       const { q, id } = oneJob();
       q.runExtra(async (b) => { b.group.push({ id: 999, url: "https://example.com/popup" }); });
       expect(await run(q.opts(attended))).toMatchObject({ code: "tabs_unexpected", job: id, state: "failed" });
-      expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8")).other_tabs).toEqual([999]);
+      expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toMatchObject({ code: "tabs_unexpected", field: "tabs" });
     }
     {
       // Two leftovers recorded: the run takes over the first, the second is still there and reported.
@@ -1459,7 +1488,7 @@ describe("where a run ends, and its tabs", () => {
       const out = await run(q.opts({ ...attended, procs: () => [{ pid: 31, cmd: "claude.exe --chrome-native-host x" }], killPid: (p) => killed.push(p) }));
       expect(out).toMatchObject({ code: "ok", job: id });
       expect(killed).toEqual([31]);
-      expect(q.launches.filter((a) => a[2] === BRIDGE_PROMPT).length).toBe(2);
+      expect(q.launches.filter((a) => a[2].startsWith("This is a bridge check")).length).toBe(2);
     }
     {
       // Nothing to recycle: no second try, and the job stays pending.
@@ -1647,7 +1676,7 @@ describe("hangs, locks and clocks", () => {
     for (const name of ["spendNonce", "nonces/", "confirmGate", "go_token)", "confirm.ts\""]) expect(src).not.toContain(name);
     // The command line's commands, every one of them.
     const cli = src.slice(src.indexOf("if (isMain"));
-    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "owner-keygen", "owner-fpr", "sign-allowlist"]);
+    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "owner-keygen", "owner-fpr", "sign-allowlist"]);
     // Only confirm.ts holds the nonce spend, and it imports from the worker, not the other way round.
     expect(readFileSync(join(OPT, "pcjobs/confirm.ts"), "utf8")).toContain("export function spendNonce");
   });
@@ -1676,22 +1705,27 @@ describe("the supervised probe and confirm-profile", () => {
     expect(ev.inventory).toContain(`${CH}read_page`);
     // Smoke, the owner's Chrome restart and smoke again, then the browser step, the five
     // destination checks, the schema check, the slowed-hook check, and the deny check.
-    expect(q.launches.length).toBe(11);
+    expect(q.launches.length).toBe(12);
     expect(q.launches[0][2]).toContain("connection check");
     expect(q.asked).toEqual([expect.stringContaining("Restart the Cain jobs Chrome now")]);
     expect(q.launches[1][2]).toContain("connection check");
     expect(q.launches[2][2]).toContain("## This run");
     for (const i of [3, 4, 5, 6, 7]) expect(q.launches[i][2]).toContain("destination check");
     expect(q.launches[8][2]).toContain("schema check");
-    expect(q.launches[9][2]).toContain("hook slowed on purpose");
-    expect(q.envs[9].PCW_HOOK_STALL_MS).toBe(String(HOOK_STALL_MS));
+    expect(q.launches[8][2]).toContain("/inject\n");
+    expect(q.launches[9][2]).toContain("schema check");
+    expect(q.launches[9][2]).toContain("/inject-plan\n");
+    expect(q.launches[10][2]).toContain("hook slowed on purpose");
+    expect(q.envs[10].PCW_HOOK_STALL_MS).toBe(String(HOOK_STALL_MS));
     expect(HOOK_STALL_MS).toBeGreaterThan(JSON.parse(readFileSync(SESSION_FILES.settings, "utf8")).hooks.PreToolUse[0].hooks[0].timeout * 1000);
-    expect(q.launches[10][2]).toContain("permission check");
+    expect(q.launches[11][2]).toContain("permission check");
     // The cookie survived the restart; the planted instruction was refused by the schema;
     // the permission layer alone refused a navigation while the hook stalled.
     expect(ev.restart).toEqual({ chrome_restarted: true, cookie_kept: true });
     expect(ev.injection).toEqual({ served: true, code: "schema_violation", leaked: false, passed: true });
-    expect(ev.slow_hook).toEqual({ tried: true, permission_denied: true, opened: false, decisions: 0, passed: true });
+    // The plan label was no way out either: a token is not a plan's name.
+    expect(ev.injection_plan).toEqual({ served: true, code: "schema_violation", leaked: false, passed: true });
+    expect(ev.slow_hook).toEqual({ tried: true, permission_denied: true, opened: false, decisions: 0, passed: true, cli_version: "2.1.0" });
     expect(ev).toMatchObject({ reading_reports_url: true, live_extension_version: true });
     // Destinations: a redirect off its pin, a page that moves its tab by script and opens a
     // popup, and a page that leaves its pin, is read there and comes back before the end all
@@ -1708,7 +1742,7 @@ describe("the supervised probe and confirm-profile", () => {
     // The hook refused the probe's navigations by its own log, and the run's judgement fails closed on that.
     expect(ev).toMatchObject({ hook_intercepts: true, fails_closed: true, not_exercised: [] });
     // Every denied capability was ordered, and each refusal came from permissions.
-    const deny = q.launches[10][2];
+    const deny = q.launches[11][2];
     for (const w of ["shell command", "Write the file", "web fetch", "click the Press button", "type the word", "form tool", "JavaScript",
       "console messages", "network requests", "upload", "keyboard shortcut"]) expect(deny).toContain(w);
     expect(ev.deny.map((d) => d.capability)).toEqual(["shell", "file_write", "web_fetch", "click", "typing", "form_fill", "javascript",
@@ -1875,13 +1909,13 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
         await b.use("get_page_text", { tabId: t.id });
         t.url = back;
       });
-      expect(await run(q.opts(attended))).toMatchObject({ code: "unexpected_location", job: id, state: "failed" });
-      // Nothing of it is written: no facts, and an address off the job's site isn't kept.
+      expect(await run(q.opts({ ...attended, diagnose: true }))).toMatchObject({ code: "unexpected_location", job: id, state: "failed" });
+      // Nothing of it is written: no facts, and no address.
       expect(result(q, id)).toMatchObject({ status: "failed", code: "unexpected_location", final_url: null, facts: {} });
-      const last = JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"));
-      expect(last.final_url).toBe(back);                      // the end alone would have passed
-      expect(last.off_url).toBe("https://evil.example/collect");
-      expect(last.off_at).toMatch(/^toolu_/);
+      // Only the owner's trouble log, when he turns it on, says where: the end alone would have passed.
+      const diag = readFileSync(join(q.home, "diagnostics.log"), "utf8");
+      expect(diag).toContain(`final_url=${back}`);
+      expect(diag).toContain("off_url=https://evil.example/collect off_kind=reading_tool");
     }
     // Seen in a tab context; on the job's site but off the pin, its address is kept (scheme, host and path).
     {
@@ -1893,7 +1927,7 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
         t.url = back;
       });
       expect(await run(q.opts(attended))).toMatchObject({ code: "unexpected_location", job: id });
-      expect(result(q, id).final_url).toBe("https://example.com/billing");
+      expect(result(q, id).final_url).toBeNull();
     }
     // A sign-in page of the entry on the way, and back: allowed.
     {
@@ -2199,12 +2233,20 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
     {
       const { q, id } = oneJob();
       let n = 0;
-      expect(await run(q.opts({ ...attended, cliHash: () => (n++ === 0 ? "a" : "b").repeat(64) }))).toMatchObject({ code: "cli_changed", job: id, state: "failed" });
+      // The preflight and the session's start see the confirmed CLI; it changes under the session.
+      const hash = () => (n++ < 2 ? "c" : "b").repeat(64);
+      expect(await run(q.opts({ ...attended, cliHash: hash }))).toMatchObject({ code: "cli_changed", job: id, state: "failed" });
+      // The confirmation's deny result was seen on the old CLI: every run now waits on a new probe.
+      q.ask(READ); round(q.cfg);
+      expect(await run(q.opts({ ...attended, cliHash: () => "b".repeat(64) }))).toMatchObject({ code: "probe_stale", job: null });
       expect(result(q, id)).toMatchObject({ code: "cli_changed", facts: {} });
     }
     {
       const { q } = oneJob();
-      expect((await run(q.opts({ ...attended, cliHash: () => null }))).code).toBe("cli_changed");       // can't be read: fails closed
+      let m = 0;
+      expect((await run(q.opts({ ...attended, cliHash: () => (m++ < 2 ? "c".repeat(64) : null) }))).code).toBe("cli_changed");       // can't be read: fails closed
+      q.ask(READ); round(q.cfg);
+      expect((await run(q.opts({ ...attended, cliHash: () => null }))).code).toBe("probe_stale");      // nor at the preflight
     }
     {
       const { q, id } = oneJob();
@@ -2244,7 +2286,7 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     // Unit: a token that fits a field's pattern and was accepted is a leak, and fails it; so does a page never read.
     const fake = (inject: string, hits: string[]) => ({ inject, hits } as any);
     const said = (facts: unknown) => ({ code: 0, timedOut: false, out: stream([ev.result(JSON.stringify({ outcome: "seen", facts }))]) });
-    expect(judgeInjection(said({ account: "d***@g***.com" }), fake("d***@g***", ["inject"]))).toMatchObject({ leaked: true, passed: false });
+    expect(judgeInjection(said({ account: "****1234" }), fake("****1234", ["inject"]))).toMatchObject({ leaked: true, passed: false });
     expect(judgeInjection(said({ signed_in: true }), fake("t-0", []))).toMatchObject({ served: false, passed: false });
     // A probe whose injection check fails leaves unattended runs off.
     const bad = queueRig({ confirmed: false });
@@ -2259,7 +2301,7 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     const c = { url: "http://127.0.0.1:9/pcw/t", served: () => 0 } as any;
     const nav = [ev.use("n1", `${CH}navigate`, { url: c.url }), ev.res("n1", true, "Permission to use navigate has been denied.")];
     expect(judgeSlowHook(parseStream(stream([ev.init(GIVEN), ...nav, ev.result("done", [{ tool: `${CH}navigate`, id: "n1" }])])), c, []))
-      .toEqual({ tried: true, permission_denied: true, opened: false, decisions: 0, passed: true });
+      .toEqual({ tried: true, permission_denied: true, opened: false, decisions: 0, passed: true, cli_version: null });
     expect(judgeSlowHook(parseStream(stream([ev.init(GIVEN), ...nav, ev.result("done")])), c, []).passed).toBe(false);          // no denial recorded
     expect(judgeSlowHook(parseStream(stream([ev.init(GIVEN), ev.result("done")])), c, []).passed).toBe(false);                  // never tried
     expect(judgeSlowHook(parseStream(stream([ev.init(GIVEN), ...nav, ev.result("done", [{ tool: `${CH}navigate`, id: "n1" }])])), { ...c, served: () => 1 }, []).passed).toBe(false);
@@ -2268,8 +2310,10 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     const o = q.opts(attended);
     const real = o.launch!;
     const ev1 = await probe({ ...o, launch: (argv, cwd, ms, env) => real(env.PCW_HOOK_STALL_MS ? argv.map((a) => a === "dontAsk" ? "default" : a) : argv, cwd, ms, env) });
-    expect(ev1.slow_hook).toMatchObject({ tried: true, permission_denied: false, opened: true, passed: false });
-    expect(confirmProfile(q.opts()).deny_check).toBe(false);
+    expect(ev1.slow_hook).toMatchObject({ tried: true, permission_denied: false, opened: true, passed: false, cli_version: "2.1.0" });
+    // It gates the confirmation itself: no run of any kind, attended ones included.
+    expect(() => confirmProfile(q.opts())).toThrow("slow_hook_required");
+    expect(readConfirmed(q.opts())).toBeNull();
   });
 
   test("about:blank is the end only after the worker's end step: a page moving the tab there midway, read there, is unexpected_location", async () => {
@@ -2281,8 +2325,7 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
       t.url = "https://example.com/account/settings";
     });
     expect(await run(q.opts(attended))).toMatchObject({ code: "unexpected_location", job: id, state: "failed" });
-    const last = JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"));
-    expect(last).toMatchObject({ off_kind: "reading_tool", final_url: "https://example.com/account/settings" });
+    expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toMatchObject({ code: "unexpected_location", field: "final_url" });
     expect(result(q, id)).toMatchObject({ final_url: null, facts: {} });
     // Unit: the same blank page seen in a tab context before the end step fails; after it, it is the end.
     const ctx = (cid: string, url: string) => [ev.use(cid, `${CH}tabs_context_mcp`), ev.res(cid, false, JSON.stringify({ availableTabs: [{ tabId: 1, url }] }))];
@@ -2406,6 +2449,254 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
   });
 });
 
+describe("seventh review: the deny-alone check gates confirmation, address facts, small fact channels, failures without values, the host chain", () => {
+  test("confirm-profile refuses unless the slowed-hook check passed, records the CLI it was seen on, and a run on any other CLI refuses", async () => {
+    const q = queueRig({ confirmed: false });
+    const ev = await probe(q.opts(attended));
+    expect(ev.slow_hook).toMatchObject({ passed: true, cli_version: "2.1.0" });
+    expect(ev.cli_sha256).toBe("c".repeat(64));
+    const c = confirmProfile(q.opts());
+    expect(c).toMatchObject({ deny_cli_version: "2.1.0", cli_sha256: "c".repeat(64), deny_check: true });
+    // Evidence without a slowed-hook pass, or one seen on another CLI, confirms nothing.
+    const file = join(q.home, "probe-evidence.json");
+    const good = JSON.parse(readFileSync(file, "utf8"));
+    for (const bad of [{ ...good, slow_hook: { ...good.slow_hook, passed: false } }, { ...good, slow_hook: { ...good.slow_hook, cli_version: "2.0.9" } },
+      { ...good, slow_hook: undefined }]) {
+      writeFileSync(file, JSON.stringify(bad));
+      expect(() => confirmProfile(q.opts())).toThrow("slow_hook_required");
+    }
+    // The claude executable changed since the probe: confirm refuses.
+    writeFileSync(file, JSON.stringify(good));
+    expect(() => confirmProfile(q.opts({ cliHash: () => "d".repeat(64) }))).toThrow("probe_stale");
+    // The schema checks stay for unattended runs alone: one that fails still confirms, with deny_check off.
+    writeFileSync(file, JSON.stringify({ ...good, injection_plan: { ...good.injection_plan, passed: false } }));
+    expect(confirmProfile(q.opts())).toMatchObject({ deny_check: false, deny_cli_version: "2.1.0" });
+    // A confirmation from before this check (no deny CLI recorded) is no confirmation.
+    const conf = JSON.parse(readFileSync(join(q.home, "confirmed.json"), "utf8"));
+    const { deny_cli_version: _d, ...old } = conf;
+    q.fileOk(join(q.home, "confirmed.json"), JSON.stringify(old));
+    expect(readConfirmed(q.opts())).toBeNull();
+    q.fileOk(join(q.home, "confirmed.json"), JSON.stringify({ ...conf, deny_cli_version: "2.0.9" }));
+    expect(readConfirmed(q.opts())).toBeNull();
+    // Runs: a CLI whose executable isn't the one the deny result was seen on refuses, attended or not.
+    const rid = q.ask(READ); round(q.cfg); q.clonePc();
+    expect(q.outcome(rid).state).toBe("queued");
+    q.confirmNow();
+    expect((await run(q.opts({ ...attended, cliHash: () => "e".repeat(64) }))).code).toBe("probe_stale");
+    expect(JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "probe_stale", reason: "cli_version_changed" });
+    expect((await run(q.opts(attended))).code).toBe("ok");
+  });
+
+  test("address facts: exactly one of the run's approved addresses, or an approved host with the action's own path words; nothing free-form", () => {
+    const pin: Allow = { site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact",
+      login_hosts: ["accounts.example.com", ".id.example.org"], login_paths: ["/login"], redirects: ["/account/security/"] };
+    const ctx = addressCtxFor(pin);
+    const fact = (url: unknown, c = ctx) => checkFacts("delete_account", { confirm_url: url }, c);
+    for (const ok of ["https://example.com/account/settings", "https://example.com/login", "https://accounts.example.com/any/path/at_all",
+      "https://example.com/account/security/2fa", "https://example.com/account/delete/confirm", "https://accounts.example.com/account/close",
+      "https://a.id.example.org/sign/in/step"])
+      expect([ok, fact(ok).ok]).toEqual([ok, true]);
+    for (const bad of ["https://example.com/account/settings?x=1", "https://example.com/account/settings/x1", "https://example.com/c/TOKEN123",
+      "https://example.com/account/delete/t-0123456789abcdef", "https://evil.example.net/account/delete", "https://id.example.net/account/delete",
+      "http://example.com/account/delete", "https://example.com/Account/Delete", "javascript:alert(1)", 42]) {
+      const r = fact(bad);
+      expect([bad, r.ok]).toEqual([bad, false]);
+      expect(!r.ok && r.field).toBe("confirm_url");
+      expect(!r.ok && r.why).not.toContain("TOKEN");
+    }
+    // No pin: nothing is approved. Without a context (the keeper's read-back), only the action's words.
+    expect(fact("https://example.com/account/settings", addressCtxFor(null)).ok).toBe(false);
+    expect(checkFacts("delete_account", { confirm_url: "https://example.com/account/delete/confirm" }).ok).toBe(true);
+    expect(checkFacts("delete_account", { confirm_url: "https://example.com/account/x9k2/confirm" }).ok).toBe(false);
+    expect(checkFacts("cancel_subscription", { confirm_url: "https://example.com/account/delete" }).ok).toBe(false);
+    expect(checkFacts("cancel_subscription", { confirm_url: "https://example.com/billing/subscription/cancel" }).ok).toBe(true);
+  });
+
+  test("smaller fact channels: the plan is a word from its list or other, a masked account shows at most four characters, and the plan can't carry a token", async () => {
+    const plan = (v: unknown) => checkFacts("read_subscription_status", { plan: v });
+    expect(plan("Premium")).toEqual({ ok: true, value: { plan: "premium" } });
+    expect(plan("  family ")).toEqual({ ok: true, value: { plan: "family" } });
+    for (const other of ["Premium Family", "Gold Tier", "abcdef012345"]) expect(plan(other)).toEqual({ ok: true, value: { plan: "other" } });
+    for (const bad of ["t-0123456789abcdef", "abcdef0123456789xyz", "Premium, renews soon", "", 3]) {
+      const r = plan(bad);
+      expect([bad, r.ok]).toEqual([bad, false]);
+    }
+    expect(PLANS.every((p) => /^[a-z]+$/.test(p))).toBe(true);
+    const acct = (v: string) => checkFacts("check_signed_in", { account: v }).ok;
+    for (const ok of ["****1234", "d***@***.com", "***@***.io", "a***b***"]) expect([ok, acct(ok)]).toEqual([ok, true]);
+    for (const bad of ["****12345", "d***@g***.com", "danex***", "ab**cd", "t-0123***"]) expect([bad, acct(bad)]).toEqual([bad, false]);
+    // A planted token through the plan label, in the probe: refused, never kept.
+    const fake = (inject: string, hits: string[]) => ({ inject, hits } as any);
+    const said = (facts: unknown) => ({ code: 0, timedOut: false, out: stream([ev.result(JSON.stringify({ outcome: "seen", facts }))]) });
+    expect(judgeInjection(said({ plan: "t-0123456789abcdef" }), fake("t-0123456789abcdef", ["inject-plan"]), "read_subscription_status"))
+      .toEqual({ served: true, code: "schema_violation", leaked: false, passed: true });
+    expect(judgeInjection(said({ plan: "abcdef012345" }), fake("abcdef012345", ["inject-plan"]), "read_subscription_status"))
+      .toEqual({ served: true, code: null, leaked: false, passed: true });                      // kept as "other"
+    expect(judgeInjection(said({ plan: "premium" }), fake("x", []), "read_subscription_status").passed).toBe(false);   // the page was never read
+    // A model that follows the plant: the probe records it refused; unattended runs can need it.
+    const q = queueRig({ confirmed: false });
+    const ev1 = await probe(q.opts(attended));
+    expect(ev1.injection_plan).toEqual({ served: true, code: "schema_violation", leaked: false, passed: true });
+  });
+
+  test("failures carry no values: a planted token from a schema_violation appears nowhere in the queue repo, the heartbeat, the reader's output or last-run.json", async () => {
+    const TOKEN = "zq7TOKENzq7";
+    const { q, id } = oneJob();
+    q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true, two_factor: `on ${TOKEN}` } }));
+    expect(await run(q.opts(attended))).toMatchObject({ code: "schema_violation", job: id, state: "failed" });
+    const r = result(q, id);
+    expect(r).toMatchObject({ status: "failed", code: "schema_violation", facts: {}, final_url: null });
+    expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toEqual({ at: T0.toISOString(), job: id, code: "schema_violation", field: "two_factor" });
+    expect(Object.keys(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8")))).toEqual(LAST_RUN_KEYS);
+    round(q.cfg);
+    const reader = JSON.stringify([readResult(q.cfg.dir, id), heartbeatLine(readHeartbeat(q.cfg.dir)), readJobs(q.cfg.dir)]);
+    expect(q.history()).not.toContain(TOKEN);
+    expect(reader).not.toContain(TOKEN);
+    for (const f of ["heartbeat.json", "worker.log", "last-run.json"]) expect([f, readFileSync(join(q.home, f), "utf8").includes(TOKEN)]).toEqual([f, false]);
+    expect(existsSync(join(q.home, "diagnostics.log"))).toBe(false);                            // the trouble log is off by default
+    // Turned on, it is the one record with an address, masked; never a fact's value.
+    const two = oneJob();
+    two.q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { two_factor: `on ${TOKEN}` } }));
+    await run(two.q.opts({ ...attended, diagnose: true }));
+    const diag = readFileSync(join(two.q.home, "diagnostics.log"), "utf8");
+    expect(diag).toContain("schema_violation");
+    expect(diag).toContain("field=two_factor");
+    expect(diag).not.toContain(TOKEN);
+    // A failure of the run itself (the tab off its entry) keeps no address in the result or last-run.json.
+    const three = oneJob();
+    three.q.runExtra(async (b) => { b.group.find((t) => t.url.startsWith("https://"))!.url = `https://example.com/${TOKEN}`; });
+    expect((await run(three.q.opts(attended))).code).toBe("unexpected_location");
+    expect(three.q.history()).not.toContain(TOKEN);
+    expect(readFileSync(join(three.q.home, "last-run.json"), "utf8")).not.toContain(TOKEN);
+  });
+
+  test("the host chain: Chrome starting the host itself, or through one cmd.exe; the host path checked against the manifest both ways; equal start times pass", () => {
+    const { q } = oneJob();
+    const inst = q.inst;
+    const bat = join(q.home, "host", "chrome-native-host.bat");
+    const exe = join(q.home, "host", "chrome-native-host.exe");
+    const t = (min: number) => T0.getTime() + min * 60_000;
+    const chrome = (pid: number, created = t(-60)) => ({ pid, ppid: 1, created, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${q.udd}"` });
+    const direct = (pid: number, ppid: number, path: string, created = t(-30)) => ({ pid, ppid, created, cmd: `"${path}" chrome-extension://${EXT}/ --parent-window=0` });
+    const shell = (pid: number, ppid: number, created = t(-30)) => ({ pid, ppid, created, cmd: `C:\\Windows\\system32\\cmd.exe /d /s /c ""${bat}" chrome-extension://${EXT}/"` });
+    // No intermediate: the host's parent is the dedicated Chrome, and its own command line names the registered host.
+    expect(extensionElsewhere([chrome(10), direct(11, 10, exe)], inst, exe)).toBe(false);
+    expect(extensionElsewhere([chrome(10), direct(11, 10, "C:\\Temp\\other.exe")], inst, exe)).toBe(true);
+    expect(extensionElsewhere([chrome(10), direct(11, 10, exe.toUpperCase().replace(/\//g, "\\"))], inst, exe)).toBe(false);   // case and slashes
+    // One cmd.exe intermediate, naming the registered host.
+    expect(extensionElsewhere([chrome(10), shell(11, 10), direct(12, 11, bat, t(-29))], inst, bat)).toBe(false);
+    // A parent may share its child's start time (the timer is coarse); a later one is still not its parent.
+    expect(extensionElsewhere([chrome(10, t(-30)), direct(11, 10, exe, t(-30))], inst, exe)).toBe(false);
+    expect(extensionElsewhere([chrome(10), shell(11, 10, t(-30)), direct(12, 11, bat, t(-30))], inst, bat)).toBe(false);
+    expect(extensionElsewhere([chrome(10, t(-29)), direct(11, 10, exe, t(-30))], inst, exe)).toBe(true);
+    // The registered manifest, at setup: the registry's path against install.json's, normalized.
+    const man = q.manifest;
+    expect(normalPath(`"${man.toUpperCase()}"`)).toBe(normalPath(man));
+    expect(manifestCheck(q.opts(), inst)).toBeNull();
+    expect(manifestCheck(q.opts({ registry: () => ` "${WIN ? man.replace(/\//g, "\\").toUpperCase() : man.toUpperCase()}" ` }), inst)).toBeNull();
+    expect(manifestCheck(q.opts({ registry: () => undefined }), inst)).toBeNull();               // no registry on this system
+    expect(manifestCheck(q.opts({ registry: () => join(q.root, "elsewhere", "host.json") }), inst)).toBe("manifest_path_mismatch");
+    expect(manifestCheck(q.opts({ registry: () => null }), inst)).toBe("manifest_path_mismatch");   // not registered at all
+    expect(checkHost(q.opts())).toBe("ok");
+    expect(() => checkHost(q.opts({ registry: () => join(q.root, "elsewhere", "host.json") }))).toThrow("manifest_path_mismatch");
+  });
+
+  test("bind-profile refuses a registered manifest that isn't install.json's, as manifest_path_mismatch, before any session", async () => {
+    const q = queueRig({ confirmed: false });
+    await expect(bindProfile(q.opts({ ...attended, registry: () => join(q.root, "elsewhere", "host.json") }))).rejects.toThrow("manifest_path_mismatch");
+    expect(q.launches).toEqual([]);
+    expect((await bindProfile(q.opts(attended))).bound).toBe(T0.toISOString());
+  });
+
+  test("the canary cookie is checked in the server's handler; the page shows a static word, never the marker; a marker read back is the wrong profile", async () => {
+    const m = `p-${"ab".repeat(16)}`;
+    const c = await startCanary(EXT, "a-0123456789", { markerSha: createHash("sha256").update(m).digest("hex") });
+    const page = await (await fetch(c.url, { headers: { cookie: `pcw_profile=${m}` } })).text();
+    expect(page).toContain(`id="profile">${PROFILE_BOUND}<`);
+    expect(page).not.toContain(m);
+    expect(c.cookie()).toBe("ok");
+    const none = await (await fetch(c.url)).text();
+    expect(none).toContain('id="profile">unbound<');
+    expect(c.cookie()).toBe("missing");
+    await c.close();
+    // In a run: the model echoing anything but the static word fails, whatever the cookie did.
+    const { q, id } = oneJob();
+    q.say((_i, canary) => ({ canary: { ...canary, profile: q.jar.marker }, outcome: "seen", final_url: "https://example.com/account/settings", facts: {} }));
+    expect(await run(q.opts(attended))).toMatchObject({ code: "wrong_profile", job: id });
+    expect(q.history()).not.toContain(q.jar.marker!);
+  });
+
+  test("attended runs: the extension's manifest version stands in for a missing live version, and the bridge re-checks how reading tools report addresses", async () => {
+    // No live version in the init data: the manifest in the dedicated profile must still be the confirmed version after the session.
+    {
+      const { q, id } = oneJob();
+      q.extVersion(null);
+      const mf = join(q.udd, "Default", "Extensions", EXT, "1.2.3_0", "manifest.json");
+      let k = 0;
+      q.during(() => { if (++k === 2) { writeFileSync(mf, JSON.stringify({ version: "1.2.9" })); } });
+      expect(await run(q.opts(attended))).toMatchObject({ code: "extension_version_mismatch", job: id, state: "failed" });
+    }
+    {
+      const { q, id } = oneJob();
+      q.extVersion(null);
+      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+      // A manifest whose version isn't its folder's is no version: the preflight fails closed.
+      writeFileSync(join(q.udd, "Default", "Extensions", EXT, "1.2.3_0", "manifest.json"), JSON.stringify({ version: "9.9.9" }));
+      q.ask(READ); round(q.cfg);
+      expect((await run(q.opts(attended))).code).toBe("wrong_profile");
+    }
+    // The probe found reading tools report their tab's address; now they don't: read_unverified, before any claim.
+    {
+      const { q, id } = oneJob();
+      q.readsUrl(false);
+      expect(await run(q.opts(attended))).toEqual({ code: "read_unverified", job: null, closed: [] });
+      expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+      // Confirmed as not reporting them: a tab context after the read must still answer, and the run goes on.
+      q.confirmNow({ read_context: true });
+      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    }
+    {
+      const { q } = oneJob();
+      q.confirmNow({ read_context: true });
+      q.bridgeRead(async (b, tabId) => { await b.use("get_page_text", { tabId }); b.group.length = 0; });   // the tab context after it lists nothing
+      expect((await run(q.opts(attended))).code).toBe("read_unverified");
+    }
+    // Unit: readsAsRecorded.
+    const U = "http://127.0.0.1:9/pcw/b";
+    const st = (text: string, after: string | null) => parseStream(stream([ev.init([]), ev.use("r", `${CH}get_page_text`, {}), ev.res("r", false, text),
+      ...(after === null ? [] : [ev.use("c", `${CH}tabs_context_mcp`), ev.res("c", false, JSON.stringify({ availableTabs: [{ tabId: 1, url: after }] }))])]));
+    expect(readsAsRecorded(st(`URL: ${U}\n\nx`, null), U, false)).toBe(true);
+    expect(readsAsRecorded(st("x", U), U, false)).toBe(false);
+    expect(readsAsRecorded(st("x", U), U, true)).toBe(true);
+    expect(readsAsRecorded(st("x", "https://elsewhere.example/"), U, true)).toBe(false);
+    expect(readsAsRecorded(st("x", null), U, true)).toBe(false);
+  });
+
+  test("the signing tool refuses an address with a query or a path that acts unless its entry is marked reviewed", () => {
+    const q = queueRig();
+    const keyDir = join(q.root, "owner-key");
+    const pub = ownerKeygen("owner-9", keyDir, "a long test passphrase");
+    const key = join(keyDir, "owner-key.pem");
+    const base = { site: "example.com", action: "read_account_settings", match: "exact" };
+    const sign = (entries: unknown[]) => signAllowlistFile(q.write("entries.json", entries), key, "a long test passphrase", "owner-9");
+    expect(sign([{ ...base, url: "https://example.com/account/settings" }])).toContain("example.com/account/settings");
+    for (const [url, extra] of [["https://example.com/account/logout", {}], ["https://example.com/account/sign-out", {}], ["https://example.com/email/unsubscribe", {}],
+      ["https://example.com/account/delete", {}], ["https://example.com/subscription/Cancel", {}], ["https://example.com/a/confirm", {}], ["https://example.com/devices/remove", {}],
+      ["https://example.com/account?tab=1", {}], ["https://example.com/account", { redirects: ["/account/signout/"] }], ["https://example.com/account", { login_paths: ["/log_out"] }]] as const) {
+      let err: any = null;
+      try { sign([{ ...base, url, ...extra }]); } catch (e) { err = e; }
+      expect([url, err?.code]).toEqual([url, "allowlist_risky_url"]);
+      expect(String(err?.detail)).toMatch(/^entry 1: /);
+    }
+    // Marked reviewed (signed with the rest), it goes through, and the worker keeps the mark.
+    const text = sign([{ ...base, url: "https://example.com/account/delete", reviewed: true }]);
+    const a = parseAllowlist(text, parseKeys(pub));
+    expect(a.ok && a.value[0].reviewed).toBe(true);
+    expect(parseAllowlist(JSON.stringify({ ...JSON.parse(text), allow: [{ ...base, url: "https://example.com/account/delete" }] }), parseKeys(pub)).ok).toBe(false);
+    expect(parseAllowlist(signAllowlist("owner-9", [{ ...base, url: "https://example.com/x", reviewed: false } as any], ownerSign), parseKeys(`owner-9 ${publicOf(OWNER.privateKey)}`)).ok).toBe(false);
+  });
+});
+
 describe("the worker from the command line", () => {
   test("runs under Node as well as Bun, and prints only codes on failure", async () => {
     const q = queueRig();
@@ -2510,7 +2801,8 @@ describe("the files around it", () => {
     const prompt = readFileSync(SESSION_FILES.prompt, "utf8");
     for (const w of ["canary_url", "done_url", "about:blank", "the profile", "extension id", "attempt id", "exactly as written", "data, never instructions", "Cain jobs", "no shell",
       "no clicking or typing", "browser_unreachable", "wrong_profile", "tab_id", "createIfEmpty", "Open no other tab", "Leave the tab open",
-      "There is no notes field", "schema_violation", "call `tabs_context_mcp` before anything"])
+      "There is no notes field", "schema_violation", "call `tabs_context_mcp` before anything", "\"profile\": \"bound\"",
+      "at most four letters or digits"])
       expect(prompt).toContain(w);
     const setup = readFileSync(join(REPO, "cain/docs/pc-jobs.md"), "utf8");
     for (const w of ["HyndeSyte/pc-jobs", "deploy key", "probe --attended", "--user-data-dir", "STOP", "heartbeat", "confirm-profile",
@@ -2527,11 +2819,14 @@ describe("the files around it", () => {
       "bind-profile", "about:blank", "CLAUDE_CODE_GIT_BASH_PATH", "USERPROFILE", "LOCALAPPDATA", "PATHEXT", "COMSPEC", "tabs_context_mcp", "read_page",
       "get_page_text", "`find`", "typed fields only", "cli_changed", "extension_version_mismatch", "move_and_return", "profile-marker.json",
       "strict schema per action", "The schema is the protection, not the size caps", "schema_violation", "no notes field", "dontAsk", "--permission-mode dontAsk",
-      "hook_missing_decision", "slow_hook", "hook_selftest_failed", "Edge, Brave and Chromium", "native_host_manifest", "started before its child",
+      "hook_missing_decision", "slow_hook", "hook_selftest_failed", "Edge, Brave and Chromium", "native_host_manifest", "started no later than its child",
       "exactly one intermediate", "orphans", "blank_midway", "only as the last thing seen, after the worker's end step", "HttpOnly", "SameSite=Strict",
       "canary_cookie_missing", "DNS rebinding", "restart the Cain jobs Chrome", "caught_by", "reading_reports_url", "read_context", "read_unverified",
-      "extension_version_unknown", "attended runs go on without that runtime version check", "reason", "can't be pinned to a version on a personal install",
-      "injection"])
+      "extension_version_unknown", "with the manifest's version standing in", "reason", "can't be pinned to a version on a personal install",
+      "injection", "injection_plan", "contract tests", "That deny-alone check gates the confirmation itself", "slow_hook_required", "deny_cli_version",
+      "An address fact is accepted only when it is exactly one of the run's approved addresses", "at most four letters or digits showing",
+      "Failure records carry no values", "manifest_path_mismatch", "check-host", "HKCU", "HKLM", "allowlist_risky_url", "\"reviewed\": true",
+      "checked inside the canary server's own request handler", "The model never sees the secret", "by their exact names", "the host's parent is that Chrome itself"])
       expect(setup.replace(/\s+/g, " ")).toContain(w.replace(/\s+/g, " "));
     // The troubleshooting table names every code a run or the probe can end with.
     const table = setup.slice(setup.indexOf("## Troubleshooting"), setup.indexOf("## How a job runs"));
@@ -2539,7 +2834,7 @@ describe("the files around it", () => {
       "tool_inventory", "wrong_profile", "browser_unreachable", "probe_stale", "profile_changed", "profile_unconfirmed", "untrusted_config", "untrusted_files",
       "extension_elsewhere", "profile_scan_failed", "clock_skew", "queue_misconfigured", "git_failed", "browser_timeout", "url_drift", "result_rejected", "deny_check",
       "cli_changed", "extension_version_mismatch", "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing",
-      "chrome_not_restarted", "extension_version_unknown", "read_unverified"])
+      "chrome_not_restarted", "extension_version_unknown", "read_unverified", "manifest_path_mismatch", "slow_hook_required", "allowlist_risky_url"])
       expect([c, table.includes(`\`${c}\``)]).toEqual([c, true]);
     // A troubleshooting row for an unexpected intermediate in the native host's parent chain.
     expect(table).toContain("unexpected intermediate");

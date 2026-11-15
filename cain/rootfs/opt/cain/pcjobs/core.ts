@@ -56,46 +56,64 @@ export const MAX_FACTS = 8;
 const TOKEN_SKEW_MS = 5 * 60_000;
 
 // ---- The fixed action set, and the strict schema of what each may report ------------
-// A fact is one of: a boolean; one word from a list; a date (YYYY-MM-DD); a count (a whole
-// number in a range); a URL path reduced to its allowed form (scheme, host and path, on
-// https); or a short label limited by its pattern. There is no free-form string field
-// anywhere in facts: a value that doesn't fit its field's schema fails the run as
-// schema_violation and nothing of it is written. The schema is the protection; the size
-// caps are only a backstop.
+// A fact is one of: a boolean; one word from a list (a per-action enum: a label the list
+// doesn't name, in the shape of a short label, is kept as "other"); a date (YYYY-MM-DD); a
+// count (a whole number in a range); a masked account; a SHA-256; or an address. There is
+// no free-form string field anywhere in facts: a value that doesn't fit its field's schema
+// fails the run as schema_violation and nothing of it is written. The schema is the
+// protection; the size caps are only a backstop.
+//
+// An address fact is accepted only when it is exactly one of the run's approved addresses
+// (the pin, a sign-in address, an allowed redirect) or on an approved host with a path
+// made only of the action's own words (its per-action path pattern). No free-form path
+// anywhere: the worker, which knows the run's approved addresses, passes them in
+// (AddressCtx); without them (the keeper reading back a result the worker already
+// checked, the confirm path's format) only the host shape and the action's path words count.
 export type FactType =
   | { t: "bool" }
-  | { t: "enum"; of: readonly string[] }
+  | { t: "enum"; of: readonly string[]; other?: true }
   | { t: "date" }
   | { t: "count"; max: number }
-  | { t: "path" }
+  | { t: "address"; words: readonly string[] }
   | { t: "label"; re: RegExp; max: number; ok?: (v: string) => boolean; what: string };
 const bool: FactType = { t: "bool" };
 const date: FactType = { t: "date" };
 const count = (max: number): FactType => ({ t: "count", max });
 const oneOf = (...of: string[]): FactType => ({ t: "enum", of });
-// A masked account name as a site shows it (d***@g***.com, ****1234): at least three
-// mask characters and at most eight letters or digits left showing, so a token or a
-// name can't pass for one.
-const ACCOUNT: FactType = { t: "label", re: /^[A-Za-z0-9*._@+-]{3,40}$/, max: 40, what: "a masked account (d***@g***.com, ****1234)",
-  ok: (v) => (v.match(/\*/g) ?? []).length >= 3 && (v.match(/[A-Za-z0-9]/g) ?? []).length <= 8 };
-// A plan's name as a site labels it: one to four short words of letters, digits and "+".
-const LABEL: FactType = { t: "label", re: /^[A-Za-z0-9+]{1,12}( [A-Za-z0-9+]{1,12}){0,3}$/, max: 40, what: "a short label (one to four short words)" };
+// A per-action enum whose unknown labels are kept as "other", never as the label itself.
+const labelOf = (...of: string[]): FactType => ({ t: "enum", of: [...of, "other"], other: true });
+// The shape a label must have to be kept as "other": one to four short words of letters,
+// digits and "+". Anything else (a token, a sentence, punctuation) is schema_violation.
+const LABEL_SHAPE = /^[A-Za-z0-9+]{1,12}( [A-Za-z0-9+]{1,12}){0,3}$/;
+// The most a masked account may show: at most this many letters or digits.
+export const ACCOUNT_VISIBLE = 4;
+// A masked account name as a site shows it (****1234, d***@***.com): at least three mask
+// characters and at most four letters or digits left showing, so a token or a name can't
+// pass for one.
+const ACCOUNT: FactType = { t: "label", re: /^[A-Za-z0-9*._@+-]{3,40}$/, max: 40, what: "a masked account (****1234, d***@***.com)",
+  ok: (v) => (v.match(/\*/g) ?? []).length >= 3 && (v.match(/[A-Za-z0-9]/g) ?? []).length <= ACCOUNT_VISIBLE };
 const SHA256: FactType = { t: "label", re: /^[0-9a-f]{64}$/, max: 64, what: "a SHA-256 in hex" };
-const URLPATH: FactType = { t: "path" };
+const address = (...words: string[]): FactType => ({ t: "address", words });
+
+// The plans a subscription page may name, as one word from this list; any other short
+// label is "other".
+export const PLANS = ["free", "basic", "standard", "premium", "plus", "pro", "family", "individual", "student", "duo", "business", "trial"];
 
 // The read-only set: the worker refuses any job whose action isn't here.
 export const READ_ACTIONS: Record<string, Record<string, FactType>> = {
   read_account_settings: { signed_in: bool, account_exists: bool, account: ACCOUNT, two_factor: oneOf("on", "off", "unknown"), last_changed: date,
     signed_in_devices: count(999) },
   check_signed_in: { signed_in: bool, second_factor_asked: bool, account: ACCOUNT },
-  read_subscription_status: { signed_in: bool, status: oneOf("active", "paused", "cancelled", "none", "unknown"), plan: LABEL, renews_on: date },
+  read_subscription_status: { signed_in: bool, status: oneOf("active", "paused", "cancelled", "none", "unknown"), plan: labelOf(...PLANS), renews_on: date },
 };
 // Irreversible actions: in the format so the confirm path can be built on it, and refused
 // by both ends until it ships. Their preview reports what the confirmation screen shows.
-const PREVIEW_FACTS: Record<string, FactType> = { account: ACCOUNT, confirm_url: URLPATH, prompt_sha256: SHA256, button_label: LABEL };
+const PREVIEW_WORDS = ["account", "accounts", "settings", "profile", "security", "privacy", "data", "confirm", "confirmation", "verify"];
 export const IRREVERSIBLE_ACTIONS: Record<string, Record<string, FactType>> = {
-  delete_account: PREVIEW_FACTS,
-  cancel_subscription: PREVIEW_FACTS,
+  delete_account: { account: ACCOUNT, confirm_url: address(...PREVIEW_WORDS, "delete", "deletion", "close", "remove"), prompt_sha256: SHA256,
+    button_label: labelOf("delete", "delete account", "delete my account", "close account", "confirm", "continue") },
+  cancel_subscription: { account: ACCOUNT, confirm_url: address(...PREVIEW_WORDS, "subscription", "subscriptions", "membership", "plan", "billing", "cancel", "cancellation"),
+    prompt_sha256: SHA256, button_label: labelOf("cancel", "cancel subscription", "cancel membership", "cancel plan", "confirm", "continue") },
 };
 export const isReadOnly = (j: { action: string; step: Step }) => j.step === "read" && Object.hasOwn(READ_ACTIONS, j.action);
 export const factsFor = (j: { action: string }) => READ_ACTIONS[j.action] ?? IRREVERSIBLE_ACTIONS[j.action] ?? {};
@@ -209,22 +227,42 @@ export function parseDate(v: string): string | null {
 // ---- Facts ----------------------------------------------------------------------------
 // The strict schema for this action: known names only, each value of its field's type.
 // The reasons name a field, never repeat a value (it may be page text). A date is taken in
-// the common forms and kept as YYYY-MM-DD; a path is kept only when it is already in its
-// reduced form (https, host and path, nothing else), never reduced on the way in.
-export function factOk(t: FactType, v: unknown): boolean {
+// the common forms and kept as YYYY-MM-DD; an enum's word compares in lower case, and a
+// per-action label the list doesn't name is kept as "other"; an address is kept only when
+// it is already in its reduced form (https, host and path, nothing else), never reduced on
+// the way in, and only when it is one the run approved (AddressCtx) or on an approved host
+// with a path of the action's own words.
+export interface AddressCtx { exact: (url: string) => boolean; hosts: readonly string[] }
+const ADDRESS_SHAPE = /^https:\/\/[a-z0-9.-]+(\/[a-z0-9-]{1,40}){0,6}\/?$/;
+function addressOk(t: Extract<FactType, { t: "address" }>, v: unknown, ctx?: AddressCtx): boolean {
+  if (typeof v !== "string" || v.length > 240 || sanitizeUrl(v) !== v) return false;
+  if (ctx?.exact(v)) return true;
+  if (!ADDRESS_SHAPE.test(v)) return false;
+  const u = new URL(v);
+  if (ctx && !ctx.hosts.includes(u.hostname)) return false;
+  return u.pathname.split("/").filter(Boolean).every((w) => t.words.includes(w));
+}
+// A value as its field keeps it, or undefined when it doesn't fit.
+export function factValue(t: FactType, v: unknown, ctx?: AddressCtx): string | boolean | number | undefined {
   switch (t.t) {
-    case "bool": return typeof v === "boolean";
-    case "enum": return typeof v === "string" && t.of.includes(v);
-    case "date": return typeof v === "string" && DAY.test(v);
-    case "count": return Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= t.max;
-    case "path": return typeof v === "string" && v.length <= 240 && sanitizeUrl(v) === v && /^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9._~%\/-]{0,200}$/.test(v);
-    case "label": return typeof v === "string" && v.length <= t.max && t.re.test(v) && (!t.ok || t.ok(v));
+    case "bool": return typeof v === "boolean" ? v : undefined;
+    case "enum": {
+      if (typeof v !== "string") return undefined;
+      const w = v.trim().toLowerCase().replace(/\s+/g, " ");
+      if (t.of.includes(w)) return w;
+      return t.other && LABEL_SHAPE.test(v.trim()) ? "other" : undefined;
+    }
+    case "date": { if (typeof v !== "string") return undefined; const d = DAY.test(v) ? v : parseDate(v); return d ?? undefined; }
+    case "count": return Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= t.max ? v as number : undefined;
+    case "address": return addressOk(t, v, ctx) ? v as string : undefined;
+    case "label": return typeof v === "string" && v.length <= t.max && t.re.test(v) && (!t.ok || t.ok(v)) ? v : undefined;
   }
 }
+export const factOk = (t: FactType, v: unknown, ctx?: AddressCtx) => factValue(t, v, ctx) !== undefined;
 const factWhat = (t: FactType) => t.t === "enum" ? `one of ${t.of.join(", ")}` : t.t === "label" ? t.what : t.t === "count" ? `a whole number from 0 to ${t.max}`
-  : t.t === "path" ? "an https address reduced to scheme, host and path" : `a ${t.t}`;
+  : t.t === "address" ? "one of the run's approved addresses, or an approved host with the action's own path words" : `a ${t.t}`;
 
-export function checkFacts(action: string, facts: unknown): Checked<Record<string, string | boolean | number>> {
+export function checkFacts(action: string, facts: unknown, ctx?: AddressCtx): Checked<Record<string, string | boolean | number>> {
   if (!isObj(facts)) return no("facts is an object of named values", "facts");
   const types = factsFor({ action });
   const keys = Object.keys(facts);
@@ -233,10 +271,9 @@ export function checkFacts(action: string, facts: unknown): Checked<Record<strin
   for (const k of keys) {
     const t = Object.hasOwn(types, k) ? types[k] : undefined;
     if (!t) return no(`a fact this action doesn't report (it reports ${Object.keys(types).join(", ")})`, /^[a-z_]{1,40}$/.test(k) ? k : "unknown_fact");
-    let v = facts[k];
-    if (t.t === "date" && typeof v === "string") v = parseDate(v) ?? v;
-    if (!factOk(t, v)) return no(`fact ${k} isn't ${factWhat(t)}`, k);
-    out[k] = v as string | boolean | number;
+    const v = factValue(t, facts[k], ctx);
+    if (v === undefined) return no(`fact ${k} isn't ${factWhat(t)}`, k);
+    out[k] = v;
   }
   return { ok: true, value: out };
 }
@@ -482,12 +519,13 @@ export function confirmGate(job: Job, live: unknown): Code | null {
 // settings page redirecting to /account/security/) can be allowed that, bounded: an
 // entry's `redirects` lists path prefixes on the pinned address's own host, each
 // starting and ending with "/" (or an exact path without the trailing "/"), and the end
-// check accepts a final address under one of them. The signature is his Ed25519 key's, over the
+// check accepts a final address under one of them. `"reviewed": true` says the owner has
+// looked at an address the signing tool would otherwise refuse (riskyEntry, below). The signature is his Ed25519 key's, over the
 // canonical bytes of {v, kid, allow}; the worker checks it against owner.pub on the PC,
 // and owner.pub against the fingerprint pinned in his install config.
 export interface Allow {
   site: string; action: string; url: string; match: "exact" | "prefix"; login_hosts?: string[]; login_paths?: string[]; alternatives?: true;
-  redirects?: string[];
+  redirects?: string[]; reviewed?: true;
 }
 
 export const allowBody = (kid: string, allow: Allow[]) => canonical({ v: 1, kid, allow });
@@ -500,7 +538,7 @@ const LOGIN_HOST = /^\.?(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z
 const LOGIN_PATH = /^\/[A-Za-z0-9._~%\/-]{0,100}\*?$/;
 const listOf = (x: unknown, re: RegExp) => x === undefined || (Array.isArray(x) && x.length <= 8 && x.every((v) => typeof v === "string" && re.test(v)));
 const REDIRECT_PATH = /^\/(?:[A-Za-z0-9._~%-]+\/)*[A-Za-z0-9._~%-]*$/;
-const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives", "redirects"];
+const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives", "redirects", "reviewed"];
 
 function entriesOk(list: unknown): Checked<Allow[]> {
   if (!Array.isArray(list)) return no("allow is a list");
@@ -512,7 +550,7 @@ function entriesOk(list: unknown): Checked<Allow[]> {
       || typeof e.site !== "string" || !SITE.test(e.site)
       || typeof e.action !== "string" || !Object.hasOwn(READ_ACTIONS, e.action) || !plainOnSite(e.url, e.site)
       || (e.match !== "exact" && e.match !== "prefix") || !listOf(e.login_hosts, LOGIN_HOST) || !listOf(e.login_paths, LOGIN_PATH)
-      || (e.alternatives !== undefined && e.alternatives !== true)
+      || (e.alternatives !== undefined && e.alternatives !== true) || (e.reviewed !== undefined && e.reviewed !== true)
       || !(e.redirects === undefined || (listOf(e.redirects, REDIRECT_PATH) && e.redirects.every((r: string) => r !== "/" && r.length <= 100))))
       return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), and optionally login_hosts, login_paths, alternatives (true) and redirects (path prefixes on its host)}");
     const a: Allow = { site: e.site, action: e.action, url: e.url, match: e.match };
@@ -520,9 +558,27 @@ function entriesOk(list: unknown): Checked<Allow[]> {
     if (e.login_paths !== undefined) a.login_paths = e.login_paths;
     if (e.alternatives === true) a.alternatives = true;
     if (e.redirects !== undefined) a.redirects = e.redirects;
+    if (e.reviewed === true) a.reviewed = true;
     out.push(a);
   }
   return { ok: true, value: out };
+}
+
+// What the signing tool refuses unless the entry says "reviewed": true: an address with a
+// query, or whose path (the pin's, a redirect's or a sign-in path's) has a word that acts:
+// logout, signout, unsubscribe, confirm, delete, remove or cancel (with or without a
+// hyphen or underscore, in any case). The word found, or null.
+export const RISKY_PATH = /log[-_]?out|sign[-_]?out|unsubscribe|confirm|delete|remove|cancel/i;
+export function riskyEntry(e: any): string | null {
+  if (!isObj(e) || e.reviewed === true) return null;
+  let u: URL;
+  try { u = new URL(String(e.url)); } catch { return "url"; }
+  if (u.search || u.href.includes("?")) return "query";
+  for (const p of [u.pathname, ...(Array.isArray(e.redirects) ? e.redirects : []), ...(Array.isArray(e.login_paths) ? e.login_paths : [])]) {
+    const m = RISKY_PATH.exec(String(p));
+    if (m) return m[0].toLowerCase();
+  }
+  return null;
 }
 
 export function parseAllowlist(text: string, ownerKeys: Map<string, KeyObject>): Checked<Allow[]> {
@@ -596,6 +652,18 @@ export function onLogin(url: unknown, a: Allow): boolean {
   const fold = (p: string) => { let x = loose ? p.toLowerCase() : p; while (loose && x.length > 1 && x.endsWith("/")) x = x.slice(0, -1); return x; };
   const path = fold(u.pathname);
   return (a.login_paths ?? []).some((p) => p.endsWith("*") ? path.startsWith(fold(p.slice(0, -1)) || "/") : path === fold(p));
+}
+
+// The run's approved addresses, for its address facts: exactly the pin, one of its sign-in
+// addresses or an allowed redirect; and its approved hosts (the pin's host and its exact
+// sign-in hosts), where a path of the action's own words is accepted too.
+export function addressCtxFor(pin: Allow | null): AddressCtx {
+  if (!pin) return { exact: () => false, hosts: [] };
+  const host = new URL(pin.url).hostname;
+  return {
+    exact: (url) => url === sanitizeUrl(pin.url) || (sanitizeUrl(url) === url && (onLogin(url, pin) || onRedirect(url, pin))),
+    hosts: [host, ...(pin.login_hosts ?? []).filter((h) => !h.startsWith("."))],
+  };
 }
 
 export function pinFor(job: Job, list: Allow[]): Allow | null {
