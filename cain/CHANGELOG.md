@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.0
+
+- Cain can now hand chores that need your browser to your PC: a small job queue that a scheduled task on your PC runs in a Chrome profile of its own, and Cain reads the short result.
+- It does nothing until you set it up once at your PC (the steps are in the pull request and in Cain's docs). Until then nothing changes.
+- This version only reads pages. Anything irreversible will need your tap on a card first, and that card comes later.
+- New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
+
 ## 0.11.0
 
 - Ship cards now say what your tap installs ("Ship Cain 0.11.0?", or that nothing installs), then one line from Cain on what you'll notice.

@@ -305,6 +305,16 @@ same id says how it ended).
 The keeper looks at Cain's own queue every 2 seconds and runs as soon as something is
 in it; the record's inbox (your page, laptop sessions) is read every minute.
 
+## PC jobs (since 0.12.0)
+
+Chores that need a browser signed in as you go to a small job queue in a private repo
+of their own (`pc_jobs_repo`, default `HyndeSyte/pc-jobs`), run by a scheduled task on
+your PC in a Chrome profile named Cain jobs. Cain's PC job keeper is the queue's one
+writer of jobs and holds `pc_jobs_token`, so his session never does. With no token it
+waits and does nothing. The one-time setup at your PC, the job and result formats and
+the worker's prompt are in `cain/docs/pc-jobs.md` and `cain/docs/pc-worker/` in this
+repo.
+
 ## Laptop sessions (tools, not part of the App)
 
 `cain/tools/` in this repo holds a laptop's side. Nothing there ships in the App, and

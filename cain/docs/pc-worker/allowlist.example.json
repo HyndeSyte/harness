@@ -1,0 +1,6 @@
+{
+  "v": 1,
+  "allow": [
+    { "site": "example.com", "action": "read_account_settings", "steps": ["read"] }
+  ]
+}
