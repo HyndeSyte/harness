@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendEntry, claim, clean, decide, fate, filedKey, filingId, fileSnapshot, outcomeOf, readJournal, requestFor, stepsOf, type Entry } from "../tools/session-end";
+import { appendEntry, claim, clean, decide, fate, filedKey, filingId, fileSnapshot, journalOf, outcomeOf, readJournal, requestFor, stepsOf, type Entry } from "../tools/session-end";
 
 const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
 const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
@@ -117,7 +117,8 @@ describe("once only", () => {
     expect(readJournal(p).map((x) => x.n)).toEqual([1]);
     appendEntry(p, { n: 2, key: "k3", at: 3, kind: "open" });
     expect(readJournal(p).map((x) => [x.n, x.key])).toEqual([[1, "k1"], [2, "k3"]]);
-    expect(readFileSync(p, "utf8").split("\n")[1]).toBe(torn);                // kept as it was
+    expect(readFileSync(p, "utf8").split("\n").slice(1, 3)).toEqual([torn, JSON.stringify({ torn: true })]);   // kept as it was, marked
+    expect(journalOf(p).damaged).toEqual([]);
   });
 
   test("no journal yet is empty; one that can't be read is never taken for empty", () => {
@@ -127,11 +128,33 @@ describe("once only", () => {
     expect(() => readJournal(join(d, "folder.journal"))).toThrow();
   });
 
-  test("a snapshot older than the journal's last entry is passed over: the record's newest note stays the newest state", () => {
+  test("a snapshot that had read less of the transcript than the journal's last entry is older and passed over, whatever the clock says", () => {
     const d = mkdtempSync(join(tmpdir(), "journal-"));
-    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [b]), at: 2_000, kind: "open", id: "x", raw: "{}" }) + "\n");
-    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [a], why: "open", at: 1_000 })).toEqual({ id: null, same: true });
+    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [b]), at: 1_000, kind: "open", id: "x", raw: "{}", mark: 200 }) + "\n");
+    // An older end, delayed, with a later clock: passed over.
+    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [a], why: "open", at: 5_000, mark: 100 })).toEqual({ id: null, same: true });
     expect(readJournal(join(d, "s1.journal"))).toHaveLength(1);
+  });
+
+  test("a newer snapshot taken after the clock moved back is filed: the transcript, not the clock, says it's newer", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [a]), at: 2_000, kind: "open", id: "x", raw: "{}", mark: 100 }) + "\n");
+    const r = fileSnapshot(d, { session: "s1", held: ["P33"], open: [b], why: "open", at: 1_000, mark: 200 });
+    expect(r.same).toBe(false);
+    expect(r.id).toMatch(/-000002-/);
+    expect(readJournal(join(d, "s1.journal")).map((x) => [x.n, x.mark])).toEqual([[1, 100], [2, 200]]);
+  });
+
+  test("a journal's damaged lines are told from a crash's: a cut-off last line or a line marked torn is expected, any other is damage", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    const ok = (n: number) => JSON.stringify({ n, key: `k${n}`, at: n, kind: "open" });
+    writeFileSync(join(d, "a.journal"), [ok(1), '{"n": 2, "ke', JSON.stringify({ torn: true }), ok(2), ""].join("\n"));
+    expect(journalOf(join(d, "a.journal"))).toMatchObject({ damaged: [] });
+    writeFileSync(join(d, "b.journal"), [ok(1), ok(2), '{"n": 3, "ke'].join("\n"));                     // cut off, last
+    expect(journalOf(join(d, "b.journal"))).toMatchObject({ damaged: [] });
+    writeFileSync(join(d, "c.journal"), [ok(1), "not json at all", ok(2), ""].join("\n"));              // damage in the middle
+    expect(journalOf(join(d, "c.journal")).damaged).toEqual([2]);
+    expect(journalOf(join(d, "c.journal")).entries.map((x) => x.n)).toEqual([1, 2]);
   });
 
   test("a lock is made new, refused while it's fresh, and taken over once it's 2 minutes old", () => {

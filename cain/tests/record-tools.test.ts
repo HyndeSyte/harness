@@ -293,7 +293,8 @@ describe("session-end", () => {
   const ender = (l: ReturnType<typeof laptop>, session = SA) => {
     const transcript = join(l.root, `transcript-${session}.jsonl`);
     return {
-      steps: (...s: [string, string][]) => writeFileSync(transcript, plan(...s)),
+      // A transcript only grows: each new plan is added, as a session adds it.
+      steps: (...s: [string, string][]) => writeFileSync(transcript, plan(...s), { flag: "a" }),
       end: () => l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: session, transcript_path: transcript }) }),
     };
   };
@@ -392,9 +393,10 @@ describe("session-end", () => {
 
   test("two ends of one session at once with different steps take turns: the journal's last entry is the newer snapshot, and the record's newest note", async () => {
     const l = held();
+    // The same transcript at two moments: the second end read more of it (the newer snapshot).
     const [t1, t2] = [join(l.root, "t1.jsonl"), join(l.root, "t2.jsonl")];
     writeFileSync(t1, plan(["Verify after his tap", "pending"]));
-    writeFileSync(t2, plan(["Merge", "pending"]));
+    writeFileSync(t2, plan(["Verify after his tap", "pending"]) + plan(["Merge", "pending"]));
     const env = cleanEnv({ RECORD_CLONE: l.clone });
     const start = (t: string) => Bun.spawn([process.execPath, join(TOOLS, "session-end.ts"), "--hook"], { cwd: l.root, env, stdout: "pipe", stderr: "pipe",
       stdin: Buffer.from(JSON.stringify({ session_id: SA, transcript_path: t })) });
@@ -403,12 +405,39 @@ describe("session-end", () => {
     expect(cycle(l.cfg).ok).toBe(true);
     const n = notes(l);
     const journal = readFileSync(join(l.clone, ".git", "record-holds", `${SA}.journal`), "utf8").trim().split("\n").map((x) => JSON.parse(x));
-    expect(journal.map((e) => e.n)).toEqual(journal.map((_, i) => i + 1));                 // one or two entries, in turn
-    for (let i = 1; i < journal.length; i++) expect(journal[i].at).toBeGreaterThanOrEqual(journal[i - 1].at);
-    const last = JSON.parse(journal.at(-1).raw).ops[0].text.includes("Merge") ? "Merge" : "Verify after his tap";
-    const newest = n.lastIndexOf("Merge") > n.lastIndexOf("Verify after his tap") ? "Merge" : "Verify after his tap";
-    expect(newest).toBe(last);
+    expect(journal.map((e) => e.n)).toEqual(journal.map((_, i) => i + 1));                 // in turn: the older one first, or passed over
+    expect(JSON.parse(journal.at(-1).raw).ops[0].text).toContain("with these steps open: Merge.");   // the newer snapshot, always
+    expect(n.lastIndexOf("Merge")).toBeGreaterThan(n.lastIndexOf("Verify after his tap"));
   }, 90_000);
+
+  test("an end's snapshot cut off before it was moved in is taken up by a start alone: whole, filed; cut off, kept aside", () => {
+    const l = held();
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(join(memo, "pending"), { recursive: true });
+    const snap = { session: SA, held: ["P33"], open: [{ content: "Verify after his tap", status: "pending" }], why: "open", at: Date.now(), mark: 10 };
+    const old = (Date.now() - 3 * 60_000) / 1000;
+    writeFileSync(join(memo, "pending", `${SA}-000000000000001-77.json.77.part`), JSON.stringify(snap));
+    writeFileSync(join(memo, "pending", `${SA}-000000000000002-78.json.78.part`), '{"session": "' + SA);
+    for (const p of readdirSync(join(memo, "pending"))) utimesSync(join(memo, "pending", p), old, old);
+    const said = l.tool("session-end.ts", ["--flush"]);
+    expect(said.code).toBe(0);
+    expect(said.out).toContain("Submitted 1 to the record from a laptop session's end");
+    expect(said.out).toContain("kept aside, unreadable (an end's snapshot was cut off while it was written)");
+    expect(readdirSync(join(memo, "pending"))).toEqual([]);
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+  }, 60_000);
+
+  test("a journal that can't be read is said at every start, never passed over in silence", () => {
+    const l = held();
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(join(memo, `${SB}.journal`), { recursive: true });           // a folder where a journal should be
+    const said = l.tool("session-end.ts", ["--flush"]);
+    expect(said.code).toBe(0);
+    expect(said.out).toContain(`A laptop session's journal can't be read (`);
+    expect(said.out).toContain(join(memo, `${SB}.journal`));
+    expect(l.tool("session-end.ts", ["--flush"]).out).toBe(said.out);     // again at the next start
+  }, 60_000);
 
   test("an end that can't get its turn in time leaves its snapshot, and the next start files it", async () => {
     const l = held();
@@ -437,9 +466,10 @@ describe("session-end", () => {
     e.steps(["Verify after his tap", "pending"]);
     expect(e.end().out).toBe("Open steps (1): submitted to the record");
     const lines = readFileSync(join(memo, `${SA}.journal`), "utf8").trim().split("\n");
-    expect(lines).toHaveLength(3);
-    expect(lines[1]).toBe('{"n": 2, "key": "1111');
-    expect(JSON.parse(lines[2]).n).toBe(2);
+    expect(lines).toHaveLength(4);
+    expect(lines[1]).toBe('{"n": 2, "key": "1111');                     // kept as it was
+    expect(JSON.parse(lines[2])).toEqual({ torn: true });                  // marked
+    expect(JSON.parse(lines[3]).n).toBe(2);
     expect(cycle(l.cfg).ok).toBe(true);
     expect(notes(l)).toContain("with these steps open: Verify after his tap.");
   }, 60_000);
