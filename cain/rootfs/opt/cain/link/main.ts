@@ -46,6 +46,8 @@
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { teeConsole } from "../logfile";
 import { localReadings, verdict } from "../clock";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
@@ -87,6 +89,8 @@ const API = "https://discord.com/api/v10";
 const SWEEP_MS = 60_000;
 
 mkdirSync(DIR, { recursive: true, mode: 0o700 });
+// A copy of the link's log lines for the device smoke test (the App log is Home Assistant's).
+teeConsole(process.env.LINK_LOG ?? "/data/work/link.log");
 mkdirSync(TRUST_DIR, { recursive: true, mode: 0o755 });
 // No Stop saved yet (a first start): written as running, so readers that find no file
 // can take it as stopped.
@@ -141,6 +145,18 @@ function readOr(path: string): string | null {
   try { return readFileSync(path, "utf8"); }
   catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
+// The same, for a tap's fresh read: cancelled through the signal when it runs past its limit
+// (an aborted read rejects, and the tap answers busy).
+async function readOrAsync(path: string, signal: AbortSignal): Promise<string | null> {
+  try { return await readFile(path, { encoding: "utf8", signal }); }
+  catch (e: any) { if (e?.name === "AbortError" || signal.aborted) throw e; return e?.code === "ENOENT" ? null : ""; }
+}
+const outcomeOf = (t: string | null) => {
+  if (t === null) return null;
+  try { const o = JSON.parse(t); return o && typeof o.state === "string" ? { state: o.state, reason: typeof o.reason === "string" ? o.reason : undefined } : null; }
+  catch { return null; }
+};
+const outcomePath = (id: string) => `${RECORD_OUTCOMES}/${id.replace(/[^A-Za-z0-9._:-]/g, "_")}.json`;
 
 // A pull request now. GitHub's API says whether it's open and its head; when that
 // can't be read (it allows 60 asks an hour without a key), the head alone comes from
@@ -207,11 +223,12 @@ const link = new Link({
     writeFileSync(`${RECORD_QUEUE}/.${name}`, JSON.stringify(req));
     renameSync(`${RECORD_QUEUE}/.${name}`, `${RECORD_QUEUE}/${name}`);
   },
-  outcome: (id) => {
-    const t = readOr(`${RECORD_OUTCOMES}/${id.replace(/[^A-Za-z0-9._:-]/g, "_")}.json`);
-    if (t === null) return null;
-    try { const o = JSON.parse(t); return o && typeof o.state === "string" ? { state: o.state, reason: typeof o.reason === "string" ? o.reason : undefined } : null; }
-    catch { return null; }
+  outcome: (id) => outcomeOf(readOr(outcomePath(id))),
+  // A tap's fresh read: the four files at once, each read cancelled when the limit passes.
+  readFresh: async (id, signal) => {
+    const [pending, holds, checks, status, out] = await Promise.all([readOrAsync(`${RECORD}/state/PENDING.md`, signal), readOrAsync(HOLDS, signal),
+      readOrAsync(`${RECORD}/state/checks.json`, signal), readOrAsync(RECORD_STATUS, signal), id ? readOrAsync(outcomePath(id), signal) : Promise.resolve(null)]);
+    return { files: { pending, holds, checks, status }, outcome: outcomeOf(out) };
   },
   maxCheckDays: MAX_CHECK_DAYS,
   waitTimeout: (w) => appendFileSync(RECORD_WAITS, JSON.stringify(w) + "\n"),
@@ -291,7 +308,7 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -332,6 +349,8 @@ Bun.serve({
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/clock": return json(link.clockReport());
+        case "/reads": return json(await link.probeReads(Number(b.n ?? 20)));
+        case "/slowread": return json(link.slowRead());
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

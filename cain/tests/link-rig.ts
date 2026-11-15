@@ -99,7 +99,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const limited = new Set<string>();             // the same, answered with Discord's rate limit
   const limitN: Record<string, number> = {};     // the next n calls to a path prefix are rate limited
   const lose = { posts: 0 };                     // posts Discord makes but whose answer never arrives
-  const hang = { interactions: false };          // the link stops mid-tap: its answer never returns
+  // The link stops mid-tap: its answer never returns (edits: only the card's edit after a deferred answer).
+  const hang = { interactions: false, edits: false };
   // Discord is slow: posts to his DM, reads of it, or whose bot this is, wait until release()
   const gate = { posts: false, history: false, identity: false };
   const waiting: (() => void)[] = [];
@@ -153,6 +154,15 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       if (body.components !== undefined) m.components = body.components;
       if (body.content !== undefined || discord.marksButtonEdits) m.edited_timestamp = new Date(t.now).toISOString();
       return copy(m);
+    }
+    // The tapped card, edited through the interaction's webhook after a deferred answer.
+    if (method === "PATCH" && /^\/webhooks\/[^/]+\/[^/]+\/messages\/@original$/.test(path)) {
+      if (hang.interactions || hang.edits) return new Promise(() => {});
+      if (posted[tapped]) {
+        if (body.content !== undefined) posted[tapped].content = body.content;
+        if (body.components !== undefined) posted[tapped].components = body.components;
+      }
+      return null;
     }
     if (method === "POST" && path.startsWith("/interactions/")) {
       if (hang.interactions) return new Promise(() => {});
@@ -229,8 +239,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,
     posts: () => calls.filter((c) => c.method === "POST" && c.path === `/channels/${DM}/messages`).length,
     answers: () => calls.filter((c) => c.path.startsWith("/interactions/")).map((c) => c.body.type),
-    updates: () => calls.filter((c) => c.path.startsWith("/interactions/") && c.body.type === 7).map((c) => c.body.data),
-    ephemerals: () => calls.filter((c) => c.path.startsWith("/webhooks/")).map((c) => c.body),
+    // The tapped card's edits: an update answer, or (after a deferred answer) an edit of @original.
+    updates: () => calls.filter((c) => (c.path.startsWith("/interactions/") && c.body.type === 7)
+      || (c.method === "PATCH" && c.path.endsWith("/messages/@original"))).map((c) => (c.path.startsWith("/interactions/") ? c.body.data : c.body)),
+    ephemerals: () => calls.filter((c) => c.method === "POST" && c.path.startsWith("/webhooks/")).map((c) => c.body),
     cards: () => Object.values(posted).filter((m: any) => m.author.id === BOT),
     last: () => posted[lastId],
     msg: (id: string) => posted[id],

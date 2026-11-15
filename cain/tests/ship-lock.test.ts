@@ -371,11 +371,11 @@ describe("review fixes (Fable, Nov 13)", () => {
   test("when Discord doesn't take the card's edit, the sweep makes it", async () => {
     const r = rig();
     const id = await ship(r);
-    r.failing.add("PATCH");
+    r.failing.add("PATCH /channels/");                       // the link's own edits; the tap's answer still goes
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
     expect(r.msg(id).content).toBe(`${card}\n\nYou tapped Ship: landing it in main now.`);
     expect(r.relayed).toHaveLength(1);                      // Cain is told all the same
-    r.failing.delete("PATCH");
+    r.failing.delete("PATCH /channels/");
     await sweep(r);
     expect(r.msg(id).content).toBe(`${card}\n\nShipped: it's in main as of 8:00 AM. Installing it is next.`);
     const edits = r.calls.filter((c) => c.method === "PATCH").length;

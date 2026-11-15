@@ -47,6 +47,11 @@
 #   keeper.sh replied <message id>       what a message of his replied to, if anything
 #   keeper.sh morning "text"             post the one morning message (with Stop)
 #   keeper.sh stopped                    whether everything is stopped (Dane's Stop), and since when
+#   keeper.sh reads [n]                  n fresh reads of the record keeper's files (default 20), 4 seconds
+#                                        apart, the way a tap reads them: their times, the 95th percentile
+#                                        and whether it passes (at most one second); about 80 seconds
+#   keeper.sh slow-read                  the smoke test: the next tap's fresh read is held past its limit,
+#                                        so that tap must answer "Busy, tap again." and keep its buttons
 #   keeper.sh clock                      the clock verdict (the record keeper's, with the source that
 #                                        satisfied it, and the box's own), the ledger's generation, whether
 #                                        a push or a reset is outstanding, and the last tap's read time
@@ -72,7 +77,8 @@ cmd="${1:-handover}"; shift || true
 if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock|reads) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  slow-read) url="$link/slowread"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
@@ -153,6 +159,8 @@ case "$cmd" in
   replied)  body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   stopped)  body='{}' ;;
   clock)    body='{}' ;;
+  slow-read) body='{}' ;;
+  reads)    body=$(jq -nc --arg n "${1:-20}" '{n: ($n | tonumber? // 20)}') ;;
   card)     body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   check)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" --arg e "$edit" \
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
@@ -161,6 +169,7 @@ case "$cmd" in
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac
-out=$(curl -sS -m 45 -H "@$hdr" -d "$body" "$url" 2>&1) \
+wait=45; [ "$cmd" = reads ] && wait=240   # the reads are spread over more than a keeper round
+out=$(curl -sS -m "$wait" -H "@$hdr" -d "$body" "$url" 2>&1) \
   || { jq -nc --arg e "$out" '{status: "error", said: ("No answer: " + $e)}'; exit 1; }
 echo "$out"

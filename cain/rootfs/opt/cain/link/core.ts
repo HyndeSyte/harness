@@ -209,7 +209,14 @@ export interface State {
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
   ledgerGen?: number;                // the highest ledger generation a verified read has seen (0.12.0)
+  postedGen?: number;                // the highest ledger generation on a card the link posted (the keeper's floor after a re-clone)
+  // Taps honoured while the keeper's ledger was unpushed (0.12.0): if the keeper then resets its
+  // copy, Cain and Dane hear of them as acted on a check that may not have landed. Cleared once
+  // a push lands.
+  uncertain?: Uncertain[];
+  outageTold?: string;               // the keeper outage (its start) Dane was told of, once
 }
+export interface Uncertain { gen: number | null; check: string | null; item: string; at: number; msg: string; label: string; told?: boolean }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
 export interface SentRec { at: number; last?: boolean; asks?: boolean }
@@ -347,8 +354,22 @@ export interface RecordFiles { pending: string | null; holds: string | null; che
 // push that landed, and its clock verdict with the source that satisfied it.
 export interface KeeperStatus {
   at?: string; generation?: number; unpushed?: boolean;
-  push_failed?: { at: string; why: string }; reset?: { at: string; why: string };
+  push_failed?: { at: string; why: string; since?: string }; reset?: { at: string; why: string };
+  last_reset?: { at: string; why: string };          // the latest reset, kept after the push that ended it
+  outage?: { since: string; rounds: number };        // rounds that ended unpushed or reset, and since when
   clock?: { synced: boolean; source: string | null; diagnostic: string; at: string };
+}
+
+// A push error in plain words, for Dane (never the raw text: it is git's, and may name things).
+export function plainPush(why: string | undefined, reset: boolean): string {
+  const w = why ?? "";
+  if (/no-such-remote|smoke test/i.test(w)) return "the smoke test is blocking it on purpose";
+  if (/conflict|couldn't be rebased/i.test(w)) return "GitHub's copy changed in a way the box couldn't merge";
+  if (/authentication|could not read username|terminal prompts disabled|denied|\b40[13]\b/i.test(w)) return "GitHub turned down the box's sign-in (the GitHub token in the App's options may have expired)";
+  if (/could not resolve|timed out|timeout|connection|unable to access|failed to connect|network/i.test(w)) return "GitHub didn't answer";
+  if (/rejected|non-fast-forward|protected/i.test(w)) return "GitHub turned the save down";
+  if (!w && reset) return "the box had to start its copy over";
+  return "GitHub turned the save down for a reason the box couldn't name";
 }
 // undefined: no status file (the keeper hasn't written one); null: one that can't be read.
 export function keeperStatus(text: string | null | undefined): KeeperStatus | null | undefined {
@@ -414,6 +435,12 @@ export const TAP_READ_MS = 1_500;
 const BUSY_TAP = "Busy, tap again.";
 const CLOCK_TAP = "The box's clock isn't synchronized just now, so nothing was done. Tap again in a few minutes.";
 const RESET_TAP = "Cain's record is being put back in step, so nothing was done. Tap again in a few minutes.";
+const UNPUSHED_TAP = "Cain's record hasn't saved for over half an hour, so nothing was done. Tap again once it has.";
+// A push failure older than this: taps are refused (their own reason) instead of honoured and
+// journaled; and the keeper outage Dane hears of once (or after OUTAGE_ROUNDS rounds).
+export const UNPUSHED_TAP_MS = 30 * 60_000;
+export const OUTAGE_NOTICE_MS = 30 * 60_000;
+export const OUTAGE_ROUNDS = 3;
 // How recent the keeper's own clock verdict must be to count at tap time (its rounds run every
 // minute), and how long after a push error the sweep leaves cards alone.
 export const KEEPER_CLOCK_FRESH_MS = 10 * 60_000;
@@ -423,6 +450,20 @@ const shortDay = (ms: number, tz = "America/New_York") =>
   new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
 
 export class Refusal extends Error {}
+type CheckState = "ok" | "changed" | "behind" | "unknown" | "busy" | "clock" | "reset" | "unpushed";
+// When the keeper's current run of push failures (or its reset) began, as its status says.
+function outageSince(st: KeeperStatus): number {
+  const t = [st.outage?.since, st.push_failed?.since, st.push_failed?.at, st.reset?.at].map((x) => (x ? Date.parse(x) : NaN)).filter(Number.isFinite);
+  return t.length ? Math.min(...t) : Infinity;
+}
+// A wait that ends early, rejecting, once the signal aborts.
+function abortable(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((ok, no) => {
+    if (signal.aborted) return no(new Error("aborted"));
+    const t = setTimeout(ok, ms);
+    signal.addEventListener("abort", () => { clearTimeout(t); no(new Error("aborted")); }, { once: true });
+  });
+}
 class StaleCheck extends Refusal {}
 
 export interface Meta { item: string; question: string; replyTo?: string }
@@ -563,6 +604,10 @@ export interface Deps {
   paired: () => string;                                            // who Cain is paired with
   log?: (line: string) => void;
   record?: () => RecordFiles;                                      // PENDING.md, the keeper's holds and its source checks
+  // A tap's fresh read of the keeper's files (the ledger, the list, its status and the check's
+  // outcome), cancelled through the signal when it runs past its limit. Absent: record and outcome.
+  readFresh?: (outcome: string | null, signal: AbortSignal) => Promise<{ files: RecordFiles; outcome: { state: string; reason?: string } | null }>;
+  tapReadMs?: number;                                              // the tests' TAP_READ_MS
   submitRecord?: (req: Record<string, unknown>) => void;           // a request into the record keeper's local queue (a source check, a one-off's log line)
   outcome?: (id: string) => { state: string; reason?: string } | null;   // the record keeper's outcome for one of those, once it has one
   maxCheckDays?: number;                                           // the App's source_check_max_days (default 7)
@@ -978,6 +1023,8 @@ export class Link {
     const id = String(msg.id);
     s.messages[id] = { ...(s.messages[id] ?? {}), ...extra,
       digest: digest(msg.content ?? "", msg.components), until: now + REMEMBER_MS };
+    const gen = extra.checked?.gen;
+    if (typeof gen === "number" && gen > (s.postedGen ?? 0)) s.postedGen = gen;
   }
 
   private async post(text: string, comps: any[], opts: { timeoutMs?: number; replyTo?: string; nonce?: string } = {}): Promise<any> {
@@ -1074,9 +1121,10 @@ export class Link {
   //              a push just failed;
   //   "busy"     the read took longer than TAP_READ_MS;
   //   "clock"    a tap while the box's clock isn't synchronized;
-  //   "reset"    the keeper reset its copy and hasn't pushed since.
+  //   "reset"    the keeper reset its copy and hasn't pushed since;
+  //   "unpushed" a tap while the keeper's push has failed for over UNPUSHED_TAP_MS.
   // A tap is honoured only on "ok"; the sweep takes buttons off only on "changed".
-  private checkState(item: string, ref: Ref | undefined, o: { sweep?: boolean; seen?: number } = {}): "ok" | "changed" | "behind" | "unknown" | "busy" | "clock" | "reset" {
+  private checkState(item: string, ref: Ref | undefined, o: { sweep?: boolean; seen?: number } = {}): CheckState {
     if (!ref || !ref.req) return "changed";
     const t0 = Date.now();
     let f: RecordFiles | undefined, out: { state: string } | null | undefined;
@@ -1084,9 +1132,79 @@ export class Link {
       f = this.d.record?.();
       out = this.d.outcome?.(ref.req);
     } catch { return "unknown"; }
-    const took = Date.now() - t0;
-    if (!o.sweep) this.tapRead = { ms: took, at: this.d.now() };
-    if (took > TAP_READ_MS) return "busy";
+    if (Date.now() - t0 > TAP_READ_MS) return "busy";
+    return this.judge(item, ref, f, out, o);
+  }
+
+  // A tap's fresh read, after its deferred answer went to Discord: the keeper's files read with a
+  // hard limit (TAP_READ_MS), the read itself cancelled through an abort signal when the limit
+  // passes, so a stalled read answers "busy" within the limit.
+  private async tapState(item: string, ref: Ref | undefined): Promise<CheckState> {
+    if (!ref || !ref.req) return "changed";
+    const r = await this.freshRead(ref.req);
+    if (r === "busy" || r === "unknown") return r;
+    return this.judge(item, ref, r.files, r.outcome, {});
+  }
+
+  // One fresh read of the keeper's files, raced against the limit: "busy" past it (the read is
+  // aborted), "unknown" when it failed. Its time is kept for keeper.sh clock.
+  private async freshRead(req: string | null): Promise<{ files: RecordFiles | undefined; outcome: { state: string; reason?: string } | null | undefined; ms: number } | "busy" | "unknown"> {
+    const limit = this.d.tapReadMs ?? TAP_READ_MS;
+    const ac = new AbortController();
+    const t0 = Date.now();
+    const slow = this.slowNext;
+    this.slowNext = 0;
+    const read = (async () => {
+      if (slow) await abortable(slow, ac.signal);   // the smoke test's delayed read (keeper.sh slow-read)
+      if (this.d.readFresh) return this.d.readFresh(req, ac.signal);
+      return { files: this.d.record?.(), outcome: req ? this.d.outcome?.(req) : null };
+    })();
+    read.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<"busy">((ok) => { timer = setTimeout(() => { ac.abort(); ok("busy"); }, limit); });
+    let r: Awaited<typeof read> | "busy";
+    try { r = await Promise.race([read, late]); }
+    catch { clearTimeout(timer); this.tapRead = { ms: Date.now() - t0, at: this.d.now() }; return "unknown"; }
+    clearTimeout(timer);
+    const ms = Date.now() - t0;
+    this.tapRead = { ms: r === "busy" ? Math.max(ms, limit) : ms, at: this.d.now() };
+    if (r === "busy" || ms > limit) return "busy";
+    this.lastFresh = r.files;
+    return { ...r, ms };
+  }
+  // The smoke test's one delayed read (ms), and the files of the last fresh read that finished.
+  private slowNext = 0;
+  private lastFresh: RecordFiles | undefined;
+  slowRead(): { status: "ok"; said: string; delay_ms: number } {
+    const limit = this.d.tapReadMs ?? TAP_READ_MS;
+    this.slowNext = limit + 1_000;
+    return { status: "ok", said: `The next tap's fresh read waits ${this.slowNext} ms, past its ${limit} ms limit: it must answer "${BUSY_TAP}" and keep its buttons.`, delay_ms: this.slowNext };
+  }
+
+  // The smoke test's measured reads: n fresh reads, gapMs apart (spread over more than a keeper
+  // round, so some run while a round fetches), with their times, the 95th percentile and how many
+  // keeper rounds ended meanwhile.
+  async probeReads(n = 20, gapMs = 4_000): Promise<Record<string, unknown>> {
+    const count = Math.max(1, Math.min(50, Math.floor(Number(n) || 20)));
+    const sleep = this.d.sleep ?? ((ms: number) => new Promise<void>((ok) => setTimeout(ok, ms)));
+    const ms: number[] = [], rounds = new Set<string>();
+    let busy = 0;
+    for (let i = 0; i < count; i++) {
+      if (i) await sleep(gapMs);
+      const r = await this.freshRead(null);
+      if (r === "busy") busy++;
+      ms.push(this.tapRead?.ms ?? 0);
+      const st = r !== "busy" && r !== "unknown" ? keeperStatus(r.files?.status) : null;
+      if (st?.at) rounds.add(st.at);
+    }
+    const sorted = [...ms].sort((a, b) => a - b);
+    const p95 = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)];
+    return { status: "ok", reads: count, reads_ms: ms, p95_ms: p95, max_ms: sorted.at(-1), busy, limit_ms: this.d.tapReadMs ?? TAP_READ_MS,
+      keeper_rounds_seen: Math.max(0, rounds.size - 1), pass: p95 <= 1_000 && busy === 0 };
+  }
+
+  // The verdict on what a read found (see checkState).
+  private judge(item: string, ref: Ref, f: RecordFiles | undefined, out: { state: string } | null | undefined, o: { sweep?: boolean; seen?: number }): CheckState {
     if (!f || typeof f.checks !== "string") return "unknown";
     const st = keeperStatus(f.status);
     if (st === null) return "unknown";
@@ -1104,6 +1222,8 @@ export class Link {
     if (typeof f.pending !== "string" && e.hash) return "unknown";   // the row's cells can't be compared
     if (!inStep(e, f.pending, id) || !isFresh(e, this.d.now(), this.maxDays())) return "changed";
     if (!o.sweep && !this.clockOk(st)) return "clock";
+    // Honoured while a push fails, but not once the failure is older than UNPUSHED_TAP_MS.
+    if (!o.sweep && st?.unpushed && this.d.now() - outageSince(st) > UNPUSHED_TAP_MS) return "unpushed";
     return "ok";
   }
 
@@ -1155,6 +1275,78 @@ export class Link {
     if (st?.reset) throw new Refusal(`Nothing was posted: the record keeper had to reset its copy of the record (${clip(st.reset.why, 160)}), so asks and Ship cards wait until its next push to GitHub lands. Ask again in a few minutes.`);
   }
 
+  // A tap honoured while the keeper's ledger is unpushed (as its fresh read found): the card's
+  // generation, its check, the item, the time and the tapped label, kept in the link's state in
+  // /data until a push lands.
+  private journal(m: Shown, cid: string, msgId: string, item: string, now: number): void {
+    const st = keeperStatus(this.lastFresh?.status);
+    if (!st?.unpushed) return;
+    const i = Number(cid.split(":")[2]);
+    const s = this.d.load();
+    (s.uncertain ??= []).push({ gen: m.checked?.gen ?? null, check: m.checked?.req ?? null, item, at: now, msg: msgId,
+      label: m.q?.options[i] ?? "" });
+    s.uncertain = s.uncertain.slice(-50);
+    this.d.save(s);
+    this.log(`tap on card ${msgId} honoured while the record keeper's ledger is unpushed; journaled`);
+  }
+
+  // The journal against the keeper's status (each sweep): taps made before a reset that came
+  // after them are listed to Cain in a relayed line and to Dane in one short notice, as acted on
+  // a check that may not have landed; once a push lands (nothing unpushed, no reset), the
+  // journal is cleared.
+  private async uncertainTaps(): Promise<void> {
+    const s = this.d.load();
+    if (!s.uncertain?.length) return;
+    const st = keeperStatus(this.files().status);
+    if (!st) return;
+    const at = st.last_reset ? Date.parse(st.last_reset.at) : NaN;
+    const hit = Number.isFinite(at) ? s.uncertain.filter((u) => !u.told && u.at <= at) : [];
+    if (hit.length) {
+      const tz = this.d.tz ?? "America/New_York";
+      const when = (ms: number) => new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz }).format(ms);
+      const list = hit.map((u) => `card generation ${u.gen ?? "none"}, check ${u.check ?? "none"}, ${u.item}, at ${when(u.at)} (Discord message ${u.msg}, "${u.label}")`).join("; ");
+      this.d.relay(`The record keeper reset its copy of the record (${clip(st.last_reset!.why, 160)}) after Dane tapped on cards whose source check may not have landed: ${list}. Acted on a check that may not have landed: check each item at its source, record what he tapped again if it's missing, and ask again with --checked if it still needs him.`);
+      const n = hit.length;
+      try {
+        await this.notice(`Heads up: ${n === 1 ? "one of your taps" : `${n} of your taps`} (${hit.map((u) => when(u.at)).join(", ")}) acted on a check that may not have landed: Cain's record had to start over before it saved. Cain is checking ${n === 1 ? "it" : "them"}; nothing for you to do.`);
+      } catch (e) { this.log(`couldn't tell him about taps on a check that may not have landed: ${String(e).slice(0, 80)}`); }
+      const s2 = this.d.load();
+      for (const u of s2.uncertain ?? []) if (hit.some((h) => h.msg === u.msg && h.at === u.at)) u.told = true;
+      this.d.save(s2);
+      this.log(`told Cain and him of ${n} tap(s) on a check that may not have landed`);
+      return;
+    }
+    if (!st.unpushed && !st.reset) {
+      delete s.uncertain;
+      this.d.save(s);
+      this.log("a push landed: the journal of taps made while the ledger was unpushed is cleared");
+    }
+  }
+
+  // A keeper outage (its status unpushed or reset for over OUTAGE_NOTICE_MS, or OUTAGE_ROUNDS
+  // rounds): one notice to Dane, through the link's own notice path, with the push error in
+  // plain words; once per outage.
+  private async outageNotice(): Promise<void> {
+    const st = keeperStatus(this.files().status);
+    const o = st?.outage;
+    if (!st || !o || (!st.unpushed && !st.reset)) return;
+    const since = Date.parse(o.since);
+    if (!Number.isFinite(since)) return;
+    const s = this.d.load();
+    if (s.outageTold === o.since) return;
+    if (this.d.now() - since <= OUTAGE_NOTICE_MS && o.rounds < OUTAGE_ROUNDS) return;
+    const tz = this.d.tz ?? "America/New_York";
+    const when = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz }).format(since);
+    const why = plainPush(st.push_failed?.why, !!st.reset);
+    try {
+      await this.notice(`Cain's record hasn't saved to GitHub since ${when}: ${why}. Nothing is lost: the box keeps its copy and keeps trying.`);
+    } catch (e) { this.log(`couldn't tell him the record isn't saving: ${String(e).slice(0, 80)}`); return; }
+    const s2 = this.d.load();
+    s2.outageTold = o.since;
+    this.d.save(s2);
+    this.log(`told him the record hasn't saved since ${o.since} (${why})`);
+  }
+
   // The clock and the last tap's read time, for the device smoke test (keeper.sh clock).
   clockReport(): Record<string, unknown> {
     const st = keeperStatus(this.files().status);
@@ -1163,11 +1355,13 @@ export class Link {
     return {
       keeper: st === undefined ? "no status yet" : st === null ? "status unreadable" : {
         clock: st.clock ?? null, generation: st.generation ?? 0, unpushed: st.unpushed === true,
-        push_failed: st.push_failed ?? null, reset: st.reset ?? null, at: st.at ?? null },
+        push_failed: st.push_failed ?? null, reset: st.reset ?? null, last_reset: st.last_reset ?? null, outage: st.outage ?? null, at: st.at ?? null },
       box: local ? { synced: local.synced, source: local.source, diagnostic: local.diagnostic } : null,
       tap_synced: this.clockOk(st ?? undefined),
       tap_read_ms: this.tapRead?.ms ?? null, tap_read_limit_ms: TAP_READ_MS,
       tap_read_at: this.tapRead ? new Date(this.tapRead.at).toISOString() : null,
+      posted_gen: this.d.load().postedGen ?? 0,
+      uncertain_taps: (this.d.load().uncertain ?? []).length,
     };
   }
 
@@ -1854,7 +2048,22 @@ export class Link {
     return "";
   }
 
+  // Taps already answered with a deferred update (an ask or Ship card about an item, before its
+  // fresh read): their answers go to the interaction's webhook instead. A later acknowledgement
+  // is already done, and an update edits the tapped card through @original.
+  private deferred = new WeakSet<object>();
+
   private async answer(it: any, kind: number, data?: unknown): Promise<boolean> {
+    if (it && typeof it === "object" && this.deferred.has(it)) {
+      if (kind === ACK) return true;
+      try {
+        await this.rest("PATCH", `/webhooks/${String(it.application_id ?? "")}/${it.token}/messages/@original`, data ?? {}, false);
+        return true;
+      } catch (e) {
+        this.log(`couldn't update a tapped card after its deferred answer: ${String(e).slice(0, 80)}`);
+        return false;
+      }
+    }
     try {
       await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, data ? { type: kind, data } : { type: kind }, false);
       return true;
@@ -1902,7 +2111,7 @@ export class Link {
   }
 
   // Why a card that looks live has stopped mattering, or "".
-  private deadReason(m: Shown, now: number): string {
+  private async deadReason(m: Shown, now: number): Promise<string> {
     if (m.q?.used) return "answered";
     if (m.expires != null && m.expires <= now) return "expired";
     if (m.until - DAY <= now) return "forgetting";
@@ -1913,12 +2122,13 @@ export class Link {
       const holds = parseHolds(f.holds);
       if (holds && heldElsewhere(holds, item)) return "held elsewhere";
       if (m.kind === "ask" || m.kind === "ship") {
-        const c = this.checkState(item, m.checked);
+        const c = await this.tapState(item, m.checked);
         if (c === "changed") return "status changed";
         if (c === "unknown" || c === "behind") return "status unreadable";
         if (c === "busy") return "status busy";
         if (c === "clock") return "clock unsynced";
         if (c === "reset") return "record reset";
+        if (c === "unpushed") return "record unpushed";
       }
     }
     return "";
@@ -1976,8 +2186,15 @@ export class Link {
       this.log("tap refused: card was changed after it was posted");
       return "refused: card was changed after it was posted";
     }
+    // An ask or Ship card about an item: its fresh read of the keeper's files comes first, so the
+    // tap is acknowledged at once with a deferred update and answered after the read, within
+    // Discord's window whatever the read does.
+    const item = boundItem(rec);
+    if (cid !== RESUME && item && (rec.kind === "ask" || rec.kind === "ship")) {
+      if (await this.answer(it, ACK)) this.deferred.add(it);
+    }
     if (cid !== RESUME) {
-      const why = this.deadReason(rec, now);
+      const why = await this.deadReason(rec, now);
       // The ledger, the keeper's status or the check's outcome couldn't be read, or the ledger
       // is behind the card's generation: the tap is rejected with the status-changed reason, and
       // the card keeps its buttons for the sweep to judge. A read over its limit is "busy, tap
@@ -1988,6 +2205,7 @@ export class Link {
         "status busy": [BUSY_TAP, "refused: busy", `the ledger's read took ${this.tapRead?.ms ?? "?"} ms, over ${TAP_READ_MS} ms`],
         "clock unsynced": [CLOCK_TAP, "refused: clock", "the box's clock isn't synchronized now"],
         "record reset": [RESET_TAP, "refused: record reset", "the record keeper reset its copy and hasn't pushed since"],
+        "record unpushed": [UNPUSHED_TAP, "refused: record unpushed", `the record keeper's push has failed for over ${UNPUSHED_TAP_MS / 60_000} minutes`],
       };
       if (held[why]) {
         const [say, out, line] = held[why];
@@ -2004,6 +2222,9 @@ export class Link {
         return this.deadTap(it, msgId, why);
       }
     }
+    // Honoured while the keeper's ledger is unpushed: journaled, so that if the keeper then
+    // resets its copy, Cain and Dane hear this tap acted on a check that may not have landed.
+    if (cid.startsWith("q:") && item && (rec.kind === "ask" || rec.kind === "ship")) this.journal(rec, cid, msgId, item, now);
     if (cid.startsWith("q:")) return this.onQuestion(it, cid, msgId);
     if (cid === RESUME) { this.setStop(false); return this.stopTap(it, cid, msgId); }
     return this.toSpecialist(it, cid, msgId);
@@ -2940,6 +3161,8 @@ export class Link {
       this.backfillLabels();
       await this.sendOwedToggle();
       await this.retryLandings();
+      await this.uncertainTaps();
+      await this.outageNotice();
       await this.checkKey();
       await this.showDue();
       await this.decide();

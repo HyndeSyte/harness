@@ -11,9 +11,11 @@
 - A change to your whole open list saves whole or not at all: a row that says two different things are done or not done stops all of it, and Cain fixes and resends.
 - A row's next step stays short (the current step and its latest check); older history goes in a note on the item.
 - If saving the record to GitHub fails, nothing is lost or undone: the box keeps its copy and saves it again a minute later, and a question already out keeps working. Only if the box ever has to start its copy over do questions and taps wait, a few minutes, until it has saved again.
-- Taps that can't be confirmed right now do nothing and say why, and the question keeps its buttons: "Busy, tap again" when the record is slow to read, or a note that the box's clock isn't set right just now.
-- The box's clock is checked four ways now, the kernel's own flag first (the one that works on your Pi), and GitHub's clock as a backstop. If the clock ever jumps backwards, checks made "in the future" stop counting.
-- Right after this install Cain runs a short test, about ten minutes: a few test questions (tap any answer, or tap an old one when he says so) and a harmless Ship card (tap Not now). For one step he asks you to set source_check_max_days to 0 and then back to 7. He tells you in a line whether it worked. If not, restore the App from the backup taken before the install; nothing else needs undoing.
+- Your tap is answered right away, and the App then checks the record: taps that can't be confirmed right now do nothing and say why, and the question keeps its buttons: "Busy, tap again" when the record is slow to read (never longer than a second and a half), or a note that the box's clock isn't set right just now.
+- If saving the record to GitHub keeps failing (over half an hour, or three tries in a row), you get one notice saying why in plain words. After half an hour of that, taps wait until it saves.
+- If the box ever has to start its copy over after you tapped while it couldn't save, you get one short notice that those taps may not have counted, and Cain checks them.
+- The box's clock is checked four ways now, the kernel's own flag first (the one that works on your Pi), and GitHub's clock as a backstop. If the clock ever jumps backwards by more than a few seconds, checks made "in the future" stop counting.
+- Right after this install Cain runs a test, under about twenty minutes: a few test questions (tap any answer, or tap an old one when he says so), a harmless Ship card (tap Not now), and a couple of notices that the record isn't saving, which he causes on purpose. For one step he asks you to set source_check_max_days to 0 and then back to 7, the only option you change. At the end he asks you to restore the App from the backup taken before the install, send him one message he gives you, then install the update again. He tells you in a line whether it all worked. If not, restore the App from that backup; nothing else needs undoing.
 
 ## 0.11.0
 

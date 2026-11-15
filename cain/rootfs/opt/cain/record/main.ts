@@ -17,9 +17,10 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
-  maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, type OneOff, type WaitTimeout,
+  maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, checksText, parseChecks, type OneOff, type WaitTimeout,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
+import { teeConsole } from "../logfile.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; relay: string;
@@ -31,10 +32,21 @@ export type Config = {
   // system time it ended at (default: ../clock.ts, the box's three sources then that header).
   clockReadings?: (dateHeader: string | null, at: number) => Reading[];
   status?: string;         // the keeper's status for the link (default /data/record-ledger.json, next to the queue)
-  blockPush?: string;      // the smoke test's switch: while this file exists, a round pushes to a wrong remote (default /data/record-block-push)
+  blockPush?: string;      // the smoke test's switch: while this file exists, a round pushes to a wrong remote (default /data/record-block-push);
+                           // empty, for one round; holding a time (ms since 1970), for every round until then
+  clockTest?: string;      // the smoke test's clock switch (default /data/record-clock-test): "header-only" (one round with the box's
+                           // own sources left out, so GitHub's Date header decides), "none" (no source says synchronized), or
+                           // "step:-600" (the keeper's clock reads that many seconds off), the last two while the file exists
+  forceConflict?: string;  // the smoke test's switch (default /data/record-force-conflict): the next round with local commits
+                           // GitHub doesn't have treats their rebase as a conflict and resets the copy, as a real one would
+  linkState?: string;      // the link's own state (default /data/link/state.json, next to the queue), read only: the highest ledger generation
+                           // it posted on a card is a floor for the keeper's, so a re-clone with its state file lost never goes below it
   checkin?: string;        // where new audit lines wait for Cain's next check-in (default /data/record-checkin.txt, next to the queue)
   waits?: string;          // the link's wait timeouts (default /data/record-waits.jsonl, next to the queue)
   beforePush?: () => void; // the tests' hook: runs right before the push
+  fetchDate?: () => string | null;   // the tests' stand-in for GitHub's Date header on a fetch from a local remote
+  leakCheck?: string;      // the smoke test's leak check (default /data/record-leak-check): see leakCheck()
+  logFile?: string;        // the keeper's log copy (RECORD_LOG, /data/work/record-keeper.log), which the leak check reads
 };
 
 // Whether the system clock is synchronized by the box's own sources (../clock.ts: the kernel's
@@ -44,8 +56,26 @@ export function clockSynced(): boolean {
   return verdict(localReadings()).synced;
 }
 
-// The round's clock verdict, from the configured sources.
-function clockVerdict(cfg: Config, dateHeader: string | null, at: number): Verdict {
+// The smoke test's clock switch, as this round reads it (null: off). header-only is used up by
+// the round that reads it.
+type ClockTest = { kind: "header-only" } | { kind: "none" } | { kind: "step"; ms: number };
+function clockTest(cfg: Config): ClockTest | null {
+  const f = cfg.clockTest ?? join(dirname(cfg.queue), "record-clock-test");
+  if (!existsSync(f)) return null;
+  let t = "";
+  try { t = readFileSync(f, "utf8").trim(); } catch { return null; }
+  if (t === "header-only") { rmSync(f, { force: true }); return { kind: "header-only" }; }
+  if (t === "none") return { kind: "none" };
+  const m = /^step:(-?\d{1,6})$/.exec(t);
+  if (m) return { kind: "step", ms: Number(m[1]) * 1000 };
+  return null;
+}
+
+// The round's clock verdict, from the configured sources (and the smoke test's switch).
+function clockVerdict(cfg: Config, dateHeader: string | null, at: number, test: ClockTest | null = null): Verdict {
+  if (test?.kind === "none") return verdict([{ source: "kernel", state: "unsynced", detail: "smoke test: clock-test none" },
+    { source: "http-date", state: "unsynced", detail: "smoke test: clock-test none" }]);
+  if (test?.kind === "header-only") return verdict([dateHeaderReading(dateHeader, at)]);
   if (cfg.clockReadings) return verdict(cfg.clockReadings(dateHeader, at));
   if (cfg.clockSynced) {
     let ok = false;
@@ -67,6 +97,14 @@ export function blobSha(content: string): string {
 }
 
 class GitError extends Error {}
+
+// What git said, with the token and any credentials in a remote's address taken out, so neither
+// reaches a log line, the status file or a line relayed to Cain.
+export function redact(cfg: { token?: string }, text: string): string {
+  let out = text;
+  if (cfg.token) out = out.split(cfg.token).join("<token>");
+  return out.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/@]+@/gi, "$1<userinfo>@");
+}
 
 // trace: the fetch's HTTP exchange is traced (headers only, credentials redacted) so the round
 // can read GitHub's Date header; the trace lines are kept out of what this returns.
@@ -90,7 +128,7 @@ function git(cfg: Config, args: string[], cwd = cfg.dir, trace?: { date: string 
     for (const l of lines) { const m = /<= Recv header: date: (.+?)\s*$/i.exec(l); if (m && traced.test(l)) trace.date = m[1]; }
     out = lines.filter((l) => !traced.test(l)).join("\n").trim();
   }
-  if (cfg.token) out = out.split(cfg.token).join("<token>");
+  out = redact(cfg, out);
   if (p.exitCode !== 0) throw new GitError(`git ${args[0]}: ${out.split("\n")[0]}`);
   return out;
 }
@@ -100,6 +138,7 @@ function git(cfg: Config, args: string[], cwd = cfg.dir, trace?: { date: string 
 // the copy to GitHub's (reset says why). A fetch that fails (GitHub down) leaves the copy as
 // it is, so local work goes on. date: GitHub's Date header on the fetch (null: none).
 type Synced = { date: string | null; fetchedAt: number; cloned: boolean; fetched: boolean; reset: string | null };
+const conflictFile = (cfg: Config) => cfg.forceConflict ?? join(dirname(cfg.queue), "record-force-conflict");
 function sync(cfg: Config, now: () => number = Date.now): Synced {
   let cloned = false, reset: string | null = null;
   if (!existsSync(join(cfg.dir, ".git"))) {
@@ -121,7 +160,11 @@ function sync(cfg: Config, now: () => number = Date.now): Synced {
   const fetchedAt = now();
   if (fetched) {
     if (ahead(cfg)) {
-      try { git(cfg, ["rebase", "--quiet", `origin/${cfg.branch}`]); }
+      try {
+        // The smoke test's forced conflict: this rebase counts as one that conflicted.
+        if (existsSync(conflictFile(cfg))) { rmSync(conflictFile(cfg), { force: true }); throw new GitError("git rebase: conflict forced by the smoke test (record.sh force-conflict)"); }
+        git(cfg, ["rebase", "--quiet", `origin/${cfg.branch}`]);
+      }
       catch (e) {
         try { git(cfg, ["rebase", "--abort"]); } catch { /* none in progress */ }
         reset = `its local commits couldn't be rebased onto GitHub's copy (${clean((e as Error).message, 160)})`;
@@ -130,7 +173,7 @@ function sync(cfg: Config, now: () => number = Date.now): Synced {
       }
     } else git(cfg, ["reset", "--quiet", "--hard", `origin/${cfg.branch}`]);   // a fast-forward: nothing local is lost
   }
-  return { date: trace.date, fetchedAt, cloned, fetched, reset };
+  return { date: trace.date ?? (fetched ? cfg.fetchDate?.() ?? null : null), fetchedAt, cloned, fetched, reset };
 }
 
 // The copy has commits GitHub doesn't (as last fetched).
@@ -238,8 +281,13 @@ type Owed = { o: Outcome; local: boolean; relay: string[]; log: string[] };
 type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downtime; pushed?: string;
   generation?: number;                    // the highest ledger generation the keeper has written or seen
   unpushed?: boolean;                     // local commits GitHub doesn't have: the last push failed
-  pushFailed?: { at: string; why: string };
+  pushFailed?: { at: string; why: string; since?: string };   // the last push error; since: the first of this run of them
   reset?: { at: string; why: string };    // the copy was reset (lost local commits) since the last push that landed
+  lastReset?: { at: string; why: string };   // the latest reset, kept after the push that ends it (the link reports taps made before it)
+  outage?: { since: string; rounds: number };   // rounds that ended unpushed or reset, since when (cleared once a push lands)
+  // Takes that waited behind a job and were settled in a commit GitHub doesn't have yet: kept until
+  // the push that carries them lands, so a reset runs them again like other queued requests.
+  settled?: Waiting[];
   owed?: Owed[]; clockKey?: string };
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
@@ -265,11 +313,19 @@ function revive(j: any): State | null {
   const span = (x: any) => x && typeof x.at === "string" && typeof x.why === "string" ? { at: x.at, why: x.why } : undefined;
   const owed = (Array.isArray(j.owed) ? j.owed : []).filter((w: any) => w && w.o && typeof w.o.id === "string" && Array.isArray(w.relay) && Array.isArray(w.log))
     .map((w: any) => ({ o: w.o, local: w.local === true, relay: w.relay.map(String), log: w.log.map(String) }));
-  const pushFailed = span(j.pushFailed), reset = span(j.reset);
+  const pushFailed = span(j.pushFailed), reset = span(j.reset), lastReset = span(j.lastReset);
+  if (pushFailed && typeof j.pushFailed.since === "string") (pushFailed as any).since = j.pushFailed.since;
+  const settled: Waiting[] = [];
+  for (const w of Array.isArray(j.settled) ? j.settled : []) {
+    const r = parseRequest(JSON.stringify(w?.req ?? null));
+    if (r.req && !r.error && typeof w.since === "string") settled.push({ req: r.req, since: w.since, local: w.local === true });
+  }
+  const outage = j.outage && typeof j.outage.since === "string" && Number.isInteger(j.outage.rounds) ? { since: j.outage.since, rounds: j.outage.rounds } : undefined;
   return { holds, waiting, alive: typeof j.alive === "string" ? j.alive : undefined, downtime,
     ...(typeof j.pushed === "string" && /^[0-9a-f]{40}$/.test(j.pushed) ? { pushed: j.pushed } : {}),
     ...(Number.isInteger(j.generation) && j.generation > 0 ? { generation: j.generation } : {}),
     ...(j.unpushed === true ? { unpushed: true } : {}), ...(pushFailed ? { pushFailed } : {}), ...(reset ? { reset } : {}),
+    ...(lastReset ? { lastReset } : {}), ...(outage ? { outage } : {}), ...(settled.length ? { settled } : {}),
     ...(owed.length ? { owed } : {}), ...(typeof j.clockKey === "string" ? { clockKey: j.clockKey } : {}) };
 }
 
@@ -408,7 +464,10 @@ function deliver(cfg: Config, w: Owed) {
 // round when GitHub answers and otherwise on the next round. Nothing leaves a queue until
 // GitHub has the commit.
 export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?: boolean } {
-  const clock = () => cfg.now?.() ?? new Date();
+  // The smoke test's clock switch, read once per round: a step moves the keeper's clock.
+  const test = clockTest(cfg);
+  const step = test?.kind === "step" ? test.ms : 0;
+  const clock = () => new Date((cfg.now?.() ?? new Date()).getTime() + step);
   let st: State | undefined;
   let cv: Verdict | undefined;
   let was: { alive?: string; downtime: Downtime } = { downtime: [] };
@@ -422,17 +481,26 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
     try {
       synced0 = sync(cfg, () => clock().getTime());
       st = loadState(cfg);
+      // The generation floor: the keeper's own count (its state file, in /data outside the
+      // working copy) and the highest generation the link has posted on a card, so a re-clone
+      // with the state file lost never goes below a card that is up.
+      const floor = linkFloor(cfg);
+      if (floor > (st.generation ?? 0)) st.generation = floor;
       // A reset of the copy (a rebase that conflicted, or a copy cloned again after the keeper
-      // had written a ledger): lost local commits. Asks and taps wait for the next push.
+      // had written a ledger or the link had posted a card on one): lost local commits. Asks and
+      // taps wait for the next push.
       const lost = synced0.reset ?? (synced0.cloned && ((st.generation ?? 0) > 0 || st.unpushed) ? "the keeper's copy of the record was missing and was cloned again from GitHub" : null);
       if (lost) resetCopy(cfg, st, lost, clock());
       // A round counts as the keeper working only once its push lands: until then the state
       // is saved with the last good round's time, so a push outage is downtime.
       was = { alive: st.alive, downtime: [...st.downtime] };
       beat(st, clock());
-      cv = clockVerdict(cfg, synced0.date, synced0.fetchedAt);
+      cv = clockVerdict(cfg, synced0.date, synced0.fetchedAt, test);
       if (cv.synced !== true) cv = { ...cv, synced: false };
       noteClock(st, cv);
+      // The measured offset against GitHub's Date header, every round that has one.
+      if (synced0.date) { const r = dateHeaderReading(synced0.date, synced0.fetchedAt); log(`clock: offset against GitHub's Date header ${r.detail ?? r.state}`); }
+      if (test) log(`clock: the smoke test's clock switch is on (${test.kind === "step" ? `step ${test.ms / 1000} s` : test.kind})`);
       items = pending(cfg);
       if (items.length || st.waiting.length) book = logbook(cfg);
       // A take that has its final outcome in the log already (a /data restored from
@@ -504,6 +572,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           const waited = idleMs({ renewed: w.since } as any, at, S.downtime);
           if (p.state === "waiting" && waited <= HOLD_IDLE_MS) { i++; continue; }
           S.waiting.splice(i, 1);
+          // Kept until the push carrying it lands: a reset runs it again.
+          (S.settled ??= []).push(w);
           const base = outcomeOf(w.req, at);
           const o: Outcome = p.state === "ok" ? apply(p, base)
             : p.state === "waiting" ? { ...base, state: "refused", reason: clean(`waited a day: ${p.reason}`) }
@@ -542,6 +612,15 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           commit(`Source checks: ${what.join("; ")}`);
         }
       } catch (e) { undo(); log(`couldn't keep the ledger in step (${(e as Error).message}); trying again next round`); }
+      // The ledger's generation never comes down, even after a reset or a re-clone put an older
+      // ledger in the copy: it is written again above the keeper's count.
+      try {
+        const raw = t.read(CHECKS_PATH);
+        if (raw !== null && generationOf(raw) < (S.generation ?? 0) && linkFree(cfg, CHECKS_PATH)) {
+          writeWhole(join(cfg.dir, CHECKS_PATH), checksText(parseChecks(raw), (S.generation ?? 0) + 1));
+          commit(`Source checks: generation ${(S.generation ?? 0) + 1}, above the ${generationOf(raw)} the copy came back with`);
+        }
+      } catch (e) { undo(); log(`couldn't raise the ledger's generation (${(e as Error).message}); trying again next round`); }
       // The record's copy is the keeper's: put back if anyone else changed it.
       const published = publishedHolds(cfg);
       if (published === null ? Object.keys(S.holds).length > 0 : published !== holdsText(S.holds))
@@ -587,6 +666,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         // Cain's requests that were already applied are let go, with their status file if it
         // was never written.
         if (synced0.fetched) landed(cfg, S, clock());
+        tally(S, clock());
         finish(cfg, S, items, outcomes, book);
         writeStatus(cfg, S, cv, clock());
         return { applied: items.length, ok: true };
@@ -595,8 +675,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       writeAtomic(stateFile(cfg), unlanded(S));
       appliedNames = new Set(items.filter((it) => it.local).map((it) => it.name));
     } catch (e) {
-      log(`stopped this round, nothing let go: ${(e as Error).message}`);
-      if (st && cv) writeStatus(cfg, st, cv, clock());
+      log(`stopped this round, nothing let go: ${redact(cfg, (e as Error).message)}`);
+      if (st && cv) { tally(st, clock()); writeStatus(cfg, st, cv, clock()); }
       return { applied: 0, ok: false };
     }
     let why = "";
@@ -615,18 +695,20 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       if (!answered || ahead(cfg)) {
         st!.unpushed = true;
         if (!st!.pushFailed) log(`push didn't land (${clean(why, 200)}); the local commits stay and their outcomes stand`);
-        st!.pushFailed = { at: clock().toISOString(), why: clean(why, 200) };
+        st!.pushFailed = { at: clock().toISOString(), why: clean(why, 200), since: st!.pushFailed?.since ?? clock().toISOString() };
+        // GitHub answered (a lost race): rebase and try again now. Otherwise the next round.
+        const retry = answered && !existsSync(blockFile(cfg)) && attempt < 2;
+        if (!retry) { tally(st!, clock()); releaseBlock(cfg, clock()); }
         writeAtomic(stateFile(cfg), unlanded(st!));
         writeStatus(cfg, st!, cv!, clock());
-        // GitHub answered (a lost race): rebase and try again now. Otherwise the next round.
-        if (answered && !existsSync(blockFile(cfg)) && attempt < 2) continue;
-        if (existsSync(blockFile(cfg))) rmSync(blockFile(cfg), { force: true });
+        if (retry) continue;
         return { applied: items.length, ok: false, pushFailed: true };
       }
     }
     // GitHub has it: the holds and waiting takes are saved, the requests can go,
     // and Cain hears what needs him.
     landed(cfg, st!, clock());
+    tally(st!, clock());
     finish(cfg, st!, items, outcomes, book);
     rmSync(`${stateFile(cfg)}.next`, { force: true });
     writeStatus(cfg, st!, cv!, clock());
@@ -641,6 +723,37 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
 let appliedNames = new Set<string>();
 
 const blockFile = (cfg: Config) => cfg.blockPush ?? join(dirname(cfg.queue), "record-block-push");
+
+// The push block, after a round it blocked: an empty file was for that one round; one holding a
+// time stays until then (the smoke test's push failure kept going for a few minutes).
+function releaseBlock(cfg: Config, now: Date) {
+  const f = blockFile(cfg);
+  if (!existsSync(f)) return;
+  let until = NaN;
+  try { until = Number(readFileSync(f, "utf8").trim() || NaN); } catch { /* removed below */ }
+  if (!(Number.isFinite(until) && now.getTime() < until)) rmSync(f, { force: true });
+}
+
+// The highest ledger generation the link has posted on a card, from its own state file (read
+// only; 0 when there is none or it can't be read).
+export function linkFloor(cfg: Config): number {
+  const f = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
+  try {
+    if (!existsSync(f) || lstatSync(f).size > 20_000_000) return 0;
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    let g = Number.isInteger(j?.postedGen) ? j.postedGen : 0;
+    for (const m of Object.values<any>(j?.messages ?? {})) if (Number.isInteger(m?.checked?.gen) && m.checked.gen > g) g = m.checked.gen;
+    return g > 0 ? g : 0;
+  } catch { return 0; }
+}
+
+// The run of rounds that ended with local commits unpushed or the copy reset: since when, and
+// how many (the link tells Dane once it passes 30 minutes or three rounds). Cleared once clean.
+function tally(st: State, now: Date) {
+  if (!st.unpushed && !st.reset) { delete st.outage; return; }
+  const since = [st.pushFailed?.since, st.reset?.at, now.toISOString()].filter((x): x is string => !!x).sort()[0];
+  st.outage = { since: st.outage?.since && st.outage.since < since ? st.outage.since : since, rounds: (st.outage?.rounds ?? 0) + 1 };
+}
 const statusFile = (cfg: Config) => cfg.status ?? join(dirname(cfg.queue), "record-ledger.json");
 
 // A whole file, written so a reader sees the old one or the new one, never half of it.
@@ -657,7 +770,7 @@ function landed(cfg: Config, st: State, now: Date) {
   st.pushed = git(cfg, ["rev-parse", "HEAD"]);
   if (st.unpushed || st.pushFailed) log("push landed: GitHub has the keeper's local commits");
   if (st.reset) log("the copy is in step with GitHub again after its reset; asks and taps go on");
-  delete st.unpushed; delete st.pushFailed; delete st.reset;
+  delete st.unpushed; delete st.pushFailed; delete st.reset; delete st.settled;
   appliedNames = new Set();
   for (const w of st.owed ?? []) deliver(cfg, w);
   delete st.owed;
@@ -669,9 +782,18 @@ function landed(cfg: Config, st: State, now: Date) {
 // next push lands.
 function resetCopy(cfg: Config, st: State, why: string, now: Date) {
   st.reset = { at: now.toISOString(), why: clean(why, 240) };
+  st.lastReset = st.reset;
   log(`reset: ${why}; asks and taps are refused until the next push to GitHub lands`);
   const queued = new Set<string>();
   for (const p of pending(cfg)) if (p.req) queued.add(p.req.id);
+  // Takes settled in the lost commits wait again, ahead of the others, and are planned again
+  // this round like any queued request.
+  for (const w of st.settled ?? []) queued.add(w.req.id);
+  if (st.settled?.length) {
+    log(`reset: ${st.settled.map((w) => w.req.id).join(", ")} settled in a commit that was lost; planned again`);
+    st.waiting = [...st.settled, ...st.waiting.filter((w) => !st.settled!.some((x) => x.req.id === w.req.id))];
+    delete st.settled;
+  }
   // Those still queued are applied again, and owed again then.
   const lost = (st.owed ?? []).filter((w) => !queued.has(w.o.id));
   st.owed = [];
@@ -697,6 +819,7 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
     writeAtomic(statusFile(cfg), JSON.stringify({
       at: now.toISOString(), generation: st.generation ?? 0, unpushed: st.unpushed === true,
       ...(st.pushFailed ? { push_failed: st.pushFailed } : {}), ...(st.reset ? { reset: st.reset } : {}),
+      ...(st.lastReset ? { last_reset: st.lastReset } : {}), ...(st.outage ? { outage: st.outage } : {}),
       clock: { synced: v.synced, source: v.source, diagnostic: v.diagnostic, at: now.toISOString() },
     }) + "\n");
   } catch (e) { log(`couldn't write the status for the link: ${(e as Error).message}`); }
@@ -777,6 +900,31 @@ function finish(cfg: Config, st: State, items: Pending[], outcomes: (Outcome | n
   });
 }
 
+// The smoke test's leak check (record.sh leak-check): while its flag file exists, the keeper, which
+// alone holds the token, reads its own log copy, its status file, the relay queue, its audit
+// files and any files the flag lists (the refusal line Cain saved), and says per file whether the
+// token or a web address's userinfo is in it. Never the match itself: only yes or no. The result
+// goes to <flag>.json and one log line; the flag is removed.
+export function leakCheck(cfg: Config): { clean: boolean; files: { path: string; token: boolean; userinfo: boolean }[] } | null {
+  const flag = cfg.leakCheck ?? join(dirname(cfg.queue), "record-leak-check");
+  if (!existsSync(flag)) return null;
+  let extra: string[] = [];
+  try { extra = readFileSync(flag, "utf8").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("/")); } catch { /* none */ }
+  rmSync(flag, { force: true });
+  const paths = [cfg.logFile, `${cfg.logFile ?? ""}.1`, statusFile(cfg), cfg.relay, waitsFile(cfg), checkinFile(cfg), ...extra]
+    .filter((p): p is string => !!p && p !== ".1" && existsSync(p) && lstatSync(p).isFile());
+  const files = paths.map((path) => {
+    let t = "";
+    try { const b = readFileSync(path); t = b.subarray(Math.max(0, b.length - 5_000_000)).toString("utf8"); } catch { /* unreadable: nothing found */ }
+    return { path, token: !!cfg.token && t.includes(cfg.token), userinfo: /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/@<>'"]+@/i.test(t) };
+  });
+  const clean = files.every((f) => !f.token && !f.userinfo);
+  const out = { at: new Date().toISOString(), clean, files };
+  try { writeAtomic(`${flag}.json`, JSON.stringify(out) + "\n"); } catch { /* the log line says it */ }
+  log(clean ? `leak check: clean (${files.length} files, no token and no userinfo)` : `leak check: FOUND in ${files.filter((f) => f.token || f.userinfo).map((f) => `${f.path} (${f.token ? "token" : "userinfo"})`).join(", ")}`);
+  return { clean, files };
+}
+
 // Once a day: the deterministic check, written to state/record-check.md.
 export function nightly(cfg: Config): boolean {
   try {
@@ -834,12 +982,13 @@ export async function keep(cfg: Config, o: {
   while (!o.stop?.()) {
     if (clock() >= due || (!paused && queued(cfg))) {
       let ok = false, local = false;
-      try { const r = run(cfg); ok = r.ok; local = (r as any).pushFailed === true; } catch (e) { log(`cycle error: ${e}`); }
+      try { const r = run(cfg); ok = r.ok; local = (r as any).pushFailed === true; } catch (e) { log(`cycle error: ${redact(cfg, String(e))}`); }
       due = clock() + fullMs;
       // A round whose local work was done but whose push failed doesn't pause Cain's queue: new
       // requests still get their local outcome at once (and each tries the push again).
       paused = !ok && !local;
     }
+    try { leakCheck(cfg); } catch (e) { log(`leak check didn't finish: ${(e as Error).message}`); }
     if (o.nightly !== false) {
       const now = new Date();
       const hm = now.toLocaleTimeString("en-GB", { timeZone: cfg.tz, hour: "2-digit", minute: "2-digit" }).replace(":", "");
@@ -871,8 +1020,14 @@ if (import.meta.main) {
     waits: process.env.RECORD_WAITS ?? "/data/record-waits.jsonl",
     status: process.env.RECORD_STATUS ?? "/data/record-ledger.json",
     blockPush: process.env.RECORD_BLOCK_PUSH ?? "/data/record-block-push",
+    clockTest: process.env.RECORD_CLOCK_TEST ?? "/data/record-clock-test",
+    forceConflict: process.env.RECORD_FORCE_CONFLICT ?? "/data/record-force-conflict",
+    linkState: process.env.LINK_STATE ?? "/data/link/state.json",
+    leakCheck: process.env.RECORD_LEAK_CHECK ?? "/data/record-leak-check",
+    logFile: process.env.RECORD_LOG ?? "/data/work/record-keeper.log",
   };
   delete process.env.RECORD_TOKEN;   // kept only in cfg, handed to git per call
+  teeConsole(cfg.logFile);
   if (!cfg.token) {
     log("no GitHub token in the add-on's options yet; the record keeper is waiting");
     while (true) await Bun.sleep(3_600_000);

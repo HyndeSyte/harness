@@ -9,6 +9,7 @@
 // take, pass and release. Anyone may file a note on any item (state/notes/<item>.md,
 // also the keeper's own), so his words always reach its holder.
 import { createHash } from "node:crypto";
+import { DATE_SKEW_MS } from "../clock.ts";
 
 export type RowField = "Item" | "Who" | "Next step" | "Waits for" | "Done when";
 
@@ -562,12 +563,19 @@ export const staleAfter = (e: CheckEntry | undefined, maxDays = DEFAULT_MAX_CHEC
   e?.stale_after ? Date.parse(e.stale_after) : e?.checked_at ? Date.parse(e.checked_at) + maxDays * DAY_MS : NaN;
 // Of the row's version, not aged out by the keeper and not pending a rewrite (with no clock),
 // and, given a time, no older than the limit.
+// A check dated after the clock now reads, by more than DATE_SKEW_MS (10 seconds): the clock
+// stepped back. A smaller gap is ordinary drift and the check stands.
+export function steppedBack(e: CheckEntry | undefined, now: number): boolean {
+  return !!e?.checked_at && Date.parse(e.checked_at) - now > DATE_SKEW_MS;
+}
 export function isFresh(e: CheckEntry | undefined, now?: number, maxDays = DEFAULT_MAX_CHECK_DAYS): boolean {
   if (!e || e.checked === undefined || e.checked_version !== e.version || e.aged || e.pending_rewrite || e.stepped_back) return false;
   if (now === undefined) return true;
   const until = staleAfter(e, maxDays);
-  // A clock that reads earlier than the check's own time stepped back: it doesn't count.
-  if (e.checked_at && now < Date.parse(e.checked_at)) return false;
+  // A clock that reads earlier than the check's own time by more than the Date header's skew
+  // margin stepped back: it doesn't count. Within the margin (a few seconds of ordinary drift
+  // between the keeper's clock and the link's) the check stands.
+  if (steppedBack(e, now)) return false;
   // A limit of 0 days (the smoke test's expired check): nothing counts, even in the same instant.
   return Number.isFinite(until) && now <= until && !(e.checked_at && until <= Date.parse(e.checked_at));
 }
@@ -1119,7 +1127,8 @@ function rowCell(text: string | null, id: string, col: string): string | undefin
 // The ledger kept in step with the list between requests: rows changed outside the keeper
 // (their cells no longer match the hash it wrote) go up a version, and, while the clock is
 // synchronized, checks past their stale_after are aged out. A check whose time is later than
-// the clock reads now (the clock stepped back) is marked stepped_back and never counts again.
+// the clock reads now by more than DATE_SKEW_MS (the clock stepped back) is marked stepped_back
+// and never counts again; within that margin it stands.
 // Returns the files to write, or null when nothing changes. Only once a ledger exists.
 export function upkeep(tree: Tree, ctx: { at: Date; tz?: string; maxCheckDays?: number; clockSynced?: boolean; generation?: number }): { writes: Map<string, string>; bumped: string[]; aged: string[]; stepped: string[] } | null {
   const raw = tree.read(CHECKS_PATH), list = tree.read(PENDING_PATH);
@@ -1132,7 +1141,7 @@ export function upkeep(tree: Tree, ctx: { at: Date; tz?: string; maxCheckDays?: 
   if (ctx.clockSynced === true) ({ ledger, aged } = ageChecks(ledger, ctx.at, ctx.maxCheckDays));
   const stepped: string[] = [];
   for (const [k, e] of Object.entries(ledger))
-    if (e.checked_at && !e.stepped_back && ctx.at.getTime() < Date.parse(e.checked_at)) { ledger = { ...ledger, [k]: { ...e, stepped_back: iso } }; stepped.push(k); }
+    if (!e.stepped_back && steppedBack(e, ctx.at.getTime())) { ledger = { ...ledger, [k]: { ...e, stepped_back: iso } }; stepped.push(k); }
   if (!bumped.length && !aged.length && !stepped.length) return null;
   const text = nextChecksText(ledger, raw, ctx.generation);
   const writes = new Map<string, string>(text === null ? [] : [[CHECKS_PATH, text]]);

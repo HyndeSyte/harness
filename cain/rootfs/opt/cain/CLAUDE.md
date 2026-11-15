@@ -139,7 +139,14 @@ specialist (the Harness add-on) does.
   still good for the row as it stands; if it can't read it, the tap does nothing and he's
   told the status changed. Other taps that do nothing and keep the buttons: a slow read
   ("Busy, tap again"), the box's clock not synchronized just now, or the record being put
-  back in step after a reset. Nothing to do for any of them unless he asks. A held ask
+  back in step after a reset, or (once the keeper's pushes have failed for over half an hour)
+  the record not saving. Nothing to do for any of them unless he asks. A tap honoured while
+  the keeper's push is failing is journaled; if the keeper then has to reset its copy, you get
+  a relayed line listing each such tap ("Acted on a check that may not have landed", with its
+  item, card generation, check and time) and he gets one short notice from the App: check each
+  item at its source, record what he tapped again if it's missing, and ask again with
+  --checked if it still needs him. A long push outage (over 30 minutes or three rounds) also
+  gets him one notice from the App with the error in plain words: don't repeat it. A held ask
   whose row changes is dropped unasked, and you're told. Check again and ask again if it
   still needs him.
 - A one-off (`--item none`) needs no check, but only for something that is no open item:
@@ -440,7 +447,7 @@ create, update or run any other routine.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 Right after an install that brings source checks (0.12.0), run the device smoke test, on
-an item you hold, two paths and two outcomes:
+an item you hold, under about twenty minutes in all. The steps that change things come last.
 1. A checked ask with a concrete source, whose text says it is a quick test and any answer
    does: it must post, and his tap on it must come back relayed.
 2. The same ask with a deliberately vague source (`--checked "from memory"`): nothing may
@@ -458,10 +465,45 @@ an item you hold, two paths and two outcomes:
    `/opt/cain/keeper.sh clock` must show unpushed until the next round pushes it.
 7. Ask him to set source_check_max_days to 0 in the App's options for one ask; a checked
    test ask must post nothing and say the check is past source_check_max_days. Then ask him
-   to set it back to 7.
+   to set it back to 7. That is the only option he changes.
 8. Run `/opt/cain/keeper.sh clock`: put the clock verdict, the source that satisfied it, and
    the tap read time in your report line.
-Keep it to about ten minutes; each test ask says it is the smoke test and any answer does.
+9. `/opt/cain/record.sh clock-test header-only` (answers "clock test: header-only"), then a
+   checked test ask (must post) and a vague one (save its refusal line to
+   /tmp/smoke-refusal.txt). /data/work/record-keeper.log must show "clock: synchronized, by
+   the GitHub Date header" and "clock: offset against GitHub's Date header". Then
+   `/opt/cain/record.sh leak-check /tmp/smoke-refusal.txt` must print `"clean":true`; any
+   true under token or userinfo fails. Never print or read the token yourself.
+10. `/opt/cain/keeper.sh reads 20` (about 80 seconds): `"pass":true`, p95_ms at most 1000,
+   keeper_rounds_seen at least 1.
+11. `/opt/cain/keeper.sh slow-read`, then a checked test ask he taps: he must see "Busy, tap
+   again." with the buttons kept, and /data/work/link.log "tap refused: the ledger's read
+   took". His next tap counts.
+12. `/opt/cain/record.sh block-push 3`, then a checked test ask: for over two minutes
+   keeper.sh clock shows unpushed, /data/work/link.log shows "left card <id>'s buttons on"
+   once, the buttons stay, and after three rounds he gets one notice that the record hasn't
+   saved ("the smoke test is blocking it on purpose"). Then unpushed goes false.
+13. With a checked test ask up, `pkill -f /opt/cain/link/main.ts`: the link is back within
+   about 5 seconds (keeper.sh clock answers), and his tap on the card comes back relayed.
+14. `/opt/cain/record.sh clock-test none`: a checked ask posts nothing (the refusal names each
+   clock source) and a tap answers the clock isn't synchronized. `/opt/cain/record.sh
+   clock-test step:-600`: the keeper log shows "dated after the clock stepped back" and a tap
+   on an earlier card is refused as status changed. `/opt/cain/record.sh clock-test off`: a
+   new checked ask posts and its tap counts.
+15. `/opt/cain/record.sh block-push 2`, a checked test ask he taps, a queued row edit and a
+   take of an item you hold, then `/opt/cain/record.sh force-conflict`: the keeper log shows
+   the forced reset, asks and taps are refused with the reset reason, keeper.sh clock's
+   generation never goes down, you get the "Acted on a check that may not have landed" line
+   and he gets one notice; after the push lands everything works and the edit and take are
+   done.
+16. Last, the rollback: ask him to restore this App from the backup Home Assistant took just
+   before the install (you can't change Home Assistant), and give him a message to send you
+   once it's restored: "Rollback check: run /opt/cain/keeper.sh stopped and jq -r .alive
+   /data/record-holds.json". The restored version (which doesn't have these steps) answers
+   that: keeper.sh answering shows the link is back, and an alive time within the last two
+   minutes shows the keeper is. Then he installs this version again from the App's update in
+   Home Assistant, and you confirm it runs and that `/opt/cain/keeper.sh clock` answers.
+Each test ask says it is the smoke test and any answer does.
 It passes only when you also see committed in the record: the `check` request done in
 log/requests/, state/checks.json with that row's entry and your check, and the open
 table's Checked column showing it. Tell him the result in one line with the commit hashes

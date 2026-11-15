@@ -11,8 +11,20 @@
 #                               <since>: only notes after that time (any ISO form or offset).
 #   record.sh submit <file>     queue a request (JSON, see CLAUDE.md); prints its id
 #   record.sh status <id>       done / conflict / rejected / refused / relayed, or "waiting"
-#   record.sh block-push        the device smoke test only: the record keeper's next round pushes to a
-#                               wrong remote (its push fails, its local commits stay), then it pushes as usual
+#   record.sh block-push [minutes]
+#                               the device smoke test only: the record keeper's next round (or, with
+#                               minutes, every round for that long) pushes to a wrong remote (its push
+#                               fails, its local commits stay), then it pushes as usual
+#   record.sh clock-test <header-only|none|step:-N|off>
+#                               the device smoke test only: one round with the box's own clock sources
+#                               left out (GitHub's Date header decides), no source synchronized, or the
+#                               keeper's clock N seconds off, until off
+#   record.sh leak-check [files]
+#                               the device smoke test only: the record keeper says per file (its log copy,
+#                               its status, the relay queue, and the files named) whether its token or a
+#                               web address's userinfo is in it, printing yes or no, never the match
+#   record.sh force-conflict    the device smoke test only: the next round with unpushed local commits
+#                               resets the keeper's copy, as a rebase conflict would
 set -u
 dir="${RECORD_DIR:-/data/record}"
 queue="${RECORD_QUEUE:-/data/record-queue}"
@@ -72,7 +84,37 @@ case "${1:-}" in
     f="$outcomes/$(printf '%s' "$id" | tr -c 'A-Za-z0-9._:-' '_').json"
     if [ -f "$f" ]; then jq -r '"\(.state)\(if .reason then ": " + .reason else "" end)"' "$f"; else echo waiting; fi ;;
   block-push)
-    # The keeper removes it once that round's push has failed.
-    : > "${RECORD_BLOCK_PUSH:-/data/record-block-push}" && echo "the record keeper's next round pushes to a wrong remote, once" ;;
-  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id> | block-push" >&2; exit 2 ;;
+    # The keeper removes it once that round's push has failed; with minutes, once they have passed.
+    f="${RECORD_BLOCK_PUSH:-/data/record-block-push}"
+    case "${2:-}" in
+      '') : > "$f" && echo "the record keeper's next round pushes to a wrong remote, once" ;;
+      *[!0-9]*) echo "block-push takes a number of minutes" >&2; exit 2 ;;
+      *) echo $(( ($(date +%s) + 60 * $2) * 1000 )) > "$f" && echo "the record keeper's rounds push to a wrong remote for the next $2 minutes" ;;
+    esac ;;
+  clock-test)
+    # The smoke test's clock switch: header-only (one round, GitHub's Date header alone), none
+    # (no clock source says synchronized), step:-600 (the keeper's clock reads 600 seconds early),
+    # off.
+    f="${RECORD_CLOCK_TEST:-/data/record-clock-test}"
+    case "${2:-}" in
+      header-only|none) printf '%s\n' "$2" > "$f" && echo "clock test: $2" ;;
+      step:-[0-9]*|step:[0-9]*) printf '%s\n' "$2" > "$f" && echo "clock test: $2" ;;
+      off) rm -f "$f" && echo "clock test: off" ;;
+      *) echo "clock-test takes header-only, none, step:-<seconds> or off" >&2; exit 2 ;;
+    esac ;;
+  leak-check)
+    # The record keeper (which alone holds the token) reads its log copy, its status file, the relay
+    # queue and the files named here, and says per file whether the token or a web address's
+    # userinfo is in them: yes or no, never the match.
+    f="${RECORD_LEAK_CHECK:-/data/record-leak-check}"
+    shift
+    rm -f "$f.json"
+    : > "$f.tmp"; for p in "$@"; do case "$p" in /*) printf '%s\n' "$p" >> "$f.tmp" ;; *) printf '%s\n' "$PWD/$p" >> "$f.tmp" ;; esac; done
+    mv "$f.tmp" "$f"
+    for _ in $(seq 1 60); do [ -f "$f.json" ] && break; sleep 2; done
+    if [ -f "$f.json" ]; then jq -c '{clean, files: [.files[] | {path, token, userinfo}]}' "$f.json"; else echo '{"clean":null,"said":"the record keeper did not answer within 2 minutes"}'; exit 1; fi ;;
+  force-conflict)
+    # The next round with unpushed local commits treats their rebase as a conflict and resets.
+    : > "${RECORD_FORCE_CONFLICT:-/data/record-force-conflict}" && echo "the record keeper's next round with unpushed commits resets its copy, as after a conflict" ;;
+  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id> | block-push [minutes] | clock-test <header-only|none|step:-N|off> | force-conflict | leak-check [files]" >&2; exit 2 ;;
 esac

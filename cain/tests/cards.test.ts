@@ -417,9 +417,9 @@ describe("cards replace each other only for the same item and question", () => {
 
 describe("taps on dead cards", () => {
   const dead = async (r: ReturnType<typeof rig>, msg: any, cid: string, line: string) => {
-    const before = r.relayed.length;
+    const before = r.relayed.length, edits = r.updates().length;
     expect(await r.tap(msg, cid)).toStartWith("dead:");
-    expect(r.answers().at(-1)).toBe(7);                               // updated in place, never a silent ack
+    expect(r.updates().length).toBe(edits + 1);                       // updated in place (after a deferred answer for an ask), never a silent ack
     expect(r.updates().at(-1).components).toEqual([]);
     expect(r.updates().at(-1).content.endsWith(line)).toBe(true);
     expect(r.ephemerals().at(-1)).toEqual({ content: EXPIRED_TAP, flags: 64, allowed_mentions: { parse: [] } });
@@ -505,12 +505,12 @@ describe("a tap is never lost, and a card never posted twice", () => {
   test("the link stops mid-tap: Cain was already told, and the sweep finishes the card", async () => {
     const r = rig();
     const id = await ask(r, "P08", "Q2");
-    r.hang.interactions = true;                                       // Discord never hears back
+    r.hang.edits = true;                                              // the card's edit after the deferred answer never hears back
     void r.tap(snap(r.msg(id)), r.ids(id)[1]);
     await tick();
     expect(r.state().messages[id].outcome).toBe("answered");
     expect(r.relayed).toEqual([expect.stringContaining('Dane tapped "Not filed" on your question P08 Q2')]);
-    r.hang.interactions = false;
+    r.hang.edits = false;
     r.restart();
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
