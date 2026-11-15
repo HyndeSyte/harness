@@ -311,7 +311,10 @@ Chores that need a browser signed in as you go to a small job queue in a private
 of their own (`pc_jobs_repo`, default `HyndeSyte/pc-jobs`), run by a scheduled task on
 your PC in a Chrome profile named Cain jobs. Cain's PC job keeper is the queue's one
 writer of jobs and holds `pc_jobs_token`, so his session never does. With no token it
-waits and does nothing. The one-time setup at your PC, the job and result formats and
+waits and does nothing. This version is read-only by enforcement: the PC worker runs
+only actions from a fixed read-only set that your signed allowlist pins to an address,
+and irreversible jobs are refused until the confirm path ships. Results are typed facts
+and reason codes, read by Cain as data, never as instructions. The one-time setup at your PC, the job and result formats and
 the worker's prompt are in `cain/docs/pc-jobs.md` and `cain/docs/pc-worker/` in this
 repo.
 

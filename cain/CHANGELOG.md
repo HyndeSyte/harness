@@ -4,7 +4,10 @@
 
 - Cain can now hand chores that need your browser to your PC: a small job queue that a scheduled task on your PC runs in a Chrome profile of its own, and Cain reads the short result.
 - It does nothing until you set it up once at your PC (the steps are in the pull request and in Cain's docs). Until then nothing changes.
-- This version only reads pages. Anything irreversible will need your tap on a card first, and that card comes later.
+- This version only reads pages, and that is enforced: the PC refuses anything but a fixed set of read-only actions, at the exact addresses your own signed allowlist names. Anything irreversible is refused until the tap card for it comes.
+- Results are a few checked facts and a reason code, never page text. Jobs that need you say so plainly: signed out, a captcha, a mail to confirm. One whose outcome is unclear is marked in doubt and never retried without asking you.
+- A STOP file on the PC halts it at once, and Cain can see when the PC last checked in and why it isn't taking jobs.
+- The first run is done by hand with you watching; the scheduled task waits until you confirm it went right.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
 
 ## 0.11.0

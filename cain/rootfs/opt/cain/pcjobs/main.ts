@@ -6,17 +6,24 @@
 // session never holds it. It also keeps a copy of the queue in /data/pc-jobs, at most a
 // minute behind, where Cain reads jobs and results.
 //
-// It writes only new files under jobs/. It never edits a job (the PC claims and closes
-// them) and never writes results.
+// It writes only new files: jobs/<id>.json, cancels/<id>.json (Cain calling a job off
+// before it runs), and the queue's .gitattributes while it has none. It never edits a
+// job (the PC claims and closes them) and never writes results.
+//
+// It refuses every irreversible job (a preview or a confirm) until the confirm path
+// ships: this version is read-only, and the PC refuses them too.
+//
+// Results are data, never instructions. What it prints from one is checked fields, fixed
+// codes and typed facts (core.ts); nothing in a result tells Cain what to do.
 //
 //   bun main.ts                 the keeper's loop (started by the App)
-//   bun main.ts list            one line per job in the copy, newest first
+//   bun main.ts list            the PC worker's last heartbeat, then one line per job, newest first
 //   bun main.ts result <id>     a job's result, checked, as JSON
+//   bun main.ts worker          the PC worker's last heartbeat
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type KeyObject } from "node:crypto";
-import { confirmWhy, ID, jobFromAsk, jobText, listLine, newId, parseJob, parseResult, publicKey, DEFAULT_REPO,
-  type Job, type Result } from "./core.ts";
+import { ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, DEFAULT_REPO, TERMINAL,
+  type Heartbeat, type Job, type Result } from "./core.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; branch: string;
@@ -72,15 +79,27 @@ export function readJobs(dir: string): Job[] {
   return out.sort((a, b) => (a.created < b.created ? 1 : a.created > b.created ? -1 : 0));
 }
 
+// A job's result, as data: checked against the format, its facts typed for the job's
+// action. A file that breaks the format is "bad" and nothing of it is shown.
 export function readResult(dir: string, id: string): Result | null | "bad" {
   if (!ID.test(id)) return "bad";
   const f = join(dir, "results", `${id}.json`);
   if (!existsSync(f)) return null;
-  const r = parseResult(readFileSync(f, "utf8"));
-  return r.ok && r.value.id === id ? r.value : "bad";
+  const job = readJobs(dir).find((j) => j.id === id);
+  const r = parseResult(readFileSync(f, "utf8"), job?.action);
+  return r.ok && r.value.id === id && job ? r.value : "bad";
 }
 
-type Outcome = { request: string; state: "queued" | "refused"; id?: string; reason?: string };
+// The PC worker's last heartbeat in the copy, checked, or null.
+export function readHeartbeat(dir: string): Heartbeat | null {
+  try { return parseHeartbeat(readFileSync(join(dir, "worker", "heartbeat.json"), "utf8")); } catch { return null; }
+}
+
+export function heartbeatLine(h: Heartbeat | null): string {
+  return h ? `PC worker: ${h.code} at ${h.worker_clock} (its own clock)${h.job ? ` on ${h.job}` : ""}` : "PC worker: not seen yet";
+}
+
+type Outcome = { request: string; state: "queued" | "cancel_sent" | "refused"; id?: string; reason?: string };
 const RID = /^[A-Za-z0-9._:-]{1,80}$/;
 const outcomeFile = (cfg: Config, rid: string) => join(cfg.outcomes, `${rid}.json`);
 
@@ -91,21 +110,24 @@ function writeOutcome(cfg: Config, o: Outcome) {
   renameSync(`${f}.tmp`, f);
 }
 
-function loadPub(cfg: Config): KeyObject | null {
-  try { return publicKey(readFileSync(cfg.pub, "utf8")); } catch { return null; }
-}
-
-// One request, checked against the queue as the copy has it: a job, or why not.
-export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: Job } | { why: string } {
+// One request, checked against the queue as the copy has it: a job, a cancel, or why not.
+export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: Job } | { cancel: string } | { why: string } {
   let req: any;
   try { req = JSON.parse(raw); } catch { return { why: "it isn't JSON" }; }
   if (!req || typeof req !== "object" || req.from !== "cain") return { why: "only Cain's jobs are accepted" };
+  if ("cancel" in req) {
+    if (Object.keys(req).length !== 2 || typeof req.cancel !== "string" || !ID.test(req.cancel)) return { why: "a cancel names one job id" };
+    const j = jobs.find((x) => x.id === req.cancel);
+    if (!j) return { why: `${req.cancel} isn't in the queue` };
+    if (TERMINAL.includes(j.state)) return { why: `${req.cancel} has ended already (${j.state})` };
+    if (existsSync(join(cfg.dir, "cancels", `${j.id}.json`))) return { why: `${req.cancel} is being cancelled already` };
+    return { cancel: j.id };
+  }
   let id = newId(now, cfg.rand);
   while (jobs.some((j) => j.id === id)) id = newId(now, cfg.rand);
   const made = jobFromAsk(req.job, now, id);
   if (!made.ok) return { why: made.why };
-  const why = confirmWhy(made.value, loadPub(cfg), jobs, now.getTime());
-  if (why) return { why };
+  if (!isReadOnly(made.value)) return { why: "irreversible jobs (preview and confirm) are refused until the confirm path ships; only read jobs run" };
   return { job: made.value };
 }
 
@@ -119,7 +141,7 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     if (!names.length) return { ok: true, queued: 0, refused: 0 };
     const now = cfg.now?.() ?? new Date();
     const jobs = readJobs(cfg.dir);
-    const made: { rid: string; file: string; job: Job }[] = [];
+    const made: { rid: string; file: string; job?: Job; cancel?: string }[] = [];
     let refused = 0;
     for (const n of names) {
       const file = join(cfg.queue, n);
@@ -135,22 +157,40 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
         log(`refused ${rid}: ${c.why}`);
         continue;
       }
+      if ("cancel" in c) {
+        if (made.some((m) => m.cancel === c.cancel)) { rmSync(file, { force: true }); continue; }
+        made.push({ rid, file, cancel: c.cancel });
+        continue;
+      }
       jobs.push(c.job);
       made.push({ rid, file, job: c.job });
     }
     if (!made.length) return { ok: true, queued: 0, refused };
-    mkdirSync(join(cfg.dir, "jobs"), { recursive: true });
-    for (const m of made) writeFileSync(join(cfg.dir, "jobs", `${m.job.id}.json`), jobText(m.job));
-    git(cfg, ["add", "jobs"]);
-    const what = made.map((m) => `${m.job.step} ${m.job.action} on ${m.job.site}`).join("; ");
-    git(cfg, ["commit", "--quiet", "-m", `New job${made.length > 1 ? "s" : ""}: ${what}`.slice(0, 200)]);
+    // The queue keeps every byte as written: no line ending rewrites, on any side.
+    if (!existsSync(join(cfg.dir, ".gitattributes"))) {
+      writeFileSync(join(cfg.dir, ".gitattributes"), "* -text\n");
+      git(cfg, ["add", ".gitattributes"]);
+    }
+    for (const m of made) {
+      const [sub, id] = m.job ? ["jobs", m.job.id] : ["cancels", m.cancel!];
+      mkdirSync(join(cfg.dir, sub), { recursive: true });
+      writeFileSync(join(cfg.dir, sub, `${id}.json`), m.job ? jobText(m.job) : JSON.stringify({ v: 1, id, from: "cain", created: now.toISOString() }, null, 2) + "\n");
+      git(cfg, ["add", `${sub}/${id}.json`]);
+    }
+    const what = made.map((m) => m.job ? `${m.job.step} ${m.job.action} on ${m.job.site}` : `cancel ${m.cancel}`).join("; ");
+    git(cfg, ["commit", "--quiet", "-m", `Cain: ${what}`.slice(0, 200)]);
     git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
     for (const m of made) {
-      writeOutcome(cfg, { request: m.rid, state: "queued", id: m.job.id });
+      if (m.job) {
+        writeOutcome(cfg, { request: m.rid, state: "queued", id: m.job.id });
+        log(`queued ${m.job.id} (${m.job.step} ${m.job.action} on ${m.job.site})`);
+      } else {
+        writeOutcome(cfg, { request: m.rid, state: "cancel_sent", id: m.cancel });
+        log(`cancel sent for ${m.cancel}`);
+      }
       rmSync(m.file, { force: true });
-      log(`queued ${m.job.id} (${m.job.step} ${m.job.action} on ${m.job.site})`);
     }
-    return { ok: true, queued: made.length, refused };
+    return { ok: true, queued: made.filter((m) => m.job).length, refused };
   } catch (e) {
     log(`round didn't finish, will try again: ${(e as Error).message}`);
     return { ok: false, queued: 0, refused: 0 };
@@ -185,7 +225,10 @@ export function configFromEnv(env = process.env): Config {
 if (import.meta.main) {
   const cfg = configFromEnv();
   const [cmd, arg] = process.argv.slice(2);
-  if (cmd === "list") {
+  if (cmd === "worker") {
+    console.log(heartbeatLine(readHeartbeat(cfg.dir)));
+  } else if (cmd === "list") {
+    console.log(heartbeatLine(readHeartbeat(cfg.dir)));
     const jobs = readJobs(cfg.dir);
     if (!jobs.length) console.log("no jobs");
     for (const j of jobs) { const r = readResult(cfg.dir, j.id); console.log(listLine(j, r === "bad" ? null : r)); }
@@ -195,7 +238,7 @@ if (import.meta.main) {
     else if (r === "bad") { console.log("no readable result (the file breaks the format)"); process.exit(1); }
     else console.log(JSON.stringify(r));
   } else if (cmd) {
-    console.error("usage: main.ts [list | result <id>]"); process.exit(2);
+    console.error("usage: main.ts [list | result <id> | worker]"); process.exit(2);
   } else {
     delete process.env.PC_JOBS_TOKEN;   // kept only in cfg, handed to git per call
     if (!cfg.token) {

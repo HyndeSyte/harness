@@ -32,3 +32,14 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests
+
+  # The PC job worker runs on Dane's Windows PC: its tests run on Windows too. Not a
+  # required check (RELEASING.md); pytest and bun above stay the gate.
+  pcjobs-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - run: bun test cain/tests/pcjobs.test.ts
