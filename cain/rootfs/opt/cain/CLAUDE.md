@@ -126,16 +126,22 @@ specialist (the Harness add-on) does.
   the keeper has accepted it, for the row as it stands, does the card go out. If the keeper
   turns it down, fails or doesn't answer in time, nothing is posted and keeper.sh tells you
   why in one line; ask again (a check that landed meanwhile counts, so no new `--checked`
-  is needed then). Until the box's clock is synchronized the keeper takes no check: wait a
-  few minutes. A later ask on the same item, while the row hasn't changed and the check is
-  fresh, needs none. If the source already answers the question, don't ask it: record what
+  is needed then). Until the box's clock is synchronized the keeper takes no check: the
+  refusal line names what each clock source said; wait a few minutes. If the keeper had to
+  reset its copy of the record, asks and Ship cards are refused until its next push lands
+  (the line says so): ask again in a few minutes. A push to GitHub that fails changes
+  nothing for you: the keeper keeps its work and pushes it later. A later ask on the same
+  item, while the row hasn't changed and the check is fresh, needs none. If the source already answers the question, don't ask it: record what
   you found.
 - When the row changes after an ask or Ship card for it went up (or its check ages out),
   the link takes its buttons off ("Status changed, re-check needed") and tells you. His tap
   counts only once the link has read the record keeper's ledger again and found the check
   still good for the row as it stands; if it can't read it, the tap does nothing and he's
-  told the status changed. A held ask whose row changes is dropped unasked, and you're told.
-  Check again and ask again if it still needs him.
+  told the status changed. Other taps that do nothing and keep the buttons: a slow read
+  ("Busy, tap again"), the box's clock not synchronized just now, or the record being put
+  back in step after a reset. Nothing to do for any of them unless he asks. A held ask
+  whose row changes is dropped unasked, and you're told. Check again and ask again if it
+  still needs him.
 - A one-off (`--item none`) needs no check, but only for something that is no open item:
   the link refuses one that holds an open row's item code or its whole Item phrase, and
   logs every one-off as declared about no open item. One whose words overlap an open row's
@@ -443,6 +449,19 @@ an item you hold, two paths and two outcomes:
    that brought this version (already in main), with a line saying it is a test and to tap
    Not now; his Not now must come back relayed, and nothing ships. Then the same card with
    a deliberately vague source: nothing may post.
+4. A checked test ask, then a row op on its row (a word in its Next step), then ask him to
+   tap the old card: it must be refused with the status-changed reason, its buttons off.
+5. A one-off whose words overlap an open item: it must answer "needs reason"; send it again
+   with `--reason` (that it is the smoke test): it must post, with the reason in log/requests/.
+6. Run `/opt/cain/record.sh block-push`, then a checked test ask, and ask him to tap it
+   within the minute: the tap must come back relayed (honoured, nothing moved), and
+   `/opt/cain/keeper.sh clock` must show unpushed until the next round pushes it.
+7. Ask him to set source_check_max_days to 0 in the App's options for one ask; a checked
+   test ask must post nothing and say the check is past source_check_max_days. Then ask him
+   to set it back to 7.
+8. Run `/opt/cain/keeper.sh clock`: put the clock verdict, the source that satisfied it, and
+   the tap read time in your report line.
+Keep it to about ten minutes; each test ask says it is the smoke test and any answer does.
 It passes only when you also see committed in the record: the `check` request done in
 log/requests/, state/checks.json with that row's entry and your check, and the open
 table's Checked column showing it. Tell him the result in one line with the commit hashes

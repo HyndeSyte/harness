@@ -399,7 +399,7 @@ describe("the one-off audit (a looser match, limited)", () => {
       { id: "link-oneoff-0", at: new Date(T0.getTime() - DAYS(8)).toISOString(), text: "County packet business?" },
     ], pending, now);
     expect(a.hits).toEqual([`Nov 11, 2026 (link-oneoff-1): "Is the county business-license packet in?" may be about P08 ("Business-license packet for the county"), shared words: "business", "license", "packet", "county"`]);
-    expect(a.text).toContain("Week to Nov 11, 2026: 1 possible match in 2 one-offs; 0 wait timeouts.");
+    expect(a.text).toContain("Week to Nov 11, 2026: 1 possible match in 2 one-offs; 0 wait timeouts; 0 tap timeouts.");
     expect(a.text).toContain("The guard is limited");
   });
 
@@ -415,7 +415,7 @@ describe("the one-off audit (a looser match, limited)", () => {
     expect(k.outcome("link-oneoff-1")).toMatchObject({ state: "done", declared: `his question about the phone app, not the calendar item (overlaps P44: "specialist", "plain", "command")` });
     expect(k.log().find((o) => o.id === "link-oneoff-1")!.declared).toContain("his question about the phone app");
     const audit = k.upstream(ONE_OFF_AUDIT_PATH)!;
-    expect(audit).toContain("Week to Nov 11, 2026: 1 possible match in 1 one-off; 0 wait timeouts.");
+    expect(audit).toContain("Week to Nov 11, 2026: 1 possible match in 1 one-off; 0 wait timeouts; 0 tap timeouts.");
     expect(audit).toContain(`(link-oneoff-1): "Is the specialist's plain-command fix in?" may be about P44`);
     expect(audit).toContain(`re-declared about no open item: "his question about the phone app, not the calendar item`);
     // The new hit waits for Cain's next check-in, once.
@@ -490,7 +490,7 @@ describe("the link asks only on an accepted check of the row as it stands", () =
     const id = `link-check-p08-${NOV11_8AM}`;
     expect(r.submitted).toEqual([{ id, from: "cain", kind: "change",
       summary: `Source check on P08 before asking him: ${CHECKED}`, ops: [{ op: "check", item: "P08", text: CHECKED, row: rowId("P08"), version: 4 }] }]);
-    expect(r.state().messages[(out as any).message].checked).toEqual({ row: rowId("P08"), version: 4, req: id });
+    expect(r.state().messages[(out as any).message].checked).toEqual({ row: rowId("P08"), version: 4, req: id, gen: 0 });
     // The same check sent again while it still counts (say his line was refused): the accepted one stands.
     await r.link.answered({ item: "P08", question: "Q2" });
     expect((await r.link.ask({ text: "Is the packet filed yet?", options: opts, item: "P08", question: "Q3", checked: CHECKED })).status).toBe("posted");
@@ -724,7 +724,8 @@ describe("end to end: the link and the record keeper on a real git repo", () => 
     return (async () => {
       const ask = (q: string, checked?: string) => l.link.ask({ text: "Is the specialist fixed?", options: ["Fixed", "Not fixed"], item: "P44", question: q, ...(checked ? { checked } : {}) });
       await expect(ask("Q1")).rejects.toThrow("No source check on this item yet");
-      k.at(new Date(T0.getTime() + MIN));
+      // One clock on the box: the link's never reads earlier than the keeper's.
+      k.at(new Date(T0.getTime() + MIN)); l.later(MIN);
       const q1 = await ask("Q1", "the specialist's log, read at 8 this morning") as any;
       expect(q1.status).toBe("posted");
       const req = l.state().messages[q1.message].checked.req;

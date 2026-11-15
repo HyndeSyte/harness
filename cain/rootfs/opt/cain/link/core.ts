@@ -88,8 +88,9 @@ import { freshReviewed, type Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import { judgeChecks, type Facts, type Landed } from "./merge";
-import { checkTextProblem, inStep, isFresh, MAX_ONE_OFF_REASON, maxCheckDays, ONE_OFF_SUMMARY, oneOffHit, oneOffLoose, parseChecks,
+import { checkTextProblem, generationOf, inStep, isFresh, MAX_ONE_OFF_REASON, maxCheckDays, ONE_OFF_SUMMARY, oneOffHit, oneOffLoose, parseChecks,
   repeatsCheck, staleAfter, type Checks } from "../record/core";
+import type { Verdict } from "../clock";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -207,13 +208,16 @@ export interface State {
   stopAt?: string;                   // the message holding the moving Stop
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
+  ledgerGen?: number;                // the highest ledger generation a verified read has seen (0.12.0)
 }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
 export interface SentRec { at: number; last?: boolean; asks?: boolean }
 // A source check's reference (0.12.0): the row's ledger id and version the keeper accepted a
 // check of, and the request that carried it, when one did.
-export interface Ref { row: string | null; version: number; req?: string }
+// gen: the ledger's generation when the card went up; a tap counts only while the ledger's is
+// no lower (a ledger that went backwards never validates a card).
+export interface Ref { row: string | null; version: number; req?: string; gen?: number }
 
 export function emptyState(): State {
   // Card ids start from the clock, so a fresh state never reuses an id the
@@ -335,11 +339,27 @@ export function nextCheckin(ms: number, tz = "America/New_York", at = "0710"): n
 }
 
 // -- what Cain's record says: PENDING.md from the keeper's copy, and the holds ----------
-export interface RecordFiles { pending: string | null; holds: string | null; checks?: string | null }   // null: no such file
+// status: the record keeper's status for the link (/data/record-ledger.json, record/main.ts).
+export interface RecordFiles { pending: string | null; holds: string | null; checks?: string | null; status?: string | null }   // null: no such file
+
+// The record keeper's status, as it writes it every round: the ledger's generation, whether
+// local commits wait for a push after one failed, whether its copy was reset since the last
+// push that landed, and its clock verdict with the source that satisfied it.
+export interface KeeperStatus {
+  at?: string; generation?: number; unpushed?: boolean;
+  push_failed?: { at: string; why: string }; reset?: { at: string; why: string };
+  clock?: { synced: boolean; source: string | null; diagnostic: string; at: string };
+}
+// undefined: no status file (the keeper hasn't written one); null: one that can't be read.
+export function keeperStatus(text: string | null | undefined): KeeperStatus | null | undefined {
+  if (text === undefined || text === null) return undefined;
+  try { const j = JSON.parse(text); return j && typeof j === "object" && !Array.isArray(j) ? j : null; } catch { return null; }
+}
 export type Holds = Record<string, { holder?: string; branches?: string[] }>;
 
 // The holds, from the record keeper's own file (/data/record-holds.json): written
-// whole, only once its push is on GitHub, with the holds under "holds". A missing
+// whole once its local commits are made (a push that fails keeps them, and pushes them
+// later), with the holds under "holds". A missing
 // file is no holds; one that can't be read is null, and nothing is decided from it.
 export function parseHolds(text: string | null): Holds | null {
   if (text === null) return {};
@@ -385,9 +405,19 @@ export const CHECK_WAIT_MS = 30_000;
 const CHECK_POLL_MS = 500;
 export const STATUS_CHANGED = "Status changed, re-check needed";
 const STATUS_TAP = "Its status changed since it was checked, so nothing was done.";
-// How long a tap's fresh read of the ledger and the keeper's outcome may take before the tap
-// is rejected (Discord wants its answer within 3 seconds).
+// How long a tap's fresh read of the ledger, the keeper's status and the check's outcome (three
+// small local files) may take before the tap is refused as busy. Discord wants the tap's answer
+// within 3 seconds, and the answer itself is a call to Discord after the read, so the read gets
+// half of that. The device smoke test prints the measured read time (keeper.sh clock) so this
+// can be tuned from the Pi, and each busy refusal is counted in the keeper's audit.
 export const TAP_READ_MS = 1_500;
+const BUSY_TAP = "Busy, tap again.";
+const CLOCK_TAP = "The box's clock isn't synchronized just now, so nothing was done. Tap again in a few minutes.";
+const RESET_TAP = "Cain's record is being put back in step, so nothing was done. Tap again in a few minutes.";
+// How recent the keeper's own clock verdict must be to count at tap time (its rounds run every
+// minute), and how long after a push error the sweep leaves cards alone.
+export const KEEPER_CLOCK_FRESH_MS = 10 * 60_000;
+export const PUSH_QUIET_MS = 2 * 60_000;
 // "Nov 13", in the zone.
 const shortDay = (ms: number, tz = "America/New_York") =>
   new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
@@ -536,8 +566,9 @@ export interface Deps {
   submitRecord?: (req: Record<string, unknown>) => void;           // a request into the record keeper's local queue (a source check, a one-off's log line)
   outcome?: (id: string) => { state: string; reason?: string } | null;   // the record keeper's outcome for one of those, once it has one
   maxCheckDays?: number;                                           // the App's source_check_max_days (default 7)
+  localClock?: () => Verdict;                                      // the box's own clock sources now (../clock.ts), for taps
   sleep?: (ms: number) => Promise<void>;                           // waiting on the keeper's outcome (the tests' clock)
-  waitTimeout?: (w: { id: string; at: string; waited_ms: number }) => void;   // a check the keeper didn't answer in time, for its audit
+  waitTimeout?: (w: { id: string; at: string; waited_ms: number; kind?: "tap" }) => void;   // a check the keeper didn't answer in time, or a tap refused as busy, for its audit
   tune?: (r: { at: string; kind: string; item: string; said: string }) => void;   // a source-check or one-off refusal, logged for tuning the rules
   pull?: (pr: string) => Promise<Pull | null>;                     // a pull request now; null: can't tell
   tz?: string;                                                     // the check-ins' zone
@@ -1030,38 +1061,125 @@ export class Link {
   }
 
   // Whether a posted ask or Ship card for an item still rests on an accepted check, from a fresh
-  // read of the keeper's local ledger and its outcome file (never the table's order): "ok" when
-  // the check's outcome is done, the row's hidden id and version are the card's, the row's cells
-  // are as the keeper last wrote them, and its check is fresh and unexpired; "changed" when any
-  // of that is known to be otherwise (a card with no check counts so); "unknown" when a read
-  // failed or took longer than TAP_READ_MS. A tap is honoured only on "ok"; the sweep takes
-  // buttons off only on "changed".
-  private checkState(item: string, ref: Ref | undefined): "ok" | "changed" | "unknown" {
+  // read of the keeper's local ledger, its status and the check's outcome file (never the table's
+  // order):
+  //   "ok"       the check's outcome is done, the row's hidden id and version are the card's, its
+  //              cells are as the keeper last wrote them, the check is fresh and unexpired (and
+  //              not dated after the clock now reads), the ledger's generation is no lower than
+  //              the card's, and, for a tap, the box's clock is synchronized now;
+  //   "changed"  any of that is known to be otherwise (a card with no check counts so);
+  //   "behind"   the ledger's generation is below the card's (it went backwards);
+  //   "unknown"  a read failed, or (for the sweep) isn't a verified read: the ledger doesn't parse
+  //              or is below the generation last seen, the list or the outcome can't be read, or
+  //              a push just failed;
+  //   "busy"     the read took longer than TAP_READ_MS;
+  //   "clock"    a tap while the box's clock isn't synchronized;
+  //   "reset"    the keeper reset its copy and hasn't pushed since.
+  // A tap is honoured only on "ok"; the sweep takes buttons off only on "changed".
+  private checkState(item: string, ref: Ref | undefined, o: { sweep?: boolean; seen?: number } = {}): "ok" | "changed" | "behind" | "unknown" | "busy" | "clock" | "reset" {
     if (!ref || !ref.req) return "changed";
     const t0 = Date.now();
-    let f: RecordFiles | undefined, o: { state: string } | null | undefined;
+    let f: RecordFiles | undefined, out: { state: string } | null | undefined;
     try {
       f = this.d.record?.();
-      o = this.d.outcome?.(ref.req);
+      out = this.d.outcome?.(ref.req);
     } catch { return "unknown"; }
-    if (Date.now() - t0 > TAP_READ_MS || !f || typeof f.checks !== "string") return "unknown";
+    const took = Date.now() - t0;
+    if (!o.sweep) this.tapRead = { ms: took, at: this.d.now() };
+    if (took > TAP_READ_MS) return "busy";
+    if (!f || typeof f.checks !== "string") return "unknown";
+    const st = keeperStatus(f.status);
+    if (st === null) return "unknown";
+    if (st?.reset) return "reset";
+    if (o.sweep && this.pushTrouble(st)) return "unknown";
     try { JSON.parse(f.checks); } catch { return "unknown"; }
-    if (!o) return "unknown";
-    if (o.state !== "done") return "changed";
+    if (o.sweep && typeof f.pending !== "string") return "unknown";   // the working copy isn't intact
+    const gen = generationOf(f.checks);
+    if (o.sweep && gen < (o.seen ?? 0)) return "unknown";
+    if (ref.gen !== undefined && gen < ref.gen) return "behind";
+    if (!out) return "unknown";
+    if (out.state !== "done") return "changed";
     const id = item.toUpperCase(), e = parseChecks(f.checks)[id];
     if (!e || e.id !== ref.row || e.version !== ref.version) return "changed";
-    if (e.hash && typeof f.pending !== "string") return "unknown";   // the row's cells can't be compared
+    if (typeof f.pending !== "string" && e.hash) return "unknown";   // the row's cells can't be compared
     if (!inStep(e, f.pending, id) || !isFresh(e, this.d.now(), this.maxDays())) return "changed";
+    if (!o.sweep && !this.clockOk(st)) return "clock";
     return "ok";
   }
 
+  // The last tap's read time, for the smoke test (keeper.sh clock).
+  private tapRead: { ms: number; at: number } | null = null;
+
+  // Cards whose buttons the sweep left on for want of a verified read (logged once each).
+  private sweepHeld = new Set<string>();
+
+  // The ledger's generation from a verified read (it parses, isn't below the one last seen, the
+  // list and the keeper's status are readable, no reset and no recent push error), or null.
+  private verifiedGen(f: RecordFiles, seen: number): number | null {
+    if (typeof f.checks !== "string" || typeof f.pending !== "string") return null;
+    try { JSON.parse(f.checks); } catch { return null; }
+    const st = keeperStatus(f.status);
+    if (st === null || st?.reset || this.pushTrouble(st)) return null;
+    const gen = generationOf(f.checks);
+    return gen >= seen ? gen : null;
+  }
+
+  // A push failed and hasn't landed since, or failed within PUSH_QUIET_MS: the sweep leaves
+  // cards as they are.
+  private pushTrouble(st: KeeperStatus | undefined): boolean {
+    if (!st) return false;
+    if (st.unpushed) return true;
+    const at = st.push_failed ? Date.parse(st.push_failed.at) : NaN;
+    return Number.isFinite(at) && this.d.now() - at < PUSH_QUIET_MS;
+  }
+
+  // Whether the box's clock is synchronized at tap time: not when the keeper's recent verdict
+  // says it isn't; otherwise when the box's own sources say so now, or the keeper's recent
+  // verdict does (its rounds add GitHub's Date header). With neither wired (no sources, no
+  // status: the tests), yes.
+  private clockOk(st: KeeperStatus | undefined): boolean {
+    const now = this.d.now();
+    const c = st?.clock, at = c ? Date.parse(c.at) : NaN;
+    const recent = Number.isFinite(at) && Math.abs(now - at) <= KEEPER_CLOCK_FRESH_MS;
+    if (recent && c!.synced !== true) return false;
+    let local: Verdict | null = null;
+    try { local = this.d.localClock?.() ?? null; } catch { local = null; }
+    if (local?.synced) return true;
+    if (recent && c!.synced === true) return true;
+    return !this.d.localClock && st === undefined;
+  }
+
+  // The keeper reset its copy and hasn't pushed since: asks and Ship cards wait, as taps do.
+  private notReset(): void {
+    const st = keeperStatus(this.files().status);
+    if (st?.reset) throw new Refusal(`Nothing was posted: the record keeper had to reset its copy of the record (${clip(st.reset.why, 160)}), so asks and Ship cards wait until its next push to GitHub lands. Ask again in a few minutes.`);
+  }
+
+  // The clock and the last tap's read time, for the device smoke test (keeper.sh clock).
+  clockReport(): Record<string, unknown> {
+    const st = keeperStatus(this.files().status);
+    let local: Verdict | null = null;
+    try { local = this.d.localClock?.() ?? null; } catch { local = null; }
+    return {
+      keeper: st === undefined ? "no status yet" : st === null ? "status unreadable" : {
+        clock: st.clock ?? null, generation: st.generation ?? 0, unpushed: st.unpushed === true,
+        push_failed: st.push_failed ?? null, reset: st.reset ?? null, at: st.at ?? null },
+      box: local ? { synced: local.synced, source: local.source, diagnostic: local.diagnostic } : null,
+      tap_synced: this.clockOk(st ?? undefined),
+      tap_read_ms: this.tapRead?.ms ?? null, tap_read_limit_ms: TAP_READ_MS,
+      tap_read_at: this.tapRead ? new Date(this.tapRead.at).toISOString() : null,
+    };
+  }
+
   // The accepted source check an ask or Ship card for the item rests on now, or null: the
-  // keeper's own fresh check, from its ledger alone, of the row as it stands.
+  // keeper's own fresh check, from its ledger alone, of the row as it stands, with the ledger's
+  // generation.
   private freshRef(item: string): Ref | null {
     const id = item.toUpperCase();
-    const e = this.ledger()[id];
-    if (!e || !isFresh(e, this.d.now(), this.maxDays()) || !inStep(e, this.files().pending, id)) return null;
-    return { row: e.id, version: e.version, ...(e.checked_req ? { req: e.checked_req } : {}) };
+    const f = this.files();
+    const e = ledgerOf(f.checks)[id];
+    if (!e || !isFresh(e, this.d.now(), this.maxDays()) || !inStep(e, f.pending, id)) return null;
+    return { row: e.id, version: e.version, ...(e.checked_req ? { req: e.checked_req } : {}), gen: generationOf(f.checks) };
   }
 
   // A check passed now goes to the record keeper, and the link waits for its outcome: only a
@@ -1094,6 +1212,8 @@ export class Link {
     if (o.state !== "done")
       this.refuse("keeper", id, `Nothing was posted: the record keeper said ${o.state} to your source check${o.reason ? ` (${clip(o.reason, 300)})` : ""}. Check it at its source again and ask with a new --checked.`);
     const e = this.ledger()[id];
+    if (e && e.checked_req === req && e.checked_version === e.version && !e.pending_rewrite && !e.stepped_back && !isFresh(e, this.d.now(), this.maxDays()))
+      this.refuse("expired", id, `Nothing was posted: the record keeper took your source check, but it is already past source_check_max_days (${this.maxDays()} day${this.maxDays() === 1 ? "" : "s"}), so it doesn't count.`);
     if (!e || e.checked_req !== req || !isFresh(e, this.d.now(), this.maxDays()))
       throw new StaleCheck("Nothing was posted: the record keeper took your source check, but the row changed right after it; check it at its source again and ask with a new --checked if it still needs him.");
     return { row: e.id, version: e.version, req };
@@ -1499,6 +1619,7 @@ export class Link {
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
     const text = w.text;                 // no "P08 Q2: ": the item and question are data
     this.mayAsk(meta.item);
+    this.notReset();
     if (meta.item === "none") { const hold = this.oneOff(text, a.reason); if (hold) return hold; }
     await this.acceptedCheck(meta.item, this.sourceCheck(meta.item, a.checked));
     this.refNow(meta.item);
@@ -1570,6 +1691,7 @@ export class Link {
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(said);
     this.mayAsk(meta.item);
+    this.notReset();
     const check = this.sourceCheck(meta.item, a.checked);
     const w = this.cainWords("ship", "Ship card", said, { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
@@ -1793,7 +1915,10 @@ export class Link {
       if (m.kind === "ask" || m.kind === "ship") {
         const c = this.checkState(item, m.checked);
         if (c === "changed") return "status changed";
-        if (c === "unknown") return "status unreadable";
+        if (c === "unknown" || c === "behind") return "status unreadable";
+        if (c === "busy") return "status busy";
+        if (c === "clock") return "clock unsynced";
+        if (c === "reset") return "record reset";
       }
     }
     return "";
@@ -1853,13 +1978,25 @@ export class Link {
     }
     if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
-      // The ledger or the keeper's outcome couldn't be read in time: the tap is rejected with
-      // the status-changed reason, and the card keeps its buttons for the sweep to judge.
-      if (why === "status unreadable") {
+      // The ledger, the keeper's status or the check's outcome couldn't be read, or the ledger
+      // is behind the card's generation: the tap is rejected with the status-changed reason, and
+      // the card keeps its buttons for the sweep to judge. A read over its limit is "busy, tap
+      // again" (counted in the keeper's audit); a clock that isn't synchronized now, or a copy
+      // the keeper reset and hasn't pushed since, refuse it too. The card keeps its buttons.
+      const held: Record<string, [string, string, string]> = {
+        "status unreadable": [STATUS_TAP, "refused: status unreadable", "the source check couldn't be confirmed from the ledger"],
+        "status busy": [BUSY_TAP, "refused: busy", `the ledger's read took ${this.tapRead?.ms ?? "?"} ms, over ${TAP_READ_MS} ms`],
+        "clock unsynced": [CLOCK_TAP, "refused: clock", "the box's clock isn't synchronized now"],
+        "record reset": [RESET_TAP, "refused: record reset", "the record keeper reset its copy and hasn't pushed since"],
+      };
+      if (held[why]) {
+        const [say, out, line] = held[why];
         await this.answer(it, ACK);
-        await this.ephemeral(it, STATUS_TAP);
-        this.log("tap refused: the source check couldn't be confirmed from the ledger in time");
-        return "refused: status unreadable";
+        await this.ephemeral(it, say);
+        this.log(`tap refused: ${line}; the card keeps its buttons`);
+        if (why === "status busy")
+          try { this.d.waitTimeout?.({ id: `tap-${msgId}-${now}`, at: new Date(now).toISOString(), waited_ms: this.tapRead?.ms ?? TAP_READ_MS, kind: "tap" }); } catch { /* logged above */ }
+        return out;
       }
       if (why) {
         rec.outcome = why === "answered" ? "answered" : "expired"; rec.why = why;
@@ -2966,6 +3103,9 @@ export class Link {
           || ((m.posted ?? 0) === (s.messages[cur].posted ?? 0) && newerId(id, cur))) newest.set(k, id);
     }
     const told: [string, Shown, string][] = [];
+    // The generation a verified read of the ledger has seen: a ledger below it is no verified read.
+    const seen = s.ledgerGen ?? 0;
+    const heldNow = new Set<string>();
     for (const [id, m] of Object.entries(s.messages)) {
       if (!m.buttons || m.outcome || !m.kind) continue;
       const item = boundItem(m);
@@ -2975,12 +3115,26 @@ export class Link {
       else if (pulls.has(id)) why = pulls.get(id)!;
       else if (item && closed.has(item.toUpperCase())) why = "item closed";
       else if (item && holds && heldElsewhere(holds, item)) why = "held elsewhere";
-      else if (item && (m.kind === "ask" || m.kind === "ship") && this.checkState(item, m.checked) === "changed") why = "status changed";
+      else if (item && (m.kind === "ask" || m.kind === "ship")) {
+        // Buttons come off for a status change only on a verified read of an intact ledger and
+        // working copy, never during or right after a push error; otherwise the card stays as
+        // it is, logged once.
+        const c = this.checkState(item, m.checked, { sweep: true, seen });
+        if (c === "changed") why = "status changed";
+        else if (c !== "ok") {
+          heldNow.add(`${id}:${c}`);
+          if (!this.sweepHeld.has(`${id}:${c}`)) this.log(`left card ${id}'s buttons on: no verified read of the ledger (${c})`);
+        }
+        if (!why) { const k = rivalKey(m); if (k && newest.get(k) !== id) why = "replaced"; }
+      }
       else { const k = rivalKey(m); if (k && newest.get(k) !== id) why = "replaced"; }
       if (!why) continue;
       m.outcome = why === "replaced" ? "replaced" : "expired"; m.why = why;
       told.push([id, m, why]);
     }
+    this.sweepHeld = heldNow;
+    const gen = this.verifiedGen(f, seen);
+    if (gen !== null && gen > seen) { s.ledgerGen = gen; if (!told.length) this.d.save(s); }
     if (!told.length) return;
     this.d.save(s);
     for (const [id, m, why] of told) {
@@ -3062,7 +3216,8 @@ export class Link {
       if (h.expires <= now) lines.push(`Your held question ${what} was never shown: it expired at the morning check-in. Ask again if it still matters.`);
       else if (item && closed.has(item.toUpperCase())) lines.push(`Your held question ${what} was dropped unasked: ${item} is closed in PENDING.md.`);
       else if (item && holds && heldElsewhere(holds, item)) lines.push(`Your held question ${what} was dropped unasked: ${item} is now held by another session. Don't ask him about it or say who has it.`);
-      else if (item && !this.freshRef(item)) lines.push(`Your held question ${what} was dropped unasked: its row changed after your source check. Check it at its source again, and ask again with --checked if it still needs him.`);
+      else if (item && !this.freshRef(item) && this.verifiedGen(f, s.ledgerGen ?? 0) !== null) lines.push(`Your held question ${what} was dropped unasked: its row changed after your source check. Check it at its source again, and ask again with --checked if it still needs him.`);
+      else if (item && !this.freshRef(item)) { keep.push(h); continue; }   // no verified read just now: it waits
       else keep.push(h);
     }
     if (lines.length) { s.held = keep; this.d.save(s); for (const l of lines) this.d.relay(`${l} Nothing to tell him.`); }

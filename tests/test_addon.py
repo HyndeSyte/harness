@@ -127,7 +127,7 @@ def test_cain_config_denies_every_api_and_mapping():
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
         "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n"
-        "  source_check_max_days: int(1,90)\n")
+        "  source_check_max_days: int(0,90)\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():
@@ -689,7 +689,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # Cain's scripts only, from this machine: the specialist can't show its own cards,
     # ask, put up a Ship card, or close Cain's questions.
     assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", '
-            '"/look", "/cards", "/check", "/replay", "/connector", "/sent"])' in link)
+            '"/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock"])' in link)
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

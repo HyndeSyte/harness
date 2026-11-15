@@ -147,7 +147,7 @@ describe("2. the link waits on the keeper's local work only", () => {
     k.cain({ id: "link-oneoff-1", summary: "One-off ask to him: Lunch at noon?", ops: [{ op: "one-off", text: "Lunch at noon?", not_about_item: true }] });
     run();
     const audit = k.upstream(ONE_OFF_AUDIT_PATH)!;
-    expect(audit).toContain("0 possible matches in 1 one-off; 1 wait timeout.");
+    expect(audit).toContain("0 possible matches in 1 one-off; 1 wait timeout; 0 tap timeouts.");
     expect(audit).toMatch(new RegExp(`\\(${id}\\): the link gave up waiting after 30 seconds and posted nothing; the keeper's local round for it took [0-9.]+ seconds`));
     expect(readFileSync(k.cfg.checkin!, "utf8")).toContain(`(${id}): the link gave up waiting`);
   }, 30_000);

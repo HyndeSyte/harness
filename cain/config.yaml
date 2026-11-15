@@ -40,7 +40,8 @@ timeout: 30
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
 # source_check_max_days: how many days a source check counts (by the record keeper's time
-# for it) before Cain's asks and Ship cards about that item need a new one. 7 by default.
+# for it) before Cain's asks and Ship cards about that item need a new one. 7 by default; 0
+# only for one step of the device smoke test (every check is past it at once).
 options:
   github_token: ""
   gemini_api_key: ""
@@ -64,4 +65,4 @@ schema:
   anthropic_monthly_usd: float(0,200)
   codex_monthly_runs: int(0,5000)
   owner_user_id: match(^([0-9a-f]{32})?$)?
-  source_check_max_days: int(1,90)
+  source_check_max_days: int(0,90)

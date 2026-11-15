@@ -47,6 +47,9 @@
 #   keeper.sh replied <message id>       what a message of his replied to, if anything
 #   keeper.sh morning "text"             post the one morning message (with Stop)
 #   keeper.sh stopped                    whether everything is stopped (Dane's Stop), and since when
+#   keeper.sh clock                      the clock verdict (the record keeper's, with the source that
+#                                        satisfied it, and the box's own), the ledger's generation, whether
+#                                        a push or a reset is outstanding, and the last tap's read time
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
@@ -69,7 +72,7 @@ cmd="${1:-handover}"; shift || true
 if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
@@ -149,6 +152,7 @@ case "$cmd" in
   answered) body=$(jq -nc --arg it "$item" --arg q "$question" --arg r "" "$meta") ;;
   replied)  body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   stopped)  body='{}' ;;
+  clock)    body='{}' ;;
   card)     body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   check)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" --arg e "$edit" \
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;

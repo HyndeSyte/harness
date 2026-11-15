@@ -329,20 +329,53 @@ and `remove`:
   again whatever clock reads it later ("Source checks: P44 aged out").
 - `pending_rewrite`: set when a whole-file write that changed the row was refused for it
   (above). Cleared when a write changes the row.
+- `clock`: which clock source said the keeper's clock was synchronized when it took the
+  check (`kernel`, `timedatectl`, `timesyncd` or `http-date`, below).
+- `stepped_back`: set when the keeper's clock reads earlier than `checked_at` (the clock
+  stepped back): the check never counts again.
+
+The file also holds `_generation`, a number that goes up by one with every write of the
+ledger and never comes down: each write takes one more than both the file's number and the
+keeper's own count (kept in `/data/record-holds.json`), so even a copy reset to an older
+ledger never reuses a number. The link puts the generation on every ask and Ship card it
+posts, and a tap is refused (with the status-changed reason) while the ledger's generation is
+below the card's: a ledger that went backwards can never validate a card.
 
 `Since` carries no status meaning: it is the day the row was added, never read for
 freshness, and a row from before the ledger starts at version 1 with no check whatever it
 says.
 
 A check is fresh while `checked_version` is the row's `version`, the row's cells match
-`hash`, it isn't `aged` or pending a rewrite, and `stale_after` hasn't passed. Otherwise it
-is stale and the link refuses to rest a card on it.
+`hash`, it isn't `aged`, `stepped_back` or pending a rewrite, `stale_after` hasn't passed,
+and the clock doesn't read earlier than `checked_at`. Otherwise it is stale and the link
+refuses to rest a card on it.
 
 The keeper dates and ages checks by its own clock only, never the link's, and only while
-that clock is synchronized: it reads `timedatectl`'s NTPSynchronized, systemd-timesyncd's
-flag file, or else the kernel's own flag (`adjtimex`, read only; the App's container shares
-the host's kernel). Until one of them says synchronized, every `check` is rejected ("the
-keeper's clock isn't synchronized yet") and nothing ages.
+that clock is synchronized. Four sources, in this order (`clock.ts`); any one that says
+synchronized is enough, and the keeper records which one did (with each check, and in its
+status file):
+
+1. The kernel's own flag, through `adjtimex` (read only; the App's container shares the
+   host's kernel). This is the one that works on the Pi: measured inside the Cain App's
+   container on Home Assistant OS, `timedatectl` isn't installed and systemd's time-sync
+   flag files don't exist, while `adjtimex` reported state 0, status 8193, STA_UNSYNC clear
+   (synchronized), with the system clock within about 8 seconds of GitHub's HTTP Date
+   header. So it is read first.
+2. `timedatectl`'s NTPSynchronized, when it is installed and answers.
+3. systemd-timesyncd's flag file.
+4. The HTTP Date header of the round's own fetch from GitHub: synchronized when it is
+   within 10 seconds of the system clock (the header has one-second resolution and the
+   fetch takes a moment; a clock that was never set is off by days).
+
+When none qualifies, the keeper logs one diagnostic naming what each source returned
+(absent, unreadable, unsynced, the skew), once each time that changes ("clock: not
+synchronized, so no source check is taken: no clock source says synchronized: kernel flag
+unsynced (...), timedatectl absent, timesyncd flag file absent, GitHub Date header unsynced
+(+42 s)"), every `check` is rejected with that diagnostic in its reason (which keeper.sh's
+refusal line relays to Cain), and nothing ages. A tap also needs the clock synchronized at
+tap time (below), and a check whose time is later than the clock now reads (a backward step)
+is invalidated: the link refuses taps on it at once and the keeper marks it `stepped_back`
+("Source checks: P44 dated after the clock stepped back").
 
 The open table's `Checked` column is a projection of the ledger: made again on every write
 of the open list (row ops and whole-file puts alike), added the first time it's missing,
@@ -378,20 +411,42 @@ What Cain's link enforces:
   id in `/data/record-waits.jsonl`; the keeper logs the round's time for it and counts the
   week's timeouts in `state/one-off-audit.md`. A check still pending then may land later: a
   later ask finds it in the ledger, but the pending copy never posts a card. If the link
-  can't hand the check to the queue at all, nothing is posted either. (A round still starts
-  with a fetch from GitHub, so a GitHub outage at that moment still refuses, safely.)
+  can't hand the check to the queue at all, nothing is posted either. A round whose fetch
+  from GitHub fails works on the local copy as it is, so a GitHub outage doesn't refuse a
+  question either (see When a push fails, below).
 - Right before posting, the link reads the row's version again and refuses (or, for a
   held ask, drops it and tells Cain) when the check no longer counts.
 - A posted, unanswered ask or Ship card for an item loses its buttons when the row's
   version changes, its check ages out or goes pending a rewrite, or the keeper's outcome
   for its check reads anything but done: the link edits it to say "Status changed,
-  re-check needed" and tells Cain.
+  re-check needed" and tells Cain. The sweep does this only after a verified read of an
+  intact ledger and working copy: the ledger parses, its generation isn't below the last one
+  a verified read saw, the open list, the keeper's status and the check's outcome file are
+  readable, the keeper hasn't reset its copy, and no push has failed (or failed in the last 2
+  minutes). A read that isn't verified leaves the card as it is, logged once; so does a held
+  ask, which waits instead of being dropped.
 - A tap on an ask or Ship card is honoured only after a fresh read of the keeper's local
-  ledger and its outcome file confirms the check's outcome is done, the row's hidden id and
-  version are the card's, its cells match, and the check is unexpired. Any read failure, or
-  a read slower than 1.5 seconds, rejects the tap with the status-changed reason ("Its
-  status changed since it was checked, so nothing was done."); the card keeps its buttons
-  for the sweep to judge. Where the row sits in the table is never used.
+  ledger, its status file and the check's outcome file confirms the check's outcome is done,
+  the row's hidden id and version are the card's, its cells match, the check is unexpired
+  and not dated after the clock now reads, the ledger's generation is no lower than the
+  card's, and the clock is synchronized now. The tap reasons, each refused with the card's
+  buttons kept unless it says otherwise:
+  - status changed: the row moved, the check aged out or stepped back, or its outcome isn't
+    done. "Its status changed since it was checked, so nothing was done.", and the buttons
+    come off ("Status changed, re-check needed").
+  - status unreadable: a read failed, or the ledger is behind the card's generation. The
+    same status-changed words; the sweep judges the card later.
+  - busy: the read took longer than 1.5 seconds (half of Discord's 3 seconds for an answer,
+    leaving the rest for the answer itself; tuned from the measured read time the smoke test
+    prints). "Busy, tap again." Each is logged to `/data/record-waits.jsonl` and counted in
+    `state/one-off-audit.md` as a tap timeout.
+  - clock: the box's clock isn't synchronized now (the keeper's verdict from the last 10
+    minutes says it isn't, or neither the box's own sources nor that verdict says it is).
+    "The box's clock isn't synchronized just now, so nothing was done. Tap again in a few
+    minutes."
+  - record reset: the keeper had to reset its copy and hasn't pushed since. "Cain's record
+    is being put back in step, so nothing was done. Tap again in a few minutes."
+  Where the row sits in the table is never used.
 - A one-off (`--item none`) is refused when its text holds an open row's item code or the
   row's whole Item phrase, quoting what matched. One whose words overlap an open row's Item
   more loosely (two of the row's distinctive words, or its only one) is held: nothing is
@@ -408,7 +463,23 @@ What Cain's link enforces:
 - Every refusal quotes what it matched: the vague source word, the repeated check, the two
   bundled clauses, the overlapping words. The link logs its refusals of checks and
   one-offs to `/data/work/source-check-refusals.jsonl`, and the keeper its own to its log
-  ("refused for tuning"), for tuning the rules.
+  ("refused for tuning"), for tuning the rules. The word lists (vague sources, mail words,
+  status words for bundled rows, distinctive words for one-off overlaps) are heuristics: tune
+  them from that refusal log after one or two weeks of use.
+
+When a push fails. A failed push never resets the keeper's copy. The keeper keeps its local
+commit, and the outcome it already wrote for the link stays valid. It marks its status file
+(`/data/record-ledger.json`, written whole every round, read by the link) `unpushed`, with
+the push error, and tries again: at once after rebasing onto GitHub's copy when GitHub
+answered (a lost race), otherwise on its next round. Requests stay in its queue until GitHub
+has them, but are applied once; Cain's other requests hear done once the push lands. A valid
+card keeps its buttons through the failure and his tap on it counts; a card whose row moved
+meanwhile is refused as usual. Only when a reset is unavoidable (the rebase conflicts with
+what GitHub has, or the copy has to be cloned again) does the keeper reset its copy to
+GitHub's: it logs why, marks `reset` in its status file, runs the requests still queued
+again on GitHub's copy, tells Cain which others may not have landed, and the link refuses
+asks ("the record keeper had to reset its copy of the record ...") and taps (record reset)
+until the next push lands. The ledger's generation still only goes up.
 
 What is mechanical and what rests on Cain's word. Mechanical, in code: no ask or Ship card
 about an item posts, and no tap on one counts, without a `check` the keeper accepted for
@@ -420,8 +491,9 @@ that he actually read the source he names, that what he read says what the row a
 question imply, and that a one-off's reason is true. The gate proves a check was recorded,
 not that the source was read.
 
-Device smoke test. Right after installing a version with source checks, Cain runs two
-paths against the real record and reports the result to you in one line:
+Device smoke test. Right after installing a version with source checks, Cain runs these
+against the real record, about ten minutes in all, and reports the result to you in one
+line:
 
 1. A checked ask about an item he holds, with a concrete source: it posts, and your tap on
    it is accepted (the link relays it to him). It says it is the smoke test; any answer
@@ -431,6 +503,19 @@ paths against the real record and reports the result to you in one line:
 3. The Ship path the same way, on a harmless card: a checked Ship card for the pull request
    that brought this version (already in main), where your tap on "Not now" is accepted and
    nothing ships; and the same card with a deliberately vague source, which posts nothing.
+4. A checked test ask, then an edit of its row (a word in its Next step): you tap the old
+   card, and it must be refused with the status-changed reason, its buttons off.
+5. A one-off that looks like an open item: it must be held ("needs reason"); sent again
+   with `--reason`, it must post, and the reason must show in `log/requests/`.
+6. `/opt/cain/record.sh block-push`, then a checked test ask: its check lands locally while
+   that round's push goes to a wrong remote. You tap it during the blocked push: it must be
+   honoured (nothing moved), with the buttons kept until then; `keeper.sh clock` must show
+   `unpushed` until the next round pushes.
+7. An expired check: you set source_check_max_days to 0 in the App's options for one ask
+   (the App restarts); a checked test ask must post nothing and say the check is past
+   source_check_max_days. Then you set it back to 7.
+8. `/opt/cain/keeper.sh clock`: the clock verdict, which source satisfied it, and the
+   measured tap read time (from step 4's or 6's tap), all in his one-line report.
 
 It passes only when he sees committed in the record the `check` request done in
 `log/requests/`, `state/checks.json` with that row's entry and his check, and the open
@@ -439,7 +524,11 @@ entry, the ledger write and the table change), so you can spot-check them on Git
 
 Rollback. If the smoke test fails, the remedy is one step: in Home Assistant, restore this
 App from the backup taken just before the install (every install takes one first), which
-brings back its previous version. There is no switch that lets cards through without a
+brings back its previous version. The rollback test runs this version's record against the
+previous keeper, copied into the tests as `cain/tests/fixtures/keeper-0.11.0`: that fixture is
+pinned to the version installed on the Pi (0.11.0 today), and moves when the Pi's does. After any
+rebase onto a version bump (another pull request, number 21, also bumps this App's version),
+both test suites and the rollback test run again on the new head before Ship. There is no switch that lets cards through without a
 check. The previous version's record keeper (as of 0.11.0) ignores state/checks.json, the
 `Checked` column and `state/one-off-audit.md` without error (tested): it reads and edits the
 open list with the column in it, leaves the ledger and audit files alone, and rejects any

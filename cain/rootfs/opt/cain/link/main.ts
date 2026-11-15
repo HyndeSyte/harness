@@ -46,6 +46,7 @@
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { localReadings, verdict } from "../clock";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
@@ -73,7 +74,9 @@ const RECORD_WAITS = process.env.RECORD_WAITS ?? "/data/record-waits.jsonl";   /
 const TUNING = process.env.SOURCE_CHECK_TUNING ?? "/data/work/source-check-refusals.jsonl";   // refusals, for tuning the rules
 // The App's source_check_max_days option: how old a source check may be (by the keeper's
 // time for it) before an ask or Ship card can't rest on it. 7 when unset.
-const MAX_CHECK_DAYS = Number(process.env.SOURCE_CHECK_MAX_DAYS ?? "") || undefined;
+// 0 is allowed (the smoke test's expired check).
+const MAX_CHECK_DAYS = /^\d+$/.test(process.env.SOURCE_CHECK_MAX_DAYS ?? "") ? Number(process.env.SOURCE_CHECK_MAX_DAYS) : undefined;
+const RECORD_STATUS = process.env.RECORD_STATUS ?? "/data/record-ledger.json";   // the keeper's status: generation, push, reset, clock
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
@@ -193,7 +196,9 @@ const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
-  record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`) }),
+  record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`), status: readOr(RECORD_STATUS) }),
+  // The box's own clock sources at tap time (the keeper's rounds add GitHub's Date header).
+  localClock: () => verdict(localReadings()),
   // A source check or a one-off's log line, handed to the record keeper through its local
   // queue as record.sh does; the link waits for a check's outcome before posting.
   submitRecord: (req) => {
@@ -286,7 +291,7 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -326,6 +331,7 @@ Bun.serve({
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
+        case "/clock": return json(link.clockReport());
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

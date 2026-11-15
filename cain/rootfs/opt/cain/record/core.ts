@@ -468,6 +468,15 @@ export function itemKnown(text: string | null, id: string): boolean {
 //   pending_rewrite  set when a whole-file write that changed this row was refused for it
 //               (it bundled two statuses): what was refused. Its check doesn't count, and no
 //               new check is taken, until a write changes the row cleanly.
+//   clock       which clock source said the keeper's clock was synchronized when it took the
+//               check (kernel, timedatectl, timesyncd or http-date; see ../clock.ts).
+//   stepped_back  when the keeper's clock read earlier than checked_at (a backward step): the
+//               check never counts again.
+// The file also holds "_generation", a number that goes up by one with every write of the
+// ledger and never comes down, even across a reset of the keeper's copy (the keeper keeps its
+// own count too). The link puts it on each ask and Ship card, and a tap counts only while the
+// ledger's generation is no lower than the card's, so a ledger that went backwards can't
+// validate a card.
 // A check is fresh while checked_version is the row's version, it isn't aged, pending a
 // rewrite or out of step with the row's cells, and it is no older than stale_after (the
 // App's source_check_max_days, 7 by default, from checked_at). The check op carries the id and
@@ -480,13 +489,20 @@ export function itemKnown(text: string | null, id: string): boolean {
 export type CheckEntry = {
   id: string; version: number; changed: string; hash?: string;
   checked?: string; checked_at?: string; checked_version?: number; checked_req?: string; by?: string;
-  stale_after?: string; aged?: string; pending_rewrite?: string;
+  stale_after?: string; aged?: string; pending_rewrite?: string; clock?: string; stepped_back?: string;
 };
 export type Checks = Record<string, CheckEntry>;
 export const CHECKED_COLUMN = "Checked";
 const UNVERSIONED = new Set(["ID", "Since", CHECKED_COLUMN]);
 export const ROW_ID = /^r[0-9a-f]{12}$/;
 const DAY_MS = 86_400_000;
+export const GENERATION_KEY = "_generation";   // not an item code: those start with a letter or digit
+
+// The ledger's generation (0: none written yet, or a file that can't be read).
+export function generationOf(text: string | null | undefined): number {
+  if (!text) return 0;
+  try { const g = JSON.parse(text)?.[GENERATION_KEY]; return Number.isInteger(g) && g > 0 ? g : 0; } catch { return 0; }
+}
 
 export function parseChecks(text: string | null): Checks {
   if (!text) return {};
@@ -505,28 +521,40 @@ export function parseChecks(text: string | null): Checks {
       if (typeof v.by === "string") e.by = v.by;
       if (typeof v.stale_after === "string" && !Number.isNaN(Date.parse(v.stale_after))) e.stale_after = v.stale_after;
       if (typeof v.aged === "string") e.aged = v.aged;
+      if (typeof v.clock === "string") e.clock = v.clock;
     }
+    if (typeof v.stepped_back === "string" && v.stepped_back) e.stepped_back = v.stepped_back;
     if (typeof v.pending_rewrite === "string" && v.pending_rewrite) e.pending_rewrite = v.pending_rewrite;
     out[k] = e;
   }
   return out;
 }
-export function checksText(c: Checks): string {
-  const out: Record<string, CheckEntry> = {};
+export function checksText(c: Checks, generation?: number): string {
+  const out: Record<string, unknown> = {};
+  if (generation !== undefined && generation > 0) out[GENERATION_KEY] = generation;
   for (const k of Object.keys(c).sort()) {
     const e = c[k];
     out[k] = { id: e.id, version: e.version, changed: e.changed, ...(e.hash ? { hash: e.hash } : {}),
       ...(e.checked !== undefined ? { checked: e.checked, checked_at: e.checked_at, checked_version: e.checked_version,
         ...(e.stale_after ? { stale_after: e.stale_after } : {}), ...(e.aged ? { aged: e.aged } : {}),
-        ...(e.checked_req ? { checked_req: e.checked_req } : {}), ...(e.by ? { by: e.by } : {}) } : {}),
-      ...(e.pending_rewrite ? { pending_rewrite: e.pending_rewrite } : {}) };
+        ...(e.checked_req ? { checked_req: e.checked_req } : {}), ...(e.by ? { by: e.by } : {}), ...(e.clock ? { clock: e.clock } : {}) } : {}),
+      ...(e.pending_rewrite ? { pending_rewrite: e.pending_rewrite } : {}), ...(e.stepped_back ? { stepped_back: e.stepped_back } : {}) };
   }
   return JSON.stringify(out, null, 2) + "\n";
 }
-// The App's source_check_max_days, as a number of days (1 to 90; anything else: the default).
+// The ledger's text as a write leaves it: unchanged (null) when the entries are as they were;
+// otherwise stamped with the next generation, one above both the file's and the keeper's own
+// count (so a ledger reset to an older copy never reuses a number).
+export function nextChecksText(ledger: Checks, before: string | null, keeperGeneration = 0): string | null {
+  const was = generationOf(before);
+  if (before !== null && checksText(ledger, was) === before) return null;
+  return checksText(ledger, Math.max(was, keeperGeneration) + 1);
+}
+// The App's source_check_max_days, as a number of days (0 to 90; anything else: the default).
+// 0 is for the device smoke test: every check is past it at once.
 export function maxCheckDays(v: unknown): number {
   const n = typeof v === "number" ? v : Number(String(v ?? "").trim() || NaN);
-  return Number.isInteger(n) && n >= 1 && n <= 90 ? n : DEFAULT_MAX_CHECK_DAYS;
+  return Number.isInteger(n) && n >= 0 && n <= 90 ? n : DEFAULT_MAX_CHECK_DAYS;
 }
 // When a check stops counting by age: the keeper's stale_after for it, or (an entry written
 // before it had one) its keeper time plus the limit. NaN: no time.
@@ -535,10 +563,13 @@ export const staleAfter = (e: CheckEntry | undefined, maxDays = DEFAULT_MAX_CHEC
 // Of the row's version, not aged out by the keeper and not pending a rewrite (with no clock),
 // and, given a time, no older than the limit.
 export function isFresh(e: CheckEntry | undefined, now?: number, maxDays = DEFAULT_MAX_CHECK_DAYS): boolean {
-  if (!e || e.checked === undefined || e.checked_version !== e.version || e.aged || e.pending_rewrite) return false;
+  if (!e || e.checked === undefined || e.checked_version !== e.version || e.aged || e.pending_rewrite || e.stepped_back) return false;
   if (now === undefined) return true;
   const until = staleAfter(e, maxDays);
-  return Number.isFinite(until) && now <= until;
+  // A clock that reads earlier than the check's own time stepped back: it doesn't count.
+  if (e.checked_at && now < Date.parse(e.checked_at)) return false;
+  // A limit of 0 days (the smoke test's expired check): nothing counts, even in the same instant.
+  return Number.isFinite(until) && now <= until && !(e.checked_at && until <= Date.parse(e.checked_at));
 }
 
 const norm = (s: string) => s.trim().replace(/\s+/g, " ");
@@ -916,7 +947,9 @@ export function oneOffLoose(pending: string | null | undefined, text: string): {
 export type OneOff = { id: string; at: string; text: string; declared?: string };
 // A refusal the link gave because the keeper's outcome didn't arrive in time, with the
 // keeper's local time for that request's round once it had one (null: none yet).
-export type WaitTimeout = { id: string; at: string; waited_ms: number; round_ms: number | null };
+// kind "tap": a tap whose fresh read of the ledger went over the link's limit (waited_ms is how
+// long the read took); he was told busy, tap again.
+export type WaitTimeout = { id: string; at: string; waited_ms: number; round_ms: number | null; kind?: "tap" };
 export const ONE_OFF_SUMMARY = "One-off ask to him: ";
 // The audit file: one line for the past seven days, then each hit. Same input, same text.
 export function oneOffAudit(oneOffs: OneOff[], pending: string | null, now: Date, tz = "America/New_York", waits: WaitTimeout[] = []): { text: string; hits: string[] } {
@@ -927,13 +960,19 @@ export function oneOffAudit(oneOffs: OneOff[], pending: string | null, now: Date
   const hits: string[] = [];
   for (const o of recent) for (const h of oneOffLoose(pending, o.text))
     hits.push(`${day(new Date(o.at))} (${o.id}): "${clean(o.text, 120)}" may be about ${h.id} ("${clean(h.item, 60)}"), shared words: ${h.shared.map((w) => `"${w}"`).join(", ")}${o.declared ? `; re-declared about no open item: "${clean(o.declared, 120)}"` : ""}`);
-  const timed = waits.filter((w) => inWeek(w.at)).sort((a, b) => a.at.localeCompare(b.at));
+  const week = waits.filter((w) => inWeek(w.at)).sort((a, b) => a.at.localeCompare(b.at));
+  const timed = week.filter((w) => w.kind !== "tap"), taps = week.filter((w) => w.kind === "tap");
+  const matches = hits.length;
   for (const w of timed)
     hits.push(`${day(new Date(w.at))} (${w.id}): the link gave up waiting after ${Math.round(w.waited_ms / 1000)} seconds and posted nothing; the keeper's local round for it ${w.round_ms === null ? "hadn't finished when this was written" : `took ${Math.round(w.round_ms / 100) / 10} seconds`}`);
-  const line = `Week to ${day(now)}: ${hits.length - timed.length} possible match${hits.length - timed.length === 1 ? "" : "es"} in ${recent.length} one-off${recent.length === 1 ? "" : "s"}; ${timed.length} wait timeout${timed.length === 1 ? "" : "s"}.`;
+  for (const w of taps)
+    hits.push(`${day(new Date(w.at))} (${w.id}): a tap's fresh read of the ledger took ${Math.round(w.waited_ms)} ms, over the link's limit; he was told busy, tap again`);
+  const n = (k: number, one: string, many: string) => `${k} ${k === 1 ? one : many}`;
+  const line = `Week to ${day(now)}: ${n(matches, "possible match", "possible matches")} in ${n(recent.length, "one-off", "one-offs")}; ${n(timed.length, "wait timeout", "wait timeouts")}; ${n(taps.length, "tap timeout", "tap timeouts")}.`;
   const text = ["# One-off audit", "",
-    "The keeper's looser match of the past week's one-off asks against the open rows, and the asks the link refused because",
-    "the keeper's answer didn't come in time. Look at each: if a one-off was about an open item, check that item at its",
+    "The keeper's looser match of the past week's one-off asks against the open rows, the asks the link refused because",
+    "the keeper's answer didn't come in time, and taps refused as busy because the ledger's read took too long (the",
+    "link's tap read limit is tuned from these). Look at each: if a one-off was about an open item, check that item at its",
     "source and ask under it. New lines reach Cain at his next check-in. The guard is limited: a one-off sharing no item",
     "code, Item phrase or distinctive word with a row isn't caught.", "",
     line, ...(hits.length ? ["", ...hits.map((h) => `- ${h}`)] : []), ""].join("\n");
@@ -1055,6 +1094,9 @@ export type PlanContext = {
   tz?: string;            // for the dates written in the open list
   maxCheckDays?: number;  // the App's source_check_max_days: a check's stale_after, and the Checked cell
   clockSynced?: boolean;  // the keeper's clock is synchronized: only then is a check taken
+  clockSource?: string;   // which source said so (recorded with each check)
+  clockWhy?: string;      // when it isn't: what each source returned (named in the refusal)
+  generation?: number;    // the keeper's own count of ledger generations (never comes down)
 };
 export type Plan =
   // declared: a one-off's reason and the overlap it answers, for the request log.
@@ -1076,9 +1118,10 @@ function rowCell(text: string | null, id: string, col: string): string | undefin
 
 // The ledger kept in step with the list between requests: rows changed outside the keeper
 // (their cells no longer match the hash it wrote) go up a version, and, while the clock is
-// synchronized, checks past their stale_after are aged out. Returns the files to write, or
-// null when nothing changes. Only once a ledger exists.
-export function upkeep(tree: Tree, ctx: { at: Date; tz?: string; maxCheckDays?: number; clockSynced?: boolean }): { writes: Map<string, string>; bumped: string[]; aged: string[] } | null {
+// synchronized, checks past their stale_after are aged out. A check whose time is later than
+// the clock reads now (the clock stepped back) is marked stepped_back and never counts again.
+// Returns the files to write, or null when nothing changes. Only once a ledger exists.
+export function upkeep(tree: Tree, ctx: { at: Date; tz?: string; maxCheckDays?: number; clockSynced?: boolean; generation?: number }): { writes: Map<string, string>; bumped: string[]; aged: string[]; stepped: string[] } | null {
   const raw = tree.read(CHECKS_PATH), list = tree.read(PENDING_PATH);
   if (raw === null || list === null) return null;
   let ledger = parseChecks(raw);
@@ -1087,11 +1130,15 @@ export function upkeep(tree: Tree, ctx: { at: Date; tz?: string; maxCheckDays?: 
   if (bumped.length) ledger = reconcile(ledger, list, list, iso, "upkeep");
   let aged: string[] = [];
   if (ctx.clockSynced === true) ({ ledger, aged } = ageChecks(ledger, ctx.at, ctx.maxCheckDays));
-  if (!bumped.length && !aged.length) return null;
-  const writes = new Map<string, string>([[CHECKS_PATH, checksText(ledger)]]);
+  const stepped: string[] = [];
+  for (const [k, e] of Object.entries(ledger))
+    if (e.checked_at && !e.stepped_back && ctx.at.getTime() < Date.parse(e.checked_at)) { ledger = { ...ledger, [k]: { ...e, stepped_back: iso } }; stepped.push(k); }
+  if (!bumped.length && !aged.length && !stepped.length) return null;
+  const text = nextChecksText(ledger, raw, ctx.generation);
+  const writes = new Map<string, string>(text === null ? [] : [[CHECKS_PATH, text]]);
   const shown = projectChecked(list, ledger, ctx.tz, ctx.maxCheckDays);
   if (shown !== list) writes.set(PENDING_PATH, shown);
-  return { writes, bumped, aged };
+  return { writes, bumped, aged, stepped };
 }
 
 // Checks a change against the record and returns the files to write, or why not.
@@ -1134,7 +1181,7 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       marked = true;
     }
     if (!marked || committed === null || raw === null) return { state: "rejected", reason };
-    const side = new Map<string, string | null>([[CHECKS_PATH, checksText(L)]]);
+    const side = new Map<string, string | null>([[CHECKS_PATH, nextChecksText(L, raw, ctx.generation) ?? raw]]);
     const shown = projectChecked(committed, L, ctx.tz, ctx.maxCheckDays);
     if (shown !== committed) side.set(PENDING_PATH, shown);
     return { state: "rejected", reason, writes: side };
@@ -1241,7 +1288,7 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       if (sender !== "cain") return rejected(`check ${id}: only Cain's link sends source checks`);
       if (h && h.holder !== sender) return refused(heldBy(id));
       // Checks are dated and aged by the keeper's own clock, so only once it is synchronized.
-      if (ctx.clockSynced !== true) return rejected(`check ${id}: the keeper's clock isn't synchronized yet, so no source check can be dated; try again in a few minutes`);
+      if (ctx.clockSynced !== true) return rejected(`check ${id}: the keeper's clock isn't synchronized yet${ctx.clockWhy ? ` (${clean(ctx.clockWhy, 220)})` : ""}, so no source check can be dated; try again in a few minutes`);
       const bad = checkTextProblem(o.text);
       if (bad) return rejected(`check ${id}: ${bad}`);
       const list = current(PENDING_PATH);
@@ -1258,9 +1305,10 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       // A row the ledger didn't know yet gets its id from this request alone, so the same check
       // applied again after a lost push gives the row the same id.
       const entry: CheckEntry = e ?? { id: newRowId(`${req.id}\u0000${id}`), version: 1, changed: iso };
-      const { aged: _aged, ...kept } = entry;
+      const { aged: _aged, stepped_back: _stepped, clock: _clock, ...kept } = entry;
       const until = new Date(ctx.at.getTime() + maxCheckDays(ctx.maxCheckDays) * DAY_MS).toISOString();
-      ledger = { ...ledger, [id]: { ...kept, checked: o.text.trim(), checked_at: iso, checked_version: entry.version, stale_after: until, checked_req: req.id, by: sender } };
+      ledger = { ...ledger, [id]: { ...kept, checked: o.text.trim(), checked_at: iso, checked_version: entry.version, stale_after: until, checked_req: req.id, by: sender,
+        ...(ctx.clockSource ? { clock: ctx.clockSource } : {}) } };
       checked = true;
       if (h?.holder === sender) touched.add(id);
       continue;
@@ -1384,8 +1432,8 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       if (Buffer.byteLength(shown) > MAX_BYTES) return rejected(`${PENDING_PATH}: over ${MAX_BYTES / 1000} KB; split it into topics`);
       if (shown !== committed || writes.has(PENDING_PATH)) writes.set(PENDING_PATH, shown);
     }
-    const text = checksText(ledger);
-    if (text !== tree.read(CHECKS_PATH)) writes.set(CHECKS_PATH, text);
+    const text = nextChecksText(ledger, tree.read(CHECKS_PATH), ctx.generation);
+    if (text !== null) writes.set(CHECKS_PATH, text);
   }
   // The holder's word on its own row renews its hold.
   for (const id of touched) if (holds[id]?.holder === sender) holds[id].renewed = iso;

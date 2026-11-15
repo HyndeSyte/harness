@@ -11,6 +11,8 @@
 #                               <since>: only notes after that time (any ISO form or offset).
 #   record.sh submit <file>     queue a request (JSON, see CLAUDE.md); prints its id
 #   record.sh status <id>       done / conflict / rejected / refused / relayed, or "waiting"
+#   record.sh block-push        the device smoke test only: the record keeper's next round pushes to a
+#                               wrong remote (its push fails, its local commits stay), then it pushes as usual
 set -u
 dir="${RECORD_DIR:-/data/record}"
 queue="${RECORD_QUEUE:-/data/record-queue}"
@@ -69,5 +71,8 @@ case "${1:-}" in
     id="${2:?id}"
     f="$outcomes/$(printf '%s' "$id" | tr -c 'A-Za-z0-9._:-' '_').json"
     if [ -f "$f" ]; then jq -r '"\(.state)\(if .reason then ": " + .reason else "" end)"' "$f"; else echo waiting; fi ;;
-  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id>" >&2; exit 2 ;;
+  block-push)
+    # The keeper removes it once that round's push has failed.
+    : > "${RECORD_BLOCK_PUSH:-/data/record-block-push}" && echo "the record keeper's next round pushes to a wrong remote, once" ;;
+  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id> | block-push" >&2; exit 2 ;;
 esac

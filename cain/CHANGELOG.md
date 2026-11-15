@@ -10,7 +10,10 @@
 - A one-off question that names one of your open items is held back; one that only sounds like one waits until Cain names the item or says why it isn't, and that reason is kept.
 - A change to your whole open list saves whole or not at all: a row that says two different things are done or not done stops all of it, and Cain fixes and resends.
 - A row's next step stays short (the current step and its latest check); older history goes in a note on the item.
-- Right after this install Cain runs a short test: one question that should go out and one that shouldn't, and the same for a harmless Ship card. Tap any answer on the test question, and Not now on the test Ship card. He tells you in a line whether it worked. If not, restore the App from the backup taken before the install; nothing else needs undoing.
+- If saving the record to GitHub fails, nothing is lost or undone: the box keeps its copy and saves it again a minute later, and a question already out keeps working. Only if the box ever has to start its copy over do questions and taps wait, a few minutes, until it has saved again.
+- Taps that can't be confirmed right now do nothing and say why, and the question keeps its buttons: "Busy, tap again" when the record is slow to read, or a note that the box's clock isn't set right just now.
+- The box's clock is checked four ways now, the kernel's own flag first (the one that works on your Pi), and GitHub's clock as a backstop. If the clock ever jumps backwards, checks made "in the future" stop counting.
+- Right after this install Cain runs a short test, about ten minutes: a few test questions (tap any answer, or tap an old one when he says so) and a harmless Ship card (tap Not now). For one step he asks you to set source_check_max_days to 0 and then back to 7. He tells you in a line whether it worked. If not, restore the App from the backup taken before the install; nothing else needs undoing.
 
 ## 0.11.0
 
