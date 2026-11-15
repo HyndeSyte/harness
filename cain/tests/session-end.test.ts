@@ -148,6 +148,16 @@ describe("once only", () => {
     expect(fileSnapshot(d, snap([b], 400)).id).toMatch(/-000002-/);                                    // B, truly newer: filed
   });
 
+  test("with the same transcript, the record decides: a delayed snapshot that read older holds can't replace a newer one", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    const snap = (held: string[], rmark: number) => ({ session: "s1", held, open: [a], why: "open" as const, at: 1, mark: 150, rmark });
+    expect(fileSnapshot(d, snap(["P33"], 10)).id).toMatch(/-000001-/);                 // A, captured first
+    expect(fileSnapshot(d, snap(["P44"], 12)).id).toMatch(/-000002-/);                 // B, captured last
+    expect(fileSnapshot(d, snap(["P33"], 11))).toEqual({ id: null, same: true });     // A, captured between, delayed: passed over
+    expect(readJournal(join(d, "s1.journal")).at(-1)!.key).toBe(filedKey(["P44"], [a]));
+    expect(fileSnapshot(d, snap(["P33"], 13)).id).toMatch(/-000003-/);                 // the record moved on: newer, filed
+  });
+
   test("a newer snapshot taken after the clock moved back is filed: the transcript, not the clock, says it's newer", () => {
     const d = mkdtempSync(join(tmpdir(), "journal-"));
     writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [a]), at: 2_000, kind: "open", id: "x", raw: JSON.stringify({ id: "x" }), mark: 100 }) + "\n");

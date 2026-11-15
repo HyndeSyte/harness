@@ -44,8 +44,9 @@
 // A journal line cut off by a crash stays as it is, marked torn, and the next entry starts on a
 // line of its own; any other line that can't be read is damage, named at every flush; a journal
 // that can't be read is never taken for an empty one, and is named at every flush too. Which of
-// two snapshots of a session is newer is read from its transcript, not a clock: a transcript only
-// grows, so the one that had read more of it is the newer.
+// two snapshots of a session is newer is read from what they saw, not a clock: its transcript
+// only grows, so the one that had read more of it is the newer; with the same transcript, the
+// one that saw more of the record (whose holds it read; the record only moves on) is.
 // It never holds up the session's end: any failure is one line.
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
@@ -121,7 +122,7 @@ export const filingId = (session: string, n: number, key: string) => `laptop-end
 
 // One journal entry: n, the state's key, when, what kind of end, and for a filing its id and
 // the request as sent.
-export interface Entry { n: number; key: string; at: number; kind: "open" | "empty" | Why; id?: string; raw?: string; mark?: number; seen?: "unread" }
+export interface Entry { n: number; key: string; at: number; kind: "open" | "empty" | Why; id?: string; raw?: string; mark?: number; rmark?: number; seen?: "unread" }
 
 // A journal's entries, and its damaged lines: a line that can't be read that is neither its last
 // (a crash cut it off; the next append marks it torn) nor marked torn. No journal yet is empty;
@@ -153,7 +154,8 @@ export function isEntry(p: any): p is Entry {
   return !!p && typeof p === "object" && Number.isInteger(p.n) && p.n >= 1 && typeof p.key === "string" && p.key.length > 0
     && typeof p.at === "number" && ["open", "empty", "unread", "unplanned"].includes(p.kind)
     && (p.id === undefined) === (p.raw === undefined) && (p.id === undefined || (typeof p.id === "string" && p.id.length > 0 && typeof p.raw === "string" && idOf(p.raw) === p.id))
-    && (p.mark === undefined || (Number.isInteger(p.mark) && p.mark >= 0)) && (p.seen === undefined || p.seen === "unread");
+    && (p.mark === undefined || (Number.isInteger(p.mark) && p.mark >= 0)) && (p.rmark === undefined || (Number.isInteger(p.rmark) && p.rmark >= 0))
+    && (p.seen === undefined || p.seen === "unread");
 }
 const idOf = (raw: string) => { try { return JSON.parse(raw)?.id; } catch { return undefined; } };
 
@@ -296,8 +298,14 @@ function aside(dir: string, kind: "refused" | "unreadable", name: string, why: s
 }
 
 // What one end saw: the session, the items it held, its open steps and why, how much of the
-// transcript it had read (mark: its order among the session's snapshots), and when (dating the note).
-export interface Snapshot { session: string; held: string[]; open: Step[]; why: Why; at: number; mark?: number }
+// transcript it had read (mark) and how far the record it read the holds from had come (rmark:
+// its commits), which together order the session's snapshots, and when (dating the note).
+export interface Snapshot { session: string; held: string[]; open: Step[]; why: Why; at: number; mark?: number; rmark?: number }
+
+// The order of what a snapshot saw: transcript first, then the record.
+type Seen = [number, number];
+const seenOf = (x: { mark?: number; rmark?: number }): Seen => [x.mark ?? -1, x.rmark ?? -1];
+const after = (a: Seen, b: Seen) => a[0] > b[0] || (a[0] === b[0] && a[1] > b[1]);
 
 // Journals one end's snapshot and, if it's a filing, puts it in the outbox. The caller holds the
 // session's lock. A snapshot that had read less of the transcript than the journal's last entry
@@ -308,27 +316,28 @@ export function fileSnapshot(dir: string, s: Snapshot): { id: string | null; sam
   const key = filedKey(s.held, s.open, s.why);
   const journal = readJournal(journalPath);
   const last = journal.at(-1);
-  const high = journal.reduce((m, e) => (e.mark !== undefined && e.mark > m ? e.mark : m), -1);   // the most of the transcript seen
-  if (last && high >= 0 && s.mark === undefined) {
+  // The most seen: transcript first, then the record (whose holds a snapshot read).
+  const high = journal.reduce<Seen>((m, e) => (e.mark !== undefined && after(seenOf(e), m) ? seenOf(e) : m), [-1, -1]);
+  if (last && high[0] >= 0 && s.mark === undefined) {
     // Of unknown order (its transcript couldn't be read): noted, and the known state stands.
     appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, seen: "unread" });
     return { id: null, same: true };
   }
-  if (high >= 0 && s.mark! < high) return { id: null, same: true };   // older than what's been seen
+  if (high[0] >= 0 && after(high, seenOf(s))) return { id: null, same: true };   // older than what's been seen
   const d = decide(journal, key, s.held, s.open, s.why);
+  const seen = { ...(s.mark !== undefined ? { mark: s.mark } : {}), ...(s.rmark !== undefined ? { rmark: s.rmark } : {}) };
   if (d.same) {
     // The same state seen later: the most seen moves on, so a delayed older snapshot can't pass it.
-    if (last && s.mark !== undefined && s.mark > high) appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, mark: s.mark });
+    if (last && s.mark !== undefined && after(seenOf(s), high)) appendEntry(journalPath, { n: last.n, key: last.key, at: s.at, kind: last.kind, ...seen });
     return { id: null, same: true };
   }
   const kind: Entry["kind"] = s.why === "open" ? (s.open.length ? "open" : "empty") : s.why;
-  const mark = s.mark !== undefined ? { mark: s.mark } : {};
-  if (!d.file) { appendEntry(journalPath, { n: d.n, key, at: s.at, kind, ...mark }); return { id: null, same: false }; }
+  if (!d.file) { appendEntry(journalPath, { n: d.n, key, at: s.at, kind, ...seen }); return { id: null, same: false }; }
   const req = requestFor(s.open, s.held, s.why, new Date(s.at), d.wasOpen);
   req.from = `laptop:${s.session}`;
   req.id = filingId(s.session, d.n, key);
   const raw = JSON.stringify(req, null, 1) + "\n";
-  appendEntry(journalPath, { n: d.n, key, at: s.at, kind, id: req.id, raw, ...mark });
+  appendEntry(journalPath, { n: d.n, key, at: s.at, kind, id: req.id, raw, ...seen });
   enqueue(dir, req.id, raw);                           // after the journal: a stop in between is put back
   return { id: req.id, same: false };
 }
@@ -558,8 +567,10 @@ if (import.meta.main) {
   const { steps, planned } = stepsOf(kept);
   const open = steps.filter((s) => s.status !== "completed");
   const held = Object.entries(holdsAt(rec)).filter(([, h]: [string, any]) => h?.holder === `laptop:${session}`).map(([item]) => item).sort();
+  const commits = Number(git(rec.dir, ["rev-list", "--count", rec.ref])?.trim());   // how far the record had come: its order
+  const rmark = Number.isInteger(commits) && commits > 0 ? commits : undefined;
   const why: Why = !read ? "unread" : !planned ? "unplanned" : "open";
-  const snap: Snapshot = { session: session!, held, open, why, at: Date.now(), ...(mark !== undefined ? { mark } : {}) };
+  const snap: Snapshot = { session: session!, held, open, why, at: Date.now(), ...(mark !== undefined ? { mark } : {}), ...(rmark !== undefined ? { rmark } : {}) };
   mkdirSync(dir, { recursive: true });
   if (a.dry === true) {                                // what this end would file, changing nothing
     const key = filedKey(held, open, why);
