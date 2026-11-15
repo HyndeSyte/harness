@@ -43,11 +43,12 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__claude-in-chrome__navigate|mcp__claude-in-chrome__tabs_create_mcp",
+        "matcher": "mcp__claude-in-chrome__.*",
         "hooks": [
           {
             "type": "command",
-            "command": "\"$PCW_RUNTIME\" \"$PCW_WORKER\" nav-guard"
+            "command": "\"$PCW_RUNTIME\" \"$PCW_WORKER\" nav-guard",
+            "timeout": 15
           }
         ]
       }

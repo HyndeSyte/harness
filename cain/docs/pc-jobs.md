@@ -9,6 +9,11 @@ tells you what matters.
 
 ## What is enforced, and what is not
 
+The guarantee, in one line:
+**restricted browser tools against owner-approved addresses**.
+It is not side-effect-free browsing: a page on an address you approved can still act
+when it loads (below).
+
 - **Read-only actions, in code.** The worker refuses any job whose action isn't in a
   fixed read-only set, and your signed allowlist can only name those actions.
   Irreversible jobs (closing an account, cancelling a subscription) are
@@ -18,31 +23,40 @@ tells you what matters.
   `pcjobs/confirm.ts`, which `worker.ts` doesn't import; a test holds every worker
   command to that.
 - **The whole session is pinned, in code.** Windows Task Scheduler (or you, by hand)
-  runs the worker, and the worker starts the session itself: the `claude` command in
-  print mode with `--chrome`, the pinned settings file
-  `cain/docs/pc-worker/session-settings.json` (`--settings`) and no other settings
-  source (`--setting-sources ""`: none of user, project or local), the same allow and
-  deny lists on the command line, `--strict-mcp-config` with no MCP servers but Claude in
-  Chrome, from an empty folder, with the CLI's autoupdater off (`DISABLE_AUTOUPDATER=1`
-  in its environment). Claude Code still reads managed settings whatever the flags say,
-  so before every run the worker also reads your user settings
-  (`~/.claude/settings.json`, or under `CLAUDE_CONFIG_DIR`), the session folder's
-  project and local settings, the managed settings files and your user memory file
-  (`~/.claude/CLAUDE.md`). It fails closed (`untrusted_config`) if any of those settings
-  holds hooks, permission allow rules or a permission-skipping default mode, can't be
-  read as JSON, or if the memory file isn't empty. It hashes the settings file, the
-  session prompt and those outside files into the confirmation and fails closed
-  (`untrusted_config`) if any of them changes. The settings deny every shell, every file
-  tool, web fetch and web search, and allow only Claude in Chrome's reading tools. The
-  model reads its instruction from its prompt and prints its report: it reads and writes
-  no file at all. Not checked: Windows registry policies for Claude Code and a
-  `managed-settings.d` folder, if your version reads them; keep none.
+  runs the worker, and the worker starts the session itself, straight from an argument
+  list and never through a shell (on Windows `claude` must be `claude.exe`, not a
+  `.cmd` or `.ps1` wrapper): the `claude` command in print mode with `--chrome`, the
+  pinned settings file `cain/docs/pc-worker/session-settings.json` (`--settings`) and no
+  other settings source (`--setting-sources ""`: none of user, project or local), the
+  same allow and deny lists on the command line, `--strict-mcp-config` with no MCP
+  servers but Claude in Chrome, from an empty folder, with the CLI's autoupdater off
+  (`DISABLE_AUTOUPDATER=1`). The session's environment is an allowlist (the variables
+  Windows and the `claude` command need to start, such as `PATH`, `USERPROFILE`,
+  `APPDATA`, `TEMP`; nothing else of yours, no API key): sign the `claude` command in
+  once with its own login. The worker fails closed (`untrusted_config`) if its own
+  environment sets `CLAUDE_CONFIG_DIR`, an API base address (`ANTHROPIC_BASE_URL` and
+  the like) or any `CLAUDE_CODE_*` variable (so don't start it from inside a Claude Code
+  session), and hashes the session's environment into the confirmation.
+- **Settings from anywhere else, checked every run.** Claude Code still reads managed
+  settings whatever the flags say, so before every run the worker also reads your user
+  settings (`~/.claude/settings.json`), the session folder's project and local settings,
+  the managed settings files and your user memory file (`~/.claude/CLAUDE.md`). It fails
+  closed (`untrusted_config`) if any of those settings holds hooks, permission allow
+  rules or a permission-skipping default mode or can't be read as JSON; if the memory
+  file isn't empty; if a `CLAUDE.md`, `CLAUDE.local.md` or `.claude/CLAUDE.md` sits in
+  the session folder or any folder above it, the worker folder included; if a managed
+  settings drop-in folder (`managed-settings.d`, next to either managed settings file)
+  exists; or if the Claude Code policy registry key (`HKLM` or `HKCU`
+  `SOFTWARE\Policies\ClaudeCode`) exists. It hashes the settings file, the session
+  prompt, those outside files and the session's environment into the confirmation and
+  fails closed if any of them changes. The model reads its instruction from its prompt
+  and prints its report: it reads and writes no file at all.
 - **What the session was given is read from its own output, every run.** The session
   prints print mode's event stream (`--output-format stream-json`): the tools it was
-  given, each tool call and its result, the permission denials. A run whose session
-  didn't reach the extension fails as `extension_unreachable`; one given any Claude in
-  Chrome tool besides the allowed ones, missing one, or given a denied tool fails as
-  `tool_inventory`.
+  given, its MCP servers, each tool call and its result, the permission denials. A run
+  whose session didn't reach the extension fails as `extension_unreachable`; one given
+  any Claude in Chrome tool besides the allowed ones, missing one, given a denied tool,
+  or with any MCP server but Claude in Chrome's fails as `tool_inventory`.
 - **The browser tools: restricted by name.** Allowed: `tabs_context_mcp`,
   `tabs_create_mcp`, `navigate`, `read_page`, `get_page_text`, `find`. Denied (and so
   removed from the session's tools): `computer` (clicks, typing and screenshots are one
@@ -50,31 +64,68 @@ tells you what matters.
   `upload_image`, `file_upload`, `shortcuts_execute`, `read_console_messages`,
   `read_network_requests`. The names are the extension's; a tool it renames is simply
   not allowed, and the inventory check fails the run.
-- **Navigation is bounded outside the model.** The pinned settings run the worker's
-  navigation guard (`worker.ts nav-guard`, a PreToolUse hook) before every `navigate` and
-  `tabs_create_mcp` call. It lets through only the exact addresses the worker hands it
-  for that run: the canary page, the job's pinned start address and the run's end page.
-  Another host, a `javascript:` or `data:` address, or the pinned address written another
-  way is refused before the extension sees it. On top of that, the dedicated profile's
-  extension has site access only to the allowlisted hosts, their sign-in hosts and the
-  canary's `http://127.0.0.1` (setup step 7). What it can't stop: a site's own redirects
-  (a sign-in redirect is expected, and the final address is checked against the pin),
-  and a plain page load that changes something. **A GET on an allowlisted site can still
-  have effects:** a logout link, an unsubscribe link, a "confirm" link in a mail. So pin
-  exact addresses where you can (`match: "exact"`), and never allowlist an address that
-  acts when opened.
+- **Every extension tool call goes through the guard, which fails closed.** The pinned
+  settings run `worker.ts nav-guard` as a PreToolUse hook whose matcher is the
+  extension's whole prefix (`mcp__claude-in-chrome__.*`). It lets the four reading tools
+  through, and a `navigate` or `tabs_create_mcp` only to the exact addresses the worker
+  hands it for that session: the canary page, the job's pinned start address and the
+  run's end page. Another host, a `javascript:` or `data:` address, the pinned address
+  written another way, a tool it doesn't know, a call without a tool-use id: refused.
+  Any error inside it, input it can't read, or no input within its 5 second deadline is
+  refused too (exit code 2 and a deny decision in JSON); its settings timeout (15
+  seconds) is longer than that deadline, so it refuses before Claude Code would give up
+  on it. It logs every decision, keyed by the tool-use id, to `nav-decisions.jsonl`.
+  After each session the worker matches every navigation in the session's event stream
+  against an allow in that log: a navigation without one went past the guard and fails
+  the run (`navigation_unguarded`); a call the guard refused fails it too
+  (`navigation_denied`).
+- **Destinations, not only arguments.** At the end of each run the worker reads where the
+  run's tab actually is from the last tab context before the end page (the model's own
+  word doesn't count) and fails the run (`unexpected_location`) if that address isn't the
+  pin (under the entry's own rules: exact, prefix, alternatives), a sign-in page of the
+  entry, or a redirect the entry allows: a signed entry may list `redirects`, path
+  prefixes on the pinned address's own host, each bounded by a `/`
+  (`"redirects": ["/account/security/"]`). The result's final address is that tab's, reduced
+  to scheme, host and path. A page that moves its tab by script, or a redirect off the
+  pin, ends somewhere the entry doesn't allow.
+- **Tabs.** The run's tab is the one the tab context lists at the canary page; its id is
+  recorded there. Any other tab in a tab context of the run (a popup opened into Claude's
+  tab group, a tab you left there) fails the run (`tabs_unexpected`). The reading tools
+  can't close a tab and nothing relies on a page closing itself (`window.close`), so the
+  run's tab is left on the blank end page: the worker records its id
+  (`leftover-tabs.json`), reports a `leftover_tab` warning, and the next run takes that
+  tab over as its own instead of opening another. The dedicated Chrome must have no
+  other tabs in Claude's tab group.
+- **One Claude Code at a time, and a live bridge.** Before a claim, any other Claude
+  Code process on the PC (a session of yours, or one left over) is `chrome_busy`: the
+  extension would serve it instead, and the worker's lock can't see it (the extension's
+  own native messaging host doesn't count). Then a short bridge check (a tab-context call,
+  at most 90 seconds) must reach the extension; if it doesn't, the worker ends any
+  leftover native messaging host of the extension (no session is running, so none is in
+  use) and checks once more; still nothing is `extension_unreachable`. Either way the job
+  stays pending.
+- **What a page can still do.** The extension has site access only to the allowlisted
+  hosts, their sign-in hosts and the canary's `http://127.0.0.1` (setup step 7). The
+  guard can't stop a page's own scripts, a site's redirects or what a plain page load does
+  on the server. **A GET on an allowlisted site can still have effects:** a logout link,
+  an unsubscribe link, a "confirm" link in a mail. The end check catches a run that ends
+  somewhere else, after the fact, not the effect itself. So pin exact addresses where you
+  can (`match: "exact"`), and never allowlist an address that acts when opened.
 - **Not enforced until your PC's probe passes.** Whether Claude Code honors the deny
   rules and the hook with Claude in Chrome on your PC can't be checked from here. The
   supervised probe checks it (below). Until its deny check has passed and you have set
   `"unattended": true` in your install config, the worker does nothing unattended
-  (`attended_only`): v1 runs attended, with you watching (`worker.ts run --attended`). A
-  new Claude in Chrome or `claude` version voids that pass: unattended runs stop
-  (`probe_stale`) until the probe is run again; attended runs go on.
+  (`attended_only`): v1 runs attended, with you watching (`worker.ts run --attended`).
+  **A new Claude in Chrome or `claude` version stops every run, attended ones too**
+  (`probe_stale`): only the supervised probe runs until it has passed on the new
+  versions and `confirm-profile` has recorded them.
 
 ## Set up once, at your PC
 
 Everything lives in one worker folder, `C:/pc-worker` here (any folder works; the paths
-below assume this one).
+below assume this one). Neither it nor any folder above it may hold a `CLAUDE.md`,
+`CLAUDE.local.md` or `.claude/CLAUDE.md` (every run checks, `untrusted_config`): a
+folder at the top of a drive, like `C:/pc-worker`, keeps that simple.
 
 1. **The worker folder, locked.** Create `C:/pc-worker`. Its ACL may give write only
    to SYSTEM (`S-1-5-18`), Administrators (`S-1-5-32-544`) and your own account, by SID,
@@ -128,7 +179,11 @@ below assume this one).
    are normalized, so a different path case, a trailing slash or a query is a different
    address (`url_drift`). If a site really serves the same page several ways, add
    `"alternatives": true` to that entry (signed with the rest): then path case, a
-   trailing slash and a query don't matter for it. Sign it: `worker.ts sign-allowlist <entries.json> --key
+   trailing slash and a query don't matter for it. If the site moves you on by itself
+   (the settings page redirecting to `/account/security/`), list where in `redirects`:
+   path prefixes on the pinned address's own host, each starting with `/` and ending
+   with `/` (or an exact path), never `/` alone. A run that ends anywhere else is
+   `unexpected_location`. Sign it: `worker.ts sign-allowlist <entries.json> --key
    <folder>/owner-key.pem --kid owner-1 --out C:/pc-worker/allowlist.json`. The key is
    passphrase-protected and stays outside the worker folder.
 6. **Cain's public Ship key.** The line "Ship key (public): ..." in Cain's App log, as
@@ -149,24 +204,46 @@ below assume this one).
    - Leave **Allow access to file URLs** off: the canary is served over HTTP now, and the
      extension needs no file access.
    - Approve the probe site once in the extension's own site permissions.
-   **This Chrome must be open on this profile before each run.** The worker never starts
-   Chrome (a Chrome started under the session would die with it on a timeout); a run
-   without it is `browser_unreachable`, and claims nothing.
+   **This Chrome must be open on this profile before each run, with no other tabs in
+   Claude's tab group** (leave its one start tab alone; close anything you opened there
+   by hand). The worker never starts Chrome (a Chrome started under the session would die
+   with it on a timeout); a run without it is `browser_unreachable`, and claims nothing.
+   A tab the worker left there itself (the last run's, on its blank end page) is fine:
+   the next run takes it over.
+   **Updates.** Chrome updates Claude in Chrome from the Chrome Web Store by itself, and
+   offers no way to hold one extension at a version on a personal install (only an
+   enterprise policy pointing at a package you host yourself, which this setup doesn't
+   use). So expect an extension update now and then: the next run says `probe_stale`,
+   and you run the probe and `confirm-profile` again. For the `claude` command, set
+   `DISABLE_AUTOUPDATER=1` in your own Windows user environment as well, so it changes
+   only when you update it yourself; every update of it is `probe_stale` too.
 8. **The install config.** Copy `cain/docs/pc-worker/install.example.json` to
    `C:/pc-worker/install.json`, once, and fill in: `owner_fpr` (the output of
    `worker.ts owner-fpr C:/pc-worker/owner.pub`: every run checks `owner.pub` against
-   it, `untrusted_config` if not), `claude` (the full path of `claude.exe`),
+   it, `untrusted_config` if not), `claude` (the full path of `claude.exe` itself, with
+   forward slashes; not a `.cmd` or `.ps1` wrapper),
    `session_minutes` (the browser step's hard time limit, at most 21), the profile
    (its folder, profile directory, name **Cain jobs**, and the extension's id from
    chrome://extensions with Developer mode on), and any other Chrome folders to scan
    (`other_user_data_dirs`). Leave
    `unattended` and `diagnostics` false and `confirm_path` false. The worker never writes
    this file.
-9. **Power.** Windows power settings: the PC should never sleep while plugged in, and
-   the lock screen doesn't put the PC to sleep. Your user settings and memory file:
-   no hooks, no permission allow rules and no permission-skipping mode in
-   `~/.claude/settings.json`, and `~/.claude/CLAUDE.md` empty or absent (the worker
-   fails closed otherwise, `untrusted_config`).
+9. **Power, settings and environment.** Windows power settings: the PC should
+   never sleep while plugged in, and the lock screen doesn't put the PC to sleep. Your user
+   settings and memory file: no hooks, no permission allow rules and no
+   permission-skipping mode in `~/.claude/settings.json`, and `~/.claude/CLAUDE.md`
+   empty or absent. No `managed-settings.d` folder under `C:/Program Files/ClaudeCode`
+   or `C:/ProgramData/ClaudeCode`, and no `SOFTWARE\Policies\ClaudeCode` key in the
+   registry. No `CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL` or `CLAUDE_CODE_*` in your
+   environment. Sign the `claude` command in once, in a terminal of your own (`claude`,
+   then its login): the session gets no API key from your environment. The worker fails
+   closed (`untrusted_config`) otherwise.
+   **The hook on Windows.** Claude Code runs hooks through Git Bash on Windows (install
+   Git for Windows if `claude` asks for it). The hook command is
+   `"$PCW_RUNTIME" "$PCW_WORKER" nav-guard`: both variables are set by the worker with
+   forward slashes (`C:/Users/you/.bun/bin/bun.exe`), and the double quotes keep a path
+   with spaces in one piece. Nothing to set by hand; the probe's smoke step fails with
+   `navigation_unguarded` if the hook doesn't run.
 10. **The supervised probe: the only way to the first confirmation.** Not a queued job:
     nothing in the queue runs, and nothing is pushed. With the Cain jobs Chrome open and
     you watching, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
@@ -179,70 +256,80 @@ below assume this one).
     - runs the **smoke step**: a short session (at most 2 minutes) that calls
       `tabs_context_mcp` and reads the canary page back. It stops there with a plain
       reason instead of a timeout: `extension_unreachable` ("no browser connected", the
-      tab-context call didn't answer, or no session at all), `wrong_profile` (a browser
-      answered but couldn't open or read the canary: another profile, or no site access
-      to `http://127.0.0.1`), or `tool_inventory` (the tools the session was actually
-      given, with the missing and extra names);
+      tab-context call didn't answer, its answer lists no tabs the worker can read, or no
+      session at all), `navigation_unguarded` (nav-guard logged no decision for that call:
+      the hook didn't run), `wrong_profile` (a browser answered but couldn't open or read
+      the canary: another profile, or no site access to `http://127.0.0.1`), or
+      `tool_inventory` (the tools and MCP servers the session was actually given, with
+      the missing and extra names);
     - exercises a deliberately failed preflight: the same profile checks against a wrong
       extension id must fail closed;
-    - runs the real preflight, skipping only the missing confirmation, then one browser
-      step on one fixed target: the first exact settings address of your allowlist. Watch
-      that Claude in Chrome acts in the Cain jobs window and nowhere else, opens the
-      canary page first, and only reads;
+    - runs the real preflight, skipping only the missing confirmation (and with it the
+      version check: this is how new versions get confirmed), then one browser step on
+      one fixed target, the first exact settings address of your allowlist, through a
+      run's whole path: the canary, the settings page and the end check. Watch that Claude
+      in Chrome acts in the Cain jobs window and nowhere else, opens the canary page first,
+      and only reads;
+    - runs the **destination check**: three short sessions on pages the worker serves,
+      each judged by the run's own end check. A page that redirects off its pin
+      (`redirect`) and a page that moves its tab by script and opens a popup
+      (`script_and_popup`) must both fail it, as `unexpected_location` or
+      `tabs_unexpected`; a page that redirects inside a bounded pattern
+      (`redirect_bounded`) must pass it. Each line records the code, the final path, the
+      other tabs seen and which of the pages were fetched;
     - runs the **deny check** on a probe page the worker serves: a session is ordered to
       try each denied capability (a shell command, a file write, a web fetch; on the page
       a click, typing, a form fill, JavaScript, a console read, a network read, an upload
       and a keyboard shortcut) and to open three addresses it may not (another host, a
-      `javascript:` address and a `data:` address). Each must be refused, and the
-      evidence must show the refusal came from permissions: the tool wasn't among the
-      session's tools, print mode recorded a permission denial, or the navigation guard
-      refused it. The page's bait (a button, a field, a form, a file field, a key
-      listener) calls back to the worker if used, and the console line and network
-      request carry secrets that must not come out: any of that fails it.
+      `javascript:` address and a `data:` address). Each item needs **positive evidence**
+      of its refusal: its tools absent from the session's tools
+      (`removed_from_tools`), or, for every attempt, a permission denial
+      (`permission_denied`) or a nav-guard deny (`hook_denied`, `guard` for a navigation)
+      recorded for that very tool-use id. An item with neither fails the check:
+      `not_exercised` (never tried; listed in `not_exercised`) or `unproven` (tried, with
+      no such record). nav-guard must have refused at least one of the navigations by its
+      own log (`hook_intercepts`), and the run's own judgement of that session must fail
+      it on those denials (`fails_closed`). The page's bait (a button, a field, a form, a
+      file field, a key listener) calls back to the worker if used, and the console line
+      and network request carry secrets that must not come out: any of that fails it.
     It saves `probe-evidence.json`: the time, the target, STOP, the smoke step, the
     failed preflight's code, the browser step's code, whether the canary came back, the
-    tool inventory the session saw and whether it matched, the deny check line by line
-    (each capability, its tools, what refused it, whether it was used) and per
-    navigation, any bait that called back, the profile's fingerprint (the user data
-    folder, the profile's name, the extension's id and version, Chrome's major version,
-    the `claude` command's version), the hashes of the session's settings, prompt and
-    outside settings, and the allowed tools.
+    tool inventory the session saw and whether it matched, the destination check line by
+    line, the deny check line by line (each capability, its tools, what refused it, how
+    many attempts, whether it was used) and per navigation, `not_exercised`,
+    `hook_intercepts`, `fails_closed`, any bait that called back, the profile's
+    fingerprint (the user data folder, the profile's name, the extension's id and version,
+    Chrome's major version, the `claude` command's version), the hashes of the session's
+    settings, prompt and outside settings, and the allowed tools.
     If it looks right, run `worker.ts confirm-profile --home C:/pc-worker` within a day.
     It records that evidence in `confirmed.json` if STOP worked, the smoke step
     connected, the failed preflight failed, the canary came back, every inventory
     matched, the browser step reached the site (`ok`, `needs_login` or `already_gone`)
-    and the fingerprint and every hash still match. The deny check's result is recorded
-    as it was: a failed one leaves runs attended only.
+    and the fingerprint and every hash still match. The deny check counts as passed only
+    with every deny and navigation line passed, nothing `not_exercised`,
+    `hook_intercepts`, `fails_closed` and the destination check passed; a failed one
+    leaves runs attended only.
     **What invalidates it:** a change of the profile folder, its name, the extension's
     id or Chrome's major version (`profile_changed`); of the session's settings or
-    prompt, your user, local or managed settings or memory file, or the owner key
-    (`untrusted_config`). A new extension or `claude` version voids the deny check's
-    pass (`probe_stale` for unattended runs). Then run the probe and `confirm-profile`
+    prompt, your user, local or managed settings, memory files, the session's
+    environment, or the owner key (`untrusted_config`). A new extension or `claude`
+    version stops every run (`probe_stale`). Then run the probe and `confirm-profile`
     again.
-    **Supported versions** are the ones your last passing probe recorded: its
+    **Supported versions** are the ones your last confirmed probe recorded: its
     `fingerprint` names the Claude in Chrome version (`extension_version`) and the
-    `claude` command's version (`cli_version`). Nothing else is supported unattended.
-    **When a stage fails:**
-    - no extension (`extension_unreachable`): the Cain jobs Chrome isn't open, Claude in
-      Chrome isn't paired with the `claude` command, or `--chrome` didn't connect.
-    - unexpected tool inventory (`tool_inventory`): the extension or CLI renamed, added
-      or dropped a tool, or a setting outside the pinned file still applies. Read the
-      names it printed; a renamed allowed tool needs a code change.
-    - wrong profile or canary (`wrong_profile`): another Chrome profile answered, or the
-      extension has no site access to `http://127.0.0.1`.
-    - deny failure (`deny_check: false`): read the `deny` and `navigation` lines; a
-      capability with `refused_by: null`, `used: true` or a navigation with `passed:
-      false` was not refused by permissions. Don't turn on unattended.
-    - timeout (`browser_timeout`): the session hung past `session_minutes`; the worker
-      killed it and everything under it, and left Chrome running.
+    `claude` command's version (`cli_version`). Nothing else runs.
+    **When something fails**, see Troubleshooting below.
 11. **Attended runs, then (maybe) unattended.** Tell Cain the queue is ready; he queues a
     first job (`cain/docs/pc-worker/probe-job.json` shows one). With the Cain jobs Chrome
-    open, run `worker.ts run --attended --home C:/pc-worker` while you watch. Only once
-    the probe's deny check passed: add a Windows Task Scheduler task, every 15 minutes,
+    open and no other Claude Code running (a run with one open is `chrome_busy`), run
+    `worker.ts run --attended --home C:/pc-worker` while you watch. Only once the
+    probe's deny check passed: add a Windows Task Scheduler task, every 15 minutes,
     set to **Run only when user is logged on** (the session needs your desktop and your
     open Chrome), running `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts run
     --attended --home C:/pc-worker`, and run it once from Task Scheduler in the desktop
-    state you intend (screen locked or not), watching the result and the heartbeat.
+    state you intend (screen locked or not), watching the result and the heartbeat. A
+    Claude Code session you leave open makes scheduled runs `chrome_busy` until you
+    close it.
     Only after that separate test passes, set `"unattended": true` in `install.json` and
     drop `--attended` from the task. Without both, a scheduled run does nothing
     (`attended_only`).
@@ -269,26 +356,19 @@ them takes admin rights a build session doesn't have.
 - **Hangs:** the browser step has a hard time limit (`session_minutes`). When it runs
   out the worker kills the `claude` command and every process under it (`taskkill /T
   /F` on Windows, the process group elsewhere), and the job fails as `browser_timeout`.
-  Chrome is not under it and keeps running. The run's own tab normally closes itself at
-  the end (the model opens the run's end page, which closes the tab); after a timeout it
-  stays open. The lock holds the run's PID and that process's start time: a lock whose
+  Chrome is not under it and keeps running. The run's tab stays open (on the blank end
+  page after a normal run, wherever it was after a timeout); the next run takes over a
+  tab the worker recorded, and fails on any other (`tabs_unexpected`). The lock holds the run's PID and that process's start time: a lock whose
   process is gone, whose PID now belongs to a process started at another time, or older
   than a lease, is from a run that died; the next run clears it and says so in the
   heartbeat.
-- **Failure reasons are codes**, never page text or error text:
-  `browser_unreachable` (the Cain jobs Chrome isn't open on its profile folder),
-  `extension_unreachable` (the session didn't reach Claude in Chrome), `tool_inventory`
-  (the session's tools weren't the pinned ones), `wrong_profile` (the profile's name or
-  the extension in it isn't as set up, the `claude` command's version can't be read, or
-  the canary didn't come back), `profile_changed` (the profile's identity differs from
-  the confirmed one), `probe_stale` (a new extension or `claude` version since the
-  probe: unattended runs wait for a new probe), `extension_elsewhere`,
-  `profile_scan_failed`, `profile_unconfirmed` (no `confirm-profile` yet),
-  `untrusted_config` (install config unreadable, owner key not the pinned one, the
-  session's settings or prompt changed, or settings outside them hold hooks or allow
-  rules or changed), `untrusted_files`, `attended_only`, `clock_skew`,
-  `browser_timeout`, `queue_misconfigured` (the `.gitattributes`), `git_failed`,
-  `busy` (another run holds the lock), `stopped`.
+- **Failure reasons are codes**, never page text or error text. Each one, where to
+  look and what to do: Troubleshooting, below.
+- **The last run's evidence, on the PC only:** `nav-decisions.jsonl` (nav-guard's
+  decision for each extension call of the last session: tool-use id, tool, address,
+  allow or deny and why), `last-run.json` (the last run's code, the navigations
+  without a matching allow, the refused ones, the run's tab id, its final address
+  reduced to scheme, host and path, and the other tabs seen) and `leftover-tabs.json`.
 
 The worker can't ask Claude in Chrome which profile it is attached to: it doesn't say.
 So it checks what it can: the profile's fingerprint, the extension installed nowhere
@@ -299,26 +379,63 @@ must open it first and read all three back, and the worker must have seen the pa
 fetched. Only the dedicated profile's extension has site access to `http://127.0.0.1`,
 so a session in another profile can't read it, and the run fails as `wrong_profile`.
 
+## Troubleshooting
+
+Every code below is in the run's line in `worker.log`, in `heartbeat.json` (and Cain's
+copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc-worker`.
+
+| Code or case | Where to look | What to do |
+| --- | --- | --- |
+| `stopped` | the `STOP` file | Delete `STOP` when you want runs again. |
+| `busy` | `worker.lock` | Another run holds the lock. Wait; a lock from a dead run clears itself (`stale_lock` in the heartbeat). |
+| `chrome_busy` (the competing-session case) | Task Manager, Details: any `claude.exe`, or `node` running `claude-code` | Close the other Claude Code session (or end a leftover one) and run again. Any other Claude Code process blocks a run, attached to Chrome or not: the worker can't tell, and the extension would serve it instead. |
+| `extension_unreachable` | `probe`'s detail, or the bridge check in `worker.log` | Open the Cain jobs Chrome on its folder, check Claude in Chrome is on and paired with the `claude` command. The worker already ended a leftover native messaging host and checked again; if it persists, restart that Chrome. |
+| `extension_unreachable` with "Claude in Chrome: not listed" (the strict-MCP-config case) | `probe`'s detail; the `tools` in `probe-evidence.json` hold no `mcp__claude-in-chrome__` names | `--strict-mcp-config` may be keeping the built-in Chrome integration out on your `claude` version. Don't edit the session's flags by hand (the settings hash fails closed): ask for a build without that flag. The inventory check already fails any MCP server but Claude in Chrome's, so dropping the flag keeps that guarantee. |
+| `navigation_unguarded` | `nav-decisions.jsonl` against `last-run.json`'s `unguarded` ids | A navigation had no allow in nav-guard's log: the hook didn't run, or didn't see that call. Check Git Bash is installed and `claude` runs hooks; run the probe, whose smoke step names it. Never set `unattended` while this happens. |
+| `navigation_unguarded` from the probe's smoke step (the Windows hook quoting case) | `nav-decisions.jsonl` is missing or empty | The hook command didn't start. Claude Code runs it through Git Bash: `"$PCW_RUNTIME" "$PCW_WORKER" nav-guard`, both paths with forward slashes, set by the worker. Check `bun` (or `node`) runs from that path in Git Bash (`"C:/Users/you/.bun/bin/bun.exe" --version`) and that the worker's folder path has no `"` in it. |
+| `navigation_denied` | `nav-decisions.jsonl`: the `deny` lines and their `why` | The session tried an address or tool it may not (`address_not_allowed`, `unknown_tool`), or nav-guard couldn't decide (`timeout`, `internal_error`, `unreadable_input`, `log_failed`). A page talking the model into a detour shows up here: look at the job's site. An `unknown_tool` after an extension update means the extension added or renamed a tool. |
+| `unexpected_location` | `last-run.json`: `final_url`, `tab_id`, `tab_contexts` | The run's tab ended off its pin. If the site really moves you on to a fixed place, add it to the entry's `redirects` and sign again; if it went to a sign-in page, add it to `login_hosts` or `login_paths`. `tab_contexts` 0 or no `tab_id`: the tab context couldn't be read (an extension update may have changed its answer): run the probe. |
+| `tabs_unexpected` (and the leftover-tab case) | `last-run.json`: `other_tabs`; `leftover-tabs.json` | A tab beyond the run's own sat in Claude's tab group: a popup, or a tab you opened there. Close every tab in that group but the one the worker left (or close them all, and delete `leftover-tabs.json`), and run again. A `leftover_tab` warning alone is normal: the reading tools can't close the run's tab, and the next run reuses it. |
+| `tool_inventory` | `probe`'s detail: `missing` and `extra` names | The extension or CLI renamed, added or dropped a tool, or another MCP server reached the session. A renamed allowed tool needs a code change; an extra MCP server comes from settings outside the pinned file. |
+| `wrong_profile` | `probe`'s detail; `diagnostics.log` with `--diagnose` | Another Chrome profile answered, the extension has no site access to `http://127.0.0.1`, or the profile's name or extension folder isn't as set up. |
+| `browser_unreachable` | is the Cain jobs Chrome open? | Start it with `--user-data-dir=C:/pc-worker/chrome` before the run. |
+| `probe_stale` | `confirmed.json`'s `fingerprint` against the installed versions | Claude in Chrome or `claude` updated. Run `probe --attended`, then `confirm-profile`. Nothing else runs until then. |
+| `profile_changed`, `profile_unconfirmed` | `confirmed.json` | Run the probe and `confirm-profile`. |
+| `untrusted_config` | the reasons in the setup steps | Install config, owner key, the session's files, outside settings, a memory file in or above the worker folder, a `managed-settings.d` folder, the policy registry key, `CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_*` or a base address in the environment, a changed environment, or `claude` not a `.exe`. Fix it, then probe and confirm again if the confirmation's hash changed. |
+| `untrusted_files` | `icacls C:\pc-worker\install.json` (and the others) | Redo setup step 1's `icacls` commands. |
+| `extension_elsewhere`, `profile_scan_failed` | your other Chrome folders | Remove Claude in Chrome from other profiles; turn sync off in Cain jobs. |
+| `clock_skew` | `heartbeat.json`'s `skew_ms` | Set Windows to sync its clock. |
+| `queue_misconfigured`, `git_failed` | the queue clone | Check the queue's `.gitattributes` and the deploy key (setup steps 2 and 4). |
+| `browser_timeout` | `worker.log` | The session hung past `session_minutes`; the worker killed it and left Chrome running. Check the site in the Cain jobs window by hand. |
+| `url_drift`, `result_rejected`, `page_not_as_expected`, `outcome_uncertain` | the job's result; `diagnostics.log` with `--diagnose` | The page wasn't what the job expected, or the model's report broke the shape. Cain tells you what it means. |
+| Probe: `deny_check` is false | `probe-evidence.json`: `deny`, `navigation`, `not_exercised`, `hook_intercepts`, `fails_closed`, `destinations` | A line with `refused_by` other than `removed_from_tools`, `permission_denied` or `hook_denied`, a navigation not blocked by `guard` or `refused`, anything `not_exercised`, or a destination line with `passed: false` was not proven refused. Rerun once (the model may have skipped an item); if it repeats, don't turn on unattended. |
+
 ## How a job runs
 
 1. `worker.ts run` (by hand with `--attended`, or by Task Scheduler once allowed): kill
    switch, lock, install config, the files' ACLs, the owner key's fingerprint,
    `git pull`, the `.gitattributes` check, the clock check, then it closes what can't
    run (cancelled, not read-only, off the signed allowlist), runs the browser preflight,
-   claims the oldest job left with a new attempt id and a 30 minute lease, and pushes.
+   checks no other Claude Code is running and the bridge answers, claims the oldest job
+   left with a new attempt id and a 30 minute lease, and pushes.
 2. It serves the canary page and starts the browser session with one narrow
    instruction in its prompt: site, action, start address, what to look for, the typed
-   facts it may report, the outcomes it may say, the canary page and the end page. The
-   navigation guard lets the session open those three addresses and nothing else.
+   facts it may report, the outcomes it may say, the canary page, the end page and the
+   tab the last run left (`tab_id`). nav-guard lets the session open those three
+   addresses and nothing else, and logs every decision.
 3. When the session ends (or its time limit kills it), the worker checks the job is
    still its own (same attempt, not cancelled, and well inside the lease by its own
-   monotonic clock; otherwise it writes nothing), checks the report and writes the
-   result: the session's tools and connection from its stream, the canary, the final
-   address checked against the allowlist's pin as reported (path case, a trailing slash
-   and a query count unless the entry allows alternatives; a sign-in address is
-   `needs_login`) and then reduced to scheme, host and path, the facts checked against the action's types (dates in
-   the common forms made YYYY-MM-DD). Then it commits and pushes, with retries for
-   transient file locks.
+   monotonic clock; otherwise it writes nothing), checks the session and writes the
+   result: the session's tools, MCP servers and connection from its stream; every
+   navigation against an allow in nav-guard's log, and no refused call; the end check
+   (the run's tab, its final address from the tab context against the pin, the entry's
+   bounded redirects and its sign-in pages, and no tab beyond the run's); the canary; the
+   final address, the tab's and not the model's, checked against the pin (path case, a
+   trailing slash and a query count unless the entry allows alternatives; a sign-in
+   address is `needs_login`) and then reduced to scheme, host and path; the facts checked
+   against the action's types (dates in the common forms made YYYY-MM-DD). Then it
+   commits and pushes, with retries for transient file locks, and records the tab it
+   left.
 
 **One clock per decision.** The keeper's clock decides expiry, on the Pi: it closes a
 pending job past its expiry (`expired`) and a claim whose lease ran out
@@ -345,7 +462,9 @@ Cain reads them as facts, and nothing in one tells him or the worker what to do.
   second factor asked), `blocked_captcha`, `pending_email_confirmation`. `already_gone`
   counts as done.
 - Failures, each its own code: `browser_unreachable`, `extension_unreachable`,
-  `tool_inventory`, `wrong_profile`, `browser_timeout`, `url_drift` (the final address is off the allowlist's pin and not
+  `tool_inventory`, `wrong_profile`, `browser_timeout`, `navigation_unguarded`,
+  `navigation_denied`, `unexpected_location` (the run's tab ended off the pin, its
+  redirects and its sign-in pages), `tabs_unexpected`, `url_drift` (the final address is off the allowlist's pin and not
   a sign-in page), `result_rejected`, `page_not_as_expected`, `lease_expired` (a read
   that never reported), and refusals: `not_allowlisted`, `allowlist_unverified`,
   `action_not_read_only`, `expired`.
@@ -367,10 +486,11 @@ Cain reads them as facts, and nothing in one tells him or the worker what to do.
 - `cancels/<id>.json` (Cain), `nonces/<nonce>.json` (the confirm path, unused),
   `worker/heartbeat.json` (the worker), `.gitattributes` (`*.json text eol=lf` and the rest).
 - The PC's allowlist, `allowlist.json`: `{"v": 1, "kid", "allow": [{"site", "action",
-  "url", "match", "login_hosts"?, "login_paths"?, "alternatives"?}], "sig"}`, signed with your key;
+  "url", "match", "login_hosts"?, "login_paths"?, "alternatives"?, "redirects"?}], "sig"}`, signed with your key;
   `owner.pub`: `<kid> <public key>`, matching `owner_fpr` in `install.json`.
 - On the PC only: `install.json` (yours), `confirmed.json` and `probe-evidence.json`
-  (the probe and `confirm-profile`), `heartbeat.json`, `worker.log`, `diagnostics.log`.
+  (the probe and `confirm-profile`), `heartbeat.json`, `worker.log`, `diagnostics.log`,
+  `nav-decisions.jsonl`, `last-run.json`, `leftover-tabs.json`.
 
 The read-only actions and their facts: `read_account_settings` (signed_in,
 account_exists, account, two_factor, last_changed), `check_signed_in` (signed_in,

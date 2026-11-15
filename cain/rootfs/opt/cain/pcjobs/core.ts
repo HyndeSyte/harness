@@ -37,6 +37,7 @@ export const CODES = [
   "untrusted_config", "untrusted_files", "clock_skew", "attended_only", "browser_timeout",
   "extension_unreachable", "tool_inventory", "profile_scan_failed", "probe_stale",
   "url_drift", "result_rejected", "page_not_as_expected", "outcome_uncertain", "lease_expired",
+  "navigation_unguarded", "navigation_denied", "unexpected_location", "tabs_unexpected", "chrome_busy",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -439,7 +440,7 @@ export function confirmGate(job: Job, live: unknown): Code | null {
 }
 
 // ---- The PC's allowlist, signed by Dane --------------------------------------------
-// {"v": 1, "kid": "<his key id>", "allow": [{site, action, url, match, login_hosts?, login_paths?, alternatives?}], "sig": "<base64url>"}
+// {"v": 1, "kid": "<his key id>", "allow": [{site, action, url, match, login_hosts?, login_paths?, alternatives?, redirects?}], "sig": "<base64url>"}
 // Each entry pins one read-only action on one site to an exact address or an address
 // prefix (match "exact" or "prefix"). A real site sends a signed-out visitor to its
 // sign-in page, often on another host (accounts.example.com) or path (/login): those
@@ -448,11 +449,16 @@ export function confirmGate(job: Job, live: unknown): Code | null {
 // url_drift. Addresses keep URL semantics: only the host's case and a default port are
 // normalized, so path case, a query and a trailing slash all make a different address,
 // unless the entry says `"alternatives": true` (then path case, a trailing slash and a
-// query are ignored for that entry). The signature is his Ed25519 key's, over the
+// query are ignored for that entry). A site that moves the visitor on by itself (the
+// settings page redirecting to /account/security/) can be allowed that, bounded: an
+// entry's `redirects` lists path prefixes on the pinned address's own host, each
+// starting and ending with "/" (or an exact path without the trailing "/"), and the end
+// check accepts a final address under one of them. The signature is his Ed25519 key's, over the
 // canonical bytes of {v, kid, allow}; the worker checks it against owner.pub on the PC,
 // and owner.pub against the fingerprint pinned in his install config.
 export interface Allow {
   site: string; action: string; url: string; match: "exact" | "prefix"; login_hosts?: string[]; login_paths?: string[]; alternatives?: true;
+  redirects?: string[];
 }
 
 export const allowBody = (kid: string, allow: Allow[]) => canonical({ v: 1, kid, allow });
@@ -464,7 +470,8 @@ export function signAllowlist(kid: string, allow: Allow[], sign: (data: Buffer) 
 const LOGIN_HOST = /^\.?(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
 const LOGIN_PATH = /^\/[A-Za-z0-9._~%\/-]{0,100}\*?$/;
 const listOf = (x: unknown, re: RegExp) => x === undefined || (Array.isArray(x) && x.length <= 8 && x.every((v) => typeof v === "string" && re.test(v)));
-const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives"];
+const REDIRECT_PATH = /^\/(?:[A-Za-z0-9._~%-]+\/)*[A-Za-z0-9._~%-]*$/;
+const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives", "redirects"];
 
 function entriesOk(list: unknown): Checked<Allow[]> {
   if (!Array.isArray(list)) return no("allow is a list");
@@ -476,12 +483,14 @@ function entriesOk(list: unknown): Checked<Allow[]> {
       || typeof e.site !== "string" || !SITE.test(e.site)
       || typeof e.action !== "string" || !Object.hasOwn(READ_ACTIONS, e.action) || !plainOnSite(e.url, e.site)
       || (e.match !== "exact" && e.match !== "prefix") || !listOf(e.login_hosts, LOGIN_HOST) || !listOf(e.login_paths, LOGIN_PATH)
-      || (e.alternatives !== undefined && e.alternatives !== true))
-      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), and optionally login_hosts, login_paths and alternatives (true)}");
+      || (e.alternatives !== undefined && e.alternatives !== true)
+      || !(e.redirects === undefined || (listOf(e.redirects, REDIRECT_PATH) && e.redirects.every((r: string) => r !== "/" && r.length <= 100))))
+      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), and optionally login_hosts, login_paths, alternatives (true) and redirects (path prefixes on its host)}");
     const a: Allow = { site: e.site, action: e.action, url: e.url, match: e.match };
     if (e.login_hosts !== undefined) a.login_hosts = e.login_hosts;
     if (e.login_paths !== undefined) a.login_paths = e.login_paths;
     if (e.alternatives === true) a.alternatives = true;
+    if (e.redirects !== undefined) a.redirects = e.redirects;
     out.push(a);
   }
   return { ok: true, value: out };
@@ -530,6 +539,18 @@ export function onPin(url: unknown, a: Allow): boolean {
   if (uu.host !== pp.host || uu.search !== pp.search) return false;
   const base = pp.pathname.endsWith("/") ? pp.pathname : `${pp.pathname}/`;
   return uu.pathname.startsWith(base);
+}
+
+// An address the entry's site may redirect to by itself: on the pinned address's own
+// host, https, its path one of the entry's redirect paths, or under one that ends in "/"
+// (at that "/" boundary). Any query; the result keeps only scheme, host and path.
+export function onRedirect(url: unknown, a: Allow): boolean {
+  if (!a.redirects?.length) return false;
+  const u = normalUrl(url), p = normalUrl(a.url);
+  if (!u || !p) return false;
+  const uu = new URL(u), pp = new URL(p);
+  if (uu.host !== pp.host) return false;
+  return a.redirects.some((r) => r.endsWith("/") ? uu.pathname.startsWith(r) : uu.pathname === r);
 }
 
 // An address on one of the entry's sign-in pages: needs_login, not url_drift. A sign-in
