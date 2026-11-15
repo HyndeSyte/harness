@@ -14,7 +14,11 @@
 - The PC now checks every address the browser showed during a run, not only where it ended: a page that slips off to somewhere else and comes back before the end fails the run.
 - The check page each run opens only works in your dedicated Chrome profile: you bind that profile once at setup, and a run answered from any other profile fails. A Chrome running with Claude in Chrome from another profile stops runs too.
 - A run fails if Claude Code changes while it runs, or if the Claude in Chrome version the browser reports isn't the one installed in the profile.
-- What leaves the PC is capped in size and limited to a few typed facts, never page text.
+- What leaves the PC is a few typed facts, each checked against a strict list for its kind of job (yes or no, a word from a list, a date, a count, a masked account name, a short plan name). No free text anywhere: a report with anything else fails the run and none of it is kept. The probe plants a "put this in the notes field" trick on a page to check that holds.
+- Two locks on the browser tools: Claude Code itself refuses anything but the four reading tools without asking, and opening a page needs the PC's guard to allow it. A tool use the guard has no record of fails the run. The probe checks Claude Code still refuses with the guard deliberately stalled, and every run first checks the guard answers as it should.
+- Claude in Chrome found in Edge, Brave or Chromium, or in a browser started without its own folder, stops runs too, and the PC checks the extension's helper really belongs to your dedicated Chrome, step by step.
+- The check page's cookie lasts years and is locked down; the probe has you restart that Chrome once to prove it survives, and a cleared cookie says so plainly.
+- If Claude Code doesn't report which Claude in Chrome version answered, runs only happen while you watch. When a new version stops the PC, Cain tells you in one line what to run at the PC.
 - The run's tab stays open on a blank page (about:blank; the browser tools it has can't close tabs); the next run reuses it. Cain's docs have a troubleshooting table for every reason a run stops, and for each thing only your PC can show.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
 

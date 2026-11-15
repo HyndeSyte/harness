@@ -316,8 +316,9 @@ every run until you probe again. Cain's PC job keeper is the queue's one
 writer of jobs and holds `pc_jobs_token`, so his session never does. With no token it
 waits and does nothing. This version is read-only by enforcement: the PC worker runs
 only actions from a fixed read-only set that your signed allowlist pins to an address,
-and irreversible jobs are refused until the confirm path ships. Results are typed facts
-and reason codes, read by Cain as data, never as instructions. The keeper's clock
+and irreversible jobs are refused until the confirm path ships. Results are typed facts,
+each checked against a strict schema for its action (a value outside it fails the run
+and nothing of it is kept), and reason codes, read by Cain as data, never as instructions. The keeper's clock
 closes jobs past their expiry and claims whose lease ran out. The one-time setup at your
 PC, what is enforced and what isn't, the job and result formats and the browser
 session's settings and prompt are in `cain/docs/pc-jobs.md` and `cain/docs/pc-worker/`

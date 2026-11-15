@@ -96,11 +96,24 @@ export function readHeartbeat(dir: string): Heartbeat | null {
   try { return parseHeartbeat(readFileSync(join(dir, "worker", "heartbeat.json"), "utf8")); } catch { return null; }
 }
 
+// When a version stopped runs, the one line Cain tells Dane, naming what to run at the PC
+// (cain/docs/pc-jobs.md, "Supported versions"). null when there's nothing for him to do.
+export const REPROBE = "worker.ts probe --attended, then worker.ts confirm-profile";
+export function heartbeatNotice(h: Heartbeat | null): string | null {
+  if (!h?.reason) return null;
+  if (h.reason === "extension_version_changed")
+    return `The PC stopped taking jobs because Claude in Chrome updated. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
+  if (h.reason === "cli_version_changed") return `The PC stopped taking jobs because Claude Code updated. At the PC: run ${REPROBE}.`;
+  return `The PC runs jobs only while you watch: Claude Code doesn't report Claude in Chrome's version, so unattended runs stay off. At the PC: run ${REPROBE} after the next Claude Code update.`;
+}
+
 export function heartbeatLine(h: Heartbeat | null): string {
   if (!h) return "PC worker: not seen yet";
   const extra = [h.stale_lock ? "cleared a stale lock" : "", h.skew_ms !== null && h.skew_ms > 0 ? `the Pi's clock ahead by ${Math.round(h.skew_ms / 1000)}s` : ""]
     .filter(Boolean).join(", ");
-  return `PC worker: ${h.code} at ${h.worker_clock} (its own clock)${h.job ? ` on ${h.job}` : ""}${extra ? ` (${extra})` : ""}`;
+  const notice = heartbeatNotice(h);
+  return `PC worker: ${h.code}${h.reason ? ` (${h.reason})` : ""} at ${h.worker_clock} (its own clock)${h.job ? ` on ${h.job}` : ""}${extra ? ` (${extra})` : ""}`
+    + (notice ? `\nFor Dane: ${notice}` : "");
 }
 
 // Jobs the keeper's clock says are over: a pending job past its expiry, and a claim

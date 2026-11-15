@@ -39,6 +39,7 @@ export const CODES = [
   "url_drift", "result_rejected", "page_not_as_expected", "outcome_uncertain", "lease_expired",
   "navigation_unguarded", "navigation_denied", "unexpected_location", "tabs_unexpected", "chrome_busy",
   "cli_changed", "extension_version_mismatch",
+  "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing", "extension_version_unknown", "read_unverified",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -54,26 +55,38 @@ export const SKEW_MS = 2 * 60_000;               // the Pi's and the PC's clocks
 export const MAX_FACTS = 8;
 const TOKEN_SKEW_MS = 5 * 60_000;
 
-// ---- The fixed action set, and the facts each may report ---------------------------
-// A fact is one of: a boolean; one word from a list; a date (YYYY-MM-DD); a short token
-// matching its pattern. Nothing else gets into a result.
+// ---- The fixed action set, and the strict schema of what each may report ------------
+// A fact is one of: a boolean; one word from a list; a date (YYYY-MM-DD); a count (a whole
+// number in a range); a URL path reduced to its allowed form (scheme, host and path, on
+// https); or a short label limited by its pattern. There is no free-form string field
+// anywhere in facts: a value that doesn't fit its field's schema fails the run as
+// schema_violation and nothing of it is written. The schema is the protection; the size
+// caps are only a backstop.
 export type FactType =
   | { t: "bool" }
   | { t: "enum"; of: readonly string[] }
   | { t: "date" }
-  | { t: "token"; re: RegExp; max: number };
+  | { t: "count"; max: number }
+  | { t: "path" }
+  | { t: "label"; re: RegExp; max: number; ok?: (v: string) => boolean; what: string };
 const bool: FactType = { t: "bool" };
 const date: FactType = { t: "date" };
+const count = (max: number): FactType => ({ t: "count", max });
 const oneOf = (...of: string[]): FactType => ({ t: "enum", of });
-// A masked account name as a site shows it (d***@g***.com, ****1234), no spaces.
-const ACCOUNT: FactType = { t: "token", re: /^[A-Za-z0-9*._@+-]{1,64}$/, max: 64 };
-const LABEL: FactType = { t: "token", re: /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/, max: 40 };
-const URLPATH: FactType = { t: "token", re: /^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9._~%\/-]{0,200}$/, max: 240 };
-const SHA256: FactType = { t: "token", re: /^[0-9a-f]{64}$/, max: 64 };
+// A masked account name as a site shows it (d***@g***.com, ****1234): at least three
+// mask characters and at most eight letters or digits left showing, so a token or a
+// name can't pass for one.
+const ACCOUNT: FactType = { t: "label", re: /^[A-Za-z0-9*._@+-]{3,40}$/, max: 40, what: "a masked account (d***@g***.com, ****1234)",
+  ok: (v) => (v.match(/\*/g) ?? []).length >= 3 && (v.match(/[A-Za-z0-9]/g) ?? []).length <= 8 };
+// A plan's name as a site labels it: one to four short words of letters, digits and "+".
+const LABEL: FactType = { t: "label", re: /^[A-Za-z0-9+]{1,12}( [A-Za-z0-9+]{1,12}){0,3}$/, max: 40, what: "a short label (one to four short words)" };
+const SHA256: FactType = { t: "label", re: /^[0-9a-f]{64}$/, max: 64, what: "a SHA-256 in hex" };
+const URLPATH: FactType = { t: "path" };
 
 // The read-only set: the worker refuses any job whose action isn't here.
 export const READ_ACTIONS: Record<string, Record<string, FactType>> = {
-  read_account_settings: { signed_in: bool, account_exists: bool, account: ACCOUNT, two_factor: oneOf("on", "off", "unknown"), last_changed: date },
+  read_account_settings: { signed_in: bool, account_exists: bool, account: ACCOUNT, two_factor: oneOf("on", "off", "unknown"), last_changed: date,
+    signed_in_devices: count(999) },
   check_signed_in: { signed_in: bool, second_factor_asked: bool, account: ACCOUNT },
   read_subscription_status: { signed_in: bool, status: oneOf("active", "paused", "cancelled", "none", "unknown"), plan: LABEL, renews_on: date },
 };
@@ -118,7 +131,7 @@ export interface Result {
   handoff: Handoff | null;
   worker_clock: string;        // the clock of whoever wrote this (the PC's, or the keeper's for an expiry)
   final_url: string | null;    // scheme, host and path only
-  facts: Record<string, string | boolean>;
+  facts: Record<string, string | boolean | number>;
   tools: string[];             // the Claude in Chrome tools the browser session was allowed (none when nothing ran)
   attended: boolean;           // the owner ran it by hand, watching
 }
@@ -193,27 +206,37 @@ export function parseDate(v: string): string | null {
   return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 }
 
-// ---- Facts --------------------------------------------------------------------------
-// Typed facts for this action: known names only, each value of its type and length.
-// The reasons name a field, never repeat a value (it may be page text).
-export function checkFacts(action: string, facts: unknown): Checked<Record<string, string | boolean>> {
-  if (!isObj(facts)) return no("facts is an object of named values");
+// ---- Facts ----------------------------------------------------------------------------
+// The strict schema for this action: known names only, each value of its field's type.
+// The reasons name a field, never repeat a value (it may be page text). A date is taken in
+// the common forms and kept as YYYY-MM-DD; a path is kept only when it is already in its
+// reduced form (https, host and path, nothing else), never reduced on the way in.
+export function factOk(t: FactType, v: unknown): boolean {
+  switch (t.t) {
+    case "bool": return typeof v === "boolean";
+    case "enum": return typeof v === "string" && t.of.includes(v);
+    case "date": return typeof v === "string" && DAY.test(v);
+    case "count": return Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= t.max;
+    case "path": return typeof v === "string" && v.length <= 240 && sanitizeUrl(v) === v && /^https:\/\/[a-z0-9.-]+\/[A-Za-z0-9._~%\/-]{0,200}$/.test(v);
+    case "label": return typeof v === "string" && v.length <= t.max && t.re.test(v) && (!t.ok || t.ok(v));
+  }
+}
+const factWhat = (t: FactType) => t.t === "enum" ? `one of ${t.of.join(", ")}` : t.t === "label" ? t.what : t.t === "count" ? `a whole number from 0 to ${t.max}`
+  : t.t === "path" ? "an https address reduced to scheme, host and path" : `a ${t.t}`;
+
+export function checkFacts(action: string, facts: unknown): Checked<Record<string, string | boolean | number>> {
+  if (!isObj(facts)) return no("facts is an object of named values", "facts");
   const types = factsFor({ action });
   const keys = Object.keys(facts);
-  if (keys.length > MAX_FACTS) return no(`at most ${MAX_FACTS} facts`);
-  const out: Record<string, string | boolean> = {};
+  if (keys.length > MAX_FACTS) return no(`at most ${MAX_FACTS} facts`, "facts");
+  const out: Record<string, string | boolean | number> = {};
   for (const k of keys) {
     const t = Object.hasOwn(types, k) ? types[k] : undefined;
     if (!t) return no(`a fact this action doesn't report (it reports ${Object.keys(types).join(", ")})`, /^[a-z_]{1,40}$/.test(k) ? k : "unknown_fact");
     let v = facts[k];
     if (t.t === "date" && typeof v === "string") v = parseDate(v) ?? v;
-    const good = t.t === "bool" ? typeof v === "boolean"
-      : typeof v !== "string" ? false
-      : t.t === "enum" ? t.of.includes(v)
-      : t.t === "date" ? DAY.test(v)
-      : v.length <= t.max && t.re.test(v);
-    if (!good) return no(`fact ${k} isn't ${t.t === "enum" ? `one of ${t.of.join(", ")}` : t.t === "token" ? "a short token of its pattern" : `a ${t.t}`}`, k);
-    out[k] = v;
+    if (!factOk(t, v)) return no(`fact ${k} isn't ${factWhat(t)}`, k);
+    out[k] = v as string | boolean | number;
   }
   return { ok: true, value: out };
 }
@@ -283,7 +306,7 @@ export function parseResult(text: string, action?: string): Checked<Result> {
     const f = checkFacts(action, r.facts);
     if (!f.ok) return f;
   } else if (!isObj(r.facts) || Object.keys(r.facts).length > MAX_FACTS
-    || !Object.entries(r.facts).every(([k, v]) => k.length <= 40 && (typeof v === "boolean" || (typeof v === "string" && v.length <= FACT_MAX))))
+    || !Object.entries(r.facts).every(([k, v]) => k.length <= 40 && (typeof v === "boolean" || Number.isSafeInteger(v) || (typeof v === "string" && v.length <= FACT_MAX))))
     return no("facts is an object of named values");
   if (!Array.isArray(r.tools) || r.tools.length > 16 || !r.tools.every((t: unknown) => typeof t === "string" && TOOL.test(t)))
     return no("tools is a short list of tool names");
@@ -614,8 +637,14 @@ export function listLine(j: Job, r: Result | null): string {
 // stale_lock: this run found a lock left by a run that died (or hung) and cleared it.
 // skew_ms: how far the keeper's clock was seen ahead of the PC's (its newest commit or
 // job time), or null when there was nothing to measure against.
+// reason: a fixed word on why runs stopped, when a version did it: Claude in Chrome's or
+// Claude Code's version changed since the last confirmed probe (probe_stale), or Claude
+// Code doesn't report Claude in Chrome's version, so unattended runs can't check it
+// (extension_version_unknown). null otherwise. Never free text.
+export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown"] as const;
+export type Reason = typeof REASONS[number];
 export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed";
-  job: string | null; stale_lock: boolean; skew_ms: number | null }
+  job: string | null; stale_lock: boolean; skew_ms: number | null; reason: Reason | null }
 export const HEARTBEAT_CODES = [...CODES, "idle", "stopped", "busy", "queue_misconfigured", "git_failed"];
 
 // The queue's .gitattributes: every structured file it holds is text with LF line
@@ -631,9 +660,12 @@ export const attributesGood = (text: string) => {
 export function parseHeartbeat(text: string): Heartbeat | null {
   try {
     const h = JSON.parse(text);
-    if (!isObj(h) || !exact(h, ["v", "worker_clock", "code", "job", "stale_lock", "skew_ms"]) || h.v !== 1 || !isIso(h.worker_clock)
+    if (!isObj(h)) return null;
+    if (!Object.hasOwn(h, "reason")) h.reason = null;              // a heartbeat from before reasons
+    if (!exact(h, ["v", "worker_clock", "code", "job", "stale_lock", "skew_ms", "reason"]) || h.v !== 1 || !isIso(h.worker_clock)
       || !HEARTBEAT_CODES.includes(h.code) || !(h.job === null || (typeof h.job === "string" && ID.test(h.job)))
-      || typeof h.stale_lock !== "boolean" || !(h.skew_ms === null || Number.isSafeInteger(h.skew_ms))) return null;
+      || typeof h.stale_lock !== "boolean" || !(h.skew_ms === null || Number.isSafeInteger(h.skew_ms))
+      || !(h.reason === null || REASONS.includes(h.reason))) return null;
     return h as Heartbeat;
   } catch { return null; }
 }

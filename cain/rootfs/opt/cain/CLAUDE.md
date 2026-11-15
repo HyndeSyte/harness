@@ -271,13 +271,19 @@ in the harness repo; until then the keeper says it is waiting).
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
   their own codes (`browser_unreachable`, `extension_unreachable`, `tool_inventory`,
   `wrong_profile`, `url_drift`, `unexpected_location`, `tabs_unexpected`,
-  `navigation_unguarded`, `navigation_denied`, `cli_changed`,
-  `extension_version_mismatch`, `result_rejected`, `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
+  `navigation_unguarded`, `navigation_denied`, `hook_missing_decision`, `cli_changed`,
+  `extension_version_mismatch`, `schema_violation` (the report had a value outside its
+  typed fields; nothing of it was kept), `canary_cookie_missing`, `result_rejected`,
+  `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
   `probe_stale` (a new Claude in Chrome or Claude Code version: nothing runs until he
-  probes again), `chrome_busy` (another Claude Code is open on his PC),
+  probes again), `extension_version_unknown` (unattended runs stay off),
+  `hook_selftest_failed`, `chrome_busy` (another Claude Code is open on his PC),
   `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and
   why. Those are fixed at his PC, so they
   go on his "At his PC" list, never in the morning message.
+- When a version stopped the PC, `pcjobs.sh worker` (and `list`) prints a second line,
+  "For Dane: ...", naming what to run at the PC. That line is what goes on his "At his
+  PC" list, in those words.
 - This version runs jobs only while he is at the PC and starts a run himself, until his
   setup allows unattended runs. A job past its expiry is closed by your keeper without
   running; that isn't a failure of his.
