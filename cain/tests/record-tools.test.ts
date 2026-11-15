@@ -100,6 +100,17 @@ describe("record-send", () => {
   }, 30_000);
 });
 
+// The holds file at a clone's fetched commit made unreadable: its object removed from the clone
+// (a fetch of a few objects leaves them loose). Returns how to put it back.
+function holdsGone(clone: string): () => void {
+  const blob = sh(["git", "rev-parse", "origin/main:state/holds.json"], clone);
+  const obj = join(clone, ".git", "objects", blob.slice(0, 2), blob.slice(2));
+  const saved = readFileSync(obj);
+  chmodSync(obj, 0o644);
+  rmSync(obj);
+  return () => writeFileSync(obj, saved);
+}
+
 describe("record-holds", () => {
   test("prints the session's holds, and tells it once when one has ended", () => {
     const l = laptop();
@@ -122,6 +133,20 @@ describe("record-holds", () => {
     // Not set up on this machine: the hook stays quiet and never blocks the prompt.
     const bare = Bun.spawnSync([process.execPath, join(TOOLS, "record-holds.ts"), "--hook"], { env: cleanEnv(), stdin: Buffer.from(JSON.stringify({ session_id: SA })), stdout: "pipe" });
     expect([bare.exitCode, bare.stdout.toString()]).toEqual([0, ""]);
+  }, 60_000);
+
+  test("holds that can't be read are said, never taken for a hold that ended", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x")] }]);
+    cycle(l.cfg);
+    const hook = () => l.tool("record-holds.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, hook_event_name: "UserPromptSubmit" }) });
+    expect(hook().out).toContain("- P33, since ");
+    const back = holdsGone(l.clone);
+    expect(hook()).toEqual({ code: 0, out: "Record holds not checked: the record's holds couldn't be read", err: "" });
+    back();
+    const again = hook().out;
+    expect(again).toContain("- P33, since ");
+    expect(again).not.toContain("has ended");
   }, 60_000);
 
   test("the holder's hook shows a note filed on its item once, and its next write waits until it has read one", () => {
@@ -507,6 +532,33 @@ describe("session-end", () => {
     expect(l.tool("session-end.ts", ["--flush"]).out).toBe("Submitted 1 to the record from a laptop session's end");
     expect(cycle(l.cfg).ok).toBe(true);
     expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+  }, 60_000);
+
+  test("an end whose record's holds can't be read keeps its snapshot, never takes it for holding nothing, and it's filed once they can be read", () => {
+    const l = held();
+    const e = ender(l);
+    const back = holdsGone(l.clone);
+    e.steps(["Verify after his tap", "pending"]);
+    expect(e.end().out).toMatch(/^Open steps \(1\): waiting here: the record couldn't be read, so the items held aren't known yet; kept for the next session's start or end that can read it: /);
+    expect(readdirSync(join(l.clone, ".git", "record-holds"))).not.toContain(`${SA}.journal`);   // nothing journaled as holding nothing
+    expect(l.tool("session-end.ts", ["--flush"]).out).toContain("An end's snapshot waits: the record couldn't be read");
+    back();
+    expect(l.tool("session-end.ts", ["--flush"]).out).toBe("Submitted 1 to the record from a laptop session's end");
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+  }, 60_000);
+
+  test("holds that can be read and name nothing of this session's are read as none: no holds file at all, or only another session's", () => {
+    const l = laptop();
+    const rec = clone(l.clone) as Clone;
+    const count = () => Number(sh(["git", "rev-list", "--count", "origin/main"], l.clone));
+    expect(() => sh(["git", "cat-file", "-e", "origin/main:state/holds.json"], l.clone)).toThrow();   // none at all
+    expect(recordSeen(rec, SA)).toEqual({ held: [], rmark: count() });
+    l.inbox(["1.json", { id: "lap-take-b", from: B, ops: [take("P33", "chat: x")] }]);
+    expect(cycle(l.cfg).ok).toBe(true);
+    sh(["git", "fetch", "-q", "origin"], l.clone);
+    expect(recordSeen(rec, SA)).toEqual({ held: [], rmark: count() });
+    expect(recordSeen(rec, SB)).toEqual({ held: ["P33"], rmark: count() });
   }, 60_000);
 
   test("a journal that can't be read is said at every start, never passed over in silence", () => {

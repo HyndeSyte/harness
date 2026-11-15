@@ -13,7 +13,7 @@
 // comes from the hook's input, it prints only when there's something to say, looks
 // at GitHub at most every 30 seconds (RECORD_HOLDS_FETCH_S), and never blocks the prompt.
 import { randomBytes } from "node:crypto";
-import { args, check, clone, fetch, freshNotes, holdsAt, memo, noteLines, send, sessionOf, waitingFrom, when } from "./record-lib.ts";
+import { args, check, clone, fetch, freshNotes, holdsRead, memo, noteLines, send, sessionOf, waitingFrom, when } from "./record-lib.ts";
 
 const a = args(process.argv.slice(2), ["record", "session"]);
 const hook = a.hook === true;
@@ -39,7 +39,10 @@ if (!hook || now - was.fetched > Number(process.env.RECORD_HOLDS_FETCH_S ?? 30) 
   was.fetched = now;
 }
 
-const holds = holdsAt(rec);
+// Holds that can't be read are said, never taken for none (that would say a hold had ended).
+const read = holdsRead(rec);
+if (!read) quiet("Record holds not checked: the record's holds couldn't be read", 1);
+const holds = read!;
 const mine = Object.entries(holds).filter(([, h]) => h.holder === me);
 const ended = was.held.filter((id) => !mine.some(([k]) => k === id));
 const waiting = waitingFrom(rec, me);

@@ -63,6 +63,16 @@ export function treeAt(c: Clone): Tree {
 
 // Who holds what, as the keeper last pushed it.
 export const holdsAt = (c: Clone): Holds => parseHolds(treeAt(c).read(HOLDS_PATH)) ?? {};
+// The same, read with care: null when it can't be told (the commit's tree or its holds file
+// can't be read, or the file isn't the keeper's holds), so a failed read is never taken for
+// "nobody holds anything". A record with no holds file has no holds.
+export function holdsRead(c: Clone): Holds | null {
+  const listed = git(c.dir, ["ls-tree", "-z", c.ref, "--", HOLDS_PATH]);
+  if (listed === null) return null;                    // the tree can't be read
+  if (listed === "") return {};                        // no holds file: no holds
+  const text = git(c.dir, ["cat-file", "blob", `${c.ref}:${HOLDS_PATH}`]);
+  return text === null ? null : parseHolds(text);
+}
 
 function logLines(c: Clone, lastFiles?: number): any[] {
   let files = (git(c.dir, ["ls-tree", "--name-only", c.ref, "log/requests/"]) ?? "").split("\n").filter((n) => n.endsWith(".jsonl")).sort();

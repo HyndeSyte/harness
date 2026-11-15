@@ -56,7 +56,7 @@ import { closeSync, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readd
 import { dirname, isAbsolute, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { TOKEN_SHAPES } from "../rootfs/opt/cain/c1/tools.ts";
-import { type Clone, args, check, clone, fetch, git, holdsAt, outcomes, send, sessionOf } from "./record-lib.ts";
+import { type Clone, args, check, clone, fetch, git, holdsRead, outcomes, send, sessionOf } from "./record-lib.ts";
 
 export interface Step { content: string; status: string }
 const STATUSES = new Set(["pending", "in_progress", "completed"]);
@@ -274,11 +274,13 @@ export function recordAt(rec: Clone): string | null {
 }
 // What an end reads from the record, all at that one commit: the items the session held, and how
 // far the record had come (its commits; its main only moves on, so more is later). Null when the
-// commit can't be read.
+// commit, or its holds, can't be read: a failed read is never taken for holding nothing.
 export function seenAt(rec: Clone, at: string, session: string): { held: string[]; rmark: number } | null {
   const commits = Number(git(rec.dir, ["rev-list", "--count", at])?.trim());
   if (!Number.isInteger(commits) || commits < 1) return null;
-  const held = Object.entries(holdsAt({ ...rec, ref: at })).filter(([, h]: [string, any]) => h?.holder === `laptop:${session}`).map(([item]) => item).sort();
+  const holds = holdsRead({ ...rec, ref: at });
+  if (!holds) return null;
+  const held = Object.entries(holds).filter(([, h]: [string, any]) => h?.holder === `laptop:${session}`).map(([item]) => item).sort();
   return { held, rmark: commits };
 }
 export const recordSeen = (rec: Clone, session: string) => { const at = recordAt(rec); return at ? seenAt(rec, at, session) : null; };
