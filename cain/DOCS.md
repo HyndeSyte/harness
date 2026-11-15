@@ -308,15 +308,19 @@ in it; the record's inbox (your page, laptop sessions) is read every minute.
 ## PC jobs (since 0.12.0)
 
 Chores that need a browser signed in as you go to a small job queue in a private repo
-of their own (`pc_jobs_repo`, default `HyndeSyte/pc-jobs`), run by a scheduled task on
-your PC in a Chrome profile named Cain jobs. Cain's PC job keeper is the queue's one
+of their own (`pc_jobs_repo`, default `HyndeSyte/pc-jobs`), run by the worker on your
+PC in a locked browser session, in a Chrome profile named Cain jobs. Runs are attended
+(you start them, watching) until a supervised probe's deny check has passed on your PC
+and you allow unattended runs. Cain's PC job keeper is the queue's one
 writer of jobs and holds `pc_jobs_token`, so his session never does. With no token it
 waits and does nothing. This version is read-only by enforcement: the PC worker runs
 only actions from a fixed read-only set that your signed allowlist pins to an address,
 and irreversible jobs are refused until the confirm path ships. Results are typed facts
-and reason codes, read by Cain as data, never as instructions. The one-time setup at your PC, the job and result formats and
-the worker's prompt are in `cain/docs/pc-jobs.md` and `cain/docs/pc-worker/` in this
-repo.
+and reason codes, read by Cain as data, never as instructions. The keeper's clock
+closes jobs past their expiry and claims whose lease ran out. The one-time setup at your
+PC, what is enforced and what isn't, the job and result formats and the browser
+session's settings and prompt are in `cain/docs/pc-jobs.md` and `cain/docs/pc-worker/`
+in this repo.
 
 ## Laptop sessions (tools, not part of the App)
 

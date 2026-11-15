@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cain's way to the PC job queue: chores that need a browser signed in as Dane, run by a
-# scheduled task on his PC (cain/docs/pc-jobs.md). The PC job keeper (pcjobs/main.ts) is
+# worker on his PC (cain/docs/pc-jobs.md). The PC job keeper (pcjobs/main.ts) is
 # the queue's one writer and holds its GitHub token; this hands it requests and reads
 # its copy of the queue.
 #   pcjobs.sh new <file>       queue one job (JSON, see CLAUDE.md); prints its request id

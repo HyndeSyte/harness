@@ -1,7 +1,7 @@
 // The PC job queue: chores that need a browser signed in as Dane, which Cain can't do.
-// Cain writes a job (through his keeper, pcjobs/main.ts); a scheduled task on Dane's PC
-// runs it in a Chrome profile of its own, through pcjobs/worker.ts, which claims the job,
-// hands the task one narrow browser instruction, checks what the task saw and writes the
+// Cain writes a job (through his keeper, pcjobs/main.ts); pcjobs/worker.ts on Dane's PC
+// runs it in a Chrome profile of its own: it claims the job, starts a locked browser
+// session with one narrow instruction, checks what the session saw and writes the
 // result. Both live in a small private GitHub repo of their own (cain/docs/pc-jobs.md).
 //
 // This file is the format, and the checks both ends make. It needs only node:crypto and
@@ -33,7 +33,8 @@ export const CODES = [
   "ok", "already_gone", "needs_login", "pending_email_confirmation", "blocked_captcha",
   "expired", "cancelled", "not_allowlisted", "allowlist_unverified", "action_not_read_only", "bad_start_url",
   "token_refused", "preview_mismatch", "nonce_spent",
-  "browser_unreachable", "wrong_profile", "profile_unconfirmed",
+  "browser_unreachable", "wrong_profile", "profile_unconfirmed", "profile_changed", "extension_elsewhere",
+  "untrusted_config", "untrusted_files", "clock_skew", "attended_only", "browser_timeout",
   "url_drift", "result_rejected", "page_not_as_expected", "outcome_uncertain", "lease_expired",
 ] as const;
 export type State = typeof STATES[number];
@@ -112,14 +113,17 @@ export interface Result {
   status: Status;
   code: Code;
   handoff: Handoff | null;
-  worker_clock: string;        // the PC's own clock when it wrote this
+  worker_clock: string;        // the clock of whoever wrote this (the PC's, or the keeper's for an expiry)
   final_url: string | null;    // scheme, host and path only
   facts: Record<string, string | boolean>;
+  tools: string[];             // the Claude in Chrome tools the browser session was allowed (none when nothing ran)
+  attended: boolean;           // the owner ran it by hand, watching
 }
 
 export const JOB_KEYS = ["v", "id", "from", "created", "expires", "state", "lease_until", "attempt", "site", "action", "step",
   "start_url", "done_looks_like", "follows", "preview_seen", "owner_go", "go_token"];
-export const RESULT_KEYS = ["v", "id", "attempt", "status", "code", "handoff", "worker_clock", "final_url", "facts"];
+export const RESULT_KEYS = ["v", "id", "attempt", "status", "code", "handoff", "worker_clock", "final_url", "facts", "tools", "attended"];
+export const TOOL = /^[a-z][a-z0-9_]{1,39}$/;
 
 export const ID = /^j-\d{8}-[a-z0-9]{6}$/;
 export const ATTEMPT = /^a-[a-z0-9]{10}$/;
@@ -161,8 +165,30 @@ export function onSite(url: unknown, site: string): boolean {
 // A plain address: https, on the site, nothing past the path.
 const plainOnSite = (url: unknown, site: string) => onSite(url, site) && sanitizeUrl(url) === url;
 
-export type Checked<T> = { ok: true; value: T } | { ok: false; why: string };
-const no = (why: string): { ok: false; why: string } => ({ ok: false, why });
+export type Checked<T> = { ok: true; value: T } | { ok: false; why: string; field?: string };
+const no = (why: string, field?: string): { ok: false; why: string; field?: string } => (field ? { ok: false, why, field } : { ok: false, why });
+
+// ---- Dates ----------------------------------------------------------------------------
+// A date as sites show it, in the common forms, made YYYY-MM-DD: 2026-11-15, 11/15/2026
+// (month first unless the first number can't be a month), 15.11.2026, 15-11-2026,
+// Nov 15, 2026, 15 November 2026. null when it isn't one of those, or no such day.
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+export function parseDate(v: string): string | null {
+  const s = v.trim().replace(/\s+/g, " ");
+  if (s.length > 30) return null;
+  let y = 0, m = 0, d = 0, x: RegExpExecArray | null;
+  const mon = (w: string) => { const i = MONTHS.indexOf(w.slice(0, 3).toLowerCase()); return i >= 0 && /^[a-z]+\.?$/i.test(w) ? i + 1 : 0; };
+  if ((x = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s))) [y, m, d] = [+x[1], +x[2], +x[3]];
+  else if ((x = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s))) [y, m, d] = +x[1] > 12 ? [+x[3], +x[2], +x[1]] : [+x[3], +x[1], +x[2]];
+  else if ((x = /^(\d{1,2})[.-](\d{1,2})[.-](\d{4})$/.exec(s))) [y, m, d] = [+x[3], +x[2], +x[1]];
+  else if ((x = /^([A-Za-z]+\.?) (\d{1,2}),? (\d{4})$/.exec(s))) [y, m, d] = [+x[3], mon(x[1]), +x[2]];
+  else if ((x = /^(\d{1,2}) ([A-Za-z]+\.?),? (\d{4})$/.exec(s))) [y, m, d] = [+x[3], mon(x[2]), +x[1]];
+  else return null;
+  if (y < 1900 || y > 2200 || m < 1 || m > 12 || d < 1) return null;
+  const t = new Date(Date.UTC(y, m - 1, d));
+  if (t.getUTCMonth() !== m - 1 || t.getUTCDate() !== d) return null;
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
 
 // ---- Facts --------------------------------------------------------------------------
 // Typed facts for this action: known names only, each value of its type and length.
@@ -175,14 +201,15 @@ export function checkFacts(action: string, facts: unknown): Checked<Record<strin
   const out: Record<string, string | boolean> = {};
   for (const k of keys) {
     const t = Object.hasOwn(types, k) ? types[k] : undefined;
-    if (!t) return no(`a fact this action doesn't report (it reports ${Object.keys(types).join(", ")})`);
-    const v = facts[k];
+    if (!t) return no(`a fact this action doesn't report (it reports ${Object.keys(types).join(", ")})`, /^[a-z_]{1,40}$/.test(k) ? k : "unknown_fact");
+    let v = facts[k];
+    if (t.t === "date" && typeof v === "string") v = parseDate(v) ?? v;
     const good = t.t === "bool" ? typeof v === "boolean"
       : typeof v !== "string" ? false
       : t.t === "enum" ? t.of.includes(v)
       : t.t === "date" ? DAY.test(v)
       : v.length <= t.max && t.re.test(v);
-    if (!good) return no(`fact ${k} isn't ${t.t === "enum" ? `one of ${t.of.join(", ")}` : t.t === "token" ? "a short token of its pattern" : `a ${t.t}`}`);
+    if (!good) return no(`fact ${k} isn't ${t.t === "enum" ? `one of ${t.of.join(", ")}` : t.t === "token" ? "a short token of its pattern" : `a ${t.t}`}`, k);
     out[k] = v;
   }
   return { ok: true, value: out };
@@ -250,6 +277,9 @@ export function parseResult(text: string, action?: string): Checked<Result> {
     const f = checkFacts(action, r.facts);
     if (!f.ok) return f;
   } else if (!isObj(r.facts) || Object.keys(r.facts).length > MAX_FACTS) return no("facts is an object of named values");
+  if (!Array.isArray(r.tools) || r.tools.length > 16 || !r.tools.every((t: unknown) => typeof t === "string" && TOOL.test(t)))
+    return no("tools is a short list of tool names");
+  if (typeof r.attended !== "boolean") return no("attended is true or false");
   if (r.handoff !== null && r.handoff !== r.code) return no("a hand-off's code is the hand-off");
   if (r.status === "done" && !["ok", "already_gone", "pending_email_confirmation"].includes(r.code)) return no("a done result's code is ok, already_gone or pending_email_confirmation");
   if (r.status !== "done" && ["ok", "already_gone"].includes(r.code)) return no("ok and already_gone count as done");
@@ -368,6 +398,10 @@ export function readJobToken(token: string, keys: Map<string, KeyObject>, nowMs:
 
 export { publicKey };
 
+// A public key's fingerprint: the SHA-256 of its SPKI bytes, in hex. The owner pins his
+// allowlist key's in the worker's install config at setup.
+export const keyFingerprint = (k: KeyObject) => createHash("sha256").update(k.export({ format: "der", type: "spki" })).digest("hex");
+
 // A confirm job against its token, the preview it follows and that preview's result.
 // "" when it stands. jobs: every job in the queue; spent: nonces already recorded.
 export function confirmWhy(job: Job, keys: Map<string, KeyObject>, jobs: Job[], resultOf: (id: string) => Result | null,
@@ -404,11 +438,16 @@ export function confirmGate(job: Job, live: unknown): Code | null {
 }
 
 // ---- The PC's allowlist, signed by Dane --------------------------------------------
-// {"v": 1, "kid": "<his key id>", "allow": [{site, action, url, match}], "sig": "<base64url>"}
+// {"v": 1, "kid": "<his key id>", "allow": [{site, action, url, match, login_hosts?, login_paths?}], "sig": "<base64url>"}
 // Each entry pins one read-only action on one site to an exact address or an address
-// prefix (match "exact" or "prefix"). The signature is his Ed25519 key's, over the
-// canonical bytes of {v, kid, allow}; the worker checks it against owner.pub on the PC.
-export interface Allow { site: string; action: string; url: string; match: "exact" | "prefix" }
+// prefix (match "exact" or "prefix"). A real site sends a signed-out visitor to its
+// sign-in page, often on another host (accounts.example.com) or path (/login): those
+// listed in login_hosts (a host, or a host and everything under it with a leading ".")
+// and login_paths (a path, or a path prefix ending in "*") count as needs_login, not as
+// url_drift. The signature is his Ed25519 key's, over the canonical bytes of {v, kid,
+// allow}; the worker checks it against owner.pub on the PC, and owner.pub against the
+// fingerprint pinned in his install config.
+export interface Allow { site: string; action: string; url: string; match: "exact" | "prefix"; login_hosts?: string[]; login_paths?: string[] }
 
 export const allowBody = (kid: string, allow: Allow[]) => canonical({ v: 1, kid, allow });
 
@@ -416,15 +455,25 @@ export function signAllowlist(kid: string, allow: Allow[], sign: (data: Buffer) 
   return JSON.stringify({ v: 1, kid, allow, sig: b64url(sign(Buffer.from(allowBody(kid, allow), "utf8"))) }, null, 2) + "\n";
 }
 
+const LOGIN_HOST = /^\.?(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
+const LOGIN_PATH = /^\/[A-Za-z0-9._~%\/-]{0,100}\*?$/;
+const listOf = (x: unknown, re: RegExp) => x === undefined || (Array.isArray(x) && x.length <= 8 && x.every((v) => typeof v === "string" && re.test(v)));
+
 function entriesOk(list: unknown): Checked<Allow[]> {
   if (!Array.isArray(list)) return no("allow is a list");
   const out: Allow[] = [];
   for (const e of list) {
-    if (!isObj(e) || !exact(e, ["site", "action", "url", "match"]) || typeof e.site !== "string" || !SITE.test(e.site)
+    const keys = isObj(e) ? Object.keys(e) : [];
+    if (!isObj(e) || !["site", "action", "url", "match"].every((k) => keys.includes(k))
+      || keys.some((k) => !["site", "action", "url", "match", "login_hosts", "login_paths"].includes(k))
+      || typeof e.site !== "string" || !SITE.test(e.site)
       || typeof e.action !== "string" || !Object.hasOwn(READ_ACTIONS, e.action) || !plainOnSite(e.url, e.site)
-      || (e.match !== "exact" && e.match !== "prefix"))
-      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix)}");
-    out.push({ site: e.site, action: e.action, url: e.url, match: e.match });
+      || (e.match !== "exact" && e.match !== "prefix") || !listOf(e.login_hosts, LOGIN_HOST) || !listOf(e.login_paths, LOGIN_PATH))
+      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), and optionally login_hosts and login_paths}");
+    const a: Allow = { site: e.site, action: e.action, url: e.url, match: e.match };
+    if (e.login_hosts !== undefined) a.login_hosts = e.login_hosts;
+    if (e.login_paths !== undefined) a.login_paths = e.login_paths;
+    out.push(a);
   }
   return { ok: true, value: out };
 }
@@ -444,11 +493,38 @@ export function parseAllowlist(text: string, ownerKeys: Map<string, KeyObject>):
   return e;
 }
 
+// An address as it is compared: scheme, host and path, the path in lower case and
+// without a trailing slash (sites differ on both and mean the same page).
+export function normalUrl(url: string): string {
+  const s = sanitizeUrl(url);
+  if (!s) return "";
+  const u = new URL(s);
+  let path = u.pathname.toLowerCase();
+  while (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+  return `https://${u.hostname}${path === "/" ? "" : path}`;
+}
+
 // An address on an entry's pin.
 export function onPin(url: string, a: Allow): boolean {
-  if (a.match === "exact") return url === a.url;
-  const base = a.url.endsWith("/") ? a.url : `${a.url}/`;
-  return url === a.url || url.startsWith(base);
+  const u = normalUrl(url), p = normalUrl(a.url);
+  if (!u || !p) return false;
+  if (a.match === "exact") return u === p;
+  return u === p || u.startsWith(`${p}/`);
+}
+
+// An address on one of the entry's sign-in pages: needs_login, not url_drift.
+export function onLogin(url: string, a: Allow): boolean {
+  const s = sanitizeUrl(url);
+  if (!s) return false;
+  const u = new URL(s);
+  const host = u.hostname;
+  if ((a.login_hosts ?? []).some((h) => h.startsWith(".") ? host === h.slice(1) || host.endsWith(h) : host === h)) return true;
+  if (!onSite(s, a.site)) return false;
+  const path = normalUrl(s).slice(`https://${host}`.length) || "/";
+  return (a.login_paths ?? []).some((p) => {
+    const q = p.toLowerCase();
+    return q.endsWith("*") ? path.startsWith(q.slice(0, -1)) : path === (q.length > 1 ? q.replace(/\/+$/, "") : q);
+  });
 }
 
 export function pinFor(job: Job, list: Allow[]): Allow | null {
@@ -487,14 +563,29 @@ export function listLine(j: Job, r: Result | null): string {
 }
 
 // ---- The worker's heartbeat, as it lands in the queue repo -------------------------
-export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed"; job: string | null }
+// stale_lock: this run found a lock left by a run that died (or hung) and cleared it.
+// skew_ms: how far the keeper's clock was seen ahead of the PC's (its newest commit or
+// job time), or null when there was nothing to measure against.
+export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed";
+  job: string | null; stale_lock: boolean; skew_ms: number | null }
 export const HEARTBEAT_CODES = [...CODES, "idle", "stopped", "busy", "queue_misconfigured", "git_failed"];
+
+// The queue's .gitattributes: every structured file it holds is text with LF line
+// endings, so a Windows checkout never drifts to CRLF, and files stay mergeable.
+// Signatures and hashes are over canonical bytes anyway.
+export const QUEUE_ATTRIBUTES = "*.json text eol=lf\n*.md text eol=lf\n*.txt text eol=lf\n.gitattributes text eol=lf\n";
+export const attributesLines = (text: string) => text.split(/\r?\n/).map((l) => l.trim().replace(/\s+/g, " ")).filter(Boolean);
+export const attributesGood = (text: string) => {
+  const have = attributesLines(text);
+  return attributesLines(QUEUE_ATTRIBUTES).every((l) => have.includes(l)) && !have.some((l) => /^\*\s/.test(l) && /-text|binary/.test(l));
+};
 
 export function parseHeartbeat(text: string): Heartbeat | null {
   try {
     const h = JSON.parse(text);
-    if (!isObj(h) || !exact(h, ["v", "worker_clock", "code", "job"]) || h.v !== 1 || !isIso(h.worker_clock)
-      || !HEARTBEAT_CODES.includes(h.code) || !(h.job === null || (typeof h.job === "string" && ID.test(h.job)))) return null;
+    if (!isObj(h) || !exact(h, ["v", "worker_clock", "code", "job", "stale_lock", "skew_ms"]) || h.v !== 1 || !isIso(h.worker_clock)
+      || !HEARTBEAT_CODES.includes(h.code) || !(h.job === null || (typeof h.job === "string" && ID.test(h.job)))
+      || typeof h.stale_lock !== "boolean" || !(h.skew_ms === null || Number.isSafeInteger(h.skew_ms))) return null;
     return h as Heartbeat;
   } catch { return null; }
 }

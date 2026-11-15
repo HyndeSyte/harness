@@ -74,7 +74,7 @@ bashio::log.info "Cain is running"
   while true; do bun /opt/cain/record/main.ts 2>&1; sleep 10; done
 ) &
 # The PC job keeper (pcjobs/main.ts): the one writer of jobs to the PC job queue (its own
-# private repo), run on Dane's PC by a scheduled task in a Chrome profile of its own
+# private repo), run on Dane's PC by the worker in a Chrome profile of its own
 # (cain/docs/pc-jobs.md). Its token comes from the App's options and goes only into its
 # environment. With no token it waits and does nothing.
 (

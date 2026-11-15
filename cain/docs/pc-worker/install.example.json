@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "owner_fpr": "0000000000000000000000000000000000000000000000000000000000000000",
+  "claude": "C:/Users/YOU/.local/bin/claude.exe",
+  "session_minutes": 15,
+  "unattended": false,
+  "confirm_path": false,
+  "diagnostics": false,
+  "profile": {
+    "user_data_dir": "C:/pc-worker/chrome",
+    "profile_directory": "Default",
+    "profile_name": "Cain jobs",
+    "extension_id": "abcdefghijklmnopabcdefghijklmnop",
+    "chrome_path": "C:/Program Files/Google/Chrome/Application/chrome.exe"
+  },
+  "other_user_data_dirs": []
+}

@@ -6,9 +6,10 @@
 // session never holds it. It also keeps a copy of the queue in /data/pc-jobs, at most a
 // minute behind, where Cain reads jobs and results.
 //
-// It writes only new files: jobs/<id>.json, cancels/<id>.json (Cain calling a job off
-// before it runs), and the queue's .gitattributes while it has none. It never edits a
-// job (the PC claims and closes them) and never writes results.
+// It writes new files: jobs/<id>.json, cancels/<id>.json (Cain calling a job off before
+// it runs), and the queue's .gitattributes while it has none. And its clock alone decides
+// expiry: it closes a pending job past its expiry, and a claim whose lease ran out (the
+// PC's run died or hung), each with a result. Otherwise the PC claims and closes jobs.
 //
 // It refuses every irreversible job (a preview or a confirm) until the confirm path
 // ships: this version is read-only, and the PC refuses them too.
@@ -22,8 +23,8 @@
 //   bun main.ts worker          the PC worker's last heartbeat
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, DEFAULT_REPO, TERMINAL,
-  type Heartbeat, type Job, type Result } from "./core.ts";
+import { ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
+  DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type Result } from "./core.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; branch: string;
@@ -96,7 +97,26 @@ export function readHeartbeat(dir: string): Heartbeat | null {
 }
 
 export function heartbeatLine(h: Heartbeat | null): string {
-  return h ? `PC worker: ${h.code} at ${h.worker_clock} (its own clock)${h.job ? ` on ${h.job}` : ""}` : "PC worker: not seen yet";
+  if (!h) return "PC worker: not seen yet";
+  const extra = [h.stale_lock ? "cleared a stale lock" : "", h.skew_ms !== null && h.skew_ms > 0 ? `the Pi's clock ahead by ${Math.round(h.skew_ms / 1000)}s` : ""]
+    .filter(Boolean).join(", ");
+  return `PC worker: ${h.code} at ${h.worker_clock} (its own clock)${h.job ? ` on ${h.job}` : ""}${extra ? ` (${extra})` : ""}`;
+}
+
+// Jobs the keeper's clock says are over: a pending job past its expiry, and a claim
+// whose lease ran out (both with the skew allowed). A read that never reported changed
+// nothing; anything else may have done part of its step, so it is in doubt.
+export function stale(jobs: Job[], now: Date): { job: Job; result: Result }[] {
+  const out: { job: Job; result: Result }[] = [];
+  const at = now.toISOString();
+  const r = (j: Job, status: Result["status"], code: Result["code"]): Result =>
+    ({ v: 1, id: j.id, attempt: j.attempt, status, code, handoff: null, worker_clock: at, final_url: null, facts: {}, tools: [], attended: false });
+  for (const j of jobs) {
+    if (j.state === "pending" && Date.parse(j.expires) + SKEW_MS <= now.getTime()) out.push({ job: j, result: r(j, "expired", "expired") });
+    else if (j.state === "claimed" && Date.parse(j.lease_until!) + SKEW_MS <= now.getTime())
+      out.push({ job: j, result: isReadOnly(j) ? r(j, "failed", "lease_expired") : r(j, "in_doubt", "lease_expired") });
+  }
+  return out;
 }
 
 type Outcome = { request: string; state: "queued" | "cancel_sent" | "refused"; id?: string; reason?: string };
@@ -138,8 +158,20 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
   const names = existsSync(cfg.queue) ? readdirSync(cfg.queue).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort() : [];
   try {
     sync(cfg);
-    if (!names.length) return { ok: true, queued: 0, refused: 0 };
     const now = cfg.now?.() ?? new Date();
+    const over = stale(readJobs(cfg.dir), now);
+    if (over.length) {
+      for (const { job, result } of over) {
+        mkdirSync(join(cfg.dir, "results"), { recursive: true });
+        writeFileSync(join(cfg.dir, "results", `${job.id}.json`), resultText(result));
+        writeFileSync(join(cfg.dir, "jobs", `${job.id}.json`), jobText({ ...job, state: stateAfter(job, result), lease_until: null }));
+        git(cfg, ["add", `results/${job.id}.json`, `jobs/${job.id}.json`]);
+      }
+      git(cfg, ["commit", "--quiet", "-m", `Cain: close ${over.map((o) => `${o.job.id} (${o.result.code})`).join(", ")}`.slice(0, 200)]);
+      git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
+      for (const o of over) log(`closed ${o.job.id}: ${o.result.code}`);
+    }
+    if (!names.length) return { ok: true, queued: 0, refused: 0 };
     const jobs = readJobs(cfg.dir);
     const made: { rid: string; file: string; job?: Job; cancel?: string }[] = [];
     let refused = 0;
@@ -166,9 +198,9 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
       made.push({ rid, file, job: c.job });
     }
     if (!made.length) return { ok: true, queued: 0, refused };
-    // The queue keeps every byte as written: no line ending rewrites, on any side.
+    // Structured files are text with LF line endings, on every side.
     if (!existsSync(join(cfg.dir, ".gitattributes"))) {
-      writeFileSync(join(cfg.dir, ".gitattributes"), "* -text\n");
+      writeFileSync(join(cfg.dir, ".gitattributes"), QUEUE_ATTRIBUTES);
       git(cfg, ["add", ".gitattributes"]);
     }
     for (const m of made) {
