@@ -186,6 +186,59 @@ switches (`/opt/cain/c1/cutover.sh`, with its journal in `/data/c1`). Until then
 0.11.0 did. After the move there is no way back to root but restoring the backup taken before
 the update. `/data/trust/c1check.json` holds the check that runs as `cain` at every start.
 
+### If Cain stops
+
+Nothing of Cain's runs unchecked, and no stop is silent. The App stops him when a check of
+his own user finds a breach, when the move stops part way, when his start state is damaged,
+or when its safety setup doesn't check out at start; it pauses him (not a breach) when that
+check can't finish, and tries it again every 10 minutes until it does. If a try of the move
+fails, he keeps running the old way and the App says so. Each time, the App tells you itself,
+from outside his session (`/opt/cain/notice.sh`), what happened and the way back:
+
+- in Discord, from his bot, once;
+- in Home Assistant, as a notification and a push to your phone, again each day until it's
+  fixed, and taken down (with "Cain is back") when it is.
+
+The Home Assistant side is one automation with a webhook trigger. The App has no Home
+Assistant API access, on purpose: the Supervisor's route to a notification would give every
+process of the App the run of all of Home Assistant, and this webhook can only show a notice.
+Put a long random id (32 to 128 letters, digits, `-` or `_`) in this App's `notice_hook`
+option, and the same id in the automation:
+
+```yaml
+alias: Cain App alarms
+mode: queued
+triggers:
+  - trigger: webhook
+    webhook_id: <the notice_hook id>
+    allowed_methods: [POST]
+    local_only: true
+actions:
+  - if: "{{ trigger.json.state == 'clear' }}"
+    then:
+      - action: persistent_notification.dismiss
+        data: {notification_id: cain_app}
+    else:
+      - action: persistent_notification.create
+        data:
+          notification_id: cain_app
+          title: "{{ trigger.json.title }}"
+          message: "{{ trigger.json.message }}"
+  - action: notify.mobile_app_<your phone>
+    data:
+      title: "{{ trigger.json.title }}"
+      message: "{{ trigger.json.message }}"
+```
+
+With `notice_hook` empty, the alarms go to Discord only. An alarm raised before the hook is
+set reaches Home Assistant as soon as it is.
+
+**The way back** (the alarms say which applies): restart the Cain App (Settings, Apps,
+Cain, Restart); or restore two backups from just before the update, Cain's first and then the
+calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
+while the other is on its old version, it waits. After a restore, the calendar App may send
+again a card it sent after its backup was taken; the newest card is the one to answer.
+
 ## Your record: one hand on each item (since 0.6.0)
 
 The record keeper (`/opt/cain/record/main.ts`) is the record's only writer. Every

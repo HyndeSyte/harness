@@ -225,3 +225,49 @@ def test_a_card_dropped_after_seven_days_is_on_the_next_digest(ledger, clock):
     clock.advance(seconds=MAX_AGE_S + 3600)
     ob.flush()
     assert "1 message(s) couldn't be delivered" in daily.gather(ledger, config, paused=False).text
+
+
+def test_new_harness_against_the_old_link_keeps_every_card_queued(ledger, clock):
+    """The other way round (C1 second review: met in the code, a test still worth having): Cain's
+    backup restored alone brings back the 0.11.0 link, which takes only the old header and signs
+    nothing it answers. Harness 0.24.0 reads its 401s and 403s, unsigned, as no answer at all, so
+    its cards wait, queued, none made final or lost, until the two Apps agree again."""
+    from harness.cain_relay import CainLink
+    from harness.discord_chat import LinkChat
+    from harness.outbox import Outbox
+    seen = {"posts": 0, "made": 0}
+
+    class Old(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+            seen["posts"] += 1
+            if hmac.compare_digest(self.headers.get("x-harness-key", ""), K_LEGACY):   # never sent by 0.24.0
+                seen["made"] += 1
+                status, body = 200, json.dumps({"id": seen["made"]})
+            else:
+                status, body = (401, '{"status": "unauthorized"}') if seen["posts"] % 2 else (403, '{"status": "refused"}')
+            data = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Old)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        rows = [enqueue(ledger, t) for t in ("one", "two")]
+        ob = Outbox(ledger, LinkChat(CainLink(lambda: TOKEN, host="127.0.0.1", port=httpd.server_address[1])),
+                    sleep=lambda s: None)
+        for _ in range(4):
+            assert ob.flush() == 0
+            clock.advance(seconds=601)
+        for r in rows:
+            row = ledger.outbox_row(r)
+            assert row["state"] == "queued" and row["attempts"] >= 3, dict(row)
+        assert seen["posts"] >= 6 and seen["made"] == 0
+    finally:
+        httpd.shutdown()

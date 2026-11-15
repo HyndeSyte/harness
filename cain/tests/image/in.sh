@@ -194,6 +194,49 @@ final)
   [ -z "$extra" ] || fail "his session loaded a plugin from outside the image's seed: $extra"
   note "final checks held ($other couldn't be installed; loaded: $loaded)"
   ;;
+alarm)
+  # The App's alarms with Discord down (C1 second review, must-fixes 1 and 2), on the switched
+  # /data: the check of his own user can't finish here (no link runs, so its routes don't answer),
+  # and after five tries it holds his session and tells Dane. His bot can't post (its token is
+  # away), yet Home Assistant's webhook (a stand-in on this machine, at the notice_hook option's
+  # id) gets the alarm, with the way back, and never sees the hook on a command line. A breach's
+  # alarm replaces it; his session's return takes the notification down.
+  prepare
+  [ "$("$OPT/c1/state.sh")" = cut ] || fail "not cut over: $("$OPT/c1/state.sh")"
+  hook="imagetest$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  cp $D/options.json /fp/options.before
+  jq --arg h "$hook" '.notice_hook = $h' /fp/options.before > $D/options.json && chmod 0600 $D/options.json
+  mv $D/link/discord.env /fp/discord.env.away
+  : > /fp/hook.log; : > /fp/cmdlines
+  bun -e 'const fs = require("fs"); Bun.serve({ hostname: "127.0.0.1", port: 18123, async fetch(r) {
+    fs.appendFileSync("/fp/hook.log", new URL(r.url).pathname + " " + (await r.text()) + "\n"); return new Response(""); } });' >/dev/null 2>&1 &
+  srv=$!
+  # Every command line while the alarms go out, to show the hook is on none of them.
+  ( while kill -0 "$srv" 2>/dev/null; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\0' ' ' >> /fp/cmdlines; sleep 0.05; done ) &
+  sleep 1
+  export NOTICE_URL=http://127.0.0.1:18123
+  C1_VERSION=9.9.9 C1_CHECK_RETRY_S=0 "$OPT/c1/check.sh" > /fp/check.out 2>&1; rc=$?
+  [ "$rc" = 4 ] || fail "a check that couldn't finish gave $rc, not 4 (held): $(tail -n 2 /fp/check.out | tr '\n' ' ')"
+  grep -q "held (not a breach)" /fp/check.out || fail "the check didn't say he's held: $(tail -n 1 /fp/check.out)"
+  [ "$(cut -d' ' -f1 $D/c1/check-held)" = 9.9.9 ] && grep -q "the link didn't answer" $D/c1/check-held \
+    || fail "the hold isn't on record for this version: $(cat $D/c1/check-held 2>/dev/null)"
+  grep -q "^/api/webhook/$hook {\"state\":\"on\",\"alarm\":\"held\",\"title\":\"Cain is paused\"" /fp/hook.log \
+    || fail "Home Assistant didn't get the pause: $(head -c 300 /fp/hook.log)"
+  grep -q "This isn't a breach" /fp/hook.log && grep -q "Settings, System, Backups" /fp/hook.log || fail "the pause didn't say what it is and the way back"
+  grep -qx "discord 0" $D/c1/notice || fail "his bot posted, with its token away"
+  NOTICE_URL=http://127.0.0.1:18123 "$OPT/notice.sh" tell breach >/dev/null
+  grep -q "\"alarm\":\"breach\",\"title\":\"Cain is stopped\"" /fp/hook.log || fail "Home Assistant didn't get the breach's alarm"
+  "$OPT/notice.sh" clear running >/dev/null
+  grep -q "\"state\":\"clear\",\"alarm\":\"breach\",\"title\":\"Cain is back\"" /fp/hook.log || fail "the alarm didn't come down"
+  [ ! -e $D/c1/notice ] || fail "a cleared alarm stayed on record"
+  sleep 0.2; kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
+  ! grep -qF "$hook" /fp/cmdlines || fail "the hook was on a command line"
+  grep -q "18123" /fp/cmdlines || fail "the command lines weren't watched"
+  # Back as it was, for the final checks.
+  mv /fp/discord.env.away $D/link/discord.env; cp /fp/options.before $D/options.json && chmod 0600 $D/options.json
+  rm -f $D/c1/check-held /fp/hook.log
+  note "alarms reached Home Assistant with Discord down ($(wc -l < /fp/check.out) lines from the check)"
+  ;;
 plant-connector)
   # The old way recorded a claude.ai connector of his (the run script's connector check): CI has
   # no sign-in, so it can't load under his new rules, and the switch must undo itself.
@@ -212,5 +255,5 @@ legacy-here)
   [ ! -e $D/c1/journal ] || fail "a journal was begun in the old session's container"
   echo "rc=$rc"
   ;;
-*) fail "usage: in.sh points|template|switch [point]|final|plant-connector|unplant-connector|unlist-connectors|journal-there|legacy-here" ;;
+*) fail "usage: in.sh points|template|switch [point]|final|alarm|plant-connector|unplant-connector|unlist-connectors|journal-there|legacy-here" ;;
 esac

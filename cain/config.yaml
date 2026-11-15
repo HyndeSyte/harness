@@ -39,6 +39,8 @@ timeout: 30
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
+# notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
+# "If Cain stops"), hidden like a key. Empty: the alarms go to Discord only.
 options:
   github_token: ""
   gemini_api_key: ""
@@ -50,6 +52,7 @@ options:
   anthropic_monthly_usd: 30
   codex_monthly_runs: 200
   owner_user_id: ""
+  notice_hook: ""
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -61,3 +64,4 @@ schema:
   anthropic_monthly_usd: float(0,200)
   codex_monthly_runs: int(0,5000)
   owner_user_id: match(^([0-9a-f]{32})?$)?
+  notice_hook: password?

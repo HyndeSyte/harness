@@ -118,17 +118,18 @@ def test_cain_config_denies_every_api_and_mapping():
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099" and cfg["panel_admin"] == "true"
     assert cfg["init"] == "false"
     # Keys (the record keeper's GitHub token, the review runner's three API keys) as
-    # password fields, the review caps as bounded numbers, and the panel's owner (a
-    # Home Assistant user id, not a key). Nothing else.
+    # password fields, the review caps as bounded numbers, the panel's owner (a Home
+    # Assistant user id, not a key), and the alarms' webhook id, hidden like a key (C1
+    # second review: the App's alarms reach Home Assistant without its API). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\nschema:\n'
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  notice_hook: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n")
+        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():
@@ -293,10 +294,11 @@ def test_cain_start_decides_every_switch_outcome_under_errexit(tmp_path):
                  .replace("install -d -m 0700 -o root -g root", "mkdir -p"))
     script = ("set -o errexit -o nounset -o pipefail\n"
               "bashio::log.info() { :; }; bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
-              f'OPT="{opt.as_posix()}"\n' + body + '\necho "mode=$mode restart=$restart_first stopped=$switch_stopped"\n')
+              f'OPT="{opt.as_posix()}"\n' + body + '\necho "mode=$mode restart=$restart_first stopped=$switch_stopped kind=$stop_kind"\n')
     (tmp_path / "start.sh").write_text(script)
-    want = {"0": "mode=own", "1": "mode=old", "2": "mode=none restart= stopped=1",
-            "3": "mode=old", "4": "mode=none restart=1"}
+    want = {"0": "mode=own restart= stopped= kind=", "1": "mode=old restart= stopped= kind=",
+            "2": "mode=none restart= stopped=1 kind=switch-stopped",
+            "3": "mode=old restart= stopped= kind=", "4": "mode=none restart=1 stopped= kind=restart"}
     for rc, expect in want.items():
         (data / "c1").mkdir(exist_ok=True)
         for f in ("failed", "uid1000-ran", "legacy-ran"):
@@ -348,15 +350,17 @@ def test_a_breach_found_by_the_check_keeps_cain_stopped_on_that_version_only(tmp
     assert start("0.12.1").startswith("mode=own check= ") and not mark.exists()
 
 
-def test_the_check_stops_cain_only_on_a_breach_and_tries_again_what_it_couldnt_try(tmp_path):
-    """c1/check.sh: a breach writes the stop for this version and ends his session at once; a
-    check that couldn't be tried, or gave no answer, is tried again and then reported to Cain,
-    never a stop."""
+def test_the_check_stops_cain_on_a_breach_and_holds_him_when_it_cant_finish(tmp_path):
+    """c1/check.sh: a breach writes the stop for this version, ends his session and tells Dane at
+    once. A check that couldn't be tried, or gave no answer, is tried again, five tries in all, and
+    then holds his session (C1 second review, must-fix 1): the hold for this version, his session
+    ended, Dane told it's a pause, never a session left running unchecked. Held, the start tries
+    once at a time with no session to end: a check that finishes lifts the hold, and a breach turns
+    it into a stop."""
     import json
     import shutil
     import subprocess
     if not shutil.which("bash") or not shutil.which("jq"):
-        import pytest
         pytest.skip("no bash or jq")
     opt = tmp_path / "opt"
     (opt / "c1").mkdir(parents=True)
@@ -364,31 +368,335 @@ def test_the_check_stops_cain_only_on_a_breach_and_tries_again_what_it_couldnt_t
     (opt / "as-cain").write_text('#!/bin/bash\nif [ "$1" = tmux ]; then echo killed >> "$STUB/calls"; exit 0; fi\n'
                                  'n=$(cat "$STUB/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUB/n"\n'
                                  'sed -n "$((n + 1))p" "$STUB/answers"\n')
-    (opt / "as-cain").chmod(0o755)
+    (opt / "notice.sh").write_text('#!/bin/bash\necho "notice $*" >> "$STUB/calls"\n')
+    for f in ("as-cain", "notice.sh"):
+        (opt / f).chmod(0o755)
 
-    def check(*answers):
+    def check(*answers, held=False):
         stub = tmp_path / f"s{len(list(tmp_path.iterdir()))}"
         stub.mkdir()
         (stub / "answers").write_text("\n".join(answers) + "\n")
         env = {**os.environ, "STUB": stub.as_posix(), "C1_OPT": opt.as_posix(), "C1_CHECK_OUT": (stub / "out.json").as_posix(),
-               "C1_CHECK_FAILED": (stub / "failed").as_posix(), "RELAY_QUEUE": (stub / "queue").as_posix(),
+               "C1_CHECK_FAILED": (stub / "failed").as_posix(), "C1_CHECK_HELD": (stub / "held").as_posix(),
                "C1_VERSION": "0.12.0", "C1_CHECK_RETRY_S": "0"}
+        if held:                                   # the start's tries while he's held
+            (stub / "held").write_text("0.12.0 his key on /card: the link didn't answer\n")
+            env.update(C1_HELD="1", C1_CHECK_TRIES="1")
         out = subprocess.run(["bash", (opt / "c1/check.sh").as_posix()], capture_output=True, text=True, env=env)
-        assert out.returncode == 0, out.stderr[-400:]
         read = lambda f: (stub / f).read_text() if (stub / f).exists() else ""
-        return out.stdout.strip(), read("failed"), read("calls"), read("queue"), int(read("n") or 0)
+        line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+        return out.returncode, line, read("failed"), read("held"), read("calls"), int(read("n") or 0)
 
     good = json.dumps({"ok": True, "failed": [], "unchecked": [], "checks": 30})
     later = json.dumps({"ok": True, "failed": [], "unchecked": ["his key on /card: the link didn't answer"], "checks": 29})
     breach = json.dumps({"ok": False, "failed": ["can't read /data/link/discord.env"], "unchecked": [], "checks": 30})
-    line, failed, calls, queue, n = check(good)
-    assert (line, failed, calls, queue, n) == ("[c1] check: all 30 held", "", "", "", 1)
-    line, failed, calls, queue, n = check(breach)
-    assert failed == "0.12.0 can't read /data/link/discord.env\n" and calls == "killed\n" and n == 1 and "FAILED" in line
-    line, failed, calls, queue, n = check(later, later, good)
-    assert (failed, calls, queue, n) == ("", "", "", 3) and line == "[c1] check: all 30 held"
-    line, failed, calls, queue, n = check(*["not json"] * 5)
-    assert failed == "" and calls == "" and n == 5 and "gave no answer" in queue and "P33" in queue
+    assert check(good) == (0, "[c1] check: all 30 held", "", "", "", 1)
+    rc, line, failed, held, calls, n = check(breach)
+    assert (rc, failed, held, calls, n) == (3, "0.12.0 can't read /data/link/discord.env\n", "", "killed\nnotice tell breach\n", 1)
+    assert "FAILED" in line
+    assert check(later, later, good) == (0, "[c1] check: all 30 held", "", "", "", 3)
+    # Never finished: held after five tries, his session ended, Dane told it's a pause.
+    rc, line, failed, held, calls, n = check(*["not json"] * 5)
+    assert (rc, failed, held, calls, n) == (4, "", "0.12.0 the check gave no answer\n", "killed\nnotice tell held\n", 5)
+    assert "held (not a breach)" in line
+    rc, line, failed, held, calls, n = check(*[later] * 5)
+    assert (rc, held, calls, n) == (4, "0.12.0 his key on /card: the link didn't answer\n", "killed\nnotice tell held\n", 5)
+    # Held: one try each time, no session to end.
+    assert check(good, held=True) == (0, "[c1] check: all 30 held", "", "", "", 1)
+    rc, line, failed, held, calls, n = check(later, held=True)
+    assert (rc, failed, calls, n) == (4, "", "notice tell held\n", 1) and held.startswith("0.12.0 his key on /card")
+    rc, line, failed, held, calls, n = check(breach, held=True)
+    assert (rc, failed, held, calls, n) == (3, "0.12.0 can't read /data/link/discord.env\n", "", "notice tell breach\n", 1)
+
+
+def _start_block(tmp_path, stubs, extra_echo):
+    """The start's decision (services.d/cain/run, from relay() up to its log line), run as bashio
+    runs it (errexit, nounset, pipefail) on a fake /data, with stub scripts under a fake /opt/cain."""
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    block = run[run.index('relay() {'):run.index('[ -z "$stopped_why" ] || bashio::log.error')]
+    data, opt = tmp_path / "data", tmp_path / "opt"
+    (data / "c1").mkdir(parents=True, exist_ok=True)
+    (data / "link").mkdir(exist_ok=True)
+    (opt / "c1").mkdir(parents=True, exist_ok=True)
+    for name, body in stubs.items():
+        (opt / name).write_text("#!/bin/bash\n" + body + "\n")
+        (opt / name).chmod(0o755)
+    body = (block.replace("/data/", f"{data.as_posix()}/")
+                 .replace("install -d -m 0700 -o root -g root", "mkdir -p"))
+    script = ("set -o errexit -o nounset -o pipefail\n"
+              "bashio::log.info() { :; }; bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
+              'bashio::addon.version() { [ -n "${STUB_VERSION:-}" ] && echo "$STUB_VERSION"; }\n'
+              f'OPT="{opt.as_posix()}"\n' + body + "\n" + extra_echo + "\n")
+    (tmp_path / "start.sh").write_text(script)
+    return data, opt
+
+
+def _run_start(tmp_path, **env):
+    import subprocess
+    out = subprocess.run(["bash", (tmp_path / "start.sh").as_posix()], capture_output=True, text=True,
+                         env={**os.environ, **env})
+    assert out.returncode == 0, out.stderr[-500:]
+    return out.stdout.strip()
+
+
+def test_a_held_start_runs_everything_but_his_session(tmp_path):
+    """A hold of his session (c1/check.sh couldn't finish) is for the version it happened on: the
+    start runs the new way's services but not his session or check-ins, and tries the check again
+    until it finishes (hold). A breach on record wins over a hold; a new version starts afresh."""
+    import shutil
+    if not shutil.which("bash"):
+        pytest.skip("no bash")
+    data, _ = _start_block(tmp_path, {"c1/state.sh": "echo cut", "c1/lock.sh": '[ -z "${STUB_LOCK_FAIL:-}" ]'},
+                           'echo "mode=$mode held=$held kind=$stop_kind"')
+    mark = data / "c1/check-held"
+    assert _run_start(tmp_path, STUB_VERSION="0.12.0") == "mode=own held= kind="
+    mark.write_text("0.12.0 his key on /card: the link didn't answer\n")
+    assert _run_start(tmp_path, STUB_VERSION="0.12.0") == "mode=own held=1 kind="
+    assert _run_start(tmp_path, STUB_VERSION="") == "mode=own held=1 kind="            # the version can't be read
+    assert _run_start(tmp_path, STUB_VERSION="0.12.0", STUB_LOCK_FAIL="1") == "mode=none held= kind=setup"
+    (data / "c1/check-failed").write_text("0.12.0 can't read /data/link/discord.env\n")
+    assert _run_start(tmp_path, STUB_VERSION="0.12.0") == "mode=none held= kind=breach"
+    (data / "c1/check-failed").unlink()
+    assert _run_start(tmp_path, STUB_VERSION="0.12.1") == "mode=own held= kind=" and not mark.exists()
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    for step in ("start_his_session", "with_session", "checkins"):
+        assert f'if [ "$mode" != none ] && [ -z "$held" ]; then {step}; fi' in run, step
+    assert 'if [ -n "$held" ]; then hold; fi' in run
+
+
+def test_the_held_start_tries_the_check_until_it_finishes(tmp_path):
+    """hold (services.d/cain/run): Dane hears it's a pause; the check is tried once at a time,
+    without his session, until it finishes; then his session starts with what runs with it. A
+    breach found meanwhile turns the hold into a stop, here, with no restart needed to tell him."""
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        pytest.skip("no bash")
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    start = run.index("hold() {")
+    fn = run[start:run.index("\n}\n", start) + 3]
+    data, opt = tmp_path / "data", tmp_path / "opt"
+    (data / "c1").mkdir(parents=True)
+    (opt / "c1").mkdir(parents=True)
+    (data / "c1/check-held").write_text("0.12.0 his key on /card: the link didn't answer\n")
+    (opt / "notice.sh").write_text('#!/bin/bash\necho "notice $*" >> "$CALLS"\n')
+    (opt / "c1/check.sh").write_text('#!/bin/bash\necho "check held=$C1_HELD tries=$C1_CHECK_TRIES version=$C1_VERSION" >> "$CALLS"\n'
+                                     'n=$(cat "$CALLS.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$CALLS.n"\n'
+                                     'rc=$(sed -n "$((n + 1))p" "$CODES"); echo "[c1] the check said $rc"; exit "$rc"\n')
+    for f in ("notice.sh", "c1/check.sh"):
+        (opt / f).chmod(0o755)
+    script = ("set -o errexit -o nounset -o pipefail\n"
+              "bashio::log.info() { :; }; bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
+              'start_his_session() { echo start >> "$CALLS"; }; with_session() { echo with >> "$CALLS"; }\n'
+              'checkins() { echo checkins >> "$CALLS"; }; relay() { echo "relay $1" >> "$CALLS"; }\n'
+              f'OPT="{opt.as_posix()}"; SOCK_TMUX=/x; version=0.12.0; held=1; mode=own; check_stopped=""; stop_kind=""; stopped_why=""\n'
+              + fn.replace("/data/", f"{data.as_posix()}/")
+              + 'hold\necho "mode=$mode held=$held kind=$stop_kind why=$stopped_why"\n')
+    (tmp_path / "hold.sh").write_text(script)
+
+    def hold(*codes):
+        calls = tmp_path / f"calls{len(list(tmp_path.glob('calls*')))}"
+        (tmp_path / "codes").write_text("\n".join(map(str, codes)) + "\n")
+        env = {**os.environ, "CALLS": calls.as_posix(), "CODES": (tmp_path / "codes").as_posix(),
+               "C1_HELD_FIRST_S": "0", "C1_HELD_EVERY_S": "0"}
+        out = subprocess.run(["bash", (tmp_path / "hold.sh").as_posix()], capture_output=True, text=True, env=env, timeout=30)
+        assert out.returncode == 0, out.stderr[-500:]
+        return out.stdout.strip().splitlines(), calls.read_text().splitlines()
+
+    tried = "check held=1 tries=1 version=0.12.0"
+    out, calls = hold(4, 4, 0)
+    assert calls[:4] == ["notice tell held", tried, tried, tried] and calls[5:] == ["start", "with", "checkins"]
+    # Cain hears it once he's back, for the laptop session.
+    assert calls[4].startswith("relay Your session was held because the check of your own user couldn't finish "
+                               "(his key on /card: the link didn't answer)") and "P33" in calls[4]
+    assert out[-1].startswith("mode=own held= kind= ") and out[:3] == ["[c1] the check said 4"] * 2 + ["[c1] the check said 0"]
+    (data / "c1/check-failed").write_text("0.12.0 can't read /data/link/discord.env\n")
+    out, calls = hold(4, 3)
+    assert calls == ["notice tell held", tried, tried]
+    assert out[-1].startswith("mode=none held= kind=breach why=a check of his own user found a breach: can't read")
+
+
+def test_no_stop_is_silent(tmp_path):
+    """C1 second review, must-fix 2, made general: every way the start decides he isn't started
+    names the alarm Dane gets (notice.sh), and the stop tells him at once (a stop that waits for
+    the Supervisor's restart, after half an hour of asking). No stop is left to the App log."""
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        pytest.skip("no bash")
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    code = [l for l in run.splitlines() if not l.lstrip().startswith("#")]
+    sets = [l for l in code if re.search(r"(^|[\s;)])mode=none\b", l)]
+    assert len(sets) >= 9
+    for line in sets:
+        assert re.search(r"\bstop_kind=[a-z-]+", line), line
+    kinds = set(re.findall(r"\bstop_kind=([a-z-]+)", run))
+    assert kinds == {"setup", "breach", "switch-stopped", "restart", "damaged"}
+    for kind in kinds | {"held", "switch-failed", "switch-waits"}:
+        out = subprocess.run(["bash", (CAIN / "rootfs/opt/cain/notice.sh").as_posix(), "text", kind], capture_output=True, text=True)
+        assert out.returncode == 0 and out.stdout.count("\n") == 2, kind
+    start = run.index("stopped() {")
+    fn = run[start:run.index("\n}\n", start)]
+    assert '*) "$OPT/notice.sh" tell "${stop_kind:-setup}" || true' in fn
+    assert 'if [ "$asks" = 3 ]; then "$OPT/notice.sh" tell restart || true; fi' in fn
+    assert 'if [ "$mode" = none ]; then stopped; fi' in run
+    # The old one-off Discord notices are gone: notice.sh is the one way his alarms go.
+    assert "check-told" not in run and "stopped-told" not in run and '"$OPT/alert.sh" "Cain is stopped' not in run
+    # The start's decision, for each stop it can reach.
+    _start_block(tmp_path, {"c1/state.sh": 'cat "$STUB_STATE"', "c1/lock.sh": '[ "$1" != "${STUB_LOCK_FAIL:-}" ]',
+                            "c1/cutover.sh": 'exit "$STUB_RC"'}, 'echo "mode=$mode kind=$stop_kind"')
+    (tmp_path / "state").write_text("broken\n")
+    env = {"STUB_STATE": (tmp_path / "state").as_posix(), "STUB_VERSION": "0.12.0", "STUB_RC": "0"}
+    assert _run_start(tmp_path, **env) == "mode=none kind=damaged"
+    (tmp_path / "state").write_text("cut\n")
+    assert _run_start(tmp_path, **env) == "mode=own kind="
+    assert _run_start(tmp_path, **env, STUB_LOCK_FAIL="verify") == "mode=none kind=setup"
+    assert _run_start(tmp_path, **env, STUB_LOCK_FAIL="run") == "mode=none kind=setup"
+
+
+def test_each_failed_switch_reaches_dane_once(tmp_path):
+    """C1 second review, must-fix 2: a try of the switch that fails reaches Dane from root at once,
+    the first time too, not only after the third, and Cain for the laptop session; once per try,
+    never again at a start that only waits. The third, which starts the six-hour wait, says so."""
+    import shutil
+    if not shutil.which("bash") or not shutil.which("jq"):
+        pytest.skip("no bash or jq")
+    data, opt = _start_block(tmp_path, {
+        "c1/state.sh": "echo fresh",
+        "c1/lock.sh": "exit 0",
+        # 0.12.0's switch, failing its validation each time (exit 4: wait for a new container),
+        # until three failures stand; then it waits and begins nothing (exit 1).
+        "c1/cutover.sh": 'f="$STUB_DATA/c1/failed"; [ "$(wc -l < "$f" 2>/dev/null || echo 0)" -ge 3 ] && exit 1\n'
+                         'echo "2026-11-15T23:00:0$(wc -l < "$f" 2>/dev/null || echo 0)Z the smoke test failed" >> "$f"; exit 4',
+        "notice.sh": 'echo "notice $*" >> "$STUB_DATA/calls"',
+    }, 'echo "mode=$mode kind=$stop_kind"')
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "bun").write_text('#!/bin/bash\ncase "$2" in container-id) echo "boot:1";;\n'
+                                'may-retry) [ "$(wc -l < "$3" 2>/dev/null || echo 0)" -lt 3 ];; write-state) printf %s "$4" > "$3";; *) exit 0;; esac\n')
+    (bindir / "bun").chmod(0o755)
+    (data / "link/specialist-signs").write_text("1")
+    env = {"STUB_DATA": data.as_posix(), "STUB_VERSION": "0.12.0", "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}
+    calls, queue = data / "calls", data / "relay.queue"
+    read = lambda f: f.read_text().splitlines() if f.exists() else []
+    for n, kind in ((1, "switch-failed"), (2, "switch-failed"), (3, "switch-waits")):
+        assert _run_start(tmp_path, **env) == "mode=none kind=restart"
+        assert read(calls)[-1] == f"notice tell {kind}" and len(read(calls)) == n
+        assert len(read(queue)) == n and "the smoke test failed" in read(queue)[-1] and "P33" in read(queue)[-1]
+        assert (data / "c1/failed-told").read_text().strip() == str(n)
+    assert _run_start(tmp_path, **env) == "mode=old kind="            # waits: nothing new to tell
+    assert len(read(calls)) == 3 and len(read(queue)) == 3
+
+
+def test_the_apps_alarms_reach_dane_from_root_by_his_bot_and_home_assistant(tmp_path):
+    """notice.sh (C1 second review, must-fix 2): an alarm goes to his bot once, retried until it
+    goes through, and to Home Assistant's webhook (the notice_hook option) daily while it lasts and
+    at once when the hook is set or changed, even while Discord is down. The hook stays off every
+    command line. A newer alarm replaces the last; one that clears takes the notification down and
+    says so. Every alarm is plain words for him, with the way back."""
+    import hashlib
+    import json
+    import shutil
+    import subprocess
+    if not shutil.which("bash") or not shutil.which("jq") or not shutil.which("sha256sum"):
+        pytest.skip("no bash, jq or sha256sum")
+    notice = (CAIN / "rootfs/opt/cain/notice.sh").as_posix()
+    opt, data, stub, bindir = (tmp_path / d for d in ("opt", "data", "stub", "bin"))
+    for d in (opt, data, stub, bindir):
+        d.mkdir()
+    (opt / "alert.sh").write_text('#!/bin/bash\n[ -f "$STUB/discord-up" ] || exit 1\n'
+                                  'printf "%s | %s | %s\\n" "$TOKEN_FILE" "$ACCESS_FILE" "$1" >> "$STUB/discord"\n')
+    # Home Assistant's side: curl, which reads its address from stdin; what it was given is kept.
+    (bindir / "curl").write_text('#!/bin/bash\n[ -f "$STUB/ha-up" ] || exit 7\ncat > "$STUB/curl-stdin"\n'
+                                 'printf "%s\\n" "$@" > "$STUB/curl-args"\nfor a in "$@"; do last="$a"; done\n'
+                                 'printf "%s\\n" "$(grep -o "url = .*" "$STUB/curl-stdin") $last" >> "$STUB/ha"\n')
+    for f in (opt / "alert.sh", bindir / "curl"):
+        f.chmod(0o755)
+    hook = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+    options = data / "options.json"
+    options.write_text(json.dumps({"github_token": "x", "notice_hook": ""}))
+    env = {**os.environ, "STUB": stub.as_posix(), "NOTICE_OPT": opt.as_posix(), "NOTICE_DATA": data.as_posix(),
+           "NOTICE_URL": "http://ha.test:8123", "NOTICE_DAY_S": "100000",
+           "PATH": f"{bindir.as_posix()}{os.pathsep}{os.environ['PATH']}"}
+    state = data / "c1/notice"
+
+    def call(*args, **more):
+        out = subprocess.run(["bash", notice, *args], capture_output=True, text=True, env={**env, **more}, timeout=30)
+        assert out.returncode == 0, (args, out.stderr[-400:])
+        return out.stdout
+
+    read = lambda f: (stub / f).read_text().splitlines() if (stub / f).exists() else []
+    def field(k):
+        for line in state.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == k:
+                return value
+        return ""
+
+    # Every alarm: plain words for him, the way back, nothing he can't read.
+    for kind in ("breach", "switch-stopped", "damaged", "setup", "restart", "held", "switch-failed", "switch-waits"):
+        title, text = call("text", kind).splitlines()
+        for words in (title, text):
+            assert "—" not in words and "add-on" not in words.lower(), kind
+            assert not re.search(r"\b([PQ]\d+|[CDF]\d|wave \d)\b", words), kind
+        assert "Settings, " in text or "Nothing for you to do" in text, kind
+
+    # Raised while Discord is down and no hook is set: kept, nothing lost.
+    call("tell", "held")
+    assert field("kind") == "held" and field("discord") == "0" and field("sent") == "0" and read("ha") == []
+    # The hook is set: Home Assistant has it at once, by stdin, never on a command line.
+    (stub / "ha-up").touch()
+    options.write_text(json.dumps({"github_token": "x", "notice_hook": hook}))
+    call("tick")
+    assert read("ha")[-1].startswith(f'url = "http://ha.test:8123/api/webhook/{hook}"')
+    sent = json.loads(read("ha")[-1].split('" ', 1)[1])
+    assert sent["state"] == "on" and sent["alarm"] == "held" and sent["title"] == "Cain is paused" and "isn't a breach" in sent["message"]
+    assert not any(hook in a for a in read("curl-args"))
+    assert field("fp") == hashlib.sha256(hook.encode()).hexdigest()[:16] and field("discord") == "0"
+    # Discord comes back: his bot posts it once, from root's copy of the token.
+    (stub / "discord-up").touch()
+    (data / "link").mkdir()
+    (data / "link/discord.env").write_text("DISCORD_BOT_TOKEN=x\n")
+    call("tick")
+    assert len(read("discord")) == 1 and read("discord")[0].startswith(f"{data.as_posix()}/link/discord.env | ")
+    assert read("discord")[0].endswith("isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. "
+                                       "If he isn't back within an hour, restore two backups from just before his last update, Cain's and the calendar App's, "
+                                       "one after the other: Settings, System, Backups. The Cain App's log has the details.")
+    call("tick"); call("tell", "held")
+    assert len(read("discord")) == 1 and len(read("ha")) == 1             # raised already: nothing new
+    call("tick", NOTICE_DAY_S="0")
+    assert len(read("ha")) == 2 and len(read("discord")) == 1             # Home Assistant daily, Discord once
+    options.write_text(json.dumps({"notice_hook": hook[::-1]}))
+    call("tick")
+    assert len(read("ha")) == 3 and hook[::-1] in read("ha")[-1]          # a new hook has it at once
+    # A newer alarm replaces it, both ways.
+    call("tell", "breach")
+    assert read("discord")[-1].endswith("| Cain is stopped: a safety check of his own user failed after his update, so he won't run on this version. "
+                                        "To get him back now, restore two backups from just before his last update, Cain's and the calendar App's, "
+                                        "one after the other: Settings, System, Backups. A fixed update also brings him back. The Cain App's log has the details.")
+    assert json.loads(read("ha")[-1].split('" ', 1)[1])["title"] == "Cain is stopped"
+    # He runs again: the notification comes down, and both say so.
+    call("clear", "running")
+    assert not state.exists() and read("discord")[-1].endswith("| Cain is running again.")
+    last = json.loads(read("ha")[-1].split('" ', 1)[1])
+    assert (last["state"], last["title"], last["message"]) == ("clear", "Cain is back", "Cain is running again.")
+    # A failed switch isn't cleared by his running the old way, only by his running as his own user.
+    call("tell", "switch-failed")
+    call("clear", "running")
+    assert field("kind") == "switch-failed"
+    os.remove(stub / "ha-up")                                             # Home Assistant away as it clears
+    call("clear", "switched")
+    assert field("clear") == "1" and read("discord")[-1].endswith("| Cain now runs as his own user, the safer setup in his update.")
+    (stub / "ha-up").touch()
+    call("tick")
+    assert not state.exists() and json.loads(read("ha")[-1].split('" ', 1)[1])["title"] == "Cain moved to his own user"
+    # A hook that isn't one is never used.
+    for bad in ("../../api/services", "short", hook + "/x"):
+        options.write_text(json.dumps({"notice_hook": bad}))
+        n = len(read("ha"))
+        call("tell", "damaged"); call("tick", NOTICE_DAY_S="0")
+        assert len(read("ha")) == n, bad
+        state.unlink()
 
 
 def test_the_old_way_keeps_his_connectors_only_from_a_listing_that_went_through(tmp_path):
