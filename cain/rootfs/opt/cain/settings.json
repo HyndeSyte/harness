@@ -72,11 +72,10 @@
     ],
     "SessionStart": [
       {
-        "matcher": "startup|resume|clear|compact",
         "hooks": [
-          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 1", "timeout": 15 },
-          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 2", "timeout": 15 },
-          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 3", "timeout": 15 }
+          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 1 || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Part 1 of the standards (Dane) did not load: read /opt/cain/standards/registry.md yourself now, before you act. That it did not load is a defect to report.\"}}'", "timeout": 15 },
+          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 2 || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Part 2 of the standards (Dane) did not load: read /opt/cain/standards/registry.md yourself now, before you act. That it did not load is a defect to report.\"}}'", "timeout": 15 },
+          { "type": "command", "command": "bun /opt/cain/standards/load.ts cain --part 3 || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Part 3 of the standards (Dane) did not load: read /opt/cain/standards/registry.md yourself now, before you act. That it did not load is a defect to report.\"}}'", "timeout": 15 }
         ]
       }
     ]

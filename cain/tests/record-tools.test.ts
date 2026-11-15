@@ -1,7 +1,7 @@
 // The laptop's record tools (cain/tools/), run as a laptop session would run them,
 // against a keeper on a real git repo standing in for GitHub.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { openRow, rowHash } from "../rootfs/opt/cain/record/core.ts";
 import { cycle } from "../rootfs/opt/cain/record/main.ts";
@@ -297,5 +297,22 @@ describe("session-end", () => {
     writeFileSync(transcript, plan(["Build", "completed"], ["Verify after his tap", "pending"], ["Merge", "pending"]));
     expect(end().out).toBe("Open steps filed in the record (2)");
     expect(l.inboxNames()).toHaveLength(1);
+  }, 60_000);
+
+  test("a transcript that can't be read is said on the item it holds; a second end while one is filing adds nothing", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
+    cycle(l.cfg);
+    const end = () => l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: join(l.root, "gone.jsonl") }) });
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(memo, { recursive: true });
+    writeFileSync(join(memo, `${SA}.ending`), "1");                       // another end of it, filing now
+    expect(end()).toEqual({ code: 0, out: "", err: "" });
+    expect(l.inboxNames()).toHaveLength(0);
+    rmSync(join(memo, `${SA}.ending`));
+    expect(end()).toEqual({ code: 0, out: "Filed that the session ended unread", err: "" });
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(sh(["git", "show", "main:state/notes/P33.md"], l.remote)).toContain("its task list couldn't be read, so what it left open isn't known.");
+    expect(end()).toEqual({ code: 0, out: "", err: "" });                 // said once
   }, 60_000);
 });

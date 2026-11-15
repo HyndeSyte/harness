@@ -192,7 +192,15 @@ final)
   loaded="$(jq -c 'select(.type == "system" and .subtype == "init") | [.plugins[]? | {name, path}]' /fp/after.jsonl | head -n 1)"
   extra="$(jq -r --arg s "$OPT/plugin-seed/" 'select(.type == "system" and .subtype == "init") | .plugins[]? | select(((.path // "") | startswith($s) or . == "builtin") | not) | "\(.name) \(.path)"' /fp/after.jsonl)"
   [ -z "$extra" ] || fail "his session loaded a plugin from outside the image's seed: $extra"
-  note "final checks held ($other couldn't be installed; loaded: $loaded)"
+  # His standards reach his session: every SessionStart hook's answer, as the pinned Claude Code
+  # ran it for his own user under the managed settings, is a part of the registry, all of them.
+  "${as_him[@]}" ANTHROPIC_API_KEY=sk-ant-api03-ci-only-not-a-real-key timeout 120 claude -p --output-format stream-json --verbose --include-hook-events --max-turns 1 "ok" > /fp/standards.jsonl 2> /fp/standards.err || true
+  heads="$(jq -r 'select(.type == "system" and .subtype == "hook_response" and .hook_event == "SessionStart") | .stdout // ""' /fp/standards.jsonl \
+    | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null | grep -o "^Dane's standards, part [0-9] of [0-9]" | sort -u)"
+  [ "$(printf '%s\n' "$heads" | grep -c .)" = 3 ] && [ "$(printf '%s\n' "$heads" | tail -n 1)" = "Dane's standards, part 3 of 3" ] \
+    || fail "his session didn't get his standards' 3 parts: $(printf '%s' "$heads" | tr '\n' ' ')| $(head -c 300 /fp/standards.err)"
+  ! grep -q "did not load\|didn't load" /fp/standards.jsonl || fail "a part of his standards didn't load as his own user"
+  note "final checks held ($other couldn't be installed; loaded: $loaded; his standards: 3 parts)"
   ;;
 plant-connector)
   # The old way recorded a claude.ai connector of his (the run script's connector check): CI has

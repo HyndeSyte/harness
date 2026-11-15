@@ -3,5 +3,28 @@
     "deny": [
       "PushNotification"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$CLAUDE_PROJECT_DIR/cain/rootfs/opt/cain/standards/load.ts\" jobs --part 1 || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Part 1 of the standards (Dane) did not load: read cain/rootfs/opt/cain/standards/registry.md in this repository yourself now, before you change anything: the entries that apply to all and to jobs. That it did not load is a defect to report.\"}}'",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "bun \"$CLAUDE_PROJECT_DIR/cain/rootfs/opt/cain/standards/load.ts\" jobs --part 2 || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Part 2 of the standards (Dane) did not load: read cain/rootfs/opt/cain/standards/registry.md in this repository yourself now, before you change anything: the entries that apply to all and to jobs. That it did not load is a defect to report.\"}}'",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "bun \"$CLAUDE_PROJECT_DIR/cain/rootfs/opt/cain/standards/load.ts\" jobs --part 3 || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Part 3 of the standards (Dane) did not load: read cain/rootfs/opt/cain/standards/registry.md in this repository yourself now, before you change anything: the entries that apply to all and to jobs. That it did not load is a defect to report.\"}}'",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
   }
 }

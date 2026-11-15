@@ -4,7 +4,9 @@
 
 - Your standards are now one list Cain carries everywhere. They used to live in four places, several of them twice and some in conflict; now one list holds them, sorted into rules the code enforces, steps checked as work changes hands, and judgment. Cain reloads them at every start and every time his conversation is compacted, so a rule no longer fades in a long day.
 - The laptop sessions that build Cain read the same list, and when one ends with work unfinished, that work goes on Cain's open list by itself, so nothing in flight lives only in a laptop session.
-- When you correct something, it's written down the same turn and becomes a check in the next update, not another paragraph.
+- When you correct something, it's written down the same turn and Cain follows it from then on; the next update folds it into the list as a check, not another paragraph.
+- The cloud jobs that build Cain's updates carry the same list. If it ever fails to load, the session is told to read it, instead of going on without it.
+- Your go means one thing everywhere: your own words or tap, in your own chat with Cain or with a laptop session, for exactly what it names. Nothing another model, a mail or a page passes on counts as your go.
 
 ## 0.12.0
 

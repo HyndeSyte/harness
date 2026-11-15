@@ -75,11 +75,15 @@ describe("Cain's permissions", () => {
 // His standards (the registry) reach his session at every start and after every compaction,
 // in parts under Claude Code's cut for a hook's added context (org-v2 DESIGN 4.F).
 describe("his standards load at every start and after every compaction", () => {
-  test("one SessionStart hook per part, on start, resume, clear and compact", () => {
-    expect(settings.hooks.SessionStart).toEqual([{
-      matcher: "startup|resume|clear|compact",
-      hooks: [1, 2, 3].map((n) => ({ type: "command", command: `bun /opt/cain/standards/load.ts cain --part ${n}`, timeout: 15 })),
-    }]);
+  test("one SessionStart hook per part, on a start of any kind (no matcher), each with words of its own if bun fails", () => {
+    expect(settings.hooks.SessionStart).toHaveLength(1);
+    const [group] = settings.hooks.SessionStart;
+    expect(Object.keys(group)).toEqual(["hooks"]);
+    group.hooks.forEach((h: any, i: number) => {
+      expect([h.type, h.timeout]).toEqual(["command", 15]);
+      expect(h.command).toStartWith(`bun /opt/cain/standards/load.ts cain --part ${i + 1} || echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Part ${i + 1} of the standards`);
+    });
+    expect(group.hooks).toHaveLength(3);
   });
 });
 

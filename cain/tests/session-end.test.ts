@@ -2,59 +2,97 @@
 // org-v2 DESIGN 4.F, the registry's S-051): its task list replayed from its transcript, then
 // filed as a note on each item it holds, or as a line for Cain to fold in when it holds none.
 import { describe, expect, test } from "bun:test";
-import { filedKey, requestFor, stepsOf } from "../tools/session-end";
+import { clean, fileAgain, filedKey, requestFor, stepsOf } from "../tools/session-end";
 
-const use = (name: string, input: unknown) => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name, input }] } });
-const said = (text: string) => JSON.stringify({ type: "user", message: { role: "user", content: text } });
+const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
+const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
 const plan = (...s: [string, string][]) => ({ items: s.map(([content, status]) => ({ content, status })) });
 
 describe("the task list as the session left it", () => {
-  test("update_plan: items replace it; advance, done and start move steps; wrap_up finishes the one in progress", () => {
-    const lines = [
-      said("Finish the thing"),
+  test("update_plan: items replace it; advance, done and start move steps", () => {
+    const { steps, planned } = stepsOf([
       use("mcp__ccd_turn__update_plan", plan(["Look", "in_progress"], ["Build", "pending"], ["Ship", "pending"])),
       use("mcp__ccd_turn__update_plan", { advance: true }),
       use("mcp__ccd_turn__update_plan", { done: [2], start: 3 }),
-      use("mcp__ccd_turn__wrap_up", { recap: "x" }),
-    ];
-    const { steps, first } = stepsOf(lines);
-    expect(steps).toEqual([{ content: "Look", status: "completed" }, { content: "Build", status: "completed" }, { content: "Ship", status: "completed" }]);
-    expect(first).toBe("Finish the thing");
+    ]);
+    expect(planned).toBe(true);
+    expect(steps).toEqual([{ content: "Look", status: "completed" }, { content: "Build", status: "completed" }, { content: "Ship", status: "in_progress" }]);
   });
 
-  test("a later plan replaces an earlier one; steps not done stay open", () => {
+  test("wrap_up finishes nothing: a step is done only when its own status says so", () => {
+    const { steps } = stepsOf([
+      use("mcp__ccd_turn__update_plan", plan(["Build", "completed"], ["Ship", "in_progress"])),
+      use("mcp__ccd_turn__wrap_up", { recap: "Built; shipping waits on his tap." }),
+    ]);
+    expect(steps.filter((s) => s.status !== "completed").map((s) => s.content)).toEqual(["Ship"]);
+  });
+
+  test("a call that failed changes nothing", () => {
+    const { steps } = stepsOf([
+      use("mcp__ccd_turn__update_plan", plan(["Verify after his tap", "pending"]), "a1"),
+      use("mcp__ccd_turn__update_plan", plan(["Verify after his tap", "completed"]), "a2"),
+      failed("a2"),
+    ]);
+    expect(steps).toEqual([{ content: "Verify after his tap", status: "pending" }]);
+  });
+
+  test("a later plan replaces an earlier one; lines that aren't JSON are passed over; TodoWrite counts the same way", () => {
     const { steps } = stepsOf([
       use("mcp__ccd_turn__update_plan", plan(["Old", "in_progress"])),
       use("mcp__ccd_turn__update_plan", plan(["Fix it", "completed"], ["Verify after his tap", "pending"])),
       "not json at all",
     ]);
     expect(steps.filter((s) => s.status !== "completed").map((s) => s.content)).toEqual(["Verify after his tap"]);
-  });
-
-  test("TodoWrite's list counts the same way", () => {
-    const { steps } = stepsOf([use("TodoWrite", { todos: [{ content: "A", status: "completed", activeForm: "a" }, { content: "B", status: "in_progress", activeForm: "b" }] })]);
-    expect(steps.map((s) => s.status)).toEqual(["completed", "in_progress"]);
+    const todo = stepsOf([use("TodoWrite", { todos: [{ content: "A", status: "completed", activeForm: "a" }, { content: "B", status: "in_progress", activeForm: "b" }] })]);
+    expect([todo.planned, todo.steps.map((s) => s.status)]).toEqual([true, ["completed", "in_progress"]]);
+    expect(stepsOf([use("Bash", { command: "ls" })]).planned).toBe(false);
   });
 });
 
 describe("what it files", () => {
   const open = [{ content: "Verify after his tap", status: "pending" }, { content: "Clean | up", status: "in_progress" }];
+  const at = new Date("2026-11-15T03:00:00Z");
   test("nothing open: nothing filed", () => {
-    expect(requestFor("s1", [], ["P33"], "")).toBeNull();
+    expect(requestFor("s1", [], ["P33"], "open")).toBeNull();
   });
   test("a note on each item it holds, its steps on one line", () => {
-    const r = requestFor("s1", open, ["P33", "P40"], "Finish", new Date("2026-11-15T03:00:00Z"));
+    const r = requestFor("s1", open, ["P33", "P40"], "open", at);
     expect(r.ops.map((o: any) => [o.op, o.item])).toEqual([["note", "P33"], ["note", "P40"]]);
-    expect(r.ops[0].text).toContain("Verify after his tap; Clean up");
-    expect(r.ops[0].text).not.toMatch(/[\n|]/);
+    expect(r.ops[0].text).toBe("The laptop session ended (2026-11-15) with these steps open: Verify after his tap; Clean up. Its hold lapses in a day; take the item to carry it on.");
   });
-  test("the same open steps on the same items are one filing; other steps or items are another", () => {
-    expect(filedKey(["P33"], open)).toBe(filedKey(["P33"], open.map((s) => ({ ...s, status: "pending" }))));
-    expect(filedKey(["P33"], open)).not.toBe(filedKey([], open));
-    expect(filedKey(["P33"], open)).not.toBe(filedKey(["P33"], [...open, { content: "Merge", status: "pending" }]));
+  test("holding nothing: one line for Cain to fold into the open list, the steps alone (never the chat)", () => {
+    const r = requestFor("abc", open, [], "open", at);
+    expect(r.ops).toEqual([{ op: "append", path: "state/laptop-open.md", text: "- 2026-11-15 laptop session abc: Verify after his tap; Clean up\n" }]);
   });
-  test("holding nothing: one line for Cain to fold into the open list", () => {
-    const r = requestFor("abc", open, [], "Finish the thing", new Date("2026-11-15T03:00:00Z"));
-    expect(r.ops).toEqual([{ op: "append", path: "state/laptop-open.md", text: '- 2026-11-15 laptop session abc ("Finish the thing"): Verify after his tap; Clean up\n' }]);
+  test("a transcript that can't be read, or no task list, is said on the items it holds; holding none, there's nothing to say", () => {
+    expect(requestFor("s1", [], ["P33"], "unread", at).ops[0].text).toStartWith("The laptop session ended (2026-11-15) and its task list couldn't be read, so what it left open isn't known.");
+    expect(requestFor("s1", [], ["P33"], "unplanned", at).ops[0].text).toStartWith("The laptop session ended (2026-11-15) and kept no task list");
+    expect(requestFor("s1", [], [], "unread", at)).toBeNull();
+  });
+  test("anything shaped like a key is masked", () => {
+    const key = "ghp_" + "TESTONLY0123456789abcdefABCDEF0123456";
+    expect(clean(`Rotate ${key} in the vault`, 200)).toBe("Rotate [a key, masked] in the vault");
+    const r = requestFor("s1", [{ content: `Rotate ${key}`, status: "pending" }], ["P33"], "open", at);
+    expect(JSON.stringify(r)).not.toContain(key);
+  });
+});
+
+describe("filed once", () => {
+  const a = { content: "Verify after his tap", status: "pending" };
+  const b = { content: "Merge", status: "in_progress" };
+  test("the same open steps on the same items are one filing, in any order or status; other steps or items are another", () => {
+    expect(filedKey(["P33"], [a, b])).toBe(filedKey(["P33"], [{ ...b, status: "pending" }, a]));
+    expect(filedKey(["P33"], [a])).not.toBe(filedKey([], [a]));
+    expect(filedKey(["P33"], [a])).not.toBe(filedKey(["P33"], [a, b]));
+    const long = "x".repeat(130);
+    expect(filedKey([], [{ content: `${long} one`, status: "pending" }])).not.toBe(filedKey([], [{ content: `${long} two`, status: "pending" }]));
+  });
+  test("filed again only if the record refused it, or hasn't logged it a day after", () => {
+    const now = Date.parse("2026-11-15T12:00:00Z");
+    expect(fileAgain(["done"], now - 1000, now)).toBe(false);
+    expect(fileAgain(["waiting"], now - 2 * 86_400_000, now)).toBe(false);
+    for (const s of ["rejected", "conflict", "refused"]) expect(fileAgain([s], now - 1000, now)).toBe(true);
+    expect(fileAgain([], now - 3_600_000, now)).toBe(false);
+    expect(fileAgain([], now - 2 * 86_400_000, now)).toBe(true);
   });
 });

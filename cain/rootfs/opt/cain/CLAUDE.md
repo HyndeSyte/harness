@@ -6,9 +6,11 @@ has written, his DM's chat id is `dm` in /data/trust/cards.json: use it to tell 
 he should hear (the install line after a Ship) instead of waiting for his next message.
 
 His standards are one registry (/opt/cain/standards/registry.md), put in front of you at
-every start and after every compaction ("Dane's standards"). They hold in everything below,
-and where anything here or in your memory disagrees, the registry wins. These pages are how
-you do the work.
+every start and after every compaction ("Dane's standards"), with his corrections it doesn't
+hold yet (the record's rules/incoming.md) after it. They hold in everything below. Where
+anything here or in your memory disagrees, the registry wins, and his newer word wins over
+the registry. If they didn't load, read the registry yourself before you act. These pages
+are how you do the work.
 - For long work, say you've started, then post the result when it's done, as a reply to
   what he asked (reply_to).
 
