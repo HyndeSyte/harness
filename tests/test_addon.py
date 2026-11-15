@@ -1146,6 +1146,61 @@ def test_notes_are_only_ever_the_records(tmp_path):
         _notes_env_done()
 
 
+def test_what_git_cant_read_is_said_never_taken_for_none(tmp_path):
+    # Outside review, round 20: a holds file in the record's tree that git can't read is not "no
+    # holds" (a laptop's item would pass for Cain's), and a notes tree git can't walk is not "no
+    # notes". Both are said, exit 3, and the check-in says so.
+    import json
+    import os
+    import shutil
+    import subprocess
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    rec = tmp_path / "record"
+    (rec / "state" / "notes").mkdir(parents=True)
+    _write_notes(rec, "P33", [("2026-11-15T09:00:00.000Z", "cain", "dane: for the laptop session")])
+    _write_notes(rec, "P41", [("2026-11-15T10:00:00.000Z", "laptop:9f2c", "dane: the handoff")])
+    (rec / "state" / "holds.json").write_text(json.dumps({"P33": {"holder": "laptop:9f2c", "branches": []}}))
+    _as_the_keeper_pushed_it(rec)
+    _notes_env(tmp_path, rec, "2026-11-14T00:00:00.000Z")
+
+    def run(*a):
+        return subprocess.run([shutil.which("bash"), str(tmp_path / "record.sh"), *a], env=dict(os.environ),
+                              capture_output=True, text=True, encoding="utf-8", timeout=20)
+
+    def gone(spec):   # git's object for that path, set aside; returns the way to put it back
+        sha = subprocess.run(["git", "-C", str(rec), "rev-parse", f"origin/main:{spec}"], check=True,
+                             capture_output=True, text=True).stdout.strip()
+        obj = rec / ".git" / "objects" / sha[:2] / sha[2:]
+        saved = obj.read_bytes()
+        obj.chmod(0o644)
+        obj.unlink()
+        return lambda: obj.write_bytes(saved)
+
+    try:
+        r = run("unread", "2026-11-14T00:00:00Z")
+        assert r.returncode == 0 and r.stdout.startswith("P41 |") and "P33" not in r.stdout
+        # The holds file's object gone, its tree entry still there: never read as no holds.
+        back = gone("state/holds.json")
+        for args in (("unread", "2026-11-14T00:00:00Z"), ("notes", "-"), ("holds",)):
+            r = run(*args)
+            assert r.returncode == 3 and "P33" not in r.stdout and "couldn't be read" in r.stderr, (args, r)
+        line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2]
+        assert "Your record's notes couldn't be read just now" in line and "P33" not in line
+        back()
+        # The notes tree's object gone, the commit still there: never read as no notes.
+        back = gone("state/notes")
+        for args in (("notes", "P41"), ("unread", "2026-11-14T00:00:00Z"), ("notes", "-")):
+            r = run(*args)
+            assert r.returncode == 3 and r.stdout == "" and "couldn't be read" in r.stderr, (args, r)
+        back()
+        r = run("unread", "2026-11-14T00:00:00Z")
+        assert r.returncode == 0 and r.stdout.startswith("P41 |") and "P33" not in r.stdout
+    finally:
+        _notes_env_done()
+
+
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
     assert _checkin(tmp_path, "0712", IDLE + "\n  esc to interrupt") == ""
     assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed

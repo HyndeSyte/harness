@@ -33,9 +33,26 @@ reads="${NOTES_READ_DIR:-$([ -d "$home" ] && echo "$home/notes-read" || echo /da
 # read: the command says so, with exit 3, instead of reading files here.
 record_ok() { git -C "$dir" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1; }
 cant_read() { echo "The record's notes couldn't be read: this copy of the record, its $ref or its holds, can't be read." >&2; exit 3; }
-# An item's notes file in the record: its id from the record's tree (nothing when it has none),
-# then its text by that id, so what is shown, and marked read, is exactly that file.
-notes_id() { git -C "$dir" rev-parse -q --verify "$ref:state/notes/$1.md" 2>/dev/null; }
+# A path's entry in the record's tree: what ls-tree says of it ("" when the tree has no such path);
+# fails when the tree can't be read, so a tree git can't walk is never taken for an empty one.
+tree_entry() { git -C "$dir" ls-tree "$ref" -- "$1" 2>/dev/null; }
+# An item's notes file in the record: its id from the record's tree, then its text by that id, so
+# what is shown, and marked read, is exactly that file. Exit 1: the tree has no notes on it; exit 2:
+# the tree can't be read.
+notes_id() {
+  local e
+  e=$(tree_entry "state/notes/$1.md") || return 2
+  [ -n "$e" ] || return 1
+  e="${e#* blob }"; printf '%s\n' "${e%%$'\t'*}"
+}
+# The record's holds: {} only when its tree has no holds file; the file, read from git, when it
+# has one; and a failure when the tree or that file can't be read (never taken for no holds).
+holds_json() {
+  local e
+  e=$(tree_entry state/holds.json) || return 1
+  [ -n "$e" ] || { echo '{}'; return 0; }
+  git -C "$dir" cat-file blob "$ref:state/holds.json" 2>/dev/null
+}
 # Sets text to the bytes of item $1's notes file whose id is $2 (from the record's tree): from git
 # by that id, or else the copy here only when it hashes to that id (the x keeps its last newlines
 # through the $(...)). Taken once, so what is checked is what is shown. Fails, with text empty,
@@ -60,8 +77,8 @@ iso() { date -u -d "$1" +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null; }
 his_items() {
   local others list
   record_ok || return 1
-  others=$({ git -C "$dir" show "$ref:state/holds.json" 2>/dev/null || echo '{}'; } \
-    | jq -r 'to_entries[] | select(.value.holder != "cain") | .key') || { echo "couldn't read the holds" >&2; return 1; }
+  others=$(set -o pipefail; holds_json | jq -r 'to_entries[] | select(.value.holder != "cain") | .key') \
+    || { echo "couldn't read the holds" >&2; return 1; }
   list=$(git -C "$dir" ls-tree --name-only "$ref" state/notes/ 2>/dev/null) || return 1
   printf '%s\n' "$list" | sed -n 's#^state/notes/\([A-Z0-9][A-Z0-9._-]*\)\.md$#\1#p' \
     | while IFS= read -r i; do printf '%s\n' "$others" | grep -qxF "$i" || printf '%s\n' "$i"; done
@@ -89,7 +106,8 @@ case "${1:-}" in
       END { if (n != 1) exit 1 }' "$dir/state/PENDING.md" 2>/dev/null) || { echo "no single open row $item" >&2; exit 1; }
     printf '%s' "$line" | sha1sum | cut -c1-40 ;;
   holds)
-    git -C "$dir" show "$ref:state/holds.json" 2>/dev/null || echo '{}' ;;
+    record_ok || cant_read
+    holds_json || cant_read ;;
   notes)
     item="${2:-}"; since="${3:-}"
     if [ -n "$since" ]; then since=$(iso "$since") || { echo "not a time: $3" >&2; exit 2; }; fi
@@ -97,7 +115,7 @@ case "${1:-}" in
       item=$(upper "$item")
       case "$item" in [!A-Z0-9]*|*[!A-Z0-9._-]*) echo "not an item id: $2" >&2; exit 2 ;; esac
       record_ok || cant_read
-      id=$(notes_id "$item") || exit 0                     # the record has no notes on it
+      id=$(notes_id "$item"); case $? in 0) ;; 1) exit 0 ;; *) cant_read ;; esac   # 1: the record has no notes on it
       # Read means all of that file was shown: taken once and checked (take_text), then shown
       # whole, and marked only when every step of that succeeded. A read that failed anywhere, or
       # one cut by a time, marks nothing; notes that aren't the record's file aren't shown at all.
@@ -111,7 +129,7 @@ case "${1:-}" in
       # Items someone other than Cain holds are theirs to read.
       items=$(his_items) || cant_read
       for i in $items; do
-        id=$(notes_id "$i") || continue
+        id=$(notes_id "$i"); case $? in 0) ;; 1) continue ;; *) unreadable "$i"; continue ;; esac
         if take_text "$i" "$id" && rows=$(printf '%s' "$text" | note_rows "$since" "$i "); then
           [ -n "$rows" ] && printf '%s\n' "$rows"
         else
@@ -124,7 +142,7 @@ case "${1:-}" in
     if [ -n "$since" ]; then since=$(iso "$since") || { echo "not a time: $2" >&2; exit 2; }; fi
     items=$(his_items) || cant_read
     for i in $items; do
-      id=$(notes_id "$i") || continue
+      id=$(notes_id "$i"); case $? in 0) ;; 1) continue ;; *) unreadable "$i"; continue ;; esac
       if [ -f "$reads/$i" ]; then
         # Read before: unread again once the file changed in any way (a note with an old or
         # equal time included), so its newest note shows whatever its time.
