@@ -40,8 +40,13 @@ export function tailLines(path: string, max = TAIL): string[] {
     const size = fstatSync(fd).size;
     const from = Math.max(0, size - max);
     const buf = Buffer.alloc(size - from);
-    readSync(fd, buf, 0, buf.length, from);
-    const lines = buf.toString("utf8").split("\n");
+    let got = 0;
+    while (got < buf.length) {                         // a read can come back short
+      const n = readSync(fd, buf, got, buf.length - got, from + got);
+      if (n <= 0) break;
+      got += n;
+    }
+    const lines = buf.subarray(0, got).toString("utf8").split("\n");
     return from > 0 ? lines.slice(1) : lines;
   } finally { closeSync(fd); }
 }

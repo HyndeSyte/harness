@@ -36,10 +36,18 @@
 // and named at every session's start until a session deals with it. What it says of a filing
 // is that filing's own fate: submitted (in the record's inbox), filed (the keeper said done),
 // waiting here, or kept aside.
+//
+// Every flush, at a session's start or end, first settles what the journals hold: a journaled
+// filing the outbox has no trace of is put back (or marked done, or kept aside as refused, as
+// the keeper's log says), and a snapshot left by an end that couldn't take its turn in time
+// (each end leaves one before it waits) is journaled and filed then, under its session's lock.
+// A journal line cut off by a crash stays as it is and the next entry starts on a line of its
+// own; a journal that can't be read is never taken for an empty one.
 // It never holds up the session's end: any failure is one line.
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { TOKEN_SHAPES } from "../rootfs/opt/cain/c1/tools.ts";
 import { type Clone, args, check, clone, fetch, git, holdsAt, outcomes, send, sessionOf } from "./record-lib.ts";
 
@@ -114,7 +122,8 @@ export interface Entry { n: number; key: string; at: number; kind: "open" | "emp
 
 export function readJournal(path: string): Entry[] {
   let text = "";
-  try { text = readFileSync(path, "utf8"); } catch { return []; }
+  try { text = readFileSync(path, "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return []; throw e; }   // unreadable is not empty
   const out: Entry[] = [];
   for (const l of text.split("\n")) {
     if (!l.trim()) continue;
@@ -139,10 +148,39 @@ function syncDir(dir: string): void {
   try { const fd = openSync(dir, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } } catch { /* not here */ }
 }
 
-function appendEntry(path: string, e: Entry): void {
+// Appends one entry, synced. A last line cut off by a crash is left as it is (the read passes it
+// over) and the new entry starts on a line of its own.
+export function appendEntry(path: string, e: Entry): void {
+  let torn = false;
+  try {
+    const fd = openSync(path, "r");
+    try {
+      const size = fstatSync(fd).size;
+      if (size > 0) { const b = Buffer.alloc(1); readSync(fd, b, 0, 1, size - 1); torn = b[0] !== 0x0a; }
+    } finally { closeSync(fd); }
+  } catch { /* none yet */ }
   const fd = openSync(path, "a");
-  try { writeSync(fd, JSON.stringify(e) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+  try { writeSync(fd, (torn ? "\n" : "") + JSON.stringify(e) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
   syncDir(dirname(path));
+}
+
+// A transcript, a line at a time, in chunks: a long session's runs to hundreds of megabytes.
+export function eachLine(path: string, fn: (line: string) => void): void {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(4 << 20);
+    const dec = new StringDecoder("utf8");
+    let rest = "";
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      const lines = (rest + dec.write(buf.subarray(0, n))).split("\n");
+      rest = lines.pop() ?? "";
+      for (const l of lines) fn(l);
+    }
+    rest += dec.end();
+    if (rest) fn(rest);
+  } finally { closeSync(fd); }
 }
 
 // The record request, or null when there's nothing to file: only on items the session holds,
@@ -223,6 +261,99 @@ function aside(dir: string, kind: "refused" | "unreadable", name: string, why: s
   writeFileSync(join(to, `${base}.why`), why + "\n");
 }
 
+// What one end saw: the session, the items it held, its open steps and why (its time dates the note).
+export interface Snapshot { session: string; held: string[]; open: Step[]; why: Why; at: number }
+
+// Journals one end's snapshot and, if it's a filing, puts it in the outbox. The caller holds the
+// session's lock. A snapshot older than the journal's last entry is passed over: what's journaled
+// is newer, and the record's newest note must be the session's newest state. Throws when the
+// journal can't be read.
+export function fileSnapshot(dir: string, s: Snapshot): { id: string | null; same: boolean } {
+  const journalPath = join(dir, `${s.session}.journal`);
+  const key = filedKey(s.held, s.open, s.why);
+  const journal = readJournal(journalPath);
+  if (journal.length && s.at < journal.at(-1)!.at) return { id: null, same: true };
+  const d = decide(journal, key, s.held, s.open, s.why);
+  if (d.same) return { id: null, same: true };
+  const kind: Entry["kind"] = s.why === "open" ? (s.open.length ? "open" : "empty") : s.why;
+  if (!d.file) { appendEntry(journalPath, { n: d.n, key, at: s.at, kind }); return { id: null, same: false }; }
+  const req = requestFor(s.open, s.held, s.why, new Date(s.at), d.wasOpen);
+  req.from = `laptop:${s.session}`;
+  req.id = filingId(s.session, d.n, key);
+  const raw = JSON.stringify(req, null, 1) + "\n";
+  appendEntry(journalPath, { n: d.n, key, at: s.at, kind, id: req.id, raw });
+  enqueue(dir, req.id, raw);                           // after the journal: a stop in between is put back
+  return { id: req.id, same: false };
+}
+
+// An end's snapshot, kept before it waits for its session's turn: a flush files it if the end
+// couldn't.
+export function writePending(dir: string, s: Snapshot): string {
+  mkdirSync(join(dir, "pending"), { recursive: true });
+  const p = join(dir, "pending", `${s.session}-${String(s.at).padStart(15, "0")}-${process.pid}.json`);
+  writeWhole(p, JSON.stringify(s));
+  return p;
+}
+
+// Files the snapshots ends left, oldest first, each under its session's lock (one held now waits
+// for the next flush). One that can't be read is kept aside.
+function takePending(dir: string): void {
+  let names: string[] = [];
+  try { names = readdirSync(join(dir, "pending")).filter((n) => n.endsWith(".json")).sort((a, b) => a.split("-").at(-2)!.localeCompare(b.split("-").at(-2)!)); } catch { return; }
+  for (const n of names) {
+    const path = join(dir, "pending", n);
+    let s: Snapshot | null = null;
+    try { s = JSON.parse(readFileSync(path, "utf8")); } catch { /* below */ }
+    if (!s || typeof s.session !== "string" || !Array.isArray(s.held) || !Array.isArray(s.open)) {
+      mkdirSync(join(dir, "outbox", "unreadable"), { recursive: true });
+      try { renameSync(path, join(dir, "outbox", "unreadable", `pending-${n}`)); writeFileSync(join(dir, "outbox", "unreadable", `pending-${n.replace(/\.json$/, "")}.why`), "an end's snapshot couldn't be read\n"); } catch { /* taken */ }
+      continue;
+    }
+    const lock = join(dir, `${s.session}.ending`);
+    if (!claim(lock)) continue;
+    try { fileSnapshot(dir, s); rmSync(path, { force: true }); }
+    catch { /* its journal can't be read: kept, and said by its session's end */ }
+    finally { rmSync(lock, { force: true }); }
+  }
+}
+
+// Every journaled filing the outbox has no trace of: done by the keeper's log (marked), refused
+// (kept aside), held behind a job (tracked as sent), or never seen (put back).
+function reconcile(rec: Clone, dir: string): void {
+  let journals: string[] = [];
+  try { journals = readdirSync(dir).filter((n) => n.endsWith(".journal")); } catch { return; }
+  for (const j of journals) {
+    let entries: Entry[] = [];
+    try { entries = readJournal(join(dir, j)); } catch { continue; }
+    for (const e of entries) {
+      if (!e.id || !e.raw || inOutbox(dir, e.id)) continue;
+      const logged = outcomeOf(outcomes(rec, e.id) as any[]);
+      const f = fate(logged.map((o) => String(o.state)), false, 0);
+      if (f === "filed") { mkdirSync(join(dir, "outbox", "done"), { recursive: true }); writeFileSync(join(dir, "outbox", "done", e.id), ""); continue; }
+      enqueue(dir, e.id, e.raw);
+      if (f === "refused") {
+        const last = logged.filter((o) => o.state !== "done").at(-1);
+        aside(dir, "refused", `${e.id}.json`, `the record said ${last?.state ?? "no"}: ${last?.reason ?? last?.line ?? ""}`.trim());
+      } else if (f === "waiting") {
+        try { renameSync(join(dir, "outbox", `${e.id}.json`), join(dir, "outbox", `${e.id}.sent`)); } catch { /* taken */ }
+      }
+    }
+  }
+}
+
+// Whether anything waits for a flush: an outbox file, an end's snapshot, or a journaled filing
+// the outbox has no trace of. Local reads only, so a start with nothing to do needs no network.
+export function waiting(dir: string): boolean {
+  try { if (readdirSync(join(dir, "outbox"), { recursive: true }).some((x) => /\.(json|sent|part)$/.test(String(x)))) return true; } catch { /* none */ }
+  try { if (readdirSync(join(dir, "pending")).some((x) => x.endsWith(".json"))) return true; } catch { /* none */ }
+  let journals: string[] = [];
+  try { journals = readdirSync(dir).filter((n) => n.endsWith(".journal")); } catch { return false; }
+  for (const j of journals) {
+    try { if (readJournal(join(dir, j)).some((e) => e.id && e.raw && !inOutbox(dir, e.id))) return true; } catch { return true; }
+  }
+  return false;
+}
+
 export interface Flushed { lines: string[]; fates: Map<string, "submitted" | "filed" | "waiting here" | "aside"> }
 
 // Works the outbox, oldest filing first: sends what wasn't, settles what the keeper has logged,
@@ -231,7 +362,17 @@ export function flush(rec: Clone, dir: string, now = Date.now()): Flushed {
   const lock = join(dir, "outbox.lock");
   mkdirSync(join(dir, "outbox"), { recursive: true });
   if (!claim(lock, now)) return { lines: [], fates: new Map() };          // another flush is at it
-  try { return flushing(rec, dir, join(dir, "outbox"), now); } finally { rmSync(lock, { force: true }); }
+  try {
+    takePending(dir);
+    reconcile(rec, dir);
+    const out = flushing(rec, dir, join(dir, "outbox"), now);
+    // An end's snapshot still waiting after ten minutes (its session's journal can't be read, or
+    // its lock is held) is named, so it's never silent.
+    let stuck: string[] = [];
+    try { stuck = readdirSync(join(dir, "pending")).filter((n) => n.endsWith(".json") && now - statSync(join(dir, "pending", n)).mtimeMs > 600_000); } catch { /* none */ }
+    for (const n of stuck.sort()) out.lines.push(`An end's snapshot is still waiting to be filed: ${join(dir, "pending", n)}. Its session's journal may not be readable; file what it held another way, or drop it; then delete it.`);
+    return out;
+  } finally { rmSync(lock, { force: true }); }
 }
 
 function flushing(rec: Clone, dir: string, box: string, now: number): Flushed {
@@ -323,9 +464,7 @@ if (import.meta.main) {
   const rec = c as Exclude<typeof c, { error: string }>;
   const dir = memoDir(rec);
   if (a.flush === true) {
-    let any = false;
-    try { any = readdirSync(join(dir, "outbox"), { recursive: true }).some((x) => /\.(json|sent|part)$/.test(String(x))); } catch { /* none */ }
-    if (!any) say("");                                 // at every start: nothing waiting, no network
+    if (!waiting(dir)) say("");                        // at every start: nothing waiting, no network
     fetch(rec);
     say(...flush(rec, dir).lines);
   }
@@ -334,47 +473,45 @@ if (import.meta.main) {
   const session = sessionOf(a.session ?? input.session_id);
   if (!session) say("");
   fetch(rec);                                          // offline: the holds as last fetched, and the outbox
-  let lines: string[] | null = null;
-  try { lines = readFileSync(a.transcript ?? input.transcript_path, "utf8").split("\n"); } catch { /* said on the items held */ }
-  const { steps, planned } = stepsOf(lines ?? []);
+  let read = true;
+  const kept: string[] = [];
+  try { eachLine(a.transcript ?? input.transcript_path, (l) => { if (l.includes("update_plan") || l.includes("TodoWrite") || l.includes("is_error")) kept.push(l); }); }
+  catch { read = false; }
+  const { steps, planned } = stepsOf(kept);
   const open = steps.filter((s) => s.status !== "completed");
-  const me = `laptop:${session}`;
-  const held = Object.entries(holdsAt(rec)).filter(([, h]: [string, any]) => h?.holder === me).map(([item]) => item).sort();
-  const why: Why = lines === null ? "unread" : !planned ? "unplanned" : "open";
-  const key = filedKey(held, open, why);
-  const journalPath = join(dir, `${session}.journal`);
+  const held = Object.entries(holdsAt(rec)).filter(([, h]: [string, any]) => h?.holder === `laptop:${session}`).map(([item]) => item).sort();
+  const why: Why = !read ? "unread" : !planned ? "unplanned" : "open";
+  const snap: Snapshot = { session: session!, held, open, why, at: Date.now() };
+  mkdirSync(dir, { recursive: true });
   if (a.dry === true) {                                // what this end would file, changing nothing
-    const d = decide(readJournal(journalPath), key, held, open, why);
-    const r = d.file ? requestFor(open, held, why, new Date(), d.wasOpen) : null;
-    if (r) { r.from = me; r.id = filingId(session!, d.n, key); }
+    const key = filedKey(held, open, why);
+    const d = decide(readJournal(join(dir, `${session}.journal`)), key, held, open, why);
+    const r = d.file ? requestFor(open, held, why, new Date(snap.at), d.wasOpen) : null;
+    if (r) { r.from = `laptop:${session}`; r.id = filingId(session!, d.n, key); }
     say(r ? JSON.stringify(r, null, 1) : "");
   }
-  // Ends of one session take turns: a second waits for the first, then reads what it wrote.
-  mkdirSync(dir, { recursive: true });
+  // Ends of one session take turns. Its snapshot is kept first, so one that can't get its turn
+  // in time is filed by the next flush, at any session's start or end.
+  const pending = writePending(dir, snap);
+  const waitMs = Number(process.env.SESSION_END_WAIT_MS ?? 20_000);
   const waitFrom = Date.now();
   while (!claim(join(dir, `${session}.ending`))) {
-    if (Date.now() - waitFrom > 20_000) say("Open steps not filed: another end of this session held the lock for 20 seconds");
+    if (Date.now() - waitFrom > waitMs) say("Open steps not filed yet: another end of this session is filing; they go at the next session's start or end");
     await Bun.sleep(250);
   }
   lock = join(dir, `${session}.ending`);
-  const journal = readJournal(journalPath);
-  // A filing journaled but neither in the outbox nor logged by the keeper (its end stopped in
-  // between) is put back from the journal.
-  const lastFiled = [...journal].reverse().find((e) => e.id && e.raw);
-  if (lastFiled && !inOutbox(dir, lastFiled.id!) && !outcomes(rec, lastFiled.id!).length) enqueue(dir, lastFiled.id!, lastFiled.raw!);
-  const d = decide(journal, key, held, open, why);
-  if (d.same || !d.file) {
-    if (!d.same) appendEntry(journalPath, { n: d.n, key, at: Date.now(), kind: why === "open" ? (open.length ? "open" : "empty") : why });
-    say(...flush(rec, dir).lines);                     // nothing to file: what waits still goes
+  if (!existsSync(pending)) say(...flush(rec, dir).lines);   // a flush filed it meanwhile
+  let r: { id: string | null; same: boolean };
+  try { r = fileSnapshot(dir, snap); }
+  catch (e) {
+    say(`Open steps not filed: this session's journal couldn't be read (${(e as NodeJS.ErrnoException)?.code ?? e}); its snapshot is kept for the next start: ${pending}`);
   }
-  const req = requestFor(open, held, why, new Date(), d.wasOpen);
-  req.from = me;
-  req.id = filingId(session!, d.n, key);
-  const raw = JSON.stringify(req, null, 1) + "\n";
-  appendEntry(journalPath, { n: d.n, key, at: Date.now(), kind: why === "open" ? (open.length ? "open" : "empty") : why, id: req.id, raw });
-  enqueue(dir, req.id, raw);                           // after the journal: a stop in between is put back
+  rmSync(pending, { force: true });
+  rmSync(lock, { force: true });                       // its turn is over: a flush may take others' snapshots
+  lock = "";
   const done = flush(rec, dir);
-  const mine = done.fates.get(req.id);
+  if (!r!.id) say(...done.lines);                      // nothing new to file: what waits still goes
+  const mine = done.fates.get(r!.id!);
   const what = why === "open" ? (open.length ? `Open steps (${open.length})` : "That nothing is left open") : `That the session ended ${why === "unread" ? "unread" : "with no task list"}`;
   say(...done.lines.filter((l) => !l.startsWith("Submitted ")),
     mine === "submitted" ? `${what}: submitted to the record`

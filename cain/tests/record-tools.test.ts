@@ -390,7 +390,7 @@ describe("session-end", () => {
     expect(notes(l).split("with these steps open: Verify after his tap.").length - 1).toBe(1);
   }, 90_000);
 
-  test("two ends of one session at once with different steps both file, in turn: the journal's last entry is the record's newest note", async () => {
+  test("two ends of one session at once with different steps take turns: the journal's last entry is the newer snapshot, and the record's newest note", async () => {
     const l = held();
     const [t1, t2] = [join(l.root, "t1.jsonl"), join(l.root, "t2.jsonl")];
     writeFileSync(t1, plan(["Verify after his tap", "pending"]));
@@ -402,15 +402,62 @@ describe("session-end", () => {
     await Promise.all([p1.exited, p2.exited]);
     expect(cycle(l.cfg).ok).toBe(true);
     const n = notes(l);
-    expect(n).toContain("with these steps open: Verify after his tap.");
-    expect(n).toContain("with these steps open: Merge.");
     const journal = readFileSync(join(l.clone, ".git", "record-holds", `${SA}.journal`), "utf8").trim().split("\n").map((x) => JSON.parse(x));
-    expect(journal.map((e) => e.n)).toEqual([1, 2]);
+    expect(journal.map((e) => e.n)).toEqual(journal.map((_, i) => i + 1));                 // one or two entries, in turn
+    for (let i = 1; i < journal.length; i++) expect(journal[i].at).toBeGreaterThanOrEqual(journal[i - 1].at);
+    const last = JSON.parse(journal.at(-1).raw).ops[0].text.includes("Merge") ? "Merge" : "Verify after his tap";
     const newest = n.lastIndexOf("Merge") > n.lastIndexOf("Verify after his tap") ? "Merge" : "Verify after his tap";
-    expect(JSON.parse(journal[1].raw).ops[0].text).toContain(newest);
+    expect(newest).toBe(last);
   }, 90_000);
 
-  test("a filing journaled but not in the outbox (its end stopped in between) is put back and sent at the next end", () => {
+  test("an end that can't get its turn in time leaves its snapshot, and the next start files it", async () => {
+    const l = held();
+    const e = ender(l);
+    e.steps(["Verify after his tap", "pending"]);
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(memo, { recursive: true });
+    writeFileSync(join(memo, `${SA}.ending`), "1");                       // another end of it, taking long
+    const said = l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: join(l.root, `transcript-${SA}.jsonl`) }), env: { SESSION_END_WAIT_MS: "1000" } });
+    expect(said).toEqual({ code: 0, out: "Open steps not filed yet: another end of this session is filing; they go at the next session's start or end", err: "" });
+    expect(readdirSync(join(memo, "pending"))).toHaveLength(1);
+    rmSync(join(memo, `${SA}.ending`));                                     // the other end is done
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "Submitted 1 to the record from a laptop session's end", err: "" });
+    expect(readdirSync(join(memo, "pending"))).toHaveLength(0);
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });
+  }, 60_000);
+
+  test("a journal line cut off by a crash: the next end journals on a line of its own, numbered on, and files", () => {
+    const l = held();
+    const e = ender(l);
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(memo, { recursive: true });
+    writeFileSync(join(memo, `${SA}.journal`), JSON.stringify({ n: 1, key: "0000000000000000", at: 1, kind: "open" }) + "\n" + '{"n": 2, "key": "1111');
+    e.steps(["Verify after his tap", "pending"]);
+    expect(e.end().out).toBe("Open steps (1): submitted to the record");
+    const lines = readFileSync(join(memo, `${SA}.journal`), "utf8").trim().split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toBe('{"n": 2, "key": "1111');
+    expect(JSON.parse(lines[2]).n).toBe(2);
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+  }, 60_000);
+
+  test("a journal that can't be read is said, and the end's snapshot is kept: never taken for an empty journal", () => {
+    const l = held();
+    const e = ender(l);
+    const memo = join(l.clone, ".git", "record-holds");
+    mkdirSync(join(memo, `${SA}.journal`), { recursive: true });           // a folder where the journal should be
+    e.steps(["Verify after his tap", "pending"]);
+    const said = e.end();
+    expect(said.code).toBe(0);
+    expect(said.out).toStartWith("Open steps not filed: this session's journal couldn't be read (");
+    expect(readdirSync(join(memo, "pending"))).toHaveLength(1);
+    expect(l.inboxNames()).toHaveLength(0);
+  }, 60_000);
+
+  test("a filing journaled but not in the outbox (its end stopped in between) is put back and sent at the next start, once", () => {
     const l = held();
     const e = ender(l);
     e.steps(["Verify after his tap", "pending"]);
@@ -419,8 +466,9 @@ describe("session-end", () => {
     mkdirSync(memo, { recursive: true });
     const key = /-\d{6}-([0-9a-f]{16})$/.exec(dry.id)![1];
     writeFileSync(join(memo, `${SA}.journal`), JSON.stringify({ n: 1, key, at: Date.now(), kind: "open", id: dry.id, raw: JSON.stringify(dry, null, 1) + "\n" }) + "\n");
-    expect(e.end()).toEqual({ code: 0, out: "Submitted 1 to the record from a laptop session's end", err: "" });   // the same state: nothing new, but the journaled filing goes
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "Submitted 1 to the record from a laptop session's end", err: "" });   // a start alone
     expect(l.inboxNames()).toEqual([`inbox/${dry.id}.json`]);
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });                                                     // sent: not again
     expect(cycle(l.cfg).ok).toBe(true);
     expect(notes(l)).toContain("with these steps open: Verify after his tap.");
     // Settled, it leaves a mark: never put back from the journal again, however old the keeper's log.

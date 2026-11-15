@@ -2,10 +2,10 @@
 // (cain/tools/session-end.ts, org-v2 DESIGN 4.F, the registry's S-051): its task list replayed
 // from its transcript, filed as a note on each item it holds, once, and never lost on the way.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claim, clean, decide, fate, filedKey, filingId, outcomeOf, readJournal, requestFor, stepsOf, type Entry } from "../tools/session-end";
+import { appendEntry, claim, clean, decide, fate, filedKey, filingId, fileSnapshot, outcomeOf, readJournal, requestFor, stepsOf, type Entry } from "../tools/session-end";
 
 const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
 const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
@@ -110,11 +110,28 @@ describe("once only", () => {
     expect(decide([e(1, kA, "open")], filedKey([], [a]), [], [a], "open")).toEqual({ n: 2, same: false, file: false, wasOpen: true });
   });
 
-  test("a journal's line cut off mid-write is passed over; the rest is read", () => {
+  test("a journal's line cut off mid-write is passed over and stays; the next entry starts on a line of its own", () => {
     const p = join(mkdtempSync(join(tmpdir(), "journal-")), "s.journal");
-    writeFileSync(p, JSON.stringify({ n: 1, key: "k1", at: 1, kind: "open", id: "i1", raw: "{}" }) + "\n" + '{"n": 2, "key": "k2", "at"');
+    const torn = '{"n": 2, "key": "k2", "at"';
+    writeFileSync(p, JSON.stringify({ n: 1, key: "k1", at: 1, kind: "open", id: "i1", raw: "{}" }) + "\n" + torn);
     expect(readJournal(p).map((x) => x.n)).toEqual([1]);
-    expect(readJournal(join(p, "none"))).toEqual([]);
+    appendEntry(p, { n: 2, key: "k3", at: 3, kind: "open" });
+    expect(readJournal(p).map((x) => [x.n, x.key])).toEqual([[1, "k1"], [2, "k3"]]);
+    expect(readFileSync(p, "utf8").split("\n")[1]).toBe(torn);                // kept as it was
+  });
+
+  test("no journal yet is empty; one that can't be read is never taken for empty", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    expect(readJournal(join(d, "none.journal"))).toEqual([]);
+    mkdirSync(join(d, "folder.journal"));
+    expect(() => readJournal(join(d, "folder.journal"))).toThrow();
+  });
+
+  test("a snapshot older than the journal's last entry is passed over: the record's newest note stays the newest state", () => {
+    const d = mkdtempSync(join(tmpdir(), "journal-"));
+    writeFileSync(join(d, "s1.journal"), JSON.stringify({ n: 1, key: filedKey(["P33"], [b]), at: 2_000, kind: "open", id: "x", raw: "{}" }) + "\n");
+    expect(fileSnapshot(d, { session: "s1", held: ["P33"], open: [a], why: "open", at: 1_000 })).toEqual({ id: null, same: true });
+    expect(readJournal(join(d, "s1.journal"))).toHaveLength(1);
   });
 
   test("a lock is made new, refused while it's fresh, and taken over once it's 2 minutes old", () => {
