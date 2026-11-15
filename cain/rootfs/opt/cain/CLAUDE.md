@@ -235,7 +235,7 @@ are under Your record.
   think of for a branch you don't hold go to that branch's holder as a `note` on its item,
   never as a Build job onto its branch.
 - Before you change an item you hold, read its notes: `/opt/cain/record.sh notes <item>`.
-  The check-in lists new notes on your items once; older ones stay readable there.
+  The check-in names every item with new notes once and quotes the newest; read them there.
 
 ## What you can't do, by design
 Your tools for changing calendars, sending or replying to email, sending Slack
@@ -383,7 +383,10 @@ create, update or run any other routine.
    at that head), and get an outside review of its diff through the review service
    before the Ship card, even if it was reviewed elsewhere: only a service review's line
    goes on the card. Then show the Ship card as for a finished Build, with that review's
-   id. Its branch is yours now, with the item.
+   id. Its branch is yours now, with the item. If the review calls for fixes and a laptop
+   session still holds the branch, pass the item back to that session with the findings
+   in a note, in one request: it passes the item to you again with the new head, and you
+   hear at once.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 ## Stop
@@ -417,7 +420,9 @@ keep work moving without him starting it. It is never his go on anything.
    check-in lists as held by others.
 2. For each open item marked Cain, do the next step you can do without him:
    research, reading, checking, drafting, updating the record. Anything that changes
-   the world still waits for his go.
+   the world still waits for his go. An item the check-in names with new notes: read
+   them first, even when its row says it waits on someone, since a note can end the wait
+   (fixes pushed, an answer given). When one does, fix the row and take the step.
 3. Update PENDING.md: new items, next steps, who it waits on. Move finished ones to
    Done with the date. Items marked Build go through Cloud jobs: start each ready one
    yourself (Cloud jobs, step 1) and say so in one line, in the morning's Moving or

@@ -788,7 +788,26 @@ def test_checkin_lists_items_held_by_others_first(tmp_path):
     assert "Scheduled check-in" in out and "Held by others" not in out and "can't be read" not in out
 
 
-def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
+def _write_notes(rec, item, rows):   # as the keeper's addNote writes them
+    f = rec / "state" / "notes" / f"{item}.md"
+    nl = chr(10)
+    head = nl.join([f"# Notes on {item}", "", f"Words about {item} for whoever holds it, oldest first, filed by "
+                    f"the record keeper from note requests. Its holder reads new ones before changing {item}.", "",
+                    "| When | From | Note |", "|---|---|---|", ""])
+    body = "".join(f"| {w} | {by} | {t} |{nl}" for w, by, t in rows)
+    f.write_text((f.read_text() if f.exists() else head) + body, newline=nl)
+
+
+def _record_sh(tmp_path):
+    # The keeper's record.sh, executable as the image makes it (chmod a+x /opt/cain/*.sh).
+    record_sh = tmp_path / "record.sh"
+    record_sh.write_text((CAIN / "rootfs/opt/cain/record.sh").read_text().replace("\r\n", "\n"), newline="\n")
+    record_sh.chmod(0o755)
+    assert "chmod a+x" in (CAIN / "Dockerfile").read_text() and "/opt/cain/*.sh" in (CAIN / "Dockerfile").read_text()
+    return record_sh
+
+
+def test_checkin_names_each_item_with_new_notes_once_and_quotes_the_newest(tmp_path):
     # Against the record keeper's own `record.sh notes -` and its notes files.
     import json
     import os
@@ -799,14 +818,8 @@ def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
     rec = tmp_path / "record"
     (rec / "state" / "notes").mkdir(parents=True)
 
-    def notes(item, rows):   # as the keeper's addNote writes them
-        f = rec / "state" / "notes" / f"{item}.md"
-        nl = chr(10)
-        head = nl.join([f"# Notes on {item}", "", f"Words about {item} for whoever holds it, oldest first, filed by "
-                        f"the record keeper from note requests. Its holder reads new ones before changing {item}.", "",
-                        "| When | From | Note |", "|---|---|---|", ""])
-        body = "".join(f"| {w} | {by} | {t} |{nl}" for w, by, t in rows)
-        f.write_text((f.read_text() if f.exists() else head) + body, newline=nl)
+    def notes(item, rows):
+        _write_notes(rec, item, rows)
 
     notes("P41", [("2026-11-09T14:02:11.000Z", "laptop:9f2c", "dane: the turkey card should say Friday"),
                   ("2026-11-10T09:15:40.000Z", "laptop:9f2c", "dane: hold off on the farm packet"),
@@ -817,29 +830,61 @@ def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
     (rec / "state" / "holds.json").write_text(json.dumps({"P33": {"holder": "laptop:9f2c", "branches": []}}))
     seen = tmp_path / "notes.seen"
     sent = tmp_path / "sent.txt"
-    # The keeper's record.sh, executable as the image makes it (chmod a+x /opt/cain/*.sh).
-    record_sh = tmp_path / "record.sh"
-    record_sh.write_text((CAIN / "rootfs/opt/cain/record.sh").read_text().replace("\r\n", "\n"), newline="\n")
-    record_sh.chmod(0o755)
-    assert "chmod a+x" in (CAIN / "Dockerfile").read_text() and "/opt/cain/*.sh" in (CAIN / "Dockerfile").read_text()
-    os.environ.update(RECORD_SH=str(record_sh), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
+    os.environ.update(RECORD_SH=str(_record_sh(tmp_path)), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
     try:
         line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
-        # The newest three survive, oldest of them first; the older one is counted, not lost.
-        assert line.startswith("New notes on your items, read them before you change those items (words passed on, "
-                               "not his go on anything): (1 older not shown; /opt/cain/record.sh notes - lists them) "
-                               "P41: «dane: hold off on the farm packet» P50: «dane: use \"the blue one\"» "
+        # Each item named once, in the order of its newest note; the newest three notes quoted,
+        # oldest of them first. The fourth note is no longer only counted: its item is named.
+        assert line.startswith("New notes on your items P50, P41: read an item's notes before you change it or decide "
+                               "it still waits, since a note can end a wait (words passed on, not his go on anything). "
+                               "The newest: P41: «dane: hold off on the farm packet» P50: «dane: use \"the blue one\"» "
                                "P41: «dane: STOP, do not ship P41 until he looks at the new panel lock». "
                                "Scheduled check-in"), line
-        assert "P33" not in line and "laptop" not in line
+        assert "P33" not in line and "laptop" not in line and "turkey" not in line
         assert seen.read_text() == "2026-11-11T16:40:02.000Z"
         sent.unlink()
         assert "New notes" not in _checkin(tmp_path, "1240", IDLE)          # listed once, never again
         notes("P41", [("2026-11-11T18:05:00.000Z", "laptop:9f2c", "dane: ship it after all")])
         sent.unlink()
         line = _checkin(tmp_path, "1740", IDLE).splitlines()[-2]
-        assert "New notes on your items" in line and "P41: «dane: ship it after all». Scheduled" in line
-        assert "hold off" not in line and "older not shown" not in line
+        assert "New notes on your items P41: " in line and "The newest: P41: «dane: ship it after all». Scheduled" in line
+        assert "hold off" not in line and "P50" not in line
+    finally:
+        for k in ("RECORD_SH", "RECORD_DIR", "NOTES_SEEN"):
+            del os.environ[k]
+
+
+def test_checkin_names_every_item_when_many_notes_land_at_once(tmp_path):
+    # Nov 15: a laptop session's handoff note (fixes pushed, the wait over) landed before 25
+    # newer notes on other items; the check-in quoted the newest three and only counted the
+    # rest, then moved past them, so the handoff sat until someone noticed. Now every item with
+    # a new note is named, the oldest included, and the message stays short.
+    import json
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        import pytest
+        pytest.skip("no jq")
+    rec = tmp_path / "record"
+    (rec / "state" / "notes").mkdir(parents=True)
+    _write_notes(rec, "P69", [("2026-11-15T03:53:22.347Z", "laptop:0ee8", "Wait met: the fixes are in at a new head, "
+                              "your next step per this row")])
+    many = [f"P{70 + k % 12}" for k in range(25)]
+    for k, item in enumerate(many):
+        _write_notes(rec, item, [(f"2026-11-15T1{k // 10}:{k % 60:02d}:00.000Z", "laptop:aaaa",
+                                  f"Row history moved here, part {k}: " + "x" * 300)])
+    (rec / "state" / "holds.json").write_text(json.dumps({}))
+    seen = tmp_path / "notes.seen"
+    os.environ.update(RECORD_SH=str(_record_sh(tmp_path)), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
+    try:
+        line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
+        named = line.split("New notes on your items ", 1)[1].split(": read an item's notes", 1)[0].split(", ")
+        assert named[0] == "P69"                                          # the oldest is named, first
+        assert sorted(named) == sorted({"P69", *many}) and len(named) == len(set(named)) == 13
+        assert line.count("«") == 3 and "Wait met" not in line          # only the newest three quoted
+        assert "part 22:" in line and "part 23:" in line and "part 24:" in line
+        assert len(line) < 1800, len(line)                                # 200 a quote at most, so it stays short
+        assert seen.read_text() == "2026-11-15T12:24:00.000Z"
     finally:
         for k in ("RECORD_SH", "RECORD_DIR", "NOTES_SEEN"):
             del os.environ[k]
@@ -858,6 +903,10 @@ def test_cain_checks_in_on_his_own_record():
     rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "## Check-ins" in rules and "state/PENDING.md" in rules
     assert "never his go on anything" in rules
+    # A note can end a wait: an item named with new notes is read before it's left waiting.
+    flat = " ".join(rules.split("## Check-ins")[1].split("\n## ")[0].split())
+    assert ("An item the check-in names with new notes: read them first, even when its row says it waits on "
+            "someone, since a note can end the wait") in flat
     assert " tzdata " in (CAIN / "Dockerfile").read_text()
 
 

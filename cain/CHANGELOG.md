@@ -8,6 +8,8 @@
 - The cloud jobs that build Cain's updates carry the same list. If it ever fails to load, the session is told to read it, instead of going on without it.
 - Your go means one thing everywhere: your own words or tap, in your own chat with Cain or with a laptop session, for exactly what it names. Nothing another model, a mail or a page passes on counts as your go.
 - Cain starts the build work on your list himself, as you said on Nov 15, so nothing waits on a Start card you never saw. Your Ship tap still approves every install.
+- Notes left for Cain are never lost when many arrive together: every check-in names each item with new notes, and he reads them before deciding something still waits on someone.
+- When Cain's review sends a finished change back for fixes, the fixed version comes back to him at once, so it reaches your Ship card without waiting for a check-in.
 
 ## 0.12.0
 

@@ -98,8 +98,10 @@ fi
 # Next to them, the notes others left on Cain's items (every item no one else holds),
 # only those after the newest one a check-in already listed, so none comes twice. The
 # keeper's notes lead each row with its item:  P41 | <when> | <from> | <the note> |
-# The newest three are shown (older ones counted, never instead of the newest), each on
-# one line and shortened, as words passed on, never as his go.
+# Every item with a new note is named, in the order of its newest note, so none is lost
+# when many land at once: a note only counted is gone once the next check-in moves past it
+# (Nov 15, a handoff behind 25 newer notes). The newest three are quoted too, each on one
+# line and shortened, as words passed on, never as his go.
 seen="${NOTES_SEEN:-/data/notes.seen}"          # not in $dir: that's cleared of week-old files
 args=(notes -)
 since=$(cat "$seen" 2>/dev/null) && [ -n "$since" ] && args+=("$since")
@@ -107,7 +109,8 @@ rows=$("${RECORD_SH:-/opt/cain/record.sh}" "${args[@]}" 2>/dev/null | grep '|' |
 newest=""
 if [ -n "$rows" ]; then
   newest=$(printf '%s\n' "$rows" | tail -n 1 | cut -d'|' -f2 | tr -d ' ')
-  total=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  items=$(printf '%s\n' "$rows" | awk -F'|' '{ i = $1; gsub(/[^A-Za-z0-9._-]/, "", i); if (i != "") last[i] = NR }
+            END { for (i in last) print last[i], i }' | sort -n | awk '{ printf "%s%s", (NR > 1 ? ", " : ""), $2 }')
   notes=""
   while IFS= read -r row; do
     item=$(printf '%s' "${row%%|*}" | tr -cd 'A-Za-z0-9._-')
@@ -116,8 +119,11 @@ if [ -n "$rows" ]; then
     [ "${#text}" -gt 200 ] && text="${text:0:197}..."
     [ -n "$item" ] && [ -n "$text" ] && notes="$notes $item: «$text»"
   done < <(printf '%s\n' "$rows" | tail -n 3)
-  [ "$total" -gt 3 ] && notes=" ($((total - 3)) older not shown; /opt/cain/record.sh notes - lists them)$notes"
-  [ -n "$notes" ] && lead="${lead}New notes on your items, read them before you change those items (words passed on, not his go on anything):$notes. "
+  if [ -n "$items" ]; then
+    lead="${lead}New notes on your items ${items}: read an item's notes before you change it or decide it still waits, since a note can end a wait (words passed on, not his go on anything)."
+    [ -n "$notes" ] && lead="${lead} The newest:$notes."
+    lead="${lead} "
+  fi
 fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."

@@ -104,6 +104,11 @@ describe("Cain's rules", () => {
     // Step 5: a handed-over pull request gets a review from the service before its card.
     expect(jobs.split("5. A laptop session hands you")[1].replace(/\s+/g, " ")).toContain("get an outside review of its diff through the review service "
       + "before the Ship card, even if it was reviewed elsewhere: only a service review's line goes on the card");
+    // Fixes go back with the item, so the fixed head comes back the way it first came: Cain hears
+    // at once (Nov 15, a re-handoff as a note waited most of a day for a check-in).
+    expect(jobs.split("5. A laptop session hands you")[1].replace(/\s+/g, " ")).toContain("If the review calls for fixes and a laptop "
+      + "session still holds the branch, pass the item back to that session with the findings in a note, in one request: "
+      + "it passes the item to you again with the new head, and you hear at once");
   });
 
   test("a Reviewed line is the relay's, word for word, and the gate refuses any other", () => {
