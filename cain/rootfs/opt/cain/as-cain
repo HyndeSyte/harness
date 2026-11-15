@@ -8,7 +8,9 @@
 #   as-cain <command> [args...]
 set -eu
 cd /data/cain 2>/dev/null || cd /
-exec setpriv --reuid=cain --regid=cain --init-groups --no-new-privs --inh-caps=-all --bounding-set=-all \
+# prlimit first, as root: at most 1024 processes of his at once, so a runaway or a fork bomb
+# of his can't starve root's services (the link, the broker) of process slots.
+exec prlimit --nproc=1024:1024 setpriv --reuid=cain --regid=cain --init-groups --no-new-privs --inh-caps=-all --bounding-set=-all \
   env -i HOME=/data/cain USER=cain LOGNAME=cain SHELL=/bin/bash \
     PATH=/usr/local/bin:/usr/bin:/bin TERM="${TERM:-xterm-256color}" \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ="${TZ:-America/New_York}" \

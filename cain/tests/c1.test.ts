@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { type LinkMode, linkDecides, RUNS } from "../rootfs/opt/cain/c1/contract";
-import { filesUnder, holding, journalStep, manifest, mayRetry, readableFiles, secretValues } from "../rootfs/opt/cain/c1/tools";
+import { encodedForms, filesUnder, gitDirsUnder, gitHolding, holding, journalStep, manifest, mayRetry, readableFiles, searchable, secretValues } from "../rootfs/opt/cain/c1/tools";
 import { checkRequest, CAIN_ROUTES, SIG_CONTEXT, signRequest } from "../rootfs/opt/cain/link/auth";
 
 const posix = process.platform !== "win32";
@@ -139,6 +139,50 @@ describe("the secret values searched for", () => {
     writeFileSync(join(d, "a.jsonl"), `{"x": "before ${"s3cret-value-abcdefgh"} after"}\n`);
     writeFileSync(join(d, "b.jsonl"), "nothing here\n");
     expect(holding(["s3cret-value-abcdefgh", ""], [join(d, "a.jsonl"), join(d, "b.jsonl")])).toEqual([join(d, "a.jsonl")]);
+  });
+});
+
+// The scrub reaches past exact copies (C1 review service, theme 3): a value encoded (base64 at any
+// alignment, url-safe, hex), a token's shape that isn't a current value (but in his own sign-in's
+// file), and a repository's history, not only what's checked out.
+describe("the scrub finds more than exact copies", () => {
+  const TOKEN = "MTEST0000000000000000000.GtEsT0.TeStbOtToKeNnOtReAl0000000000000";
+  test("a value inside base64 at any byte alignment, url-safe, or hex", () => {
+    for (let pre = 0; pre < 6; pre++) {
+      const raw = Buffer.concat([Buffer.from("p".repeat(pre)), Buffer.from(TOKEN), Buffer.from("and after")]);
+      for (const enc of [raw.toString("base64"), raw.toString("base64url"), raw.toString("hex"), raw.toString("hex").toUpperCase()])
+        expect([pre, encodedForms(TOKEN).some((f) => enc.includes(f))]).toEqual([pre, true]);
+    }
+    expect(searchable([TOKEN])).toContain(TOKEN);
+  });
+  test("a token's shape is found though it isn't a current value; not in his own sign-in's file, and not his own sign-in", () => {
+    const d = mkdtempSync(join(tmpdir(), "c1-shape-"));
+    const old = "ghp_" + "Q".repeat(36);
+    writeFileSync(join(d, "old.jsonl"), `{"text": "the old token was ${old}"}\n`);
+    writeFileSync(join(d, ".credentials.json"), `{"token": "${old}"}`);
+    writeFileSync(join(d, "mine.json"), `{"accessToken": "sk-ant-oat01-${"r".repeat(60)}"}`);
+    writeFileSync(join(d, "code.py"), `KEY = "-----BEGIN PRIVATE KEY-----\\n" + body`);
+    writeFileSync(join(d, "key.pem"), `-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n`);
+    const files = ["old.jsonl", ".credentials.json", "mine.json", "code.py", "key.pem"].map((f) => join(d, f));
+    expect(holding(["not-in-any-file-0123456789"], files, true).map((f) => f.slice(d.length + 1)).sort()).toEqual(["key.pem", "old.jsonl"]);
+    expect(holding(["not-in-any-file-0123456789"], files)).toEqual([]);                      // shapes only when asked
+  });
+  test("a repository whose history holds a value, though no file checked out does", async () => {
+    const git = (cwd: string, ...a: string[]) => Bun.spawnSync(["git", ...a], { cwd, env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+    const d = mkdtempSync(join(tmpdir(), "c1-git-"));
+    for (const name of ["leaky", "clean"]) {
+      const r = join(d, name);
+      mkdirSync(r);
+      git(r, "init", "-q");
+      writeFileSync(join(r, "notes.txt"), name === "leaky" ? `token ${TOKEN}\n` : "nothing\n");
+      git(r, "add", "."); git(r, "commit", "-qm", "one");
+      writeFileSync(join(r, "notes.txt"), "nothing now\n");
+      git(r, "commit", "-qam", "two");
+    }
+    expect(holding(searchable([TOKEN]), filesUnder([join(d, "leaky")]).filter((f) => !f.includes(".git"))).length).toBe(0);
+    const dirs = gitDirsUnder([d]).sort();
+    expect(dirs.map((x) => x.slice(d.length + 1).replace(/\\/g, "/"))).toEqual(["clean/.git", "leaky/.git"]);
+    expect((await gitHolding(searchable([TOKEN]), dirs)).map((x) => x.slice(d.length + 1).replace(/\\/g, "/"))).toEqual(["leaky/.git"]);
   });
 });
 

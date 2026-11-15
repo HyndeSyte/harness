@@ -24,8 +24,13 @@ export interface GitOpts {
 // git in the link's copy. Under timeout(1) the whole process group goes at the limit,
 // ssh included; the runner's own limit, a little later, is the backstop.
 export function makeGit(o: GitOpts) {
+  // No system or global config, and no hook or filesystem monitor runs, whatever the copy's own
+  // config says (the copy is root's, under /data/link, out of Cain's reach; this is the second
+  // wall, C1 review service, theme 2).
   const env: Record<string, string> = { PATH: o.path ?? process.env.PATH ?? "/usr/bin:/bin", HOME: o.home,
-    GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+    GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null",
+    GIT_CONFIG_KEY_1: "core.fsmonitor", GIT_CONFIG_VALUE_1: "false" };
   let made = false;
   const bounded = (args: string[], ms: number, e: Record<string, string>) => runBounded(
     o.timeoutBin ? [o.timeoutBin, "-k", "5", String(Math.ceil(ms / 1000)), ...args] : args, e, ms + 10_000);

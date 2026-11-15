@@ -115,6 +115,12 @@ if [ "$state" = fresh ]; then
   # went through, the switch couldn't check he keeps them all, so it waits for one (C1 re-check).
   [ -f "$C/connectors-before" ] && [ "$(head -n 1 "$C/connectors-before")" = listed ] \
     || { log "his connectors haven't been listed the old way yet: the switch waits for a listing that goes through"; exit 1; }
+  # Room for its copies (his staged home and the compared copy of /data/work) twice over, and
+  # 100 MB more: without it the switch waits, nothing begun (C1 review service, themes 8, 10).
+  used=$(( $(du -sk "$D/.claude" 2>/dev/null | cut -f1) + $(du -sk "$D/work" 2>/dev/null | cut -f1) ))
+  need=$(( used * 2 + 102400 ))
+  free="${C1_FREE_KB:-$(df -Pk "$D" | awk 'NR == 2 { print $4 }')}"
+  [ "$free" -ge "$need" ] 2>/dev/null || { log "not enough free space for its copies (${free:-?} KB free, $need KB needed): the switch waits"; exit 1; }
   install -d -m 0700 -o root -g root "$C" && chmod 0700 "$C" || stop "no /data/c1"
 
   # 1. Begin.
@@ -138,7 +144,10 @@ if [ "$state" = fresh ]; then
   there "$D/cain" && abort "/data/cain is already there"
   install -d -m 0700 -o root -g root "$D/cain" || abort "couldn't make /data/cain"
   cp -a "$D/.claude" "$D/cain/.claude" || abort "couldn't copy his Claude folder"
-  rm -rf "$D/cain/.claude/channels/discord" "$D/cain/.claude/plugins"
+  # Not his to carry over: the channel's state and the plugins (the image's now), and the caches
+  # that keep what commands saw (shell snapshots, debug logs, edited files' history, session
+  # environments), which Claude Code makes again (C1 review service, theme 3).
+  rm -rf "$D/cain/.claude/channels/discord" "$D/cain/.claude/plugins" "$D/cain/.claude/shell-snapshots"     "$D/cain/.claude/debug" "$D/cain/.claude/file-history" "$D/cain/.claude/session-env"
   for f in .claude.json .claude.json.backup; do there "$D/$f" && { cp -a "$D/$f" "$D/cain/$f" || abort "couldn't copy $f"; }; done
   chown -R root:root "$D/cain" && chmod -R go-rwx "$D/cain" || abort "couldn't keep the staged home root's"
   grep -m1 '^DISCORD_BOT_TOKEN=' "$D/.claude/channels/discord/.env" > "$D/link/discord.env.tmp" \

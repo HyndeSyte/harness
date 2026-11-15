@@ -26,7 +26,10 @@ OPT=/opt/cain
 SOCK_TMUX=/run/cain/tmux/cain.sock
 
 relay() { printf '%s\n' "$(jq -cn --arg t "$1" '{text: $t}')" >> /data/relay.queue; }
-stopped_why=""; switch_stopped=""; restart_first=""
+stopped_why=""; switch_stopped=""; restart_first=""; check_stopped=""
+# This App's version, for a failed check of his own user (c1/check.sh): it keeps him stopped only
+# on the version it failed on. bashio asks the Supervisor; "unknown" if it can't say.
+version="$(bashio::addon.version 2>/dev/null || true)"; [ -n "$version" ] || version=unknown
 if ! "$OPT/c1/lock.sh" run; then
   bashio::log.error "Couldn't set up /run/cain; Cain doesn't start until that's fixed"
   mode=none
@@ -35,7 +38,16 @@ else
   # "|| true"), or one non-zero answer would end the whole start (tests/test_addon.py).
   state="$("$OPT/c1/state.sh" || true)"
   case "$state" in
-    cut) mode=own ;;
+    cut) mode=own
+         # A check of his own user that found a breach keeps him stopped on that version (or when
+         # the version can't be read); a new version gets its own check (C1 review service).
+         if [ -f /data/c1/check-failed ]; then
+           failed_on="$(head -c 200 /data/c1/check-failed | cut -d' ' -f1)"
+           if [ "$failed_on" = "$version" ] || [ "$version" = unknown ]; then
+             mode=none; check_stopped=1
+             stopped_why="a check of his own user found a breach: $(head -c 400 /data/c1/check-failed | cut -d' ' -f2-)"
+           else rm -f /data/c1/check-failed /data/c1/check-told; fi
+         fi ;;
     fresh|switching)
       mode=old
       if [ "$state" = switching ] || [ -f /data/link/specialist-signs ]; then
@@ -190,7 +202,7 @@ list_connectors() {
 if [ "$mode" != none ]; then
   ( sleep 30; list_connectors ) &
   # The c1 check (the new way): root runs it as cain and keeps its result (c1/check.sh).
-  if [ "$mode" = own ]; then ( sleep 45; "$OPT/c1/check.sh" 2>&1 | tail -n 1 ) & fi
+  if [ "$mode" = own ]; then ( sleep 45; SOCK_TMUX="$SOCK_TMUX" C1_VERSION="$version" "$OPT/c1/check.sh" 2>&1 | tail -n 1 ) & fi
 fi
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
 ( while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done ) &
@@ -272,8 +284,13 @@ if [ "$mode" = none ]; then
   # Nothing of Cain's runs; the services above keep going (the link takes the specialist's
   # signed cards and posts them by itself). A switch that stopped part way can't be fixed from
   # here: his own notice, once, with the fix, which is the backup from before the update.
+  if [ -n "$check_stopped" ] && [ ! -f /data/c1/check-told ]; then
+    if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain is stopped: a safety check of his own user failed after his update, so he won't run until a fixed update arrives. To get him back now, restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups."; then
+      touch /data/c1/check-told
+    fi
+  fi
   if [ -n "$switch_stopped" ] && [ ! -f /data/c1/stopped-told ] && [ -d /data/c1 ]; then
-    if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain is stopped: his move to a safer setup didn't finish. To get him back, restore Cain's backup from before his last update: Settings, System, Backups."; then
+    if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain is stopped: his move to a safer setup didn't finish. To get him back, restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups."; then
       touch /data/c1/stopped-told
     fi
   fi

@@ -16,8 +16,14 @@
 //   bun tools.ts readable <out file> <dir>...  every regular file under the dirs that uid 1000
 //                                              could read, by owners, modes and his groups,
 //                                              NUL-separated (computed by root: nothing of his runs)
-//   bun tools.ts scan <needles> <list> <out>   the files in the list that hold any needle
-//   bun tools.ts scan-tree <needles> <out> <dir>...   the same, for every regular file under dirs
+//   bun tools.ts scan <needles> <list> <out>   the files in the list that hold any needle, as
+//                                              it is or encoded (base64, base64url, hex)
+//   bun tools.ts scan-tree <needles> <out> <dir>...   the switch's scrub, deeper: every regular
+//                                              file under the dirs that holds a needle (as it is
+//                                              or encoded) or a token's shape (but his own
+//                                              sign-in's file), and every git folder whose
+//                                              objects hold either (history, not only what's
+//                                              checked out)
 //   bun tools.ts allowed <list>                exit 0 when every readable file is one section 3.2
 //                                              gives him (contract.ts); else print the first other
 //   bun tools.ts same-tree <a> <b>             exit 0 when the two trees have the same manifest
@@ -27,7 +33,7 @@
 //                                              paths or under one; else print the first other
 import { createHmac } from "node:crypto";
 import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, renameSync, writeSync, type Stats } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { readableAllowed } from "./contract";
 
 // A file the switch needs: any error reading it, its absence included, is a failure, so no
@@ -195,14 +201,51 @@ export function manifest(root: string): string[] {
   return out;
 }
 
-// The files that hold any needle. A file that can't be read is an error, never a pass.
-export function holding(needles: string[], files: string[]): string[] {
+// Each secret as it would read inside base64 (standard and url-safe, at each of the three byte
+// alignments, without the edge characters its neighbours share) and hex (both cases), so an
+// encoded copy is found too (C1 review service, theme 3).
+export function encodedForms(v: string): string[] {
+  const b = Buffer.from(v);
+  const out = new Set<string>();
+  for (let pad = 0; pad < 3; pad++) {
+    const enc = Buffer.concat([Buffer.alloc(pad), b]).toString("base64");
+    const core = enc.slice(Math.ceil((4 * pad) / 3), Math.floor((8 * (pad + b.length)) / 6));
+    if (core.length >= 16) { out.add(core); out.add(core.replace(/\+/g, "-").replace(/\//g, "_")); }
+  }
+  const hex = b.toString("hex");
+  out.add(hex); out.add(hex.toUpperCase());
+  return [...out];
+}
+export const searchable = (values: string[]) => [...new Set(values.flatMap((v) => [v, ...encodedForms(v)]))];
+
+// The shapes of tokens and keys, for a value that isn't a current secret (an old token, another
+// account's key). His own sign-in's file holds his own tokens by design, so it isn't searched for
+// shapes; every current value is still searched there.
+export const TOKEN_SHAPES: { what: string; re: RegExp }[] = [
+  { what: "a Discord bot token", re: /[MNO][A-Za-z\d_-]{23,27}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27,40}/ },
+  { what: "a GitHub token", re: /gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,}/ },
+  { what: "an Anthropic API key", re: /sk-ant-api\d\d-[A-Za-z0-9_-]{40,}/ },
+  { what: "an OpenAI key", re: /\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{40,}/ },
+  { what: "a Google API key", re: /AIza[0-9A-Za-z_-]{35}/ },
+  { what: "a Perplexity key", re: /pplx-[A-Za-z0-9]{40,}/ },
+  // A key itself, its body right after the header (a raw line break or an escaped one), not
+  // code that only names the header.
+  { what: "a private key", re: /-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----(?:\s|\\n)+[A-Za-z0-9+\/=]{40}/ },
+  { what: "a web token", re: /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
+];
+const HIS_OWN = new Set([".credentials.json"]);
+export const shapeIn = (s: string) => TOKEN_SHAPES.find((t) => t.re.test(s))?.what ?? null;
+
+// The files that hold any needle. A file that can't be read is an error, never a pass. With
+// shapes, a token's shape counts too, outside his own sign-in's file.
+export function holding(needles: string[], files: string[], shapes = false): string[] {
   const bufs = needles.filter((n) => n.length > 0).map((n) => Buffer.from(n));
   if (!bufs.length) return [];
-  const keep = Math.max(...bufs.map((b) => b.length)) - 1;
+  const keep = Math.max(200, ...bufs.map((b) => b.length)) - 1;
   const hits: string[] = [];
   const chunk = Buffer.alloc(4 << 20);
   for (const f of files) {
+    const look = shapes && !HIS_OWN.has(basename(f));
     const fd = openSync(f, "r");
     try {
       let tail = Buffer.alloc(0), found = false;
@@ -210,11 +253,52 @@ export function holding(needles: string[], files: string[]): string[] {
         const n = readSync(fd, chunk, 0, chunk.length, null);
         if (n <= 0) break;
         const window = Buffer.concat([tail, chunk.subarray(0, n)]);
-        if (bufs.some((b) => window.indexOf(b) >= 0)) { found = true; break; }
+        if (bufs.some((b) => window.indexOf(b) >= 0) || (look && shapeIn(window.toString("latin1")))) { found = true; break; }
         tail = window.subarray(Math.max(0, window.length - keep));
       }
       if (found) hits.push(f);
     } finally { closeSync(fd); }
+  }
+  return hits;
+}
+
+// The git folders under the roots (a repository's .git, or a bare one's objects' parent).
+export function gitDirsUnder(roots: string[]): string[] {
+  const out: string[] = [];
+  const walk = (p: string) => {
+    let st: Stats;
+    try { st = lstatSync(p); } catch (e: any) { if (e?.code === "ENOENT") return; throw e; }
+    if (!st.isDirectory()) return;
+    if (basename(p) === ".git") { out.push(p); return; }
+    for (const n of readdirSync(p)) walk(join(p, n));
+  };
+  for (const r of roots) walk(r);
+  return out;
+}
+
+// The git folders whose objects (every blob, tree and commit, history included) hold a needle or
+// a token's shape, read through git's own cat-file with no config, hooks or filesystem monitor of
+// the repository's own (C1 review service, theme 3). A repository git can't read is an error.
+export async function gitHolding(needles: string[], dirs: string[]): Promise<string[]> {
+  const bufs = needles.filter((n) => n.length > 0).map((n) => Buffer.from(n));
+  const keep = Math.max(200, ...bufs.map((b) => b.length)) - 1;
+  const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "3", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null",
+    GIT_CONFIG_KEY_1: "core.fsmonitor", GIT_CONFIG_VALUE_1: "false", GIT_CONFIG_KEY_2: "safe.directory", GIT_CONFIG_VALUE_2: "*" };
+  const hits: string[] = [];
+  for (const g of dirs) {
+    const p = Bun.spawn(["git", "--git-dir", g, "--no-replace-objects", "cat-file", "--batch-all-objects", "--batch"],
+      { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    let tail = Buffer.alloc(0), found = false;
+    for await (const c of p.stdout) {
+      if (found) continue;                                   // read to the end so git can exit
+      const window = Buffer.concat([tail, Buffer.from(c)]);
+      if (bufs.some((b) => window.indexOf(b) >= 0) || shapeIn(window.toString("latin1"))) found = true;
+      tail = window.subarray(Math.max(0, window.length - keep));
+    }
+    const code = await p.exited;
+    if (code !== 0) throw new Error(`git couldn't read the objects of ${g} (${code}): ${(await new Response(p.stderr).text()).trim().slice(0, 120)}`);
+    if (found) hits.push(g);
   }
   return hits;
 }
@@ -277,9 +361,10 @@ if (import.meta.main) {
     } else if (cmd === "readable" && a && b) {
       writeList(a, readableFiles([b, ...rest]));
     } else if (cmd === "scan" && a && b && rest[0]) {
-      writeList(rest[0], holding(needles(a), nulList(b)));
+      writeList(rest[0], holding(searchable(needles(a)), nulList(b)));
     } else if (cmd === "scan-tree" && a && b && rest.length) {
-      writeList(b, holding(needles(a), filesUnder(rest)));
+      const all = searchable(needles(a));
+      writeList(b, [...holding(all, filesUnder(rest), true), ...await gitHolding(all, gitDirsUnder(rest))]);
     } else if (cmd === "allowed" && a) {
       const bad = nulList(a).find((p) => !readableAllowed(p));
       if (bad) { console.log(bad); process.exit(1); }

@@ -51,3 +51,17 @@ jobs:
           --build-arg BUILD_FROM="$(sed -n 's/^  amd64: //p' cain/build.yaml)" cain
       - name: The switch to his own user, in the image (cain/tests/image/c1.sh)
         run: bash cain/tests/image/c1.sh cain-c1-test
+
+  # The same image and switch on arm64, the Pi's own architecture (C1 review service, theme 7),
+  # on GitHub's arm64 runner. Not a required check by name, but a Ship card waits for every
+  # check on its head to pass.
+  image-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Cain's image (aarch64)
+        run: >-
+          docker build -q -t cain-c1-test --build-arg BUILD_ARCH=aarch64
+          --build-arg BUILD_FROM="$(sed -n 's/^  aarch64: //p' cain/build.yaml)" cain
+      - name: The switch to his own user, in the image (cain/tests/image/c1.sh)
+        run: bash cain/tests/image/c1.sh cain-c1-test

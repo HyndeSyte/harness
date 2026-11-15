@@ -22,6 +22,8 @@ GH="ghp_TESTONLY0123456789abcdefABCDEF0123456"
 GEM="AIzaTESTONLY0123456789abcdefghijklmnopq"
 CODEX="eyJTESTONLY.codex.access.token.0123456789abcdefghij"
 PEMLINE="TESTONLYPEMLINE0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL"
+# The bot token inside a header, base64-encoded as a tool result would show it.
+encoded() { printf 'Authorization: Bot %s' "$BOT" | base64 -w0; }
 relay() { printf '%s' "$BOT" | bun -e 'const c=require("crypto");let t="";process.stdin.on("data",d=>t+=d).on("end",()=>process.stdout.write(c.createHmac("sha256",t).update("harness-relay-v1").digest("hex")))'; }
 
 prepare() {
@@ -32,7 +34,7 @@ prepare() {
   # with the stand-in server, driven by a fake client in place of Claude Code).
   cp /t/stub-smoke.sh "$OPT/c1/smoke.sh" && chmod 0755 "$OPT/c1/smoke.sh"
   export C1_LOGIN_PLUGIN="/t/stub-plugin${STUB_LOGIN_FAIL:+-fail}"
-  printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$BOT" "$GH" "$GEM" "$CODEX" "$PEMLINE" "$(relay)" > /needles
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$BOT" "$GH" "$GEM" "$CODEX" "$PEMLINE" "$(relay)" "$(encoded)" > /needles
   chmod 0644 /needles
 }
 
@@ -73,6 +75,15 @@ template)
   printf '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-his-own-sign-in-not-a-needle"}}\n' > $D/.claude/.credentials.json; chmod 0600 $D/.claude/.credentials.json
   printf '{"type":"user","message":"hello"}\n{"type":"tool_result","content":"DISCORD_BOT_TOKEN=%s"}\n' "$BOT" > $D/.claude/projects/-data-work/leaked.jsonl
   printf '{"type":"user","message":"a plain day"}\n' > $D/.claude/projects/-data-work/plain.jsonl
+  # Past exact copies (C1 review service, theme 3): the token base64-encoded in a transcript, a
+  # repository whose history once held a key (taken out since), and a cache of commands' output.
+  printf '{"type":"tool_result","content":"%s"}\n' "$(encoded)" > $D/.claude/projects/-data-work/encoded.jsonl
+  install -d $D/work/proj $D/.claude/shell-snapshots
+  printf 'export SNAP_KEY=%s\n' "$GH" > $D/.claude/shell-snapshots/snapshot-bash.sh
+  ( cd $D/work/proj && git init -q && printf 'key %s\n' "$GEM" > conf.txt \
+    && git -c user.name=t -c user.email=t@t add . && git -c user.name=t -c user.email=t@t commit -qm one \
+    && printf 'nothing\n' > conf.txt && git -c user.name=t -c user.email=t@t commit -qam two ) >/dev/null || fail "the template's repository"
+
   printf '{}\n' > $D/.claude/settings.json
   printf 'cache\n' > $D/.claude/plugins/cache/x
   printf 'DISCORD_BOT_TOKEN=%s\n' "$BOT" > $D/.claude/channels/discord/.env; chmod 0600 $D/.claude/channels/discord/.env
@@ -134,9 +145,26 @@ final)
   prepare
   [ "$("$OPT/c1/state.sh")" = cut ] || fail "not cut over: $("$OPT/c1/state.sh")"
   secret_free
-  for q in cain/.claude/projects/-data-work/leaked.jsonl work/leak-work.txt discord/inbox/leak.txt; do
-    [ -f "$D/c1/quarantine/$q" ] || [ -n "$(ls "$D/c1/quarantine/$q".* 2>/dev/null)" ] || fail "not quarantined: $q"
+  for q in cain/.claude/projects/-data-work/leaked.jsonl cain/.claude/projects/-data-work/encoded.jsonl work/leak-work.txt work/proj/.git discord/inbox/leak.txt; do
+    [ -e "$D/c1/quarantine/$q" ] || [ -n "$(ls -d "$D/c1/quarantine/$q".* 2>/dev/null)" ] || fail "not quarantined: $q"
   done
+  [ ! -e $D/cain/.claude/shell-snapshots ] || fail "the shell snapshots came along to his home"
+  [ -f $D/work/proj/conf.txt ] || fail "his repository's files didn't stay"
+  # The check of his own user, as the start runs it (without the running stack here), with the
+  # bot token in a running process of the discord user's (as the broker starts the plugin): it
+  # holds, since his user sees the token in no command line and no environment. And it isn't
+  # blind: the token's variable in a process of his own is found (C1 review service, themes 4, 8).
+  holder() { setpriv --reuid="$1" --regid="$1" --init-groups --no-new-privs env -i PATH=/usr/bin:/bin DISCORD_BOT_TOKEN="$BOT" bash -c 'exec sleep 30' & }
+  checked() { "$OPT/as-cain" env C1_CHECK_NO_LINK=1 bun "$OPT/c1/check.ts" | tail -n 1; }
+  holder discord; h=$!; sleep 1
+  out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
+  [ "$(printf '%s' "$out" | jq -r .ok)" = true ] || fail "the check of his own user failed: $out"
+  holder cain; h=$!; sleep 1
+  out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
+  printf '%s' "$out" | jq -e '.ok == false and (.failed | any(test("carries the bot token")))' >/dev/null \
+    || fail "the check didn't see the token in a process of his own: $out"
+  # His own processes carry no rlimit he can raise past 1024 (as-cain's prlimit).
+  [ "$("$OPT/as-cain" bash -c 'ulimit -u')" = 1024 ] || fail "his process limit isn't 1024"
   [ -f $D/cain/.claude/projects/-data-work/plain.jsonl ] || fail "his plain transcript didn't come along"
   [ -f $D/work/notes/today.md ] || fail "his notes didn't stay"
   [ "$(stat -c %U:%a $D/work)" = cain:700 ] && [ "$(stat -c %U:%a $D/cain)" = cain:700 ] || fail "his folders aren't his"

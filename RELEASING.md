@@ -146,6 +146,20 @@ Before a Ship card for a release that changes how an App starts (Cain 0.12.0: th
 his own user), the laptop session confirms from Home Assistant's backup entities that the
 last automatic backup succeeded within 24 hours: the way back has to exist first.
 
+## The way back from the move to Cain's own user (Cain 0.12.0, Harness 0.24.0)
+
+The two Apps go back together, never one alone. The Ship job takes a backup of each just
+before it updates it (Cain first, then Harness), so both exist from the same few minutes.
+In Home Assistant: Settings, System, Backups; restore Cain's, then the calendar App's
+(Harness). If only one goes back:
+- Cain alone: the calendar App's cards wait and none is lost (an answer the link didn't sign
+  is retried, cain_relay.py `_call`), but they don't move until Harness goes back too.
+- Harness alone: the link answers its old key with 503 and nothing done, and tells Cain at
+  once, at most hourly (link/main.ts `oldKeySeen`); Cain shows a new Ship card for the pull
+  request that last updated Harness, so a tap installs it again.
+A restored history only matters for an operation whose answer was lost in the minutes
+before the restore: the calendar App sends again only rows it never got an answer for.
+
 ## If Home Assistant's connector lapses
 
 Cain's Ship job installs through the claude.ai Home Assistant connector, and a

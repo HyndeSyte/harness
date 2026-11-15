@@ -27,6 +27,7 @@ run)
   install -d -m 0750 -o root -g discord /run/cain/outbox
   install -d -m 0700 -o cain -g cain /run/cain/tmux
   chmod 0700 /run/s6/container_environment 2>/dev/null
+  chmod 0400 /run/s6/container_environment/* 2>/dev/null
   [ ! -d /run/s6/container_environment ] || [ "$(stat -c %a /run/s6/container_environment)" = 700 ] \
     || die "s6's saved environment isn't root's only"
   [ ! -e "$D/options.json" ] || chmod 0600 "$D/options.json" || die "options.json couldn't be made root's only"

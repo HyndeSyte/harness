@@ -11,7 +11,7 @@
 #     his, the start's own checks passing and catching a planted root file (in.sh final);
 #   - and the named cases: kills inside an undo, a detached process of his, a failed smoke
 #     test, a failed Discord login, a connector that wouldn't load, his connectors not listed
-#     yet, three failures in a row, and the old session's container.
+#     yet, no room for the copies, three failures in a row, and the old session's container.
 # The real Discord login and a real Claude Code session aren't here (CI has neither sign-in):
 # stand-ins take their place (stub-plugin, fake-claude.ts), and the first start on the Pi does
 # them for real.
@@ -83,6 +83,15 @@ grep -q "his connectors wouldn't all load" "$fp/switch.log" || die "the undo did
 step -- unplant-connector
 settle; finish
 echo "a connector that wouldn't load undid the switch"
+
+# Not enough free space for the switch's copies: it waits (rc 1) and begins nothing.
+fresh
+rc="$(step C1_FREE_KB=1 -- switch | rc_of)"
+[ "$rc" = 1 ] || die "a switch without room for its copies gave rc=$rc, not 1"
+[ "$(step -- journal-there)" = no ] || die "a switch without room for its copies began a journal"
+grep -q "not enough free space" "$fp/switch.log" || die "the wait didn't say it was the space"
+settle; finish
+echo "the switch waits for room for its copies"
 
 # His connectors not listed the old way yet (the listing failed, or hasn't run): the switch
 # waits (rc 1) and begins nothing; once a listing went through, it switches.

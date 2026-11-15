@@ -308,6 +308,89 @@ def test_cain_start_decides_every_switch_outcome_under_errexit(tmp_path):
         assert out.stdout.strip().startswith(expect), (rc, out.stdout, out.stderr[-300:])
 
 
+def test_a_breach_found_by_the_check_keeps_cain_stopped_on_that_version_only(tmp_path):
+    """C1 review service, theme 8: a failed check of his own user is a stop, not a line. The
+    start keeps him stopped while the App is the version it failed on (or its version can't be
+    read), and a new version clears it and gets its own check."""
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        import pytest
+        pytest.skip("no bash")
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    block = run[run.index('relay() {'):run.index('[ -z "$stopped_why" ] || bashio::log.error')]
+    data = tmp_path / "data"
+    opt = tmp_path / "opt"
+    (data / "c1").mkdir(parents=True)
+    (opt / "c1").mkdir(parents=True)
+    for name, body in {"c1/state.sh": "echo cut", "c1/lock.sh": "exit 0"}.items():
+        (opt / name).write_text("#!/bin/bash\n" + body + "\n")
+        (opt / name).chmod(0o755)
+    body = block.replace("/data/", f"{data.as_posix()}/")
+    script = ("set -o errexit -o nounset -o pipefail\n"
+              "bashio::log.info() { :; }; bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
+              'bashio::addon.version() { [ -n "$STUB_VERSION" ] && echo "$STUB_VERSION"; }\n'
+              f'OPT="{opt.as_posix()}"\n' + body + '\necho "mode=$mode check=$check_stopped why=$stopped_why"\n')
+    (tmp_path / "start.sh").write_text(script)
+    mark = data / "c1/check-failed"
+
+    def start(version):
+        env = {**os.environ, "STUB_VERSION": version}
+        out = subprocess.run(["bash", (tmp_path / "start.sh").as_posix()], capture_output=True, text=True, env=env)
+        assert out.returncode == 0, out.stderr[-400:]
+        return out.stdout.strip()
+
+    assert start("0.12.0").startswith("mode=own check= ")
+    mark.write_text("0.12.0 can't read /data/link/discord.env\n")
+    out = start("0.12.0")
+    assert out.startswith("mode=none check=1 ") and "can't read /data/link/discord.env" in out
+    assert start("").startswith("mode=none check=1 ")                    # the version can't be read
+    assert start("0.12.1").startswith("mode=own check= ") and not mark.exists()
+
+
+def test_the_check_stops_cain_only_on_a_breach_and_tries_again_what_it_couldnt_try(tmp_path):
+    """c1/check.sh: a breach writes the stop for this version and ends his session at once; a
+    check that couldn't be tried, or gave no answer, is tried again and then reported to Cain,
+    never a stop."""
+    import json
+    import shutil
+    import subprocess
+    if not shutil.which("bash") or not shutil.which("jq"):
+        import pytest
+        pytest.skip("no bash or jq")
+    opt = tmp_path / "opt"
+    (opt / "c1").mkdir(parents=True)
+    shutil.copy(CAIN / "rootfs/opt/cain/c1/check.sh", opt / "c1/check.sh")
+    (opt / "as-cain").write_text('#!/bin/bash\nif [ "$1" = tmux ]; then echo killed >> "$STUB/calls"; exit 0; fi\n'
+                                 'n=$(cat "$STUB/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUB/n"\n'
+                                 'sed -n "$((n + 1))p" "$STUB/answers"\n')
+    (opt / "as-cain").chmod(0o755)
+
+    def check(*answers):
+        stub = tmp_path / f"s{len(list(tmp_path.iterdir()))}"
+        stub.mkdir()
+        (stub / "answers").write_text("\n".join(answers) + "\n")
+        env = {**os.environ, "STUB": stub.as_posix(), "C1_OPT": opt.as_posix(), "C1_CHECK_OUT": (stub / "out.json").as_posix(),
+               "C1_CHECK_FAILED": (stub / "failed").as_posix(), "RELAY_QUEUE": (stub / "queue").as_posix(),
+               "C1_VERSION": "0.12.0", "C1_CHECK_RETRY_S": "0"}
+        out = subprocess.run(["bash", (opt / "c1/check.sh").as_posix()], capture_output=True, text=True, env=env)
+        assert out.returncode == 0, out.stderr[-400:]
+        read = lambda f: (stub / f).read_text() if (stub / f).exists() else ""
+        return out.stdout.strip(), read("failed"), read("calls"), read("queue"), int(read("n") or 0)
+
+    good = json.dumps({"ok": True, "failed": [], "unchecked": [], "checks": 30})
+    later = json.dumps({"ok": True, "failed": [], "unchecked": ["his key on /card: the link didn't answer"], "checks": 29})
+    breach = json.dumps({"ok": False, "failed": ["can't read /data/link/discord.env"], "unchecked": [], "checks": 30})
+    line, failed, calls, queue, n = check(good)
+    assert (line, failed, calls, queue, n) == ("[c1] check: all 30 held", "", "", "", 1)
+    line, failed, calls, queue, n = check(breach)
+    assert failed == "0.12.0 can't read /data/link/discord.env\n" and calls == "killed\n" and n == 1 and "FAILED" in line
+    line, failed, calls, queue, n = check(later, later, good)
+    assert (failed, calls, queue, n) == ("", "", "", 3) and line == "[c1] check: all 30 held"
+    line, failed, calls, queue, n = check(*["not json"] * 5)
+    assert failed == "" and calls == "" and n == 5 and "gave no answer" in queue and "P33" in queue
+
+
 def test_the_old_way_keeps_his_connectors_only_from_a_listing_that_went_through(tmp_path):
     """C1 re-check: the switch checks every claude.ai connector of his still loads under his new
     rules. The old way keeps their names only from a listing that went through, its first line
