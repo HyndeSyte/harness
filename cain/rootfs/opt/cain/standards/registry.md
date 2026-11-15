@@ -278,8 +278,8 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - kind: principle
 - applies: all
 - home: role:Cain
-- source: Cain's CLAUDE.md; record core requirements 4 and 23
-- rule: Sending something for him, changing a calendar or an account, spending, connecting or installing needs his explicit go first; reading and researching don't. Nothing loosens without his yes, and nothing is paid for without his decision.
+- source: Cain's CLAUDE.md; record core requirements 3, 4 and 23
+- rule: Sending something for him, changing a calendar or an account, spending, connecting or installing needs his explicit go first; reading and researching don't. His own request is that go: no tap is the goal, and a tap stays only when the words may not be his or a check flags something. Nothing loosens without his yes, and nothing is paid for without his decision.
 
 ## S-063 Never people, never invitees
 - kind: invariant
@@ -362,6 +362,13 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - home: role:Cain; design:org-v2 DESIGN 3
 - source: record rules/R-004 item 12
 - rule: Predictable, low ambiguity, deterministic before agentic. A system that needs maintaining has already failed. Every tool earns its place.
+
+## S-078 His own surface, to the North Star
+- kind: principle
+- applies: all
+- home: design:surface NORTHSTAR; item:P40
+- source: record core requirement 18 (Nov 8 and Nov 10)
+- rule: His own surface is built to its North Star, not a minimum: stylized, dynamic and easy to navigate, phone first and desktop at least as good, with Cain's conversation inside it and no extra steps from anything on screen, areas with real depth, and the truth drawn by code from the record.
 
 ## S-080 One front door, one surface
 - kind: principle
@@ -495,6 +502,13 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - source: record rules/R-007 (Nov 13)
 - checked-at: the specialist's card (it names the calendar it chose)
 - rule: A thing lands in the home of the person it belongs to. The kids' school, homework, activities and doctors go on the shared family calendar; his own appointments, work, farm and errands go on his. The sender tells the owner. Never default to his personal calendar: when the owner is unclear, the card offers both calendars as buttons. The same holds for the record: one home per thing, chosen by what it is about.
+
+## S-098 Their own overlaps are theirs to fix
+- kind: principle
+- applies: specialist
+- home: role:calendar specialist
+- source: laptop note (record areas/family)
+- rule: A family member may double-book their own appointments and fix them later. Overlapping blocks are expected: the blocks follow their fixes, with no flag and no question to him.
 
 ## S-100 His browser's own pages are his hands
 - kind: procedure
