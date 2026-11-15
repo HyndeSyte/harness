@@ -404,7 +404,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   writeFileSync(join(udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
   writeFileSync(join(udd, "Last Version"), "131.0.6778.86");
   writeFileSync(join(udd, "lockfile"), "");
-  const inst: Install = { v: 1, owner_fpr: OWNER_FPR, claude: "claude", session_minutes: 15, unattended: false, confirm_path: false,
+  const inst: Install = { v: 1, owner_fpr: OWNER_FPR, claude: "C:/Users/owner/.local/bin/claude.exe", session_minutes: 15, unattended: false, confirm_path: false,
     diagnostics: false, profile: { user_data_dir: udd, profile_directory: "Default", profile_name: "Cain jobs", extension_id: EXT },
     other_user_data_dirs: [] };
   const install = (over: Partial<Install> = {}) => fileOk(join(home, "install.json"), JSON.stringify({ ...inst, ...over }, null, 2));
@@ -666,7 +666,7 @@ describe("the PC worker: one run", () => {
     // First the bridge check (a tab-context call, nothing else), then the run itself.
     expect(q.launches[0][2]).toBe(BRIDGE_PROMPT);
     const argv = q.launches[1];
-    expect(argv.slice(0, 2)).toEqual(["claude", "-p"]);
+    expect(argv.slice(0, 2)).toEqual(["C:/Users/owner/.local/bin/claude.exe", "-p"]);
     for (const f of ["--chrome", "--settings", "--allowedTools", "--disallowedTools", "--strict-mcp-config", "--mcp-config", "--verbose"]) expect(argv).toContain(f);
     expect(argv[argv.indexOf("--settings") + 1]).toBe(q.files.settings);
     expect(argv[argv.indexOf("--setting-sources") + 1]).toBe("");
