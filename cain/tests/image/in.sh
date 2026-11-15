@@ -145,23 +145,31 @@ final)
   printf '%s\n' "$GH" > $D/trust/oops.json; chmod 0644 $D/trust/oops.json
   if "$OPT/c1/lock.sh" verify 2>/dev/null; then fail "verify missed a secret in a file he can read"; fi
   rm -f $D/trust/oops.json
-  # His session can't gain another plugin, or the tools of one (C1 code review C1-3): an install
-  # of another of the marketplace's plugins into his plugins folder fails, and a new session of
-  # his still loads the Discord plugin alone.
+  # His session can't gain another plugin, or the tools of one (C1 code review C1-3): the image's
+  # copy of the marketplace lists the Discord plugin alone, so an install of any other of the
+  # official plugins fails, and a new session of his still loads only what the seed and Claude
+  # Code itself bring.
   mkt="$OPT/plugin-seed/marketplaces/claude-plugins-official/.claude-plugin/marketplace.json"
-  other="$(jq -r '.plugins[].name' "$mkt" 2>/dev/null | grep -vx discord | head -n 1)"
-  [ -n "$other" ] || fail "no other plugin in the seed's marketplace to try"
-  as_him=("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" CLAUDE_CODE_PLUGIN_CACHE_DIR="$OPT/plugin-root" DISABLE_AUTOUPDATER=1)
+  [ "$(jq -r '[.plugins[].name] | join(",")' "$mkt")" = discord ] || fail "the seed's marketplace lists more than the Discord plugin"
+  other=telegram
+  as_him=("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1)
   if "${as_him[@]}" timeout 120 claude plugin install "$other@claude-plugins-official" > /fp/install.log 2>&1; then
     fail "his session installed $other: $(tail -n 3 /fp/install.log | tr '\n' ' ')"
   fi
   "${as_him[@]}" ANTHROPIC_API_KEY=sk-ant-api03-ci-only-not-a-real-key timeout 120 claude -p --output-format stream-json --verbose --max-turns 1 "ok" > /fp/after.jsonl 2> /fp/after.err || true
   "$OPT/c1/seed-loaded.sh" /fp/after.jsonl || fail "after the install try, his session didn't load the seed's plugin"
   loaded="$(jq -c 'select(.type == "system" and .subtype == "init") | [.plugins[]? | {name, path}]' /fp/after.jsonl | head -n 1)"
-  extra="$(jq -r --arg s "$OPT/plugin-seed/" 'select(.type == "system" and .subtype == "init") | .plugins[]? | select(((.path // "") | startswith($s)) | not) | "\(.name) \(.path)"' /fp/after.jsonl)"
+  extra="$(jq -r --arg s "$OPT/plugin-seed/" 'select(.type == "system" and .subtype == "init") | .plugins[]? | select(((.path // "") | startswith($s) or . == "builtin") | not) | "\(.name) \(.path)"' /fp/after.jsonl)"
   [ -z "$extra" ] || fail "his session loaded a plugin from outside the image's seed: $extra"
   note "final checks held ($other couldn't be installed; loaded: $loaded)"
   ;;
+plant-connector)
+  # The old way recorded a claude.ai connector of his (the run script's connector check): CI has
+  # no sign-in, so it can't load under his new rules, and the switch must undo itself.
+  install -d -m 0700 $D/c1 && printf 'claude.ai Gmail
+' > $D/c1/connectors-before && chmod 0600 $D/c1/connectors-before
+  ;;
+unplant-connector) rm -f $D/c1/connectors-before ;;
 legacy-here)
   # The old root session ran in this container (the run script put it on record): the switch
   # mustn't begin here.

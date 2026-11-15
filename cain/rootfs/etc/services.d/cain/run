@@ -173,9 +173,16 @@ fi
 if [ "$mode" != none ]; then
   (
     sleep 30
-    if [ "$mode" = own ]; then out="$(timeout 120 "$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" CLAUDE_CODE_PLUGIN_CACHE_DIR="$OPT/plugin-root" claude mcp list 2>&1)"
-    else out="$(timeout 120 claude mcp list 2>&1)"; fi
+    if [ "$mode" = own ]; then out="$(timeout 120 "$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" claude mcp list 2>&1 || true)"
+    else out="$(timeout 120 claude mcp list 2>&1 || true)"; fi
     printf '%s\n' "$out" | sed -E 's#[a-z]+://[^ ]*#<address>#g' | head -n 40 | while IFS= read -r line; do echo "[cain] connector: $line"; done
+    # The old way keeps the names of his claude.ai connectors (root's file): the switch checks
+    # every one still loads under his new rules before it commits (c1/cutover.sh).
+    if [ "$mode" = old ]; then
+      names="$(printf '%s\n' "$out" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u)"
+      if [ -n "$names" ]; then printf '%s\n' "$names" > /data/c1/connectors-before.tmp && chmod 0600 /data/c1/connectors-before.tmp \
+        && mv /data/c1/connectors-before.tmp /data/c1/connectors-before || true; fi
+    fi
   ) &
   # The c1 check (the new way): root runs it as cain and keeps its result (c1/check.sh).
   if [ "$mode" = own ]; then ( sleep 45; "$OPT/c1/check.sh" 2>&1 | tail -n 1 ) & fi

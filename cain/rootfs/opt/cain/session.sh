@@ -6,8 +6,7 @@
 #                   pinned plugin from the image's seed, whose channel runs through the broker.
 #   CAIN_MODE=old   the old way, as root, as 0.11.0 ran.
 if [ "${CAIN_MODE:-}" = own ]; then
-  # The seed's plugin, and a plugins folder of root's he can't install into (C1-3).
-  export HOME=/data/cain CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/cain/plugin-seed CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/cain/plugin-root DISABLE_AUTOUPDATER=1
+  export HOME=/data/cain CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/cain/plugin-seed DISABLE_AUTOUPDATER=1
 else
   export HOME=/data
 fi

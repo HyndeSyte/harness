@@ -73,11 +73,13 @@ RUN set -eu; seed=/opt/cain/plugin-seed; pin=/opt/cain/discord/pin.json; \
     (cd /opt/cain/discord/plugin && bun install --frozen-lockfile --production --no-summary); \
     install -m 0644 /opt/cain/discord/seed-mcp.json "$plugin/.mcp.json"; \
     rm -rf /root/.claude /root/.claude.json /root/.cache /root/.bun; \
-    chown -R root:root "$seed" /opt/cain/discord/plugin; chmod -R a+rX,go-w "$seed" /opt/cain/discord/plugin; \
-    install -d -m 0755 -o root -g root /opt/cain/plugin-root
-# /opt/cain/plugin-root: his session's plugins folder (CLAUDE_CODE_PLUGIN_CACHE_DIR), root's and
-# empty, so no plugin can be installed into it: his session loads the seed's Discord plugin and
-# nothing else (with the managed MCP allowlist in settings.json, C1 code review C1-3).
+    mkt="$seed/marketplaces/claude-plugins-official/.claude-plugin/marketplace.json"; \
+    jq '.plugins |= map(select(.name == "discord"))' "$mkt" > "$mkt.tmp" && mv "$mkt.tmp" "$mkt"; \
+    test "$(jq -r '[.plugins[].name] | join(",")' "$mkt")" = discord; \
+    chown -R root:root "$seed" /opt/cain/discord/plugin; chmod -R a+rX,go-w "$seed" /opt/cain/discord/plugin
+# The seed's copy of the official marketplace lists the Discord plugin alone (C1 code review C1-3):
+# the seed's entry overrides his own at every start and isn't refreshed, so no other plugin of it
+# can be installed into his session; the managed MCP allowlist (settings.json) takes the rest.
 
 # Cain's rules (/opt/cain/settings.json and CLAUDE.md) go to /etc/claude-code, where Claude
 # Code reads managed policy, at every start that runs him as his own user, checked by hash

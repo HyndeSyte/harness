@@ -72,6 +72,17 @@ rc="$(step STUB_LOGIN_FAIL=1 -- switch | rc_of)"
 settle; finish
 echo "a failed Discord login undid the switch"
 
+# A claude.ai connector of his that wouldn't load under his new rules: undone (rc 4), so he never
+# loses his mail or calendars to the switch; without it, the switch goes through.
+fresh
+step -- plant-connector
+rc="$(step -- switch | rc_of)"
+[ "$rc" = 4 ] || die "a connector that wouldn't load gave rc=$rc, not 4"
+grep -q "his connectors wouldn't all load" "$fp/switch.log" || die "the undo didn't say it was the connectors"
+step -- unplant-connector
+settle; finish
+echo "a connector that wouldn't load undid the switch"
+
 # Three failures in a row: the next start doesn't try (6 hours), and nothing is begun.
 fresh
 for i in 1 2 3; do

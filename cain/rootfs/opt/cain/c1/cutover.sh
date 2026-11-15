@@ -194,6 +194,14 @@ if [ "$state" = fresh ]; then
   # loaded from the seed: a seed plugin registers at session start, so `claude plugin list`
   # wouldn't show it), and its reply goes through the bridge, the broker and the gate.
   "$OPT/c1/smoke.sh" || abort "the channel smoke test didn't pass"
+  # His claude.ai connectors (his mail, his calendars) must all still load under his new rules
+  # (the managed MCP allowlist): the old way kept their names (the run script's connector check),
+  # and one missing undoes the switch rather than leave him without it.
+  if [ -s "$C/connectors-before" ]; then
+    listed="$("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 timeout 180 claude mcp list 2>/dev/null || true)"
+    missing="$(printf '%s\n' "$listed" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u | comm -13 - "$C/connectors-before")"
+    [ -z "$missing" ] || abort "his connectors wouldn't all load under his new rules (missing: $(printf '%s' "$missing" | tr '\n' ',' | cut -c1-200))"
+  fi
   kp validate-1
   # Whatever the validation started is ended, not trusted to have ended: every process of uid
   # 1000 and 1001, checked gone, before the journal moves on.
