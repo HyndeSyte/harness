@@ -1,7 +1,7 @@
 // The PC job queue (rootfs/opt/cain/pcjobs/): the format, Cain's keeper on a real git
 // repo standing in for GitHub, the PC worker against the same repo, and pcjobs.sh.
 // Runs on Linux and on Windows (the pcjobs-windows job in tests.yml).
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createPublicKey, generateKeyPairSync } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +17,9 @@ import { makeToken, publicKey as shipPublicKey, readToken } from "../rootfs/opt/
 import { publicOf } from "../rootfs/opt/cain/link/shipkey.ts";
 import { b64url } from "../rootfs/opt/cain/ship-token.ts";
 import { cleanEnv, sh } from "./rig.ts";
+
+// Each test drives real git repos; git on a Windows runner is slow, so give them time.
+setDefaultTimeout(120_000);
 
 const OPT = resolve(import.meta.dir, "../rootfs/opt/cain");
 const REPO = resolve(import.meta.dir, "../..");
