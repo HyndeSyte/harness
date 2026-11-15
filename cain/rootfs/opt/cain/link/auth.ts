@@ -203,12 +203,20 @@ export const RERUN_SAFE = new Set(["/card"]);
 // is reconciled the same way, never answered with the old error for good (C1 re-check R3). An
 // operation whose "received" couldn't be recorded durably isn't done at all (503, retried: C1
 // re-check F2); one whose "done" couldn't be is answered all the same, and stays received.
+// stale(path, stored): a stored answer that may no longer hold (a card the link lost with its
+// damaged store): it's answered as the explicit unknown instead, and kept so (C1 re-check B2).
 export class SignedOps {
   private inflight = new Map<string, Promise<Answer>>();
   constructor(private log: RequestLog, private now = () => Date.now(),
-              private rerun: (path: string) => boolean = (p) => RERUN_SAFE.has(p)) {}
+              private rerun: (path: string) => boolean = (p) => RERUN_SAFE.has(p),
+              private stale: (path: string, stored: Stored) => boolean = () => false) {}
   async run(id: string, path: string, act: () => Promise<Answer>): Promise<Answer> {
     const done = this.log.get(id, this.now());
+    if (done?.state === "done" && this.stale(path, done)) {
+      const a = { status: 409, body: JSON.stringify({ status: "unknown", said: "what this operation made was lost with the link's damaged record, so whether it still stands isn't known" }) };
+      try { this.log.put(id, { at: done.at, state: "done", status: a.status, body: a.body }); } catch { /* the same answer next time */ }
+      return a;
+    }
     if (done?.state === "done") return { status: done.status ?? 200, body: done.body ?? "{}" };
     const joined = this.inflight.get(id);
     if (joined) return joined;

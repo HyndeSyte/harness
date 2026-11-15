@@ -105,7 +105,13 @@ const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
 function save(s: State): void { stateStore.save(s); }
 // Read once at the start, so a store found damaged is known before anything is asked of the link.
-load();
+// One whose loss couldn't be recorded: the link doesn't start (the run script tries again in 5
+// seconds), rather than run on a store that could later pass for a fresh one (C1 re-check B1).
+try { load(); }
+catch (e) {
+  console.log(`[cain] link: ERROR: its record of cards and messages is damaged and the loss couldn't be recorded (${String(e).slice(0, 80)}); not starting until it can`);
+  process.exit(1);
+}
 if (stateStore.lostNow()) console.log("[cain] link: ERROR: its record of cards and messages was damaged on disk (both copies), kept aside, and started over");
 else if (stateStore.lost()) console.log("[cain] link: its record of cards and messages was found damaged within the last 8 days: a card's request isn't run again meanwhile");
 
@@ -301,7 +307,9 @@ if (requests.damagedSince) console.log(`[cain] link: ERROR: its record of the sp
 else if (requests.recoveredFrom) console.log(`[cain] link: its record of the specialist's operations was read from ${requests.recoveredFrom} (the other was damaged or a step behind); nothing lost`);
 // A card's request runs again only while the cards it made are on record: a store found damaged
 // lost which request made which card, so then it's an explicit unknown too.
-const ops = new SignedOps(requests, Date.now, (p) => RERUN_SAFE.has(p) && !stateStore.lost());
+// And a card's answer from before the loss names a card that's gone: the explicit unknown.
+const ops = new SignedOps(requests, Date.now, (p) => RERUN_SAFE.has(p) && !stateStore.lost(),
+  (p, s) => p === "/card" && s.status === 200 && stateStore.lost() > 0 && s.at <= stateStore.lost());
 // A body larger than any route takes is refused before it's read, signed or not (C1-7).
 const MAX_BODY = 16_384;
 // Recorded, durably, at the specialist's first signed request: until then the run script keeps

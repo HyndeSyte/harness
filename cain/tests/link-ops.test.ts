@@ -123,6 +123,28 @@ describe("each signed operation once", () => {
     });
   }
 
+  test("a stored answer that may no longer hold (a card lost with the link's damaged store) is the explicit unknown; others keep theirs (C1 re-check B2)", async () => {
+    const f = join(dir(), "requests.json");
+    const OTHER = "c".repeat(32), NEWER = "d".repeat(32);
+    let lostAt = 0;
+    const stale = (path: string, s: { status?: number; at: number }) => path === "/card" && s.status === 200 && lostAt > 0 && s.at <= lostAt;
+    let now = 1_800_000_000_000;
+    const ops = new SignedOps(new RequestLog(f, now), () => now, undefined, stale);
+    let runs = 0;
+    const act = async () => { runs++; return { status: 200, body: '{"id":17}' }; };
+    await ops.run(ID, "/card", act);
+    await ops.run(OTHER, "/relay", act);
+    now += 1000; lostAt = now;                                 // the store lost after both were done
+    now += 1000;
+    const a = await ops.run(ID, "/card", act);
+    expect([a.status, JSON.parse(a.body).status]).toEqual([409, "unknown"]);
+    expect((await ops.run(OTHER, "/relay", act)).status).toBe(200);          // not a card: its answer stands
+    expect((await ops.run(NEWER, "/card", act)).body).toBe('{"id":17}');      // made after the loss: runs
+    expect(runs).toBe(3);
+    lostAt = 0;
+    expect((await ops.run(ID, "/card", act)).status).toBe(409);               // kept so after the window
+  });
+
   test("the folder's sync failing is the writer's error, never swallowed", () => {
     const f = join(dir(), "x.json");
     expect(() => writeSynced(f, "{}", () => { throw new Error("EIO") })).toThrow("EIO");

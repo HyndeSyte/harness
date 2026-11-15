@@ -31,14 +31,21 @@ export const CARDS_DELAY_MS = 500;
 // its folder synced), in two copies, the second first, each holding which save it is (saveGen),
 // as the request log is (C1 re-check N2). So a card the link answered for is on disk before its
 // answer is recorded, and one damaged copy loses nothing. Both damaged is never taken quietly for
-// a fresh store: they're kept aside (state.json.damaged-<time>), and lost() says so, across
+// a fresh store: the loss is recorded first, durably (state.json.lost, its time), and only then
+// are they moved aside (state.json.damaged-<time>), so no crash between the two can make it look
+// fresh; if the loss can't be recorded, nothing is moved and load() throws (C1 re-check B1). A
+// marker that can't be read, or doesn't hold a time, counts as a loss now. lost() says so, across
 // restarts, for as long as the link remembers a signed request (KEEP_MS): the link tells Cain, and
 // a card's request id isn't trusted to find its card meanwhile. A save tells onSave (the cards
 // writer) and writes nothing else.
 export function stateFile(path: string, onSave: () => void = () => {},
                           write: (path: string, body: string) => void = writeSynced, now = () => Date.now()) {
   let gen = 0, whole = false, lostAt = 0, foundNow = false;
-  try { const t = Number(readFileSync(`${path}.lost`, "utf8")); if (Number.isFinite(t) && t > 0) lostAt = t; } catch { /* never lost */ }
+  try {
+    const t = Number(readFileSync(`${path}.lost`, "utf8").trim());
+    if (Number.isSafeInteger(t) && t > 0) lostAt = t;
+    else { lostAt = now(); try { write(`${path}.lost`, String(lostAt)); } catch { /* lost in memory still */ } }
+  } catch (e: any) { if (e?.code !== "ENOENT") lostAt = now(); }
   const one = (p: string): State | "absent" | "bad" => {
     let text: string;
     try { text = readFileSync(p, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? "absent" : "bad"; }
@@ -61,10 +68,9 @@ export function stateFile(path: string, onSave: () => void = () => {},
         return best;
       }
       if (a === "absent" && b === "absent") return emptyState();
-      const t = now();
-      for (const p of [path, `${path}.2`]) { try { renameSync(p, `${p}.damaged-${t}`); } catch { /* absent */ } }
-      lostAt = t; foundNow = true;
-      try { write(`${path}.lost`, String(t)); } catch { /* lost in memory still */ }
+      if (!lostAt) { const t = now(); write(`${path}.lost`, String(t)); lostAt = t; }
+      foundNow = true;
+      for (const p of [path, `${path}.2`]) { try { renameSync(p, `${p}.damaged-${lostAt}`); } catch { /* absent */ } }
       return emptyState();
     },
     save(s: State): void {

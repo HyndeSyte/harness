@@ -228,6 +228,39 @@ describe("the cards, published for the reply hook", () => {
     expect(stateFile(p, () => {}, undefined, () => t).lost()).toBe(0);                    // until it can't matter
   });
 
+  test("a loss is recorded before the damaged copies move, and a crash between the two still counts as a loss (C1 re-check B1)", () => {
+    const damaged = () => {
+      const dir = mkdtempSync(join(tmpdir(), "state-"));
+      const p = join(dir, "state.json");
+      writeFileSync(p, "{oops"); writeFileSync(`${p}.2`, "{oops");
+      return { dir, p };
+    };
+    // The marker can't be written: nothing moves, nothing passes for a fresh store, and a later
+    // start that can write it records the loss.
+    let { dir, p } = damaged();
+    const refusing = stateFile(p, () => {}, (path, body) => { if (path.endsWith(".lost")) throw new Error("EIO"); writeFileSync(path, body); });
+    expect(() => refusing.load()).toThrow("EIO");
+    expect([readdirSync(dir).sort(), refusing.lost()]).toEqual([["state.json", "state.json.2"], 0]);
+    const later = stateFile(p);
+    later.load();
+    expect([later.lost() > 0, later.lostNow(), existsSync(`${p}.lost`)]).toEqual([true, true, true]);
+    // Killed after the marker, before the copies moved: the next start finds both, keeps the
+    // marker's time, moves them, and says it found them.
+    ({ dir, p } = damaged());
+    const t0 = Date.now() - 60_000;
+    writeFileSync(`${p}.lost`, String(t0));
+    const resumed = stateFile(p);
+    resumed.load();
+    expect([resumed.lost(), resumed.lostNow(), readdirSync(dir).filter((f) => f.includes(`.damaged-${t0}`)).length]).toEqual([t0, true, 2]);
+    // A marker that doesn't hold a time, or can't be read, counts as a loss now.
+    ({ dir, p } = damaged());
+    writeFileSync(`${p}.lost`, "garbage");
+    expect(stateFile(p).lost() > 0).toBe(true);
+    ({ dir, p } = damaged());
+    mkdirSync(`${p}.lost`);
+    expect(stateFile(p).lost() > 0).toBe(true);
+  });
+
   test("a save that couldn't be made durable throws, and the next read takes the newer copy, not a stale first one", () => {
     const dir = mkdtempSync(join(tmpdir(), "state-"));
     const p = join(dir, "state.json");
