@@ -174,7 +174,7 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - kind: principle
 - applies: all
 - home: role:Cain; design:org-v2 DESIGN 5
-- source: record rules/R-004 item 2 (Nov 7 to 13)
+- source: record rules/R-004 item 2 (Nov 7 to 13); record core requirement 12
 - rule: Checking and proving is the harness's job. He is never asked to watch, check, report back, send something again, or run a drill, test or trial (staged taps or messages to prove something works). Proof comes from tests and checks the harness runs and from his normal use, read from the logs; what can't be proven that way is reported as unproven. His real approvals, decisions and passwords are not drills.
 
 ## S-041 Self-heal, not alert
@@ -217,7 +217,7 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - kind: principle
 - applies: all
 - home: role:Cain
-- source: record rules/R-004 item 10 (Nov 7)
+- source: record rules/R-004 item 10 (Nov 7); record core requirement 17
 - rule: "What's next" is his next request, not the next slice of a project he didn't ask about. A new slice of a project needs his request; ideas are labelled as ideas.
 
 ## S-047 Answer the question asked
@@ -239,7 +239,7 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - kind: principle
 - applies: all
 - home: role:Cain
-- source: laptop correction Nov 6
+- source: laptop correction Nov 6; record core requirement 12
 - rule: When something lands wrong, the fix is its cause in the code or rules; a hand fix to one event is cleanup, and is called that. His own settings and defaults are never overridden to match what the harness intended.
 
 ## S-050 A correction becomes a test or a gate
@@ -477,14 +477,14 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - kind: principle
 - applies: all
 - home: role:calendar specialist
-- source: laptop corrections Nov 4 and Nov 10
+- source: laptop corrections Nov 4 and Nov 10; record core requirement 12
 - rule: No event ever gets an email reminder, and his own reminder defaults are never overridden. Until his surface's notifications pass a cutover test on every device, his current reminders carry on unchanged.
 
 ## S-095 No events for what isn't happening
 - kind: principle
 - applies: all
 - home: role:calendar specialist
-- source: laptop correction Nov 5
+- source: laptop correction Nov 5; record core requirement 15
 - rule: No all-day block marks something that isn't happening ("no school"). A day with nothing on is empty; to clear a day, the real event comes off.
 
 ## S-096 Test on the real target, confined

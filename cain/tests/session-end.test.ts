@@ -2,7 +2,7 @@
 // org-v2 DESIGN 4.F, the registry's S-051): its task list replayed from its transcript, then
 // filed as a note on each item it holds, or as a line for Cain to fold in when it holds none.
 import { describe, expect, test } from "bun:test";
-import { requestFor, stepsOf } from "../tools/session-end";
+import { filedKey, requestFor, stepsOf } from "../tools/session-end";
 
 const use = (name: string, input: unknown) => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name, input }] } });
 const said = (text: string) => JSON.stringify({ type: "user", message: { role: "user", content: text } });
@@ -47,6 +47,11 @@ describe("what it files", () => {
     expect(r.ops.map((o: any) => [o.op, o.item])).toEqual([["note", "P33"], ["note", "P40"]]);
     expect(r.ops[0].text).toContain("Verify after his tap; Clean up");
     expect(r.ops[0].text).not.toMatch(/[\n|]/);
+  });
+  test("the same open steps on the same items are one filing; other steps or items are another", () => {
+    expect(filedKey(["P33"], open)).toBe(filedKey(["P33"], open.map((s) => ({ ...s, status: "pending" }))));
+    expect(filedKey(["P33"], open)).not.toBe(filedKey([], open));
+    expect(filedKey(["P33"], open)).not.toBe(filedKey(["P33"], [...open, { content: "Merge", status: "pending" }]));
   });
   test("holding nothing: one line for Cain to fold into the open list", () => {
     const r = requestFor("abc", open, [], "Finish the thing", new Date("2026-11-15T03:00:00Z"));

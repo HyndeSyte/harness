@@ -126,7 +126,13 @@ describe("Cain's rules", () => {
 
   test("no record codes to him (0.11.0): things named by what they do, cards without labels, the gate holds the codes", () => {
     const flat = rules.replace(/\s+/g, " ");
-    for (const must of ["Never show him a record code", "go with it as data, never in its words",
+    // The standard itself lives in his standards now (the registry's S-013, 0.13.0); these pages
+    // keep how Cain carries it out.
+    const registry = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/standards/registry.md"), "utf8").replace(/\r\n/g, "\n");
+    const s013 = registry.split("## S-013 ")[1].split("\n## ")[0];
+    expect(s013).toContain("Nothing he reads carries a record or build code");
+    expect(s013).toContain("Each thing is named by what it does for him");
+    for (const must of ["go with it as data, never in its words",
       "A record code (an item id your record has, like P64, or \"P08 Q2\") is held every time, and no third try lets it through", "\"head\": \"<its full head sha>\""])
       expect(flat).toContain(must);
     expect(flat).not.toContain("its text starts with them");

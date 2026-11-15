@@ -5,15 +5,22 @@
 //   bun cain/tools/session-end.ts --hook     (the hook's input: session_id, transcript_path)
 //   bun cain/tools/session-end.ts --session <id> --transcript <path> [--record <clone>] [--dry]
 //
+// Give the hook a timeout of 30 (seconds): Claude Code allows a SessionEnd hook 1.5 seconds
+// unless its timeout says more, and fetching and sending the record takes longer.
+//
 // It replays the session's task list from its transcript (the app's update_plan, or
 // TodoWrite), and reads the items the session holds. Steps not done are filed:
 //   - on each item it holds, as a note ("the laptop session ended with these steps open");
 //   - when it holds none, as one line appended to state/laptop-open.md, which Cain folds into
 //     the open list at his next check-in.
-// Nothing open, nothing filed. It never holds up the session's end: any failure is one line.
-import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { args, check, clone, fetch, holdsAt, send, sessionOf } from "./record-lib.ts";
+// Nothing open, nothing filed. A session's process can end more than once (an idle stop, a
+// /clear, a resume), so the same open steps on the same items are filed once: the record
+// clone's .git folder keeps what each session last filed. It never holds up the session's
+// end: any failure is one line.
+import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
+import { type Clone, args, check, clone, fetch, git, holdsAt, send, sessionOf } from "./record-lib.ts";
 
 export interface Step { content: string; status: string }
 const STATUSES = new Set(["pending", "in_progress", "completed"]);
@@ -65,6 +72,16 @@ export function stepsOf(lines: string[]): { steps: Step[]; first: string } {
 
 const oneLine = (s: string, n: number) => s.replace(/[\r\n|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
 
+// One filing: the items held and the open steps' words (not their order of work).
+export const filedKey = (held: string[], open: Step[]) =>
+  createHash("sha1").update(JSON.stringify([held, open.map((s) => oneLine(s.content, 120))])).digest("hex").slice(0, 16);
+
+// Where a session's last filing is kept: beside record-holds' memo, in the clone's .git folder.
+function endedFile(c: Clone, session: string): string {
+  const gitDir = git(c.dir, ["rev-parse", "--git-dir"])?.trim() ?? ".git";
+  return join(isAbsolute(gitDir) ? gitDir : join(c.dir, gitDir), "record-holds", `${session}.ended`);
+}
+
 // The record request for what's open, or null when nothing is.
 export function requestFor(session: string, open: Step[], held: string[], first: string, at = new Date()): any | null {
   if (!open.length) return null;
@@ -103,8 +120,14 @@ if (import.meta.main) {
   req.id = `laptop-${stamp}-${session!.slice(0, 8)}-${rand}`;
   const raw = JSON.stringify(req, null, 1) + "\n";
   if (a.dry === true) say(raw);
+  const key = filedKey(held, open), ended = endedFile(rec, session!);
+  let last = "";
+  try { last = readFileSync(ended, "utf8").trim(); } catch { /* nothing filed yet */ }
+  if (last === key) say("");                        // filed when this session last ended
   const r = check(raw, rec);
   if (r.state !== "ok" && r.state !== "waiting") say(`Open steps not filed: ${r.line}`);
   const s = send(rec, `${stamp}-${session}-${rand}.json`, raw, `Inbox: ${req.summary} (${req.id})`);
-  say("error" in s ? `Open steps not filed: ${s.error}` : `Open steps filed in the record (${open.length})`);
+  if ("error" in s) say(`Open steps not filed: ${s.error}`);
+  try { mkdirSync(dirname(ended), { recursive: true }); writeFileSync(ended, key); } catch { /* filed again next time */ }
+  say(`Open steps filed in the record (${open.length})`);
 }

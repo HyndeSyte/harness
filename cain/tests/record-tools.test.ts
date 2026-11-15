@@ -273,3 +273,29 @@ describe("the pre-push hook", () => {
     expect(other.stderr.toString()).toContain("push refused: claude/link-cards isn't in any hold of this session");
   }, 90_000);
 });
+
+// What a laptop session leaves open, filed by its SessionEnd hook (session-end.ts): a note on
+// the item it holds, once for the same steps, however often its process ends.
+describe("session-end", () => {
+  test("files a session's open steps on the item it holds, once; a new open step files again", () => {
+    const l = laptop();
+    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
+    cycle(l.cfg);
+    const transcript = join(l.root, "transcript.jsonl");
+    const plan = (...s: [string, string][]) => JSON.stringify({ type: "assistant", message: { role: "assistant",
+      content: [{ type: "tool_use", name: "mcp__ccd_turn__update_plan", input: { items: s.map(([content, status]) => ({ content, status })) } }] } }) + "\n";
+    const end = () => l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: transcript }) });
+    writeFileSync(transcript, plan(["Build", "completed"], ["Verify after his tap", "pending"]));
+    expect(end()).toEqual({ code: 0, out: "Open steps filed in the record (1)", err: "" });
+    expect(l.inboxNames()).toHaveLength(1);
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(sh(["git", "show", "main:state/notes/P33.md"], l.remote)).toContain("with these steps open: Verify after his tap.");
+    // Its process ends again (an idle stop, a resume) with the same steps open: nothing more.
+    expect(end()).toEqual({ code: 0, out: "", err: "" });
+    expect(l.inboxNames()).toHaveLength(0);
+    // A new open step is a new filing.
+    writeFileSync(transcript, plan(["Build", "completed"], ["Verify after his tap", "pending"], ["Merge", "pending"]));
+    expect(end().out).toBe("Open steps filed in the record (2)");
+    expect(l.inboxNames()).toHaveLength(1);
+  }, 60_000);
+});
