@@ -19,6 +19,7 @@ import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
   maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, checksText, parseChecks, type OneOff, type WaitTimeout,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
+import { projectChecked, voidChecks } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
 
@@ -47,6 +48,7 @@ export type Config = {
   fetchDate?: () => string | null;   // the tests' stand-in for GitHub's Date header on a fetch from a local remote
   leakCheck?: string;      // the smoke test's leak check (default /data/record-leak-check): see leakCheck()
   logFile?: string;        // the keeper's log copy (RECORD_LOG, /data/work/record-keeper.log), which the leak check reads
+  workDir?: string;        // the folder the leak check reads whole (default: the log copy's folder, /data/work)
 };
 
 // Whether the system clock is synchronized by the box's own sources (../clock.ts: the kernel's
@@ -103,14 +105,48 @@ class GitError extends Error {}
 export function redact(cfg: { token?: string }, text: string): string {
   let out = text;
   if (cfg.token) out = out.split(cfg.token).join("<token>");
-  return out.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/@]+@/gi, "$1<userinfo>@");
+  return out
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/@]+@/gi, "$1<userinfo>@")
+    // An Authorization header in any form, and a Basic or Bearer credential on its own.
+    .replace(/\b((?:proxy-)?authorization\s*[:=]\s*)(?:(basic|bearer|token)\s+)?[^\s"',;]+/gi, (_m, h: string, k?: string) => `${h}${k ? `${k} ` : ""}<redacted>`)
+    .replace(/\b(basic|bearer)\s+(?!<redacted>)[A-Za-z0-9._~+\/=-]{8,}/gi, "$1 <redacted>");
 }
 
-// trace: the fetch's HTTP exchange is traced (headers only, credentials redacted) so the round
-// can read GitHub's Date header; the trace lines are kept out of what this returns.
-function git(cfg: Config, args: string[], cwd = cfg.dir, trace?: { date: string | null }): string {
+// The forms the leak check looks for besides the token itself: a web address's userinfo, and
+// an Authorization header or a Basic or Bearer credential.
+const USERINFO = /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/@<>'"]+@/i;
+const AUTH_HEADER = /\b(?:proxy-)?authorization\s*[:=]\s*(?!<redacted>)\S+|\b(?:basic|bearer)\s+(?!<redacted>)[A-Za-z0-9._~+\/=-]{12,}/i;
+export function leakForms(text: string, token?: string): { token: boolean; userinfo: boolean; header: boolean } {
+  return { token: !!token && text.includes(token), userinfo: USERINFO.test(text), header: AUTH_HEADER.test(text) };
+}
+
+// GitHub's Date header, from an unauthenticated HEAD request to the remote's host (no
+// credentials, no path, no git tracing): the round's fourth clock source. null when the remote
+// isn't https or the host doesn't answer within 5 seconds.
+export function headDate(remote: string): string | null {
+  let host = "";
+  try { const u = new URL(remote); if (u.protocol !== "https:") return null; host = u.host; } catch { return null; }
+  try {
+    const p = Bun.spawnSync(["curl", "-sSI", "-m", "5", "--proto", "=https", `https://${host}/`],
+      { stdout: "pipe", stderr: "pipe", env: proxyEnv() });
+    const m = /^date:\s*(.+?)\s*$/im.exec(p.stdout.toString());
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+// Only what curl needs to reach the host: no token, no askpass, no git settings.
+function proxyEnv(): Record<string, string> {
+  const e: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin" };
+  for (const k of ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE", "CURL_CA_BUNDLE"]) if (process.env[k]) e[k] = process.env[k]!;
+  return e;
+}
+
+// git with tracing off (nothing of the HTTP exchange is ever traced), the token only through
+// the askpass helper, and what it says redacted.
+function git(cfg: Config, args: string[], cwd = cfg.dir): string {
   const env: Record<string, string> = { ...process.env as any, GIT_TERMINAL_PROMPT: "0" };
-  if (trace) Object.assign(env, { GIT_TRACE_CURL: "1", GIT_TRACE_CURL_NO_DATA: "1", GIT_TRACE_REDACT: "1" });
+  for (const k of ["GIT_TRACE", "GIT_TRACE_CURL", "GIT_TRACE_CURL_NO_DATA", "GIT_TRACE_PACKET", "GIT_TRACE_PERFORMANCE", "GIT_TRACE_SETUP", "GIT_CURL_VERBOSE"]) delete env[k];
+  env.GIT_TRACE = "0"; env.GIT_TRACE_CURL = "0"; env.GIT_CURL_VERBOSE = "0";
   if (cfg.token) {
     // Rewritten every time, so nothing planted there is ever used.
     const ask = "/tmp/record-askpass.sh";
@@ -123,11 +159,6 @@ function git(cfg: Config, args: string[], cwd = cfg.dir, trace?: { date: string 
     "-c", `user.name=${KEEPER}`, "-c", "user.email=HyndeSyte@users.noreply.github.com", ...args],
     { cwd, env, stdout: "pipe", stderr: "pipe" });
   let out = (p.stdout.toString() + p.stderr.toString()).trim();
-  if (trace) {
-    const lines = out.split("\n"), traced = /^\d\d:\d\d:\d\d\.\d+ /;
-    for (const l of lines) { const m = /<= Recv header: date: (.+?)\s*$/i.exec(l); if (m && traced.test(l)) trace.date = m[1]; }
-    out = lines.filter((l) => !traced.test(l)).join("\n").trim();
-  }
   out = redact(cfg, out);
   if (p.exitCode !== 0) throw new GitError(`git ${args[0]}: ${out.split("\n")[0]}`);
   return out;
@@ -153,9 +184,8 @@ function sync(cfg: Config, now: () => number = Date.now): Synced {
   // What a round left half-written (never committed) goes; commits stay.
   git(cfg, ["reset", "--quiet", "--hard", "HEAD"]);
   git(cfg, ["clean", "-qfd"]);
-  const trace = { date: null as string | null };
   let fetched = true;
-  try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch], cfg.dir, cfg.remote.startsWith("https://") ? trace : undefined); }
+  try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch]); }
   catch (e) { fetched = false; log(`couldn't fetch from GitHub (${(e as Error).message}); working on the local copy`); }
   const fetchedAt = now();
   if (fetched) {
@@ -173,7 +203,9 @@ function sync(cfg: Config, now: () => number = Date.now): Synced {
       }
     } else git(cfg, ["reset", "--quiet", "--hard", `origin/${cfg.branch}`]);   // a fast-forward: nothing local is lost
   }
-  return { date: trace.date ?? (fetched ? cfg.fetchDate?.() ?? null : null), fetchedAt, cloned, fetched, reset };
+  // The Date header comes from its own unauthenticated HEAD request, never from git's exchange.
+  const date = fetched ? (cfg.fetchDate ? cfg.fetchDate() : headDate(cfg.remote)) : null;
+  return { date, fetchedAt: date && !cfg.fetchDate ? now() : fetchedAt, cloned, fetched, reset };
 }
 
 // The copy has commits GitHub doesn't (as last fetched).
@@ -288,7 +320,12 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // Takes that waited behind a job and were settled in a commit GitHub doesn't have yet: kept until
   // the push that carries them lands, so a reset runs them again like other queued requests.
   settled?: Waiting[];
-  owed?: Owed[]; clockKey?: string };
+  owed?: Owed[]; clockKey?: string;
+  // The reset epoch (0.12.0): each reset of the copy starts a new one. Every source check the
+  // ledger held when it began is void until taken again (voided: the ledger write that dropped
+  // them is made), and the link refuses taps on cards whose generation is below its generation.
+  epoch?: { n: number; at: string; generation: number; voided?: boolean };
+  floorWhy?: string };                    // why the link's state couldn't be read for the floor ("" or absent: it could)
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
 
@@ -326,7 +363,10 @@ function revive(j: any): State | null {
     ...(Number.isInteger(j.generation) && j.generation > 0 ? { generation: j.generation } : {}),
     ...(j.unpushed === true ? { unpushed: true } : {}), ...(pushFailed ? { pushFailed } : {}), ...(reset ? { reset } : {}),
     ...(lastReset ? { lastReset } : {}), ...(outage ? { outage } : {}), ...(settled.length ? { settled } : {}),
-    ...(owed.length ? { owed } : {}), ...(typeof j.clockKey === "string" ? { clockKey: j.clockKey } : {}) };
+    ...(owed.length ? { owed } : {}), ...(typeof j.clockKey === "string" ? { clockKey: j.clockKey } : {}),
+    ...(j.epoch && Number.isInteger(j.epoch.n) && typeof j.epoch.at === "string" && Number.isInteger(j.epoch.generation)
+      ? { epoch: { n: j.epoch.n, at: j.epoch.at, generation: j.epoch.generation, ...(j.epoch.voided === true ? { voided: true } : {}) } } : {}),
+    ...(typeof j.floorWhy === "string" && j.floorWhy ? { floorWhy: j.floorWhy } : {}) };
 }
 
 function publishedHolds(cfg: Config): string | null {
@@ -484,8 +524,16 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // The generation floor: the keeper's own count (its state file, in /data outside the
       // working copy) and the highest generation the link has posted on a card, so a re-clone
       // with the state file lost never goes below a card that is up.
-      const floor = linkFloor(cfg);
-      if (floor > (st.generation ?? 0)) st.generation = floor;
+      // A link state that can't be read (missing, corrupt, mid-write) never lowers it: the keeper
+      // keeps its own floor, says so loudly once per change, and its status tells the link to
+      // post no new card until the state can be read again.
+      const lf = readLinkFloor(cfg);
+      if (lf.floor > (st.generation ?? 0)) st.generation = lf.floor;
+      if ((lf.why ?? "") !== (st.floorWhy ?? "")) {
+        log(lf.why ? `FLOOR: the link's state can't be read (${lf.why}); keeping the keeper's own generation floor ${st.generation ?? 0} and refusing new cards until it can`
+          : "floor: the link's state can be read again; new cards go on");
+        if (lf.why) st.floorWhy = lf.why; else delete st.floorWhy;
+      }
       // A reset of the copy (a rebase that conflicted, or a copy cloned again after the keeper
       // had written a ledger or the link had posted a card on one): lost local commits. Asks and
       // taps wait for the next push.
@@ -568,6 +616,10 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       const settle = () => {
         for (let i = 0; i < S.waiting.length;) {
           const w = S.waiting[i], at = clock();
+          // A take's id is its request id: one whose final outcome is in the log already (it
+          // landed before a reset, or a rerun after one) is never applied again.
+          const prior = book.get(w.req.id);
+          if (prior && prior.state !== "waiting") { S.waiting.splice(i, 1); log(`take ${w.req.id} already ${prior.state} in the log; not applied again`); continue; }
           const p = plan(w.req, t, ctx(at));
           const waited = idleMs({ renewed: w.since } as any, at, S.downtime);
           if (p.state === "waiting" && waited <= HOLD_IDLE_MS) { i++; continue; }
@@ -612,6 +664,24 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           commit(`Source checks: ${what.join("; ")}`);
         }
       } catch (e) { undo(); log(`couldn't keep the ledger in step (${(e as Error).message}); trying again next round`); }
+      // A new reset epoch: every check the ledger holds was accepted before it, so each is dropped
+      // (its Checked cell says pending re-check) until it is taken again.
+      if (S.epoch && !S.epoch.voided) {
+        try {
+          const raw = t.read(CHECKS_PATH), list = t.read(PENDING_PATH);
+          if (raw === null) S.epoch.voided = true;
+          else if (linkFree(cfg, CHECKS_PATH) && linkFree(cfg, PENDING_PATH)) {
+            const v = voidChecks(parseChecks(raw), S.epoch.at);
+            if (v.dropped.length) {
+              writeWhole(join(cfg.dir, CHECKS_PATH), checksText(v.ledger, Math.max(S.generation ?? 0, generationOf(raw)) + 1));
+              if (list !== null) { const shown = projectChecked(list, v.ledger, cfg.tz, maxCheckDays(cfg.maxCheckDays)); if (shown !== list) writeWhole(join(cfg.dir, PENDING_PATH), shown); }
+              commit(`Source checks: ${v.dropped.join(", ")} dropped by reset epoch ${S.epoch.n}, pending re-check`);
+              log(`reset epoch ${S.epoch.n}: source checks on ${v.dropped.join(", ")} were accepted before it and are void until taken again`);
+            }
+            S.epoch.voided = true;
+          }
+        } catch (e) { undo(); log(`couldn't drop the checks from before the reset (${(e as Error).message}); trying again next round`); }
+      }
       // The ledger's generation never comes down, even after a reset or a re-clone put an older
       // ledger in the copy: it is written again above the keeper's count.
       try {
@@ -734,18 +804,26 @@ function releaseBlock(cfg: Config, now: Date) {
   if (!(Number.isFinite(until) && now.getTime() < until)) rmSync(f, { force: true });
 }
 
-// The highest ledger generation the link has posted on a card, from its own state file (read
-// only; 0 when there is none or it can't be read).
-export function linkFloor(cfg: Config): number {
+// The highest ledger generation the link has posted on a card (or is about to: it writes the
+// generation it intends before it posts), from its own state file, read only. why: the file is
+// missing, can't be parsed (corrupt, or caught mid-write) or is too big, and floor is then 0.
+export function readLinkFloor(cfg: Config): { floor: number; why?: string } {
   const f = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
+  let text: string;
   try {
-    if (!existsSync(f) || lstatSync(f).size > 20_000_000) return 0;
-    const j = JSON.parse(readFileSync(f, "utf8"));
-    let g = Number.isInteger(j?.postedGen) ? j.postedGen : 0;
-    for (const m of Object.values<any>(j?.messages ?? {})) if (Number.isInteger(m?.checked?.gen) && m.checked.gen > g) g = m.checked.gen;
-    return g > 0 ? g : 0;
-  } catch { return 0; }
+    if (!existsSync(f)) return { floor: 0, why: "missing" };
+    if (lstatSync(f).size > 20_000_000) return { floor: 0, why: "too big" };
+    text = readFileSync(f, "utf8");
+  } catch (e) { return { floor: 0, why: `unreadable: ${clean((e as Error).message, 80)}` }; }
+  let j: any;
+  try { j = JSON.parse(text); } catch { return { floor: 0, why: text.trim() ? "corrupt or mid-write" : "empty" }; }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return { floor: 0, why: "corrupt" };
+  let g = Number.isInteger(j.postedGen) ? j.postedGen : 0;
+  if (Number.isInteger(j.intendedGen) && j.intendedGen > g) g = j.intendedGen;
+  for (const m of Object.values<any>(j.messages ?? {})) if (Number.isInteger(m?.checked?.gen) && m.checked.gen > g) g = m.checked.gen;
+  return { floor: g > 0 ? g : 0 };
 }
+export function linkFloor(cfg: Config): number { return readLinkFloor(cfg).floor; }
 
 // The run of rounds that ended with local commits unpushed or the copy reset: since when, and
 // how many (the link tells Dane once it passes 30 minutes or three rounds). Cleared once clean.
@@ -783,6 +861,11 @@ function landed(cfg: Config, st: State, now: Date) {
 function resetCopy(cfg: Config, st: State, why: string, now: Date) {
   st.reset = { at: now.toISOString(), why: clean(why, 240) };
   st.lastReset = st.reset;
+  // A new epoch, one generation above everything the link could have posted on: cards below it
+  // were posted before the reset, and checks in the ledger now were accepted before it.
+  const g = (st.generation ?? 0) + 1;
+  st.generation = g;
+  st.epoch = { n: (st.epoch?.n ?? 0) + 1, at: now.toISOString(), generation: g };
   log(`reset: ${why}; asks and taps are refused until the next push to GitHub lands`);
   const queued = new Set<string>();
   for (const p of pending(cfg)) if (p.req) queued.add(p.req.id);
@@ -820,6 +903,8 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       at: now.toISOString(), generation: st.generation ?? 0, unpushed: st.unpushed === true,
       ...(st.pushFailed ? { push_failed: st.pushFailed } : {}), ...(st.reset ? { reset: st.reset } : {}),
       ...(st.lastReset ? { last_reset: st.lastReset } : {}), ...(st.outage ? { outage: st.outage } : {}),
+      ...(st.epoch ? { epoch: { n: st.epoch.n, at: st.epoch.at, generation: st.epoch.generation } } : {}),
+      ...(st.floorWhy ? { link_state: { readable: false, why: st.floorWhy } } : {}),
       clock: { synced: v.synced, source: v.source, diagnostic: v.diagnostic, at: now.toISOString() },
     }) + "\n");
   } catch (e) { log(`couldn't write the status for the link: ${(e as Error).message}`); }
@@ -901,27 +986,43 @@ function finish(cfg: Config, st: State, items: Pending[], outcomes: (Outcome | n
 }
 
 // The smoke test's leak check (record.sh leak-check): while its flag file exists, the keeper, which
-// alone holds the token, reads its own log copy, its status file, the relay queue, its audit
-// files and any files the flag lists (the refusal line Cain saved), and says per file whether the
-// token or a web address's userinfo is in it. Never the match itself: only yes or no. The result
-// goes to <flag>.json and one log line; the flag is removed.
-export function leakCheck(cfg: Config): { clean: boolean; files: { path: string; token: boolean; userinfo: boolean }[] } | null {
+// alone holds the token, reads every file under /data/work (its log copy, the link's log copy, the
+// link's rendered notices, the gate's reports, and the rest), its own state and status files, the
+// link's state, the relay queue, its audit files and any files the flag lists (the refusal line Cain
+// saved), and says per file whether the token, a web address's userinfo, or an Authorization header
+// or Basic or Bearer credential is in it. Never the match itself: only yes or no. The result goes to
+// <flag>.json and one log line; the flag is removed.
+export function leakCheck(cfg: Config): { clean: boolean; files: { path: string; token: boolean; userinfo: boolean; header: boolean }[] } | null {
   const flag = cfg.leakCheck ?? join(dirname(cfg.queue), "record-leak-check");
   if (!existsSync(flag)) return null;
   let extra: string[] = [];
   try { extra = readFileSync(flag, "utf8").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("/")); } catch { /* none */ }
   rmSync(flag, { force: true });
-  const paths = [cfg.logFile, `${cfg.logFile ?? ""}.1`, statusFile(cfg), cfg.relay, waitsFile(cfg), checkinFile(cfg), ...extra]
-    .filter((p): p is string => !!p && p !== ".1" && existsSync(p) && lstatSync(p).isFile());
+  const work = cfg.workDir ?? (cfg.logFile ? dirname(cfg.logFile) : undefined);
+  const under: string[] = [];
+  const walk = (d: string, depth: number) => {
+    if (depth > 6 || under.length > 2_000) return;
+    let names: string[] = [];
+    try { names = readdirSync(d); } catch { return; }
+    for (const n of names) {
+      const f = join(d, n);
+      try { const l = lstatSync(f); if (l.isDirectory()) walk(f, depth + 1); else if (l.isFile()) under.push(f); } catch { /* gone */ }
+    }
+  };
+  if (work) walk(work, 0);
+  const linkState = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
+  const all = [...under, cfg.logFile, `${cfg.logFile ?? ""}.1`, stateFile(cfg), statusFile(cfg), linkState, cfg.relay, waitsFile(cfg), checkinFile(cfg), ...extra];
+  const paths = [...new Set(all.filter((p): p is string => !!p && p !== ".1"))].filter((p) => { try { return existsSync(p) && lstatSync(p).isFile(); } catch { return false; } });
   const files = paths.map((path) => {
     let t = "";
     try { const b = readFileSync(path); t = b.subarray(Math.max(0, b.length - 5_000_000)).toString("utf8"); } catch { /* unreadable: nothing found */ }
-    return { path, token: !!cfg.token && t.includes(cfg.token), userinfo: /\b[a-z][a-z0-9+.-]*:\/\/[^\s\/@<>'"]+@/i.test(t) };
+    return { path, ...leakForms(t, cfg.token) };
   });
-  const clean = files.every((f) => !f.token && !f.userinfo);
+  const clean = files.every((f) => !f.token && !f.userinfo && !f.header);
   const out = { at: new Date().toISOString(), clean, files };
   try { writeAtomic(`${flag}.json`, JSON.stringify(out) + "\n"); } catch { /* the log line says it */ }
-  log(clean ? `leak check: clean (${files.length} files, no token and no userinfo)` : `leak check: FOUND in ${files.filter((f) => f.token || f.userinfo).map((f) => `${f.path} (${f.token ? "token" : "userinfo"})`).join(", ")}`);
+  log(clean ? `leak check: clean (${files.length} files, no token, no userinfo, no Authorization or Basic form)`
+    : `leak check: FOUND in ${files.filter((f) => f.token || f.userinfo || f.header).map((f) => `${f.path} (${[f.token && "token", f.userinfo && "userinfo", f.header && "header"].filter(Boolean).join(", ")})`).join(", ")}`);
   return { clean, files };
 }
 

@@ -66,6 +66,9 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
     clockSynced: () => synced.ok, checkin: join(root, "pi/record-checkin.txt"), waits: join(root, "pi/record-waits.jsonl"),
   };
   mkdirSync(cfg.queue, { recursive: true });
+  // The link's state, which the keeper reads for its generation floor (0.12.0): there, as on the Pi.
+  mkdirSync(join(root, "pi/link"), { recursive: true });
+  writeFileSync(join(root, "pi/link/state.json"), JSON.stringify({ messages: {} }));
   const pull = () => g("pull", "--quiet", "--ff-only", "origin", "main");
   const r = {
     root, remote, seed, cfg, g, pull, synced,

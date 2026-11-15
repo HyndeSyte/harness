@@ -112,7 +112,7 @@ case "${1:-}" in
     : > "$f.tmp"; for p in "$@"; do case "$p" in /*) printf '%s\n' "$p" >> "$f.tmp" ;; *) printf '%s\n' "$PWD/$p" >> "$f.tmp" ;; esac; done
     mv "$f.tmp" "$f"
     for _ in $(seq 1 60); do [ -f "$f.json" ] && break; sleep 2; done
-    if [ -f "$f.json" ]; then jq -c '{clean, files: [.files[] | {path, token, userinfo}]}' "$f.json"; else echo '{"clean":null,"said":"the record keeper did not answer within 2 minutes"}'; exit 1; fi ;;
+    if [ -f "$f.json" ]; then jq -c '{clean, files: [.files[] | {path, token, userinfo, header}]}' "$f.json"; else echo '{"clean":null,"said":"the record keeper did not answer within 2 minutes"}'; exit 1; fi ;;
   force-conflict)
     # The next round with unpushed local commits treats their rebase as a conflict and resets.
     : > "${RECORD_FORCE_CONFLICT:-/data/record-force-conflict}" && echo "the record keeper's next round with unpushed commits resets its copy, as after a conflict" ;;

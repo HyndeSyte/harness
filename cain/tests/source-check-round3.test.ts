@@ -53,6 +53,7 @@ function both() {
   const read = (p: string) => { try { return readFileSync(join(k.cfg.dir, p), "utf8"); } catch { return null; } };
   let n = 0;
   const run = () => {
+    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify(l.state()));   // the link's state, as the keeper reads it
     for (const q of l.submitted.splice(0)) writeFileSync(join(k.cfg.queue, `${String(++n).padStart(4, "0")}-${q.id}.json`), JSON.stringify(q));
     for (const w of l.waited.splice(0)) writeFileSync(k.cfg.waits!, JSON.stringify(w) + "\n", { flag: "a" });
     expect(cycle(k.cfg).ok).toBe(true);

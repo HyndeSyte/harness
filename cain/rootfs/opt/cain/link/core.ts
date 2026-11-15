@@ -215,7 +215,16 @@ export interface State {
   // a push lands.
   uncertain?: Uncertain[];
   outageTold?: string;               // the keeper outage (its start) Dane was told of, once
+  // The generation of the card about to be posted, written durably before the post (0.12.0), so the
+  // keeper's floor covers a card whose post went out but whose record never got saved.
+  intendedGen?: number;
+  // Honoured taps by idempotency key (0.12.0): claimed (written before anything is done), acted
+  // (Cain was told, or the landing began), edited (the card shows it). A retap or a Discord retry
+  // with the same key returns the recorded outcome; a restart finishes a claim from here.
+  taps?: Record<string, TapClaim>;
+  journalProbe?: number;             // the smoke test's journal write during a stalled read
 }
+export interface TapClaim { at: number; msg: string; label: string; stage: "claimed" | "acted" | "edited"; outcome: string; shown: string; line?: string }
 export interface Uncertain { gen: number | null; check: string | null; item: string; at: number; msg: string; label: string; told?: boolean }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
@@ -309,7 +318,7 @@ export function cardsView(s: State, now: number): CardsView {
 }
 
 // The link's outcome and landing lines, taken off the end of a card's words.
-const OUTCOME = /\n\n(?:You answered(?::| in a message)[^\n]*|Answered|Expired|Replaced by a newer card|Status changed, re-check needed|Turned back on since\.|Stopped again since\.|You tapped Ship[^\n]*|Shipped: [^\n]*|Not shipped: [^\n]*)$/;
+const OUTCOME = /\n\n(?:You answered(?::| in a message)[^\n]*|Answered|Expired|Replaced by a newer card|Status changed, re-check needed|Record reset since, re-check needed|Turned back on since\.|Stopped again since\.|You tapped Ship[^\n]*|Shipped: [^\n]*|Not shipped: [^\n]*)$/;
 export function withoutOutcome(content: string): string {
   return String(content ?? "").replace(OUTCOME, "");
 }
@@ -358,6 +367,8 @@ export interface KeeperStatus {
   last_reset?: { at: string; why: string };          // the latest reset, kept after the push that ended it
   outage?: { since: string; rounds: number };        // rounds that ended unpushed or reset, and since when
   clock?: { synced: boolean; source: string | null; diagnostic: string; at: string };
+  epoch?: { n: number; at: string; generation: number };   // the latest reset epoch: cards below its generation predate it
+  link_state?: { readable: boolean; why: string };          // the keeper couldn't read the link's state for its floor
 }
 
 // A push error in plain words, for Dane (never the raw text: it is git's, and may name things).
@@ -425,6 +436,9 @@ const clip = (t: string, n: number) => (t.length > n ? t.slice(0, n - 1) + "…"
 export const CHECK_WAIT_MS = 30_000;
 const CHECK_POLL_MS = 500;
 export const STATUS_CHANGED = "Status changed, re-check needed";
+export const EPOCH_CHANGED = "Record reset since, re-check needed";
+const EPOCH_TAP = "Cain's record was reset after this was asked, so nothing was done. Cain will check it again and ask again if it still needs you.";
+const SHIP_UNPUSHED_TAP = "Cain's record hasn't saved its latest changes yet, so Ship waits. Tap again once it has, in a minute or two.";
 const STATUS_TAP = "Its status changed since it was checked, so nothing was done.";
 // How long a tap's fresh read of the ledger, the keeper's status and the check's outcome (three
 // small local files) may take before the tap is refused as busy. Discord wants the tap's answer
@@ -450,7 +464,9 @@ const shortDay = (ms: number, tz = "America/New_York") =>
   new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
 
 export class Refusal extends Error {}
-type CheckState = "ok" | "changed" | "behind" | "unknown" | "busy" | "clock" | "reset" | "unpushed";
+type CheckState = "ok" | "changed" | "behind" | "unknown" | "busy" | "clock" | "reset" | "unpushed" | "epoch" | "ship-unpushed";
+// How long a read that ignores cancellation still counts as in flight before it is forgotten.
+const INFLIGHT_MAX_MS = 30_000;
 // When the keeper's current run of push failures (or its reset) began, as its status says.
 function outageSince(st: KeeperStatus): number {
   const t = [st.outage?.since, st.push_failed?.since, st.push_failed?.at, st.reset?.at].map((x) => (x ? Date.parse(x) : NaN)).filter(Number.isFinite);
@@ -549,6 +565,7 @@ function outcomeLine(m: Shown | undefined): string {
   if (m.outcome === "replaced" && m.why === STOPPED_AGAIN) return "Stopped again since.";
   if (m.outcome === "replaced") return REPLACED;
   if (m.why === "status changed") return STATUS_CHANGED;
+  if (m.why === "record reset") return EPOCH_CHANGED;
   return EXPIRED;
 }
 const TURNED_ON = "turned back on since";
@@ -615,6 +632,7 @@ export interface Deps {
   sleep?: (ms: number) => Promise<void>;                           // waiting on the keeper's outcome (the tests' clock)
   waitTimeout?: (w: { id: string; at: string; waited_ms: number; kind?: "tap" }) => void;   // a check the keeper didn't answer in time, or a tap refused as busy, for its audit
   tune?: (r: { at: string; kind: string; item: string; said: string }) => void;   // a source-check or one-off refusal, logged for tuning the rules
+  noticeLog?: (text: string) => void;                              // each notice's rendered words, for the smoke test's leak check
   pull?: (pr: string) => Promise<Pull | null>;                     // a pull request now; null: can't tell
   tz?: string;                                                     // the check-ins' zone
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
@@ -1139,38 +1157,78 @@ export class Link {
   // A tap's fresh read, after its deferred answer went to Discord: the keeper's files read with a
   // hard limit (TAP_READ_MS), the read itself cancelled through an abort signal when the limit
   // passes, so a stalled read answers "busy" within the limit.
-  private async tapState(item: string, ref: Ref | undefined): Promise<CheckState> {
+  private async tapState(item: string, ref: Ref | undefined, kind?: string): Promise<CheckState> {
     if (!ref || !ref.req) return "changed";
     const r = await this.freshRead(ref.req);
     if (r === "busy" || r === "unknown") return r;
-    return this.judge(item, ref, r.files, r.outcome, {});
+    return this.judge(item, ref, r.files, r.outcome, { kind });
   }
 
   // One fresh read of the keeper's files, raced against the limit: "busy" past it (the read is
   // aborted), "unknown" when it failed. Its time is kept for keeper.sh clock.
+  // One settle guard per read: whichever comes first, the limit or the read, decides, once, before
+  // anything is done with it. A read that finishes after the limit (by 1 ms, or one that ignored its
+  // cancellation) is disqualified for good: its files are never used. At most one read is in flight:
+  // while one is pending (even one that ignored its cancellation, up to INFLIGHT_MAX_MS), another
+  // tap answers busy at once without starting a read.
   private async freshRead(req: string | null): Promise<{ files: RecordFiles | undefined; outcome: { state: string; reason?: string } | null | undefined; ms: number } | "busy" | "unknown"> {
     const limit = this.d.tapReadMs ?? TAP_READ_MS;
+    if (this.inflight && Date.now() - this.inflight.since < INFLIGHT_MAX_MS) {
+      this.tapRead = { ms: 0, at: this.d.now() };
+      this.log("tap answered busy at once: another fresh read is still in flight");
+      return "busy";
+    }
     const ac = new AbortController();
     const t0 = Date.now();
     const slow = this.slowNext;
     this.slowNext = 0;
+    const stall = this.stallNext;
+    this.stallNext = 0;
     const read = (async () => {
+      if (stall) await new Promise<void>((ok) => setTimeout(ok, stall));   // the smoke test's stalled read: ignores cancellation
       if (slow) await abortable(slow, ac.signal);   // the smoke test's delayed read (keeper.sh slow-read)
       if (this.d.readFresh) return this.d.readFresh(req, ac.signal);
       return { files: this.d.record?.(), outcome: req ? this.d.outcome?.(req) : null };
     })();
-    read.catch(() => {});
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<"busy">((ok) => { timer = setTimeout(() => { ac.abort(); ok("busy"); }, limit); });
-    let r: Awaited<typeof read> | "busy";
-    try { r = await Promise.race([read, late]); }
-    catch { clearTimeout(timer); this.tapRead = { ms: Date.now() - t0, at: this.d.now() }; return "unknown"; }
-    clearTimeout(timer);
+    const mine = { since: Date.now() };
+    this.inflight = mine;
+    read.catch(() => {}).finally(() => { if (this.inflight === mine) this.inflight = null; });
+    type Got = Awaited<typeof read>;
+    const verdict = await new Promise<{ by: "busy" } | { by: "read"; r: Got } | { by: "error" }>((done) => {
+      let settled = false;
+      const decide = (v: { by: "busy" } | { by: "read"; r: Got } | { by: "error" }) => { if (settled) return; settled = true; clearTimeout(timer); done(v); };
+      const timer = setTimeout(() => { ac.abort(); decide({ by: "busy" }); }, limit);
+      read.then((r) => decide(Date.now() - t0 > limit ? { by: "busy" } : { by: "read", r }), () => decide({ by: "error" }));
+    });
     const ms = Date.now() - t0;
-    this.tapRead = { ms: r === "busy" ? Math.max(ms, limit) : ms, at: this.d.now() };
-    if (r === "busy" || ms > limit) return "busy";
-    this.lastFresh = r.files;
-    return { ...r, ms };
+    if (verdict.by === "error") { this.tapRead = { ms, at: this.d.now() }; return "unknown"; }
+    if (verdict.by === "busy") { if (!ac.signal.aborted) ac.abort(); this.tapRead = { ms: Math.max(ms, limit), at: this.d.now() }; return "busy"; }
+    this.tapRead = { ms, at: this.d.now() };
+    this.lastFresh = verdict.r.files;
+    return { ...verdict.r, ms };
+  }
+  private inflight: { since: number } | null = null;
+  private stallNext = 0;
+  // The smoke test's stalled read (keeper.sh stall-read): a read held for that long, ignoring its
+  // cancellation, while a journal write is made and timed, and a second read is tried (it must be
+  // answered busy at once, without starting).
+  async stallRead(seconds = 20): Promise<Record<string, unknown>> {
+    const ms = Math.max(1, Math.min(120, Number(seconds) || 20)) * 1000;
+    this.stallNext = ms;
+    const first = this.freshRead(null);
+    await new Promise<void>((ok) => setTimeout(ok, 10));
+    const t0 = Date.now();
+    const second = await this.freshRead(null);
+    const answered = Date.now() - t0;
+    const t1 = Date.now();
+    const s = this.d.load();
+    s.journalProbe = this.d.now();
+    this.d.save(s);
+    const wrote = Date.now() - t1;
+    const r1 = await first;
+    return { status: "ok", stalled_ms: ms, first: r1 === "busy" ? "busy" : "read", second_tap: second === "busy" ? "busy at once" : "read", second_answered_ms: answered,
+      journal_write_ms: wrote, still_in_flight: this.inflight !== null, pass: r1 === "busy" && second === "busy" && answered < 100 && wrote < 1_000,
+      said: `A read is held ${ms / 1000} s and ignores its cancellation: taps answer busy at once meanwhile, and a journal write still finished in ${wrote} ms.` };
   }
   // The smoke test's one delayed read (ms), and the files of the last fresh read that finished.
   private slowNext = 0;
@@ -1204,7 +1262,7 @@ export class Link {
   }
 
   // The verdict on what a read found (see checkState).
-  private judge(item: string, ref: Ref, f: RecordFiles | undefined, out: { state: string } | null | undefined, o: { sweep?: boolean; seen?: number }): CheckState {
+  private judge(item: string, ref: Ref, f: RecordFiles | undefined, out: { state: string } | null | undefined, o: { sweep?: boolean; seen?: number; kind?: string }): CheckState {
     if (!f || typeof f.checks !== "string") return "unknown";
     const st = keeperStatus(f.status);
     if (st === null) return "unknown";
@@ -1214,6 +1272,9 @@ export class Link {
     if (o.sweep && typeof f.pending !== "string") return "unknown";   // the working copy isn't intact
     const gen = generationOf(f.checks);
     if (o.sweep && gen < (o.seen ?? 0)) return "unknown";
+    // A card posted before the latest reset epoch: the check it rests on was accepted before the
+    // reset (and may have been superseded in a commit the reset lost), so it never counts again.
+    if (st?.epoch && Number.isInteger(st.epoch.generation) && (ref.gen === undefined || ref.gen < st.epoch.generation)) return "epoch";
     if (ref.gen !== undefined && gen < ref.gen) return "behind";
     if (!out) return "unknown";
     if (out.state !== "done") return "changed";
@@ -1224,6 +1285,8 @@ export class Link {
     if (!o.sweep && !this.clockOk(st)) return "clock";
     // Honoured while a push fails, but not once the failure is older than UNPUSHED_TAP_MS.
     if (!o.sweep && st?.unpushed && this.d.now() - outageSince(st) > UNPUSHED_TAP_MS) return "unpushed";
+    // A Ship tap is irreversible: it waits for a landed push, however short the failure.
+    if (!o.sweep && o.kind === "ship" && st?.unpushed) return "ship-unpushed";
     return "ok";
   }
 
@@ -1273,6 +1336,8 @@ export class Link {
   private notReset(): void {
     const st = keeperStatus(this.files().status);
     if (st?.reset) throw new Refusal(`Nothing was posted: the record keeper had to reset its copy of the record (${clip(st.reset.why, 160)}), so asks and Ship cards wait until its next push to GitHub lands. Ask again in a few minutes.`);
+    if (st?.link_state && st.link_state.readable === false)
+      throw new Refusal(`Nothing was posted: the record keeper can't read the link's state just now (${clip(st.link_state.why, 80)}), so it can't keep its generation floor above the cards that are up; asks and Ship cards wait until it can. Ask again in a few minutes.`);
   }
 
   // A tap honoured while the keeper's ledger is unpushed (as its fresh read found): the card's
@@ -1741,6 +1806,7 @@ export class Link {
   // if he tapped Stop while Discord was posting it, its Stop comes straight off again.
   async notice(text: string, timeoutMs?: number): Promise<string> {
     const words = this.ownWords("notice", "link", text);
+    try { this.d.noticeLog?.(words); } catch { /* the notice still goes */ }
     const asking = asksSomething(words);
     return asking ? this.postNotice(words, false, timeoutMs) : this.stopQueued(() => this.postNotice(words, true, timeoutMs));
   }
@@ -1844,6 +1910,17 @@ export class Link {
     this.cainWords("ask", "ask", unlabeled(e.text, e.item, e.question), { rules: AT.cain, buttons: options, known: this.liveLabels() }, { reviewed: true, published });
   }
 
+  // The generation of a card about to go up, written durably to the link's state before the post,
+  // so the keeper's floor (it reads this file) covers it even if the post's record is never saved.
+  private intend(ref: Ref | null): void {
+    const g = ref?.gen;
+    if (typeof g !== "number") return;
+    const s = this.d.load();
+    if (g <= (s.intendedGen ?? 0)) return;
+    s.intendedGen = g;
+    this.d.save(s);
+  }
+
   private async postAsk(e: Ask): Promise<string> {
     const checked = this.refNow(e.item);
     const nonce = e.nonce ?? stableNonce("ask", e.item, e.question, e.text, e.options.join("\u0001"), e.replyTo ?? "");
@@ -1851,6 +1928,7 @@ export class Link {
     // since before 0.11.0 loses the label it was stored with ("P08 Q2: ").
     const text = this.words("ask", "cain", unlabeled(e.text, e.item, e.question), { rules: ["dash", "app"] }).text;
     const options = e.options.map((o) => this.words("ask option", "cain", o, { rules: ["dash", "app"] }).text);
+    this.intend(checked);
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
       { replyTo: e.replyTo, nonce });
     const s = this.d.load();
@@ -1897,6 +1975,7 @@ export class Link {
     const checked = this.refNow(meta.item);
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
+    this.intend(checked);
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
       { replyTo: meta.replyTo, nonce });
     const now = this.d.now();
@@ -2122,8 +2201,10 @@ export class Link {
       const holds = parseHolds(f.holds);
       if (holds && heldElsewhere(holds, item)) return "held elsewhere";
       if (m.kind === "ask" || m.kind === "ship") {
-        const c = await this.tapState(item, m.checked);
+        const c = await this.tapState(item, m.checked, m.kind);
         if (c === "changed") return "status changed";
+        if (c === "epoch") return "record epoch";
+        if (c === "ship-unpushed") return "ship unpushed";
         if (c === "unknown" || c === "behind") return "status unreadable";
         if (c === "busy") return "status busy";
         if (c === "clock") return "clock unsynced";
@@ -2180,6 +2261,11 @@ export class Link {
     // Component taps only ever come for the app's own messages, so one the link doesn't
     // know is an old card of ours: take its buttons off.
     if (!rec) return this.deadTap(it, msgId, "not a card the link knows");
+    // A retap or a Discord retry with a key already honoured: the recorded outcome, nothing again
+    // (before any other check: the card shows the answer since).
+    const key = cid.startsWith("q:") ? this.tapKey(rec, cid, msgId) : null;
+    const prior = key ? s.taps?.[key] : undefined;
+    if (prior) return this.priorTap(it, msgId, prior);
     if (rec.outcome) return this.deadTap(it, msgId, rec.why ?? rec.outcome);
     if (digest(it.message.content ?? "", it.message.components) !== rec.digest) {
       await this.answer(it, ACK);
@@ -2190,6 +2276,12 @@ export class Link {
     // tap is acknowledged at once with a deferred update and answered after the read, within
     // Discord's window whatever the read does.
     const item = boundItem(rec);
+    // An interaction already answered busy is disqualified for good, whatever its read does later.
+    if (it?.id && this.disqualified.has(String(it.id)) && this.disqualified.get(String(it.id)) === msgId) {
+      await this.answer(it, ACK);
+      this.log("tap refused: that attempt was already answered busy");
+      return "refused: busy";
+    }
     if (cid !== RESUME && item && (rec.kind === "ask" || rec.kind === "ship")) {
       if (await this.answer(it, ACK)) this.deferred.add(it);
     }
@@ -2206,10 +2298,16 @@ export class Link {
         "clock unsynced": [CLOCK_TAP, "refused: clock", "the box's clock isn't synchronized now"],
         "record reset": [RESET_TAP, "refused: record reset", "the record keeper reset its copy and hasn't pushed since"],
         "record unpushed": [UNPUSHED_TAP, "refused: record unpushed", `the record keeper's push has failed for over ${UNPUSHED_TAP_MS / 60_000} minutes`],
+        "record epoch": [EPOCH_TAP, "refused: record reset since", "the card was posted before the record keeper's latest reset epoch"],
+        "ship unpushed": [SHIP_UNPUSHED_TAP, "refused: ship unpushed", "a Ship tap waits for the record keeper's push to land"],
       };
       if (held[why]) {
         const [say, out, line] = held[why];
-        await this.answer(it, ACK);
+        if (why === "status busy" && it?.id) { this.disqualified.set(String(it.id), msgId); if (this.disqualified.size > 200) this.disqualified.delete(this.disqualified.keys().next().value!); }
+        // The deferred answer left the card waiting on Discord: its original message is patched back
+        // as it was, so its buttons are live again, and the reason follows to him alone.
+        if (this.deferred.has(it)) await this.answer(it, UPDATE, { content: String(it.message?.content ?? ""), components: it.message?.components ?? [], allowed_mentions: { parse: [] } });
+        else await this.answer(it, ACK);
         await this.ephemeral(it, say);
         this.log(`tap refused: ${line}; the card keeps its buttons`);
         if (why === "status busy")
@@ -2225,7 +2323,7 @@ export class Link {
     // Honoured while the keeper's ledger is unpushed: journaled, so that if the keeper then
     // resets its copy, Cain and Dane hear this tap acted on a check that may not have landed.
     if (cid.startsWith("q:") && item && (rec.kind === "ask" || rec.kind === "ship")) this.journal(rec, cid, msgId, item, now);
-    if (cid.startsWith("q:")) return this.onQuestion(it, cid, msgId);
+    if (cid.startsWith("q:")) return this.onQuestion(it, cid, msgId, key ?? undefined);
     if (cid === RESUME) { this.setStop(false); return this.stopTap(it, cid, msgId); }
     return this.toSpecialist(it, cid, msgId);
   }
@@ -2658,7 +2756,7 @@ export class Link {
     if (ok) { r.digest = digest(shown, []); r.off = this.d.now(); }
     if (!r.labels) r.labels = labelsOf(it.message?.components);
     this.d.save(s);
-    await this.ephemeral(it, why === "status changed" ? STATUS_TAP : EXPIRED_TAP);
+    await this.ephemeral(it, why === "status changed" ? STATUS_TAP : why === "record reset" ? EPOCH_TAP : EXPIRED_TAP);
     this.log(`tap on a card that stopped mattering (${why}): answered in place`);
     return `dead: ${why}`;
   }
@@ -2679,7 +2777,64 @@ export class Link {
     return `Dane tapped "${label}" on your question${what ? ` ${what}` : ""}: "${m.q?.q ?? ""}" ${where}`;
   }
 
-  private async onQuestion(it: any, cid: string, msgId: string): Promise<string> {
+  // The idempotency key of a tap on an ask or Ship card: the card, its generation, its check, its
+  // item and the tapped label.
+  private tapKey(m: Shown, cid: string, msgId: string): string | null {
+    const i = Number(cid.split(":")[2]);
+    const label = m.q?.options[i];
+    if (label === undefined) return null;
+    return [msgId, m.checked?.gen ?? "none", m.checked?.req ?? "none", (m.item ?? "none").toUpperCase(), label].join("|");
+  }
+  // Interactions answered busy, by interaction id (with the card), never honoured afterwards.
+  private disqualified = new Map<string, string>();
+
+  // A tap whose key was honoured already: its recorded outcome, shown again, nothing done again.
+  private async priorTap(it: any, msgId: string, t: TapClaim): Promise<string> {
+    await this.answer(it, UPDATE, { content: t.shown, components: [], allowed_mentions: { parse: [] } });
+    this.log(`tap on card ${msgId} already honoured (${t.stage}): its recorded outcome, nothing done again`);
+    return `already: ${t.outcome}`;
+  }
+
+  // Claims a restart cut off (each sweep): a claim not yet acted on is acted on now, once (nothing was
+  // done for it: the claim is written before anything is); one acted on but whose card wasn't edited
+  // gets its edit. Nothing is done twice: each step is recorded before the next.
+  private async finishTaps(): Promise<void> {
+    const s = this.d.load();
+    const open = Object.entries(s.taps ?? {}).filter(([, t]) => t.stage !== "edited");
+    for (const [k, t] of open) {
+      if (this.tapsNow.has(k)) continue;
+      // A Ship tap's landing keeps its card itself (showLanding): its claim needs nothing more here.
+      if (s.messages[t.msg]?.shipping) {
+        const s1 = this.d.load();
+        if (s1.taps?.[k]) { s1.taps[k].stage = "edited"; this.d.save(s1); }
+        continue;
+      }
+      if (t.stage === "claimed") {
+        const s2 = this.d.load();
+        if (s2.taps?.[k]) s2.taps[k].stage = "acted";
+        this.d.save(s2);
+        if (t.line) this.d.relay(t.line);
+        this.log(`finished tap ${t.msg} ("${t.label}") from its claim after a restart: Cain told once`);
+      }
+      try {
+        await this.rest("PATCH", `/channels/${this.d.load().dm ?? ""}/messages/${t.msg}`, { content: t.shown, components: [], allowed_mentions: { parse: [] } });
+        const s3 = this.d.load();
+        if (s3.taps?.[k]) s3.taps[k].stage = "edited";
+        const m = s3.messages[t.msg];
+        if (m) { m.buttons = false; m.off = this.d.now(); m.digest = digest(t.shown, []); }
+        this.d.save(s3);
+        this.log(`finished tap ${t.msg}: its card shows the answer`);
+      } catch (e) { this.log(`couldn't edit card ${t.msg} after a cut-off tap: ${String(e).slice(0, 80)}`); }
+    }
+    // Claims are kept as long as their cards are remembered.
+    const s4 = this.d.load();
+    let pruned = false;
+    for (const [k, t] of Object.entries(s4.taps ?? {})) if (t.stage === "edited" && !s4.messages[t.msg]) { delete s4.taps![k]; pruned = true; }
+    if (pruned) this.d.save(s4);
+  }
+  private tapsNow = new Set<string>();
+
+  private async onQuestion(it: any, cid: string, msgId: string, key?: string): Promise<string> {
     const s = this.d.load();
     const m = s.messages[msgId];
     const q = m?.q;
@@ -2706,17 +2861,31 @@ export class Link {
     }
     const content = withLine(words, shown);
     m.digest = digest(content, []);
-    this.d.save(s);
-    // Cain hears it the moment it's saved as answered: if the link stopped now, a tap
-    // can't be marked answered and never reach him. A landing tells him when it settles
-    // (the sweep settles one the link was cut off from).
-    if (!landing) this.d.relay(this.tapLine(m, label, msgId) + extra);
-    const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
-    if (ok) {
-      const s2 = this.d.load();
-      const m2 = s2.messages[msgId];
-      if (m2) { m2.buttons = false; m2.off = this.d.now(); if (m2.shipping?.line === LANDING_LINE) m2.shipping.edited = true; this.d.save(s2); }
+    // The claim, with the key and what it will do, is written in the same save that marks the card
+    // answered, before anything is done: a restart finishes it from here, never redoes it.
+    const line = landing ? undefined : this.tapLine(m, label, msgId) + extra;
+    if (key) {
+      (s.taps ??= {})[key] = { at: this.d.now(), msg: msgId, label, stage: landing ? "acted" : "claimed", outcome: "to Cain", shown: content, ...(line ? { line } : {}) };
+      this.tapsNow.add(key);
     }
+    this.d.save(s);
+    try {
+      // Cain hears it the moment it's saved as answered: if the link stopped now, a tap
+      // can't be marked answered and never reach him. A landing tells him when it settles
+      // (the sweep settles one the link was cut off from).
+      if (line !== undefined) {
+        this.d.relay(line);
+        if (key) { const sa = this.d.load(); if (sa.taps?.[key]) { sa.taps[key].stage = "acted"; this.d.save(sa); } }
+      }
+      const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
+      if (ok) {
+        const s2 = this.d.load();
+        const m2 = s2.messages[msgId];
+        if (m2) { m2.buttons = false; m2.off = this.d.now(); if (m2.shipping?.line === LANDING_LINE) m2.shipping.edited = true; }
+        if (key && s2.taps?.[key]) s2.taps[key].stage = "edited";
+        this.d.save(s2);
+      }
+    } finally { if (key) this.tapsNow.delete(key); }
     if (m.kind === "ask") await this.releaseHeld();
     if (landing) await this.landShip(msgId);
     return "to Cain";
@@ -3161,6 +3330,7 @@ export class Link {
       this.backfillLabels();
       await this.sendOwedToggle();
       await this.retryLandings();
+      await this.finishTaps();
       await this.uncertainTaps();
       await this.outageNotice();
       await this.checkKey();
@@ -3344,6 +3514,7 @@ export class Link {
         // it is, logged once.
         const c = this.checkState(item, m.checked, { sweep: true, seen });
         if (c === "changed") why = "status changed";
+        else if (c === "epoch") why = "record reset";
         else if (c !== "ok") {
           heldNow.add(`${id}:${c}`);
           if (!this.sweepHeld.has(`${id}:${c}`)) this.log(`left card ${id}'s buttons on: no verified read of the ledger (${c})`);
@@ -3367,6 +3538,7 @@ export class Link {
         "item closed": `${m.item} is closed in PENDING.md.`,
         "held elsewhere": `${m.item} is now held by another session. Don't ask him about it or say who has it.`,
         "status changed": `${m.item}'s row changed after the source check it rested on, so its buttons came off ("${STATUS_CHANGED}"). Check it at its source again, and ask again with --checked if it still needs him.`,
+        "record reset": `the record keeper reset its copy after it was posted, so the source check it rested on no longer counts and its buttons came off ("${EPOCH_CHANGED}"). Check ${m.item} at its source again, and ask again with --checked if it still needs him.`,
       };
       if ((m.kind !== "ask" && m.kind !== "ship") || !because[why]) continue;
       const what = m.kind === "ship" ? `Ship card for ${m.ship?.pr}` : `question ${about(m.item, m.question) || `"${excerpt(m.q?.q ?? "", 60)}"`}`;

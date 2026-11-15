@@ -450,10 +450,10 @@ What Cain's link enforces:
     come off ("Status changed, re-check needed").
   - status unreadable: a read failed, or the ledger is behind the card's generation. The
     same status-changed words; the sweep judges the card later.
-  - busy: the read took longer than 1.5 seconds. The limit is enforced on the read itself: it
-    is raced against a timer and cancelled through an abort signal when the timer wins, so a
-    stalled read answers within the limit (tuned from the measured reads the smoke test
-    prints). "Busy, tap again." Each is logged to `/data/record-waits.jsonl` and counted in
+  - busy: the read took longer than 1.5 seconds, or another tap's read is still in flight. The
+    limit is enforced on the read itself: it is raced against a timer and cancelled through an
+    abort signal when the timer wins, so a stalled read answers within the limit (tuned from the
+    measured reads the smoke test prints). "Busy, tap again." Each is logged to `/data/record-waits.jsonl` and counted in
     `state/one-off-audit.md` as a tap timeout.
   - clock: the box's clock isn't synchronized now (the keeper's verdict from the last 10
     minutes says it isn't, or neither the box's own sources nor that verdict says it is).
@@ -463,7 +463,29 @@ What Cain's link enforces:
     is being put back in step, so nothing was done. Tap again in a few minutes."
   - record unpushed: the keeper's pushes have been failing for over 30 minutes. "Cain's
     record hasn't saved for over half an hour, so nothing was done. Tap again once it has."
+  - record reset since: the card was posted before the keeper's latest reset epoch (below).
+    "Cain's record was reset after this was asked, so nothing was done. Cain will check it again
+    and ask again if it still needs you." The sweep takes its buttons off on its next verified
+    read ("Record reset since, re-check needed") and tells Cain.
+  - ship unpushed: a tap on a Ship card while the keeper's status says unpushed at all, however
+    short the failure, since Ship can't be undone. "Cain's record hasn't saved its latest changes
+    yet, so Ship waits. Tap again once it has, in a minute or two." Taps on asks keep the
+    journal-and-notify path below.
   Where the row sits in the table is never used.
+
+  Each tap is decided exactly once. One settle guard per read decides between busy and honoured,
+  once, before anything is done: a read that finishes after the limit, by a millisecond or because
+  it ignored its cancellation, is busy for good, and that attempt is never honoured later. At most
+  one fresh read is in flight: while one is pending, another tap answers busy at once without
+  starting a read. A busy answer (and every refusal that keeps the buttons) patches the card's
+  original message back as it was through the interaction's webhook, so its buttons are live
+  again, and the reason follows to you alone. Each honoured tap gets an idempotency key (the
+  card, its ledger generation, its check's request id, the item and the label), written to the
+  link's state in the same atomic save that marks the card answered, before Cain is told or a
+  landing starts. A retap or a Discord retry with the same key returns the recorded outcome and
+  does nothing again. If the link stops partway, its next sweep finishes the claim from that
+  record: a claim not yet acted on is acted on once, and one acted on but not yet shown gets only
+  its card edit; nothing is done twice.
 - A one-off (`--item none`) is refused when its text holds an open row's item code or the
   row's whole Item phrase, quoting what matched. One whose words overlap an open row's Item
   more loosely (two of the row's distinctive words, or its only one) is held: nothing is
@@ -498,7 +520,29 @@ again on GitHub's copy, tells Cain which others may not have landed, and the lin
 asks ("the record keeper had to reset its copy of the record ...") and taps (record reset)
 until the next push lands. The ledger's generation still only goes up. Takes that waited
 behind one of Cain's jobs and were settled in a commit stay in the keeper's queue until the
-push carrying them lands, so a reset runs them again like the other queued requests.
+push carrying them lands, so a reset runs them again like the other queued requests. A settled
+take keeps its request id, and a take's only effect is in the record (no message, card or job
+follows from it), so a rerun after a reset is idempotent by that id: one whose final outcome is
+already in `log/requests/` is never applied again.
+
+The reset epoch. Each reset starts a new epoch, recorded in the keeper's state file
+(`/data/record-holds.json`, outside the record's working copy) and its status: its number, when
+it began, and a generation one above everything the link could have posted on. Every source
+check the ledger holds when it begins was accepted before it, so each is dropped in the same
+round (its row keeps its id and version, and its Checked cell says `pending re-check: the record
+was reset, so its last check no longer counts`) until a new check is taken. Cards posted before
+it (their generation is below the epoch's) are refused with their own reason and lose their
+buttons on the sweep's next verified read, even when the ledger came back with the very check
+they rest on: a newer check of that row may have been in a commit the reset lost.
+
+The generation floor. Before posting an ask or Ship card, the link writes the generation it is
+about to post to its own state (`intendedGen` in `/data/link/state.json`), and saves the card's
+generation after. The keeper reads that file each round and never sets its own generation below
+it. When it can't read the file (missing, corrupt, or caught mid-write), it keeps its own floor,
+never falling back to zero, logs `FLOOR: the link's state can't be read (...)` once per change,
+and marks its status so the link posts no new ask or Ship card ("the record keeper can't read
+the link's state just now") until the file reads again (`floor: the link's state can be read
+again`). The link writes its state once at start when there is none.
 
 A tap honoured while the ledger is unpushed is journaled by the link in its state file in
 `/data` (the card's generation, the check's request id, the item, the time and the label). If
@@ -520,94 +564,104 @@ that he actually read the source he names, that what he read says what the row a
 question imply, and that a one-off's reason is true. The gate proves a check was recorded,
 not that the source was read.
 
-Device smoke test. Right after installing a version with source checks, Cain runs these
-against the real record, under about twenty minutes in all (the first eight steps about seven,
-then the time given with each), and reports the result to you in one line. The steps that
-change things come last.
+Device tests: an install smoke test, then an optional resilience run. Right after installing a
+version with source checks, Cain runs the install smoke test against the real record, about
+twelve minutes in all, none of it destructive, and reports the result to you in one line. The
+destructive steps are a separate resilience run, offered once afterwards, which you can decline.
+Each test ask says it is the smoke test and any answer does.
 
-1. A checked ask about an item he holds, with a concrete source: it posts, and your tap on
-   it is accepted (the link relays it to him). It says it is the smoke test; any answer
-   does.
-2. The same kind of ask with a deliberately vague source ("from memory"): nothing posts,
-   and keeper.sh's refusal line arrives quoting the vague word.
-3. The Ship path the same way, on a harmless card: a checked Ship card for the pull request
-   that brought this version (already in main), where your tap on "Not now" is accepted and
-   nothing ships; and the same card with a deliberately vague source, which posts nothing.
-4. A checked test ask, then an edit of its row (a word in its Next step): you tap the old
-   card, and it must be refused with the status-changed reason, its buttons off.
-5. A one-off that looks like an open item: it must be held ("needs reason"); sent again
-   with `--reason`, it must post, and the reason must show in `log/requests/`.
-6. `/opt/cain/record.sh block-push`, then a checked test ask: its check lands locally while
-   that round's push goes to a wrong remote. You tap it during the blocked push: it must be
-   honoured (nothing moved), with the buttons kept until then; `keeper.sh clock` must show
-   `unpushed` until the next round pushes.
-7. An expired check: you set source_check_max_days to 0 in the App's options for one ask
-   (the App restarts); a checked test ask must post nothing and say the check is past
+The install smoke test (about twelve minutes):
+
+1. A checked ask about an item he holds, with a concrete source (`keeper.sh ask --item <id>
+   --question <q> --checked "<source, when>" ...`). Expect `"status":"posted"`; your tap on it
+   is accepted (the link relays it to him).
+2. The same kind of ask with a deliberately vague source (`--checked "from memory"`). Expect
+   `"status":"refused"` with a line quoting "memory"; nothing posts.
+3. The Ship path the same way, on a harmless card: `keeper.sh ship --item <id> --pr <the pull
+   request that brought this version> --head <its sha> --checked "<source, when>" "<test line>"`.
+   Expect `"status":"posted"`; your tap on "Not now" is accepted and nothing ships. The same card
+   with a vague source: expect `"status":"refused"`.
+4. A checked test ask, then a row op on its row (a word in its Next step), then you tap the old
+   card. Expect "Its status changed since it was checked, so nothing was done." and its buttons
+   off ("Status changed, re-check needed").
+5. A one-off that looks like an open item (`keeper.sh ask --item none ...`). Expect `"status":
+   "needs reason"`; sent again with `--reason "the smoke test"`, expect `"status":"posted"` and
+   the reason in `log/requests/`.
+6. `/opt/cain/record.sh block-push` (expect `the record keeper's next round pushes to a wrong
+   remote, once`), then a checked test ask you tap within the minute. Expect the tap relayed
+   (honoured, journaled), and `keeper.sh clock` showing `"unpushed":true` until the next round
+   pushes, then `false`.
+7. You set source_check_max_days to 0 in the App's options for one ask (the App restarts); a
+   checked test ask must answer `"status":"refused"` saying the check is past
    source_check_max_days. Then you set it back to 7. This is the only option you change.
-8. `/opt/cain/keeper.sh clock`: the clock verdict, which source satisfied it, and the
-   measured tap read time (from step 4's or 6's tap), all in his one-line report.
-9. (a) GitHub's Date header, and no secrets (1 minute). `/opt/cain/record.sh clock-test
-   header-only` (expect `clock test: header-only`): the next round leaves the box's own clock
-   sources out. Then a checked test ask with a concrete source, which must post; and one with a
-   vague source, whose refusal line he saves to `/tmp/smoke-refusal.txt`. Expect in
-   `/data/work/record-keeper.log`: `clock: the smoke test's clock switch is on (header-only)`,
-   `clock: synchronized, by the GitHub Date header (+N s)` and `clock: offset against GitHub's
-   Date header +N s`. Then `/opt/cain/record.sh leak-check /tmp/smoke-refusal.txt`: the keeper,
-   which alone holds the token, reads its log, its status file, the relay queue and that file
-   for the token and for a web address's userinfo, and prints yes or no per file, never the
-   match. Expect `{"clean":true,...}`; any `true` under token or userinfo fails the test.
-10. (b) Read times (2 minutes). `/opt/cain/keeper.sh reads 20`: twenty fresh reads, the way a
-   tap reads, 4 seconds apart, so some run while a keeper round fetches from GitHub. Expect
-   `"pass":true` with `p95_ms` at most 1000 and `keeper_rounds_seen` at least 1; a 95th
-   percentile over about one second fails.
-11. (c) A slow read (half a minute). `/opt/cain/keeper.sh slow-read` (expect `"status":"ok"`),
-   then a checked test ask, and you tap it: you must see "Busy, tap again." with the buttons
-   still on, and `/data/work/link.log` must show `tap refused: the ledger's read took`. Your
-   next tap on it is honoured.
-12. (d) A push failure that keeps going (3 minutes). `/opt/cain/record.sh block-push 3` (expect
-   `the record keeper's rounds push to a wrong remote for the next 3 minutes`), then a checked
-   test ask. For more than two minutes `keeper.sh
-   clock` must show `unpushed`; `/data/work/link.log` must show `left card <id>'s buttons on:
-   no verified read of the ledger (unknown)` once only, with the card's buttons still on; and
-   after three rounds you get one notice: "Cain's record hasn't saved to GitHub since ...: the
-   smoke test is blocking it on purpose. ...". Once the minutes pass, `keeper.sh clock` must
-   show `unpushed: false`.
-13. (e) A restart of the link (1 minute). With a checked test ask up, `pkill -f
-   /opt/cain/link/main.ts`; the App starts the link again within about 5 seconds (expect
-   `keeper.sh clock` to answer again). You tap the card: it must be honoured and relayed.
-14. (f) Clock loss and a backward step (2 minutes). `/opt/cain/record.sh clock-test none`
-   (expect `clock test: none`): a checked test ask must post nothing, its refusal naming what
-   each clock source said, and a tap on an earlier card must answer that the box's clock isn't
-   synchronized. `/opt/cain/record.sh clock-test step:-600`: the keeper's clock reads ten
-   minutes early; the log must show `dated after the clock stepped back` and a tap on a card
-   checked before it must be refused with the status-changed reason. `/opt/cain/record.sh
-   clock-test off`: a new checked test ask must post and its tap be honoured.
-15. (g) A forced reset (2 minutes). `/opt/cain/record.sh block-push 2`, then a checked test
-   ask that you tap (it is journaled), and two requests of his accepted locally and still
-   queued: a row edit and a `take` of an item he holds; then `/opt/cain/record.sh force-conflict`
-   (expect `the record keeper's next round with unpushed commits resets its copy, as after a
-   conflict`). Expect: the keeper log shows `reset: its local commits couldn't be rebased onto
-   GitHub's copy (git rebase: conflict forced by the smoke test`; asks answer "the record
-   keeper had to reset its copy of the record" and taps "Cain's record is being put back in
-   step"; `keeper.sh clock` never shows a generation lower than before; Cain gets the relayed
-   line naming the tapped card ("Acted on a check that may not have landed") and you get one
-   notice ("Heads up: one of your taps ... acted on a check that may not have landed"); once
-   the minutes pass and the push lands, asks and taps work again, and the row edit and the take
-   are done (they ran again from the queue).
-16. (h) The rollback, last (3 minutes). Cain can't change Home Assistant, so he asks you: in
-   Home Assistant, restore this App from the backup taken just before the install, which brings
-   back the pinned previous version (0.11.0). He gives you a message to send him once it's
-   restored ("Rollback check: run /opt/cain/keeper.sh stopped and jq -r .alive
-   /data/record-holds.json"), since the restored version doesn't have these steps. Expect his
-   answer to show keeper.sh answering (the link is back) and an alive time within the last two
-   minutes (the keeper is). Then you install this version again from the App's update in Home
-   Assistant, and Cain confirms it runs and `keeper.sh clock` answers. This is the one install
-   done from Home Assistant's own page, on your say.
+8. `/opt/cain/keeper.sh clock`. Expect the clock verdict, the source that satisfied it and the
+   measured tap read time (`tap_read_ms`), all in his one-line report.
+9. `/opt/cain/record.sh clock-test header-only` (expect `clock test: header-only`), then a
+   checked test ask (expect `"status":"posted"`) and a vague one whose refusal line he saves to
+   `/tmp/smoke-refusal.txt`. Expect in `/data/work/record-keeper.log`: `clock: synchronized, by
+   the GitHub Date header (+N s)` and `clock: offset against GitHub's Date header +N s`. The Date
+   header comes from its own unauthenticated HEAD request to GitHub's host (no credentials, no
+   path); git's own HTTP exchange is never traced.
+10. `/opt/cain/record.sh leak-check /tmp/smoke-refusal.txt`. The keeper, which alone holds the
+   token, reads every file under `/data/work` (its log copy, the link's log copy, the link's
+   rendered notices in `link-notices.jsonl`, the gate's reports), its own state and status
+   files, the link's state, the relay queue and that file, for the token, a web address's
+   userinfo, and an Authorization header or a Basic or Bearer credential, and prints yes or no
+   per file, never the match. Expect `{"clean":true,...}`; any `true` under token, userinfo or
+   header fails the test.
+11. `/opt/cain/keeper.sh reads 20` (about 80 seconds). Expect `"pass":true`, `p95_ms` at most
+   1000 and `keeper_rounds_seen` at least 1.
+12. `/opt/cain/keeper.sh slow-read` (expect `"status":"ok"`), then a checked test ask you tap.
+   Expect "Busy, tap again." with the buttons live again, and `/data/work/link.log` showing `tap
+   refused: the ledger's read took`. Your next tap counts.
+13. `/opt/cain/keeper.sh stall-read 20`: one fresh read is held for 20 seconds and ignores its
+   cancellation. Expect `"second_tap":"busy at once"`, `journal_write_ms` under 1000 and
+   `"pass":true`: while a read is stalled, another tap is answered busy without starting a read,
+   and a journal write to the link's state still completes.
 
 It passes only when he sees committed in the record the `check` request done in
 `log/requests/`, `state/checks.json` with that row's entry and his check, and the open
 table's `Checked` column showing it, and reports the commit hashes of those three (the log
 entry, the ledger write and the table change), so you can spot-check them on GitHub.
+
+The resilience run (optional, about twelve minutes). After the install smoke test passes, Cain
+offers it once, with buttons ("Run it", "Not now"), only after he can confirm a backup of this
+App from just before the install exists (he reads Home Assistant's backups through his
+read-only connector; if he can't see one, he doesn't offer the run). You can decline; nothing
+else depends on it. Its steps change things, so they come in this order, the rollback last:
+
+R1. `/opt/cain/record.sh block-push 3` (expect `the record keeper's rounds push to a wrong remote
+   for the next 3 minutes`), then a checked test ask. For more than two minutes `keeper.sh clock`
+   shows `"unpushed":true`; `/data/work/link.log` shows `left card <id>'s buttons on: no verified
+   read of the ledger (unknown)` once, with the buttons still on; a tap on a Ship card meanwhile
+   answers "Cain's record hasn't saved its latest changes yet, so Ship waits."; after three
+   rounds you get one notice ("Cain's record hasn't saved to GitHub since ...: the smoke test is
+   blocking it on purpose."). Then `"unpushed":false`.
+R2. With a checked test ask up, `pkill -f /opt/cain/link/main.ts`. Expect `keeper.sh clock` to
+   answer again within about 5 seconds, and your tap on the card relayed once.
+R3. `/opt/cain/record.sh clock-test none` (expect `clock test: none`): a checked ask answers
+   `"status":"refused"` naming each clock source, and a tap answers "The box's clock isn't
+   synchronized just now". `/opt/cain/record.sh clock-test step:-600` (expect `clock test:
+   step:-600`): the keeper log shows `dated after the clock stepped back` and a tap on an
+   earlier card answers the status-changed line. `/opt/cain/record.sh clock-test off` (expect
+   `clock test: off`): a new checked ask posts and its tap counts.
+R4. `/opt/cain/record.sh block-push 2`, a checked test ask you tap (journaled), a queued row
+   edit and a take of an item he holds, then `/opt/cain/record.sh force-conflict` (expect `the
+   record keeper's next round with unpushed commits resets its copy, as after a conflict`).
+   Expect: the keeper log shows `reset: its local commits couldn't be rebased onto GitHub's copy`
+   and `reset epoch N: source checks on ... are void until taken again`; asks answer "the record
+   keeper had to reset its copy of the record" until the push lands; a tap on a card posted
+   before the reset answers "Cain's record was reset after this was asked, so nothing was done."
+   and the next sweep takes its buttons off ("Record reset since, re-check needed"); the Checked
+   cells show `pending re-check`; `keeper.sh clock`'s generation never goes down; Cain gets the
+   relayed line "Acted on a check that may not have landed" and you one notice; once the push
+   lands, the row edit and the take are done, once each.
+R5. The rollback, last. Cain asks you to restore this App from the backup taken just before the
+   install, and gives you a message to send him once it's restored ("Rollback check: run
+   /opt/cain/keeper.sh stopped and jq -r .alive /data/record-holds.json"). Expect keeper.sh
+   answering and an alive time within the last two minutes. Then you install this version again
+   from the App's update in Home Assistant, and Cain confirms `keeper.sh clock` answers. This is
+   the one install done from Home Assistant's own page, on your say.
 
 Rollback. If the smoke test fails, the remedy is one step: in Home Assistant, restore this
 App from the backup taken just before the install (every install takes one first), which

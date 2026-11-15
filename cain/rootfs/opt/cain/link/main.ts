@@ -45,7 +45,7 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { teeConsole } from "../logfile";
 import { localReadings, verdict } from "../clock";
@@ -78,6 +78,7 @@ const TUNING = process.env.SOURCE_CHECK_TUNING ?? "/data/work/source-check-refus
 // time for it) before an ask or Ship card can't rest on it. 7 when unset.
 // 0 is allowed (the smoke test's expired check).
 const MAX_CHECK_DAYS = /^\d+$/.test(process.env.SOURCE_CHECK_MAX_DAYS ?? "") ? Number(process.env.SOURCE_CHECK_MAX_DAYS) : undefined;
+const NOTICES = process.env.LINK_NOTICES ?? "/data/work/link-notices.jsonl";   // the notices' rendered words (the leak check reads them)
 const RECORD_STATUS = process.env.RECORD_STATUS ?? "/data/record-ledger.json";   // the keeper's status: generation, push, reset, clock
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
@@ -232,6 +233,8 @@ const link = new Link({
   },
   maxCheckDays: MAX_CHECK_DAYS,
   waitTimeout: (w) => appendFileSync(RECORD_WAITS, JSON.stringify(w) + "\n"),
+  // Each notice's rendered words, kept under /data/work for the smoke test's leak check.
+  noticeLog: (text) => { mkdirSync(NOTICES.replace(/\/[^/]*$/, ""), { recursive: true }); appendFileSync(NOTICES, JSON.stringify({ at: new Date().toISOString(), text }) + "\n"); },
   tune: (r) => { mkdirSync(TUNING.replace(/\/[^/]*$/, ""), { recursive: true }); appendFileSync(TUNING, JSON.stringify(r) + "\n"); },
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
@@ -254,6 +257,9 @@ const link = new Link({
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
 });
+// The keeper reads this state for its generation floor and posts no new card while it can't:
+// written once at start when there is none yet (a first start).
+try { if (!existsSync(STATE)) save(load()); } catch (e) { console.log(`[cain] link: couldn't write its first state: ${String(e).slice(0, 80)}`); }
 
 // -- the gateway's health, for the Harness page ------------------------------------
 let connected = false;
@@ -308,7 +314,7 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -351,6 +357,7 @@ Bun.serve({
         case "/clock": return json(link.clockReport());
         case "/reads": return json(await link.probeReads(Number(b.n ?? 20)));
         case "/slowread": return json(link.slowRead());
+        case "/stallread": return json(await link.stallRead(Number(b.seconds ?? 20)));
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

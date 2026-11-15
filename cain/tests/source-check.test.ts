@@ -713,6 +713,7 @@ describe("end to end: the link and the record keeper on a real git repo", () => 
     let n = 0;
     // The keeper's round, as it runs every 2 seconds while the link waits.
     const run = () => {
+      writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify(l.state()));   // the link's state, as the keeper reads it
       for (const q of l.submitted.splice(0)) writeFileSync(join(k.cfg.queue, `${String(++n).padStart(4, "0")}-${q.id}.json`), JSON.stringify(q));
       expect(cycle(k.cfg).ok).toBe(true);
       l.files.pending = read(P);

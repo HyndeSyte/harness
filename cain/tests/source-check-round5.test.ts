@@ -38,6 +38,7 @@ function both() {
   };
   const queued: string[] = [];
   const run = () => {
+    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify(l.state()));   // the link's state, as the keeper reads it
     for (const q of l.submitted.splice(0)) { writeFileSync(join(k.cfg.queue, `${String(++n).padStart(4, "0")}-${q.id}.json`), JSON.stringify(q)); queued.push(q.id); }
     const r = cycle(k.cfg);
     for (const id of queued) { const o = k.outcome(id); if (o) l.outcomes[id] = { state: o.state, reason: o.reason }; }
@@ -407,8 +408,8 @@ describe("7. the smoke test's switches, and no token or credentials in what the 
     const found = leakCheck(k.cfg)!;
     console.log = realLog;
     expect(found.clean).toBe(false);
-    expect(found.files.find((f) => f.path === refusal)).toEqual({ path: refusal, token: true, userinfo: true });
-    expect(logged.join("\n")).toContain(`leak check: FOUND in ${refusal} (token)`);
+    expect(found.files.find((f) => f.path === refusal)).toEqual({ path: refusal, token: true, userinfo: true, header: false });
+    expect(logged.join("\n")).toContain(`leak check: FOUND in ${refusal} (token, userinfo)`);
     expect(logged.join("\n") + readFileSync(join(k.root, "pi/record-leak-check.json"), "utf8")).not.toContain("tok-XYZ123");
   }, 30_000);
 
@@ -449,7 +450,7 @@ describe("8. the docs: the smoke test's new steps, in order, each with its comma
     const docs = flat("../DOCS.md"), rules = flat("../rootfs/opt/cain/CLAUDE.md"), log = flat("../CHANGELOG.md");
     for (const t of [docs, rules]) {
       for (const cmd of ["record.sh clock-test header-only", "keeper.sh reads 20", "keeper.sh slow-read", "record.sh block-push 3",
-        "record.sh clock-test none", "record.sh clock-test step:-600", "record.sh force-conflict", "under about twenty minutes"]) expect(t).toContain(cmd);
+        "record.sh clock-test none", "record.sh clock-test step:-600", "record.sh force-conflict", "about twelve minutes"]) expect(t).toContain(cmd);
       // The destructive steps come last: the forced conflict, then the rollback.
       expect(t.indexOf("record.sh clock-test header-only")).toBeLessThan(t.indexOf("record.sh force-conflict"));
       expect(t.indexOf("record.sh force-conflict")).toBeLessThan(t.lastIndexOf("restore"));

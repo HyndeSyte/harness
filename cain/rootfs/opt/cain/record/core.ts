@@ -491,6 +491,7 @@ export type CheckEntry = {
   id: string; version: number; changed: string; hash?: string;
   checked?: string; checked_at?: string; checked_version?: number; checked_req?: string; by?: string;
   stale_after?: string; aged?: string; pending_rewrite?: string; clock?: string; stepped_back?: string;
+  recheck?: string;   // its check was dropped by a reset epoch (when it began): pending re-check until taken again
 };
 export type Checks = Record<string, CheckEntry>;
 export const CHECKED_COLUMN = "Checked";
@@ -526,6 +527,7 @@ export function parseChecks(text: string | null): Checks {
     }
     if (typeof v.stepped_back === "string" && v.stepped_back) e.stepped_back = v.stepped_back;
     if (typeof v.pending_rewrite === "string" && v.pending_rewrite) e.pending_rewrite = v.pending_rewrite;
+    if (typeof v.recheck === "string" && v.recheck && e.checked === undefined) e.recheck = v.recheck;
     out[k] = e;
   }
   return out;
@@ -539,7 +541,8 @@ export function checksText(c: Checks, generation?: number): string {
       ...(e.checked !== undefined ? { checked: e.checked, checked_at: e.checked_at, checked_version: e.checked_version,
         ...(e.stale_after ? { stale_after: e.stale_after } : {}), ...(e.aged ? { aged: e.aged } : {}),
         ...(e.checked_req ? { checked_req: e.checked_req } : {}), ...(e.by ? { by: e.by } : {}), ...(e.clock ? { clock: e.clock } : {}) } : {}),
-      ...(e.pending_rewrite ? { pending_rewrite: e.pending_rewrite } : {}), ...(e.stepped_back ? { stepped_back: e.stepped_back } : {}) };
+      ...(e.pending_rewrite ? { pending_rewrite: e.pending_rewrite } : {}), ...(e.stepped_back ? { stepped_back: e.stepped_back } : {}),
+      ...(e.recheck && e.checked === undefined ? { recheck: e.recheck } : {}) };
   }
   return JSON.stringify(out, null, 2) + "\n";
 }
@@ -667,12 +670,26 @@ export function ageChecks(ledger: Checks, now: Date, maxDays = DEFAULT_MAX_CHECK
   return { ledger: out, aged };
 }
 
+// A reset epoch began at `at`: every check in the ledger was accepted before it, so each is
+// dropped (the row keeps its id and version) and marked pending re-check until taken again.
+export function voidChecks(ledger: Checks, at: string): { ledger: Checks; dropped: string[] } {
+  const out: Checks = {}, dropped: string[] = [];
+  for (const [code, e] of Object.entries(ledger)) {
+    if (e.checked === undefined) { out[code] = e; continue; }
+    const { checked: _c, checked_at: _a, checked_version: _v, checked_req: _r, by: _b, stale_after: _s, aged: _g, clock: _k, stepped_back: _t, ...kept } = e;
+    out[code] = { ...kept, recheck: at };
+    dropped.push(code);
+  }
+  return { ledger: out, dropped };
+}
+
 // What the Checked cell shows: fresh or stale (by version), the check's day with its year
 // (and the time when the check and the row's last change fall on the same day), the day it
 // goes stale by age, then what was checked. The cell is made on writes, so "stale after"
 // is shown for whoever reads it later.
 export function checkedCell(e: CheckEntry | undefined, tz = "America/New_York", maxDays = DEFAULT_MAX_CHECK_DAYS): string {
   if (e?.pending_rewrite) return "pending rewrite: a whole-file write of this row was refused; write it cleanly, then check it again";
+  if (e?.recheck && e.checked === undefined) return "pending re-check: the record was reset, so its last check no longer counts";
   if (!e || e.checked === undefined || !e.checked_at) return "";
   const at = new Date(e.checked_at), ch = new Date(e.changed);
   if (Number.isNaN(at.getTime())) return "";
@@ -1314,7 +1331,7 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       // A row the ledger didn't know yet gets its id from this request alone, so the same check
       // applied again after a lost push gives the row the same id.
       const entry: CheckEntry = e ?? { id: newRowId(`${req.id}\u0000${id}`), version: 1, changed: iso };
-      const { aged: _aged, stepped_back: _stepped, clock: _clock, ...kept } = entry;
+      const { aged: _aged, stepped_back: _stepped, clock: _clock, recheck: _recheck, ...kept } = entry;
       const until = new Date(ctx.at.getTime() + maxCheckDays(ctx.maxCheckDays) * DAY_MS).toISOString();
       ledger = { ...ledger, [id]: { ...kept, checked: o.text.trim(), checked_at: iso, checked_version: entry.version, stale_after: until, checked_req: req.id, by: sender,
         ...(ctx.clockSource ? { clock: ctx.clockSource } : {}) } };

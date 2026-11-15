@@ -45,6 +45,7 @@ function both() {
   };
   const queued: string[] = [];
   const run = () => {
+    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify(l.state()));   // the link's state, as the keeper reads it
     for (const q of l.submitted.splice(0)) { writeFileSync(join(k.cfg.queue, `${String(++n).padStart(4, "0")}-${q.id}.json`), JSON.stringify(q)); queued.push(q.id); }
     const r = cycle(k.cfg);
     for (const id of queued) { const o = k.outcome(id); if (o) l.outcomes[id] = { state: o.state, reason: o.reason }; }
@@ -218,7 +219,14 @@ describe("1c. a reset of the keeper's copy: asks and taps wait for the next push
     expect(run().ok).toBe(true);
     expect(JSON.parse(l.files.status!).reset).toBeUndefined();
     expect(k.outcome("cain-next-1")).toMatchObject({ state: "conflict" });
-    expect(await l.tap(structuredClone(l.msg(q1.message)), l.ids(q1.message)[0])).not.toContain("refused");
+    // The card was posted before the reset epoch (0.12.0, sixth round): its tap is refused with its
+    // own reason, and the sweep takes its buttons off; a new checked ask posts and counts.
+    expect(await l.tap(structuredClone(l.msg(q1.message)), l.ids(q1.message)[0])).toBe("refused: record reset since");
+    await l.link.sweep();
+    expect(l.buttons(q1.message)).toEqual([]);
+    const q3 = await ask(l, "Q3", "the specialist's log again, read at 8:10");
+    expect(q3.status).toBe("posted");
+    expect(await l.tap(structuredClone(l.msg(q3.message)), l.ids(q3.message)[0])).toBe("to Cain");
   }, 30_000);
 
   test("a copy cloned again after the keeper wrote a ledger counts as a reset until the next push", () => {

@@ -106,7 +106,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const waiting: (() => void)[] = [];
   const beyond = new Set<string>();              // on Discord, but further back than the look over his DM goes
   const spy = { onCall: null as null | ((method: string, path: string) => void) };   // runs as each call reaches Discord
-  let seq = 0, lastId = "", tapped = "";
+  let seq = 0, lastId = "", tapped = "", taps = 0;
   const snowflake = (at = t.now) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(++seq));
   const rest = async (method: string, path: string, body?: any, auth = true) => {
     calls.push({ method, path, body: copy(body), auth });
@@ -220,7 +220,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   } });
   const tap = (msg: any, custom_id: string, over: any = {}) => {
     tapped = String(msg.id);
-    return link.onInteraction({ type: 3, id: "11", token: "t", application_id: BOT, channel_id: DM, user: { id: OWNER },
+    return link.onInteraction({ type: 3, id: String(10 + ++taps), token: "t", application_id: BOT, channel_id: DM, user: { id: OWNER },
       data: { custom_id }, message: copy(msg), ...over });
   };
   // Dane's own message in the DM, optionally a Discord reply to one of the bot's.

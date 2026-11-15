@@ -52,6 +52,9 @@
 #                                        and whether it passes (at most one second); about 80 seconds
 #   keeper.sh slow-read                  the smoke test: the next tap's fresh read is held past its limit,
 #                                        so that tap must answer "Busy, tap again." and keep its buttons
+#   keeper.sh stall-read [seconds]       the smoke test: a fresh read held that long (default 20), ignoring its
+#                                        cancellation; a second read meanwhile must answer busy at once, and a
+#                                        journal write to the link's state must still finish ("pass":true)
 #   keeper.sh clock                      the clock verdict (the record keeper's, with the source that
 #                                        satisfied it, and the box's own), the ledger's generation, whether
 #                                        a push or a reset is outstanding, and the last tap's read time
@@ -79,6 +82,7 @@ case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock|reads) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   slow-read) url="$link/slowread"; ctx=harness-relay-v1 ;;
+  stall-read) url="$link/stallread"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
@@ -160,6 +164,7 @@ case "$cmd" in
   stopped)  body='{}' ;;
   clock)    body='{}' ;;
   slow-read) body='{}' ;;
+  stall-read) body=$(jq -nc --arg n "${1:-20}" '{seconds: ($n | tonumber? // 20)}') ;;
   reads)    body=$(jq -nc --arg n "${1:-20}" '{n: ($n | tonumber? // 20)}') ;;
   card)     body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   check)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" --arg e "$edit" \
@@ -169,7 +174,7 @@ case "$cmd" in
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac
-wait=45; [ "$cmd" = reads ] && wait=240   # the reads are spread over more than a keeper round
+wait=45; [ "$cmd" = reads ] && wait=240; [ "$cmd" = stall-read ] && wait=150   # the reads are spread over more than a keeper round
 out=$(curl -sS -m "$wait" -H "@$hdr" -d "$body" "$url" 2>&1) \
   || { jq -nc --arg e "$out" '{status: "error", said: ("No answer: " + $e)}'; exit 1; }
 echo "$out"
