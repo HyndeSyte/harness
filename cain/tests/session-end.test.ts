@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claim, clean, fate, filedKey, filingId, requestFor, stepsOf } from "../tools/session-end";
+import { claim, clean, fate, filedKey, filingId, madeAt, nextFiling, requestFor, stepsOf } from "../tools/session-end";
 
 const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
 const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
@@ -87,8 +87,27 @@ describe("once only", () => {
     const long = "x".repeat(130);
     expect(filedKey(["P33"], [{ content: `${long} one`, status: "pending" }])).not.toBe(filedKey(["P33"], [{ content: `${long} two`, status: "pending" }]));
     const id = filingId("0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e", filedKey(["P33"], [a]));
-    expect(id).toMatch(/^laptop-end-0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e-[0-9a-f]{16}$/);
-    expect(id.length).toBeLessThanOrEqual(80);
+    expect(id).toMatch(/^laptop-end-0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e-[0-9a-f]{16}-1$/);
+    expect(filingId("0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e", filedKey(["P33"], [a]), 9999).length).toBeLessThanOrEqual(80);
+  });
+
+  test("each change is filing n + 1; the same steps again are the same filing; going back to earlier steps is a new one", () => {
+    const [kA, kB] = [filedKey(["P33"], [a]), filedKey(["P33"], [b])];
+    let last = "";
+    const seen: number[] = [];
+    for (const k of [kA, kA, kB, kA]) {
+      const { n, same } = nextFiling(last, k);
+      if (!same) last = `${k} ${n}`;
+      seen.push(n);
+    }
+    expect(seen).toEqual([1, 1, 2, 3]);
+    expect(nextFiling("garbled", kA)).toEqual({ n: 1, same: false });
+  });
+
+  test("filings are named by when they were made, so names sort in that order", () => {
+    const t = Date.parse("2026-11-15T05:03:00.120Z");
+    expect(madeAt(t)).toBe("20261115T050300.120Z");
+    expect([madeAt(t + 1), madeAt(t), madeAt(t + 1000)].sort()).toEqual([madeAt(t), madeAt(t + 1), madeAt(t + 1000)]);
   });
 
   test("a lock is made new, refused while it's fresh, and taken over once it's 2 minutes old", () => {

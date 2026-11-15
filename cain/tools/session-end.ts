@@ -18,17 +18,23 @@
 // masked; never the chat itself), or, when the transcript can't be read or kept no task list,
 // that it ended without one.
 //
-// Once only, and never lost: a filing's id comes from what it holds (the session, the items and
-// the open steps), so two ends of the same session file the same request and the record keeper,
-// which refuses an id it has seen, applies it once. A filing waits in an outbox in the record
-// clone's .git folder (written whole, then moved in) until the keeper has logged it: sent, then
-// kept until the keeper says done; sent again, as itself, if a day passes with no word. A filing
-// the record refused, or an outbox file that can't be read, is moved aside with why, never
-// deleted, and named at every session's start until a session deals with it. The lock between
-// two ends of one session is best effort; the id is what makes a second harmless.
+// Once only, in order, and never lost. Each change in what a session left open is one filing,
+// numbered in turn for the session (the same open steps again add nothing; going back to an
+// earlier set is a new filing), and its id comes from the session, that number and what it
+// holds: two ends of the same change file the same request, and the record keeper, which
+// refuses an id it has seen, applies it once. Every filing goes into an outbox in the record
+// clone's .git folder first (written whole and synced, then moved in), named by when it was
+// made, and leaves it in that order, under the same name in the record's inbox, which the keeper
+// works through by name. It stays until the keeper has logged it: kept after it's sent until the
+// keeper says done, and sent again, as itself, if a day passes with no word. A filing the record
+// refuses or would refuse, an outbox file that can't be read, or one cut off while it was
+// written is moved aside with why, never deleted, and named at every session's start until a
+// session deals with it. The locks between two ends, and between two flushes, are best effort;
+// the id is what makes a second harmless. What it says of a filing is that filing's own fate:
+// submitted (in the record's inbox), filed (the keeper said done), or waiting here.
 // It never holds up the session's end: any failure is one line.
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { TOKEN_SHAPES } from "../rootfs/opt/cain/c1/tools.ts";
 import { type Clone, args, check, clone, fetch, git, holdsAt, outcomes, send, sessionOf } from "./record-lib.ts";
@@ -90,11 +96,18 @@ export function clean(s: string, n: number): string {
 
 export type Why = "open" | "unread" | "unplanned";
 
-// One filing's identity: why, the items held and the open steps' whole words, in any order. With
-// the session it makes the record request's id, so the keeper applies one filing once.
+// What a filing holds: why, the items held and the open steps' whole words, in any order.
 export const filedKey = (held: string[], open: Step[], why: Why = "open") =>
   createHash("sha1").update(JSON.stringify([why, [...held].sort(), open.map((s) => clean(s.content, 10_000)).sort()])).digest("hex").slice(0, 16);
-export const filingId = (session: string, key: string) => `laptop-end-${session}-${key}`.slice(0, 80);
+export const filingId = (session: string, key: string, n = 1) => `laptop-end-${session}-${key}-${n}`.slice(0, 80);
+
+// This session's last filing, as "<key> <n>": the same key again is nothing new; another is
+// filing n + 1.
+export function nextFiling(last: string, key: string): { n: number; same: boolean } {
+  const [k, n] = last.trim().split(/\s+/);
+  const was = Number.isInteger(Number(n)) && Number(n) > 0 ? Number(n) : 0;
+  return k === key ? { n: was || 1, same: true } : { n: was + 1, same: false };
+}
 
 // The record request, or null when there's nothing to file: only on items the session holds.
 export function requestFor(open: Step[], held: string[], why: Why = "open", at = new Date()): any | null {
@@ -127,15 +140,16 @@ export function memoDir(c: Clone): string {
   return join(isAbsolute(gitDir) ? gitDir : join(c.dir, gitDir), "record-holds");
 }
 
-// A file whole or not at all: written beside, then moved in (a rename replaces it at once).
+// A file whole or not at all: written beside and synced, then moved in (a rename replaces it at once).
 function writeWhole(path: string, body: string): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, body);
-  renameSync(tmp, path);
+  const part = `${path}.${process.pid}.part`;
+  const fd = openSync(part, "w");
+  try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(part, path);
 }
 
-// Best effort: one end of a session files at a time; a lock left by a process that died goes
-// after 2 minutes. Two that slip past it file the same request, which the keeper applies once.
+// Best effort: one holder at a time; a lock left by a process that died goes after 2 minutes.
+// Two that slip past it do the same work, which the keeper's refusal of a seen id makes harmless.
 export function claim(lock: string, now = Date.now()): boolean {
   try { writeFileSync(lock, String(process.pid), { flag: "wx" }); return true; } catch { /* held, or left */ }
   try { if (now - statSync(lock).mtimeMs < 120_000) return false; } catch { /* gone meanwhile */ }
@@ -143,67 +157,105 @@ export function claim(lock: string, now = Date.now()): boolean {
   try { writeFileSync(lock, String(process.pid), { flag: "wx" }); return true; } catch { return false; }
 }
 
-// Puts one filing in the outbox, to be sent.
-export function enqueue(dir: string, id: string, raw: string): void {
+// When a filing was made, as the start of its name in the outbox and in the record's inbox, so
+// names sort as the filings were made.
+export const madeAt = (at: number) => new Date(at).toISOString().replace(/[-:]/g, "").replace("Z", "") + "Z";
+
+// Puts one filing in the outbox, named by when it was made. Returns its name.
+export function enqueue(dir: string, id: string, raw: string, at = Date.now()): string {
   mkdirSync(join(dir, "outbox"), { recursive: true });
-  writeWhole(join(dir, "outbox", `${id}.json`), raw);
+  const name = `${madeAt(at)}-${id}.json`;
+  writeWhole(join(dir, "outbox", name), raw);
+  return name;
 }
 
 // A filing moved aside, with why: kept, never deleted, until a session deals with it.
 function aside(dir: string, kind: "refused" | "unreadable", name: string, why: string): void {
   const to = join(dir, "outbox", kind);
   mkdirSync(to, { recursive: true });
-  const base = name.replace(/\.(json|sent)$/, "");
-  renameSync(join(dir, "outbox", name), join(to, `${base}.json`));
+  const base = name.replace(/\.(json|sent|part)$/, "");
+  try { renameSync(join(dir, "outbox", name), join(to, `${base}.json`)); } catch { return; }   // another flush took it
   writeFileSync(join(to, `${base}.why`), why + "\n");
 }
 
-// Works the outbox: sends what wasn't, settles what the keeper has logged, moves aside what it
-// refused or what can't be read. Returns what to say: how many went, and every filing aside.
-export function flush(rec: Clone, dir: string, now = Date.now()): string[] {
-  const box = join(dir, "outbox");
+export interface Flushed { lines: string[]; fates: Map<string, "submitted" | "filed" | "waiting here" | "aside"> }
+
+// Works the outbox, oldest filing first: sends what wasn't, settles what the keeper has logged,
+// moves aside what it refused or would refuse, or what can't be read. One flush at a time.
+export function flush(rec: Clone, dir: string, now = Date.now()): Flushed {
+  const lock = join(dir, "outbox.lock");
+  mkdirSync(join(dir, "outbox"), { recursive: true });
+  if (!claim(lock, now)) return { lines: [], fates: new Map() };          // another flush is at it
+  try { return flushing(rec, dir, join(dir, "outbox"), now); } finally { rmSync(lock, { force: true }); }
+}
+
+function flushing(rec: Clone, dir: string, box: string, now: number): Flushed {
+  const fates: Flushed["fates"] = new Map();
+  // A filing cut off while it was written (its process ended before it was moved in) is kept
+  // aside once it's 2 minutes old; one whole is moved in and goes on as its own.
+  let parts: string[] = [];
+  try { parts = readdirSync(box).filter((n) => n.endsWith(".part")); } catch { /* none */ }
+  for (const p of parts) {
+    try { if (now - statSync(join(box, p)).mtimeMs < 120_000) continue; } catch { continue; }
+    let req: any = null;
+    try { req = JSON.parse(readFileSync(join(box, p), "utf8")); } catch { /* cut off */ }
+    const whole = p.replace(/\.\d+\.part$/, "");
+    if (req && typeof req.id === "string" && whole.endsWith(".json")) { try { renameSync(join(box, p), join(box, whole)); } catch { /* taken */ } }
+    else aside(dir, "unreadable", p, "this filing was cut off while it was written");
+  }
   let names: string[] = [];
-  try { names = readdirSync(box).filter((n) => n.endsWith(".json") || n.endsWith(".sent")).sort(); } catch { /* no outbox yet */ }
+  try { names = readdirSync(box).filter((n) => n.endsWith(".json") || n.endsWith(".sent")).sort(); } catch { /* none */ }
   let went = 0;
+  let offline = false;
   for (const n of names) {
     const path = join(box, n);
     let raw = "", req: any = null;
     try { raw = readFileSync(path, "utf8"); req = JSON.parse(raw); } catch { /* below */ }
-    if (!req || typeof req.id !== "string") { aside(dir, "unreadable", n, "this filing couldn't be read"); continue; }
+    if (!req || typeof req.id !== "string") {
+      try { statSync(path); } catch { continue; }                          // another flush moved it
+      aside(dir, "unreadable", n, "this filing couldn't be read");
+      continue;
+    }
     const sent = n.endsWith(".sent");
     let ago = 0;
-    try { ago = now - statSync(path).mtimeMs; } catch { /* gone meanwhile */ }
+    try { ago = now - statSync(path).mtimeMs; } catch { continue; }
     const logged = outcomes(rec, req.id) as any[];
     const f = fate(logged.map((o) => String(o.state)), sent, ago);
-    if (f === "filed") { rmSync(path, { force: true }); continue; }
+    if (f === "filed") { rmSync(path, { force: true }); fates.set(req.id, "filed"); continue; }
     if (f === "refused") {
       const last = logged.filter((o) => o.state !== "done").at(-1);
       aside(dir, "refused", n, `the record said ${last?.state ?? "no"}: ${last?.reason ?? last?.line ?? ""}`.trim());
+      fates.set(req.id, "aside");
       continue;
     }
-    if (f !== "send" && f !== "resend") continue;
+    if (f === "waiting" || f === "wait") { fates.set(req.id, sent ? "submitted" : "waiting here"); continue; }
+    if (offline) { fates.set(req.id, sent ? "submitted" : "waiting here"); continue; }   // in order: none past one that couldn't go
     if (!sent) {
       const r = check(raw, rec);
-      if (r.state !== "ok" && r.state !== "waiting") { aside(dir, "refused", n, `the record would refuse it: ${r.line}`); continue; }
+      if (r.state !== "ok" && r.state !== "waiting") { aside(dir, "refused", n, `the record would refuse it: ${r.line}`); fates.set(req.id, "aside"); continue; }
     }
-    const stamp = new Date(now).toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-    const s = send(rec, `${stamp}-${req.id}.json`, raw, `Inbox: ${req.summary ?? "a laptop session's end"} (${req.id}${sent ? ", sent again" : ""})`);
-    if ("error" in s) break;                                       // offline: the rest waits too
-    if (sent) { const t = new Date(now); utimesSync(path, t, t); }
-    else renameSync(path, join(box, n.replace(/\.json$/, ".sent")));
+    const s = send(rec, n.replace(/\.(json|sent)$/, ".json"), raw, `Inbox: ${req.summary ?? "a laptop session's end"} (${req.id}${sent ? ", sent again" : ""})`);
+    if ("error" in s) { offline = true; fates.set(req.id, sent ? "submitted" : "waiting here"); continue; }
+    try {
+      const to = sent ? path : join(box, n.replace(/\.json$/, ".sent"));
+      if (!sent) renameSync(path, to);
+      const t = new Date(now);
+      utimesSync(to, t, t);                                                 // a day from this send
+    } catch { /* another flush settled it */ }
+    fates.set(req.id, "submitted");
     went++;
   }
-  const out = went ? [`Filed ${went} from a laptop session's end`] : [];
+  const lines = went ? [`Submitted ${went} to the record from a laptop session's end`] : [];
   for (const kind of ["refused", "unreadable"] as const) {
     let held: string[] = [];
     try { held = readdirSync(join(box, kind)).filter((x) => x.endsWith(".json")).sort(); } catch { /* none */ }
     for (const x of held) {
       let why = "";
       try { why = readFileSync(join(box, kind, x.replace(/\.json$/, ".why")), "utf8").trim(); } catch { /* none */ }
-      out.push(`A filing a laptop session left when it ended is kept aside, ${kind === "refused" ? `refused (${why})` : "unreadable"}: ${join(box, kind, x)}. File what it held another way, or drop it; then delete it.`);
+      lines.push(`A filing a laptop session left when it ended is kept aside, ${kind === "refused" ? `refused (${why})` : `unreadable (${why || "it couldn't be read"})`}: ${join(box, kind, x)}. File what it held another way, or drop it; then delete it.`);
     }
   }
-  return out;
+  return { lines, fates };
 }
 
 if (import.meta.main) {
@@ -221,10 +273,10 @@ if (import.meta.main) {
   const dir = memoDir(rec);
   if (a.flush === true) {
     let any = false;
-    try { any = readdirSync(join(dir, "outbox"), { recursive: true }).some((x) => /\.(json|sent)$/.test(String(x))); } catch { /* none */ }
+    try { any = readdirSync(join(dir, "outbox"), { recursive: true }).some((x) => /\.(json|sent|part)$/.test(String(x))); } catch { /* none */ }
     if (!any) say("");                                 // at every start: nothing waiting, no network
     fetch(rec);
-    say(...flush(rec, dir));
+    say(...flush(rec, dir).lines);
   }
   let input: any = {};
   if (a.hook === true) { try { input = JSON.parse(await Bun.stdin.text()); } catch { /* none */ } }
@@ -241,22 +293,24 @@ if (import.meta.main) {
   const req = requestFor(open, held, why);
   const key = req ? filedKey(held, open, why) : "";
   let last = "";
-  try { last = readFileSync(join(dir, `${session}.ended`), "utf8").trim(); } catch { /* nothing filed yet */ }
-  if (!req || last === key) say(...flush(rec, dir));  // nothing new: what waits still goes
+  try { last = readFileSync(join(dir, `${session}.ended`), "utf8"); } catch { /* nothing filed yet */ }
+  const { n, same } = nextFiling(last, key);
+  if (!req || same) say(...flush(rec, dir).lines);    // nothing new: what waits still goes
   req.from = me;
-  req.id = filingId(session!, key);
+  req.id = filingId(session!, key, n);
   const raw = JSON.stringify(req, null, 1) + "\n";
   if (a.dry === true) say(raw);
   mkdirSync(dir, { recursive: true });
   if (!claim(join(dir, `${session}.ending`))) say("");
   lock = join(dir, `${session}.ending`);
-  const r = check(raw, rec);
-  if (r.state !== "ok" && r.state !== "waiting") say(...flush(rec, dir), `Open steps not filed: ${r.line}`);
-  enqueue(dir, req.id, raw);
-  writeWhole(join(dir, `${session}.ended`), key);
-  const said = flush(rec, dir);
-  const sent = said.some((l) => l.startsWith("Filed "));
-  say(...said.filter((l) => !l.startsWith("Filed ")),
-    sent ? (why === "open" ? `Open steps filed in the record (${open.length})` : `Filed that the session ended ${why === "unread" ? "unread" : "with no task list"}`)
-      : "Open steps not sent yet: they go at the next session's start or end");
+  enqueue(dir, req.id, raw);                           // first, so even a refusal is kept
+  writeWhole(join(dir, `${session}.ended`), `${key} ${n}`);
+  const done = flush(rec, dir);
+  const mine = done.fates.get(req.id);
+  const what = why === "open" ? `Open steps (${open.length})` : `That the session ended ${why === "unread" ? "unread" : "with no task list"}`;
+  say(...done.lines.filter((l) => !l.startsWith("Submitted ")),
+    mine === "submitted" ? `${what}: submitted to the record`
+      : mine === "filed" ? `${what}: filed in the record`
+      : mine === "aside" ? `${what}: kept aside, as above`
+      : `${what}: waiting here, to go at the next session's start or end`);
 }
