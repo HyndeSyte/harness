@@ -9,11 +9,12 @@
 // transcripts, for which of the bot's messages he sent with the Discord plugin (one bot
 // token posts them all), and which of them his reply tool made (seedReplies). They are
 // streamed in chunks and the event loop gets a turn often, so a tap is never kept waiting.
-import { closeSync, createReadStream, fstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, fstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { answerText, sentIds } from "../gate/plugin";
 import { CAIN_UID, openOwnedFd } from "../owned";
+import { KEEP_MS, writeSynced } from "./auth";
 import { cardsView, emptyState, type ReplayReport, type Sent, type State } from "./core";
 
 // Whose transcripts these are (tests set their own user), read at each call.
@@ -26,17 +27,60 @@ export const REPLAY_FILE = process.env.CAIN_GATE_REPLAY ?? "/data/work/gate-repl
 export const TRANSCRIPTS = process.env.CAIN_TRANSCRIPTS ?? "/data/cain/.claude/projects";
 export const CARDS_DELAY_MS = 500;
 
-// The link's state file: read whole, written whole through a rename. A save tells onSave
-// (the cards writer) and writes nothing else.
-export function stateFile(path: string, onSave: () => void = () => {}) {
+// The link's state file: read whole, written whole and durably (a temp file synced, renamed,
+// its folder synced), in two copies, the second first, each holding which save it is (saveGen),
+// as the request log is (C1 re-check N2). So a card the link answered for is on disk before its
+// answer is recorded, and one damaged copy loses nothing. Both damaged is never taken quietly for
+// a fresh store: they're kept aside (state.json.damaged-<time>), and lost() says so, across
+// restarts, for as long as the link remembers a signed request (KEEP_MS): the link tells Cain, and
+// a card's request id isn't trusted to find its card meanwhile. A save tells onSave (the cards
+// writer) and writes nothing else.
+export function stateFile(path: string, onSave: () => void = () => {},
+                          write: (path: string, body: string) => void = writeSynced, now = () => Date.now()) {
+  let gen = 0, whole = false, lostAt = 0, foundNow = false;
+  try { const t = Number(readFileSync(`${path}.lost`, "utf8")); if (Number.isFinite(t) && t > 0) lostAt = t; } catch { /* never lost */ }
+  const one = (p: string): State | "absent" | "bad" => {
+    let text: string;
+    try { text = readFileSync(p, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? "absent" : "bad"; }
+    try {
+      const s = JSON.parse(text);
+      return s && typeof s === "object" && !Array.isArray(s) && s.cards && typeof s.cards === "object" && s.messages && typeof s.messages === "object" ? s : "bad";
+    } catch { return "bad"; }
+  };
   return {
     load(): State {
-      try { return JSON.parse(readFileSync(path, "utf8")); } catch { return emptyState(); }
+      // After the first look at both copies, the first is read alone while it's whole.
+      if (whole) { const s = one(path); if (typeof s === "object") return s; }
+      whole = true;
+      const a = one(path), b = one(`${path}.2`);
+      const good = [a, b].filter((x): x is State => typeof x === "object");
+      if (good.length) {
+        const best = good.reduce((x, y) => (Number(y.saveGen ?? 0) > Number(x.saveGen ?? 0) ? y : x));
+        gen = Math.max(gen, Number(best.saveGen ?? 0));
+        if (best !== a) whole = false;                  // the first copy is behind: both are read until a save
+        return best;
+      }
+      if (a === "absent" && b === "absent") return emptyState();
+      const t = now();
+      for (const p of [path, `${path}.2`]) { try { renameSync(p, `${p}.damaged-${t}`); } catch { /* absent */ } }
+      lostAt = t; foundNow = true;
+      try { write(`${path}.lost`, String(t)); } catch { /* lost in memory still */ }
+      return emptyState();
     },
     save(s: State): void {
-      writeFileSync(`${path}.tmp`, JSON.stringify(s), { mode: 0o600 });
-      renameSync(`${path}.tmp`, path);
+      gen += 1;
+      s.saveGen = gen;
+      const body = JSON.stringify(s);
+      try { write(`${path}.2`, body); write(path, body); }
+      catch (e) { whole = false; throw e; }             // the copies may differ: read both next time
+      whole = true;
       onSave();
+    },
+    // Found damaged by this process (so the link tells Cain once, not at every restart).
+    lostNow(): boolean { return foundNow; },
+    lost(): number {
+      if (lostAt && now() - lostAt > KEEP_MS) { lostAt = 0; try { rmSync(`${path}.lost`, { force: true }); } catch { /* gone */ } }
+      return lostAt;
     },
   };
 }

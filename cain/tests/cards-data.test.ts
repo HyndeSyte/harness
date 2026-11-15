@@ -3,11 +3,12 @@
 // message back from Discord; the cards are published for the reply hook without text;
 // and each send point logs what the gate's rules would have done, changing nothing.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
+import { KEEP_MS, writeSynced } from "../rootfs/opt/cain/link/auth";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
 // Transcripts are read only if they are files of Cain's user (C1); here, the test's own.
@@ -195,6 +196,50 @@ describe("the cards, published for the reply hook", () => {
     store.save({ ...s, owner: "4444" });
     await writer.settled();
     expect(JSON.parse(readFileSync(cardsPath, "utf8")).owner).toBe("4444");
+  });
+
+  test("the link's state on disk: two copies, the newer read; one damaged loses nothing; both damaged kept aside, never quietly a fresh store (C1 re-check N2)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    const store = stateFile(p);
+    const s = { ...rig().state(), owner: "4242" };
+    store.save(s);
+    expect(JSON.parse(readFileSync(`${p}.2`, "utf8")).owner).toBe("4242");
+    store.save({ ...s, owner: "4343" });
+    writeFileSync(p, "{not json");                                       // the first copy damaged
+    expect(stateFile(p).load().owner).toBe("4343");
+    const behind = JSON.stringify({ ...s, owner: "old", saveGen: 1 });
+    writeFileSync(p, behind);                                            // the first copy a save behind
+    expect(stateFile(p).load().owner).toBe("4343");
+    writeFileSync(`${p}.2`, "{oops");
+    const fresh = stateFile(p);
+    expect([fresh.load().owner, fresh.lost()]).toEqual(["old", 0]);
+    writeFileSync(p, "{oops");                                           // both damaged
+    let t = 1_800_000_000_000;
+    const lost = stateFile(p, () => {}, undefined, () => t);
+    const got = lost.load();
+    expect([got.owner, Object.keys(got.cards).length, lost.lost(), lost.lostNow()]).toEqual([undefined, 0, t, true]);
+    expect(readdirSync(dir).filter((f) => f.includes(".damaged-")).length).toBe(2);
+    lost.save(got);
+    t += KEEP_MS - 1;
+    const after = stateFile(p, () => {}, undefined, () => t);
+    expect([after.lost(), after.lostNow()]).toEqual([1_800_000_000_000, false]);         // a restart remembers, told once
+    t += 2;
+    expect(stateFile(p, () => {}, undefined, () => t).lost()).toBe(0);                    // until it can't matter
+  });
+
+  test("a save that couldn't be made durable throws, and the next read takes the newer copy, not a stale first one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    let failFirst = false;
+    const write = (path: string, body: string) => { if (failFirst && path === p) throw new Error("EIO"); writeFileSync(path, body); };
+    const store = stateFile(p, () => {}, write);
+    const s = rig().state();
+    store.save({ ...s, owner: "1" });
+    failFirst = true;
+    expect(() => store.save({ ...s, owner: "2" })).toThrow("EIO");       // the second copy has it, the first doesn't
+    expect(store.load().owner).toBe("2");
+    expect(() => stateFile(p, () => {}, (_p, _b) => writeSynced(_p, _b, () => { throw new Error("EIO: folder"); })).save(s)).toThrow("folder");
   });
 
   test("the link asks for a write after each save and each sweep, and answers /cards itself", () => {

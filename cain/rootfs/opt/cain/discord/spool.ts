@@ -15,19 +15,12 @@
 //   - the spool is replaced whole (a temp file, synced, renamed, its folder synced), and only
 //     when what's in it now could be read: otherwise it's left as it is, and what was already
 //     told goes again.
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { tellLinkOutcome } from "../hooks/discord-sent";
-import { syncFolder } from "../link/auth";
+import { appendSynced, syncFolder } from "../link/auth";
 
 type Post = (body: string, timeoutMs: number) => Promise<Response>;
-
-function appendSynced(path: string, text: string): void {
-  const made = !existsSync(path);
-  const fd = openSync(path, "a", 0o640);
-  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
-  if (made) syncFolder(dirname(path));
-}
 
 export class SentSpool {
   private held: string[] = [];

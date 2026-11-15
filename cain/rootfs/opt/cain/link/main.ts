@@ -48,7 +48,7 @@
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { CAIN_ROUTES, type Caller, checkRequest, RequestLog, routeAllowed, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
+import { appendSynced, CAIN_ROUTES, type Caller, checkRequest, RequestLog, RERUN_SAFE, routeAllowed, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
 import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
@@ -104,6 +104,10 @@ const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) =
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
 function save(s: State): void { stateStore.save(s); }
+// Read once at the start, so a store found damaged is known before anything is asked of the link.
+load();
+if (stateStore.lostNow()) console.log("[cain] link: ERROR: its record of cards and messages was damaged on disk (both copies), kept aside, and started over");
+else if (stateStore.lost()) console.log("[cain] link: its record of cards and messages was found damaged within the last 8 days: a card's request isn't run again meanwhile");
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -187,7 +191,8 @@ const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
-  relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
+  // Durable (C1 re-check N2): a card's line to Cain is on disk before the card's request is done.
+  relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
@@ -294,7 +299,9 @@ async function route(req: Request, url: URL, caller: Caller, raw: string, reqId?
 const requests = new RequestLog(`${DIR}/requests.json`);
 if (requests.damagedSince) console.log(`[cain] link: ERROR: its record of the specialist's operations is damaged (both copies); no new one is taken until it can't matter (8 days)`);
 else if (requests.recoveredFrom) console.log(`[cain] link: its record of the specialist's operations was read from ${requests.recoveredFrom} (the other was damaged or a step behind); nothing lost`);
-const ops = new SignedOps(requests);
+// A card's request runs again only while the cards it made are on record: a store found damaged
+// lost which request made which card, so then it's an explicit unknown too.
+const ops = new SignedOps(requests, Date.now, (p) => RERUN_SAFE.has(p) && !stateStore.lost());
 // A body larger than any route takes is refused before it's read, signed or not (C1-7).
 const MAX_BODY = 16_384;
 // Recorded, durably, at the specialist's first signed request: until then the run script keeps
@@ -433,6 +440,8 @@ async function handle(url: URL, b: any, reqId?: string): Promise<Response> {
     return json({ status: "not found" }, 404);
 }
 console.log(`[cain] link listening on ${PORT} and ${LINK_SOCK}`);
+if (stateStore.lostNow())
+  link.relayLine("The link's record of cards and messages was damaged on disk (both copies) and started over, the damaged copies kept aside: buttons on cards from before now won't work, and the calendar specialist's cards from just before may need sending again (they go out as an explicit unknown, never twice). Tell Dane in one line that the Pi's storage needs a look, and keep it in PENDING until it's fixed.");
 if (requests.damagedNow)
   link.relayLine("The link's record of what the calendar specialist asked of it is damaged on disk (both copies), so for 8 days it takes nothing new from the specialist: what the specialist sends meanwhile waits, and is dropped after 7 days, so nothing can go out twice. Tell Dane in one line that his calendar cards are paused by a storage problem on the Pi, and keep it in PENDING until it's fixed.");
 if (shipKey?.remade)

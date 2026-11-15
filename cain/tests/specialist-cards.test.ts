@@ -7,6 +7,10 @@
 // within its life whatever Cain is doing: if Cain hasn't shown it within about 2
 // minutes, it goes out by itself, and Cain is told when one can't.
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { RequestLog, SignedOps } from "../rootfs/opt/cain/link/auth";
 import { digest, EXPIRED_TAP, excerpt, RESUME, STOP } from "../rootfs/opt/cain/link/core";
 import { BOT, DAY, DM, HOUR, keeperHolds, MIN, pendingWith, PR, rig, SHA1 } from "./link-rig";
 
@@ -883,6 +887,22 @@ describe("one request, one card", () => {
     expect(r.state().cards[String(b)].shown).toBeTruthy();
     await r.link.addCard({ text: "Moved Swim.", rows, kind: "card", req: "9".repeat(32) });
     expect([told(b), r.state().cards[String(b)].announce]).toEqual([0, undefined]);
+  });
+
+  test("the signed request is recorded done only once the card and Cain's line about it are kept (C1 re-check N2)", async () => {
+    const r = rig();
+    const ops = new SignedOps(new RequestLog(join(mkdtempSync(join(tmpdir(), "ops-")), "requests.json")));
+    const req = "7".repeat(32);
+    const act = async () => {
+      try { return { status: 200, body: JSON.stringify({ id: await r.link.addCard({ text: "A note for him", rows: [], kind: "card", req }) }) }; }
+      catch (e) { return { status: 500, body: JSON.stringify({ status: "error", said: String(e) }) }; }
+    };
+    r.relayFail.n = 1;
+    expect((await ops.run(req, "/card", act)).status).toBe(500);         // his line didn't go: not done
+    const a = await ops.run(req, "/card", act);
+    expect(a.status).toBe(200);
+    expect(r.relayed.filter((x) => x.includes("has a card for Dane")).length).toBe(1);
+    expect(await ops.run(req, "/card", act)).toEqual(a);                 // done now: the stored answer
   });
 
   test("one Discord posted but whose answer was lost: the request again finds it in his DM and posts nothing more", async () => {

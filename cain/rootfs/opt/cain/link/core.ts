@@ -189,6 +189,7 @@ export interface Ask {               // Cain's question waiting behind the open 
 }
 export interface State {
   owner?: string; dm?: string; bot?: string; next: number;
+  saveGen?: number;                  // which save this is (publish.ts stateFile: the newer copy wins)
   cards: Record<string, Card>; messages: Record<string, Shown>;
   held?: Ask[];
   migrated?: boolean;                // the one-time look over cards posted before 0.7.0 is done

@@ -102,6 +102,27 @@ describe("each signed operation once", () => {
     expect(runs).toBe(1);
   });
 
+  // C1 re-check N1: the same on routes that never run again. A "received" that couldn't be made
+  // durable leaves nothing behind, in memory or on disk, so it can't pass for an operation that
+  // may have started (which would get an unknown it never earned).
+  for (const path of ["/answer", "/relay"]) {
+    test(`${path}: a failed "received" leaves nothing behind; the retry runs it once, in this process or after a restart`, async () => {
+      for (const restart of [false, true]) {
+        const f = join(dir(), "requests.json");
+        let fails = 1;                                         // the first write lands, then its folder's sync fails
+        const write = (p: string, b: string) => writeSynced(p, b, () => { if (fails > 0) { fails--; throw new Error("EIO: the folder's sync failed"); } });
+        let log = new RequestLog(f, Date.now(), write);
+        let runs = 0;
+        const act = async () => { runs++; return { status: 200, body: '{"status":"ok"}' }; };
+        const first = await new SignedOps(log).run(ID, path, act);
+        expect([first.status, runs]).toEqual([503, 0]);
+        if (restart) log = new RequestLog(f, Date.now(), write);
+        const again = await new SignedOps(log).run(ID, path, act);
+        expect([restart, again.status, runs]).toEqual([restart, 200, 1]);
+      }
+    });
+  }
+
   test("the folder's sync failing is the writer's error, never swallowed", () => {
     const f = join(dir(), "x.json");
     expect(() => writeSynced(f, "{}", () => { throw new Error("EIO") })).toThrow("EIO");

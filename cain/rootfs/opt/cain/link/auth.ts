@@ -19,7 +19,7 @@
 // explicit unknown. So a request someone holds and forwards late runs at most once, and an
 // answer the specialist can't verify is no answer.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const SIG_HEADER = "x-harness-sig";
@@ -32,6 +32,15 @@ export function syncFolder(dir: string): void {
   if (process.platform === "win32") return;
   const d = openSync(dir, "r");
   try { fsyncSync(d); } finally { closeSync(d); }
+}
+
+// Lines added durably: written, synced, and the folder synced when the file is new.
+export function appendSynced(path: string, text: string, sync: (dir: string) => void = syncFolder): void {
+  let made = false;
+  try { statSync(path); } catch (e: any) { if (e?.code === "ENOENT") made = true; else throw e; }
+  const fd = openSync(path, "a", 0o640);
+  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  if (made) sync(dirname(path));
 }
 
 // A small file written whole and durably: a temp file, fsync, rename, fsync of the folder.
@@ -154,10 +163,19 @@ export class RequestLog {
     const s = this.map.get(id);
     return s && now - s.at <= KEEP_MS ? s : null;
   }
+  // A change that couldn't be saved durably is undone (C1 re-check N1): in memory, and on disk
+  // as far as the disk takes it (the files written again without it), so a "received" that
+  // never got recorded can't later pass for an operation that may have started.
   put(id: string, s: Stored): void {
     for (const [k, v] of this.map) if (s.at - v.at > KEEP_MS) this.map.delete(k);
+    const before = this.map.get(id);
     this.map.set(id, s);
-    this.save();
+    try { this.save(); }
+    catch (e) {
+      if (before) this.map.set(id, before); else this.map.delete(id);
+      try { this.save(); } catch { /* the disk refuses still: the caller hears the first error */ }
+      throw e;
+    }
   }
   private save(): void {
     if (!this.path) return;
@@ -187,7 +205,8 @@ export const RERUN_SAFE = new Set(["/card"]);
 // re-check F2); one whose "done" couldn't be is answered all the same, and stays received.
 export class SignedOps {
   private inflight = new Map<string, Promise<Answer>>();
-  constructor(private log: RequestLog, private now = () => Date.now(), private rerun: Set<string> = RERUN_SAFE) {}
+  constructor(private log: RequestLog, private now = () => Date.now(),
+              private rerun: (path: string) => boolean = (p) => RERUN_SAFE.has(p)) {}
   async run(id: string, path: string, act: () => Promise<Answer>): Promise<Answer> {
     const done = this.log.get(id, this.now());
     if (done?.state === "done") return { status: done.status ?? 200, body: done.body ?? "{}" };
@@ -196,7 +215,7 @@ export class SignedOps {
     if (this.log.damaged(this.now()))
       return { status: 503, body: JSON.stringify({ status: "history damaged", said: "the link's record of what it has done is damaged, so it takes no new operation for now" }) };
     const p = (async (): Promise<Answer> => {
-      if (done?.state === "received" && !this.rerun.has(path)) {
+      if (done?.state === "received" && !this.rerun(path)) {
         const a = { status: 409, body: JSON.stringify({ status: "unknown", said: "the link couldn't confirm this operation finished (it stopped part way, or failed); it isn't done again" }) };
         try { this.log.put(id, { at: this.now(), state: "done", status: a.status, body: a.body }); } catch { /* still received: the same answer next time */ }
         return a;
