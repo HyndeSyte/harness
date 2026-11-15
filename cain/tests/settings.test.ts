@@ -85,6 +85,14 @@ describe("his standards load at every start and after every compaction", () => {
     });
     expect(group.hooks).toHaveLength(3);
   });
+
+  test("his plugins load in full before his session starts, so a start-up hook that takes a moment can't leave out the Discord plugin", () => {
+    // Claude Code 2.1.317, with a SessionStart hook that takes a moment: a session that loads its
+    // plugins in the background starts from an early cache-only load that hasn't taken in the
+    // seed's plugins yet, without the Discord plugin. Loaded at once, before it starts, it never
+    // is (cain/tests/image/in.sh shows both, with a slow hook).
+    expect(settings.env).toEqual({ CLAUDE_CODE_SYNC_PLUGIN_INSTALL: "1" });
+  });
 });
 
 describe("nothing of his own adds to his rules (C1)", () => {

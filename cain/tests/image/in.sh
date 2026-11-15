@@ -200,7 +200,22 @@ final)
   [ "$(printf '%s\n' "$heads" | grep -c .)" = 3 ] && [ "$(printf '%s\n' "$heads" | tail -n 1)" = "Dane's standards, part 3 of 3" ] \
     || fail "his session didn't get his standards' 3 parts: $(printf '%s' "$heads" | tr '\n' ' ')| $(head -c 300 /fp/standards.err)"
   ! grep -q "did not load\|didn't load" /fp/standards.jsonl || fail "a part of his standards didn't load as his own user"
-  note "final checks held ($other couldn't be installed; loaded: $loaded; his standards: 3 parts)"
+  # A start-up hook that takes a moment doesn't cost his session the Discord plugin. Unless it
+  # loads its plugins at once (the managed settings' CLAUDE_CODE_SYNC_PLUGIN_INSTALL), this Claude
+  # Code starts the session from an early cache-only load that hasn't taken in the seed's plugins
+  # yet, and the session has no Discord plugin: shown both ways, so the check can't pass for nothing.
+  ms=/etc/claude-code/managed-settings.json
+  cp -p "$ms" /fp/managed.orig
+  slow() {   # <jq filter on his managed settings> <name>: whether a session with a slow start-up hook loaded the seed's plugin
+    jq "$1"' | .hooks.SessionStart += [{"hooks": [{"type": "command", "command": "sleep 3", "timeout": 15}]}]' /fp/managed.orig > "$ms"
+    "${as_him[@]}" ANTHROPIC_API_KEY=sk-ant-api03-ci-only-not-a-real-key timeout 120 claude -p --output-format stream-json --verbose --max-turns 1 "ok" > "/fp/slow-$2.jsonl" 2> "/fp/slow-$2.err" || true
+    cp -p /fp/managed.orig "$ms"
+    "$OPT/c1/seed-loaded.sh" "/fp/slow-$2.jsonl" 2> "/fp/slow-$2.why"
+  }
+  slow . with || fail "with a slow start-up hook, his session didn't load the seed's plugin: $(cat /fp/slow-with.why)"
+  ! slow 'del(.env.CLAUDE_CODE_SYNC_PLUGIN_INSTALL)' without \
+    || fail "without loading plugins at once, a slow start-up hook still left the seed's plugin in: this check can't tell any more (has Claude Code changed? then the setting may no longer be needed)"
+  note "final checks held ($other couldn't be installed; loaded: $loaded; his standards: 3 parts; a slow start-up hook leaves the plugin in)"
   ;;
 plant-connector)
   # The old way recorded a claude.ai connector of his (the run script's connector check): CI has
