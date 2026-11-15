@@ -274,35 +274,50 @@ describe("the pre-push hook", () => {
   }, 90_000);
 });
 
-// What a laptop session leaves open, filed by its SessionEnd hook (session-end.ts): a note on
-// the item it holds, once for the same steps, however often its process ends.
+// What a laptop session leaves open on the items it holds, filed by its SessionEnd hook
+// (session-end.ts): a note, once however often its process ends, and never lost on the way.
 describe("session-end", () => {
-  test("files a session's open steps on the item it holds, once; a new open step files again", () => {
+  const held = () => {
     const l = laptop();
     l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
     cycle(l.cfg);
+    sh(["git", "fetch", "-q", "origin"], l.clone);                          // the hold, as last fetched
+    return l;
+  };
+  const plan = (...s: [string, string][]) => JSON.stringify({ type: "assistant", message: { role: "assistant",
+    content: [{ type: "tool_use", name: "mcp__ccd_turn__update_plan", input: { items: s.map(([content, status]) => ({ content, status })) } }] } }) + "\n";
+  const box = (l: ReturnType<typeof laptop>, ...sub: string[]) => join(l.clone, ".git", "record-holds", "outbox", ...sub);
+  const notes = (l: ReturnType<typeof laptop>) => sh(["git", "show", "main:state/notes/P33.md"], l.remote);
+
+  test("files a session's open steps on the item it holds, once; a new open step files again", () => {
+    const l = held();
     const transcript = join(l.root, "transcript.jsonl");
-    const plan = (...s: [string, string][]) => JSON.stringify({ type: "assistant", message: { role: "assistant",
-      content: [{ type: "tool_use", name: "mcp__ccd_turn__update_plan", input: { items: s.map(([content, status]) => ({ content, status })) } }] } }) + "\n";
     const end = () => l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: transcript }) });
     writeFileSync(transcript, plan(["Build", "completed"], ["Verify after his tap", "pending"]));
     expect(end()).toEqual({ code: 0, out: "Open steps filed in the record (1)", err: "" });
     expect(l.inboxNames()).toHaveLength(1);
     expect(cycle(l.cfg).ok).toBe(true);
-    expect(sh(["git", "show", "main:state/notes/P33.md"], l.remote)).toContain("with these steps open: Verify after his tap.");
-    // Its process ends again (an idle stop, a resume) with the same steps open: nothing more.
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+    // Its process ends again (an idle stop, a resume) with the same steps open: nothing more,
+    // and the outbox settles (the keeper said done).
     expect(end()).toEqual({ code: 0, out: "", err: "" });
     expect(l.inboxNames()).toHaveLength(0);
-    // A new open step is a new filing.
+    expect(readdirSync(box(l)).filter((n) => /\.(json|sent)$/.test(n))).toEqual([]);
     writeFileSync(transcript, plan(["Build", "completed"], ["Verify after his tap", "pending"], ["Merge", "pending"]));
     expect(end().out).toBe("Open steps filed in the record (2)");
     expect(l.inboxNames()).toHaveLength(1);
   }, 60_000);
 
-  test("a transcript that can't be read is said on the item it holds; a second end while one is filing adds nothing", () => {
+  test("a session that holds no item files nothing", () => {
     const l = laptop();
-    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
-    cycle(l.cfg);
+    const transcript = join(l.root, "transcript.jsonl");
+    writeFileSync(transcript, plan(["Review the renewal figures for Friday", "pending"]));
+    expect(l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SB, transcript_path: transcript }) })).toEqual({ code: 0, out: "", err: "" });
+    expect(l.inboxNames()).toHaveLength(0);
+  }, 60_000);
+
+  test("a transcript that can't be read is said on the item it holds; a second end while one is filing adds nothing", () => {
+    const l = held();
     const end = () => l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: join(l.root, "gone.jsonl") }) });
     const memo = join(l.clone, ".git", "record-holds");
     mkdirSync(memo, { recursive: true });
@@ -312,39 +327,64 @@ describe("session-end", () => {
     rmSync(join(memo, `${SA}.ending`));
     expect(end()).toEqual({ code: 0, out: "Filed that the session ended unread", err: "" });
     expect(cycle(l.cfg).ok).toBe(true);
-    expect(sh(["git", "show", "main:state/notes/P33.md"], l.remote)).toContain("its task list couldn't be read, so what it left open isn't known.");
+    expect(notes(l)).toContain("its task list couldn't be read, so what it left open isn't known.");
     expect(end()).toEqual({ code: 0, out: "", err: "" });                 // said once
   }, 60_000);
 
-  test("a filing that can't be sent waits in the outbox and goes at the next start, once", () => {
-    const l = laptop();
-    l.inbox(["1.json", { id: "lap-take-1", from: A, ops: [take("P33", "chat: x", { branches: ["claude/record-holds"] })] }]);
-    cycle(l.cfg);
-    sh(["git", "fetch", "-q", "origin"], l.clone);                          // the hold, as last fetched
+  test("two ends of one session at once file one note: the same request, which the keeper applies once", async () => {
+    const l = held();
     const transcript = join(l.root, "transcript.jsonl");
-    writeFileSync(transcript, JSON.stringify({ type: "assistant", message: { role: "assistant",
-      content: [{ type: "tool_use", name: "mcp__ccd_turn__update_plan", input: { items: [{ content: "Verify after his tap", status: "pending" }] } }] } }) + "\n");
+    writeFileSync(transcript, plan(["Verify after his tap", "pending"]));
+    const env = cleanEnv({ RECORD_CLONE: l.clone });
+    const start = () => Bun.spawn([process.execPath, join(TOOLS, "session-end.ts"), "--hook"], { cwd: l.root, env, stdout: "pipe", stderr: "pipe",
+      stdin: Buffer.from(JSON.stringify({ session_id: SA, transcript_path: transcript })) });
+    const [p1, p2] = [start(), start()];
+    await Promise.all([p1.exited, p2.exited]);
+    // Whether the lock let one or both through, the inbox holds one request id.
+    const ids = new Set(l.inboxNames().map((n) => JSON.parse(sh(["git", "show", `main:${n}`], l.remote)).id));
+    expect(ids.size).toBe(1);
+    expect(cycle(l.cfg).ok).toBe(true);
+    expect(notes(l).split("with these steps open: Verify after his tap.").length - 1).toBe(1);
+  }, 90_000);
+
+  test("a filing that can't be sent waits in the outbox, goes at the next start, and leaves once the keeper has it", () => {
+    const l = held();
+    const transcript = join(l.root, "transcript.jsonl");
+    writeFileSync(transcript, plan(["Verify after his tap", "pending"]));
     const away = `${l.remote}-away`;
     renameSync(l.remote, away);                                             // the record can't be reached
-    const ended = l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: transcript }) });
-    expect(ended.code).toBe(0);
-    expect(ended.out).toStartWith("Open steps not sent yet (");
-    expect(ended.out).toEndWith("): they go at the next session's start");
-    expect(readdirSync(join(l.clone, ".git", "record-holds", "outbox"))).toHaveLength(1);
+    expect(l.tool("session-end.ts", ["--hook"], { input: JSON.stringify({ session_id: SA, transcript_path: transcript }) }))
+      .toEqual({ code: 0, out: "Open steps not sent yet: they go at the next session's start or end", err: "" });
+    const [waiting] = readdirSync(box(l)).filter((n) => n.endsWith(".json"));
+    expect(waiting).toMatch(/^laptop-end-.*\.json$/);
+    const raw = readFileSync(box(l, waiting), "utf8");
     renameSync(away, l.remote);
-    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "Filed 1 left from a session's end", err: "" });
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "Filed 1 from a laptop session's end", err: "" });
     expect(l.inboxNames()).toHaveLength(1);
-    expect(readdirSync(join(l.clone, ".git", "record-holds", "outbox"))).toHaveLength(0);
-    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });
+    expect(readdirSync(box(l)).filter((n) => /\.(json|sent)$/.test(n))).toEqual([waiting.replace(/\.json$/, ".sent")]);   // sent, kept until the keeper has it
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });                                   // no word yet: waits
     expect(cycle(l.cfg).ok).toBe(true);
-    expect(sh(["git", "show", "main:state/notes/P33.md"], l.remote)).toContain("with these steps open: Verify after his tap.");
-    // One the keeper already has, back in the outbox (its send's answer was lost): gone, not sent again.
-    const [logged] = sh(["git", "log", "--format=%s", "-n", "20", "main"], l.remote).split("\n").filter((s) => s.includes("sent again"));
-    const id = /\((laptop-[^,]+), sent again\)/.exec(logged)![1];
-    writeFileSync(join(l.clone, ".git", "record-holds", "outbox", `${id}.json`), JSON.stringify({ id, summary: "s", kind: "change", ops: [] }));
-    sh(["git", "fetch", "-q", "origin"], l.clone);
     expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });
-    expect(readdirSync(join(l.clone, ".git", "record-holds", "outbox"))).toHaveLength(0);
+    expect(readdirSync(box(l)).filter((n) => /\.(json|sent)$/.test(n))).toEqual([]);                                     // done: gone
+    expect(notes(l)).toContain("with these steps open: Verify after his tap.");
+    // The same filing back in the outbox (an answer lost on the way): the keeper has it, so it leaves, unsent.
+    writeFileSync(box(l, waiting), raw);
+    expect(l.tool("session-end.ts", ["--flush"])).toEqual({ code: 0, out: "", err: "" });
+    expect(readdirSync(box(l)).filter((n) => /\.(json|sent)$/.test(n))).toEqual([]);
     expect(l.inboxNames()).toHaveLength(0);
   }, 90_000);
+
+  test("a filing that can't be read, or that the record refuses, is kept aside with why and named at every start, never deleted", () => {
+    const l = held();
+    mkdirSync(box(l), { recursive: true });
+    writeFileSync(box(l, "laptop-end-broken.json"), '{"kind": "change", "id": "laptop-end-br');           // cut off mid-write
+    writeFileSync(box(l, "laptop-end-nosuch.json"), JSON.stringify({ kind: "change", from: A, id: "laptop-end-nosuch", summary: "s", ops: [{ op: "note", item: "P999", text: "x" }] }));
+    const said = l.tool("session-end.ts", ["--flush"]);
+    expect(said.code).toBe(0);
+    expect(said.out).toContain(`kept aside, refused (the record would refuse it: rejected: P999 isn't an item in the record): ${box(l, "refused", "laptop-end-nosuch.json")}`);
+    expect(said.out).toContain(`kept aside, unreadable: ${box(l, "unreadable", "laptop-end-broken.json")}. File what it held another way, or drop it; then delete it.`);
+    expect(readFileSync(box(l, "unreadable", "laptop-end-broken.json"), "utf8")).toBe('{"kind": "change", "id": "laptop-end-br');
+    expect(l.inboxNames()).toHaveLength(0);
+    expect(l.tool("session-end.ts", ["--flush"]).out).toBe(said.out);                                   // named again at the next start
+  }, 60_000);
 });

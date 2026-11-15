@@ -1,11 +1,11 @@
-// What a laptop session leaves open reaches Cain's record when it ends (cain/tools/session-end.ts,
-// org-v2 DESIGN 4.F, the registry's S-051): its task list replayed from its transcript, then
-// filed as a note on each item it holds, or as a line for Cain to fold in when it holds none.
+// What a laptop session leaves open on the items it holds reaches Cain's record when it ends
+// (cain/tools/session-end.ts, org-v2 DESIGN 4.F, the registry's S-051): its task list replayed
+// from its transcript, filed as a note on each item it holds, once, and never lost on the way.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claim, clean, fileAgain, filedKey, requestFor, stepsOf } from "../tools/session-end";
+import { claim, clean, fate, filedKey, filingId, requestFor, stepsOf } from "../tools/session-end";
 
 const use = (name: string, input: unknown, id = "") => JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input }] } });
 const failed = (id: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content: "invalid input" }] } });
@@ -55,60 +55,61 @@ describe("the task list as the session left it", () => {
 describe("what it files", () => {
   const open = [{ content: "Verify after his tap", status: "pending" }, { content: "Clean | up", status: "in_progress" }];
   const at = new Date("2026-11-15T03:00:00Z");
-  test("nothing open: nothing filed", () => {
-    expect(requestFor("s1", [], ["P33"], "open")).toBeNull();
+  test("nothing open, or no item held: nothing filed", () => {
+    expect(requestFor([], ["P33"], "open")).toBeNull();
+    expect(requestFor([{ content: "Review the renewal figures for Friday", status: "pending" }, ...open], [], "open", at)).toBeNull();
+    expect(requestFor([], [], "unread", at)).toBeNull();
   });
   test("a note on each item it holds, its steps on one line", () => {
-    const r = requestFor("s1", open, ["P33", "P40"], "open", at);
+    const r = requestFor(open, ["P33", "P40"], "open", at);
     expect(r.ops.map((o: any) => [o.op, o.item])).toEqual([["note", "P33"], ["note", "P40"]]);
     expect(r.ops[0].text).toBe("The laptop session ended (2026-11-15) with these steps open: Verify after his tap; Clean up. Its hold lapses in a day; take the item to carry it on.");
   });
-  test("holding nothing: one line for Cain to fold into the open list, how many steps, never their words", () => {
-    const r = requestFor("abc", [{ content: "Review the renewal figures for Friday", status: "pending" }, ...open], [], "open", at);
-    expect(r.ops).toEqual([{ op: "append", path: "state/laptop-open.md", text: "- 2026-11-15 laptop session abc: 3 open step(s), their words kept on the laptop (resume the session there to see them)\n" }]);
-    expect(JSON.stringify(r)).not.toContain("renewal");
-  });
-  test("a transcript that can't be read, or no task list, is said on the items it holds; holding none, there's nothing to say", () => {
-    expect(requestFor("s1", [], ["P33"], "unread", at).ops[0].text).toStartWith("The laptop session ended (2026-11-15) and its task list couldn't be read, so what it left open isn't known.");
-    expect(requestFor("s1", [], ["P33"], "unplanned", at).ops[0].text).toStartWith("The laptop session ended (2026-11-15) and kept no task list");
-    expect(requestFor("s1", [], [], "unread", at)).toBeNull();
+  test("a transcript that can't be read, or no task list, is said on the items it holds", () => {
+    expect(requestFor([], ["P33"], "unread", at).ops[0].text).toStartWith("The laptop session ended (2026-11-15) and its task list couldn't be read, so what it left open isn't known.");
+    expect(requestFor([], ["P33"], "unplanned", at).ops[0].text).toStartWith("The laptop session ended (2026-11-15) and kept no task list");
   });
   test("anything shaped like a key is masked", () => {
     const key = "ghp_" + "TESTONLY0123456789abcdefABCDEF0123456";
     expect(clean(`Rotate ${key} in the vault`, 200)).toBe("Rotate [a key, masked] in the vault");
-    const r = requestFor("s1", [{ content: `Rotate ${key}`, status: "pending" }], ["P33"], "open", at);
-    expect(JSON.stringify(r)).not.toContain(key);
+    expect(JSON.stringify(requestFor([{ content: `Rotate ${key}`, status: "pending" }], ["P33"], "open", at))).not.toContain(key);
   });
 });
 
-describe("one at a time", () => {
-  test("a lock is made new, refused while it's fresh, and taken over by one process once it's 2 minutes old", () => {
+describe("once only", () => {
+  const a = { content: "Verify after his tap", status: "pending" };
+  const b = { content: "Merge", status: "in_progress" };
+  test("one filing is the same open steps on the same items, in any order or status; its id comes from it and the session", () => {
+    expect(filedKey(["P33"], [a, b])).toBe(filedKey(["P33"], [{ ...b, status: "pending" }, a]));
+    expect(filedKey(["P33"], [a])).not.toBe(filedKey(["P40"], [a]));
+    expect(filedKey(["P33"], [a])).not.toBe(filedKey(["P33"], [a, b]));
+    expect(filedKey(["P33"], [], "unread")).not.toBe(filedKey(["P33"], [], "unplanned"));
+    const long = "x".repeat(130);
+    expect(filedKey(["P33"], [{ content: `${long} one`, status: "pending" }])).not.toBe(filedKey(["P33"], [{ content: `${long} two`, status: "pending" }]));
+    const id = filingId("0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e", filedKey(["P33"], [a]));
+    expect(id).toMatch(/^laptop-end-0ee803c1-4bb1-4945-8ec3-b7ca82c30c1e-[0-9a-f]{16}$/);
+    expect(id.length).toBeLessThanOrEqual(80);
+  });
+
+  test("a lock is made new, refused while it's fresh, and taken over once it's 2 minutes old", () => {
     const lock = join(mkdtempSync(join(tmpdir(), "claim-")), "s.ending");
     expect(claim(lock)).toBe(true);
     expect(claim(lock)).toBe(false);
     const old = (Date.now() - 3 * 60_000) / 1000;
     utimesSync(lock, old, old);
-    expect(claim(lock)).toBe(true);                       // taken over
-    expect(claim(lock)).toBe(false);                      // and now fresh again
+    expect(claim(lock)).toBe(true);
+    expect(claim(lock)).toBe(false);
   });
 });
 
-describe("filed once", () => {
-  const a = { content: "Verify after his tap", status: "pending" };
-  const b = { content: "Merge", status: "in_progress" };
-  test("the same open steps on the same items are one filing, in any order or status; other steps or items are another", () => {
-    expect(filedKey(["P33"], [a, b])).toBe(filedKey(["P33"], [{ ...b, status: "pending" }, a]));
-    expect(filedKey(["P33"], [a])).not.toBe(filedKey([], [a]));
-    expect(filedKey(["P33"], [a])).not.toBe(filedKey(["P33"], [a, b]));
-    const long = "x".repeat(130);
-    expect(filedKey([], [{ content: `${long} one`, status: "pending" }])).not.toBe(filedKey([], [{ content: `${long} two`, status: "pending" }]));
-  });
-  test("filed again only if the record refused it, or hasn't logged it a day after", () => {
-    const now = Date.parse("2026-11-15T12:00:00Z");
-    expect(fileAgain(["done"], now - 1000, now)).toBe(false);
-    expect(fileAgain(["waiting"], now - 2 * 86_400_000, now)).toBe(false);
-    for (const s of ["rejected", "conflict", "refused"]) expect(fileAgain([s], now - 1000, now)).toBe(true);
-    expect(fileAgain([], now - 3_600_000, now)).toBe(false);
-    expect(fileAgain([], now - 2 * 86_400_000, now)).toBe(true);
+describe("what becomes of a filing in the outbox", () => {
+  const day = 86_400_000;
+  test("done leaves it; waiting keeps it; refused, rejected or a conflict moves it aside; never sent is sent; sent a day with no word goes again", () => {
+    expect(fate(["rejected", "done"], true, 0)).toBe("filed");             // a second copy refused as a used id
+    expect(fate(["waiting"], true, 3 * day)).toBe("waiting");
+    for (const s of ["rejected", "conflict", "refused"]) expect(fate([s], true, 0)).toBe("refused");
+    expect(fate([], false, 0)).toBe("send");
+    expect(fate([], true, day / 2)).toBe("wait");
+    expect(fate([], true, 2 * day)).toBe("resend");
   });
 });

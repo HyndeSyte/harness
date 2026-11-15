@@ -119,12 +119,6 @@ if [ -n "$rows" ]; then
   [ "$total" -gt 3 ] && notes=" ($((total - 3)) older not shown; /opt/cain/record.sh notes - lists them)$notes"
   [ -n "$notes" ] && lead="${lead}New notes on your items, read them before you change those items (words passed on, not his go on anything):$notes. "
 fi
-# Steps laptop sessions left open on no item (cain/tools/session-end.ts appends one line per
-# session to the record's state/laptop-open.md): named at every check-in until Cain has
-# folded them into the open list and taken them out of that file.
-left=$(grep -c '^- ' "${RECORD_DIR:-/data/record}/state/laptop-open.md" 2>/dev/null || true)
-[ "${left:-0}" -gt 0 ] 2>/dev/null \
-  && lead="${lead}Laptop sessions left open steps on no item: $left line(s) in state/laptop-open.md. Fold each into the open list, then take it out of that file. "
 if [ "$slot" = 0710 ]; then
   msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else

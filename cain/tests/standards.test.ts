@@ -141,6 +141,24 @@ describe("each role's text reaches its sessions whole", () => {
       .toEndWith(`His newer corrections couldn't be read (EACCES): read ${path} yourself now. They win over this list until they're folded in.`);
   });
 
+  test("in a last part nearly full, what's said of his corrections gives way to a short line naming the file, under the cut", () => {
+    const filler = (i: number, n: number) => ({ id: `S-${String(100 + i).padStart(3, "0")}`, title: `Entry ${i}`, line: i, kind: "principle", applies: ["all"], home: "role:Cain", source: "x", rule: "r".repeat(n) });
+    // Rules sized so the entries fill three parts, the last within a line of the limit.
+    let full: ReturnType<typeof filler>[] = [];
+    for (let n = 900; n < 1_200 && !full.length; n++) {
+      const es = Array.from({ length: 20 }, (_, i) => filler(i, n));
+      const ps = parts(es, "cain");
+      if (ps.length === PARTS && ps.at(-1)!.length > PART_MAX - 100) full = es;
+    }
+    expect(full.length).toBe(20);
+    for (const incomingError of ["EACCES", ""]) {
+      const ps = parts(full, "cain", { incomingError, incoming: incomingError ? [] : ["a correction ".repeat(80)], incomingPath: "/data/record/rules/incoming.md" });
+      expect(ps.length).toBe(PARTS);
+      expect(ps.at(-1)).toEndWith("His newer corrections: read /data/record/rules/incoming.md now. They win over this list.");
+      expect(ps.at(-1)!.length).toBeLessThan(8_000);
+    }
+  });
+
   test("a correction is any list line of the file", () => {
     expect(incomingOf("# Dane's corrections\n\nOne line each.\n- 2026-11-15: one\n* two\n+ three\n12. four\n-not one\n")).toEqual(["2026-11-15: one", "two", "three", "four"]);
   });

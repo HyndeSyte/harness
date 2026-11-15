@@ -121,6 +121,9 @@ export function parts(entries: Entry[], role: string, o: { incoming?: string[]; 
     else if (left) block += `\n(${left} more there, too long to show here: read them whole there now.)`;
   }
   if (block) {
+    // In the last part there can be, a line that won't fit whole gives way to a short one that
+    // still names the file (the part stays under Claude Code's cut).
+    if (out.length + 1 >= PARTS && cur.length + 2 + block.length > PART_MAX) block = `His newer corrections: read ${file} now. They win over this list.`;
     if (out.length + 1 >= PARTS) cur += `\n\n${block}`;
     else add(block);
   }

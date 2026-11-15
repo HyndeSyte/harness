@@ -845,35 +845,6 @@ def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
             del os.environ[k]
 
 
-def test_checkin_names_steps_laptop_sessions_left_open_until_cain_folds_them(tmp_path):
-    # cain/tools/session-end.ts appends a line per laptop session that ended with steps open on
-    # no item; the check-in names them until Cain has folded them into the open list.
-    import os
-    rec = tmp_path / "record"
-    (rec / "state").mkdir(parents=True)
-    head = "# Laptop sessions' open steps" + chr(10) + chr(10) + "Steps a laptop session left open on no item." + chr(10)
-    f = rec / "state" / "laptop-open.md"
-    sent = tmp_path / "sent.txt"
-    os.environ.update(RECORD_DIR=str(rec), NOTES_SEEN=str(tmp_path / "notes.seen"))
-    try:
-        assert "Laptop sessions left" not in _checkin(tmp_path, "0712", IDLE)          # no file yet
-        f.write_text(head + "- 2026-11-15 laptop session abc: Verify after his tap" + chr(10)
-                     + "- 2026-11-15 laptop session def: Merge" + chr(10), newline=chr(10))
-        sent.unlink()
-        line = _checkin(tmp_path, "1240", IDLE).splitlines()[-2]
-        assert ("Laptop sessions left open steps on no item: 2 line(s) in state/laptop-open.md. Fold each into "
-                "the open list, then take it out of that file. Scheduled check-in") in line, line
-        f.write_text(head, newline=chr(10))                                             # folded
-        sent.unlink()
-        out = _checkin(tmp_path, "1740", IDLE)
-        assert "Scheduled check-in" in out and "Laptop sessions left" not in out
-    finally:
-        for k in ("RECORD_DIR", "NOTES_SEEN"):
-            del os.environ[k]
-    rules = (CAIN / "rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
-    assert "(state/laptop-open.md), fold each into PENDING.md" in rules
-
-
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
     assert _checkin(tmp_path, "0712", IDLE + "\n  esc to interrupt") == ""
     assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed

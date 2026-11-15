@@ -414,9 +414,7 @@ something waits, say so in one line.
 The add-on prompts you at 7:10 AM, 12:30 PM and 5:30 PM. A check-in is a nudge to
 keep work moving without him starting it. It is never his go on anything.
 1. Read state/PENDING.md, then state/RESTART.md, in the org repo. Skip the items the
-   check-in lists as held by others. When it names steps laptop sessions left open
-   (state/laptop-open.md), fold each into PENDING.md (a new row, or the next step of the
-   item it belongs to) and put that file back without them, in the same request.
+   check-in lists as held by others.
 2. For each open item marked Cain, do the next step you can do without him:
    research, reading, checking, drafting, updating the record. Anything that changes
    the world still waits for his go.
