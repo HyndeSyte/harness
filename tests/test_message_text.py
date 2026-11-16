@@ -225,7 +225,7 @@ def test_the_done_claim_check_catches_one():
     assert DONE_CLAIM.search("Thanks. Swim is on your calendar as yours.")
     assert DONE_CLAIM.search("Thanks. Swim stays off your calendar.")
     assert not DONE_CLAIM.search("Thanks. I'll put Swim on your calendar as yours.")
-    assert not DONE_CLAIM.search("Taking it off your Gmail, just this once.")
+    assert not DONE_CLAIM.search("Taking it off your Gmail, this time only.")
 
 
 # -- the rules, equal on both sides ------------------------------------------------------------

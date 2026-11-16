@@ -32,6 +32,11 @@ the calendar_changes option off, there's no Add button: one line says why. Mail 
 model as data, never instructions, and never changes a calendar without his tap.
 
 Google's own email about a failed run of the work holds script becomes a digest line.
+
+Kinds of mail he has said no to are skipped by name before anything reaches the engine (0.24.0,
+fourteenth round): SKIP_KINDS here, plus any kind named in mail_skip.json in the data folder,
+read at every read, so a kind is added without a build. Each kind is matched on who sent it and
+its subject. A skipped mail makes no card and no calendar entry, and the digest never names it.
 """
 from __future__ import annotations
 
@@ -82,6 +87,20 @@ PREFIX = {"deadline": "Due", "window_closes": "Last day", "appointment": "Appt",
           "renewal": "Renews", "event": "On"}
 TIMED = ("appointment", "event")      # he has to be there: at its time, when the email gives one
 OPTION = "mail_dates"
+SKIP_FILE = "mail_skip.json"          # in the data folder: more kinds he said no to, by name
+# Kinds of mail he has said no to (fourteenth round), by name: a sender that contains any of "from"
+# and a subject that contains any of "subject" (both ignoring case), unless the subject contains
+# any of "unless". The first is Amazon managing its deliveries: Subscribe & Save cutoffs, "last day
+# to manage" reminders, delivery day changes, manage-your-subscription reminders. An Amazon order's
+# return window isn't one of them.
+SKIP_KINDS = (
+    {"name": "Amazon delivery management",
+     "from": ["amazon."],
+     "subject": ["subscribe & save", "subscribe &amp; save", "subscribe and save", "last day to manage",
+                 "manage your subscription", "manage your delivery", "manage your upcoming delivery",
+                 "delivery day", "delivery date has changed", "new delivery date", "upcoming delivery"],
+     "unless": ["return"]},
+)
 
 # What may carry a date he has to act on. Anything else never leaves the Pi.
 _PICK = re.compile(
@@ -217,6 +236,43 @@ def whose(sender: str, subject: str, what: str) -> str:
     who = sender or ""
     if _FAMILY.search(who) or _FAMILY.search(re.sub(r"[._@-]", " ", parseaddr(who)[1])):
         return UNCLEAR
+    return ""
+
+
+def skip_kinds(data_dir: str | None) -> list[dict]:
+    """SKIP_KINDS and the kinds in <data_dir>/mail_skip.json, read fresh each time: {"skip": [{"name",
+    "from": [...], "subject": [...], "unless": [...]}]} (a bare list works too). A file that can't be read
+    or an entry that doesn't fit is left out, never an error: the built-in kinds still hold."""
+    kinds = [dict(k) for k in SKIP_KINDS]
+    if not data_dir:
+        return kinds
+    try:
+        with open(os.path.join(data_dir, SKIP_FILE), encoding="utf-8") as f:
+            got = json.load(f)
+    except FileNotFoundError:
+        return kinds
+    except (OSError, ValueError) as e:
+        log.warning("%s couldn't be read (%s): only the built-in kinds are skipped", SKIP_FILE, type(e).__name__)
+        return kinds
+    entries = got.get("skip") if isinstance(got, dict) else got
+    for k in entries if isinstance(entries, list) else []:
+        if not isinstance(k, dict) or not str(k.get("name") or "").strip():
+            continue
+        words = {f: [str(w).casefold() for w in (k.get(f) or []) if str(w).strip()]
+                 for f in ("from", "subject", "unless")}
+        if words["from"] and words["subject"]:
+            kinds.append({"name": str(k["name"]).strip()[:80], **words})
+    return kinds
+
+
+def skipped_kind(sender: str, subject: str, kinds) -> str:
+    """The name of the kind he said no to that this mail is, or "": its sender holds one of the kind's
+    "from" words, its subject one of its "subject" words and none of its "unless" words."""
+    who, what = (sender or "").casefold(), (subject or "").casefold()
+    for k in kinds:
+        if any(w in who for w in k.get("from") or ()) and any(w in what for w in k.get("subject") or ()) \
+                and not any(w in what for w in k.get("unless") or ()):
+            return str(k.get("name") or "")
     return ""
 
 
@@ -451,6 +507,7 @@ class Read:
     stuck_uid: int = 0                     # the message it stopped on, to count its tries
     passed: list | None = None             # messages given up on after MAX_TRIES
     more: bool = False                     # stopped at a cap with mail left: read again at once
+    skipped: int = 0                       # mail of a kind he said no to (SKIP_KINDS), for the log only
     asked: tuple = ()                      # a look-up of these emails again, for their addresses
     why: str = ""                          # an unexpected failure's kind of exception, for the log only
 
@@ -486,7 +543,7 @@ class MailDates:
                  engine_fn: Callable, writes_on: Callable[[], bool], tz: str,
                  budget_ok: Callable[[str], bool] = lambda provider: True, family=None,
                  mailbox: Callable[[str, str], Mailbox] = Mailbox,
-                 sleep=None, monotonic=None):
+                 sleep=None, monotonic=None, data_dir: str | None = None):
         import time
         self.ledger = ledger
         self.google = google
@@ -499,6 +556,8 @@ class MailDates:
         self.budget_ok = budget_ok
         self.family = family               # caldav.FamilyCalDav, read only, or None
         self.mailbox = mailbox
+        # Where mail_skip.json is: the App's data folder unless told (fourteenth round).
+        self.data_dir = data_dir if data_dir is not None else os.environ.get("HARNESS_DATA", "/data")
         self.sleep = sleep or time.sleep
         self.monotonic = monotonic or time.monotonic
         self.chat_id: int | None = None
@@ -622,6 +681,7 @@ class MailDates:
         back, spend included, whatever went wrong."""
         box = self.mailbox(address, password)
         r = Read(validity or "", last_uid, [], [], [], 0, passed=[])
+        kinds = skip_kinds(self.data_dir)
         try:
             r.validity, r.last_uid, messages = box.read(last_uid, validity, today - timedelta(days=FIRST_DAYS))
             # Oldest first, and the mark moves only past what's done: a read that stops early, at
@@ -630,6 +690,8 @@ class MailDates:
             for m in messages:
                 if _SCRIPT_FAILED.search(m.subject) and SCRIPT_SENDER in m.sender.casefold():
                     r.script_failed.append(m.sent)
+                elif skipped_kind(m.sender, m.subject, kinds):
+                    r.skipped += 1                     # he said no to this kind: never sent, never said
                 elif m.message_id not in seen and picked(m.sender, m.subject):
                     if r.sent_to_engine >= MAX_TO_ENGINE:
                         r.more = True
@@ -728,7 +790,8 @@ class MailDates:
             for subject in r.passed or []:
                 self.ledger.event("mail_passed", {"subject": subject}, db=db)
             self.ledger.set_meta("mail_more", "1" if r.more and not r.error else "", db)
-            self.ledger.event("mail_read", {"sent": r.sent_to_engine, "found": len(r.found)}, db=db)
+            self.ledger.event("mail_read", {"sent": r.sent_to_engine, "found": len(r.found),
+                                            "skipped": r.skipped}, db=db)
         if r.error:
             self._failed("read", r.error, WORDS.get(r.error, WORDS["unreachable"]), r.why)
             return

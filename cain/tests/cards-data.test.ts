@@ -12,9 +12,9 @@ import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 // A receipt for something the specialist did, as the Harness builds it.
-const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm1"), btn("Wrong time", "k:c:wt1"), btn("Just this once", "k:c:jo1")] },
+const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm1"), btn("Wrong time", "k:c:wt1"), btn("Not this time", "k:c:jo1")] },
   { type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
-const RECEIPT = ["Not mine", "Wrong time", "Just this once", "Stop"];
+const RECEIPT = ["Not mine", "Wrong time", "Not this time", "Stop"];
 const UNDO_ROWS = [{ type: 1, components: [btn("Undo", "k:c:u1")] }, { type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
 
 async function receipt(r: ReturnType<typeof rig>, text = "Added Swim to your Gmail.", rows = RECEIPT_ROWS, expires?: number) {
@@ -83,13 +83,13 @@ describe("Cain's lines name a card's buttons", () => {
   test("the card's first line, and the line when it went out by itself", async () => {
     const r = rig();
     await r.link.addCard({ text: "Added Swim to your Gmail.", rows: RECEIPT_ROWS, kind: "card" });
-    expect(r.relayed[0]).toContain("Its buttons: Not mine, Wrong time, Just this once, Stop.");
+    expect(r.relayed[0]).toContain("Its buttons: Not mine, Wrong time, Not this time, Stop.");
     await r.link.addCard({ text: "Today: Swim at 4:30.", rows: [], kind: "digest" });
     expect(r.relayed[1]).toContain("It has no buttons.");
     r.later(3 * MIN);
     await r.link.sweep();
     const line = r.relayed.find((l) => l.includes("went out to him by itself"))!;
-    expect(line).toContain("Its buttons: Not mine, Wrong time, Just this once, Stop.");
+    expect(line).toContain("Its buttons: Not mine, Wrong time, Not this time, Stop.");
   });
 });
 

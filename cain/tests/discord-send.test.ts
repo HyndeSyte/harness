@@ -23,12 +23,12 @@ const NOW = Date.UTC(2026, 10, 12, 15, 0);
 const DM = "5151000000000000001", OTHER = "5151000000000000002";
 // A Discord id made at a time, as Discord makes them.
 const flake = (at: number, n = 1) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(n));
-// A receipt whose buttons are Not mine, Wrong time, Just this once and Stop; an approval
+// A receipt whose buttons are Not mine, Wrong time, Not this time and Stop; an approval
 // with Undo up; Cain's own ask, answered; a link notice; and two replies of Cain's own.
 const RECEIPT = "1300000000000000001", UNDO_CARD = "1300000000000000002", ASK = "1300000000000000003", NOTICE = "1300000000000000004";
 const MINE = "1300000000000000010", MINE2 = "1300000000000000011", HIS = "1300000000000000099";
 const CARDS: CardsView = { written_at: NOW, owner: "4242", dm: DM, sent: [MINE, MINE2], cards: [
-  { message: RECEIPT, kind: "card", writer: "specialist", labels: ["Not mine", "Wrong time", "Just this once", "Stop"], live: true, item: "none", question: null, posted: NOW - 3_600_000 },
+  { message: RECEIPT, kind: "card", writer: "specialist", labels: ["Not mine", "Wrong time", "Not this time", "Stop"], live: true, item: "none", question: null, posted: NOW - 3_600_000 },
   { message: UNDO_CARD, kind: "card", writer: "specialist", labels: ["Undo", "Stop"], live: true, item: "none", question: null, posted: NOW - 600_000 },
   { message: ASK, kind: "ask", writer: "cain", labels: ["Filed", "Not filed"], live: false, item: "P08", question: "Q2", posted: NOW - 7_200_000 },
   { message: NOTICE, kind: "notice", writer: "link", labels: [], live: false, item: "none", question: "notice", posted: NOW - 60_000 },
@@ -50,7 +50,7 @@ describe("what the gate does with Cain's reply", () => {
     expect(d.would).toBe("refuse");
     expect(d.hard).toBe(false);
     expect(d.hits).toMatchObject([{ rule: "button", result: "refuse", label: "Undo" }]);
-    expect(d.said).toStartWith("The message gate held this: \"Undo\" isn't on the card this answers (its buttons: Not mine, Wrong time, Just this once, Stop); live card with it: message 1300000000000000002 (");
+    expect(d.said).toStartWith("The message gate held this: \"Undo\" isn't on the card this answers (its buttons: Not mine, Wrong time, Not this time, Stop); live card with it: message 1300000000000000002 (");
     expect(d.said).toEndWith("Rewrite and send now; don't mention it to him.");
   });
 

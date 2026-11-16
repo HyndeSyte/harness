@@ -3,7 +3,7 @@
   "static_labels": [
     "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings", "Do it", "I'll do it", "Drop it",
     "Approve", "Decline", "Undo", "Undo both", "Undo these", "Use new", "Keep old", "Not mine", "Wrong time",
-    "Just this once", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
+    "Not this time", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
     "Turn on", "None wrong: stop checking", "Something was off: keep checking", "Do it now"
   ],
   "dash_words": [
@@ -109,7 +109,7 @@
     {"name": "job and a hex id", "text": "Job 3f2a9c1e failed.", "refuse": ["machine"]},
     {"name": "a masked link target isn't visible", "text": "[Watch it](https://claude.ai/code/session_X0123456789abcdef0123456789abcdef01234567)"},
     {"name": "a phone number passes", "text": "Call 5551234567 to book."},
-    {"name": "tap a button the card lacks", "text": "If it's wrong, tap Undo.", "context": {"buttons": ["Not mine", "Wrong time", "Just this once", "Stop"]}, "refuse": ["button"]},
+    {"name": "tap a button the card lacks", "text": "If it's wrong, tap Undo.", "context": {"buttons": ["Not mine", "Wrong time", "Not this time", "Stop"]}, "refuse": ["button"]},
     {"name": "with a button the card lacks", "text": "Each was added on its own card with Undo.", "context": {"buttons": ["Stop"]}, "refuse": ["button"]},
     {"name": "a button the card has", "text": "Tap Undo if that's wrong.", "context": {"buttons": ["Undo", "Stop"]}},
     {"name": "past tense passes", "text": "You tapped Ship.", "context": {"buttons": []}},

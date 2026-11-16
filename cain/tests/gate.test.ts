@@ -38,7 +38,7 @@ describe("the shared cases", () => {
 
 describe("the rules", () => {
   test("Nov 10, synthetic: tap Undo in a reply to a receipt without Undo is refused, and says which label", () => {
-    const r = check("Tap Undo on the receipt above and it's gone.", { buttons: ["Not mine", "Wrong time", "Just this once", "Stop"] });
+    const r = check("Tap Undo on the receipt above and it's gone.", { buttons: ["Not mine", "Wrong time", "Not this time", "Stop"] });
     expect(verdict(r)).toBe("refuse");
     expect(r.hits).toMatchObject([{ rule: "button", result: "refuse", label: "Undo" }]);
     expect(verdict(check("each on its own card with Undo", { buttons: ["Stop"] }))).toBe("refuse");

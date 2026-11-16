@@ -646,7 +646,7 @@ def confirmed(live, title="Turkey harvest", days=3):
 def test_a_new_confirmed_block_gets_one_receipt_with_three_buttons(live):
     card = confirmed(live)
     _, text, buttons, _ = card
-    assert labels(buttons) == ["Not mine", "Wrong time", "Just this once"]
+    assert labels(buttons) == ["Not mine", "Wrong time", "Not this time"]
     # A notice, not a question (Nov 10), with the block's whole time.
     assert text.startswith("Added to your Gmail: Busy (watching kids), ")
     assert ", for Turkey harvest on Family. Nothing to do if that's right; tap a button only if it's wrong." in text
@@ -713,7 +713,7 @@ def test_a_block_never_found_gets_the_not_confirmed_line_with_its_buttons(live):
     live.tick()
     _, text, buttons, _ = live.with_button("Not mine")
     assert text.startswith("Written to your Gmail but not confirmed: Busy (watching kids), ")
-    assert labels(buttons) == ["Not mine", "Wrong time", "Just this once"]   # it keeps its buttons
+    assert labels(buttons) == ["Not mine", "Wrong time", "Not this time"]   # it keeps its buttons
     assert not text.startswith("Added")
 
 
@@ -783,7 +783,7 @@ def test_wrong_time_removes_it_and_the_next_one_asks(live):
 def test_just_this_once_removes_only_that_block_and_stores_nothing(live):
     card = confirmed(live)
     n = len(meaning.active_examples(live.ledger))
-    live.press(card, "Just this once")
+    live.press(card, "Not this time")
     live.tick()
     assert live.google.live() == {} and len(meaning.active_examples(live.ledger)) == n
     go(live)
@@ -831,7 +831,7 @@ def test_a_cancelled_family_event_still_takes_two_reads_in_live_mode(live):
 def test_questions_and_undo_cost_no_model_calls(live):
     card = confirmed(live)
     calls = len(live.judge.calls)
-    live.press(card, "Just this once")
+    live.press(card, "Not this time")
     live.tick()
     live.live.tick(paused=False)
     assert len(live.judge.calls) == calls

@@ -11,7 +11,7 @@ import { BOT, DAY, DM, HOUR, MIN, OWNER, PR, rig, SHA1 } from "./link-rig";
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 const STOP_ONLY = [{ type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
-const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm"), btn("Wrong time", "k:c:wt"), btn("Just this once", "k:c:jo")] }, ...STOP_ONLY];
+const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm"), btn("Wrong time", "k:c:wt"), btn("Not this time", "k:c:jo")] }, ...STOP_ONLY];
 
 // A bot message the link didn't post (Cain's plugin, or something else on the bot token).
 function botMessage(r: ReturnType<typeof rig>, content: string, o: { replyTo?: string; components?: any[]; at?: number } = {}) {
