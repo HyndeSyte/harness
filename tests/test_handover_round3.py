@@ -131,13 +131,15 @@ def test_a_move_the_read_back_finds_at_neither_time_is_said_so(m, monkeypatch):
 
 # -- 2. already there: silent only for the very same event ---------------------------------------
 
-def test_an_exact_duplicate_adds_nothing_without_a_card(m):
+def test_an_exact_duplicate_adds_nothing_and_its_receipt_names_it_with_add_anyway(m):
     m.tells("add the dentist at 3 today", ask(DENTIST))
     before = dict(m.gmail.events)
     out = m.tells("add the dentist at 3 today", ask(change("gmail", "add", "  dentist ", dates="",
                                                             start=at(15).isoformat(), end=at(16).isoformat())))
-    assert out["status"] == "executed" and "Approve" not in m.labels() and "Add anyway" not in m.labels()
-    assert m.seen()[-1].startswith("Nothing added.") and "Already there, nothing to add: Dentist" in m.seen()[-1]
+    assert out["status"] == "executed" and "Approve" not in m.labels()
+    said = m.seen()[-1]
+    assert said.startswith("Nothing added.") and "Already there, nothing added: “Dentist”, today, 3:00 to 4:00" in said
+    assert "Add anyway" in m.labels()                        # never silent (0.24.0, fourth round)
     assert m.gmail.events.keys() == before.keys() and len(inserts(m)) == 1
 
 

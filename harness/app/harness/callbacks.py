@@ -110,7 +110,7 @@ class Callbacks:
                 target, "approve" if kind == "settings_approve" else "decline"))
         if kind.startswith("family_add_") and self.family_add is not None:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
-        if kind == "calendar_change_undo" and self.calendar_change is not None:
+        if kind.startswith("calendar_change_") and self.calendar_change is not None:
             return self.calendar_change.on_choice(kind, target)
         if kind.startswith("mail_dates_") and self.mail_dates is not None:
             return self.mail_dates.on_choice(kind, target)

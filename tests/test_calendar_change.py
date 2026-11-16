@@ -131,6 +131,8 @@ class FakeGmail:
 
     def insert(self, address, event):
         self.log.append(("insert", event))
+        if event["id"] in self.events:     # Google: an id already used is a 409, never a second event
+            return caldav.Outcome("exists")
         if self.answer == "ok":
             self.events[event["id"]] = copy.deepcopy(event)
             self._bump(event["id"])
@@ -767,13 +769,14 @@ def test_a_stale_offset_gets_a_tap(r):
 
 
 def test_the_same_add_twice_adds_nothing_the_second_time(r):
-    """0.24.0, third round: the very same event already there (same calendar, title and start) is
-    "nothing to add", said without a card; a looser match would be his decision on a card."""
+    """0.24.0: the very same event already there (same calendar, title, start and end) adds
+    nothing, and the receipt names it with Add anyway (fourth round: never silent)."""
     add = change(op="add", title="Dentist", start="2026-11-23T09:00:00-05:00", end="2026-11-23T10:00:00-05:00")
     r.tell(add)
     r.tell(add)
     assert len([p for p in r.icloud.events if "/hm-" in p]) == 1
-    assert "Already there, nothing to add: Dentist" in r.texts()[-1]
+    assert "Already there, nothing added: \u201cDentist\u201d" in r.texts()[-1]
+    assert r.with_button("Add anyway")
 
 
 def test_checkadds_brings_the_tap_back(r):

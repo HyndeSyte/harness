@@ -586,6 +586,9 @@ class Runner:
             self.ledger.transition(job["id"], "proposed", db=db)
             if warnings and family:
                 self.family_add.note_warned(pid, db)
+            if change:
+                # A change offered again keeps the fixed id of its first offer (0.24.0, fourth round).
+                self.calendar_change.inherit_keys(pid, params["changes"], self._earlier_keys(job), db)
             if change:                      # what it says it will do, for his tap and the record
                 self.calendar_change.note_lines(
                     pid, lines or [render.change_line(c, self.config.timezone, self.ledger.now())
@@ -726,6 +729,21 @@ class Runner:
         root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
         return [root] + json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
 
+    def _earlier_keys(self, job) -> dict:
+        """Each change of this message offered before and not done (its lease ran out, it read back
+        as not confirmed, or its card was replaced), to the key its fixed id was made from, so the
+        same change offered again writes to the same address (calendar_change.inherit_keys)."""
+        ids = self._family_of(job)
+        marks = ",".join("?" * len(ids))
+        out: dict = {}
+        for r in self.ledger.db.execute(
+                f"SELECT p.id FROM proposals p LEFT JOIN calendar_changes x ON x.proposal_id=p.id"
+                f" WHERE p.effect_type=? AND p.job_id IN ({marks}) AND (x.state IN ('lapsed','unverified','absent')"
+                " OR p.state='superseded') ORDER BY p.created_at", (effects.CALENDAR_CHANGE, *ids)).fetchall():
+            for k, v in self.calendar_change.keys_by_change(r["id"]).items():
+                out.setdefault(k, v)
+        return out
+
     def _not_yet_done(self, job, params) -> tuple[list[str], list[str], dict]:
         """Changes of this message already done, or being done, under any of its requests (its
         parts included), said in the words they were done in; and what's left to offer (0.24.0,
@@ -757,7 +775,7 @@ class Runner:
                 into = done_keys
             else:
                 lease = self.calendar_change.lease_state(r["id"])
-                if lease == "live":
+                if lease in ("live", "unsure"):          # a read that can't tell never lapses it
                     into = busy_keys
                 elif lease == "done":
                     into = done_keys

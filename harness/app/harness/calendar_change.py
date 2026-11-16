@@ -50,7 +50,9 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -94,6 +96,10 @@ STILL_CHECKING_PASSES = 3
 # 0.24.0, third round. A change being written counts as being done only while this lease runs;
 # past it, a read of the calendar says whether it's done (lease_state).
 LEASE_S = 120
+# 0.24.0, fourth round: every write to Google or iCloud gets this long, well under the lease, and is
+# abandoned after it (_bounded): it's then a write whose answer was lost, settled by reading. A
+# write that answers after its change lapsed is fenced out by its token (_drain_late).
+WRITE_TIMEOUT_S = 30
 # A read back that disagrees is read once more, this long after, asking past any cache (_read_back).
 READ_BACK_PAUSE_S = 3
 READ_BACK_DAYS = 60                    # how far on a series's end is read back
@@ -386,6 +392,7 @@ class Part:
     # (_read_back); and an add whose slot holds one only like it, which waits for his decision.
     expect: list[dict] = field(default_factory=list)
     loose: str = ""
+    change: dict = field(default_factory=dict)       # an add's change as asked, for Add anyway
 
 
 @dataclass
@@ -413,11 +420,19 @@ class CalendarChange:
         self._recording: tuple | None = None
         self._undoing: tuple | None = None     # the undo being run: (proposal, its steps left)
         self._putting_back: tuple | None = None    # a half-done part being put back: (proposal, plan)
+        self._forcing = False                  # planning an Add anyway: no already-there check
+        self.write_timeout_s = WRITE_TIMEOUT_S
+        # Writes abandoned at their timeout that answered later: (proposal, fence, calendar, outcome),
+        # put here by the write's own thread and handled on the controller's (_drain_late).
+        self._late: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
+        self.abandoned: list[threading.Thread] = []
         # The fast path's check at the moment of the write (controller._still_his): "" when his
         # message is still his newest and fresh, or why not. None: nothing to check (no Discord).
         self.fast_check: Callable[[Any], str] | None = None
         # A fast-path change that can't go without a tap after all becomes his card (runner).
         self.to_card: Callable[[Any, str], None] | None = None
+        # His Propose again, and his pick of which card a note corrects, become cards (runner).
+        self.reoffer: Callable[[str, str], str] | None = None
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -678,7 +693,9 @@ class CalendarChange:
         now = {key(b) for part in parts for b in part.bound}
         if was != now:
             return "the event to take off isn't the one that card named any more."
-        if kept.get("already", 0) != sum(1 for part in parts if part.already):
+        # The card said it was already there and now it isn't: a write he didn't see offered. The
+        # other way round (it's there now) writes nothing, and the receipt names what's there.
+        if kept.get("already", 0) > sum(1 for part in parts if part.already):
             return "what's on the calendar in that slot changed since the card."
         return ""
 
@@ -748,10 +765,10 @@ class CalendarChange:
         if c["op"] != "add":
             return False
         try:
-            start, _, _ = self._new_times(c)
+            start, end, rule = self._new_times(c)
         except (Refuse, ValueError, KeyError, TypeError):
             return False
-        return self._already_there(c, start)[0] is not None
+        return self._already_there(c, start, end, rule)[0] is not None
 
     def _is_duplicate(self, c: dict) -> bool:
         for r in self.ledger.db.execute(
@@ -786,6 +803,7 @@ class CalendarChange:
                         db.execute("DELETE FROM meta WHERE key=?", (key,))
         self._expire_offers()
         self._fail_orphans()
+        self._drain_late()
         for p in self._approved():
             self._execute(p, paused)
         if not paused:
@@ -932,29 +950,54 @@ class CalendarChange:
             return "live"
         plan = _plan(row) if row is not None else {}
         parts = plan.get("parts") or []
-        state = "not_done"
-        if parts and all(part.get("expect") or part.get("already") for part in parts):
-            state = "done"
-            for part in parts:
-                if part.get("already"):
-                    continue
-                problems, _, unread = self._check_part(Part(part["will"], part["done"], [], name=part.get("name", ""),
-                                                            bound=part.get("bound") or [], expect=part["expect"]))
-                if problems or unread:
-                    state = "not_done"
-                    break
-        log.info("calendar change %s: its lease ran out; a read says %s", render.short(proposal_id), state)
+        # Never lapsed on one read (0.24.0, fourth round): two reads, a few seconds apart, must both
+        # answer and both find it not done. One that can't be read leaves it in progress ("unsure").
+        verdicts = []
+        for attempt in range(2):
+            if attempt:
+                self.sleep(READ_BACK_PAUSE_S)
+            verdict = self._reads_done(parts) if row is not None else "not_done"
+            verdicts.append(verdict)
+            if verdict == "done":
+                break
+        state = "done" if verdicts[-1] == "done" else "not_done" if verdicts == ["not_done", "not_done"] \
+            else "unsure"
+        log.info("calendar change %s: its lease ran out; reads say %s", render.short(proposal_id), ", ".join(verdicts))
         if state == "not_done" and p["state"] in ("approved", "auto_approved", "executing"):
             with self.ledger.tx() as db:
                 db.execute("UPDATE proposals SET state='failed' WHERE id=? AND state IN"
                            " ('approved','auto_approved','executing')", (proposal_id,))
                 db.execute("UPDATE calendar_changes SET state='lapsed', updated_at=? WHERE proposal_id=?"
                            " AND state IN ('sending','settling')", (iso(self.ledger.now()), proposal_id))
+                # Its fencing token is retired: a write of it that answers from now on is fenced out
+                # (_drain_late), and a landed one is recorded, never left beside a second.
+                fence = self.ledger.get_meta(f"calendar_change_fence:{proposal_id}") or ""
+                self.ledger.set_meta(f"calendar_change_fence:{proposal_id}", f"lapsed:{fence}", db)
                 job = db.execute("SELECT state FROM jobs WHERE id=?", (p["job_id"],)).fetchone()
                 if job is not None and job["state"] == "approved":
                     self.ledger.transition(p["job_id"], "failed", db=db,
                                            receipt=json.dumps({"reason": "lease_lapsed"}))
         return state
+
+    def _reads_done(self, parts: list[dict]) -> str:
+        """One read of a change's parts: "done" when the calendar shows every part as asked, an add
+        found by its own fixed id first; "not_done" when a read answered and doesn't; "unread" when
+        a calendar couldn't be read."""
+        if not parts or not all(part.get("expect") or part.get("already") for part in parts):
+            return "not_done"
+        unread_any = False
+        for part in parts:
+            if part.get("already"):
+                continue
+            left = [e for e in part["expect"] if not (e["kind"] == "there" and self._by_id(e) == "same")]
+            if not left:
+                continue
+            problems, _, unread = self._check_part(Part(part["will"], part["done"], [], name=part.get("name", ""),
+                                                        bound=part.get("bound") or [], expect=left))
+            if problems:
+                return "not_done"
+            unread_any = unread_any or bool(unread)
+        return "unread" if unread_any else "done"
 
     def in_flight(self, proposal_id: str) -> bool:
         """Approved and not yet settled: being written, or waiting for a read."""
@@ -1077,6 +1120,7 @@ class CalendarChange:
     def _part_record(self, part: Part) -> dict:
         return {"will": part.will, "done": part.done, "name": part.name, "adds": part.adds,
                 "bound": part.bound, "already": part.already, "expect": part.expect, "loose": part.loose,
+                "change": part.change,
                 "steps": [{"spec": step.spec, "label": step.label, "what": step.what, "rows": step.rows,
                            "removed": [[c, u, i, t, d.isoformat()] for c, u, i, t, d in step.removed],
                            "status": "pending", "entry": None, "kind": "", "words": ""}
@@ -1103,9 +1147,128 @@ class CalendarChange:
             # edit yet: nothing is written, and a read says whose change it is (_settle).
             raise Stopped("changed", undo=rec.get("entry"))
         plan["seq"] = plan.get("seq", 0) + 1           # the order writes were sent in, for Undo
-        rec.update(status="trying", entry=dict(entry), seq=plan["seq"])
+        # Its fencing token, kept in the ledger before the write goes out (0.24.0, fourth round): a
+        # write that answers after its change lapsed carries a token that isn't current any more.
+        fence = f"{pid}#{plan['seq']}"
+        entry["fence"] = fence
+        rec.update(status="trying", entry=dict(entry), seq=plan["seq"], fence=fence)
         plan["read_at"] = iso(self.ledger.now())       # sent now: read a minute on, if it comes to that
-        self._save_plan(pid, plan)
+        with self.ledger.tx() as db:
+            self._save_plan(pid, plan, db)
+            self.ledger.set_meta(f"calendar_change_fence:{pid}", fence, db)
+
+    def _bounded(self, calendar: str, call, *args):
+        """One write to Google or iCloud, given write_timeout_s (30 seconds, well under the lease)
+        and abandoned after it (0.24.0, fourth round): an abandoned write is one whose answer was
+        lost ("unknown"), settled by reading like any other, never sent again blind. It keeps
+        running on its own thread; if it answers later, that answer is handed back with the write's
+        fencing token (_drain_late), so a write that lands after its change lapsed is caught."""
+        rec = self._recording
+        pid, fence = (rec[0], rec[2].get("fence")) if rec is not None else (None, None)
+        box: dict = {}
+        lock = threading.Lock()
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                box["out"] = call(*args)
+            except BaseException as e:          # handed to the caller, or logged once abandoned
+                box["err"] = e
+            with lock:
+                box["finished"] = True
+                late = box.get("late", False)
+            done.set()
+            if late:
+                self._late.put((pid, fence, calendar, box.get("out"), type(box["err"]).__name__
+                                if "err" in box else ""))
+
+        t = threading.Thread(target=run, name=f"calendar-write-{calendar}", daemon=True)
+        t.start()
+        if not done.wait(self.write_timeout_s):
+            with lock:
+                abandoned = not box.get("finished")
+                if abandoned:
+                    box["late"] = True
+            if abandoned:
+                self.abandoned.append(t)
+                log.warning("a write to %s gave no answer in %ss: abandoned, and settled by reading (%s)",
+                            calendar, self.write_timeout_s, render.short(pid or "") or "undo")
+                if rec is not None:
+                    rec[2]["abandoned"] = iso(self.ledger.now())
+                return caldav.Outcome("unknown")
+        if "err" in box:
+            raise box["err"]
+        return box["out"]
+
+    def _drain_late(self) -> None:
+        """Writes abandoned at their timeout that have answered since (0.24.0, fourth round). One whose
+        fencing token is still current is a write still being settled: the reads settle it. One
+        whose change lapsed since (its lease ran out and a read twice found it not done) and that
+        did land is recorded as landed: its change is done after all, with its receipt and Undo,
+        and the card that offered it again comes off, so there's never a second one. A change the
+        newer card already wrote finds that write there (its fixed id), and nothing more is
+        written."""
+        while True:
+            try:
+                pid, fence, calendar, out, err = self._late.get_nowait()
+            except queue.Empty:
+                return
+            kind = getattr(out, "kind", "") or ("error" if err else "unknown")
+            if pid is None:
+                log.info("an abandoned undo write to %s answered late (%s); its reads settle it", calendar, kind)
+                continue
+            current = self.ledger.get_meta(f"calendar_change_fence:{pid}")
+            if current == fence:
+                log.info("calendar change %s: an abandoned write answered late (%s), still current; "
+                         "its reads settle it", render.short(pid), kind)
+                continue
+            log.info("calendar change %s: a write fenced out by its lapse answered late (%s)",
+                     render.short(pid), kind)
+            if kind in ("ok", "exists"):
+                self._landed_late(pid, fence, already=kind == "exists")
+
+    def _landed_late(self, pid: str, fence: str, already: bool) -> None:
+        row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()
+        p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+        if row is None or p is None or row["state"] != "lapsed":
+            return
+        plan = _plan(row)
+        entries = [rec["entry"] for part in plan.get("parts", []) for rec in part["steps"]
+                   if rec.get("entry") and rec.get("fence") == fence]
+        newer = self.ledger.get_meta(f"calendar_change_reoffer:{pid}")
+        with self.ledger.tx() as db:
+            took_card = False
+            if newer:
+                from . import approvals
+                took_card = approvals.supersede(self.ledger, newer, db=db, outcome="landed")
+                if took_card:
+                    job = db.execute("SELECT job_id FROM proposals WHERE id=?", (newer,)).fetchone()
+                    st = db.execute("SELECT state FROM jobs WHERE id=?", (job[0],)).fetchone() if job else None
+                    if st is not None and st["state"] == "proposed":
+                        self.ledger.transition(job[0], "cancelled", db=db,
+                                               receipt=json.dumps({"reason": "landed_late"}))
+            undo = json.loads(row["undo_json"] or "[]")
+            if not already:
+                undo += [e for e in entries if e not in undo]
+            plan["landed_late"] = iso(self.ledger.now())
+            db.execute("UPDATE calendar_changes SET state='landed_late', undo_json=?, undo_state=?, settle_json=?,"
+                       " updated_at=? WHERE proposal_id=? AND state='lapsed'",
+                       (json.dumps(undo), "open" if undo and not already else row["undo_state"], json.dumps(plan),
+                        iso(self.ledger.now()), pid))
+            self.ledger.event("calendar_change_landed_late", {"proposal": pid, "card_off": took_card}, db=db)
+            if took_card or not already:
+                names = "; ".join(part["will"] for part in plan.get("parts", []) if part.get("will"))
+                words = (f"<b>Done after all:</b> {names}. That write went through late, after I'd offered it "
+                         "again" + (", so the newer card is off and nothing is added twice." if took_card else
+                                    "; the newer one found it there, so it's on the calendar once."))
+                buttons, binds = self._undo_button(db, pid) if undo and not already else (None, None)
+                self._say(db, self.chat_id, p["job_id"], words, buttons=buttons, binds=binds)
+
+    def join_abandoned(self, timeout: float = 5.0) -> None:
+        """Tests: wait for abandoned writes to answer."""
+        for t in self.abandoned:
+            t.join(timeout)
+        self.abandoned = [t for t in self.abandoned if t.is_alive()]
 
     def _run_step(self, pid: str, plan: dict, rec: dict, step: Step, unsure_if: tuple[str, ...] = ("unknown",),
                   guard: str | None = None) -> tuple[str, dict | None, Stopped | None]:
@@ -1163,8 +1326,12 @@ class CalendarChange:
         on Family as two lines); named for two different things, it's unclear."""
         parts: list[Part] = []
         notes: list[str] = []
+        keys = self.keys_of(pid)
+        self._forcing = bool(self.ledger.get_meta(f"calendar_change_force:{pid}"))
         for index, change in enumerate(params["changes"]):
-            more, said_here = self._plan(change, f"{pid}:{index}")
+            # Each add's fixed id comes from the proposal it was first offered under (keys_of), so a
+            # change offered again writes to the same address and never makes a second event.
+            more, said_here = self._plan(change, keys[index] if index < len(keys) else f"{pid}:{index}")
             notes += said_here
             for part in more:
                 same = next((x for x in parts if part.key and x.key and x.key[0] & part.key[0]), None)
@@ -1174,6 +1341,40 @@ class CalendarChange:
                     raise Unclear(f"you asked for two different changes to one event: "
                                   f"{render.plain(same.will)}, and {render.plain(part.will)}", "Which one?")
         return parts, notes
+
+    def keys_of(self, pid: str) -> list[str]:
+        """The key each change's fixed id is made from: the proposal and place it was first offered
+        under (0.24.0, fourth round), kept when a change is offered again (inherit_keys)."""
+        try:
+            got = json.loads(self.ledger.get_meta(f"calendar_change_keys:{pid}") or "[]")
+        except ValueError:
+            return []
+        return [str(k) for k in got] if isinstance(got, list) else []
+
+    def inherit_keys(self, new_pid: str, changes: list[dict], earlier: dict, db) -> None:
+        """A change offered again (after its lease ran out, as Not confirmed, or replaced when Harness
+        updated) keeps the key of its first offer, so its add writes to the same fixed id and finds
+        an earlier write that landed instead of making a second event. `earlier`: each change's
+        key (runner._change_key) to the key it was first offered under."""
+        keys = [earlier.get(_offer_key(c), f"{new_pid}:{i}") for i, c in enumerate(changes)]
+        if any(k != f"{new_pid}:{i}" for i, k in enumerate(keys)):
+            self.ledger.set_meta(f"calendar_change_keys:{new_pid}", json.dumps(keys), db)
+            for k in keys:
+                old = k.rsplit(":", 1)[0]
+                if old != new_pid:
+                    self.ledger.set_meta(f"calendar_change_reoffer:{old}", new_pid, db)
+
+    def keys_by_change(self, pid: str) -> dict:
+        """{change key: the key its fixed id is made from} for one proposal's changes."""
+        p = self.ledger.db.execute("SELECT params_json FROM proposals WHERE id=?", (pid,)).fetchone()
+        if p is None:
+            return {}
+        try:
+            changes = json.loads(p["params_json"])["changes"]
+        except (ValueError, KeyError, TypeError):
+            return {}
+        keys = self.keys_of(pid)
+        return {_offer_key(c): (keys[i] if i < len(keys) else f"{pid}:{i}") for i, c in enumerate(changes)}
 
     def _note_removed(self, db, removed: list) -> None:
         """(calendar, uid, instance, title, day): a day as a date, or as its record keeps it."""
@@ -1283,6 +1484,13 @@ class CalendarChange:
             if read_as and done:
                 lines.append("Read from your words: " + "; ".join(read_as) + ".")
             buttons, binds = self._undo_button(db, p["id"]) if undo else (None, None)
+            if any(part.already and part.change.get("op") == "add" for part in done):
+                # Never silent on a duplicate (0.24.0, fourth round): the event that's there is
+                # named, and Add anyway makes the second one if that's what he meant.
+                more, more_binds = self._add_anyway_button(db, p["id"])
+                buttons, binds = (buttons or [[]]), (binds or [])
+                buttons = [buttons[0] + more[0]]
+                binds = binds + more_binds
             self._say(db, self.chat_id, p["job_id"], "\n".join(lines), buttons=buttons, binds=binds)
         log.info("calendar change job %s: %s, %d of %d part(s) done, %d write(s)",
                  render.short(p["job_id"]), kind, len(done), len(results), len(undo))
@@ -1840,7 +2048,7 @@ class CalendarChange:
         if calendar == "gmail":
             self._gmail_address()
         if op in ("add", "add_series"):
-            return [self._add_part(c, key)], []
+            return [self._add_part(c, key, force=self._forcing)], []
         days = _dates(c["dates"])
         self._check_days(days)
         if op == "end_series":
@@ -1860,6 +2068,15 @@ class CalendarChange:
         if hit.repeats and hit.first != days[0]:
             raise Refuse(f"that day of {hit.title} starts on {_day_words(hit.first)}. Name that day")
         start, end, _ = self._new_times(c)
+        if _same_start(hit.start, start) and hit.end is not None and _same_start(hit.end, end) \
+                and all(_same_start(x.start, start) for x in hit.copies):
+            # Already at that time (0.24.0, fourth round): the current time is checked again at the
+            # apply, so a move that landed already (late, or before a card offering it again was
+            # tapped) is a no-op, never a second write.
+            name = self._name(c["title"], hit)
+            words = (f"Already at that time, nothing moved: \u201c{_safe(hit.title)}\u201d, "
+                     f"{self._when_words(start, end)}{self._where(hit, bool(hit.copies))}")
+            return [Part(words, words, [], name=name, already=words, bound=self._bound_of(hit, "move"))], []
         if hit.calendar == "gmail":
             steps = [self._gmail_move(hit, start, end)] + [self._copy_move(x, start, end) for x in hit.copies]
             if hit.block and hit.block != "ours":
@@ -2040,40 +2257,87 @@ class CalendarChange:
             return self._at_words(start, end)
         return f"{render.day_words(s.date(), self._today()).removeprefix('on ')}, {render.span_words(s, e)}"
 
-    def _add_part(self, c: dict, key: str) -> Part:
+    def _add_part(self, c: dict, key: str, force: bool = False) -> Part:
         start, end, rule = self._new_times(c)
         loose = ""
-        if c["op"] == "add":
-            same, like = self._already_there(c, start)
+        uid = self._uid(key, "hm-" if c["calendar"] == "family" else "cm")
+        if c["op"] == "add" and not force:
+            # Its own fixed id first (0.24.0, fourth round): a change offered again after its lease
+            # ran out keeps the id of the first offer, so an earlier write that landed late is found
+            # here, by that id, and isn't written a second time.
+            same, like = self._made_already(c, uid, start, end), None
+            if same is None:
+                same, like = self._already_there(c, start, end, rule)
             if same is not None:
                 # Nov 15: an add into a slot that held a drop-off block was recorded as done, and the
                 # removal after it reported the block gone while it stayed. Only the very same event
-                # (this calendar, the same title, the same start) is "already there": nothing is
-                # written, and nothing is recorded as made.
+                # (this calendar, the same title, start and end, all day or not, repeating or not) is
+                # "already there": nothing is written, nothing is recorded as made, and it's never
+                # silent (0.24.0, fourth round): the receipt names the event that's there, with Add
+                # anyway.
                 cal = "Family" if same.calendar == "family" else "Gmail"
-                words = (f"Already there, nothing to add: {_safe(same.title)}, {self._when_words(start, end)}, "
-                         f"is on your {cal} calendar")
-                return Part(words, words, [], name=_safe(c["title"]), already=words)
+                words = (f"Already there, nothing added: \u201c{_safe(same.title)}\u201d, "
+                         f"{self._when_words(same.start, same.end) if same.end is not None else _day_words(same.first)}, "
+                         f"is on your {cal} calendar. Add anyway adds a second one")
+                return Part(words, words, [], name=_safe(c["title"]), already=words, change=dict(c))
             if like is not None:
-                # One only like it (one name holds the other's words, or it's on the other calendar):
-                # his decision, on a card that names it, and nothing written until he taps.
+                # One only like it (one name holds the other's words, it's on the other calendar, or
+                # its end, all-day or repeating differs): his decision, on a card that names it, and
+                # nothing written until he taps.
                 cal = "Family" if like.calendar == "family" else "Gmail"
                 loose = (f"Already on your {cal} calendar at that time: \u201c{_safe(like.title)}\u201d, "
-                         f"{self._when_words(like.start, like.end) if like.end is not None else _day_words(like.first)}. "
+                         f"{self._when_words(like.start, like.end) if like.end is not None else _day_words(like.first)}"
+                         f"{', repeating' if like.repeats else ''}. "
                          "Add anyway adds a second event; Leave it adds nothing.")
         step = (self._family_add if c["calendar"] == "family" else self._gmail_add)(c, key)
         text = f"{_safe(c['title'])}{self._new_words(c, start, end)}"
         where = " (Family)" if c["calendar"] == "family" else " (Gmail)"
-        uid = self._uid(key, "hm-" if c["calendar"] == "family" else "cm")
         expect = [{"kind": "there", "calendar": c["calendar"], "id": uid, "title": c["title"],
                    "start": _text(start), "end": _text(end), "repeats": bool(rule)}]
         return Part(f"Add {text}{where}", f"Added {text}{where}", [step], name=_safe(c["title"]), adds=True,
-                    expect=expect, loose=loose)
+                    expect=expect, loose=loose, change=dict(c))
 
-    def _already_there(self, c: dict, start) -> "tuple[Found | None, Found | None]":
-        """What's already in the slot an add asks for (0.24.0, third round): (the very same event, on
-        the same calendar with the same title, normalised, at the same start; or else one only like
-        it, at the same start on either calendar, one name holding the other's words, like "School
+    def _made_already(self, c: dict, uid: str, start, end) -> "Found | None":
+        """The event this very add writes, found by its own fixed id, already there as asked: an
+        earlier write of it that landed (late, or after its lease ran out). None when it isn't, or
+        a read can't tell (then the slot is read as for any add)."""
+        try:
+            if c["calendar"] == "gmail":
+                if self.google is None or not self.address():
+                    return None
+                kind, ev = self.google.look(self._gmail_address(), uid)
+                if kind != "ok" or not ev or ev.get("status") == "cancelled":
+                    return None
+                first, last = self._gmail_when(ev.get("start")), self._gmail_when(ev.get("end"))
+                if first is None or last is None:
+                    return None
+                f = Found(uid, uid, ev.get("summary", ""), *self._span(first, last), False, first, ev, False,
+                          "gmail", last)
+            else:
+                out, body = self.client.fetch(self.client.href_for(uid))
+                if out.kind != "ok":
+                    return None
+                today = self._today()
+                occs = self._occurrences(body, *self._bounds([today - timedelta(days=1), today + timedelta(days=400)]))
+                if not occs:
+                    return None
+                o = occs[0]
+                f = Found(o.uid, o.instance, o.summary, *self._span(o.start, o.end), False, o.start, None, False,
+                          "family", o.end)
+        except (Refuse, ValueError, KeyError, TypeError, AttributeError, ical.Unreadable):
+            return None
+        if exact_title(f.title) == exact_title(c["title"]) and _same_start(f.start, start) \
+                and _same_start(f.end, end):
+            log.info("add %s: its own id is already on the calendar as asked", render.short(uid))
+            return f
+        return None
+
+    def _already_there(self, c: dict, start, end=None, rule: str = "") -> "tuple[Found | None, Found | None]":
+        """What's already in the slot an add asks for (0.24.0, third and fourth rounds): (the very
+        same event: on the same calendar with the same title, normalised, at the same start, and
+        with the same end, all day or timed alike, and repeating alike; or else one only like it:
+        the same calendar, title and start with another end, all-day status or repetition, or at
+        the same start on either calendar with one name holding the other's words, like "School
         drop-off" and Harness's "Busy (school drop-off)" block). An empty or very short title is
         never already there. A read that fails finds nothing, and the add goes as asked."""
         want = exact_title(c["title"])
@@ -2087,10 +2351,19 @@ class CalendarChange:
         asked = c["title"]
         same = like = None
         for f in first + rest:
-            if isinstance(start, datetime) != isinstance(f.start, datetime) or not _same_start(f.start, start):
+            timed = isinstance(start, datetime)
+            if f.calendar == c["calendar"] and exact_title(f.title) == want and (
+                    _same_start(f.start, start) if timed == isinstance(f.start, datetime)
+                    else self._day_of({"start": _text(f.start)}) == day):
+                exact = timed == isinstance(f.start, datetime) and (end is None or f.end is None
+                                                                    or _same_start(f.end, end)) \
+                    and bool(f.repeats) == bool(rule)
+                if exact:
+                    same = same or f
+                else:
+                    like = like or f                 # same name and start, not the same event
                 continue
-            if f.calendar == c["calendar"] and exact_title(f.title) == want:
-                same = same or f
+            if timed != isinstance(f.start, datetime) or not _same_start(f.start, start):
                 continue
             names = {n for n in (f.title, block_name(f.title)) if len(exact_title(n)) >= SHORT_TITLE}
             if any(fit(asked, n) or fit(n, asked) for n in names):
@@ -2194,7 +2467,7 @@ class CalendarChange:
         entry = {"cal": "family", "how": "put", "href": href, "before": before, "after": new,
                  "sent": new, "etag": "", "was": etag, "check": check}
         self._attempt(entry)
-        out = self.client.replace(href, etag, new)
+        out = self._bounded("family", self.client.replace, href, etag, new)
         if out.kind != "ok":
             raise Stopped(out.kind, out.status, undo=entry if out.kind == "unknown" else None)
         entry["etag"] = out.etag or ""
@@ -2229,7 +2502,7 @@ class CalendarChange:
     def _family_delete(self, href: str, etag: str, body: str) -> dict:
         entry = {"cal": "family", "how": "restore", "href": href, "before": body, "was": etag}
         self._attempt(entry)
-        out = self.client.remove_at(href, etag)
+        out = self._bounded("family", self.client.remove_at, href, etag)
         if out.kind != "ok":
             raise Stopped(out.kind, out.status, undo=entry if out.kind == "unknown" else None)
         back, _ = self.client.fetch(href)
@@ -2312,7 +2585,7 @@ class CalendarChange:
             entry = {"cal": "family", "how": "delete", "href": href, "after": ics, "sent": ics, "etag": "",
                      "check": {"kind": "there"}}
             self._attempt(entry)
-            out = self.client.put_new(href, ics)
+            out = self._bounded("family", self.client.put_new, href, ics)
             if out.kind != "ok":
                 raise Stopped(out.kind, out.status, undo=entry if out.kind == "unknown" else None)
             entry["etag"] = out.etag or ""
@@ -2370,7 +2643,7 @@ class CalendarChange:
         if e.get("recurringEventId"):
             entry["series"] = e["recurringEventId"]
         self._attempt(entry)
-        self._gmail_send(self.google.drop(address, e["id"], e.get("etag")), entry)
+        self._gmail_send(self._bounded("gmail", self.google.drop, address, e["id"], e.get("etag")), entry)
         if not self.google.really_gone(address, e["id"]):
             raise Stopped("unknown", undo=entry)
         return entry
@@ -2420,7 +2693,7 @@ class CalendarChange:
                      "wrote": {"recurrence": after}, "was": master.get("etag"),
                      "check": {"kind": "rrule", "value": after}}
             self._attempt(entry)
-            self._gmail_send(self.google.change(address, series, {"recurrence": after}, master.get("etag")), entry)
+            self._gmail_send(self._bounded("gmail", self.google.change, address, series, {"recurrence": after}, master.get("etag")), entry)
             return self._gmail_reread(address, series, entry)
         return Step(f"Gmail: {_safe(f.title)} ends, with nothing on or after {_day_words(day)}.", run,
                     [("gmail", series, "*", f.title, day)], what="Gmail",
@@ -2443,7 +2716,7 @@ class CalendarChange:
             entry = {"cal": "gmail", "how": "change", "id": e["id"], "fields": old, "wrote": fields,
                      "was": now.get("etag"), "check": {"kind": "starts", "start": _text(start), "end": _text(end)}}
             self._attempt(entry)
-            self._gmail_send(self.google.change(address, e["id"], fields, now.get("etag")), entry)
+            self._gmail_send(self._bounded("gmail", self.google.change, address, e["id"], fields, now.get("etag")), entry)
             return self._gmail_reread(address, e["id"], entry)
         return Step(f"Gmail: {_safe(f.title)} on {_day_words(f.first)} moved to {self._when_words(start, end)}.",
                     run, what="Gmail",
@@ -2471,7 +2744,7 @@ class CalendarChange:
                      "description": "", "attendees": [], "attachments": []}
             entry = {"cal": "gmail", "how": "drop", "id": uid, "wrote": wrote, "check": {"kind": "there"}}
             self._attempt(entry)
-            self._gmail_send(self.google.insert(address, event), entry)
+            self._gmail_send(self._bounded("gmail", self.google.insert, address, event), entry)
             return self._gmail_reread(address, uid, entry)
         return Step(f"Gmail: {_safe(c['title'])} added{self._new_words(c, start, end)}.", run, what="Gmail",
                     spec={"fn": "gmail_add", "c": c, "key": key})
@@ -2666,6 +2939,7 @@ class CalendarChange:
             steps = [Step(r["label"], lambda: {}, what=r["what"]) for r in recs]
             whole = Part(part["will"], part["done"], steps, name=part.get("name", ""),
                          bound=part.get("bound") or [], already=part.get("already", ""),
+                         change=part.get("change") or {},
                          expect=part.get("expect") or [], loose=part.get("loose", ""))
             landed = [s for s, r in zip(steps, recs) if r["status"] == "landed"]
             if len(landed) == len(recs):
@@ -2889,7 +3163,43 @@ class CalendarChange:
                              chat_id=self.chat_id, ttl_s=UNDO_TTL_S, db=db)
         return [[(label, choices.callback_data(nonce))]], [{"type": "choice", "nonce": nonce}]
 
+    def _add_anyway_button(self, db, proposal_id: str) -> tuple[list, list]:
+        nonce = choices.mint(self.ledger, kind="calendar_change_add_anyway", target=proposal_id,
+                             chat_id=self.chat_id, ttl_s=UNDO_TTL_S, db=db)
+        return [[("Add anyway", choices.callback_data(nonce))]], [{"type": "choice", "nonce": nonce}]
+
+    def add_anyway(self, proposal_id: str) -> str:
+        """His Add anyway on a receipt that found the very event already there: the add, as asked,
+        as a second event under a new id. His tap is the go, so it runs now, with its own receipt
+        and Undo; nothing is checked for "already there" again."""
+        row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (proposal_id,)).fetchone()
+        p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+        if row is None or p is None:
+            return "There's nothing to add there."
+        changes = [part["change"] for part in _plan(row).get("parts", []) if part.get("already") and part.get("change")]
+        if not changes:
+            return "There's nothing to add there."
+        params = {"changes": changes}
+        with self.ledger.tx() as db:
+            job = self.ledger.made_job(self.chat_id, "Add anyway: " + "; ".join(c["title"] for c in changes),
+                                       kind="add_anyway", db=db)
+            parent = self.ledger.get_meta(f"job_parent:{p['job_id']}") or p["job_id"]
+            self.ledger.set_meta(f"job_parent:{job}", parent, db)
+            pid = _create(self.ledger, job, params, p["policy_version"], db)
+            self.ledger.set_meta(f"calendar_change_force:{pid}", "1", db)
+            self.ledger.set_meta(f"calendar_change_lines:{pid}", json.dumps(
+                [render.change_line(c, self.tz, self.ledger.now()) for c in changes]), db)
+            db.execute("UPDATE proposals SET state='approved' WHERE id=?", (pid,))
+            self.ledger.transition(job, "proposed", db=db)
+            self.ledger.transition(job, "approved", db=db)
+            self.ledger.event("calendar_change_add_anyway", {"proposal": pid, "from": proposal_id}, db=db)
+        return "Adding it as a second event now."
+
     def on_choice(self, kind: str, target: str) -> str:
+        if kind == "calendar_change_add_anyway":
+            return self.add_anyway(target)
+        if kind in ("calendar_change_propose_again", "calendar_change_which") and self.reoffer is not None:
+            return self.reoffer(kind, target)
         if kind != "calendar_change_undo":
             return "Nothing changed."
         pids = [pid for pid in target.split()       # "Undo both" names the later changes too
@@ -3268,7 +3578,7 @@ class CalendarChange:
                 return "ok"                  # something already put it back
             if not self._undo_attempt(step):
                 return "not_landed"
-            return self._after_undo(self.client.put_new(href, step["before"]), href, latest)
+            return self._after_undo(self._bounded("family", self.client.put_new, href, step["before"]), href, latest)
         out, body = self.client.fetch(href)
         if out.kind == "gone" and step["how"] == "delete":
             return "ok"
@@ -3283,9 +3593,9 @@ class CalendarChange:
         if not self._undo_attempt(step):
             return "not_landed"
         if step["how"] == "delete":
-            kind = self.client.remove_at(href, out.etag or "").kind
+            kind = self._bounded("family", self.client.remove_at, href, out.etag or "").kind
             return "ok" if kind == "gone" else kind
-        return self._after_undo(self.client.replace(href, out.etag or "", step["before"]), href, latest)
+        return self._after_undo(self._bounded("family", self.client.replace, href, out.etag or "", step["before"]), href, latest)
 
     def _after_undo(self, out, href: str, latest: dict[str, str]) -> str:
         if out.kind == "ok":
@@ -3329,7 +3639,7 @@ class CalendarChange:
                 return there
             if not self._undo_attempt(step):
                 return "not_landed"
-            out = self.google.change(address, uid, step["fields"], None)
+            out = self._bounded("gmail", self.google.change, address, uid, step["fields"], None)
         else:
             if cancelled:
                 return "ok" if step["how"] == "drop" else "gone"
@@ -3341,8 +3651,8 @@ class CalendarChange:
                 return "changed"
             if not self._undo_attempt(step):
                 return "not_landed"
-            out = (self.google.drop(address, uid, cur.get("etag")) if step["how"] == "drop"
-                   else self.google.change(address, uid, step["fields"], cur.get("etag")))
+            out = (self._bounded("gmail", self.google.drop, address, uid, cur.get("etag")) if step["how"] == "drop"
+                   else self._bounded("gmail", self.google.change, address, uid, step["fields"], cur.get("etag")))
         if out.kind == "ok":
             latest[uid] = (self.google.look(address, uid)[1] or {}).get("etag") or ""
         return out.kind
@@ -3439,6 +3749,19 @@ def _length(span: timedelta) -> str:
     parts = ([f"{hours} hour{'s' * (hours != 1)}"] if hours else []) + \
         ([f"{rest} minute{'s' * (rest != 1)}"] if rest or not hours else [])
     return " ".join(parts)
+
+
+def _create(ledger: Ledger, job_id: str, params: dict, policy_version: str, db) -> str:
+    from . import approvals
+    return approvals.create_proposal(ledger, job_id=job_id, effect_type=effects.CALENDAR_CHANGE, params=params,
+                                     policy_version=policy_version, ttl_s=UNDO_TTL_S, db=db)
+
+
+def _offer_key(c: dict) -> str:
+    """One change, however its title is spaced or cased (runner._change_key's twin), as a string."""
+    return json.dumps([c.get("op"), c.get("calendar"), " ".join(str(c.get("title", "")).casefold().split()),
+                       c.get("dates", ""), c.get("start", ""), c.get("end", ""), c.get("days", ""),
+                       c.get("until", "")])
 
 
 def _moment(when) -> str:
