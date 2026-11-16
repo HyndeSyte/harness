@@ -43,6 +43,8 @@ import {
   HOOK_GAP_MARGIN_MS, hookTimingStep, judgeHookTiming, timingGaps, payloadReplay, fragmentReport,
   foldKey, answerAddressKeys, addressPaths, probeLeftovers, cleanProbe, PROBE_CLEANUP, PROBE_ENV, hookDeniedOf, lateHook, noteHookWorst, readHookWorst, COLD_UPTIME_S, versionMismatch, versionsOf,
   HOOK_START_DEADLINE_MS, marginAbort, callStart, noteHookStart, readHookStarts, coldSampleHint, extraAddressPaths, probeGateHint, STRUCTURED_PATH, removeCommand, probeVarScopes, VERSION_HOLD_HINT, chromeVersionRead, extensionFolders, readVersionHold, exeOf,
+  newCallTable, trackCall, watchCalls, readHookLog, CALL_TABLE_CAP, startDeadlineMs, HOOK_LIMITS, guardMatchers, hookedBy, pinnedHooked, versionHold, versionsAfter,
+  VERSION_HOLD_UNWRITABLE_HINT, addressListing, probeTail, runPreflight, inChromePhase,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -811,13 +813,13 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, hookTiming: async () => TIMING_OK, payloadReplay: () => REPLAY_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
     readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
-  const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string; fragment?: boolean } = {}) => {
+  const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string; fragment?: boolean; probed?: string } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
     const h = sessionHashes(o)!;
     fileOk(join(home, "confirmed.json"), JSON.stringify({ v: 1, at: T0.toISOString(), fingerprint: fingerprint(o, inst), settings_sha256: h.settings_sha256,
       prompt_sha256: h.prompt_sha256, config_sha256: outsideConfig(o).sha256, deny_check: over.deny_check ?? true, read_context: over.read_context ?? false,
       live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_ENDED.version,
-      ...workerNow(), fragment_strip: over.fragment ?? false }, null, 2));
+      ...workerNow(), fragment_strip: over.fragment ?? false, ...(over.probed ? { probed_at: over.probed } : {}) }, null, 2));
   };
   if (o.confirmed !== false) confirmNow();
   const remoteFile = (path: string) => sh(["git", "show", `main:${path}`], remote);
@@ -1194,7 +1196,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     expect(JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "probe_stale", reason: "extension_version_changed" });
     // Only the probe runs meanwhile (after a Chrome restart, which loads the new version); once its new versions are confirmed, runs go on.
     q.extVersion("1.2.4");
-    q.confirmNow({ deny_check: true });
+    q.confirmNow({ deny_check: true, probed: new Date(Date.parse(readVersionHold(q.opts())!.at) + 60_000).toISOString() });   // a probe after the hold
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
   });
 
@@ -5205,7 +5207,7 @@ describe("fifteenth review: unplaced and drifted reads end the session, the work
     await readGuardMain(env, async () => readCall({ structuredContent: { tabUrl: "https://evil.example/x" } }, "r3"), (x) => { said += x; });
     expect(readAbort(abort)).toBe("read_drift");
     expect(JSON.parse(said).hookSpecificOutput.updatedMCPToolOutput).toBe(READ_DRIFT_MESSAGE);
-    expect(ABORT_CODES).toEqual(["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low"]);
+    expect(ABORT_CODES).toEqual(["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low", "nav_log_unset"]);
   });
 
   test("an unplaced read ends the run at once with no tab-context fallback, and the report is discarded", async () => {
@@ -6516,8 +6518,8 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), ${en
     expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
     expect(readVersionHold(q.opts())).toMatchObject({ code: "extension_versions_ambiguous", folders: ["1.2.2_0", "1.2.3_0"] });
     expect(q.launches).toEqual([]);
-    const cf = join(q.home, "confirmed.json");                                      // a new probe's confirmation (confirm-profile rewrites it)
-    writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), at: new Date(T0.getTime() + 60_000).toISOString() }, null, 2));
+    const cf = join(q.home, "confirmed.json");                                      // a new probe's confirmation (confirm-profile rewrites it, with the probe's time)
+    writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), at: new Date(T0.getTime() + 60_000).toISOString(), probed_at: new Date(T0.getTime() + 30_000).toISOString() }, null, 2));
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
     expect(readVersionHold(q.opts())).toBeNull();
   });
@@ -6543,4 +6545,225 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), ${en
     expect(out.detail).toContain("an auto-update needs a new probe");
     expect(JSON.parse(q.remoteFile(`results/${id}.json`))).toMatchObject({ code: "versions_changed" });
   });
+});
+
+describe("twenty-second review: the call table, hooked calls only, the version hold's own clock, the scopes, the lock flag and one Chrome read per phase", () => {
+  test("the call table: 201 finished calls leave it as they finish; a missing hook start past the 200th call is caught; a full table ends the session", () => {
+    expect(HOOK_START_DEADLINE_MS).toBe(startDeadlineMs(HOOK_LIMITS));
+    expect(HOOK_START_DEADLINE_MS).toBe(36_000);
+    const t = newCallTable();
+    for (let i = 0; i < 201; i++) {
+      expect(trackCall(t, `n${i}`, i * 10, 1_000 + i * 10)).toBe(true);
+      expect(watchCalls(t, [{ id: `n${i}`, t0: 1_000 + i * 10 }], [`n${i}`], i * 10 + 5)).toBeNull();
+    }
+    expect(Object.keys(t.mono)).toEqual([]);                                        // every finished call left
+    expect(trackCall(t, "n201", 5_000, 6_000)).toBe(true);                          // the 202nd call is timed
+    expect(watchCalls(t, [], [], 5_000 + 35_999)).toBeNull();
+    expect(watchCalls(t, [], [], 5_000 + 36_000)).toBe("never_started");
+    // A late start that finished between two checks is still caught (checked before it leaves).
+    const late = newCallTable();
+    trackCall(late, "x", 0, 1_000);
+    expect(watchCalls(late, [{ id: "x", t0: 31_000 }], ["x"], 31_100)).toBe("late_start");
+    // Full: CALL_TABLE_CAP unfinished calls, then one more can't be tracked: the table says so, and the check ends it.
+    const full = newCallTable();
+    for (let i = 0; i < CALL_TABLE_CAP; i++) expect(trackCall(full, `f${i}`, 0, 0)).toBe(true);
+    expect(trackCall(full, "over", 0, 0)).toBe(false);
+    expect(watchCalls(full, Array.from({ length: CALL_TABLE_CAP }, (_, i) => ({ id: `f${i}`, t0: 0 })), [], 1)).toBe("table_full");
+    // The log's finished lines: a PreToolUse decision line, never a start line or a post hook.
+    const home = mkdtempSync(join(tmpdir(), "table22-"));
+    const log = join(home, "log.jsonl");
+    noteHookStart(log, "a", 1);
+    appendFileSync(log, JSON.stringify({ id: "a", tool: "navigate", decision: "allow", t0: 1, done_at: 2 }) + "\n");
+    appendFileSync(log, JSON.stringify({ id: "b", tool: "get_page_text", decision: "allow", phase: "post", t0: 3, done_at: 4 }) + "\n");
+    expect(readHookLog(log)).toEqual({ starts: [{ id: "a", t0: 1 }, { id: "a", t0: 1 }], finished: ["a"] });
+  });
+
+  test("the deadline times only the calls the pinned matcher hooks; the pinned matcher is the catch-all", () => {
+    expect(guardMatchers(JSON.parse(readFileSync(SESSION_FILES.settings, "utf8")))).toEqual([GUARD_MATCHER]);
+    expect(GUARD_MATCHER).toBe(".*");
+    for (const n of ["Read", `${CH}navigate`, "mcp__other__thing", "AnyNewTool"]) expect(pinnedHooked()(n)).toBe(true);
+    const narrow = hookedBy([`${CH}navigate`]);
+    expect([narrow(`${CH}navigate`), narrow(`${CH}find`), narrow("Read")]).toEqual([true, false, false]);
+    const names = hookedBy(["Read|Write"]);                                         // a plain name list matches exactly
+    expect([names("Read"), names("Write"), names("ReadX")]).toEqual([true, true, false]);
+    expect(hookedBy([`${CH}(navigate|find)`])(`${CH}find`)).toBe(true);
+    expect(hookedBy(null)("Read")).toBe(true);                                      // settings that can't be read: every call is timed
+    expect(hookedBy(["*"])("Read")).toBe(true);
+  });
+
+  test("a run session: 201 hooked calls, an unhooked one that never starts, then a hooked call with no start: killed 36 seconds after that call, not after the unhooked one", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mixed22-"));
+    const log = join(home, "log.jsonl");
+    const settings = join(home, "settings.json");
+    const pinned = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
+    pinned.hooks.PreToolUse[0].matcher = `${CH}navigate`;
+    writeFileSync(settings, JSON.stringify(pinned));
+    const script = join(home, "session.js");
+    writeFileSync(script, `const fs = require("node:fs");
+const log = ${JSON.stringify(log)};
+const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const use = (id, name) => say({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input: {} }] } });
+say({ type: "system", subtype: "init", session_id: "sess-mx-0022", tools: [], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
+use("u0", "Read");
+let i = 0;
+const tick = setInterval(() => {
+  for (let k = 0; k < 5 && i < 201; k++, i++) {
+    const t0 = Date.now();
+    use("n" + i, "${CH}navigate");
+    fs.appendFileSync(log, JSON.stringify({ start: "nav-guard", id: "n" + i, t0 }) + "\\n" + JSON.stringify({ id: "n" + i, tool: "navigate", decision: "allow", t0, done_at: t0 + 1 }) + "\\n");
+  }
+  if (i >= 201) clearInterval(tick);
+}, 20);
+setTimeout(() => use("late", "${CH}navigate"), 10000);
+setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 70000);`);
+    const env = cleanEnv({ PCW_NAV_LOG: log, PCW_ABORT_FILE: join(home, "abort"), PCW_SESSION_KIND: "run" });
+    const t0 = Date.now();
+    const s = await realLaunch([process.execPath, script, "--settings", settings], home, 80_000, env as Record<string, string>);
+    const ms = Date.now() - t0;
+    expect(s.aborted).toBe("hook_margin_low");
+    expect(ms).toBeGreaterThanOrEqual(45_500);                                      // not 36 seconds after the unhooked call
+    expect(ms).toBeLessThan(50_000);
+    expect(Object.keys(s.useAt ?? {}).length).toBe(200);                             // the timing record keeps its first 200
+  }, 120_000);
+
+  test("a run session without a navigation log is refused at once by its own code (nav_log_unset), nothing started", async () => {
+    const home = mkdtempSync(join(tmpdir(), "nolog22-"));
+    const marker = join(home, "started");
+    const t0 = Date.now();
+    const s = await realLaunch([process.execPath, "-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "x")`], home, 60_000,
+      cleanEnv({ PCW_SESSION_KIND: "run", PCW_ABORT_FILE: join(home, "abort") }) as Record<string, string>);
+    expect(s.aborted).toBe("nav_log_unset");
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(existsSync(marker)).toBe(false);
+    expect(sessionCode(s, parseStream(s.out), [], [])).toBe("nav_log_unset");
+    expect(ABORT_CODES).toContain("nav_log_unset");
+  });
+
+  test("the version hold records its time and versions; edited confirmation bytes, or a probe from before it, don't clear it; a fresh probe's confirmation does", async () => {
+    const { q, id } = oneJob();
+    const extra = join(q.udd, "Default", "Extensions", EXT, "1.2.2_0");
+    mkdirSync(extra);
+    writeFileSync(join(extra, "manifest.json"), JSON.stringify({ version: "1.2.2" }));
+    expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
+    const hold = readVersionHold(q.opts())!;
+    expect(hold).toMatchObject({ code: "extension_versions_ambiguous", folders: ["1.2.2_0", "1.2.3_0"],
+      seen: { extension_version: "1.2.3", chrome_version: "131.0.6778.86", chrome_version_source: "last_version_file" } });
+    rmSync(extra, { recursive: true });
+    const cf = join(q.home, "confirmed.json");
+    const conf = JSON.parse(readFileSync(cf, "utf8"));
+    const at = (ms: number) => new Date(Date.parse(hold.at) + ms).toISOString();
+    // Bytes edited by hand: a later "at", extra spaces. Still held.
+    writeFileSync(cf, JSON.stringify({ ...conf, at: at(60_000) }, null, 4));
+    expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
+    // A probe run before the hold, confirmed after it: still held.
+    writeFileSync(cf, JSON.stringify({ ...conf, at: at(120_000), probed_at: at(-60_000) }, null, 2));
+    expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
+    // A fresh probe of other versions than the loaded ones: still held (probe_stale would name them).
+    writeFileSync(cf, JSON.stringify({ ...conf, at: at(120_000), probed_at: at(60_000), fingerprint: { ...conf.fingerprint, extension_version: "1.2.2" } }, null, 2));
+    expect(versionHold(q.opts(), q.inst, new Date(at(180_000)))).toBe(null);          // a mismatch: probe_stale refuses instead
+    expect(readVersionHold(q.opts())).not.toBeNull();
+    // A fresh probe of the loaded versions, confirmed after it: cleared.
+    writeFileSync(cf, JSON.stringify({ ...conf, at: at(120_000), probed_at: at(60_000) }, null, 2));
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(readVersionHold(q.opts())).toBeNull();
+  });
+
+  test("a hold that can't be written refuses this run and every later one by name until it is written", async () => {
+    const { q, id } = oneJob();
+    const extra = join(q.udd, "Default", "Extensions", EXT, "1.2.2_0");
+    mkdirSync(extra);
+    const holdFile = join(q.home, "version-hold.json");
+    mkdirSync(join(holdFile, "blocked"), { recursive: true });                      // the rename onto it fails
+    expect(await run(q.opts(attended))).toEqual({ code: "version_hold_unwritable", job: null, closed: [], detail: VERSION_HOLD_UNWRITABLE_HINT });
+    rmSync(extra, { recursive: true });                                             // the condition gone: still refused
+    expect((await run(q.opts(attended))).code).toBe("version_hold_unwritable");
+    expect(existsSync(`${holdFile}.tmp`)).toBe(false);
+    rmSync(holdFile, { recursive: true });                                          // writable again: the hold is written, and holds
+    expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
+    expect(readVersionHold(q.opts())).toMatchObject({ code: "extension_versions_ambiguous" });
+    expect(existsSync(`${holdFile}.pending`)).toBe(false);
+    expect(q.launches.length).toBe(0);
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "version_hold_unwritable", job: null, stale_lock: false, skew_ms: null, reason: null })).toContain("free disk space");
+    void id;
+  });
+
+  test("after the session: an update unpacked is update_pending, and the hold is written even beside a version mismatch; the report is not queued", async () => {
+    const { q, id } = oneJob();
+    q.during(() => {
+      writeFileSync(join(q.udd, "Last Version"), "132.0.0.1");                       // a mismatch
+      const extra = join(q.udd, "Default", "Extensions", EXT, "1.2.4_0");            // and a newer folder unpacked
+      mkdirSync(extra, { recursive: true });
+      writeFileSync(join(extra, "manifest.json"), JSON.stringify({ version: "1.2.4" }));
+    });
+    const out = await run(q.opts(attended));
+    expect(out).toMatchObject({ code: "versions_changed", job: id });
+    expect(out.detail).toMatch(/^update_pending: /);
+    expect(readVersionHold(q.opts())).toMatchObject({ code: "update_pending" });
+    const r = result(q, id);
+    expect(r.code).toBe("versions_changed");
+    expect(r.facts ?? {}).toEqual({});                                              // nothing of its report kept
+    expect(q.remoteHas(`reports/${id}.json`)).toBe(false);
+  });
+
+  test("Chrome's version is read once per phase, its source recorded; another source after the session is named, not versions_changed; the fallback is in the run log", async () => {
+    const { q, id } = oneJob();
+    let reads = 0;
+    const exe = () => { reads++; return "131.0.6778.86"; };
+    // The confirmation as a probe reading chrome.exe would record it.
+    const cf = join(q.home, "confirmed.json");
+    const conf = JSON.parse(readFileSync(cf, "utf8"));
+    writeFileSync(cf, JSON.stringify({ ...conf, fingerprint: { ...conf.fingerprint, chrome_version_source: "chrome_exe" } }, null, 2));
+    expect(fingerprint(q.opts({ exeVersion: exe }), q.inst)?.chrome_version_source).toBe("chrome_exe");
+    reads = 0;
+    expect(await run(q.opts({ ...attended, exeVersion: exe }))).toMatchObject({ code: "ok", job: id });
+    expect(reads).toBe(2);                                                          // the preflight's one, and the after-session one
+    // chrome.exe unreadable after the session, and the Last Version file in another format: a note, not a failure.
+    const { q: q2, id: id2 } = oneJob();
+    const cf2 = join(q2.home, "confirmed.json");
+    const conf2 = JSON.parse(readFileSync(cf2, "utf8"));
+    writeFileSync(cf2, JSON.stringify({ ...conf2, fingerprint: { ...conf2.fingerprint, chrome_version: "131.0.6778.086", chrome_version_source: "chrome_exe" } }, null, 2));
+    let after = false;
+    q2.during(() => { after = true; });
+    const out = await run(q2.opts({ ...attended, exeVersion: () => (after ? null : "131.0.6778.086") }));
+    expect(out).toMatchObject({ code: "ok", job: id2 });
+    expect(out.detail).toContain("chrome_version_source");
+    expect(out.detail).toContain("a source difference");
+    const logText = readFileSync(join(q2.home, "worker.log"), "utf8");
+    expect(logText).toContain("chrome_version_fallback last_version_file");
+    // Like with like: the same source with another version is versions_changed.
+    expect(inChromePhase(() => versionsAfter(q2.opts({ exeVersion: () => "131.0.6778.99" }), q2.inst)).changed).toContain("Chrome is 131.0.6778.99");
+  });
+
+  test("a failed registry lookup says the scope is unknown and prints all three removal commands", () => {
+    const q = queueRig();
+    const out = probeVarScopes(q.opts({ platform: "win32", envRegistry: () => null }), ["PCW_HOOK_TIMING"]);
+    expect(out).toEqual([{ name: "PCW_HOOK_TIMING", scope: "unknown", lookup_failed: true, remove: removeCommand("PCW_HOOK_TIMING", "unknown", "win32") }]);
+    for (const w of ["lookup failed", "Remove-Item Env:PCW_HOOK_TIMING", "'User'", "'Machine'"]) expect(out[0].remove).toContain(w);
+    // A variable this process doesn't have, with the lookup failing: nothing claimed for it.
+    expect(probeVarScopes(q.opts({ platform: "win32", envRegistry: () => null }), [])).toEqual([]);
+    expect(probeVarScopes(q.opts({ platform: "win32", envRegistry: () => { throw new Error("no reg"); } }), ["PCW_HOOK_TIMING"])[0].scope).toBe("unknown");
+  });
+
+  test("the stale-lock flag is kept by the lock's path: a copy of the options still reports it", async () => {
+    const { q } = oneJob();
+    writeFileSync(join(q.home, "worker.lock"), JSON.stringify({ pid: 99999, at: T0.toISOString() }));
+    const o = q.opts({ ...attended, pidAlive: () => false });
+    runPreflight(o);
+    expect(existsSync(join(q.home, "worker.lock"))).toBe(false);
+    await next({ ...o });
+    expect(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ stale_lock: true });
+  });
+
+  test("the schema-mismatch listing is grouped by tool with the failing tool marked, and the probe prints the same hint at its end", async () => {
+    const paths = { read_page: ["tool_response.content[].url", STRUCTURED_PATH], find: [STRUCTURED_PATH] };
+    expect(addressListing(paths)).toBe(`find: ${STRUCTURED_PATH}; read_page (fails): tool_response.content[].url, ${STRUCTURED_PATH}`);
+    const q = queueRig({ confirmed: false });
+    const ev = await probe(q.opts(attended));
+    expect(probeTail(ev, "linux")).toBeNull();
+    const bad = { ...ev, address_paths: paths, structured_address: { ...ev.structured_address, passed: false } };
+    const tail = probeTail(bad as any, "linux")!;
+    expect(tail.step).toBe("structured_address");
+    expect(tail.hint).toBe(probeGateHint("structured_address", bad as any));
+    expect(tail.hint).toContain("read_page (fails)");
+  }, 120_000);
 });

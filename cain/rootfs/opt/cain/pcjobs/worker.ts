@@ -53,7 +53,7 @@
 // prints, logs and pushes is fixed words, ids and reason codes. Runs on Bun, or on Node
 // 22.18 or later (which runs TypeScript as is); paths are joined, never written with a
 // slash, so it runs the same on Windows.
-import { existsSync, lstatSync, mkdirSync, openSync, closeSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, writeSync, appendFileSync } from "node:fs";
+import { existsSync, fsyncSync, lstatSync, mkdirSync, openSync, closeSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, writeSync, appendFileSync } from "node:fs";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { homedir, uptime as osUptime } from "node:os";
@@ -121,8 +121,8 @@ export interface Opts {
   managedDirs?: string[];                           // the managed settings drop-in folders (managedDropins unless a test stands in)
   policyKeys?: () => string[];                      // Windows: the Claude Code policy registry keys that exist (policyKeys unless a test stands in)
   env?: Record<string, string | undefined>;         // the worker's own environment (process.env unless a test stands in)
-  envRegistry?: (name: string) => ("user" | "machine")[]; // Windows: the registry scopes that set a variable (registryEnvScopes unless a test stands in)
-  exeVersion?: (exe: string) => string | null;      // Windows: an executable's file version (exeFileVersion unless a test stands in)
+  envRegistry?: (name: string) => ("user" | "machine")[] | null; // Windows: the registry scopes that set a variable, null when the lookup failed (registryEnvScopes unless a test stands in)
+  exeVersion?: (exe: string) => string | null;      // a test's stand-in for an executable's file version (Windows reads it with chromeExeVersions)
   procs?: () => Proc[] | null;                      // the running processes (listProcs unless a test stands in)
   killPid?: (pid: number) => void;                  // ends one process (a stuck bridge's), killTree unless a test stands in
   platform?: string;
@@ -595,8 +595,10 @@ export function outsideConfig(o: Opts): OutsideConfig {
 // until a new probe passes and confirm-profile records the new versions.
 export interface Fingerprint {
   user_data_dir: string; profile_name: string; extension_id: string; chrome_major: number; chrome_version: string; extension_version: string; cli_version: string;
+  chrome_version_source?: ChromeVersionSource;      // where chrome_version was read (0.12.0, twenty-second round); absent in older confirmations
 }
 const FP_KEYS = ["user_data_dir", "profile_name", "extension_id", "chrome_major", "chrome_version", "extension_version", "cli_version"];
+const fpShape = (f: any) => same(f, FP_KEYS) || (same(f, [...FP_KEYS, "chrome_version_source"]) && (f.chrome_version_source === "chrome_exe" || f.chrome_version_source === "last_version_file"));
 const IDENTITY = ["user_data_dir", "profile_name", "extension_id"] as const;
 const VERSIONS = ["extension_version", "cli_version", "chrome_version", "chrome_major"] as const;
 
@@ -751,53 +753,129 @@ export function extensionFolders(inst: Install): string[] {
 // runs from (its process's command line names it), read on Windows; only when that can't be read, the
 // user data folder's Last Version file, named as the fallback it is (source).
 export type ChromeVersionSource = "chrome_exe" | "last_version_file";
-export const exeFileVersion = (exe: string): string | null => {
+export const exeOf = (cmd: string): string | null => { const m = /^\s*(?:"([^"]+)"|(\S+))/.exec(cmd); return m ? (m[1] ?? m[2]) : null; };
+// Chrome's version, read once per phase (0.12.0, twenty-second round): a run's preflight, and the check after
+// its session, each read it with one PowerShell call (chromeExeVersions: the dedicated Chrome's process and its
+// executable's file version together) and every check of that phase reuses that one reading. Outside a phase
+// (a probe step, confirm-profile) each read is its own. The Last Version file, the fallback, is named in the
+// run log (chrome_version_fallback) whenever a run's phase uses it.
+export interface ChromeRead { version: string; source: ChromeVersionSource }
+let chromePhase: { key: string; read: ChromeRead | null } | null = null;
+let chromePhaseOn = 0;
+export function inChromePhase<T>(fn: () => T): T {
+  if (chromePhaseOn === 0) chromePhase = null;
+  chromePhaseOn++;
+  try { return fn(); } finally { chromePhaseOn--; if (chromePhaseOn === 0) chromePhase = null; }
+}
+export function chromeVersionRead(o: Opts, inst: Install): ChromeRead | null {
+  const key = resolve(inst.profile.user_data_dir);
+  if (chromePhaseOn && chromePhase?.key === key) return chromePhase.read;
+  const read = chromeVersionReadNow(o, inst);
+  if (chromePhaseOn) chromePhase = { key, read };
+  if (chromePhaseOn && read?.source === "last_version_file" && (platform(o) === "win32" || o.exeVersion))
+    try { appendFileSync(P.log(o), `${clock(o).toISOString()} chrome_version_fallback last_version_file ${read.version}: chrome.exe's file version couldn't be read\n`); } catch { /* never stops it */ }
+  return read;
+}
+// The dedicated Chrome's executable versions, in one PowerShell call: each chrome.exe process's id, parent,
+// command line and its executable's file version. null when the call fails.
+export const chromeExeVersions = (): { proc: Proc; version: string }[] | null => {
   try {
-    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "(Get-Item -LiteralPath $env:PCW_EXE).VersionInfo.FileVersion"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 20_000, windowsHide: true, env: { ...process.env, PCW_EXE: exe } });
-    return out.trim() || null;
+    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { $v = ''; try { $v = (Get-Item -LiteralPath $_.ExecutablePath).VersionInfo.FileVersion } catch { }; \"$($_.ProcessId)|$($_.ParentProcessId)|$v|$($_.CommandLine)\" }"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
+    return out.split(/\r?\n/).map((l) => /^\s*(\d+)\|(\d+)\|([^|]*)\|(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
+      .map((m) => ({ proc: { pid: Number(m[1]), ppid: Number(m[2]), created: null, cmd: m[4].trim() }, version: m[3].trim() }));
   } catch { return null; }
 };
-export const exeOf = (cmd: string): string | null => { const m = /^\s*(?:"([^"]+)"|(\S+))/.exec(cmd); return m ? (m[1] ?? m[2]) : null; };
-export function chromeVersionRead(o: Opts, inst: Install): { version: string; source: ChromeVersionSource } | null {
+function chromeVersionReadNow(o: Opts, inst: Install): ChromeRead | null {
   const OK = /^\d+(\.\d+){1,3}$/;
-  if (platform(o) === "win32" || o.exeVersion) {
+  if (o.exeVersion) {
+    // A test's stand-in: the process list and one version read of the dedicated Chrome's executable.
     const ps = (o.procs ?? (() => listProcs(platform(o))))() ?? [];
     const exe = exeOf(ps.find((p) => isDedicated(p, inst))?.cmd ?? "");
-    const v = exe ? (o.exeVersion ?? exeFileVersion)(exe)?.trim() ?? null : null;
+    const v = exe ? o.exeVersion(exe)?.trim() ?? null : null;
+    if (v && OK.test(v)) return { version: v, source: "chrome_exe" };
+  } else if (platform(o) === "win32") {
+    const v = (chromeExeVersions() ?? []).find((x) => isDedicated(x.proc, inst))?.version ?? null;
     if (v && OK.test(v)) return { version: v, source: "chrome_exe" };
   }
   let v = "";
   try { v = readFileSync(join(inst.profile.user_data_dir, "Last Version"), "utf8").trim(); } catch { v = ""; }
   return OK.test(v) ? { version: v, source: "last_version_file" } : null;
 }
-// The version hold (version-hold.json): an update pending or more than one version folder seen at a
-// run's preflight holds every run (its code) until a new probe has been confirmed (the confirmation
-// file differs from the one the hold saw: confirm-profile writes it only after a fresh probe), so an
-// auto-update always needs a new probe, even once Chrome has settled on one folder again. While the
-// installed versions differ from the confirmation's, probe_stale says so instead (it needs the same).
-export interface VersionHold { at: string; code: "update_pending" | "extension_versions_ambiguous"; folders: string[]; confirmed: string | null }
-const confirmedSha = (o: Opts): string | null => { try { return createHash("sha256").update(readFileSync(P.confirmed(o))).digest("hex"); } catch { return null; } };
-export function readVersionHold(o: Opts): VersionHold | null {
-  const x = readJson(P.versionHold(o)) as any;
-  return x && typeof x.at === "string" && (x.code === "update_pending" || x.code === "extension_versions_ambiguous")
-    ? { at: x.at, code: x.code, folders: Array.isArray(x.folders) ? x.folders.filter((f: unknown) => typeof f === "string").slice(0, 10) : [], confirmed: typeof x.confirmed === "string" ? x.confirmed : null } : null;
+// The version hold (version-hold.json, 0.12.0, twenty-first and twenty-second rounds): an update pending or
+// more than one version folder seen at a run's preflight, or after its session, holds every run (its code)
+// until a new probe has been confirmed. The hold records when it was made and the versions it saw (the
+// extension's loaded version, Chrome's and where that was read from). It clears only for a confirmation whose
+// probe ran after the hold was made (its probed_at, the probe evidence's own time) and whose probed versions
+// are the ones loaded now: never on a mere change of the confirmation file's bytes. So an auto-update always
+// needs a new probe, even once Chrome has settled on one folder again. While the installed versions differ
+// from the confirmation's, probe_stale says so instead (it needs the same). The hold is written whole: a
+// temporary file, flushed, then renamed into place. A write that fails refuses this run and every later one
+// (version_hold_unwritable) until it succeeds: the hold it couldn't write is kept beside it
+// (version-hold.pending, and in this process) and written again first at each preflight.
+export type HoldCode = "update_pending" | "extension_versions_ambiguous";
+export interface HoldSeen { extension_version: string | null; chrome_version: string | null; chrome_version_source: ChromeVersionSource | null }
+export interface VersionHold { at: string; code: HoldCode; folders: string[]; seen: HoldSeen }
+const holdCode = (x: unknown): x is HoldCode => x === "update_pending" || x === "extension_versions_ambiguous";
+function parseHold(x: any): VersionHold | null {
+  if (!x || typeof x.at !== "string" || !Number.isFinite(Date.parse(x.at)) || !holdCode(x.code)) return null;
+  const s = x.seen && typeof x.seen === "object" ? x.seen : {};
+  const str = (v: unknown) => typeof v === "string" ? v : null;
+  return { at: x.at, code: x.code, folders: Array.isArray(x.folders) ? x.folders.filter((f: unknown) => typeof f === "string").slice(0, 10) : [],
+    seen: { extension_version: str(s.extension_version), chrome_version: str(s.chrome_version),
+      chrome_version_source: s.chrome_version_source === "chrome_exe" || s.chrome_version_source === "last_version_file" ? s.chrome_version_source : null } };
 }
-export function versionHold(o: Opts, inst: Install, now: Date): VersionHold["code"] | null {
+export function readVersionHold(o: Opts): VersionHold | null { return parseHold(readJson(P.versionHold(o))); }
+const holdPendingFile = (o: Opts) => `${P.versionHold(o)}.pending`;
+const holdsUnwritten = new Map<string, VersionHold>();     // this process's holds it couldn't write, by path
+// Written whole: a temporary file, flushed to disk, then renamed into place. false when any step fails.
+export function writeVersionHold(o: Opts, h: VersionHold): boolean {
+  const f = P.versionHold(o), tmp = `${f}.tmp`;
+  try {
+    const fd = openSync(tmp, "w");
+    try { writeSync(fd, JSON.stringify(h) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmp, f);
+    return true;
+  } catch { try { rmSync(tmp, { force: true }); } catch { /* left */ } return false; }
+}
+function unwrittenHold(o: Opts): VersionHold | null {
+  return holdsUnwritten.get(P.versionHold(o)) ?? parseHold(readJson(holdPendingFile(o)));
+}
+export function versionHold(o: Opts, inst: Install, now: Date): HoldCode | "version_hold_unwritable" | null {
   const folders = extensionFolders(inst);
-  const code = updatePending(inst) ? "update_pending" : folders.length > 1 ? "extension_versions_ambiguous" : null;
-  if (code) {
-    const had = readVersionHold(o);
-    if (!had || had.code !== code) try { writeFileSync(P.versionHold(o), JSON.stringify({ at: now.toISOString(), code, folders, confirmed: had?.confirmed ?? confirmedSha(o) }) + "\n"); } catch { /* the refusal stands */ }
-    return code;
+  const code: HoldCode | null = updatePending(inst) ? "update_pending" : folders.length > 1 ? "extension_versions_ambiguous" : null;
+  let had = readVersionHold(o);
+  const owed = unwrittenHold(o);
+  // A hold to write: a new condition (none kept, or another code), or one an earlier write couldn't keep.
+  const want: VersionHold | null = code && (!had || had.code !== code)
+    ? { at: now.toISOString(), code, folders, seen: { extension_version: activeExtensionVersion(inst), chrome_version: chromeVersionRead(o, inst)?.version ?? null,
+      chrome_version_source: chromeVersionRead(o, inst)?.source ?? null } }
+    : !had && owed ? owed : null;
+  if (want) {
+    if (!writeVersionHold(o, want)) {
+      holdsUnwritten.set(P.versionHold(o), want);
+      try { writeFileSync(holdPendingFile(o), JSON.stringify(want) + "\n"); } catch { /* this process still holds it */ }
+      try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_unwritable ${want.code}\n`); } catch { /* never stops it */ }
+      return "version_hold_unwritable";
+    }
+    had = want;
   }
-  const had = readVersionHold(o);
+  if (had && owed) { holdsUnwritten.delete(P.versionHold(o)); rmSync(holdPendingFile(o), { force: true }); }
+  if (code) return code;
   if (!had) return null;
-  const sha = confirmedSha(o);
-  if (sha !== null && sha !== had.confirmed) { rmSync(P.versionHold(o), { force: true }); return null; }
+  // Cleared only by a confirmation of a probe run after the hold, of the versions loaded now.
+  const c = readConfirmed(o), fp = fingerprint(o, inst);
+  const probed = c?.probed_at ? Date.parse(c.probed_at) : NaN;
+  if (c && fp && Number.isFinite(probed) && probed > Date.parse(had.at) && c.fingerprint.extension_id === fp.extension_id
+    && c.fingerprint.extension_version === fp.extension_version && c.fingerprint.chrome_version === fp.chrome_version) {
+    rmSync(P.versionHold(o), { force: true });
+    return null;
+  }
   if (versionMismatch(o, inst)) return null;           // probe_stale refuses next, naming what changed
   return had.code;
 }
+export const VERSION_HOLD_UNWRITABLE_HINT = "the worker couldn't write its version hold (version-hold.json in the worker folder): no run starts until it can. Free disk space, or check that the worker folder can be written, then run again; the hold is then kept and asks for a new probe";
 export const VERSION_HOLD_HINT = "Claude in Chrome's version in the Cain jobs profile can't be bound to the probe (an update waiting, or more than one version folder): an auto-update needs a new probe. Restart the Cain jobs Chrome, then run the probe again and confirm-profile";
 
 // The claude executable's SHA-256, read in pieces (it is large), or null when it can't be read.
@@ -824,12 +902,14 @@ export function fingerprint(o: Opts, inst: Install): Fingerprint | null {
   if (name !== p.profile_name) return null;
   const extension_version = activeExtensionVersion(inst);
   if (!extension_version) return null;
-  const chrome_version = chromeVersionRead(o, inst)?.version ?? "";
+  const chrome = chromeVersionRead(o, inst);
+  const chrome_version = chrome?.version ?? "";
   const chrome_major = /^\d+(\.\d+){1,3}$/.test(chrome_version) ? parseInt(chrome_version.split(".")[0], 10) || 0 : 0;
   if (!chrome_major) return null;
   const cli_version = (o.cliVersion ?? (() => cliVersion(inst)))();
   if (!cli_version) return null;
-  return { user_data_dir: resolve(p.user_data_dir), profile_name: name, extension_id: p.extension_id, chrome_major, chrome_version, extension_version, cli_version };
+  return { user_data_dir: resolve(p.user_data_dir), profile_name: name, extension_id: p.extension_id, chrome_major, chrome_version, extension_version, cli_version,
+    chrome_version_source: chrome!.source };
 }
 // The versions a probe ran against and a confirmation holds (0.12.0, twentieth round): the extension's
 // id and version and Chrome's version, as they are in the fingerprint, named on their own in the probe's
@@ -847,9 +927,14 @@ export function versionMismatch(o: Opts, inst: Install): string | null {
   if (c.fingerprint.extension_id !== fp.extension_id) said.push(`the extension's id is ${fp.extension_id}, the probe saw ${c.fingerprint.extension_id}`);
   if (c.fingerprint.extension_version !== fp.extension_version) said.push(`Claude in Chrome is ${fp.extension_version} as the profile's preferences load it, the probe saw ${c.fingerprint.extension_version}`);
   if (c.fingerprint.chrome_version !== fp.chrome_version)
-    said.push(`Chrome is ${fp.chrome_version}${chromeVersionRead(o, inst)?.source === "last_version_file" ? " (from the Last Version file, the fallback: chrome.exe's file version couldn't be read)" : ""}, the probe saw ${c.fingerprint.chrome_version}`);
+    said.push(`Chrome is ${fp.chrome_version}${fp.chrome_version_source === "last_version_file" ? " (from the Last Version file, the fallback: chrome.exe's file version couldn't be read)" : ""}, the probe saw ${c.fingerprint.chrome_version}${sourceNote(c.fingerprint, fp)}`);
   return said.length ? `version_mismatch: ${said.join("; ")}: an auto-update needs a new probe: run the probe again, then confirm-profile` : null;
 }
+// Chrome's version read from another source than the probe's (twenty-second round): said in the detail, so
+// a format difference between chrome.exe's file version and the Last Version file is named, not hidden.
+export const sourceNote = (was: Fingerprint, now: Fingerprint): string =>
+  was.chrome_version_source && now.chrome_version_source && was.chrome_version_source !== now.chrome_version_source
+    ? ` (read from ${now.chrome_version_source === "chrome_exe" ? "chrome.exe's file version" : "the Last Version file"} now, the probe read it from ${was.chrome_version_source === "chrome_exe" ? "chrome.exe's file version" : "the Last Version file"}: a source difference, which may be only a format difference)` : "";
 const sameParts = (a: Fingerprint, b: Fingerprint, keys: readonly string[]) => keys.every((k) => (a as any)[k] === (b as any)[k]);
 // Which version stopped runs (probe_stale): the extension's, Chrome's, or the CLI's.
 export function staleReason(o: Opts, inst: Install): Reason {
@@ -1134,9 +1219,10 @@ export interface Confirmed {
   v: 1; at: string; fingerprint: Fingerprint; settings_sha256: string; prompt_sha256: string; config_sha256: string; deny_check: boolean;
   read_context: boolean; live_extension_version: boolean; deny_cli_version: string; cli_sha256: string; boundary_version: string | null;
   worker_sha256: string | null; cain_version: string | null; policy_version: string | null; fragment_strip: boolean; guard_sha256: string | null;
+  probed_at: string | null;          // the probe's own time (its evidence's at), 0.12.0 twenty-second round: what clears a version hold
 }
 const CONFIRMED_KEYS = ["v", "at", "fingerprint", "settings_sha256", "prompt_sha256", "config_sha256", "deny_check", "read_context", "live_extension_version",
-  "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version", "fragment_strip", "guard_sha256"];
+  "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version", "fragment_strip", "guard_sha256", "probed_at"];
 const HEX64 = /^[0-9a-f]{64}$/;
 // The hook's policy version: raised whenever what nav-guard or read-guard allows or refuses changes,
 // or the pinned settings do (18: read-guard's strict parser refuses a byte order mark, lone
@@ -1173,11 +1259,13 @@ export function readConfirmed(o: Opts): Confirmed | null {
   if (c && typeof c === "object" && !Array.isArray(c)) for (const k of ["worker_sha256", "cain_version", "policy_version", "guard_sha256"]) if (!Object.hasOwn(c, k)) c = { ...c, [k]: null };
   if (c && !(c.guard_sha256 === null || (typeof c.guard_sha256 === "string" && HEX64.test(c.guard_sha256)))) return null;
   if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "fragment_strip")) c = { ...c, fragment_strip: false };
+  if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "probed_at")) c = { ...c, probed_at: null };
+  if (c && !(c.probed_at === null || (typeof c.probed_at === "string" && Number.isFinite(Date.parse(c.probed_at))))) return null;
   if (c && typeof c.fragment_strip !== "boolean") return null;
   if (c && !(c.worker_sha256 === null || (typeof c.worker_sha256 === "string" && HEX64.test(c.worker_sha256)))) return null;
   if (c && !(c.cain_version === null || (typeof c.cain_version === "string" && /^\d+\.\d+\.\d+$/.test(c.cain_version)))) return null;
   if (c && !(c.policy_version === null || (typeof c.policy_version === "string" && /^\d{1,3}$/.test(c.policy_version)))) return null;
-  if (!same(c, CONFIRMED_KEYS) || !(c.boundary_version === null || (typeof c.boundary_version === "string" && /^\d{1,3}$/.test(c.boundary_version))) || c.v !== 1 || !same(c.fingerprint, FP_KEYS)
+  if (!same(c, CONFIRMED_KEYS) || !(c.boundary_version === null || (typeof c.boundary_version === "string" && /^\d{1,3}$/.test(c.boundary_version))) || c.v !== 1 || !fpShape(c.fingerprint)
     || ![c.settings_sha256, c.prompt_sha256, c.config_sha256, c.cli_sha256].every((x) => typeof x === "string" && HEX64.test(x)) || typeof c.deny_check !== "boolean"
     || typeof c.deny_cli_version !== "string" || c.deny_cli_version !== c.fingerprint.cli_version
     || typeof c.read_context !== "boolean" || typeof c.live_extension_version !== "boolean") return null;
@@ -1187,7 +1275,11 @@ export function readConfirmed(o: Opts): Confirmed | null {
 // The browser preflight. bypassConfirm is the supervised probe's: everything but the
 // missing confirmation (and the pinned hashes it would hold) is checked. The worker
 // never starts Chrome: the dedicated one must already be open on its profile.
+// Chrome's version is read once for the whole preflight (inChromePhase, twenty-second round).
 export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false): Code | null {
+  return inChromePhase(() => preflightChecks(o, inst, bypassConfirm));
+}
+function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code | null {
   if (inst.unattended) return "unattended_unsupported";
   // The worker's own Claude Code sign-in, made once at setup.
   if (!signedIn(o)) return "worker_signin_missing";
@@ -1497,8 +1589,8 @@ export async function next(o: Opts): Promise<NextOut> {
   if (!o.attended) return { claim: null, closed: [], code: "attended_only" };
   if (existsSync(P.stop(o))) return quit("stopped");
   const l = lock(o, now, "run");
-  st.stale = l.stale || staleSeen.has(o);
-  staleSeen.delete(o);
+  st.stale = l.stale || staleSeen.has(resolve(P.lock(o)));
+  staleSeen.delete(resolve(P.lock(o)));
   if (!l.got) return quit("busy");
   let keep = false;
   try {
@@ -2108,7 +2200,7 @@ export function markerSession(dir: string, token: string): string | null {
 // confirmation. The probe's kill_latency step measures that escalation on this PC.
 // hook_margin_low (0.12.0, twentieth round): the worker's own abort, never a hook's, for a real run whose
 // hook started so late that under HOOK_GAP_MARGIN_MS of the timeout was left past the budget (lateHook).
-export const ABORT_CODES = ["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low"] as const;
+export const ABORT_CODES = ["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low", "nav_log_unset"] as const;
 export type AbortCode = typeof ABORT_CODES[number];
 export const ABORT_POLL_MS = 100;
 // read-guard's hold: with its input deadline (HOOK_MS), below the settings' hook timeout
@@ -3364,20 +3456,37 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   // Every session notes when each tool call was printed (0.12.0, nineteenth round: runs record their hooks' gaps).
   const timing = true;
   const useAt: Record<string, number> = {}, useCliAt: Record<string, number> = {};
-  // Each call's start on the worker's monotonic clock (callStart), for its hook-start deadline (marginAbort).
-  const callMono: Record<string, number> = {};
+  // Each hooked call's start on the worker's monotonic clock (callStart), for its hook-start deadline
+  // (watchCalls, 0.12.0, twenty-second round): a table of its own, an entry evicted once its call's finished
+  // line is seen, and a call it can't take (CALL_TABLE_CAP unfinished calls already) ends the session. useAt
+  // stays the session's timing record (its first 200 calls), never the deadline's table.
+  const calls = newCallTable();
+  const hooked = env.PCW_SESSION_KIND === "run" ? pinnedHooked(argv.includes("--settings") ? argv[argv.indexOf("--settings") + 1] : undefined) : () => true;
+  // A table found full is checked and its finished calls evicted at once, then the call tried again; still
+  // full (or the check failed), it stays marked full and the next check ends the session.
+  const track = (id: string, start: number, wall: number) => {
+    if (trackCall(calls, id, start, wall) || !env.PCW_NAV_LOG) return;
+    calls.full = false;
+    const lg = readHookLog(env.PCW_NAV_LOG);
+    if (watchCalls(calls, lg.starts, lg.finished, performance.now()) || !trackCall(calls, id, start, wall)) calls.full = true;
+  };
   const noteUses = (line: string, t: number, mono: number) => {
     try {
       const ev = JSON.parse(line);
       const cliAt = typeof ev?.timestamp === "string" ? Date.parse(ev.timestamp) : typeof ev?.timestamp === "number" ? ev.timestamp : NaN;
       for (const c of ev?.message?.content ?? [])
-        if (c?.type === "tool_use" && typeof c.id === "string" && useAt[c.id] === undefined && Object.keys(useAt).length < 200) {
-          useAt[c.id] = t;
-          callMono[c.id] = callStart(mono, t, Number.isFinite(cliAt) ? cliAt : null);
-          if (Number.isFinite(cliAt)) useCliAt[c.id] = cliAt;
+        if (c?.type === "tool_use" && typeof c.id === "string") {
+          if (useAt[c.id] === undefined && Object.keys(useAt).length < 200) {
+            useAt[c.id] = t;
+            if (Number.isFinite(cliAt)) useCliAt[c.id] = cliAt;
+          }
+          if (hooked(typeof c.name === "string" ? c.name : "")) track(c.id, callStart(mono, t, Number.isFinite(cliAt) ? cliAt : null), t);
         }
     } catch { /* not one event */ }
   };
+  // A run session with no navigation log to read can't see a hook start: refused before anything starts,
+  // by its own name (nav_log_unset), never left to die at the hook-start deadline.
+  if (env.PCW_SESSION_KIND === "run" && !env.PCW_NAV_LOG) { done({ code: null, out: "", timedOut: false, stopped: false, aborted: "nav_log_unset", useAt }); return; }
   const started = Date.now();
   // Straight from the argument list: never a shell, so nothing in it is ever parsed as a command.
   const full = wrap?.length ? [...wrap, ...argv] : argv;
@@ -3391,16 +3500,16 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
     const why = readAbort(env.PCW_ABORT_FILE);
     if (why) { aborted = why; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
   }, ABORT_POLL_MS) : undefined;
-  // A run's hook that started too late, or never (0.12.0, twentieth and twenty-first rounds): in a run session
+  // A run's hook that started too late, or never (0.12.0, twentieth to twenty-second rounds): in a run session
   // (PCW_SESSION_KIND run, so never in a session the probe bound to a timing step), every MARGIN_POLL_MS
-  // each call is checked against its hook's start line (marginAbort): a start gap that leaves under
-  // HOOK_GAP_MARGIN_MS of the timeout past the budget, or no start line by HOOK_START_DEADLINE_MS on the
-  // worker's own monotonic clock from the call's event, ends this session at once (hook_margin_low).
-  // With no log file to read, every call counts as never started.
+  // each tracked call is checked against its hook's start line (watchCalls): a start gap that leaves under
+  // HOOK_GAP_MARGIN_MS of the timeout past the budget, no start line by HOOK_START_DEADLINE_MS on the
+  // worker's own monotonic clock from the call's event, or a call the table couldn't take, ends this
+  // session at once (hook_margin_low). Finished calls leave the table after the check.
   const marginWatch = env.PCW_SESSION_KIND === "run" ? setInterval(() => {
     if (aborted) return;
-    const starts = env.PCW_NAV_LOG ? readHookStarts(env.PCW_NAV_LOG) : [];
-    if (marginAbort(callMono, useAt, starts, performance.now())) { aborted = "hook_margin_low"; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
+    const log = readHookLog(env.PCW_NAV_LOG!);
+    if (watchCalls(calls, log.starts, log.finished, performance.now())) { aborted = "hook_margin_low"; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
   }, MARGIN_POLL_MS) : undefined;
   const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); if (abortWatch) clearInterval(abortWatch); if (marginWatch) clearInterval(marginWatch); if (liveChild === child.pid) setLiveChild(null); };
   child.stdout?.on("data", (d) => {
@@ -4077,17 +4186,23 @@ export function noteHookStart(file: string | undefined, id: string | null, t0: n
   if (!file || !id) return;
   try { appendFileSync(file, JSON.stringify({ start: "nav-guard", id, t0 }) + "\n"); } catch { /* the worker's deadline decides */ }
 }
-export function readHookStarts(file: string): { id: string; t0: number }[] {
+export function readHookStarts(file: string): { id: string; t0: number }[] { return readHookLog(file).starts; }
+// The log as the deadline reads it: every start (the start line or the finished line of a PreToolUse
+// hook), and the ids whose PreToolUse hook has finished (its decision line, done_at): those calls leave
+// the deadline's table once checked (twenty-second round).
+export function readHookLog(file: string): { starts: { id: string; t0: number }[]; finished: string[] } {
   let text = "";
-  try { text = readFileSync(file, "utf8"); } catch { return []; }
-  const out: { id: string; t0: number }[] = [];
+  try { text = readFileSync(file, "utf8"); } catch { return { starts: [], finished: [] }; }
+  const starts: { id: string; t0: number }[] = [], finished: string[] = [];
   for (const l of text.split(/\r?\n/)) {
     try {
       const d = JSON.parse(l);
-      if (d && typeof d.id === "string" && typeof d.t0 === "number" && d.phase !== "post" && (d.start === "nav-guard" || typeof d.done_at === "number")) out.push({ id: d.id, t0: d.t0 });
+      if (!d || typeof d.id !== "string" || typeof d.t0 !== "number" || d.phase === "post") continue;
+      if (d.start === "nav-guard" || typeof d.done_at === "number") starts.push({ id: d.id, t0: d.t0 });
+      if (d.start === undefined && typeof d.done_at === "number") finished.push(d.id);
     } catch { /* a torn line */ }
   }
-  return out;
+  return { starts, finished };
 }
 // The worker's own deadline for each tool call of a run (0.12.0, twenty-first round). The twentieth round's
 // abort fired only on a gap it could see in the hook log, so a hook that never started, or started after
@@ -4098,7 +4213,8 @@ export function readHookStarts(file: string): { id: string; t0: number }[] {
 // finished line) by the timeout less the margin (36 seconds), the session ends (hook_margin_low). A hook
 // whose start line shows a gap that leaves under the margin past the budget ends it too (the twentieth
 // round's rule, now on the start line, not only the finished one). Never skipped in a run session.
-export const HOOK_START_DEADLINE_MS = HOOK_TIMEOUT_S * 1000 - HOOK_GAP_MARGIN_MS;
+// The deadline, in one place (twenty-second round): the hooks' timeout less the margin (36 seconds).
+export const startDeadlineMs = (lim: Pick<TimingLimits, "timeout" | "margin">) => lim.timeout - lim.margin;
 export function marginAbort(calls: Record<string, number>, useAt: Record<string, number>, starts: { id: string; t0: number }[], nowMono: number,
   lim: TimingLimits = HOOK_LIMITS): "never_started" | "late_start" | null {
   const began = new Map<string, number>();
@@ -4110,9 +4226,53 @@ export function marginAbort(calls: Record<string, number>, useAt: Record<string,
     if (lim.timeout - gap - lim.budget < lim.margin) return "late_start";
   }
   for (const [id, start] of Object.entries(calls))
-    if (!began.has(id) && nowMono - start >= lim.timeout - lim.margin) return "never_started";
+    if (!began.has(id) && nowMono - start >= startDeadlineMs(lim)) return "never_started";
   return null;
 }
+// The deadline's table of a run's hooked calls (0.12.0, twenty-second round): each call's start on the
+// monotonic clock (mono) and its printing on the wall clock (wall, for the start gap), kept until its
+// PreToolUse hook's finished line is seen. Every hooked call has its own deadline: a call the table can't
+// take (CALL_TABLE_CAP unfinished calls already in it) marks it full, and a full table ends the session
+// (hook_margin_low, table_full), never an untimed call.
+export const CALL_TABLE_CAP = 200;
+export interface CallTable { mono: Record<string, number>; wall: Record<string, number>; full: boolean }
+export const newCallTable = (): CallTable => ({ mono: {}, wall: {}, full: false });
+export function trackCall(t: CallTable, id: string, mono: number, wall: number, cap = CALL_TABLE_CAP): boolean {
+  if (Object.hasOwn(t.mono, id)) return true;
+  if (Object.keys(t.mono).length >= cap) { t.full = true; return false; }
+  t.mono[id] = mono; t.wall[id] = wall;
+  return true;
+}
+// One check of the table: a full table, then each call's start (marginAbort); only then the finished
+// calls leave it, so a hook that started late and finished between two checks is still caught.
+export function watchCalls(t: CallTable, starts: { id: string; t0: number }[], finished: string[], nowMono: number,
+  lim: TimingLimits = HOOK_LIMITS): "never_started" | "late_start" | "table_full" | null {
+  if (t.full) return "table_full";
+  const why = marginAbort(t.mono, t.wall, starts, nowMono, lim);
+  if (why) return why;
+  for (const id of finished) if (Object.hasOwn(t.mono, id)) { delete t.mono[id]; delete t.wall[id]; }
+  return null;
+}
+// Which tool names the pinned PreToolUse guard (nav-guard) runs for (twenty-second round): the deadline
+// times only those, so an unhooked call never ends a run. Claude Code's matcher rule: a plain name list
+// ("A|B") matches exactly, anything else as a regular expression; "" and "*" match every tool. The pinned
+// matcher is GUARD_MATCHER (".*"), a catch-all, which checkSettings requires and a test asserts. Settings
+// that can't be read time every call (fail closed).
+export function guardMatchers(settings: any): string[] | null {
+  const pre = settings?.hooks?.PreToolUse;
+  if (!Array.isArray(pre)) return null;
+  const out = pre.filter((h: any) => typeof h?.matcher === "string" && Array.isArray(h.hooks) && h.hooks.some((x: any) => x?.command === HOOK_COMMAND)).map((h: any) => h.matcher as string);
+  return out.length ? out : null;
+}
+export function hookedBy(matchers: string[] | null): (name: string) => boolean {
+  if (matchers === null) return () => true;
+  const tests = matchers.map((m) => m === "" || m === "*" ? () => true
+    : /^[A-Za-z0-9_|]+$/.test(m) ? ((names: string[]) => (n: string) => names.includes(n))(m.split("|"))
+    : (() => { try { const r = new RegExp(m); return (n: string) => r.test(n); } catch { return () => true; } })());
+  return (name) => tests.some((t) => t(name));
+}
+// The session's own settings file (its --settings argument), else the pinned one.
+export const pinnedHooked = (file: string = SESSION_FILES.settings): ((name: string) => boolean) => hookedBy(guardMatchers(readJson(file)));
 // A call's start on the monotonic clock: its arrival, moved back by how far the event's own timestamp
 // (cliAt, wall clock) lies before the arrival's wall time, at most the timeout; no usable timestamp, the arrival.
 export function callStart(arrivalMono: number, arrivalWall: number, cliAt: number | null, lim: TimingLimits = HOOK_LIMITS): number {
@@ -4175,7 +4335,7 @@ async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof 
   const expected = expectedOf(canary, inst.profile.extension_id, job.attempt!);
   return { s, stream, expected, log: readNavLog(P.navLog(o)), canaryUrl: canary.url,
     checks: { cliChanged: !before || before !== after, diskExtension: activeExtensionVersion(inst), workerPaths: wallOf(o).paths, wallTokens: wallOf(o).tokens,
-      versionsChanged: versionsAfter(o, inst) } };
+      ...((v) => ({ versionsChanged: v.changed, versionsNote: v.note }))(versionsAfter(o, inst)) } };
 }
 
 // The extension's version as the session saw it (its init data), against the one on disk:
@@ -4222,17 +4382,33 @@ export interface Verdict { bad: Code | null; given: unknown; guard: GuardCheck; 
 // tab's address, so each read needs a tab context after it. needLive: an unattended run.
 // workerPaths: the worker folder and its config folder, for the second wall (guardCheck).
 export interface SessionChecks { cliChanged: boolean; diskExtension: string | null; contextAfterRead?: boolean; needLive?: boolean; confirmedExtension?: string | null;
-  workerPaths?: string[]; wallTokens?: string[]; versionsChanged?: string | null }
-// Both versions rechecked once the session has ended (0.12.0, twenty-first round): the loaded extension
-// version and Chrome's, against the confirmation (versionMismatch), and the extension's version folders
-// (more than one, or an update unpacked meanwhile). Any: the run fails versions_changed, its report
-// discarded, naming what changed; the next run's preflight then holds until a new probe.
-export function versionsAfter(o: Opts, inst: Install): string | null {
-  const mm = versionMismatch(o, inst);
-  if (mm) return mm;
-  const folders = extensionFolders(inst);
-  if (updatePending(inst) || folders.length > 1) return `extension_versions_ambiguous: version folders ${folders.join(", ")}: an auto-update needs a new probe`;
-  return null;
+  workerPaths?: string[]; wallTokens?: string[]; versionsChanged?: string | null; versionsNote?: string | null }
+// Both versions rechecked once the session has ended (0.12.0, twenty-first and twenty-second rounds), with
+// Chrome's version read once for the check (inChromePhase). First the hold step (versionHold), which writes the
+// hold whenever an update is pending or a second version folder shows, whatever else is wrong: update_pending
+// and extension_versions_ambiguous by their own codes. Then the loaded extension's id and version and Chrome's
+// version against the confirmation, like with like: Chrome's read from another source than the probe's is a
+// note (versionsNote, in the run log and the run's detail), never versions_changed on a format difference.
+// Any change: the run fails versions_changed, its report discarded, naming what changed.
+export function versionsAfter(o: Opts, inst: Install): { changed: string | null; note: string | null } {
+  return inChromePhase(() => {
+    const held = versionHold(o, inst, clock(o));
+    if (held === "update_pending") return { changed: "update_pending: a Claude in Chrome update was unpacked during the session: an auto-update needs a new probe", note: null };
+    if (held === "extension_versions_ambiguous") return { changed: `extension_versions_ambiguous: version folders ${extensionFolders(inst).join(", ")}: an auto-update needs a new probe`, note: null };
+    if (held === "version_hold_unwritable") return { changed: "version_hold_unwritable: the version hold couldn't be written: no run until it can be", note: null };
+    const c = readConfirmed(o), fp = fingerprint(o, inst);
+    if (!c || !fp) return { changed: null, note: null };
+    const said: string[] = [];
+    if (c.fingerprint.extension_id !== fp.extension_id) said.push(`the extension's id is ${fp.extension_id}, the probe saw ${c.fingerprint.extension_id}`);
+    if (c.fingerprint.extension_version !== fp.extension_version) said.push(`Claude in Chrome is ${fp.extension_version} as the profile's preferences load it, the probe saw ${c.fingerprint.extension_version}`);
+    const was = c.fingerprint.chrome_version_source, now = fp.chrome_version_source;
+    let note: string | null = null;
+    if (was && now && was !== now) {
+      if (c.fingerprint.chrome_version !== fp.chrome_version) note = `chrome_version_source: Chrome reads ${fp.chrome_version} after the session${sourceNote(c.fingerprint, fp)}; the probe saw ${c.fingerprint.chrome_version}`;
+    } else if (c.fingerprint.chrome_version !== fp.chrome_version) said.push(`Chrome is ${fp.chrome_version}, the probe saw ${c.fingerprint.chrome_version}`);
+    if (note) try { appendFileSync(P.log(o), `${clock(o).toISOString()} ${note}\n`); } catch { /* never stops it */ }
+    return { changed: said.length ? `version_mismatch: ${said.join("; ")}: an auto-update needs a new probe: run the probe again, then confirm-profile` : null, note };
+  });
 }
 export function verdict(s: Session, st: Stream, log: Decision[], tools: string[], denied: string[], canaryUrl: string,
   pin: Allow | null, leftovers: number[], checks: SessionChecks = { cliChanged: false, diskExtension: null }): Verdict {
@@ -4291,6 +4467,7 @@ export async function run(o: Opts): Promise<RunOut> {
     let detail: string | null = null;
     if (n.code === "probe_stale") try { detail = versionMismatch(o, mustInstall(o)); } catch { detail = null; }
     if (n.code === "update_pending" || n.code === "extension_versions_ambiguous") detail = VERSION_HOLD_HINT;
+    if (n.code === "version_hold_unwritable") detail = VERSION_HOLD_UNWRITABLE_HINT;
     return { code: n.code, job: null, closed: n.closed, ...(detail ? { detail } : {}) };
   }
   const c = n.claim;
@@ -4338,7 +4515,7 @@ export async function run(o: Opts): Promise<RunOut> {
     v.given = stripCanary(v.given);
     beat(o, final.code, mine.id, now, c.st, warnings);
     return { code: final.code, job: mine.id, closed: n.closed, state: stateAfter(mine, final), ...(warnings.length ? { warnings } : {}), ...(drift && drift !== "read_drift" ? { drift } : {}),
-      ...(unplaced.length ? { unplaced } : {}), ...(hook_denied.length ? { hook_denied } : {}), ...(final.code === "versions_changed" && checks.versionsChanged ? { detail: checks.versionsChanged } : {}) };
+      ...(unplaced.length ? { unplaced } : {}), ...(hook_denied.length ? { hook_denied } : {}), ...(final.code === "versions_changed" && checks.versionsChanged ? { detail: checks.versionsChanged } : checks.versionsNote ? { detail: checks.versionsNote } : {}) };
   } catch (e) {
     // The session's own folders failed it (its transcripts couldn't be deleted, or the
     // worker's sign-in went missing): the job fails with that code, loudly, and the
@@ -4730,11 +4907,27 @@ export const extraAddressPaths = (p: AddressPathsLine | undefined | null): strin
   p && typeof p === "object" ? [...new Set(Object.entries(p).flatMap(([tool, paths]) => (Array.isArray(paths) ? paths : []).filter((x) => x !== STRUCTURED_PATH).map((x) => `${tool}: ${x}`)))].sort() : [];
 // The refusal's words for a gate, with what the evidence names: the cold sample's uptime, and the extra
 // address-named key paths when structured_address failed on them (a schema mismatch, not a forged answer).
+// The address paths the probe recorded, grouped by tool (twenty-second round): each tool once, its paths
+// listed, and a tool with a path beyond the structured one marked "fails".
+export function addressListing(p: AddressPathsLine | undefined | null): string {
+  if (!p || typeof p !== "object") return "";
+  return Object.keys(p).sort().map((tool) => {
+    const paths = [...new Set((Array.isArray((p as any)[tool]) ? (p as any)[tool] : []).filter((x: unknown) => typeof x === "string"))].sort() as string[];
+    const fails = paths.some((x) => x !== STRUCTURED_PATH);
+    return `${tool}${fails ? " (fails)" : ""}: ${paths.join(", ") || "none"}`;
+  }).join("; ");
+}
+// What the probe prints after its evidence (twenty-second round): the refusal confirm-profile would give for
+// the first step that didn't pass, the same hint, so the owner sees it at the end of the probe's own output.
+export function probeTail(ev: Evidence, plat: string): { step: string; hint: string } | null {
+  const gate = probeGate(ev, plat);
+  return gate ? { step: gate, hint: probeGateHint(gate, ev) } : null;
+}
 export function probeGateHint(gate: string, ev: Partial<Evidence>): string {
   if (gate === "hook_timing" && ev.hook_timing?.why === "cold_sample_missing") return coldSampleHint(ev.hook_timing.uptime_s);
   const extra = extraAddressPaths(ev.address_paths);
   if (gate === "structured_address" && extra.length)
-    return `the probe's structured_address step didn't pass: this PC's reading tools answer with address-named keys beyond ${STRUCTURED_PATH} (${extra.join("; ")}). That is a schema mismatch between Claude in Chrome's answers and the read guard's rule, not a forged answer: nothing runs until a policy change (report it with these paths: needs a code change)`;
+    return `the probe's structured_address step didn't pass: this PC's reading tools answer with address-named keys beyond ${STRUCTURED_PATH} (by tool, the failing ones marked: ${addressListing(ev.address_paths)}). That is a schema mismatch between Claude in Chrome's answers and the read guard's rule, not a forged answer: nothing runs until a policy change (report it with these paths: needs a code change)`;
   return PROBE_GATE_HINT[gate];
 }
 export const PROBE_GATE_HINT: Record<string, string> = {
@@ -4998,6 +5191,7 @@ export interface HookTimingLine {
 }
 export interface TimingLimits { budget: number; timeout: number; margin: number; stall: number }
 export const HOOK_LIMITS: TimingLimits = { budget: HOOK_BUDGET_MS, timeout: HOOK_TIMEOUT_S * 1000, margin: HOOK_GAP_MARGIN_MS, stall: HOOK_STALL_MS };
+export const HOOK_START_DEADLINE_MS = startDeadlineMs(HOOK_LIMITS);
 export const CAPTURE_MAX = 50;
 export const WARM_SAMPLES = 3;
 export const HOOK_TIMING_PROMPT = `This is a hook timing check of the PC job worker. Use only Claude in Chrome.
@@ -5705,7 +5899,7 @@ export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}):
     // context after each read, and that is what lets unattended runs on (read_unverified otherwise).
     read_context: ev.structured_address?.passed !== true, live_extension_version: ev.live_extension_version === true,
     deny_cli_version: ev.slow_hook.cli_version, cli_sha256: cli, boundary_version: boundary.version, ...workerNow(),
-    fragment_strip: ev.fragment_strip?.passed === true };
+    fragment_strip: ev.fragment_strip?.passed === true, probed_at: ev.at };
   writeFileSync(P.confirmed(o), JSON.stringify(c, null, 2) + "\n");
   rmSync(P.killFailed(o), { force: true });
   lockDown(o, P.confirmed(o));
@@ -5859,14 +6053,28 @@ export function cleanProbe(o: Opts): { swept: string[]; vars: string[] } {
 // Where a probe variable is set (0.12.0, twenty-first round), so the owner removes it where it lives: the
 // user's or the machine's environment in the registry (Windows: HKCU\Environment and the Session Manager's
 // Environment key), else this process alone (the terminal). Each with the exact command that removes it.
-export interface VarScope { name: string; scope: "process" | "user" | "machine"; remove: string }
+// A registry lookup that failed (reg missing, refused, timed out, or any answer but found or not found):
+// the scope is unknown (twenty-second round), said so, and all three removal commands are printed.
+export interface VarScope { name: string; scope: "process" | "user" | "machine" | "unknown"; remove: string; lookup_failed?: true }
 const USER_ENV_KEY = "HKCU\\Environment";
 const MACHINE_ENV_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
-export const registryEnvScopes = (name: string): ("user" | "machine")[] => {
-  const has = (key: string) => { try { return spawnSync("reg", ["query", key, "/v", name], { stdio: "ignore", timeout: 10_000, windowsHide: true }).status === 0; } catch { return false; } };
-  return [...(has(USER_ENV_KEY) ? ["user" as const] : []), ...(has(MACHINE_ENV_KEY) ? ["machine" as const] : [])];
+// null: a lookup failed. reg answers 0 when the value is there and 1 with "unable to find" when it isn't;
+// anything else (no reg, a refusal, a timeout, another message) is a failed lookup, never "not set".
+export const registryEnvScopes = (name: string): ("user" | "machine")[] | null => {
+  const has = (key: string): boolean | null => {
+    try {
+      const r = spawnSync("reg", ["query", key, "/v", name], { stdio: ["ignore", "ignore", "pipe"], encoding: "utf8", timeout: 10_000, windowsHide: true });
+      if (r.error || r.status === null) return null;
+      if (r.status === 0) return true;
+      return r.status === 1 && /unable to find/i.test(String(r.stderr ?? "")) ? false : null;
+    } catch { return null; }
+  };
+  const u = has(USER_ENV_KEY), m = has(MACHINE_ENV_KEY);
+  if (u === null || m === null) return null;
+  return [...(u ? ["user" as const] : []), ...(m ? ["machine" as const] : [])];
 };
 export function removeCommand(name: string, scope: VarScope["scope"], plat: string): string {
+  if (scope === "unknown") return `the registry lookup failed, so run all three: ${(["process", "user", "machine"] as const).map((x) => `${x}: ${removeCommand(name, x, plat)}`).join("; ")}`;
   if (scope === "user") return `[Environment]::SetEnvironmentVariable('${name}', $null, 'User')`;
   if (scope === "machine") return `[Environment]::SetEnvironmentVariable('${name}', $null, 'Machine') (in an administrator PowerShell)`;
   return plat === "win32" ? `Remove-Item Env:${name}` : `unset ${name}`;
@@ -5877,7 +6085,11 @@ export function probeVarScopes(o: Opts, vars: string[]): VarScope[] {
   const reg = plat === "win32" ? (o.envRegistry ?? registryEnvScopes) : null;
   const out: VarScope[] = [];
   for (const name of PROBE_ENV) {
-    const scopes: VarScope["scope"][] = reg ? reg(name) : [];
+    let got: ("user" | "machine")[] | null = [];
+    if (reg) { try { got = reg(name); } catch { got = null; } }
+    // A failed lookup for a variable this process has: where it is set can't be told, so never a silent process scope.
+    if (got === null) { if (names.has(name)) out.push({ name, scope: "unknown", remove: removeCommand(name, "unknown", plat), lookup_failed: true }); continue; }
+    const scopes: VarScope["scope"][] = [...got];
     if (names.has(name) && !scopes.length) scopes.push("process");
     for (const scope of scopes) out.push({ name, scope, remove: removeCommand(name, scope, plat) });
   }
@@ -5887,7 +6099,9 @@ export function probeVarScopes(o: Opts, vars: string[]): VarScope[] {
 // holding it means a live probe's files and variables: nothing is swept, and the run refuses (busy), naming
 // the holder. With the lock held, leftovers are swept and the run refuses (probe_leftover), naming each
 // variable's scope and the command that removes it there; then the worker is started again (a new terminal).
-const staleSeen = new WeakSet<Opts>();     // a stale lock the preflight cleared, for next()'s heartbeat
+// A stale lock the preflight cleared, for next()'s heartbeat: keyed by the lock's path (twenty-second round),
+// so a copy of the options (the probe's, run's) never loses it.
+const staleSeen = new Set<string>();
 export function runPreflight(o: Opts): void {
   if (!o.attended) return;                 // next() refuses it first, reading nothing
   const now = clock(o);
@@ -5900,7 +6114,7 @@ export function runPreflight(o: Opts): void {
     throw new WorkerError("busy", { holder: "probe", pid: Number.isSafeInteger(h?.pid) ? h.pid : null,
       hint: "a probe holds the worker's lock, so nothing was checked or swept: wait for the probe to end, then run again" });
   }
-  if (l.stale) staleSeen.add(o);
+  if (l.stale) staleSeen.add(resolve(P.lock(o)));
   let left: ProbeLeftovers, swept: string[] = [];
   try {
     left = probeLeftovers(o);
@@ -5911,7 +6125,7 @@ export function runPreflight(o: Opts): void {
   const vars = [...new Set([...left.vars, ...scopes.map((v) => v.name)])].sort();
   try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe_leftover ${JSON.stringify({ vars, scopes: scopes.map((v) => `${v.name}:${v.scope}`), files: left.files.length })}\n`); } catch { /* never stops it */ }
   throw new WorkerError("probe_leftover", { vars, scopes, files: left.files, swept,
-    hint: `the probe's leftovers were found before this run, so it didn't start: ${left.files.length ? `the files were swept (${PROBE_CLEANUP} does the same); ` : ""}${scopes.length ? `remove ${scopes.map((v) => `${v.name} (${v.scope} scope) with: ${v.remove}`).join("; ")}; then close this terminal and start the worker again in a new one; ` : ""}then run again` });
+    hint: `the probe's leftovers were found before this run, so it didn't start: ${left.files.length ? `the files were swept (${PROBE_CLEANUP} does the same); ` : ""}${scopes.length ? `remove ${scopes.map((v) => v.scope === "unknown" ? `${v.name} (scope unknown: ${v.remove})` : `${v.name} (${v.scope} scope) with: ${v.remove}`).join("; ")}; then close this terminal and start the worker again in a new one; ` : ""}then run again` });
 }
 export interface ProbeMode { deny: boolean; timing: string | null; capture: string | null; full: boolean; stall: number }
 const NO_PROBE: ProbeMode = { deny: false, timing: null, capture: null, full: false, stall: 0 };
@@ -6052,7 +6266,7 @@ if (isMain && process.argv[2] === "nav-guard") {
   try {
     const [cmd, a1] = args;
     if (cmd === "run") run(o).then(say, fail);
-    else if (cmd === "probe") probe(o).then(say, fail);
+    else if (cmd === "probe") probe(o).then((ev) => { say(ev); const t = probeTail(ev, platform(o)); if (t) say(t); }, fail);
     else if (cmd === "bind-profile") bindProfile(o).then(say, fail);
     else if (cmd === "confirm-profile") {
       const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });

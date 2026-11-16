@@ -131,6 +131,11 @@ export const PC_NOTICES: Record<string, string> = {
 export const PC_NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
 export const PC_NOTICE_ID = /^[0-9a-f]{16,64}$/;
 export const PC_JOB_ID = /^j-\d{8}-[a-z0-9]{6}$/;
+// A PC job as the owner's line names it (0.12.0, twenty-second round): by what it does, its site and action
+// (the queue's own shapes), never by its queue id.
+const PC_SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
+const PC_ACTION = /^[a-z][a-z0-9_]{2,39}$/;
+export const pcJobWords = (j: { site: string; action: string }) => `the job to ${j.action.replace(/_/g, " ")} on ${j.site}`;
 const PC_NOTICE_KEEP = 200;              // the notice ids the link remembers having posted (the newest)
 export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
@@ -150,7 +155,7 @@ const MOVED = "stop moved";              // a message's Stop moved on: its butto
 const REPOSTED = "moved down";           // an older Stopped notice, once a newer one carries Turn back on
 export const STILL_STOPPED = "**Still stopped.** Cain's Build and Ship jobs, Ship cards and outside reviews stay stopped, and nothing lands in main, until you tap Turn back on.";
 // Machine text he never sees on a card: a full sha, a job's session id, an ISO time.
-const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"],
+const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"], [/\bj-\d{8}-[a-z0-9]{6}\b/, "a PC job id"],
   [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, "an ISO time"]];
 const LIMIT = 2000;
 const SUPPRESS_EMBEDS = 1 << 2;
@@ -1577,21 +1582,30 @@ export class Link {
   //
   // Twenty-first round: a notice may carry its id (the keeper's, kept before it posts) and the job it
   // is about. The link deduplicates on the id: one it has already posted is answered "posted" with that
-  // message, and nothing is posted again, so a post whose acknowledgement was lost isn't repeated. The
-  // job, a PC job id of the queue's own shape only, is named on the line with the code.
+  // message, and nothing is posted again, so a post whose acknowledgement was lost isn't repeated.
+  // Twenty-second round: the job is named by what it does, {site, action} in the queue's own shapes, never
+  // by its queue id (Cain's rules and the gate keep those ids away from him); the notice id stays in the
+  // payload, never in the words.
   async pcNotice(code: unknown, job?: unknown, id?: unknown): Promise<{ status: "posted"; message: string; duplicate?: true }> {
     const c = String(code ?? "");
     const base = Object.hasOwn(PC_NOTICES, c) ? PC_NOTICES[c] : PC_NOTICE_CODE.test(c) ? pcNoticeUnknown(c) : "";
     if (!base) throw new Refusal("not a PC job keeper notice");
     const nid = id === undefined || id === null ? null : String(id);
     if (nid !== null && !PC_NOTICE_ID.test(nid)) throw new Refusal("not a PC job keeper notice id");
-    const j = job === undefined || job === null ? null : String(job);
-    if (j !== null && !PC_JOB_ID.test(j)) throw new Refusal("not a PC job id");
+    let what: { site: string; action: string } | null = null;
+    if (job !== undefined && job !== null) {
+      const j = job as any;
+      if (typeof j !== "object" || Array.isArray(j) || typeof j.site !== "string" || typeof j.action !== "string" || !PC_SITE.test(j.site) || !PC_ACTION.test(j.action)
+        || Object.keys(j).some((k) => k !== "site" && k !== "action"))
+        throw new Refusal("not a PC job: a job is named by its site and action, never by its queue id");
+      what = { site: j.site, action: j.action };
+    }
     if (nid !== null) {
       const had = this.d.load().pcNotices?.[nid];
       if (had) return { status: "posted", message: had.msg, duplicate: true };
     }
-    const text = j ? `${base} (Job ${j}, code ${c}.)` : base;
+    const text = what ? `${base} (It is ${pcJobWords(what)}, code ${c}.)` : base;
+    noMachineText(text);
     const message = await this.notice(text);
     if (nid !== null) {
       const s = this.d.load();

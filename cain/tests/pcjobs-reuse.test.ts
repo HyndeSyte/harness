@@ -703,7 +703,7 @@ describe("twentieth review: the once-only notices, delivered and kept beside the
     expect(first).toMatchObject({ posted: false });                                 // not marked: the link didn't acknowledge it (its id kept)
     expect(round(cfg()).ok).toBe(true);
     expect(n.calls).toEqual(["reuse_store_unreadable", "reuse_store_unreadable"]);
-    expect(JSON.parse(readFileSync(told, "utf8")).told.store).toEqual({ id: first.id, posted: true, clear: 0 });   // marked once the link said posted, same id
+    expect(JSON.parse(readFileSync(told, "utf8")).told.store).toEqual({ id: first.id, posted: true, clear: 0, code: "reuse_store_unreadable" });   // marked once the link said posted, same id
     expect(round(cfg()).ok).toBe(true);
     expect(n.calls.length).toBe(2);
   });
@@ -824,15 +824,16 @@ describe("twenty-first review: bounded waits with a notice, three clear rounds, 
     if (WIN) return;
     const { cfg } = queue();
     const sent: { code: string; n?: any }[] = [];
-    const c = { ...cfg, notify: (code: string, n?: any) => { sent.push({ code, n }); return true; } } as Config;
+    const c = { ...cfg, queue: mkdtempSync(join(tmpdir(), "pcjobs-q-")), notify: (code: string, n?: any) => { sent.push({ code, n }); return true; } } as Config;
     mkdirSync(dirname(c.used!), { recursive: true });
     writeFileSync(c.used!, JSON.stringify({ m: MSG, job: "j-20261115-legacy", state: "pending", rid: "pc-0009" }) + "\n");
     symlinkSync(join(cfg.dir, "nowhere"), join(cfg.dir, "results", "dangling.json"));
+    writeFileSync(join(c.queue, "pc-0009.json"), ask({ ...READ }));                // its request, still waiting: what the job does
     for (let i = 0; i < 2; i++) reconcileReuse(c, [], "d".repeat(40));
     expect(sent).toEqual([]);                                                       // two rounds: still waiting, nobody told
     for (let i = 0; i < 3; i++) reconcileReuse(c, [], "d".repeat(40));
     expect(sent.map((x) => x.code)).toEqual(["reuse_record_unreadable"]);           // the third round tells, once
-    expect(sent[0].n).toMatchObject({ job: "j-20261115-legacy" });
+    expect(sent[0].n.job).toEqual({ site: "example.com", action: "read_account_settings" });   // by what it does, never its id
     expect(sent[0].n.id).toMatch(/^[0-9a-f]{24}$/);
     expect(reuseLedger(c).get(MSG)).toMatchObject({ state: "pending" });
   });
@@ -843,10 +844,11 @@ describe("twenty-first review: bounded waits with a notice, three clear rounds, 
     w.first();
     const h = w.hook("exit 1");
     w.request({ ...READ, owner_reuse: reuse() });
-    const sent: { code: string; job?: string }[] = [];
+    const sent: { code: string; job?: any }[] = [];
     const cfg = () => w.cfg("pi-1", { notify: ((code: string, n?: any) => { sent.push({ code, job: n?.job }); return true; }) as any });
     expect(round(cfg()).ok).toBe(false);                                            // three refused pushes
-    const job = reuseLedger({ used: w.used }).get(MSG)!.job;
+    const job = { site: "example.com", action: "read_account_settings" };
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject(job);               // the ledger keeps what the job does
     expect(sent).toEqual([{ code: "reuse_push_refused", job: undefined }]);
     const away = `${w.remote}.away`;
     renameSync(w.remote, away);
@@ -901,10 +903,92 @@ describe("twenty-first review: bounded waits with a notice, three clear rounds, 
     expect(lines.length).toBe(1);                                                   // posted once
     const again = await r.link.pcNotice("reuse_store_unreadable", undefined, sent[0]);
     expect(again).toMatchObject({ status: "posted", duplicate: true });
-    // The job is named with the code, in the queue's own id shape only.
-    const named = await r.link.pcNotice("reuse_fetch_failed", "j-20261115-abcdef", "e".repeat(24));
-    expect(r.posted[named.message].content).toBe(`${PC_NOTICES.reuse_fetch_failed} (Job j-20261115-abcdef, code reuse_fetch_failed.)`);
-    await expect(r.link.pcNotice("reuse_fetch_failed", "P64", "f".repeat(24))).rejects.toThrow("not a PC job id");
+    // The job is named by what it does, with the code; never by its queue id.
+    const named = await r.link.pcNotice("reuse_fetch_failed", { site: "example.com", action: "read_account_settings" }, "e".repeat(24));
+    expect(r.posted[named.message].content).toBe(`${PC_NOTICES.reuse_fetch_failed} (It is the job to read account settings on example.com, code reuse_fetch_failed.)`);
+    for (const bad of ["j-20261115-abcdef", "P64", { site: "example.com", action: "read_account_settings", id: "j-20261115-abcdef" }, { site: "Example Com", action: "x" }])
+      await expect(r.link.pcNotice("reuse_fetch_failed", bad, "f".repeat(24))).rejects.toThrow("never by its queue id");
     await expect(r.link.pcNotice("reuse_fetch_failed", undefined, "not hex")).rejects.toThrow("not a PC job keeper notice id");
+  });
+});
+
+describe("twenty-second review: the job named by what it does, a lost acknowledgement kept until confirmed, and an unreadable store counted on a failed fetch", () => {
+  test.skipIf(!Bun.which("curl"))("end to end: the keeper's tell, the link's route, the gate's rules: the line names the job by its site and action, posts, and is not refused", async () => {
+    const TOKEN = "not-a-real-token.for-the-notice-test";
+    const dir = mkdtempSync(join(tmpdir(), "pcjobs-notice22-"));
+    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
+    const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
+    const r = rig();
+    const bodies: any[] = [];
+    // The link's route (link/main.ts: the relay key, then link.pcNotice with the body's code, job and id).
+    const server = Bun.serve({ port: 0, async fetch(req) {
+      if (req.headers.get("x-harness-key") !== key) return Response.json({ status: "refused" }, { status: 403 });
+      const b: any = await req.json();
+      bodies.push(b);
+      try { return Response.json(await r.link.pcNotice(b.code, b.job, b.id)); }
+      catch (e) { return Response.json({ status: "refused", said: (e as Error).message }, { status: 400 }); }
+    } });
+    const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
+    const used = join(dir, "state", "used.jsonl");
+    try {
+      const src = `const { tell } = await import(${JSON.stringify(main)});
+        tell({ used: ${JSON.stringify(used)}, link: "http://127.0.0.1:${server.port}", discordEnv: ${JSON.stringify(join(dir, ".env"))} }, "reuse_fetch_failed", "fetch:${MSG}",
+          { site: "example.com", action: "read_account_settings" });`;
+      await Bun.spawn(["bun", "-e", src], { stdout: "pipe", stderr: "pipe" }).exited;
+      expect(bodies.length).toBe(1);
+      expect(bodies[0]).toEqual({ code: "reuse_fetch_failed", id: expect.stringMatching(/^[0-9a-f]{24}$/), job: { site: "example.com", action: "read_account_settings" } });
+      const marks = JSON.parse(readFileSync(`${used}.told.json`, "utf8")).told;
+      expect(marks[`fetch:${MSG}`]).toMatchObject({ posted: true });                 // the link answered posted
+      const lines = Object.values(r.posted).map((m: any) => m.content as string);
+      const line = lines.find((t) => t.startsWith(PC_NOTICES.reuse_fetch_failed))!;
+      expect(line).toBe(`${PC_NOTICES.reuse_fetch_failed} (It is the job to read account settings on example.com, code reuse_fetch_failed.)`);
+      expect(line).not.toMatch(/j-\d{8}-[a-z0-9]{6}/);
+      expect(line).not.toContain(bodies[0].id);                                     // the notice id stays in the payload
+      expect(r.reports).toEqual([]);                                                // the gate's rules: nothing to fix or hold
+      // An id in the words would be refused by the gate's machine-text rule.
+      await expect(r.link.pcNotice("reuse_fetch_failed", "j-20261115-abcdef", "a".repeat(24))).rejects.toThrow("never by its queue id");
+    } finally { server.stop(true); }
+  }, 30_000);
+
+  test("a post whose acknowledgement was lost, three clear rounds, then a recurrence: one post, one id", () => {
+    const w = world();
+    w.first();
+    const ids: string[] = [];
+    const postedIds = new Set<string>();
+    let lose = true;
+    // The link: deduplicates on the id; the first answer is lost after it posted.
+    const notify = ((_code: string, n?: any) => {
+      ids.push(n.id);
+      postedIds.add(n.id);
+      if (lose) { lose = false; return false; }
+      return true;
+    }) as any;
+    mkdirSync(w.used, { recursive: true });
+    expect(round(w.cfg("pi-1", { notify })).ok).toBe(true);                        // told; the answer lost
+    rmSync(w.used, { recursive: true, force: true });
+    for (let i = 0; i < 3; i++) expect(round(w.cfg("pi-1", { notify })).ok).toBe(true);   // three clear rounds
+    mkdirSync(w.used, { recursive: true });
+    expect(round(w.cfg("pi-1", { notify })).ok).toBe(true);                        // it comes back
+    expect(postedIds.size).toBe(1);                                                 // one post
+    expect(new Set(ids).size).toBe(1);                                              // one id, sent again until confirmed
+    expect(ids.length).toBe(2);
+  });
+
+  test("rounds that can't fetch and can't read the tap store count: the store's own notice after three, once", () => {
+    if (WIN) return;
+    const w = world();
+    w.first();
+    const away = `${w.remote}.away`;
+    renameSync(w.remote, away);
+    mkdirSync(w.used, { recursive: true });                                         // the store can't be read
+    for (let i = 0; i < 2; i++) expect(round(w.cfg("pi-1")).ok).toBe(false);
+    expect(w.told).toEqual([]);
+    expect(round(w.cfg("pi-1")).ok).toBe(false);
+    expect(w.told).toEqual(["reuse_store_unreadable"]);
+    for (let i = 0; i < 2; i++) expect(round(w.cfg("pi-1")).ok).toBe(false);
+    expect(w.told).toEqual(["reuse_store_unreadable"]);
+    renameSync(away, w.remote);
+    expect(round(w.cfg("pi-1")).ok).toBe(true);                                    // fetches again: the store's own path takes over, still once
+    expect(w.told).toEqual(["reuse_store_unreadable"]);
   });
 });

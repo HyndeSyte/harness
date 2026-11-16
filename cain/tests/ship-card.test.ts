@@ -12,7 +12,7 @@ import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, N
 import { watchFile } from "../rootfs/opt/cain/link/merge";
 import { acceptedFor, supersede, keepWatch, otherLive } from "../rootfs/opt/cain/link/shipgate";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -476,4 +476,33 @@ describe("twenty-first review: one live acceptance per pull request, and superse
     r.github.watched[PR] = SHA1;
     expect(r.msg(await ship(r)).content).toContain(LINE);
   });
+});
+
+describe("twenty-second review: one live acceptance per pull request, made true under a per-pull-request lock", () => {
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  test("a second watch of the same pull request finishing while the first holds the lock is never kept as an acceptance", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate22-"));
+    let second: any = null;
+    const first = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { beforeWrite: () => { second = keepWatch(dir, line(SHA2), watchFile(dir, SHA2), { waitMs: 200 }); } });
+    expect(first.accepted_head).toBe(SHA1);
+    expect(second).toMatchObject({ accepted_head: null, passed: false, failure: "live_acceptance" });
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+    expect(existsSync(join(dir, "ship-gate-pr-5.lock"))).toBe(false);              // the lock is let go
+  });
+  test("two watches for different heads of one pull request completing together, in two processes: one kept", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate22-"));
+    const mod = join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts");
+    const go = Date.now() + 1_500;
+    const one = (head: string) => Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
+      const l = ${JSON.stringify(line(head))};
+      while (Date.now() < ${go}) {}
+      const k = keepWatch(${JSON.stringify(dir)}, l, ${JSON.stringify(watchFile(dir, head))}, { beforeWrite: () => { const t = Date.now() + 300; while (Date.now() < t) {} } });
+      console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
+    const ps = [one(SHA1), one(SHA2)];
+    const outs = await Promise.all(ps.map(async (p) => { await p.exited; return JSON.parse((await new Response(p.stdout).text()).trim()); }));
+    expect(outs.filter((o) => o.accepted).length).toBe(1);
+    expect(outs.filter((o) => o.failure === "live_acceptance").length).toBe(1);
+    expect(acceptedFor(dir, 5).length).toBe(1);
+  }, 30_000);
 });

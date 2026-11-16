@@ -311,8 +311,8 @@ in the harness repo; until then the keeper says it is waiting).
   when the queue can't be read safely or a job from his tap was refused three times: a
   shallow copy, the queue's branch missing, an empty queue with a tap pending, an
   unreadable tap record, a tap it can't settle, and a tap whose settling has waited three
-  rounds on an unreadable record or a failed fetch from GitHub (that line names the job and
-  its code). Each is told once while it lasts, and again only if it clears for three rounds
+  rounds on an unreadable record or a failed fetch from GitHub (that line names the job by
+  what it does, its action and site, and its code; never its id). Each is told once while it lasts, and again only if it clears for three rounds
   in a row and comes back; a code your App has no words for comes as "a stop
   condition the App does not know" with its code. Don't repeat it; if he asks, the fix is in
   that line and in the Troubleshooting table of cain/docs/pc-jobs.md.
@@ -339,7 +339,8 @@ in the harness repo; until then the keeper says it is waiting).
   the run didn't start: the refusal gives the command that removes each setting where it is
   set; he runs it, opens a new terminal and runs again), `versions_changed` (Claude in Chrome
   or Chrome updated during the run; its report was thrown away: he restarts the Cain jobs
-  Chrome and probes again), `refusal_cap` (the session was refused twelve times
+  Chrome and probes again), `nav_log_unset` (the worker started a run session without its
+  navigation log, so nothing ran: he starts the worker again from a new terminal), `refusal_cap` (the session was refused twelve times
   and ended), `domain_not_allowed` (the job named
   a host its allowlist entry doesn't allow; nothing ran), `containment_unavailable` (the
   PC couldn't build or start its Windows Job Object helper, so nothing runs uncontained),
@@ -349,7 +350,9 @@ in the harness repo; until then the keeper says it is waiting).
   one his probe saw: nothing runs until he probes and confirms again), `update_pending` (Chrome has a Claude in Chrome update waiting: he
   restarts the Cain jobs Chrome and probes again; an auto-update always needs a new probe),
   `extension_versions_ambiguous` (the Cain jobs profile holds more than one Claude in Chrome
-  version: he restarts the Cain jobs Chrome and probes again), `boundary_not_accepted` (he hasn't accepted the stated
+  version: he restarts the Cain jobs Chrome and probes again), `version_hold_unwritable` (the
+  worker couldn't write its note that Claude in Chrome's version changed: he frees disk space
+  or fixes the worker folder, then runs again and probes), `boundary_not_accepted` (he hasn't accepted the stated
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),

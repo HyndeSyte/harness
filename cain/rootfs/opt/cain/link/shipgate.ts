@@ -22,7 +22,7 @@
 //                                              head can go once a new watch accepts it
 // Every watch ends with a named failure past its caps (merge.ts): one wait GitHub asks for over 15
 // minutes (rate_wait_cap), or 2 hours in all (watch_cap).
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { gateReport, watchAccepted, watchFile, watchShipGate, type MergeDeps, type WatchLine } from "./merge";
 
@@ -60,15 +60,48 @@ export const liveWhy = (other: string[]) =>
   `another live acceptance of this pull request stands (${other.join(", ")}): supersede it first (keeper.sh ship-gate --supersede ${other[0]}, once the pull request's head has moved past it), then watch again`;
 // The watch's line as it is kept: an acceptance is kept only when no other live acceptance of its pull
 // request stands, read again as it is written; otherwise it is kept as a failure (live_acceptance).
-export function keepWatch(dir: string, line: WatchLine, out: string): WatchLine {
-  let kept = line;
-  if (line.pr !== null && line.accepted_head) {
-    const other = otherLive(dir, line.pr, line.accepted_head);
-    if (other.length) kept = { ...line, accepted_head: null, passed: false, failure: "live_acceptance", failure_why: liveWhy(other) };
+// Twenty-second round: the check and the write happen under the pull request's own lock file
+// (ship-gate-pr-<n>.lock, made exclusively), so two watches of one pull request finishing together can't
+// both pass the check before either writes: the second waits for the lock (o.waitMs, default 10 seconds),
+// then checks again and sees the first; a lock it can't get in that time keeps its line as a failure
+// (live_acceptance), never an acceptance. A lock older than LOCK_STALE_MS (a watch killed holding it) is
+// taken over.
+export const LOCK_STALE_MS = 60_000;
+const lockFile = (dir: string, pr: number) => `${dir}/ship-gate-pr-${pr}.lock`;
+const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function takeLock(f: string, waitMs: number): boolean {
+  const until = Date.now() + waitMs;
+  for (;;) {
+    try { closeSync(openSync(f, "wx")); return true; }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      try { if (Date.now() - statSync(f).mtimeMs > LOCK_STALE_MS) { rmSync(f, { force: true }); continue; } } catch { continue; }
+      if (Date.now() >= until) return false;
+      pause(50);
+    }
   }
+}
+export function keepWatch(dir: string, line: WatchLine, out: string, o: { waitMs?: number; beforeWrite?: () => void } = {}): WatchLine {
+  let kept = line;
   mkdirSync(dirname(out), { recursive: true });
-  writeFileSync(`${out}.tmp`, JSON.stringify(kept, null, 2) + "\n");
-  renameSync(`${out}.tmp`, out);
+  const locked = line.pr !== null && line.accepted_head ? lockFile(dir, line.pr) : null;
+  if (locked) mkdirSync(dir, { recursive: true });
+  if (locked && !takeLock(locked, o.waitMs ?? 10_000)) {
+    kept = { ...line, accepted_head: null, passed: false, failure: "live_acceptance",
+      failure_why: `another watch of this pull request was being kept at the same moment (its lock, ${locked}, stayed held): run the watch again once it is done` };
+    writeFileSync(`${out}.tmp`, JSON.stringify(kept, null, 2) + "\n");
+    renameSync(`${out}.tmp`, out);
+    return kept;
+  }
+  try {
+    if (line.pr !== null && line.accepted_head) {
+      const other = otherLive(dir, line.pr, line.accepted_head);
+      if (other.length) kept = { ...line, accepted_head: null, passed: false, failure: "live_acceptance", failure_why: liveWhy(other) };
+    }
+    o.beforeWrite?.();
+    writeFileSync(`${out}.tmp`, JSON.stringify(kept, null, 2) + "\n");
+    renameSync(`${out}.tmp`, out);
+  } finally { if (locked) rmSync(locked, { force: true }); }
   return kept;
 }
 // keeper.sh ship-gate --supersede <sha>: the acceptance kept for that sha is marked replaced, with

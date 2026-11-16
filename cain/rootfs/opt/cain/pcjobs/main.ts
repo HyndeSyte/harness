@@ -131,7 +131,8 @@ export const PUSH_TIMEOUT_MS = 60_000;
 export type ReuseState = "pending" | "final" | "rolled_back";
 export type PushAnswer = "ok" | "refused" | "unknown";
 export interface PushAttempt { commit: string; answer?: PushAnswer; said?: string }
-export interface ReuseLine { m: string; job: string; state: ReuseState; rid?: string; commit?: string; attempts: PushAttempt[]; legacy: boolean; settled?: string }
+export interface ReuseLine { m: string; job: string; state: ReuseState; rid?: string; commit?: string; attempts: PushAttempt[]; legacy: boolean; settled?: string;
+  site?: string; action?: string }       // what the job does, for the owner's line (twenty-second round: never its id)
 const COMMIT = /^[0-9a-f]{40}$/;
 export class StoreUnreadable extends Error {}
 // Every tap's latest state, by message id, with every push attempt recorded for its job.
@@ -153,18 +154,19 @@ export function reuseLedger(cfg: Pick<Config, "used">): Map<string, ReuseLine> {
     const rid = typeof o.rid === "string" ? o.rid : undefined;
     const cur = out.get(o.m);
     const same = cur && cur.state === "pending" && cur.job === o.job;
+    const what = typeof o.site === "string" && typeof o.action === "string" ? { site: o.site, action: o.action } : cur?.job === o.job && cur.site && cur.action ? { site: cur.site, action: cur.action } : {};
     if (state === "pending" && same && o.ev === "answer") {
       const a = cur!.attempts.at(-1);
       if (a && !a.answer && ["ok", "refused", "unknown"].includes(o.answer)) { a.answer = o.answer; if (typeof o.said === "string") a.said = o.said; }
       continue;
     }
-    if (state === "pending" && same && o.ev === "push" && commit) { cur!.attempts.push({ commit }); cur!.commit ??= commit; continue; }
+    if (state === "pending" && same && o.ev === "push" && commit) { cur!.attempts.push({ commit }); cur!.commit ??= commit; Object.assign(cur!, what); continue; }
     if (state === "pending") {
-      out.set(o.m, { m: o.m, job: o.job, state, ...(rid ? { rid } : {}), ...(commit ? { commit } : {}), attempts: commit ? [{ commit }] : [], legacy: !commit });
+      out.set(o.m, { m: o.m, job: o.job, state, ...(rid ? { rid } : {}), ...(commit ? { commit } : {}), attempts: commit ? [{ commit }] : [], legacy: !commit, ...what });
       continue;
     }
     out.set(o.m, { m: o.m, job: o.job, state, ...(rid ? { rid } : {}), ...(cur?.job === o.job && cur.commit ? { commit: cur.commit } : commit ? { commit } : {}),
-      attempts: cur?.job === o.job ? cur.attempts : [], legacy: false, ...(typeof o.settled === "string" ? { settled: o.settled } : {}) });
+      attempts: cur?.job === o.job ? cur.attempts : [], legacy: false, ...(typeof o.settled === "string" ? { settled: o.settled } : {}), ...what });
   }
   return out;
 }
@@ -196,9 +198,9 @@ export function recordReuse(cfg: Pick<Config, "used">, m: string, job: string, s
   appendLine(cfg, { m, job, state, ...(rid ? { rid } : {}), ...(commit ? { commit } : {}), ...extra });
 }
 // One push attempt of a tap's job: the commit it will push (before), and the remote's answer (after).
-export type Tap = { m: string; job: string; rid: string };
+export type Tap = { m: string; job: string; rid: string; site?: string; action?: string };
 export function recordAttempt(cfg: Pick<Config, "used">, t: Tap, commit: string): void {
-  appendLine(cfg, { m: t.m, job: t.job, state: "pending", rid: t.rid, ev: "push", commit });
+  appendLine(cfg, { m: t.m, job: t.job, state: "pending", rid: t.rid, ev: "push", commit, ...(t.site && t.action ? { site: t.site, action: t.action } : {}) });
 }
 export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnswer, said?: string): void {
   appendLine(cfg, { m: t.m, job: t.job, state: "pending", rid: t.rid, ev: "answer", answer, ...(said ? { said: said.slice(0, 300) } : {}) });
@@ -224,17 +226,32 @@ export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnsw
 //     again with the same id and the link, which deduplicates on it, doesn't post it twice;
 //   - twenty-first round: two waits are bounded with a notice: a legacy pending line whose record
 //     can't be read, and a third-refusal settle whose round couldn't fetch from GitHub. After
-//     WAIT_ROUNDS (3) such rounds for one tap, a once-only notice names the job and the code.
+//     WAIT_ROUNDS (3) such rounds for one tap, a once-only notice names the job and the code. The legacy
+//     line's notice was told at once before (reuse_unsettled); it became this third-round notice;
+//   - twenty-second round: the notice names the job by what it does (its site and action), never by its
+//     queue id, and the notice id stays in the payload, never in the words; a mark whose post was never
+//     acknowledged is never cleared: it is sent again with its saved id until the link answers posted;
+//     a round that can't fetch and can't read the tap store counts toward the store's own notice
+//     (reuse_store_unreadable, after three such rounds).
 export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused"
   | "reuse_record_unreadable" | "reuse_fetch_failed";
-export interface NoticeSend { id: string; job?: string }
+// The job a notice is about, by what it does (twenty-second round): its site and action, never its id.
+export interface JobWhat { site: string; action: string }
+export interface NoticeSend { id: string; job?: JobWhat }
 export type Notify = (code: PcNotice, n?: NoticeSend) => boolean;
 export const CLEAR_ROUNDS = 3;
 export const WAIT_ROUNDS = 3;
-interface ToldMark { id: string; posted: boolean; clear: number }
+// A mark keeps its code and job (twenty-second round), so a post whose acknowledgement was lost is sent
+// again with its saved id until the link confirms it, whether or not its condition is still here.
+interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat }
 interface Told { told: Record<string, ToldMark>; waits: Record<string, number> }
 const toldFile = (cfg: Pick<Config, "used">) => `${cfg.used ?? USED_REUSE}.told.json`;
 const NOTICE_ID = /^[0-9a-f]{16,64}$/;
+const SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
+const ACTION = /^[a-z][a-z0-9_]{2,39}$/;
+const jobWhat = (x: any): JobWhat | undefined =>
+  x && typeof x === "object" && typeof x.site === "string" && typeof x.action === "string" && SITE.test(x.site) && ACTION.test(x.action) ? { site: x.site, action: x.action } : undefined;
+const NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
 // The notice file as read: version 2 ({v, told, waits}), or the twentieth round's list of keys (each
 // read as posted, with a fresh id). Unreadable: nothing told, no waits.
 function readTold(cfg: Pick<Config, "used">): Told {
@@ -244,7 +261,11 @@ function readTold(cfg: Pick<Config, "used">): Told {
   const told: Record<string, ToldMark> = {}, waits: Record<string, number> = {};
   if (a && typeof a === "object" && a.told && typeof a.told === "object")
     for (const [k, m] of Object.entries(a.told as Record<string, any>))
-      if (m && typeof m.id === "string" && NOTICE_ID.test(m.id)) told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0 };
+      if (m && typeof m.id === "string" && NOTICE_ID.test(m.id)) {
+        const code = typeof m.code === "string" && NOTICE_CODE.test(m.code) ? m.code as PcNotice : NOTICE_CODE.test(k) ? k as PcNotice : undefined;
+        const job = jobWhat(m.job);
+        told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0, ...(code ? { code } : {}), ...(job ? { job } : {}) };
+      }
   if (a && typeof a === "object" && a.waits && typeof a.waits === "object")
     for (const [k, n] of Object.entries(a.waits as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) waits[k] = n as number;
   return { told, waits };
@@ -257,37 +278,60 @@ function saveTold(cfg: Pick<Config, "used">, t: Told): void {
     renameSync(`${toldFile(cfg)}.tmp`, toldFile(cfg));
   } catch (e) { log(`couldn't keep which notices went out: ${(e as Error).message}`); }
 }
+// One send of a mark, with its saved id: true once the link confirms it posted (or had already posted it).
+function send(cfg: Config, m: ToldMark, code: PcNotice): boolean {
+  let ok = false;
+  try { ok = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(m.job ? { job: m.job } : {}) }); } catch { ok = false; }
+  if (!ok) log(`couldn't tell the owner (${code}); trying again next round, with the same notice id`);
+  return ok;
+}
 // The condition is here this round: told once (its id kept before the post), and its clear count reset.
-export function tell(cfg: Config, code: PcNotice, key: string = code, job?: string): void {
+export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobWhat): void {
   const t = readTold(cfg);
   let m = t.told[key];
   if (m?.posted) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
-  if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0 }; saveTold(cfg, t); }
+  const what = jobWhat(job);
+  if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0, code, ...(what ? { job: what } : {}) }; saveTold(cfg, t); }
   m.clear = 0;
-  let ok = false;
-  try { ok = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(job && ID.test(job) ? { job } : {}) }); } catch { ok = false; }
-  if (!ok) { log(`couldn't tell the owner (${code}); trying again next round, with the same notice id`); return; }
+  m.code ??= code;
+  if (!send(cfg, m, code)) { saveTold(cfg, t); return; }
   m.posted = true;
   saveTold(cfg, t);
 }
-// A condition seen clear this round: its mark goes only after CLEAR_ROUNDS clear rounds in a row,
-// so a condition that comes back after that is told again, and one that flaps is told once.
+// A condition seen clear this round. A mark whose post was never acknowledged (posted false) is never
+// counted down or deleted (twenty-second round): it is sent again with its saved id until the link answers
+// posted or already posted, and only then does its clear count start. A posted mark goes after
+// CLEAR_ROUNDS clear rounds in a row, so a condition that comes back after that is told again, and one that
+// flaps is told once.
 export function cleared(cfg: Config, key: string): void {
   const t = readTold(cfg);
   let changed = false;
   const m = t.told[key];
-  if (m) { m.clear += 1; if (m.clear >= CLEAR_ROUNDS) delete t.told[key]; changed = true; }
+  if (m && !m.posted) {
+    if (m.code && send(cfg, m, m.code)) { m.posted = true; m.clear = 0; changed = true; }
+  } else if (m) { m.clear += 1; if (m.clear >= CLEAR_ROUNDS) delete t.told[key]; changed = true; }
   if (t.waits[key] !== undefined) { delete t.waits[key]; changed = true; }
   if (changed) saveTold(cfg, t);
 }
-// One more round a bounded wait lasted (its key): at WAIT_ROUNDS, the once-only notice naming the job.
-export function waited(cfg: Config, code: PcNotice, key: string, job: string): number {
+// One more round a bounded wait lasted (its key): at WAIT_ROUNDS, the once-only notice naming the job by
+// what it does (when the keeper knows it).
+export function waited(cfg: Config, code: PcNotice, key: string, job?: JobWhat): number {
   const t = readTold(cfg);
   const n = (t.waits[key] ?? 0) + 1;
   t.waits[key] = n;
   saveTold(cfg, t);
   if (n >= WAIT_ROUNDS) tell(cfg, code, key, job);
   return n;
+}
+// What a tap's job does, for the owner's line: the ledger's own record of it, else the request still
+// waiting in the queue folder, else the job file in the queue copy. Never its id.
+export function whatOf(cfg: Config, l: Pick<ReuseLine, "job" | "rid" | "site" | "action">): JobWhat | undefined {
+  const own = jobWhat(l);
+  if (own) return own;
+  const read = (f: string) => { try { return JSON.parse(readFileSync(f, "utf8")); } catch { return null; } };
+  if (l.rid && RID.test(l.rid)) { const r = jobWhat(read(join(cfg.queue, `${l.rid}.json`))?.job); if (r) return r; }
+  if (ID.test(l.job)) return jobWhat(read(join(cfg.dir, "jobs", `${l.job}.json`)));
+  return undefined;
 }
 // The real send: one POST to the link's /pc-notice, keyed as linkReuse keys it.
 export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
@@ -298,7 +342,7 @@ export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
     const key = createHmac("sha256", tok).update("harness-relay-v1").digest("hex");
     const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     const conf = [`url = ${q(`${cfg.link ?? LINK}/pc-notice`)}`, `header = ${q(`X-Harness-Key: ${key}`)}`, `header = "Content-Type: application/json"`,
-      `data-binary = ${q(JSON.stringify({ code, ...(n?.id ? { id: n.id } : {}), ...(n?.job ? { job: n.job } : {}) }))}`, `max-time = 40`, `noproxy = "*"`, `silent`].join("\n") + "\n";
+      `data-binary = ${q(JSON.stringify({ code, ...(n?.id ? { id: n.id } : {}), ...(n?.job ? { job: { site: n.job.site, action: n.job.action } } : {}) }))}`, `max-time = 40`, `noproxy = "*"`, `silent`].join("\n") + "\n";
     const p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore",
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
     if (p.exitCode !== 0) return false;
@@ -385,7 +429,7 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
       try { rec = jobs.some((j) => j.id === l.job) || named(cfg.dir, [l.job, ...(l.rid ? [l.rid] : [])], resolve(cfg.used ?? USED_REUSE)); } catch { rec = null; }
       if (rec === null) {
         unsettled.push(l.job);
-        const n = waited(cfg, "reuse_record_unreadable", `record:${l.m}`, l.job);
+        const n = waited(cfg, "reuse_record_unreadable", `record:${l.m}`, whatOf(cfg, l));
         log(`the reuse tap for ${l.job} (written by an older keeper) can't be settled yet: a file in the queue copy can't be read (round ${n}; the owner is told after ${WAIT_ROUNDS})`);
         continue;
       }
@@ -592,6 +636,8 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
     return `The PC stopped taking jobs because Chrome has a Claude in Chrome update waiting, and an auto-update needs a new probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   if (h?.code === "extension_versions_ambiguous")
     return `The PC stopped taking jobs because the Cain jobs profile holds more than one Claude in Chrome version, so the one Chrome runs can't be bound to the probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
+  if (h?.code === "version_hold_unwritable")
+    return "The PC stopped taking jobs because its worker couldn't write a note that Claude in Chrome's version changed. At the PC: free disk space or check the worker folder can be written, then start a run; it then asks for a new probe.";
   if (h?.code === "worker_signin_missing")
     return "The PC isn't taking jobs because the worker's own Claude Code isn't signed in. At the PC: run the setup step that signs in claude-config, then start a run.";
   if (h?.code === "session_cleanup_failed")
@@ -718,9 +764,12 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     catch (e) {
       // A round that couldn't fetch can't settle a tap whose pushes were all refused (the third-refusal
       // settle): one more round of that wait for each, told once after WAIT_ROUNDS.
+      // A round whose tap store can't be read either (twenty-second round) counts too: three such rounds in a
+      // row raise the store's own once-only notice (reuse_store_unreadable, its usual key).
       let taps: ReuseLine[] = [];
-      try { taps = [...reuseLedger(cfg).values()].filter((l) => l.state === "pending" && !l.legacy && l.attempts.length > 0 && l.attempts.every((a) => a.answer === "refused")); } catch { taps = []; }
-      for (const l of taps) waited(cfg, "reuse_fetch_failed", `fetch:${l.m}`, l.job);
+      try { taps = [...reuseLedger(cfg).values()].filter((l) => l.state === "pending" && !l.legacy && l.attempts.length > 0 && l.attempts.every((a) => a.answer === "refused")); cleared(cfg, "store"); }
+      catch (s) { taps = []; if (s instanceof StoreUnreadable) waited(cfg, "reuse_store_unreadable", "store"); }
+      for (const l of taps) waited(cfg, "reuse_fetch_failed", `fetch:${l.m}`, whatOf(cfg, l));
       throw e;
     }
     const now = cfg.now?.() ?? new Date();
@@ -804,7 +853,7 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     git(cfg, ["commit", "--quiet", "-m", `Cain: ${what}`.slice(0, 200)]);
     // Each reuse tap spent before the push, flushed to disk, with the commit each attempt pushes and
     // the remote's answer to it (a failure to write stops the round: nothing more is pushed).
-    const taps: Tap[] = made.filter((m) => m.job?.owner_reuse).map((m) => ({ m: m.job!.owner_reuse!.message_id, job: m.job!.id, rid: m.rid }));
+    const taps: Tap[] = made.filter((m) => m.job?.owner_reuse).map((m) => ({ m: m.job!.owner_reuse!.message_id, job: m.job!.id, rid: m.rid, site: m.job!.site, action: m.job!.action }));
     push(cfg, taps);
     const commit = git(cfg, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
     cfg.afterPush?.();
