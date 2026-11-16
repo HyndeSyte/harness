@@ -384,7 +384,8 @@ describe("the used-tap store: written before every push attempt, each answer aft
     expect(pushAnswer(0, "", false)).toMatchObject({ answer: "ok" });
     expect(pushAnswer(1, "!\tHEAD:refs/heads/main\t[remote rejected] (pre-receive hook declined)", false)).toMatchObject({ answer: "refused", nonFastForward: false, said: expect.stringContaining("pre-receive hook declined") });
     expect(pushAnswer(1, "!\tHEAD:refs/heads/main\t[rejected] (fetch first)", false)).toMatchObject({ answer: "refused", nonFastForward: true });
-    expect(pushAnswer(1, "! [rejected] HEAD -> main (non-fast-forward)", false)).toMatchObject({ answer: "refused", nonFastForward: true });
+    // Not git's porcelain line for the ref (twentieth round): unknown, never refused.
+    expect(pushAnswer(1, "! [rejected] HEAD -> main (non-fast-forward)", false)).toMatchObject({ answer: "unknown", nonFastForward: false });
     expect(pushAnswer(null, "", true)).toMatchObject({ answer: "unknown", said: "no answer in time" });
     expect(pushAnswer(128, "fatal: unable to access 'https://github.com/x/y.git/': Connection reset by peer", false)).toMatchObject({ answer: "unknown" });
     expect(pushAnswer(1, "something else entirely", false)).toMatchObject({ answer: "unknown" });
@@ -470,15 +471,17 @@ describe("nineteenth review: a tap rolls back only on a record that every push o
     // A replay meanwhile: refused with the same pending status.
     expect(check(w.cfg("pi-1"), ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his answered for ${pending.job} and is ${PENDING_STATUS}` });
     rmSync(h);
-    expect(round(w.cfg("pi-2"))).toMatchObject({ ok: true, queued: 1 });
+    // Settled on the very next round of the same keeper (no restart), once its fetch shows none of the commits.
+    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
     const now = reuseLedger({ used: w.used }).get(MSG)!;
     expect(now).toMatchObject({ state: "final" });
     expect(now.job).not.toBe(pending.job);
     expect(w.settles()).toEqual(["rolled_back", "final"]);
     expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: now.job });
-    expect(round(w.cfg("pi-2")).ok).toBe(true);
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
     expect(w.settles().filter((x) => x === "rolled_back").length).toBe(1);
     expect(w.told).toEqual(["reuse_push_refused"]);
+    expect(PC_NOTICES.reuse_push_refused).toContain("next round, within a minute");
   });
 
   test("one unknown answer among the attempts (a push that timed out): spent, never rolled back", () => {
@@ -620,9 +623,197 @@ describe("nineteenth review: the keeper's lines to the owner are the link's own 
       expect(r.posted[a.message].content).toBe(text);
       expect(text).not.toMatch(/\u2014|add-on|j-\d{8}/);
     }
-    await expect(r.link.pcNotice("anything")).rejects.toThrow("not a PC job keeper notice");
+    await expect(r.link.pcNotice("Anything else!")).rejects.toThrow("not a PC job keeper notice");
     const src = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
     const codes = src.match(/export type PcNotice = ([^;]+);/)![1].match(/"([a-z_]+)"/g)!.map((x) => x.slice(1, -1));
     expect(codes.sort()).toEqual(Object.keys(PC_NOTICES).sort());
+  });
+});
+
+describe("twentieth review: a push is refused only on git's porcelain line for the ref; landed checks before any rollback", () => {
+  test("the porcelain line for the exact ref decides: '!' is refused; a non-zero exit with the ref updated, or no line for it, is unknown", () => {
+    const ref = "refs/heads/main";
+    // The ref updated, then a failure after it (the tracking ref, a hook's error printed after the update).
+    const updated = "To github.com:x/pc-jobs.git\n \tHEAD:refs/heads/main\t1111111..2222222\nDone\nerror: update_ref failed for ref 'refs/remotes/origin/main': cannot lock ref";
+    expect(pushAnswer(1, updated, false, ref)).toMatchObject({ answer: "unknown" });
+    expect(pushAnswer(1, "To x\n*\tHEAD:refs/heads/main\t[new branch]\nDone\nremote: error: post-receive hook failed", false, ref)).toMatchObject({ answer: "unknown" });
+    expect(pushAnswer(1, "To x\n=\tHEAD:refs/heads/main\t[up to date]\nDone", false, ref)).toMatchObject({ answer: "unknown" });
+    // A '!' line for another ref, or words that only look like a refusal: unknown.
+    expect(pushAnswer(1, "To x\n!\tHEAD:refs/heads/other\t[remote rejected] (pre-receive hook declined)\nDone", false, ref)).toMatchObject({ answer: "unknown" });
+    expect(pushAnswer(1, "remote: Permission to x/pc-jobs.git denied\nfatal: unable to access: The requested URL returned error: 403", false, ref)).toMatchObject({ answer: "unknown" });
+    expect(pushAnswer(1, "fatal: Authentication failed for 'https://github.com/x/pc-jobs.git/'", false, ref)).toMatchObject({ answer: "unknown" });
+    // The '!' line for the ref: refused, and a non-fast-forward told apart.
+    expect(pushAnswer(1, "To x\n!\tHEAD:refs/heads/main\t[remote rejected] (protected branch hook declined)\nDone", false, ref)).toMatchObject({ answer: "refused", nonFastForward: false });
+    expect(pushAnswer(1, "To x\n!\tHEAD:refs/heads/main\t[rejected] (non-fast-forward)\nDone", false, ref)).toMatchObject({ answer: "refused", nonFastForward: true });
+  });
+
+  test("a push that landed but exited non-zero (a post-push failure) is unknown on every try, and the next round finds it landed, never rolled back", () => {
+    const w = world();
+    w.first();
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    // The real push goes through; then its exit is made a failure, with an error printed after the update.
+    const after = (p: { exitCode: number | null; out: string; timedOut: boolean }) => ({ ...p, exitCode: 1, out: `${p.out}\nerror: update_ref failed for ref 'refs/remotes/origin/main': cannot lock ref` });
+    expect(round(w.cfg("pi-1", { pushResult: after })).ok).toBe(false);
+    const l = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(l.attempts.map((a) => a.answer)).toEqual(["unknown", "unknown", "unknown"]);
+    expect(w.told).toEqual([]);                                                    // never told as refused
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.settles()).toEqual(["final"]);
+    expect(w.lines().some((x) => x.state === "rolled_back")).toBe(false);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: l.job });
+    replayRefused(w, l.job);
+  });
+
+  test("the landed checks run before any rollback, in order (the recorded commit, then any record naming it); an all-refused record never outweighs them", () => {
+    const src = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
+    const body = src.slice(src.indexOf("export function pushSeen"), src.indexOf("function commitsSeen"));
+    expect(body.indexOf("commitsSeen(")).toBeGreaterThan(-1);
+    expect(body.indexOf("commitsSeen(")).toBeLessThan(body.indexOf("named("));
+    expect(body.indexOf("named(")).toBeLessThan(body.indexOf('a.answer === "ok"'));
+    const rec = src.slice(src.indexOf("export function reconcileReuse"));
+    expect(rec.indexOf("pushSeen(")).toBeLessThan(rec.indexOf("allRefused"));
+    // Every attempt recorded refused, yet a worker record in the queue names the job: landed.
+    const { cfg } = queue();
+    const c = { ...cfg, notify: () => true } as Config;
+    const job = "j-20261115-eeeeee", t = { m: MSG, job, state: "pending", rid: "pc-0007" };
+    recordReuse(c, MSG, job, "pending", "pc-0007", "e".repeat(40));
+    for (const o of [{ ev: "answer", answer: "refused" }, { ev: "push", commit: "e".repeat(40) }, { ev: "answer", answer: "refused" }, { ev: "push", commit: "e".repeat(40) }, { ev: "answer", answer: "refused" }])
+      appendFileSync(cfg.used!, JSON.stringify({ ...t, ...o }) + "\n");
+    expect(reuseLedger(c).get(MSG)!.attempts.map((a) => a.answer)).toEqual(["refused", "refused", "refused"]);
+    mkdirSync(join(cfg.dir, "worker"), { recursive: true });
+    writeFileSync(join(cfg.dir, "worker", "taken.json"), JSON.stringify({ took: job }));
+    expect(reconcileReuse(c, [], null)).toMatchObject({ finalised: [job], rolledBack: [] });
+  });
+});
+
+describe("twentieth review: the once-only notices, delivered and kept beside the store", () => {
+  // A link that answers as given, call by call: true is "posted", false no answer.
+  const counting = (answers: boolean[]) => { const calls: string[] = []; return { calls, notify: (c: string) => { calls.push(c); return answers[Math.min(calls.length - 1, answers.length - 1)]; } }; };
+
+  test("a failed link post is tried again next round, and told once when it succeeds; the mark is a file of its own beside the store", () => {
+    const w = world();
+    w.first();
+    mkdirSync(w.used, { recursive: true });                                         // the store can't be read
+    const n = counting([false, true]);
+    const cfg = () => w.cfg("pi-1", { notify: n.notify as any });
+    const told = `${w.used}.told.json`;
+    expect(round(cfg()).ok).toBe(true);
+    expect(n.calls).toEqual(["reuse_store_unreadable"]);
+    expect(existsSync(told)).toBe(false);                                           // not marked: the link didn't acknowledge it
+    expect(round(cfg()).ok).toBe(true);
+    expect(n.calls).toEqual(["reuse_store_unreadable", "reuse_store_unreadable"]);
+    expect(JSON.parse(readFileSync(told, "utf8"))).toEqual(["store"]);              // marked once the link said posted
+    expect(round(cfg()).ok).toBe(true);
+    expect(n.calls.length).toBe(2);
+  });
+
+  test("an unreadable store across three rounds: told once", () => {
+    const w = world();
+    w.first();
+    mkdirSync(w.used, { recursive: true });
+    for (let i = 0; i < 3; i++) expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.told).toEqual(["reuse_store_unreadable"]);
+  });
+
+  test("a condition seen clear is forgotten, so its coming back is told again", () => {
+    const w = world();
+    w.first();
+    mkdirSync(w.used, { recursive: true });
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.told).toEqual(["reuse_store_unreadable"]);
+    rmSync(w.used, { recursive: true, force: true });                               // readable again (no store yet)
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8"))).toEqual([]);
+    mkdirSync(w.used, { recursive: true });                                         // and broken again
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.told).toEqual(["reuse_store_unreadable", "reuse_store_unreadable"]);
+  });
+
+  test("a keeper ahead of the link: a code it has no words for posts the generic line naming it", async () => {
+    const r = rig();
+    const a = await r.link.pcNotice("queue_new_condition");
+    expect(a.status).toBe("posted");
+    expect(r.posted[a.message].content).toBe("Your PC job keeper reported a stop condition the App does not know, code queue_new_condition, see troubleshooting in pc-jobs.md.");
+    // Only a plain code: no words, record codes or long strings from the keeper reach Discord.
+    for (const bad of ["P64", "has space", "x".repeat(41), "", "a-b"]) await expect(r.link.pcNotice(bad)).rejects.toThrow("not a PC job keeper notice");
+    expect(r.posted[(await r.link.pcNotice("constructor")).message].content).toContain("code constructor,");   // a name every object has is still just a code
+  });
+
+  test.skipIf(!Bun.which("curl"))("the keeper marks a notice told only on the link's posted answer, over its local API, an unknown code included", async () => {
+    const TOKEN = "not-a-real-token.for-the-notice-test";
+    const dir = mkdtempSync(join(tmpdir(), "pcjobs-notice-"));
+    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
+    const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
+    const r = rig();
+    let up = false;
+    const server = Bun.serve({ port: 0, async fetch(req) {
+      if (req.headers.get("x-harness-key") !== key) return Response.json({ status: "refused" }, { status: 403 });
+      if (!up) return Response.json({ status: "refused", said: "busy" }, { status: 503 });
+      const b: any = await req.json();
+      try { return Response.json(await r.link.pcNotice(b.code)); }
+      catch (e) { return Response.json({ status: "refused", said: (e as Error).message }, { status: 400 }); }
+    } });
+    const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
+    const used = join(dir, "state", "used.jsonl");
+    const run = async (code: string) => {
+      const src = `const { tell } = await import(${JSON.stringify(main)});
+        tell({ used: ${JSON.stringify(used)}, link: "http://127.0.0.1:${server.port}", discordEnv: ${JSON.stringify(join(dir, ".env"))} }, ${JSON.stringify(code)});`;
+      await Bun.spawn(["bun", "-e", src], { stdout: "pipe", stderr: "pipe" }).exited;
+    };
+    const told = () => { try { return JSON.parse(readFileSync(`${used}.told.json`, "utf8")); } catch { return null; } };
+    try {
+      await run("queue_new_condition");
+      expect(told()).toBeNull();                                                    // the link didn't post it: not marked
+      up = true;
+      await run("queue_new_condition");
+      expect(told()).toEqual(["queue_new_condition"]);
+      const n = Object.keys(r.posted).length;
+      await run("queue_new_condition");
+      expect(Object.keys(r.posted).length).toBe(n);                                 // told once
+    } finally { server.stop(true); }
+  }, 30_000);
+});
+
+describe("twentieth review: a round-17 pending line gets the record check before it is finalised", () => {
+  test("an upgrade where a worker record in the queue names the old line's job: landed, not spent, and nobody told", () => {
+    const w = world();
+    w.first();
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    // The older keeper's push did land: the queue holds a report naming its job.
+    const pc = w.clone();
+    mkdirSync(join(pc, "results"), { recursive: true });
+    writeFileSync(join(pc, "results", "j-20261115-old017.json"), JSON.stringify({ id: "j-20261115-old017", status: "done" }) + "\n");
+    git(["add", "-A"], pc); git(["commit", "--quiet", "-m", "report"], pc); git(["push", "--quiet", "origin", "HEAD:main"], pc);
+    mkdirSync(join(w.root, "state"), { recursive: true });
+    writeFileSync(w.used, JSON.stringify({ m: MSG, job: "j-20261115-old017", state: "pending", rid }) + "\n");
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.lines().slice(1)).toEqual([{ m: MSG, job: "j-20261115-old017", state: "final", rid, migrated: "round17_pending" }]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: "j-20261115-old017" });
+    expect(w.told).toEqual([]);
+    replayRefused(w, "j-20261115-old017");
+  });
+});
+
+describe("twentieth review: after a third refused push, the tap settles on the next round", () => {
+  test("refused again on the next round: rolled back and tried again, the owner still told once; a replay meanwhile is refused as pending", () => {
+    if (WIN) return;                                                               // the refusing hook is a shell script
+    const w = world();
+    w.first();
+    const h = w.hook("exit 1");
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    expect(round(w.cfg("pi-1")).ok).toBe(false);
+    const first = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(check(w.cfg("pi-1"), ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his answered for ${first.job} and is ${PENDING_STATUS}` });
+    expect(PENDING_STATUS).toContain("next round, within a minute");
+    expect(round(w.cfg("pi-1")).ok).toBe(false);                                    // settled (rolled back), then refused again
+    expect(w.settles()).toEqual(["rolled_back"]);
+    expect(w.told).toEqual(["reuse_push_refused"]);
+    rmSync(h);
+    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
+    expect(w.settles()).toEqual(["rolled_back", "rolled_back", "final"]);
+    expect(w.outcome(rid)).toMatchObject({ state: "queued" });
+    expect(w.told).toEqual(["reuse_push_refused"]);
   });
 });

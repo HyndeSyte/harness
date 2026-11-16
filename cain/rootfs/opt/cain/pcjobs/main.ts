@@ -37,8 +37,9 @@ export type Config = {
   afterPush?: () => void;        // the tests' stand-in for the keeper being killed between the push and the finalise
   pushWaitMs?: number;           // the wait between push tries (default PUSH_WAIT_MS; the tests' shorter)
   pushTimeoutMs?: number;        // one push's time limit; past it the answer is unknown (default PUSH_TIMEOUT_MS)
-  onPushAnswer?: () => void;     
-  beforePush?: () => void;       // the tests' stand-in for the branch moving on GitHub just before a push     // the tests' stand-in for the keeper being killed after a push, before its answer is written
+  onPushAnswer?: () => void;     // the tests' stand-in for the keeper being killed after a push, before its answer is written
+  beforePush?: () => void;       // the tests' stand-in for the branch moving on GitHub just before a push
+  pushResult?: (r: GitRun) => GitRun;   // the tests' stand-in for a push that landed, then failed (a tracking ref, a hook's error)
   notify?: Notify;               // the tests' stand-in for the link's /pc-notice
 };
 
@@ -98,22 +99,27 @@ export function linkReuse(cfg: Pick<Config, "link" | "discordEnv">): ReuseCheck 
 //   3. Once a push is ok, the tap is finalised (final).
 // A pending tap counts as spent. At the start of each round, once the queue copy is brought up to
 // date from GitHub (sync), every pending tap is settled against the queue as that fetch gave it:
-//   - landed (final): any recorded commit is in the fetched branch, an attempt was answered ok, or
-//     any job, report or worker record in the queue names the job id or the request id;
-//   - rolled back: none of that, and every recorded attempt has a refused answer and none is
-//     unknown or unanswered; the request, still waiting, is then checked afresh;
+//   - landed (final): checked first, in this order: any recorded commit is in the fetched branch,
+//     any job, report or worker record in the queue names the job id or the request id, or an
+//     attempt was answered ok;
+//   - rolled back: none of that, and every recorded attempt has a refused answer (git's porcelain
+//     "!" line for the exact ref, nothing else) and none is unknown or unanswered; the request,
+//     still waiting, is then checked afresh. After a third refused push this is the very next
+//     round (within a minute), once its fetch shows none of the recorded commits in the branch;
 //   - spent (final, settled "spent"): none of that either (an unknown or missing answer, a branch
 //     rewritten, a report pruned): the tap stays used for good, and its request, still waiting, is
 //     refused with that reason;
 //   - unsettled: a shallow copy, or a git answer that is neither yes nor no: that tap alone stays
 //     pending (spent) and its request waits; the round goes on for unrelated requests.
-// A pending line without a commit (written by the seventeenth round's keeper) is legacy: it is
-// treated as spent and finalised with one migration line, and the owner is told once.
+// A pending line without a commit (written by the seventeenth round's keeper) is legacy: it gets
+// the same record check (a job, report or worker record naming its job or request: landed, final
+// with a migration mark); with no record it is spent, finalised with one migration line, and the
+// owner is told once.
 // A line without a state (written before the seventeenth round) is final.
 // Each stop condition (a shallow copy, a missing branch, an empty remote with a pending tap, an
 // unreadable store, a tap that can't be settled, a push refused on every try) posts the owner one
 // Discord line through the link, naming it and the recovery step (cain/docs/pc-jobs.md,
-// Troubleshooting), at most once while it lasts (the told file beside the store).
+// Troubleshooting), at most once while it lasts (the notice file beside the store, below).
 // The file's folder is flushed to disk (fsync) too whenever the file or a folder above it is
 // made, so the file's own entry survives a power cut; the file is only appended to, never
 // renamed or rewritten. A folder that can't be flushed throws (the round stops before the push),
@@ -200,8 +206,18 @@ export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnsw
 
 // ---- One line to the owner, through the link, once while its condition lasts --------------
 // The keeper sends only a code; the link posts its own fixed words for it (link/core.ts
-// PC_NOTICES), so nothing from the queue reaches Discord. The told file beside the store keeps
-// which have gone out; a condition seen to clear is forgotten, so a later one is told again.
+// PC_NOTICES), so nothing from the queue reaches Discord. Delivery and persistence (0.12.0,
+// twentieth round):
+//   - which notices went out lives in a small file of its own beside the tap store,
+//     `<store>.told.json` (default /data/pc-jobs-reuse-used.jsonl.told.json), never in the store
+//     itself, so an unreadable store doesn't lose it and the store stays append-only; it is a
+//     JSON list of keys, written whole to a temporary file and renamed;
+//   - a notice is marked sent only once the link acknowledges the post (its answer says
+//     "posted"); no answer, a refusal or an error leaves it unmarked, so the next round tries again;
+//   - a mark is removed when its condition is seen clear (the store read, the branch back, the tap
+//     settled), so the condition coming back is told again;
+//   - a notice file that can't be read counts as nothing told (a notice may then go out again,
+//     never be lost).
 export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused";
 export type Notify = (code: PcNotice) => boolean;
 const toldFile = (cfg: Pick<Config, "used">) => `${cfg.used ?? USED_REUSE}.told.json`;
@@ -247,26 +263,44 @@ export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
 }
 
 // Whether the queue as fetched this round shows a tap's push reached GitHub: "landed" (a recorded
-// commit is in the branch, an attempt was answered ok, or the job or request is named anywhere in
-// the queue), "absent" (none of that, in a full copy whose answers are all clear), "shallow" (a
+// commit is in the branch, the job or request is named anywhere in the queue, or an attempt was
+// answered ok), "absent" (none of that, in a full copy whose answers are all clear), "shallow" (a
 // shallow copy can't tell), or "unknown" (git said neither yes nor no, or a file couldn't be read).
+// The landed checks run first, in this order (0.12.0, twentieth round): (1) any recorded commit in
+// the fetched branch, (2) any job, report or worker record naming the job or the request, (3) an ok
+// answer. Only once none shows it does an ambiguity (shallow, unknown) or "absent" come back, and
+// only "absent" lets the caller weigh a rollback.
 export type PushSeen = "landed" | "absent" | "shallow" | "unknown";
 export function pushSeen(cfg: Config, l: ReuseLine, fetched: string | null): PushSeen {
-  try { if (named(cfg.dir, [l.job, ...(l.rid ? [l.rid] : [])], resolve(cfg.used ?? USED_REUSE))) return "landed"; } catch { return "unknown"; }
+  // (1) The recorded commits, against the branch as this round's fetch gave it.
+  const inBranch = commitsSeen(cfg, l, fetched);
+  if (inBranch === "landed") return "landed";
+  // (2) Any record in the queue copy naming the job or its request.
+  let recorded: boolean | null;
+  try { recorded = named(cfg.dir, [l.job, ...(l.rid ? [l.rid] : [])], resolve(cfg.used ?? USED_REUSE)); } catch { recorded = null; }
+  if (recorded) return "landed";
+  // (3) GitHub's own ok to a push of it.
   if (l.attempts.some((a) => a.answer === "ok")) return "landed";
+  if (recorded === null) return "unknown";
+  return inBranch;
+}
+// Whether any recorded commit of a tap is in the fetched branch: landed, absent (a full copy, every
+// answer clear), shallow, or unknown (no fetch, or git said neither yes nor no).
+function commitsSeen(cfg: Config, l: ReuseLine, fetched: string | null): PushSeen {
   if (!fetched) return "unknown";
   const shallow = existsSync(join(cfg.dir, ".git", "shallow"));
+  let unclear: PushSeen | null = null;
   for (const a of l.attempts) {
     // Is the commit in the branch as fetched? git answers 0 (yes) or 1 (no) for a commit it has;
     // one it doesn't have at all was never fetched, so in a full copy it is in no part of the branch.
     const has = Bun.spawnSync(["git", "cat-file", "-e", `${a.commit}^{commit}`], { cwd: cfg.dir, stdout: "ignore", stderr: "ignore" });
-    if (has.exitCode !== 0) { if (shallow) return "shallow"; continue; }
+    if (has.exitCode !== 0) { if (shallow) unclear ??= "shallow"; continue; }
     const x = Bun.spawnSync(["git", "merge-base", "--is-ancestor", a.commit, fetched], { cwd: cfg.dir, stdout: "ignore", stderr: "ignore" });
     if (x.exitCode === 0) return "landed";
-    if (x.exitCode !== 1) return "unknown";
-    if (shallow) return "shallow";
+    if (x.exitCode !== 1) unclear ??= "unknown";
+    else if (shallow) unclear ??= "shallow";
   }
-  return "absent";
+  return unclear ?? "absent";
 }
 // Whether any file of the queue copy (the job files, reports, worker records, cancels, anything
 // but git's own folder) names one of these ids. A file that can't be read is an ambiguity: it throws.
@@ -288,7 +322,7 @@ function named(dir: string, ids: string[], skip: string): boolean {
 export class ReuseUnsettled extends Error {}
 // The status a pending tap's replay is refused with, and the line the owner hears after a push
 // refused on every try: the same words.
-export const PENDING_STATUS = "pending: whether its job reached the PC's queue is settled at the keeper's next start, and until then the tap stays used";
+export const PENDING_STATUS = "pending: whether its job reached the PC's queue is settled at the keeper's next round, within a minute, once a fetch from GitHub shows where its pushes went, and until then the tap stays used";
 export const SPENT_WHY = "the keeper can't show whether the job made from that tap reached the PC's queue, so the tap counts as used for good; ask him again";
 // Step 0 of a round, after sync: every pending tap settled against the queue as GitHub has it.
 // fetched: the branch's commit this round's fetch brought (sync), or null when it brought none.
@@ -299,15 +333,37 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
   for (const l of reuseLedger(cfg).values()) {
     if (l.state !== "pending") continue;
     if (l.legacy) {
-      // The seventeenth round's keeper wrote no commit: nothing could ever prove it absent, so spent.
+      // The seventeenth round's keeper wrote no commit. The same record check first (0.12.0, twentieth
+      // round): a job, report or worker record naming its job or request means it landed. With no
+      // such record, nothing could ever prove it absent, so it is spent. A record that can't be read
+      // leaves it pending (spent) for a later round.
+      let rec: boolean | null;
+      try { rec = jobs.some((j) => j.id === l.job) || named(cfg.dir, [l.job, ...(l.rid ? [l.rid] : [])], resolve(cfg.used ?? USED_REUSE)); } catch { rec = null; }
+      if (rec === null) {
+        unsettled.push(l.job);
+        tell(cfg, "reuse_unsettled", `unsettled:${l.m}`);
+        log(`the reuse tap for ${l.job} (written by an older keeper) can't be settled yet: a file in the queue copy can't be read`);
+        continue;
+      }
+      if (rec) {
+        recordReuse(cfg, l.m, l.job, "final", l.rid, undefined, { migrated: "round17_pending" });
+        finalised.push(l.job);
+        if (waiting(l)) { writeOutcome(cfg, { request: l.rid!, state: "queued", id: l.job }); rmSync(join(cfg.queue, `${l.rid}.json`), { force: true }); }
+        cleared(cfg, `unsettled:${l.m}`);
+        log(`migrated the reuse tap for ${l.job} (written by an older keeper, no commit): a record in the queue names it, so it landed`);
+        continue;
+      }
       recordReuse(cfg, l.m, l.job, "final", l.rid, undefined, { settled: "spent", migrated: "round17_pending" });
+      cleared(cfg, `unsettled:${l.m}`);
       spent.push(l.job);
       if (waiting(l)) { writeOutcome(cfg, { request: l.rid!, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` }); rmSync(join(cfg.queue, `${l.rid}.json`), { force: true }); }
       tell(cfg, "reuse_migrated", `migrated:${l.m}`);
       log(`migrated the reuse tap for ${l.job} (written by an older keeper, no commit): spent`);
       continue;
     }
-    const seen = jobs.some((j) => j.id === l.job && j.owner_reuse?.message_id === l.m) ? "landed" : pushSeen(cfg, l, fetched);
+    // Every landed check runs before any rollback decision: pushSeen's (commits, records, an ok answer), then the jobs as read.
+    let seen = pushSeen(cfg, l, fetched);
+    if (seen !== "landed" && jobs.some((j) => j.id === l.job && j.owner_reuse?.message_id === l.m)) seen = "landed";
     if (seen === "landed") {
       recordReuse(cfg, l.m, l.job, "final", l.rid, l.commit);
       finalised.push(l.job);
@@ -315,15 +371,17 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
         writeOutcome(cfg, { request: l.rid!, state: "queued", id: l.job });
         rmSync(join(cfg.queue, `${l.rid}.json`), { force: true });
       }
-      cleared(cfg, `shallow:${l.m}`); cleared(cfg, `unsettled:${l.m}`);
+      cleared(cfg, `shallow:${l.m}`); cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `refused:${l.m}`);
       log(`settled the reuse tap for ${l.job}: its push reached the queue`);
     } else if (seen === "absent") {
       const allRefused = l.attempts.length > 0 && l.attempts.every((a) => a.answer === "refused");
       if (allRefused) {
         recordReuse(cfg, l.m, l.job, "rolled_back", l.rid, l.commit);
         rolledBack.push(l.job);
-        log(`rolled back the reuse tap for ${l.job}: GitHub refused every push of it (${l.attempts.length}), and nothing in the queue holds it`);
+        // The refusal notice stays marked for this tap: a rolled-back tap refused again is the same condition, not told twice.
+        log(`rolled back the reuse tap for ${l.job}: GitHub refused every push of it (${l.attempts.length}), and this round's fetch shows none of its commits in the branch and no record of it`);
       } else {
+        cleared(cfg, `refused:${l.m}`);
         recordReuse(cfg, l.m, l.job, "final", l.rid, l.commit, { settled: "spent" });
         spent.push(l.job);
         if (waiting(l)) { writeOutcome(cfg, { request: l.rid!, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` }); rmSync(join(cfg.queue, `${l.rid}.json`), { force: true }); }
@@ -401,15 +459,22 @@ export function sync(cfg: Config, seen: { remoteHeads?: boolean } = {}): string 
   return at;
 }
 
-// One push's answer, read from git: ok, refused (the remote said no: its words kept), or unknown
-// (a timeout, a broken connection, anything it can't read as a yes or a no).
-export function pushAnswer(exitCode: number | null, out: string, timedOut: boolean): { answer: PushAnswer; said: string; nonFastForward: boolean } {
+// One push's answer, read from git (0.12.0, twentieth round). Only `git push --porcelain`'s own
+// line for the exact ref decides a refusal: that line flagged "!" ([rejected] or [remote rejected])
+// is refused, the remote's words kept. A zero exit is ok. Everything else is unknown, never
+// refused: a timeout, a broken connection, an answer with no line for that ref, and a non-zero exit
+// whose line for the ref shows it updated (a post-push failure: the local tracking ref couldn't be
+// written, a hook's error printed after the update). An unknown answer never frees a tap.
+export type GitRun = { exitCode: number | null; out: string; timedOut: boolean };
+export function pushAnswer(exitCode: number | null, out: string, timedOut: boolean, ref = "refs/heads/main"): { answer: PushAnswer; said: string; nonFastForward: boolean } {
   const said = out.replace(/\s+/g, " ").trim().slice(0, 300);
   if (timedOut || exitCode === null) return { answer: "unknown", said: "no answer in time", nonFastForward: false };
   if (exitCode === 0) return { answer: "ok", said: "", nonFastForward: false };
-  const nonFastForward = /non-fast-forward|\(fetch first\)|\[rejected\]/.test(out);
-  const refused = nonFastForward || /\[remote rejected\]|pre-receive hook declined|protected branch|Authentication failed|returned error: 40[134]|Permission to \S+ denied/.test(out);
-  return { answer: refused ? "refused" : "unknown", said, nonFastForward };
+  // Porcelain: one line per ref, "<flag>\t<from>:<to>\t<summary>".
+  const line = out.split(/\r?\n/).find((l) => { const f = l.split("\t"); return f.length >= 3 && f[0].length === 1 && f[1].endsWith(`:${ref}`); });
+  if (!line?.startsWith("!")) return { answer: "unknown", said, nonFastForward: false };
+  const nonFastForward = /\[rejected\].*\((?:non-fast-forward|fetch first)\)/.test(line);
+  return { answer: "refused", said, nonFastForward };
 }
 export class PushRefused extends Error { constructor(m: string, readonly answers: PushAnswer[]) { super(m); } }
 // The push, tried up to PUSH_TRIES times with a short wait between. Before each attempt every
@@ -422,14 +487,17 @@ export function push(cfg: Config, taps: Tap[] = []): void {
     cfg.beforePush?.();
     const commit = git(cfg, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
     for (const t of taps) recordAttempt(cfg, t, commit);
-    const p = gitRun(cfg, ["push", "--porcelain", "origin", `HEAD:${cfg.branch}`], cfg.pushTimeoutMs ?? PUSH_TIMEOUT_MS);
+    const ref = `refs/heads/${cfg.branch}`;
+    let p = gitRun(cfg, ["push", "--porcelain", "origin", `HEAD:${ref}`], cfg.pushTimeoutMs ?? PUSH_TIMEOUT_MS);
+    if (cfg.pushResult) p = cfg.pushResult(p);
     cfg.onPushAnswer?.();
-    const a = pushAnswer(p.exitCode, p.out, p.timedOut);
+    const a = pushAnswer(p.exitCode, p.out, p.timedOut, ref);
     answers.push(a.answer);
     for (const t of taps) recordAnswer(cfg, t, a.answer, a.said);
     if (a.answer === "ok") return;
     if (i >= PUSH_TRIES) {
-      if (taps.length && answers.every((x) => x === "refused")) for (const t of taps) tell(cfg, "reuse_push_refused", `refused:${t.m}:${t.job}`);
+      // Told once per tap (not per job made from it), so a tap rolled back and refused again isn't told twice.
+      if (taps.length && answers.every((x) => x === "refused")) for (const t of taps) tell(cfg, "reuse_push_refused", `refused:${t.m}`);
       throw new PushRefused(`git push: ${a.answer}${a.said ? ` (${a.said})` : ""}`, answers);
     }
     log(`push ${i} of ${PUSH_TRIES} didn't go through (${a.answer}), trying again: ${a.said}`);

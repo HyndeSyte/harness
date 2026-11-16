@@ -123,8 +123,11 @@ export const PC_NOTICES: Record<string, string> = {
   queue_empty_pending: "Your PC job keeper stopped: the PC job queue on GitHub is empty while a tap of yours approving a reused value waits to be settled. Fix: give the queue its first commit again, as in setup step 2 (pc-jobs.md, Troubleshooting); the tap then counts as used.",
   reuse_store_unreadable: "Your PC job keeper can't read its record of the taps you spent on reused values, so it takes no job that reuses a value until it can. Other PC jobs go on. Fix: see the store row in pc-jobs.md, Troubleshooting.",
   reuse_unsettled: "Your PC job keeper can't tell whether a job made from a tap of yours approving a reused value reached your PC: git gave no clear answer. The tap stays used, other PC jobs go on, and it tries again each round. If it lasts, see pc-jobs.md, Troubleshooting.",
-  reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next start; if it is freed, the job is queued again by itself.",
+  reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next round, within a minute, once GitHub shows none of it arrived; then the job is queued again by itself. If it keeps being refused, check the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
 };
+// A code the keeper sends that this link has no words for (a keeper ahead of the link).
+export const PC_NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
+export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
 export const CONNECTOR_LABEL = "Open connector settings";
 const CONNECTOR_ONCE_MS = 12 * 3_600_000;  // one notice about the connector per item in this long
@@ -1557,9 +1560,13 @@ export class Link {
 
   // -- one line from the PC job keeper (POST /pc-notice, 0.12.0 nineteenth round) -------
   // The keeper sends only a code; the words are the link's own (PC_NOTICES), so nothing from the
-  // queue or a page reaches Discord. The keeper sends each condition once while it lasts.
+  // queue or a page reaches Discord. The keeper sends each condition once while it lasts, and marks
+  // it sent only on this answer ("posted"). A keeper newer than this link may send a code the link
+  // has no words for (0.12.0, twentieth round): a plain code (lower-case letters, digits and "_",
+  // at most 40) gets the generic line, naming the code; anything else is refused.
   async pcNotice(code: unknown): Promise<{ status: "posted"; message: string }> {
-    const text = PC_NOTICES[String(code ?? "")];
+    const c = String(code ?? "");
+    const text = Object.hasOwn(PC_NOTICES, c) ? PC_NOTICES[c] : PC_NOTICE_CODE.test(c) ? pcNoticeUnknown(c) : "";
     if (!text) throw new Refusal("not a PC job keeper notice");
     return { status: "posted", message: await this.notice(text) };
   }

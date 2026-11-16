@@ -35,7 +35,7 @@
 //                                       exactly those values when posted; a message he typed never counts
 //                                       (core.ts reuseProof); "ok", or refused with why
 //     POST /pc-notice {code}            one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
-//                                       condition and its fix; "posted", or refused for an unknown code
+//                                       condition and its fix; "posted" (a plain code it has no words for gets a generic line naming it), or refused
 // Nothing is published to the LAN: the App has no "ports:".
 //
 // The gate (piece D), enforcing since 0.10.0: the link's send points fix and refuse
