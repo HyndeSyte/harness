@@ -668,18 +668,45 @@ What Cain's link enforces:
   posts, the link appends one record per button to its issued-key log (`/data/link-issued.log`, outside
   its restorable state `/data/link/state.json`): the tap key, its structured target (the card's item
   and the writes its tap allows) and the card's Discord message id, each record fsynced before the
-  card's own record is saved, so no tap on it counts before its key is durable. A card whose keys
-  can't be written loses its buttons and the ask is refused ("ask again in a minute"). The record
+  card's own record is saved, so no tap on it counts before its key is durable.
+
+  The issuance order (round 13). A card with buttons is posted without buttons first. Then its keys,
+  each with its button's custom id, its expiry and the message id Discord returned, are appended and
+  fsynced to the issued-key log; then the link's state is saved; only then are the buttons edited on,
+  and an `armed` record is logged. So a card can't be tapped before its keys and its record are both
+  durable. If the log write fails, the card never gets buttons and says so ("This card couldn't be made
+  tappable"), and the ask is refused ("ask again in a minute"). If the state save fails after the keys
+  were logged, a `void` record is logged, the card says it was withdrawn, and a later tap on it is
+  told the card was withdrawn (the keeper refuses its key without using it up). If the button edit
+  fails, you get one line on the card saying its buttons are on their way; at the link's next start
+  they are put on from the log, with one more line saying they're on. A crash between any two steps
+  is covered the same way at the next start: keys logged but no saved record is withdrawn; a saved
+  record with no buttons gets them. The record
   keeper reads that log each round (the same round that takes the check, or the next) and mirrors
   every key into its own append-only log (`/data/record-issued.log`); a key in neither log is forged
   or stale ("isn't one the link issued"). A key in the log that the link's state no longer lists was
   lost to a restore of that state: the request citing it comes back "was lost", Cain hears it, and
   the link posts "Your tap was lost when the App's state was restored from an older copy, please
   answer again." on that card's own thread (its message id comes from the log). A tap on a card the
-  restored state no longer knows, but whose keys are in the log, is told the same way, once. Issued
+  restored state no longer knows, but whose keys are in the log, is told the same way, once. After a
+  whole-image restore the log may have lost the card too (round 13): a tap on a card the bot authored,
+  with a well-formed button id, is still told as lost, never as forged, when the keeper's mirror has
+  its message id, or the record remote's history does (each tap-derived commit also carries
+  `Tap-Card: <message id>`, listed in the keeper's status), or it is newer than every card the
+  restored state and log know (the restore's boundary). Any other unknown card's tap is "not a card
+  the link knows". Issued
   keys are kept for their whole actionable life, until consumed or tombstoned plus a margin
   (`TAP_ISSUED_KEEP_MS`, 100 days), the same on the link (its log and its state) and on the keeper
   (its mirror), so a restore on day 4, 10 or 89 is told as lost, never refused as not issued.
+
+  Expiry (round 13). When a card's keys expire, its buttons come off by the message id in the
+  issued-key log, with an "Expired" line added, even on a card the link's state no longer knows, and
+  the card goes into a compact expired-key index (`/data/link-expired.log`, one record per card, not per
+  key). A late tap on it is told it expired. Retention is aligned at 100 days: issued keys (the link's
+  log and state, the keeper's mirror), and tombstones. A landing unresolved past 90 days becomes a
+  tombstone; at 100 days from its first failure the tombstone and its issued key are forgotten
+  together, `keeper.sh clock` lists it under `expired_landings`, Cain hears one line, and it can no
+  longer be settled by hand.
 
   The run counter (round 12). Each start of the link raises its run counter and makes a new nonce,
   fsynced in its state before any key is issued or any request is sent under that run, then logs the
@@ -704,9 +731,30 @@ What Cain's link enforces:
   settle log) are framed: one record per line, `<length>:<CRC-32>:<JSON>`, each appended and fsynced.
   At start a torn final record (a write cut short by a power cut) is truncated, with one logged line
   and one line to Cain; the records before it stand. The keeper keeps each of its logs' high-water
-  record counts in its state, and refuses to start (one logged line and one line to Cain, with a
-  plain reason) while a log is missing or holds fewer records than that count: put the log back from
-  the backup taken with that state, or restore the whole App.
+  record counts in its state (consumed keys, its mirror, the install log), counted only after each
+  record's fsync; a new log's folder is fsynced when the log is created.
+
+  Degraded start and recovery (round 13). A log missing, or shorter than its high-water count, or the
+  keeper's state missing (a partial restore, or a wiped image), is a detected restore, never a refusal:
+  the keeper starts degraded, rebuilds its consumed set from the record remote's trailers and its
+  issued set from the surviving mirror or the link's log, resets its counts, logs and relays one line
+  (Cain hears "detected a restore"), and holds every request that carries a tap key until the rebuild
+  completes. A partial restore in the other direction (the state older than the logs) loses nothing:
+  the counts move up. The keeper refuses to start only for a case no rule explains (a log that can't be
+  read, or one with a damaged record before its end); then Cain tells you in one line, and if you agree
+  you send exactly `recover logs` in your DM. Cain runs `keeper.sh recover-logs --said <that message's
+  id>`: the link checks it is your own message, under a day old, exactly that line, used once (written
+  to the landing ledger like a settle), and leaves it for the keeper, which moves the damaged log aside
+  and goes on only once its rebuild is verified against the record remote.
+
+  The remote-down hold (round 13). The rebuild counts only against a fresh fetch of the record remote.
+  While GitHub doesn't answer, the keeper still starts, but every request that carries a tap key is
+  held (consumed set unverified): it stays in Cain's queue, untouched, and Cain gets one "Pending: your
+  request ..." line for it. Hand settles are held too (`keeper.sh settle` answers pending, nothing
+  settled). `keeper.sh clock` shows `consumed_unverified` with its tries, and you get one notice per
+  outage once a round has tried. It retries each round GitHub could answer, logging on a backoff (1,
+  2, 4 up to 30 minutes). Ask cards keep posting. Once the rebuild completes, the held requests are
+  decided again: a key already acted on is refused, a fresh one acts once.
 
   The hand settle in the ledger first (round 12). A hand settle's entry, with your consumed message
   id, is appended to the landing ledger's settle log (`settled.log` in the ledger's folder) in one
@@ -731,13 +779,37 @@ What Cain's link enforces:
   unconfirmed day; after that, one digest message lists every unresolved key with its two settle
   lines, daily for 7 days, then weekly. `keeper.sh clock` lists them all as before.
 
-  Install taps behind a flag (round 12). Until Cain runs `keeper.sh install-taps on`, a Ship tap
-  lands nothing: it answers "Installs wait for the post-install tests" and the card keeps its
-  buttons, and Cain hears it. He turns it on once the Pi smoke test, the forced-webhook step, the
-  pull-the-plug case and one real settle cycle have passed; `keeper.sh install-taps once` lets
-  exactly one Ship tap through, for the pull-the-plug case itself. `keeper.sh clock` shows
-  `install_taps` (on, once or off). The live CLI test's edit-after-reply case is a known skip in CI
-  and in cloud sessions, tracked in issue 24. You have nothing to set up beyond the smoke test's one option change.
+  Install taps behind a flag (round 12). Until install taps are on, a Ship tap lands nothing: it
+  answers "Installs wait for the post-install tests" and the card keeps its buttons, and Cain hears it.
+  The durable install flag (round 13): the flag and each once use are framed, fsynced records in a
+  keeper-owned log (`/data/record-install.log`), covered by the keeper's high-water and rebuild logic,
+  and read as off when it is missing, corrupt or unreadable. After any restore that lost install
+  records the keeper appends off itself, so the flag stays off after an image restore. Install taps
+  turn on only through your own line: `keeper.sh install-taps on` only proposes, and only once the
+  post-install tests' result file (`/data/work/install-tests.json`, which Cain writes from the smoke
+  test and the resilience run) names the full head they ran on and says both passed, each dated within
+  7 days. Then the link sends you the exact line `install taps on`; once you send it, Cain runs
+  `keeper.sh install-taps on --said <that message's id>`, and it is on: your line is used once and
+  written to the landing ledger like a settle, and the flag record names the tests' head.
+  `keeper.sh install-taps once` (Cain's) lets exactly one Ship tap through, for the pull-the-plug case:
+  that use is appended to the install log before the landing ledger's first write, so a crash anywhere
+  after it can't let a second Ship tap through, and the landing's take carries `Install-Once: <tap key>`
+  as a commit trailer. `keeper.sh install-taps off` (Cain's) stops them. `keeper.sh clock` shows
+  `install_taps` (on, once or off) and why.
+
+  The combined fault scenario (round 13). Before install taps turn on, you run one combined fault
+  scenario on the Pi, with Cain, after the smoke test and the resilience run: a checked test ask and a
+  Ship card for a real Ship you mean to make are up (never a test card: one already in main pushes
+  nothing); Cain arms `keeper.sh install-taps once`; you
+  tap Ship and pull the Pi's power right after; with the Pi off its network (so GitHub can't be
+  reached) you power it on: the keeper starts and `keeper.sh clock` shows `consumed_unverified`, a
+  tap on the test ask comes back held ("Pending"), and a second Ship tap answers that installs wait;
+  then the network comes back: the landing settles once, the held tap is decided once, and the clock
+  shows `install_taps` off and no `consumed_unverified`. Cain records the result in the result file.
+  The design is frozen for this scenario: nothing new is added before it runs.
+
+  The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
+  issue 24. You have nothing to set up beyond the smoke test's one option change.
 
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap

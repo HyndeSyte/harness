@@ -45,6 +45,11 @@ export interface Landings {
   // truncated (at start).
   settleHand?(key: string, how: "landed" | "not landed", at: string, said: string): boolean;
   handSettles?(): { key: string; how: "landed" | "not landed"; at: string; said: string }[];
+  // Round 13: the owner's other single-use lines (install taps on, recover logs), in the same settle log
+  // ({t: "owner", kind, said, at}), before any effect; false when his message was used already (by any
+  // owner line or hand settle) or the log couldn't be written.
+  ownerLine?(kind: "install" | "recover", said: string, at: string): boolean;
+  ownerLines?(): { kind: string; said: string; at: string }[];
   repair?(): { torn: boolean; bytes: number };
   entries(): LandingEntry[] | null;
   // keep: keys never pruned whatever their age (the link's unresolved keys).
@@ -126,7 +131,7 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
     },
     settleHand(key, how, at, said) {
       try {
-        if (api.handSettles!().some((h) => h.key === key || h.said === said)) { log(`hand settle of landing ${keyName(key).slice(0, 12)} refused: its key or message is in the settle log already`); return false; }
+        if (api.handSettles!().some((h) => h.key === key || h.said === said) || api.ownerLines!().some((h) => h.said === said)) { log(`hand settle of landing ${keyName(key).slice(0, 12)} refused: its key or message is in the settle log already`); return false; }
         appendLog(join(dir, SETTLED_LOG), { key, how, at, said });
         o.sync?.("settle-log");
       } catch (e: any) { log(`couldn't append the hand settle of landing ${keyName(key).slice(0, 12)} to the settle log: ${String(e?.message ?? e).slice(0, 80)}`); return false; }
@@ -136,6 +141,18 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
     handSettles() {
       const r = readLog(join(dir, SETTLED_LOG), { repair: false });
       return r.records.filter((x: any) => x && typeof x.key === "string" && (x.how === "landed" || x.how === "not landed") && typeof x.said === "string" && typeof x.at === "string");
+    },
+    ownerLine(kind, said, at) {
+      try {
+        if (api.handSettles!().some((h) => h.said === said) || api.ownerLines!().some((h) => h.said === said)) { log(`owner line (${kind}) refused: his message is in the settle log already`); return false; }
+        appendLog(join(dir, SETTLED_LOG), { t: "owner", kind, said, at });
+        o.sync?.("settle-log");
+        return true;
+      } catch (e: any) { log(`couldn't append the owner's ${kind} line to the settle log: ${String(e?.message ?? e).slice(0, 80)}`); return false; }
+    },
+    ownerLines() {
+      const r = readLog(join(dir, SETTLED_LOG), { repair: false });
+      return r.records.filter((x: any) => x?.t === "owner" && typeof x.kind === "string" && typeof x.said === "string" && typeof x.at === "string");
     },
     repair() { const r = readLog(join(dir, SETTLED_LOG)); return { torn: r.torn, bytes: r.tornBytes }; },
     entries() {

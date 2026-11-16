@@ -69,14 +69,18 @@ export function readLog<T = any>(file: string, o: { repair?: boolean } = {}): Lo
 
 // Appends one record and fsyncs it (and its directory when the file is new). Throws on failure:
 // the caller acts only once this returns.
+// Round 13: a test's view of each fsync, in order ("file <path>" or "dir <path>").
+export const syncSpy: { on: null | ((what: string) => void) } = { on: null };
 export function appendLog(file: string, rec: unknown): void {
   const fresh = !existsSync(file);
   if (fresh) mkdirSync(dirname(file), { recursive: true });
   const fd = openSync(file, "a", 0o600);
-  try { writeSync(fd, frame(rec)); fsyncSync(fd); } finally { closeSync(fd); }
-  if (fresh) {
-    try { const d = openSync(dirname(file), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* a directory that can't be opened to sync (not on Linux) */ }
-  }
+  try { writeSync(fd, frame(rec)); fsyncSync(fd); syncSpy.on?.(`file ${file}`); } finally { closeSync(fd); }
+  // A new log's directory entry is fsynced too, so a power cut can't lose the whole file.
+  if (fresh) syncDir(dirname(file));
+}
+export function syncDir(dir: string): void {
+  try { const d = openSync(dir, "r"); try { fsyncSync(d); syncSpy.on?.(`dir ${dir}`); } finally { closeSync(d); } } catch { /* a directory that can't be opened to sync (not on Linux) */ }
 }
 
 // The same file's content written whole and fsynced, for a test that wants a log in a given state.

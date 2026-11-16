@@ -81,11 +81,23 @@
 #                                        The settle goes to the landing ledger's settle log (fsynced) before
 #                                        anything else happens. An audit line goes to the link's log, and
 #                                        the usual outcome line follows
-#   keeper.sh install-taps on|once|off   whether his Ship taps land in main: off until Cain runs it with on,
-#                                        after the Pi smoke test, the forced-webhook step, the pull-the-plug
-#                                        case and one real settle cycle pass; once lets exactly one Ship tap
-#                                        land (the pull-the-plug case itself). Until then a Ship tap answers
-#                                        that installs wait for the post-install tests, and keeps its buttons
+#   keeper.sh install-taps on|once|off [--said <his message id>]
+#                                        whether his Ship taps land in main, kept in the record keeper's
+#                                        install log (off when it is missing or damaged). on only proposes:
+#                                        once /data/work/install-tests.json says the smoke test and the
+#                                        resilience run passed (each dated, within 7 days) on a full head
+#                                        sha, the link sends him the exact line "install taps on"; once he
+#                                        sends it, on --said <that message's id> turns it on (his line is
+#                                        single use, written to the landing ledger first). once (Cain's)
+#                                        lets exactly one Ship tap land (the pull-the-plug case itself);
+#                                        off (Cain's) stops them. Until on, a Ship tap answers that installs
+#                                        wait for the post-install tests, and keeps its buttons
+#   keeper.sh recover-logs --said <his message id>
+#                                        the owner's alone, only when the record keeper says it refuses to
+#                                        start for a case no rule explains: his own message in his DM, under
+#                                        a day old, saying exactly "recover logs", single use; the keeper
+#                                        moves the damaged log aside and goes on once its rebuild is
+#                                        verified against GitHub
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
@@ -114,6 +126,7 @@ case "$cmd" in
   stall-read) url="$link/stallread"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   install-taps) url="$link/installtaps"; ctx=harness-relay-v1 ;;
+  recover-logs) url="$link/recoverlogs"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -121,7 +134,7 @@ if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
 fi
 item="" question="" reply_to="" pr="" head="" edit="" review="" checked="" reason="" said=""
 case "$cmd" in
-  show|ask|ship|answered|check|connector|settle)
+  show|ask|ship|answered|check|connector|settle|install-taps|recover-logs)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -202,7 +215,8 @@ case "$cmd" in
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
   settle)   body=$(jq -nc --arg t "${1:-}" --arg h "${2:-}" --arg s "$said" '{tap: $t, how: $h, said: $s}') ;;
-  install-taps) body=$(jq -nc --arg h "${1:-}" '{how: $h}') ;;
+  install-taps) body=$(jq -nc --arg h "${1:-}" --arg s "$said" '{how: $h} + (if $s == "" then {} else {said: $s} end)') ;;
+  recover-logs) body=$(jq -nc --arg s "$said" '{said: $s}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;

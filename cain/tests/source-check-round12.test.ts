@@ -372,23 +372,21 @@ describe("9. framed append-only logs", () => {
     expect(readConsumed(k.cfg).get("tap-00000000f901")).toBe("cain-ship-t");
   }, 30_000);
 
-  test("a missing log, or one shorter than its high-water count: the keeper refuses to start, with a plain reason", () => {
+  // Round 13: no longer a refusal: a detected restore, a degraded start and a rebuild (round 13's tests).
+  test("a missing log, or one shorter than its high-water count: a detected restore, rebuilt, never a refusal", () => {
     const k = keeperRig();
     k.cain({ id: "cain-ship-m", tap: "tap-00000000f911", ops: [{ op: "take", item: "P33", for: "his Ship tap", job: "ship Cain 0.12.0" }] });
     expect(cycle(k.cfg).ok).toBe(true);
     expect(k.kept().logHigh.consumed).toBe(1);
-    const saved = readFileSync(tapsLogFile(k.cfg));
     rmSync(tapsLogFile(k.cfg));
     k.cain({ id: "cain-r9c", ops: [{ op: "note", item: "P44", text: "a round" }] });
     const out: any = cycle(k.cfg);
-    expect(out.ok).toBe(false);
-    expect(out.refused).toContain("is missing, but its state says it held 1 records");
-    expect(k.relayed()).toContain("The record keeper refuses to start");
-    writeLogForTest(tapsLogFile(k.cfg), []);                          // there, but shorter
-    expect((cycle(k.cfg) as any).refused).toContain("holds 0 records, fewer than the 1");
-    writeFileSync(tapsLogFile(k.cfg), saved);
-    expect(cycle(k.cfg).ok).toBe(true);
+    expect(out.ok).toBe(true);
+    expect(out.refused).toBeUndefined();
+    expect(k.relayed()).toContain("The record keeper detected a restore");
     expect(k.states("cain-r9c")).toEqual(["done"]);
+    expect(readConsumed(k.cfg).get("tap-00000000f911")).toBe("cain-ship-m");   // back from the history
+    expect(k.kept().rebuild).toBeUndefined();
   }, 30_000);
 
   test("the frame: length and checksum per record; a bad middle record is skipped, a torn last one truncated", () => {
@@ -406,7 +404,7 @@ describe("9. framed append-only logs", () => {
 });
 
 describe("10. install taps behind a flag", () => {
-  test("a Ship tap waits, buttons on, until keeper.sh install-taps on; once lets exactly one through", async () => {
+  test("a Ship tap waits, buttons on, until install taps are on; once lets exactly one through", async () => {
     const r = shipRig({ installTaps: false });
     expect((r.link.clockReport() as any).install_taps).toBe("off");
     const id = await shipCard(r);
@@ -416,14 +414,15 @@ describe("10. install taps behind a flag", () => {
     expect(r.ephemerals().some((e: any) => e.content === INSTALL_WAIT)).toBe(true);
     expect(r.github.landings).toHaveLength(0);
     expect(r.relayed.some((x) => x.includes("install taps aren't on yet"))).toBe(true);
-    expect(() => r.link.installTaps({ how: "yes" })).toThrow("on, once or off");
-    expect(r.link.installTaps({ how: "once" })).toMatchObject({ status: "ok", install_taps: "once" });
+    await expect(r.link.installTaps({ how: "yes" })).rejects.toThrow("on, once or off");
+    expect(await r.link.installTaps({ how: "once" })).toMatchObject({ status: "ok", install_taps: "once" });
     await r.tap(structuredClone(r.msg(id)), r.ids(id)[0]);
     await r.link.whenLanded();
     expect(landedLines(r)).toHaveLength(1);
     expect((r.link.clockReport() as any).install_taps).toBe("off");
-    r.link.installTaps({ how: "on" });
-    expect((r.link.clockReport() as any).install_taps).toBe("on");
+    // Round 13: on is the owner's line alone (round 13's tests); Cain's on without it only proposes.
+    await expect(r.link.installTaps({ how: "on" })).rejects.toThrow("result file");
+    expect((r.link.clockReport() as any).install_taps).toBe("off");
   });
   test("keeper.sh, the docs and Cain's rules say so; the live CLI test is a known skip naming its issue", () => {
     expect(flat("../rootfs/opt/cain/keeper.sh")).toContain("keeper.sh install-taps on|once|off");

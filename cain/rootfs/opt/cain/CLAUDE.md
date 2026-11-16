@@ -619,14 +619,32 @@ R5. Last, the rollback: ask him to restore this App from that backup (you can't 
    answers.
 Nothing lets cards through without a check.
 
-Install taps. Until you run `/opt/cain/keeper.sh install-taps on`, his Ship taps land nothing: the
-card answers him that installs wait for the post-install tests and keeps its buttons, and you get a
-line saying so. Run it only once all of these have passed on the Pi: the install smoke test, its
-forced-webhook step (14), the pull-the-plug case (R4b, with install-taps once) and one real settle
+Install taps. Until install taps are on, his Ship taps land nothing: the card answers him that
+installs wait for the post-install tests and keeps its buttons, and you get a line saying so. They
+turn on only through his own line. Once all of these have passed on the Pi: the install smoke test,
+its forced-webhook step (14), the pull-the-plug case (R4b, with install-taps once), one real settle
 cycle (an unresolved landing settled by his own settle line; if none has come up, ask him once with
-buttons whether to turn installs on without it, and do as he taps). `keeper.sh clock` shows
-install_taps. If the record keeper ever says it refuses to start (a log missing or shorter than its
-state says), tell him in one line that it needs its log back from the backup, and nothing more.
+buttons whether to go on without it, and do as he taps) and the combined fault scenario (DOCS.md),
+write /data/work/install-tests.json: `{"head": "<full sha of the installed head>", "smoke": {"pass":
+true, "at": "<when>"}, "resilience": {"pass": true, "at": "<when>"}}`, true only for what passed. Then
+run `/opt/cain/keeper.sh install-taps on`: it only proposes, sending him the exact line `install taps
+on`. Once he sends it, run `/opt/cain/keeper.sh install-taps on --said <his message id>`. Never send
+that line for him or run it without his message. `install-taps once` and `install-taps off` are
+yours. `keeper.sh clock` shows install_taps and why; after any restore it reads off until his line
+again.
+
+The record keeper after a restore. If it detected a restore (a line saying "detected a restore"), it
+started degraded and rebuilds by itself: nothing to tell him. While it can't reach GitHub, a request
+of yours that carries a tap key is held, not refused: you get "Pending: your request ..." once; send
+nothing again, it is decided by itself once the rebuild completes. `keeper.sh settle` answers pending
+then too: run the same settle again once keeper.sh clock shows consumed_unverified null. Only if it
+says it refuses to start (a log it can't read): tell him in one line that it needs his OK to rebuild
+its logs, and that he sends exactly `recover logs` if he agrees; then run
+`/opt/cain/keeper.sh recover-logs --said <his message id>`, and nothing more.
+
+A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
+saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:
+ask again in a minute. A request from a tap on a withdrawn card is refused: record nothing from it.
 
 ## Stop
 His Stop button stops what would start next: the calendar specialist, your Build and

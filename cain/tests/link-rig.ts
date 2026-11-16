@@ -1,6 +1,7 @@
 // A fake Discord, record and clock around Cain's link (link/core.ts), for the tests.
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { mkdtempSync } from "node:fs";
+import { appendLog } from "../rootfs/opt/cain/applog";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { emptyState, Link, type Pull, State } from "../rootfs/opt/cain/link/core";
@@ -41,10 +42,14 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
     noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; unchecked?: boolean; maxCheckDays?: number;
-    installTaps?: boolean; issuedLog?: string | null } = {}) {
+    installTaps?: boolean; issuedLog?: string | null; keeperMirror?: string } = {}) {
   let state: State = emptyState();
   // Round 12: Ship taps land only once install taps are on; the tests about other things have them on.
-  if (opts.installTaps !== false) state.installTaps = { on: true, at: 0 };
+  // Round 13: in the keeper-owned install log, turned on by the owner's line on the tests' head.
+  const installDir = mkdtempSync(join(tmpdir(), "link-install-"));
+  const installLog = join(installDir, "record-install.log"), installResults = join(installDir, "install-tests.json");
+  if (opts.installTaps !== false) appendLog(installLog, { t: "flag", how: "on", by: "owner", said: "1570000000000000001", head: "a".repeat(40), at: "2026-11-01T00:00:00.000Z" });
+  const recoverFile = join(installDir, "record-recover.json");
   // Round 12: the link's issued-key log, a real file (null: none); the crash points the tests set; and
   // the durable saves, in order with the log's appends.
   const issuedLog = opts.issuedLog === null ? undefined : (opts.issuedLog ?? join(mkdtempSync(join(tmpdir(), "link-issued-")), "link-issued.log"));
@@ -93,9 +98,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // killed at the ceiling, and what Discord answers to a webhook patch of @original (another id).
   const survive = { fn: null as null | ((id: string) => boolean | null) };
   const landLedger = { keys: new Set<string>(), broken: false, what: new Map<string, { pr: string; head: string; at: string; base?: string }>(), settled: new Map<string, string>(), said: new Map<string, string>(),
-    hand: [] as { key: string; how: string; at: string; said: string }[],
+    hand: [] as { key: string; how: string; at: string; said: string }[], owner: [] as { kind: string; said: string; at: string }[],
     untrusted: null as string | null, pruned: 0 };
-  const disk = { corrupt: null as string | null, writes: 0 };
+  const disk = { corrupt: null as string | null, writes: 0, failSaves: 0 };
   const kills = { n: 0 };
   const autoKeep = (req: any) => {
     if (!keeper.auto) return;
@@ -198,9 +203,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     return null;
   };
   const deps = {
-    rest, load: () => (disk.corrupt !== null ? emptyState() : copy(state)), save: (s: State) => { state = copy(s); disk.corrupt = null; disk.writes++; }, now: () => t.now,
+    rest, load: () => (disk.corrupt !== null ? emptyState() : copy(state)),
+    save: (s: State) => { if (disk.failSaves > 0) { disk.failSaves--; throw new Error("ENOSPC: no space left on device"); } state = copy(s); disk.corrupt = null; disk.writes++; }, now: () => t.now,
     saveDurable: (s: State) => { durable.push({ run: s.run, nonce: s.runNonce }); state = copy(s); disk.corrupt = null; disk.writes++; },
-    issuedLog,
+    issuedLog, installLog, installResults, recoverFile, keeperMirror: opts.keeperMirror,
     crashPoint: (where: string) => { if (crash.at === where) { crash.at = null; throw new Error(`crash injected at ${where}`); } },
     stateHealth: () => (disk.corrupt !== null ? { ok: false, why: "corrupt or mid-write" } : { ok: true }),
     requestLogged: (id: string) => (survive.fn ? survive.fn(id) : true),
@@ -222,6 +228,11 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
         return true;
       },
       handSettles: () => landLedger.hand.map((h) => ({ ...h })),
+      ownerLine: (kind: string, said: string, at: string) => {
+        if (landLedger.broken || landLedger.hand.some((h) => h.said === said) || landLedger.owner.some((h) => h.said === said)) return false;
+        landLedger.owner.push({ kind, said, at }); return true;
+      },
+      ownerLines: () => landLedger.owner.map((h) => ({ ...h })),
       repair: () => ({ torn: false, bytes: 0 }),
       entries: () => [...landLedger.keys].map((key) => ({ key, ...(landLedger.what.get(key) ?? { pr: "", head: "", at: "" }),
         ...(landLedger.settled.has(key) ? { settled: { how: landLedger.settled.get(key) as any, at: new Date(t.now).toISOString(),
@@ -297,7 +308,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     get link() { return checking(link); },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
     reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited, survive, landLedger, disk, kills, deps,
-    issuedLog, crash, durable,
+    issuedLog, crash, durable, installLog, installResults, recoverFile,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

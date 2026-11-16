@@ -22,7 +22,8 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
-import { appendLog, readLog } from "../applog.ts";
+import { appendLog, readLog, syncDir } from "../applog.ts";
+import { installState } from "../installflag.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; relay: string;
@@ -53,6 +54,9 @@ export type Config = {
   tapsLog?: string;        // round 11: the append-only log of consumed tap keys (default /data/record-taps.jsonl, next to the queue)
   linkIssued?: string;     // round 12: the link's issued-key log, read only (default /data/link-issued.log)
   issuedLog?: string;      // round 12: the keeper's own mirror of it (default /data/record-issued.log)
+  installLog?: string;     // round 13: the install-taps log the keeper owns (default /data/record-install.log)
+  recover?: string;        // round 13: the owner's accepted recover-logs line (default /data/record-recover.json)
+  onItem?: (id: string) => void;   // round 13: the tests' hook, run as each request comes up for its decision
 };
 
 // Whether the system clock is synchronized by the box's own sources (../clock.ts: the kernel's
@@ -348,8 +352,15 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   linkSeen?: { run: number; nonce: string };
   // Round 12: how many records each of the keeper's append-only logs held after its last round (the
   // high-water count): a log missing or shorter than that refuses the keeper's start.
-  logHigh?: { consumed?: number; issued?: number };
+  logHigh?: { consumed?: number; issued?: number; install?: number };
   linkRestore?: { at: string; why: string };
+  // Round 13: a detected restore (a log missing or shorter than its high-water count, or the keeper's state
+  // missing): the consumed set isn't verified until it is rebuilt from the record remote's history, which
+  // needs GitHub. Meanwhile every tap-derived request is held (told: the request ids Cain heard pending for),
+  // and the rebuild is tried again each round GitHub answers (tries, next: its log line's backoff).
+  rebuild?: { since: string; why: string; tries: number; next?: string; told?: string[] };
+  recovered?: string[];                   // round 13: the owner's recover-logs message ids already used
+  historyCards?: string[];                // round 13: card message ids named by Tap-Card trailers (newest last)
   tapNotices?: TapNotice[] };
 type TapNotice = { tap: string; why: "refused" | "lost"; reason: string; msg?: string; at: string };
 const TAPS_KEPT = 1000;
@@ -375,6 +386,8 @@ const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record
 export const tapsLogFile = (cfg: Config) => cfg.tapsLog ?? join(dirname(cfg.queue), "record-taps.jsonl");
 export const linkIssuedFile = (cfg: Config) => cfg.linkIssued ?? join(dirname(cfg.queue), "link-issued.log");
 export const issuedMirrorFile = (cfg: Config) => cfg.issuedLog ?? join(dirname(cfg.queue), "record-issued.log");
+export const installLogFile = (cfg: Config) => cfg.installLog ?? join(dirname(cfg.queue), "record-install.log");
+export const recoverFile = (cfg: Config) => cfg.recover ?? join(dirname(cfg.queue), "record-recover.json");
 // Round 12: an issued key counts for its whole actionable life: until consumed or tombstoned (90 days),
 // plus a margin. The link keeps it as long (TAP_ISSUED_KEEP_MS).
 export const ISSUED_KEEP_MS = 100 * 86_400_000;
@@ -389,7 +402,7 @@ function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appe
 // Round 12: the issued keys the keeper knows, from the link's issued-key log and its own mirror of it,
 // each with its card's item, kind, label, message id and target; keys older than ISSUED_KEEP_MS are
 // stale. runs: the link's run records ({run, nonce}) in the order logged.
-export type IssuedRec = IssuedTap & { kid: string; at: number; run?: number; nonce?: string };
+export type IssuedRec = IssuedTap & { kid: string; at: number; run?: number; nonce?: string; voided?: boolean };
 export function readIssued(cfg: Config, now: number): { keys: Map<string, IssuedRec>; runs: { run: number; nonce: string }[] } {
   const keys = new Map<string, IssuedRec>(), runs: { run: number; nonce: string }[] = [];
   for (const f of [issuedMirrorFile(cfg), linkIssuedFile(cfg)]) {
@@ -405,6 +418,11 @@ export function readIssued(cfg: Config, now: number): { keys: Map<string, Issued
         at: Number.isFinite(at) ? at : now, ...(Number.isInteger(r.run) ? { run: r.run } : {}), ...(typeof r.nonce === "string" ? { nonce: r.nonce } : {}) });
     }
   }
+  // Round 13: a card the link voided (its record never saved after its keys were logged): withdrawn.
+  for (const f of [issuedMirrorFile(cfg), linkIssuedFile(cfg)]) {
+    try { for (const r of readLog<any>(f, { repair: false }).records) if (r?.t === "void" && typeof r.msg === "string") for (const k of keys.values()) if (k.msg === r.msg) k.voided = true; }
+    catch { /* unreadable: the other file */ }
+  }
   return { keys, runs };
 }
 // Round 12: the link's issued-key records the keeper's mirror doesn't have yet, appended to it, so a
@@ -416,43 +434,74 @@ function mirrorIssued(cfg: Config): number {
   const have = new Set(mine.filter((r) => r?.t === "key").map((r) => r.kid));
   let n = 0;
   for (const r of link) if (r?.t === "key" && TAP_KEY.test(r.kid) && !have.has(r.kid)) { appendLog(issuedMirrorFile(cfg), r); have.add(r.kid); n++; }
+  // Round 13: the link's void records too, once each.
+  const voided = new Set(mine.filter((r) => r?.t === "void").map((r) => r.msg));
+  for (const r of link) if (r?.t === "void" && typeof r.msg === "string" && !voided.has(r.msg)) { appendLog(issuedMirrorFile(cfg), r); voided.add(r.msg); n++; }
   return n;
 }
 
 // Round 12: the record remote's history of consumed tap keys: every tap-derived commit carries its key
 // as a "Tap-Key: tap-<12 hex>" trailer (and its request id as "Tap-Request"). Read from the remote's
 // branch and the local copy's head.
-export function historyTaps(cfg: Config): Map<string, string> {
+export function historyTaps(cfg: Config, o: { cards?: string[]; once?: Set<string>; refs?: string[] } = {}): Map<string, string> {
   const out = new Map<string, string>();
-  for (const ref of [`origin/${cfg.branch}`, "HEAD"]) {
+  for (const ref of o.refs ?? [`origin/${cfg.branch}`, "HEAD"]) {
     let text = "";
-    try { text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)%x1f%h", ref]); } catch { continue; }
+    try { text = git(cfg, ["log", "--reverse", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)%x1f%h%x1f%(trailers:key=Tap-Card,valueonly,separator=%x2C)%x1f%(trailers:key=Install-Once,valueonly,separator=%x2C)", ref]); } catch { continue; }
     for (const rec of text.split("\x1e")) {
-      const [k, id, sha] = rec.split("\x1f").map((x) => (x ?? "").trim());
+      const [k, id, sha, card, once] = rec.split("\x1f").map((x) => (x ?? "").trim());
       if (k && TAP_KEY.test(k) && !out.has(k)) out.set(k, id || `the commit ${sha}`);
+      if (card && /^\d{15,22}$/.test(card) && o.cards && !o.cards.includes(card)) o.cards.push(card);
+      if (once && TAP_KEY.test(once)) o.once?.add(once);
     }
   }
   return out;
 }
-const trailer = (tap?: string, id?: string) => (tap && TAP_KEY.test(tap) ? `\n\nTap-Key: ${tap}\nTap-Request: ${clean(id ?? "", 120)}` : "");
+// Round 13: with the card's message id (Tap-Card), and Install-Once when the tap was the one Ship tap an
+// install-taps once allowed.
+const trailer = (tap?: string, id?: string, card?: string, once?: boolean) => (tap && TAP_KEY.test(tap)
+  ? `\n\nTap-Key: ${tap}\nTap-Request: ${clean(id ?? "", 120)}${card && /^\d{15,22}$/.test(card) ? `\nTap-Card: ${card}` : ""}${once ? `\nInstall-Once: ${tap}` : ""}` : "");
 // Round 12: per process, the keepers (by working copy) whose consumed set was rebuilt from history.
 const rebuilt = new Set<string>();
 export function forgetRebuild(cfg: Config) { rebuilt.delete(cfg.dir); }
 
 // Round 12: the keeper's start check: each of its append-only logs (consumed keys, its issued-key
-// mirror) must be there and hold at least the high-water count its state kept. null: fine.
-export function logsProblem(cfg: Config, st: State): string | null {
+// mirror; round 13: the install log) must be there and hold at least the high-water count its state kept.
+// Round 13: one missing or shorter than its count is a detected restore (lost), never fatal: the keeper
+// starts degraded and rebuilds. Only a case no rule explains is fatal (a log that can't be read, or with a
+// damaged record before its end): then it refuses to start until the owner's recover-logs line.
+export function logsCheck(cfg: Config, st: State): { lost: string[]; installLost: boolean; fatal: string | null; fatalFile?: string } {
   const want = st.logHigh ?? {};
-  const checks: [string, string, number | undefined][] = [["consumed tap keys", tapsLogFile(cfg), want.consumed], ["issued tap keys (the keeper's mirror)", issuedMirrorFile(cfg), want.issued]];
+  const out: { lost: string[]; installLost: boolean; fatal: string | null; fatalFile?: string } = { lost: [], installLost: false, fatal: null };
+  const checks: [string, string, number | undefined][] = [["consumed tap keys", tapsLogFile(cfg), want.consumed],
+    ["issued tap keys (the keeper's mirror)", issuedMirrorFile(cfg), want.issued], ["install taps", installLogFile(cfg), want.install]];
   for (const [what, f, high] of checks) {
-    if (!high) continue;
     let r;
-    try { r = readLog(f, { repair: false }); } catch (e) { return `its log of ${what} (${f}) can't be read (${(e as Error).message}); its state says it held ${high} records`; }
-    if (r.missing) return `its log of ${what} (${f}) is missing, but its state says it held ${high} records: put the log back from the backup taken with that state, or restore the whole App`;
-    const n = r.records.length;
-    if (n < high) return `its log of ${what} (${f}) holds ${n} records, fewer than the ${high} its state says it held: put the log back from the backup taken with that state, or restore the whole App`;
+    try { r = readLog(f, { repair: false }); }
+    catch (e) { if (!out.fatal) { out.fatal = `its log of ${what} (${f}) can't be read (${(e as Error).message.slice(0, 120)})`; out.fatalFile = f; } continue; }
+    if (r.bad) { if (!out.fatal) { out.fatal = `its log of ${what} (${f}) has ${r.bad} damaged record(s) before its end, which no power cut explains`; out.fatalFile = f; } continue; }
+    if (!high) continue;
+    if (r.missing) out.lost.push(`its log of ${what} is missing, but its state says it held ${high} records`);
+    else if (r.records.length < high) out.lost.push(`its log of ${what} holds ${r.records.length} records, fewer than the ${high} its state says it held`);
+    else continue;
+    if (f === installLogFile(cfg)) out.installLost = true;
   }
-  return null;
+  return out;
+}
+// The high-water counts as the logs stand now (each record counted only once its append was fsynced).
+function logCounts(cfg: Config): NonNullable<State["logHigh"]> {
+  const n = (f: string) => { try { return readLog(f, { repair: false }).records.length; } catch { return 0; } };
+  return { consumed: n(tapsLogFile(cfg)), issued: n(issuedMirrorFile(cfg)), install: n(installLogFile(cfg)) };
+}
+// Round 13: the owner's accepted recover-logs line (keeper.sh recover-logs, written by the link), under a
+// day old and not used before.
+function recoverAsked(cfg: Config, st: State, now: number): { said: string } | null {
+  try {
+    const j = JSON.parse(readFileSync(recoverFile(cfg), "utf8"));
+    const at = Date.parse(String(j?.at ?? ""));
+    if (typeof j?.said !== "string" || !/^\d{15,22}$/.test(j.said) || !Number.isFinite(at) || now - at > 86_400_000 || (st.recovered ?? []).includes(j.said)) return null;
+    return { said: j.said };
+  } catch { return null; }
 }
 let refusedWhy = "";
 
@@ -501,7 +550,13 @@ function revive(j: any): State | null {
       ? { issuedSeen: Object.fromEntries(Object.entries<any>(j.issuedSeen).filter(([k, v]) => TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string" && typeof v.at === "string")) } : {}),
     ...(j.linkSeen && Number.isInteger(j.linkSeen.run) && typeof j.linkSeen.nonce === "string" ? { linkSeen: { run: j.linkSeen.run, nonce: j.linkSeen.nonce } } : {}),
     ...(span(j.linkRestore) ? { linkRestore: span(j.linkRestore)! } : {}),
-    ...(j.logHigh && typeof j.logHigh === "object" ? { logHigh: { ...(Number.isInteger(j.logHigh.consumed) ? { consumed: j.logHigh.consumed } : {}), ...(Number.isInteger(j.logHigh.issued) ? { issued: j.logHigh.issued } : {}) } } : {}),
+    ...(j.logHigh && typeof j.logHigh === "object" ? { logHigh: { ...(Number.isInteger(j.logHigh.consumed) ? { consumed: j.logHigh.consumed } : {}), ...(Number.isInteger(j.logHigh.issued) ? { issued: j.logHigh.issued } : {}),
+      ...(Number.isInteger(j.logHigh.install) ? { install: j.logHigh.install } : {}) } } : {}),
+    ...(j.rebuild && typeof j.rebuild.since === "string" && typeof j.rebuild.why === "string" ? { rebuild: { since: j.rebuild.since, why: j.rebuild.why,
+      tries: Number.isInteger(j.rebuild.tries) ? j.rebuild.tries : 0, ...(typeof j.rebuild.next === "string" ? { next: j.rebuild.next } : {}),
+      ...(Array.isArray(j.rebuild.told) ? { told: j.rebuild.told.filter((x: any) => typeof x === "string").slice(-200) } : {}) } } : {}),
+    ...(Array.isArray(j.recovered) ? { recovered: j.recovered.filter((x: any) => typeof x === "string").slice(-50) } : {}),
+    ...(Array.isArray(j.historyCards) ? { historyCards: j.historyCards.filter((x: any) => typeof x === "string" && /^\d{15,22}$/.test(x)).slice(-1000) } : {}),
     ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && (n.why === "refused" || n.why === "lost") && typeof n.at === "string")
       .map((n: any) => ({ tap: n.tap, why: n.why, reason: String(n.reason ?? ""), ...(typeof n.msg === "string" ? { msg: n.msg } : {}), at: n.at })) } : {}) };
 }
@@ -652,22 +707,58 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
   for (let attempt = 0; attempt < 3; attempt++) {
     const started = performance.now();   // the round's own time (not the record's clock), for round_ms
     let items: Pending[] = [];
+    held = new Set<string>();
     const outcomes: (Outcome | null)[] = [];
     let book = new Map<string, Outcome>();
     let synced0: Synced;
     try {
       // Round 12: a log missing or shorter than its high-water count refuses the round (and the start).
+      // Round 13: one missing or shorter is a detected restore: a degraded start that rebuilds; only a case
+      // no rule explains refuses, until the owner's recover-logs line.
       { const fresh = !existsSync(stateFile(cfg));
         const st0 = loadState(cfg);
-        const why = logsProblem(cfg, st0);
-        if (why) {
-          if (why !== refusedWhy) { refusedWhy = why; log(`REFUSED TO START: ${why}`); relay(cfg, `The record keeper refuses to start: ${why}. Nothing is applied until then. Tell him in one line that the record keeper needs its log back (DOCS.md, Restores), and nothing more.`); }
-          return { applied: 0, ok: false, refused: why } as any;
+        const lc = logsCheck(cfg, st0);
+        const nowIso0 = clock().toISOString();
+        if (lc.fatal) {
+          const asked = recoverAsked(cfg, st0, clock().getTime());
+          if (!asked) {
+            const why = lc.fatal;
+            if (why !== refusedWhy) { refusedWhy = why; log(`REFUSED TO START: ${why}`); relay(cfg, `The record keeper refuses to start: ${why}. Nothing is applied until then. Only he can accept a rebuild: tell him in one line that the record keeper needs his OK to rebuild its logs, and that if he agrees he sends exactly "recover logs"; then run keeper.sh recover-logs --said <that message's id> (DOCS.md, Restores). Nothing more.`); }
+            return { applied: 0, ok: false, refused: why } as any;
+          }
+          const aside = `${lc.fatalFile}.damaged-${nowIso0.replace(/[^0-9]/g, "").slice(0, 14)}`;
+          try { renameSync(lc.fatalFile!, aside); syncDir(dirname(aside)); }
+          catch (e) { try { rmSync(lc.fatalFile!, { recursive: true, force: true }); } catch { /* it stays: the next round refuses again */ } log(`couldn't move ${lc.fatalFile} aside (${(e as Error).message}); removed it instead`); }
+          st0.recovered = [...(st0.recovered ?? []), asked.said].slice(-50);
+          rmSync(recoverFile(cfg), { force: true });
+          lc.lost.push(`${lc.fatal}; moved aside on his recover-logs line (message ${asked.said})`);
+          log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted: ${lc.fatalFile} moved aside, rebuilding`);
         }
         refusedWhy = "";
-        if (fresh) forgetRebuild(cfg); }
+        if (fresh || lc.lost.length) {
+          const why = lc.lost.length ? lc.lost.join("; ") : "the keeper's state was missing (a first start, or a wiped or restored image)";
+          st0.rebuild = { since: nowIso0, why, tries: 0 };
+          // The counts reset to what the logs hold now, so the loss is detected once.
+          st0.logHigh = logCounts(cfg);
+          // Install taps default to off after any restore that lost install records.
+          if (lc.installLost) {
+            try { appendLog(installLogFile(cfg), { t: "flag", how: "off", by: "keeper", why: "a restore lost install-log records", at: nowIso0 }); st0.logHigh.install = (st0.logHigh.install ?? 0) + 1; }
+            catch (e) { log(`couldn't write install taps off after the restore: ${(e as Error).message}`); }
+          }
+          // A keeper with no state takes its holds from the record after the sync, so its state isn't written
+          // here: the rebuild mark is carried into this round's state below (startRebuild).
+          if (!fresh) writeAtomic(stateFile(cfg), JSON.stringify(st0));
+          startRebuild.set(cfg.dir, { rebuild: st0.rebuild!, logHigh: st0.logHigh });
+          forgetRebuild(cfg);
+          if (lc.lost.length) {
+            log(`RESTORE DETECTED: ${why}; starting degraded: tap-derived requests wait until the consumed set is rebuilt from the record's history`);
+            relay(cfg, `The record keeper detected a restore (${why}). It started degraded: it rebuilds its consumed tap keys from the record's history on GitHub and its issued keys from the surviving log, resets its counts, and holds every request that carries a tap key until that is done (each held one gets a pending line). Asks go on. Nothing to tell him.`);
+          } else log(`no keeper state: the consumed set is rebuilt from the record's history before any tap-derived request is taken`);
+        } }
       synced0 = sync(cfg, () => clock().getTime());
       st = loadState(cfg);
+      { const sr = startRebuild.get(cfg.dir);
+        if (sr) { startRebuild.delete(cfg.dir); if (!st.rebuild) st.rebuild = sr.rebuild; st.logHigh = sr.logHigh; } }
       // The generation floor: the keeper's own count (its state file, in /data outside the
       // working copy) and the highest generation the link has posted on a card, so a re-clone
       // with the state file lost never goes below a card that is up.
@@ -853,7 +944,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
 
       // Consumed tap keys older than TAP_KEEP_MS go (round 9).
       // Round 10: the link's issued tap keys, read once for the round, and never a key whose landing is unresolved.
-      const linkTaps = readLinkTaps(cfg);
+      let linkTaps = readLinkTaps(cfg);
       { const pruned = pruneTaps(S.taps, clock().getTime(), linkTaps?.unresolved); if (pruned) log(`pruned ${pruned} consumed tap key(s) older than ${TAP_KEEP_MS / 86_400_000} days`); }
       let tapWhy: string | null = null;
       // Round 11: consumed keys from the append-only log (never pruned). Round 12: a torn final record
@@ -871,7 +962,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       }
       try { const n = mirrorIssued(cfg); if (n) log(`mirrored ${n} issued tap key(s) from the link's issued-key log`); }
       catch (e) { log(`couldn't mirror the link's issued-key log: ${(e as Error).message}`); }
-      const reg = readIssued(cfg, clock().getTime());
+      let reg = readIssued(cfg, clock().getTime());
       let restored = false;
       if (linkTaps && linkTaps.run !== null) {
         const nonce = linkTaps.nonce ?? "";
@@ -889,14 +980,38 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         }
         S.linkSeen = { run: linkTaps.run, nonce };
       }
-      if (restored || synced0.reset || synced0.cloned || !rebuilt.has(cfg.dir)) {
-        try {
+      // Round 13: after a detected restore (S.rebuild) the rebuild counts only against a fresh fetch of the
+      // record remote; until then the consumed set is unverified and tap-derived requests are held. A plain
+      // restart rebuilds best effort from the local copy as before.
+      if (S.rebuild || restored || synced0.reset || synced0.cloned || !rebuilt.has(cfg.dir)) {
+        if (S.rebuild && !synced0.fetched) {
+          const tries = S.rebuild.tries + 1;
+          const due = !S.rebuild.next || Date.parse(S.rebuild.next) <= clock().getTime();
+          S.rebuild = { ...S.rebuild, tries, ...(due ? { next: new Date(clock().getTime() + Math.min(30, 2 ** Math.min(tries - 1, 5)) * 60_000).toISOString() } : {}) };
+          if (due) log(`rebuild waits: GitHub didn't answer (try ${tries}); tap-derived requests stay held, and it tries again each round GitHub answers`);
+        } else try {
           const have = readConsumed(cfg);
+          const cards = [...(S.historyCards ?? [])], once = new Set<string>();
           let n = 0;
-          for (const [k, id] of historyTaps(cfg)) if (!have.has(k)) { appendConsumed(cfg, k, id, nowIso); n++; }
+          for (const [k, id] of historyTaps(cfg, { cards, once, ...(S.rebuild ? { refs: [`origin/${cfg.branch}`] } : {}) })) if (!have.has(k)) { appendConsumed(cfg, k, id, nowIso); n++; }
+          S.historyCards = cards.slice(-1000);
+          // The one Ship tap an install-taps once let through, as the remote's Install-Once trailers have it.
+          const used = new Set(installState(installLogFile(cfg)).onceUsed);
+          for (const k of once) if (!used.has(k)) appendLog(installLogFile(cfg), { t: "once-used", kid: k, by: "keeper", why: "rebuilt from the record's history", at: nowIso });
           rebuilt.add(cfg.dir);
           log(`rebuilt the consumed tap keys from the record's history${n ? `: ${n} key(s) not in the log added` : ": nothing missing"}`);
-        } catch (e) { log(`couldn't rebuild the consumed tap keys from the record's history: ${(e as Error).message}`); }
+          if (S.rebuild) {
+            const was = S.rebuild;
+            delete S.rebuild;
+            S.logHigh = logCounts(cfg);
+            log(`REBUILD COMPLETE: the consumed set is verified against the record remote (${n} key(s) added, after ${was.tries} wait(s)); held tap-derived requests are decided now`);
+            if (was.tries || was.told?.length || n || was.why !== "the keeper's state was missing (a first start, or a wiped or restored image)")
+              relay(cfg, `The record keeper's rebuild is complete: its consumed tap keys are verified against the record's history on GitHub (${n} added), so requests that carry a tap key are decided again, the held ones first. Nothing to tell him.`);
+          }
+        } catch (e) {
+          log(`couldn't rebuild the consumed tap keys from the record's history: ${(e as Error).message}`);
+          if (S.rebuild) S.rebuild = { ...S.rebuild, tries: S.rebuild.tries + 1 };
+        }
       }
       const consumed = readConsumed(cfg);
       delete S.issuedSeen;
@@ -910,12 +1025,39 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         if (it.local && it.req && seen.has(id) && !it.error) { outcomes.push(null); continue; }
         const base = { id, from: clean(it.req?.from ?? "unknown", 80), kind: it.req?.kind ?? "unknown",
           summary: clean(it.req?.summary ?? "(unreadable request)", 200), at: at.toISOString() };
+        cfg.onItem?.(id);
+        const tapK = it.req && !it.error && typeof it.req.tap === "string" && TAP_KEY.test(it.req.tap) ? it.req.tap : null;
+        // Round 13: while the consumed set is unverified (a detected restore not yet rebuilt), a request that
+        // carries a tap key is held, untouched in its queue, with one pending line to Cain; it is decided once
+        // the rebuild completes.
+        if (tapK && S.rebuild && !seen.has(id)) {
+          held.add(it.name);
+          outcomes.push(null);
+          const told = S.rebuild.told ?? (S.rebuild.told = []);
+          if (!told.includes(id)) {
+            told.push(id);
+            log(`held ${id} (tap key ${tapK}): the consumed set is unverified until its rebuild from the record's history completes`);
+            if (it.local) relay(cfg, `Pending: your request ${id} carries tap key ${tapK}, and the record keeper can't verify yet that it wasn't already acted on (${S.rebuild.why}; the rebuild needs GitHub). It is held, not refused, and decided by itself once the rebuild completes. Send nothing again. Nothing to tell him.`);
+          }
+          continue;
+        }
+        // Round 13: a key that misses the mirror (or the link's state) is looked up again, synchronously, in
+        // the link's issued-key log up to its current length (and the state re-read), before deciding: a
+        // card posted within this round is known.
+        if (tapK && (!reg.keys.has(tapK) || (linkTaps && !linkTaps.issued[tapK]))) {
+          try { if (mirrorIssued(cfg)) reg = readIssued(cfg, clock().getTime()); } catch (e) { log(`couldn't read the link's issued-key log again: ${(e as Error).message}`); }
+          linkTaps = readLinkTaps(cfg) ?? linkTaps;
+        }
         let o: Outcome;
         if (it.error) o = { ...base, state: "rejected", reason: clean(it.error) };
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
         else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && (S.taps?.[it.req!.tap] ?? consumed.get(it.req!.tap)) !== undefined
           && (S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)) !== id)
           o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)}; act on a tap key once` };
+        else if (tapK && reg.keys.get(tapK)?.voided) {
+          // Round 13: a key of a card the link withdrew (its record never saved): told, never used up.
+          o = { ...base, state: "rejected", reason: `tap key ${tapK} is from a card the link withdrew (its record couldn't be saved after its keys were logged), so no tap on it counts: record nothing from it, and ask again with --checked if it still needs him` };
+        }
         else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && linkTaps && !linkTaps.issued[it.req!.tap] && reg.keys.has(it.req!.tap)) {
           // Round 11: a key the keeper saw issued that the link's state no longer lists: lost, told to him
           // (on the card's thread, by the link) and to Cain (this line), never silently refused. Round 12:
@@ -939,7 +1081,10 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         logOutcome(cfg, o);
         seen.add(id);
         // Round 12: a tap-derived request that is done carries its key in a commit trailer.
-        o.commit = commit(message(o) + (o.state === "done" ? trailer(it.req?.tap, id) : ""));
+        { const card = tapK ? reg.keys.get(tapK)?.msg : undefined;
+          const once = !!tapK && o.state === "done" && installState(installLogFile(cfg)).onceUsed.includes(tapK);
+          o.commit = commit(message(o) + (o.state === "done" ? trailer(it.req?.tap, id, card, once) : ""));
+          if (o.state === "done" && card && /^\d{15,22}$/.test(card)) S.historyCards = [...(S.historyCards ?? []).filter((c) => c !== card), card].slice(-1000); }
         outcomes.push(o);
         owed.push(owe(o, !!it.local, it.req, !!it.error));
         if (o.state === "done" && it.req?.tap && TAP_KEY.test(it.req.tap)) {
@@ -965,8 +1110,10 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       items.forEach((it, i) => { const o = outcomes[i]; if (o && it.local && linkOwn(it.req)) local(cfg, o, round_ms, waited); });
       S.generation = generation();
       S.owed = [...(S.owed ?? []), ...owed];
-      // Round 12: the logs' high-water counts, kept in the state.
-      try { S.logHigh = { consumed: readLog(tapsLogFile(cfg), { repair: false }).records.length, issued: readLog(issuedMirrorFile(cfg), { repair: false }).records.length }; }
+      // Round 12: the logs' high-water counts, kept in the state. Round 13: counted from the logs after
+      // every append of the round returned (each append is fsynced first), so a count is never ahead of
+      // its records; the state carrying it is written after.
+      try { S.logHigh = logCounts(cfg); }
       catch (e) { log(`couldn't count the append-only logs: ${(e as Error).message}`); }
       if (commits === 0 && !ahead(cfg)) {
         // Nothing to push: a good round all the same, in step with GitHub as last fetched.
@@ -980,7 +1127,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       }
       // Saved before the push: the holds and the ledger's generation are the local commits'.
       writeAtomic(stateFile(cfg), unlanded(S));
-      appliedNames = new Set(items.filter((it) => it.local).map((it) => it.name));
+      appliedNames = new Set(items.filter((it) => it.local && !held.has(it.name)).map((it) => it.name));
     } catch (e) {
       log(`stopped this round, nothing let go: ${redact(cfg, (e as Error).message)}`);
       if (st && cv) { tally(st, clock()); writeStatus(cfg, st, cv, clock()); }
@@ -1028,6 +1175,10 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
 // Local queue files already applied in a round whose push hasn't landed: they don't call for
 // another round by themselves (the next minute's round pushes them).
 let appliedNames = new Set<string>();
+// Round 13: this round's held requests (by queue name), left in their queue.
+let held = new Set<string>();
+// Round 13: a rebuild mark made at the start check, carried into the round's state.
+const startRebuild = new Map<string, { rebuild: NonNullable<State["rebuild"]>; logHigh: State["logHigh"] }>();
 
 const blockFile = (cfg: Config) => cfg.blockPush ?? join(dirname(cfg.queue), "record-block-push");
 
@@ -1198,6 +1349,8 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       ...(st.epochWait ? { epoch_wait: st.epochWait } : {}),
       ...(st.tapNotices?.length ? { tap_notices: st.tapNotices } : {}),
       ...(st.linkRestore ? { link_restore: st.linkRestore } : {}),
+      ...(st.rebuild ? { consumed_unverified: { since: st.rebuild.since, why: st.rebuild.why, tries: st.rebuild.tries } } : {}),
+      ...(st.historyCards?.length ? { history_cards: st.historyCards.slice(-500) } : {}),
       recheck_pending: recheckPending(cfg),
       clock: { synced: v.synced, source: v.source, diagnostic: v.diagnostic, at: now.toISOString() },
     }) + "\n");
@@ -1293,7 +1446,7 @@ function finish(cfg: Config, st: State, items: Pending[], outcomes: (Outcome | n
   writeAtomic(stateFile(cfg), JSON.stringify(st));
   mkdirSync(cfg.outcomes, { recursive: true });
   items.forEach((it, i) => {
-    if (!it.local) return;
+    if (!it.local || held.has(it.name)) return;   // round 13: a held request stays in the queue
     rmSync(it.local, { force: true });
     const before = !outcomes[i] && it.req ? book.get(it.req.id) : undefined;
     if (before && !existsSync(outcomeFile(cfg, before.id))) writeFileSync(outcomeFile(cfg, before.id), JSON.stringify(before));
@@ -1444,6 +1597,8 @@ if (import.meta.main) {
     tapsLog: process.env.RECORD_TAPS_LOG ?? "/data/record-taps.jsonl",
     linkIssued: process.env.LINK_ISSUED_LOG ?? "/data/link-issued.log",
     issuedLog: process.env.RECORD_ISSUED_LOG ?? "/data/record-issued.log",
+    installLog: process.env.RECORD_INSTALL_LOG ?? "/data/record-install.log",
+    recover: process.env.RECORD_RECOVER ?? "/data/record-recover.json",
   };
   delete process.env.RECORD_TOKEN;   // kept only in cfg, handed to git per call
   teeConsole(cfg.logFile);
@@ -1451,14 +1606,9 @@ if (import.meta.main) {
     log("no GitHub token in the add-on's options yet; the record keeper is waiting");
     while (true) await Bun.sleep(3_600_000);
   }
-  // Round 12: an append-only log missing or shorter than its high-water count: the keeper doesn't start.
-  { let why: string | null = null;
-    try { why = logsProblem(cfg, loadState(cfg)); } catch (e) { why = `its state couldn't be read to check its logs (${(e as Error).message})`; }
-    if (why) {
-      log(`REFUSED TO START: ${why}`);
-      try { relay(cfg, `The record keeper refuses to start: ${why}. Nothing is applied until then. Tell him in one line that the record keeper needs its log back (DOCS.md, Restores), and nothing more.`); } catch { /* the log line stands */ }
-      while (logsProblem(cfg, loadState(cfg))) await Bun.sleep(60_000);
-    } }
+  // Round 13: the start check is each round's (cycle): a log missing or shorter than its high-water count
+  // starts the keeper degraded; only a case no rule explains refuses, round by round, until the owner's
+  // recover-logs line, so the keeper never has to be restarted by hand.
   log("keeping the record");
   await keep(cfg, { fullMs: Number(process.env.RECORD_INTERVAL_S ?? 60) * 1000, pollMs: Number(process.env.RECORD_POLL_MS ?? 2000) });
 }
