@@ -61,6 +61,11 @@ PRESS_WAIT_S = 8                      # a tap's answer to Cain's link waits this
 TAP_JOURNAL = ".taps.jsonl"           # beside the ledger: taps written down before they're taken (fourteenth round)
 FENCED_TAP = ("Not taken: Harness is waiting to restart so its records can be put back from a backup. Restart the "
               "Harness App in Home Assistant now. Nothing changed.")
+# Fifteenth round: a tap that couldn't be written down is refused (never "working"), and he hears it.
+UNRECORDED_TAP = "Not taken: Harness couldn't write your tap down, so nothing changed."
+# Fifteenth round: the no-ledger degraded start refuses taps at once, through the link's answer route.
+DEGRADED_TAP = ("Not taken: Harness started without its records, so it takes nothing until it starts normally. "
+                "Nothing changed.")
 ROUTES = ("/handover", "/digest", "/press", "/morning-posted", "/meanings", "/places", "/fastpath")
 BIG = ("/meanings", "/places")
 STUCK_S = 10 * 60
@@ -113,6 +118,20 @@ def _restore_key(value) -> str:
     return text if re.fullmatch(r"[0-9]{1,4} [0-9A-Za-z._-]{4,64}", text) else ""
 
 
+def _fsync_dir(folder: str) -> None:
+    """A file's creation, rename or removal is durable only once its folder's entry is on disk."""
+    try:
+        fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def key_for(token: str) -> str:
     return hmac.new(token.encode(), KEY_CONTEXT, hashlib.sha256).hexdigest()
 
@@ -143,6 +162,9 @@ class Handover:
     job: str = ""                        # the job's short id: for the log, never for him
     journaled: bool = False              # /press: written to the tap journal (fourteenth round)
     told: bool = False                   # /press: he was told once that it waits (fourteenth round)
+    # Fifteenth round: the tap's one terminal note to him, sent once (Inbox.notify), whoever settles it.
+    notified: str = ""
+    _note_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def finish(self, status: str, said: str = "", **extra) -> None:
         if not self.done.is_set():
@@ -158,7 +180,7 @@ class Handover:
 class Inbox:
     def __init__(self, token_fn: Callable[[], str], wake: threading.Event | None = None, *, journal: str = "",
                  staged: Callable[[], bool] | None = None,
-                 answer: Callable[[str, str], None] | None = None):
+                 answer: Callable[[str, str], None] | None = None, refusing: str = ""):
         self._token_fn = token_fn
         self.queue: "queue.Queue[Handover]" = queue.Queue()
         self._front: list[Handover] = []     # fourteenth round: items given back by the controller, taken first
@@ -171,6 +193,9 @@ class Inbox:
         self.staged = staged or (lambda: False)   # a restore is staged: a tap is answered at once, not queued
         self.fenced = ""                          # the controller's fence reason, once it has seen the staged restore
         self.answer = answer                      # posts a short note to him on a tap (the link's /answer)
+        # Fifteenth round: the no-ledger degraded start: every tap is refused at once with DEGRADED_TAP, and he
+        # hears it through the link's answer route; never queued.
+        self.refusing = refusing
         self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
         self.migration: dict = {}            # twelfth round: the ledger waiting for its move (migrate.waiting_summary)
         self.degraded = ""                   # thirteenth round: why it started without its records, or ""
@@ -185,7 +210,10 @@ class Inbox:
         if self.beat_at is None:
             return {"status": "starting", "loop_age_s": None, **extra}
         age = time.monotonic() - self.beat_at
-        return {"status": "ok" if age < STUCK_S else "stuck", "loop_age_s": int(age), **extra}
+        # Fifteenth round: while a staged restore fences the records the loop still turns and is judged by its own
+        # beat, marked fenced beside it, so a stall or a dead loop never passes for a staged restore.
+        fenced = {"fenced": True} if self.fenced else {}
+        return {"status": "ok" if age < STUCK_S else "stuck", "loop_age_s": int(age), **fenced, **extra}
 
     def key_ok(self, presented: str) -> bool:
         token = self._token_fn()
@@ -210,65 +238,157 @@ class Inbox:
         with self._lock:
             self._front[:0] = list(items)
 
-    # -- the tap journal (fourteenth round) --------------------------------------------------------------
+    # -- the tap journal (fourteenth round; fifteenth: commits and pending notes in the journal itself) --------
+    #
+    # One JSON line per record, appended and fsynced: {"press", "at"} when a tap is taken; {"committed": key} once
+    # what it did is committed in the ledger; {"notice": text, "key": key} for a note to him that couldn't be
+    # posted yet. A tap's lines are struck off (the file rewritten without them) only after its commit, or once
+    # he has been told it wasn't taken. A line that can't be read (a torn tail) is skipped, never the whole file.
+
+    @staticmethod
+    def key(press: dict) -> str:
+        return f"{str((press or {}).get('id', ''))}|{str((press or {}).get('custom_id', ''))}"
+
     def _journal_lines(self) -> list[dict]:
+        rows = []
         try:
-            with open(self.journal, encoding="utf-8") as f:
-                rows = [json.loads(line) for line in f if line.strip()]
+            with open(self.journal, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        log.error("a line of the tap journal couldn't be read; skipped")
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
         except FileNotFoundError:
             return []
-        except (OSError, ValueError):
+        except OSError:
             log.error("the tap journal couldn't be read")
             return []
-        return [r for r in rows if isinstance(r, dict)]
+        return rows
+
+    def _append(self, row: dict) -> bool:
+        """One line appended, written whole and fsynced, or not at all: a short write or a failed fsync is cut
+        back off (best effort) and counts as not written."""
+        data = (json.dumps(row) + "\n").encode()
+        with self._lock:
+            try:
+                new = not os.path.exists(self.journal)
+                fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            except OSError as e:
+                log.error("the tap journal couldn't be opened: %s", type(e).__name__)
+                return False
+            try:
+                size = os.fstat(fd).st_size
+                try:
+                    wrote = os.write(fd, data)
+                    if wrote != len(data):
+                        raise OSError(f"short write ({wrote} of {len(data)} bytes)")
+                    os.fsync(fd)
+                except OSError as e:
+                    log.error("the tap journal couldn't be written: %s", e)
+                    try:
+                        os.ftruncate(fd, size)
+                        os.fsync(fd)
+                    except OSError:
+                        pass
+                    return False
+            finally:
+                os.close(fd)
+            if new:
+                _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
+        return True
 
     def journal_add(self, h: Handover) -> bool:
-        """Writes the tap down (appended, flushed and synced) before Cain's link hears it was taken. Whether it
-        was written."""
+        """Writes the tap down (appended and fsynced) before Cain's link hears it was taken. Whether it was
+        written whole: fifteenth round, a tap that wasn't is refused, never queued."""
         if not self.journal:
             return False
-        row = {"press": {k: str(v) for k, v in h.press.items()}, "at": time.time()}
-        try:
-            with self._lock, open(self.journal, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except OSError as e:
-            log.error("a tap couldn't be written to the journal: %s", type(e).__name__)
+        if not self._append({"press": {k: str(v) for k, v in h.press.items()}, "at": time.time()}):
             return False
         h.journaled = True
         return True
 
+    def journal_commit(self, press: dict) -> bool:
+        """Fifteenth round: what the tap did is committed in the ledger. Recorded in the journal itself, before
+        the tap is struck off, so a replay never acts twice even when the ledger is later put back from a backup
+        that predates it."""
+        if not self.journal or not press:
+            return False
+        return self._append({"committed": self.key(press), "at": time.time()})
+
+    def journal_notice(self, press: dict, text: str) -> bool:
+        """Fifteenth round: a note to him on that tap that couldn't be posted now; posted at the next start."""
+        if not self.journal or not press:
+            return False
+        return self._append({"notice": text, "key": self.key(press), "at": time.time()})
+
     def journal_done(self, press: dict) -> None:
-        """Strikes a tap off once what it did is committed (or he has been told it wasn't taken)."""
+        """Strikes a tap off (all its lines) once what it did is committed, or he has been told it wasn't taken."""
         if not self.journal or not press:
             return
-        key = (str(press.get("id", "")), str(press.get("custom_id", "")))
+        key = self.key(press)
+
+        def mine(r: dict) -> bool:
+            return (self.key(r["press"]) if isinstance(r.get("press"), dict)
+                    else str(r.get("committed") or r.get("key") or "")) == key
         with self._lock:
             rows = self._journal_lines()
-            keep = [r for r in rows if (str(r.get("press", {}).get("id", "")),
-                                        str(r.get("press", {}).get("custom_id", ""))) != key]
+            keep = [r for r in rows if not mine(r)]
             if len(keep) == len(rows):
                 return
             try:
                 if not keep:
                     os.remove(self.journal)
-                    return
-                tmp = self.journal + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write("".join(json.dumps(r) + "\n" for r in keep))
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, self.journal)
+                else:
+                    tmp = self.journal + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        f.write("".join(json.dumps(r) + "\n" for r in keep))
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, self.journal)
+                _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
             except OSError as e:
                 log.error("the tap journal couldn't be updated: %s", type(e).__name__)
 
     def journaled(self) -> list[dict]:
-        """The taps written down and not yet struck off: {"press", "at"} each, oldest first."""
+        """The taps written down and not yet struck off, oldest first: {"press", "at", "committed", "notice"}
+        each (committed: what it did is in the ledger; notice: a note to him still to post, or "")."""
         if not self.journal:
             return []
         with self._lock:
-            return self._journal_lines()
+            rows = self._journal_lines()
+        taps: dict[str, dict] = {}
+        for r in rows:
+            if isinstance(r.get("press"), dict):
+                k = self.key(r["press"])
+                taps.setdefault(k, {"press": {a: str(b) for a, b in r["press"].items()}, "at": r.get("at"),
+                                    "committed": False, "notice": ""})
+            elif r.get("committed") and str(r["committed"]) in taps:
+                taps[str(r["committed"])]["committed"] = True
+            elif r.get("notice") and str(r.get("key") or "") in taps:
+                taps[str(r["key"])]["notice"] = str(r["notice"])
+        return list(taps.values())
+
+    def queued_keys(self) -> set[str]:
+        """Fifteenth round: the taps queued for the controller now, read under the queue's own mutex."""
+        with self._lock, self.queue.mutex:
+            items = list(self._front) + list(self.queue.queue)
+        return {self.key(h.press) for h in items if h.kind == "press"}
+
+    def notify(self, h: Handover, text: str) -> bool:
+        """Fifteenth round: the one terminal note to him on an accepted tap, behind a once-flag, so whichever of
+        the controller's paths settles it (or both, in a race) he hears it once. Whether he has been told."""
+        with h._note_lock:
+            if h.notified:
+                return True
+            if not self.tell(h, text):
+                return False
+            h.notified = text
+            return True
 
     def tell(self, h: Handover, text: str) -> bool:
         """A short note to him on that tap (the link's follow-up to its deferred answer). Whether it went."""
@@ -369,18 +489,25 @@ def _handler(inbox: Inbox, wait_s: float):
             the restart, and never queued. Otherwise it's written to the tap journal first, then queued for the
             controller's thread, and this answers once the controller has committed what it did (its note to
             him is the follow-up), or after PRESS_WAIT_S with "working": the tap is then written down, so a stop
-            before the controller takes it loses nothing (the next start takes it, or tells him)."""
-            if inbox.fenced or inbox.staged():
-                said = inbox.fenced or FENCED_TAP
-                h.finish("refused", said, restore_staged=True)
-                inbox.tell(h, said)
+            before the controller takes it loses nothing (the next start takes it, or tells him).
+
+            Fifteenth round: a tap that couldn't be written down whole (a failed append, a short write, a failed
+            fsync) is refused, never "working", and he's told nothing changed; in the no-ledger degraded start
+            every tap is refused at once the same way. Once a tap is queued, the controller alone settles what he
+            hears about it (Inbox.notify, once), never this waiter."""
+            refused = (DEGRADED_TAP if inbox.refusing else (inbox.fenced or FENCED_TAP)
+                       if inbox.fenced or inbox.staged() else "")
+            if refused:
+                h.finish("refused", refused, **({"degraded": True} if inbox.refusing else {"restore_staged": True}))
+                inbox.notify(h, refused)
                 return self._reply(200, h.result)
-            inbox.journal_add(h)
+            if inbox.journal and not inbox.journal_add(h):
+                h.finish("refused", UNRECORDED_TAP, journaled=False)
+                inbox.notify(h, UNRECORDED_TAP)
+                return self._reply(200, h.result)
             inbox.submit(h)
             if not h.done.wait(min(wait_s, PRESS_WAIT_S)):
                 return self._reply(202, {"status": "working", "queued": True, "journaled": h.journaled})
-            if h.result.get("status") == "refused" and h.result.get("said"):
-                inbox.tell(h, str(h.result["said"]))
             return self._reply(200, h.result)
 
         def do_GET(self):

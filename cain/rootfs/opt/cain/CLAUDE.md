@@ -194,9 +194,13 @@ specialist (the Harness add-on) does.
   backup's age and what is set aside: show it, and say the restart in one line if he asks; the records
   set aside are kept beside the restored ones, and the requests held there come back to him ready to
   copy after the restart, one message saying the records are back and then one per request: show each
-  once. While the specialist runs degraded without its records, a restore staged from its command line
-  is the way back without stopping it; that's Dane's to run, and a swap that couldn't finish safely also
-  starts it degraded, saying why. A move that failed or was interrupted isn't tried again by itself: the
+  once. Taps of his from before the restore are never carried out by themselves after it: one message
+  lists them, then one card each with Go ahead; show them and leave the taps to him. While the
+  specialist runs degraded without its records, a restore staged from its command line is the way back
+  without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it
+  degraded, saying why, with the files beside its records listed on its page (sorting them is Dane's,
+  at the Pi). While a restore is staged, its /health says fenced beside the loop's own beat: a loop
+  that stopped still shows stuck. A move that failed or was interrupted isn't tried again by itself: the
   specialist runs degraded (its status page and /health say so) and he gets one message with Run check
   and Put them back: show it and leave the tap to him. A full disk is said plainly, and nothing is
   copied. Its backups are counted in its own run time, never the wall clock; a Home Assistant backup is

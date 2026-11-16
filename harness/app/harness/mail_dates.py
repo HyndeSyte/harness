@@ -89,18 +89,24 @@ TIMED = ("appointment", "event")      # he has to be there: at its time, when th
 OPTION = "mail_dates"
 SKIP_FILE = "mail_skip.json"          # in the data folder: more kinds he said no to, by name
 # Kinds of mail he has said no to (fourteenth round), by name: a sender that contains any of "from"
-# and a subject that contains any of "subject" (both ignoring case), unless the subject contains
-# any of "unless". The first is Amazon managing its deliveries: Subscribe & Save cutoffs, "last day
-# to manage" reminders, delivery day changes, manage-your-subscription reminders. An Amazon order's
-# return window isn't one of them.
+# and a subject that contains any of "subject" (both ignoring case), unless the subject holds any of
+# "unless" as a whole word. Fifteenth round: the first is Amazon managing Subscribe & Save deliveries
+# and nothing else: the Amazon sender and a Subscribe & Save marker (in the subject, or else in the
+# mail's own text, read here on the Pi) before any subject phrase counts. A Prime, Audible or Kindle
+# renewal, an ordinary order's new delivery date and an order's return window all go through.
+SAVE_MARKERS = ["subscribe & save", "subscribe &amp; save", "subscribe and save"]
 SKIP_KINDS = (
     {"name": "Amazon delivery management",
      "from": ["amazon."],
-     "subject": ["subscribe & save", "subscribe &amp; save", "subscribe and save", "last day to manage",
-                 "manage your subscription", "manage your delivery", "manage your upcoming delivery",
-                 "delivery day", "delivery date has changed", "new delivery date", "upcoming delivery"],
-     "unless": ["return"]},
+     "marker": SAVE_MARKERS,
+     "subject": SAVE_MARKERS + ["last day to manage", "manage your delivery", "manage your upcoming delivery",
+                                "delivery date has changed"],
+     "unless": ["return", "returns"]},
 )
+SKIP_FIELDS = ("from", "subject", "unless")
+SKIPPED_META = "mail_skipped"         # {"count", "recent": [{"sender", "subject", "rule"}]}: the status page's
+SKIP_MIN = 3                          # a word in mail_skip.json shorter than this would match far too much
+SKIP_RECENT = 20                      # skipped mail shown on the status page, newest last
 
 # What may carry a date he has to act on. Anything else never leaves the Pi.
 _PICK = re.compile(
@@ -239,40 +245,95 @@ def whose(sender: str, subject: str, what: str) -> str:
     return ""
 
 
-def skip_kinds(data_dir: str | None) -> list[dict]:
+def skip_file_check(data_dir: str | None) -> tuple[list[dict], str]:
     """SKIP_KINDS and the kinds in <data_dir>/mail_skip.json, read fresh each time: {"skip": [{"name",
-    "from": [...], "subject": [...], "unless": [...]}]} (a bare list works too). A file that can't be read
-    or an entry that doesn't fit is left out, never an error: the built-in kinds still hold."""
+    "from": [...], "subject": [...], "unless": [...]}]} (a bare list works too), and why the file was
+    ignored ("" when it wasn't). Fifteenth round, strict: every entry is a mapping with a name, "from" and
+    "subject" lists (and "unless", when given) of strings at least SKIP_MIN characters long, and nothing
+    else; one entry that doesn't fit and the whole file is ignored, the built-in kinds still hold, and the
+    reason shows on the status page."""
     kinds = [dict(k) for k in SKIP_KINDS]
     if not data_dir:
-        return kinds
+        return kinds, ""
     try:
         with open(os.path.join(data_dir, SKIP_FILE), encoding="utf-8") as f:
             got = json.load(f)
     except FileNotFoundError:
-        return kinds
+        return kinds, ""
     except (OSError, ValueError) as e:
         log.warning("%s couldn't be read (%s): only the built-in kinds are skipped", SKIP_FILE, type(e).__name__)
-        return kinds
-    entries = got.get("skip") if isinstance(got, dict) else got
-    for k in entries if isinstance(entries, list) else []:
-        if not isinstance(k, dict) or not str(k.get("name") or "").strip():
-            continue
-        words = {f: [str(w).casefold() for w in (k.get(f) or []) if str(w).strip()]
-                 for f in ("from", "subject", "unless")}
-        if words["from"] and words["subject"]:
-            kinds.append({"name": str(k["name"]).strip()[:80], **words})
-    return kinds
+        return kinds, f"it couldn't be read ({type(e).__name__})"
+    entries = got.get("skip") if isinstance(got, dict) and set(got) == {"skip"} else got
+    if not isinstance(entries, list):
+        return kinds, 'it isn\'t a list of kinds (or {"skip": [...]})'
+    extra = []
+    for n, k in enumerate(entries, 1):
+        why = _skip_entry_problem(k)
+        if why:
+            log.warning("%s is ignored: entry %d %s; only the built-in kinds are skipped", SKIP_FILE, n, why)
+            return kinds, f"entry {n} {why}"
+        extra.append({"name": k["name"].strip()[:80],
+                      **{f: [w.strip().casefold() for w in k.get(f) or []] for f in SKIP_FIELDS}})
+    return kinds + extra, ""
 
 
-def skipped_kind(sender: str, subject: str, kinds) -> str:
+def _skip_entry_problem(k) -> str:
+    if not isinstance(k, dict):
+        return "isn't a mapping"
+    unknown = sorted(set(k) - {"name", *SKIP_FIELDS})
+    if unknown:
+        return f"has a field it doesn't know ({unknown[0]})"
+    if not isinstance(k.get("name"), str) or not k["name"].strip():
+        return "has no name"
+    for f in SKIP_FIELDS:
+        if f not in k:
+            if f == "unless":
+                continue
+            return f'has no "{f}" list'
+        words = k[f]
+        if not isinstance(words, list) or (not words and f != "unless"):
+            return f'has "{f}" that isn\'t a list of words'
+        for w in words:
+            if not isinstance(w, str):
+                return f'has a word in "{f}" that isn\'t text'
+            if len(w.strip()) < SKIP_MIN:
+                return f'has a word in "{f}" shorter than {SKIP_MIN} characters'
+    return ""
+
+
+def skip_kinds(data_dir: str | None) -> list[dict]:
+    """The kinds skipped now (skip_file_check without its reason)."""
+    return skip_file_check(data_dir)[0]
+
+
+def _has_word(text: str, word: str) -> bool:
+    return re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", text) is not None
+
+
+def skipped_kind(sender: str, subject: str, kinds, body=None) -> str:
     """The name of the kind he said no to that this mail is, or "": its sender holds one of the kind's
-    "from" words, its subject one of its "subject" words and none of its "unless" words."""
+    "from" words, its subject one of its "subject" words and none of its "unless" words as a whole word
+    ("returning" isn't "return"); and for a kind with markers, a marker is in the subject or else in the
+    mail's text (`body`: a callable read only then)."""
     who, what = (sender or "").casefold(), (subject or "").casefold()
     for k in kinds:
-        if any(w in who for w in k.get("from") or ()) and any(w in what for w in k.get("subject") or ()) \
-                and not any(w in what for w in k.get("unless") or ()):
-            return str(k.get("name") or "")
+        if not any(w in who for w in k.get("from") or ()):
+            continue
+        if not any(w in what for w in k.get("subject") or ()):
+            continue
+        if any(_has_word(what, w) for w in k.get("unless") or ()):
+            continue
+        marks = k.get("marker") or ()
+        if marks and not any(w in what for w in marks):
+            text = ""
+            if body is not None:
+                try:
+                    text = (body() or "").casefold()
+                except Exception:              # noqa: BLE001: unread text can't show the marker
+                    text = ""
+            if not any(w in text for w in marks):
+                continue
+        return str(k.get("name") or "")
     return ""
 
 
@@ -508,6 +569,8 @@ class Read:
     passed: list | None = None             # messages given up on after MAX_TRIES
     more: bool = False                     # stopped at a cap with mail left: read again at once
     skipped: int = 0                       # mail of a kind he said no to (SKIP_KINDS), for the log only
+    skipped_list: list | None = None       # fifteenth round: {"sender", "subject", "rule"} each, for the status page
+    skip_problem: str = ""                 # fifteenth round: why mail_skip.json was ignored, or ""
     asked: tuple = ()                      # a look-up of these emails again, for their addresses
     why: str = ""                          # an unexpected failure's kind of exception, for the log only
 
@@ -558,6 +621,7 @@ class MailDates:
         self.mailbox = mailbox
         # Where mail_skip.json is: the App's data folder unless told (fourteenth round).
         self.data_dir = data_dir if data_dir is not None else os.environ.get("HARNESS_DATA", "/data")
+        self.skip_problem = ""             # fifteenth round: why mail_skip.json was ignored at the last read
         self.sleep = sleep or time.sleep
         self.monotonic = monotonic or time.monotonic
         self.chat_id: int | None = None
@@ -681,7 +745,16 @@ class MailDates:
         back, spend included, whatever went wrong."""
         box = self.mailbox(address, password)
         r = Read(validity or "", last_uid, [], [], [], 0, passed=[])
-        kinds = skip_kinds(self.data_dir)
+        kinds, r.skip_problem = skip_file_check(self.data_dir)
+        r.skipped_list = []
+
+        fetched: set = set()
+
+        def text_of(m):
+            if m.uid not in fetched:           # once a message, whether for its marker or the engine
+                m.text = box.text_for(m)
+                fetched.add(m.uid)
+            return m.text
         try:
             r.validity, r.last_uid, messages = box.read(last_uid, validity, today - timedelta(days=FIRST_DAYS))
             # Oldest first, and the mark moves only past what's done: a read that stops early, at
@@ -690,14 +763,15 @@ class MailDates:
             for m in messages:
                 if _SCRIPT_FAILED.search(m.subject) and SCRIPT_SENDER in m.sender.casefold():
                     r.script_failed.append(m.sent)
-                elif skipped_kind(m.sender, m.subject, kinds):
+                elif (rule := skipped_kind(m.sender, m.subject, kinds, body=lambda m=m: text_of(m))):
                     r.skipped += 1                     # he said no to this kind: never sent, never said
+                    r.skipped_list.append({"sender": m.sender[:80], "subject": m.subject[:100], "rule": rule})
                 elif m.message_id not in seen and picked(m.sender, m.subject):
                     if r.sent_to_engine >= MAX_TO_ENGINE:
                         r.more = True
                         break
                     try:
-                        m.text = box.text_for(m)
+                        text_of(m)
                         out = call_with_retries(
                             engine, system=SYSTEM, user=user_content(m, today), schema=output_schema(),
                             budget_s=60, sleep=self.sleep, monotonic=self.monotonic)
@@ -792,6 +866,14 @@ class MailDates:
             self.ledger.set_meta("mail_more", "1" if r.more and not r.error else "", db)
             self.ledger.event("mail_read", {"sent": r.sent_to_engine, "found": len(r.found),
                                             "skipped": r.skipped}, db=db)
+            # Fifteenth round: what was skipped, by sender, subject and rule, on the status page (never the digest),
+            # so a kind that skips too much shows.
+            if r.skipped_list:
+                kept = self.skipped_status()
+                kept = {"count": int(kept.get("count") or 0) + len(r.skipped_list),
+                        "recent": (list(kept.get("recent") or []) + r.skipped_list)[-SKIP_RECENT:]}
+                self.ledger.set_meta(SKIPPED_META, json.dumps(kept), db)
+        self.skip_problem = r.skip_problem
         if r.error:
             self._failed("read", r.error, WORDS.get(r.error, WORDS["unreachable"]), r.why)
             return
@@ -1333,6 +1415,14 @@ class MailDates:
                 return
 
     # -- what he sees --------------------------------------------------------------------------
+    def skipped_status(self) -> dict:
+        """Fifteenth round: mail skipped by kind so far, {"count", "recent": [{"sender", "subject", "rule"}]}."""
+        try:
+            got = json.loads(self.ledger.get_meta(SKIPPED_META) or "{}")
+        except ValueError:
+            got = {}
+        return got if isinstance(got, dict) else {}
+
     def digest_line(self) -> str:
         parts = []
         if not self.configured():

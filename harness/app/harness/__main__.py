@@ -13,6 +13,7 @@ import os
 import queue
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -66,9 +67,12 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     # stages (it holds the same lock); a swap that can't finish safely starts degraded rather than open the
     # records beside a log that isn't theirs.
     if not migrate.hold_process_lock(path, wait_s=migrate.LOCK_WAIT_S):
-        raise migrate.SwapRefused("another process holds harness.lock beside the records")
+        # Fifteenth round: a staging slower than LOCK_WAIT_S: degraded for now, and the lock is tried again on a
+        # timer (degraded(lock_wait=True)); the start goes on by itself once the staging has finished.
+        raise migrate.LockBusy("another process holds harness.lock beside the records (a restore being staged)")
+    swapped: dict = {}
     try:
-        migrate.apply_staged_restore(path)
+        swapped = migrate.apply_staged_restore(path) or {}
     except migrate.SwapRefused:
         raise
     except OSError as e:
@@ -191,6 +195,9 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     controller.handovers = handover.Inbox(discord_token, wake=keeper.wake, journal=path + handover.TAP_JOURNAL,
                                           staged=lambda: migrate.restore_staged(path),
                                           answer=chat.answer_callback)
+    # Fifteenth round: across a restore (swapped in at this start, or staged at it) no tap written down before is
+    # taken by itself; they're listed for him instead (Controller._replay_taps).
+    controller.restored_at_start = bool(swapped.get("ok")) or migrate.restore_staged(path)
     try:
         handover.serve(controller.handovers,
                        port=int(os.environ.get("HARNESS_HANDOVER_PORT", handover.PORT)))
@@ -201,36 +208,87 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     return controller, web, listener
 
 
-def degraded(data_dir: str, port: int, why: str) -> int:
+LOCK_RETRY_S = 5            # fifteenth round: how often a start waiting on a restore being staged tries the lock again
+NOTE_RETRY_S = 60           # fifteenth round: how often the degraded note to him is tried again until it goes
+NOTE_TRIES = 10
+
+
+def degraded(data_dir: str, port: int, why: str, *, lock_wait: bool = False, files: list | None = None,
+             handover_port: int | None = None):
     """Thirteenth round: when the records can't be opened at all, the specialist still serves its status page and
     Cain's health check (status "degraded", with why), so it's seen and said, and waits to be stopped. A restore
-    staged by the command line (with the App stopped) or from a Home Assistant backup is the way back."""
+    staged by the command line (with the App stopped) or from a Home Assistant backup is the way back.
+
+    Fifteenth round: a tap is refused at once and he hears it through the link's answer route (never silent); one
+    best-effort note goes to him through Cain's link, tried again until it goes; the files beside the records are
+    listed on the page when a swap can't be sorted by itself. With lock_wait (a restore being staged took longer
+    than LOCK_WAIT_S) the lock is tried again every LOCK_RETRY_S and "retry" is returned once it's free: main then
+    starts normally. Otherwise the exit code once stopped."""
     log = logging.getLogger("harness")
     # Fourteenth round: nothing here touches the records, so the lock is let go: a restore can be staged from the
     # command line (python3 -m harness.migrate <records> --restore <schema> <build>) without stopping the App,
     # and the next start swaps it in.
     from . import migrate
-    migrate.release_process_lock(os.path.join(data_dir, "harness.sqlite"))
+    path = os.path.join(data_dir, "harness.sqlite")
+    migrate.release_process_lock(path)
     vault = Vault(os.path.join(data_dir, "secrets.json"))
+    token = lambda: vault.get("discord_bot_token")          # noqa: E731
+    mig = {"degraded": True, "why": why}
+    if lock_wait:
+        from datetime import datetime, timezone
+        mig.update({"lock_wait": True, "lock_wait_since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "lock_retry_s": LOCK_RETRY_S})
+    if files:
+        mig["files"] = list(files)
     status: dict = {"notes": [f"Harness started degraded: {why}. Calendar work is off until it starts normally."],
-                    "migration": {"degraded": True, "why": why}}
+                    "migration": mig}
     web = serve(SetupApp(vault, status, queue.Queue()), port=port)
-    inbox = handover.Inbox(lambda: vault.get("discord_bot_token"))
-    inbox.migration = {"degraded": True, "why": why}
+    chat = LinkChat(CainLink(token))
+    inbox = handover.Inbox(token, refusing=why, answer=chat.answer_callback)
+    inbox.migration = dict(mig)
     inbox.degraded = why
+    srv = None
     try:
-        handover.serve(inbox, port=int(os.environ.get("HARNESS_HANDOVER_PORT", handover.PORT)))
+        srv = handover.serve(inbox, port=int(handover_port if handover_port is not None
+                                             else os.environ.get("HARNESS_HANDOVER_PORT", handover.PORT)))
     except OSError as e:
         log.error("handover: can't listen: %s", e)
     stop_now = []
-    signal.signal(signal.SIGTERM, lambda *_: stop_now.append(1))
-    signal.signal(signal.SIGINT, lambda *_: stop_now.append(1))
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *_: stop_now.append(1))
+        signal.signal(signal.SIGINT, lambda *_: stop_now.append(1))
+    note = ("Harness started without its records, so calendar work is off until it starts normally: "
+            f"{why}. Its status page in Home Assistant says what's beside the records.")
+    if lock_wait:
+        note = ("Harness is waiting for a restore being staged beside its records before it starts; calendar work "
+                "is off until then and it starts by itself once the staging is done.")
+    note_tries, note_at, lock_at = 0, -1e9, time.monotonic()
+    out: int | str = 1
     while not stop_now:
+        now = time.monotonic()
+        if note_tries < NOTE_TRIES and now - note_at >= NOTE_RETRY_S:
+            note_at, note_tries = now, note_tries + 1
+            try:
+                chat.send_message(0, note, kind="notice")       # best effort: Cain's link may be down too
+                note_tries = NOTE_TRIES
+            except Exception as e:                              # noqa: BLE001
+                log.info("the degraded note couldn't be posted (%s); tried again later", type(e).__name__)
+        if lock_wait and now - lock_at >= LOCK_RETRY_S:
+            lock_at = now
+            if migrate.hold_process_lock(path, wait_s=0):
+                log.warning("the restore being staged has finished: starting normally")
+                out = "retry"
+                break
         for h in inbox.take():
             h.finish("refused", f"Not taken: Harness started degraded ({why}). Nothing changed.")
         time.sleep(1)
     web.shutdown()
-    return 1
+    if srv is not None and hasattr(srv, "server_close"):
+        srv.shutdown()
+        srv.server_close()
+    if hasattr(web, "server_close"):
+        web.server_close()
+    return out
 
 
 class Stop(Exception):
@@ -246,14 +304,19 @@ def main() -> int:
     log = logging.getLogger("harness")
     data_dir = os.environ.get("HARNESS_DATA", "/data")
     port = int(os.environ.get("HARNESS_PORT", "8099"))
-    try:
-        controller, web, listener = build(data_dir, port=port)
-    except Exception as e:                     # noqa: BLE001: thirteenth round, never a start that can't recover
-        log.error("the specialist couldn't start (%s): serving the status page and health only", type(e).__name__)
-        from . import migrate
-        why = (f"the records weren't opened: {e}" if isinstance(e, migrate.SwapRefused)
-               else f"the records couldn't be opened ({type(e).__name__})")
-        return degraded(data_dir, port, why)
+    while True:
+        try:
+            controller, web, listener = build(data_dir, port=port)
+            break
+        except Exception as e:                 # noqa: BLE001: thirteenth round, never a start that can't recover
+            log.error("the specialist couldn't start (%s): serving the status page and health only", type(e).__name__)
+            from . import migrate
+            why = (f"the records weren't opened: {e}" if isinstance(e, migrate.SwapRefused)
+                   else f"the records couldn't be opened ({type(e).__name__})")
+            got = degraded(data_dir, port, why, lock_wait=isinstance(e, migrate.LockBusy),
+                           files=getattr(e, "files", None))
+            if got != "retry":                 # fifteenth round: the lock came free, so the start goes on
+                return got
 
     def stop(*_):
         raise Stop()

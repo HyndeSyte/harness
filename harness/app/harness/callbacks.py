@@ -50,6 +50,7 @@ class Callbacks:
         self.settings_fn = settings_fn     # (change_id, "approve"|"decline") -> message
         self.family_add = family_add       # family_add.FamilyAdd, or None
         self.migration_fn: Callable[[str, str], str] | None = None   # (kind, target) -> message (eleventh round)
+        self.reconfirm_fn: Callable[[str], str] | None = None   # a tap relisted after a restore (fifteenth round)
 
     def handle(self, inc) -> str:
         """Returns what happened, for tests and the event log."""
@@ -115,6 +116,8 @@ class Callbacks:
         if kind in ("migration_check", "migration_override", "migration_restore", "migration_clock") \
                 and self.migration_fn is not None:
             return self.migration_fn(kind, target)            # the ledger's own migration (eleventh round)
+        if kind == "tap_reconfirm" and self.reconfirm_fn is not None:
+            return self.reconfirm_fn(target)                  # the tap he made before the restore, taken now
         if kind.startswith("family_add_") and self.family_add is not None:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
         if kind.startswith("calendar_change_") and self.calendar_change is not None:

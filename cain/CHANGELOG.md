@@ -27,6 +27,7 @@
 - On your say, Cain can send you the card that takes the specialist's clock as right when it's behind its records and old backups aren't pruned; only your tap does it.
 - The receipt button that takes one Gmail block off without remembering anything is now "Not this time", and Cain's message checks know it by that name.
 - After a restore, Cain shows each held request the specialist passes back once, one message each.
+- After a restore, Cain shows the specialist's list of your taps from before it, each with Go ahead, and leaves those taps to you.
 
 ## 0.11.0
 

@@ -57,7 +57,17 @@
 - **Possibly overwritten is told for a time zone or all-day change by someone else,** and for a real note or description removed, even on a calendar that tidies fields by itself.
 - **The check's write test event gets a fresh address each time** and is only ever created where nothing is; if it can't be shown gone, each start tries again and Harness's page shows it until it's gone.
 - **The receipt card's third button is now "Not this time"** (it was "Just this once"): it takes that one block off and remembers nothing.
-- **Mail you've said no to is skipped,** starting with Amazon's delivery management mail (Subscribe & Save cutoffs, last day to manage, delivery day changes). An order's return window still comes through. More kinds can be added by name in /data/mail_skip.json, no update needed.
+- **Mail you've said no to is skipped,** starting with Amazon's Subscribe & Save delivery management mail (its cutoffs and delivery changes). An order's return window still comes through. More kinds can be added by name in /data/mail_skip.json, no update needed.
+- **A tap that can't be saved is turned down at once,** with a note that nothing changed, never left waiting.
+- **A tap is never done twice across a restore.** After your records are put back from a backup, taps from before it aren't carried out by themselves: one message lists them, then a card each with Go ahead, if you still want it.
+- **A turned-down tap is told once,** even when Harness restarts before it can tell you, and a tap while Harness runs without its records is answered on the spot.
+- **Two restores in a row bring back every held request, once each.** A set of records put aside is cleared only after its own requests came back.
+- **Amazon's skipped mail is only Subscribe & Save delivery management.** Prime, Audible and Kindle renewals, an order's new delivery date and its return window all come through. Harness's page counts the mail it skipped, with sender, subject and the rule, and if mail_skip.json has a mistake it's ignored whole and the page says why.
+- **A restore whose own note can't be read moves nothing.** Harness starts degraded and its page lists the files beside your records. A restore refused for a file that isn't its own can be sorted from the App's command line, which moves just those files aside after you type yes.
+- **No button is dead after a restore is staged.** A card with buttons waits and goes out after the restart, and a tap meanwhile is answered that Harness is waiting to restart.
+- **A start that waited for a restore being staged goes on by itself** once the staging is done; its page shows the wait.
+- **While a restore is staged, Harness's page still shows its loop and its clock check,** so a stuck Harness never looks like one waiting to restart.
+- **Possibly overwritten is told for a removed repeat exception in another time zone,** and time zones some calendars write by other names (Windows or older names) are no longer told as someone else's edit.
 
 ## 0.23.0
 

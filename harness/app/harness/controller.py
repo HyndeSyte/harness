@@ -26,7 +26,7 @@ import re
 import time
 from concurrent.futures import Executor
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -210,6 +210,7 @@ class Controller:
                                              mail_dates=self.mail_dates,
                                              meaning_live=self.meaning_live)
         self.callbacks.migration_fn = self._migration_choice
+        self.callbacks.reconfirm_fn = self._reconfirm_tap      # fifteenth round
 
     def _still_his(self, p) -> tuple[str, str]:
         """At the moment a change goes through with no tap (calendar_change._execute): ("", the
@@ -380,18 +381,27 @@ class Controller:
         """Twelfth round, each tick: the App's run time summed in the ledger (migrate.heartbeat: backups are
         kept by run time, not the wall clock); and while the ledger waits for its move, its Run check notice is
         posted again if Discord refused it, a reminder goes once a day, and the wait shows on the status page
-        and in Cain's /health."""
+        and in Cain's /health. Fifteenth round: while a staged restore fences the records the heartbeat and the
+        clock check keep running (the run time is summed in memory, since the fence takes no write), and the page
+        and /health say fenced beside the loop's own beat, so a stall or a dead loop never looks like a staged
+        restore."""
+        fenced = bool(self.ledger.fenced)
         try:
-            if not self.ledger.fenced:         # fourteenth round: a staged restore's fence takes no write
+            if not fenced:
                 migrate.heartbeat(self.ledger)
                 if migrate.waiting(self.ledger) and self.config is not None:
                     migrate.tend_waiting(self.ledger, self.config.owner_user_id, self.config.timezone)
                 if self.config is not None and not migrate.restore_staged(self.ledger.path):
                     migrate.post_clock_card(self.ledger, self.config.owner_user_id)   # thirteenth round
-            summary = migrate.migration_summary(self.ledger)
+            else:
+                migrate.heartbeat(self.ledger, write=False)
+            summary = migrate.migration_summary(self.ledger)   # reads only: the clock check runs fenced too
         except Exception as e:                 # never stops the loop
             log.warning("migration upkeep failed: %s", type(e).__name__)
             return
+        if fenced:
+            summary = {**summary, "fenced": True, "fenced_beat": iso(self.ledger.now()),
+                       "run_time_s": int(migrate.heartbeat(self.ledger, write=False))}
         self.status_box["migration"] = summary or None
         if self.handovers is not None:
             self.handovers.migration = summary
@@ -580,7 +590,8 @@ class Controller:
         """Fourteenth round: each handover and tap is taken on its own. One the ledger can't take now (busy past
         the bounded wait) goes back to the front of the queue with everything after it, and a tap's owner is told
         once that it waits: never dropped. One the fence refuses gets the fence's plain reason. Any other failure
-        is told, never silent."""
+        is told, never silent. Fifteenth round: a tap's refusal here is its one terminal outcome, told to him by
+        this loop (_refuse_tap, once), whatever the HTTP waiter already answered Cain's link."""
         items = self.handovers.take() if self.handovers is not None else []
         for i, h in enumerate(items):
             if self.ledger.fenced:             # his Put them back tap just staged one: the rest are refused
@@ -598,51 +609,177 @@ class Controller:
                 self.handovers.give_back(items[i:])
                 return
             except LedgerFenced as e:
-                h.finish("refused", str(e) or self.FENCED, restore_staged=True)
                 if h.kind == "press":
-                    self.handovers.journal_done(h.press)
+                    self._refuse_tap(h, str(e) or self.FENCED, restore_staged=True)
+                else:
+                    h.finish("refused", str(e) or self.FENCED, restore_staged=True)
             except Exception as e:             # noqa: BLE001: told, and the rest still taken
                 log.error("a %s couldn't be taken: %s: %s", h.kind, type(e).__name__, e)
-                h.finish("error", "That couldn't be taken (an error in Harness, logged). Nothing changed.")
                 if h.kind == "press":
-                    self.handovers.tell(h, "That tap couldn't be taken (an error in Harness, logged). Nothing "
-                                           "changed.")
-                    self.handovers.journal_done(h.press)
+                    self._refuse_tap(h, "That tap couldn't be taken (an error in Harness, logged). Nothing changed.",
+                                     status="error")
+                else:
+                    h.finish("error", "That couldn't be taken (an error in Harness, logged). Nothing changed.")
             if h.kind == "press" and migrate.restore_staged(self.ledger.path):
                 self._fence()                  # fenced once the tap that staged it has its reply recorded
+
+    def _refuse_tap(self, h, text: str, *, status: str = "refused", **extra) -> None:
+        """Fifteenth round: a queued tap's one terminal refusal. He's told once (Inbox.notify), then it's struck
+        off the journal; a note that couldn't be posted now is kept in the journal and posted at the next start,
+        so it's never lost to a restart."""
+        h.finish(status, text, **extra)
+        if self.handovers is None:
+            return
+        if self.handovers.notify(h, text):
+            self.handovers.journal_done(h.press)
+        elif h.journaled and self.handovers.journal_notice(h.press, text):
+            log.warning("a note on a refused tap couldn't be posted now; it goes at the next start")
+        else:
+            self.handovers.journal_done(h.press)
 
     def _replay_taps(self) -> None:
         """Fourteenth round, once per start: taps written to the journal that the last run never committed (it
         stopped first). One from the last TAP_REPLAY_S is taken now (a tap already in the ledger isn't taken
-        twice); an older one is struck off and he's told it wasn't taken, so a tap is never silently lost."""
+        twice); an older one is struck off and he's told it wasn't taken, so a tap is never silently lost.
+
+        Fifteenth round: a tap whose commit is in the journal is never taken again, whatever the ledger says. Across
+        a restore (a swap applied at this start, or a restore staged at it) nothing is taken by itself: every tap
+        written down is listed for him, each with a fresh button of its own (_relist_taps). A note to him the last
+        run couldn't post is posted now. A tap's age is from Discord's own stamp in its id where that reads as a
+        real time, else from when it was written down, and unknown while the clock is flagged as behind the
+        records (then it's reported, not taken). The queue is read under its own mutex."""
         if getattr(self, "_taps_replayed", False) or self.handovers is None:
             return
         self._taps_replayed = True
-        queued = {(str(h.press.get("id", "")), str(h.press.get("custom_id", "")))
-                  for h in list(self.handovers._front) + list(self.handovers.queue.queue) if h.kind == "press"}
-        late = []
+        queued = self.handovers.queued_keys()
+        boundary = bool(getattr(self, "restored_at_start", False))
+        try:
+            stalled = bool(migrate.clock_stall(self.ledger))
+        except Exception:                       # noqa: BLE001: an unreadable clock check counts as a stall
+            stalled = True
+        late, relist = [], []
         for row in self.handovers.journaled():
-            p = {k: str(v) for k, v in (row.get("press") or {}).items()}
-            if (p.get("id", ""), p.get("custom_id", "")) in queued:
+            p = row["press"]
+            if self.handovers.key(p) in queued:
                 continue
-            try:
-                age = time.time() - float(row.get("at") or 0)
-            except (TypeError, ValueError):
-                age = 1e9
-            if age <= self.TAP_REPLAY_S:
+            if row.get("notice"):
+                self._post_pending_notice(p, row["notice"], row.get("at"))
+                continue
+            if boundary:
+                relist.append(row)
+                continue
+            if row.get("committed"):
+                self.handovers.journal_done(p)  # done before the stop; only its strike was left
+                continue
+            age = None if stalled else self._tap_age(row)
+            if age is not None and age <= self.TAP_REPLAY_S:
                 log.warning("a tap the last run didn't finish is taken now")
                 self.handovers.give_back([handover.Handover(kind="press", press=p, journaled=True)])
             else:
                 late.append(p)
+        if relist and self.config is not None:
+            self._relist_taps(relist)
         if late and self.config is not None:
             with self.ledger.tx() as db:
                 self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=(
                     f"Harness stopped before it took {'a tap' if len(late) == 1 else f'{len(late)} taps'} of yours, "
                     "so nothing changed from "
                     f"{'it' if len(late) == 1 else 'them'}. A card still works until it runs out."))
-                self.ledger.event("taps_not_taken", {"count": len(late)}, db=db)
+                self.ledger.event("taps_not_taken", {"count": len(late), "clock_stalled": stalled}, db=db)
             for p in late:
                 self.handovers.journal_done(p)
+
+    @staticmethod
+    def _tap_age(row: dict) -> float | None:
+        """Seconds since the tap: Discord's stamp in the interaction's id when it reads as a real time (after
+        2020, not ahead of now by more than a day), else when it was written down. None when neither reads."""
+        now = time.time()
+        when = snowflake_time((row.get("press") or {}).get("id"))
+        if when is not None:
+            t = when.timestamp()
+            if datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() <= t <= now + 86400:
+                return now - t
+        try:
+            return now - float(row.get("at"))
+        except (TypeError, ValueError):
+            return None
+
+    def _post_pending_notice(self, p: dict, text: str, at) -> None:
+        """Fifteenth round: a note the last run owed him on a tap, posted now (on the tap while Discord still
+        takes it, else as a message), then struck off."""
+        h = handover.Handover(kind="press", press=p, journaled=True)
+        fresh = self._tap_age({"press": p, "at": at})
+        if fresh is not None and fresh <= self.TAP_REPLAY_S and self.handovers.notify(h, text):
+            self.handovers.journal_done(p)
+            return
+        if self.config is None:
+            return
+        with self.ledger.tx() as db:
+            self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
+                                text=render.fit("About a tap of yours: " + render.escape(text)))
+            self.ledger.event("tap_notice_posted", {}, db=db)
+        self.handovers.journal_done(p)
+
+    RELIST_MAX = 10
+
+    def _relist_taps(self, rows: list[dict]) -> None:
+        """Fifteenth round: the records were put back from a backup at this start, so no tap written down before it
+        is taken by itself (the backup may predate it, or have it). He gets a message listing them, then one card
+        per tap with a fresh button that does that tap now, on the records in use, if he still wants it."""
+        owner, tz = self.config.owner_user_id, ZoneInfo(self.config.timezone)
+        shown = rows[:self.RELIST_MAX]
+        with self.ledger.tx() as db:
+            n = len(rows)
+            self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
+                "<b>Harness's records were put back from a backup</b>, so "
+                f"{'a tap of yours from before it was' if n == 1 else f'{n} taps of yours from before it were'} "
+                "not carried out on them. "
+                + ("It follows with its own button, if you still want it."
+                   if n == 1 else "Each follows with its own button, if you still want it.")
+                + ("" if n <= len(shown) else f" The newest {len(shown)} are shown; the rest were not carried out.")))
+            for row in shown:
+                p = row["press"]
+                t = None
+                try:
+                    t = datetime.fromtimestamp(float(row.get("at")), timezone.utc).astimezone(tz)
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pass
+                when = f"{t:%a %-I:%M %p}" if t else "before the restart"
+                before = ("It was carried out on the records before they were put back; the records in use now "
+                          "don't have it." if row.get("committed") else "It wasn't carried out.")
+                nonce = choices.mint(self.ledger, kind="tap_reconfirm", chat_id=owner, ttl_s=self.TAP_RELIST_TTL_S,
+                                     target=json.dumps({"custom_id": p.get("custom_id", ""),
+                                                        "message_id": p.get("message_id", "")}), db=db)
+                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
+                    f"A tap of yours from {render.escape(when)}. {before} Go ahead does it now."),
+                    buttons=[[("Go ahead", choices.callback_data(nonce))]],
+                    binds=[{"type": "choice", "nonce": nonce}])
+            self.ledger.event("taps_relisted", {"count": n, "shown": len(shown)}, db=db)
+        for row in rows:
+            self.handovers.journal_done(row["press"])
+
+    TAP_RELIST_TTL_S = 24 * 3600
+
+    def _reconfirm_tap(self, target: str) -> str:
+        """His Go ahead on a relisted tap (fifteenth round): the tap he made before the restore, taken now on the
+        records in use, through the same checks as any tap (that card, once, before it expires)."""
+        try:
+            t = json.loads(target or "{}")
+            cid = str(t.get("custom_id") or "")
+            mid = int(t.get("message_id") or 0)
+        except (ValueError, TypeError, AttributeError):
+            return "That can't be read, so nothing changed."
+        if not cid.startswith(DISCORD_PREFIX):
+            return "That can't be read, so nothing changed."
+        if cid in (STOP, RESUME):
+            return render.escape(self.commands._stop("") if cid == STOP else self.commands._resume(""))
+        inc = Incoming(update_id=-int(time.time() * 1000), kind="callback", user_id=self.config.owner_user_id,
+                       chat_id=self.config.owner_user_id, chat_type="private", message_id=mid, callback_id="",
+                       callback_data=cid[len(DISCORD_PREFIX):])
+        got = self.callbacks.handle(inc)
+        if got == "ok" or got == "stopped":
+            return ""
+        return render.escape(callbacks.REFUSALS.get(got, "Not valid.")) + " Nothing changed."
 
     def drain_on_stop(self) -> dict:
         """Fourteenth round, as the App stops: whatever is still queued is answered, so nothing is dropped
@@ -659,8 +796,8 @@ class Controller:
                                            "back.")
                 else:
                     out["told"] += 1
-                    self.handovers.tell(h, "Not taken: Harness stopped before it took your tap. Nothing "
-                                           "changed.")
+                    self.handovers.notify(h, "Not taken: Harness stopped before it took your tap. Nothing "
+                                             "changed.")
                 h.finish("working" if h.journaled else "refused", "Harness is stopping.")
             else:
                 out["refused"] += 1
@@ -676,9 +813,7 @@ class Controller:
         Fourteenth round: the fence is the ledger's mode flag, and the outbox's delivery marks are exempt."""
         for h in (self.handovers.take() if self.handovers is not None else []):
             if h.kind == "press":
-                h.finish("refused", self.FENCED, restore_staged=True)
-                self.handovers.tell(h, self.FENCED)
-                self.handovers.journal_done(h.press)
+                self._refuse_tap(h, self.FENCED, restore_staged=True)   # told once, then struck off
             else:
                 h.finish("refused", self.FENCED, restore_staged=True)
         self._beat()
@@ -778,6 +913,10 @@ class Controller:
         p = h.press
         self._press_inner(h, p)
         # Fourteenth round: answered (and struck off the tap journal) only once what it did is committed.
+        # Fifteenth round: the commit is written in the journal itself first, so a replay never acts twice, even
+        # after the ledger is put back from a backup that predates it.
+        if self.handovers is not None and h.journaled:
+            self.handovers.journal_commit(p)
         h.finish("ok")
         if self.handovers is not None:
             self.handovers.journal_done(p)
@@ -1476,6 +1615,10 @@ class Controller:
                             "text": self.ledger.get_meta("last_digest_text") or ""},
             "meaning_shadow": self.meaning.status() if self.meaning is not None else None,
             "discord": self._discord_status(),
+            # Fifteenth round: mail skipped by kind (sender, subject, rule), and why mail_skip.json was ignored.
+            "mail_skipped": self.mail_dates.skipped_status() if self.mail_dates is not None else None,
+            "mail_skip_problem": (getattr(self.mail_dates, "skip_problem", "") or None)
+            if self.mail_dates is not None else None,
         })
 
     def _discord_status(self) -> dict | None:

@@ -148,6 +148,27 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
     if mig.get("restore_staged"):
         parts.append('<div class="no">⚠ A restore is staged: restart the App now to put the records back. Nothing '
                      'new is taken until then.</div>')
+    if mig.get("fenced"):
+        # Fifteenth round: the loop still beats while fenced; this line is redrawn by it, so a stale time here means
+        # the loop has stopped, not that a restore waits.
+        parts.append(f'<div class="muted">Fenced for the staged restore. The loop last beat at '
+                     f'{_e(str(mig.get("fenced_beat", ""))[:19])} UTC; run time {_e(mig.get("run_time_s", 0))} s. '
+                     'The clock check still runs.</div>')
+    if mig.get("lock_wait"):
+        parts.append(f'<div class="no">⚠ Waiting for a restore being staged beside the records (harness.lock is '
+                     f'held) since {_e(str(mig.get("lock_wait_since", ""))[:19])} UTC; it is tried again every '
+                     f'{_e(mig.get("lock_retry_s", ""))} s and Harness starts normally once it is free.</div>')
+    for f in mig.get("files") or []:
+        parts.append(f'<div class="muted">Beside the records: {_e(f)}</div>')
+    if st.get("mail_skip_problem"):
+        parts.append(f'<div class="no">⚠ mail_skip.json is ignored: {_e(st["mail_skip_problem"])}. Only the built-in '
+                     'kinds are skipped.</div>')
+    skipped = st.get("mail_skipped") or {}
+    if skipped.get("count"):
+        parts.append(f'<div class="muted">Mail skipped by kind: {_e(skipped["count"])} so far.</div>')
+        for r in skipped.get("recent") or []:
+            parts.append(f'<div class="muted">· {_e(r.get("sender", ""))}: {_e(r.get("subject", ""))} '
+                         f'({_e(r.get("rule", ""))})</div>')
     stall = mig.get("pruning_stalled") or {}
     if stall:
         held = (f' by the record {_e(stall.get("kind", ""))} (#{_e(stall.get("event"))}) stamped '

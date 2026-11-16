@@ -417,7 +417,7 @@ class LedgerBusy(TimeoutError):
 
 class LedgerFenced(RuntimeError):
     """Fourteenth round: a restore is staged, so the ledger takes no write (Ledger.fence): it fails at once with
-    the plain reason, never waits. Only the outbox's delivery bookkeeping is exempt (tx(fence_exempt=True))."""
+    the plain reason, never waits. Only the outbox's delivery bookkeeping is exempt (Ledger.outbox_tx)."""
 
 
 # Fourteenth round: the staged restore's fence is a mode flag per ledger file, not a held lock.
@@ -530,8 +530,18 @@ class Ledger:
     def _key(self) -> str:
         return f"mem:{id(self)}" if not self.path or self.path == ":memory:" else os.path.abspath(self.path)
 
+    def tx(self):
+        """One write transaction (_tx). Fails at once with LedgerFenced while a staged restore fences the ledger."""
+        return self._tx(False)
+
+    def outbox_tx(self):
+        """Fifteenth round: the one write a staged restore's fence lets through, the outbox's own delivery
+        bookkeeping (sent marks, retries, a card's button binds), so the restart card goes out and nothing is
+        posted twice. Nothing else may use it: the exemption is this method, not an argument any caller can pass."""
+        return self._tx(True)
+
     @contextmanager
-    def tx(self, *, fence_exempt: bool = False):
+    def _tx(self, fence_exempt: bool):
         """One write transaction. BEGIN IMMEDIATE so two writers can never
         interleave a read-check-write. Twelfth round: while another thread holds this ledger's
         writers off (hold_writers, the migration), it waits until that's over. Fourteenth round: while a

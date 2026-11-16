@@ -35,8 +35,9 @@ def rows(g):
 def test_amazon_delivery_management_is_a_kind_by_name():
     kinds = skip_kinds(None)
     assert kinds[0]["name"] == "Amazon delivery management"
+    # Fifteenth round: only with a Subscribe & Save marker (test_mail_skip_round15 has the rest).
     for subject in (SAVE, "Review your upcoming Subscribe & Save delivery",
-                    "Your delivery day has changed", "Manage your subscription: next delivery Dec 2"):
+                    "Subscribe & Save: your delivery date has changed"):
         assert skipped_kind(AMAZON, subject, kinds) == "Amazon delivery management", subject
     assert skipped_kind(AMAZON, RETURN_SUBJECT, kinds) == ""
     assert skipped_kind(AMAZON, "Your order of PC parts has shipped", kinds) == ""

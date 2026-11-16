@@ -112,10 +112,15 @@ def test_a_tap_taken_then_killed_before_the_write_is_taken_at_the_next_start(m, 
     journal = killed_after_the_tap(tmp_path, press)
     assert [r["press"]["custom_id"] for r in json.loads("[" + ",".join(open(journal)) + "]")] == [press["custom_id"]]
     assert migrate.clock_stall(m.ledger)                                    # nothing was written by the dead run
+    assert not m.ledger.db.execute("SELECT 1 FROM updates WHERE update_id=?", (int(press["id"]),)).fetchone()
+    # Fifteenth round: while the clock is flagged a tap's age is unknown, so it would be reported, not taken
+    # (test_handover_round15_taps); here the clock is right again by the next start.
+    clock.advance(hours=3)
     m.c.handovers.journal = journal                                         # the next start
     m.c._taps_replayed = False
     m.c.tick()
-    assert migrate.clock_stall(m.ledger) == {}                              # his tap took the clock as right
+    assert m.ledger.db.execute("SELECT COUNT(*) FROM updates WHERE update_id=? AND kind='callback'",
+                               (int(press["id"]),)).fetchone()[0] == 1      # his tap was taken
     assert m.c.handovers.journaled() == [] and not pathlib.Path(journal).exists()
     m.c._taps_replayed = False
     m.c.tick()                                                              # struck off: never taken twice

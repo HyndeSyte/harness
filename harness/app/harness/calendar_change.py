@@ -705,6 +705,70 @@ def _bare(value) -> list[str] | str:
     return value
 
 
+# Fifteenth round: zone names calendars write that aren't IANA names, mapped to the IANA name before a zone is
+# compared or a baseline's zone rewrite recorded: Windows ids (Outlook, Exchange), their display names, legacy
+# links, and the prefixed forms some clients and iCloud write (/mozilla.org/.../America/New_York).
+ZONE_ALIASES = {
+    "eastern standard time": "America/New_York", "eastern time (us & canada)": "America/New_York",
+    "us eastern standard time": "America/Indiana/Indianapolis",
+    "central standard time": "America/Chicago", "central time (us & canada)": "America/Chicago",
+    "mountain standard time": "America/Denver", "mountain time (us & canada)": "America/Denver",
+    "us mountain standard time": "America/Phoenix", "arizona": "America/Phoenix",
+    "pacific standard time": "America/Los_Angeles", "pacific time (us & canada)": "America/Los_Angeles",
+    "alaskan standard time": "America/Anchorage", "alaska": "America/Anchorage",
+    "hawaiian standard time": "Pacific/Honolulu", "hawaii": "Pacific/Honolulu",
+    "atlantic standard time": "America/Halifax", "atlantic time (canada)": "America/Halifax",
+    "gmt standard time": "Europe/London", "greenwich standard time": "Atlantic/Reykjavik",
+    "w. europe standard time": "Europe/Berlin", "romance standard time": "Europe/Paris",
+    "central europe standard time": "Europe/Budapest", "central european standard time": "Europe/Warsaw",
+    "e. europe standard time": "Europe/Chisinau", "gtb standard time": "Europe/Bucharest",
+    "fle standard time": "Europe/Kiev", "tokyo standard time": "Asia/Tokyo",
+    "china standard time": "Asia/Shanghai", "india standard time": "Asia/Kolkata",
+    "aus eastern standard time": "Australia/Sydney", "utc": "UTC", "coordinated universal time": "UTC",
+    "us/eastern": "America/New_York", "us/central": "America/Chicago", "us/mountain": "America/Denver",
+    "us/pacific": "America/Los_Angeles", "us/alaska": "America/Anchorage", "us/hawaii": "Pacific/Honolulu",
+    "us/arizona": "America/Phoenix", "us/east-indiana": "America/Indiana/Indianapolis",
+    "est5edt": "America/New_York", "cst6cdt": "America/Chicago", "mst7mdt": "America/Denver",
+    "pst8pdt": "America/Los_Angeles", "gb": "Europe/London", "asia/calcutta": "Asia/Kolkata",
+    "etc/utc": "UTC", "etc/gmt": "UTC", "gmt": "UTC", "z": "UTC", "zulu": "UTC", "uct": "UTC", "universal": "UTC",
+    "etc/universal": "UTC", "etc/zulu": "UTC", "etc/uct": "UTC",
+}
+
+
+def iana_zone(zone: str) -> str:
+    """Fifteenth round: a zone as its IANA name (ZONE_ALIASES), or as written when it isn't a known alias."""
+    text = str(zone or "").strip().strip('"')
+    if not text:
+        return ""
+    m_ = re.match(r"^\(UTC[^)]*\)\s*(.+)$", text)            # Outlook's "(UTC-05:00) Eastern Time (US & Canada)"
+    if m_:
+        text = m_.group(1).strip()
+    if text.startswith("/"):                                   # /mozilla.org/20050126_1/America/New_York and kin
+        parts = [p for p in text.split("/") if p]
+        for i in range(len(parts)):
+            cand = "/".join(parts[i:])
+            if cand.lower() in ZONE_ALIASES or re.fullmatch(r"[A-Z][A-Za-z_]+(?:/[A-Za-z0-9_+-]+)+", cand):
+                text = cand
+                break
+    return ZONE_ALIASES.get(text.lower(), text)
+
+
+def zone_forms(*bodies: str) -> dict:
+    """Fifteenth round, for the smoke run's record: the zone names a calendar wrote (TZID parameters and VTIMEZONE
+    ids as written, or Google's timeZone values) and the IANA names they map to."""
+    raw: set = set()
+    for body in bodies:
+        if isinstance(body, dict):
+            for k in ("start", "end", "originalStartTime"):
+                v = body.get(k)
+                if isinstance(v, dict) and v.get("timeZone"):
+                    raw.add(str(v["timeZone"]))
+            continue
+        for m_ in re.finditer(r"(?:;TZID=|^TZID:)\"?([^\";:\r\n]+)", str(body or ""), re.M):
+            raw.add(m_.group(1).strip())
+    return {"written": sorted(raw), "iana": sorted({iana_zone(z) for z in raw})}
+
+
 def _ics_when(text: str, params: dict) -> tuple | None:
     """One iCalendar date or date-time as (all-day, instant, zone): the UTC instant (or the date), so a time zone
     or all-day change shows; None when it can't be resolved (an unknown zone, a period)."""
@@ -717,7 +781,7 @@ def _ics_when(text: str, params: dict) -> tuple | None:
     naive = datetime.strptime(m_.group(1), "%Y%m%dT%H%M%S")
     if m_.group(2):
         return (False, naive.replace(tzinfo=timezone.utc).isoformat(), "UTC")
-    zone = params.get("TZID", "")
+    zone = iana_zone(params.get("TZID", ""))
     if not zone:
         return (False, "floating " + naive.isoformat(), "")
     try:
@@ -742,9 +806,13 @@ def _rule(text: str) -> tuple | None:
     return tuple(sorted(parts.items()))
 
 
-def _resolved(field, value) -> tuple | None:
+_KNOWN_TIME_PARAMS = {"TZID", "VALUE"}
+
+
+def _resolved(field, value, strict: bool = False) -> tuple | None:
     """Fourteenth round: a temporal field (_TEMPORAL_FIELDS) as what it means: (sorted resolved values, sorted
-    zones). None when any part can't be resolved, which counts as a real change."""
+    zones). None when any part can't be resolved, which counts as a real change. Fifteenth round: zones by their
+    IANA names (iana_zone); strict, a parameter other than TZID and VALUE can't be resolved either."""
     if value is None:
         return None
     whens: list = []
@@ -757,6 +825,8 @@ def _resolved(field, value) -> tuple | None:
             for p in raw:
                 k, _, v = p.partition("=")
                 params[k.strip().upper()] = v.strip().strip('"')
+            if strict and set(params) - _KNOWN_TIME_PARAMS:
+                return None
             if name.upper() in ("RRULE", "EXRULE"):
                 r = _rule(body)
                 if r is None:
@@ -786,7 +856,7 @@ def _resolved(field, value) -> tuple | None:
         at = datetime.fromisoformat(str(v.get("dateTime", "")).replace("Z", "+00:00"))
     except ValueError:
         return None
-    zone = str(v.get("timeZone") or "")
+    zone = iana_zone(str(v.get("timeZone") or ""))
     if at.tzinfo is None:
         if not zone:
             return None
@@ -837,7 +907,14 @@ def _matches_baseline(x: dict, baseline: dict | None) -> bool:
     if kind == "added":
         return x["now"] == b.get("now")
     if kind == "removed":
-        return "was" in b and _bare(x["was"]) == _bare(b.get("was"))
+        if "was" not in b:
+            return False
+        if prop in _TEMPORAL_FIELDS:
+            # Fifteenth round: a removed time by what it means (instant or date, all-day, zone), like a kept one,
+            # never with its parameters set aside; one that can't be resolved is reported.
+            was, base = _resolved(x["field"], x["was"], strict=True), _resolved(x["field"], b.get("was"), strict=True)
+            return was is not None and base is not None and was == base
+        return _bare(x["was"]) == _bare(b.get("was"))
     if prop in _TEMPORAL_FIELDS:
         was, now = _resolved(x["field"], x["was"]), _resolved(x["field"], x["now"])
         if was is None or now is None or was[0] != now[0]:
@@ -1793,6 +1870,8 @@ class CalendarChange:
                   "etag_strength": _strength(got.get("etags") or []),
                   # Thirteenth round: what this calendar rewrites on a write that changes nothing (_baseline_family).
                   "baseline": got.get("baseline"),
+                  # Fifteenth round: the zone names it writes, as written and as IANA names.
+                  "zone_form": got.get("zone_form"),
                   **({"unguarded_put": got.get("unguarded_put", "")} if provider == "family" else {})}
         gate = card_gate(self.ledger)
         run = dict(smoke_run(self.ledger))
@@ -2010,7 +2089,9 @@ class CalendarChange:
                                                "extendedProperties": {"private": dict(private)}})
             if out.kind != "ok":
                 return {**got, "why": "its test event couldn't be added"}
+            self._zone_form = None
             got["baseline"] = self._baseline_gmail(address, uid, desc)     # thirteenth round
+            got["zone_form"] = self._zone_form
             old = stale_kind("edit", uid, {"description": f"{CONFORM_MARK} 1"},
                              {"description": f"{CONFORM_MARK} 2"}, f"{CONFORM_MARK} 2")
             if kinds.get("edit") in ("enforced", "ignored") and old:
@@ -2118,7 +2199,9 @@ class CalendarChange:
             out = self.client.put_new(href, one)
             if out.kind != "ok":
                 return {**got, "why": "its test event couldn't be added"}
+            self._zone_form = None
             got["baseline"] = self._baseline_family(href, fetch)             # thirteenth round
+            got["zone_form"] = self._zone_form
             old = stale_kind("edit", href, lambda b: note(b, f"{CONFORM_MARK} 1"),
                              lambda b: note(b, f"{CONFORM_MARK} 2"), f"{CONFORM_MARK} 2")
             if kinds.get("edit") in ("enforced", "ignored") and old:
@@ -2185,6 +2268,7 @@ class CalendarChange:
         again, now = fetch(href)
         if again.kind != "ok":
             return None
+        self._zone_form = zone_forms(body, now)        # fifteenth round: the smoke run records the form
         return _baseline_of(_lost_fields(_ics_fields(body), _ics_fields(body), _ics_fields(now)))
 
     def _baseline_gmail(self, address: str, uid: str, desc) -> dict | None:
@@ -2198,6 +2282,7 @@ class CalendarChange:
         kind, now = desc(uid)
         if kind != "ok" or not now:
             return None
+        self._zone_form = zone_forms(ev, now)          # fifteenth round: the smoke run records the form
         return _baseline_of(_lost_fields(_gmail_fields(ev), _gmail_fields(ev), _gmail_fields(now)))
 
     def _drop_test(self, href: str, fetch) -> bool:

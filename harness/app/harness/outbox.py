@@ -69,6 +69,11 @@ class Outbox:
             when = written.astimezone(self.tz).strftime("%a %-I:%M %p")
             text = render.fit(f"<i>Delayed: written {when}.</i>\n" + text)
         binds = json.loads(row["binds_json"]) if row["binds_json"] else []
+        if binds and self.ledger.fenced:
+            # Fifteenth round: no card with buttons goes out while a staged restore fences the records, so no
+            # button is ever left unbound. It stays queued; at the next unfenced start it's sent and bound as
+            # usual (the fence is engaged and lifted only on the controller's thread, which also runs this).
+            return False
         try:
             mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
         except ChatError as e:
@@ -76,9 +81,8 @@ class Outbox:
             return False
         now = self.ledger.now()
         # Fourteenth round: the delivery marks are exempt from a staged restore's fence (the restart card goes
-        # out and isn't sent twice); a card's buttons aren't bound while fenced (they fail closed: taps are
-        # refused until the restart, which sets these records aside anyway).
-        with self.ledger.tx(fence_exempt=True) as db:
+        # out and isn't sent twice). Fifteenth round: through the ledger's outbox-only method.
+        with self.ledger.outbox_tx() as db:
             db.execute("UPDATE outbox SET state='sent', sent_at=?, message_id=?,"
                        " attempts=attempts+1, last_error=NULL WHERE id=?",
                        (iso(now), mid, row["id"]))
@@ -90,8 +94,6 @@ class Outbox:
                 # message id 0: nothing can bind to it; leave the buttons dead
                 binds = []
                 self.ledger.event("unbindable_message", {"outbox": row["id"]}, db=db)
-        if self.ledger.fenced:
-            binds = []
         for b in binds:
             try:
                 if b["type"] == "approval":
@@ -115,7 +117,7 @@ class Outbox:
             return False
         except ValueError:
             pass
-        with self.ledger.tx(fence_exempt=True) as db:
+        with self.ledger.outbox_tx() as db:
             db.execute("UPDATE outbox SET state='sent', sent_at=?, attempts=attempts+1, last_error=NULL"
                        " WHERE id=?", (iso(self.ledger.now()), row["id"]))
         return True
@@ -155,12 +157,12 @@ class Outbox:
             # An outage delays a reply; it never loses one. Only a refusal
             # that will never change (blocked bot, bad request) is final.
             wait = max(e.retry_after or 0, _backoff(attempts))
-            with self.ledger.tx(fence_exempt=True) as db:
+            with self.ledger.outbox_tx() as db:
                 db.execute("UPDATE outbox SET attempts=?, last_error=?, not_before=?"
                            " WHERE id=?", (attempts, str(e)[:200],
                                            iso(now + timedelta(seconds=wait)), row["id"]))
             return
-        with self.ledger.tx(fence_exempt=True) as db:
+        with self.ledger.outbox_tx() as db:
             db.execute("UPDATE outbox SET state='dead', attempts=?, last_error=? WHERE id=?",
                        (attempts, str(e)[:200], row["id"]))
             self.ledger.event("delivery_failed", {"outbox": row["id"], "kind": row["kind"],

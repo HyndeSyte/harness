@@ -694,7 +694,8 @@ On Gmail, and then the same on Family:
    a read shows it gone; every start retries the removal (only of an event carrying that run's own tag),
    and one still there shows on Harness's page with how many tries so far. It's safe to delete by hand. The item
    also takes each calendar's normalisation baseline: on its own test event it writes back exactly what
-   it read, reads again, and keeps which fields the calendar rewrote by itself (see below). The no-card flag stays off until both are recorded: `fastpath on`
+   it read, reads again, and keeps which fields the calendar rewrote by itself (see below), with the
+   zone names it writes (`zone_form`: as written, and as IANA names). The no-card flag stays off until both are recorded: `fastpath on`
    refuses the run by name (`gmail.etag_strength`, `family.etag_strength`, `family.unguarded_put`)
    until then.
 
@@ -750,7 +751,12 @@ value that's the same once spacing, case, escapes and parameters are set aside. 
 (`DTSTART`, `DTEND`, `RECURRENCE-ID`, `EXDATE`, `RRULE`, and all-day or timed) are never loosened that
 way: they're compared by the instant or day they resolve to, whether they're all-day, and their time
 zone, so someone changing an event's time zone or making it all-day is told, unless it's exactly the
-zone rewrite the baseline showed. Anything ambiguous counts as a possible lost update and is told, as is
+zone rewrite the baseline showed. A removed time is matched the same way, by what it means (instant or
+day, all-day, zone), never with its parameters set aside, and one carrying a parameter that can't be
+resolved is told. Zone names that aren't IANA names (Windows ids such as "Eastern Standard Time", older
+names such as "US/Eastern", and prefixed forms such as `/mozilla.org/.../America/New_York`) are mapped
+to their IANA name first, so a calendar that writes one form and reads back another is never told as
+someone's edit. Anything ambiguous counts as a possible lost update and is told, as is
 anything else, such as someone's real edit of the same field. A field the baseline never saw (a reminder,
 a repeat rule) raises nothing when it comes back as it went. The pinned stamps below stay out as before.
 
@@ -839,7 +845,18 @@ did (or says it's still working, never a final answer before a durable write); t
 you as a follow-up. A tap caught by a stop is taken at the next start, or, if it's by then too old for
 Discord (14 minutes), you're told it wasn't taken. A tap the busy ledger can't take after the bounded
 wait stays queued and you're told once; nothing queued is dropped as the App stops (it's kept in the
-journal or you're told). A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
+journal or you're told). A tap that can't be written to the journal whole (the append fails, a short
+write, the fsync fails) is turned down at once, never answered "working", and you're told nothing
+changed. The journal records, besides each tap, its commit (once what it did is in the ledger) and any
+note owed to you; a tap is struck off only after its commit, or once you've been told it wasn't taken,
+and a tap with its commit recorded is never taken again. A refused tap is told to you once, by the
+controller alone (never also by the waiting answer to Cain's link); a note that can't go now stays in
+the journal and goes at the next start. A tap's age is read from Discord's own stamp in its id where
+that reads as a real time; while the clock is flagged as behind the records it counts as unknown, and
+the tap is reported, not taken. Across a restore (the swap applied at that start) nothing written in
+the journal is taken by itself: one message lists those taps, then one card each with *Go ahead*, which
+does that tap now on the records in use. While Harness runs degraded without its records a tap is
+refused at once and you hear it through Cain's link. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
 the App such a writer waits in bounded slices, logging each and trying again, and gives up after five
 minutes with an error rather than hang. The hold is always released, even when what it holds fails. The
 checkpoint and the online backup run under the hold strictly before the migration's transaction begins,
@@ -892,12 +909,26 @@ rename and before the marker is cleared, and each finished step is recorded in t
 never repeats a move. A stop or a power cut between any two steps is finished at the next start (one
 that fails its check there is set aside and the old ledger put back, also step by step). A move is
 never made over a file that's already there, and nothing at the records' name is opened beside a
-`-wal` or `-shm` it doesn't own; either one stops the start, which runs degraded and says why. The restored ledger is migrated again on that start, with rows intact, rehearsing itself as
+`-wal` or `-shm` it doesn't own; either one stops the start, which runs degraded and says why. The
+refusal is recorded in the swap marker with the files that caused it; with the App stopped (or degraded),
+`python3 -m harness.migrate /data/harness.sqlite --set-aside` lists them, asks you to type yes, moves
+just those files into `harness-set-aside-<time>/` beside the records, and clears the refusal, so the next
+start finishes the swap. A swap marker that can't be read (damaged or cut short) is never deleted and
+nothing is moved: the start runs degraded, and the page lists the files at the records' live and kept
+names, as `python3 -m harness.migrate /data/harness.sqlite --swap` does, for sorting by hand. The marker
+itself is always written whole (a temporary file, fsynced, renamed, and the folder fsynced). If a start
+waits the full two minutes for a restore being staged, it runs degraded, shows the wait on its page,
+tries the lock again every 5 seconds and starts normally by itself once the staging is done. While
+degraded, Harness posts one note to you through Cain's link (tried again until it goes). The restored ledger is migrated again on that start, with rows intact, rehearsing itself as
 any install does, so it doesn't need a fresh *Run check*.
 
 Once your tap stages it, Harness is fenced and takes nothing new until it restarts. The fence is a mode,
 not a held lock: any ledger write then fails at once with a plain reason, while sending messages already
-queued (and marking them sent) still works. A request or a tap is answered at once that it's waiting to
+queued (and marking them sent) still works, through the ledger's one outbox-only exemption. A card with
+buttons isn't sent while fenced: it waits in the outbox and goes out, its buttons bound, at the next
+start that isn't fenced, so no button is ever dead; a tap meanwhile gets the restart answer. The loop's
+heartbeat and the clock check keep running while fenced, and the page and `/health` say fenced beside
+the loop's own beat, so a stuck or stopped loop still shows as stuck. A request or a tap is answered at once that it's waiting to
 restart (never queued), and one card asks you to restart the Harness
 App now (Settings, Apps, Harness, Restart). The card says how old the backup is and how many held
 requests, buttons not tapped yet, writes still being confirmed and changes you could still undo are in
@@ -906,8 +937,11 @@ set aside come back to you, one message saying the records are back and then one
 to copy into the calendar app. The kept ledger is opened read-write once first to fold its log in, so a
 request committed only in its `-wal` comes back too. Which have gone is recorded beside the kept files
 (`harness-replaced-<time>.sqlite.postback.json`, naming each before it's posted, and the ledger records
-the post in the same transaction), so a stop at any point neither repeats nor loses one. Once all are
-posted and the records aren't waiting on a move, older kept sets are pruned, and the latest is kept. The page and `/health`
+the post in the same transaction), so a stop at any point neither repeats nor loses one. Every kept set whose own marker doesn't say done is
+posted back, oldest first, so two restores in a row with the first post-back cut short bring both sets'
+held requests back, once each (a post recorded in records set aside since counts only if it was
+delivered from there). A kept set is pruned only once its own marker says done and the records aren't
+waiting on a move; one that isn't stays, counted in the space check, and the latest is always kept. The page and `/health`
 show a staged restore meanwhile. The copies beside the ledger live on the same device: a Home Assistant backup
 is the off-device copy, and one is recommended before installing (the Ship job takes one first).
 
@@ -936,14 +970,19 @@ calendar as before, and its message says so: "From your mail, on your Gmail cale
 
 **Kinds you've said no to are skipped.** Mail of a kind on the skip list is passed over before
 anything is sent to the model, matched on who sent it and its subject: no card, no calendar entry, and
-the digest never mentions it. The first kind is Amazon's delivery management mail (Subscribe & Save
-cutoffs and "last day to manage" reminders, delivery day changes, manage-your-subscription reminders);
-an Amazon order's return window still comes through. To skip another kind without a new build, add it
-by name to `/data/mail_skip.json`, read at every pick, for example
+the digest never mentions it. The first kind is Amazon's Subscribe & Save delivery management: the mail
+must come from Amazon and say Subscribe & Save (in its subject, or else in its text, read on the Pi)
+before a subject like "last day to manage", "manage your delivery" or "delivery date has changed"
+counts. Prime, Audible and Kindle renewals, an ordinary order's new delivery date and an order's return
+window all come through ("return" counts only as a whole word, so "returning" doesn't). To skip another
+kind without a new build, add it by name to `/data/mail_skip.json`, read at every pick, for example
 `{"skip": [{"name": "Pet shop points", "from": ["pawsclub.example"], "subject": ["points statement"],
 "unless": ["order"]}]}`: a mail is skipped when its sender contains a `from` text and its subject a
-`subject` text but no `unless` text. A file that can't be read is ignored and the built-in kinds still
-apply.
+`subject` text but no `unless` word. The file is checked strictly: each entry needs a `name`, and `from`
+and `subject` lists (`unless` when given) of texts at least three characters long, and nothing else; one
+entry that doesn't fit, or a file that can't be read, and the whole file is ignored, the built-in kinds
+still apply, and Harness's page says why. The page also counts the mail skipped so far, with the sender,
+subject and rule of the latest, so a rule that skips too much shows.
 
 Mail is handed to the model as quoted data, with a line saying it is never instructions, so an
 email can't tell Harness to do anything. Mail never makes a calendar change on its own: a date for
