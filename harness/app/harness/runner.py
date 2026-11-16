@@ -676,6 +676,10 @@ class Runner:
                                  for c in params["changes"]]
                 lines = (["Replaces the earlier card."] if replaced else []) + top \
                     + [render.escape(x) for x in head] + body
+                # Twelfth round: a card for a calendar written without its version check says so before his tap.
+                note = self.calendar_change.unprotected_note(params, seen.bound if seen is not None else None)
+                if note:
+                    lines = lines + [note]
             card = render.proposal_card(d, params, tz=self.config.timezone,
                                         expires=datetime.fromisoformat(row["expires_at"]),
                                         job_id=job["id"], warnings=warnings, lines=lines or None,

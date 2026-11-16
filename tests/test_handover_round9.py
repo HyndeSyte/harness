@@ -200,7 +200,8 @@ def test_a_calendar_that_enforces_if_match_passes_the_conformance_item(m, calend
     assert out["status"] == "ok" and out["result"] == "enforced"
     assert calendar_change.conformance_of(m.ledger, calendar) == "enforced"
     created = m.cc.created_by(run)
-    assert len(created) == 2 and {x["cal"] for x in created} == {calendar}   # tenth round: a one-off and a series
+    # Tenth round: a one-off and a series; twelfth round: on Family, a third for the PUT with no If-Match.
+    assert len(created) == (3 if calendar == "family" else 2) and {x["cal"] for x in created} == {calendar}
     assert not m.cc.smoke_leftovers(run)                         # its test event is taken off after
     gate = calendar_change.card_gate(m.ledger)
     assert calendar in calendar_change.closed_providers(m.ledger)   # the fenced and series-day edits still to come
@@ -234,7 +235,7 @@ def test_a_calendar_that_ignores_if_match_never_opens_and_he_is_told(m, monkeypa
     assert HAIRCUT not in " ".join(map(str, sent)) and haircut_at(m) == "10:00"
     name = "Gmail" if calendar == "gmail" else "Family"
     told = [t for t in m.seen() if t.startswith(f"Harness can't change {name} safely.")]     # eleventh round
-    assert len(told) == 1 and "could be overwritten" in told[0] and "by hand in the calendar app" in told[0]
+    assert len(told) == 1 and "can be overwritten or deleted" in told[0] and "by hand in the calendar app" in told[0]
     _, missing, _ = m.cc.smoke_evidence(run)
     assert any(x.startswith(f"{calendar}.conformance: the calendar accepted a write sent with an out of date version")
                for x in missing)

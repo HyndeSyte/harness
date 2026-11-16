@@ -676,12 +676,19 @@ On Gmail, and then the same on Family:
    as a line ready to copy (calendar, what, title, when), and it stays held. *Open without protection*
    (your tap only, kept in the log; Cain's `gate-open` there just sends you that message again) lets
    changes there go as a read-compare-write: each is read just before writing and compared with your
-   card, then sent with no If-Match, and every receipt for that calendar says *Unprotected*. A calendar
+   card, then sent with no If-Match, so edits made at the same time by someone else can be overwritten
+   or deleted. It opens that one calendar only: the authorisation is per calendar. Every card and
+   receipt for that calendar says *Unprotected*. A calendar
    that turned down the fresh edit also gets *Test again*. This is never refused outright. One that
    refuses stale edits but takes the stale removal stays closed too, with a message saying removals
    there aren't protected; after its override, removals there stay held. The item runs again after
    every install. Once the two edits are read back and the
    conformance item passed on a calendar, its held cards come back.
+   The item also records each calendar's etag strength (strong, weak, or none, from every version it
+   read), and on Family it sends one PUT with no If-Match to a test event of its own and records whether
+   Family took it or refused it. The no-card flag stays off until both are recorded: `fastpath on`
+   refuses the run by name (`gmail.etag_strength`, `family.etag_strength`, `family.unguarded_put`)
+   until then.
 
 And once, on either calendar: two days of one throwaway repeating event taken off on two cards, both
 Done. The listing lag is measured from the record itself: from each write's read back by its id to
@@ -708,16 +715,36 @@ left it (sent with its version as If-Match). If a step says "Not confirmed" whil
 show the change, the log has both reads ("read back of gmail (first)" and "(fresh)"): that's the
 case to report, and the paths without a tap stay off. Nothing else to set up.
 
-### Weak versions and a gate that closes again
+### Weak versions, unprotected writes and a gate that closes again
 
 Versions (etags) are compared weakly for reads (`W/"x"` and `"x"` are the same version when the card's
 and the pre-write read's are compared), and If-Match is sent only when the calendar gave a strong
 version: a weak one never matches under If-Match's strong comparison. Where a calendar gives only weak
-versions, the fence is a read-compare-write: the read just before the write is compared with the card,
-the compare is logged (`read-compare-write (it gives only a weak version)`), and the write goes with no
-If-Match. A calendar the conformance item passed closes its gate again only when a write's read back
-shows the event's content changed while its version stayed the same; the message names that write. A
-write that changed nothing and kept its version never closes it.
+versions (or none), the fence is a read-compare-write: the read just before the write is compared with
+the card, the compare is logged (`read-compare-write (it gives only a weak version)`), and the write
+goes with no If-Match. This narrows the window but doesn't prevent a stale write: an edit made by
+someone else between that read and the write can be overwritten or deleted.
+
+So every write sent without If-Match is labelled. Its receipt (the Done message, or Not confirmed) and
+an Undo sent that way say *Unprotected*, whether the calendar was opened without protection or the
+event only gave a weak version on a calendar that's otherwise protected; never a normal-looking receipt
+for an unfenced write. An approval card for a calendar opened without protection, or one the check
+found gives only weak versions, says *Unprotected* before your tap too. After such a write, its read
+back is compared with the read just before it plus the change it meant: if any field outside the change
+differs, you get a *Possibly overwritten* message naming each field with its value before and after.
+An edit wholly overwritten in the moment between the read and the write can't be seen afterwards; the
+*Unprotected* label is there for that.
+
+A calendar the conformance item passed closes its gate again only when a write that carried If-Match,
+on a calendar meant to be protected, reads back with the event's content changed while its version
+stayed the same; the message names that write. A calendar opened without protection, and any
+read-compare-write, never closes it again that way, so there's no loop of closing and reopening. A
+write that changed nothing and kept its version never closes it. The stamps a calendar rewrites on any
+write never count as content, pinned per calendar: on Family `DTSTAMP`, `LAST-MODIFIED`, `SEQUENCE` and
+`CREATED`; on Gmail the event's `etag`, `updated`, `sequence`, `created` and `htmlLink`. A write whose
+read back doesn't show it (its version moved) still fails visibly as *Not confirmed*, and counts toward
+that calendar's gate review: the count and when are kept in the gate and the log
+(`calendar_gate_review`), for the next check after installing. It never closes the gate by itself.
 
 ### Before a Ship card: the migration on a copy of the ledger
 
@@ -727,7 +754,9 @@ tree (the `harness` App folder of a checkout of the pull request's head) or its 
 image's `/opt/harness`), as Harness sees it; add a ledger path first to use a ledger file other than
 the live one (`keeper.sh fastpath migrate-check <path> --candidate <path>`). Harness runs the
 candidate's own code in a separate, isolated Python (`python3 -m harness.migrate <ledger path>` from
-that tree): it opens the ledger read only, copies it with SQLite's own backup into a temporary file,
+that tree): it opens the ledger read only, copies it with SQLite's online backup API into a temporary
+file (never a plain file copy, so what's still in the write-ahead log is copied too), checks the copy's
+integrity,
 runs that build's migration and install step on the copy with no calendars, deletes the copy, and
 answers with what it found: the candidate's build id (computed by the candidate itself, as its image
 will), the schema version, whether the paths without a tap are off (they must be), whether the gate is
@@ -762,18 +791,40 @@ unrehearsed, why the dry run failed, and that a backup is taken first; the recor
 *Move them anyway* tap, once, for that build id. A tap is refused when a failed dry run for that build
 is on record that the card didn't say.
 
-Just before it migrates, Harness takes a restorable copy of the ledger with SQLite's own backup,
-beside it in `/data`, named `harness-before-s<schema>-<build>-<time>.sqlite`, keyed by the source
-schema version and the build. No new copy is taken when the ledger's content matches the newest one
-(repeated attempts after a failure), the newest three are kept, and the oldest at each schema version
-is never deleted until a later migration has succeeded and the ledger has run on it for a day. The
-schema steps are numbered; a duplicate or conflicting step number (a ledger that recorded another step
-under the same number) is refused, and the ledger waits as above. To restore one: stop the Harness App;
-copy that file over `/data/harness.sqlite` (from the host, the App's data folder is
-`/mnt/data/supervisor/addons/data/0fcc2575_harness/`; or restore the Home Assistant backup the Ship job
-takes before installing, which holds it too); delete any `harness.sqlite-wal` and `harness.sqlite-shm`
-beside it; start the App. The restored ledger is the one from before the migration, so the same build
-rehearses and migrates it again on start.
+While the ledger waits, the wait is never silent: the message with *Run check* is retried with backoff
+until Discord takes it (one Discord refuses for good is posted again), a reminder with *Run check* goes
+once a day while it waits, a handover refused meanwhile says why and whether that message reached you,
+and the wait shows on Harness's page and in the `/health` answer Cain's App reads (`migration`). Neither
+App has Home Assistant API access, so it isn't a Home Assistant sensor or repair issue.
+
+The migration itself holds every other writer of the ledger off (the poller, Discord taps and the
+handover service wait, and transactions already open finish first), takes the backup, and applies the
+migration as one transaction: it lands whole or not at all. Work accepted before (held requests, taps
+waiting to be handled, outcomes still being read) is in the ledger and goes on after. If the App is
+stopped in the middle, the ledger is still at its old schema with the backup beside it, and the next
+start migrates again.
+
+Just before it migrates, Harness takes a restorable copy of the ledger after a checkpoint, with SQLite's
+online backup API (never a plain file copy), beside it in `/data`, named
+`harness-before-s<schema>-<build>-<time>.sqlite`, keyed by the source schema version and the build. The
+copy is checked before anything moves: SQLite's integrity check on it, and its rows per table against
+the live ledger; a copy that fails either means nothing is migrated and it waits as above. No new copy
+is taken when its content checksum (computed on the backup file itself) matches the newest one's
+(repeated attempts after a failure), the newest three are kept, and the oldest at each schema version is
+never deleted until a later migration has succeeded and the App has run on it for a day of run time.
+Run time is summed in the ledger from the monotonic clock, never the wall clock, and nothing is deleted
+while the clock can't be trusted (earlier than the newest time the ledger recorded, or not set yet). A
+dry run dated later than now counts as none. The schema steps are numbered; a duplicate or conflicting
+step number (a ledger that recorded another step under the same number) is refused, and the ledger waits
+as above.
+
+To restore one, by its schema version and build: `python3 -m harness.migrate /data/harness.sqlite
+--restore <schema> <build>` inside the App, or Cain's `keeper.sh fastpath migrate-restore <schema>
+<build>` on your say, which only posts you a card; your *Put them back* tap does it. Either checks the
+backup and stages it beside the ledger; it replaces the ledger the next time Harness starts, the ledger
+it replaces kept as `harness-replaced-<time>.sqlite`, and the restored one is migrated again on that
+start, with rows intact. The copies beside the ledger live on the same device: a Home Assistant backup
+is the off-device copy, and one is recommended before installing (the Ship job takes one first).
 
 ## Dates from your mail
 
@@ -914,8 +965,9 @@ stays. Uninstalling the add-on also starts over, and deletes the ledger.
 ## Backups
 
 Backups include `/data` (the ledger, the keys, the app-specific password, the calendar
-addresses and the last Family push, and the three newest ledger copies taken before a migration,
-`harness-before-<build>-<time>.sqlite`). The add-on stops briefly during a
+addresses and the last Family push, and the ledger copies taken before a migration,
+`harness-before-s<schema>-<build>-<time>.sqlite`). That Home Assistant backup is the copy off the
+device; take one before installing. The add-on stops briefly during a
 backup so the database is copied whole. After a restore, anything done after the
 backup was taken is gone.
 

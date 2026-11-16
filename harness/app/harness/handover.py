@@ -101,6 +101,13 @@ def _ledger_path(value) -> str:
     return text if all(c.isalnum() or c in "/._-" for c in text) else ""
 
 
+def _restore_key(value) -> str:
+    """migrate-restore's backup key (twelfth round): "<schema> <build>", a whole number and a build id of
+    plain characters, or nothing."""
+    text = " ".join(str(value or "").split())
+    return text if re.fullmatch(r"[0-9]{1,4} [0-9A-Za-z._-]{4,64}", text) else ""
+
+
 def key_for(token: str) -> str:
     return hmac.new(token.encode(), KEY_CONTEXT, hashlib.sha256).hexdigest()
 
@@ -123,6 +130,7 @@ class Handover:
     smoke_run: str = ""                  # /handover: names the smoke run; never its step (tenth round)
     script: dict = field(default_factory=dict)   # /fastpath smoke-step: the step's script (tenth round)
     candidate: str = ""                  # /fastpath migrate-check: the incoming build's tree or image (tenth round)
+    restore: str = ""                    # /fastpath migrate-restore: "<schema> <build>" of a backup (twelfth round)
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
@@ -146,15 +154,17 @@ class Inbox:
         self.queue: "queue.Queue[Handover]" = queue.Queue()
         self.wake = wake
         self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
+        self.migration: dict = {}            # twelfth round: the ledger waiting for its move (migrate.waiting_summary)
 
     def beat(self) -> None:
         self.beat_at = time.monotonic()
 
     def health(self) -> dict:
+        extra = {"migration": dict(self.migration)} if self.migration else {}
         if self.beat_at is None:
-            return {"status": "starting", "loop_age_s": None}
+            return {"status": "starting", "loop_age_s": None, **extra}
         age = time.monotonic() - self.beat_at
-        return {"status": "ok" if age < STUCK_S else "stuck", "loop_age_s": int(age)}
+        return {"status": "ok" if age < STUCK_S else "stuck", "loop_age_s": int(age), **extra}
 
     def key_ok(self, presented: str) -> bool:
         token = self._token_fn()
@@ -234,6 +244,7 @@ def _handler(inbox: Inbox, wait_s: float):
                          smoke_run=_run_id(body.get("smoke_run")),
                          script=_script(body.get("script")),
                          candidate=_ledger_path(body.get("candidate")),
+                         restore=_restore_key(body.get("restore")),
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
             inbox.submit(h)

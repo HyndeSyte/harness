@@ -112,7 +112,7 @@ class Callbacks:
         if kind in ("settings_approve", "settings_decline") and self.settings_fn:
             return render.escape(self.settings_fn(
                 target, "approve" if kind == "settings_approve" else "decline"))
-        if kind in ("migration_check", "migration_override") and self.migration_fn is not None:
+        if kind in ("migration_check", "migration_override", "migration_restore") and self.migration_fn is not None:
             return self.migration_fn(kind, target)            # the ledger's own migration (eleventh round)
         if kind.startswith("family_add_") and self.family_add is not None:
             return self.family_add.on_choice(kind, target)   # plain text, no model words

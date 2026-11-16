@@ -17,7 +17,9 @@ Two rules carry most of the weight:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -391,6 +393,13 @@ class LedgerError(RuntimeError):
     pass
 
 
+# 0.24.0, twelfth round: the migration holds every other writer of a ledger file off (Ledger.hold_writers).
+# Keyed by the file's absolute path, so a second Ledger opened on the same file in this process waits too.
+_GATE = threading.Condition()
+_HELD: dict[str, int] = {}                 # file -> the thread holding its writers off
+_ACTIVE: dict[str, dict[int, int]] = {}    # file -> {thread: open write transactions}
+
+
 class Ledger:
     def __init__(self, path: str, clock: Callable[[], datetime] = utcnow):
         self.path = path
@@ -488,18 +497,70 @@ class Ledger:
             self.set_meta("rules_need_tap", "1", db)
 
     # -- plumbing ------------------------------------------------------
+    def _key(self) -> str:
+        return f"mem:{id(self)}" if not self.path or self.path == ":memory:" else os.path.abspath(self.path)
+
     @contextmanager
     def tx(self):
         """One write transaction. BEGIN IMMEDIATE so two writers can never
-        interleave a read-check-write."""
-        self.db.execute("BEGIN IMMEDIATE")
+        interleave a read-check-write. Twelfth round: while another thread holds this ledger's
+        writers off (hold_writers, the migration), it waits until that's over."""
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            while _HELD.get(key, me) != me:
+                _GATE.wait()
+            mine = _ACTIVE.setdefault(key, {})
+            mine[me] = mine.get(me, 0) + 1
         try:
-            yield self.db
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-        else:
-            self.db.execute("COMMIT")
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.db
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+            else:
+                self.db.execute("COMMIT")
+        finally:
+            with _GATE:
+                mine = _ACTIVE.get(key, {})
+                mine[me] = mine.get(me, 1) - 1
+                if mine[me] <= 0:
+                    mine.pop(me, None)
+                _GATE.notify_all()
+
+    @contextmanager
+    def hold_writers(self, timeout_s: float = 60.0):
+        """Twelfth round: every other thread's write transaction on this ledger file waits until this ends,
+        and the ones already open are drained first (each runs to its end). For the migration at startup: the
+        poller, Discord taps and the handover service write only through tx(), so none of them interleaves
+        with the backup or the migration. Nested holds on the same thread are fine. Raises TimeoutError when
+        an open transaction doesn't end within timeout_s (nothing is held then)."""
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            if _HELD.get(key) == me:
+                nested = True
+            else:
+                nested = False
+                if not _GATE.wait_for(lambda: key not in _HELD, timeout_s):
+                    raise TimeoutError("another hold on the ledger didn't end")
+                _HELD[key] = me
+                drained = _GATE.wait_for(
+                    lambda: not any(n for t, n in _ACTIVE.get(key, {}).items() if t != me), timeout_s)
+                if not drained:
+                    _HELD.pop(key, None)
+                    _GATE.notify_all()
+                    raise TimeoutError("a write transaction on the ledger didn't end")
+        try:
+            yield
+        finally:
+            if not nested:
+                with _GATE:
+                    _HELD.pop(key, None)
+                    _GATE.notify_all()
+
+    def writers_held(self) -> bool:
+        with _GATE:
+            return self._key() in _HELD
 
     def now(self) -> datetime:
         return self.clock()

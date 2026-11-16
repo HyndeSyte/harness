@@ -137,6 +137,11 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
                      ' UTC</div>')
     for note in st.get("notes") or []:
         parts.append(f'<div class="no">⚠ {_e(note)}</div>')
+    mig = st.get("migration") or {}
+    if mig.get("waiting"):
+        # Twelfth round: the ledger waiting for its move is never silent.
+        parts.append(f'<div class="no">⚠ Records not moved to this update yet: {_e(mig.get("why", ""))}. Calendar '
+                     f'changes wait. The message with Run check: {_e(mig.get("notice", "none"))}.</div>')
     parts.append("</div>")
 
     parts.extend(_discord_section(st.get("discord")))

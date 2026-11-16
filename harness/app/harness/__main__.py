@@ -57,6 +57,9 @@ def configure_logging() -> None:
 
 def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_PORT):
     vault = Vault(os.path.join(data_dir, "secrets.json"))
+    # Twelfth round: a restore he tapped (migrate.stage_restore) is swapped in before the ledger opens.
+    from . import migrate
+    migrate.apply_staged_restore(os.path.join(data_dir, "harness.sqlite"))
     ledger = Ledger(os.path.join(data_dir, "harness.sqlite"))
     transport = UrllibTransport()
     # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;

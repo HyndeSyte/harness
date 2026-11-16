@@ -43,8 +43,8 @@ def m(ledger, tmp_path, clock):
 def failing_dry_run(monkeypatch, said="the copy's sweep stopped on a card it couldn't read"):
     real = migrate.dry_run
 
-    def fails(path, version=None, build=None):
-        got = real(path, version, build)
+    def fails(path, version=None, build=None, **kw):
+        got = real(path, version, build, **kw)
         return {**got, "ok": False, "said": said}
     monkeypatch.setattr(migrate, "dry_run", fails)
     return real
@@ -250,7 +250,8 @@ def test_the_oldest_backup_at_a_schema_version_is_kept_until_a_later_migration_r
     migrate.backup(ledger, "b-later2")
     assert made[0] in [b["path"] for b in migrate.backups(ledger)]
     clock.advance(hours=25)
-    with ledger.tx() as db:
+    with ledger.tx() as db:          # twelfth round: a day of the App's run time, not of the wall clock
+        ledger.set_meta(migrate.UPTIME, str(migrate.uptime(ledger) + 25 * 3600), db)
         ledger.set_meta("test_content", "a day on", db)
     migrate.backup(ledger, "b-later3")
     kept = [b["path"] for b in migrate.backups(ledger)]

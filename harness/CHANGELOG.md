@@ -35,6 +35,14 @@
 - **A question Cain doesn't answer in 10 minutes comes to you,** on a card that quotes what's already known, even after a restart.
 - **Nothing is done twice.** When a request runs again, what the calendar shows as done is shown as done, something still being written counts as in progress for 2 minutes, and anything not done is offered again on a card.
 - **Mail is read as data, never as instructions,** and never changes a calendar without your tap.
+- **Every change sent without the calendar's version check says Unprotected,** on its card before your tap and on its receipt after, whether you opened that calendar without protection or the event only gave a weak version. Open without protection says plainly that edits made at the same time by someone else can be overwritten or deleted, and it opens that one calendar only.
+- **A possible lost update is told.** After a change sent without the version check, Harness reads it back, and if anything your change didn't touch changed too, you get a Possibly overwritten message with each value before and after.
+- **No loop of closing and reopening.** A calendar you opened without protection, and any change sent without the version check, never closes that calendar's cards again. A change the calendar doesn't show afterwards still says Not confirmed and is counted for the next check.
+- **Moving your records is safer.** The copy and the backup are taken with SQLite's own online backup, checked (integrity and row counts) before anything moves, and everything else that writes your records waits while they move in one step, so a stop in the middle leaves them as they were with the backup beside them, and the next start moves them again.
+- **A wait is never silent.** If the rehearsal fails, its message is sent again until it reaches you, a reminder comes once a day, and Harness's page shows the wait.
+- **Backups follow run time, not the clock.** The oldest backup stays until Harness has actually run a day on the new version, and nothing is deleted while the clock looks wrong.
+- **Put your records back by version.** A backup can be restored by its schema version and build, on your tap (Put them back) or from the App's command line; it takes effect the next time Harness starts and is moved to the running version again. A Home Assistant backup before installing is the copy off the device.
+- **The check after installing records more.** It records whether each calendar gives strong or weak versions, and on Family whether a change sent with no version check is taken, before the no-card paths can turn on.
 
 ## 0.23.0
 

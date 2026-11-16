@@ -366,8 +366,26 @@ class Controller:
         if self.handovers is not None:
             self.handovers.beat()
 
+    def _tend_migration(self) -> None:
+        """Twelfth round, each tick: the App's run time summed in the ledger (migrate.heartbeat: backups are
+        kept by run time, not the wall clock); and while the ledger waits for its move, its Run check notice is
+        posted again if Discord refused it, a reminder goes once a day, and the wait shows on the status page
+        and in Cain's /health."""
+        try:
+            migrate.heartbeat(self.ledger)
+            if migrate.waiting(self.ledger) and self.config is not None:
+                migrate.tend_waiting(self.ledger, self.config.owner_user_id, self.config.timezone)
+            summary = migrate.waiting_summary(self.ledger)
+        except Exception as e:                 # never stops the loop
+            log.warning("migration upkeep failed: %s", type(e).__name__)
+            return
+        self.status_box["migration"] = summary or None
+        if self.handovers is not None:
+            self.handovers.migration = summary
+
     def tick(self) -> None:
         self._beat()
+        self._tend_migration()
         self._drain_requests()
         if self._discord_mode():
             self._discord_tick()
@@ -660,11 +678,17 @@ class Controller:
         if held:
             # Tenth and eleventh rounds: the live ledger waits because its own dry run of this build failed;
             # nothing is taken meanwhile. He has Run check; keeper.sh fastpath migrate-check is the same.
+            # Twelfth round: the answer carries the reason and where his Run check message is, so Cain can say so.
+            notice = {"sent": "He has the message with Run check.",
+                      "queued": "The message with Run check hasn't reached him yet; it's being sent again until "
+                                "it does."}.get(migrate.notice_state(self.ledger),
+                                                "The message with Run check is being posted to him again.")
             h.finish("refused", "Not taken: the specialist was updated, and its rehearsal of moving its records to "
-                                f"the new build on a copy of them didn't pass ({held.get('why', 'see the log')}). He "
-                                "has a message with Run check, which rehearses it again; keeper.sh fastpath "
+                                f"the new build on a copy of them didn't pass ({held.get('why', 'see the log')}). "
+                                f"{notice} Run check rehearses it again; keeper.sh fastpath "
                                 "migrate-check does the same. keeper.sh fastpath migrate-override only sends him "
-                                "a card to move them unrehearsed, on his tap. Nothing changed.")
+                                "a card to move them unrehearsed, on his tap. Nothing changed.",
+                     waiting=migrate.waiting_summary(self.ledger))
             return
         if h.smoke_run:
             # Tenth round: a handover only ever reads his own messages, so one naming the smoke run cites a
@@ -947,7 +971,11 @@ class Controller:
             # a candidate (a source tree or an image path), the incoming build's own migration, recorded
             # under its own build id, which its install step looks for before touching the live ledger.
             path = h.path or self.ledger.path
-            got = migrate.candidate_dry_run(path, h.candidate) if h.candidate else migrate.dry_run(path)
+            live = not h.candidate and path == self.ledger.path
+            if live:
+                migrate.checkpoint(self.ledger)        # twelfth round: copied from the live connection
+            got = migrate.candidate_dry_run(path, h.candidate) if h.candidate else \
+                migrate.dry_run(path, source=self.ledger.db if live else None)
             log.info("migration dry run%s on a copy of %s: %s", " of a candidate build" if h.candidate else "", path,
                      "ok" if got.get("ok") else got.get("said"))
             # Ninth round: the result is kept in the live ledger, keyed by the build that ran it and the
@@ -962,6 +990,11 @@ class Controller:
                 said += " This build was waiting for it, so the records are moved now, with a backup taken first."
             h.finish("ok" if got.get("ok") else "refused", said, result=got)
             return
+        if h.state == "migrate-restore":
+            # Twelfth round: Cain names a backup by schema and build; he gets a card, and only his tap stages it.
+            status, said = migrate.request_restore(self.ledger, self.config.owner_user_id, h.restore, by="cain")
+            h.finish(status, said)
+            return
         if h.state == "migrate-override":
             # Eleventh round: the override is his alone. Cain's command only posts him a card saying the
             # migration is unrehearsed, why the dry run failed and that a backup is taken first; it runs only
@@ -971,7 +1004,8 @@ class Controller:
             return
         now = fast_path(self.ledger)
         h.finish("unknown", "Say smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open "
-                 "<gmail|family>, migrate-check [path] [candidate] or migrate-override. "
+                 "<gmail|family>, migrate-check [path] [candidate], migrate-override or "
+                 "migrate-restore <schema> <build>. "
                  "It's " + ("on" if now.get("on") else "off (card only)") + " now.")
 
     def _migration_choice(self, kind: str, target: str) -> str:
@@ -979,6 +1013,8 @@ class Controller:
         owner = self.config.owner_user_id
         if kind == "migration_check":
             said = migrate.check_tapped(self.ledger, self.calendar_change, owner, target)
+        elif kind == "migration_restore":
+            said = migrate.restore_tapped(self.ledger, target)
         else:
             said = migrate.override_tapped(self.ledger, self.calendar_change, owner, target)
         return said
