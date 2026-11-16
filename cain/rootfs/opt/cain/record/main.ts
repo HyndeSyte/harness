@@ -366,6 +366,8 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // needs GitHub. Meanwhile every tap-derived request is held (told: the request ids Cain heard pending for),
   // and the rebuild is tried again each round GitHub answers (tries, next: its log line's backoff).
   rebuild?: { since: string; why: string; tries: number; next?: string; told?: string[] };
+  holdSince?: string;                     // round 15: when the last unverified hold began, as the keeper saw it
+
   recovered?: string[];                   // round 13: the owner's recover-logs message ids already used
   historyCards?: string[];                // round 13: card message ids named by Tap-Card trailers (newest last)
   // Round 14: the owner-line nonces used (install taps on <nonce>, recover logs <nonce>): committed with an
@@ -373,7 +375,7 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // recover line accepted at the start check, waiting for its trailer.
   linesDone?: string[]; historyLines?: string[]; recoverLines?: { nonce: string; said: string }[];
   tapNotices?: TapNotice[] };
-type TapNotice = { tap: string; why: "refused" | "lost" | "expired"; reason: string; msg?: string; at: string };
+type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time"; reason: string; msg?: string; at: string };
 const TAPS_KEPT = 1000;
 // Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
 // Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
@@ -425,9 +427,16 @@ export function ledgerStarted(cfg: Config): Set<string> {
 }
 // Round 14: a held tap's tap time, from the link's held-tap log (null: not held there).
 export const linkHeldFile = (cfg: Config) => cfg.linkHeld ?? join(dirname(cfg.queue), "link-held.log");
-function heldTapTime(cfg: Config, kid: string): number | null {
-  try { const r = readLog<any>(linkHeldFile(cfg), { repair: false }).records.find((x) => x?.t === "held" && x.kid === kid); return r && Number.isFinite(Number(r.at)) ? Number(r.at) : null; }
-  catch { return null; }
+// Round 15: with the interaction's snowflake time (Discord's own record of the tap), when the link logged it.
+export const HELD_CLOCK_TOLERANCE_MS = 2 * 60_000;
+const snowflakeMs = (id: string) => { try { return Number(BigInt(id) >> 22n) + 1420070400000; } catch { return NaN; } };
+function heldTap(cfg: Config, kid: string): { at: number; sf: number | null } | null {
+  try {
+    const r = readLog<any>(linkHeldFile(cfg), { repair: false }).records.find((x) => x?.t === "held" && x.kid === kid);
+    if (!r || !Number.isFinite(Number(r.at))) return null;
+    const sf = typeof r.it === "string" && /^\d{15,22}$/.test(r.it) ? snowflakeMs(r.it) : NaN;
+    return { at: Number(r.at), sf: Number.isFinite(sf) ? sf : null };
+  } catch { return null; }
 }
 function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }); }
 
@@ -592,12 +601,13 @@ function revive(j: any): State | null {
     ...(j.rebuild && typeof j.rebuild.since === "string" && typeof j.rebuild.why === "string" ? { rebuild: { since: j.rebuild.since, why: j.rebuild.why,
       tries: Number.isInteger(j.rebuild.tries) ? j.rebuild.tries : 0, ...(typeof j.rebuild.next === "string" ? { next: j.rebuild.next } : {}),
       ...(Array.isArray(j.rebuild.told) ? { told: j.rebuild.told.filter((x: any) => typeof x === "string").slice(-200) } : {}) } } : {}),
+    ...(typeof j.holdSince === "string" ? { holdSince: j.holdSince } : {}),
     ...(Array.isArray(j.recovered) ? { recovered: j.recovered.filter((x: any) => typeof x === "string").slice(-50) } : {}),
     ...(Array.isArray(j.historyCards) ? { historyCards: j.historyCards.filter((x: any) => typeof x === "string" && /^\d{15,22}$/.test(x)).slice(-1000) } : {}),
     ...(Array.isArray(j.linesDone) ? { linesDone: j.linesDone.filter((x: any) => typeof x === "string").slice(-200) } : {}),
     ...(Array.isArray(j.historyLines) ? { historyLines: j.historyLines.filter((x: any) => typeof x === "string").slice(-200) } : {}),
     ...(Array.isArray(j.recoverLines) ? { recoverLines: j.recoverLines.filter((x: any) => typeof x?.nonce === "string" && typeof x?.said === "string").slice(-50) } : {}),
-    ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && (n.why === "refused" || n.why === "lost") && typeof n.at === "string")
+    ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && ["refused", "lost", "expired", "time"].includes(n.why) && typeof n.at === "string")
       .map((n: any) => ({ tap: n.tap, why: n.why, reason: String(n.reason ?? ""), ...(typeof n.msg === "string" ? { msg: n.msg } : {}), at: n.at })) } : {}) };
 }
 
@@ -776,6 +786,22 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted: ${lc.fatalFile} moved aside, rebuilding`);
         }
         refusedWhy = "";
+        // Round 15: his recover line counts whatever state the keeper is in: degraded, unverified, the remote
+        // unreachable, or well. With nothing damaged to move aside, it is taken as his OK to verify again: the
+        // consumed set is rebuilt and checked against a fresh fetch (an unverified start) before any tap-derived
+        // request counts. Its use is committed locally with an Owner-Line trailer, pushed when the remote answers.
+        // (A keeper with no state at all takes it on its next round, once its state is written.)
+        if (!fresh) {
+          const asked = recoverAsked(cfg, st0, clock().getTime());
+          if (asked) {
+            st0.recovered = [...(st0.recovered ?? []), asked.said].slice(-50);
+            if (asked.nonce) st0.recoverLines = [...(st0.recoverLines ?? []), { nonce: asked.nonce, said: asked.said }].slice(-50);
+            writeAtomic(stateFile(cfg), JSON.stringify(st0));
+            rmSync(recoverFile(cfg), { force: true });
+            forgetRebuild(cfg);
+            log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted with no damaged log to move aside: the consumed set is rebuilt and verified against a fresh fetch`);
+          }
+        }
         if (fresh || lc.lost.length) {
           const why = lc.lost.length ? lc.lost.join("; ") : "the keeper's state was missing (a first start, or a wiped or restored image)";
           st0.rebuild = { since: nowIso0, why, tries: 0 };
@@ -1051,6 +1077,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           if (S.rebuild) {
             const was = S.rebuild;
             delete S.rebuild;
+            S.holdSince = was.since;
             S.logHigh = logCounts(cfg);
             log(`REBUILD COMPLETE: the consumed set is verified against the record remote (${n} key(s) added, after ${was.tries} wait(s)); held tap-derived requests are decided now`);
             if (was.tries || was.told?.length || n || (was.why !== "the keeper's state was missing (a first start, or a wiped or restored image)" && was.why !== KEEPER_START_WHY))
@@ -1065,6 +1092,15 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       delete S.issuedSeen;
       S.tapNotices = (S.tapNotices ?? []).filter((n) => clock().getTime() - Date.parse(n.at) <= TAP_KEEP_MS + 86_400_000);
       const notice = (n: Omit<TapNotice, "at">) => { if (!S.tapNotices!.some((x) => x.tap === n.tap && x.why === n.why)) S.tapNotices!.push({ ...n, at: nowIso }); };
+      // Round 15: a held tap's time is Discord's (its interaction id's snowflake), never earlier than the start of
+      // the hold the keeper itself saw; without a held record, the link's issued time, else now.
+      let hd: ReturnType<typeof heldTap> = null;
+      const holdStart = Date.parse(S.rebuild?.since ?? S.holdSince ?? "");
+      const tapTimeOf = (k: string) => {
+        const h = heldTap(cfg, k);
+        if (h) return Math.max(h.sf ?? h.at, Number.isFinite(holdStart) ? holdStart : -Infinity);
+        return linkTaps?.issued[k]?.at ?? clock().getTime();
+      };
       for (const it of items) {
         const at = clock();
         const id = it.req?.id ?? `unreadable-${it.name}`;
@@ -1104,7 +1140,15 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           // Round 14: a key the landing ledger consumed still takes its Ship take once: the landing's own write.
           && !(!S.taps?.[it.req!.tap] && consumed.get(it.req!.tap) === LEDGER_CONSUMER && tapDerived({ ops: it.req!.ops as any[] }).ship))
           o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)}; act on a tap key once` };
-        else if (tapK && typeof reg.keys.get(tapK)?.exp === "number" && (heldTapTime(cfg, tapK) ?? linkTaps?.issued[tapK]?.at ?? clock().getTime()) > reg.keys.get(tapK)!.exp!) {
+        else if (tapK && (hd = heldTap(cfg, tapK)) && hd.sf !== null && Math.abs(hd.at - hd.sf) > HELD_CLOCK_TOLERANCE_MS) {
+          // Round 15: a held tap whose time the link's clock and Discord's interaction id disagree on by more than
+          // the tolerance: refused with both times quoted, the key not used up, and he is told on the card.
+          const r = reg.keys.get(tapK);
+          o = { ...base, state: "rejected", reason: `tap key ${tapK} was held, and its tap time can't be judged: the link logged "${new Date(hd.at).toISOString()}" but Discord's interaction id says "${new Date(hd.sf).toISOString()}", ${Math.round(Math.abs(hd.at - hd.sf) / 1000)} s apart (over ${HELD_CLOCK_TOLERANCE_MS / 60_000} minutes). Nothing was recorded from it and the key isn't used up: record nothing from it, and ask again with --checked if it still needs him` };
+          notice({ tap: tapK, why: "time", reason: o.reason!, ...(r?.msg ? { msg: r.msg } : {}) });
+          log(`tap key ${tapK} refused: its held tap's time disagrees with Discord's by over the tolerance`);
+        }
+        else if (tapK && typeof reg.keys.get(tapK)?.exp === "number" && tapTimeOf(tapK) > reg.keys.get(tapK)!.exp!) {
           // Round 14: the keeper enforces expiry: a key tapped after the expiry its issued record carries is
           // refused without being used up, whatever the card's buttons showed; judged by its tap time (a held
           // tap's, from the link's held-tap log), and he is told on the card that it expired.

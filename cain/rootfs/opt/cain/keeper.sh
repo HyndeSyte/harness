@@ -96,14 +96,18 @@
 #                                        off (Cain's) stops them. Until on, a Ship tap answers that installs
 #                                        wait for the post-install tests, and keeps its buttons
 #   keeper.sh recover-logs [--said <his message id>]
-#                                        the owner's alone, only when the record keeper says it refuses to
-#                                        start for a case no rule explains. Without --said it only proposes,
+#                                        the owner's alone, when the record keeper says it refuses to start
+#                                        for a case no rule explains (or asks for his OK). Without --said it only proposes,
 #                                        sending him the exact line "recover logs <code>" (bound like the
 #                                        install line). keeper.sh recover-logs --said <his message id>: his
 #                                        own message in his DM, under a day old, sent after the proposal,
 #                                        saying exactly that line, single use; the keeper
 #                                        moves the damaged log aside and goes on once its rebuild is
-#                                        verified against GitHub
+#                                        verified against GitHub. Round 15: it works in any keeper state
+#                                        (degraded, unverified, GitHub unreachable); a line whose code no
+#                                        longer counts (an earlier start, another epoch, used already)
+#                                        answers "proposed": he is told the cause in one line,
+#                                        with a fresh code at once
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"

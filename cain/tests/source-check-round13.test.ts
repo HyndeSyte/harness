@@ -109,6 +109,7 @@ describe("1. issuance: posted without buttons, keys logged, state saved, then th
     await expect(askCard(r)).rejects.toThrow("crash injected");
     const card = posted(r, "packet");
     expect(r.buttons(card.id)).toEqual([]);
+    r.files.status = JSON.stringify({ clock: { synced: true, source: "the rig", diagnostic: "", at: new Date(r.t.now).toISOString() } });   // round 15: re-arm waits for a verified consumed set
     r.restart();
     await r.link.sweep();
     expect(r.buttons(card.id)).toEqual(["Filed", "Not filed"]);
@@ -127,6 +128,7 @@ describe("1. issuance: posted without buttons, keys logged, state saved, then th
     expect(onThread(r, id, CARD_BUTTONS_LATE)).toHaveLength(1);
     await r.link.sweep();                                             // the same run: not before a start
     expect(r.buttons(id)).toEqual([]);
+    r.files.status = JSON.stringify({ clock: { synced: true, source: "the rig", diagnostic: "", at: new Date(r.t.now).toISOString() } });   // round 15: re-arm waits for a verified consumed set
     r.restart();
     await r.link.sweep();
     expect(r.buttons(id)).toEqual(["Filed", "Not filed"]);

@@ -126,6 +126,7 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
     const ledger = JSON.parse(r.files.checks!);
     ledger.P08.version = 2;                                            // the row changed since its check
     r.files.checks = JSON.stringify(ledger);
+    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
@@ -139,6 +140,7 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
   test("its record is saved again before the retried edit; a save that fails withdraws it instead", async () => {
     const r = shipRig();
     const id = await unarmedAsk(r);
+    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
     r.disk.failSaves = 1;
     await r.link.sweep();
@@ -153,6 +155,7 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
     const consumed = side(r, "record-taps.jsonl");
     appendLog(consumed, { tap: logged(r).find((x) => x.t === "key" && x.msg === id)!.kid, id: "cain-earlier", at: "x" });
     r.deps.consumedLog = consumed;
+    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
@@ -162,6 +165,7 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
   test("all checks pass: armed, as before", async () => {
     const r = shipRig();
     const id = await unarmedAsk(r);
+    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
     await r.link.sweep();
     expect(r.buttons(id)).toEqual(["Filed", "Not filed"]);
@@ -314,6 +318,14 @@ describe("3. the held queue is durable and judged by tap time", () => {
       "tap-00000000b311": { item: "P11", kind: "ask", label: "Filed", msg: "1570000000000000311", at: at + MIN },
       "tap-00000000b312": { item: "P11", kind: "ask", label: "Filed", msg: "1570000000000000312", at: at + 20 * MIN } } }));
     appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000b311", msg: "1570000000000000311", at: at + MIN });
+    // Round 15: the keeper's own hold (a start with the remote down) begins before the taps.
+    k.cain({ id: "cain-hold-0", ops: [{ op: "note", item: "P44", text: "a round" }] });
+    expect(cycle(k.cfg).ok).toBe(true);
+    forgetRebuild(k.cfg);
+    remoteDown(k);
+    k.cain({ id: "cain-hold-start", ops: [{ op: "note", item: "P44", text: "a round" }] });
+    cycle(k.cfg);
+    remoteBack(k);
     k.at(new Date(at + 60 * MIN));                                     // decided well after the expiry
     k.cain({ id: "cain-in-time", tap: "tap-00000000b311", ops: [{ op: "note", item: "P11", text: "his tap" }] }, { issue: false });
     k.cain({ id: "cain-too-late", tap: "tap-00000000b312", ops: [{ op: "note", item: "P11", text: "his tap" }] }, { issue: false });

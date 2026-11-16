@@ -643,13 +643,21 @@ then too: run the same settle again once keeper.sh clock shows consumed_unverifi
 says it refuses to start (a log it can't read): run `/opt/cain/keeper.sh recover-logs` (it only
 proposes, sending him the exact line `recover logs <code>`) and tell him in one line that it needs his
 OK to rebuild its logs; once he sends that line, run
-`/opt/cain/keeper.sh recover-logs --said <his message id>`, and nothing more.
+`/opt/cain/keeper.sh recover-logs --said <his message id>`, and nothing more. This works whatever state the
+keeper is in (degraded, unverified, GitHub unreachable). If it answers "proposed" with the cause (his code
+was from before a restart, another record epoch, or used already), he was already told in one line and sent
+a fresh code: wait for his new line and run it again with that message's id.
 Every start of the record keeper checks its taps against GitHub first, so right after a restart (or while
 GitHub can't be reached) his tap on a question is Held: his card says so, and you hear it is held; record
 nothing from it. It comes to you again by itself, with its tap key, once the keeper has checked, and then
 you act on it as on any tap. If the item changed meanwhile you get "Tap not acted: ..." instead (he was
 told on the card): record nothing, check again and ask again with --checked if it still needs him. A Ship
-tap meanwhile waits and keeps its buttons; show nothing new, he taps again once it's done.
+tap meanwhile is not taken: its card gets the line "Not taken yet: ..." and keeps its buttons, nothing of
+the tap is kept, and the line clears once the record has checked; show nothing new, he taps Ship again then.
+A released held tap whose line starts "Replay of held tap key" was relayed once already before a restart:
+if you had a line with that tap key, do not act on it again (the keeper refuses a second request for a key
+anyway). A held tap the App's clock and Discord's disagree about (over 2 minutes) comes back as "Tap not
+acted: ..." too: record nothing, and ask again with --checked if it still needs him.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:

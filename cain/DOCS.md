@@ -839,8 +839,8 @@ What Cain's link enforces:
   once the keeper is verified, each held tap is judged again: expiry by its tap time (a tap made before
   its card expired still acts), and a row whose version changed since is told on the card as not acted
   because the item changed (Cain gets "Tap not acted: ..."). One that passes is relayed to Cain with its
-  tap key, then marked released; a crash between the two relays it again, and the keeper's one request
-  per tap key keeps it to one effect. Held requests in the keeper's queue are Cain's own files, and stay
+  tap key, its release marked first (round 15, below: a crash repeats it only flagged as a replay, and
+  the keeper's one request per tap key keeps it to one effect). Held requests in the keeper's queue are Cain's own files, and stay
   there across a kill of either process.
 
   Every path says so on the card (round 14). Each tap is answered at once, and each hold or refusal puts
@@ -856,8 +856,8 @@ What Cain's link enforces:
   then takes its buttons off through a durable removal queue (`/data/link-strip.log`, framed and
   fsynced) that is retried each sweep until Discord takes the edit, so a tap while an edit is failing
   is still told it expired. After a detected restore (an armed card in the issued-key log the state
-  doesn't know, a lost tap, or the keeper's own detected restore), the link looks over the bot's recent
-  messages in your DM once and takes the buttons off any card the rebuilt state and log don't know, with
+  doesn't know, a lost tap, or the keeper's own detected restore), the link looks over the bot's
+  messages in your DM once (round 15: paged back to the 100-day card horizon) and takes the buttons off any card the rebuilt state and log don't know, with
   a line saying it was lost in a restore of the App's state; a card past 100 days (one a `Tap-Card`
   trailer names included) is told expired, not lost.
 
@@ -879,6 +879,66 @@ What Cain's link enforces:
   consumed log aside over SSH and restart the App: the keeper starts degraded, a tap on a test ask
   comes back held on the card, and once the network is back the held tap acts exactly once and a
   repeat of it is refused).
+
+  Round 15 (the fifteenth review's fixes; the design stays frozen for the combined fault scenario, and
+  no new store was added).
+
+  Your recover line works whatever state the keeper is in. `keeper.sh recover-logs` is exempt from the
+  unverified hold: it can be proposed and accepted while the keeper is in its degraded start, its consumed
+  set unverified and the record remote unreachable. The keeper takes your accepted line on its next round
+  in any state: with a damaged log it moves it aside as before; with nothing damaged it takes the line as
+  your OK to verify again (its consumed set rebuilt and checked against a fresh fetch before any tap
+  counts). Either way its use is committed locally with its `Owner-Line: recover <code>` trailer and pushed
+  when the remote answers, and the rebuild then finds it. A line whose code no longer counts (proposed
+  before the App's current start, in another record epoch, or used already) is never refused in silence:
+  the link answers in your DM with one line naming the cause and a fresh code at once, in the same
+  message. The old code still never counts, and a line read back from history never does.
+
+  A Ship tap while the consumed set is unverified. It gets its own line on the card at once: "Not taken
+  yet: Cain's record is still checking which taps were already acted on. Nothing shipped; tap Ship again
+  once this line clears." Its buttons stay; nothing durable is kept for the tap (no held record, no tap
+  record), so a restart while it waits leaves the card with the line and nothing recorded. Once the
+  keeper's status says the consumed set is verified, the line is edited away and a Ship tap after that
+  acts once.
+
+  A held tap's time is Discord's. The held record carries the tap's interaction id, and its time is the
+  interaction id's snowflake timestamp, never the link's clock alone. The keeper takes that time, and no
+  earlier than the hold start the keeper itself saw (the start of its own unverified period); a tap whose
+  link-logged time and snowflake time are more than 2 minutes apart is refused, with both times quoted,
+  without using the key up, and the card says the App's clock and Discord's disagreed (the link checks the
+  same before it relays, and drops the tap with that line). Your owner lines are bound the same way: your
+  message must be sent after the proposal by snowflake order, must not be dated more than 2 minutes ahead
+  of the App's clock, and the proposal's own snowflake time must agree with the time the App logged for
+  it within 2 minutes.
+
+  No card is re-armed at a start until the keeper's status says its consumed set is verified (a fresh
+  fetch merged; a missing or unreadable status is not verified). Until then a card that would be re-armed
+  stays buttonless with a line saying its buttons go on once the record has checked; once verified, the
+  re-arm runs every arming check above and arms it (its text back as posted) or tells it withdrawn or
+  expired. A key consumed only on the remote is known by then, so that card never shows buttons.
+
+  A held tap's release is marked before its relay: a `releasing` record is fsynced in
+  `/data/link-held.log`, then the line goes to Cain with its tap key, then `released`. After a crash
+  between the two, the next sweep drops the tap if the keeper already acted on its key (and logs it), and
+  otherwise relays it once more flagged as a replay ("Replay of held tap key ..."), which Cain's rules say
+  is not acted on again.
+
+  The post-restore sweep pages back to the 100-day card horizon: newest first, 100 messages at a time,
+  stopping at the first message older than 100 days or where your DM's history ends, once per detected
+  restore. Restore detection gates it: a restore that isn't detected sweeps nothing, and the tap path
+  still refuses a card it doesn't know with a line.
+
+  The exactly-once limit, plainly. Across a whole-image restore, exactly-once holds only for consumptions
+  that reached the remote. A consumption committed locally while the remote was down, followed by a
+  restore of the copy, the ledger and the keeper's state together to an older consistent snapshot, is a
+  known gap: a re-tap on a card that survived on Discord can act again. A test pins that behaviour as the
+  known gap; closing it would take a new store, which this round doesn't add.
+
+  The combined fault scenario, round 15. It also includes your recover line under a degraded start with
+  the remote unreachable: with the Pi off its network, move the keeper's consumed log aside over SSH and
+  restart the App (a degraded start); Cain runs `keeper.sh recover-logs`, you send the line with its code,
+  and Cain runs it with `--said`: it is accepted, the keeper commits its use locally, and once the network
+  is back the trailer reaches the remote and the held tap acts exactly once.
 
   The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
   issue 24. You have nothing to set up beyond the smoke test's one option change.

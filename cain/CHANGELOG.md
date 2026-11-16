@@ -55,6 +55,11 @@
 - Every tap that does nothing now says why on the card itself: held, withdrawn, expired, lost in a restore, or already acted on.
 - A tap made after its question expired never counts, even if the buttons were still showing because removing them failed; removing them is retried until it works. After a restore from a backup, questions the App no longer knows lose their buttons and say they were lost in a restore.
 - The lines you send to turn install taps on or to let the record rebuild its logs now end with a short code the App gives you each time ("install taps on" plus its code). Each code works once, only as a new message, and only until the App restarts; an old line can't be reused, even after a restore.
+- Your "recover logs" line now works whatever state the record is in, even right after a restore with GitHub out of reach. If its code no longer counts (the App restarted, the record was reset, or it was used already), you get one line saying why and a fresh code at once.
+- A Ship tap made while the record is still checking which taps were acted on gets its own line on the card ("Not taken yet ... tap Ship again once this line clears"); the line goes away by itself once the check is done, and nothing of that tap is kept.
+- A held tap is judged by Discord's own time for it, not only the App's clock; if the two disagree by over 2 minutes, it isn't used and the card says so. Questions whose buttons were late get them at a start only once the record has checked.
+- A held tap that a restart cut off in the middle of being passed to Cain reaches him once more only marked as a repeat, or not at all if it was already acted on. After a restore, the App looks back over the last 100 days of your DM for cards it no longer knows.
+- One known gap, said plainly: if a tap was used while GitHub was down, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 
 ## 0.11.0
