@@ -397,3 +397,15 @@ describe("a Reviewed line in Cain's other words through the link", () => {
     expect(r.link.checkSend({ text: `Shipped. ${REVIEW.line}` })).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "reviewed", result: "unsure" }] });
   });
 });
+
+describe("nineteenth review: the Ship card and the ship_gate watch's head", () => {
+  test("a card for another head than the one the watch accepted is refused; the accepted head's card goes", async () => {
+    const r = shipRig();
+    r.github.watched[PR] = SHA2;                                    // the watch bound to and accepted the first head pushed
+    await expect(r.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 })).rejects.toThrow("the Ship gate's watch of this pull request accepted another head");
+    r.github.watched[PR] = SHA1;
+    expect(r.msg(await ship(r)).content).toContain(LINE);
+    delete r.github.watched[PR];                                    // no watch: as before
+    expect(r.msg(await ship(r)).content).toContain(LINE);
+  });
+});

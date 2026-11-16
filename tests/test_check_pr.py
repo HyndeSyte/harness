@@ -1,4 +1,5 @@
 """The pull request check (.github/scripts/check_pr.py): description and versions."""
+import hashlib
 import importlib.util
 import io
 import json
@@ -518,3 +519,62 @@ def test_ci_fails_closed_when_the_body_cant_be_read(repo, monkeypatch, capsys):
     assert "Couldn't read the description" in capsys.readouterr().out
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     assert check_pr.main(["--base", "main", "--head", "pr"]) == 1
+
+
+# -- the PC worker's guard: policy version, pinned timeouts and the guard-surface lines agree --
+
+def _hook(policy, timeout=40):
+    return f'// the hook\nexport const POLICY_VERSION = "{policy}";\nexport const HOOK_TIMEOUT_S = {timeout};\n'
+
+
+def _settings(*timeouts):
+    return json.dumps({"hooks": {"PreToolUse": [{"matcher": "x", "hooks": [{"type": "command", "command": "c", "timeout": t}]} for t in timeouts]}})
+
+
+def _guard_body(head, policy):
+    lines = [f"Hook policy version: {policy}"]
+    for f in check_pr.GUARD_FILES:
+        if head.get(f) is not None:
+            lines.append(f"- {f} sha256 {hashlib.sha256(head[f].encode()).hexdigest()[:16]}")
+    return GOOD_BODY + "\n" + "\n".join(lines) + "\n"
+
+
+def test_the_guard_check_applies_only_when_the_guard_changes():
+    head = {check_pr.GUARD_HOOK: _hook(18), check_pr.GUARD_SETTINGS: _settings(30)}
+    assert check_pr.check_guard(["cain/run.sh"], {}, head, GOOD_BODY) == []
+
+
+def test_a_consistent_guard_passes_and_each_inconsistency_is_named():
+    hook, settings, psl = check_pr.GUARD_FILES
+    head = {hook: _hook(19), settings: _settings(40, 40), psl: "com\n"}
+    base = {hook: _hook(18), settings: _settings(40, 40), psl: "com\n"}
+    assert check_pr.check_guard([hook], base, head, _guard_body(head, 19)) == []
+    # The policy version left at main's (a rebase over a pull request that touched the guard).
+    same = {**head, hook: _hook(18)}
+    assert any("must step above main's 18" in p for p in check_pr.check_guard([hook], base, same, _guard_body(same, 18)))
+    # A pinned timeout that isn't the hook's.
+    off = {**head, settings: _settings(40, 30)}
+    assert any("every hook timeout must be the hook's HOOK_TIMEOUT_S (40)" in p for p in check_pr.check_guard([settings], base, off, _guard_body(off, 19)))
+    # The description's policy line, and a guard-surface line from an earlier head.
+    assert any('"Hook policy version: 19"' in p for p in check_pr.check_guard([hook], base, head, _guard_body(head, 18)))
+    stale = _guard_body({**head, hook: _hook(19) + "// earlier\n"}, 19)
+    problems = check_pr.check_guard([hook], base, head, stale)
+    assert len(problems) == 1 and "guard-surface section is stale" in problems[0]
+    # No base hook (main before the worker landed): any version.
+    assert check_pr.check_guard([hook], {}, head, _guard_body(head, 19)) == []
+    # A hook without the two plain lines.
+    assert any("must define POLICY_VERSION" in p for p in check_pr.check_guard([hook], base, {**head, hook: "nothing\n"}, GOOD_BODY))
+
+
+def test_the_guard_check_on_git(repo, tmp_path, capsys):
+    hook, settings, psl = check_pr.GUARD_FILES
+    _commit(repo, {hook: _hook(19), settings: _settings(40), psl: "com\n", "cain/config.yaml": cfg("0.4.6"), "cain/CHANGELOG.md": log("0.4.6", "0.4.5")})
+    body = tmp_path / "body.md"
+    head = {hook: _hook(19), settings: _settings(40), psl: "com\n"}
+    body.write_text(marked(_guard_body(head, 19), check_pr.round_marker("Cain", "0.4.6", log("0.4.6", "0.4.5"))))
+    assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 0
+    capsys.readouterr()
+    _commit(repo, {settings: _settings(30)})
+    assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 1
+    out = capsys.readouterr().out
+    assert "every hook timeout" in out and "guard-surface section is stale" in out

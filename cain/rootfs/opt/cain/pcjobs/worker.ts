@@ -82,10 +82,12 @@ export { registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScop
 // start the session (its own exit codes): containment_unavailable.
 // initAt / firstTurnAt: when the init event and the first assistant event arrived (ms since
 // the epoch), for the probe's check that the inventory gate runs before the model's first turn.
-// useAt: when each tool call's event (the model's tool_use, by its id) arrived, in the probe's
+// useAt: when each tool call's event (the model's tool_use, by its id) arrived, in every session
+// (0.12.0, nineteenth round: runs record their hooks' start gaps from it); useCliAt: the CLI's own
+// timestamp on that event, where the event carries one. Formerly only in the probe's
 // hook_timing sessions alone (PCW_HOOK_TIMING set): the CLI prints it before it runs the call's hooks.
 export interface Session { code: number | null; out: string; timedOut: boolean; stopped?: boolean; aborted?: AbortCode; pid?: number; started?: number;
-  containment_failed?: boolean; initAt?: number; firstTurnAt?: number; useAt?: Record<string, number>;
+  containment_failed?: boolean; initAt?: number; firstTurnAt?: number; useAt?: Record<string, number>; useCliAt?: Record<string, number>;
   abort_kill?: KillEnd }           // a hook's abort: how the escalation ended the session, and how long it took (escalateAbort)
 // gate: checks the session's init event (the tools it was given) the moment it arrives;
 // false ends the session at once.
@@ -168,6 +170,8 @@ const P = {
   killFailed: (o: Opts) => join(o.home, "abort-kill-failed.json"),
   hookTiming: (o: Opts) => join(o.home, "hook-timing.jsonl"),
   hookCapture: (o: Opts) => join(o.home, "hook-capture"),
+  probeMarks: (o: Opts) => join(o.home, "probe-marks"),
+  hookMargin: (o: Opts) => join(o.home, "hook-margin.json"),
 };
 
 export const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -419,7 +423,7 @@ export const HOOK_GAP_MARGIN_MS = 4_000;
 export const HOOK_REPLY_MS = 1_000;
 // nav-guard's and read-guard's longest run: the budget. The settings' timeout sits above it.
 export const HOOK_DEADLINE_MS = HOOK_BUDGET_MS;
-export interface Budget { total: number; left: () => number; spent: () => boolean }
+export interface Budget { total: number; left: () => number; spent: () => boolean; start?: number }
 // The budget from t0 (the hook process's start): the whole of HOOK_BUDGET_MS, or less when the
 // environment says (PCW_HOOK_BUDGET_MS, the tests'), never more. left() is what a wait may still
 // take: the time to the budget's end less the reply's reserve.
@@ -428,7 +432,7 @@ export function hookBudget(env: Record<string, string | undefined>, t0 = Date.no
   const total = Math.min(Math.max(Number.isFinite(n) ? n : HOOK_BUDGET_MS, 200), HOOK_BUDGET_MS);
   const reserve = Math.min(HOOK_REPLY_MS, Math.floor(total / 5));
   const left = () => Math.max(0, t0 + total - reserve - now());
-  return { total, left, spent: () => left() <= 0 };
+  return { total, left, spent: () => left() <= 0, start: t0 };
 }
 // When the hook's process started (its runtime's own clock origin), so the budget counts the
 // runtime's start too.
@@ -1042,15 +1046,26 @@ const chromeRunning = (udd: string) => ["lockfile", "SingletonLock", "SingletonS
 export interface Confirmed {
   v: 1; at: string; fingerprint: Fingerprint; settings_sha256: string; prompt_sha256: string; config_sha256: string; deny_check: boolean;
   read_context: boolean; live_extension_version: boolean; deny_cli_version: string; cli_sha256: string; boundary_version: string | null;
-  worker_sha256: string | null; cain_version: string | null; policy_version: string | null; fragment_strip: boolean;
+  worker_sha256: string | null; cain_version: string | null; policy_version: string | null; fragment_strip: boolean; guard_sha256: string | null;
 }
 const CONFIRMED_KEYS = ["v", "at", "fingerprint", "settings_sha256", "prompt_sha256", "config_sha256", "deny_check", "read_context", "live_extension_version",
-  "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version", "fragment_strip"];
+  "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version", "fragment_strip", "guard_sha256"];
 const HEX64 = /^[0-9a-f]{64}$/;
-// The hook's policy version: raised whenever what nav-guard or read-guard allows or refuses changes
-// (18: read-guard's strict parser refuses a byte order mark, lone surrogates and unsafe integers, and
-// the hooks' timeout in the pinned settings is 40 seconds).
-export const POLICY_VERSION = "18";
+// The hook's policy version: raised whenever what nav-guard or read-guard allows or refuses changes,
+// or the pinned settings do (18: read-guard's strict parser refuses a byte order mark, lone
+// surrogates and unsafe integers, and the hooks' timeout in the pinned settings is 40 seconds; 19:
+// both hooks refuse at once when probe mode shows outside a bound probe session, and read-guard names
+// why a read is unplaced). The pull request check (check_pr.py) wants it above main's whenever the
+// guard changed against main, so a rebase over another pull request that touched the guard bumps it again.
+export const POLICY_VERSION = "19";
+// The hook bundle (the hook's own code: worker.ts, which holds nav-guard and read-guard, the format
+// it imports and the pinned Public Suffix List) plus the pinned session settings, hashed into every
+// confirmation (0.12.0, nineteenth round): the confirmation binds to what the hook is, not to the
+// policy number alone, so any change to any of them is probe_stale (worker_changed).
+export const GUARD_FILES = [WORKER_FILE, join(HERE, "core.ts"), PSL_FILE, SESSION_FILES.settings];
+export function guardSha(files: string[] = GUARD_FILES): string | null {
+  try { const h = createHash("sha256"); for (const f of files) h.update(readFileSync(f)).update("\0"); return h.digest("hex"); } catch { return null; }
+}
 // The worker's own code, hashed into every confirmation: this file, the format, the Windows
 // helper's source and the pinned Public Suffix List (core.ts also checks the list's own hash).
 export const WORKER_CODE = [WORKER_FILE, join(HERE, "core.ts"), join(HERE, "jobrun.cs"), PSL_FILE];
@@ -1061,13 +1076,14 @@ export function cainVersion(file = join(HERE, "..", "..", "..", "..", "config.ya
   try { return /^version:\s*"(\d+\.\d+\.\d+)"\s*$/m.exec(readFileSync(file, "utf8"))?.[1] ?? null; } catch { return null; }
 }
 // What the worker is now, against what a confirmation recorded.
-export const workerNow = () => ({ worker_sha256: workerSha(), cain_version: cainVersion(), policy_version: POLICY_VERSION });
+export const workerNow = () => ({ worker_sha256: workerSha(), cain_version: cainVersion(), policy_version: POLICY_VERSION, guard_sha256: guardSha() });
 export const workerChanged = (c: Confirmed) => { const n = workerNow(); return c.worker_sha256 === null || c.worker_sha256 !== n.worker_sha256
-  || c.cain_version !== n.cain_version || c.policy_version !== n.policy_version; };
+  || c.cain_version !== n.cain_version || c.policy_version !== n.policy_version || c.guard_sha256 === null || c.guard_sha256 !== n.guard_sha256; };
 export function readConfirmed(o: Opts): Confirmed | null {
   let c = readJson(P.confirmed(o));
   if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "boundary_version")) c = { ...c, boundary_version: null };
-  if (c && typeof c === "object" && !Array.isArray(c)) for (const k of ["worker_sha256", "cain_version", "policy_version"]) if (!Object.hasOwn(c, k)) c = { ...c, [k]: null };
+  if (c && typeof c === "object" && !Array.isArray(c)) for (const k of ["worker_sha256", "cain_version", "policy_version", "guard_sha256"]) if (!Object.hasOwn(c, k)) c = { ...c, [k]: null };
+  if (c && !(c.guard_sha256 === null || (typeof c.guard_sha256 === "string" && HEX64.test(c.guard_sha256)))) return null;
   if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "fragment_strip")) c = { ...c, fragment_strip: false };
   if (c && typeof c.fragment_strip !== "boolean") return null;
   if (c && !(c.worker_sha256 === null || (typeof c.worker_sha256 === "string" && HEX64.test(c.worker_sha256)))) return null;
@@ -1699,7 +1715,7 @@ export function sessionEnv(o: Opts, navAllow: string[], contextAfterRead = false
     PCW_DENY_PATHS: JSON.stringify(wall.paths), PCW_DENY_TOKENS: JSON.stringify(wall.tokens), PCW_HOOK_KEY_FILE: fwd(hookKey(o)),
     PCW_NAV_DOMAINS: JSON.stringify(sc.domains), PCW_NAV_CANARY: JSON.stringify(sc.canary), PCW_NAV_QUERY: JSON.stringify(sc.query),
     PCW_RESOLVE: o.resolveHosts === false ? "0" : "1", PCW_INVENTORY_DIR: fwd(P.inventory(o)), PCW_SESSION_TOKEN: randomBytes(16).toString("hex"),
-    PCW_ABORT_FILE: fwd(P.abort(o)),
+    PCW_ABORT_FILE: fwd(P.abort(o)), PCW_SESSION_KIND: "run", PCW_PROBE_DIR: fwd(P.probeMarks(o)),
     ...(scope.fragmentStrip === true ? { PCW_FRAGMENT_STRIP: POLICY_VERSION } : {}),
     ...(contextAfterRead ? { PCW_CONTEXT_AFTER_READ: "1" } : {}) };
 }
@@ -2086,7 +2102,8 @@ export function markKillFailed(o: Opts, why: AbortCode | null, k: KillEnd): void
 // phase "post": read-guard's decision on a reading tool's answer, after the tool ran (the
 // read-time drift check, below); every other decision is nav-guard's, before the call.
 export interface Decision { id: string | null; tool: string; url: string | null; decision: "allow" | "deny"; why: string; domain?: string | null; host_hmac?: string | null; url_hmac?: string | null;
-  resolved?: "public" | "unresolved"; phase?: "post"; sid?: string | null; fragment_stripped?: true; cap?: AbortCode; waited_ms?: number }
+  resolved?: "public" | "unresolved"; phase?: "post"; sid?: string | null; fragment_stripped?: true; cap?: AbortCode; waited_ms?: number;
+  reason?: UnplacedReason; t0?: number; done_at?: number }
 // The per-install key for the hook log's hashes: 32 random bytes in the worker folder
 // (hook-key, inside its ACL, behind the wall), made on first use. Keyed, so the log's
 // hashes can't be checked against a guessed address by anyone without it.
@@ -2492,7 +2509,7 @@ export async function hookMain(env: Record<string, string | undefined>, read: ()
   // The cumulative cap: this refusal and every earlier one of the session, of any kind.
   if (d.decision === "deny" && !d.cap && d.why !== "session_aborted" && history.filter((x) => x.phase !== "post" && x.decision === "deny").length + 1 >= REFUSALS_MAX)
     d = { ...d, cap: "refusal_cap" };
-  d = { ...d, sid };
+  d = { ...d, sid, ...(budget.start !== undefined ? { t0: budget.start } : {}), done_at: Date.now() };
   try {
     if (!env.PCW_NAV_LOG) throw new Error("no log");
     appendFileSync(env.PCW_NAV_LOG, JSON.stringify(d) + "\n");
@@ -2713,15 +2730,29 @@ export function readScope(url: string, scope: NavScope): string | null {
   if (onCanary(u, scope.canary)) return null;
   return hostScope(u.hostname, scope);
 }
+// Why a read counts as unplaced, named (0.12.0, nineteenth round), for the run's report: the strict
+// parser's own rejections (bom, lone_surrogate, unsafe_integer, number_range, not_strict_json), a key
+// written twice (duplicate_key), more than one address field, whatever its case or depth
+// (address_fields: url beside URL, or a nested copy of tabUrl), or no address in the one field (no_address).
+export const UNPLACED_REASONS = ["bom", "lone_surrogate", "unsafe_integer", "number_range", "not_strict_json", "duplicate_key", "address_fields", "no_address", "unreadable", "probe_marker"] as const;
+export type UnplacedReason = typeof UNPLACED_REASONS[number];
+export const parserReason = (e: unknown): UnplacedReason => {
+  const m = (e as Error)?.message;
+  return (["bom", "lone_surrogate", "unsafe_integer", "number_range"] as const).find((x) => x === m) ?? "not_strict_json";
+};
+// The address-field rule on a strictly parsed input: every key whose ASCII-folded form is an
+// address name, at every depth, counted after decoding; more than one is address_fields.
+export const addressFieldsProblem = (st: Pick<Strict, "dup" | "addressKeys">): UnplacedReason | null =>
+  st.dup ? "duplicate_key" : st.addressKeys > 1 ? "address_fields" : null;
 export function readDecide(input: string, scope: NavScope, key: Buffer | null = null): Decision {
   let call: any, parsed: Strict;
-  try { parsed = parseStrict(input); call = parsed.value; } catch { return { id: null, tool: "", url: null, decision: "deny", why: "read_unplaced", phase: "post" }; }
+  try { parsed = parseStrict(input); call = parsed.value; } catch (e) { return { id: null, tool: "", url: null, decision: "deny", why: "read_unplaced", phase: "post", reason: parserReason(e) }; }
   const id = typeof call?.tool_use_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(call.tool_use_id) ? call.tool_use_id : null;
   const name = typeof call?.tool_name === "string" ? call.tool_name : "";
   const tool = (name.startsWith(CHROME) ? name.slice(CHROME.length) : name).slice(0, 100);
   if (!name.startsWith(CHROME) || !PAGE_READING.includes(tool)) return { id, tool, url: null, decision: "allow", why: "not_a_read", phase: "post" };
   const url = structuredUrl(call?.tool_response, parsed);
-  if (!url) return { id, tool, url: null, decision: "deny", why: "read_unplaced", phase: "post" };
+  if (!url) return { id, tool, url: null, decision: "deny", why: "read_unplaced", phase: "post", reason: addressFieldsProblem(parsed) ?? "no_address" };
   if (readScope(url, scope)) return { id, tool, url: null, decision: "deny", why: "read_drift", phase: "post", ...deniedAddress(url, key) };
   return { id, tool, url: null, decision: "allow", why: "read_on_scope", phase: "post" };
 }
@@ -2738,8 +2769,9 @@ export async function readGuardMain(env: Record<string, string | undefined>, rea
     const input = await Promise.race([read(), new Promise<never>((_, fail) => { timer = setTimeout(() => fail(new Error("timeout")), Math.min(ms, budget.left())); })]);
     d = readDecide(input, scopeFromEnv(env), readKey(env.PCW_HOOK_KEY_FILE));
   } catch {
-    d = { id: null, tool: "", url: null, decision: "deny", why: "read_unplaced", phase: "post" };
+    d = { id: null, tool: "", url: null, decision: "deny", why: "read_unplaced", phase: "post", reason: "unreadable" };
   } finally { clearTimeout(timer); }
+  d = { ...d, ...(budget.start !== undefined ? { t0: budget.start } : {}), done_at: Date.now() };
   try {
     if (!env.PCW_NAV_LOG) throw new Error("no log");
     appendFileSync(env.PCW_NAV_LOG, JSON.stringify(d) + "\n");
@@ -2868,7 +2900,24 @@ export function readNavLog(file: string): Decision[] {
   try { text = readFileSync(file, "utf8"); } catch { return []; }
   const out: Decision[] = [];
   for (const l of text.split(/\r?\n/)) {
-    try { const d = JSON.parse(l); if (d && (d.decision === "allow" || d.decision === "deny") && typeof d.tool === "string") out.push(d); } catch { /* a torn line */ }
+    try {
+      const d = JSON.parse(l);
+      if (d && (d.decision === "allow" || d.decision === "deny") && typeof d.tool === "string") { delete d.t0; delete d.done_at; out.push(d); }
+    } catch { /* a torn line */ }
+  }
+  return out;
+}
+// The hooks' own timing in the same log (t0: the hook process's start, done_at: when it answered),
+// by call id and phase: no addresses, no page values (hookRunsOf).
+export function readHookTimes(file: string): Pick<Decision, "id" | "phase" | "t0" | "done_at">[] {
+  let text = "";
+  try { text = readFileSync(file, "utf8"); } catch { return []; }
+  const out: Pick<Decision, "id" | "phase" | "t0" | "done_at">[] = [];
+  for (const l of text.split(/\r?\n/)) {
+    try {
+      const d = JSON.parse(l);
+      if (d && typeof d.t0 === "number" && typeof d.done_at === "number") out.push({ id: typeof d.id === "string" ? d.id : null, ...(d.phase === "post" ? { phase: "post" as const } : {}), t0: d.t0, done_at: d.done_at });
+    } catch { /* a torn line */ }
   }
   return out;
 }
@@ -3187,12 +3236,18 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   let out = "", timedOut = false, stopped = false, aborted: AbortCode | null = null, gated = !gate, buf = "";
   let killing: Promise<KillEnd> | null = null;
   let initAt: number | undefined, firstTurnAt: number | undefined;
-  const timing = !!env.PCW_HOOK_TIMING;
-  const useAt: Record<string, number> = {};
+  // Every session notes when each tool call was printed (0.12.0, nineteenth round: runs record their hooks' gaps).
+  const timing = true;
+  const useAt: Record<string, number> = {}, useCliAt: Record<string, number> = {};
   const noteUses = (line: string, t: number) => {
     try {
-      for (const c of JSON.parse(line)?.message?.content ?? [])
-        if (c?.type === "tool_use" && typeof c.id === "string" && useAt[c.id] === undefined && Object.keys(useAt).length < 200) useAt[c.id] = t;
+      const ev = JSON.parse(line);
+      const cliAt = typeof ev?.timestamp === "string" ? Date.parse(ev.timestamp) : typeof ev?.timestamp === "number" ? ev.timestamp : NaN;
+      for (const c of ev?.message?.content ?? [])
+        if (c?.type === "tool_use" && typeof c.id === "string" && useAt[c.id] === undefined && Object.keys(useAt).length < 200) {
+          useAt[c.id] = t;
+          if (Number.isFinite(cliAt)) useCliAt[c.id] = cliAt;
+        }
     } catch { /* not one event */ }
   };
   const started = Date.now();
@@ -3231,7 +3286,7 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   });
   const fin = async (code: number | null, o: string) => { const abort_kill = killing ? await killing : undefined; done({ code, out: o, timedOut, stopped, ...(aborted ? { aborted } : {}), ...(abort_kill ? { abort_kill } : {}), ...(child.pid ? { pid: child.pid, started } : {}),
     ...(wrap?.length && code !== null && JOB_HELPER_CODES.includes(code) && !timedOut && !stopped && !aborted ? { containment_failed: true } : {}),
-    ...(initAt !== undefined ? { initAt } : {}), ...(firstTurnAt !== undefined ? { firstTurnAt } : {}), ...(timing ? { useAt } : {}) }); };
+    ...(initAt !== undefined ? { initAt } : {}), ...(firstTurnAt !== undefined ? { firstTurnAt } : {}), useAt, ...(Object.keys(useCliAt).length ? { useCliAt } : {}) }); };
   child.on("error", () => { end(); fin(null, ""); });
   child.on("close", (code) => { end(); if (child.pid && !timedOut && !stopped && process.platform !== "win32") { try { process.kill(-child.pid, "SIGKILL"); } catch { /* none left */ } } fin(code, out); });
 });
@@ -3548,6 +3603,7 @@ export interface Canary {
   hits: string[]; served: () => number; cookie: () => CookieState; bound: () => boolean; record: () => CanaryRecord[];
   secrets: { console: string; net: string }; inject: string; refusedHosts: () => number; offsite: string;
   opened: () => string[];   // the fragment check page's own record of the address it was opened at (FRAGMENT_PATH)
+  fragmentNonce: string;    // this step's nonce, in the check page's path and in its report (0.12.0, nineteenth round)
   close: () => Promise<void>;
 }
 export const MARKER_COOKIE = "pcw_profile";
@@ -3579,6 +3635,7 @@ export async function startCanary(extensionId: string, attempt: string, opt: Can
   const offsite = `o-${randomBytes(8).toString("hex")}`;
   const hits: string[] = [];
   const opened: string[] = [];
+  const fragmentNonce = randomBytes(16).toString("hex");
   const record: CanaryRecord[] = [];
   let served = 0, bound = false, roundtrips = 0, cookie: CookieState = null, refusedHosts = 0;
   const base = `${CANARY_PATH}/${token}`;
@@ -3635,16 +3692,18 @@ console.log("probe console ${secrets.console}"); fetch("${base}/net/${secrets.ne
     // request line: neither the page's own request (which never carries a fragment) nor the
     // report's path or query. Only that record decides the step: what the hook or the CLI says
     // they did with the address is recorded beside it, never read for the verdict.
-    if (opt.fragment && path === `${base}${FRAGMENT_PATH}`) {
-      ok(res, fragmentPage(base));
+    // The page and its report carry this step's nonce (fragmentNonce) in their paths, and the report
+    // in its body too; only the first report for that nonce counts (0.12.0, nineteenth round).
+    if (opt.fragment && path === `${base}${FRAGMENT_PATH}/${fragmentNonce}`) {
+      ok(res, fragmentPage(base, fragmentNonce));
       return;
     }
-    if (opt.fragment && path === `${base}/opened` && req.method === "POST") {
+    if (opt.fragment && path === `${base}/opened/${fragmentNonce}` && req.method === "POST") {
       let body = "";
       req.setEncoding("utf8");
       req.on("data", (x: string) => { if (body.length < 8_000) body += x; });
       req.on("end", () => {
-        if (opened.length < 20) opened.push(fragmentReport(body));
+        if (!opened.length) { const r = fragmentReport(body, fragmentNonce); if (r !== null) opened.push(r); }
         res.writeHead(204); res.end();
       });
       return;
@@ -3718,7 +3777,7 @@ Then open http://127.0.0.1:${port}${base}/hit/cred?d=&lt;what it said&gt; so we 
   return {
     url: `http://127.0.0.1:${port}${base}`, bindUrl: `http://127.0.0.1:${port}${base}/bind`, base, value, port, token, hits, served: () => served,
     cookie: () => cookie, bound: () => bound, record: () => record.map((r) => ({ ...r })), secrets, inject, offsite, refusedHosts: () => refusedHosts,
-    opened: () => [...opened],
+    opened: () => [...opened], fragmentNonce,
     close: () => new Promise((ok) => { server.closeAllConnections?.(); server.close(() => ok()); }),
   };
 }
@@ -3848,7 +3907,33 @@ function stillOurs(o: Opts, c: Claim, now: Date): Job | "cancelled" | null {
   return job;
 }
 
-export interface RunOut { code: Heartbeat["code"] | Code; job: string | null; closed: string[]; state?: string; warnings?: string[]; drift?: string }
+export interface RunOut { code: Heartbeat["code"] | Code; job: string | null; closed: string[]; state?: string; warnings?: string[]; drift?: string;
+  unplaced?: { tool: string; reason: string }[] }
+// Every unplaced read of a run, with its named reason (0.12.0, nineteenth round): the owner's run
+// report shows each, never only a count. No values: the tool's name and the reason.
+export function unplacedOf(log: Decision[]): { tool: string; reason: string }[] {
+  return log.filter((d) => d.why === "read_unplaced").slice(0, 20).map((d) => ({ tool: d.tool || "unknown", reason: d.reason ?? "no_address" }));
+}
+// The hooks' timing on a real run (0.12.0, nineteenth round): each hook run's start gap (its
+// process's start against the CLI printing the call, Session.useAt) and how long it ran, from the
+// hook's own log lines (t0, done_at). No page values. margin_ms is what the longest gap leaves of
+// the hooks' timeout once the whole budget is spent; under HOOK_GAP_MARGIN_MS it is recorded
+// (hook-margin.json), and confirmation renewal is refused until a probe newer than it.
+export interface HookRuns { samples: number; gaps_ms: number[]; max_gap_ms: number | null; max_ran_ms: number | null; finished_at: number | null; margin_ms: number | null }
+export function hookRunsOf(s: Pick<Session, "useAt">, log: Pick<Decision, "id" | "phase" | "t0" | "done_at">[], lim: TimingLimits = HOOK_LIMITS): HookRuns {
+  const at = s.useAt ?? {};
+  const timed = log.filter((d) => typeof d.t0 === "number" && typeof d.done_at === "number");
+  const gaps = timed.filter((d) => d.id && d.phase !== "post" && at[d.id] !== undefined && d.t0! >= at[d.id]).map((d) => d.t0! - at[d.id!]);
+  const ran = timed.map((d) => d.done_at! - d.t0!);
+  const max_gap_ms = gaps.length ? Math.max(...gaps) : null;
+  return { samples: timed.length, gaps_ms: gaps.slice(0, 50), max_gap_ms, max_ran_ms: ran.length ? Math.max(...ran) : null,
+    finished_at: timed.length ? Math.max(...timed.map((d) => d.done_at!)) : null, margin_ms: max_gap_ms === null ? null : lim.timeout - max_gap_ms - lim.budget };
+}
+export interface LowMargin { at: string; margin_ms: number }
+export function readLowMargin(o: Opts): LowMargin | null {
+  const x = readJson(P.hookMargin(o)) as any;
+  return x && typeof x.at === "string" && typeof x.margin_ms === "number" ? { at: x.at, margin_ms: x.margin_ms } : null;
+}
 
 // One browser session against a fresh canary. What the session did is read from its
 // event stream and nav-guard's log of the same session.
@@ -3950,7 +4035,8 @@ export function verdict(s: Session, st: Stream, log: Decision[], tools: string[]
 
 // last-run.json: the run's job id, code and failing field's name, and for a read_drift the
 // registrable domain the page moved the tab to (domain), nothing else. It stays on the PC.
-export const LAST_RUN_KEYS = ["at", "job", "code", "field", "domain"];
+// hook: the hooks' timing on that run (hookRunsOf: counts and milliseconds, no values).
+export const LAST_RUN_KEYS = ["at", "job", "code", "field", "domain", "hook"];
 // The field is written only when it is one of the worker's own field names or one of the
 // action's schema keys; anything else (a key the model made up, a lowercase word copied
 // from a page, a report key with _size after it) is written as unknown_field.
@@ -4006,13 +4092,18 @@ export async function run(o: Opts): Promise<RunOut> {
     // values, no tool input, no addresses (the owner's trouble log below is the one place
     // for those, off by default).
     const drift = driftLine(final.code, log);
-    try { writeFileSync(P.lastRun(o), JSON.stringify(lastRunOf(now, mine.id, final.code, failField, mine.action, drift?.split(":")[1] ?? null), null, 2) + "\n"); } catch { /* never stops a run */ }
+    const hook = hookRunsOf(s, readHookTimes(P.navLog(o)));
+    const unplaced = unplacedOf(log);
+    try { writeFileSync(P.lastRun(o), JSON.stringify({ ...lastRunOf(now, mine.id, final.code, failField, mine.action, drift?.split(":")[1] ?? null), hook }, null, 2) + "\n"); } catch { /* never stops a run */ }
+    if (hook.margin_ms !== null && hook.margin_ms < HOOK_GAP_MARGIN_MS)
+      try { writeFileSync(P.hookMargin(o), JSON.stringify({ at: now.toISOString(), margin_ms: hook.margin_ms }) + "\n"); } catch { /* never stops a run */ }
     diagnose(o, c.inst, now, mine.id, final.code, final.final_url ?? sanitizeUrl(v.end?.final_url ?? (v.bad ? null : (v.given as any)?.final_url)), failField,
       { off_url: sanitizeUrl(v.end?.off_url) ?? (v.end?.off_url ? "unparsed" : null), off_kind: v.end?.off_kind ?? null, other_tabs: v.end?.others.length ?? 0,
         missing: v.guard.missing.length });
     v.given = stripCanary(v.given);
     beat(o, final.code, mine.id, now, c.st, warnings);
-    return { code: final.code, job: mine.id, closed: n.closed, state: stateAfter(mine, final), ...(warnings.length ? { warnings } : {}), ...(drift && drift !== "read_drift" ? { drift } : {}) };
+    return { code: final.code, job: mine.id, closed: n.closed, state: stateAfter(mine, final), ...(warnings.length ? { warnings } : {}), ...(drift && drift !== "read_drift" ? { drift } : {}),
+      ...(unplaced.length ? { unplaced } : {}) };
   } catch (e) {
     // The session's own folders failed it (its transcripts couldn't be deleted, or the
     // worker's sign-in went missing): the job fails with that code, loudly, and the
@@ -4243,31 +4334,37 @@ export function judgeForged(s: Session, log: Decision[]): ForgedLine {
 // beside it (stripped, tab_bare) and never read for the verdict: no gating step reads a
 // recorded-only value (RECORDED_ONLY, below).
 export const FRAGMENT_MARK = "pcw-fragment-check";
-// The check page itself, served under the canary's base path: its script reports
-// window.location.href and window.location.hash in a POST body (fragmentReport reads it).
-export const fragmentPage = (base: string) => `<!doctype html><meta charset="utf-8"><title>Fragment check</title><p>Fragment check.</p>
+// The check page itself, served under the canary's base path at FRAGMENT_PATH/<nonce>: its script
+// reports window.location.href and window.location.hash, with the step's nonce, in a POST body to
+// /opened/<nonce> (fragmentReport reads it).
+export const fragmentPage = (base: string, nonce: string) => `<!doctype html><meta charset="utf-8"><title>Fragment check</title><p>Fragment check.</p>
 <script>(function () {
   var href = String(window.location.href), hash = String(window.location.hash);
-  fetch("${base}/opened", { method: "POST", headers: { "content-type": "text/plain" }, body: JSON.stringify({ href: href, hash: hash }) });
+  fetch("${base}/opened/${nonce}", { method: "POST", headers: { "content-type": "text/plain" }, body: JSON.stringify({ href: href, hash: hash, nonce: "${nonce}" }) });
 })();</script>`;
 // The address one report says the page was opened at: its href, with its hash put back on when
-// the href lacks the "#" the hash shows (so a fragment the page saw is never lost). A body that
-// isn't that report records "" (never the page's bare address), and the step fails.
-export function fragmentReport(body: string): string {
+// the href lacks the "#" the hash shows (so a fragment the page saw is never lost). A report
+// without the step's nonce in its body counts as none (null); a body that is the right report's
+// but carries no address records "" (never the page's bare address), and the step fails.
+export function fragmentReport(body: string, nonce: string): string | null {
   let b: any;
-  try { b = JSON.parse(body); } catch { return ""; }
+  try { b = JSON.parse(body); } catch { return null; }
+  if (b?.nonce !== nonce) return null;
   const href = typeof b?.href === "string" ? b.href : "", hash = typeof b?.hash === "string" ? b.hash : "";
   if (!href) return "";
   return (hash && !href.includes("#") ? href + hash : href).slice(0, 2_000);
 }
 export const FRAGMENT_PATH = "/fragment-check";
-export interface FragmentLine { tried: boolean; stripped: boolean; tab_bare: boolean; received: string[]; received_bare: boolean; passed: boolean }
-export const FRAGMENT_PROMPT = (c: Pick<Canary, "url">) => `This is a fragment check of the PC job worker. Use only Claude in Chrome.
-1. Open ${c.url}${FRAGMENT_PATH}#${FRAGMENT_MARK} with navigate.
+// why: "no_page_report" when the page sent no report for the step's nonce in time (the step fails
+// for that reason, not a generic one); null otherwise.
+export interface FragmentLine { tried: boolean; stripped: boolean; tab_bare: boolean; received: string[]; received_bare: boolean; why: "no_page_report" | null; passed: boolean }
+export const fragmentPageUrl = (c: Pick<Canary, "url" | "fragmentNonce">) => `${c.url}${FRAGMENT_PATH}/${c.fragmentNonce}`;
+export const FRAGMENT_PROMPT = (c: Pick<Canary, "url" | "fragmentNonce">) => `This is a fragment check of the PC job worker. Use only Claude in Chrome.
+1. Open ${fragmentPageUrl(c)}#${FRAGMENT_MARK} with navigate.
 2. Call tabs_context_mcp.
 Then end your reply with the word done.`;
-export function judgeFragmentStrip(st: Stream, c: Pick<Canary, "url" | "opened">, log: Decision[]): FragmentLine {
-  const page = `${c.url}${FRAGMENT_PATH}`;
+export function judgeFragmentStrip(st: Stream, c: Pick<Canary, "url" | "opened" | "fragmentNonce">, log: Decision[]): FragmentLine {
+  const page = fragmentPageUrl(c);
   const nav = log.find((d) => d.phase !== "post" && NAVIGATING.includes(d.tool));
   const stripped = !!nav && nav.decision === "allow" && nav.fragment_stripped === true && nav.url === page;
   const ctx = st.uses.filter((u) => u.name === CONTEXT_TOOL && st.results[u.id] && !st.results[u.id].error);
@@ -4275,7 +4372,7 @@ export function judgeFragmentStrip(st: Stream, c: Pick<Canary, "url" | "opened">
   const tab_bare = tabs.some((t) => t.url === page) && !tabs.some((t) => (t.url ?? "").includes(FRAGMENT_MARK));
   const received = c.opened();
   const received_bare = received.length > 0 && received.every((u) => u === page);
-  return { tried: !!nav, stripped, tab_bare, received, received_bare, passed: received_bare };
+  return { tried: !!nav, stripped, tab_bare, received, received_bare, why: received.length ? null : "no_page_report", passed: received_bare };
 }
 // kill_latency: how long the worker's escalation took to end the sessions a hook aborted in
 // the probe (the redirect and forged reads), against ABORT_KILL_MS, which sits below the
@@ -4612,33 +4709,30 @@ export function judgeSlowHook(st: Stream, c: Canary, log: Decision[], cliVersion
     passed: calls.length > 0 && permission_denied && !opened && reads.length > 0 && read_fails_closed, cli_version: cliVersion };
 }
 
-// ---- The probe's hook_timing step (0.12.0, eighteenth round) -----------------------------------
-// The hook budget's margin, measured on this PC instead of asserted. Four short sessions of the
-// probe's own, the first of the probe (so a probe run first thing after a reboot, or after the PC
-// sat idle, measures a cold start):
-//   cold and warm: one tool call each; the gap between the CLI printing the call (its tool_use
-//     event, which it prints before it runs the call's hooks: Session.useAt) and the hook
-//     process's own start (its runtime's clock origin), from the hook's timing line
-//     (PCW_HOOK_TIMING). That gap is Git Bash and the runtime starting, and it counts against the
-//     CLI's timeout, which starts at the spawn, but not against the hook's budget, which starts
-//     at the process's start. A call whose hook started before its event arrived can't be
-//     measured, and counts as no measurement;
-//   full_budget: one call to an allowed tool (tabs_context_mcp, which the permission layer lets
-//     run) with the hook held (PCW_HOOK_FULL_BUDGET) so it answers only at its hard stop, at the
-//     budget's end, with its deny: blocked when the CLI shows the call refused with the hook's
-//     deny (so the CLI received the blocking result, rather than giving up on the hook and
-//     running the tool);
+// ---- The probe's hook_timing step (0.12.0, eighteenth and nineteenth rounds) ---------------------
+// The hook budget's margin, measured on this PC instead of asserted. Short sessions of the probe's
+// own, the very first of the probe, in this order (nineteenth round):
+//   full_budget, the very first, cold session: one call to an allowed tool (tabs_context_mcp, which
+//     the permission layer lets run) with the hook held (PCW_HOOK_FULL_BUDGET) so it answers only at
+//     its hard stop, at the budget's end, with its deny: blocked when the CLI shows the call refused
+//     with the hook's deny. Its gap is the cold sample;
+//   warm: WARM_SAMPLES sessions of one tool call each, the warm samples, whose spread (longest less
+//     shortest) is reported;
 //   overrun: one navigation with the hook stalled past the CLI's timeout (PCW_HOOK_STALL_MS):
 //     what the CLI did with it is recorded (refused by the permission layer, an error, or ran).
-// The step passes only when the cold and warm gaps were measured, the longest gap plus the budget
-// stays HOOK_GAP_MARGIN_MS under the hooks' timeout, the held call was blocked, and the overrun
-// call didn't run. It gates confirm-profile (PROBE_GATES); a failure means this PC's cold start
-// eats the margin (see Troubleshooting), or the CLI didn't take the hook's blocking answer.
-// The step's sessions also capture the PreToolUse payloads the CLI sends (PCW_HOOK_CAPTURE) for
-// the payload_replay step.
+// A gap is the time between the CLI printing a call (its tool_use event, timed as it arrives:
+// Session.useAt) and the hook process's own start (its runtime's clock origin), from the hook's
+// timing line (PCW_HOOK_TIMING). Where the event carries the CLI's own timestamp, the gap from it is
+// recorded too (cli_gaps_ms). A call whose hook started before its event arrived can't be measured.
+// Each session is bound to its probe step (bindProbe): the hook's probe-only behaviours work in
+// those sessions alone. The step passes only when the cold gap and at least WARM_SAMPLES warm gaps
+// were measured, the longest gap plus the budget stays HOOK_GAP_MARGIN_MS under the hooks' timeout,
+// the held call was blocked, and the overrun call didn't run. It gates confirm-profile (PROBE_GATES).
+// The sessions also capture the PreToolUse payloads the CLI sends (PCW_HOOK_CAPTURE) for payload_replay.
 export interface TimingStamp { hook: string; t0: number; id: string | null; read_at: number | null; answered_at: number; answer: string }
 export interface HookTimingLine {
-  cold_gap_ms: number | null; warm_gaps_ms: number[]; max_gap_ms: number | null; budget_ms: number; timeout_ms: number; margin_ms: number;
+  cold_gap_ms: number | null; warm_gaps_ms: number[]; warm_spread_ms: number | null; cli_gaps_ms: number[]; max_gap_ms: number | null;
+  budget_ms: number; timeout_ms: number; margin_ms: number;
   full_budget: { tried: boolean; answered_ms: number | null; blocked: boolean };
   overrun: { tried: boolean; cli: "refused" | "error" | "ran" | "not_tried" };
   why: string | null; passed: boolean;
@@ -4646,6 +4740,7 @@ export interface HookTimingLine {
 export interface TimingLimits { budget: number; timeout: number; margin: number; stall: number }
 export const HOOK_LIMITS: TimingLimits = { budget: HOOK_BUDGET_MS, timeout: HOOK_TIMEOUT_S * 1000, margin: HOOK_GAP_MARGIN_MS, stall: HOOK_STALL_MS };
 export const CAPTURE_MAX = 50;
+export const WARM_SAMPLES = 3;
 export const HOOK_TIMING_PROMPT = `This is a hook timing check of the PC job worker. Use only Claude in Chrome.
 1. Call tabs_context_mcp once.
 Then reply with the single word: done.`;
@@ -4668,18 +4763,18 @@ export function readStamps(file: string): TimingStamp[] {
   }
   return out;
 }
-// Each measured gap of one session: a hook's start against its call's event.
-export function timingGaps(s: Session, stamps: TimingStamp[]): number[] {
-  const at = s.useAt ?? {};
+// Each measured gap of one session: a hook's start against its call's event (as it arrived, or, with
+// cli, against the CLI's own timestamp on the event).
+export function timingGaps(s: Session, stamps: { id: string | null; t0: number }[], cli = false): number[] {
+  const at = (cli ? s.useCliAt : s.useAt) ?? {};
   return stamps.filter((x) => x.id !== null && at[x.id] !== undefined && x.t0 >= at[x.id]).map((x) => x.t0 - at[x.id!]);
 }
-export interface TimingSessions {
-  cold: { session: Session; stamps: TimingStamp[] } | null; warm: { session: Session; stamps: TimingStamp[] } | null;
-  full: { session: Session; stamps: TimingStamp[] } | null; overrun: { session: Session } | null;
-}
+type Sample = { session: Session; stamps: TimingStamp[] };
+export interface TimingSessions { full: Sample | null; warm: Sample[]; overrun: { session: Session } | null }
 export function judgeHookTiming(m: TimingSessions, lim: TimingLimits = HOOK_LIMITS): HookTimingLine {
-  const cold = m.cold ? timingGaps(m.cold.session, m.cold.stamps) : [];
-  const warm = [...cold.slice(1), ...(m.warm ? timingGaps(m.warm.session, m.warm.stamps) : [])];
+  const cold = m.full ? timingGaps(m.full.session, m.full.stamps) : [];
+  const warm = m.warm.flatMap((w) => timingGaps(w.session, w.stamps));
+  const cli_gaps_ms = [...(m.full ? [m.full] : []), ...m.warm].flatMap((w) => timingGaps(w.session, w.stamps, true));
   const all = [...cold, ...warm];
   const max_gap_ms = all.length ? Math.max(...all) : null;
   // The held call: refused with the hook's own deny.
@@ -4695,30 +4790,33 @@ export function judgeHookTiming(m: TimingSessions, lim: TimingLimits = HOOK_LIMI
   const ores = nav ? ost!.results[nav.id] : undefined;
   const cli: HookTimingLine["overrun"]["cli"] = !nav ? "not_tried" : ost!.denials.some((d) => d.id === nav.id) ? "refused" : ores && !ores.error ? "ran" : "error";
   const overrun = { tried: !!nav, cli };
-  const why = !cold.length || !warm.length ? "gap_unmeasured"
+  const why = !cold.length || warm.length < WARM_SAMPLES ? "gap_unmeasured"
     : max_gap_ms! + lim.budget + lim.margin > lim.timeout ? "gap_too_long"
     : !full_budget.tried || !blocked ? "full_budget_not_blocked"
     : cli === "ran" || cli === "not_tried" ? "overrun_ran"
     : null;
-  return { cold_gap_ms: cold.length ? cold[0] : null, warm_gaps_ms: warm, max_gap_ms, budget_ms: lim.budget, timeout_ms: lim.timeout, margin_ms: lim.margin,
-    full_budget, overrun, why, passed: why === null };
+  return { cold_gap_ms: cold.length ? cold[0] : null, warm_gaps_ms: warm, warm_spread_ms: warm.length ? Math.max(...warm) - Math.min(...warm) : null,
+    cli_gaps_ms, max_gap_ms, budget_ms: lim.budget, timeout_ms: lim.timeout, margin_ms: lim.margin, full_budget, overrun, why, passed: why === null };
 }
-// The step's four sessions: run(prompt, extra environment) is one session as the probe runs them.
+// The step's sessions: run(prompt, extra environment) is one session as the probe runs them; each is
+// bound to its probe step through a marker in probeDir.
 export async function hookTimingStep(run: (prompt: string, env: Record<string, string>) => Promise<Session>, file: string, capture: string | null,
-  lim: TimingLimits = HOOK_LIMITS): Promise<HookTimingLine> {
-  const one = async (prompt: string, env: Record<string, string>) => {
+  lim: TimingLimits = HOOK_LIMITS, probeDir: string = join(dirname(file), "probe-marks")): Promise<HookTimingLine> {
+  const one = async (prompt: string, step: keyof typeof PROBE_STEPS, env: Record<string, string>) => {
     rmSync(file, { force: true });
-    const session = await run(prompt, { PCW_HOOK_TIMING: file, ...env });
+    const b = bindProbe(probeDir, step, { PCW_HOOK_TIMING: file, ...env });
+    let session: Session;
+    try { session = await run(prompt, b.env); } finally { b.end(); }
     const stamps = readStamps(file);
     rmSync(file, { force: true });
     return { session, stamps };
   };
   const cap: Record<string, string> = capture ? { PCW_HOOK_CAPTURE: capture } : {};
-  const cold = await one(HOOK_TIMING_PROMPT, cap);
-  const warm = await one(HOOK_TIMING_PROMPT, cap);
-  const full = await one(HOOK_FULL_PROMPT, { PCW_HOOK_FULL_BUDGET: "1" });
-  const overrun = await one(HOOK_OVERRUN_PROMPT, { PCW_HOOK_STALL_MS: String(lim.stall) });
-  return judgeHookTiming({ cold, warm, full, overrun }, lim);
+  const full = await one(HOOK_FULL_PROMPT, "hook_timing_held", { PCW_HOOK_FULL_BUDGET: "1", ...cap });
+  const warm: Sample[] = [];
+  for (let i = 0; i < WARM_SAMPLES; i++) warm.push(await one(HOOK_TIMING_PROMPT, "hook_timing_gap", cap));
+  const overrun = await one(HOOK_OVERRUN_PROMPT, "hook_timing_overrun", { PCW_HOOK_STALL_MS: String(lim.stall) });
+  return judgeHookTiming({ full, warm, overrun }, lim);
 }
 
 // ---- The probe's payload_replay step (0.12.0, eighteenth round) -------------------------------------
@@ -4742,7 +4840,8 @@ export function payloadReplay(dir: string): PayloadReplayLine {
     try { raw = readFileSync(join(dir, n), "utf8"); } catch { failures.push("unreadable"); continue; }
     let st: Strict;
     try { st = parseStrict(raw); } catch (e) { failures.push((e as Error).message); continue; }
-    if (st.dup) { failures.push("duplicate_key"); continue; }
+    const fields = addressFieldsProblem(st);
+    if (fields) { failures.push(fields); continue; }
     parsed++;
     let same = false;
     try { same = JSON.stringify(st.value) === JSON.stringify(JSON.parse(raw)); } catch { same = false; }
@@ -4842,7 +4941,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     rmSync(P.hookCapture(o), { recursive: true, force: true });
     mkdirSync(P.hookCapture(o), { recursive: true });
     const hook_timing = await (o.hookTiming ?? ((x: Opts) => hookTimingStep((prompt, env) => runSession(x, sessionArgv(inst, x, h.settings, prompt),
-      Math.min(limit, 2 * 60_000), { ...sessionEnv(x, [END_URL]), ...env }), P.hookTiming(x), P.hookCapture(x))))(o);
+      Math.min(limit, 2 * 60_000), { ...sessionEnv(x, [END_URL]), ...env }), P.hookTiming(x), P.hookCapture(x), HOOK_LIMITS, P.probeMarks(x))))(o);
     try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe hook_timing ${JSON.stringify(hook_timing)}\n`); } catch { /* never stops a probe */ }
     const attempt = newAttempt(o.rand);
     // 2. The smoke step.
@@ -4996,10 +5095,11 @@ export async function probe(o: Opts): Promise<Evidence> {
     // 5c. The slowed hook: the permission layer alone refuses a navigation.
     const sl = await startCanary(inst.profile.extension_id, attempt, { markerSha: marker });
     let ss: Session;
+    const sb = bindProbe(P.probeMarks(o), "slow_hook", { PCW_HOOK_STALL_MS: String(HOOK_STALL_MS) });
     try {
       ss = await runSession(o, sessionArgv(inst, o, h.settings, SLOW_PROMPT(sl)), Math.min(limit, 5 * 60_000),
-        { ...sessionEnv(o, [sl.url]), PCW_HOOK_STALL_MS: String(HOOK_STALL_MS) });
-    } finally { await sl.close(); }
+        { ...sessionEnv(o, [sl.url]), ...sb.env });
+    } finally { sb.end(); await sl.close(); }
     keepTabs(o, parseStream(ss.out));
     const slow_hook = judgeSlowHook(parseStream(ss.out), sl, readNavLog(P.navLog(o)), fp.cli_version);
     // 6. The deny check, on the probe page.
@@ -5061,7 +5161,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     let fragment_strip: FragmentLine;
     let glog: Decision[] = [];
     try {
-      gs = await runSession(o, sessionArgv(inst, o, h.settings, FRAGMENT_PROMPT(gc)), Math.min(limit, 3 * 60_000), sessionEnv(o, [`${gc.url}${FRAGMENT_PATH}`], false, { fragmentStrip: true }));
+      gs = await runSession(o, sessionArgv(inst, o, h.settings, FRAGMENT_PROMPT(gc)), Math.min(limit, 3 * 60_000), sessionEnv(o, [fragmentPageUrl(gc)], false, { fragmentStrip: true }));
       // The page's own report can trail its load by a moment: wait for it (up to 2 seconds) before the server closes.
       for (let t = 0; t < 2_000 && !gc.opened().length; t += 50) await new Promise((ok) => setTimeout(ok, 50));
       const gst = parseStream(gs.out);
@@ -5074,7 +5174,9 @@ export async function probe(o: Opts): Promise<Evidence> {
     const ac = await startCanary(inst.profile.extension_id, attempt, { markerSha: marker });
     let as: Session;
     try {
-      as = await runSession(o, sessionArgv(inst, o, h.settings, READS_PROMPT(ac)), Math.min(limit, 3 * 60_000), { ...sessionEnv(o, [ac.url]), PCW_HOOK_CAPTURE: P.hookCapture(o) });
+      const rb = bindProbe(P.probeMarks(o), "reading_tools", { PCW_HOOK_CAPTURE: fwd(P.hookCapture(o)) });
+      try { as = await runSession(o, sessionArgv(inst, o, h.settings, READS_PROMPT(ac)), Math.min(limit, 3 * 60_000), { ...sessionEnv(o, [ac.url]), ...rb.env }); }
+      finally { rb.end(); }
     } finally { await ac.close(); }
     const ast = parseStream(as.out);
     keepTabs(o, ast);
@@ -5285,8 +5387,14 @@ export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}):
     { step: gate, hint: PROBE_GATE_HINT[gate], ...(gate === "redirect_read" ? { session_ended: false, secret_withheld: ev.redirect_read?.secret_withheld === true } : {}) });
   // The worker the probe ran is the worker confirming.
   const wn = workerNow();
-  if (!ev.worker || ev.worker.worker_sha256 !== wn.worker_sha256 || ev.worker.cain_version !== wn.cain_version || ev.worker.policy_version !== wn.policy_version)
+  if (!ev.worker || ev.worker.worker_sha256 !== wn.worker_sha256 || ev.worker.cain_version !== wn.cain_version || ev.worker.policy_version !== wn.policy_version
+    || ev.worker.guard_sha256 !== wn.guard_sha256)
     throw new WorkerError("probe_stale", "the worker changed since the probe (a new release): run the probe again");
+  // A real run's hooks left less than HOOK_GAP_MARGIN_MS of the timeout (hookRunsOf) since this probe:
+  // no renewal until a new probe measures the margin again.
+  const low = readLowMargin(o);
+  if (low && Date.parse(low.at) >= Date.parse(ev.at))
+    throw new WorkerError("hook_margin_low", `a run on ${low.at} saw its hooks start so late that only ${low.margin_ms} ms of the ${HOOK_TIMEOUT_S} second timeout was left past the budget (at least ${HOOK_GAP_MARGIN_MS} needed): see the hook_margin_low row in Troubleshooting, then run the probe again`);
   // The stated boundary, accepted once, with the version of its text recorded.
   const boundary = boundaryFor(ev);
   if (opt.acceptBoundary !== true) throw new WorkerError("boundary_not_accepted",
@@ -5408,6 +5516,60 @@ export function signAllowlistFile(entriesFile: string, keyFile: string, passphra
   return text;
 }
 
+// ---- The hook's probe-only behaviours, bound to the probe (0.12.0, nineteenth round) ------------
+// The hook has behaviours only the probe may use: the timing line (PCW_HOOK_TIMING), the payload
+// capture (PCW_HOOK_CAPTURE), the hold to the whole budget (PCW_HOOK_FULL_BUDGET) and the stall past
+// the CLI's timeout (PCW_HOOK_STALL_MS). Each works only in a session the probe bound to one of its
+// steps: PCW_SESSION_KIND "probe", PCW_PROBE_STEP one of PROBE_STEPS (which names the behaviours
+// that step may use), PCW_PROBE_TOKEN equal to the session's own PCW_SESSION_TOKEN, and the marker
+// file PCW_PROBE_DIR/<token>.probe holding exactly "<token> <step>", written by the probe for that
+// session and deleted after it. Anything else that looks like probe mode (one of those variables, a
+// file left in the probe folder, a stale marker of another session, a behaviour the step doesn't
+// name) in a session that isn't so bound, and in any session started as a run whatever it holds,
+// makes the hook deny at once (probe_marker): it never stalls, holds or captures.
+export const PROBE_STEPS: Record<string, ("timing" | "capture" | "full" | "stall")[]> = {
+  hook_timing_held: ["timing", "full", "capture"], hook_timing_gap: ["timing", "capture"], hook_timing_overrun: ["timing", "stall"],
+  slow_hook: ["stall"], reading_tools: ["capture"],
+};
+const PROBE_VARS = ["PCW_HOOK_TIMING", "PCW_HOOK_CAPTURE", "PCW_HOOK_FULL_BUDGET", "PCW_HOOK_STALL_MS", "PCW_PROBE_STEP", "PCW_PROBE_TOKEN"];
+export interface ProbeMode { deny: boolean; timing: string | null; capture: string | null; full: boolean; stall: number }
+const NO_PROBE: ProbeMode = { deny: false, timing: null, capture: null, full: false, stall: 0 };
+export function probeMode(env: Record<string, string | undefined>): ProbeMode {
+  const dir = env.PCW_PROBE_DIR;
+  let files: string[] = [];
+  try { files = dir ? readdirSync(dir) : []; } catch { files = []; }
+  const vars = PROBE_VARS.filter((k) => env[k] !== undefined && env[k] !== "");
+  if (!vars.length && !files.length) return NO_PROBE;
+  const deny = { ...NO_PROBE, deny: true };
+  if (env.PCW_SESSION_KIND !== "probe") return deny;
+  const step = env.PCW_PROBE_STEP ?? "", token = env.PCW_PROBE_TOKEN ?? "";
+  const may = PROBE_STEPS[step];
+  if (!may || !/^[0-9a-f]{32}$/.test(token) || token !== env.PCW_SESSION_TOKEN || !dir) return deny;
+  if (files.length !== 1 || files[0] !== `${token}.probe`) return deny;
+  let held = "";
+  try { held = readFileSync(join(dir, files[0]), "utf8"); } catch { return deny; }
+  if (held !== `${token} ${step}\n`) return deny;
+  const want = { timing: !!env.PCW_HOOK_TIMING, capture: !!env.PCW_HOOK_CAPTURE, full: env.PCW_HOOK_FULL_BUDGET !== undefined, stall: env.PCW_HOOK_STALL_MS !== undefined };
+  if ((Object.keys(want) as (keyof typeof want)[]).some((k) => want[k] && !may.includes(k))) return deny;
+  if (want.full && env.PCW_HOOK_FULL_BUDGET !== "1") return deny;
+  const stall = want.stall ? Math.min(parseInt(env.PCW_HOOK_STALL_MS ?? "", 10) || 0, 120_000) : 0;
+  return { deny: false, timing: env.PCW_HOOK_TIMING || null, capture: env.PCW_HOOK_CAPTURE || null, full: want.full, stall };
+}
+// One probe session bound to a step: its token, its marker file and the variables the hook checks.
+// The returned end() deletes the marker; the probe calls it once the session is over.
+export function bindProbe(dir: string, step: keyof typeof PROBE_STEPS, extra: Record<string, string> = {}): { env: Record<string, string>; end: () => void } {
+  const token = randomBytes(16).toString("hex");
+  mkdirSync(dir, { recursive: true });
+  for (const f of readdirSync(dir)) rmSync(join(dir, f), { force: true, recursive: true });
+  writeFileSync(join(dir, `${token}.probe`), `${token} ${step}\n`);
+  return { env: { ...extra, PCW_SESSION_KIND: "probe", PCW_PROBE_STEP: step, PCW_PROBE_TOKEN: token, PCW_SESSION_TOKEN: token, PCW_PROBE_DIR: fwd(dir) },
+    end: () => { try { for (const f of readdirSync(dir)) rmSync(join(dir, f), { force: true, recursive: true }); } catch { /* none */ } } };
+}
+// A hook input kept for the payload_replay step, under its cap.
+export function captureInput(dir: string, kind: "pre" | "post", text: string): void {
+  try { if (readdirSync(dir).length < CAPTURE_MAX) writeFileSync(join(dir, `${kind}-${Date.now()}-${process.pid}-${randomBytes(3).toString("hex")}.json`), text); } catch { /* never stops the hook */ }
+}
+
 // ---- The command line ---------------------------------------------------------------------------
 function flag(args: string[], name: string, dflt?: string): string | undefined {
   const i = args.indexOf(name);
@@ -5423,17 +5585,24 @@ if (isMain && process.argv[2] === "nav-guard") {
   // that isn't a logged allow is a deny: exit 2 with the decision on stdout.
   const t0 = processStart();
   let callId: string | null = null, readAt: number | null = null;
-  // The probe's hook_timing step (PCW_HOOK_TIMING, set only by the probe's own sessions): one line
-  // per hook run, with the process's start, the call it answered and when it answered.
+  // The probe-only behaviours, bound to the probe's own session and step (probeMode).
+  const probe = probeMode(process.env);
+  // The probe's hook_timing step: one line per hook run, with the process's start, the call it
+  // answered and when it answered.
   const stamp = (answer: string) => {
-    const f = process.env.PCW_HOOK_TIMING;
+    const f = probe.timing;
     if (f) try { appendFileSync(f, JSON.stringify({ hook: "nav-guard", t0, id: callId, read_at: readAt, answered_at: Date.now(), answer }) + "\n"); } catch { /* never stops the hook */ }
   };
   const refuse = (why: string) => { try { stamp(`deny:${why}`); process.stdout.write(denyJson(why) + "\n"); process.stderr.write(`${DENY_MESSAGE}\n`); } finally { process.exit(2); } };
   // The probe's slowed hook (PCW_HOOK_STALL_MS, set only by the probe's own session): no
   // answer and no decision until well past Claude Code's timeout for it, so the probe sees
   // what the permission layer does alone. It still refuses in the end.
-  const stall = Math.min(parseInt(process.env.PCW_HOOK_STALL_MS ?? "", 10) || 0, 120_000);
+  // Probe mode outside a bound probe session (a run, a leftover marker, a stale variable): deny at once.
+  if (probe.deny) {
+    try { if (process.env.PCW_NAV_LOG) appendFileSync(process.env.PCW_NAV_LOG, JSON.stringify({ id: null, tool: "", url: null, decision: "deny", why: "probe_marker", t0, done_at: Date.now() }) + "\n"); } catch { /* the deny stands */ }
+    refuse("probe_marker");
+  }
+  const stall = probe.stall;
   if (stall > 0) setTimeout(() => refuse("stalled"), stall);
   // The one budget, from the process's start: the hard stop answers at its end, with the deny.
   const budget = hookBudget(process.env, processStart());
@@ -5450,20 +5619,26 @@ if (isMain && process.argv[2] === "nav-guard") {
   const read = () => readRaw().then((t) => {
     readAt = Date.now();
     try { const x = JSON.parse(t)?.tool_use_id; callId = typeof x === "string" ? x.slice(0, 100) : null; } catch { callId = null; }
-    const dir = process.env.PCW_HOOK_CAPTURE;
-    if (dir) try { if (readdirSync(dir).length < CAPTURE_MAX) writeFileSync(join(dir, `pre-${Date.now()}-${process.pid}.json`), t); } catch { /* never stops the hook */ }
+    if (probe.capture) captureInput(probe.capture, "pre", t);
     return t;
   });
   process.on("uncaughtException", () => refuse("internal_error"));
   // The probe's held hook (PCW_HOOK_FULL_BUDGET, set only by the probe's hook_timing step): it
   // reads its input and decides nothing, so the hard stop answers at the budget's end, with the deny.
-  const full = process.env.PCW_HOOK_FULL_BUDGET === "1";
-  if (!stall && !full) hookMain(process.env, read, (x) => process.stdout.write(x), (x) => process.stderr.write(x), navDecide, dnsResolver, budget)
+  const full = probe.full;
+  if (probe.deny) { /* refused above */ }
+  else if (!stall && !full) hookMain(process.env, read, (x) => process.stdout.write(x), (x) => process.stderr.write(x), navDecide, dnsResolver, budget)
     .then((code) => { clearTimeout(hard); stamp(code === 0 ? "allow" : "deny"); process.exit(code); }, () => refuse("internal_error"));
   else if (full) read().catch(() => { /* the hard stop answers */ });
 } else if (isMain && process.argv[2] === "read-guard") {
   // The read-time drift check (PostToolUse). Every way out that isn't a logged allow replaces the answer.
   const block = () => { try { writeAbort(process.env.PCW_ABORT_FILE, "read_unplaced", null); process.stdout.write(readBlockJson("read_unplaced") + "\n"); } finally { process.exit(0); } };
+  // Probe mode outside a bound probe session: the read is refused at once, never captured.
+  const probe = probeMode(process.env);
+  if (probe.deny) {
+    try { if (process.env.PCW_NAV_LOG) appendFileSync(process.env.PCW_NAV_LOG, JSON.stringify({ id: null, tool: "", url: null, decision: "deny", why: "read_unplaced", phase: "post", reason: "probe_marker" }) + "\n"); } catch { /* the block stands */ }
+    block();
+  }
   // The one budget, from the process's start: the hard stop answers at its end, with the block.
   const budget = hookBudget(process.env, processStart());
   const hard = setTimeout(block, Math.max(0, budget.left() + Math.min(HOOK_REPLY_MS, Math.floor(budget.total / 5)) - 50));
@@ -5473,6 +5648,11 @@ if (isMain && process.argv[2] === "nav-guard") {
     process.stdin.on("data", (d) => { text += d; if (text.length > 4_000_000) fail(new Error("too_big")); });
     process.stdin.on("end", () => ok(text));
     process.stdin.on("error", fail);
+  }).then((t) => {
+    // In the probe's capture sessions alone (bound to the probe, probeMode): the reading tool's
+    // answer as it came, for the payload_replay step, under the same cap.
+    if (probe.capture) captureInput(probe.capture, "post", t);
+    return t;
   });
   process.on("uncaughtException", block);
   readGuardMain(process.env, read, (x) => process.stdout.write(x), budget).then((code) => { clearTimeout(hard); process.exit(code); }, block);

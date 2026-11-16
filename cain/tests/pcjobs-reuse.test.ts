@@ -7,13 +7,13 @@
 // finalised after, settled from the queue at the start of each round).
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { check, fsyncDir, PUSH_TRIES, readJobs, reconcileReuse, recordReuse, ReuseUnsettled, reuseAnswer, reuseLedger, round, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
-import { askValues } from "../rootfs/opt/cain/link/core";
+import { askValues, PC_NOTICES } from "../rootfs/opt/cain/link/core";
 
 const VALUE = "****plnt";
 const ASKED = `Check the account the PC reported, "${VALUE}", in a new job?`;
@@ -294,238 +294,100 @@ describe("the keeper asks the link over its local API", () => {
   }, 30_000);
 });
 
-describe("seventeenth review: the used-tap store is written before the push, finalised after, and settled at start", () => {
-  const WIN = process.platform === "win32";
-  const git = (args: string[], cwd: string) => { const p = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" }); if (p.exitCode !== 0) throw new Error(p.stderr.toString()); return p.stdout.toString(); };
-  // A real queue: a bare repository, the keeper's copy, its request folder and its used-tap file.
-  const world = () => {
-    const root = mkdtempSync(join(tmpdir(), "pcjobs-tap-"));
-    const remote = join(root, "pc-jobs.git");
-    git(["init", "--quiet", "--bare", "-b", "main", remote], root);
-    const used = join(root, "state", "reuse-used.jsonl");
-    const cfg = (copy: string, over: Partial<Config> = {}): Config => ({ remote, dir: join(root, copy), queue: join(root, "queue"), outcomes: join(root, "outcomes"),
-      branch: "main", pub: "", now: () => T0, used, verifyReuse: yes, pushWaitMs: 10, ...over });
-    mkdirSync(join(root, "queue"), { recursive: true });
-    let n = 0;
-    const request = (job: any) => { const rid = `pc-${String(++n).padStart(4, "0")}`; writeFileSync(join(root, "queue", `${rid}.json`), ask(job)); return rid; };
-    const outcome = (rid: string) => { try { return JSON.parse(readFileSync(join(root, "outcomes", `${rid}.json`), "utf8")); } catch { return null; } };
-    const remoteJobs = () => { const c = join(root, `look-${++n}`); git(["clone", "--quiet", remote, c], root); return readJobs(c); };
-    return { root, remote, used, cfg, request, outcome, remoteJobs };
+// ---- The keeper's used-tap store, against a real git remote ------------------------------
+const WIN = process.platform === "win32";
+const git = (args: string[], cwd: string) => { const p = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, stdout: "pipe", stderr: "pipe" }); if (p.exitCode !== 0) throw new Error(p.stderr.toString()); return p.stdout.toString(); };
+// A real queue: a bare repository, the keeper's copies, its request folder, its used-tap file and the notices it sent.
+const world = () => {
+  const root = mkdtempSync(join(tmpdir(), "pcjobs-tap-"));
+  const remote = join(root, "pc-jobs.git");
+  git(["init", "--quiet", "--bare", "-b", "main", remote], root);
+  const used = join(root, "state", "reuse-used.jsonl");
+  const told: string[] = [];
+  const cfg = (copy: string, over: Partial<Config> = {}): Config => ({ remote, dir: join(root, copy), queue: join(root, "queue"), outcomes: join(root, "outcomes"),
+    branch: "main", pub: "", now: () => T0, used, verifyReuse: yes, pushWaitMs: 10, notify: (c) => { told.push(c); return true; }, ...over });
+  mkdirSync(join(root, "queue"), { recursive: true });
+  let n = 0;
+  const request = (job: any) => { const rid = `pc-${String(++n).padStart(4, "0")}`; writeFileSync(join(root, "queue", `${rid}.json`), ask(job)); return rid; };
+  const outcome = (rid: string) => { try { return JSON.parse(readFileSync(join(root, "outcomes", `${rid}.json`), "utf8")); } catch { return null; } };
+  const clone = () => { const c = join(root, `look-${++n}`); git(["clone", "--quiet", remote, c], root); return c; };
+  const lines = () => readFileSync(used, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  // The settled states written (pending lines, push records and answers left out).
+  const settles = () => lines().filter((l) => l.state !== "pending").map((l) => l.settled ? `${l.state}:${l.settled}` : l.state);
+  const hook = (body: string) => { const h = join(remote, "hooks", "pre-receive"); writeFileSync(h, `#!/bin/sh\n${body}\n`); chmodSync(h, 0o755); return h; };
+  const first = () => { request({ ...READ }); expect(round(cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 }); };   // the branch exists first
+  // The keeper killed after the push went through, before the answer was written (so only the commit records it).
+  const killedMidPush = () => {
+    first();
+    const rid = request({ ...READ, owner_reuse: reuse() });
+    expect(round(cfg("pi-1", { onPushAnswer: () => { throw new Error("killed"); } })).ok).toBe(false);
+    const l = reuseLedger({ used }).get(MSG)!;
+    expect(l).toMatchObject({ state: "pending", rid, attempts: [{ commit: expect.stringMatching(/^[0-9a-f]{40}$/) }] });
+    expect(l.attempts[0].answer).toBeUndefined();
+    return { rid, job: l.job, commit: l.commit! };
   };
+  // The worker side: a fresh, unrelated history pushed over the branch (a rewrite).
+  const rewrite = (files: Record<string, string>) => {
+    const pc = clone();
+    git(["checkout", "--quiet", "--orphan", "fresh"], pc);
+    git(["rm", "-r", "--quiet", "--cached", "."], pc);
+    for (const d of ["jobs", "results", "worker"]) rmSync(join(pc, d), { recursive: true, force: true });
+    writeFileSync(join(pc, ".gitattributes"), "* text eol=lf\n");
+    for (const [f, t] of Object.entries(files)) { mkdirSync(join(pc, f, ".."), { recursive: true }); writeFileSync(join(pc, f), t); }
+    git(["add", "-A"], pc);
+    git(["commit", "--quiet", "-m", "rewritten"], pc);
+    git(["push", "--quiet", "--force", "origin", "HEAD:main"], pc);
+  };
+  return { root, remote, used, told, cfg, request, outcome, clone, lines, settles, hook, first, killedMidPush, rewrite };
+};
+// A replay of the same tap, for another job: refused, by the store alone.
+const replayRefused = (w: ReturnType<typeof world>, job: string) => {
+  expect(check(w.cfg("pi-x"), ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his already answered for ${job}; ask him again for this job` });
+};
 
+describe("the used-tap store: written before every push attempt, each answer after, settled at start", () => {
   test("the keeper killed between the push and the finalise: on restart the tap is settled from the queue, and replaying it is refused", () => {
     const w = world();
     const rid = w.request({ ...READ, owner_reuse: reuse() });
-    // The push goes through; the keeper dies before it can finalise the tap.
     expect(round(w.cfg("pi-1", { afterPush: () => { throw new Error("killed"); } })).ok).toBe(false);
-    const [pushed] = w.remoteJobs();
+    const [pushed] = readJobs(w.clone());
     expect(pushed.owner_reuse?.message_id).toBe(MSG);
-    // On disk before the push: pending, with its job and request.
-    expect(reuseLedger({ used: w.used }).get(MSG)).toEqual({ m: MSG, job: pushed.id, state: "pending", rid, commit: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    // On disk: pending, with its job, request, the commit pushed and the remote's answer.
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ m: MSG, job: pushed.id, state: "pending", rid, attempts: [{ commit: expect.stringMatching(/^[0-9a-f]{40}$/), answer: "ok" }] });
+    expect(w.lines().map((l) => l.ev)).toEqual(["push", "answer"]);
     expect(usedReuse({ used: w.used }).get(MSG)).toBe(pushed.id);                 // a pending tap is spent already
-    expect(w.outcome(rid)).toBeNull();                                            // its request never heard back
-    // Restart: a fresh copy of the queue. The round settles the pending tap from the queue first: finalised, and the request told.
+    expect(w.outcome(rid)).toBeNull();
     const again = w.cfg("pi-2");
     expect(round(again)).toMatchObject({ ok: true });
     expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job: pushed.id, state: "final" });
     expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: pushed.id });
-    expect(existsSync(join(w.root, "queue", `${rid}.json`))).toBe(false);
-    // Replay the tap for another job: refused, by the queue and by the store alone.
-    const replay = w.request({ ...READ, start_url: "https://example.com/account/settings", owner_reuse: reuse() });
+    const replay = w.request({ ...READ, owner_reuse: reuse() });
     expect(round(again)).toMatchObject({ ok: true, refused: 1, queued: 0 });
     expect(w.outcome(replay)).toEqual({ request: replay, state: "refused", reason: `owner_reuse refused: that tap of his already answered for ${pushed.id}; ask him again for this job` });
-    expect(check(again, ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his already answered for ${pushed.id}; ask him again for this job` });
-    expect(w.remoteJobs().length).toBe(1);
+    replayRefused(w, pushed.id);
+    expect(readJobs(w.clone()).length).toBe(1);
   });
 
-  test("a push that never went through: the pending tap is rolled back at the next round, and the waiting request is queued afresh", () => {
-    if (WIN) return;                                                               // the refusing hook below is a shell script
-    const w = world();
-    // The first round makes the branch, so the hook below only refuses the next push.
-    w.request({ ...READ });
-    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
-    const hook = join(w.remote, "hooks", "pre-receive");
-    writeFileSync(hook, "#!/bin/sh\nexit 1\n"); chmodSync(hook, 0o755);
-    const rid = w.request({ ...READ, owner_reuse: reuse() });
-    expect(round(w.cfg("pi-1")).ok).toBe(false);
-    const pending = reuseLedger({ used: w.used }).get(MSG)!;
-    expect(pending).toMatchObject({ state: "pending", rid });
-    expect(w.remoteJobs().some((j) => j.id === pending.job)).toBe(false);
-    // GitHub takes pushes again: the next round rolls the tap back first, then checks the request afresh.
-    rmSync(hook);
-    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
-    const now = reuseLedger({ used: w.used }).get(MSG)!;
-    expect(now.state).toBe("final");
-    expect(now.job).not.toBe(pending.job);
-    expect(readFileSync(w.used, "utf8").trim().split("\n").map((l) => JSON.parse(l).state)).toEqual(["pending", "rolled_back", "pending", "final"]);
-    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: now.job });
-    expect(w.remoteJobs().filter((j) => j.owner_reuse?.message_id === MSG).map((j) => j.id)).toEqual([now.job]);
-  });
-
-  test("a tap that can't be written before the push stops the round: nothing is pushed", () => {
-    if (WIN) return;
-    const w = world();
-    w.request({ ...READ });
-    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
-    mkdirSync(w.used, { recursive: true });                                       // the file can't be opened for appending
-    const rid = w.request({ ...READ, owner_reuse: reuse() });
-    expect(round(w.cfg("pi-1")).ok).toBe(false);
-    expect(w.remoteJobs().some((j) => j.owner_reuse)).toBe(false);
-    expect(w.outcome(rid)).toBeNull();
-  });
-
-  test("lines from before this round (no state) are final; a rolled-back tap is free again; a pending tap with no proof either way stays spent", () => {
+  test("lines without a state are final; a rolled-back tap is free again", () => {
     const { cfg } = queue();
     mkdirSync(join(cfg.dir, "state"), { recursive: true });
     writeFileSync(cfg.used!, JSON.stringify({ m: MSG, job: "j-20261115-aaaaaa" }) + "\n");
     expect(reuseLedger(cfg).get(MSG)).toMatchObject({ state: "final" });
-    // Pending, with no commit and no fetched branch: nothing proves the push never landed, so it can't roll back.
-    recordReuse(cfg, "123456789012345678", "j-20261115-bbbbbb", "pending");
-    expect(() => reconcileReuse(cfg, [])).toThrow(ReuseUnsettled);
+    recordReuse(cfg, "123456789012345678", "j-20261115-bbbbbb", "pending", "pc-0001", "b".repeat(40));
     expect(usedReuse(cfg).get("123456789012345678")).toBe("j-20261115-bbbbbb");
     recordReuse(cfg, "123456789012345678", "j-20261115-bbbbbb", "rolled_back");
     expect(usedReuse(cfg).has("123456789012345678")).toBe(false);
     expect(usedReuse(cfg).get(MSG)).toBe("j-20261115-aaaaaa");
   });
-});
 
-describe("eighteenth review: a pending tap rolls back only on proof its push never reached GitHub, after a bounded retry", () => {
-  const WIN = process.platform === "win32";
-  const git = (args: string[], cwd: string) => { const p = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd, stdout: "pipe", stderr: "pipe" }); if (p.exitCode !== 0) throw new Error(p.stderr.toString()); return p.stdout.toString(); };
-  const world = () => {
-    const root = mkdtempSync(join(tmpdir(), "pcjobs-tap18-"));
-    const remote = join(root, "pc-jobs.git");
-    git(["init", "--quiet", "--bare", "-b", "main", remote], root);
-    const used = join(root, "state", "reuse-used.jsonl");
-    const cfg = (copy: string, over: Partial<Config> = {}): Config => ({ remote, dir: join(root, copy), queue: join(root, "queue"), outcomes: join(root, "outcomes"),
-      branch: "main", pub: "", now: () => T0, used, verifyReuse: yes, pushWaitMs: 10, ...over });
-    mkdirSync(join(root, "queue"), { recursive: true });
-    let n = 0;
-    const request = (job: any) => { const rid = `pc-${String(++n).padStart(4, "0")}`; writeFileSync(join(root, "queue", `${rid}.json`), ask(job)); return rid; };
-    const outcome = (rid: string) => { try { return JSON.parse(readFileSync(join(root, "outcomes", `${rid}.json`), "utf8")); } catch { return null; } };
-    const clone = () => { const c = join(root, `look-${++n}`); git(["clone", "--quiet", remote, c], root); return c; };
-    const states = () => readFileSync(used, "utf8").trim().split("\n").map((l) => JSON.parse(l).state);
-    // The keeper killed between the push and the finalise: the tap is pending, its push landed.
-    const killedAfterPush = () => {
-      w0.request({ ...READ });                                                   // the branch exists first
-      expect(round(w0.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
-      const rid = w0.request({ ...READ, owner_reuse: reuse() });
-      expect(round(w0.cfg("pi-1", { afterPush: () => { throw new Error("killed"); } })).ok).toBe(false);
-      const l = reuseLedger({ used })!.get(MSG)!;
-      expect(l).toMatchObject({ state: "pending", rid });
-      expect(l.commit).toMatch(/^[0-9a-f]{40}$/);
-      return { rid, job: l.job, commit: l.commit! };
-    };
-    const w0 = { root, remote, used, cfg, request, outcome, clone, states, killedAfterPush };
-    return w0;
-  };
-  // A replay of the same tap, for another job: refused, by the store alone.
-  const replayRefused = (w: ReturnType<typeof world>, job: string) => {
-    expect(check(w.cfg("pi-x"), ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his already answered for ${job}; ask him again for this job` });
-  };
-
-  test("(a) the worker consumed the job (took it out of the jobs folder, kept a record naming it), then the keeper restarts: the tap stays spent", () => {
-    const w = world();
-    const { job } = w.killedAfterPush();
-    const pc = w.clone();
-    git(["rm", "--quiet", `jobs/${job}.json`], pc);
-    mkdirSync(join(pc, "worker"), { recursive: true });
-    writeFileSync(join(pc, "worker", "last-run.json"), JSON.stringify({ job, code: "ok" }) + "\n");
-    git(["add", "worker/last-run.json"], pc);
-    git(["commit", "--quiet", "-m", "worker"], pc);
-    git(["push", "--quiet", "origin", "HEAD:main"], pc);
-    expect(round(w.cfg("pi-2")).ok).toBe(true);                                // a fresh copy: the restart
-    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "final" });
-    expect(w.states()).not.toContain("rolled_back");
-    replayRefused(w, job);
-  });
-
-  test("(b) the job moved into a report, the branch rewritten without the keeper's commit, then a restart: the report names it, so the tap stays spent", () => {
-    const w = world();
-    const { job, commit } = w.killedAfterPush();
-    const pc = w.clone();
-    git(["checkout", "--quiet", "--orphan", "fresh"], pc);
-    git(["rm", "-r", "--quiet", "--cached", "."], pc);
-    rmSync(join(pc, "jobs"), { recursive: true, force: true });
-    mkdirSync(join(pc, "results"), { recursive: true });
-    writeFileSync(join(pc, "results", "moved.json"), JSON.stringify({ id: job, status: "done" }) + "\n");
-    git(["add", "results/moved.json"], pc);
-    git(["commit", "--quiet", "-m", "moved"], pc);
-    git(["push", "--quiet", "--force", "origin", "HEAD:main"], pc);
-    const c2 = w.cfg("pi-2");
-    expect(round(c2).ok).toBe(true);
-    expect(Bun.spawnSync(["git", "merge-base", "--is-ancestor", commit, "origin/main"], { cwd: c2.dir }).exitCode).not.toBe(0);   // the commit is gone from the branch
-    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "final" });
-    expect(w.states()).not.toContain("rolled_back");
-    replayRefused(w, job);
-  });
-
-  test("(c) a sync that fails, then a restart: the round stops and the tap stays pending, so spent; once GitHub answers it settles", () => {
-    const w = world();
-    const { job, rid } = w.killedAfterPush();
-    const away = `${w.remote}.away`;
-    renameSync(w.remote, away);                                                   // GitHub unreachable
-    expect(round(w.cfg("pi-2")).ok).toBe(false);
-    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "pending" });
-    expect(w.states()).toEqual(["pending"]);
-    replayRefused(w, job);
-    expect(w.outcome(rid)).toBeNull();
-    renameSync(away, w.remote);
-    expect(round(w.cfg("pi-3")).ok).toBe(true);
-    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "final" });
-    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: job });
-  });
-
-  test("(d) a push that provably never landed (its commit not in the branch, nothing naming the job or request): rolled back once, and the request is checked afresh", () => {
-    if (WIN) return;
-    const w = world();
-    w.request({ ...READ });
-    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
-    const count = join(w.root, "pushes");
-    const hook = join(w.remote, "hooks", "pre-receive");
-    writeFileSync(hook, `#!/bin/sh\necho x >> "${count}"\nexit 1\n`); chmodSync(hook, 0o755);
-    const rid = w.request({ ...READ, owner_reuse: reuse() });
-    expect(round(w.cfg("pi-1")).ok).toBe(false);
-    expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(PUSH_TRIES);     // tried PUSH_TRIES times, then stopped
-    const pending = reuseLedger({ used: w.used }).get(MSG)!;
-    expect(pending).toMatchObject({ state: "pending", rid });
-    rmSync(hook);
-    // A restart on a fresh copy: the branch, fetched whole, lacks the commit, and nothing names the job: rolled back, then queued afresh.
-    expect(round(w.cfg("pi-2"))).toMatchObject({ ok: true, queued: 1 });
-    const now = reuseLedger({ used: w.used }).get(MSG)!;
-    expect(now).toMatchObject({ state: "final" });
-    expect(now.job).not.toBe(pending.job);
-    expect(w.states()).toEqual(["pending", "rolled_back", "pending", "final"]);
-    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: now.job });
-    expect(readJobs(w.clone()).filter((j) => j.owner_reuse?.message_id === MSG).map((j) => j.id)).toEqual([now.job]);
-    // Another round rolls back nothing more.
-    expect(round(w.cfg("pi-2")).ok).toBe(true);
-    expect(w.states().filter((x) => x === "rolled_back").length).toBe(1);
-  });
-
-  test("(e) the bounded retry: a push refused once goes through on the second try, and the tap is final", () => {
-    if (WIN) return;
-    const w = world();
-    w.request({ ...READ });
-    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
-    const count = join(w.root, "pushes");
-    const hook = join(w.remote, "hooks", "pre-receive");
-    writeFileSync(hook, `#!/bin/sh\necho x >> "${count}"\n[ "$(wc -l < "${count}")" -ge 2 ] || exit 1\nexit 0\n`); chmodSync(hook, 0o755);
-    const rid = w.request({ ...READ, owner_reuse: reuse() });
-    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
-    expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(2);
-    expect(w.states()).toEqual(["pending", "final"]);
-    const l = reuseLedger({ used: w.used }).get(MSG)!;
-    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: l.job });
-  });
-
-  test("a pending tap with the queue's branch gone, or no commit recorded, can't be settled: the round stops, the tap stays spent", () => {
-    const w = world();
-    w.killedAfterPush();
-    rmSync(w.remote, { recursive: true, force: true });
-    git(["init", "--quiet", "--bare", "-b", "main", w.remote], w.root);       // an empty queue: no branch to fetch
-    expect(round(w.cfg("pi-2")).ok).toBe(false);
-    expect(w.states()).toEqual(["pending"]);
+  test("the remote's answer is read as ok, refused (its words kept) or unknown", () => {
+    expect(pushAnswer(0, "", false)).toMatchObject({ answer: "ok" });
+    expect(pushAnswer(1, "!\tHEAD:refs/heads/main\t[remote rejected] (pre-receive hook declined)", false)).toMatchObject({ answer: "refused", nonFastForward: false, said: expect.stringContaining("pre-receive hook declined") });
+    expect(pushAnswer(1, "!\tHEAD:refs/heads/main\t[rejected] (fetch first)", false)).toMatchObject({ answer: "refused", nonFastForward: true });
+    expect(pushAnswer(1, "! [rejected] HEAD -> main (non-fast-forward)", false)).toMatchObject({ answer: "refused", nonFastForward: true });
+    expect(pushAnswer(null, "", true)).toMatchObject({ answer: "unknown", said: "no answer in time" });
+    expect(pushAnswer(128, "fatal: unable to access 'https://github.com/x/y.git/': Connection reset by peer", false)).toMatchObject({ answer: "unknown" });
+    expect(pushAnswer(1, "something else entirely", false)).toMatchObject({ answer: "unknown" });
   });
 
   test("the store's folder is flushed to disk when the store is made (and every folder made for it); a folder that can't be flushed throws", () => {
@@ -535,5 +397,232 @@ describe("eighteenth review: a pending tap rolls back only on proof its push nev
     expect(reuseLedger({ used }).get(MSG)).toMatchObject({ state: "pending", commit: "a".repeat(40) });
     if (!WIN) expect(() => fsyncDir(join(root, "missing"))).toThrow();
     expect(() => fsyncDir(join(root, "missing"), "win32")).not.toThrow();      // Windows can't open a folder to flush it
+  });
+});
+
+describe("nineteenth review: a tap rolls back only on a record that every push of it was refused; absence of evidence keeps it spent", () => {
+  test("a job accepted and consumed, then the commit and every record rewritten away, then a restart: spent, never rolled back", () => {
+    const w = world();
+    const { job, rid } = w.killedMidPush();
+    // The worker took the job and wrote its record; then the branch was rewritten without any of it.
+    w.rewrite({ "worker/heartbeat.json": "{}\n" });
+    expect(round(w.cfg("pi-2")).ok).toBe(true);
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "final", settled: "spent" });
+    expect(w.settles()).toEqual(["final:spent"]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` });
+    replayRefused(w, job);
+    expect(readJobs(w.clone()).some((j) => j.owner_reuse)).toBe(false);          // nothing queued a second time
+  });
+
+  test("the report pruned before the restart: spent", () => {
+    const w = world();
+    const { job } = w.killedMidPush();
+    // The worker moved the job into a report, then the report was pruned and the history squashed.
+    const pc = w.clone();
+    git(["rm", "--quiet", `jobs/${job}.json`], pc);
+    mkdirSync(join(pc, "results"), { recursive: true });
+    writeFileSync(join(pc, "results", `${job}.json`), JSON.stringify({ id: job, status: "done" }) + "\n");
+    git(["add", "-A"], pc); git(["commit", "--quiet", "-m", "report"], pc); git(["push", "--quiet", "origin", "HEAD:main"], pc);
+    w.rewrite({});
+    expect(round(w.cfg("pi-2")).ok).toBe(true);
+    expect(w.settles()).toEqual(["final:spent"]);
+    replayRefused(w, job);
+  });
+
+  test("a non-fast-forward refusal, then a rebased push that lands, then a restart: landed (final) on the rebased commit alone", () => {
+    const w = world();
+    w.first();
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    let n = 0;
+    const cfg = w.cfg("pi-1", {
+      // Before the keeper's first push, the worker pushes a commit of its own: the keeper's is now behind.
+      beforePush: () => { if (n++ === 0) { const pc = w.clone(); mkdirSync(join(pc, "worker"), { recursive: true }); writeFileSync(join(pc, "worker", "heartbeat.json"), "{}\n"); git(["add", "-A"], pc); git(["commit", "--quiet", "-m", "beat"], pc); git(["push", "--quiet", "origin", "HEAD:main"], pc); } },
+      // Killed after the second (rebased) push went through, before its answer was written.
+      onPushAnswer: () => { if (n === 2) throw new Error("killed"); },
+    });
+    expect(round(cfg).ok).toBe(false);
+    const l = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(l.attempts.length).toBe(2);
+    expect(l.attempts[0]).toMatchObject({ answer: "refused", said: expect.stringMatching(/fetch first|non-fast-forward|rejected/) });
+    expect(l.attempts[1].answer).toBeUndefined();
+    expect(l.attempts[1].commit).not.toBe(l.attempts[0].commit);                 // the rebased commit, recorded before its push
+    // The worker consumes the job: its file goes, so only the rebased commit in the branch shows it landed.
+    const pc = w.clone();
+    git(["rm", "--quiet", `jobs/${l.job}.json`], pc); git(["commit", "--quiet", "-m", "took it"], pc); git(["push", "--quiet", "origin", "HEAD:main"], pc);
+    expect(round(w.cfg("pi-2")).ok).toBe(true);
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job: l.job, state: "final" });
+    expect(w.settles()).toEqual(["final"]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: l.job });
+  });
+
+  test("three recorded refusals, then a restart: rolled back exactly once, the owner told once, a replay meanwhile refused as pending", () => {
+    if (WIN) return;                                                               // the refusing hook is a shell script
+    const w = world();
+    w.first();
+    const count = join(w.root, "pushes");
+    const h = w.hook(`echo x >> "${count}"\nexit 1`);
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    expect(round(w.cfg("pi-1")).ok).toBe(false);
+    expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(PUSH_TRIES);
+    const pending = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(pending.attempts.map((a) => a.answer)).toEqual(["refused", "refused", "refused"]);
+    expect(w.told).toEqual(["reuse_push_refused"]);
+    // A replay meanwhile: refused with the same pending status.
+    expect(check(w.cfg("pi-1"), ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his answered for ${pending.job} and is ${PENDING_STATUS}` });
+    rmSync(h);
+    expect(round(w.cfg("pi-2"))).toMatchObject({ ok: true, queued: 1 });
+    const now = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(now).toMatchObject({ state: "final" });
+    expect(now.job).not.toBe(pending.job);
+    expect(w.settles()).toEqual(["rolled_back", "final"]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: now.job });
+    expect(round(w.cfg("pi-2")).ok).toBe(true);
+    expect(w.settles().filter((x) => x === "rolled_back").length).toBe(1);
+    expect(w.told).toEqual(["reuse_push_refused"]);
+  });
+
+  test("one unknown answer among the attempts (a push that timed out): spent, never rolled back", () => {
+    if (WIN) return;
+    const w = world();
+    w.first();
+    const count = join(w.root, "pushes");
+    // The first push hangs past the keeper's time limit; the others are refused.
+    const h = w.hook(`echo x >> "${count}"\n[ "$(wc -l < "${count}")" -ge 2 ] || sleep 3\nexit 1`);
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    expect(round(w.cfg("pi-1", { pushTimeoutMs: 700 })).ok).toBe(false);
+    expect(reuseLedger({ used: w.used }).get(MSG)!.attempts.map((a) => a.answer)).toEqual(["unknown", "refused", "refused"]);
+    expect(w.told).toEqual([]);                                                    // not every try was refused
+    Bun.sleepSync(3_000);
+    rmSync(h);
+    expect(round(w.cfg("pi-2")).ok).toBe(true);
+    expect(w.settles()).toEqual(["final:spent"]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` });
+  }, 20_000);
+
+  test("the bounded retry: a push refused once goes through on the second try, and the tap is final", () => {
+    if (WIN) return;
+    const w = world();
+    w.first();
+    const count = join(w.root, "pushes");
+    w.hook(`echo x >> "${count}"\n[ "$(wc -l < "${count}")" -ge 2 ] || exit 1\nexit 0`);
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
+    expect(w.settles()).toEqual(["final"]);
+    const l = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(l.attempts.map((a) => a.answer)).toEqual(["refused", "ok"]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: l.job });
+  });
+
+  test("a sync that fails: the round stops and the tap stays pending; once GitHub answers it settles", () => {
+    const w = world();
+    const { job, rid } = w.killedMidPush();
+    const away = `${w.remote}.away`;
+    renameSync(w.remote, away);
+    expect(round(w.cfg("pi-2")).ok).toBe(false);
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "pending" });
+    expect(check(w.cfg("pi-x"), ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his answered for ${job} and is ${PENDING_STATUS}` });
+    renameSync(away, w.remote);
+    expect(round(w.cfg("pi-3")).ok).toBe(true);
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "final" });
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: job });
+  });
+});
+
+describe("nineteenth review: legacy lines and every stop condition are told to the owner once, scoped to the tap where they can be", () => {
+  test("an upgrade from a seventeenth-round store (a pending line without a commit): spent, one migration line, the owner told once", () => {
+    const w = world();
+    w.first();
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    mkdirSync(join(w.root, "state"), { recursive: true });
+    writeFileSync(w.used, JSON.stringify({ m: MSG, job: "j-20261115-old017", state: "pending", rid }) + "\n");
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ legacy: true });
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.lines().slice(1)).toEqual([{ m: MSG, job: "j-20261115-old017", state: "final", rid, settled: "spent", migrated: "round17_pending" }]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` });
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.lines().length).toBe(2);
+    expect(w.told).toEqual(["reuse_migrated"]);
+    replayRefused(w, "j-20261115-old017");
+  });
+
+  test("a shallow copy: only that tap waits (its request too), other requests go on, the owner told once", () => {
+    if (WIN) return;                                                               // a file:// address to a Windows path
+    const w = world();
+    const { job, rid } = w.killedMidPush();
+    // The worker consumes the job over a few commits; the keeper's copy is shallow.
+    const pc = w.clone();
+    git(["rm", "--quiet", `jobs/${job}.json`], pc); git(["commit", "--quiet", "-m", "took it"], pc);
+    for (let i = 0; i < 3; i++) { writeFileSync(join(pc, "beat"), `${i}\n`); git(["add", "-A"], pc); git(["commit", "--quiet", "-m", `beat ${i}`], pc); }
+    git(["push", "--quiet", "origin", "HEAD:main"], pc);
+    git(["clone", "--quiet", "--depth", "1", `file://${w.remote}`, join(w.root, "pi-2")], w.root);
+    const other = w.request({ ...READ, start_url: "https://example.com/account/settings" });
+    expect(round(w.cfg("pi-2"))).toMatchObject({ ok: true, queued: 1 });
+    expect(w.outcome(other)).toMatchObject({ state: "queued" });
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job, state: "pending" });
+    expect(existsSync(join(w.root, "queue", `${rid}.json`))).toBe(true);            // its request waits
+    expect(round(w.cfg("pi-2")).ok).toBe(true);
+    expect(w.told).toEqual(["reuse_shallow"]);
+  });
+
+  test("the queue's branch missing, and an empty remote, with a pending tap: the round stops, the owner told once for each", () => {
+    const w = world();
+    w.killedMidPush();
+    const pc = w.clone();
+    git(["push", "--quiet", "origin", "HEAD:other"], pc);
+    git(["symbolic-ref", "HEAD", "refs/heads/other"], w.remote);
+    git(["push", "--quiet", "origin", "--delete", "main"], pc);
+    expect(round(w.cfg("pi-2")).ok).toBe(false);
+    expect(round(w.cfg("pi-2")).ok).toBe(false);
+    expect(w.told).toEqual(["queue_branch_missing"]);
+    rmSync(w.remote, { recursive: true, force: true });
+    git(["init", "--quiet", "--bare", "-b", "main", w.remote], w.root);
+    expect(round(w.cfg("pi-3")).ok).toBe(false);
+    expect(round(w.cfg("pi-3")).ok).toBe(false);
+    expect(w.told).toEqual(["queue_branch_missing", "queue_empty_pending"]);
+    expect(w.settles()).toEqual([]);                                               // still pending: spent
+  });
+
+  test("an unreadable store: reuse requests wait, other jobs go on, the owner told once; a replay is refused", () => {
+    const w = world();
+    w.first();
+    mkdirSync(w.used, { recursive: true });                                         // the store can't be read as a file
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    const other = w.request({ ...READ });
+    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
+    expect(w.outcome(other)).toMatchObject({ state: "queued" });
+    expect(w.outcome(rid)).toBeNull();
+    expect(existsSync(join(w.root, "queue", `${rid}.json`))).toBe(true);
+    expect(round(w.cfg("pi-1")).ok).toBe(true);
+    expect(w.told).toEqual(["reuse_store_unreadable"]);
+    expect(check(w.cfg("pi-1"), ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: expect.stringContaining("can't read its record of used taps") });
+    expect(readJobs(w.clone()).some((j) => j.owner_reuse)).toBe(false);
+  });
+
+  test("a pending line that can't be settled (a file in the queue copy that can't be read): only that tap waits, the owner told once", () => {
+    if (WIN) return;
+    const { cfg } = queue();
+    const told: string[] = [];
+    const c = { ...cfg, notify: (x: string) => { told.push(x); return true; } } as Config;
+    recordReuse(c, MSG, "j-20261115-cccccc", "pending", "pc-0009", "c".repeat(40));
+    symlinkSync(join(cfg.dir, "nowhere"), join(cfg.dir, "results", "dangling.json"));
+    for (let i = 0; i < 2; i++) expect(reconcileReuse(c, [], "d".repeat(40))).toMatchObject({ unsettled: ["j-20261115-cccccc"] });
+    expect(reuseLedger(c).get(MSG)).toMatchObject({ state: "pending" });
+    expect(told).toEqual(["reuse_unsettled"]);
+  });
+});
+
+describe("nineteenth review: the keeper's lines to the owner are the link's own fixed words", () => {
+  test("each code posts its words through the gate unchanged; an unknown code is refused; every code the keeper sends has words", async () => {
+    const r = rig();
+    for (const [code, text] of Object.entries(PC_NOTICES)) {
+      const a = await r.link.pcNotice(code);
+      expect(a.status).toBe("posted");
+      expect(r.posted[a.message].content).toBe(text);
+      expect(text).not.toMatch(/\u2014|add-on|j-\d{8}/);
+    }
+    await expect(r.link.pcNotice("anything")).rejects.toThrow("not a PC job keeper notice");
+    const src = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
+    const codes = src.match(/export type PcNotice = ([^;]+);/)![1].match(/"([a-z_]+)"/g)!.map((x) => x.slice(1, -1));
+    expect(codes.sort()).toEqual(Object.keys(PC_NOTICES).sort());
   });
 });

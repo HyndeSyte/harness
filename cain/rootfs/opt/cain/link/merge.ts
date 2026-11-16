@@ -23,7 +23,7 @@ const TESTS_YML = ".github/workflows/tests.yml";
 
 export interface Git { code: number; out: string; err: string }
 export interface MergeDeps {
-  api: (path: string) => Promise<{ status: number; body: any }>;     // GET https://api.github.com<path>
+  api: (path: string) => Promise<{ status: number; body: any; headers?: Record<string, string> }>;     // GET https://api.github.com<path> (headers lower-cased, where read)
   git: (args: string[], o?: { ssh?: boolean; timeoutMs?: number }) => Promise<Git>;
   stopped: () => boolean;
   remote?: (repo: string) => string;   // where git fetches and pushes; GitHub over SSH unless a test says
@@ -383,17 +383,42 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
 // Windows attempt it saw. Run by keeper.sh ship-gate (shipgate.ts) against the real repository.
 export type GateDecision = "accept" | "hold" | "refuse";
 export interface GateReport { head: string; at: string; decision: GateDecision; why: string; windows: CheckState["state"] | "not_required" | null;
-  workflow: HeadDetail["workflow"] | null; attempts: { id: number; status: string; conclusion: string | null; run_id?: number; run_attempt?: number; via: string[] }[] }
-// A rate-limit page (HTTP 403 or 429) anywhere in the reading counts as a failed page (0.12.0,
-// eighteenth round): the report holds, whatever the rest of the reading said, and never accepts.
+  workflow: HeadDetail["workflow"] | null; attempts: { id: number; status: string; conclusion: string | null; run_id?: number; run_attempt?: number; via: string[] }[];
+  limited?: { kind: "rate_limit" | "permission"; endpoint: string; wait_ms: number | null } }
+// A refused page anywhere in the reading counts as a failed page: the report holds, whatever the
+// rest of the reading said, and never accepts. Which kind of refusal, read from GitHub's answer
+// (0.12.0, nineteenth round): a rate limit only on a 429, or a 403 carrying x-ratelimit-remaining 0,
+// a Retry-After header, or a body that says secondary rate limit; any other 403 is a permission
+// failure, named with the endpoint it refused. wait_ms: how long GitHub asks to wait (Retry-After,
+// or x-ratelimit-reset less now), which the watch honours before its next reading.
 export const RATE_LIMITED = [403, 429];
+export function refusalOf(r: { status: number; body: any; headers?: Record<string, string> }, now: number): { kind: "rate_limit" | "permission"; wait_ms: number | null } | null {
+  if (!RATE_LIMITED.includes(r.status)) return null;
+  const h = r.headers ?? {};
+  const after = h["retry-after"] !== undefined && /^\d{1,6}$/.test(h["retry-after"].trim()) ? Number(h["retry-after"].trim()) * 1000 : null;
+  const reset = h["x-ratelimit-reset"] !== undefined && /^\d{9,11}$/.test(h["x-ratelimit-reset"].trim()) ? Math.max(0, Number(h["x-ratelimit-reset"].trim()) * 1000 - now) : null;
+  const wait_ms = after ?? reset;
+  let said = "";
+  try { said = typeof r.body === "string" ? r.body : JSON.stringify(r.body ?? ""); } catch { said = ""; }
+  const limit = r.status === 429 || h["x-ratelimit-remaining"]?.trim() === "0" || h["retry-after"] !== undefined || /secondary rate limit/i.test(said);
+  return { kind: limit ? "rate_limit" : "permission", wait_ms: limit ? wait_ms : null };
+}
 export async function gateReport(d: Pick<MergeDeps, "api">, repo: string, head: string, now = () => new Date()): Promise<GateReport> {
   const at = now().toISOString();
   if (!SHA.test(head)) return { head, at, decision: "refuse", why: "that isn't a full commit sha", windows: null, workflow: null, attempts: [] };
-  let limited = false;
-  const seen: Pick<MergeDeps, "api"> = { api: async (path) => { const r = await d.api(path); if (RATE_LIMITED.includes(r.status)) limited = true; return r; } };
+  let limited: GateReport["limited"] | undefined;
+  const seen: Pick<MergeDeps, "api"> = { api: async (path) => {
+    const r = await d.api(path);
+    const k = refusalOf(r, now().getTime());
+    // The first refusal names the reading; a rate limit outranks a permission failure seen first.
+    if (k && (!limited || (limited.kind === "permission" && k.kind === "rate_limit"))) limited = { kind: k.kind, endpoint: path.split("?")[0], wait_ms: k.wait_ms };
+    return r;
+  } };
   const h = await headDetail(seen, repo, head);
-  if (limited) return { head, at, decision: "hold", why: "GitHub's rate limit (HTTP 403 or 429) stopped a page of the reading, so nothing is judged on it", windows: null, workflow: null, attempts: [] };
+  if (limited) return { head, at, decision: "hold", why: limited.kind === "rate_limit"
+    ? `GitHub's rate limit stopped a page of the reading (${limited.endpoint}), so nothing is judged on it${limited.wait_ms !== null ? `; GitHub asks to wait ${Math.ceil(limited.wait_ms / 1000)} s` : ""}`
+    : `GitHub refused the reading of ${limited.endpoint} (HTTP 403, not a rate limit): a permission failure, so nothing is judged on it`,
+    windows: null, workflow: null, attempts: [], limited };
   if (h === "missing") return { head, at, decision: "refuse", why: "GitHub doesn't have that commit", windows: null, workflow: null, attempts: [] };
   if (h === null) return { head, at, decision: "hold", why: "GitHub didn't answer about its checks, or a listing wasn't whole", windows: null, workflow: null, attempts: [] };
   const w = h.checks.windows ? judgeChecks(h.checks.runs, true).find((c) => c.name === WINDOWS_CHECK)!.state : "not_required";
@@ -421,21 +446,54 @@ export function judgeShipGate(head: string, reports: GateReport[]): ShipGateLine
   return { step: "ship_gate", head, workflow: [...reports].reverse().find((r) => r.workflow)?.workflow ?? null, reports, attempts_seen,
     refused_while_pending, accepted_early, accepted_after_pass, passed: refused_while_pending && !accepted_early && accepted_after_pass };
 }
-// Watches one head: a report now, then one every everyMs until the gate accepts, refuses for
-// good, or untilMs passes; the line is judged on every report taken.
-export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, head: string, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<ShipGateLine> {
+// Watches one head: a report now, then one every everyMs (or longer, when GitHub asked to wait:
+// Retry-After or x-ratelimit-reset) until the gate accepts, refuses for good, or untilMs passes;
+// the line is judged on every report taken.
+//
+// Started before the candidate head is pushed (0.12.0, nineteenth round), it watches a pull request
+// instead (pr): it reads the pull request's head sha each time, and binds to the first head it sees
+// (one different from the head at its start, from); once bound, it reads and accepts only that sha,
+// whatever later pushes do to the branch. bound_head is kept with the line, and the Ship card is
+// refused for any other head of that pull request while the watch's acceptance stands (core.ts ship).
+export interface WatchTarget { head?: string; pr?: number; from?: string | null }
+export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, target: string | WatchTarget, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<ShipGateLine & { bound_head: string | null; accepted_head: string | null }> {
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((ok) => setTimeout(ok, ms)));
   const now = o.now ?? (() => new Date());
+  const t = typeof target === "string" ? { head: target } : target;
   const t0 = now().getTime();
   const reports: GateReport[] = [];
+  let bound: string | null = t.head && SHA.test(t.head) ? t.head : null;
+  let from: string | null | undefined = t.from;
   while (true) {
-    const r = await gateReport(d, repo, head, now);
-    reports.push(r);
-    o.each?.(r);
-    // A run not listed yet (just after the push) is watched on; a failed attempt settles it.
-    const settled = r.decision === "accept" || r.windows === "failed" || (r.decision === "refuse" && r.windows !== "missing");
-    if (settled || now().getTime() - t0 + o.everyMs > o.untilMs) break;
-    await sleep(o.everyMs);
+    let wait = o.everyMs;
+    if (!bound && t.pr !== undefined) {
+      // The pull request's head now: the first one past its start binds the watch.
+      const r = await d.api(`/repos/${repo}/pulls/${t.pr}`).catch(() => null);
+      const sha = r && r.status === 200 && typeof r.body?.head?.sha === "string" && SHA.test(r.body.head.sha) ? r.body.head.sha : null;
+      if (from === undefined) from = sha;
+      else if (sha && sha !== from) bound = sha;
+      const k = r ? refusalOf(r, now().getTime()) : null;
+      if (k?.wait_ms) wait = Math.max(wait, k.wait_ms);
+    }
+    if (bound) {
+      const r = await gateReport(d, repo, bound, now);
+      reports.push(r);
+      o.each?.(r);
+      // A run not listed yet (just after the push) is watched on; a failed attempt settles it.
+      const settled = r.decision === "accept" || r.windows === "failed" || (r.decision === "refuse" && r.windows !== "missing");
+      if (settled) break;
+      if (r.limited?.wait_ms) wait = Math.max(wait, r.limited.wait_ms);
+    }
+    if (now().getTime() - t0 + wait > o.untilMs) break;
+    await sleep(wait);
   }
-  return judgeShipGate(head, reports);
+  const line = judgeShipGate(bound ?? t.head ?? "", reports);
+  const last = reports.at(-1);
+  return { ...line, bound_head: bound, accepted_head: last && last.decision === "accept" ? last.head : null };
+}
+// The watch's record for one pull request (keeper.sh ship-gate --pr), as the Ship card reads it:
+// the head the watch accepted, or null.
+export const watchFile = (dir: string, pr: number) => `${dir}/ship-gate-pr-${pr}.json`;
+export function watchAccepted(text: string | null): string | null {
+  try { const x = JSON.parse(text ?? ""); return typeof x?.accepted_head === "string" && SHA.test(x.accepted_head) ? x.accepted_head : null; } catch { return null; }
 }

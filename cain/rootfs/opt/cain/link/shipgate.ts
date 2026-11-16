@@ -9,25 +9,34 @@
 //                                              every --every minutes (default 10) for up to --hours
 //                                              (default 2), judged (merge.ts judgeShipGate), and
 //                                              kept in /data/work/ship-gate-<head>.json
+//   bun shipgate.ts --pr <number> --watch      the same, started before the candidate head is pushed:
+//                                              it binds to the first head the pull request shows after
+//                                              its start and accepts only that sha; kept in
+//                                              /data/work/ship-gate-pr-<number>.json, where the Ship card
+//                                              reads which head it accepted
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { gateReport, watchShipGate, type MergeDeps } from "./merge";
+import { gateReport, watchFile, watchShipGate, type MergeDeps } from "./merge";
 
 export const SHIP_REPO = "HyndeSyte/harness";
-async function api(path: string): Promise<{ status: number; body: any }> {
+async function api(path: string): Promise<{ status: number; body: any; headers: Record<string, string> }> {
   const r = await fetch(`https://api.github.com${path}`, { redirect: "error", signal: AbortSignal.timeout(15000),
     headers: { accept: "application/vnd.github+json", "user-agent": "cain-link", "x-github-api-version": "2022-11-28" } });
-  return { status: r.status, body: await r.json().catch(() => null) };
+  const headers: Record<string, string> = {};
+  for (const k of ["retry-after", "x-ratelimit-remaining", "x-ratelimit-reset"]) { const v = r.headers.get(k); if (v !== null) headers[k] = v; }
+  return { status: r.status, body: await r.json().catch(() => null), headers };
 }
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
   const flag = (n: string) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
-  const head = (args[0] ?? "").toLowerCase();
+  const prArg = flag("--pr");
+  const pr = prArg !== undefined && /^\d{1,7}$/.test(prArg) ? Number(prArg) : null;
+  const head = prArg !== undefined ? "" : (args[0] ?? "").toLowerCase();
   const repo = flag("--repo") ?? SHIP_REPO;
   const d: Pick<MergeDeps, "api"> = { api };
-  if (!/^[0-9a-f]{40}$/.test(head) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
-    console.error("usage: shipgate.ts <full head sha> [--watch [--every <minutes>] [--hours <hours>] [--out <file>]] [--repo owner/name]");
+  if ((pr === null && !/^[0-9a-f]{40}$/.test(head)) || (prArg !== undefined && (pr === null || !args.includes("--watch"))) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    console.error("usage: shipgate.ts <full head sha> [--watch [--every <minutes>] [--hours <hours>] [--out <file>]] [--repo owner/name]\n       shipgate.ts --pr <number> --watch [...]");
     process.exit(2);
   }
   if (!args.includes("--watch")) {
@@ -35,11 +44,11 @@ if (import.meta.main) {
   } else {
     const every = Math.min(Math.max(Number(flag("--every") ?? 10), 2), 60) * 60_000;
     const hours = Math.min(Math.max(Number(flag("--hours") ?? 2), 0.1), 6) * 3_600_000;
-    const out = flag("--out") ?? `/data/work/ship-gate-${head}.json`;
-    const line = await watchShipGate(d, repo, head, { everyMs: every, untilMs: hours,
+    const out = flag("--out") ?? (pr !== null ? watchFile("/data/work", pr) : `/data/work/ship-gate-${head}.json`);
+    const line = await watchShipGate(d, repo, pr !== null ? { pr } : head, { everyMs: every, untilMs: hours,
       each: (r) => console.log(JSON.stringify({ at: r.at, decision: r.decision, why: r.why, windows: r.windows, attempts: r.attempts.length })) });
     try { mkdirSync(dirname(out), { recursive: true }); writeFileSync(out, JSON.stringify(line, null, 2) + "\n"); } catch { /* printed below anyway */ }
-    console.log(JSON.stringify({ step: line.step, head, passed: line.passed, refused_while_pending: line.refused_while_pending,
+    console.log(JSON.stringify({ step: line.step, head: line.bound_head, accepted_head: line.accepted_head, passed: line.passed, refused_while_pending: line.refused_while_pending,
       accepted_early: line.accepted_early, accepted_after_pass: line.accepted_after_pass, attempts_seen: line.attempts_seen, kept: out }, null, 2));
   }
 }

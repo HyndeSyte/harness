@@ -114,6 +114,17 @@ const STOPPED_FIRST: Landed = { ok: false, why: "his Stop came first", again: fa
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
 const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
 const SHOW_WAIT_MS = 2 * 60_000;         // a card with buttons Cain hasn't shown by then goes out by itself
+// The PC job keeper's lines to him (pcjobs/main.ts tell): each names what happened and the fix,
+// with its Troubleshooting row in cain/docs/pc-jobs.md.
+export const PC_NOTICES: Record<string, string> = {
+  reuse_migrated: "Your PC job keeper counted a tap of yours approving a reused value as used: an older version wrote it down without the record that could show whether its job reached your PC. If you still want that check, Cain asks you again.",
+  reuse_shallow: "Your PC job keeper can't settle a tap of yours approving a reused value, because its copy of the PC job queue is shallow. Fix: delete the pc-jobs folder in the Cain App's data and restart the App (pc-jobs.md, Troubleshooting). Other PC jobs go on, and the tap stays used meanwhile.",
+  queue_branch_missing: "Your PC job keeper stopped: the PC job queue's main branch is missing on GitHub while a tap of yours approving a reused value waits to be settled. Fix: restore the main branch in the pc-jobs repository (pc-jobs.md, Troubleshooting). The keeper goes on by itself once it is back.",
+  queue_empty_pending: "Your PC job keeper stopped: the PC job queue on GitHub is empty while a tap of yours approving a reused value waits to be settled. Fix: give the queue its first commit again, as in setup step 2 (pc-jobs.md, Troubleshooting); the tap then counts as used.",
+  reuse_store_unreadable: "Your PC job keeper can't read its record of the taps you spent on reused values, so it takes no job that reuses a value until it can. Other PC jobs go on. Fix: see the store row in pc-jobs.md, Troubleshooting.",
+  reuse_unsettled: "Your PC job keeper can't tell whether a job made from a tap of yours approving a reused value reached your PC: git gave no clear answer. The tap stays used, other PC jobs go on, and it tries again each round. If it lasts, see pc-jobs.md, Troubleshooting.",
+  reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next start; if it is freed, the job is queued again by itself.",
+};
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
 export const CONNECTOR_LABEL = "Open connector settings";
 const CONNECTOR_ONCE_MS = 12 * 3_600_000;  // one notice about the connector per item in this long
@@ -526,7 +537,8 @@ export interface Deps {
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
-  checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;   // the head's check runs (merge.ts headChecks)
+  checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
+  gateWatch?: (pr: string) => string | null;                       // the head a ship_gate watch of this pull request accepted (merge.ts watchAccepted), or null   // the head's check runs (merge.ts headChecks)
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1434,6 +1446,11 @@ export class Link {
       if (rev.head !== head || (rev.pr !== null && rev.pr.toLowerCase() !== pr.toLowerCase()))
         throw new Refusal(`review ${review} was of another head or pull request: get a review of this head as it is now`);
     }
+    // A ship_gate watch of this pull request accepted another head (it binds to the first head
+    // pushed after its start): a card for any other head is refused while that stands.
+    const watched = this.d.gateWatch?.(pr) ?? null;
+    if (watched && watched !== head)
+      throw new Refusal("the Ship gate's watch of this pull request accepted another head (the first one pushed after it started): watch this head with keeper.sh ship-gate --pr before showing its card");
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
@@ -1535,6 +1552,15 @@ export class Link {
     return { status: "ok", reply_to: rid, card: m?.card ?? null, item: m?.item ?? null, question: m?.question || null,
       asked: m?.q?.q ?? null, open: m ? live(m, now) : null,
       buttons: m?.buttons ? [...(m.labels ?? [])] : [], live: m ? live(m, now) : null };
+  }
+
+  // -- one line from the PC job keeper (POST /pc-notice, 0.12.0 nineteenth round) -------
+  // The keeper sends only a code; the words are the link's own (PC_NOTICES), so nothing from the
+  // queue or a page reaches Discord. The keeper sends each condition once while it lasts.
+  async pcNotice(code: unknown): Promise<{ status: "posted"; message: string }> {
+    const text = PC_NOTICES[String(code ?? "")];
+    if (!text) throw new Refusal("not a PC job keeper notice");
+    return { status: "posted", message: await this.notice(text) };
   }
 
   // -- his yes to reusing a PC result's values (POST /reuse, the PC job keeper's ask) ----

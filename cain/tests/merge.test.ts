@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, refusalOf, watchAccepted, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
@@ -628,7 +628,7 @@ describe("seventeenth review: the Windows gate reads every run and every attempt
     for (const status of [403, 429]) for (const w of where) {
       // The limited page carries a body shaped like a good listing: it still counts as failed.
       const body = { total_count: 1, check_runs: [win(902, "success")], workflow_runs: runs, jobs: [job(902, "success")], encoding: "base64", content: "" };
-      const d = { api: async (p: string) => p.includes(w) ? { status, body } : green().api(p) };
+      const d = { api: async (p: string) => p.includes(w) ? { status, body, headers: status === 403 ? { "x-ratelimit-remaining": "0" } : {} } : green().api(p) };
       const r = await gateReport(d, REPO, H1);
       expect([status, w, r.decision]).toEqual([status, w, "hold"]);
       expect(r.why).toContain("rate limit");
@@ -640,7 +640,7 @@ describe("seventeenth review: the Windows gate reads every run and every attempt
     expect(await gateReport(two, REPO, H1)).toMatchObject({ decision: "hold" });
     // The watch keeps watching through a limited reading and accepts only on a whole one.
     let i = 0;
-    const flaky = { api: async (p: string) => i === 1 && p.includes("/actions/runs?") ? { status: 403, body: null } : fake({ checkPages: i === 0 ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] }).api(p) };
+    const flaky = { api: async (p: string) => i === 1 && p.includes("/actions/runs?") ? { status: 403, body: null, headers: { "retry-after": "0" } } : fake({ checkPages: i === 0 ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] }).api(p) };
     const line = await watchShipGate(flaky, REPO, H1, { everyMs: 1, untilMs: 1_000, sleep: async () => { i++; } });
     expect(line.reports.map((r) => r.decision)).toEqual(["hold", "hold", "accept"]);
     expect(line.passed).toBe(true);
@@ -681,5 +681,67 @@ describe("seventeenth review: the Windows gate reads every run and every attempt
     const slow = await watchShipGate(fake({ checkPages: [[win(5, null, "in_progress")]] }), REPO, H1, { everyMs: 10, untilMs: 35, sleep: async () => { t += 10; }, now: () => new Date(t) });
     expect(slow.reports.length).toBe(4);                                  // at 0, 10, 20 and 30: the next would pass 35
     expect(slow.passed).toBe(false);
+  });
+  test("nineteenth review: a rate limit only on a 429, or a 403 with x-ratelimit-remaining 0, Retry-After or a secondary-limit body; any other 403 is a permission failure naming the endpoint", async () => {
+    const NOW = Date.parse("2026-11-16T10:00:00Z");
+    expect(refusalOf({ status: 429, body: null }, NOW)).toEqual({ kind: "rate_limit", wait_ms: null });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "30" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 30_000 });
+    expect(refusalOf({ status: 403, body: null, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(NOW / 1000 + 90) } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 90_000 });
+    expect(refusalOf({ status: 403, body: null, headers: { "retry-after": "5" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 5_000 });
+    expect(refusalOf({ status: 403, body: { message: "You have exceeded a secondary rate limit. Please wait." } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: null });
+    expect(refusalOf({ status: 403, body: { message: "Resource not accessible by integration" }, headers: { "x-ratelimit-remaining": "57" } }, NOW)).toEqual({ kind: "permission", wait_ms: null });
+    expect(refusalOf({ status: 403, body: { message: "API rate limit exceeded" } }, NOW)).toEqual({ kind: "permission", wait_ms: null });
+    expect(refusalOf({ status: 200, body: null }, NOW)).toBeNull();
+    // In the reading: a plain 403 holds as a permission failure naming its endpoint; a limited one names the rate limit and the wait.
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 1 }];
+    const green = () => fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [[job(902, "success")]] } });
+    const plain = { api: async (p: string) => p.includes("/actions/runs?") ? { status: 403, body: { message: "Forbidden" } } : green().api(p) };
+    const r = await gateReport(plain, REPO, H1, () => new Date(NOW));
+    expect(r).toMatchObject({ decision: "hold", limited: { kind: "permission", endpoint: `/repos/${REPO}/actions/runs`, wait_ms: null } });
+    expect(r.why).toBe(`GitHub refused the reading of /repos/${REPO}/actions/runs (HTTP 403, not a rate limit): a permission failure, so nothing is judged on it`);
+    const limited = { api: async (p: string) => p.includes("/actions/runs?") ? { status: 403, body: null, headers: { "retry-after": "120" } } : green().api(p) };
+    const l = await gateReport(limited, REPO, H1, () => new Date(NOW));
+    expect(l).toMatchObject({ decision: "hold", limited: { kind: "rate_limit", wait_ms: 120_000 } });
+    expect(l.why).toContain("rate limit stopped a page of the reading");
+    expect(l.why).toContain("wait 120 s");
+  });
+
+  test("nineteenth review: the watch honours Retry-After and x-ratelimit-reset before its next reading", async () => {
+    let t = Date.parse("2026-11-16T10:00:00Z");
+    const waits: number[] = [];
+    let i = 0;
+    const green = () => fake({ checkPages: [[win(5, "success")]] });
+    const d = { api: async (p: string) => {
+      if (i === 0 && p.includes("check_name=pcjobs-windows")) return { status: 429, body: null, headers: { "retry-after": "300" } };
+      if (i === 1 && p.includes("check_name=pcjobs-windows")) return { status: 403, body: null, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(t / 1000 + 600) } };
+      return green().api(p);
+    } };
+    const line = await watchShipGate(d, REPO, H1, { everyMs: 60_000, untilMs: 3 * 3_600_000, sleep: async (ms) => { waits.push(ms); t += ms; i++; }, now: () => new Date(t) });
+    expect(waits).toEqual([300_000, 600_000]);
+    expect(line.reports.map((r) => r.decision)).toEqual(["hold", "hold", "accept"]);
+  });
+
+  test("nineteenth review: a watch started before the push binds to the first head and accepts only for it; a later push doesn't move it", async () => {
+    const OLD = "f".repeat(40);
+    let prHead = OLD, i = 0;
+    const seen: string[] = [];
+    const green = () => fake({ checkPages: i < 2 ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] });
+    const d = { api: async (p: string) => {
+      seen.push(p);
+      if (p === `/repos/${REPO}/pulls/21`) return { status: 200, body: { head: { sha: prHead } } };
+      if (p.includes(H2)) throw new Error(`read the second head: ${p}`);
+      return green().api(p);
+    } };
+    const line = await watchShipGate(d, REPO, { pr: 21 }, { everyMs: 1, untilMs: 10_000, sleep: async () => {
+      i++;
+      if (i === 1) prHead = H1;                                                // the candidate head is pushed
+      if (i === 2) prHead = H2;                                                // a later push moves the branch
+    } });
+    expect(line.bound_head).toBe(H1);
+    expect(line.accepted_head).toBe(H1);
+    expect(line.reports.every((r) => r.head === H1)).toBe(true);
+    expect(line.passed).toBe(true);
+    expect(watchAccepted(JSON.stringify(line))).toBe(H1);
+    expect(watchAccepted("not json")).toBeNull();
   });
 });

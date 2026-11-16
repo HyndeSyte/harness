@@ -18,7 +18,15 @@
    before the next heading, LF line ends, trailing spaces dropped). Every round of fixes
    changes the newest section, so a description left from an earlier round fails until
    it is refreshed; the failure prints the line to add.
-5. The required checks keep reporting: the pytest and bun jobs in tests.yml and
+5. The PC worker's guard is consistent (only when the pull request changes the hook,
+   worker.ts, the pinned session settings or the pinned Public Suffix List): the hook's
+   policy version (POLICY_VERSION) steps above main's whenever main has one, so a branch
+   rebased over another pull request that touched the guard bumps it again; every hook
+   timeout in the pinned settings equals the hook's HOOK_TIMEOUT_S; and the description
+   carries the line "Hook policy version: <N>" for that version and the guard-surface
+   section's hash line of each of the three files as they are at the head
+   (cain/tools/guard-surface.sh prints them).
+6. The required checks keep reporting: the pytest and bun jobs in tests.yml and
    the pr job in pr.yml keep their names, with no path or branch filters and no
    `if` or `continue-on-error`, and no other workflow reuses those names. The
    pcjobs-windows job in tests.yml isn't required by GitHub, but the link reads it
@@ -53,6 +61,11 @@ NOT_SHIPPED = ("tests/", "tools/")
 ROOT_RELEASE = ("repository.yaml",)
 # How a round marker names each App.
 APP_NAMES = {"harness": "Harness", "cain": "Cain"}
+# The PC worker's guard surface (cain/tools/guard-surface.sh): the hook, the pinned session
+# settings and the pinned Public Suffix List.
+GUARD_HOOK = "cain/rootfs/opt/cain/pcjobs/worker.ts"
+GUARD_SETTINGS = "cain/docs/pc-worker/session-settings.json"
+GUARD_FILES = (GUARD_HOOK, GUARD_SETTINGS, "cain/rootfs/opt/cain/pcjobs/public_suffix_list.dat")
 HEADINGS = ("What changed", "How it was tested", "Not verified", "Anything Dane must do")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 # The required checks (RELEASING.md): workflow file -> job ids that must stay as they are.
@@ -172,6 +185,61 @@ def check_round(body: str, markers: list[str]) -> list[str]:
     return [f'The description isn\'t for this round of changes: add the line "{m}" (it changes '
             "whenever the newest CHANGELOG section does, so refresh the description with it)."
             for m in markers if m not in lines]
+
+
+def _policy(text: str | None) -> int | None:
+    m = re.search(r'^export const POLICY_VERSION = "(\d{1,3})";$', text or "", re.M)
+    return int(m.group(1)) if m else None
+
+
+def _hook_timeout(text: str | None) -> int | None:
+    m = re.search(r"^export const HOOK_TIMEOUT_S = (\d{1,3});$", text or "", re.M)
+    return int(m.group(1)) if m else None
+
+
+def _settings_timeouts(text: str | None) -> list | None:
+    try:
+        doc = json.loads(text or "")
+    except ValueError:
+        return None
+    out = []
+    hooks = doc.get("hooks") if isinstance(doc, dict) else None
+    for groups in (hooks or {}).values() if isinstance(hooks, dict) else []:
+        for g in groups if isinstance(groups, list) else []:
+            for h in (g.get("hooks") if isinstance(g, dict) else None) or []:
+                out.append(h.get("timeout") if isinstance(h, dict) else None)
+    return out
+
+
+def check_guard(changed: list[str], base: dict, head: dict, body: str | None) -> list[str]:
+    """The PC worker's guard, consistent: base and head map each GUARD_FILES path to its text
+    (None when missing)."""
+    if not any(f in GUARD_FILES for f in changed):
+        return []
+    problems = []
+    n, old = _policy(head.get(GUARD_HOOK)), _policy(base.get(GUARD_HOOK))
+    timeout = _hook_timeout(head.get(GUARD_HOOK))
+    if head.get(GUARD_HOOK) is not None and (n is None or timeout is None):
+        problems.append(f"{GUARD_HOOK} must define POLICY_VERSION and HOOK_TIMEOUT_S as plain lines.")
+    if n is not None and old is not None and n <= old:
+        problems.append(f"The PC worker's guard changed against main, so the hook's policy version must step above "
+                        f"main's {old} (it is {n}): bump POLICY_VERSION, which needs a new probe and confirmation.")
+    ts = _settings_timeouts(head.get(GUARD_SETTINGS))
+    if head.get(GUARD_SETTINGS) is not None and timeout is not None and (not ts or any(t != timeout for t in ts)):
+        problems.append(f"{GUARD_SETTINGS}: every hook timeout must be the hook's HOOK_TIMEOUT_S ({timeout}); "
+                        f"it has {ts}.")
+    if body is not None:
+        lines = {line.strip() for line in body.replace("\r\n", "\n").split("\n")}
+        if n is not None and f"Hook policy version: {n}" not in lines:
+            problems.append(f'The description must carry the line "Hook policy version: {n}" (the hook\'s POLICY_VERSION).')
+        for f in GUARD_FILES:
+            if head.get(f) is None:
+                continue
+            want = f"- {f} sha256 {hashlib.sha256(head[f].encode('utf-8')).hexdigest()[:16]}"
+            if want not in lines:
+                problems.append(f'The description\'s guard-surface section is stale: it needs the line "{want}" '
+                                "(regenerate it with cain/tools/guard-surface.sh).")
+    return problems
 
 
 def shipped(app: str, path: str) -> bool:
@@ -401,9 +469,12 @@ def main(argv: list[str] | None = None) -> int:
         problems.append(STALE)
     else:
         base_snap, head_snap = snapshot(a.base), snapshot(head)
-        problems += check_versions(changed_files(a.base, head), base_snap, head_snap)
+        changed = changed_files(a.base, head)
+        problems += check_versions(changed, base_snap, head_snap)
         if body is not None:
             problems += check_round(body, expected_markers(base_snap, head_snap))
+        problems += check_guard(changed, {f: file_at(a.base, f) for f in GUARD_FILES},
+                                {f: file_at(head, f) for f in GUARD_FILES}, body)
         problems += check_workflows(workflows_at(head))
 
     for p in problems:

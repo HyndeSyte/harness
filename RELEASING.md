@@ -32,6 +32,13 @@ branch is up to date with `main` and these checks passed on it:
     didn't change keeps `main`'s version. A change to `repository.yaml` needs at least
     one App bumped. A `config.yaml` whose `version` is missing, duplicated, unparseable
     or not a quoted `X.Y.Z` fails, on `main` or the branch;
+  - when the pull request changes the PC worker's guard (its hook `worker.ts`, the pinned
+    session settings or the pinned Public Suffix List): the hook's `POLICY_VERSION` steps
+    above `main`'s (so a rebase over another pull request that touched the guard bumps it
+    again), every hook timeout in the pinned settings equals the hook's `HOOK_TIMEOUT_S`,
+    and the description carries `Hook policy version: <N>` and the guard-surface hash line
+    of each of those three files at the head (`cain/tools/guard-surface.sh` prints them). A
+    new policy version needs a new probe and confirmation on the PC;
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
     filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
     the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
@@ -47,12 +54,17 @@ flaky Windows run needs a new commit; a run for another commit doesn't count, an
 all refuses; GitHub not answering holds). It reads every run and every attempt: the head's
 check runs of that name with every attempt listed, and GitHub Actions' workflow runs for the
 head with each attempt's jobs, each listing followed page by page until it is whole; a page
-that fails or a listing that isn't whole holds, and so does a rate-limit page from GitHub (HTTP
-403 or 429), whatever it holds. `/opt/cain/keeper.sh ship-gate <full head
+that fails or a listing that isn't whole holds, and so does a refused page from GitHub (HTTP
+403 or 429), whatever it holds: named a rate limit only on a 429, or a 403 with
+`x-ratelimit-remaining: 0`, a `Retry-After` header or a body that says secondary rate limit,
+and otherwise a permission failure naming the endpoint. `/opt/cain/keeper.sh ship-gate <full head
 sha>` on the Pi reads that gate for a head without acting and prints what it would decide and
 why, the workflow file it read and every attempt it saw (`--watch` keeps watching a fresh
 head until its Windows run is done: the PC probe's `ship_gate` step, started before that head
-is pushed so it sees the Windows run pending). Run it once on a head
+is pushed so it sees the Windows run pending; `--pr <number> --watch` instead binds to the
+first head the pull request shows after the watch started, accepts only that sha, honours
+GitHub's Retry-After and rate-limit reset before its next reading, and a Ship card for any
+other head of that pull request is refused while that acceptance stands). Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
   Run it before pushing (needs PyYAML):

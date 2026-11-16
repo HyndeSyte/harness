@@ -91,6 +91,15 @@
 - Claude Code now gives the PC's page checks 40 seconds, up from 30, and the probe measures how long they take to start on your PC, cold and warm, and refuses to confirm if that leaves too little room. Run the probe first thing after restarting the PC.
 - The page check now refuses page answers it can't read exactly (a hidden mark at the start, broken characters, numbers too long to keep), and the probe replays what your Claude Code really sends through it. This update needs a new probe and confirmation.
 - The Ship card's Windows check now waits when GitHub limits how often it can be read, and the setup step that watches it now starts before the change is sent.
+- A tap you gave to reuse a value is now freed only when the Pi has a record that GitHub refused every try at sending its job. If that record is missing, or one try's answer was unclear, the tap stays used for good, even if the job later vanished from the queue. A tap written by the earlier test version counts as used, and you get one message about it.
+- When the job queue can't be read properly (a partial copy, its branch gone, an empty queue, an unreadable tap record, a tap it can't settle) or a job from your tap is refused three times, you get one Discord message saying what happened and how to fix it. Other jobs keep going where they safely can.
+- The page check now names why it couldn't place a page (for example two address fields, or broken characters), and a run's report lists each such page with its reason.
+- The page check's test-only modes (holding, stalling, timing, keeping inputs) now work only inside the probe step that asked for them. In a real run any sign of them makes the check refuse at once.
+- The probe's timing check now starts with its held check as the very first, cold session, takes three warm samples and shows their spread. Real runs record how long the page checks took to start, and confirming again is refused if that left less than 4 seconds to spare.
+- The probe's check of what Claude Code sends now also covers what the page-reading tools return.
+- The Ship card's Windows check now tells a GitHub rate limit apart from a permission problem, and waits as long as GitHub asks. Watching a pull request locks on to the first change pushed after the watch started, and a Ship card for a different change of it is refused.
+- Your probe's "#" check page now has a one-time code of its own, and says plainly when the page never reported.
+- Your confirmation is now tied to the exact page-check code and pinned settings, not just a version number. This update needs a new probe and confirmation.
 
 ## 0.11.0
 

@@ -56,6 +56,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     windows: false,                                // the head's tests.yml names pcjobs-windows (merge.ts headChecks)
     runsHang: false,
     asked: [] as string[],
+    watched: {} as Record<string, string>,         // the head a ship_gate watch accepted, by pull request (merge.ts watchAccepted)
   };
   // The review service's lines, as /data/trust/reviewed.json has them (null: it can't be read).
   const reviews = { list: [] as Reviewed[] | null };
@@ -164,6 +165,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(Array.isArray(github.runs)
       ? { runs: copy(github.runs), windows: github.windows || github.runs.some((x: any) => x?.name === "pcjobs-windows" && x?.app?.id === ACTIONS_APP) }
       : github.runs); } : undefined,
+    gateWatch: (pr: string) => github.watched[pr] ?? null,
     factsMs: opts.factsMs ?? 50,
     reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,

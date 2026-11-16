@@ -565,8 +565,16 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   accepted; an escaped or raw lone surrogate (`\ud800` without its pair) is rejected as not
   strict JSON; an integer past the safe range (more than 9007199254740991 either way) is
   **rejected** (never rounded, never kept as a string), and a number that overflows to
-  infinity too. Each rejection makes the read unplaced. The probe's `payload_replay` step
-  replays the hook input your own Claude Code really sent through this parser. It checks the address against the run's domains
+  infinity too. Each rejection makes the read unplaced. **More than one address field is
+  unplaced too** (0.12.0, nineteenth round): after decoding, every key whose ASCII-folded
+  form is an address name is counted at every depth the gate reads, so `url` beside `URL`,
+  or a nested copy of `tabUrl`, makes the read unplaced with the reason `address_fields`.
+  Every unplaced read carries its named reason (`bom`, `lone_surrogate`, `unsafe_integer`,
+  `number_range`, `not_strict_json`, `duplicate_key`, `address_fields`, `no_address`,
+  `unreadable`, `probe_marker`) in `nav-decisions.jsonl`, and **the run's report that
+  `worker.ts run` prints lists each unplaced read with its tool and reason** (`unplaced`),
+  not only a count. The probe's `payload_replay` step replays the hook input your own
+  Claude Code really sent through this parser, with the same address-field rule. It checks the address against the run's domains
   as it would a navigation (the check page and the end page pass). **Both failures end the
   run at once, with no fallback**: a page that moved its tab off the job's sites after an
   allowed navigation (a redirect, a script) is `read_drift`; an answer with no address in
@@ -1155,7 +1163,9 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     (`process_end_required` otherwise), **the tab-context order tripped at most once**
     (`context_order_failed` otherwise), **round 15's five steps passed** (each refuses by
     its own name, below), the probe was made by this same worker (its
-    code, its Cain version and the hook's policy version: `probe_stale` otherwise), and
+    code, its Cain version, the hook's policy version and, since the nineteenth round, one
+    hash over the hook bundle (`worker.ts`, `core.ts` and the pinned Public Suffix List) and
+    the pinned session settings, `guard_sha256`: `probe_stale` otherwise), and
     the fingerprint, the `claude` executable's hash and every other hash still match. It
     records the worker it was made with (`worker_sha256`, `cain_version`,
     `policy_version`): **a new release of the worker, its version step included, makes it
@@ -1212,33 +1222,55 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       shows this in a real Chromium). Whether the hook
       logged the allow as stripped (the updated input it handed Claude Code, `stripped`) and
       whether the tab list showed the bare address (`tab_bare`) are recorded beside it and
-      never read for the verdict. Only a pass turns stripping on (`fragment_strip` in
+      never read for the verdict. **The check page carries a nonce of that step's own in its
+      path** (`/fragment-check/<nonce>`), its report must carry the same nonce, and only the
+      first report for it counts; when no report for it came in time, the step says
+      `no_page_report` (its `why`), not a generic failure. Only a pass turns stripping on (`fragment_strip` in
       `confirmed.json`); otherwise every address with a fragment stays refused.
     - `session_ids` (recorded, a diagnostic, not a gate): whether the init event's session
       id equals the one the hook's input carries, in every decision of that session. The
       barrier uses the worker's own token, never either id.
     - `hook_timing` (gates; it runs first, before the smoke step, so **run the probe first
-      thing after restarting the PC, or after it sat idle**, to measure a cold start): four
-      short sessions. Two measure the gap between Claude Code printing a tool call and the
-      hook process's own start (the cold one first, then a warm one: `cold_gap_ms`,
-      `warm_gaps_ms`); in one the hook is held to its whole 26 second budget and must reach
-      Claude Code as a refusal of an allowed call (`full_budget`: `blocked`, with when it
-      answered); in one the hook is stalled past the 40 second timeout, and what Claude Code
-      did with that navigation is recorded (`overrun`: `refused`, `error` or `ran`). It
-      passes only when both gaps were measured, the longest gap plus the 26 second budget
-      stays 4 seconds under the 40 second timeout (a gap of at most 10 seconds), the held
-      hook's refusal reached Claude Code, and the stalled navigation didn't run. A refusal
-      names which (`gap_unmeasured`, `gap_too_long`, `full_budget_not_blocked`,
+      thing after restarting the PC, or after it sat idle**, to measure a cold start): five
+      short sessions, in this order (nineteenth round). **The very first, cold session holds
+      the hook to its whole 26 second budget**: it must reach Claude Code as a refusal of an
+      allowed call (`full_budget`: `blocked`, with when it answered), and its gap between
+      Claude Code printing the call and the hook process's own start is the cold sample
+      (`cold_gap_ms`). Then **three warm sessions**, one call each, give the warm samples
+      (`warm_gaps_ms`) and their spread (`warm_spread_ms`, longest less shortest). Where Claude
+      Code's event carries its own timestamp, the gap from it is recorded too (`cli_gaps_ms`).
+      Last, the hook is stalled past the 40 second timeout, and what Claude Code did with that
+      navigation is recorded (`overrun`: `refused`, `error` or `ran`). It passes only when the
+      cold gap and at least three warm gaps were measured, the longest gap plus the 26 second
+      budget stays 4 seconds under the 40 second timeout (a gap of at most 10 seconds), the
+      held hook's refusal reached Claude Code, and the stalled navigation didn't run. A
+      refusal names which (`gap_unmeasured`, `gap_too_long`, `full_budget_not_blocked`,
       `overrun_ran`). In `worker.log`: `probe hook_timing`.
-    - `payload_replay` (gates): the PreToolUse inputs your Claude Code really sent the hook
-      during `hook_timing` and the reading-tools session (kept for the probe alone, at most
-      50, deleted once replayed) go back through the read guard's strict parser: each must
-      parse, with no key twice, to what a plain JSON reading gives (`captured`, `parsed`,
-      `agreed`, and each failure's reason: `bom`, `lone_surrogate`, `unsafe_integer`,
-      `number_range`, `duplicate_key`, `disagrees`; never a payload). A failure means this
-      Claude Code writes hook input the strict parser refuses, so every page read would
-      count as unplaced: nothing runs; report it with the reasons (needs a code change).
-      In `worker.log`: `probe round18`.
+      **The hook's probe-only behaviours** (the hold, the stall, the timing file and the
+      payload capture) work only in a session the probe bound to that step: the session's
+      own token, the step's name and a marker file the probe writes in `probe-marks` for
+      that one session and deletes after it. In a run, or in any session not so bound, a
+      sign of probe mode (one of those settings, a file left in `probe-marks`, a stale marker
+      of another session) makes the hook refuse at once (`probe_marker`): it never holds,
+      stalls or captures there.
+      **On every real run** the hooks log when each started and answered (no addresses, no
+      page values), and the run's record (`last-run.json`, `hook`) keeps each start gap, the
+      longest, how long the hooks ran and when the last finished. When the longest gap leaves
+      less than 4 seconds of the timeout past the budget, it is written to `hook-margin.json`,
+      and `confirm-profile` refuses to renew (`hook_margin_low`) until a newer probe has
+      measured the margin again.
+    - `payload_replay` (gates): the hook inputs your Claude Code really sent during
+      `hook_timing` and the reading-tools session, both the PreToolUse calls and **the
+      reading tools' answers that read-guard reads** (kept for the probe alone, at most 50 in
+      all, deleted once replayed) go back through the read guard's strict parser: each must
+      parse, with no key twice and at most one address field, to what a plain JSON reading
+      gives (`captured`, `parsed`, `agreed`, and each failure's reason: `bom`,
+      `lone_surrogate`, `unsafe_integer`, `number_range`, `duplicate_key`, `address_fields`,
+      `disagrees`; counts and reasons only, never a payload). A page whose text Claude Code
+      cut in the middle of an emoji (a split surrogate pair) shows as `lone_surrogate`. A
+      failure means this Claude Code writes hook input the strict parser refuses, so those
+      page reads would count as unplaced: nothing runs; report it with the reasons (needs a
+      code change). In `worker.log`: `probe round18`.
     - `job_readback` (Windows): the helper's `inspect` run makes, joins and reads back its
       Job Object from inside whatever job the worker itself runs in (`outer_job` says
       whether there was one), as every run does.
@@ -1298,9 +1330,14 @@ with every attempt listed (not only the newest), and GitHub Actions' workflow ru
 head with, for each, every attempt's jobs; each listing is followed page by page until it
 is whole. A page that fails, a total that shifts between pages, or a listing that stops
 short holds the gate (it waits), so a failed attempt on a page it didn't read can never
-pass as green. **A rate-limit page from GitHub (HTTP 403 or 429) counts as a failed page**,
-whatever it holds: the gate holds and never accepts on that reading (the dry run says
-`hold`, naming the rate limit). Tests run that gate against a fake GitHub for each case, a failed attempt
+pass as green. **A refused page from GitHub (HTTP 403 or 429) counts as a failed page**,
+whatever it holds: the gate holds and never accepts on that reading. Which refusal it was is
+read from GitHub's answer (nineteenth round): **a rate limit** only on a 429, or a 403 that
+carries `x-ratelimit-remaining: 0`, a `Retry-After` header, or a body that says secondary
+rate limit (the dry run says `hold`, naming the rate limit and how long GitHub asked to
+wait); **any other 403 is a permission failure**, and the dry run says `hold` naming the
+endpoint GitHub refused. The watch waits as long as `Retry-After` or `x-ratelimit-reset`
+asks before its next reading. Tests run that gate against a fake GitHub for each case, a failed attempt
 on a second page and a page error among them.
 
 **Read the gate without acting, once, before relying on it** (Cain, or you through him):
@@ -1317,7 +1354,12 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     build say the head it will push, or push a head whose sha you know (a commit made but not
     yet pushed), start `/opt/cain/keeper.sh ship-gate <full head sha> --watch` on the Pi (or
     have Cain run it and show you its lines), then push. A watch started after the Windows run
-    finished never sees it pending and doesn't pass. It reads the gate now and then every 10
+    finished never sees it pending and doesn't pass. Better still, **watch the pull request
+    instead of a sha**: `/opt/cain/keeper.sh ship-gate --pr <number> --watch`, started before
+    the push, binds to the first head the pull request shows after it started and reads and
+    accepts only that sha, whatever a later push does to the branch; it is kept in
+    `/data/work/ship-gate-pr-<number>.json`, and **a Ship card for any other head of that pull
+    request is refused** while that acceptance stands (watch the new head to move it). It reads the gate now and then every 10
     minutes (`--every`) for up to 2 hours (`--hours`), printing one line per reading, and
     keeps the step in `/data/work/ship-gate-<head>.json`: the workflow file read, the head
     judged, every reading with its decision and every attempt seen. It passes only when the
@@ -1337,21 +1379,52 @@ Chrome behave that way. Only the supervised probe, on your PC, verifies that.
 ## Fault scenarios (the keeper's used-tap store)
 
 What the keeper's store of spent "Use it" taps does when something breaks, each shown by a
-test (`cain/tests/pcjobs-reuse.test.ts`) against a real git remote, and one you run on the Pi:
+test (`cain/tests/pcjobs-reuse.test.ts`) against a real git remote, and one you run on the Pi.
+
+**The evidence rule (nineteenth round): a tap rolls back only on a positive record that no
+push of its job ever succeeded.** Before each push attempt the keeper appends to the tap's
+pending line the commit that attempt will push (so a commit rebased after GitHub refused a
+push that wasn't a fast-forward is recorded too), and after each attempt the remote's answer:
+`ok`, `refused` (with GitHub's words) or `unknown` (a timeout, a broken connection, an answer
+it can't read). At the next start the tap counts as landed (final) if any recorded commit is
+in the fetched branch, an attempt was answered `ok`, or any job, report or worker record in
+the queue names its job or request. It **rolls back only when every recorded attempt was
+refused and none is unknown or unanswered**. The absence of the commit and of every record
+never rolls a tap back on its own: then the tap stays used for good (`settled: spent`), and
+its request, if still waiting, is refused with that reason.
 
 - **The keeper is killed between the push and marking the tap final**, then restarts on a
-  fresh copy of the queue: the job is in the queue, so the tap is made final, and a replay
-  of that tap is refused.
-- **The worker takes the job out of the queue, or moves it into a report**, before the
-  keeper restarts: the job or request is named in the queue, so the tap stays spent.
+  fresh copy of the queue: the push was answered `ok` (or the job is in the queue), so the
+  tap is made final, and a replay of that tap is refused.
+- **A job accepted and consumed, then the commit and every record rewritten away** (the
+  branch's history replaced), then a restart: no record shows every push refused, so the tap
+  stays spent; it is never rolled back.
+- **The report pruned before the restart**: the same, spent.
+- **A push refused as not a fast-forward, then a rebased push that lands**, then a restart:
+  the rebased commit was recorded before its push and is in the branch, so it is final.
 - **GitHub can't be reached when the keeper restarts**: the round stops, the tap stays
   pending (spent), and a replay is refused; once GitHub answers, the next round settles it.
-- **A push that never reached GitHub** (three tries, each refused): only then, with its
-  commit not in the fetched branch and nothing in the queue naming its job or request, is
-  the tap rolled back, once, and the request checked afresh.
-- **The Pi loses power right after a tap is written.** Run this once on the Pi (in Cain's
+- **Three pushes, each refused**: you get one Discord line saying the job didn't reach your
+  PC's queue and the tap is settled at the keeper's next start; a replay meanwhile is refused
+  with that same pending status. At the next start the tap is rolled back, once, and the
+  request checked afresh.
+- **One push timed out among the three**: its answer is `unknown`, so the tap stays spent.
+- **An older store** (a pending line written by the seventeenth round's keeper, with no
+  commit): it is treated as spent and finalised with one migration line, and you get one
+  Discord line about it.
+- **A stop condition** (a shallow copy of the queue, the queue's branch missing, an empty
+  queue on GitHub with a tap pending, a store that can't be read, a tap that can't be
+  settled): you get one Discord line naming it and the fix (the Troubleshooting rows
+  `reuse_shallow`, `queue_branch_missing`, `queue_empty_pending`, `reuse_store_unreadable`,
+  `reuse_unsettled`). A shallow copy and a tap that can't be settled hold that tap alone
+  (its request waits); other jobs go on. An unreadable store holds every reuse request and
+  lets other jobs go on. A missing branch or an empty queue stops the round.
+- **The Pi loses power right after a tap is written.** Run this on the Pi (in Cain's
   App terminal, or have Cain run it), against a scratch store on the same disk (the code
-  path the keeper uses, not its live store):
+  path the keeper uses, not its live store). **Repeat it several times (at least three
+  power cuts), and note the Pi's storage card model** (its brand and model, printed on the
+  card, or `cat /sys/block/mmcblk0/device/name` on the Pi) with the results: whether a write
+  survives a power cut depends on the card.
   1. Write a pending tap and flush it:
      `cd /opt/cain/pcjobs && PC_JOBS_REUSE_USED=/data/work/reuse-fault.jsonl bun -e 'import { configFromEnv, recordReuse } from "./main.ts"; recordReuse(configFromEnv(), "1300000000000000099", "j-20261116-fault1", "pending", "pc-fault", "0".repeat(40)); console.log("flushed")'`.
      It prints `flushed` only once the line and the store's folder are flushed to disk.
@@ -1360,10 +1433,10 @@ test (`cain/tests/pcjobs-reuse.test.ts`) against a real git remote, and one you 
   3. Check the pending line survived and a replay of that tap is refused:
      `cd /opt/cain/pcjobs && PC_JOBS_REUSE_USED=/data/work/reuse-fault.jsonl bun -e 'import { check, configFromEnv, reuseLedger } from "./main.ts"; const c = configFromEnv(); console.log(JSON.stringify(reuseLedger(c).get("1300000000000000099"))); console.log(JSON.stringify(check(c, JSON.stringify({ from: "cain", job: { site: "example.com", action: "read_account_settings", step: "read", start_url: "https://example.com/account", done_looks_like: "x", owner_reuse: { values: ["****test"], go: "\u201cUse it\u201d", message_id: "1300000000000000099" } } }), [], new Date())))'`.
      It must print the line with `"state":"pending"`, then a refusal that says
-     `that tap of his already answered for j-20261116-fault1`. Anything else (no line, a
-     torn line, no refusal) means the store isn't safe across a power cut on this storage:
-     report it.
-  4. Delete the scratch store: `rm /data/work/reuse-fault.jsonl`.
+     `that tap of his answered for j-20261116-fault1 and is pending`. Anything else (no
+     line, a torn line, no refusal) means the store isn't safe across a power cut on this
+     storage: report it, with the card model.
+  4. Delete the scratch store: `rm /data/work/reuse-fault.jsonl`, then repeat from step 1.
 
 ## Watching it, and stopping it
 
@@ -1463,6 +1536,16 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `redirect_read`, `structured_address`, `forged_address`, `kill_latency` (`confirm-profile`) | `probe-evidence.json`: that step's line (for `redirect_read`, its `session_ended` and `secret_withheld`; the refusal says which failed); `worker.log`: `probe round15` and `probe round16` | That probe step didn't pass (above, under the probe). Nothing runs on this Claude Code and extension: rerun the probe once; if it repeats, report it (needs a code change). `session_ids` and `fragment_strip` never refuse: the first is a diagnostic, the second only turns fragment stripping on. |
 | `hook_timing` (`confirm-profile`) | `probe-evidence.json`: `hook_timing` (`cold_gap_ms`, `warm_gaps_ms`, `max_gap_ms`, `full_budget`, `overrun`, `why`); `worker.log`: `probe hook_timing` | `gap_too_long`: on this PC the hook's start (Git Bash and the runtime) takes so long that it plus the hook's 26 second budget comes within 4 seconds of the 40 second timeout. Close other heavy programs, check whether your security software scans Git Bash or the runtime on every start, restart the PC and run the probe again first thing. `gap_unmeasured`: Claude Code didn't print a tool call before starting its hook, so the gap couldn't be measured: report it (needs a code change). `full_budget_not_blocked`: a hook held to its budget didn't reach Claude Code as a refusal (the CLI gave up on it first, or ran the call anyway): report it with your `claude` version (needs a code change). `overrun_ran`: a navigation whose hook never answered ran anyway: the permission layer isn't refusing on its own; check `session-settings.json` is the pinned one and report it. |
 | `payload_replay` (`confirm-profile`) | `probe-evidence.json`: `payload_replay` (`captured`, `parsed`, `agreed`, `failures`); `worker.log`: `probe round18` | The hook input your Claude Code sent was refused by the read guard's strict parser (`bom`: it starts with a byte order mark; `lone_surrogate`; `unsafe_integer`: a number past the safe range; `duplicate_key`; `disagrees`), or nothing was captured (`captured` 0: the probe's sessions made no tool call). Every page read would count as unplaced, so nothing runs. Run the probe once more; if it repeats, report the reasons (needs a code change). |
+| `hook_margin_low` (`confirm-profile`) | `hook-margin.json` in the worker folder; `last-run.json`: `hook` | A real run's hooks started so late that less than 4 seconds of the 40 second timeout was left past the 26 second budget. Close heavy programs (a scan, a backup), restart the PC, then run the probe again first thing (its `hook_timing` measures the margin anew) and `confirm-profile`. Needs a code change: only if it repeats on an idle PC. |
+| `probe_marker` (a run's `navigation_denied`, `hook_missing_decision` or `read_unplaced` with reason `probe_marker`) | `nav-decisions.jsonl`: a line with `why` or `reason` `probe_marker`; the `probe-marks` folder in the worker folder | The hook saw a sign of probe mode in a run: a file left in `probe-marks`, or a probe setting in the environment. Delete everything in `probe-marks`, close the terminal you started the run from and open a new one, then run again. Needs a code change: no, unless it repeats with `probe-marks` empty. |
+| `fragment_strip` with `no_page_report` | `probe-evidence.json`: `fragment_strip` (`why`, `received`) | The fragment check page sent no report for its step's nonce in time (the page didn't load, its script was blocked, or the extension took long). Fragments stay refused; that's safe. Run the probe again; if it repeats, check the Cain jobs Chrome allows scripts on `http://127.0.0.1`. |
+| `reuse_migrated` (a Discord line from Cain's App) | `/data/pc-jobs-reuse-used.jsonl` on the Pi: a line with `migrated` | A tap written by an older keeper was counted as used. Nothing to fix: if you still want that check, let Cain ask again and tap. |
+| `reuse_shallow` (a Discord line) | `/data/pc-jobs/.git/shallow` on the Pi | The keeper's copy of the queue is shallow, so it can't tell whether a tap's job reached your PC; that tap waits, other jobs go on. Fix: delete `/data/pc-jobs` on the Pi (Cain's App terminal: `rm -rf /data/pc-jobs`) and restart the Cain App; it makes a full copy. |
+| `queue_branch_missing` (a Discord line) | the `pc-jobs` repository on GitHub: its branches | The queue's `main` branch is gone while a tap waits to be settled; the keeper's round stops. Fix: restore `main` in the `pc-jobs` repository (GitHub's page for the repository lists deleted branches to restore for a while), or push the queue's last `main` back from the PC's clone. The keeper goes on by itself. |
+| `queue_empty_pending` (a Discord line) | the `pc-jobs` repository on GitHub | The queue on GitHub has no branch at all while a tap waits to be settled; the round stops. Fix: give it its first commit again (setup step 2); the tap then counts as used. |
+| `reuse_store_unreadable` (a Discord line) | `/data/pc-jobs-reuse-used.jsonl` on the Pi | The keeper can't read its record of used taps (it isn't a readable file), so it takes no reuse job until it can; other jobs go on. Fix: make it a readable file again (if something replaced it with a folder, move that aside); never delete a readable one: it is what keeps a tap from answering twice. |
+| `reuse_unsettled` (a Discord line) | the keeper's log in the Cain App's log | Git gave no clear answer about a tap's job (a file in the queue copy it couldn't read, or git neither yes nor no). That tap waits; other jobs go on; it tries each round. If it lasts a day, delete `/data/pc-jobs` and restart the Cain App. |
+| `reuse_push_refused` (a Discord line) | the keeper's log: `push 3 of 3` | GitHub refused the push of a job made from your tap three times. The tap is settled at the keeper's next start (rolled back only because every try was refused), and the job is queued again by itself. If it repeats, check the `pc_jobs_token` option (Contents read and write on `pc-jobs`). |
 | `extension_slow_attach` (`confirm-profile`) | `probe-evidence.json`: `not_ready` (counts, `waits_ms`, `first_wait_ms`) | A probe session hit the not-ready cap: Claude in Chrome took too long to attach. Restart the Cain jobs Chrome, wait a minute, then run the probe again. Needs a code change: only if it repeats on a healthy Chrome. |
 | `abort_kill_failed` | `abort-kill-failed.json` in the worker folder; `worker.log`: `abort_kill_failed` | A hook ended a session, and the worker couldn't see it gone within 8 seconds after ending its Job Object and then its process. The PC is unconfirmed until a new probe: check Task Manager for a leftover `claude` or `pcw-jobrun`, end it, then run the probe and `confirm-profile` again (which clears the file). Report it if it repeats. |
 | `navigation_denied` with `fragment_not_allowed` | `nav-decisions.jsonl`: the deny line | The session tried an address with a `#` part. Fragments are refused unless your probe's `fragment_strip` step passed. Nothing to fix unless the job's own address has one: pin it without the `#` part. |
