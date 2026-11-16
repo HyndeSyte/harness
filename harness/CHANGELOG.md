@@ -73,6 +73,13 @@
 - **A tap that went through but couldn't be noted down says so,** instead of being ignored.
 - **A restore held up by a stray file goes on by itself once the file is gone,** and the command line that moves stray files aside only ever moves the restore's own stray log files, checking each copy first. If Harness can't tell you it started without its records, its page says the note wasn't delivered.
 - **A Subscribe & Save advert at the bottom of an ordinary Amazon delivery mail no longer hides it.** Only a mail that says Subscribe & Save at the top or in its subject is skipped, and mail_skip.json has size limits (50 kinds, 20 words a list).
+- **A tap cut off by an error is never called turned down.** If something goes wrong after Harness began acting on your tap, it says it can't tell yet whether it went through, keeps it, and reads your calendar for it at its next start before doing anything with it; nothing is done twice.
+- **Add anyway and Undo are looked for on your calendar too.** After a restore, an Add anyway already there isn't added a second time, and an Undo already done isn't done again. A kind of tap Harness can't look for on your calendar gets no Go ahead once it may have run, and its card says so.
+- **A change you deleted since isn't put back.** If the calendar shows an event Harness added was taken off afterwards, its card says so, with no Go ahead. For a change of several parts, the card says which parts are there, and Go ahead does only the rest.
+- **Every tap card after a restore is pointed to, never promised a button.** A tap whose time can't be read still gets its card, marked "time unknown".
+- **Subscribe & Save mail that opens with a greeting is still skipped,** and a word like "deals" in it no longer counts as an advert; an ordinary order mail with a real offer in it still comes through.
+- **Setting stray files aside from the command line takes back a copy that fails,** a full disk included, says why and leaves everything as it was.
+- **A message held through a restore makes no promise it can't keep,** and one whose time had already passed says so.
 
 ## 0.23.0
 

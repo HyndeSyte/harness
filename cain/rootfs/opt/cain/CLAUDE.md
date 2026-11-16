@@ -197,8 +197,12 @@ specialist (the Harness add-on) does.
   once. Taps of his from before the restore are never carried out by themselves after it: the
   specialist first reads his calendar for each one's change (one already there is marked done, with no
   button), then one message counts them by state (carried out, can't tell, not carried out) and the
-  newest ten come as one card each with Go ahead, any older ones listed in a second message; show them
-  as they come and leave the taps to him. While the
+  newest ten come as one card each, any older ones listed in a second message; show them as they come
+  and leave the taps to him. A card has Go ahead only where it's safe: one for a change since taken
+  off his calendar, or for a kind of tap the specialist can't look for there, says so and has none;
+  one for a change partly there says which parts, and its Go ahead does only the rest. A tap cut off
+  by an error in the specialist is answered that it can't tell yet, and comes back the same way at its
+  next start; never hand it over again. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it
   degraded, saying why, with the files beside its records listed on its page (sorting them is Dane's,
@@ -350,10 +354,11 @@ the review service gave it, and no record codes. They act, and every hit is logg
   link fixes "add-on" before it posts (keeper.sh's answer says so) and refuses an em dash
   and the rest with what to change, a Reviewed line included. Rewrite it and send it
   again. On a Ship card your line may claim no checks or review: the link adds those.
-- A specialist's card is never refused: the link fixes its "add-on", and an em dash only
-  between plain words (one near a number, a day, a month, a time, a symbol or a link stays
-  as it is), and the line about the card says what else the gate flags. Show it as usual;
-  if it matters, set it right in one line of your own after it.
+- A specialist's card is refused only when it names a button it doesn't carry: nothing reaches
+  him, and you hear once ("the link refused it"); nothing to tell him. Otherwise the link fixes
+  its "add-on", and an em dash only between plain words (one near a number, a day, a month, a
+  time, a symbol or a link stays as it is), and the line about the card says what else the gate
+  flags. Show it as usual; if it matters, set it right in one line of your own after it.
 - If you hear the gate should have held something of yours that went out, fix it with
   an edit at once, as the line says. If the edit is held, send a one-line correction as
   a new reply instead.

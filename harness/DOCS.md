@@ -852,7 +852,16 @@ by a stable identity (the change and the fixed id each add is written under, or 
 bound to); one whose intent can't be written isn't acted on and you're told nothing changed. Once what it
 did is in the ledger its outcome is recorded; every journal write is checked, and one that fails is
 logged and told (a tap that went through but whose outcome couldn't be written says so). A tap with an
-intent and no outcome is "outcome unknown", never "not carried out". A refusal's outcome and its note
+intent and no outcome is "outcome unknown", never "not carried out". An error after the intent is
+written keeps that: the tap isn't refused or struck off, its intent stays, you're told on the tap that
+Harness can't tell yet whether it went through, and at the next start the calendar is read for it by its
+identity before anything is done with it (a tap the records in use already took is left to their own
+reads, with no *Go ahead*). Only an error before the intent, or a calendar's own answer turning it down,
+is a refusal. A tap on a choice that writes a calendar names its identity too: *Add anyway* the fixed ids
+its adds are written under (made from the receipt it came from, so the same tap taken again writes to
+the same ids, and the writer reads that id before writing), *Undo* and the Family *Undo* each event and
+the state it must read in afterwards. Any other choice that writes a calendar has no identity to read,
+so once it may have run its card offers no *Go ahead* and says so. A refusal's outcome and its note
 are written before the note is posted, and the note's delivery after it, so after a restart a refused
 tap is never taken again and its note goes again only if its delivery wasn't recorded; a tap is struck
 off only once its outcome is recorded and its note delivered. A tap's age is read from Discord's own
@@ -861,10 +870,14 @@ journal's is used. While the clock is flagged as behind the records the age is u
 reported, not taken; if that tap was on the clock card, the card is posted again. Across a restore (the
 swap applied at that start) nothing written in the journal is taken by itself. For each tap that may
 have reached a calendar, the calendar is read first for its effect by that identity; one it shows is
-marked done, with no button. Then one message counts the rest by what's recorded (carried out before
-the records were put back, can't tell, not carried out), the newest ten each get a card with *Go
-ahead* that says which, and any older ones are listed in a second message by time and state. *Go
-ahead* reads the calendar again first: if the change is there it does nothing more; otherwise the tap
+marked done, with no button. A Google event read as cancelled at its fixed id was added and deleted
+since: its card says so and has no *Go ahead*, and nothing is put back. A change of several parts is
+read part by part: its card names which are there, and its *Go ahead* does only the others. Then one
+message counts the rest by what's recorded (carried out before the records were put back, can't tell,
+not carried out) and points at the cards below it; the newest ten each get a card that says which (a
+tap whose time can't be read always gets one, marked "time unknown"), and any older ones are listed in a
+second message by time and state. *Go ahead* reads the calendar again first: if the change is there it
+does nothing more; otherwise the tap
 goes through the usual checks on the records in use, and the write itself reads the event's fixed id
 or version first, so nothing is made twice. While Harness runs degraded without its records a tap is
 refused at once and you hear it through Cain's link. The tap journal is a required part of the
@@ -931,7 +944,10 @@ only ever a `-wal` or `-shm` at the records' name that isn't theirs. A marker na
 records' own file or log, the staged restore, a kept set, anything outside the folder) is refused by
 name and nothing moves. It lists them, asks you to type yes, copies each into
 `harness-set-aside-<time>-<n>/` beside the records (a new folder each time), checks the copy byte for
-byte, only then removes the original, and clears the refusal, so the next start finishes the swap. A swap marker that can't be read (damaged or cut short) is never deleted and
+byte, only then removes the original, and clears the refusal, so the next start finishes the swap. A
+copy or fsync that fails (a full disk, say) or a copy that doesn't match takes back what it made, the
+partial copy and the folder, leaves the originals and the marker as they were, says why in plain words
+and exits non-zero. A swap marker that can't be read (damaged or cut short) is never deleted and
 nothing is moved: the start runs degraded, and the page lists the files at the records' live and kept
 names, as `python3 -m harness.migrate /data/harness.sqlite --swap` does, for sorting by hand. The marker
 itself is always written whole (a temporary file, fsynced, renamed, and the folder fsynced). If a start
@@ -943,11 +959,12 @@ any install does, so it doesn't need a fresh *Run check*.
 
 Once your tap stages it, Harness is fenced and takes nothing new until it restarts. The fence is a mode,
 not a held lock: any ledger write then fails at once with a plain reason, while sending messages already
-queued (and marking them sent) still works, through the ledger's one outbox-only exemption. A card with
+queued (and marking them sent) still works, through the ledger's one outbox-only exemption (a private pass only the outbox's own method hands over: a guard against a stray flag or wrong argument by accident, not against code set on getting past it). A card with
 buttons isn't sent while fenced, so no button is ever dead; a tap meanwhile gets the restart answer.
 After the restart, the swap sets those records aside, and every message still waiting in them (a card
 held by the fence among them, even one made in the same moment as the restart card) comes back once,
-without its buttons, which belonged to the records set aside. If the restore isn't used after all, it
+without its buttons, which belonged to the records set aside; nothing asks again for it, and one whose
+buttons had already run out says its time has passed. If the restore isn't used after all, it
 goes out from the records as they are, its buttons bound. The loop's
 heartbeat and the clock check keep running while fenced, and the page and `/health` say fenced beside
 the loop's own beat, so a stuck or stopped loop still shows as stuck. A request or a tap is answered at once that it's waiting to
@@ -995,9 +1012,10 @@ calendar as before, and its message says so: "From your mail, on your Gmail cale
 anything is sent to the model, matched on who sent it and its subject: no card, no calendar entry, and
 the digest never mentions it. The first kind is Amazon's Subscribe & Save delivery management: the mail
 must come from Amazon and say Subscribe & Save in its subject, or else where its text says what the mail
-is (a header line at the top, or the first block of text before the order's items, read on the Pi;
-never in a promotional footer or a quoted section, and a first block that reads as an advert keeps the
-mail) before a subject like "last day to manage", "manage your delivery" or "delivery date has changed"
+is (a header line at the top, or the first block of text before the order's items, after any greeting
+on its own line such as "Hello Alex,", read on the Pi; never in a promotional footer or a quoted section,
+and a first block that reads as an advert by its shape, an offer such as "save 15%" or a run of calls to
+action and links, keeps the mail; one word such as "deals" or "discover" doesn't make it an advert) before a subject like "last day to manage", "manage your delivery" or "delivery date has changed"
 counts. Prime, Audible and Kindle renewals, an ordinary order's new delivery date and an order's return
 window all come through ("return" counts only as a whole word, so "returning" doesn't). To skip another
 kind without a new build, add it by name to `/data/mail_skip.json`, read at every pick, for example

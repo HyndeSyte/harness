@@ -29,6 +29,8 @@
 - After a restore, Cain shows each held request the specialist passes back once, one message each.
 - After a restore, Cain shows the specialist's list of your taps from before it, each with Go ahead, and leaves those taps to you.
 - Those taps now say whether each was carried out, not carried out, or the specialist can't tell, and one already on your calendar comes with no button.
+- A specialist's card that names a button it doesn't carry no longer reaches you: the link holds it back and Cain hears why.
+- A tap card the specialist can't safely offer again comes with no Go ahead and says so, and Cain leaves it at that.
 
 ## 0.11.0
 
