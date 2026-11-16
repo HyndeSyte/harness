@@ -155,12 +155,15 @@ class Inbox:
         self.wake = wake
         self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
         self.migration: dict = {}            # twelfth round: the ledger waiting for its move (migrate.waiting_summary)
+        self.degraded = ""                   # thirteenth round: why it started without its records, or ""
 
     def beat(self) -> None:
         self.beat_at = time.monotonic()
 
     def health(self) -> dict:
         extra = {"migration": dict(self.migration)} if self.migration else {}
+        if self.degraded:
+            return {"status": "degraded", "why": self.degraded, "loop_age_s": None, **extra}
         if self.beat_at is None:
             return {"status": "starting", "loop_age_s": None, **extra}
         age = time.monotonic() - self.beat_at
@@ -174,6 +177,10 @@ class Inbox:
         self.queue.put(h)
         if self.wake is not None:
             self.wake.set()
+
+    def pending(self) -> int:
+        """Handovers and taps queued for the controller's thread, not taken yet (thirteenth round)."""
+        return self.queue.qsize()
 
     def take(self) -> list[Handover]:
         out = []
@@ -247,6 +254,12 @@ def _handler(inbox: Inbox, wait_s: float):
                          restore=_restore_key(body.get("restore")),
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
+            if h.kind == "press":
+                # Thirteenth round: a tap is acknowledged here, before any ledger write, and queued in memory for
+                # the controller's thread (the only one that writes the ledger), however long a hold lasts.
+                h.finish("ok", queued=True)
+                inbox.submit(h)
+                return self._reply(200, h.result)
             inbox.submit(h)
             if not h.done.wait(wait_s):
                 return self._reply(202, {"status": "working", "said": (

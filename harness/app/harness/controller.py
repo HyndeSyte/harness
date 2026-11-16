@@ -352,6 +352,11 @@ class Controller:
         swept = migrate.run_live(self.ledger, self.calendar_change, self.config.owner_user_id)
         if swept:
             log.info("ledger migrated: %s", swept)
+        # Thirteenth round: after a restore, the requests held in the records it set aside are posted back once.
+        try:
+            migrate.after_restore(self.ledger, self.config.owner_user_id, self.config.timezone)
+        except Exception as e:                 # noqa: BLE001: never stops the start
+            log.warning("the held requests of the records set aside couldn't be posted back: %s", type(e).__name__)
         self.runner.reconcile_after_restart()
         if self.family_add is not None:
             self.family_add.reconcile_after_restart()
@@ -375,7 +380,9 @@ class Controller:
             migrate.heartbeat(self.ledger)
             if migrate.waiting(self.ledger) and self.config is not None:
                 migrate.tend_waiting(self.ledger, self.config.owner_user_id, self.config.timezone)
-            summary = migrate.waiting_summary(self.ledger)
+            if self.config is not None and not migrate.restore_staged(self.ledger.path):
+                migrate.post_clock_card(self.ledger, self.config.owner_user_id)   # thirteenth round
+            summary = migrate.migration_summary(self.ledger)
         except Exception as e:                 # never stops the loop
             log.warning("migration upkeep failed: %s", type(e).__name__)
             return
@@ -532,6 +539,9 @@ class Controller:
             self._publish()
             self._wait(10)
             return
+        if migrate.restore_staged(self.ledger.path):
+            self._fenced_tick()
+            return
         for h in (self.handovers.take() if self.handovers is not None else []):
             {"press": self._press, "digest": self._cain_digest,
              "morning-posted": self._morning_posted,
@@ -545,6 +555,28 @@ class Controller:
         self._beat()
         self._finish_handovers()
         self._wait(0.3 if (self._busy() or self._handover_jobs) else 3)
+
+    FENCED = ("Not taken: Harness is waiting to restart so its records can be put back from a backup. Restart the "
+              "Harness App in Home Assistant now. Nothing changed.")
+
+    def _fenced_tick(self) -> None:
+        """Thirteenth round: a restore is staged, so nothing new is taken until the restart (whatever is recorded
+        now is set aside by it). Each handover gets a plain answer, each tap an answer on its button; the outbox
+        still posts (the card that asks him to restart), and the page and Cain's /health say a restore waits."""
+        for h in (self.handovers.take() if self.handovers is not None else []):
+            if h.kind == "press":
+                h.finish("ok")
+                p = h.press
+                try:
+                    self.api.answer_callback(f"{p.get('app', '')}:{p.get('token', '')}", self.FENCED)
+                except Exception as e:         # noqa: BLE001: an answer that didn't go changes nothing
+                    log.info("a tap while the restore waits couldn't be answered: %s", type(e).__name__)
+            else:
+                h.finish("refused", self.FENCED, restore_staged=True)
+        self._beat()
+        self.outbox.flush()
+        self._publish()
+        self._wait(3)
 
     def _wait(self, seconds: float) -> None:
         if self.discord is None:
@@ -995,6 +1027,17 @@ class Controller:
             status, said = migrate.request_restore(self.ledger, self.config.owner_user_id, h.restore, by="cain")
             h.finish(status, said)
             return
+        if h.state == "migrate-clock":
+            # Thirteenth round: only posts him the card with Use the clock as it is now, when the clock holds
+            # backup pruning up; the clock is taken as right only on his tap.
+            sent = migrate.post_clock_card(self.ledger, self.config.owner_user_id, force=True)
+            stall = migrate.clock_stall(self.ledger)
+            h.finish("ok" if sent else "refused",
+                     (f"He has a card to take the clock as right; pruning is held up by a record stamped "
+                      f"{stall.get('at', '')}. Nothing changed yet." if sent else
+                      "The clock doesn't hold pruning up by a record, so there's no card to send. Nothing changed."),
+                     pruning_stalled=stall)
+            return
         if h.state == "migrate-override":
             # Eleventh round: the override is his alone. Cain's command only posts him a card saying the
             # migration is unrehearsed, why the dry run failed and that a backup is taken first; it runs only
@@ -1004,8 +1047,8 @@ class Controller:
             return
         now = fast_path(self.ledger)
         h.finish("unknown", "Say smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open "
-                 "<gmail|family>, migrate-check [path] [candidate], migrate-override or "
-                 "migrate-restore <schema> <build>. "
+                 "<gmail|family>, migrate-check [path] [candidate], migrate-override, "
+                 "migrate-restore <schema> <build> or migrate-clock. "
                  "It's " + ("on" if now.get("on") else "off (card only)") + " now.")
 
     def _migration_choice(self, kind: str, target: str) -> str:
@@ -1014,7 +1057,9 @@ class Controller:
         if kind == "migration_check":
             said = migrate.check_tapped(self.ledger, self.calendar_change, owner, target)
         elif kind == "migration_restore":
-            said = migrate.restore_tapped(self.ledger, target)
+            said = migrate.restore_tapped(self.ledger, target, owner)
+        elif kind == "migration_clock":
+            said = migrate.accept_clock(self.ledger, by="owner tap")
         else:
             said = migrate.override_tapped(self.ledger, self.calendar_change, owner, target)
         return said

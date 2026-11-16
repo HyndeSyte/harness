@@ -142,6 +142,17 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
         # Twelfth round: the ledger waiting for its move is never silent.
         parts.append(f'<div class="no">⚠ Records not moved to this update yet: {_e(mig.get("why", ""))}. Calendar '
                      f'changes wait. The message with Run check: {_e(mig.get("notice", "none"))}.</div>')
+    if mig.get("degraded"):
+        # Thirteenth round: a start without its records moved (or opened) is said, never a dead App.
+        parts.append(f'<div class="no">⚠ Running degraded: {_e(mig.get("why", ""))}.</div>')
+    if mig.get("restore_staged"):
+        parts.append('<div class="no">⚠ A restore is staged: restart the App now to put the records back. Nothing '
+                     'new is taken until then.</div>')
+    stall = mig.get("pruning_stalled") or {}
+    if stall:
+        held = (f' by the record {_e(stall.get("kind", ""))} (#{_e(stall.get("event"))}) stamped '
+                f'{_e(str(stall.get("at", ""))[:19])} UTC' if stall.get("event") is not None else "")
+        parts.append(f'<div class="no">⚠ Old backups aren\'t pruned: {_e(stall.get("why", ""))}{held}.</div>')
     parts.append("</div>")
 
     parts.extend(_discord_section(st.get("discord")))

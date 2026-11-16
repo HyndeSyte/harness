@@ -38,6 +38,16 @@ MACHINE_VALUE = re.compile(r"(?i)\b(?:job|http|uid|nonce)\s*\{\}")
 
 # (file, words in the literal, why it may stay). Kept short: each one is a decision.
 ALLOWED = [
+    # Thirteenth round: a staged restore is swapped in only at the App's start, so his tap is followed by one ask to
+    # restart it, with the exact path, and everything taken meanwhile is answered with the same ask.
+    ("migrate.py", "Restart Harness now to put its records back",
+     "the one card after his Put them back tap: the restore is used only when the App starts (thirteenth round)"),
+    ("migrate.py", "Ready: restart Harness now",
+     "the answer on his Put them back tap, pointing at that card (thirteenth round)"),
+    ("controller.py", "Harness is waiting to restart so its records",
+     "what a request or tap gets while a staged restore waits for the restart (thirteenth round)"),
+    ("setup_web.py", "A restore is staged: restart the App now",
+     "the status page while a staged restore waits for the restart (thirteenth round)"),
     ("calendar_change.py", "Try again",
      "the button after a calendar refused its own safety check: a new card read from the calendar just now, for "
      "his tap, a decision, not a resend ask (eighth round)"),

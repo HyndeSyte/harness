@@ -602,6 +602,16 @@ IGNORED_STAMPS = {"family": ("DTSTAMP", "LAST-MODIFIED", "SEQUENCE", "CREATED"),
 _ICS_VOLATILE = re.compile(r"^(?:" + "|".join(IGNORED_STAMPS["family"]) + r")[;:]", re.I)
 
 
+# Thirteenth round: the unguarded PUT's own test event (_unguarded_put): far in the past, no alarm, a plain title.
+UNGUARDED_AT = datetime(2001, 1, 1, 3, 0, tzinfo=timezone.utc)
+UNGUARDED_TITLE = SMOKE_PREFIX + "Harness write test (safe to delete)"
+
+
+def _no_alarm(ics: str) -> str:
+    """An iCalendar body without any VALARM."""
+    return re.sub(r"BEGIN:VALARM\r?\n.*?END:VALARM\r?\n", "", ics, flags=re.S)
+
+
 def _ics_fields(body: str) -> dict:
     """An iCalendar body as fields (twelfth round): {(component, property): [values]}, each component keyed
     by its kind and RECURRENCE-ID, without the pinned stamps (IGNORED_STAMPS). For telling which fields a
@@ -643,6 +653,55 @@ def _lost_fields(before: dict, intended: dict, back: dict) -> list[dict]:
             continue
         lost.append({"field": k, "was": before.get(k), "now": back.get(k)})
     return lost
+
+
+_GMAIL_READ_ONLY = ("id", "kind", "iCalUID", "creator", "organizer")
+
+
+def _field_key(field) -> str:
+    """A field of _ics_fields or _gmail_fields as a baseline key: the component path without its RECURRENCE-ID."""
+    if isinstance(field, (tuple, list)):
+        return re.sub(r"\[[^\]]*\]", "", str(field[0])) + "/" + str(field[1])
+    return str(field)
+
+
+def _canon(value) -> str:
+    """A value with what a calendar normalises taken out: an iCalendar line's name and parameters, escapes, case
+    and spacing."""
+    if isinstance(value, list):
+        value = "\n".join(re.sub(r"^[A-Z-]+(?:;[^:]*)?:", "", str(v)) for v in value)
+    return " ".join(str(value).replace("\\", "").lower().split())
+
+
+def _baseline_of(diff: list[dict]) -> dict:
+    """Thirteenth round: a no-op round trip's differences as a calendar's baseline: {field key: {"kind": "added",
+    "now": value} | {"kind": "removed"} | {"kind": "changed"}}."""
+    out = {}
+    for x in diff:
+        if x["was"] is None:
+            out[_field_key(x["field"])] = {"kind": "added", "now": x["now"]}
+        elif x["now"] is None:
+            out[_field_key(x["field"])] = {"kind": "removed"}
+        else:
+            out[_field_key(x["field"])] = {"kind": "changed"}
+    return out
+
+
+def _matches_baseline(x: dict, baseline: dict | None) -> bool:
+    """Whether a difference after a write is only the calendar's own normalisation (thirteenth round): the same
+    field changed the same way in the baseline: added with the same value, removed, or changed to a value that's
+    the same once normalised (_canon). Anything else is someone's edit."""
+    b = (baseline or {}).get(_field_key(x["field"]))
+    if not b:
+        return False
+    kind = "added" if x["was"] is None else "removed" if x["now"] is None else "changed"
+    if b.get("kind") != kind:
+        return False
+    if kind == "added":
+        return x["now"] == b.get("now")
+    if kind == "changed":
+        return _canon(x["was"]) == _canon(x["now"])
+    return True
 
 
 def _gmail_fields(event: dict) -> dict:
@@ -1588,6 +1647,8 @@ class CalendarChange:
                   "id": got.get("id", ""), "cleared": bool(got.get("cleared")),
                   # Twelfth round: the strength of the versions it read, and on Family a PUT with no If-Match.
                   "etag_strength": _strength(got.get("etags") or []),
+                  # Thirteenth round: what this calendar rewrites on a write that changes nothing (_baseline_family).
+                  "baseline": got.get("baseline"),
                   **({"unguarded_put": got.get("unguarded_put", "")} if provider == "family" else {})}
         gate = card_gate(self.ledger)
         run = dict(smoke_run(self.ledger))
@@ -1805,6 +1866,7 @@ class CalendarChange:
                                                "extendedProperties": {"private": dict(private)}})
             if out.kind != "ok":
                 return {**got, "why": "its test event couldn't be added"}
+            got["baseline"] = self._baseline_gmail(address, uid, desc)     # thirteenth round
             old = stale_kind("edit", uid, {"description": f"{CONFORM_MARK} 1"},
                              {"description": f"{CONFORM_MARK} 2"}, f"{CONFORM_MARK} 2")
             if kinds.get("edit") in ("enforced", "ignored") and old:
@@ -1895,8 +1957,12 @@ class CalendarChange:
         day = start.date().isoformat()
         pid_ = "hm-" + secrets.token_hex(16)
         phref = self.client.href_for(pid_)
-        plain = ics_edit.build(pid_, title, start, end, "", "", self.tz, self.ledger.now()).replace("END:VEVENT", tag, 1)
-        self._note_created(run_id, {"cal": "family", "href": phref, "nonce": nonce, "day": day})
+        # Thirteenth round: the PUT with no If-Match goes to a test event of its own far in the past, with no
+        # alarm and a title that says what it is, so it can't remind anyone or sit in the week ahead.
+        past = UNGUARDED_AT
+        plain = _no_alarm(ics_edit.build(pid_, UNGUARDED_TITLE, past, past + timedelta(minutes=15), "", "", self.tz,
+                                         self.ledger.now())).replace("END:VEVENT", tag, 1)
+        self._note_created(run_id, {"cal": "family", "href": phref, "nonce": nonce, "day": past.date().isoformat()})
         self._note_created(run_id, {"cal": "family", "href": href, "nonce": nonce, "day": day})   # before sending
         self._note_created(run_id, {"cal": "family", "href": shref, "nonce": nonce, "day": day,
                                     "until": (start + timedelta(days=2)).date().isoformat()})
@@ -1907,6 +1973,7 @@ class CalendarChange:
             out = self.client.put_new(href, one)
             if out.kind != "ok":
                 return {**got, "why": "its test event couldn't be added"}
+            got["baseline"] = self._baseline_family(href, fetch)             # thirteenth round
             old = stale_kind("edit", href, lambda b: note(b, f"{CONFORM_MARK} 1"),
                              lambda b: note(b, f"{CONFORM_MARK} 2"), f"{CONFORM_MARK} 2")
             if kinds.get("edit") in ("enforced", "ignored") and old:
@@ -1934,20 +2001,62 @@ class CalendarChange:
 
     def _unguarded_put(self, href: str, ics: str, fetch) -> tuple[str, str]:
         """Twelfth round: on Family, its own test event replaced with no If-Match: "taken" (the replace
-        landed and reads back), "refused" (turned down), or "unknown". (result, its answer in words)."""
+        landed and reads back), "refused" (turned down), or "unknown". (result, its answer in words).
+        Thirteenth round: the test event is far in the past with no alarm (UNGUARDED_AT, UNGUARDED_TITLE), and
+        it's removed and read back gone before the result counts: one that can't be shown gone is "unknown"."""
         if self.client.put_new(href, ics).kind != "ok":
             return "unknown", "its test event couldn't be added"
         back, body = fetch(href)
         if back.kind != "ok" or "END:VEVENT" not in (body or ""):
+            self._drop_test(href, fetch)
             return "unknown", "its test event couldn't be read back"
         mark = f"{CONFORM_MARK} 0"
         out = self.client.replace(href, None, body.replace("END:VEVENT", f"DESCRIPTION:{mark}\r\nEND:VEVENT", 1))
         back, now = fetch(href)
         if out.kind == "ok" and back.kind == "ok" and mark in (now or ""):
-            return "taken", "a replace with no If-Match was taken and reads back"
-        if out.kind not in ("ok", "unknown"):
-            return "refused", _out_words(out, "a replace with no If-Match")
-        return "unknown", _out_words(out, "a replace with no If-Match")
+            got = "taken", "a replace with no If-Match was taken and reads back"
+        elif out.kind not in ("ok", "unknown"):
+            got = "refused", _out_words(out, "a replace with no If-Match")
+        else:
+            got = "unknown", _out_words(out, "a replace with no If-Match")
+        if not self._drop_test(href, fetch):
+            return "unknown", got[1] + "; its test event couldn't be shown removed afterwards"
+        return got
+
+    def _baseline_family(self, href: str, fetch) -> dict | None:
+        """Thirteenth round: what Family rewrites on a write that changes nothing: the run's test event read, written
+        back as read (with its version), read again, and the two reads compared. That calendar's baseline for the
+        lost-update compare (_check_lost); None when it couldn't be taken."""
+        back, body = fetch(href)
+        if back.kind != "ok" or "END:VEVENT" not in (body or ""):
+            return None
+        if self.client.replace(href, back.etag or None, body).kind != "ok":
+            return None
+        again, now = fetch(href)
+        if again.kind != "ok":
+            return None
+        return _baseline_of(_lost_fields(_ics_fields(body), _ics_fields(body), _ics_fields(now)))
+
+    def _baseline_gmail(self, address: str, uid: str, desc) -> dict | None:
+        """The same for Gmail: the event's own fields written back as read (stamps and ids left out)."""
+        kind, ev = desc(uid)
+        if kind != "ok" or not ev:
+            return None
+        same = {k: v for k, v in ev.items() if k not in IGNORED_STAMPS["gmail"] and k not in _GMAIL_READ_ONLY}
+        if self.google.change(address, uid, same, ev.get("etag")).kind != "ok":
+            return None
+        kind, now = desc(uid)
+        if kind != "ok" or not now:
+            return None
+        return _baseline_of(_lost_fields(_gmail_fields(ev), _gmail_fields(ev), _gmail_fields(now)))
+
+    def _drop_test(self, href: str, fetch) -> bool:
+        """The unguarded PUT's test event removed and read back gone (thirteenth round). Whether it's gone."""
+        back, _ = fetch(href)
+        if back.kind == "ok":
+            self.client.remove_at(href, back.etag or "")
+            back, _ = fetch(href)
+        return back.kind == "gone"
 
     def _maybe_open(self, gate: dict, provider: str, now: str) -> bool:
         """A calendar's gate opens (ninth round) once the run has read back a fenced edit and a series-day
@@ -6129,6 +6238,11 @@ class CalendarChange:
         values before and after. An edit wholly overwritten in the moment between that read and the write
         can't be seen afterwards; that's why such receipts say Unprotected."""
         lost = _lost_fields(before, intended, back)
+        # Thirteenth round: a difference that's only this calendar's own normalisation, as its no-op round trip
+        # in the smoke run showed (its baseline), isn't a lost update. The pinned stamps stay out as before.
+        baseline = (((card_gate(self.ledger).get("conformance") or {}).get(provider) or {}).get("baseline")
+                    or ((smoke_run(self.ledger).get("conformance") or {}).get(provider) or {}).get("baseline"))
+        lost = [x for x in lost if not _matches_baseline(x, baseline)]
         if not lost:
             return []
         rec = self._recording

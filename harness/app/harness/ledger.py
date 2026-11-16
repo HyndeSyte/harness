@@ -17,9 +17,11 @@ Two rules carry most of the weight:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -398,6 +400,25 @@ class LedgerError(RuntimeError):
 _GATE = threading.Condition()
 _HELD: dict[str, int] = {}                 # file -> the thread holding its writers off
 _ACTIVE: dict[str, dict[int, int]] = {}    # file -> {thread: open write transactions}
+# Thirteenth round: a writer kept waiting by another thread's hold waits in bounded slices, logging each one and
+# trying again, and gives up (LedgerBusy) after WRITER_WAIT_MAX_S rather than hang. Every such wait is noted in
+# _CROSS: in the App every ledger write is on the controller's thread (Discord taps and Cain's handovers are
+# queued in memory by the HTTP threads, which never write), so a write from another thread under the hold is a
+# bug. With STRICT_HOLD on (the tests), it's an AssertionError at once.
+WRITER_WAIT_S = 5.0
+WRITER_WAIT_MAX_S = 300.0
+STRICT_HOLD = False
+_CROSS: list[dict] = []                     # {"file", "thread", "waited_s"}: writes from another thread under a hold
+
+
+class LedgerBusy(TimeoutError):
+    """A write waited WRITER_WAIT_MAX_S for another thread's hold on the ledger and gave up; nothing was written."""
+
+
+def cross_thread_writes() -> list[dict]:
+    """Writes another thread tried while a hold was on (thirteenth round): none is expected."""
+    with _GATE:
+        return list(_CROSS)
 
 
 class Ledger:
@@ -507,8 +528,8 @@ class Ledger:
         writers off (hold_writers, the migration), it waits until that's over."""
         key, me = self._key(), threading.get_ident()
         with _GATE:
-            while _HELD.get(key, me) != me:
-                _GATE.wait()
+            if _HELD.get(key, me) != me:
+                self._wait_for_hold(key, me)
             mine = _ACTIVE.setdefault(key, {})
             mine[me] = mine.get(me, 0) + 1
         try:
@@ -527,6 +548,43 @@ class Ledger:
                 if mine[me] <= 0:
                     mine.pop(me, None)
                 _GATE.notify_all()
+
+    def _wait_for_hold(self, key: str, me: int) -> None:
+        """Called with _GATE held, when another thread holds this ledger's writers off (thirteenth round)."""
+        name = threading.current_thread().name
+        _CROSS.append({"file": os.path.basename(key), "thread": name, "waited_s": 0.0})
+        if STRICT_HOLD:
+            raise AssertionError(f"a ledger write from thread {name} while another thread holds the writers")
+        start = time.monotonic()
+        while _HELD.get(key, me) != me:
+            _GATE.wait(WRITER_WAIT_S)
+            waited = time.monotonic() - start
+            _CROSS[-1]["waited_s"] = round(waited, 1)
+            if _HELD.get(key, me) == me:
+                break
+            if waited >= WRITER_WAIT_MAX_S:
+                logging.getLogger("harness.ledger").error(
+                    "a ledger write on thread %s gave up after %.0fs waiting for the hold", name, waited)
+                raise LedgerBusy(f"the ledger was held for {waited:.0f}s")
+            logging.getLogger("harness.ledger").warning(
+                "a ledger write on thread %s has waited %.0fs for the hold; trying again", name, waited)
+
+    def engage_hold(self) -> None:
+        """Thirteenth round: holds this ledger's writers off from this thread until release_hold (a staged
+        restore: everything from now on is set aside at the restart). Other threads' writes wait, bounded."""
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            if _HELD.get(key) not in (None, me):
+                raise TimeoutError("another hold on the ledger is on")
+            _HELD[key] = me
+            _GATE.notify_all()
+
+    def release_hold(self) -> None:
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            if _HELD.get(key) == me:
+                _HELD.pop(key, None)
+            _GATE.notify_all()
 
     @contextmanager
     def hold_writers(self, timeout_s: float = 60.0):

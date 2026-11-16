@@ -43,6 +43,13 @@
 - **Backups follow run time, not the clock.** The oldest backup stays until Harness has actually run a day on the new version, and nothing is deleted while the clock looks wrong.
 - **Put your records back by version.** A backup can be restored by its schema version and build, on your tap (Put them back) or from the App's command line; it takes effect the next time Harness starts and is moved to the running version again. A Home Assistant backup before installing is the copy off the device.
 - **The check after installing records more.** It records whether each calendar gives strong or weak versions, and on Family whether a change sent with no version check is taken, before the no-card paths can turn on.
+- **Putting your records back is safe at any moment.** Your Put them back tap (or the command line, which now refuses while Harness runs) only stages the backup; Harness swaps it in at its next start, before it opens the records, moving the old records and their log aside together, and a stop in the middle is finished at the next start.
+- **After Put them back, one card asks you to restart Harness now,** saying how old the backup is and what's set aside (held requests, untapped buttons, writes still being confirmed, changes you could undo). Until the restart nothing new is taken, and after it the requests held in the records set aside come back to you ready to copy.
+- **A move that fails or is cut short doesn't stop Harness starting.** It runs degraded, its page and Cain's health check say so, and you get one message with Run check and Put them back. A full disk is said plainly before anything is copied.
+- **When the clock is behind Harness's own records,** its page names the record holding up backup pruning, and one card offers Use the clock as it is now.
+- **Fewer false Possibly overwritten messages.** The check after installing learns which fields each calendar rewrites by itself, and only those are left out; someone's real edit is still told.
+- **The check's write test on Family uses an event far in the past with no alarm,** titled as safe to delete, and removes it before it records the result.
+- **Taps are never kept waiting by moving your records:** they're taken at once and handled right after.
 
 ## 0.23.0
 

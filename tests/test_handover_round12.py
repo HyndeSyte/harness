@@ -319,7 +319,7 @@ migrate.run_live(led, None, 424242, version="0.24.0", build="bcrash")
 
 
 @pytest.mark.migrate_gate
-def test_a_kill_mid_migration_leaves_the_old_schema_and_the_backup_and_the_next_start_migrates(tmp_path, clock):
+def test_a_kill_mid_migration_leaves_the_old_schema_and_the_backup_and_run_check_migrates(tmp_path, clock):
     path = tmp_path / "harness.sqlite"
     led = Ledger(str(path), clock=clock)
     with led.tx() as db:
@@ -334,8 +334,12 @@ def test_a_kill_mid_migration_leaves_the_old_schema_and_the_backup_and_the_next_
     assert not led.db.execute("SELECT 1 FROM events WHERE kind='halfway'").fetchone()   # rolled back whole
     files = list(tmp_path.glob("harness-before-s1-bcrash-*.sqlite"))
     assert len(files) == 1 and migrate.verify_copy(str(files[0])) == ""
+    # Thirteenth round: the next start doesn't try again by itself; it starts degraded and waits for Run check.
     got = migrate.run_live(led, None, OWNER, version="0.24.0", build="bcrash")
+    assert got.get("waiting") and "interrupted" in got["why"] and migrate.waiting(led)["degraded"] is True
+    got = migrate.run_live(led, None, OWNER, version="0.24.0", build="bcrash", retry=True)
     assert not got.get("waiting") and migrate.schema(led) == migrate.HANDOVER
+    assert not (tmp_path / ("harness.sqlite" + migrate.MIGRATING)).exists()
     assert led.db.execute("SELECT COUNT(*) FROM events WHERE kind='precious'").fetchone()[0] == 1
 
 

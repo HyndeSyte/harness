@@ -686,7 +686,11 @@ On Gmail, and then the same on Family:
    conformance item passed on a calendar, its held cards come back.
    The item also records each calendar's etag strength (strong, weak, or none, from every version it
    read), and on Family it sends one PUT with no If-Match to a test event of its own and records whether
-   Family took it or refused it. The no-card flag stays off until both are recorded: `fastpath on`
+   Family took it or refused it. That test event is far in the past (1 January 2001, 3:00 UTC), with no
+   reminder and the title "Smoke test: Harness write test (safe to delete)"; it's removed and read back
+   gone before the result is recorded, and one that can't be shown gone is recorded as unknown. The item
+   also takes each calendar's normalisation baseline: on its own test event it writes back exactly what
+   it read, reads again, and keeps which fields the calendar rewrote by itself (see below). The no-card flag stays off until both are recorded: `fastpath on`
    refuses the run by name (`gmail.etag_strength`, `family.etag_strength`, `family.unguarded_put`)
    until then.
 
@@ -733,7 +737,12 @@ found gives only weak versions, says *Unprotected* before your tap too. After su
 back is compared with the read just before it plus the change it meant: if any field outside the change
 differs, you get a *Possibly overwritten* message naming each field with its value before and after.
 An edit wholly overwritten in the moment between the read and the write can't be seen afterwards; the
-*Unprotected* label is there for that.
+*Unprotected* label is there for that. A calendar that rewrites fields of its own on any write doesn't
+bring that message: the difference is compared with that calendar's baseline from the check after
+installing (a no-op round trip on its test event), and only a difference matching it is left out: the
+same field added with the same value, removed, or changed to a value that's the same once spacing, case,
+escapes and parameters are set aside. Anything else, such as someone's real edit of the same field, is
+still told. The pinned stamps below stay out as before.
 
 A calendar the conformance item passed closes its gate again only when a write that carried If-Match,
 on a calendar meant to be protected, reads back with the event's content changed while its version
@@ -801,8 +810,25 @@ The migration itself holds every other writer of the ledger off (the poller, Dis
 handover service wait, and transactions already open finish first), takes the backup, and applies the
 migration as one transaction: it lands whole or not at all. Work accepted before (held requests, taps
 waiting to be handled, outcomes still being read) is in the ledger and goes on after. If the App is
-stopped in the middle, the ledger is still at its old schema with the backup beside it, and the next
-start migrates again.
+stopped in the middle, the ledger is still at its old schema with the backup beside it. The next start
+doesn't try again by itself (a move that kills the App can't keep it from starting): it starts degraded,
+serving its page and Cain's `/health` (both say degraded, and why), and you get one message saying the
+move was interrupted, with *Run check* (rehearse and move again) and *Put them back* (restore the newest
+backup). A migration that fails with an error does the same. If the records can't be opened at all,
+Harness still serves its page and `/health` with status `degraded` and why, and takes nothing.
+
+The writer hold is safe for live interactions. In Harness every ledger write is on one thread, the
+controller's: a Discord tap is acknowledged to Cain's link at once by the handover service, before any
+ledger write, and queued in memory, as Cain's handovers are, until the controller takes it after the
+hold. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
+the App such a writer waits in bounded slices, logging each and trying again, and gives up after five
+minutes with an error rather than hang. The hold is always released, even when what it holds fails. The
+checkpoint and the online backup run under the hold strictly before the migration's transaction begins,
+never inside one (Harness refuses that order), so the checkpoint can't find the ledger locked.
+
+Free space is checked before the dry run's copy and before the backup: room for two copies of the ledger
+and its log plus 16 MB. Without it nothing is copied (never a half-written file) and the ledger waits as
+above, saying "there isn't enough free space for a copy of the records" with how much is free and needed.
 
 Just before it migrates, Harness takes a restorable copy of the ledger after a checkpoint, with SQLite's
 online backup API (never a plain file copy), beside it in `/data`, named
@@ -813,17 +839,38 @@ is taken when its content checksum (computed on the backup file itself) matches 
 (repeated attempts after a failure), the newest three are kept, and the oldest at each schema version is
 never deleted until a later migration has succeeded and the App has run on it for a day of run time.
 Run time is summed in the ledger from the monotonic clock, never the wall clock, and nothing is deleted
-while the clock can't be trusted (earlier than the newest time the ledger recorded, or not set yet). A
+while the clock can't be trusted (earlier than the newest time the ledger recorded, or not set yet).
+Events stamped before 1 January 2026 (written before a time sync) never count for that rule. While it
+holds pruning up, Harness's page and Cain's `/health` (`migration.pruning_stalled`) name the record
+that holds it (its number, kind and time), and when the clock is behind it by more than ten minutes you
+get one card with *Use the clock as it is now*: your tap takes the clock as right, records up to then
+stop counting for the rule, and pruning goes on. Cain's `keeper.sh fastpath migrate-clock` only posts
+that card again; nothing changes without your tap. A
 dry run dated later than now counts as none. The schema steps are numbered; a duplicate or conflicting
 step number (a ledger that recorded another step under the same number) is refused, and the ledger waits
 as above.
 
-To restore one, by its schema version and build: `python3 -m harness.migrate /data/harness.sqlite
---restore <schema> <build>` inside the App, or Cain's `keeper.sh fastpath migrate-restore <schema>
-<build>` on your say, which only posts you a card; your *Put them back* tap does it. Either checks the
-backup and stages it beside the ledger; it replaces the ledger the next time Harness starts, the ledger
-it replaces kept as `harness-replaced-<time>.sqlite`, and the restored one is migrated again on that
-start, with rows intact. The copies beside the ledger live on the same device: a Home Assistant backup
+To restore one, by its schema version and build: Cain's `keeper.sh fastpath migrate-restore <schema>
+<build>` on your say, which only posts you a card; your *Put them back* tap does it. With the App
+stopped, `python3 -m harness.migrate /data/harness.sqlite --restore <schema> <build>` does it from the
+command line; it refuses while Harness runs, which holds `/data/harness.lock` for as long as it runs,
+and says so. Either one never touches the live ledger: it checks the backup and writes only a staged
+file beside it (`harness.sqlite.restore`) and then, last, its marker (`harness.sqlite.restore.json`).
+All swapping is done by Harness itself at its next start, before it opens the ledger: it writes a swap
+marker first, checks the staged file again (`PRAGMA integrity_check`), moves the ledger it replaces
+together with its `-wal` and `-shm` files to `harness-replaced-<time>.sqlite` (never a stale log left
+beside the restored file), then renames the staged file into place, which is atomic. A stop between any
+two steps is finished at the next start (one that fails its check there is set aside and the old ledger
+put back). The restored ledger is migrated again on that start, with rows intact, rehearsing itself as
+any install does, so it doesn't need a fresh *Run check*.
+
+Once your tap stages it, the writer hold engages and Harness takes nothing new until it restarts: a
+request or a tap is answered that it's waiting to restart, and one card asks you to restart the Harness
+App now (Settings, Apps, Harness, Restart). The card says how old the backup is and how many held
+requests, buttons not tapped yet, writes still being confirmed and changes you could still undo are in
+the records it sets aside. Once the restored ledger opens, the requests that were held in the records
+set aside come back to you in one message, ready to copy into the calendar app. The page and `/health`
+show a staged restore meanwhile. The copies beside the ledger live on the same device: a Home Assistant backup
 is the off-device copy, and one is recommended before installing (the Ship job takes one first).
 
 ## Dates from your mail

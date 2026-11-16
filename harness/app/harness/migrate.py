@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 
 from . import approvals, choices, effects, provenance, render
@@ -60,6 +61,17 @@ HEARTBEAT_S = 60                   # how often the run time is written to the le
 CLOCK_FLOOR = (2026, 1, 1)         # a clock earlier than this day (UTC) hasn't been set: no time sync yet
 REMINDED = "migration_waiting_reminded"     # the day the waiting reminder last went, in his zone
 RESTORE_SUFFIX = ".restore"        # a staged restore beside the ledger, swapped in at the next start
+# Thirteenth round: the restore swap, the process lock, free space, an interrupted move and the clock.
+STAGE_MARKER = RESTORE_SUFFIX + ".json"   # written last when a restore is staged: the staged file is whole
+SWAP_MARKER = ".swap.json"         # beside the ledger while a swap is under way: the next start finishes it
+RESTORED = ".restored.json"        # beside the ledger after a swap, until the kept ledger's held requests are posted
+MIGRATING = ".migrating"           # beside the ledger while the migration's transaction is open
+LOCK_NAME = "harness.lock"         # the specialist holds it (flock) for as long as it runs
+SPACE_MARGIN = 16 * 1024 * 1024    # free space kept spare beyond two copies of the ledger
+CLOCK_ACCEPTED = "migration_clock_accepted"   # {"at", "event_id"}: events up to that id don't count for the clock
+CLOCK_TOLD = "migration_clock_told"            # the event id the clock card was last posted for
+CLOCK_CARD_S = 600                 # a clock behind the newest event by more than this gets the card
+FAILED_TOLD = "migration_failure_told:"        # + build: the failure was posted once
 
 # The ledger's schema steps, in order: (number, name). A number is never reused for another step, and a ledger
 # that records a step under a number with another name is refused (eleventh round): two changes that each
@@ -159,9 +171,11 @@ def waiting(ledger: Ledger) -> dict:
 
 def self_dry_run(ledger: Ledger, version: str, build: str) -> dict:
     """Eleventh round: the specialist rehearses its own build's migration on a copy of its own ledger, inside
-    its container (dry_run), and records it. What was kept."""
-    checkpoint(ledger)
-    got = dry_run(ledger.path, version=version, build=build, source=ledger.db)
+    its container (dry_run), and records it. What was kept. Thirteenth round: under the writer hold, the
+    checkpoint and the copy both, before any transaction."""
+    with ledger.hold_writers():
+        checkpoint(ledger)
+        got = dry_run(ledger.path, version=version, build=build, source=ledger.db)
     got.setdefault("build", build)
     got.setdefault("version", version)
     got["self_serve"] = True
@@ -172,7 +186,7 @@ def self_dry_run(ledger: Ledger, version: str, build: str) -> dict:
 
 
 def run_live(ledger: Ledger, cc, chat_id: int, version: str | None = None, build: str | None = None,
-             tell: bool = False) -> dict:
+             tell: bool = False, retry: bool = False) -> dict:
     """The install step on the live ledger. Eleventh round: when a migration is needed and no valid dry run
     of this very build is recorded (dry_run_problem), the specialist runs one itself on a copy of its ledger
     and records it; on a pass it takes a backup and migrates at once, so a normal install never waits on
@@ -188,38 +202,123 @@ def run_live(ledger: Ledger, cc, chat_id: int, version: str | None = None, build
     version, build = version or cal.app_version(), build or cal.app_build()
     try:
         with ledger.hold_writers():
-            return _run_live(ledger, cc, chat_id, version, build, tell)
+            return _run_live(ledger, cc, chat_id, version, build, tell, retry)
     except TimeoutError as e:
         return _wait(ledger, chat_id, version, build, f"the ledger couldn't be held for the move ({e})", tell)
 
 
-def _run_live(ledger: Ledger, cc, chat_id: int, version: str, build: str, tell: bool) -> dict:
+def _run_live(ledger: Ledger, cc, chat_id: int, version: str, build: str, tell: bool,
+              retry: bool = False) -> dict:
+    marker = _side(ledger, MIGRATING)
     if not needed(ledger, version, build):
+        _remove_file(marker)
         _clear_waiting(ledger)
         return run(ledger, cc, chat_id, version, build)
     try:
         check_steps(STEPS, ledger)
     except StepConflict as e:
         return _wait(ledger, chat_id, version, build, f"the schema steps conflict: {e}", tell)
+    if marker and os.path.isfile(marker) and not retry:
+        # Thirteenth round: the last start stopped in the middle of the move (its transaction never landed, so
+        # the records are as they were). It isn't tried again by itself, so a move that kills the App can't
+        # keep it from starting: it starts degraded, says so once, and waits for Run check or Put them back.
+        return _wait(ledger, chat_id, version, build, "the last move of the records was interrupted before it "
+                     "finished, so nothing was moved and the records are as they were before it", tell,
+                     degraded=True)
     why = dry_run_missing(ledger, build)
     if why:
         self_dry_run(ledger, version, build)
         why = dry_run_missing(ledger, build)
     if why:
         return _wait(ledger, chat_id, version, build, why, tell)
+    room = space_problem(ledger.path)
+    if room:
+        return _wait(ledger, chat_id, version, build, room, tell)
     copy = backup(ledger, build)
     if not copy:
         return _wait(ledger, chat_id, version, build, "the ledger couldn't be backed up and checked first", tell)
+    _write_json(marker, {"build": build, "at": iso(ledger.now())})
     try:
         out = run(ledger, cc, chat_id, version, build,
                   finish=lambda db: (_clear_waiting(ledger, db), _succeeded(ledger, build, db)))
     except Exception as e:   # noqa: BLE001: a failed migration leaves the ledger as it was, and waits
         log.error("the migration of build %s failed: %s", build, type(e).__name__)
-        return _wait(ledger, chat_id, version, build, f"the migration failed ({type(e).__name__})", tell)
+        _remove_file(marker)
+        return _wait(ledger, chat_id, version, build, f"the migration failed ({type(e).__name__})", tell,
+                     degraded=True)
+    _remove_file(marker)
     return {**out, "backup": copy}
 
 
-def _wait(ledger: Ledger, chat_id: int, version: str, build: str, why: str, tell: bool) -> dict:
+def _side(ledger: Ledger, suffix: str) -> str:
+    """A file beside the ledger (thirteenth round), "" for a ledger in memory."""
+    if not ledger.path or ledger.path == ":memory:":
+        return ""
+    return os.path.abspath(ledger.path) + suffix
+
+
+def _write_json(path: str, data: dict) -> None:
+    """Written whole or not at all: a temporary file, flushed to disk, renamed into place."""
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            got = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _remove_file(path: str) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+# -- free space (thirteenth round) ------------------------------------------------------------------------------
+
+def _free_bytes(folder: str) -> int:
+    import shutil
+    return shutil.disk_usage(folder).free
+
+
+def space_problem(ledger_path: str, folder: str | None = None) -> str:
+    """Why a copy of the ledger can't be made in `folder` (beside the ledger when none), or "": checked before the
+    dry run's copy and the backup, so a full disk is said plainly and never leaves a half-written file. Room for
+    two copies of the ledger and its log, plus SPACE_MARGIN."""
+    if not ledger_path or ledger_path == ":memory:":
+        return ""
+    size = 0
+    for extra in ("", "-wal"):
+        try:
+            size += os.path.getsize(os.path.abspath(ledger_path) + extra)
+        except OSError:
+            pass
+    need = 2 * size + SPACE_MARGIN
+    where = folder or os.path.dirname(os.path.abspath(ledger_path))
+    try:
+        free = _free_bytes(where)
+    except OSError:
+        return "the free space for a copy of the records couldn't be read"
+    if free < need:
+        return (f"there isn't enough free space for a copy of the records ({free // (1024 * 1024)} MB free, "
+                f"{-(-need // (1024 * 1024))} MB needed)")
+    return ""
+
+
+def _wait(ledger: Ledger, chat_id: int, version: str, build: str, why: str, tell: bool,
+          degraded: bool = False) -> dict:
     """Nothing is migrated: calendar changes wait. He's told once per build (and again after a Run check tap
     that failed too), with Run check as the only button. Twelfth round: the notice's outbox row is kept, so
     one Discord never took is posted again (tend_waiting), and a reminder goes once a day while it waits."""
@@ -228,20 +327,44 @@ def _wait(ledger: Ledger, chat_id: int, version: str, build: str, why: str, tell
         first = kept.get("build") != build
         rec = {"build": build, "version": version, "at": iso(ledger.now()), "why": why,
                "since": kept.get("since") if not first and kept.get("since") else iso(ledger.now()),
-               "notice": kept.get("notice") if not first else None}
+               "notice": kept.get("notice") if not first else None, "degraded": degraded}
         if first:
-            ledger.event("migration_waiting", {"build": build, "why": why}, db=db)
-        if (first or tell) and chat_id:
-            rec["notice"] = _post_waiting(ledger, chat_id, version, why, db)
+            ledger.event("migration_waiting", {"build": build, "why": why, "degraded": degraded}, db=db)
+        # Thirteenth round: a failed or interrupted move is posted once per build (and again only on his tap).
+        told = degraded and ledger.get_meta(FAILED_TOLD + build) is not None
+        if (first or tell) and chat_id and not (told and not tell):
+            rec["notice"] = _post_waiting(ledger, chat_id, version, why, db, degraded=degraded)
+            if degraded:
+                ledger.set_meta(FAILED_TOLD + build, iso(ledger.now()), db)
         ledger.set_meta(WAITING, json.dumps(rec), db)
     log.warning("the live ledger wasn't migrated for build %s: %s; calendar changes wait for Run check (or "
                 "keeper.sh fastpath migrate-check)", build, why)
     return {"waiting": True, "build": build, "why": why}
 
 
-def _post_waiting(ledger: Ledger, chat_id: int, version: str, why: str, db, reminder: bool = False) -> int:
-    """The Run check notice (or its daily reminder). Its outbox row id."""
+def _post_waiting(ledger: Ledger, chat_id: int, version: str, why: str, db, reminder: bool = False,
+                  degraded: bool = False) -> int:
+    """The Run check notice (or its daily reminder). Its outbox row id. Thirteenth round: a move that failed or
+    was interrupted says so, and carries Put them back too when a backup of these records is kept."""
     nonce = choices.mint(ledger, kind="migration_check", target=version, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+    buttons = [("Run check", choices.callback_data(nonce))]
+    binds = [{"type": "choice", "nonce": nonce}]
+    if degraded:
+        newest = next((b for b in reversed(backups(ledger)) if os.path.isfile(str(b.get("path", "")))), None)
+        if newest is not None:
+            back = choices.mint(ledger, kind="migration_restore",
+                                target=f"{newest.get('schema')} {newest.get('build')}",
+                                chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+            buttons.append(("Put them back", choices.callback_data(back)))
+            binds.append({"type": "choice", "nonce": back})
+        head = (f"<b>Harness {render.escape(version)} couldn't move its records over.</b> "
+                f"{render.escape(why[:1].upper() + why[1:])}. It runs on without them moved: the status page and "
+                "Cain's health check say so, and calendar changes wait. Run check rehearses the move again and, if "
+                "it passes, moves them, with a backup taken first."
+                + (" Put them back restores the records from their newest backup instead." if len(buttons) > 1
+                   else ""))
+        return ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(head), buttons=[buttons],
+                              binds=binds, db=db)
     head = (f"<b>Still waiting: Harness {render.escape(version)} hasn't moved its records over yet.</b> "
             if reminder else
             f"<b>Harness {render.escape(version)} is installed, but hasn't moved its records over yet.</b> ")
@@ -250,8 +373,7 @@ def _post_waiting(ledger: Ledger, chat_id: int, version: str, why: str, db, remi
         f"{render.escape(why)}. So nothing was moved. Until it's done, calendar changes wait and nothing "
         "on your calendars changes. Run check rehearses it again, and if it passes the records are "
         "moved then, with a backup taken first."),
-        buttons=[[("Run check", choices.callback_data(nonce))]],
-        binds=[{"type": "choice", "nonce": nonce}], db=db)
+        buttons=[buttons], binds=binds, db=db)
 
 
 def notice_state(ledger: Ledger) -> str:
@@ -288,7 +410,7 @@ def tend_waiting(ledger: Ledger, chat_id: int, tz: str = "UTC") -> str:
         return ""
     with ledger.tx() as db:
         kept["notice"] = _post_waiting(ledger, chat_id, kept.get("version", ""), kept.get("why", ""), db,
-                                       reminder=did == "reminded")
+                                       reminder=did == "reminded", degraded=bool(kept.get("degraded")))
         ledger.set_meta(WAITING, json.dumps(kept), db)
         if did == "reminded":
             ledger.set_meta(REMINDED, today, db)
@@ -304,10 +426,23 @@ def waiting_summary(ledger: Ledger) -> dict:
         return {}
     return {"waiting": True, "build": kept.get("build", ""), "version": kept.get("version", ""),
             "why": kept.get("why", ""), "since": kept.get("since") or kept.get("at", ""),
-            "notice": notice_state(ledger) or "none"}
+            "notice": notice_state(ledger) or "none", "degraded": bool(kept.get("degraded"))}
+
+
+def migration_summary(ledger: Ledger) -> dict:
+    """Thirteenth round: what the status page and Cain's /health show: the wait (waiting_summary), a restore
+    staged for the next start, and a pruning stall with the event that holds it. {} when none."""
+    out = dict(waiting_summary(ledger))
+    stall = clock_stall(ledger)
+    if stall:
+        out["pruning_stalled"] = stall
+    if restore_staged(ledger.path):
+        out["restore_staged"] = True
+    return out
 
 
 def _clear_waiting(ledger: Ledger, db=None) -> None:
+    _remove_file(_side(ledger, MIGRATING))
     if ledger.get_meta(WAITING) is not None or ledger.get_meta(REMINDED) is not None:
         if db is not None:
             db.execute("DELETE FROM meta WHERE key IN (?, ?)", (WAITING, REMINDED))
@@ -372,18 +507,75 @@ def uptime(ledger: Ledger) -> float:
 def clock_problem(ledger: Ledger) -> str:
     """Why the wall clock can't be trusted now, or "": earlier than the newest time the ledger recorded (the
     clock stepped back), or earlier than CLOCK_FLOOR (no time sync yet after a boot)."""
-    now = ledger.now()
+    return clock_stall(ledger).get("why", "")
+
+
+def _floor():
     from datetime import timezone as _tz
-    if now < datetime(*CLOCK_FLOOR, tzinfo=_tz.utc):
-        return "the clock isn't set yet"
-    row = ledger.db.execute("SELECT MAX(at) FROM events").fetchone()
+    return datetime(*CLOCK_FLOOR, tzinfo=_tz.utc)
+
+
+def clock_stall(ledger: Ledger) -> dict:
+    """Thirteenth round: why the clock stops backup pruning, with the event that holds it: {"why", "event", "kind",
+    "at", "now"} ({} when none). Events stamped earlier than CLOCK_FLOOR (written before a time sync) never count,
+    nor events up to the one he accepted the clock over (accept_clock)."""
+    now = ledger.now()
+    if now < _floor():
+        return {"why": "the clock isn't set yet", "event": None, "kind": "", "at": "", "now": iso(now)}
     try:
-        newest = datetime.fromisoformat(row[0]) if row and row[0] else None
+        upto = int(json.loads(ledger.get_meta(CLOCK_ACCEPTED) or "{}").get("event_id") or 0)
+    except (ValueError, TypeError, AttributeError):
+        upto = 0
+    row = ledger.db.execute("SELECT id, kind, at FROM events WHERE id > ? AND at >= ? ORDER BY at DESC, id DESC "
+                            "LIMIT 1", (upto, iso(_floor()))).fetchone()
+    try:
+        newest = datetime.fromisoformat(row[2]) if row and row[2] else None
     except ValueError:
         newest = None
     if newest is not None and now < newest:
-        return "the clock is earlier than the newest time the ledger recorded"
-    return ""
+        return {"why": "the clock is earlier than the newest time the ledger recorded", "event": row[0],
+                "kind": row[1], "at": row[2], "now": iso(now), "behind_s": int((newest - now).total_seconds())}
+    return {}
+
+
+def accept_clock(ledger: Ledger, by: str) -> str:
+    """His tap (or keeper.sh fastpath migrate-clock's card): the clock as it is now is taken as right; every event
+    recorded so far stops counting for the clock rule, so pruning goes on. What to tell him."""
+    stall = clock_stall(ledger)
+    if not stall or stall.get("event") is None:
+        return "The clock agrees with the records now, so nothing changed."
+    top = ledger.db.execute("SELECT MAX(id) FROM events").fetchone()[0] or 0
+    kept = {"at": iso(ledger.now()), "event_id": top, "over": stall.get("at", ""), "by": by}
+    with ledger.tx() as db:
+        ledger.set_meta(CLOCK_ACCEPTED, json.dumps(kept), db)
+        ledger.event("migration_clock_accepted", kept, db=db)
+    log.warning("the clock is taken as right by %s (it was behind the record stamped %s); backups are pruned again",
+                by, stall.get("at", ""))
+    return ("Done: Harness takes the clock as it is now. Older backups are pruned again from the next one, and "
+            "records stamped later than now no longer hold it up.")
+
+
+def post_clock_card(ledger: Ledger, chat_id: int, force: bool = False) -> bool:
+    """The card with Use the clock as it is now (thirteenth round): once per event that holds the clock up, when
+    it's behind by more than CLOCK_CARD_S (or on keeper.sh fastpath migrate-clock, force). Whether it went."""
+    stall = clock_stall(ledger)
+    if not chat_id or not stall or stall.get("event") is None:
+        return False
+    if not force and (stall.get("behind_s", 0) < CLOCK_CARD_S or ledger.get_meta(CLOCK_TOLD) == str(stall["event"])):
+        return False
+    with ledger.tx() as db:
+        nonce = choices.mint(ledger, kind="migration_clock", target=str(stall["event"]), chat_id=chat_id,
+                             ttl_s=CARD_TTL_S, db=db)
+        ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(
+            "<b>Harness's clock is behind its own records, so old backups aren't pruned.</b> The clock says "
+            f"{render.escape(stall['now'][:16].replace('T', ' '))} UTC, and a record "
+            f"({render.escape(stall['kind'])}) is stamped {render.escape(stall['at'][:16].replace('T', ' '))} UTC. "
+            "If the clock is right now, Use the clock as it is now lets pruning go on; nothing else changes."),
+            buttons=[[("Use the clock as it is now", choices.callback_data(nonce))]],
+            binds=[{"type": "choice", "nonce": nonce}], db=db)
+        ledger.set_meta(CLOCK_TOLD, str(stall["event"]), db)
+        ledger.event("migration_clock_card", {"event": stall["event"], "at": stall["at"]}, db=db)
+    return True
 
 
 def _list(ledger: Ledger, key: str) -> list:
@@ -402,7 +594,7 @@ def check_tapped(ledger: Ledger, cc, chat_id: int, target: str = "") -> str:
         return "Nothing is waiting for its records to move, so nothing changed."
     build = cal.app_build()
     got = self_dry_run(ledger, cal.app_version(), build)
-    out = run_live(ledger, cc, chat_id, tell=True) if got.get("ok") else \
+    out = run_live(ledger, cc, chat_id, tell=True, retry=True) if got.get("ok") else \
         _wait(ledger, chat_id, cal.app_version(), build, dry_run_problem(ledger, build), True)
     if out.get("waiting"):
         return "The rehearsal didn't pass again, so nothing was moved; the message below says why."
@@ -459,7 +651,7 @@ def override_tapped(ledger: Ledger, cc, chat_id: int, target: str) -> str:
         ledger.set_meta(OVERRIDE + build, json.dumps(kept), db)
         ledger.event("migration_override", kept, db=db)
     log.warning("the migration of build %s runs without a passing dry run: his tap on the override card", build)
-    out = run_live(ledger, cc, chat_id)
+    out = run_live(ledger, cc, chat_id, retry=True)
     if out.get("waiting"):
         with ledger.tx() as db:
             db.execute("DELETE FROM meta WHERE key=?", (OVERRIDE + build,))
@@ -467,14 +659,26 @@ def override_tapped(ledger: Ledger, cc, chat_id: int, target: str) -> str:
     return "Moved without a rehearsal, as you asked, with a backup taken first. That's kept in the log."
 
 
+class OrderError(RuntimeError):
+    """Thirteenth round: a checkpoint or a backup asked for inside a transaction, where it can't be done whole."""
+
+
 def checkpoint(ledger: Ledger) -> None:
     """Folds the write-ahead log into the ledger file (twelfth round), so a copy starts from a settled file.
-    The copy itself is still taken through SQLite (copy_ledger), which reads anything left in the log too."""
+    The copy itself is still taken through SQLite (copy_ledger), which reads anything left in the log too.
+    Thirteenth round: always under the writer hold and strictly before the migration's transaction, never inside
+    one (OrderError), so the checkpoint can't find the ledger locked."""
     import sqlite3
-    try:
-        ledger.db.execute("PRAGMA wal_checkpoint(FULL)").fetchall()
-    except sqlite3.Error as e:
-        log.warning("the ledger's checkpoint before its copy didn't run: %s", type(e).__name__)
+    if ledger.db.in_transaction:
+        raise OrderError("the checkpoint runs before the migration's transaction, never inside it")
+    with ledger.hold_writers():
+        try:
+            row = ledger.db.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+        except sqlite3.Error as e:
+            log.warning("the ledger's checkpoint before its copy didn't run: %s", type(e).__name__)
+            return
+    if row is not None and row[0]:
+        log.warning("the ledger's checkpoint before its copy was busy; the copy still reads the log")
 
 
 def copy_ledger(source, dest: str) -> None:
@@ -613,6 +817,12 @@ def backup(ledger: Ledger, build: str) -> str:
     import sqlite3
     if not ledger.path or ledger.path == ":memory:":
         return ""
+    if ledger.db.in_transaction:
+        raise OrderError("the backup is taken before the migration's transaction, never inside it")
+    room = space_problem(ledger.path)
+    if room:
+        log.error("the ledger backup before the migration wasn't made: %s", room)
+        return ""
     with ledger.hold_writers():
         src_schema = schema(ledger)
         folder = os.path.dirname(os.path.abspath(ledger.path))
@@ -654,7 +864,9 @@ def backup(ledger: Ledger, build: str) -> str:
         keep = {b["path"] for b in kept} if clock else \
             {b["path"] for b in kept[-BACKUP_KEEP:]} | _protected(ledger, kept)
         if clock:
-            log.warning("no backup is pruned now: %s", clock)
+            stall = clock_stall(ledger)
+            log.warning("no backup is pruned now: %s (record %s, stamped %s)", clock, stall.get("event"),
+                        stall.get("at", ""))
         for b in kept:
             if b["path"] not in keep:
                 _remove(b["path"])
@@ -824,6 +1036,9 @@ def dry_run(path: str, version: str | None = None, build: str | None = None, sou
     from . import calendar_change as cal
     if not path or not os.path.isfile(path):
         return {"ok": False, "said": f"no ledger file at {path or '(none given)'}"}
+    room = space_problem(path, tempfile.gettempdir())     # thirteenth round: before any copy is started
+    if room:
+        return {"ok": False, "said": room, "build": build or cal.app_build(), "version": version or cal.app_version()}
     tmp = tempfile.mkdtemp(prefix="harness-migrate-check-")
     copy = os.path.join(tmp, "ledger-copy.sqlite")
     try:
@@ -1004,20 +1219,68 @@ def listed(ledger: Ledger, batch: str) -> list[str]:
     return [str(x) for x in got] if isinstance(got, list) else []
 
 
-# -- restore (twelfth round) ----------------------------------------------------------------------------------
+# -- the process lock (thirteenth round) ----------------------------------------------------------------------
+
+_LOCK: dict = {}                   # folder -> the open lock file the specialist holds
+
+
+def hold_process_lock(ledger_path: str) -> bool:
+    """The specialist takes LOCK_NAME beside the ledger (an exclusive flock) before the swap and keeps it while it
+    runs, so the restore command line can tell it's running. Whether it has it."""
+    import fcntl
+    folder = os.path.dirname(os.path.abspath(ledger_path))
+    if folder in _LOCK:
+        return True
+    f = open(os.path.join(folder, LOCK_NAME), "a+")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        log.error("another process holds %s beside the ledger", LOCK_NAME)
+        return False
+    _LOCK[folder] = f
+    return True
+
+
+def release_process_lock(ledger_path: str) -> None:
+    f = _LOCK.pop(os.path.dirname(os.path.abspath(ledger_path)), None)
+    if f is not None:
+        f.close()
+
+
+def specialist_running(ledger_path: str) -> bool:
+    """Whether a process holds the specialist's lock file beside this ledger (not this one's own hold)."""
+    import fcntl
+    folder = os.path.dirname(os.path.abspath(ledger_path))
+    if folder in _LOCK:
+        return True
+    path = os.path.join(folder, LOCK_NAME)
+    if not os.path.isfile(path):
+        return False
+    with open(path, "a+") as f:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return False
+
+
+# -- restore (twelfth and thirteenth rounds) --------------------------------------------------------------------
 
 def find_backup(ledger_path: str, schema_n: int, build: str) -> str:
     """The newest backup beside the ledger taken at that source schema version before that build's migration
-    (named harness-before-s<schema>-<build>-<time>.sqlite), or "" when there's none."""
+    (named harness-before-s<schema>-<build>-<time>.sqlite), or "" when there's none. The ledger itself is only
+    read (opened read only), for a backup kept under another build (backup's dedup)."""
     import glob
-    import os
     folder = os.path.dirname(os.path.abspath(ledger_path))
     found = sorted(p for p in glob.glob(os.path.join(folder, f"harness-before-s{int(schema_n)}-{_safe_build(build)}-*"
                                                                 ".sqlite")) if not p.endswith(".part"))
     if found:
         return found[-1]
-    # One taken for an earlier build whose content was the same (backup's dedup) is kept under this build too.
     import sqlite3
+    if not os.path.isfile(ledger_path):
+        return ""
     try:
         conn = sqlite3.connect(f"file:{os.path.abspath(ledger_path)}?mode=ro", uri=True)
         try:
@@ -1035,82 +1298,194 @@ def find_backup(ledger_path: str, schema_n: int, build: str) -> str:
     return ""
 
 
-def stage_restore(ledger_path: str, schema_n: int, build: str) -> dict:
+def restore_staged(ledger_path: str) -> bool:
+    """A restore is staged whole for the next start: its file and, written last, its marker."""
+    if not ledger_path or ledger_path == ":memory:":
+        return False
+    staged = os.path.abspath(ledger_path) + RESTORE_SUFFIX
+    return os.path.isfile(staged) and os.path.isfile(os.path.abspath(ledger_path) + STAGE_MARKER)
+
+
+def stage_restore(ledger_path: str, schema_n: int, build: str, cli: bool = False) -> dict:
     """Restore, keyed by schema and build: the backup find_backup names is checked (integrity) and copied with
-    SQLite's backup API to <ledger>.restore beside the ledger. Nothing is replaced while the App runs: the
-    staged copy is swapped in at its next start (apply_staged_restore), the ledger it replaces kept beside it.
-    Then the App migrates it again as on any install (run_live)."""
-    import os
+    SQLite's backup API to <ledger>.restore beside the ledger, then its marker <ledger>.restore.json is written
+    last. Thirteenth round: it never touches the live ledger (it only reads it, for find_backup), and all swapping
+    is done by the specialist at its next start, before it opens the ledger (apply_staged_restore). From the
+    command line (cli) it refuses while the specialist runs, which holds LOCK_NAME."""
     import sqlite3
     try:
         n = int(schema_n)
     except (TypeError, ValueError):
         return {"ok": False, "said": "the schema version is a whole number"}
+    if cli and specialist_running(ledger_path):
+        return {"ok": False, "said": "Harness is running (it holds harness.lock beside the records), so nothing was "
+                                     "staged: while it runs, ask through Cain (keeper.sh fastpath migrate-restore), "
+                                     "which puts a card to the owner; or stop the App first"}
     chosen = find_backup(ledger_path, n, build)
     if not chosen:
         return {"ok": False, "said": f"no backup beside the ledger for schema {n} and build {build}"}
     problem = verify_copy(chosen)
     if problem:
         return {"ok": False, "said": f"that backup can't be used: {problem}", "backup": os.path.basename(chosen)}
-    staged = os.path.abspath(ledger_path) + RESTORE_SUFFIX
+    base = os.path.abspath(ledger_path)
+    staged, marker = base + RESTORE_SUFFIX, base + STAGE_MARKER
+    _remove_file(marker)
     _remove(staged)
+    room = space_problem(chosen)
+    if room:
+        return {"ok": False, "said": room, "backup": os.path.basename(chosen)}
+    part = staged + ".part"
     try:
-        copy_ledger(chosen, staged)
+        copy_ledger(chosen, part)
+        problem = verify_copy(part)
+        if problem:
+            raise OSError(problem)
+        os.replace(part, staged)
+        _write_json(marker, {"from": os.path.basename(chosen), "schema": n, "build": build})
     except (sqlite3.Error, OSError) as e:
+        _remove(part)
         _remove(staged)
         return {"ok": False, "said": f"the backup couldn't be staged ({type(e).__name__})"}
-    with open(staged + ".json", "w", encoding="utf-8") as f:
-        json.dump({"from": os.path.basename(chosen), "schema": n, "build": build}, f)
     log.warning("restore staged from %s: it replaces the ledger at the App's next start", os.path.basename(chosen))
     return {"ok": True, "staged": os.path.basename(staged), "backup": os.path.basename(chosen),
-            "said": "Staged. It replaces the records the next time Harness starts; the records it replaces are "
-                    "kept beside them, and the restored ones move to this build again."}
+            "said": "Staged. It replaces the records the next time Harness starts, before it opens them; the records "
+                    "it replaces are kept beside them, and the restored ones move to this build again."}
+
+
+def _swap_step(phase: str) -> None:
+    """A point in the swap a test can stop at, as a crash would (thirteenth round). Nothing in production."""
 
 
 def apply_staged_restore(ledger_path: str, now: datetime | None = None) -> dict:
-    """At startup, before the ledger opens: a staged restore (stage_restore) is checked again and swapped in.
-    The ledger it replaces is copied first with SQLite's backup API (its log included) to
-    harness-replaced-<time>.sqlite beside it. {} when nothing is staged."""
-    import os
-    import sqlite3
+    """At startup, before the ledger opens (thirteenth round): a staged restore is swapped in. A swap marker is
+    written first, so a stop between any two steps is finished at the next start. The staged file is checked
+    (PRAGMA integrity_check) at swap time; the ledger it replaces moves with its -wal and -shm files, together, to
+    harness-replaced-<time>.sqlite beside it (never a stale log left beside the restored file); then the staged
+    file is renamed into place, which is atomic. {} when nothing is staged."""
     from datetime import timezone as _tz
-    staged = os.path.abspath(ledger_path) + RESTORE_SUFFIX
+    base = os.path.abspath(ledger_path)
+    staged, marker, swap = base + RESTORE_SUFFIX, base + STAGE_MARKER, base + SWAP_MARKER
+    if os.path.isfile(swap):
+        plan = _read_json(swap)
+        log.warning("a restore swap was under way when the App stopped: finishing it")
+        return _finish_swap(base, plan)
     if not os.path.isfile(staged):
+        _remove_file(marker)
         return {}
+    if not os.path.isfile(marker):
+        log.error("a staged restore without its marker (staging stopped midway) wasn't used")
+        os.replace(staged, staged + ".refused")
+        return {"ok": False, "said": "the staged restore wasn't finished being staged"}
     problem = verify_copy(staged)
     if problem:
         log.error("the staged restore wasn't used: %s", problem)
         os.replace(staged, staged + ".refused")
+        _remove_file(marker)
         return {"ok": False, "said": problem}
     stamp = (now or datetime.now(_tz.utc)).strftime("%Y%m%dT%H%M%SZ")
-    folder = os.path.dirname(os.path.abspath(ledger_path))
+    folder = os.path.dirname(base)
     kept = os.path.join(folder, f"harness-replaced-{stamp}.sqlite")
-    if os.path.isfile(ledger_path):
-        try:
-            copy_ledger(ledger_path, kept)
-        except (sqlite3.Error, OSError) as e:
-            log.error("the staged restore wasn't used: the ledger it replaces couldn't be kept (%s)",
-                      type(e).__name__)
-            return {"ok": False, "said": "the ledger it replaces couldn't be kept"}
-    for extra in ("-wal", "-shm"):
-        _remove(os.path.abspath(ledger_path) + extra)
-    os.replace(staged, ledger_path)
-    info = {}
-    try:
-        with open(staged + ".json", encoding="utf-8") as f:
-            info = json.load(f)
-    except (OSError, ValueError):
-        pass
-    _remove(staged + ".json")
-    log.warning("restored the ledger from %s; the one it replaced is %s", info.get("from", "a staged backup"),
+    n = 1
+    while any(os.path.exists(kept + x) for x in ("", "-wal", "-shm")):
+        n += 1
+        kept = os.path.join(folder, f"harness-replaced-{stamp}-{n}.sqlite")
+    plan = {"kept": kept, "from": _read_json(marker).get("from", ""), "at": stamp}
+    _write_json(swap, plan)
+    _swap_step("marker")
+    return _finish_swap(base, plan)
+
+
+def _finish_swap(base: str, plan: dict) -> dict:
+    """The swap from wherever it stopped: before the rename it's rolled forward (the old files moved, then the
+    staged file renamed into place), after it only the markers are left to clear. A staged file that fails its
+    check here is set aside and the old ledger moved back: rolled back."""
+    staged, marker, swap = base + RESTORE_SUFFIX, base + STAGE_MARKER, base + SWAP_MARKER
+    kept = str(plan.get("kept") or "")
+    if not kept:
+        _remove_file(swap)
+        return {"ok": False, "said": "the swap marker couldn't be read"}
+    if os.path.isfile(staged):
+        problem = verify_copy(staged)
+        if problem:
+            for x in ("", "-wal", "-shm"):
+                if os.path.exists(kept + x) and not os.path.exists(base + x):
+                    os.replace(kept + x, base + x)
+            os.replace(staged, staged + ".refused")
+            _remove_file(marker)
+            _remove_file(swap)
+            log.error("the staged restore failed its check at the swap (%s): rolled back to the ledger as it was",
+                      problem)
+            return {"ok": False, "said": problem, "rolled_back": True}
+        for x in ("", "-wal", "-shm"):          # the old ledger and its log move together
+            if os.path.exists(base + x):
+                os.replace(base + x, kept + x)
+            _swap_step("moved" + x)
+        os.replace(staged, base)                # atomic: the ledger is the old one or the restored one
+        _swap_step("renamed")
+    elif not os.path.isfile(base):
+        for x in ("", "-wal", "-shm"):          # nothing to put in place: the old ledger goes back
+            if os.path.exists(kept + x):
+                os.replace(kept + x, base + x)
+        _remove_file(marker)
+        _remove_file(swap)
+        return {"ok": False, "said": "the staged restore was gone", "rolled_back": True}
+    _write_json(base + RESTORED, {"from": plan.get("from", ""), "kept": os.path.basename(kept), "at": plan.get("at")})
+    _remove_file(base + MIGRATING)              # a move interrupted on the old ledger isn't this one's
+    _remove_file(marker)
+    _remove_file(swap)
+    log.warning("restored the ledger from %s; the one it replaced is %s", plan.get("from") or "a staged backup",
                 os.path.basename(kept))
-    return {"ok": True, "from": info.get("from", ""), "replaced": os.path.basename(kept)}
+    return {"ok": True, "from": plan.get("from", ""), "replaced": os.path.basename(kept)}
+
+
+def _lost_counts(ledger: Ledger, since: str) -> dict:
+    """What the records set aside by a restore hold that the backup doesn't (recorded after `since`): held
+    requests, buttons not tapped yet, writes whose outcome is still being read, and writes he could still undo."""
+    import sqlite3
+    now = iso(ledger.now())
+
+    def count(sql: str, *args) -> int:
+        try:
+            return int(ledger.db.execute(sql, args).fetchone()[0] or 0)
+        except sqlite3.Error:
+            return 0
+    from . import calendar_change as cal
+    held = 0
+    for _, value in ledger.db.execute("SELECT key, value FROM meta WHERE key LIKE ?", (f"{cal.HELD}%",)):
+        try:
+            held += (json.loads(value).get("at") or "") > since
+        except (ValueError, AttributeError):
+            held += 1
+    return {
+        "held": held,
+        "taps": count("SELECT COUNT(*) FROM choices WHERE consumed_at IS NULL AND expires_at > ? AND created_at > ? "
+                      "AND kind NOT LIKE 'migration_%'", now, since)
+        + count("SELECT COUNT(*) FROM approvals WHERE consumed_at IS NULL AND expires_at > ? AND created_at > ?",
+                now, since),
+        "watches": count("SELECT COUNT(*) FROM calendar_changes WHERE (state IN ('sending','settling') OR "
+                         "undo_state='settling') AND created_at > ?", since)
+        + count("SELECT COUNT(*) FROM family_adds WHERE (state IN ('sending','settling') OR undo_state IN "
+                "('settling','unknown')) AND created_at > ?", since),
+        "undoable": count("SELECT COUNT(*) FROM calendar_changes WHERE undo_state='open' AND created_at > ?", since)
+        + count("SELECT COUNT(*) FROM family_adds WHERE undo_state='open' AND created_at > ?", since),
+    }
+
+
+def _age(ledger: Ledger, at: str) -> str:
+    try:
+        s = max(0, int((ledger.now() - datetime.fromisoformat(at)).total_seconds()))
+    except (ValueError, TypeError):
+        return "an unknown time"
+    if s < 2 * 3600:
+        return f"{max(1, s // 60)} minute{'s' if s // 60 != 1 else ''}"
+    if s < 2 * 86400:
+        return f"{s // 3600} hours"
+    return f"{s // 86400} days"
 
 
 def request_restore(ledger: Ledger, chat_id: int, key: str, by: str) -> tuple[str, str]:
     """Cain's keeper.sh fastpath migrate-restore <schema> <build> (twelfth round): only posts him a card naming
     the backup; it's staged only on his tap (restore_tapped). (status, said)."""
-    import os
     try:
         n_text, build = key.split(" ", 1)
         n = int(n_text)
@@ -1126,9 +1501,9 @@ def request_restore(ledger: Ledger, chat_id: int, key: str, by: str) -> tuple[st
                              ttl_s=CARD_TTL_S, db=db)
         ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(
             "<b>Put Harness's records back from a backup?</b> The backup was taken just before an update moved "
-            "them. Put them back replaces the records with it the next time Harness starts: anything recorded "
-            "since that backup is set aside (kept beside them, not deleted), and the records then move to the "
-            "running build again, with a new backup first."),
+            "them. Put them back gets it ready and stops taking anything new; a restart of the App then replaces "
+            "the records with it: anything recorded since that backup is set aside (kept beside them, not "
+            "deleted), and the records then move to the running build again, with a new backup first."),
             buttons=[[("Put them back", choices.callback_data(nonce))]],
             binds=[{"type": "choice", "nonce": nonce}], db=db)
         ledger.event("migration_restore_asked", {"backup": os.path.basename(chosen), "by": by}, db=db)
@@ -1136,8 +1511,11 @@ def request_restore(ledger: Ledger, chat_id: int, key: str, by: str) -> tuple[st
                   "the next time Harness starts. Nothing changed yet.")
 
 
-def restore_tapped(ledger: Ledger, target: str) -> str:
-    """His tap on the restore card: stages it (stage_restore). What to tell him."""
+def restore_tapped(ledger: Ledger, target: str, chat_id: int = 0) -> str:
+    """His tap on Put them back: stages it (stage_restore). Thirteenth round: then the writer hold engages until the
+    restart (nothing new is taken: the controller answers requests and taps plainly), and one card tells him to
+    restart the App now, with the backup's age and what the records set aside hold that it doesn't. What to tell
+    him."""
     try:
         n_text, build = (target or "").split(" ", 1)
     except ValueError:
@@ -1148,18 +1526,91 @@ def restore_tapped(ledger: Ledger, target: str) -> str:
                      {k: got.get(k, "") for k in ("backup", "said")}, db=db)
     if not got.get("ok"):
         return f"Not put back: {render.escape(got.get('said', 'see the log'))}. Nothing changed."
-    return ("Ready: the records are put back from that backup the next time Harness starts, which an update or "
-            "a restart of the Home Assistant host does. What they replace is kept beside them.")
+    entry = next((b for b in backups(ledger) if os.path.basename(str(b.get("path", ""))) == got.get("backup")), {})
+    since = str(entry.get("at") or "")
+    if not since:
+        try:
+            from datetime import timezone as _tz
+            mtime = os.path.getmtime(os.path.join(os.path.dirname(os.path.abspath(ledger.path)), got["backup"]))
+            since = iso(datetime.fromtimestamp(mtime, _tz.utc))
+        except (OSError, KeyError):
+            since = ""
+    lost = _lost_counts(ledger, since)
+    if chat_id:
+        with ledger.tx() as db:
+            ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(
+                "<b>Restart Harness now to put its records back.</b> In Home Assistant: Settings, Apps, Harness, "
+                f"Restart. The backup it goes back to was taken {_age(ledger, since)} ago. Until the restart Harness "
+                "takes nothing new: requests and taps are answered that it's waiting to restart. Set aside with the "
+                "records it replaces (kept beside them, not deleted), so not in the restored ones: "
+                f"{lost['held']} held request{'s' if lost['held'] != 1 else ''} (passed back to you ready to copy "
+                f"after the restart), {lost['taps']} button{'s' if lost['taps'] != 1 else ''} not tapped yet, "
+                f"{lost['watches']} write{'s' if lost['watches'] != 1 else ''} still being confirmed, and "
+                f"{lost['undoable']} change{'s' if lost['undoable'] != 1 else ''} you could still undo."), db=db)
+            ledger.event("migration_restore_fenced", {"backup": got.get("backup", ""), **lost}, db=db)
+    try:
+        ledger.engage_hold()
+    except TimeoutError:
+        log.warning("the writer hold for the staged restore couldn't engage now; the controller still takes nothing")
+    log.warning("a restore is staged: nothing new is taken until the App restarts")
+    return "Ready: restart Harness now and the records are put back from that backup. The message below says what's set aside."
+
+
+def held_in_kept(ledger: Ledger, kept_path: str, tz: str) -> list[str]:
+    """The requests held in a ledger a restore set aside (opened read only), as ready-to-copy lines."""
+    import sqlite3
+    from . import calendar_change as cal
+    out: list[str] = []
+    try:
+        conn = sqlite3.connect(f"file:{kept_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return out
+    try:
+        for key, _ in conn.execute("SELECT key, value FROM meta WHERE key LIKE ?", (f"{cal.HELD}%",)).fetchall():
+            row = conn.execute("SELECT params_json FROM proposals WHERE id=?", (key[len(cal.HELD):],)).fetchone()
+            try:
+                changes = json.loads(row[0])["changes"] if row else []
+            except (ValueError, KeyError, TypeError):
+                continue
+            out += ["• " + render.escape(cal._copy_line(c, tz)) for c in changes]
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return out
+
+
+def after_restore(ledger: Ledger, chat_id: int, tz: str) -> dict:
+    """Once the restored ledger is open (thirteenth round): the requests held in the records it set aside are
+    posted back, ready to copy, once. {} when no swap was just done."""
+    side = _side(ledger, RESTORED)
+    if not side or not os.path.isfile(side) or not chat_id:
+        return {}
+    info = _read_json(side)
+    kept = os.path.join(os.path.dirname(os.path.abspath(ledger.path)), str(info.get("kept") or ""))
+    lines = held_in_kept(ledger, kept, tz) if info.get("kept") else []
+    with ledger.tx() as db:
+        ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(
+            f"<b>Harness's records are back from the backup</b> ({render.escape(str(info.get('from') or 'a backup'))})."
+            f" The records they replaced are kept as {render.escape(str(info.get('kept') or ''))}. "
+            + ("These requests were waiting there; ready to copy into the calendar app:\n" + "\n".join(lines)
+               if lines else "No requests were waiting there.")), db=db)
+        ledger.event("migration_restored", {"from": info.get("from", ""), "kept": info.get("kept", ""),
+                                            "held_passed_back": len(lines)}, db=db)
+    _remove_file(side)
+    return {"held": len(lines), **info}
 
 
 if __name__ == "__main__":
     # python3 -m harness.migrate <ledger path>: this build's dry run on a copy. Tenth round:
     # python3 -m harness.migrate <ledger path> --candidate <tree or image path>: the candidate's own.
     # Twelfth round: python3 -m harness.migrate <ledger path> --restore <schema> <build>: stage that backup.
+    # Thirteenth round: it writes only the staged file and its marker, never the ledger, and refuses while the
+    # specialist runs (it holds harness.lock); the specialist swaps it in at its next start.
     import sys
     args = sys.argv[1:]
     if len(args) == 4 and args[1] == "--restore":
-        got = stage_restore(args[0], args[2], args[3])
+        got = stage_restore(args[0], args[2], args[3], cli=True)   # refused while the specialist runs
         print(json.dumps(got, indent=1, sort_keys=True))
         sys.exit(0 if got.get("ok") else 1)
     if len(args) == 3 and args[1] == "--candidate":

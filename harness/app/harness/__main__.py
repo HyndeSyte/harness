@@ -58,9 +58,16 @@ def configure_logging() -> None:
 def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_PORT):
     vault = Vault(os.path.join(data_dir, "secrets.json"))
     # Twelfth round: a restore he tapped (migrate.stage_restore) is swapped in before the ledger opens.
+    # Thirteenth round: the specialist holds its lock file first (the restore command line refuses while it's
+    # held), and all swapping is done here, before the ledger opens.
     from . import migrate
-    migrate.apply_staged_restore(os.path.join(data_dir, "harness.sqlite"))
-    ledger = Ledger(os.path.join(data_dir, "harness.sqlite"))
+    path = os.path.join(data_dir, "harness.sqlite")
+    migrate.hold_process_lock(path)
+    try:
+        migrate.apply_staged_restore(path)
+    except OSError as e:
+        logging.getLogger("harness").error("the staged restore couldn't be swapped in: %s", type(e).__name__)
+    ledger = Ledger(path)
     transport = UrllibTransport()
     # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;
     # taps come back to /press. The bot token reads his DM when Cain hands a request over.
@@ -182,6 +189,33 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     return controller, web, listener
 
 
+def degraded(data_dir: str, port: int, why: str) -> int:
+    """Thirteenth round: when the records can't be opened at all, the specialist still serves its status page and
+    Cain's health check (status "degraded", with why), so it's seen and said, and waits to be stopped. A restore
+    staged by the command line (with the App stopped) or from a Home Assistant backup is the way back."""
+    log = logging.getLogger("harness")
+    vault = Vault(os.path.join(data_dir, "secrets.json"))
+    status: dict = {"notes": [f"Harness started degraded: {why}. Calendar work is off until it starts normally."],
+                    "migration": {"degraded": True, "why": why}}
+    web = serve(SetupApp(vault, status, queue.Queue()), port=port)
+    inbox = handover.Inbox(lambda: vault.get("discord_bot_token"))
+    inbox.migration = {"degraded": True, "why": why}
+    inbox.degraded = why
+    try:
+        handover.serve(inbox, port=int(os.environ.get("HARNESS_HANDOVER_PORT", handover.PORT)))
+    except OSError as e:
+        log.error("handover: can't listen: %s", e)
+    stop_now = []
+    signal.signal(signal.SIGTERM, lambda *_: stop_now.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop_now.append(1))
+    while not stop_now:
+        for h in inbox.take():
+            h.finish("refused", f"Not taken: Harness started degraded ({why}). Nothing changed.")
+        time.sleep(1)
+    web.shutdown()
+    return 1
+
+
 class Stop(Exception):
     """Raised from the signal handler so a blocking wait is interrupted at
     once, not after its timeout: Home Assistant gives an add-on a limited
@@ -195,7 +229,11 @@ def main() -> int:
     log = logging.getLogger("harness")
     data_dir = os.environ.get("HARNESS_DATA", "/data")
     port = int(os.environ.get("HARNESS_PORT", "8099"))
-    controller, web, listener = build(data_dir, port=port)
+    try:
+        controller, web, listener = build(data_dir, port=port)
+    except Exception as e:                     # noqa: BLE001: thirteenth round, never a start that can't recover
+        log.error("the specialist couldn't start (%s): serving the status page and health only", type(e).__name__)
+        return degraded(data_dir, port, f"the records couldn't be opened ({type(e).__name__})")
 
     def stop(*_):
         raise Stop()
