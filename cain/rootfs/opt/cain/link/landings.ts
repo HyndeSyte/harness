@@ -15,12 +15,14 @@
 //   the marker's (or the link's state's), or that is missing while the marker isn't, came back
 //   from a backup: it isn't trusted (claims answer null) until each of its keys was looked for on
 //   the remote main by its head (the landing's token), and settled by what the remote said.
+import { appendLog, readLog } from "../applog";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 export const LANDING_KEEP_MS = 30 * 86_400_000;
 const META = ".ledger.json";
+export const SETTLED_LOG = "settled.log";   // round 12: the hand settles, append-only (../applog.ts)
 
 // base: main's tip when the key was claimed (round 9): settlement searches from it to the remote tip.
 // epoch: the record keeper's reset epoch the link read right before the claim (round 10): re-read after
@@ -37,6 +39,13 @@ export interface Landings {
   claim(key: string, what: { pr: string; head: string; at: string; base?: string; epoch?: number }): boolean | null;
   settle(key: string, how: "landed" | "not landed", at: string, note?: { voided?: boolean; forced?: boolean; said?: string }): void;
   reconcile?(): HeadLanding[];
+  // Round 12: a hand settle, as one framed record appended and fsynced to the ledger's settle log
+  // (settled.log in its directory) before any effect, then mirrored on the key's own file; false when it
+  // couldn't be written (nothing settled). handSettles: the log's records. repair: a torn final record
+  // truncated (at start).
+  settleHand?(key: string, how: "landed" | "not landed", at: string, said: string): boolean;
+  handSettles?(): { key: string; how: "landed" | "not landed"; at: string; said: string }[];
+  repair?(): { torn: boolean; bytes: number };
   entries(): LandingEntry[] | null;
   // keep: keys never pruned whatever their age (the link's unresolved keys).
   prune(now: number, keepMs?: number, keep?: Set<string>): number;
@@ -115,6 +124,20 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
           catch (x: any) { log(`couldn't link landing ${keyName(e.key).slice(0, 12)}: ${String(x?.message ?? x).slice(0, 80)}`); }
         }
     },
+    settleHand(key, how, at, said) {
+      try {
+        if (api.handSettles!().some((h) => h.key === key || h.said === said)) { log(`hand settle of landing ${keyName(key).slice(0, 12)} refused: its key or message is in the settle log already`); return false; }
+        appendLog(join(dir, SETTLED_LOG), { key, how, at, said });
+        o.sync?.("settle-log");
+      } catch (e: any) { log(`couldn't append the hand settle of landing ${keyName(key).slice(0, 12)} to the settle log: ${String(e?.message ?? e).slice(0, 80)}`); return false; }
+      api.settle(key, how, at, { forced: true, said });   // the key's own file mirrors it
+      return true;
+    },
+    handSettles() {
+      const r = readLog(join(dir, SETTLED_LOG), { repair: false });
+      return r.records.filter((x: any) => x && typeof x.key === "string" && (x.how === "landed" || x.how === "not landed") && typeof x.said === "string" && typeof x.at === "string");
+    },
+    repair() { const r = readLog(join(dir, SETTLED_LOG)); return { torn: r.torn, bytes: r.tornBytes }; },
     entries() {
       if (!existsSync(dir)) return [];
       try {

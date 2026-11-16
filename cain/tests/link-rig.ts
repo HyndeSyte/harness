@@ -1,5 +1,8 @@
 // A fake Discord, record and clock around Cain's link (link/core.ts), for the tests.
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { emptyState, Link, type Pull, State } from "../rootfs/opt/cain/link/core";
 import { ACTIONS_APP, type Facts, type Landed } from "../rootfs/opt/cain/link/merge";
 import type { Reviewed } from "../rootfs/opt/cain/reviewed";
@@ -37,8 +40,16 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 }
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
-    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; unchecked?: boolean; maxCheckDays?: number } = {}) {
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; unchecked?: boolean; maxCheckDays?: number;
+    installTaps?: boolean; issuedLog?: string | null } = {}) {
   let state: State = emptyState();
+  // Round 12: Ship taps land only once install taps are on; the tests about other things have them on.
+  if (opts.installTaps !== false) state.installTaps = { on: true, at: 0 };
+  // Round 12: the link's issued-key log, a real file (null: none); the crash points the tests set; and
+  // the durable saves, in order with the log's appends.
+  const issuedLog = opts.issuedLog === null ? undefined : (opts.issuedLog ?? join(mkdtempSync(join(tmpdir(), "link-issued-")), "link-issued.log"));
+  const crash = { at: null as string | null };
+  const durable: { run?: number; nonce?: string }[] = [];
   // GitHub, as the link's landings see it (merge.ts is tested on its own).
   const github = {
     main: [] as string[],                          // heads landed in main
@@ -82,6 +93,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // killed at the ceiling, and what Discord answers to a webhook patch of @original (another id).
   const survive = { fn: null as null | ((id: string) => boolean | null) };
   const landLedger = { keys: new Set<string>(), broken: false, what: new Map<string, { pr: string; head: string; at: string; base?: string }>(), settled: new Map<string, string>(), said: new Map<string, string>(),
+    hand: [] as { key: string; how: string; at: string; said: string }[],
     untrusted: null as string | null, pruned: 0 };
   const disk = { corrupt: null as string | null, writes: 0 };
   const kills = { n: 0 };
@@ -187,6 +199,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const deps = {
     rest, load: () => (disk.corrupt !== null ? emptyState() : copy(state)), save: (s: State) => { state = copy(s); disk.corrupt = null; disk.writes++; }, now: () => t.now,
+    saveDurable: (s: State) => { durable.push({ run: s.run, nonce: s.runNonce }); state = copy(s); disk.corrupt = null; disk.writes++; },
+    issuedLog,
+    crashPoint: (where: string) => { if (crash.at === where) { crash.at = null; throw new Error(`crash injected at ${where}`); } },
     stateHealth: () => (disk.corrupt !== null ? { ok: false, why: "corrupt or mid-write" } : { ok: true }),
     requestLogged: (id: string) => (survive.fn ? survive.fn(id) : true),
     landings: {
@@ -198,6 +213,16 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       settle: (key: string, how: string, at?: string, note?: { said?: string }) => {
         if (!landLedger.settled.has(key)) { landLedger.settled.set(key, how); if (note?.said) landLedger.said.set(key, note.said); }
       },
+      // Round 12: the ledger's settle log, appended before any effect of a hand settle.
+      settleHand: (key: string, how: string, at: string, said: string) => {
+        if (landLedger.broken) return false;
+        if (landLedger.hand.some((h) => h.key === key || h.said === said)) return false;
+        landLedger.hand.push({ key, how, at, said });
+        if (!landLedger.settled.has(key)) { landLedger.settled.set(key, how); landLedger.said.set(key, said); }
+        return true;
+      },
+      handSettles: () => landLedger.hand.map((h) => ({ ...h })),
+      repair: () => ({ torn: false, bytes: 0 }),
       entries: () => [...landLedger.keys].map((key) => ({ key, ...(landLedger.what.get(key) ?? { pr: "", head: "", at: "" }),
         ...(landLedger.settled.has(key) ? { settled: { how: landLedger.settled.get(key) as any, at: new Date(t.now).toISOString(),
           ...(landLedger.said.has(key) ? { said: landLedger.said.get(key) } : {}) } } : {}) })),
@@ -272,6 +297,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     get link() { return checking(link); },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
     reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited, survive, landLedger, disk, kills, deps,
+    issuedLog, crash, durable,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

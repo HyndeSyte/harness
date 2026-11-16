@@ -10,7 +10,8 @@ import { settleForm, settleWordsProblem, TAP_REFUSED, TAP_RESTORE_LOST, tapKid, 
   UNRESOLVED_ALERT_MS, UNRESOLVED_TOMB_MS } from "../rootfs/opt/cain/link/core";
 import { landingLedger } from "../rootfs/opt/cain/link/landings";
 import { tapIssuedProblem } from "../rootfs/opt/cain/record/core.ts";
-import { cycle, readConsumed, readLinkTaps, tapsLogFile } from "../rootfs/opt/cain/record/main.ts";
+import { cycle, readConsumed, readIssued, readLinkTaps, tapsLogFile } from "../rootfs/opt/cain/record/main.ts";
+import { appendLog } from "../rootfs/opt/cain/applog.ts";
 import { DAY, MIN, PR, SHA1, pendingWith, rig as linkRig } from "./link-rig";
 import { rig as keeperRig } from "./rig.ts";
 
@@ -193,10 +194,12 @@ describe("3. consumed keys in an append-only log, and taps lost to a restore of 
     const f = join(k.root, "pi/link/state.json");
     const link = (run: number, nonce: string, issued: Record<string, unknown>) => writeFileSync(f, JSON.stringify({ messages: {}, run, runNonce: nonce, issued }));
     const K = "tap-00000000e001";
-    link(4, "aaaa", { [K]: { item: "P11", kind: "ask", label: "Filed", at: 0, msg: "1570000000000000801", target: { item: "P11", writes: ["row-close", "decision"] } } });
+    const reg = { item: "P11", kind: "ask", label: "Filed", at: 0, msg: "1570000000000000801", target: { item: "P11", writes: ["row-close", "decision"] } };
+    link(4, "aaaa", { [K]: reg });
+    appendLog(join(k.root, "pi/link-issued.log"), { t: "key", kid: K, ...reg, at: k.cfg.now!().getTime() });   // round 12: issued means logged
     k.cain({ id: "cain-before", ops: [{ op: "note", item: "P44", text: "a round first" }] });
     expect(cycle(k.cfg).ok).toBe(true);
-    expect(k.kept().issuedSeen[K]).toBeDefined();
+    expect(readIssued(k.cfg, k.cfg.now!().getTime()).keys.get(K)).toBeDefined();   // round 12: the keeper's mirror
     expect(k.kept().linkSeen).toEqual({ run: 4, nonce: "aaaa" });
     // The link's state comes back from an older copy (a lower run, then a restart: the same run, another
     // nonce), without the key; Cain's request from that tap is outstanding.
@@ -241,7 +244,7 @@ describe("4. unresolved keys over days", () => {
     const { id, key, kid } = await unresolved(r);
     const reminders = () => onThread(r, id, unresolvedReminder(kid));
     expect(reminders()).toHaveLength(0);
-    expect(unresolvedReminder(kid)).toContain(`"settle ${kid} landed"`);
+    expect(unresolvedReminder(kid)).toContain(`\n${settleForm(kid, "landed")}\n`);
     expect(unresolvedReminder(kid)).toContain("Reconciling a landing by hand");
     r.later(DAY);
     await r.link.sweep();
@@ -251,7 +254,8 @@ describe("4. unresolved keys over days", () => {
     expect(reminders()).toHaveLength(1);                              // once a day, not each sweep
     r.later(12 * 60 * MIN);
     await r.link.sweep();
-    expect(reminders()).toHaveLength(2);
+    expect(reminders()).toHaveLength(1);                              // round 12: the thread line once, then a digest
+    expect(r.cards().filter((m: any) => String(m.content).includes("still unconfirmed") && String(m.content).includes(`settle ${kid} landed`))).toHaveLength(1);
     const clock: any = r.link.clockReport();
     expect(clock.unresolved_landings[0]).toMatchObject({ tap_key: kid, settle: [`settle ${kid} landed`, `settle ${kid} not-landed`], how: "DOCS.md, Reconciling a landing by hand" });
     // Past 7 days: one alert line to Cain.

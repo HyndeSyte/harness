@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseHolds, tapDerived, type Holds, type Outcome } from "../rootfs/opt/cain/record/core.ts";
 import type { Config } from "../rootfs/opt/cain/record/main.ts";
+import { appendLog } from "../rootfs/opt/cain/applog.ts";
 
 export const T0 = new Date("2026-11-11T13:00:00Z");
 export const hrs = (n: number) => new Date(T0.getTime() + n * 3_600_000);
@@ -71,7 +72,7 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
   writeFileSync(join(root, "pi/link/state.json"), JSON.stringify({ messages: {} }));
   const pull = () => g("pull", "--quiet", "--ff-only", "origin", "main");
   const r = {
-    root, remote, seed, cfg, g, pull, synced,
+    root, remote, seed, cfg, g, pull, synced, logged: new Set<string>(),
     at(d: Date) { now = d; },
     // The clock moves to d with the keeper running all along (its last round a minute
     // before), so none of it counts as keeper downtime.
@@ -103,6 +104,8 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
       st.issued ??= {};
       if (replace || !st.issued[tap]) st.issued[tap] = { ...what, at: now.getTime() };
       writeFileSync(f, JSON.stringify(st));
+      // Round 12: and in the link's issued-key log, where the keeper looks it up.
+      if (replace || !r.logged.has(tap)) { appendLog(join(root, "pi/link-issued.log"), { t: "key", kid: tap, ...what, at: now.getTime() }); r.logged.add(tap); }
     },
     // Requests from laptop sessions, pushed to the record's inbox together in one commit.
     inbox(...reqs: [string, Record<string, unknown>][]) {

@@ -39,6 +39,13 @@
 - A tap's record entry must match what you tapped: each tap now carries what it may do (close that item, start that Ship, or record your answer), and the record checks that, not the wording. If it turns one down, Cain gets the reason and you get one line under the card.
 - Taps already used are kept in a log that only grows, so even restoring the App's saved state can't make one count twice. A tap lost that way gets one line under its card asking you to answer again.
 - A Ship you settled by hand and later shipped for real shows as one landing, and a record restart during the push never undoes a landing.
+- Each button's tap key is saved for good before a question can be tapped, and kept for its whole life (about 100 days). If the App's saved state is ever restored from an older copy, a tap on a question from after that copy gets one line under it asking you to answer again, never a silent "not recognised".
+- Even restoring the whole App from a backup can't make a tap count twice: each tap the record used is noted in the record's own history on GitHub, and the App reads it back after a restore.
+- A line torn by a power cut in the middle of writing one of its logs is found and cleaned up at the next start, with nothing for you to do. Only if the record keeper finds one of its logs missing does it refuse to start, and Cain tells you in one line.
+- When you settle a Ship by hand, the App writes it down first, then acts, so a power cut in between can't settle it twice or half way. Copying the settle line from your phone works even with the backticks, odd spaces, capitals or a long dash it picks up; the key and landed or not-landed must still be right.
+- If Cain records a tap the wrong way, the record turns it down without using it up: your answer stands, you get one line saying there is nothing to do, and Cain records it the right way.
+- An unsettled Ship gets one line under its card on its first day, then one message listing all of them each day for a week, then once a week.
+- Ship taps only install after Cain has finished the tests after this install (he switches them on); until then a Ship tap says installs wait and keeps its buttons.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 
 ## 0.11.0

@@ -65,7 +65,8 @@
 #                                        (recheck_pending), whether Ship taps are held, and the last tap's read time
 #                                        unresolved_landings (each with the exact settle messages and its age),
 #                                        tombstoned_landings (unresolved past 90 days: kept, no longer blocking)
-#                                        and landings_by_head (the ledger's reconciliation, one landing per head)
+#                                        and landings_by_head (the ledger's reconciliation, one landing per head),
+#                                        and install_taps (on, once or off: whether his Ship taps land yet)
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or
@@ -74,8 +75,17 @@
 #                                        "settle <tap key> not-landed" for this very key and verdict; the link
 #                                        reads that message itself. One message settles one key once (its id
 #                                        is consumed); one that says both, or "not landed" as two words, is
-#                                        refused with the reason. An audit line goes to the link's log, and
+#                                        refused with the reason. Copying noise is forgiven: backticks or a
+#                                        code fence around it, Unicode spaces, an en or em dash for the
+#                                        hyphen, capitals; a refusal shows the text as received, normalised.
+#                                        The settle goes to the landing ledger's settle log (fsynced) before
+#                                        anything else happens. An audit line goes to the link's log, and
 #                                        the usual outcome line follows
+#   keeper.sh install-taps on|once|off   whether his Ship taps land in main: off until Cain runs it with on,
+#                                        after the Pi smoke test, the forced-webhook step, the pull-the-plug
+#                                        case and one real settle cycle pass; once lets exactly one Ship tap
+#                                        land (the pull-the-plug case itself). Until then a Ship tap answers
+#                                        that installs wait for the post-install tests, and keeps its buttons
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
@@ -103,6 +113,7 @@ case "$cmd" in
   fail-webhook) url="$link/failwebhook"; ctx=harness-relay-v1 ;;
   stall-read) url="$link/stallread"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
+  install-taps) url="$link/installtaps"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -191,6 +202,7 @@ case "$cmd" in
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
   settle)   body=$(jq -nc --arg t "${1:-}" --arg h "${2:-}" --arg s "$said" '{tap: $t, how: $h, said: $s}') ;;
+  install-taps) body=$(jq -nc --arg h "${1:-}" '{how: $h}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;

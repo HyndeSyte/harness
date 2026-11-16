@@ -127,6 +127,9 @@ const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) =
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
 function save(s: State): void { stateStore.save(s); }
+function saveDurable(s: State): void { stateStore.saveDurable(s); }
+// Round 12: the issued-key log, outside the link's restorable state (../applog.ts).
+const ISSUED_LOG = process.env.LINK_ISSUED_LOG ?? "/data/link-issued.log";
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -220,7 +223,7 @@ const SHIP_REPO = "HyndeSyte/harness";
 const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
 
 const link = new Link({
-  rest, load, save, now: Date.now, paired, toHarness,
+  rest, load, save, saveDurable, issuedLog: ISSUED_LOG, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`), status: readOr(RECORD_STATUS) }),
@@ -343,7 +346,7 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook", "/settle"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook", "/settle", "/installtaps"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -385,6 +388,7 @@ Bun.serve({
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/clock": return json(link.clockReport());
         case "/settle": return json(await link.settleKey({ tap: b.tap, how: b.how, said: b.said }));
+        case "/installtaps": return json(link.installTaps({ how: b.how }));
         case "/reads": return json(await link.probeReads(Number(b.n ?? 20)));
         case "/slowread": return json(link.slowRead());
         case "/failwebhook": return json(link.failWebhook());

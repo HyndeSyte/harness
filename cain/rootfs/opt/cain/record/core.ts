@@ -83,7 +83,7 @@ export function tapIssuedProblem(req: { tap?: string; ops?: any[] }, issued: Rec
   if (!k || !TAP_KEY.test(k)) return null;
   if (!issued) return `tap key ${k} can't be checked: the link's list of issued tap keys can't be read now; send the request again in a minute under a new id`;
   const reg = issued[k];
-  if (!reg) return `tap key ${k} isn't one the link issued (or it is over four days old): use the tap key the relayed tap line ended with`;
+  if (!reg) return `tap key ${k} isn't one the link issued (it isn't in the link's issued-key log, or it is over 100 days old): use the tap key the relayed tap line ended with`;
   const t = targetOf(reg);
   const allows = t.writes.length ? t.writes.map((w) => WRITE_WORDS[w] ?? w).join(" or ") : "no write";
   const from = reg.kind === "ship" ? `a "${reg.label ?? "Ship"}" tap on a Ship card` : t.item === "NONE" ? "a question about no open item" : "a question";

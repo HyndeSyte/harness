@@ -92,6 +92,7 @@ import { judgeChecks, type Facts, type Landed } from "./merge";
 import { checkTextProblem, generationOf, inStep, isFresh, MAX_ONE_OFF_REASON, maxCheckDays, ONE_OFF_SUMMARY, oneOffHit, oneOffLoose, parseChecks,
   repeatsCheck, staleAfter, type Checks } from "../record/core";
 import type { Verdict } from "../clock";
+import { appendLog, readLog } from "../applog";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -117,9 +118,14 @@ const LANDING_TRY_MS = 2 * 3_600_000;
 export const UNRESOLVED_TELL_FAILS = 5;
 export const UNRESOLVED_TELL_MS = 15 * 60_000;
 const UNRESOLVED_BACKOFF_MAX_MS = 5 * 60_000;
-// How long an issued tap key stays listed for the record keeper (round 10): past the keeper's own
-// three days (TAP_KEEP_MS), unless its landing is unresolved.
-export const TAP_ISSUED_KEEP_MS = 4 * DAY;
+// How long an issued tap key stays listed for the record keeper (round 10), unless its landing is
+// unresolved. Round 12: a key's whole actionable life, until consumed or tombstoned (90 days) plus a
+// margin, the same in the link's issued-key log, its state and the keeper's mirror.
+export const TAP_ISSUED_KEEP_MS = 100 * DAY;
+// Round 12: after the first per-thread reminder, one digest of every unresolved key a day for a week,
+// then once a week.
+export const UNRESOLVED_DIGEST_DAILY_MS = 7 * DAY;
+export const WEEK = 7 * DAY;
 // Round 11: an unresolved landing key, after its first line to him, is told again once a day with the
 // exact settle message he can send; past UNRESOLVED_ALERT_MS Cain gets one alert line; past
 // UNRESOLVED_TOMB_MS it becomes a tombstone: its record is kept (state, ledger, issued key), it is listed
@@ -273,6 +279,11 @@ export interface State {
   // state) already told to him, by tap key and kind, with when.
   tapNoticed?: Record<string, number>;
   recheck?: Record<string, { at: number; why: string; key?: string }>;
+  // Round 12: when the last digest of unresolved landings went to him (daily for a week, then weekly).
+  unresolvedDigestAt?: number;
+  // Round 12: Ship taps land only once this is on (keeper.sh install-taps on, after the post-install
+  // tests); once: exactly one Ship tap is let through (the smoke test's pull-the-plug case).
+  installTaps?: { on: boolean; at: number; once?: boolean };
 }
 // stage "lost": the tap rested on a check that didn't survive a reset of the record, so it was never
 // acted on past the reset; told: Dane (on the card's thread) and Cain (a relayed line) heard so.
@@ -297,30 +308,57 @@ export function tapTarget(item: string, kind: string, label: string): TapTarget 
 }
 // The exact message he sends to settle a landing by hand (round 11).
 export const settleForm = (kid: string, how: "landed" | "not-landed") => `settle ${kid} ${how}`;
+// Round 12: his message as copied from the reminder on a phone, normalised: a code fence or the
+// backticks around it taken off, non-breaking and other Unicode spaces made plain spaces, zero-width
+// characters dropped, an en or em dash (or another dash a keyboard substitutes) read as a hyphen, case
+// ignored, spacing collapsed, and one closing full stop or exclamation mark dropped.
+export function settleNormalise(content: string): string {
+  let t = String(content ?? "");
+  t = t.replace(/[\u200b-\u200d\u2060\ufeff\u00ad]/g, "");
+  t = t.replace(/[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/g, " ");
+  t = t.replace(/[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/g, "-");
+  t = t.trim();
+  const fence = /^```[a-z]*\s*([\s\S]*?)\s*```$/i.exec(t);
+  if (fence) t = fence[1];
+  t = t.trim().replace(/^`+|`+$/g, "");
+  return t.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]$/, "").trim();
+}
 // Whether his message settles that key that way (round 11): null when it is exactly the settle form for
-// it, else the plain reason it doesn't. Case and spacing don't matter, nor one closing full stop.
+// it, else the plain reason it doesn't, with what was received (normalised, round 12). The key match and
+// the single verdict stay strict; only copying's noise is forgiven (settleNormalise).
 export function settleWordsProblem(content: string, kid: string, how: "landed" | "not-landed"): string | null {
-  const t = content.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.!]$/, "");
+  const t = settleNormalise(content);
+  const got = ` (received, normalised: "${t.slice(0, 120)}")`;
   const exact = /^settle (tap-[0-9a-f]{12}) (landed|not-landed)$/.exec(t);
   if (exact) {
-    if (exact[1] !== kid) return `his message names tap key ${exact[1]}, not ${kid}: a message settles only the key it names`;
-    if (exact[2] !== how) return `his message says ${exact[2]}, but the command says ${how}`;
+    if (exact[1] !== kid) return `his message names tap key ${exact[1]}, not ${kid}: a message settles only the key it names${got}`;
+    if (exact[2] !== how) return `his message says ${exact[2]}, but the command says ${how}${got}`;
     return null;
   }
   const negs = (t.match(/\bnot[ -]landed\b|\bdid ?n[o']?t land\b|\bnever landed\b/g) ?? []).length;
   const lands = (t.match(/\blanded\b/g) ?? []).length - (t.match(/\bnot[ -]landed\b|\bnever landed\b/g) ?? []).length;
   const form = `"${settleForm(kid, "landed")}" or "${settleForm(kid, "not-landed")}"`;
-  if (negs && lands > 0) return `his message says both landed and not landed, so it settles nothing; he sends exactly ${form}`;
-  if (how === "landed" && /\bnot landed\b/.test(t)) return `his message says "not landed" (two words), the opposite of landed; he sends exactly ${form}`;
-  if (how === "not-landed" && /\bnot landed\b/.test(t)) return `his message writes "not landed" as two words; he sends exactly ${form}, with not-landed as one word`;
-  return `his message isn't of the exact form ${form}`;
+  if (negs && lands > 0) return `his message says both landed and not landed, so it settles nothing; he sends exactly ${form}${got}`;
+  if (how === "landed" && /\bnot landed\b/.test(t)) return `his message says "not landed" (two words), the opposite of landed; he sends exactly ${form}${got}`;
+  if (how === "not-landed" && /\bnot landed\b/.test(t)) return `his message writes "not landed" as two words; he sends exactly ${form}, with not-landed as one word${got}`;
+  return `his message isn't of the exact form ${form}${got}`;
 }
-// Told to him once a day while a landing stays unresolved, on its card's thread (round 11).
+// Told to him on the card's thread the first day a landing stays unconfirmed (round 11), with both
+// settle lines each in its own code block (round 12), so a long press copies exactly one.
 export const unresolvedReminder = (kid: string) =>
-  `Still can't tell whether this Ship landed. Check main on GitHub from your PC, then send exactly "${settleForm(kid, "landed")}" or "${settleForm(kid, "not-landed")}". How: "Reconciling a landing by hand" in the Cain App's documentation.`;
+  `Still can't tell whether this Ship landed. Check main on GitHub from your PC, then send exactly one of these two lines:\n\`\`\`\n${settleForm(kid, "landed")}\n\`\`\`\n\`\`\`\n${settleForm(kid, "not-landed")}\n\`\`\`\nHow: "Reconciling a landing by hand" in the Cain App's documentation.`;
+// Round 12: after that, one digest for every unresolved key (daily for a week, then weekly).
+export const unresolvedDigest = (kids: string[]) =>
+  `${kids.length === 1 ? "One Ship is" : `${kids.length} Ships are`} still unconfirmed. For each, check main on GitHub from your PC, then send exactly one of its two lines:\n` +
+  kids.map((k) => `\`\`\`\n${settleForm(k, "landed")}\n\`\`\`\n\`\`\`\n${settleForm(k, "not-landed")}\n\`\`\``).join("\n") +
+  `\nHow: "Reconciling a landing by hand" in the Cain App's documentation.`;
 // Told to him on a card's thread when the record keeper refused or lost a request from his tap (round 11).
-export const TAP_REFUSED = "Your tap couldn't be recorded as it was; Cain has the reason and will sort it out.";
+// Round 12: a refusal doesn't use the tap up; the line says what happens next.
+export const TAP_REFUSED = "Cain's first try at recording your tap didn't match this card, so nothing was recorded yet. Your answer still stands and Cain is recording it again; nothing to do unless you want to change it, then answer in a message.";
 export const TAP_RESTORE_LOST = "Your tap was lost when the App's state was restored from an older copy, please answer again.";
+// Round 12: a Ship tap before install taps are switched on (keeper.sh install-taps on, after the
+// post-install tests pass): nothing lands, the buttons stay.
+export const INSTALL_WAIT = "Installs wait for the post-install tests: nothing shipped, and this card stays up. Cain turns installs on once those tests pass.";
 export interface Uncertain { gen: number | null; check: string | null; item: string; at: number; msg: string; label: string; told?: boolean; key?: string; epoch?: number; ref?: Ref; kind?: string }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
@@ -791,6 +829,14 @@ export interface Deps {
   transcripts?: (since: number) => Sent | Promise<Sent>;
   writeReplay?: (r: ReplayReport) => string | void;             // where it was written
   replayPauseMs?: number;
+  // Round 12: the link's append-only issued-key log (/data/link-issued.log, outside its restorable
+  // state): every tap key a card offers, with its target and card message id, and each run's number and
+  // nonce, framed and fsynced before the card can be tapped (../applog.ts).
+  issuedLog?: string;
+  // Round 12: a save that is fsynced before it returns (the run counter and nonce); save when absent.
+  saveDurable?: (s: State) => void;
+  // Round 12: the tests' crash injection, called at named points (hand settle); absent in production.
+  crashPoint?: (where: string) => void;
 }
 
 // One send point's hits, for the gate's log, and what was done: "fixed" (and posted),
@@ -1813,6 +1859,8 @@ export class Link {
       posted_gen: this.d.load().postedGen ?? 0,
       uncertain_taps: (this.d.load().uncertain ?? []).length,
       link_run: this.d.load().run ?? 0,
+      // Round 12: whether his Ship taps land yet (keeper.sh install-taps on, after the post-install tests).
+      install_taps: (() => { const f = this.d.load().installTaps; return f?.on ? "on" : f?.once ? "once" : "off"; })(),
       // Landings the remote can't settle yet (round 9): each key with its age and last error.
       unresolved_landings: Object.entries(this.d.load().unresolved ?? {}).map(([k, u]) => ({ tap_key: tapKid(k), what: u.what,
         since: new Date(u.since).toISOString(), age_min: Math.round((this.d.now() - u.since) / 60_000), failures: u.fails, last_error: u.last,
@@ -2334,6 +2382,7 @@ export class Link {
     this.intend(checked);
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
       { replyTo: e.replyTo, nonce });
+    try { this.issueKeys(String(msg.id), { checked: checked ?? undefined, item: e.item, kind: "ask" }, options); } catch (x) { await this.unissuable(String(msg.id), x); }
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
       ...(checked ? { checked } : {}), buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
@@ -2399,6 +2448,7 @@ export class Link {
     this.intend(checked);
     const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
       { replyTo: meta.replyTo, nonce });
+    try { this.issueKeys(String(msg.id), { checked: checked ?? undefined, item: meta.item, kind: "ship" }, options); } catch (x) { await this.unissuable(String(msg.id), x); }
     const now = this.d.now();
     const s = this.d.load();
     this.remember(s, msg, { kind: "ship", item: meta.item, question: `ship:${m[3]}`, posted: now, expires: this.askExpiry(now),
@@ -2700,7 +2750,14 @@ export class Link {
     }
     // Component taps only ever come for the app's own messages, so one the link doesn't
     // know is an old card of ours: take its buttons off.
-    if (!rec) return this.deadTap(it, msgId, "not a card the link knows");
+    if (!rec) {
+      // Round 12: a card whose keys are in the issued-key log but which this state doesn't know: the
+      // state was restored from an older copy. The tap is told as lost on the card's own thread, once.
+      const lost = cid.startsWith("q:") ? this.issuedOn(msgId) : [];
+      const out = await this.deadTap(it, msgId, lost.length ? "lost to a restore of the link's state" : "not a card the link knows");
+      if (lost.length) await this.tellRestoreLost(msgId, `card ${msgId}`);
+      return out;
+    }
     // A retap or a Discord retry with a key already honoured: the recorded outcome, nothing again
     // (before any other check: the card shows the answer since).
     const key = cid.startsWith("q:") ? this.tapKey(rec, cid, msgId) : null;
@@ -2804,6 +2861,25 @@ export class Link {
         rec.outcome = why === "answered" ? "answered" : "expired"; rec.why = why;
         this.d.save(s);
         return this.deadTap(it, msgId, why);
+      }
+    }
+    // Round 12: a Ship tap before install taps are on (keeper.sh install-taps on, after the post-install
+    // tests): nothing lands, the card keeps its buttons, he is told installs wait, and Cain hears it.
+    // "once" lets exactly one Ship tap through (the smoke test's pull-the-plug case) and is used up by it.
+    if (cid.startsWith("q:") && rec.kind === "ship" && rec.ship && rec.q?.options[Number(cid.split(":")[2])] === "Ship") {
+      const flag = this.d.load().installTaps;
+      if (!flag?.on && !flag?.once) {
+        if (this.deferred.has(it)) await this.restoreCard(it, msgId); else await this.answer(it, ACK);
+        await this.ephemeral(it, INSTALL_WAIT);
+        this.log(`Ship tap on card ${msgId} refused: install taps aren't on yet (keeper.sh install-taps on, after the post-install tests); the card keeps its buttons`);
+        this.d.relay(`Dane tapped Ship on card ${msgId}, but install taps aren't on yet, so nothing landed and the card keeps its buttons; he was told installs wait for the post-install tests. Run keeper.sh install-taps on once the smoke test, the forced-webhook step, the pull-the-plug case and one real settle cycle have passed. Nothing more to tell him.`);
+        return "refused: installs wait";
+      }
+      if (!flag.on && flag.once) {
+        const s1 = this.d.load();
+        s1.installTaps = { on: false, at: this.d.now() };
+        this.d.save(s1);
+        this.log(`Ship tap on card ${msgId}: the one Ship tap install-taps once allowed, used up now`);
       }
     }
     // Honoured while the keeper's ledger is unpushed: journaled, so that if the keeper then
@@ -3405,7 +3481,10 @@ export class Link {
         item: (m.item ?? "none").toUpperCase(), req: m.checked?.req ?? null, ...(m.checked?.epoch !== undefined ? { epoch: m.checked.epoch } : {}), words,
         ...(m.checked ? { ref: { ...m.checked } } : {}), kind: m.kind, run, nonce: this.runNonce };
       { const item = (m.item ?? "none").toUpperCase(), kind = m.kind ?? "ask";
-        (s.issued ??= {})[tapKid(key)] = { item, kind, label, at: this.d.now(), msg: msgId, target: tapTarget(item, kind, label) }; }
+        (s.issued ??= {})[tapKid(key)] = { item, kind, label, at: this.d.now(), msg: msgId, target: tapTarget(item, kind, label) };
+        // Round 12: a card adopted at its tap (its post never heard back) has its keys logged now.
+        if (this.d.issuedLog && !this.issuedOn(msgId).length)
+          try { this.issueKeys(msgId, m, q.options); } catch (e) { this.log(`couldn't log card ${msgId}'s tap keys at its tap: ${String(e).slice(0, 80)}`); } }
       this.tapsNow.add(key);
     }
     this.d.save(s);
@@ -3571,6 +3650,8 @@ export class Link {
     if (!/^\d{15,22}$/.test(said)) throw new Refusal("settle is the owner's alone: --said <the Discord id of his message saying it landed, or did not land>");
     const s = this.d.load();
     const used = s.settleSaid?.[said] ?? (() => {
+      const h = this.d.landings?.handSettles?.()?.find((x) => x.said === said);
+      if (h) return { tap: tapKid(h.key), at: Date.parse(h.at) };
       const e = this.d.landings?.entries()?.find((x) => x.settled?.said === said);
       return e ? { tap: tapKid(e.key), at: Date.parse(e.settled!.at) } : undefined;
     })();
@@ -3585,23 +3666,56 @@ export class Link {
     if (this.d.now() - snowflakeTime(said) > DAY) throw new Refusal("his message is over a day old: ask him again, nothing settled");
     const bad = settleWordsProblem(String(msg?.content ?? ""), tap, how);
     if (bad) throw new Refusal(`${bad}: nothing settled`);
+    // Round 12: the settled entry, with his consumed message id, goes to the landing ledger's settle log
+    // in one fsynced append before any effect of the settle (the outcome, the relayed line, the state's
+    // copy). A crash before it leaves nothing settled (the same message settles it when run again); a
+    // crash after it is finished from the ledger on the next sweep (finishHandSettles), once.
+    const howW: "landed" | "not landed" = how === "landed" ? "landed" : "not landed";
+    if (!this.d.landings?.settleHand) throw new Refusal("the landing ledger can't take a hand settle here: nothing settled");
+    this.d.crashPoint?.("hand-settle:before-ledger");
+    if (!this.d.landings.settleHand(key, howW, new Date(this.d.now()).toISOString(), said))
+      throw new Refusal("the landing ledger's settle log couldn't be written: nothing settled; run it again in a minute");
+    this.d.crashPoint?.("hand-settle:after-ledger");
+    await this.applyHandSettle(key, howW, said, `his message ${said}: "${excerpt(String(msg?.content ?? ""), 80)}"`);
+    return { status: "settled", said: `Tap key ${tap} settled as ${howW}.` };
+  }
+
+  // Round 12: a hand settle's effects, after its entry is in the ledger: the state's copy (the consumed
+  // message id, the key no longer unresolved or a tombstone), the audit line, Cain's line and the card's
+  // outcome. Each step is done once: the state's copy is saved before the lines, and the outcome only
+  // while the card still shows the landing.
+  private async applyHandSettle(key: string, how: "landed" | "not landed", said: string, words = `his message ${said}`): Promise<boolean> {
+    const s = this.d.load();
+    const kid = tapKid(key);
     const tomb = s.tombstones?.[key];
-    const u: Unresolved = s.unresolved?.[key] ?? tomb!;
-    const msgId = u.msg ?? Object.entries(s.messages).find(([, m]) => m.shipping?.key === key)?.[0];
+    const u: Unresolved | undefined = s.unresolved?.[key] ?? tomb;
+    const msgId = u?.msg ?? Object.entries(s.messages).find(([, m]) => m.shipping?.key === key)?.[0];
     const m = msgId ? s.messages[msgId] : undefined;
-    const at = new Date(this.d.now()).toISOString();
-    (s.settleSaid ??= {})[said] = { tap, at: this.d.now() };
-    if (tomb) { delete s.tombstones![key]; if (!Object.keys(s.tombstones!).length) delete s.tombstones; }
-    if (tomb && m?.shipping?.state === "tombstone") m.shipping.state = "landing";   // settled now as the owner says
-    this.d.save(s);
-    this.log(`settle: tap key ${tap} force-settled as ${how === "landed" ? "landed" : "not landed"} by the owner (his message ${said}: "${excerpt(String(msg?.content ?? ""), 80)}"), after ${u.fails} failed look(s) since ${new Date(u.since).toISOString()}${tomb ? " (a tombstone)" : ""}; last error: ${u.last}`);
-    this.d.relay(`Landing settled by Dane: tap key ${tap}${m?.ship ? ` (${m.ship.pr} at ${m.ship.head})` : ""} was settled by hand as ${how === "landed" ? "landed" : "not landed"}, on his own message, since the remote couldn't settle it (${u.fails} tries; last error: ${u.last}). The usual outcome line follows. Nothing to tell him: he decided it.`);
-    this.d.landings?.settle(key, how === "landed" ? "landed" : "not landed", at, { forced: true, said });
-    if (!tomb) this.unresolvedClear(key);
+    if (!u && m?.shipping?.state !== "landing" && m?.shipping?.state !== "tombstone") return false;
+    if (u) {
+      (s.settleSaid ??= {})[said] = { tap: kid, at: this.d.now() };
+      if (tomb) { delete s.tombstones![key]; if (!Object.keys(s.tombstones!).length) delete s.tombstones; }
+      if (s.unresolved?.[key]) { delete s.unresolved[key]; if (!Object.keys(s.unresolved).length) delete s.unresolved; }
+      if (m?.shipping?.state === "tombstone") m.shipping.state = "landing";   // settled now as the owner says
+      this.d.save(s);
+      this.log(`settle: tap key ${kid} force-settled as ${how} by the owner (${words}), after ${u.fails} failed look(s) since ${new Date(u.since).toISOString()}${tomb ? " (a tombstone)" : ""}; last error: ${u.last}`);
+      this.d.relay(`Landing settled by Dane: tap key ${kid}${m?.ship ? ` (${m.ship.pr} at ${m.ship.head})` : ""} was settled by hand as ${how}, on his own message, since the remote couldn't settle it (${u.fails} tries; last error: ${u.last}). The usual outcome line follows. Nothing to tell him: he decided it.`);
+    } else if (m?.shipping?.state === "tombstone") {
+      const s2 = this.d.load();
+      if (s2.messages[msgId!]?.shipping) { s2.messages[msgId!].shipping!.state = "landing"; this.d.save(s2); }
+    }
     if (msgId && this.d.load().messages[msgId]?.shipping?.state === "landing")
       await this.queue(msgId, () => this.settleLanding(msgId, how === "landed" ? { ok: true, already: true }
         : { ok: false, why: "the owner settled it by hand as not landed", again: false, abandoned: true } as Landed));
-    return { status: "settled", said: `Tap key ${tap} settled as ${how === "landed" ? "landed" : "not landed"}.` };
+    return true;
+  }
+
+  // Round 12: hand settles in the ledger whose effects a crash cut off, finished once, each sweep.
+  private async finishHandSettles(): Promise<void> {
+    let list: { key: string; how: "landed" | "not landed"; said: string }[] = [];
+    try { list = this.d.landings?.handSettles?.() ?? []; } catch { return; }
+    for (const h of list)
+      if (await this.applyHandSettle(h.key, h.how, h.said)) this.log(`finished the hand settle of tap key ${tapKid(h.key)} from the landing ledger after a cut-off`);
   }
 
   // Round 11: unresolved keys over time. After his first line, he is told again once a day on the card's
@@ -3635,7 +3749,8 @@ export class Link {
         this.d.save(s);
         this.d.relay(`Landing unresolved for over 7 days: tap key ${kid} (failures ${u0.fails}; last error: ${u0.last}). Only he can settle it: he checks main on GitHub from his PC and sends "${settleForm(kid, "landed")}" or "${settleForm(kid, "not-landed")}"; then run keeper.sh settle with that message's id. He is reminded daily; at 90 days it becomes a tombstone.`);
       }
-      if (u0.told && now - (u0.reminded ?? u0.toldAt ?? u0.since) >= UNRESOLVED_REMIND_MS) {
+      // Round 12: the per-thread line goes once, on the first day it stays unconfirmed after he was told.
+      if (u0.told && !u0.reminded && now - (u0.toldAt ?? u0.since) >= UNRESOLVED_REMIND_MS) {
         const s = this.d.load();
         if (!s.unresolved?.[key]) continue;
         s.unresolved[key].reminded = now;
@@ -3643,10 +3758,55 @@ export class Link {
         try {
           if (u0.msg) await this.post(unresolvedReminder(kid), [], { replyTo: u0.msg });
           else await this.notice(unresolvedReminder(kid));
-          this.log(`reminded him that tap key ${kid}'s landing is still unresolved, with the exact settle message`);
+          this.log(`reminded him that tap key ${kid}'s landing is still unresolved, with the exact settle messages`);
         } catch (e) { this.log(`couldn't remind him that tap key ${kid}'s landing is unresolved: ${String(e).slice(0, 80)}`); }
       }
     }
+    await this.unresolvedDigest();
+  }
+
+  // Round 12: after each key's one per-thread line, one digest message for every unresolved key whose
+  // line went a day or more ago: daily while any of them had its line within the last 7 days, then
+  // weekly. keeper.sh clock lists them all as before.
+  private async unresolvedDigest(): Promise<void> {
+    const now = this.d.now();
+    const s = this.d.load();
+    const due = Object.entries(s.unresolved ?? {}).filter(([, u]) => u.reminded && now - u.reminded >= UNRESOLVED_REMIND_MS);
+    if (!due.length) return;
+    const daily = due.some(([, u]) => now - u.reminded! <= UNRESOLVED_DIGEST_DAILY_MS + UNRESOLVED_REMIND_MS / 2);
+    if (now - (s.unresolvedDigestAt ?? 0) < (daily ? UNRESOLVED_REMIND_MS : WEEK) - 60_000) return;
+    s.unresolvedDigestAt = now;
+    this.d.save(s);
+    const kids = due.map(([k]) => tapKid(k)).sort();
+    try {
+      await this.notice(unresolvedDigest(kids));
+      this.log(`sent him the ${daily ? "daily" : "weekly"} digest of ${kids.length} unresolved landing(s): ${kids.join(", ")}`);
+    } catch (e) { this.log(`couldn't send him the digest of unresolved landings: ${String(e).slice(0, 80)}`); }
+  }
+
+  // Round 12: keeper.sh install-taps on|once|off. Cain turns it on after the Pi smoke test, the forced-
+  // webhook step, the pull-the-plug case and one real settle cycle pass; once lets one Ship tap through
+  // (for the pull-the-plug case itself).
+  installTaps(a: { how?: unknown }): { status: "ok"; install_taps: string; said: string } {
+    const how = String(a.how ?? "").trim();
+    if (how !== "on" && how !== "once" && how !== "off") throw new Refusal("install-taps needs on, once or off");
+    const s = this.d.load();
+    s.installTaps = { on: how === "on", at: this.d.now(), ...(how === "once" ? { once: true } : {}) };
+    this.d.save(s);
+    this.log(`install taps ${how === "on" ? "switched on: Ship taps land" : how === "once" ? "allowed once: the next Ship tap lands, then they wait again" : "switched off: Ship taps wait"}`);
+    return { status: "ok", install_taps: how, said: how === "on" ? "Install taps are on: his Ship taps land in main." : how === "once" ? "His next Ship tap lands; after it, Ship taps wait again until install-taps on." : "Install taps are off: his Ship taps wait." };
+  }
+
+  // Round 12: one line on a card's thread saying a tap on it was lost to a restore of the link's state.
+  private async tellRestoreLost(msgId: string, what: string): Promise<void> {
+    const id = `${msgId}:lost`;
+    const s = this.d.load();
+    if (s.tapNoticed?.[id]) return;
+    (s.tapNoticed ??= {})[id] = this.d.now();
+    this.d.save(s);
+    try { await this.post(TAP_RESTORE_LOST, [], { replyTo: msgId }); this.log(`told him a tap on ${what} was lost to a restore of the link's state`); }
+    catch (e) { this.log(`couldn't tell him a tap on ${what} was lost: ${String(e).slice(0, 80)}`); }
+    this.d.relay(`A tap of his on a card (Discord message ${msgId}) was lost: the link's state was restored from an older copy and no longer knows that card, so nothing was done from it. He was told on the card. Record nothing from it; once its item's re-check is accepted, ask again with --checked if it still needs him. Nothing more to tell him.`);
   }
 
   // Round 11: the record keeper's tap notices (its status's tap_notices): a request from his tap it
@@ -3662,7 +3822,8 @@ export class Link {
       if (s.tapNoticed?.[id]) continue;
       (s.tapNoticed ??= {})[id] = this.d.now();
       this.d.save(s);
-      const msg = (typeof n.msg === "string" && /^\d{15,22}$/.test(n.msg) ? n.msg : undefined) ?? s.issued?.[n.tap]?.msg;
+      // Round 12: the card's message id from the keeper's notice, the state, or else the issued-key log.
+      const msg = (typeof n.msg === "string" && /^\d{15,22}$/.test(n.msg) ? n.msg : undefined) ?? s.issued?.[n.tap]?.msg ?? this.issuedKid(n.tap)?.msg;
       const text = n.why === "lost" ? TAP_RESTORE_LOST : TAP_REFUSED;
       try {
         if (msg) await this.post(text, [], { replyTo: msg }); else await this.notice(text);
@@ -4153,6 +4314,7 @@ export class Link {
       this.backfillLabels();
       this.runNo();
       await this.settleAbandoned();
+      await this.finishHandSettles();
       await this.unresolvedChores();
       await this.tapNotices();
       await this.sendOwedToggle();
@@ -4187,9 +4349,66 @@ export class Link {
     s.runNonce = randomBytes(8).toString("hex");
     this.runN = s.run;
     this.runNonce = s.runNonce;
-    this.d.save(s);
+    // Round 12: the counter and nonce are fsynced in the state before anything is issued or sent under
+    // this run, then logged in the issued-key log, so a start the process didn't survive is a gap in the
+    // runs (a restart), never a run number used twice (a restore's sign).
+    (this.d.saveDurable ?? this.d.save)(s);
+    this.repairLogs();
+    if (this.d.issuedLog) {
+      try { appendLog(this.d.issuedLog, { t: "run", run: s.run, nonce: s.runNonce, at: this.d.now() }); }
+      catch (e) { this.log(`couldn't log run ${s.run} in the issued-key log: ${String(e).slice(0, 80)}`); }
+    }
     this.log(`link run ${this.runN} started: claims from earlier runs are judged by the live-tap predicate`);
     return this.runN;
+  }
+
+  // Round 12: at start, each append-only log of the link's (its issued keys, the landing ledger's hand
+  // settles) has a torn final record (a write a power cut cut short) truncated off, with one logged line
+  // and one line to Cain.
+  private repairLogs(): void {
+    const torn: string[] = [];
+    if (this.d.issuedLog) {
+      try { const r = readLog(this.d.issuedLog); if (r.torn) torn.push(`the issued-key log (${r.tornBytes} bytes)`); }
+      catch (e) { this.log(`couldn't read the issued-key log: ${String(e).slice(0, 80)}`); }
+    }
+    try { const r = this.d.landings?.repair?.(); if (r?.torn) torn.push(`the landing ledger's settle log (${r.bytes} bytes)`); }
+    catch (e) { this.log(`couldn't read the landing ledger's settle log: ${String(e).slice(0, 80)}`); }
+    for (const w of torn) {
+      this.log(`TORN: a torn final record in ${w} was truncated at start; the records before it stand`);
+      this.d.relay(`The link found a torn final record in ${w} at start (a write cut short, as by a power cut) and truncated it; every record before it stands. Nothing to tell him.`);
+    }
+  }
+
+  // Round 12: the tap keys a card offers (one per button), its structured target and its message id,
+  // appended to the issued-key log and fsynced before the card's record is saved, so no tap on it can
+  // count before its key is durable. Throws when they can't be written.
+  private issueKeys(msgId: string, m: Pick<Shown, "checked" | "item" | "kind">, options: string[]): void {
+    if (!this.d.issuedLog) return;
+    const run = this.runNo();
+    for (const label of options) {
+      const key = [msgId, m.checked?.gen ?? "none", m.checked?.req ?? "none", (m.item ?? "none").toUpperCase(), label].join("|");
+      const item = (m.item ?? "none").toUpperCase(), kind = m.kind ?? "ask";
+      appendLog(this.d.issuedLog, { t: "key", kid: tapKid(key), item, kind, label, msg: msgId, target: tapTarget(item, kind, label), run, nonce: this.runNonce, at: this.d.now() });
+    }
+  }
+  // Round 12: one key's record in the issued-key log.
+  private issuedKid(kid: string): any | null {
+    if (!this.d.issuedLog) return null;
+    try { return readLog(this.d.issuedLog, { repair: false }).records.find((r: any) => r?.t === "key" && r.kid === kid) ?? null; }
+    catch { return null; }
+  }
+  // Round 12: the issued-key log's keys for one card (empty: none, or no log).
+  private issuedOn(msgId: string): any[] {
+    if (!this.d.issuedLog) return [];
+    try { return readLog(this.d.issuedLog, { repair: false }).records.filter((r: any) => r?.t === "key" && r.msg === msgId); }
+    catch { return []; }
+  }
+  // Round 12: a card posted, whose keys can't be made durable: its buttons come off and the post is refused.
+  private async unissuable(msgId: string, e: unknown): Promise<never> {
+    this.log(`couldn't write card ${msgId}'s tap keys to the issued-key log (${String(e).slice(0, 80)}): its buttons come off`);
+    try { await this.rest("PATCH", `/channels/${this.d.load().dm ?? ""}/messages/${msgId}`, { components: [], allowed_mentions: { parse: [] } }); }
+    catch (x) { this.log(`couldn't take card ${msgId}'s buttons off: ${String(x).slice(0, 80)}`); }
+    throw new Refusal("its tap keys couldn't be written to the link's issued-key log, so its buttons were taken off: ask again in a minute");
   }
 
   // The landing ledger's upkeep, each sweep. A ledger that came back from a backup (landings.ts

@@ -549,7 +549,7 @@ What Cain's link enforces:
   pruned once it is older than `TAP_KEEP_MS` (3 days: the longest card lifetime, until the morning
   check-in after next, under two days, plus a margin), except a key whose landing the link still
   lists as unresolved. Since round 11 each consumed key is also appended, fsynced, to the keeper's
-  own append-only log (`/data/record-taps.jsonl`, one line per key with its request and time, outside
+  own append-only log (`/data/record-taps.jsonl`, one framed record per key with its request and time since round 12, outside
   the working copy and apart from the link's state). That log is never pruned or rewritten, so a key is
   refused a second time whatever happens to the state file or to the link's state.
 
@@ -649,8 +649,9 @@ What Cain's link enforces:
      tombstone.
 
   Unresolved keys over days (round 11). After the first "Landing unconfirmed" line, you are told
-  again once a day on the card's thread while the key stays unresolved, with the exact settle lines
-  and a pointer to this section ("Reconciling a landing by hand"). `keeper.sh clock` lists each one
+  again on the card's thread on its first unconfirmed day, with the exact settle lines and a pointer to
+  this section ("Reconciling a landing by hand"); then in one digest for every unresolved key, daily
+  for 7 days, then weekly (round 12, below). `keeper.sh clock` lists each one
   under `unresolved_landings` with its two settle lines. Past 7 days Cain gets one alert line. Past
   90 days the key becomes a tombstone: it keeps its record (its entry in the link's state, its ledger
   file and its issued key), `keeper.sh clock` lists it under `tombstoned_landings`, it is no longer
@@ -662,6 +663,81 @@ What Cain's link enforces:
   (`keeper.sh clock`, `landings_by_head`) shows one landing per head: the real landing over the
   forced one. Also, a reset that arrives during the push does not undo the landing and is reported as
   landed: once the claim is made the push goes on, and the outcome is what main says.
+
+  Issued tap keys, made durable before a card can be tapped (round 12). When an ask or Ship card
+  posts, the link appends one record per button to its issued-key log (`/data/link-issued.log`, outside
+  its restorable state `/data/link/state.json`): the tap key, its structured target (the card's item
+  and the writes its tap allows) and the card's Discord message id, each record fsynced before the
+  card's own record is saved, so no tap on it counts before its key is durable. A card whose keys
+  can't be written loses its buttons and the ask is refused ("ask again in a minute"). The record
+  keeper reads that log each round (the same round that takes the check, or the next) and mirrors
+  every key into its own append-only log (`/data/record-issued.log`); a key in neither log is forged
+  or stale ("isn't one the link issued"). A key in the log that the link's state no longer lists was
+  lost to a restore of that state: the request citing it comes back "was lost", Cain hears it, and
+  the link posts "Your tap was lost when the App's state was restored from an older copy, please
+  answer again." on that card's own thread (its message id comes from the log). A tap on a card the
+  restored state no longer knows, but whose keys are in the log, is told the same way, once. Issued
+  keys are kept for their whole actionable life, until consumed or tombstoned plus a margin
+  (`TAP_ISSUED_KEEP_MS`, 100 days), the same on the link (its log and its state) and on the keeper
+  (its mirror), so a restore on day 4, 10 or 89 is told as lost, never refused as not issued.
+
+  The run counter (round 12). Each start of the link raises its run counter and makes a new nonce,
+  fsynced in its state before any key is issued or any request is sent under that run, then logs the
+  run and nonce in the issued-key log. A run number the keeper has never seen (a gap, because a start
+  died before its first issuance) is a restart; a run number logged twice with another nonce is a
+  restore of the link's state.
+
+  Restores: which are covered and how (round 12).
+  - The link's state alone (`/data/link/state.json` from an older copy): its issued keys come back
+    from the issued-key log and the keeper's mirror, taps on its cards are told as lost on each card,
+    and consumed keys are the keeper's, so none counts twice.
+  - The keeper's state alone (`/data/record-holds.json`): consumed keys are in its append-only log
+    (`/data/record-taps.jsonl`) and in the record remote's history. Every tap-derived commit carries
+    its key in a commit trailer, `Tap-Key: tap-<12 hex>` (with its request id as `Tap-Request`), and
+    at the keeper's start, after its state or copy was lost, and after a detected restore of the link's
+    state, the keeper rebuilds its consumed set from the remote's history (git log trailers),
+    appending each key the log lacks, and refuses those keys too.
+  - The whole image (all of `/data` from a backup taken before the tap): the logs come back as old as
+    the state, so the remote's history is what remembers the key, and the rebuild at start refuses it.
+    A whole-image restore is what Home Assistant's App backup does.
+  The append-only logs (issued keys, the keeper's mirror, consumed keys, and the landing ledger's
+  settle log) are framed: one record per line, `<length>:<CRC-32>:<JSON>`, each appended and fsynced.
+  At start a torn final record (a write cut short by a power cut) is truncated, with one logged line
+  and one line to Cain; the records before it stand. The keeper keeps each of its logs' high-water
+  record counts in its state, and refuses to start (one logged line and one line to Cain, with a
+  plain reason) while a log is missing or holds fewer records than that count: put the log back from
+  the backup taken with that state, or restore the whole App.
+
+  The hand settle in the ledger first (round 12). A hand settle's entry, with your consumed message
+  id, is appended to the landing ledger's settle log (`settled.log` in the ledger's folder) in one
+  fsynced append before any effect: the landed or abandoned outcome, Cain's lines, and the link
+  state's copy, which only mirrors it. A crash before that append settles nothing (the same message
+  settles it when run again); a crash after it is finished from the ledger on the next sweep, once. A
+  message in the settle log can never settle a second key.
+
+  Settle messages as copied (round 12). Copying from the reminder on a phone is forgiven: backticks or
+  a code fence around the line are taken off, non-breaking and zero-width spaces are normalised, an
+  en or em dash counts as the hyphen in not-landed, and capitals don't matter. The key match and the
+  single verdict stay strict, and a refusal shows the text as received, normalised. The reminder shows
+  both lines, each in its own code block.
+
+  A target mismatch doesn't use the key up (round 12). A request whose write isn't one its key's card
+  allows is refused with the reason, and the key stays unused: Cain sends the write the card allows
+  with the same key, or routes any other write as an ordinary request (`"tap": "none"`) with its
+  source check redone. You get one line on the card saying your answer stands and there is nothing to
+  do.
+
+  Reminders taper (round 12). An unresolved landing gets one line on its card's thread on its first
+  unconfirmed day; after that, one digest message lists every unresolved key with its two settle
+  lines, daily for 7 days, then weekly. `keeper.sh clock` lists them all as before.
+
+  Install taps behind a flag (round 12). Until Cain runs `keeper.sh install-taps on`, a Ship tap
+  lands nothing: it answers "Installs wait for the post-install tests" and the card keeps its
+  buttons, and Cain hears it. He turns it on once the Pi smoke test, the forced-webhook step, the
+  pull-the-plug case and one real settle cycle have passed; `keeper.sh install-taps once` lets
+  exactly one Ship tap through, for the pull-the-plug case itself. `keeper.sh clock` shows
+  `install_taps` (on, once or off). The live CLI test's edit-after-reply case is a known skip in CI
+  and in cloud sessions, tracked in issue 24. You have nothing to set up beyond the smoke test's one option change.
 
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap

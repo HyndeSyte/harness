@@ -22,6 +22,7 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
+import { appendLog, readLog } from "../applog.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; relay: string;
@@ -50,6 +51,8 @@ export type Config = {
   logFile?: string;        // the keeper's log copy (RECORD_LOG, /data/work/record-keeper.log), which the leak check reads
   workDir?: string;        // the folder the leak check reads whole (default: the log copy's folder, /data/work)
   tapsLog?: string;        // round 11: the append-only log of consumed tap keys (default /data/record-taps.jsonl, next to the queue)
+  linkIssued?: string;     // round 12: the link's issued-key log, read only (default /data/link-issued.log)
+  issuedLog?: string;      // round 12: the keeper's own mirror of it (default /data/record-issued.log)
 };
 
 // Whether the system clock is synchronized by the box's own sources (../clock.ts: the kernel's
@@ -341,8 +344,11 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // nonce last seen (a lower run, or the same run with another nonce, is a restore of its state), and the
   // latest restore seen; and the tap notices for the link (a refused or lost tap-derived request), which
   // go into the status file for it to tell him once each.
-  issuedSeen?: Record<string, IssuedTap & { at: string }>;
+  issuedSeen?: Record<string, IssuedTap & { at: string }>;   // before round 12; the mirror log replaces it
   linkSeen?: { run: number; nonce: string };
+  // Round 12: how many records each of the keeper's append-only logs held after its last round (the
+  // high-water count): a log missing or shorter than that refuses the keeper's start.
+  logHigh?: { consumed?: number; issued?: number };
   linkRestore?: { at: string; why: string };
   tapNotices?: TapNotice[] };
 type TapNotice = { tap: string; why: "refused" | "lost"; reason: string; msg?: string; at: string };
@@ -362,26 +368,93 @@ export function pruneTaps(taps: Record<string, { id: string; at: string }> | und
 }
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
-// Round 11: consumed tap keys, one JSON line each ({tap, id, at}), only ever appended to and fsynced, in
-// the keeper's own folder (/data/record-taps.jsonl), outside the working copy and apart from the link's
-// state, so neither a reset of the copy nor a restore of the link's state forgets one. Never pruned.
+// Round 11: consumed tap keys, in the keeper's own folder (/data/record-taps.jsonl), outside the working
+// copy and apart from the link's state, so neither a reset of the copy nor a restore of the link's state
+// forgets one. Never pruned. Round 12: one framed record each ({tap, id, at}: ../applog.ts), appended and
+// fsynced; a torn final record is truncated at the next read and told once.
 export const tapsLogFile = (cfg: Config) => cfg.tapsLog ?? join(dirname(cfg.queue), "record-taps.jsonl");
+export const linkIssuedFile = (cfg: Config) => cfg.linkIssued ?? join(dirname(cfg.queue), "link-issued.log");
+export const issuedMirrorFile = (cfg: Config) => cfg.issuedLog ?? join(dirname(cfg.queue), "record-issued.log");
+// Round 12: an issued key counts for its whole actionable life: until consumed or tombstoned (90 days),
+// plus a margin. The link keeps it as long (TAP_ISSUED_KEEP_MS).
+export const ISSUED_KEEP_MS = 100 * 86_400_000;
 export function readConsumed(cfg: Config): Map<string, string> {
   const out = new Map<string, string>();
-  try {
-    for (const line of readFileSync(tapsLogFile(cfg), "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      try { const j = JSON.parse(line); if (TAP_KEY.test(j?.tap) && typeof j.id === "string" && !out.has(j.tap)) out.set(j.tap, j.id); } catch { /* a torn last line */ }
-    }
-  } catch { /* none yet */ }
+  for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records)
+    if (TAP_KEY.test(j?.tap) && typeof j.id === "string" && !out.has(j.tap)) out.set(j.tap, j.id);
   return out;
 }
-function appendConsumed(cfg: Config, tap: string, id: string, at: string) {
-  const f = tapsLogFile(cfg);
-  mkdirSync(dirname(f), { recursive: true });
-  const fd = openSync(f, "a");
-  try { writeSync(fd, JSON.stringify({ tap, id, at }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }); }
+
+// Round 12: the issued keys the keeper knows, from the link's issued-key log and its own mirror of it,
+// each with its card's item, kind, label, message id and target; keys older than ISSUED_KEEP_MS are
+// stale. runs: the link's run records ({run, nonce}) in the order logged.
+export type IssuedRec = IssuedTap & { kid: string; at: number; run?: number; nonce?: string };
+export function readIssued(cfg: Config, now: number): { keys: Map<string, IssuedRec>; runs: { run: number; nonce: string }[] } {
+  const keys = new Map<string, IssuedRec>(), runs: { run: number; nonce: string }[] = [];
+  for (const f of [issuedMirrorFile(cfg), linkIssuedFile(cfg)]) {
+    let recs: any[] = [];
+    try { recs = readLog<any>(f, { repair: f === issuedMirrorFile(cfg) ? undefined : false }).records; } catch { /* unreadable: the other file */ }
+    for (const r of recs) {
+      if (r?.t === "run" && Number.isInteger(r.run) && typeof r.nonce === "string") { if (f === linkIssuedFile(cfg)) runs.push({ run: r.run, nonce: r.nonce }); continue; }
+      if (r?.t !== "key" || !TAP_KEY.test(r.kid) || typeof r.item !== "string" || typeof r.kind !== "string") continue;
+      const at = Number(r.at);
+      if (Number.isFinite(at) && now - at > ISSUED_KEEP_MS) continue;
+      if (!keys.has(r.kid)) keys.set(r.kid, { kid: r.kid, item: r.item, kind: r.kind, ...(typeof r.label === "string" ? { label: r.label } : {}),
+        ...(typeof r.msg === "string" ? { msg: r.msg } : {}), ...(r.target && typeof r.target.item === "string" && Array.isArray(r.target.writes) ? { target: r.target } : {}),
+        at: Number.isFinite(at) ? at : now, ...(Number.isInteger(r.run) ? { run: r.run } : {}), ...(typeof r.nonce === "string" ? { nonce: r.nonce } : {}) });
+    }
+  }
+  return { keys, runs };
 }
+// Round 12: the link's issued-key records the keeper's mirror doesn't have yet, appended to it, so a
+// key the link issued is remembered on both sides for its whole life. Returns how many were added.
+function mirrorIssued(cfg: Config): number {
+  let link: any[] = [], mine: any[] = [];
+  try { link = readLog<any>(linkIssuedFile(cfg), { repair: false }).records; } catch { return 0; }
+  try { mine = readLog<any>(issuedMirrorFile(cfg)).records; } catch { /* none yet */ }
+  const have = new Set(mine.filter((r) => r?.t === "key").map((r) => r.kid));
+  let n = 0;
+  for (const r of link) if (r?.t === "key" && TAP_KEY.test(r.kid) && !have.has(r.kid)) { appendLog(issuedMirrorFile(cfg), r); have.add(r.kid); n++; }
+  return n;
+}
+
+// Round 12: the record remote's history of consumed tap keys: every tap-derived commit carries its key
+// as a "Tap-Key: tap-<12 hex>" trailer (and its request id as "Tap-Request"). Read from the remote's
+// branch and the local copy's head.
+export function historyTaps(cfg: Config): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const ref of [`origin/${cfg.branch}`, "HEAD"]) {
+    let text = "";
+    try { text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)%x1f%h", ref]); } catch { continue; }
+    for (const rec of text.split("\x1e")) {
+      const [k, id, sha] = rec.split("\x1f").map((x) => (x ?? "").trim());
+      if (k && TAP_KEY.test(k) && !out.has(k)) out.set(k, id || `the commit ${sha}`);
+    }
+  }
+  return out;
+}
+const trailer = (tap?: string, id?: string) => (tap && TAP_KEY.test(tap) ? `\n\nTap-Key: ${tap}\nTap-Request: ${clean(id ?? "", 120)}` : "");
+// Round 12: per process, the keepers (by working copy) whose consumed set was rebuilt from history.
+const rebuilt = new Set<string>();
+export function forgetRebuild(cfg: Config) { rebuilt.delete(cfg.dir); }
+
+// Round 12: the keeper's start check: each of its append-only logs (consumed keys, its issued-key
+// mirror) must be there and hold at least the high-water count its state kept. null: fine.
+export function logsProblem(cfg: Config, st: State): string | null {
+  const want = st.logHigh ?? {};
+  const checks: [string, string, number | undefined][] = [["consumed tap keys", tapsLogFile(cfg), want.consumed], ["issued tap keys (the keeper's mirror)", issuedMirrorFile(cfg), want.issued]];
+  for (const [what, f, high] of checks) {
+    if (!high) continue;
+    let r;
+    try { r = readLog(f, { repair: false }); } catch (e) { return `its log of ${what} (${f}) can't be read (${(e as Error).message}); its state says it held ${high} records`; }
+    if (r.missing) return `its log of ${what} (${f}) is missing, but its state says it held ${high} records: put the log back from the backup taken with that state, or restore the whole App`;
+    const n = r.records.length;
+    if (n < high) return `its log of ${what} (${f}) holds ${n} records, fewer than the ${high} its state says it held: put the log back from the backup taken with that state, or restore the whole App`;
+  }
+  return null;
+}
+let refusedWhy = "";
 
 function writeAtomic(file: string, text: string) {
   mkdirSync(dirname(file), { recursive: true });
@@ -428,6 +501,7 @@ function revive(j: any): State | null {
       ? { issuedSeen: Object.fromEntries(Object.entries<any>(j.issuedSeen).filter(([k, v]) => TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string" && typeof v.at === "string")) } : {}),
     ...(j.linkSeen && Number.isInteger(j.linkSeen.run) && typeof j.linkSeen.nonce === "string" ? { linkSeen: { run: j.linkSeen.run, nonce: j.linkSeen.nonce } } : {}),
     ...(span(j.linkRestore) ? { linkRestore: span(j.linkRestore)! } : {}),
+    ...(j.logHigh && typeof j.logHigh === "object" ? { logHigh: { ...(Number.isInteger(j.logHigh.consumed) ? { consumed: j.logHigh.consumed } : {}), ...(Number.isInteger(j.logHigh.issued) ? { issued: j.logHigh.issued } : {}) } } : {}),
     ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && (n.why === "refused" || n.why === "lost") && typeof n.at === "string")
       .map((n: any) => ({ tap: n.tap, why: n.why, reason: String(n.reason ?? ""), ...(typeof n.msg === "string" ? { msg: n.msg } : {}), at: n.at })) } : {}) };
 }
@@ -582,6 +656,16 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
     let book = new Map<string, Outcome>();
     let synced0: Synced;
     try {
+      // Round 12: a log missing or shorter than its high-water count refuses the round (and the start).
+      { const fresh = !existsSync(stateFile(cfg));
+        const st0 = loadState(cfg);
+        const why = logsProblem(cfg, st0);
+        if (why) {
+          if (why !== refusedWhy) { refusedWhy = why; log(`REFUSED TO START: ${why}`); relay(cfg, `The record keeper refuses to start: ${why}. Nothing is applied until then. Tell him in one line that the record keeper needs its log back (DOCS.md, Restores), and nothing more.`); }
+          return { applied: 0, ok: false, refused: why } as any;
+        }
+        refusedWhy = "";
+        if (fresh) forgetRebuild(cfg); }
       synced0 = sync(cfg, () => clock().getTime());
       st = loadState(cfg);
       // The generation floor: the keeper's own count (its state file, in /data outside the
@@ -696,7 +780,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
             : p.state === "waiting" ? { ...base, state: "refused", reason: clean(`waited a day: ${p.reason}`) }
             : { ...base, state: p.state, reason: clean(p.reason) };
           logOutcome(cfg, o);
-          o.commit = commit(message(o));
+          o.commit = commit(message(o) + (o.state === "done" ? trailer(w.req.tap, w.req.id) : ""));
           owed.push(owe(o, w.local, w.req, false));
         }
       };
@@ -772,24 +856,50 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       const linkTaps = readLinkTaps(cfg);
       { const pruned = pruneTaps(S.taps, clock().getTime(), linkTaps?.unresolved); if (pruned) log(`pruned ${pruned} consumed tap key(s) older than ${TAP_KEEP_MS / 86_400_000} days`); }
       let tapWhy: string | null = null;
-      // Round 11: consumed keys from the append-only log (never pruned); a restore of the link's state
-      // (its run lower than last seen, or the same run with another nonce); the issued keys seen so far.
-      const consumed = readConsumed(cfg);
+      // Round 11: consumed keys from the append-only log (never pruned). Round 12: a torn final record
+      // truncated and told; the link's issued-key log mirrored into the keeper's own; a restore of the
+      // link's state told by a run number logged twice with another nonce (or, with no run records, its
+      // run going down, or the same run with another nonce); and at the keeper's start, after its state
+      // or copy was lost, and after a detected restore, the consumed set rebuilt from the record remote's
+      // history (Tap-Key trailers), each key not in the log appended to it.
       const nowIso = clock().toISOString();
-      if (linkTaps) {
-        if (linkTaps.run !== null) {
-          const seen = S.linkSeen;
-          if (seen && (linkTaps.run < seen.run || (linkTaps.run === seen.run && linkTaps.nonce !== seen.nonce))) {
-            S.linkRestore = { at: nowIso, why: `its run went from ${seen.run} to ${linkTaps.run}${linkTaps.run === seen.run ? " with a new nonce" : ""}` };
-            log(`the link's state was restored from an older copy (${S.linkRestore.why}): tap requests whose keys it no longer lists are lost, and told`);
-          }
-          S.linkSeen = { run: linkTaps.run, nonce: linkTaps.nonce ?? "" };
-        }
-        S.issuedSeen ??= {};
-        for (const [k, v] of Object.entries(linkTaps.issued)) if (!S.issuedSeen[k]) S.issuedSeen[k] = { ...v, at: nowIso };
+      for (const [what, f] of [["consumed tap keys", tapsLogFile(cfg)], ["issued tap keys (the keeper's mirror)", issuedMirrorFile(cfg)]] as const) {
+        try {
+          const r = readLog(f);
+          if (r.torn) { log(`TORN: a torn final record (${r.tornBytes} bytes) in the log of ${what} was truncated; the records before it stand`); relay(cfg, `The record keeper found a torn final record in its log of ${what} (a write cut short, as by a power cut) and truncated it; every record before it stands. Nothing to tell him.`); }
+        } catch (e) { log(`couldn't read the log of ${what}: ${(e as Error).message}`); }
       }
-      for (const [k, v] of Object.entries(S.issuedSeen ?? {}))
-        if (clock().getTime() - Date.parse(v.at) > TAP_KEEP_MS && !linkTaps?.unresolved.has(k)) delete S.issuedSeen![k];   // inside the link's own 4 days
+      try { const n = mirrorIssued(cfg); if (n) log(`mirrored ${n} issued tap key(s) from the link's issued-key log`); }
+      catch (e) { log(`couldn't mirror the link's issued-key log: ${(e as Error).message}`); }
+      const reg = readIssued(cfg, clock().getTime());
+      let restored = false;
+      if (linkTaps && linkTaps.run !== null) {
+        const nonce = linkTaps.nonce ?? "";
+        const twice = reg.runs.find((x) => x.run === linkTaps.run && x.nonce !== nonce);
+        const seen = S.linkSeen;
+        const fresh = !seen || seen.run !== linkTaps.run || seen.nonce !== nonce;
+        let why: string | null = null;
+        if (twice && !reg.runs.some((x) => x.run === linkTaps.run && x.nonce === nonce)) why = `its run ${linkTaps.run} is in the issued-key log already, with another nonce`;
+        else if (!reg.runs.length && seen && (linkTaps.run < seen.run || (linkTaps.run === seen.run && nonce !== seen.nonce)))
+          why = `its run went from ${seen.run} to ${linkTaps.run}${linkTaps.run === seen.run ? " with a new nonce" : ""}`;
+        if (why && fresh) {
+          S.linkRestore = { at: nowIso, why };
+          restored = true;
+          log(`the link's state was restored from an older copy (${why}): tap requests whose keys it no longer lists are lost, and told`);
+        }
+        S.linkSeen = { run: linkTaps.run, nonce };
+      }
+      if (restored || synced0.reset || synced0.cloned || !rebuilt.has(cfg.dir)) {
+        try {
+          const have = readConsumed(cfg);
+          let n = 0;
+          for (const [k, id] of historyTaps(cfg)) if (!have.has(k)) { appendConsumed(cfg, k, id, nowIso); n++; }
+          rebuilt.add(cfg.dir);
+          log(`rebuilt the consumed tap keys from the record's history${n ? `: ${n} key(s) not in the log added` : ": nothing missing"}`);
+        } catch (e) { log(`couldn't rebuild the consumed tap keys from the record's history: ${(e as Error).message}`); }
+      }
+      const consumed = readConsumed(cfg);
+      delete S.issuedSeen;
       S.tapNotices = (S.tapNotices ?? []).filter((n) => clock().getTime() - Date.parse(n.at) <= TAP_KEEP_MS + 86_400_000);
       const notice = (n: Omit<TapNotice, "at">) => { if (!S.tapNotices!.some((x) => x.tap === n.tap && x.why === n.why)) S.tapNotices!.push({ ...n, at: nowIso }); };
       for (const it of items) {
@@ -806,26 +916,30 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && (S.taps?.[it.req!.tap] ?? consumed.get(it.req!.tap)) !== undefined
           && (S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)) !== id)
           o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)}; act on a tap key once` };
-        else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && linkTaps && !linkTaps.issued[it.req!.tap] && S.issuedSeen?.[it.req!.tap]) {
+        else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && linkTaps && !linkTaps.issued[it.req!.tap] && reg.keys.has(it.req!.tap)) {
           // Round 11: a key the keeper saw issued that the link's state no longer lists: lost, told to him
-          // (on the card's thread, by the link) and to Cain (this line), never silently refused.
-          const k = it.req!.tap, seen = S.issuedSeen[k];
+          // (on the card's thread, by the link) and to Cain (this line), never silently refused. Round 12:
+          // issued means in the issued-key log (the link's or the keeper's mirror), for the key's whole life.
+          const k = it.req!.tap, seen = reg.keys.get(k)!;
           o = { ...base, state: "rejected", reason: clean(`tap key ${k} was lost: the link's state was restored from an older copy${S.linkRestore ? ` (${S.linkRestore.why})` : ""} and no longer lists it, so nothing was recorded from it. He is told on the card; record nothing from that tap, and once ${seen.item === "NONE" ? "it" : `${seen.item}'s re-check`} is accepted ask again with --checked if it still needs him`) };
           notice({ tap: k, why: "lost", reason: o.reason!, ...(seen.msg ? { msg: seen.msg } : {}) });
           log(`tap key ${k} lost to a restore of the link's state: request ${id} told as lost`);
         }
-        else if ((tapWhy = tapIssuedProblem(it.req!, linkTaps ? linkTaps.issued : null))) {
-          o = { ...base, state: "rejected", reason: clean(tapWhy) };
+        else if ((tapWhy = tapIssuedProblem(it.req!, Object.fromEntries(reg.keys)))) {
+          // Round 12: a target mismatch doesn't use the key up: Cain sends the right write with the same
+          // key, or routes any other write as an ordinary request ("tap": "none") with its check redone.
+          const k = it.req!.tap!, r = reg.keys.get(k);
+          o = { ...base, state: "rejected", reason: clean(r ? `${tapWhy}. The tap key isn't used up: send the write its card allows with the same tap key, or route any other write as an ordinary request with "tap": "none" and its source check redone` : tapWhy, 600) };
           // Round 11: a request whose target doesn't match its key's: he hears one line on the card.
-          const k = it.req!.tap!, reg = linkTaps?.issued[k];
-          if (reg) notice({ tap: k, why: "refused", reason: o.reason!, ...(reg.msg ? { msg: reg.msg } : {}) });
+          if (r) notice({ tap: k, why: "refused", reason: o.reason!, ...(r.msg ? { msg: r.msg } : {}) });
         }
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
         else o = decide(it.req!, !!it.local, base);
         if (it.repoPath && existsSync(join(cfg.dir, it.repoPath))) rmSync(join(cfg.dir, it.repoPath), { force: true });
         logOutcome(cfg, o);
         seen.add(id);
-        o.commit = commit(message(o));
+        // Round 12: a tap-derived request that is done carries its key in a commit trailer.
+        o.commit = commit(message(o) + (o.state === "done" ? trailer(it.req?.tap, id) : ""));
         outcomes.push(o);
         owed.push(owe(o, !!it.local, it.req, !!it.error));
         if (o.state === "done" && it.req?.tap && TAP_KEY.test(it.req.tap)) {
@@ -851,6 +965,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       items.forEach((it, i) => { const o = outcomes[i]; if (o && it.local && linkOwn(it.req)) local(cfg, o, round_ms, waited); });
       S.generation = generation();
       S.owed = [...(S.owed ?? []), ...owed];
+      // Round 12: the logs' high-water counts, kept in the state.
+      try { S.logHigh = { consumed: readLog(tapsLogFile(cfg), { repair: false }).records.length, issued: readLog(issuedMirrorFile(cfg), { repair: false }).records.length }; }
+      catch (e) { log(`couldn't count the append-only logs: ${(e as Error).message}`); }
       if (commits === 0 && !ahead(cfg)) {
         // Nothing to push: a good round all the same, in step with GitHub as last fetched.
         // Cain's requests that were already applied are let go, with their status file if it
@@ -1324,6 +1441,9 @@ if (import.meta.main) {
     linkState: process.env.LINK_STATE ?? "/data/link/state.json",
     leakCheck: process.env.RECORD_LEAK_CHECK ?? "/data/record-leak-check",
     logFile: process.env.RECORD_LOG ?? "/data/work/record-keeper.log",
+    tapsLog: process.env.RECORD_TAPS_LOG ?? "/data/record-taps.jsonl",
+    linkIssued: process.env.LINK_ISSUED_LOG ?? "/data/link-issued.log",
+    issuedLog: process.env.RECORD_ISSUED_LOG ?? "/data/record-issued.log",
   };
   delete process.env.RECORD_TOKEN;   // kept only in cfg, handed to git per call
   teeConsole(cfg.logFile);
@@ -1331,6 +1451,14 @@ if (import.meta.main) {
     log("no GitHub token in the add-on's options yet; the record keeper is waiting");
     while (true) await Bun.sleep(3_600_000);
   }
+  // Round 12: an append-only log missing or shorter than its high-water count: the keeper doesn't start.
+  { let why: string | null = null;
+    try { why = logsProblem(cfg, loadState(cfg)); } catch (e) { why = `its state couldn't be read to check its logs (${(e as Error).message})`; }
+    if (why) {
+      log(`REFUSED TO START: ${why}`);
+      try { relay(cfg, `The record keeper refuses to start: ${why}. Nothing is applied until then. Tell him in one line that the record keeper needs its log back (DOCS.md, Restores), and nothing more.`); } catch { /* the log line stands */ }
+      while (logsProblem(cfg, loadState(cfg))) await Bun.sleep(60_000);
+    } }
   log("keeping the record");
   await keep(cfg, { fullMs: Number(process.env.RECORD_INTERVAL_S ?? 60) * 1000, pollMs: Number(process.env.RECORD_POLL_MS ?? 2000) });
 }

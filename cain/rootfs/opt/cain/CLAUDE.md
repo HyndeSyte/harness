@@ -160,11 +160,17 @@ specialist (the Harness add-on) does.
   say `"tap": "none"`; a Ship take always carries its Ship tap's key. The keeper checks a tap key
   against the link's list of the keys it issued: one the link didn't issue is refused ("isn't one
   the link issued"), and so is one from a card for another item, and one that isn't a Ship card's
-  Ship tap on a take for a Ship job. Each issued key carries what its tap allows: a Ship card's Ship
-  tap a take for its Ship job, a question about an item closing that row or a decision, any other
-  tap a decision. The keeper matches on that, never on your wording; a refusal comes to you with its
-  reason and he gets one line on the card, so act on the reason (usually: use the right tap key, or
-  `"tap": "none"` when it didn't come from a tap). A request whose key was lost because the link's
+  Ship tap on a take for a Ship job. A key counts as issued only once it is in the link's
+  issued-key log, written before the card could be tapped. Each issued key carries what its tap
+  allows, and the keeper matches on that, never on your wording. Writes a tap allows, per card kind:
+  a Ship card's Ship tap, a `take` for its Ship job on its item; a Ship card's Not now, a decision
+  (an append to a decisions.md); a question about an item, a `row-close` of that item or a decision;
+  a question about no open item, a decision. Route any other write that follows from his answer as an
+  ordinary request with "tap": "none" and its source check redone (ask again with --checked if it
+  needs him). A refusal for a write the key doesn't allow comes to you with its reason and doesn't use
+  the key up: send the write the card allows with the same tap key, or route the other write as an
+  ordinary request with "tap": "none" and its source check redone. He gets one line on the card saying
+  his answer stands and there's nothing to do. A request whose key was lost because the link's
   state was restored from an older copy comes back "was lost": record nothing from that tap, and
   once the item's re-check is accepted ask again with --checked if it still needs him (he was told
   on the card). A decision written from a tap still names its item (P08 Q2) in its text, for the
@@ -479,7 +485,10 @@ create, update or run any other routine.
      a message already used for a settle is refused on reuse. If he answers in other words, point
      him to the reminder under the card instead of guessing. You get "Landing settled by Dane: ..." and then the
      usual landed or abandoned line. Never run it on your own judgment or without his message.
-     He is reminded once a day while it stays unresolved; past 7 days you get one "Landing
+     He is reminded once a day for the first week (one line on the card on its first day, then one
+     digest of every unsettled Ship), then weekly; his settle line may come with backticks, odd spaces,
+     capitals or a long dash for the hyphen (copied from the reminder), and the link forgives that, but
+     never another key or both verdicts. Past 7 days you get one "Landing
      unresolved for over 7 days" line (nothing new to do: he decides it). Past 90 days it becomes a
      tombstone ("Landing tombstoned: ..."): kept on file, listed under tombstoned_landings, and no
      longer blocking a new Ship card for that pull request and head; he can still settle it the same
@@ -596,7 +605,8 @@ R4. `/opt/cain/record.sh block-push 2`, a checked test ask he taps, a queued row
    as "Lost to the record's reset, please answer again." on its card's thread, with your relayed
    line; once the push lands, the edit and take are done once each, and asks resume within two
    keeper rounds of the push landing (about two minutes): a new checked ask posts and counts.
-R4b. Only on a real Ship he means to make, and only if he wants to: he taps Ship, then pulls the
+R4b. Only on a real Ship he means to make, and only if he wants to: first run
+   `/opt/cain/keeper.sh install-taps once` (it lets exactly that one Ship tap land), then he taps Ship, then pulls the
    Pi's power right after, before the card shows how it went. On the next start the landing
    settles to landed exactly once: one "The link landed it" line, no second push, keeper.sh clock
    without unresolved_landings. Never offer it with a test card (one already in main pushes
@@ -608,6 +618,15 @@ R5. Last, the rollback: ask him to restore this App from that backup (you can't 
    Then he installs this version again from the App's update, and you confirm keeper.sh clock
    answers.
 Nothing lets cards through without a check.
+
+Install taps. Until you run `/opt/cain/keeper.sh install-taps on`, his Ship taps land nothing: the
+card answers him that installs wait for the post-install tests and keeps its buttons, and you get a
+line saying so. Run it only once all of these have passed on the Pi: the install smoke test, its
+forced-webhook step (14), the pull-the-plug case (R4b, with install-taps once) and one real settle
+cycle (an unresolved landing settled by his own settle line; if none has come up, ask him once with
+buttons whether to turn installs on without it, and do as he taps). `keeper.sh clock` shows
+install_taps. If the record keeper ever says it refuses to start (a log missing or shorter than its
+state says), tell him in one line that it needs its log back from the backup, and nothing more.
 
 ## Stop
 His Stop button stops what would start next: the calendar specialist, your Build and

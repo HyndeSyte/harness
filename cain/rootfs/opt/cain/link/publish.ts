@@ -9,7 +9,7 @@
 // transcripts, for which of the bot's messages he sent with the Discord plugin (one bot
 // token posts them all), and which of them his reply tool made (seedReplies). They are
 // streamed in chunks and the event loop gets a turn often, so a tap is never kept waiting.
-import { createReadStream, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { answerText, sentIds } from "../gate/plugin";
@@ -30,6 +30,14 @@ export function stateFile(path: string, onSave: () => void = () => {}) {
     save(s: State): void {
       writeFileSync(`${path}.tmp`, JSON.stringify(s), { mode: 0o600 });
       renameSync(`${path}.tmp`, path);
+      onSave();
+    },
+    // Round 12: the same save, fsynced (the file, then its folder) before it returns: the run counter.
+    saveDurable(s: State): void {
+      const fd = openSync(`${path}.tmp`, "w", 0o600);
+      try { writeSync(fd, JSON.stringify(s)); fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(`${path}.tmp`, path);
+      try { const d = openSync(dirname(path), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* a folder that can't be synced */ }
       onSave();
     },
   };
