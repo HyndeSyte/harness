@@ -20,6 +20,15 @@ function botMessage(r: ReturnType<typeof rig>, content: string, o: { replyTo?: s
     ...(o.replyTo ? { message_reference: { type: 0, message_id: o.replyTo, channel_id: DM } } : {}) };
   return id;
 }
+// A card the link took before 0.12.0, when one naming a button it lacked went out flagged; the link now refuses
+// such a card, so the replay meets one only in his history.
+function legacyCard(r: ReturnType<typeof rig>, text: string, rows: any[], kind: string): number {
+  const s = r.state();
+  const id = s.next++;
+  s.cards[String(id)] = { text, rows, kind, created: r.t.now, shown: null, expires: null, due: null } as any;
+  r.setState(s);
+  return id;
+}
 const done = async (r: ReturnType<typeof rig>) => { await r.link.whenReplayed(); return r.replays.at(-1); };
 
 // A DM like his: an ask he answered, a specialist card naming a button it lacks, Cain's
@@ -28,7 +37,7 @@ const done = async (r: ReturnType<typeof rig>) => { await r.link.whenReplayed();
 async function dm(r: ReturnType<typeof rig>) {
   const ask = (await r.link.ask({ text: "Is the add-on's packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
   await r.tap(structuredClone(r.msg(ask)), r.ids(ask)[0]);
-  const digest = await r.link.addCard({ text: "Three blocks added, each on its own card with Undo.", rows: STOP_ONLY, kind: "digest" });
+  const digest = legacyCard(r, "Three blocks added, each on its own card with Undo.", STOP_ONLY, "digest");
   const digestMsg = await r.link.show(digest, { item: "none" });
   const card = await r.link.addCard({ text: "Added Swim to your Gmail.", rows: RECEIPT_ROWS, kind: "card" });
   const receipt = await r.link.show(card, { item: "none" });
@@ -118,7 +127,7 @@ describe("the replay", () => {
 
   test("the specialist's cards that never went out are read as the link got them", async () => {
     const r = rig();
-    await r.link.addCard({ text: "Swim moved, with Undo.", rows: STOP_ONLY, kind: "card" });   // waiting for Cain
+    legacyCard(r, "Swim moved, with Undo.", STOP_ONLY, "card");               // waiting for Cain
     r.link.replay(14);
     const rep = await done(r);
     expect(rep.messages.cards_never_posted).toBe(1);
@@ -352,8 +361,8 @@ describe("the replay after the rules were tuned (0.10.0)", () => {
     const r = rig();
     r.stop.stopped = true; r.stop.at = r.t.now;
     // As 0.9.0 recorded it: a specialist's Stopped notice, with the link's line, its buttons gone.
-    const card = await r.link.addCard({ text: "Stopped. Nothing runs.\n\nCain's Build and Ship jobs, Ship cards and outside reviews are stopped too, and nothing lands in main, until you tap Turn back on. A job already running finishes.",
-      rows: [], kind: "card" });
+    const card = legacyCard(r, "Stopped. Nothing runs.\n\nCain's Build and Ship jobs, Ship cards and outside reviews are stopped too, and nothing lands in main, until you tap Turn back on. A job already running finishes.",
+      [], "card");
     const id = await r.link.show(card, { item: "none" });
     r.link.replay(14);
     const rep = await done(r);

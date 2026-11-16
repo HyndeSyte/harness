@@ -198,11 +198,11 @@ class Crash(BaseException):
 def test_go_ahead_reads_the_calendar_first_and_never_blindly_reruns(m, monkeypatch):
     calls = []
     monkeypatch.setattr(m.c.callbacks, "handle", lambda inc: calls.append(inc) or "ok")
-    monkeypatch.setattr(m.c, "_tap_effect", lambda op: "done")
+    monkeypatch.setattr(m.c, "_tap_read", lambda op: ("done", []))
     said = m.c._reconfirm_tap(json.dumps({"custom_id": "k:a:whatever", "message_id": "5",
                                           "op": {"effect": "calendar_change"}}))
     assert calls == [] and "on your calendar already" in said
-    monkeypatch.setattr(m.c, "_tap_effect", lambda op: "not_done")
+    monkeypatch.setattr(m.c, "_tap_read", lambda op: ("not_done", []))
     m.c._reconfirm_tap(json.dumps({"custom_id": "k:a:whatever", "message_id": "5",
                                    "op": {"effect": "calendar_change"}}))
     assert len(calls) == 1                                                    # only once it isn't there

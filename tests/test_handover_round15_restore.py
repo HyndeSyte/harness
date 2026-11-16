@@ -85,8 +85,8 @@ def test_the_start_is_degraded_with_the_listing_on_the_status_page(tmp_path, clo
     page = run_degraded(monkeypatch, tmp_path, target.parent, str(e.value), files=e.value.files)
     assert page["migration"]["files"] == e.value.files
     assert pathlib.Path(str(target) + migrate.SWAP_MARKER).read_text() == "{"
-    src = (APP / "harness" / "__main__.py").read_text()
-    assert 'files=getattr(e, "files", None)' in src
+    # Seventeenth round: main() handing the files to the degraded start is tested through main() itself
+    # (test_handover_round17_restore.py).
 
 
 # Sixteenth round: the atomic marker write is tested by failing its write, fsync and rename (test_handover_round16_restore.py).
@@ -164,15 +164,8 @@ def test_a_staging_past_the_wait_goes_degraded_then_starts_by_itself(tmp_path, c
         assert migrate.hold_process_lock(str(path))                          # and it holds the lock now
     finally:
         migrate.release_process_lock(str(path))
-    src = (APP / "harness" / "__main__.py").read_text()
-    assert 'if got != "retry":' in src and "lock_wait=isinstance(e, migrate.LockBusy)" in src
-
-
-def test_the_page_shows_the_lock_wait():
-    import inspect
-    from harness import setup_web
-    src = inspect.getsource(setup_web)
-    assert 'mig.get("lock_wait")' in src and "tried again every" in src
+    # Seventeenth round: main() starting again once the lock comes free, and the page's lock wait, are tested
+    # behaviourally (test_handover_round17_restore.py).
 
 
 # -- 13. a refused swap sorted from the command line ----------------------------------------------------------------

@@ -667,7 +667,7 @@ def test_the_card_shows_the_ledgers_evidence_and_every_no_card_path(m):
                   "Gmail: A card for an event that changed since it", "Family: A card for an event that changed since it",
                   "so nothing was sent and it was not applied", "Two days of one series on Family, “Pool”",
                   "A write whose answer came late, Gmail", "within 0 seconds", "asked 7:30 AM Wed Nov 11",
-                  "Your own newest message, under 2 minutes old", "A date from your mail you tap Add to Family on",
+                  "Your own newest message, under 2 minutes old", "A date from your mail you send to Family from its card",
                   "Family calendar adds: none yet"):
         assert words in card, words
     assert {"Turn on", "Keep cards"} <= set(m.labels())

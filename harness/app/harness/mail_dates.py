@@ -120,9 +120,25 @@ _HEADER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{1,40}:\s*\S")
 _ORDER_ITEMS = re.compile(r"(?i)\b(order\s*#|order number|order summary|items? in (this|your) (order|delivery)|"
                           r"qty\b|quantity\b|item subtotal|shipment details|ship to\b)")
 _QUOTED = re.compile(r"(?im)^\s*(>|on .{1,80} wrote:|-{2,}\s*original message|-{2,}\s*forwarded message)")
-_PROMO = re.compile(r"(?i)\b(learn more|sign up|join now|try it|start saving|save up to|discover|explore|"
-                    r"recommended for you|you might also like|deals?\b|\d+\s*% off|limited time|"
-                    r"unsubscribe|advertisement|sponsored)")
+# Seventeenth round: promotion is told by its structure, not by one common word ("deals", "discover"): an explicit
+# offer (a discount), or a block of calls to action and links (two or more between them).
+_OFFER = re.compile(r"(?i)(\bsave up to \$?\d|\bsave \$?\d+(\.\d+)?\s*%|\d+\s*%\s*off\b|\bsave \$\d)")
+_CTA = re.compile(r"(?i)\b(learn more|shop now|sign up|join now|start saving|try it|recommended for you|"
+                  r"you might also like|unsubscribe|advertisement|sponsored|limited[- ]time)\b")
+_LINK = re.compile(r"(?i)\bhttps?://\S+")
+# A salutation on its own line: a greeting and up to three words ("Hello Alex", "Hi there!"), or a short line ending
+# in a comma of at most four words ("Alex,", "Dear Alex Doe,"), so a sentence cut by a comma isn't one.
+_SALUTATION = re.compile(r"(?i)^\s*((hi|hello|hey|dear|greetings|good (morning|afternoon|evening))\b(\s+[\w'.-]+){0,3}"
+                         r"|[\w'.-]+(\s+[\w'.-]+){0,3}\s*,)\s*[,.!]?\s*$")
+
+
+def _promotional(lead: str) -> bool:
+    """Whether a block reads as promotion by its structure (seventeenth round): an explicit offer, or two or more
+    calls to action and links between them."""
+    if _OFFER.search(lead):
+        return True
+    return len(_CTA.findall(lead)) + len(_LINK.findall(lead)) >= 2
+
 
 # What may carry a date he has to act on. Anything else never leaves the Pi.
 _PICK = re.compile(
@@ -340,7 +356,9 @@ def marker_placed(text: str, marks) -> bool:
     """Sixteenth round: whether a marker sits where it says what the mail is: in a header line at the top of the
     text, or in its first block of text before the order's items (cut at a quoted section too). A marker only in a
     promotional or quoted section further down doesn't count, and a first block that reads as promotion is
-    ambiguous: then it doesn't count either, and the mail is kept."""
+    ambiguous: then it doesn't count either, and the mail is kept. Seventeenth round: leading salutation-only lines
+    ("Hello Alex," on its own) are passed over before the first block is chosen, and promotion is told by its
+    structure (_promotional), never by one common word."""
     lines = (text or "").replace("\r\n", "\n").casefold().split("\n")
     i = 0
     while i < len(lines) and not lines[i].strip():
@@ -351,8 +369,8 @@ def marker_placed(text: str, marks) -> bool:
         i += 1
     if any(w in line for line in header for w in marks):
         return True
-    while i < len(lines) and not lines[i].strip():
-        i += 1
+    while i < len(lines) and (not lines[i].strip() or _SALUTATION.match(lines[i])):
+        i += 1                                 # blank lines and a salutation on its own line
     block = []
     while i < len(lines) and lines[i].strip():
         block.append(lines[i])
@@ -365,7 +383,7 @@ def marker_placed(text: str, marks) -> bool:
     lead = lead[:LEAD_MAX]
     if not any(w in lead for w in marks):
         return False
-    return not _PROMO.search(lead)
+    return not _promotional(lead)
 
 
 def skipped_kind(sender: str, subject: str, kinds, body=None) -> str:

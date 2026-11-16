@@ -940,6 +940,12 @@ def _when(text: str) -> datetime | date:
     return date.fromisoformat(text) if effects.DATE_RE.fullmatch(text) else datetime.fromisoformat(text)
 
 
+def add_anyway_key(proposal_id: str, index: int) -> str:
+    """The key an Add anyway's add takes its fixed id from (seventeenth round): the receipt's proposal and the
+    add's place, so the same tap taken twice writes to one id."""
+    return f"anyway:{proposal_id}:{index}"
+
+
 class Refuse(Exception):
     """Nothing was written. His words, as plain text: escaped where they're sent."""
 
@@ -3148,7 +3154,7 @@ class CalendarChange:
         date included."""
         from .family_add import LOOSENED
         out = ["Your own newest message, under 2 minutes old, with one clear change.",
-               "A date from your mail you tap Add to Family on."]
+               "A date from your mail you send to Family from its card."]
         if self.ledger.get_meta(LOOSENED):
             when = self.ledger.db.execute("SELECT at FROM events WHERE kind='family_add_loosened' ORDER BY id DESC"
                                           " LIMIT 1").fetchone()
@@ -4559,7 +4565,10 @@ class CalendarChange:
         notes: list[str] = []
         keys = self.keys_of(pid)
         self._forcing = bool(self.ledger.get_meta(f"calendar_change_force:{pid}"))
+        skip = self._skipped(pid)
         for index, change in enumerate(params["changes"]):
+            if index in skip:
+                continue                       # seventeenth round: the calendar already shows it (skip_found)
             # Each add's fixed id comes from the proposal it was first offered under (keys_of), so a
             # change offered again writes to the same address and never makes a second event.
             more, said_here = self._plan(change, keys[index] if index < len(keys) else f"{pid}:{index}")
@@ -5915,18 +5924,43 @@ class CalendarChange:
             [fact[0].upper() + fact[1:]] if fact else []
 
     # -- a tap's effect, read by its own identity (sixteenth round) -----------------------------------------------
+    LANDED = ("done", "removed")
+
     def tap_effect(self, op: dict) -> str:
-        """For a tap whose outcome isn't known (the records put back from a backup): whether the calendar shows what
-        the Approve led to, read by the effect's own stable identity and never by a search of the slot. An add (or
-        a repeating add) by the fixed id it's written under (from the key in `op`); a Gmail removal by the event id
-        the card was bound to. "done" when every part reads as done, "not_done" when a read answered that one
-        isn't, "unread" when a read couldn't tell, "unchecked" when a part carries no identity to read by."""
-        changes = list((op or {}).get("changes") or [])
-        if not changes:
+        """For a tap whose outcome isn't known (the records put back from a backup, or an error after its intent):
+        whether the calendar shows what it led to, read by the effect's own stable identity and never by a search
+        of the slot (tap_parts). "done" when every part reads as done; "removed" (seventeenth round) when every part
+        landed and one has since been taken off the calendar (a Google event read as cancelled at its fixed id):
+        nothing is done again; "mixed" when some parts landed and others didn't (Go ahead runs only the others);
+        else "not_done" when a read answered that a part isn't there, "unread" when a read couldn't tell,
+        "unchecked" when a part carries no identity to read by."""
+        if (op or {}).get("effect") == "undo":
+            return self.combine(self.undo_parts(op))
+        return self.combine(self.tap_parts(op))
+
+    @classmethod
+    def combine(cls, got: list[str]) -> str:
+        if not got:
             return "unchecked"
-        pid = str(op.get("proposal") or "")
-        keys = [str(k) for k in op.get("keys") or []]
-        bound = [b for b in op.get("bound") or [] if isinstance(b, dict)]
+        if all(v in cls.LANDED for v in got):
+            return "removed" if "removed" in got else "done"
+        if any(v in cls.LANDED for v in got):
+            return "mixed"
+        for verdict in ("not_done", "unread", "unchecked"):
+            if verdict in got:
+                return verdict
+        return "unread"
+
+    def tap_parts(self, op: dict) -> list[str]:
+        """Seventeenth round: the read of tap_effect, one verdict per change in `op` (in order): an add (or a
+        repeating add) by the fixed id it's written under (from the key in `op`): "done" there, "removed" read as
+        cancelled there (it was added and has since been deleted), "not_done" not there; a Gmail removal by the event
+        id the card was bound to ("done" when that event is gone or cancelled); "unread"; "unchecked" for a change
+        that carries no identity to read by."""
+        changes = list((op or {}).get("changes") or [])
+        pid = str((op or {}).get("proposal") or "")
+        keys = [str(k) for k in (op or {}).get("keys") or []]
+        bound = [b for b in (op or {}).get("bound") or [] if isinstance(b, dict)]
         got = []
         for i, c in enumerate(changes):
             kind, calendar = c.get("op"), c.get("calendar")
@@ -5934,32 +5968,140 @@ class CalendarChange:
                 key = keys[i] if i < len(keys) else f"{pid}:{i}"
                 got.append(self._there_by_id(calendar, self._uid(key, "hm-" if calendar == "family" else "cm")))
             elif kind == "remove" and calendar == "gmail":
-                mine = [b for b in bound if b.get("op") == "remove" and b.get("calendar") == "gmail"]
+                mine = [b for b in bound if b.get("op") == "remove" and b.get("calendar") == "gmail"
+                        and (b.get("change") in (None, i))]
                 if not mine:
                     got.append("unchecked")
-                for b in mine:
-                    there = self._there_by_id("gmail", str(b.get("instance") or b.get("id") or ""))
-                    got.append({"done": "not_done", "not_done": "done"}.get(there, there))
+                    continue
+                each = [self._there_by_id("gmail", str(b.get("instance") or b.get("id") or "")) for b in mine]
+                each = [{"done": "not_done", "not_done": "done", "removed": "done"}.get(x, x) for x in each]
+                got.append("done" if all(x == "done" for x in each) else
+                           next(v for v in ("not_done", "unread") if v in each))
             else:
                 got.append("unchecked")
-        for verdict in ("not_done", "unread", "unchecked"):
-            if verdict in got:
-                return verdict
-        return "done"
+        return got
 
     def _there_by_id(self, calendar: str, ident: str) -> str:
-        """One event read by its id: "done" (there, not cancelled), "not_done" (gone), "unread"."""
+        """One event read by its id: "done" (there, not cancelled), "removed" (a Google event read as cancelled:
+        it was there and has been deleted since), "not_done" (no such event), "unread"."""
         if not ident:
             return "unread"
         if calendar == "gmail":
             if self.google is None or not self.address():
                 return "unread"
             kind, ev = self.google.look(self._gmail_address(), ident)
-            if kind == "gone" or (kind == "ok" and (ev or {}).get("status") == "cancelled"):
+            if kind == "ok" and (ev or {}).get("status") == "cancelled":
+                return "removed"
+            if kind == "gone":
                 return "not_done"
             return "done" if kind == "ok" and ev else "unread"
         out, _ = self.client.fetch(self.client.href_for(ident))
         return {"ok": "done", "gone": "not_done"}.get(out.kind, "unread")
+
+    # -- a choice tap's readable identity (seventeenth round) --------------------------------------------------
+    def add_anyway_op(self, proposal_id: str) -> dict | None:
+        """His Add anyway, named by a stable identity before it's acted on: the adds it makes and the keys their
+        fixed ids are made from. The keys come from the receipt's own proposal (add_anyway_key), not from the new
+        proposal it creates, so the same tap taken again (Go ahead after the records were put back, where its
+        nonce reads unused) writes to the very same ids and finds the first write."""
+        row = self.ledger.db.execute("SELECT settle_json FROM calendar_changes WHERE proposal_id=?",
+                                     (proposal_id,)).fetchone()
+        if row is None:
+            return None
+        changes = [part["change"] for part in _plan(row).get("parts", []) if part.get("already") and part.get("change")]
+        if not changes:
+            return None
+        return {"effect": effects.CALENDAR_CHANGE, "kind": "calendar_change_add_anyway", "proposal": "",
+                "changes": changes, "keys": [add_anyway_key(proposal_id, i) for i in range(len(changes))],
+                "bound": []}
+
+    def undo_op(self, target: str) -> dict | None:
+        """His Undo, named by a stable identity before it's acted on: each event it puts back (its id or address)
+        and the state it must read in afterwards (gone; there again; or its version from before the change), from
+        the first step this change made on it. None when there's nothing open to undo."""
+        steps, seen = [], set()
+        for pid in str(target or "").split():
+            row = self.ledger.db.execute("SELECT undo_json, undo_state FROM calendar_changes WHERE proposal_id=?",
+                                         (pid,)).fetchone()
+            if row is None or row["undo_state"] != "open":
+                continue
+            try:
+                undo = json.loads(row["undo_json"] or "[]")
+            except ValueError:
+                undo = []
+            for st in undo if isinstance(undo, list) else []:
+                if not isinstance(st, dict):
+                    continue
+                if st.get("cal") not in ("gmail", "family"):
+                    steps.append({"cal": str(st.get("cal") or "")})
+                    continue
+                key = self._object_key(st)
+                if key in seen:
+                    continue                    # the first step on an event is what Undo puts it back to
+                seen.add(key)
+                if st["cal"] == "gmail":
+                    steps.append({"cal": "gmail", "how": st.get("how", ""), "id": st.get("id", ""),
+                                  "fields": st.get("fields") or {}})
+                else:
+                    steps.append({"cal": "family", "how": st.get("how", ""), "href": st.get("href", ""),
+                                  "before": st.get("before", "")})
+        if not steps:
+            return None
+        return {"effect": "undo", "kind": "calendar_change_undo", "steps": steps}
+
+    def undo_parts(self, op: dict) -> list[str]:
+        """The read of an Undo's identity, one verdict per event: "done" when it reads as Undo leaves it, "not_done"
+        when a read answered that it doesn't, "removed" when the event was deleted since (an edit's undo), "unread",
+        "unchecked" for a step with nothing to read (a Family rule)."""
+        got = []
+        for st in (op or {}).get("steps") or []:
+            how = st.get("how")
+            try:
+                if st.get("cal") == "gmail":
+                    if self.google is None or not self.address():
+                        got.append("unread")
+                        continue
+                    kind, cur = self.google.look(self._gmail_address(), str(st.get("id") or ""))
+                    if kind == "unknown":
+                        got.append("unread")
+                        continue
+                    cancelled = kind == "gone" or (cur or {}).get("status") == "cancelled"
+                    if how == "drop":
+                        got.append("done" if cancelled else "not_done")
+                    elif how == "restore":
+                        got.append("not_done" if cancelled else "done")
+                    elif cancelled:
+                        got.append("removed")
+                    else:
+                        got.append("done" if self._as_written(cur, st.get("fields") or {}) else "not_done")
+                elif st.get("cal") == "family":
+                    out, body = self.client.fetch(str(st.get("href") or ""))
+                    if out.kind not in ("ok", "gone"):
+                        got.append("unread")
+                    elif how == "delete":
+                        got.append("done" if out.kind == "gone" else "not_done")
+                    elif out.kind == "gone":
+                        got.append("not_done" if how == "restore" else "removed")
+                    else:
+                        got.append("done" if caldav._unchanged(body, st.get("before") or "") else "not_done")
+                else:
+                    got.append("unchecked")
+            except (KeyError, TypeError, ValueError, AttributeError):
+                got.append("unread")
+        return got
+
+    def skip_found(self, pid: str, indexes: list[int]) -> None:
+        """Seventeenth round: his Go ahead on a change some of whose parts the calendar already shows: those parts
+        are left out when it runs (_plan_all), so only what isn't there is done."""
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(f"calendar_change_skip:{pid}", json.dumps(sorted(set(int(i) for i in indexes))), db)
+
+    def _skipped(self, pid: str) -> set[int]:
+        try:
+            got = json.loads(self.ledger.get_meta(f"calendar_change_skip:{pid}") or "[]")
+            return {int(i) for i in got} if isinstance(got, list) else set()
+        except (ValueError, TypeError):
+            return set()
 
     def _uid(self, key: str, prefix: str) -> str:
         return prefix + hashlib.sha256(f"calendar_change:{key}".encode()).hexdigest()[:32]
@@ -5997,6 +6139,20 @@ class CalendarChange:
         start, end, rule = self._new_times(c)
         loose = ""
         uid = self._uid(key, "hm-" if c["calendar"] == "family" else "cm")
+        if force:
+            # Seventeenth round: an Add anyway writes no check for "already there", but it reads its own fixed id
+            # first: a write of this very tap that landed is found and kept, and one deleted since isn't put back.
+            text = f"{_safe(c['title'])}{self._new_words(c, start, end)}"
+            where = " (Family)" if c["calendar"] == "family" else " (Gmail)"
+            there = self._there_by_id(c["calendar"], uid)
+            if there == "done":
+                expect = [{"kind": "there", "calendar": c["calendar"], "id": uid, "title": c["title"],
+                           "start": _text(start), "end": _text(end), "repeats": bool(rule)}]
+                return Part(f"Add {text}{where}", f"On the calendar: {text}{where}", [], name=_safe(c["title"]),
+                            adds=True, expect=expect, change=dict(c))
+            if there == "removed":
+                raise Refuse(f"\u201c{render.plain(c['title'])}\u201d was added as a second event before and has since "
+                             f"been taken off your calendar, so it isn't added again")
         if c["op"] == "add" and not force:
             # Its own fixed id first (0.24.0, fourth round): a change offered again after its lease
             # ran out keeps the id of the first offer, so an earlier write that landed late is found
@@ -7277,6 +7433,10 @@ class CalendarChange:
             self.ledger.set_meta(f"job_parent:{job}", parent, db)
             pid = _create(self.ledger, job, params, p["policy_version"], db)
             self.ledger.set_meta(f"calendar_change_force:{pid}", "1", db)
+            # Seventeenth round: its fixed ids come from the receipt's proposal (add_anyway_op), so the same tap
+            # taken again writes to the same ids and the forced writer finds the first write there.
+            self.ledger.set_meta(f"calendar_change_keys:{pid}", json.dumps(
+                [add_anyway_key(proposal_id, i) for i in range(len(changes))]), db)
             self.ledger.set_meta(f"calendar_change_lines:{pid}", json.dumps(
                 [render.change_line(c, self.tz, self.ledger.now()) for c in changes]), db)
             db.execute("UPDATE proposals SET state='approved' WHERE id=?", (pid,))

@@ -975,9 +975,18 @@ export class Link {
     const comps = (c.rows ?? []).filter((r: any) => (r.components ?? []).every((b: any) =>
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
     // The specialist's words: em dashes and "add-on" fixed, and stored that way, so the card
-    // posted is exactly the card kept. Never refused: its outbox takes a refusal as dead,
-    // and an approval or an Undo would be lost to him. What else the gate flags, Cain hears.
+    // posted is exactly the card kept. Refused only for a button it names and doesn't carry
+    // (below); anything else the gate flags goes out, and Cain hears.
     const w = this.words("card", "specialist", String(c.text ?? ""), { rules: AT.card, buttons: labelsOf(comps), known: this.liveLabels() });
+    // 0.12.0: a card that names a button it doesn't carry ("Go ahead does it now" with no Go ahead) points him at
+    // something that isn't there, so it's refused, not flagged: the specialist hears why, and Cain once.
+    const missing = w.hits.filter((h) => h.rule === "button" && h.result === "refuse" && h.label);
+    if (missing.length) {
+      this.report("card", "specialist", w.hits, "refused");
+      const said = [...new Set(missing.map((h) => `"${h.label}"`))].join(", ");
+      this.d.relay(`The calendar specialist sent a card naming ${said}, which isn't on it, so the link refused it and nothing went to him. Nothing to tell him; it's logged for a fix.`);
+      throw new Refusal(`the card names ${said}, which it doesn't carry`);
+    }
     this.report("card", "specialist", w.hits, w.refused.length ? "posted as it is" : "fixed");
     // The specialist's Stop and Turn back on notices also say what that did on Cain's
     // side, from what's true now: the link's own words.

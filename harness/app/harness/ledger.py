@@ -542,7 +542,10 @@ class Ledger:
         bookkeeping (sent marks, retries, a card's button binds), so the restart card goes out and nothing is
         posted twice. Nothing else may use it: the exemption is this method, not an argument any caller can pass.
         Sixteenth round: asserted at run time. _tx takes the exemption only as this module's private pass, which only
-        this method hands it; anything else (True included) is refused with a TypeError."""
+        this method hands it; anything else (True included) is refused with a TypeError. Seventeenth round, said
+        plainly: this is a guard against accidents (a stray flag or a wrong argument), not against intent. Python
+        code in the same process can reach a module-private name, so the pass stops mistakes, not a caller set on
+        getting past the fence; the controller stays the ledger's one writer by design and by review."""
         return self._tx(_OUTBOX_PASS)
 
     @contextmanager

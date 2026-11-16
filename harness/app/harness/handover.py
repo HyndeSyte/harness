@@ -162,6 +162,7 @@ class Handover:
     job: str = ""                        # the job's short id: for the log, never for him
     journaled: bool = False              # /press: written to the tap journal (fourteenth round)
     told: bool = False                   # /press: he was told once that it waits (fourteenth round)
+    intent: bool = False                 # /press: its execution intent is in the journal (seventeenth round)
 
     def finish(self, status: str, said: str = "", **extra) -> None:
         if not self.done.is_set():

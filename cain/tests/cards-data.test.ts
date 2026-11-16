@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
+import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, Refusal, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
@@ -299,15 +299,26 @@ describe("the gate at the link's send points", () => {
     expect(r.last().content).toBe("## Thu Nov 12\n• The App restarts at 4:30");
   });
 
-  test("a specialist card naming a button it lacks is never refused: posted as it is, logged, and Cain told once", async () => {
+  test("a specialist card naming a button it lacks is refused: nothing posted, logged, and Cain told once", async () => {
     const r = rig();
-    const card = await r.link.addCard({ text: "Three blocks added — each on its own card with Undo.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
-    expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Undo" isn\'t one of its buttons. It goes out as it is');
-    const id = await r.link.show(card, { item: "none" });
-    expect(r.msg(id).content).toBe("Three blocks added, each on its own card with Undo.");   // the dash fixed, the rest as it was
-    expect(r.state().cards[String(card)].text).toBe("Three blocks added, each on its own card with Undo.");
-    expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", did: "posted as it is", hits: [{ rule: "dash" }, { rule: "button", label: "Undo" }] }]);
-    expect(r.relayed.filter((l) => l.includes("flags its words"))).toHaveLength(1);
+    const before = Object.keys(r.state().cards).length;
+    let refused: unknown = null;
+    try {
+      await r.link.addCard({ text: "Three blocks added — each on its own card with Undo.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
+    } catch (e) { refused = e; }
+    expect(refused).toBeInstanceOf(Refusal);
+    expect(String((refused as Error).message)).toContain('"Undo"');
+    expect(Object.keys(r.state().cards)).toHaveLength(before);                 // nothing kept, nothing to show
+    expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", did: "refused", hits: [{ rule: "dash" }, { rule: "button", label: "Undo" }] }]);
+    expect(r.relayed.filter((l) => l.includes("the link refused it"))).toHaveLength(1);
+  });
+
+  test("a specialist card naming a button it carries, or a relist card naming none, goes out", async () => {
+    const r = rig();
+    const card = await r.link.addCard({ text: "Undone? Tap Undo to take it off.", rows: [{ type: 1, components: [btn("Undo", "k:c:abc")] }], kind: "card" });
+    expect(r.state().cards[String(card)]).toBeDefined();
+    const plain = await r.link.addCard({ text: "A tap of yours (time unknown). It was on your calendar and has since been taken off, so it isn't done again and there's no Go ahead.", rows: [], kind: "card" });
+    expect(r.state().cards[String(plain)]).toBeDefined();
   });
 
   test("the specialist's numbers aren't checked as machine text; its notes after a tap get only the fixes", async () => {

@@ -26,6 +26,7 @@ Step 2, the handover sweep:
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -1854,24 +1855,53 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
                     h.update(chunk)
             return h.hexdigest()
         if movable:
-            os.makedirs(dest, exist_ok=False)
-            copied = []
-            for name in movable:
-                src, dst = os.path.join(folder, name), os.path.join(dest, name)
-                shutil.copy2(src, dst)
-                with open(dst, "rb") as f:
-                    os.fsync(f.fileno())
-                if digest(src) != digest(dst):
-                    for c in copied + [dst]:
-                        _remove(c)
-                    return {"ok": False, "said": f"the copy of {name} didn't match it, so nothing was moved",
-                            "files": swap_files(base)}
-                copied.append(dst)
-            _fsync_dir(dest)
-            _fsync_dir(folder)
-            for name in movable:
-                os.remove(os.path.join(folder, name))
-            _fsync_dir(folder)
+            # Seventeenth round: a copy or fsync that fails (a full disk, most likely) or a copy that doesn't match
+            # takes back what it made (the partial copies, then the folder while empty) and leaves the originals
+            # and the marker as they were, with a plain reason; the command line then exits non-zero.
+            copied: list[str] = []
+
+            def take_back() -> None:
+                for c in copied:
+                    try:
+                        os.remove(c)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(dest)
+                except OSError:
+                    pass
+            try:
+                os.makedirs(dest, exist_ok=False)
+                for name in movable:
+                    src, dst = os.path.join(folder, name), os.path.join(dest, name)
+                    copied.append(dst)
+                    shutil.copy2(src, dst)
+                    with open(dst, "rb") as f:
+                        os.fsync(f.fileno())
+                    if digest(src) != digest(dst):
+                        take_back()
+                        return {"ok": False, "said": f"the copy of {name} didn't match it, so nothing was moved and "
+                                                     "the swap marker is as it was", "files": swap_files(base)}
+                _fsync_dir(dest)
+                _fsync_dir(folder)
+            except OSError as e:
+                take_back()
+                reason = ("the disk is full" if getattr(e, "errno", None) in (errno.ENOSPC, errno.EDQUOT)
+                          else f"a copy couldn't be made ({type(e).__name__})")
+                log.error("setting the swap's files aside failed: %s", reason)
+                return {"ok": False, "said": f"{reason}, so nothing was moved and the swap marker is as it was",
+                        "files": swap_files(base)}
+            try:
+                for name in movable:
+                    os.remove(os.path.join(folder, name))
+                _fsync_dir(folder)
+            except OSError as e:
+                # The copies are whole and checked, so they stay (the folder holds what was taken off); the marker
+                # is left as it was, so the swap isn't finished on a half-moved set.
+                log.error("an original couldn't be removed after its copy was made (%s)", type(e).__name__)
+                return {"ok": False, "said": f"the copies are in {os.path.basename(dest)}/, but an original couldn't be "
+                                             f"removed ({type(e).__name__}), so the swap marker is as it was",
+                        "files": swap_files(base)}
         plan = {k: v for k, v in plan.items() if k not in ("refused", "conflict")}
         _write_json(swap, plan)
         log.warning("files the restore swap refused were set aside in %s", os.path.basename(dest))
@@ -2124,17 +2154,38 @@ def _went_in_kept(kept: str, flag: str, text: str = "") -> bool:
     return False
 
 
-def held_messages(kept_path: str) -> list[tuple[str, str, bool]]:
+def held_messages(kept_path: str, now: str = "") -> list[tuple[str, str, bool, bool]]:
     """Sixteenth round: the messages a kept set still had queued when the records were put back (cards held by the
-    fence among them, the restart card's own turn included), not its own post-backs: (key, text, had buttons)."""
+    fence among them, the restart card's own turn included), not its own post-backs: (key, text, had buttons,
+    expired). Seventeenth round: a card whose buttons all ran out by `now` (an ISO time; the choices and approvals
+    it was bound to, read in the kept set) is time-bound and its time has passed: expired."""
     import sqlite3
-    out: list[tuple[str, str, bool]] = []
+    out: list[tuple[str, str, bool, bool]] = []
     if not os.path.isfile(kept_path):
         return out
     try:
         conn = sqlite3.connect(f"file:{kept_path}?mode=ro", uri=True)
     except sqlite3.Error:
         return out
+
+    def ran_out(binds_json) -> bool:
+        try:
+            binds = json.loads(binds_json or "[]")
+        except ValueError:
+            return False
+        ends = []
+        for b in binds if isinstance(binds, list) else []:
+            table = {"choice": "choices", "approval": "approvals"}.get((b or {}).get("type"))
+            if table is None:
+                return False
+            try:
+                row = conn.execute(f"SELECT expires_at FROM {table} WHERE nonce=?", (b.get("nonce"),)).fetchone()
+            except sqlite3.Error:
+                return False
+            if row is None or not row[0]:
+                return False
+            ends.append(str(row[0]))
+        return bool(ends) and bool(now) and all(_before(e, now) for e in ends)
     try:
         ours = set()
         for (value,) in conn.execute("SELECT value FROM meta WHERE key LIKE ?", (POSTED + "%",)).fetchall():
@@ -2142,13 +2193,13 @@ def held_messages(kept_path: str) -> list[tuple[str, str, bool]]:
                 ours.add(int(json.loads(value).get("outbox")))
             except (ValueError, TypeError, AttributeError):
                 pass
-        for rid, text, buttons in conn.execute("SELECT id, text, buttons_json FROM outbox WHERE state='queued' "
-                                               "ORDER BY id").fetchall():
+        for rid, text, buttons, binds in conn.execute(
+                "SELECT id, text, buttons_json, binds_json FROM outbox WHERE state='queued' ORDER BY id").fetchall():
             post_back = str(text).startswith(("<b>Harness's records are back from the backup</b>",
                                               "A request that was waiting in the records set aside",
                                               "<i>A message that was waiting to go out"))
             if rid not in ours and text and not post_back:
-                out.append((f"outbox:{rid}", str(text), bool(buttons)))
+                out.append((f"outbox:{rid}", str(text), bool(buttons), ran_out(binds)))
     except sqlite3.Error:
         pass
     finally:
@@ -2156,10 +2207,25 @@ def held_messages(kept_path: str) -> list[tuple[str, str, bool]]:
     return out
 
 
-def _held_message_text(text: str, buttons: bool) -> str:
-    return render.fit("<i>A message that was waiting to go out when the records were put back"
-                      + (" (its buttons belonged to the records set aside, so they're left off; Harness asks again "
-                         "where it still needs your answer)" if buttons else "") + ":</i>\n" + text)
+def _before(a: str, b: str) -> bool:
+    """Whether ISO time `a` is at or before ISO time `b`; False when either can't be read."""
+    try:
+        return datetime.fromisoformat(a) <= datetime.fromisoformat(b)
+    except (TypeError, ValueError):
+        return False
+
+
+def _held_message_text(text: str, buttons: bool, expired: bool = False) -> str:
+    """Seventeenth round: no promise that Harness asks again (nothing re-raises it); a card whose time has passed
+    says so, for the record only."""
+    if expired:
+        head = ("<i>A message that was waiting to go out when the records were put back. Its time has passed, so "
+                "it's here only for the record" + (" and its buttons are left off" if buttons else "") + ":</i>\n")
+    else:
+        head = ("<i>A message that was waiting to go out when the records were put back"
+                + (" (its buttons belonged to the records set aside, so they're left off)" if buttons else "")
+                + ":</i>\n")
+    return render.fit(head + text)
 
 
 def _post_back(ledger: Ledger, chat_id: int, tz: str, kept: str, frm: str) -> int:
@@ -2167,7 +2233,7 @@ def _post_back(ledger: Ledger, chat_id: int, tz: str, kept: str, frm: str) -> in
     still had queued, once. How many requests it holds."""
     name = os.path.basename(kept)
     items = held_items(kept, tz)
-    messages = held_messages(kept)
+    messages = held_messages(kept, iso(ledger.now()))
     mark_path = kept + POSTBACK
     mark = _read_json(mark_path)
     posted = list(mark.get("posted") or [])
@@ -2183,10 +2249,10 @@ def _post_back(ledger: Ledger, chat_id: int, tz: str, kept: str, frm: str) -> in
                    "follows, ready to copy into the calendar app." if items
                    else "No requests were waiting there."))
         if key.startswith("outbox:"):
-            return _held_message_text(lines[0], lines[1])
+            return _held_message_text(lines[0], lines[1], lines[2])
         return render.fit("A request that was waiting in the records set aside; ready to copy into the calendar "
                           "app:\n" + "\n".join(lines))
-    todo = [("summary", [])] + items + [(k, (t, b)) for k, t, b in messages]
+    todo = [("summary", [])] + items + [(k, (t, b, x)) for k, t, b, x in messages]
     for key, lines in todo:
         if key in posted:
             continue

@@ -494,6 +494,25 @@ class FamilyAdd:
         out, _ = self.client.fetch(self.client.href_for(caldav.uid_for(pid)))
         return {"ok": "done", "gone": "not_done"}.get(out.kind, "unread")
 
+    def undo_op(self, target: str) -> dict | None:
+        """Seventeenth round: his Undo on a Family add, named before it's acted on by the event it takes off (its
+        address, from the proposal) and the state it must read in afterwards: gone. None when nothing is open."""
+        row = self.ledger.db.execute("SELECT undo_state FROM family_adds WHERE proposal_id=?",
+                                     (str(target or ""),)).fetchone()
+        if row is None or row["undo_state"] != "open":
+            return None
+        return {"effect": "undo", "kind": "family_add_undo",
+                "steps": [{"cal": "family", "how": "delete", "href": self.client.href_for(caldav.uid_for(target))}]}
+
+    def undo_parts(self, op: dict) -> list[str]:
+        """The read of a Family Undo's identity: "done" when the event is gone, "not_done" when it's there,
+        "unread" when the calendar couldn't tell."""
+        got = []
+        for st in (op or {}).get("steps") or []:
+            out, _ = self.client.fetch(str(st.get("href") or ""))
+            got.append({"gone": "done", "ok": "not_done"}.get(out.kind, "unread"))
+        return got
+
     def _counted_uids(self, b: dict) -> list[str]:
         return [r["uid"] for r in self.ledger.db.execute(
             "SELECT uid FROM family_adds WHERE state IN ('created','written','unconfirmed') AND rowid>?",

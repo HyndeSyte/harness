@@ -53,7 +53,8 @@ def test_where_the_marker_sits_decides(text, counts):
 
 def test_ambiguous_evidence_keeps_the_mail():
     kinds = skip_kinds(None)
-    promo_lead = "Discover Subscribe & Save: deals on your favourites. Your delivery date has changed."
+    # Seventeenth round: promotion by its structure (an offer), not by a single word such as "deals".
+    promo_lead = "Subscribe & Save: save 15% on your favourites. Your delivery date has changed."
     assert skipped_kind(AMAZON, DELAY, kinds, body=lambda: promo_lead) == ""
     assert skipped_kind(AMAZON, DELAY, kinds, body=lambda: REAL) == BUILT_IN
     assert skipped_kind(AMAZON, "Subscribe & Save: " + DELAY, kinds, body=lambda: FOOTER) == BUILT_IN   # subject
