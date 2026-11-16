@@ -24,7 +24,9 @@ import logging
 import socket
 import ssl
 import threading
+import time
 import urllib.error
+from contextlib import contextmanager
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
@@ -98,6 +100,97 @@ class Transport(Protocol):
                 json_body: Any = None, timeout: float = 30) -> HttpResponse: ...
 
 
+# 0.24.0, fifth round: one total deadline for everything a calendar write sends from its thread
+# (calendar_change._bounded): connect, TLS, the request and the whole answer, every request it makes
+# (a sign-in, a name check, the write), and no retries. Set per thread; each request gets only what's
+# left, and a watchdog shuts its socket at the deadline, so a server that answers a byte at a time
+# can't keep the thread past it.
+_DEADLINE = threading.local()
+
+
+@contextmanager
+def deadline(seconds: float):
+    """Everything this thread sends inside it ends by `seconds` from now, answered or not."""
+    before = getattr(_DEADLINE, "at", None)
+    at = time.monotonic() + seconds
+    _DEADLINE.at = at if before is None else min(before, at)
+    try:
+        yield
+    finally:
+        _DEADLINE.at = before
+
+
+def remaining() -> float | None:
+    """Seconds left before this thread's deadline, or None when it has none."""
+    at = getattr(_DEADLINE, "at", None)
+    return None if at is None else at - time.monotonic()
+
+
+class _Watched:
+    """The sockets one request opened, shut by its watchdog at the deadline."""
+
+    def __init__(self):
+        self.socks: list = []
+        self.fired = False
+        self.lock = threading.Lock()
+
+    def add(self, sock) -> None:
+        with self.lock:
+            self.socks.append(sock)
+            fired = self.fired
+        if fired:
+            self._shut(sock)
+
+    def fire(self) -> None:
+        with self.lock:
+            self.fired = True
+            socks = list(self.socks)
+        for sock in socks:
+            self._shut(sock)
+
+    @staticmethod
+    def _shut(sock) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+_WATCHED = threading.local()
+
+
+def _watch(sock) -> None:
+    w = getattr(_WATCHED, "w", None)
+    if w is not None:
+        w.add(sock)
+
+
+class _WatchedHTTPS(http.client.HTTPSConnection):
+    def connect(self):
+        super().connect()
+        _watch(self.sock)
+
+
+class _WatchedHTTP(http.client.HTTPConnection):
+    def connect(self):
+        super().connect()
+        _watch(self.sock)
+
+
+class _WatchedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_WatchedHTTPS, req, context=self._context)
+
+
+class _WatchedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_WatchedHTTP, req)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None                     # the 3xx comes back as an answer, not a new request
@@ -112,10 +205,36 @@ class UrllibTransport:
         if not follow_redirects:
             handlers.append(_NoRedirect())
         ctx = ssl.create_default_context(cafile=cafile)
-        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        handlers.append(_WatchedHTTPSHandler(context=ctx))
+        handlers.append(_WatchedHTTPHandler())
         self._opener = urllib.request.build_opener(*handlers)
 
     def request(self, method, url, *, headers=None, json_body=None, body=None, timeout=30):
+        left = remaining()
+        if left is None:
+            return self._request(method, url, headers=headers, json_body=json_body, body=body, timeout=timeout)
+        if left <= 0:
+            raise TransportError("timeout", "deadline")      # nothing was sent
+        w = _Watched()
+        _WATCHED.w = w
+        timer = threading.Timer(left, w.fire)
+        timer.daemon = True
+        timer.start()
+        try:
+            answer = self._request(method, url, headers=headers, json_body=json_body, body=body,
+                                   timeout=min(timeout, left))
+            if w.fired:                      # cut off at the deadline: what came isn't a whole answer
+                raise TransportError("timeout", "deadline")
+            return answer
+        except Exception:                    # a socket shut under a read can surface as anything
+            if w.fired:
+                raise TransportError("timeout", "deadline") from None
+            raise
+        finally:
+            timer.cancel()
+            _WATCHED.w = None
+
+    def _request(self, method, url, *, headers=None, json_body=None, body=None, timeout=30):
         data = body
         hdrs = dict(headers or {})
         if json_body is not None:

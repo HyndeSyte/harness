@@ -670,8 +670,10 @@ class Runner:
         one after all (calendar_change._execute): it comes on his card, saying why, and nothing is
         written. The proposal it was is replaced by one compare-and-set, so it can't also run."""
         with self.ledger.tx() as db:
-            took = db.execute("UPDATE proposals SET state='superseded' WHERE id=? AND state='auto_approved'",
-                              (p["id"],)).rowcount == 1
+            # Also his tapped change when writes are paused (0.24.0, fifth round: too many writes still
+            # running), by the same compare-and-set on the state it was read in.
+            took = db.execute("UPDATE proposals SET state='superseded' WHERE id=? AND state=? AND state IN"
+                              " ('auto_approved','approved')", (p["id"], p["state"])).rowcount == 1
             if took:
                 self.ledger.event("fast_path_to_card", {"proposal": p["id"], "why": why[:80]}, db=db)
         if not took:

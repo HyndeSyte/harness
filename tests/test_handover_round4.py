@@ -434,7 +434,7 @@ def test_not_confirmed_is_read_again_and_confirmed_with_a_follow_up(m, monkeypat
     m.tells("add the dentist at 3 today", ask(DENTIST))
     assert m.seen()[-1].startswith("Not confirmed.") and rows(m)[-1]["state"] == "unverified"
     plan = json.loads(rows(m)[-1]["settle_json"])
-    assert len(plan["recheck"]) == 2
+    assert len(plan["recheck"]) == 3                          # 30 seconds, 2 minutes, the long window (fifth round)
     m.clock.t += timedelta(seconds=10)
     m.c.tick()
     assert rows(m)[-1]["state"] == "unverified"              # not due yet
@@ -445,7 +445,9 @@ def test_not_confirmed_is_read_again_and_confirmed_with_a_follow_up(m, monkeypat
     assert len([x for x in m.gmail.log if x[0] == "insert"]) == 1
 
 
-def test_not_confirmed_twice_more_is_settled_as_absent_and_never_written_again(m, monkeypatch):
+def test_not_confirmed_twice_more_is_not_seen_yet_and_never_written_again(m, monkeypatch):
+    """Fifth round: two minutes on it's "not seen yet", never a settled "not done"; the long window
+    follows (test_handover_round5)."""
     _hide_dentist_from_day_reads(m, monkeypatch)
     m.tells("add the dentist at 3 today", ask(DENTIST))
     assert rows(m)[-1]["state"] == "unverified"
@@ -456,8 +458,8 @@ def test_not_confirmed_twice_more_is_settled_as_absent_and_never_written_again(m
     assert rows(m)[-1]["state"] == "unverified" and len(m.seen()) == seen     # said nothing yet
     m.clock.t += timedelta(minutes=2)
     m.c.tick()
-    assert rows(m)[-1]["state"] == "absent"
-    assert m.seen()[-1].startswith("Not done: Add Dentist") and "nothing is written again" in m.seen()[-1]
+    assert rows(m)[-1]["state"] == "unverified"
+    assert m.seen()[-1].startswith("Not seen yet: Add Dentist") and "Nothing is written again" in m.seen()[-1]
     m.clock.t += timedelta(minutes=5)
     m.c.tick()
     assert len([x for x in m.gmail.log if x[0] == "insert"]) == 1

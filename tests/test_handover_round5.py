@@ -58,7 +58,8 @@ from datetime import timedelta  # noqa: E402
 from test_discord_keeper import OWNER  # noqa: E402
 from test_plain_commands import (FAMILY_PATH, GMAIL, TZ, Morning, at, ask, change,  # noqa: E402,F401
                                  nothing_he_shouldnt_see, plain_prompt)  # noqa: F401  (autouse)
-from test_handover_round4 import _lapse_and_reoffer, rows  # noqa: E402
+from test_handover_round4 import DENTIST, _hide_dentist_from_day_reads, _lapse_and_reoffer, dentists, rows  # noqa: E402
+from fake_caldav import no_network  # noqa: E402,F401  (autouse)
 
 
 @pytest.fixture
@@ -318,3 +319,159 @@ def test_a_late_icloud_add_refused_because_the_newer_card_wrote_it_reads_as_ther
     assert m.ledger.db.execute("SELECT state FROM calendar_changes WHERE proposal_id=?",
                                (first,)).fetchone()[0] == "landed_late"
     assert len([p for p in m.icloud.events if "/hm-" in p]) == 1
+
+
+# -- 3. a bounded write lifetime, and follow-up reads after a lapse --------------------------------
+
+import time  # noqa: E402
+
+from harness import caldav, net  # noqa: E402
+
+
+def test_a_write_that_stalls_in_connect_ends_by_itself_at_its_deadline(m, monkeypatch):
+    """A transport that honours the thread's deadline (net.deadline): the write is abandoned at its
+    wait and its thread ends by itself at the deadline, answered or not."""
+    left = []
+
+    def stalls(address, event):
+        left.append(net.remaining())
+        time.sleep(max(0.0, net.remaining() or 0))       # connect never completes before the deadline
+        return caldav.Outcome("unknown")
+    monkeypatch.setattr(m.gmail, "insert", stalls)
+    m.cc.write_timeout_s, m.cc.write_deadline_s = 0.05, 0.3
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert rows(m)[-1]["state"] == "settling" and left and left[0] <= 0.3
+    assert m.cc.live_abandoned() == 1
+    time.sleep(0.5)
+    assert m.cc.live_abandoned() == 0                    # it ended by itself
+    assert calendar_change.WRITE_DEADLINE_S == 45 < calendar_change.LEASE_S
+
+
+def test_the_lease_is_never_read_as_run_out_before_the_last_writes_deadline(m, monkeypatch):
+    gate, calls = __import__("test_handover_round4").hang_first_insert(m, monkeypatch)
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    pid = rows(m)[-1]["proposal_id"]
+    m.clock.t += timedelta(minutes=3)                    # the lease has run out ...
+    plan = json.loads(rows(m)[-1]["settle_json"])
+    plan["read_at"] = (m.clock() - timedelta(seconds=10)).isoformat()   # ... but a write went out 10 s ago
+    with m.ledger.tx() as db:
+        db.execute("UPDATE calendar_changes SET settle_json=? WHERE proposal_id=?", (json.dumps(plan), pid))
+    reads = []
+    real = m.gmail.events_between
+    monkeypatch.setattr(m.gmail, "events_between", lambda *a, **k: reads.append(1) or real(*a, **k))
+    assert m.cc.lease_state(pid) == "live" and not reads
+    m.clock.t += timedelta(seconds=40)
+    assert m.cc.lease_state(pid) != "live" and reads
+    gate.set()
+    m.cc.join_abandoned()
+
+
+def test_a_write_that_commits_with_no_answer_ever_is_read_as_done(m, monkeypatch):
+    real = m.gmail.insert
+
+    def commits_silently(address, event):
+        real(address, event)                             # Google writes it ...
+        time.sleep(max(0.0, net.remaining() or 0))       # ... and its answer never arrives
+        return caldav.Outcome("unknown")
+    monkeypatch.setattr(m.gmail, "insert", commits_silently)
+    m.cc.write_timeout_s, m.cc.write_deadline_s = 0.05, 0.2
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert rows(m)[-1]["state"] == "settling"
+    settle(m)
+    assert rows(m)[-1]["state"] == "done" and m.seen()[-1].startswith("Done.") and "Undo" in m.labels()
+    assert len(dentists(m)) == 1
+    time.sleep(0.3)
+
+
+def test_a_lapsed_change_that_appears_on_a_later_read_is_done_after_all_with_undo(m, monkeypatch):
+    gate, calls, first, newer = _lapse_and_reoffer(m, monkeypatch)
+    plan = json.loads(m.ledger.db.execute("SELECT settle_json FROM calendar_changes WHERE proposal_id=?",
+                                          (first,)).fetchone()[0])
+    assert len(plan["recheck"]) == 3 and plan["lapsed_at"]      # read again like one not confirmed
+    # Google committed the first write, but its answer never came back: it shows on a later read.
+    m.gmail.events[calls[0]] = {"id": calls[0], "summary": "Dentist", "status": "confirmed", "etag": '"late"',
+                                "start": {"dateTime": at(15).isoformat(), "timeZone": TZ},
+                                "end": {"dateTime": at(16).isoformat(), "timeZone": TZ}}
+    settle(m, minutes=0.6, ticks=1)
+    m.c.outbox.flush()
+    said = [t for t in m.seen() if t.startswith("Done after all")]
+    assert said and "the newer card is off" in said[-1] and "Undo" in m.labels()
+    assert m.ledger.db.execute("SELECT state FROM proposals WHERE id=?", (newer,)).fetchone()[0] == "superseded"
+    assert m.ledger.db.execute("SELECT state FROM calendar_changes WHERE proposal_id=?",
+                               (first,)).fetchone()[0] == "landed_late"
+    gate.set()
+    m.cc.join_abandoned()
+    m.c.tick()
+    assert len(dentists(m)) == 1
+
+
+def test_at_the_cap_of_running_writes_new_writes_wait_on_a_card(m):
+    hold = threading.Event()
+    for _ in range(calendar_change.MAX_ABANDONED):
+        t = threading.Thread(target=hold.wait, args=(10,), daemon=True)
+        t.start()
+        m.cc.abandoned.append(t)
+    try:
+        out = m.tells("add the dentist at 3 today", ask(DENTIST))
+        assert not dentists(m) and out["status"] != "executed"
+        assert "writes to your calendars are paused" in m.seen()[-1] and "Approve" in m.labels()
+    finally:
+        hold.set()
+        m.cc.join_abandoned()
+    m.tap("Approve")                                     # they've finished: his tap writes it
+    assert len(dentists(m)) == 1
+
+
+# -- 4. not observed is not failure ----------------------------------------------------------------
+
+def test_not_seen_is_said_as_not_seen_yet_then_not_found_by_id_and_a_later_appearance_is_done_after_all(m, monkeypatch):
+    _hide_dentist_from_day_reads(m, monkeypatch)
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    pid = rows(m)[-1]["proposal_id"]
+    uid = next(k for k, e in m.gmail.events.items() if e.get("summary") == "Dentist")
+    kept = m.gmail.events.pop(uid)                       # not there by id either
+    settle(m, minutes=0.6, ticks=1)
+    settle(m, minutes=2, ticks=1)
+    assert m.seen()[-1].startswith("Not seen yet: Add Dentist") and "in about 7 minutes" in m.seen()[-1]
+    assert not any(t.startswith("Not done") for t in m.seen())
+    lists, looks = [], []
+    real_list, real_look = m.gmail.events_between, m.gmail.look
+    monkeypatch.setattr(m.gmail, "events_between", lambda *a, **k: lists.append(1) or real_list(*a, **k))
+    monkeypatch.setattr(m.gmail, "look", lambda a, u: looks.append(u) or real_look(a, u))
+    settle(m, minutes=8, ticks=1)                        # the long window's read: by id, not a list
+    assert uid in looks and not lists
+    assert rows(m)[-1]["state"] == "absent"
+    assert m.seen()[-1].startswith("Not found: Add Dentist") and "Its event id is kept" in m.seen()[-1]
+    plan = json.loads(rows(m)[-1]["settle_json"])
+    assert plan["parts"][0]["expect"][0]["id"] == uid and plan["watch_next"]
+    m.gmail.events[uid] = kept                           # it shows up later after all
+    settle(m, minutes=31, ticks=1)
+    assert m.seen()[-1].startswith("Done after all: Add Dentist") and "Undo" in m.labels()
+    assert m.ledger.db.execute("SELECT state FROM calendar_changes WHERE proposal_id=?",
+                               (pid,)).fetchone()[0] == "landed_late"
+    assert len([x for x in m.gmail.log if x[0] == "insert"]) == 1     # never written again
+
+
+def test_the_long_window_comes_from_the_smoke_tests_record(m, monkeypatch):
+    m.ledger.set_meta(calendar_change.LATE_READ, "900")
+    _hide_dentist_from_day_reads(m, monkeypatch)
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    plan = json.loads(rows(m)[-1]["settle_json"])
+    from datetime import datetime
+    last = datetime.fromisoformat(plan["recheck"][-1]) - m.clock()
+    assert 899 <= last.total_seconds() <= 901
+
+
+def test_unresolved_follow_ups_carry_on_after_a_restart(m, monkeypatch):
+    _hide_dentist_from_day_reads(m, monkeypatch)
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    uid = next(k for k, e in m.gmail.events.items() if e.get("summary") == "Dentist")
+    m.gmail.events.pop(uid)
+    settle(m, minutes=2.6, ticks=2)
+    # Harness restarts: a new instance reads only the ledger.
+    from harness.calendar_change import CalendarChange
+    cc = CalendarChange(m.ledger, m.client, m.gmail, enabled=lambda: True, address=lambda: GMAIL, tz=TZ)
+    cc.bind(OWNER)
+    m.clock.t += timedelta(minutes=8)
+    cc.run_pending(paused=False)
+    assert rows(m)[-1]["state"] == "absent"

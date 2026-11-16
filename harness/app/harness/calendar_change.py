@@ -60,7 +60,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from . import (caldav, choices, commands, effects, family_copy, family_rules, google_cal, ical, ics_edit,
-               provenance, render)
+               net, provenance, render)
 from .canonical import canonical_hash
 from .family_add import GAVE_UP_WORDS, _looks_pasted, gave_up, read_due
 from .ledger import Ledger, iso
@@ -100,9 +100,25 @@ LEASE_S = 120
 # abandoned after it (_bounded): it's then a write whose answer was lost, settled by reading. A
 # write that answers after its change lapsed is fenced out by its token (_drain_late).
 WRITE_TIMEOUT_S = 30
-# A change the read back doesn't show is read again, in the background, this long after its
-# receipt: confirmed then, with a follow-up receipt, or settled as absent after the last.
+# 0.24.0, fifth round: one total deadline for everything a write's thread sends (connect, TLS, the
+# request and the whole answer; every request it makes; no retries), enforced in that thread by the
+# transport (net.deadline), so an abandoned write ends by itself. Well under the lease, and a
+# change's lease is never read as run out until this long after its last write was sent.
+WRITE_DEADLINE_S = 45
+# Writes abandoned and still running at once, at most: at this many, new writes wait, and the change
+# comes back on a card saying writes are paused.
+MAX_ABANDONED = 3
+# A change the read back doesn't show, or one whose lease ran out, is read again in the background
+# this long after: about 30 seconds and 2 minutes on, then once more after the long window
+# (LATE_READ_S, which the smoke test's record sizes from the listing lag it saw; 10 minutes until
+# then), that last read by the event's id where the calendar can. Only after it is it said as not
+# found, and its event ids are still read for (WATCH_EVERY, for a week): one that shows up later is
+# Done after all, with Undo.
 RECHECK_S = (30, 120)
+LATE_READ = "calendar_late_read_s"
+LATE_READ_S = 600
+WATCH_EVERY = timedelta(minutes=30)
+WATCH_FOR = timedelta(days=7)
 # A read back that disagrees is read once more, this long after, asking past any cache (_read_back).
 READ_BACK_PAUSE_S = 3
 READ_BACK_DAYS = 60                    # how far on a series's end is read back
@@ -140,6 +156,15 @@ def fast_path(ledger: Ledger) -> dict:
     except ValueError:
         return {}
     return got if isinstance(got, dict) else {}
+
+
+def late_read_s(ledger: Ledger) -> int:
+    """The long window's read, in seconds after the receipt or the lapse (LATE_READ)."""
+    try:
+        got = int(ledger.get_meta(LATE_READ) or LATE_READ_S)
+    except ValueError:
+        return LATE_READ_S
+    return max(RECHECK_S[-1] + 60, min(got, 3600))
 
 
 def fast_path_on(ledger: Ledger) -> bool:
@@ -425,6 +450,7 @@ class CalendarChange:
         self._putting_back: tuple | None = None    # a half-done part being put back: (proposal, plan)
         self._forcing = False                  # planning an Add anyway: no already-there check
         self.write_timeout_s = WRITE_TIMEOUT_S
+        self.write_deadline_s = WRITE_DEADLINE_S
         # Writes abandoned at their timeout that answered later: (proposal, fence, calendar, outcome),
         # put here by the write's own thread and handled on the controller's (_drain_late).
         self._late: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
@@ -961,6 +987,11 @@ class CalendarChange:
         if (self.ledger.now() - since).total_seconds() < LEASE_S:
             return "live"
         plan = _plan(row) if row is not None else {}
+        # Never read as run out while a write of it could still be on its way (0.24.0, fifth round):
+        # not before its last write's deadline has passed (the write's own thread ends by then).
+        sent = plan.get("read_at")
+        if sent and (self.ledger.now() - datetime.fromisoformat(sent)).total_seconds() < self.write_deadline_s:
+            return "live"
         parts = plan.get("parts") or []
         # Never lapsed on one read (0.24.0, fourth round): two reads, a few seconds apart, must both
         # answer and both find it not done. One that can't be read leaves it in progress ("unsure").
@@ -979,6 +1010,13 @@ class CalendarChange:
             with self.ledger.tx() as db:
                 db.execute("UPDATE proposals SET state='failed' WHERE id=? AND state IN"
                            " ('approved','auto_approved','executing')", (proposal_id,))
+                if row is not None and plan.get("parts"):
+                    # Read again like a change not confirmed (fifth round): 30 seconds, 2 minutes, the long
+                    # window, then watched by id; one that shows up is Done after all (_recheck_unverified).
+                    self._schedule_reads(plan, list(range(len(plan["parts"]))))
+                    plan["lapsed_at"] = iso(self.ledger.now())
+                    db.execute("UPDATE calendar_changes SET settle_json=? WHERE proposal_id=?",
+                               (json.dumps(plan), proposal_id))
                 db.execute("UPDATE calendar_changes SET state='lapsed', updated_at=? WHERE proposal_id=?"
                            " AND state IN ('sending','settling')", (iso(self.ledger.now()), proposal_id))
                 # Its fencing token is retired: a write of it that answers from now on is fenced out
@@ -1147,6 +1185,12 @@ class CalendarChange:
         # still his newest and fresh (a read of the DM just now), and, in the same transaction that
         # takes the change, no card open or replaced for it. Either fails: his card, nothing written.
         why = self._fast_path_holds(p)
+        if not why and self.live_abandoned() >= MAX_ABANDONED:
+            # 0.24.0, fifth round: too many writes still running past their wait. No new write goes
+            # out; the change comes back on a card saying writes are paused.
+            why = ("writes to your calendars are paused: earlier writes haven't answered yet, and each ends "
+                   f"by itself within {self.write_deadline_s} seconds")
+            log.warning("%d abandoned writes still running: writes paused", self.live_abandoned())
         # Recorded before anything else, so a crash from here on can never run it twice.
         now = iso(self.ledger.now())
         with self.ledger.tx() as db:
@@ -1274,7 +1318,8 @@ class CalendarChange:
 
         def run() -> None:
             try:
-                box["out"] = call(*args)
+                with net.deadline(self.write_deadline_s):
+                    box["out"] = call(*args)
             except BaseException as e:          # handed to the caller, or logged once abandoned
                 box["err"] = e
             with lock:
@@ -1286,6 +1331,7 @@ class CalendarChange:
                                 if "err" in box else "", getattr(call, "__name__", "")))
 
         t = threading.Thread(target=run, name=f"calendar-write-{calendar}", daemon=True)
+        t.pid = pid                              # type: ignore[attr-defined]
         t.start()
         if not done.wait(self.write_timeout_s):
             with lock:
@@ -1427,12 +1473,21 @@ class CalendarChange:
 
     def _landed_late(self, pid: str, fence: str, already: bool) -> None:
         row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()
-        p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
-        if row is None or p is None or row["state"] != "lapsed":
+        if row is None or row["state"] != "lapsed":
             return
         plan = _plan(row)
         entries = [rec["entry"] for part in plan.get("parts", []) for rec in part["steps"]
                    if rec.get("entry") and rec.get("fence") == fence]
+        self._done_after_all(pid, plan, [] if already else entries, already=already)
+
+    def _done_after_all(self, pid: str, plan: dict, entries: list[dict], already: bool = False) -> None:
+        """A change that lapsed, or was said as not found, that the calendar now shows (a write that
+        answered late, or a later read): Done after all, with Undo for what it wrote, and the card that
+        offered it again comes off, so there's never a second one (0.24.0, fourth and fifth rounds)."""
+        row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()
+        p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+        if row is None or p is None or row["state"] not in ("lapsed", "absent"):
+            return
         newer = self.ledger.get_meta(f"calendar_change_reoffer:{pid}")
         with self.ledger.tx() as db:
             took_card = False
@@ -1446,21 +1501,32 @@ class CalendarChange:
                         self.ledger.transition(job[0], "cancelled", db=db,
                                                receipt=json.dumps({"reason": "landed_late"}))
             undo = json.loads(row["undo_json"] or "[]")
-            if not already:
-                undo += [e for e in entries if e not in undo]
+            undo += [e for e in entries if e not in undo]
             plan["landed_late"] = iso(self.ledger.now())
+            plan.pop("recheck", None)
+            plan.pop("watch_next", None)
             db.execute("UPDATE calendar_changes SET state='landed_late', undo_json=?, undo_state=?, settle_json=?,"
-                       " updated_at=? WHERE proposal_id=? AND state='lapsed'",
-                       (json.dumps(undo), "open" if undo and not already else row["undo_state"], json.dumps(plan),
+                       " updated_at=? WHERE proposal_id=? AND state IN ('lapsed','absent')",
+                       (json.dumps(undo), "open" if undo else row["undo_state"], json.dumps(plan),
                         iso(self.ledger.now()), pid))
+            db.execute("UPDATE proposals SET state='executed' WHERE id=? AND state='failed'", (pid,))
             self.ledger.event("calendar_change_landed_late", {"proposal": pid, "card_off": took_card}, db=db)
             if took_card or not already:
                 names = "; ".join(part["will"] for part in plan.get("parts", []) if part.get("will"))
-                words = (f"<b>Done after all:</b> {names}. That write went through late, after I'd offered it "
-                         "again" + (", so the newer card is off and nothing is added twice." if took_card else
-                                    "; the newer one found it there, so it's on the calendar once."))
-                buttons, binds = self._undo_button(db, pid) if undo and not already else (None, None)
+                if row["state"] == "absent":
+                    words = f"<b>Done after all:</b> {names}. A later read of the calendar shows it as asked."
+                else:
+                    words = (f"<b>Done after all:</b> {names}. That went through late, after I'd offered it "
+                             "again" + (", so the newer card is off and nothing is added twice." if took_card else
+                                        "; the newer one found it there, so it's on the calendar once."
+                                        if already else "."))
+                buttons, binds = self._undo_button(db, pid) if undo else (None, None)
                 self._say(db, self.chat_id, p["job_id"], words, buttons=buttons, binds=binds)
+
+    def live_abandoned(self, pid: str | None = None) -> int:
+        """Abandoned writes still running (of one change, given `pid`)."""
+        self.abandoned = [t for t in self.abandoned if t.is_alive()]
+        return sum(1 for t in self.abandoned if pid is None or getattr(t, "pid", None) == pid)
 
     def join_abandoned(self, timeout: float = 5.0) -> None:
         """Tests: wait for abandoned writes to answer."""
@@ -1654,11 +1720,9 @@ class CalendarChange:
                 row = db.execute("SELECT settle_json FROM calendar_changes WHERE proposal_id=?", (p["id"],)).fetchone()
                 plan = json.loads(row[0]) if row and row[0] else {}
                 if plan.get("parts") and len(plan["parts"]) == len(results):
-                    base = self.ledger.now()
-                    plan["recheck"] = [iso(base + timedelta(seconds=x)) for x in RECHECK_S]
-                    plan["unverified"] = [i for i, (_, lnd, st, _) in enumerate(results)
-                                          if st is not None and (st.kind == "read_back"
-                                                                 or (st.kind == "fenced" and not lnd))]
+                    self._schedule_reads(plan, [i for i, (_, lnd, st, _) in enumerate(results)
+                                                if st is not None and (st.kind == "read_back"
+                                                                       or (st.kind == "fenced" and not lnd))])
                     self._save_plan(p["id"], plan, db)
             if ok:
                 db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
@@ -1727,45 +1791,190 @@ class CalendarChange:
         log.info("calendar change job %s: %s, %d of %d part(s) done, %d write(s)",
                  render.short(p["job_id"]), kind, len(done), len(results), len(undo))
 
+    def _schedule_reads(self, plan: dict, parts: list[int]) -> None:
+        """A change not confirmed, or whose lease ran out: read again about 30 seconds and 2 minutes on,
+        then once more after the long window (late_read_s), the last by id (0.24.0, fifth round)."""
+        base = self.ledger.now()
+        plan["recheck"] = [iso(base + timedelta(seconds=x)) for x in (*RECHECK_S, late_read_s(self.ledger))]
+        plan["unverified"] = parts
+        plan.pop("told_not_yet", None)
+
     def _recheck_unverified(self) -> None:
-        """Changes kept as not confirmed, read again about 30 seconds and 2 minutes after their
-        receipt (0.24.0, fourth round): a read that now shows each part as asked confirms it, with a
-        follow-up receipt; after the last read, one that still doesn't is settled as absent, said
-        once. A read that can't tell waits for the next. Nothing is written either way."""
+        """Changes kept as not confirmed, and changes whose lease ran out, read again in the background
+        (0.24.0, fourth and fifth rounds): about 30 seconds and 2 minutes on, then after the long
+        window, by the event's id where the calendar can. A read that shows each part as asked confirms
+        it: "Confirmed." for one not confirmed, "Done after all" with Undo for one that lapsed. Not seen
+        by 2 minutes is said once as not seen yet, to be read for again; not seen by the long window is
+        said once as not found, and its event ids are still read for, every 30 minutes for a week, so a
+        later appearance is Done after all with Undo. A read that can't tell waits for the next. Nothing
+        is written either way, and all of it is in the ledger, so a restart goes on where it was."""
         now = self.ledger.now()
-        for row in self.ledger.db.execute("SELECT * FROM calendar_changes WHERE state='unverified'").fetchall():
+        for row in self.ledger.db.execute(
+                "SELECT * FROM calendar_changes WHERE state IN ('unverified','lapsed','absent')").fetchall():
             plan = _plan(row)
             due = plan.get("recheck") or []
-            if not due or datetime.fromisoformat(due[0]) > now:
-                continue
-            parts = [plan["parts"][i] for i in plan.get("unverified", []) if i < len(plan.get("parts", []))]
-            verdict = self._reads_done(parts) if parts else "unread"
-            rest = due[1:]
-            log.info("calendar change %s: not confirmed, read again: %s", render.short(row["proposal_id"]), verdict)
-            plan["recheck"] = rest
-            with self.ledger.tx() as db:
-                if verdict == "done":
-                    plan.pop("recheck", None)
-                    db.execute("UPDATE calendar_changes SET state='done', settle_json=?, updated_at=? WHERE"
-                               " proposal_id=? AND state='unverified'", (json.dumps(plan), iso(now), row["proposal_id"]))
-                    db.execute("UPDATE proposals SET state='executed' WHERE id=? AND state='failed'",
-                               (row["proposal_id"],))
-                    db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
-                    self.ledger.event("calendar_change_confirmed_later", {"proposal": row["proposal_id"]}, db=db)
-                    self._say(db, self.chat_id, row["job_id"], "<b>Confirmed.</b> A later read of the calendar "
-                              "shows it as asked: " + "; ".join(part["will"] for part in parts) + ".")
-                elif not rest and verdict == "not_done":
+            watch = plan.get("watch_next")
+            if due and datetime.fromisoformat(due[0]) <= now:
+                self._follow_up(row, plan, due, now)
+            elif not due and watch and datetime.fromisoformat(watch) <= now:
+                self._watch(row, plan, now)
+
+    def _parts_followed(self, plan: dict) -> list[dict]:
+        return [plan["parts"][i] for i in plan.get("unverified", []) if i < len(plan.get("parts", []))]
+
+    def _follow_up(self, row, plan: dict, due: list[str], now: datetime) -> None:
+        pid = row["proposal_id"]
+        parts = self._parts_followed(plan)
+        last = len(due) == 1
+        verdict = (self._by_id_done(parts) if last else self._reads_done(parts)) if parts else "unread"
+        rest = due[1:]
+        log.info("calendar change %s: %s, read again%s: %s", render.short(pid), row["state"],
+                 " by id" if last else "", verdict)
+        plan["recheck"] = rest
+        if verdict == "done":
+            plan.pop("recheck", None)
+            if row["state"] == "unverified":
+                self._confirmed(row, plan, parts)
+            else:
+                self._done_after_all(pid, plan, self._sent_entries(plan, row))
+            return
+        with self.ledger.tx() as db:
+            if not rest and verdict == "not_done":
+                plan["watch_next"] = iso(now + WATCH_EVERY)
+                plan["watch_until"] = iso(now + WATCH_FOR)
+                if row["state"] == "unverified":
                     db.execute("UPDATE calendar_changes SET state='absent', settle_json=?, updated_at=? WHERE"
-                               " proposal_id=? AND state='unverified'", (json.dumps(plan), iso(now), row["proposal_id"]))
-                    self.ledger.event("calendar_change_absent", {"proposal": row["proposal_id"]}, db=db)
+                               " proposal_id=? AND state='unverified'", (json.dumps(plan), iso(now), pid))
+                    self.ledger.event("calendar_change_absent", {"proposal": pid}, db=db)
                     undo = row["undo_state"] == "open"
-                    buttons, binds = self._undo_button(db, row["proposal_id"]) if undo else (None, None)
-                    self._say(db, self.chat_id, row["job_id"], "<b>Not done:</b> " + "; ".join(
-                        part["will"] for part in parts) + ". A read two minutes on still doesn't show it, so it's "
-                        "settled as not on the calendar, and nothing is written again."
+                    buttons, binds = self._undo_button(db, pid) if undo else (None, None)
+                    minutes = max(1, round(late_read_s(self.ledger) / 60))
+                    self._say(db, self.chat_id, row["job_id"], "<b>Not found:</b> " + "; ".join(
+                        part["will"] for part in parts) + f". Reads over {minutes} minutes, the last by its own "
+                        "id, don't show it on the calendar, so nothing more is said about it and nothing is "
+                        "written again. Its event id is kept: if it shows up later, you'll hear."
                         + (" Undo puts back what did go through." if undo else ""), buttons=buttons, binds=binds)
                 else:
-                    self._save_plan(row["proposal_id"], plan, db)
+                    self._save_plan(pid, plan, db)     # lapsed: its card offered again is what he sees
+                return
+            if row["state"] == "unverified" and len(rest) == 1 and verdict == "not_done" \
+                    and not plan.get("told_not_yet"):
+                # Not "not done" (fifth round): not seen yet, and read for again.
+                plan["told_not_yet"] = iso(now)
+                minutes = max(1, round((datetime.fromisoformat(rest[0]) - now).total_seconds() / 60))
+                self._say(db, self.chat_id, row["job_id"], "<b>Not seen yet:</b> " + "; ".join(
+                    part["will"] for part in parts) + ". A read two minutes on doesn't show it yet, so I'll read "
+                    f"the calendar for it again in about {minutes} minutes. Nothing is written again.")
+            self._save_plan(pid, plan, db)
+
+    def _confirmed(self, row, plan: dict, parts: list[dict]) -> None:
+        now = self.ledger.now()
+        with self.ledger.tx() as db:
+            db.execute("UPDATE calendar_changes SET state='done', settle_json=?, updated_at=? WHERE"
+                       " proposal_id=? AND state='unverified'", (json.dumps(plan), iso(now), row["proposal_id"]))
+            db.execute("UPDATE proposals SET state='executed' WHERE id=? AND state='failed'",
+                       (row["proposal_id"],))
+            db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
+            self.ledger.event("calendar_change_confirmed_later", {"proposal": row["proposal_id"]}, db=db)
+            self._say(db, self.chat_id, row["job_id"], "<b>Confirmed.</b> A later read of the calendar "
+                      "shows it as asked: " + "; ".join(part["will"] for part in parts) + ".")
+
+    def _watch(self, row, plan: dict, now: datetime) -> None:
+        """A change said as not found, or whose lease ran out, still read for by its event ids, every 30
+        minutes for a week (fifth round). One that shows up is Done after all, with Undo. One a newer
+        card already did is left to that card."""
+        pid = row["proposal_id"]
+        newer = self.ledger.get_meta(f"calendar_change_reoffer:{pid}")
+        if newer:
+            st = self.ledger.db.execute("SELECT state FROM proposals WHERE id=?", (newer,)).fetchone()
+            if st is not None and st["state"] in ("approved", "auto_approved", "executing", "executed"):
+                plan.pop("watch_next", None)
+                self._save_plan(pid, plan)
+                return
+        verdict = self._by_id_done(self._parts_followed(plan))
+        if verdict == "done":
+            plan.pop("watch_next", None)
+            self._done_after_all(pid, plan, self._sent_entries(plan, row))
+            return
+        until = plan.get("watch_until")
+        plan["watch_next"] = iso(now + WATCH_EVERY) if not until or datetime.fromisoformat(until) > now else None
+        if not plan["watch_next"]:
+            plan.pop("watch_next")
+        self._save_plan(pid, plan)
+
+    @staticmethod
+    def _sent_entries(plan: dict, row) -> list[dict]:
+        """What Undo puts back of a change the calendar now shows: what it recorded as landed, and every
+        write it sent and never heard back from."""
+        undo = json.loads(row["undo_json"] or "[]")
+        for part in plan.get("parts", []):
+            for rec in part.get("steps", []):
+                e = rec.get("entry")
+                if e and rec.get("status") in ("landed", "trying", "unsure") and e not in undo:
+                    undo.append(e)
+        return undo
+
+    def _by_id_done(self, parts: list[dict]) -> str:
+        """The long window's read (fifth round): each part read by its event's id where the calendar can
+        (an add at its fixed id, a moved event by its id, a removed one by its id), not a list; a series
+        ended is read the usual way. "done", "not_done" or "unread"."""
+        if not parts:
+            return "unread"
+        unread = False
+        for part in parts:
+            if part.get("already"):
+                continue
+            for e in part.get("expect") or []:
+                got = self._one_by_id(e)
+                if got == "unread":
+                    unread = True
+                elif got == "not_done":
+                    return "not_done"
+        return "unread" if unread else "done"
+
+    def _one_by_id(self, e: dict) -> str:
+        kind = e.get("kind")
+        try:
+            if kind == "there":
+                same = self._by_id(e, whole=True, recurring=e.get("repeats") if "repeats" in e else None)
+                return "done" if same == "same" else "not_done"
+            if kind == "ended":
+                return {"done": "done", "not_done": "not_done"}.get(self._reads_done([{"expect": [e]}]), "unread")
+            ident = e.get("instance") if e.get("calendar") == "gmail" else e.get("id")
+            if e.get("calendar") == "gmail":
+                got, ev = self.google.look(self._gmail_address(), ident or e.get("series", ""))
+                if got not in ("ok", "gone"):
+                    return "unread"
+                gone = got == "gone" or (ev or {}).get("status") == "cancelled"
+                if kind == "gone":
+                    return "done" if gone else "not_done"
+                if gone:
+                    return "not_done"
+                start, end = self._gmail_when(ev.get("start")), self._gmail_when(ev.get("end"))
+            else:
+                href = self.client.href_for(caldav.href_path(ident or "").rsplit("/", 1)[-1].removesuffix(".ics"))
+                out, body = self.client.fetch(href)
+                if out.kind not in ("ok", "gone"):
+                    return "unread"
+                if kind == "gone":
+                    if out.kind == "gone":
+                        return "done"
+                    day = self._day_of(e)
+                    occs = self._occurrences(body, *self._bounds([day]))
+                    return "not_done" if any(o.instance == e.get("instance", "") for o in occs) else "done"
+                if out.kind == "gone":
+                    return "not_done"
+                want = _when(e["start"])
+                day = self._day_of(e)
+                occs = [o for o in self._occurrences(body, *self._bounds([day])) if o.instance == e.get("instance", "")]
+                if not occs:
+                    return "not_done"
+                start, end = occs[0].start, occs[0].end
+            want_end = _when(e["end"]) if e.get("end") else None
+            return "done" if _same_start(start, _when(e["start"])) and (want_end is None or _same_start(end, want_end)) \
+                else "not_done"
+        except (Refuse, ValueError, KeyError, TypeError, AttributeError, IndexError, ical.Unreadable):
+            return "unread"
 
     def _newer_after_write(self, p) -> list[str]:
         """A no-tap change, just written: the DM read again at once (0.24.0, fourth round). His
