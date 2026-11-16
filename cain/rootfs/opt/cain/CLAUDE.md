@@ -68,13 +68,20 @@ specialist (the Harness add-on) does.
   from you as "from Cain".
 - All three are off after the specialist's 0.24.0 update, behind one switch: every change comes
   on a card until the smoke test in its docs ("After installing 0.24.0") has passed on his real
-  calendars and he has tapped Turn on. Write the result as the JSON checklist its docs give,
-  "pass" or "fail" for each item, with the listing lag in seconds, and run
-  `/opt/cain/keeper.sh fastpath on <result.json>`. Never write "pass" for a step you didn't see
-  pass. Anything short of all passed is refused. A passing record goes to him on a card with Turn
-  on and Keep cards: show it like any card, and leave the choice to him; only his Turn on turns
-  the paths on. Run `/opt/cain/keeper.sh fastpath off` if a later change reads back wrong when the
-  calendar shows it right.
+  calendars and he has tapped Turn on. Run it before any other calendar use: start it with
+  `/opt/cain/keeper.sh fastpath smoke-start`, which answers with the run's id ("run"), then hand
+  over each step of its checklist like any request, so each comes on its card and he taps it: on
+  Gmail and on Family an add, a move and its Undo, a removal, and a move refused for an older
+  version (the event changed in the calendar app before his tap); once, two days of one throwaway
+  repeating event taken off on two cards. Then run `/opt/cain/keeper.sh fastpath on <run id>`.
+  The specialist builds every item from its own record; you send no pass or fail, and anything you
+  say passed is ignored. An item with no evidence is refused by name: hand over what's missing and
+  ask again. A full run goes to him on a card that shows the evidence (event ids and times, in
+  plain words) and every path Turn on lets go without a card, with Turn on and Keep cards: show it
+  like any card, and leave the choice to him; only his Turn on turns the paths on. After it, a
+  Turn off button sits on that card; his tap there, or `/opt/cain/keeper.sh fastpath off`, puts
+  every change back on a card, and any approved and not yet written comes back as a card. Run
+  `fastpath off` if a later change reads back wrong when the calendar shows it right.
 - When a handover answers "needs_clarification" with a question for you ("No card went to
   him"), answer it at once with a note on the same message:
   `/opt/cain/keeper.sh handover --message <id> "<the answer>"`. If only he can answer it, ask
@@ -92,7 +99,11 @@ specialist (the Harness add-on) does.
   yet" means it will be read for again, not that it failed; "Not found" comes only after the
   longer window, and even then a later appearance brings "Done after all". "Confirmed" or "Done
   after all" means it is done; "Done after all" also takes the card offering it again off. A
-  card saying writes are paused means earlier writes haven't answered yet: show it, nothing more.
+  card saying writes are paused means earlier writes haven't answered yet: show it, nothing more;
+  once they have, a fresh card says writes have resumed: show that one.
+- "Not applied" means the calendar turned the write down because the event changed since his
+  card: nothing was written, and it isn't read for again. One fresh card follows with the event as
+  it is now: show it, and don't hand the change over again yourself.
 - A note on a message with cards still open replaces only the card it corrects; the others
   stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's
   own rules decide which card a note speaks to. When it could correct more than one, or it can't

@@ -5,15 +5,21 @@
 #                                        (it reads his message itself); answers with card ids.
 #                                        --message: the id in the tag of the message it rests on
 #                                        (its last 30 minutes); without it, his newest message
-#   keeper.sh fastpath on <result.json>  the post-install smoke test's record, a fixed checklist,
-#                                        "pass" or "fail" each: {"gmail": {"add","move","remove",
-#                                        "undo"}, "family": {the same four}, "late_landing",
-#                                        "listing_lag_seconds": <number>}. Anything short of all
-#                                        passed is refused. A passing record goes to Dane on a card
-#                                        with Turn on and Keep cards; only his Turn on tap lets his
-#                                        own fresh, clear words, a mail date he taps Add to Family
-#                                        on and Family adds after the bake-in tap go through
-#                                        without a card. Until then, every change comes on a card
+#   keeper.sh fastpath smoke-start      start the post-install smoke run: the specialist issues its
+#                                        id (answers with "run") and records every change approved
+#                                        after it under that id. Run the checklist through the normal
+#                                        card path, each change on its card and tapped
+#   keeper.sh fastpath on <run id>       ask for that run's result. The specialist builds every item
+#                                        from its own record (event ids, request and read-back times,
+#                                        the writes refused for an older version, the listing lag);
+#                                        an item with no evidence is refused by name, and nothing you
+#                                        send as passed counts. A full run goes to Dane on a card
+#                                        showing the evidence and every no-card path, with Turn on and
+#                                        Keep cards; only his Turn on tap lets his own fresh, clear
+#                                        words, a mail date he taps Add to Family on and Family adds
+#                                        after the bake-in tap go through without a card, and a Turn
+#                                        off button then sits on that card. Until then, every change
+#                                        comes on a card
 #   keeper.sh fastpath off               every calendar change on a card again
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
@@ -84,10 +90,10 @@ case "$cmd" in
 esac
 if [ "$cmd" = fastpath ]; then
   case "${1:-}" in
-    on) [ -r "${2:-}" ] && jq -e 'type == "object"' "$2" >/dev/null 2>&1 \
-          || { echo '{"status":"error","said":"fastpath on takes the smoke test result file, a JSON object: fastpath on <result.json>"}'; exit 2; } ;;
-    off) ;;
-    *) echo '{"status":"error","said":"fastpath takes on <result.json> or off"}'; exit 2 ;;
+    smoke-start|off) ;;
+    on) [[ "${2:-}" =~ ^[0-9a-f]{6,32}$ ]] \
+          || { echo '{"status":"error","said":"fastpath on takes the smoke run id that fastpath smoke-start gave: fastpath on <run id>"}'; exit 2; } ;;
+    *) echo '{"status":"error","said":"fastpath takes smoke-start, on <run id> or off"}'; exit 2 ;;
   esac
 fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -145,8 +151,8 @@ case "$cmd" in
   handover) body=$(jq -nc --arg s "${1:-}" --arg p "$owner" --arg m "$message" \
               '{suggestion: $s, paired: $p} + (if $m == "" then {} else {message: $m} end)') ;;
   digest)   body='{}' ;;
-  fastpath) if [ "$1" = on ]; then body=$(jq -c '{state: "on", record: .}' "$2")
-            else body='{"state":"off"}'; fi ;;
+  fastpath) if [ "$1" = on ]; then body=$(jq -nc --arg r "$2" '{state: "on", run: $r}')
+            else body=$(jq -nc --arg s "$1" '{state: $s}'); fi ;;
   meanings)
     # The whole table each time: the specialist stores only what's new.
     if jq -e 'type == "array" or type == "object"' "$1" >/dev/null 2>&1; then

@@ -7,7 +7,8 @@
 - Cain names your message with every calendar request, answers the calendar specialist's questions himself on the same message, and never asks you to repeat a change you already made in words.
 - The specialist's address can only be moved by a test, and that is logged.
 - Cain says a calendar change is done only when the specialist's read of the calendar shows it, and a note correcting one card no longer replaces the others.
-- After the calendar specialist's update, every calendar change comes on a card until a check on your real calendars has passed and you tap Turn on. Cain sends that check's result, item by item; anything short of all passed is refused, and a passing one comes to you on a card with Turn on and Keep cards.
+- After the calendar specialist's update, every calendar change comes on a card until a check on your real calendars has passed and you tap Turn on. Cain starts the check and hands each step over on its card; the specialist judges it from its own record, never from what Cain says, and a full one comes to you on a card showing what it saw, with Turn on and Keep cards, and a Turn off button there after.
+- When the calendar turns a change down because the event changed since its card, Cain shows the fresh card that follows and doesn't hand it over again.
 
 ## 0.11.0
 

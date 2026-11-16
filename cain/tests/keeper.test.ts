@@ -126,20 +126,19 @@ describe("keeper.sh against a fake link", () => {
     } finally { server.stop(true); }
   }, 30_000);
 
-  test.skipIf(!ready)("fastpath sends the smoke test's result file, or off; nothing else is sent", async () => {
+  test.skipIf(!ready)("fastpath starts a smoke run, names it, or turns off; no pass or fail record is sent", async () => {
     const dir = mkdtempSync(join(tmpdir(), "keeper-"));
     writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
     writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
-    const record = { gmail: { add: "pass", move: "pass", remove: "pass", undo: "pass" },
-                     family: { add: "pass", move: "pass", remove: "pass", undo: "fail" },
-                     late_landing: "pass", listing_lag_seconds: 12 };
+    const record = { gmail: { add: "pass", move: "pass", remove: "pass", undo: "pass", stale: "pass" },
+                     family: { add: "pass", move: "pass", remove: "pass", undo: "pass", stale: "pass" },
+                     series: "pass", late_landing: "pass", listing_lag_seconds: 12 };
     writeFileSync(join(dir, "result.json"), JSON.stringify(record));
-    writeFileSync(join(dir, "words.txt"), "Added, moved and removed a test event; each read back");
     const key = createHmac("sha256", TOKEN).update("harness-handover-v1").digest("hex");
     const seen: { path: string; keyed: boolean; body: any }[] = [];
     const server = Bun.serve({ port: 0, async fetch(req) {
       seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body: JSON.parse(await req.text()) });
-      return Response.json({ status: "ok" });
+      return Response.json({ status: "ok", run: "a1b2c3d4e5f6" });
     } });
     const env = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_KEEPER_TEST: "1", CAIN_DISCORD_DIR: dir };
     const keeper = async (...args: string[]) => {
@@ -148,20 +147,23 @@ describe("keeper.sh against a fake link", () => {
       return { code: await p.exited, out };
     };
     try {
-      expect(await keeper("fastpath")).toMatchObject({ code: 2 });             // on or off, nothing else
-      expect(await keeper("fastpath", "on")).toMatchObject({ code: 2 });       // on needs the result file
-      expect(await keeper("fastpath", "on", "it all worked")).toMatchObject({ code: 2 });   // words aren't a record
-      expect(await keeper("fastpath", "on", join(dir, "words.txt"))).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath")).toMatchObject({ code: 2 });             // smoke-start, on or off
+      expect(await keeper("fastpath", "on")).toMatchObject({ code: 2 });       // on names the run
+      expect(await keeper("fastpath", "on", "it all worked")).toMatchObject({ code: 2 });   // words aren't a run
+      expect(await keeper("fastpath", "on", join(dir, "result.json"))).toMatchObject({ code: 2 });   // nor a record
       expect(await keeper("fastpath", "maybe")).toMatchObject({ code: 2 });
       expect(seen.length).toBe(0);
-      await keeper("fastpath", "on", join(dir, "result.json"));                // the specialist judges it
+      expect((await keeper("fastpath", "smoke-start")).out).toContain("a1b2c3d4e5f6");   // the specialist's id
+      await keeper("fastpath", "on", "a1b2c3d4e5f6");                          // the specialist judges it
       await keeper("fastpath", "off");
       expect(seen).toEqual([
-        { path: "/fastpath", keyed: true, body: { state: "on", record } },
+        { path: "/fastpath", keyed: true, body: { state: "smoke-start" } },
+        { path: "/fastpath", keyed: true, body: { state: "on", run: "a1b2c3d4e5f6" } },
         { path: "/fastpath", keyed: true, body: { state: "off" } },
       ]);
       const usage = (await keeper("help")).out;
-      expect(usage).toContain("keeper.sh fastpath on <result.json>");
+      expect(usage).toContain("keeper.sh fastpath smoke-start");
+      expect(usage).toContain("keeper.sh fastpath on <run id>");
     } finally { server.stop(true); }
   }, 30_000);
 

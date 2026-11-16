@@ -355,21 +355,44 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   never become a second event, and the calendar is searched by that id first. If the first write
   answers after all, its token is no longer current: it's recorded as done ("Done after all"), with
   *Undo*, and the card that offered it again comes off; if you'd already tapped that card, it found
-  the first write there and added nothing. A move offered again checks the event's current time
-  first, and one already at its new time moves nothing.
+  the first write there and added nothing. A move or removal offered again carries the version the
+  first card was bound to (sixth round), so whichever of the two writes reaches the calendar second
+  is refused by it: one event, one Done. If the first write lands just before your tap, the card
+  comes off; if its answer was lost, your tap finds it already done, reads that first write back,
+  and says "Done after all" with its *Undo*. If writes were paused, each change on a paused card comes
+  back on a fresh card saying writes have resumed as soon as fewer than three are still running
+  (only writes still running count, so the number drops as each ends at its deadline; after a
+  restart none are), and the paused card comes off.
+- **Late receipts say whose request it was.** "Done after all" quotes your request, says the day and
+  time you asked and how it was approved (your tap on its card, or with no card from your own fresh
+  message), and says how old the request is when it's more than a day. If you'd declined the card
+  that offered it again, it says it went through although you declined it, with *Undo* first. *Undo*
+  of a late one is sent with the event's version as it is now; if the event was changed since, it's
+  left as it is and the message says how it reads now.
 - **A stale move or removal is turned down by the calendar itself.** The card keeps each event's
-  version as its read found it (Google's etag, or the iCloud resource's), and the move or removal is
-  sent with that version (If-Match), so if a correction, an *Undo* or anyone's edit changed the event
-  since, Google or iCloud refuses the write rather than applying it. One exception, so a second card
-  on the same event isn't refused because of the first one's write elsewhere in it (two days of one
-  Family series are one iCloud resource): when a read just before the write shows that very event,
-  by id, with the title and start the card showed, the version from that read is sent instead, so
-  anything newer than it is still refused. A write refused for its version is read by the event's
-  id and compared with the change (title, start, end, all day or not, repeating or not): Done only
-  when it already shows the change as asked (with nothing of Harness's there to undo); otherwise
-  "Not confirmed", with what that read shows, and it joins the reads again. A late add whose fixed
-  address turns out to be taken (Google's 409, iCloud's 412) is never assumed to be Harness's own
-  write: the event there is read and compared the same way, and only a match counts as there.
+  version as its read found it (Google's etag, or the iCloud resource's), byte for byte, quotes and a
+  weak marker included, and the move or removal is sent with exactly that version (If-Match), so if a
+  correction, an *Undo* or anyone's edit changed the event since, Google or iCloud refuses the write
+  rather than applying it. The card also keeps what it showed of the event: title, start, end, all
+  day or not, the series's rule, location and notes. One exception, so a second card on the same
+  series isn't refused because of the first one's write elsewhere in it (two days of one Family
+  series are one iCloud resource, and a Google series edit can give a day a new version): only for a
+  day of a Google series or an iCloud resource holding a series or several events, and only when a
+  read just before the write shows the event the card targets with every one of those fields the
+  same, the version from that read is sent instead, so anything newer than it is still refused. Any
+  difference (an end time, the series's rule, the notes, the location) sends the card's version, and
+  the calendar refuses it. Each move or removal's If-Match and the calendar's answer code are in the
+  log. A write refused for its version is read by the event's id and compared with the change (title,
+  start, end, all day or not, repeating or not; a Google event read back cancelled counts as gone):
+  when it already shows the change as asked, it's Done (with nothing of Harness's there to undo,
+  unless an earlier approval of the same change has a write that never answered: then that write is
+  read back, and it's "Done after all" with its *Undo*). Otherwise it's **Not applied**: the receipt
+  says the event changed since your card and what the read found, and one fresh card follows, read
+  anew so it's bound to the event as it is now. A refused write is never "Not confirmed", never read
+  for again and never "Not seen yet" or "Not found"; those are only for writes whose outcome is
+  unknown (no answer, or a lapsed deadline). A late add whose fixed address turns out to be taken
+  (Google's 409, iCloud's 412) is never assumed to be Harness's own write: the event there is read
+  and compared the same way, and only a match counts as there.
 - **Bound to the event the card names.** A removal or a move is bound to the very event its card or
   receipt names (calendar, id, and for a repeating event which day of it): a different event found
   later is never changed in its place, and nothing changes if the event isn't that one any more.
@@ -403,10 +426,12 @@ Cain doesn't pass your words on: Harness reads your DM itself.
   is the go); and Family adds once you've tapped "stop checking" on the bake-in card (Family
   calendar adds, above). All three sit behind one switch, and it's **off after installing**, so
   every change comes on a normal card, until the smoke test below has passed on the real calendars,
-  Cain sends its record (`keeper.sh fastpath on <result.json>`), and you tap *Turn on* on the card
-  that shows it. A record with anything short of every item passed is refused and nothing changes;
-  *Keep cards* leaves it off; the record, who tapped and when are kept in the record, and
-  `keeper.sh fastpath off` turns it off again at any time. Even with the bake-in tap already given,
+  Harness has found every item of it in its own record (`keeper.sh fastpath on <run id>`), and you
+  tap *Turn on* on the card that shows the evidence. A run with any item missing from the record is
+  refused and nothing changes; *Keep cards* leaves it off; the run, who tapped and when are kept in
+  the record; *Turn off* on that card, or `keeper.sh fastpath off`, turns it off again at any time,
+  and a change approved for a path without a tap and not yet written then comes on a card instead.
+  Even with the bake-in tap already given,
   a Family add is a normal card while the switch is off. Each path is checked against the switch
   again at the moment of the write. Once on, each is also checked again then: for your message,
   a fresh read of the DM must still show it as your newest, still under 2 minutes old, with no card
@@ -506,42 +531,38 @@ Cain doesn't pass your words on: Harness reads your DM itself.
 
 The read back is tested against fake calendars; Google and iCloud can list a change a little
 late. So the three paths without a tap stay off after installing, and every change comes on a card,
-until this has been run once with throwaway events on a day with nothing else on it (each name
-below is an example; use anything unmistakable), looking at both calendars after each step. Each
-step comes on a card for now; tap *Approve*:
+until this has been run once, before any other use, with throwaway events on a day with nothing else
+on it (each name below is an example; use anything unmistakable). Cain starts it with
+`keeper.sh fastpath smoke-start`: Harness issues the run's id and records every change approved from
+then on under it. Every step goes through the normal card path: Cain hands it over, and you tap
+*Approve* on its card. The run's first add is let go at once, so its answer comes late and is read
+back a minute later like any lost answer: that's the late landing item.
 
-1. An add: "add Smoke test A at 3 PM tomorrow". The receipt says Done, and Gmail shows it.
-2. A duplicate add: the same words again. The receipt says "Already there, nothing added", names
-   the event, and has *Add anyway*; Gmail still shows one.
-3. A removal: "take off Smoke test A tomorrow". Done, and it's gone from Gmail.
-4. A move: add "Smoke test B at 4 PM tomorrow", then "move Smoke test B to 5 PM". Done, and Gmail
-   shows it at 5 only.
-5. A Family add from mail: tap *Add to Family* on a date from the kids' mail (or wait for the next
-   one). Done, and Family shows it.
-6. Undo of each: tap *Undo* on each of those receipts. Each says "Undone", and both calendars are
-   back as they were.
+On Gmail, and then the same on Family:
 
-7. A late write: a change whose write is held past its wait (or one whose card was offered again
-   after its lease ran out) is read back and said as done once, never twice.
-8. The listing lag: how many seconds after an add's receipt it first showed in each calendar's
-   list.
+1. An add: "add Smoke test A at 3 PM tomorrow". Done, and the calendar shows it.
+2. A move: "move Smoke test A to 4 PM". Done, and it shows at 4 only. Then *Undo* on it: "Undone".
+3. A removal: "take off Smoke test A tomorrow". Done, and it's gone.
+4. A write refused for an older version: ask to move a throwaway event, change its time in the
+   calendar app before tapping *Approve*, then tap. The receipt says "Not applied", and a fresh card
+   follows (tap *Decline* on it). The log shows the If-Match sent and the answer code (412 on both
+   calendars).
 
-If a step says "Not confirmed" while the calendar does show the change, the log has both reads
-("read back of gmail (first)" and "(fresh)"): that's the case to report, and the paths without a
-tap stay off. Cain writes the result as a JSON file with this fixed checklist, `"pass"` or
-`"fail"` for each item:
+And once, on either calendar: two days of one throwaway repeating event taken off on two cards, both
+Done. The listing lag is measured from the record itself: from each write's read back by its id to
+the days, read as you'd see them, showing it.
 
-```json
-{"gmail":  {"add": "pass", "move": "pass", "remove": "pass", "undo": "pass"},
- "family": {"add": "pass", "move": "pass", "remove": "pass", "undo": "pass"},
- "late_landing": "pass", "listing_lag_seconds": 12}
-```
-
-and runs `keeper.sh fastpath on <result.json>`. Anything short of every item passed (a fail, a
-missing item, a lag that isn't a number of seconds from 0 to 3600) is refused and nothing changes.
-A passing record sizes the longer read window from the lag, and comes to you on a card that says
-in plain words what passed, with *Turn on* and *Keep cards*. Only your *Turn on* turns the paths
-without a tap on; the record, who tapped and when are kept. Nothing else to set up.
+Then Cain runs `keeper.sh fastpath on <run id>`. Harness builds each item from its own record: the
+event ids, when each was asked and read back, the refused writes with their answer, the two days of
+the series, the late landing and the listing lag (from 0 to 3600 seconds; anything longer fails).
+Anything Cain says passed is ignored, and an item with no evidence in the record is refused by
+name, and nothing changes. A full run sizes the longer read window from the lag, and comes to you on
+one card that lists each item's evidence (ids and times, in plain words) and every path *Turn on*
+lets go without a card, the stored "stop checking" for Family adds with its date included, with
+*Turn on* and *Keep cards*. Only your *Turn on* turns the paths on; the run, who tapped and when are
+kept, and a *Turn off* button then sits on that card. If a step says "Not confirmed" while the
+calendar does show the change, the log has both reads ("read back of gmail (first)" and "(fresh)"):
+that's the case to report, and the paths without a tap stay off. Nothing else to set up.
 
 ## Dates from your mail
 
