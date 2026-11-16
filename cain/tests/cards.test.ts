@@ -239,7 +239,7 @@ describe("the sweep takes buttons off cards that stopped mattering", () => {
     expect(r.buttons(old)).toEqual(["Undo", "Stop"]);
     r.failing.clear();
     // 0.12.0, round 15: a card's buttons are put on again at a start only once the keeper's consumed set is verified.
-    (r.files as any).status = JSON.stringify({ clock: { synced: true, source: "kernel", diagnostic: "synchronized", at: new Date(r.t.now).toISOString() } });
+    r.keeperVerified();
     await r.link.sweep();                                              // ...and the sweep finishes it
     expect(r.buttons(old)).toEqual([]);
     expect(r.msg(old).content).toBe("Tie you up for the turkey harvest?\n\nReplaced by a newer card");

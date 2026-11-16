@@ -80,7 +80,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const landWaiting: (() => void)[] = [];
   const stop = { stopped: false, at: null as number | null, broken: false };
   const harnessDown = { down: false };                // the calendar specialist doesn't take taps
-  const t = { now: opts.now ?? NOV11_8AM };
+  // now: the Pi's clock (the link's); discord: how far Discord's own clock is from it (round 16: a Pi with no
+  // real-time clock can be hours off until time sync), which every new message and interaction id carries.
+  const t = { now: opts.now ?? NOV11_8AM, discord: 0 };
   const files: { pending: string | null; holds: string | null; checks?: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null, checks: null };
   const submitted: any[] = [];                    // requests the link handed the record keeper (source checks, one-offs)
   const outcomes: Record<string, { state: string; reason?: string }> = {};   // the keeper's outcome per request, once settled
@@ -135,7 +137,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const beyond = new Set<string>();              // on Discord, but further back than the look over his DM goes
   const spy = { onCall: null as null | ((method: string, path: string) => void) };   // runs as each call reaches Discord
   let seq = 0, lastId = "", tapped = "", taps = 0;
-  const snowflake = (at = t.now) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(++seq));
+  const snowflake = (at = t.now + t.discord) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(++seq));
   const rest = async (method: string, path: string, body?: any, auth = true) => {
     calls.push({ method, path, body: copy(body), auth });
     spy.onCall?.(method, path);
@@ -172,6 +174,11 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       const limit = Number(q.get("limit") ?? 50), before = q.get("before");
       return Object.values(posted).filter((m: any) => !beyond.has(m.id) && (!before || BigInt(m.id) < BigInt(before)))
         .sort((a: any, b: any) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1)).slice(0, limit).map(copy);
+    }
+    // The DM channel itself: its last message id (round 16: the link's start mark).
+    if (method === "GET" && path === `/channels/${DM}`) {
+      const ids = Object.keys(posted).sort((a, b) => (BigInt(a) > BigInt(b) ? 1 : -1));
+      return { id: DM, type: 1, last_message_id: ids.at(-1) ?? null };
     }
     const one = new RegExp(`^/channels/${DM}/messages/(\\d+)$`).exec(path);
     if (one && method === "GET") return posted[one[1]] ? copy(posted[one[1]]) : { author: { id: OWNER } };
@@ -294,7 +301,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   } });
   const tap = (msg: any, custom_id: string, over: any = {}) => {
     tapped = String(msg.id);
-    return link.onInteraction({ type: 3, id: String(10 + ++taps), token: "t", application_id: BOT, channel_id: DM, user: { id: OWNER },
+    return link.onInteraction({ type: 3, id: t.discord ? snowflake() : String(10 + ++taps), token: "t", application_id: BOT, channel_id: DM, user: { id: OWNER },
       data: { custom_id }, message: copy(msg), ...over });
   };
   // Dane's own message in the DM, optionally a Discord reply to one of the bot's.
@@ -326,6 +333,14 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     state: () => copy(state) as State,
     setState: (s: State) => { state = copy(s); },
     restart: () => { link = new Link(deps); return link; },
+    // Round 16: the record keeper's status with its consumed set verified for its current start, by a fresh
+    // fetch that saw this link run (the link takes "verified" only then); extra fields merged in.
+    keeperVerified: (extra: Record<string, unknown> = {}) => {
+      (link as any).runNo();
+      const nonce = `k${(++seq).toString(16)}`, at = new Date(t.now).toISOString();
+      (files as any).status = JSON.stringify({ clock: { synced: true, source: "the rig", diagnostic: "", at }, start: { nonce, at },
+        verified: { start: nonce, at, link: state.runNonce ?? null, fetches: 1 }, ...extra });
+    },
     later: (ms: number) => { t.now += ms; },
   };
   return r;

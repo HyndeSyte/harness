@@ -644,7 +644,13 @@ says it refuses to start (a log it can't read): run `/opt/cain/keeper.sh recover
 proposes, sending him the exact line `recover logs <code>`) and tell him in one line that it needs his
 OK to rebuild its logs; once he sends that line, run
 `/opt/cain/keeper.sh recover-logs --said <his message id>`, and nothing more. This works whatever state the
-keeper is in (degraded, unverified, GitHub unreachable). If it answers "proposed" with the cause (his code
+keeper is in (degraded, unverified, GitHub unreachable), and whatever the Pi's clock says: his line counts
+within 30 minutes of its code by Discord's own times. If the Pi's clock is off, he is told so ("The Pi's
+clock is off by about N minutes, waiting for time sync."): say nothing more about it. His recover line
+only lets the keeper rebuild: it never marks the taps verified and never turns install taps on; taps stay
+held, and `keeper.sh install-taps on` is refused, until a fresh fetch from GitHub verifies (keeper.sh clock
+shows consumed_verified true). Run `--said` only for a message he sent after the App's start: one read
+back from older history is refused and nothing is sent him. If it answers "proposed" with the cause (his code
 was from before a restart, another record epoch, or used already), he was already told in one line and sent
 a fresh code: wait for his new line and run it again with that message's id.
 Every start of the record keeper checks its taps against GitHub first, so right after a restart (or while
@@ -654,10 +660,16 @@ you act on it as on any tap. If the item changed meanwhile you get "Tap not acte
 told on the card): record nothing, check again and ask again with --checked if it still needs him. A Ship
 tap meanwhile is not taken: its card gets the line "Not taken yet: ..." and keeps its buttons, nothing of
 the tap is kept, and the line clears once the record has checked; show nothing new, he taps Ship again then.
-A released held tap whose line starts "Replay of held tap key" was relayed once already before a restart:
-if you had a line with that tap key, do not act on it again (the keeper refuses a second request for a key
-anyway). A held tap the App's clock and Discord's disagree about (over 2 minutes) comes back as "Tap not
-acted: ..." too: record nothing, and ask again with --checked if it still needs him.
+A released held tap whose line starts "Replay of held tap key" may have reached you once already before a
+restart: look its tap key up in the record keeper's record (its consumed-key log and request log, under
+log/requests/) and in state/decisions.md, and act on it only if the key is in none of them, never from
+memory (the keeper refuses a second request for a key anyway). If no request of yours for that key reaches
+the keeper within 10 minutes, the link asks him on the card to answer again on the fresh card you send:
+check the item again and ask again with --checked if it still needs him. Held taps are judged by Discord's
+own times, never the Pi's clock; if the Pi's clock is off, his card says "The Pi's clock is off by about N
+minutes, waiting for time sync." Nothing to do or tell him about it. A held tap refused because its hold
+began after its card expired comes back as "Tap not acted: ..." too: record nothing, and ask again with
+--checked if it still needs him.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:
@@ -665,7 +677,9 @@ ask again in a minute. A request from a tap on a withdrawn card is refused: reco
 A card withdrawn at the App's start (you hear "was withdrawn at the App's start") failed a check before
 its buttons could go on: check its item again and ask again with --checked if it still needs him. A
 request from a tap made after its card expired is refused as expired without using the key (he was told
-on the card): record nothing. Cards lost in a restore of the App's state lose their buttons and say so;
+on the card): record nothing. After a restore of the App's state, every Ship card from before it loses its buttons and says so, and
+you hear it: check Home Assistant first, then show a new Ship card for the same pull request and head with
+--checked if it still needs him. Cards lost in a restore of the App's state lose their buttons and say so;
 you hear how many: check those items again and ask again what still needs him.
 
 ## Stop

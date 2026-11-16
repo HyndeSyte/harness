@@ -150,6 +150,8 @@ async function rest(method: string, path: string, body?: unknown, auth = true, t
     redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? (path.startsWith("/interactions/") ? 3000 : 20000)) });
   if (r.status === 204) return null;
   const data = await r.json().catch(() => null);
+  // Round 16: a rate limit carries its Retry-After (seconds), which the restore sweep honours.
+  if (r.status === 429) throw new Error(`discord 429: ${String(data?.message ?? "").slice(0, 100)} (retry_after ${Number(data?.retry_after ?? r.headers.get("retry-after") ?? 1)})`);
   if (r.status >= 400) throw new Error(`discord ${r.status}: ${String(data?.message ?? "").slice(0, 100)}`);
   return data;
 }

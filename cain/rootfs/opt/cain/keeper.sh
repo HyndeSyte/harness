@@ -94,20 +94,27 @@
 #                                        trailer). once (Cain's)
 #                                        lets exactly one Ship tap land (the pull-the-plug case itself);
 #                                        off (Cain's) stops them. Until on, a Ship tap answers that installs
-#                                        wait for the post-install tests, and keeps its buttons
+#                                        wait for the post-install tests, and keeps its buttons. Round 16: on
+#                                        (with or without --said) is refused until the record keeper's status
+#                                        says a fresh fetch verified its consumed set (keeper.sh clock:
+#                                        consumed_verified true); nothing is proposed or used up meanwhile
 #   keeper.sh recover-logs [--said <his message id>]
 #                                        the owner's alone, when the record keeper says it refuses to start
 #                                        for a case no rule explains (or asks for his OK). Without --said it only proposes,
 #                                        sending him the exact line "recover logs <code>" (bound like the
 #                                        install line). keeper.sh recover-logs --said <his message id>: his
-#                                        own message in his DM, under a day old, sent after the proposal,
+#                                        own message in his DM, sent after the proposal (round 16: within
+#                                        30 minutes of it by Discord's own times, never the Pi's clock),
 #                                        saying exactly that line, single use; the keeper
 #                                        moves the damaged log aside and goes on once its rebuild is
 #                                        verified against GitHub. Round 15: it works in any keeper state
 #                                        (degraded, unverified, GitHub unreachable); a line whose code no
 #                                        longer counts (an earlier start, another epoch, used already)
 #                                        answers "proposed": he is told the cause in one line,
-#                                        with a fresh code at once
+#                                        with a fresh code at once. Round 16: only a live message counts (one
+#                                        after the link's start); one read back from history draws no reply
+#                                        and no code. It never marks anything verified: only a fresh fetch
+#                                        does. If the Pi's clock is off from Discord's, he is told so
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"

@@ -9,7 +9,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { appendLog, readLog } from "../rootfs/opt/cain/applog.ts";
-import { CARD_CHECKING, CARD_LOST_RESTORE, CARD_WITHDRAWN, CLOCK_TOLERANCE_MS, INSTALL_LINE, KEEPER_START_WHY, RECOVER_LINE, SHIP_CHECKING,
+import { CARD_CHECKING, CARD_LOST_RESTORE, CARD_WITHDRAWN, CLOCK_TOLERANCE_MS, clockOffLine, INSTALL_LINE, KEEPER_START_WHY, RECOVER_LINE, SHIP_CHECKING,
   TAP_EXPIRED, TAP_TIME_DISAGREE } from "../rootfs/opt/cain/link/core";
 import { cycle, forgetRebuild, issuedMirrorFile, linkHeldFile, readConsumed, recoverFile, tapsLogFile } from "../rootfs/opt/cain/record/main.ts";
 import { DAY, DM, MIN, PR, SHA1, pendingWith, rig as linkRig } from "./link-rig";
@@ -34,7 +34,8 @@ const side = (r: R, name: string) => join(dirname(r.issuedLog!), name);
 const clock = (r: R) => ({ clock: { synced: true, source: "the rig", diagnostic: "", at: new Date(r.t.now).toISOString() } });
 const unverified = (r: R, why = KEEPER_START_WHY, extra: Record<string, unknown> = {}) =>
   { r.files.status = JSON.stringify({ ...clock(r), consumed_unverified: { since: "2026-11-11T13:00:00.000Z", why, tries: 0 }, ...extra }); };
-const verified = (r: R, extra: Record<string, unknown> = {}) => { r.files.status = JSON.stringify({ ...clock(r), ...extra }); };
+// Round 16: verified for the keeper's current start and this link run.
+const verified = (r: R, extra: Record<string, unknown> = {}) => r.keeperVerified(extra);
 const tapLines = (r: R) => r.relayed.filter((x) => x.includes("Dane tapped") && x.includes("Tap key"));
 const proposed = (r: R, words: string) => /```\n([a-z ]+ [a-z][0-9a-f]{5})\n```/.exec(String(r.cards().filter((m: any) => String(m.content).includes(words)).at(-1)!.content))![1];
 const unarmedAsk = async (r: R) => {
@@ -108,6 +109,7 @@ describe("1. his recover line works whatever state the keeper is in", () => {
     await r.link.recoverLogs({});
     const old = proposed(r, RECOVER_LINE);
     r.restart();
+    await r.link.sweep();                                              // round 16: this start's mark in his DM
     const before = r.cards().length;
     const out = await r.link.recoverLogs({ said: r.his(old).id });
     expect(out).toMatchObject({ status: "proposed" });
@@ -214,16 +216,14 @@ describe("3. a held tap's time is Discord's", () => {
     expect(onThread(r, id, TAP_EXPIRED)).toHaveLength(1);
   });
 
-  test("the clocks apart beyond the tolerance: refused with both times quoted, and the card says so", async () => {
+  test("the clocks apart beyond the tolerance: round 16 judges it by Discord's time alone, so it acts, and the card says the Pi's clock is off", async () => {
     const { r, id, out } = await heldAt(-10 * MIN, -10 * MIN - CLOCK_TOLERANCE_MS - 60_000);
     expect(out).toBe("held");
     verified(r);
     await r.link.sweep();
-    expect(tapLines(r)).toHaveLength(0);
-    expect(onThread(r, id, TAP_TIME_DISAGREE)).toHaveLength(1);
-    const told = r.relayed.find((x) => x.startsWith("Tap not acted:"))!;
-    expect(told).toContain("Discord's interaction id says \"");
-    expect(told).toContain("the App logged his tap at \"");
+    expect(tapLines(r)).toHaveLength(1);
+    expect(onThread(r, id, TAP_TIME_DISAGREE)).toHaveLength(0);
+    expect(onThread(r, id, clockOffLine(CLOCK_TOLERANCE_MS + 60_000))).toHaveLength(1);
   });
 
   test("the keeper: Discord's time, no earlier than its own hold start, and refused with a quoted line when the clocks disagree", () => {
@@ -237,11 +237,11 @@ describe("3. a held tap's time is Discord's", () => {
     const cases: [string, number, number][] = [
       ["tap-00000000c301", exp + 60_000, exp - 30_000],                // the link says after expiry, Discord before: acts
       ["tap-00000000c302", exp - 60_000, exp + 30_000],                // the link says before, Discord after: expired
-      ["tap-00000000c303", exp - 5 * MIN, exp - 5 * MIN + 3 * MIN],    // three minutes apart: refused
+      ["tap-00000000c303", exp - 5 * MIN, exp - 5 * MIN + 3 * MIN],    // three minutes apart: round 16, judged by Discord's time: acts
     ];
     const state: any = { messages: {}, issued: {} };
     cases.forEach(([kid, linkAt, discordAt], i) => {
-      const msg = `157000000000000030${i}`;
+      const msg = sf(at + i);                                          // round 16: the card's post, by Discord's time
       appendLog(linkLog(k), key(kid, msg));
       state.issued[kid] = { item: "P11", kind: "ask", label: "Filed", msg, at: linkAt };
       appendLog(linkHeldFile(k.cfg), { t: "held", kid, msg, at: linkAt, it: sf(discordAt) });
@@ -252,15 +252,13 @@ describe("3. a held tap's time is Discord's", () => {
     expect(cycle(k.cfg).ok).toBe(true);
     expect(k.reason("cain-k3-1") ?? "").not.toContain("expired");
     expect(k.reason("cain-k3-2")).toContain("had expired when he tapped it");
-    const why = k.reason("cain-k3-3")!;
-    expect(why).toContain("its tap time can't be judged");
-    expect(why).toContain(`the link logged "${new Date(cases[2][1]).toISOString()}"`);
-    expect(why).toContain(`Discord's interaction id says "${new Date(cases[2][2]).toISOString()}"`);
-    expect(readConsumed(k.cfg).has("tap-00000000c303")).toBe(false);
-    expect(status(k).tap_notices).toEqual(expect.arrayContaining([expect.objectContaining({ tap: "tap-00000000c303", why: "time" })]));
+    expect(k.reason("cain-k3-3") ?? "").not.toContain("expired");
+    expect(k.reason("cain-k3-3") ?? "").not.toContain("can't be judged");
+    expect(readConsumed(k.cfg).has("tap-00000000c303")).toBe(true);
+    expect((status(k).tap_notices ?? []).some((n: any) => n.why === "time")).toBe(false);
   }, 60_000);
 
-  test("the keeper's own hold start bounds a held tap's time from below", () => {
+  test("round 16: a keeper restart during the hold no longer moves its floor: the tap Discord dates before expiry acts", () => {
     const k = keeperRig();
     const at = k.cfg.now!().getTime();
     const sf = (ms: number) => String(((BigInt(ms) - 1420070400000n) << 22n) + 9n);
@@ -274,12 +272,14 @@ describe("3. a held tap's time is Discord's", () => {
     cycle(k.cfg);
     remoteBack(k);
     // A held tap whose record claims +5 minutes on both clocks, for a card that expired at +10.
-    appendLog(linkLog(k), { t: "key", kid: "tap-00000000c401", item: "P11", kind: "ask", label: "Filed", msg: "1570000000000000401", target: { item: "P11", writes: ["row-close", "decision"] }, at, exp: at + 10 * MIN });
-    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: { "tap-00000000c401": { item: "P11", kind: "ask", label: "Filed", msg: "1570000000000000401", at: at + 5 * MIN } } }));
-    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000c401", msg: "1570000000000000401", at: at + 5 * MIN, it: sf(at + 5 * MIN) });
+    const card = sf(at);
+    appendLog(linkLog(k), { t: "key", kid: "tap-00000000c401", item: "P11", kind: "ask", label: "Filed", msg: card, target: { item: "P11", writes: ["row-close", "decision"] }, at, exp: at + 10 * MIN });
+    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: { "tap-00000000c401": { item: "P11", kind: "ask", label: "Filed", msg: card, at: at + 5 * MIN } } }));
+    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000c401", msg: card, at: at + 5 * MIN, it: sf(at + 5 * MIN) });
     k.cain({ id: "cain-k4-2", tap: "tap-00000000c401", ops: [{ op: "note", item: "P11", text: "his tap" }] }, { issue: false });
     expect(cycle(k.cfg).ok).toBe(true);
-    expect(k.reason("cain-k4-2")).toContain("had expired when he tapped it");
+    expect(k.reason("cain-k4-2") ?? "").not.toContain("expired");
+    expect(k.states("cain-k4-2")).toEqual(["done"]);
   }, 60_000);
 
   test("the keeper's time notice reaches the card", async () => {
@@ -291,17 +291,21 @@ describe("3. a held tap's time is Discord's", () => {
     expect(onThread(r, id, TAP_TIME_DISAGREE)).toHaveLength(1);
   });
 
-  test("his owner line, by Discord's clock: a message dated ahead of the App's clock beyond the tolerance is refused", async () => {
+  test("round 16: his owner line dated ahead of the App's clock beyond the tolerance still counts, and he is told the Pi's clock is off", async () => {
     const r = shipRig({ installTaps: false });
     writeFileSync(r.installResults, JSON.stringify({ head: "b".repeat(40),
       smoke: { pass: true, at: new Date(r.t.now - DAY).toISOString() }, resilience: { pass: true, at: new Date(r.t.now - DAY / 2).toISOString() } }));
+    r.keeperVerified();                                                // round 16: install-on waits for a verified keeper
     await r.link.installTaps({ how: "on" });
     const line = proposed(r, INSTALL_LINE);
     r.t.now += CLOCK_TOLERANCE_MS + MIN;
     const ahead = r.his(line);                                         // Discord's time for it, ahead of...
     r.t.now -= CLOCK_TOLERANCE_MS + MIN;                               // ...the App's clock
-    await expect(r.link.installTaps({ how: "on", said: ahead.id })).rejects.toThrow("the App's clock disagrees with Discord's");
-    expect(await r.link.installTaps({ how: "on", said: r.his(line).id })).toMatchObject({ status: "ok" });
+    r.keeperVerified();
+    const out = await r.link.installTaps({ how: "on", said: ahead.id });
+    expect(out).toMatchObject({ status: "ok" });
+    expect(out.said).toContain("The Pi's clock is off by about");
+    expect(r.cards().some((m: any) => String(m.content).startsWith("The Pi's clock is off by about 3 minutes"))).toBe(true);
   });
 });
 
@@ -373,12 +377,14 @@ describe("5. a held tap's release is marked before its relay", () => {
   test("relayed, a crash before its released record, a restart: the second line is flagged as a replay, then nothing more", async () => {
     const { r } = await heldOne();
     r.restart();
+    verified(r);                                                       // round 16: verified for the new link run
     await r.link.sweep();
     const lines = tapLines(r);
     expect(lines).toHaveLength(2);
     expect(lines[0].startsWith("Replay")).toBe(false);
     expect(lines[1].startsWith("Replay of held tap key")).toBe(true);
     r.restart();
+    verified(r);
     await r.link.sweep();
     expect(tapLines(r)).toHaveLength(2);
   });
@@ -390,6 +396,7 @@ describe("5. a held tap's release is marked before its relay", () => {
     appendLog(consumed, { tap: kid, id: "cain-acted", at: "x" });
     r.deps.consumedLog = consumed;
     r.restart();
+    verified(r);
     await r.link.sweep();
     expect(tapLines(r)).toHaveLength(1);
     expect(r.logs.some((l) => l.includes(`held tap ${kid}: its release was cut off, and the record keeper already acted on its key`))).toBe(true);

@@ -38,7 +38,8 @@ const tapFromLog = (r: R, msg: string) => {
 const clock = (r: R) => ({ clock: { synced: true, source: "the rig", diagnostic: "", at: new Date(r.t.now).toISOString() } });
 const unverified = (r: R, why = KEEPER_START_WHY, extra: Record<string, unknown> = {}) =>
   { r.files.status = JSON.stringify({ ...clock(r), consumed_unverified: { since: "2026-11-11T13:00:00.000Z", why, tries: 0 }, ...extra }); };
-const verified = (r: R, extra: Record<string, unknown> = {}) => { r.files.status = JSON.stringify({ ...clock(r), ...extra }); };
+// Round 16: verified for the keeper's current start and this link run.
+const verified = (r: R, extra: Record<string, unknown> = {}) => r.keeperVerified(extra);
 const tapLines = (r: R) => r.relayed.filter((x) => x.includes("Dane tapped") && x.includes("Tap key"));
 // A card whose button edit failed at its post: unarmed, for the next start to retry.
 const unarmedAsk = async (r: R) => {
@@ -126,8 +127,8 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
     const ledger = JSON.parse(r.files.checks!);
     ledger.P08.version = 2;                                            // the row changed since its check
     r.files.checks = JSON.stringify(ledger);
-    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
+    verified(r);  // round 16: verified for the new link run
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
     expect(r.msg(id).content).toContain(CARD_WITHDRAWN);
@@ -140,8 +141,8 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
   test("its record is saved again before the retried edit; a save that fails withdraws it instead", async () => {
     const r = shipRig();
     const id = await unarmedAsk(r);
-    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
+    verified(r);  // round 16: verified for the new link run
     r.disk.failSaves = 1;
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
@@ -155,8 +156,8 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
     const consumed = side(r, "record-taps.jsonl");
     appendLog(consumed, { tap: logged(r).find((x) => x.t === "key" && x.msg === id)!.kid, id: "cain-earlier", at: "x" });
     r.deps.consumedLog = consumed;
-    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
+    verified(r);  // round 16: verified for the new link run
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
     expect(r.msg(id).content).toContain(CARD_WITHDRAWN);
@@ -165,8 +166,8 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
   test("all checks pass: armed, as before", async () => {
     const r = shipRig();
     const id = await unarmedAsk(r);
-    verified(r);                                                       // round 15: re-arm waits for a verified consumed set
     r.restart();
+    verified(r);  // round 16: verified for the new link run
     await r.link.sweep();
     expect(r.buttons(id)).toEqual(["Filed", "Not filed"]);
     expect(r.state().messages[id].rearmed).toBe(r.t.now);
@@ -475,6 +476,7 @@ describe("6. his lines are bound to a nonce, the keeper's epoch and this start",
   const passResults = (r: R) => writeFileSync(r.installResults, JSON.stringify({ head: "b".repeat(40),
     smoke: { pass: true, at: new Date(r.t.now - DAY).toISOString() }, resilience: { pass: true, at: new Date(r.t.now - DAY / 2).toISOString() } }));
   const propose = async (r: R) => {
+    if (!r.files.status) r.keeperVerified();                          // round 16: install-on waits for a verified keeper
     await r.link.installTaps({ how: "on" });
     return /```\n(install taps on [a-z][0-9a-f]{5})\n```/.exec(String(r.cards().filter((m: any) => String(m.content).includes(INSTALL_LINE)).at(-1)!.content))![1];
   };
@@ -492,6 +494,8 @@ describe("6. his lines are bound to a nonce, the keeper's epoch and this start",
     st.ownerProposals = st.ownerProposals!.map((p) => ({ ...p, used: undefined }));
     r.setState(st);
     r.restart();
+    await r.link.sweep();                                              // round 16: this start's mark in his DM
+    r.keeperVerified();
     await expect(r.link.installTaps({ how: "on", said: r.his(line).id })).rejects.toThrow("before the App's current start");
   });
 
@@ -502,15 +506,16 @@ describe("6. his lines are bound to a nonce, the keeper's epoch and this start",
     const line = await propose(r);
     const code = line.split(" ")[3];
     await expect(r.link.installTaps({ how: "on", said: r.his("install taps on b12345").id })).rejects.toThrow("isn't one the App proposed");
-    await expect(r.link.installTaps({ how: "on", said: early.id })).rejects.toThrow("isn't one the App proposed");
-    r.files.status = JSON.stringify({ epoch: { n: 3, at: "x", generation: 1 } });
+    await expect(r.link.installTaps({ how: "on", said: early.id })).rejects.toThrow("can't be told live yet");   // round 16: history draws nothing
+    r.keeperVerified({ epoch: { n: 3, at: "x", generation: 1 } });
     await expect(r.link.installTaps({ how: "on", said: r.his(line).id })).rejects.toThrow("record epoch 0");
-    r.files.status = JSON.stringify({ used_lines: [code] });
+    r.keeperVerified({ used_lines: [code] });
     await expect(r.link.installTaps({ how: "on", said: r.his(line).id })).rejects.toThrow("as the record's history shows");
   });
 
   test("a line read from older history never counts: only a live message after the proposal", async () => {
     const r = shipRig({ installTaps: false });
+    await r.link.sweep();                                              // round 16: this start's mark in his DM
     passResults(r);
     const line = await propose(r);
     const st = r.state();

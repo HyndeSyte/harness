@@ -109,8 +109,8 @@ describe("1. issuance: posted without buttons, keys logged, state saved, then th
     await expect(askCard(r)).rejects.toThrow("crash injected");
     const card = posted(r, "packet");
     expect(r.buttons(card.id)).toEqual([]);
-    r.files.status = JSON.stringify({ clock: { synced: true, source: "the rig", diagnostic: "", at: new Date(r.t.now).toISOString() } });   // round 15: re-arm waits for a verified consumed set
     r.restart();
+    r.keeperVerified();  // round 16: verified for the new link run
     await r.link.sweep();
     expect(r.buttons(card.id)).toEqual(["Filed", "Not filed"]);
     expect(logged(r).some((x) => x.t === "armed" && x.msg === card.id)).toBe(true);
@@ -128,8 +128,8 @@ describe("1. issuance: posted without buttons, keys logged, state saved, then th
     expect(onThread(r, id, CARD_BUTTONS_LATE)).toHaveLength(1);
     await r.link.sweep();                                             // the same run: not before a start
     expect(r.buttons(id)).toEqual([]);
-    r.files.status = JSON.stringify({ clock: { synced: true, source: "the rig", diagnostic: "", at: new Date(r.t.now).toISOString() } });   // round 15: re-arm waits for a verified consumed set
     r.restart();
+    r.keeperVerified();  // round 16: verified for the new link run
     await r.link.sweep();
     expect(r.buttons(id)).toEqual(["Filed", "Not filed"]);
     expect(onThread(r, id, CARD_BUTTONS_ON)).toHaveLength(1);
@@ -333,6 +333,7 @@ describe("4. install taps: a keeper-owned log, and his own line", () => {
     const r = shipRig({ installTaps: false });
     await expect(r.link.installTaps({ how: "on" })).rejects.toThrow("result file isn't there yet");
     passResults(r);
+    r.keeperVerified();                                                // round 16: install-on waits for a verified keeper
     expect(await r.link.installTaps({ how: "on" })).toMatchObject({ status: "proposed", install_taps: "off" });
     // Round 14: the line carries the proposal's code.
     const line = /```\n(install taps on [a-z][0-9a-f]{5})\n```/.exec(String(r.cards().find((m: any) => String(m.content).includes("install taps on"))!.content))![1];
@@ -549,6 +550,7 @@ describe("6. a key that misses the mirror is looked up again before deciding", (
 describe("recover-logs on the link", () => {
   test("his exact line, single use, written to the ledger and the keeper's recover file", async () => {
     const r = shipRig();
+    await r.link.sweep();                                              // round 16: this start's mark in his DM
     await expect(r.link.recoverLogs({ said: r.his("recover the logs").id })).rejects.toThrow(`doesn't say exactly "${RECOVER_LINE} <the code`);
     expect(await r.link.recoverLogs({})).toMatchObject({ status: "proposed" });
     const line = /```\n(recover logs [a-z][0-9a-f]{5})\n```/.exec(String(r.cards().find((m: any) => String(m.content).includes("recover logs"))!.content))![1];

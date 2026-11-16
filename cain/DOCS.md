@@ -909,7 +909,8 @@ What Cain's link enforces:
   same before it relays, and drops the tap with that line). Your owner lines are bound the same way: your
   message must be sent after the proposal by snowflake order, must not be dated more than 2 minutes ahead
   of the App's clock, and the proposal's own snowflake time must agree with the time the App logged for
-  it within 2 minutes.
+  it within 2 minutes. (Round 16 replaces every comparison with the Pi's clock in this paragraph: see
+  below.)
 
   No card is re-armed at a start until the keeper's status says its consumed set is verified (a fresh
   fetch merged; a missing or unreadable status is not verified). Until then a card that would be re-armed
@@ -939,6 +940,73 @@ What Cain's link enforces:
   restart the App (a degraded start); Cain runs `keeper.sh recover-logs`, you send the line with its code,
   and Cain runs it with `--said`: it is accepted, the keeper commits its use locally, and once the network
   is back the trailer reaches the remote and the held tap acts exactly once.
+
+  Round 16 (the sixteenth review's fixes, to the fifteenth round's own additions; the design stays frozen
+  for the combined fault scenario, and the only new file is the restore sweep's cursor).
+
+  Nothing an owner line or a held tap counts on is judged against the Pi's clock. A Raspberry Pi has no
+  real-time clock: after a power cut its clock can be hours off until time sync, which is exactly the
+  combined fault scenario. So your recover line (and your install line) is live when your message comes
+  after the proposal's by snowflake order and within 30 minutes of it, snowflake to snowflake; the Pi's
+  clock plays no part, and a line past that bound is told to you with both of Discord's times and a fresh
+  code. A held tap is judged snowflake against snowflake: its interaction id's time against its card's
+  expiry expressed as a snowflake time (the card's post snowflake plus the lifetime its key record
+  carries). When the Pi's clock is the outlier against Discord's (over 2 minutes), the reply to your line,
+  or the card of a held tap, says so plainly that the Pi's clock is off by about N minutes, waiting for
+  time sync ("The Pi's clock is off by about N minutes, waiting for time sync."). Nothing waits on it and no fresh code is issued that would fail the same way.
+
+  The keeper's verified status is bound to the keeper's current start. Each start of the keeper mints a
+  start nonce and writes it into its status at once, with the consumed set unverified; a fresh fetch in that
+  start writes `verified` naming that start, the keeper's time of the fetch, and the link run nonce it read
+  in the link's state. The link takes "verified" only when it names the keeper's current start and this link
+  run (so a fetch after this link's start); anything older or missing reads as unverified, so it waits. A
+  status left from before a restart, or restored with the image, re-arms nothing and clears no waiting line
+  until a fresh fetch. None of this reads a clock.
+
+  Your recover line only clears the damaged-log state and runs the rebuild again: it never marks the
+  consumed set verified (only a fresh fetch does) and never turns install taps on. Your install-on line waits
+  under the unverified hold like any tap: until the keeper's status is verified for its current start and
+  this link run, `keeper.sh install-taps on` proposes nothing and switches nothing on, and your message
+  isn't used up.
+
+  When verification is first observed, the link runs the arming checks again on every card still showing
+  buttons before any waiting line is cleared: a card with a waiting line (a Ship card's "Not taken yet"
+  line, or a card whose buttons wait at a start) gets every check (not expired, none of its keys consumed,
+  its source check accepted for its row now), and any other card is withdrawn here for a key the keeper
+  consumed (its other lapses keep their usual lines). A card that fails is withdrawn or expired, its waiting
+  line replaced by that line; only then are the clean ones' lines cleared.
+
+  Held releases resolve only once the consumed set is verified for the keeper's current start and this link
+  run: the card keeps its held line meanwhile, and with the remote down at a restart nothing is resolved. A
+  replayed line carries the tap key and is flagged ("Replay of held tap key ..."): Cain looks the key up in
+  the keeper's consumed-key log and request log and in state/decisions.md, and acts only if it is in none of
+  them, never from memory. If no keeper request for the key appears within 10 minutes, the link puts one
+  line on the card asking you to answer again on the fresh card Cain sends, and tells Cain.
+
+  The link answers only live messages as commands: one newer, by snowflake, than the newest message in your
+  DM when the link started (its first sweep reads the DM's last message id), or than a proposal this link
+  run posted. History reads, the paged restore sweep included, draw no reply and no code.
+
+  The post-restore sweep keeps a durable cursor (`/data/link-sweep.json`: the restore it is for and the
+  oldest message id reached), saved after each page. It is marked complete only at the 100-day horizon or
+  the end of your DM's history; a restart resumes from the cursor; a rate limit waits its Retry-After and
+  reads the page again.
+
+  The keeper floors a held tap's time by the hold start the held record carries (written by the link when it
+  held the tap, as a snowflake time), never by a hold start it observes again after its own restart, so a
+  keeper restart between hold and release no longer moves it. A refusal that does come from the floor (a
+  hold its record says began after the card expired) puts a line on the card naming the restart.
+
+  On a detected restore, every Ship card issued before the snapshot (each Ship card the restored state
+  knows) stays buttonless until it is reissued, with a line saying so, and Cain hears to show a new one.
+  Question cards keep their usual handling. Ship landings stay bounded besides by the pull request's merged
+  state: one landing per head.
+
+  The combined fault scenario, round 16. It also includes the recover line with the Pi's clock hours off:
+  after the power cut, before time sync (or with the clock set hours off over SSH), with the remote
+  unreachable, Cain proposes the recover line, you send it, and it counts by Discord's times; you are told
+  the Pi's clock is off; the keeper's status stays unverified, no card re-arms and install taps stay off
+  until the network is back and a fresh fetch verifies.
 
   The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
   issue 24. You have nothing to set up beyond the smoke test's one option change.
