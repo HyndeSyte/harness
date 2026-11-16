@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import approvals, commands, effects, policy, prompts, provenance, render, rules, schema
+from . import approvals, choices, commands, effects, policy, prompts, provenance, render, rules, schema
 from .config import Config
 from .engines import CallOutcome, Engine, EngineError, EngineResult, call_with_retries
 from .ledger import Ledger, iso
@@ -518,8 +518,17 @@ class Runner:
             done_lines, busy_lines, params = self._not_yet_done(job, params)
             # A later note or rerun replaces only the open cards whose change it addresses; the
             # others stay as they are, still offered on their own cards (0.24.0, third round).
-            waiting_lines, params, replaced_keys, racing = self._address_open(job, params)
+            waiting_lines, params, replaced_keys, racing, asks, quiet = self._address_open(job, params)
+            if quiet:
+                self._newer_note(job, quiet)
+            for c, pids in asks:
+                self._ask_which(job, c, pids)
             if not params["changes"]:
+                if asks and not (done_lines or busy_lines):
+                    with self.ledger.tx() as db:      # its answer is the card asking which
+                        receipt["reason"] = "asked_which"
+                        self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
+                    return
                 self._all_done(job, receipt, done_lines, busy_lines, waiting_lines)
                 return
             head = [f"Already done: {x}" for x in done_lines] + [f"In progress: {x}" for x in busy_lines] \
@@ -646,36 +655,14 @@ class Runner:
             return "Nothing to bring back there."
         return f"Back on {n} new card{'s' * (n != 1)}, each waiting for your tap."
 
-    def _again(self, p, why: str, extra: dict | None = None) -> str:
-        """One earlier request's change, as a new request of the same message (its quote, flags and
-        fixed ids kept), on a card. The new request's id, or "" if it couldn't be offered."""
+    def _again(self, p, why: str) -> str:
+        """One earlier request's change, as a new request of the same message, on a card."""
         old = self.ledger.job(p["job_id"])
-        if old is None:
-            return ""
-        root = self.ledger.get_meta(f"job_parent:{p['job_id']}") or p["job_id"]
         try:
             params = json.loads(p["params_json"])
         except (ValueError, TypeError):
             return ""
-        with self.ledger.tx() as db:
-            new = self.ledger.made_job(old["chat_id"], self.ledger.job_text(p["job_id"]), kind="message_again", db=db,
-                                       reply_to=old["reply_to_message_id"], created_at=old["created_at"])
-            self.ledger.set_meta(f"job_parent:{new}", root, db)
-            flags = self.ledger.get_meta(f"job_flags:{p['job_id']}") or self.ledger.get_meta(f"job_flags:{root}")
-            if flags:
-                self.ledger.set_meta(f"job_flags:{new}", flags, db)
-            parts = json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
-            if root != new:
-                self.ledger.set_meta(f"job_parts:{root}", json.dumps(parts + [new]), db)
-            for k, v in (extra or {}).items():
-                self.ledger.set_meta(f"{k}:{new}", v, db)
-        job = self.ledger.job(new)
-        d = effects.REGISTRY[effects.CALENDAR_CHANGE]
-        seen = self.calendar_change.preview_quiet(job, params)
-        warnings = [why] + (seen.checks if seen else [])
-        self._offer(job, d, params, {"reason": "offered_again"}, warnings, seen.lines if seen else None,
-                    seen=seen, replaced=False)
-        return new
+        return self._offer_new(old, params, why, replaced=False) if old is not None else ""
 
     def card_instead(self, p, why: str) -> None:
         """A change that was going through with no tap, found at the moment of its write to need
@@ -882,48 +869,73 @@ class Runner:
         return ([render.plain(x) for x in dict.fromkeys(done)], [render.plain(x) for x in dict.fromkeys(busy)],
                 {**params, "changes": left})
 
-    def _address_open(self, job, params) -> tuple[list[str], dict, set, bool]:
-        """The open cards of this message, against a rerun's changes (0.24.0, third round). A card
-        whose change the rerun addresses (the same event, by calendar and id, or the same kind of
-        change to an event of that name) and doesn't repeat is replaced, by one compare-and-set; a
-        card offering exactly a change the rerun repeats stands, and that change isn't offered
-        twice; a card the rerun doesn't address stands, still offered. A card his tap took first
-        isn't replaced: the new change is checked against what that does. (lines for the cards that
-        stand, params left, keys of changes that replaced a card, whether one raced his tap)."""
+    def _address_open(self, job, params) -> tuple[list[str], dict, set, bool, list, list]:
+        """The open cards of this message, against a rerun's changes (0.24.0, third and fourth
+        rounds). A rerun's change replaces an open card, by one compare-and-set, when it speaks to
+        that card's change: the same event (by calendar and id), or else, by name only (the same
+        kind of change to an event one name holds the other's words of), when exactly one open card
+        matches; when several match by name, none is replaced and a card asks which one it corrects.
+        A card offering exactly a change the rerun repeats stands (unless it's replaced anyway), and
+        that change isn't offered twice; a card the rerun doesn't speak to stands, still offered. A
+        card his tap took first isn't replaced: the new change is checked against what that does.
+        (lines for the cards that stand, params left, keys of changes that replaced a card, whether
+        one raced his tap, [(a change, the cards it may correct)] to ask about, and the open cards
+        when the rerun speaks to none of them)."""
         ids = [j for j in self._family_of(job) if j != job["id"]]
         if not ids or not params["changes"]:
-            return [], params, set(), False
+            return [], params, set(), False, [], []
         marks = ",".join("?" * len(ids))
         open_rows = self.ledger.db.execute(
             f"SELECT id, job_id, params_json FROM proposals WHERE effect_type=? AND state='proposed'"
-            f" AND job_id IN ({marks})", (effects.CALENDAR_CHANGE, *ids)).fetchall()
+            f" AND job_id IN ({marks}) ORDER BY created_at", (effects.CALENDAR_CHANGE, *ids)).fetchall()
         if not open_rows:
-            return [], params, set(), False
+            return [], params, set(), False, [], []
         cc = self.calendar_change
         mine = []
         for c in params["changes"]:
             seen = cc.preview_quiet(job, {"changes": [c]})
             mine.append((c, {(b["calendar"], b["series"], b["instance"]) for b in (seen.bound if seen else [])}))
-        stands, left, replaced_keys, racing, drop = [], [], set(), False, set()
+        cards = []
         for r in open_rows:
             try:
                 theirs = json.loads(r["params_json"])["changes"]
             except (ValueError, KeyError, TypeError):
                 continue
             kept = cc.bound_of(r["id"]) or {}
-            their_targets = {(b["calendar"], b["series"], b["instance"]) for b in kept.get("bound", [])}
             raw = self.ledger.get_meta(f"calendar_change_lines:{r['id']}")
             said = (json.loads(raw) if raw else []) or [render.change_line(t, self.config.timezone,
                                                                            self.ledger.now()) for t in theirs]
-            same = [i for i, (c, _) in enumerate(mine) if any(_change_key(c) == _change_key(t) for t in theirs)]
-            hits = [i for i, (c, targets) in enumerate(mine) if i not in same
-                    and any(_addresses(t, their_targets, c, targets) for t in theirs)]
-            if same and not hits:
-                drop |= set(same)                    # offered already, on a card that stands
-                stands.append(render.plain(said[0]))
+            cards.append({"row": r, "theirs": theirs, "said": render.plain(said[0]),
+                          "targets": {(b["calendar"], b["series"], b["instance"]) for b in kept.get("bound", [])}})
+        replace: dict[str, set] = {}
+        repeats: dict[int, list] = {}
+        asks, unclear = [], set()
+        for i, (c, targets) in enumerate(mine):
+            again = [k for k in cards if any(_change_key(c) == _change_key(t) for t in k["theirs"])]
+            if again:
+                repeats[i] = again
                 continue
-            if not hits:
-                stands.append(render.plain(said[0]))  # not addressed: it stands, still offered
+            by_id = [k for k in cards if targets and k["targets"] and targets & k["targets"]]
+            by_name = [k for k in cards if k not in by_id and any(_addresses(t, set(), c, set()) for t in k["theirs"])]
+            hit = by_id or (by_name if len(by_name) == 1 else [])
+            for k in hit:
+                replace.setdefault(k["row"]["id"], set()).add(i)
+            if not hit and len(by_name) > 1:
+                asks.append((c, [k["row"]["id"] for k in by_name]))
+                unclear.add(i)
+        drop = set(unclear)
+        for i, again in repeats.items():
+            if any(k["row"]["id"] in replace for k in again):
+                for k in again:
+                    if k["row"]["id"] in replace:
+                        replace[k["row"]["id"]].add(i)
+            else:
+                drop.add(i)                          # offered already, on a card that stands
+        stands, replaced_keys, racing = [], set(), False
+        for k in cards:
+            r = k["row"]
+            if r["id"] not in replace:
+                stands.append(k["said"])             # not spoken to (or asked about): it stands
                 continue
             with self.ledger.tx() as db:
                 won = approvals.supersede(self.ledger, r["id"], db=db)
@@ -933,14 +945,123 @@ class Runner:
                         self.ledger.transition(r["job_id"], "cancelled", db=db,
                                                receipt=json.dumps({"reason": "replaced"}))
             if won:
-                replaced_keys |= {_change_key(mine[i][0]) for i in hits + same}
-                log.info("job %s: a card it addresses was replaced", job["id"])
+                replaced_keys |= {_change_key(mine[i][0]) for i in replace[r["id"]]}
+                log.info("job %s: a card it speaks to was replaced", job["id"])
             else:
                 racing = True                         # his tap got there first
-        for i, (c, _) in enumerate(mine):
-            if i not in drop:
-                left.append(c)
-        return list(dict.fromkeys(stands)), {**params, "changes": left}, replaced_keys, racing
+        left = [c for i, (c, _) in enumerate(mine) if i not in drop]
+        spoke = bool(replace or repeats or asks)
+        quiet = [] if spoke else [k["row"]["id"] for k in cards]
+        return list(dict.fromkeys(stands)), {**params, "changes": left}, replaced_keys, racing, asks, quiet
+
+    # -- a note that can't say which card it corrects, or speaks to none ------------------------------
+    def _ask_which(self, job, change: dict, pids: list[str]) -> None:
+        """A note whose change may correct several open cards by name: none is replaced, and one card
+        asks which (0.24.0, fourth round). His pick replaces that card with the corrected change, on
+        a new card; Neither puts the change on a card of its own, beside the others."""
+        import secrets
+        token = secrets.token_hex(6)
+        said = []
+        for pid in pids[:4]:
+            raw = self.ledger.get_meta(f"calendar_change_lines:{pid}")
+            p = self.ledger.db.execute("SELECT params_json FROM proposals WHERE id=?", (pid,)).fetchone()
+            first = (json.loads(raw) if raw else []) or [render.change_line(json.loads(p[0])["changes"][0],
+                                                                            self.config.timezone, self.ledger.now())]
+            said.append(render.plain(first[0]))
+        what = render.plain(render.change_line(change, self.config.timezone, self.ledger.now()))
+        lines = ["<b>Which card does the newer note correct?</b> It could be more than one, so nothing was "
+                 f"replaced yet. The correction: {render.escape(what)}."]
+        lines += [f"Card {i}: {render.escape(x)}" for i, x in enumerate(said, 1)]
+        lines.append("Pick the card it replaces, or Neither to put it on a card of its own and leave these as they are.")
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(f"calendar_change_which:{token}", json.dumps(
+                {"job": job["id"], "change": change, "cards": pids[:4]}), db)
+            buttons, binds = [], []
+            for i in list(range(len(said))) + [-1]:
+                nonce = choices.mint(self.ledger, kind="calendar_change_which", target=f"{token}:{i}",
+                                     chat_id=job["chat_id"], ttl_s=self.config.approval_ttl_s, db=db)
+                buttons.append((f"Card {i + 1}" if i >= 0 else "Neither", choices.callback_data(nonce)))
+                binds.append({"type": "choice", "nonce": nonce})
+            self._reply(db, job, "\n".join(lines), raw=True, kind="card", buttons=[buttons], binds=binds)
+        log.info("job %s: its note may correct %d cards; asked which", job["id"], len(said))
+
+    def _which_picked(self, target: str) -> str:
+        token, _, pick = target.rpartition(":")
+        try:
+            data = json.loads(self.ledger.get_meta(f"calendar_change_which:{token}") or "{}")
+            index = int(pick)
+        except ValueError:
+            return "Nothing changed."
+        if not data:
+            return "Nothing changed."
+        job = self.ledger.job(data["job"])
+        if job is None:
+            return "Nothing changed."
+        params = {"changes": [data["change"]]}
+        if index < 0:
+            self._offer_new(job, params, "you said the newer note corrects none of the earlier cards, so this "
+                                         "is a card of its own and they stand.", replaced=False)
+            return "Put on a card of its own; the other cards stay as they are."
+        pid = data["cards"][index] if index < len(data["cards"]) else ""
+        with self.ledger.tx() as db:
+            won = bool(pid) and approvals.supersede(self.ledger, pid, db=db)
+            if won:
+                p = db.execute("SELECT job_id FROM proposals WHERE id=?", (pid,)).fetchone()
+                st = db.execute("SELECT state FROM jobs WHERE id=?", (p[0],)).fetchone()
+                if st is not None and st["state"] == "proposed":
+                    self.ledger.transition(p[0], "cancelled", db=db, receipt=json.dumps({"reason": "replaced"}))
+        why = ("you picked the card this corrects, so it replaces that one." if won else
+               "your tap on the card it corrects came first; this one is checked against what that does.")
+        self._offer_new(job, params, why, replaced=won)
+        return "The correction is on a new card." + (" That card is off." if won else "")
+
+    def _offer_new(self, src, params: dict, why: str, *, replaced: bool) -> str:
+        """A change for the same message as `src` (its quote, flags and fixed ids kept), as a new
+        request, on a card: never applied without his tap. Its request's id."""
+        root = self.ledger.get_meta(f"job_parent:{src['id']}") or src["id"]
+        with self.ledger.tx() as db:
+            new = self.ledger.made_job(src["chat_id"], self.ledger.job_text(src["id"]), kind="message_again",
+                                       db=db, reply_to=src["reply_to_message_id"], created_at=src["created_at"])
+            self.ledger.set_meta(f"job_parent:{new}", root, db)
+            flags = self.ledger.get_meta(f"job_flags:{src['id']}") or self.ledger.get_meta(f"job_flags:{root}")
+            if flags:
+                self.ledger.set_meta(f"job_flags:{new}", flags, db)
+            parts = json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
+            self.ledger.set_meta(f"job_parts:{root}", json.dumps(parts + [new]), db)
+        job = self.ledger.job(new)
+        seen = self.calendar_change.preview_quiet(job, params)
+        warnings = [why] + (seen.checks if seen else [])
+        self._offer(job, effects.REGISTRY[effects.CALENDAR_CHANGE], params, {"reason": "offered_again"}, warnings,
+                    seen.lines if seen else None, seen=seen, replaced=replaced)
+        return new
+
+    def _newer_note(self, job, pids: list[str]) -> None:
+        """A note ran on this message and speaks to none of its open cards (0.24.0, fourth round):
+        each stands, its Approve relabeled "Approve as shown", and one notice beside them says a
+        newer note came in; Approve on each then asks once more before it does anything
+        (approvals: calendar_change_note_check)."""
+        said = []
+        with self.ledger.tx() as db:
+            for pid in pids:
+                self.ledger.set_meta(f"calendar_change_note_check:{pid}", "pending", db)
+                raw = self.ledger.get_meta(f"calendar_change_lines:{pid}")
+                if raw:
+                    said.append(render.plain(json.loads(raw)[0]))
+                for a in db.execute("SELECT nonce, message_id FROM approvals WHERE proposal_id=? AND consumed_at IS NULL",
+                                    (pid,)).fetchall():
+                    buttons = render.proposal_buttons(a["nonce"], approve="Approve as shown")
+                    if a["message_id"]:
+                        self.ledger.enqueue(chat_id=job["chat_id"], kind="rebutton", text=str(a["message_id"]),
+                                            buttons=buttons, db=db)
+                    else:
+                        db.execute("UPDATE outbox SET buttons_json=? WHERE state IN ('queued','held') AND binds_json LIKE ?",
+                                   (json.dumps(buttons), f'%{a["nonce"]}%'))
+            self._reply(db, job, "A newer note about your message came in after "
+                        + ("this card" if len(pids) == 1 else "these cards") + ", and it doesn't speak to "
+                        + ("it" if len(pids) == 1 else "any of them") + (": " + "; ".join(said) if said else "")
+                        + ". " + ("It stays" if len(pids) == 1 else "They stay") + " as shown, and Approve now asks "
+                        "once more before it does anything.", kind="notice")
+        log.info("job %s: a note that speaks to none of its %d open card(s): each asks once more", job["id"], len(pids))
 
     def _all_done(self, job, receipt, done_lines, busy_lines=(), waiting_lines=()) -> None:
         receipt["reason"] = "already_done"

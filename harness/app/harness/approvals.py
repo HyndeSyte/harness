@@ -154,6 +154,11 @@ def _verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
         if p["policy_version"] != policy_version or a["policy_version"] != policy_version:
             return Verdict(False, "policy changed since the card was shown",
                            proposal_id=p["id"])
+        if action == "approve" and ledger.get_meta(f"calendar_change_note_check:{p['id']}") == "pending":
+            # A newer note came in that speaks to none of the open cards (runner._newer_note): his
+            # first Approve only confirms he's seen that; the next one approves (0.24.0, fourth round).
+            ledger.set_meta(f"calendar_change_note_check:{p['id']}", "confirmed", db)
+            return Verdict(False, "confirm_after_note", proposal_id=p["id"])
         # One compare-and-set on the proposal decides it (0.24.0, third round): his tap and a
         # newer card replacing this one (supersede_open) can't both win, nor two taps on one
         # proposal. Only the winner uses up the button.

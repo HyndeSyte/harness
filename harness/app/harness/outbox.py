@@ -56,7 +56,7 @@ class Outbox:
         return sent
 
     def _send(self, row) -> bool:
-        if row["kind"] == "unbutton":
+        if row["kind"] in ("unbutton", "rebutton"):
             return self._unbutton(row)
         buttons = json.loads(row["buttons_json"]) if row["buttons_json"] else None
         if buttons:
@@ -100,8 +100,11 @@ class Outbox:
     def _unbutton(self, row) -> bool:
         """A card replaced by a newer one (approvals.supersede_open): its buttons come off. Its
         approval is already used up, so a tap that beats this is refused anyway."""
+        buttons = json.loads(row["buttons_json"]) if row["kind"] == "rebutton" and row["buttons_json"] else None
+        if buttons:
+            buttons = [[tuple(b) for b in r] for r in buttons]
         try:
-            self.api.edit_reply_markup(row["chat_id"], int(row["text"]), None)
+            self.api.edit_reply_markup(row["chat_id"], int(row["text"]), buttons)
         except ChatError as e:
             self._failed(row, e)
             return False

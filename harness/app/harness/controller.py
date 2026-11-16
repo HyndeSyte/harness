@@ -705,7 +705,7 @@ class Controller:
         in_place = job["state"] == "needs_clarification" or (
             job["state"] in ("no_action", "answered") and self._answered_to_cain(job_id))
         beside = any(st in ("proposed", "approved") for st in states.values())
-        if not in_place and not beside:
+        if not in_place and not beside and not self._all_closed(family):
             return                       # a card he saw (a rule, a refusal) isn't sent again
         marks = ",".join("?" * len(family))
         last = self.ledger.db.execute(f"SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id IN ({marks})",
@@ -733,6 +733,16 @@ class Controller:
             self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
         log.info("handover: a note for job %s: it runs again%s", render.short(job_id),
                  "" if in_place else " beside its open cards")
+
+    def _all_closed(self, family: list[str]) -> bool:
+        """Every card of this message was declined or ran out, and nothing of it was done: a note
+        then runs it again as a new request of the same message, its quote and flags kept, and any
+        change comes on a new card (0.24.0, fourth round)."""
+        marks = ",".join("?" * len(family))
+        got = [r[0] for r in self.ledger.db.execute(
+            f"SELECT state FROM proposals WHERE job_id IN ({marks})", tuple(family)).fetchall()]
+        return bool(got) and all(st in ("declined", "expired", "superseded") for st in got) \
+            and any(st in ("declined", "expired") for st in got)
 
     def _answered_to_cain(self, job_id: str) -> bool:
         """Its last answer went to Cain alone, so running it again shows him nothing twice."""

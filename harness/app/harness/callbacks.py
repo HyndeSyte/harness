@@ -28,6 +28,7 @@ REFUSALS = {
     "proposal is no longer open": "That's no longer open.",
     "replaced": "Replaced by a newer card.",
     "replaced_by_update": "Replaced when Harness updated. Nothing was done.",
+    "confirm_after_note": "A newer note came in after this card and doesn't change it. Approve once more to go ahead as shown.",
     "proposal changed after the card was shown": "That changed after you saw it; not done.",
     "policy changed since the card was shown": "The rules changed since; not done.",
 }

@@ -470,3 +470,86 @@ def test_a_retry_of_a_not_confirmed_add_finds_its_first_write_and_adds_nothing(m
     m.tells("add the dentist at 3 today", ask(DENTIST))        # he says it again
     assert "Already there, nothing added: “Dentist”" in m.seen()[-1] and "Add anyway" in m.labels()
     assert len([x for x in m.gmail.log if x[0] == "insert"]) == 1
+
+
+# -- 6. supersede matching ---------------------------------------------------------------------------
+
+def _two_cards(m, second="Dentist checkup"):
+    mid = m.he_says(f"add the dentist at 3 and the {second.lower()} at 5", ago=10 * 60)
+    m.claude.script = [ask(DENTIST, change("gmail", "add", second, dates="", start=at(17).isoformat(),
+                                           end=at(18).isoformat()))]
+    m.handover(paired=OWNER, message=mid)
+    cards = sorted(cid for cid in m.link.cards if any(c["label"] == "Approve" for r in m.link.cards[cid]["rows"]
+                                                     for c in r["components"]))
+    assert len(cards) == 2
+    return mid, cards
+
+
+def test_a_note_matching_several_cards_by_name_asks_which_one(m):
+    mid, (first, second) = _two_cards(m)
+    m.claude.script = [ask(change("gmail", "add", "Dentist", dates="", start=at(16).isoformat(), end=at(17).isoformat()))]
+    m.handover(paired=OWNER, message=mid, suggestion="He means the dentist at 4.")
+    assert m.link.cards[first]["rows"] and m.link.cards[second]["rows"]          # neither replaced yet
+    asked = m.seen()[-1]
+    assert asked.startswith("Which card does the newer note correct?")
+    assert "Card 1: Add Dentist" in asked and "Card 2: Add Dentist checkup" in asked
+    assert {"Card 1", "Card 2", "Neither"} <= set(m.labels())
+    m.tap("Card 1")
+    m.c.outbox.flush()
+    assert m.link.cards[first]["rows"] == [] and m.link.cards[second]["rows"]
+    new = [t for t in m.seen() if "Replaces the earlier card." in t]
+    assert new and "4:00" in new[-1] and m.seen()[-1] == "The correction is on a new card. That card is off."
+    m.tap("Approve")
+    assert [e["start"]["dateTime"] for e in dentists(m)] == [at(16).isoformat()]
+    press(m, second, "Approve")
+    assert [e["summary"] for e in m.gmail.events.values() if e.get("summary") == "Dentist checkup"]
+
+
+def test_neither_puts_the_correction_on_its_own_card(m):
+    mid, (first, second) = _two_cards(m)
+    m.claude.script = [ask(change("gmail", "add", "Dentist", dates="", start=at(16).isoformat(), end=at(17).isoformat()))]
+    m.handover(paired=OWNER, message=mid, suggestion="He means the dentist at 4.")
+    m.tap("Neither")
+    m.c.outbox.flush()
+    assert m.link.cards[first]["rows"] and m.link.cards[second]["rows"]
+    assert any("a card of its own and they stand" in t for t in m.seen())
+
+
+def test_a_note_matching_exactly_one_card_by_name_replaces_only_it(m):
+    mid, (first, second) = _two_cards(m, second="Swim")
+    m.claude.script = [ask(change("gmail", "add", "Dentist", dates="", start=at(16).isoformat(), end=at(17).isoformat()))]
+    m.handover(paired=OWNER, message=mid, suggestion="He means the dentist at 4.")
+    m.c.outbox.flush()
+    assert m.link.cards[first]["rows"] == [] and m.link.cards[second]["rows"]
+    assert "Replaces the earlier card." in m.seen()[-1]
+
+
+def test_a_note_that_speaks_to_none_of_the_open_cards_makes_their_approve_ask_once_more(m):
+    from test_plain_commands import PT_ID
+    mid, (first, second) = _two_cards(m, second="Swim")
+    m.claude.script = [ask(change("gmail", "remove", "PT"))]
+    m.handover(paired=OWNER, message=mid, suggestion="Also, no PT today.")
+    m.c.outbox.flush()
+    notice = [t for t in m.seen() if t.startswith("A newer note about your message came in")]
+    assert notice and "it doesn't speak to any of them" in notice[-1] and "Approve now asks once more" in notice[-1]
+    labels = [c["label"] for r in m.link.cards[first]["rows"] for c in r["components"]]
+    assert labels[0] == "Approve as shown"
+    press(m, first, "Approve as shown")
+    assert not dentists(m)                                   # the first tap only confirms
+    assert any("A newer note came in after this card" in (t or "") for _, t in m.link.answers)
+    press(m, first, "Approve as shown")
+    assert len(dentists(m)) == 1
+    assert m.gmail.events[PT_ID].get("status") != "cancelled"   # the PT removal waits on its own card
+
+
+def test_a_note_on_a_request_whose_cards_were_all_declined_runs_it_again(m):
+    mid = m.he_says("add the dentist at 3 today", ago=10 * 60)
+    m.claude.script = [ask(DENTIST)]
+    m.handover(paired=OWNER, message=mid)
+    m.tap("Decline")
+    m.claude.script = [ask(change("gmail", "add", "Dentist", dates="", start=at(16).isoformat(), end=at(17).isoformat()))]
+    out = m.handover(paired=OWNER, message=mid, suggestion="He meant the dentist at 4, not 3.")
+    assert out["status"] == "waiting for his tap" and "Approve" in m.labels()
+    assert "Your message: “add the dentist at 3 today”" in m.seen()[-1]      # its provenance kept
+    m.tap("Approve")
+    assert [e["start"]["dateTime"] for e in dentists(m)] == [at(16).isoformat()]
