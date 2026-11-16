@@ -384,8 +384,12 @@ describe("8. the replay bound is monotonic, and the prompt supersedes the old ke
     expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(0);
     r.t.mono += REPLAY_WAIT_MS + 1;
     await r.link.sweep();
-    expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(1);
     const kid = kidOf(r, id);
+    // Round 18: the line asking him again waits for the keeper's status to show the supersede mirrored.
+    expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(0);
+    r.keeperVerified({ superseded: [kid] });
+    await r.link.sweep();
+    expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(1);
     const sup = logged(r).findIndex((x) => x.t === "supersede" && x.kid === kid);
     expect(sup).toBeGreaterThan(-1);
     expect(r.relayed.some((x) => x.includes(`tap key ${kid} is superseded`))).toBe(true);
@@ -453,7 +457,8 @@ describe("9. the invariant document, and the code against it", () => {
     expect(keeper).not.toContain("now - at > 86_400_000");
     expect(keeper).toMatch(/function writeAtomic[\s\S]{0,300}fsyncSync\(fd\)[\s\S]{0,80}renameSync\(tmp, file\);\s*syncDir/);
     // The link state's saves that are relied on: fsynced.
-    expect(pub).toContain("if (sync) return this.saveDurable(s);");
+    // Round 18: every save is the durable one.
+    expect(pub).toContain("save(s: State, _sync = false): void { this.saveDurable(s); }");
     for (const t of ["this.d.save(s, true);\n    try {\n      // Cain hears it", "replaced = record(s, { ...msg, components: comps });\n      this.d.save(s, true);"]) expect(core).toContain(t);
     // No status time in the held record; the keeper floors by the hold's id.
     expect(core).not.toContain("consumed_unverified?.since ?? ks?.start?.at");

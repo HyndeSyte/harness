@@ -520,6 +520,7 @@ describe("5. whole-image restores and expiry", () => {
     await r.link.sweep();
     expect(r.state().tombstones?.[key]).toBeDefined();
     r.t.now = since + 100 * DAY + MIN;
+    (r.link as any).noteStamp(r.snowflake());                           // round 18: a Discord stamp at the new time
     await r.link.sweep();
     expect(r.state().tombstones?.[key]).toBeUndefined();
     expect((r.link.clockReport() as any).expired_landings).toEqual([expect.objectContaining({ tap_key: tapKid(key) })]);

@@ -155,7 +155,17 @@ describe("2. issued-key memory lasts the key's whole life", () => {
     const k = keeperRig();
     appendLog(linkLog(k), { t: "key", kid: "tap-00000000b999", ...ASK("1"), at: 0 });
     expect(readIssued(k.cfg, 99 * DAY).keys.has("tap-00000000b999")).toBe(true);
-    expect(readIssued(k.cfg, 101 * DAY).keys.has("tap-00000000b999")).toBe(false);
+    // Round 18: a key without a card snowflake is never aged by the Pi's clock; it goes once a key logged after it has
+    // a card snowflake more than 100 days behind the newest card's.
+    expect(readIssued(k.cfg, 101 * DAY).keys.has("tap-00000000b999")).toBe(true);
+    const sfAt = (ms: number) => String(((BigInt(ms) - 1420070400000n) << 22n) + 1n);
+    const T = Date.UTC(2026, 0, 1);
+    appendLog(linkLog(k), { t: "key", kid: "tap-00000000b998", ...ASK(sfAt(T)), at: T });
+    expect(readIssued(k.cfg, 101 * DAY).keys.has("tap-00000000b999")).toBe(true);
+    appendLog(linkLog(k), { t: "key", kid: "tap-00000000b997", ...ASK(sfAt(T + 101 * DAY)), at: T + 101 * DAY });
+    expect(readIssued(k.cfg, 0).keys.has("tap-00000000b999")).toBe(false);
+    expect(readIssued(k.cfg, 0).keys.has("tap-00000000b998")).toBe(false);
+    expect(readIssued(k.cfg, 0).keys.has("tap-00000000b997")).toBe(true);
   }, 30_000);
 });
 

@@ -312,6 +312,9 @@ describe("5. held releases resolve only once verified, and a replay with no keep
     // No keeper request for the key within the bound: one line on the card asking for a fresh tap.
     r.t.now += REPLAY_WAIT_MS + MIN;
     await r.link.sweep();
+    // Round 18: the line waits for the keeper's status to show the supersede mirrored.
+    const sup = readLog<any>(r.issuedLog!, { repair: false }).records.find((x) => x.t === "supersede");
+    r.keeperVerified({ superseded: [sup.kid] });
     await r.link.sweep();
     expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(1);
     expect(r.relayed.filter((x) => x.startsWith("No request came for replayed held tap key"))).toHaveLength(1);
@@ -384,6 +387,7 @@ describe("7. the restore sweep keeps a durable cursor and honours Retry-After", 
     expect(cursor.before).toMatch(/^\d+$/);
     r.failing.clear();
     r.restart();
+    (r.link as any).noteStamp(r.snowflake());                         // round 18: a Discord stamp compared in this run
     const from = r.calls.length;
     await r.link.sweep();
     const reads = r.calls.slice(from).filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`));
@@ -402,6 +406,7 @@ describe("7. the restore sweep keeps a durable cursor and honours Retry-After", 
     await r.link.sweep();
     unverified(r, "its log of consumed tap keys is missing");
     r.restart();
+    (r.link as any).noteStamp(r.snowflake());                         // round 18: a Discord stamp compared in this run
     r.limitN[`GET /channels/${DM}/messages?limit=100`] = 1;
     const waits = r.keeper.waits;
     await r.link.sweep();

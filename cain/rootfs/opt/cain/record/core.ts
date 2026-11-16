@@ -1214,6 +1214,7 @@ export type PlanContext = {
   clockSource?: string;   // which source said so (recorded with each check)
   clockWhy?: string;      // when it isn't: what each source returned (named in the refusal)
   generation?: number;    // the keeper's own count of ledger generations (never comes down)
+  lapsed?: (item: string, h: Hold) => boolean;   // round 18: the keeper's lapse (monotonic within its run, or the idle day)
 };
 export type Plan =
   // declared: a one-off's reason and the overlap it answers, for the request log.
@@ -1271,7 +1272,7 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
   // An expired hold is as good as gone.
   const holds: Holds = {};
   for (const [k, h] of Object.entries(ctx.holds ?? {}))
-    if (!expired(h, at, downtime)) holds[k] = { ...h, branches: [...h.branches] };
+    if (!(ctx.lapsed ? ctx.lapsed(k, h) : expired(h, at, downtime))) holds[k] = { ...h, branches: [...h.branches] };
   const writes = new Map<string, string | null>();   // null = delete
   const current = (p: string) => writes.has(p) ? writes.get(p)! : tree.read(p);
   const touched = new Set<string>();   // the sender's own held rows it changed: renewed

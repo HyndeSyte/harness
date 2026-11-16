@@ -22,24 +22,30 @@ export const CARDS_DELAY_MS = 500;
 
 // The link's state file: read whole, written whole through a rename. A save tells onSave
 // (the cards writer) and writes nothing else.
-export function stateFile(path: string, onSave: () => void = () => {}) {
+// Round 18: every save is fsynced: the temp file before the rename, the folder after it, so no save that isn't
+// durable can ever replace one that is (a tap's claim, an owner proposal, the verification tuple, a card's record
+// before its buttons all live in it). io: the file operations, and a crash point between the write and the fsync,
+// for the tests' power-cut model.
+export type StateIo = {
+  open: (p: string, flags: string, mode?: number) => number; write: (fd: number, text: string) => void; fsync: (fd: number) => void;
+  close: (fd: number) => void; rename: (a: string, b: string) => void; read: (p: string) => string; crash?: (where: string) => void;
+};
+const realIo: StateIo = { open: (p, f, m) => openSync(p, f, m), write: (fd, t) => { writeSync(fd, t); }, fsync: (fd) => fsyncSync(fd),
+  close: (fd) => closeSync(fd), rename: (a, b) => renameSync(a, b), read: (p) => readFileSync(p, "utf8") };
+export function stateFile(path: string, onSave: () => void = () => {}, io: StateIo = realIo) {
   return {
     load(): State {
-      try { return JSON.parse(readFileSync(path, "utf8")); } catch { return emptyState(); }
+      try { return JSON.parse(io.read(path)); } catch { return emptyState(); }
     },
-    // Round 17: sync fsyncs it like saveDurable (a save something is relied on after).
-    save(s: State, sync = false): void {
-      if (sync) return this.saveDurable(s);
-      writeFileSync(`${path}.tmp`, JSON.stringify(s), { mode: 0o600 });
-      renameSync(`${path}.tmp`, path);
-      onSave();
-    },
-    // Round 12: the same save, fsynced (the file, then its folder) before it returns: the run counter.
+    // Round 18: sync is kept for the callers' wording; every save is the durable one.
+    save(s: State, _sync = false): void { this.saveDurable(s); },
+    // Round 12: the save, fsynced (the file, then its folder) before it returns.
     saveDurable(s: State): void {
-      const fd = openSync(`${path}.tmp`, "w", 0o600);
-      try { writeSync(fd, JSON.stringify(s)); fsyncSync(fd); } finally { closeSync(fd); }
-      renameSync(`${path}.tmp`, path);
-      try { const d = openSync(dirname(path), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* a folder that can't be synced */ }
+      const fd = io.open(`${path}.tmp`, "w", 0o600);
+      try { io.write(fd, JSON.stringify(s)); io.crash?.("state:after-write"); io.fsync(fd); } finally { io.close(fd); }
+      io.rename(`${path}.tmp`, path);
+      io.crash?.("state:after-rename");
+      try { const d = io.open(dirname(path), "r"); try { io.fsync(d); } finally { io.close(d); } } catch { /* a folder that can't be synced */ }
       onSave();
     },
   };

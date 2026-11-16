@@ -416,6 +416,7 @@ describe("6. the post-restore sweep pages back to the card horizon", () => {
     writeFileSync(r.issuedLog!, log0);
     unverified(r, "its log of consumed tap keys is missing");
     r.restart();
+    (r.link as any).noteStamp(r.snowflake());                         // round 18: a Discord stamp compared in this run
     const reads0 = r.reads();
     await r.link.sweep();
     const pages = r.reads() - reads0;

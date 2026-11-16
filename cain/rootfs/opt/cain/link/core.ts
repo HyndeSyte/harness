@@ -415,6 +415,9 @@ export const TAP_REPLAY_AGAIN = "Your held answer may not have reached Cain afte
 export const SHIP_RESTORE_REISSUE = "Its buttons are off after a restore of the App: a Ship card from before the restore isn't tappable. Cain sends a new one if it still needs you.";
 // Round 16: a held tap refused because its hold began after its card expired (by the held record).
 export const TAP_HOLD_FLOOR = "Not acted: your answer was held across a restart of Cain's record, and by then its card had expired. Cain asks again if it still needs you.";
+// Round 18: a replayed held tap the keeper consumed before its supersede took: it stands, and the card says so
+// instead of asking him again.
+export const TAP_REPLAY_ACTED = "Your answer here was acted on after all, so there's nothing to answer again.";
 // Round 18: a tap the link can't place in Discord's time (no interaction id on its held record, or no card id to
 // date the card's expiry from) is refused, never judged by the Pi's clock.
 export const TAP_UNSTAMPED = "Not acted: Discord's time for this answer couldn't be read, so it can't be judged. Cain asks again if it still needs you.";
@@ -1182,7 +1185,14 @@ export class Link {
     } catch (e) { this.log(`couldn't read his DM's last message for a source check's anchor: ${String(e).slice(0, 80)}`); }
     return best;
   }
-  private piClockOff(): boolean { return this.skew !== null && Math.abs(this.skew) > CLOCK_TOLERANCE_MS; }
+  private piClockOff(): boolean { return this.piClock() === "off"; }
+  // Round 18: the Pi's clock verdict: unknown until this run has compared a Discord stamp (a post or a tap) with it,
+  // then in step or off. Unknown is never taken as in step: the restore sweep's done mark waits for "in step", and the
+  // "clock is off" line for a comparison that says off.
+  private piClock(): "unknown" | "in step" | "off" {
+    if (this.skew === null) return "unknown";
+    return Math.abs(this.skew) > CLOCK_TOLERANCE_MS ? "off" : "in step";
+  }
   // Round 17: the monotonic clock (this process only), for bounds that must not follow a step of the Pi's clock.
   private mono(): number { return this.d.mono ? this.d.mono() : performance.now(); }
   // Round 16: the newest message in his DM when this link started (its channel's last message id, by
@@ -2068,6 +2078,7 @@ export class Link {
       // Round 11: the landing ledger's reconciliation, one row per head.
       landings_by_head: (this.d.landings?.reconcile?.() ?? []).map((h) => ({ pr: h.pr, head: h.head, landed: h.landed ? tapKid(h.landed) : null,
         keys: h.keys.map(tapKid), forced: h.forced.map(tapKid), open: h.open.map(tapKid) })),
+      pi_clock: this.piClock(),
       recheck_queue: Object.entries(this.d.load().recheck ?? {}).map(([item, r]) => ({ item, why: r.why, since: new Date(r.at).toISOString() })),
     };
   }
@@ -3711,6 +3722,7 @@ export class Link {
     }
     this.pruneTaps();
   }
+  private issuedSeen = new Map<string, number>();
   // Claims are kept as long as their cards are remembered.
   private pruneTaps(): void {
     const s4 = this.d.load();
@@ -3718,8 +3730,21 @@ export class Link {
     const unresolved = new Set([...Object.keys(s4.unresolved ?? {}), ...Object.keys(s4.tombstones ?? {})]);
     const kids = new Set([...unresolved].map(tapKid));
     for (const [k, t] of Object.entries(s4.taps ?? {})) if (t.stage === "edited" && !s4.messages[t.msg] && !unresolved.has(k)) { delete s4.taps![k]; pruned = true; }
-    for (const [kid, v] of Object.entries(s4.issued ?? {}))
-      if (this.d.now() - v.at > TAP_ISSUED_KEEP_MS && !kids.has(kid)) { delete s4.issued![kid]; pruned = true; }
+    // Round 18: a tap record is pruned by a snowflake comparison (its card's against the newest Discord stamp this run
+    // has seen), or, without a card snowflake, on the monotonic clock of this run (from when this run first saw it):
+    // never by a wall-clock duration, since a pruned record makes the keeper refuse its key as lost.
+    const newest = this.newestSf ? snowflakeTime(this.newestSf) : null;
+    for (const [kid, v] of Object.entries(s4.issued ?? {})) {
+      if (kids.has(kid)) continue;
+      const card = /^\d{15,22}$/.test(String(v.msg ?? "")) ? snowflakeTime(String(v.msg)) : null;
+      let old = false;
+      if (card !== null) old = newest !== null && newest - card > TAP_ISSUED_KEEP_MS;
+      else {
+        if (!this.issuedSeen.has(kid)) this.issuedSeen.set(kid, this.mono());
+        old = this.mono() - this.issuedSeen.get(kid)! > TAP_ISSUED_KEEP_MS;
+      }
+      if (old) { delete s4.issued![kid]; this.issuedSeen.delete(kid); pruned = true; }
+    }
     if (pruned) this.d.save(s4);
   }
   private tapsNow = new Set<string>();
@@ -4906,7 +4931,15 @@ export class Link {
   private runNo(): number {
     if (this.runN) return this.runN;
     const s = this.d.load();
-    s.run = (Number.isInteger(s.run) ? s.run! : 0) + 1;
+    // Round 18: the run number is one above both the state's and the issued-key log's highest run record (the log is
+    // outside the restorable state), and the nonce is fresh randomness: a state restored from a backup can't reuse a
+    // run, nor the nonce the keeper's verified status names, so its waiting cards stay unarmed until a new verification.
+    let logged = 0;
+    if (this.d.issuedLog && existsSync(this.d.issuedLog)) {
+      try { for (const r of readLog<any>(this.d.issuedLog, { repair: false }).records) if (r?.t === "run" && Number.isInteger(r.run) && r.run > logged) logged = r.run; }
+      catch { /* a log that can't be read: the state's count */ }
+    }
+    s.run = Math.max(Number.isInteger(s.run) ? s.run! : 0, logged) + 1;
     s.runNonce = randomBytes(8).toString("hex");
     this.runN = s.run;
     this.runNonce = s.runNonce;
@@ -5521,23 +5554,44 @@ export class Link {
     const replays = recs.filter((r) => r?.t === "released" && r.replay === true && typeof r.kid === "string" && !settled.has(r.kid));
     if (!replays.length) return;
     const consumed = this.consumedKids();
-    const notes = (keeperStatus(this.files().status) as any)?.tap_notices;
+    const st = keeperStatus(this.files().status) as any;
+    const notes = st?.tap_notices;
     const noticed = new Set<string>(Array.isArray(notes) ? notes.map((n: any) => String(n?.tap ?? "")) : []);
+    // Round 18: the supersedes this link has appended, and those the keeper's status shows mirrored.
+    const ours = new Set<string>();
+    if (this.d.issuedLog && existsSync(this.d.issuedLog)) {
+      try { for (const x of readLog<any>(this.d.issuedLog, { repair: false }).records) if (x?.t === "supersede" && typeof x.kid === "string") ours.add(x.kid); } catch { /* read again next sweep */ }
+    }
+    const mirrored = new Set<string>(Array.isArray(st?.superseded) ? st.superseded.map((k: any) => String(k)) : []);
     for (const r of replays) {
-      if (consumed.has(r.kid) || noticed.has(r.kid)) {
-        try { appendLog(f, { t: "replay-done", kid: r.kid, how: "the keeper has a request for it", at: this.d.now() }); } catch { /* the next sweep */ }
-        continue;
-      }
-      // Round 17: the 10-minute bound runs on the monotonic clock, from when this process first saw the replay
-      // (a restart starts it again, so it is never shorter), never on the Pi's clock.
-      if (!this.replaySeen.has(r.kid)) this.replaySeen.set(r.kid, this.mono());
-      if (this.mono() - this.replaySeen.get(r.kid)! < REPLAY_WAIT_MS) continue;
       const held = recs.find((x) => x?.t === "held" && x.kid === r.kid);
-      // Round 17: the old key is superseded (fsynced in the issued-key log, which the keeper reads) before the line
-      // asking him again goes, so a late request of Cain's for it is refused, with a line on the card.
-      if (this.d.issuedLog) {
+      if (!ours.has(r.kid)) {
+        if (consumed.has(r.kid) || noticed.has(r.kid)) {
+          try { appendLog(f, { t: "replay-done", kid: r.kid, how: "the keeper has a request for it", at: this.d.now() }); } catch { /* the next sweep */ }
+          continue;
+        }
+        // Round 17: the 10-minute bound runs on the monotonic clock, from when this process first saw the replay
+        // (a restart starts it again, so it is never shorter), never on the Pi's clock.
+        if (!this.replaySeen.has(r.kid)) this.replaySeen.set(r.kid, this.mono());
+        if (this.mono() - this.replaySeen.get(r.kid)! < REPLAY_WAIT_MS) continue;
+        // Round 17: the old key is superseded (fsynced in the issued-key log, which the keeper reads) before the line
+        // asking him again goes, so a late request of Cain's for it is refused, with a line on the card.
+        if (!this.d.issuedLog) continue;
         try { appendLog(this.d.issuedLog, { t: "supersede", kid: r.kid, ...(held?.msg ? { msg: held.msg } : {}), at: this.d.now() }); }
         catch (e) { this.log(`couldn't supersede replayed tap key ${r.kid} (${String(e).slice(0, 80)}): asked again next sweep`); continue; }
+        this.log(`replayed held tap ${r.kid}: superseded; the line asking him again waits for the record keeper's mirror of it`);
+      }
+      // Round 18: supersede ordered against consumption. The line asking him again waits until the keeper's status
+      // shows the supersede mirrored (from then on the keeper refuses the key, and it reads the link's log for a
+      // supersede just before consuming any key), and the key is still absent from the consumed-key log. A key the
+      // keeper consumed meanwhile gets the outcome of that tap on the card instead: exactly one of the two.
+      if (!mirrored.has(r.kid)) continue;
+      if (this.consumedKids().has(r.kid)) {
+        try { appendLog(f, { t: "replay-done", kid: r.kid, how: "consumed before the supersede took", at: this.d.now() }); } catch { continue; }
+        if (held?.msg) { try { await this.post(TAP_REPLAY_ACTED, [], { replyTo: held.msg }); } catch (e) { this.log(`couldn't tell him on card ${held.msg} that his answer was acted on: ${String(e).slice(0, 80)}`); } }
+        this.d.relay(`Replayed held tap key ${r.kid} was acted on by the record keeper before its supersede took, so it stands: he was told on the card that his answer was acted on, and he isn't asked again. Nothing more to do or tell him.`);
+        this.log(`replayed held tap ${r.kid}: consumed before the supersede was mirrored; he was told it acted`);
+        continue;
       }
       try { appendLog(f, { t: "replay-done", kid: r.kid, how: "no request: asked again", at: this.d.now() }); } catch { continue; }
       if (held?.msg) { try { await this.post(TAP_REPLAY_AGAIN, [], { replyTo: held.msg }); } catch (e) { this.log(`couldn't ask him again on card ${held.msg}: ${String(e).slice(0, 80)}`); } }
@@ -5635,11 +5689,12 @@ export class Link {
       lost += await this.sweepPage(page, id.bot, horizon);
       const oldest = String(batch.at(-1)?.id ?? "");
       const end = past || batch.length < 100 || !oldest;
-      const off = end && this.piClockOff();
+      const verdict = this.piClock();
+      const off = end && verdict !== "in step";
       cur = { restore: key, before: oldest || cur.before, done: end && !off };
       try { this.saveCursor(cur); } catch (e) { this.log(`couldn't save the restore sweep's cursor: ${String(e).slice(0, 80)}`); }
       this.d.crashPoint?.("sweep:after-page");
-      if (off) { this.log("the restore sweep reached its horizon, but the Pi's clock is flagged off: not marked done, read again next start"); this.restoreSwept = false; }
+      if (off) { this.log(`the restore sweep reached its horizon, but the Pi's clock is ${verdict === "off" ? "flagged off" : "not yet compared with a Discord stamp in this run"}: not marked done, read again`); this.restoreSwept = false; }
       if (end) break;
     }
     if (lost) this.tellLostCards(lost);

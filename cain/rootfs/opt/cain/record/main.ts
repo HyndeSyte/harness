@@ -18,7 +18,7 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
   maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, checksText, parseChecks, type OneOff, type WaitTimeout,
-  type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
+  type Downtime, type Hold, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
 import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
@@ -28,6 +28,7 @@ import { installState } from "../installflag.ts";
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; relay: string;
   branch: string; token?: string; hygieneAt: string; tz: string; now?: () => Date;
+  mono?: () => number;   // round 18: the keeper's monotonic clock (this process only); the tests' stand-in
   holds?: string;   // the keeper's own copy of the holds; default /data/record-holds.json (next to the queue)
   maxCheckDays?: number;   // the App's source_check_max_days (default 7): a check's stale_after, and the Checked cells
   clockSynced?: () => boolean;   // the tests' stand-in for the clock sources: one reading, synced or not
@@ -459,7 +460,32 @@ export function expirySf(k: { msg?: string; at?: number; exp?: number; life?: nu
   if (typeof k.life === "number" && Number.isFinite(k.life)) return m + k.life;
   return typeof k.at === "number" && Number.isFinite(k.at) ? m + (k.exp - k.at) : null;
 }
+// Round 18: an item hold lapses after a day without a word from its holder on the monotonic clock of this keeper
+// process (from when it first saw that renewal), or by the wall clock's idle day, whichever comes first: a step of the
+// Pi's clock back can't keep a hold alive past a day of real time in this run (a hold that outlived its day would
+// refuse a tap on Cain's card as held elsewhere), and a lapse only ever frees the item.
+const holdSeen = new Map<string, number>();
+export function holdLapsed(cfg: Config, k: string, h: Hold, at: Date, downtime: Downtime): boolean {
+  const mono = cfg.mono ? cfg.mono() : performance.now();
+  const key = `${cfg.dir}\u0000${k}\u0000${h.renewed}`;
+  if (!holdSeen.has(key)) holdSeen.set(key, mono);
+  if (holdSeen.size > 5000) holdSeen.delete(holdSeen.keys().next().value!);
+  return mono - holdSeen.get(key)! > HOLD_IDLE_MS || expired(h, at, downtime);
+}
 function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }); }
+// Round 18: whether the link has superseded a key, read from its issued-key log now (its tail, as it stands at this
+// instant), just before the keeper consumes that key: a supersede the link appended after this round's mirror is
+// still seen, so a key is either consumed or superseded, never both.
+export function supersededNow(cfg: Config, kid: string): boolean {
+  try { return readLog<any>(linkIssuedFile(cfg), { repair: false }).records.some((r) => r?.t === "supersede" && r.kid === kid); }
+  catch { return false; }
+}
+// Round 18: the supersede records the keeper has mirrored (its own issued-key log), for its status: the link asks
+// him again only once its supersede shows here and the key is still absent from the consumed-key log.
+function mirroredSupersedes(cfg: Config): string[] {
+  try { return [...new Set(readLog<any>(issuedMirrorFile(cfg), { repair: false }).records.filter((r) => r?.t === "supersede" && typeof r.kid === "string").map((r) => r.kid as string))].slice(-200); }
+  catch { return []; }
+}
 
 // Round 12: the issued keys the keeper knows, from the link's issued-key log and its own mirror of it,
 // each with its card's item, kind, label, message id and target; keys older than ISSUED_KEEP_MS are
@@ -477,12 +503,27 @@ export function readIssued(cfg: Config, now: number): { keys: Map<string, Issued
   // card's in the logs), never by the Pi's clock; only a key with no card snowflake falls back to its logged time.
   let newest = -Infinity;
   for (const [, recs] of files) for (const r of recs) if (r?.t === "key") { const m = snowflakeMs(String(r.msg ?? "")); if (Number.isFinite(m) && m > newest) newest = m; }
+  // Round 18: for each key record, the card snowflake of the nearest key logged after it in its file (a bound on its age).
+  const laterSf = new Map<any, number>();
+  for (const [, recs] of files) {
+    let next = NaN;
+    for (let i = recs.length - 1; i >= 0; i--) {
+      const r = recs[i];
+      if (r?.t !== "key") continue;
+      laterSf.set(r, next);
+      const m = snowflakeMs(String(r.msg ?? ""));
+      if (Number.isFinite(m)) next = m;
+    }
+  }
   for (const [f, recs] of files) {
     for (const r of recs) {
       if (r?.t === "run" && Number.isInteger(r.run) && typeof r.nonce === "string") { if (f === linkIssuedFile(cfg)) runs.push({ run: r.run, nonce: r.nonce }); continue; }
       if (r?.t !== "key" || !TAP_KEY.test(r.kid) || typeof r.item !== "string" || typeof r.kind !== "string") continue;
       const at = Number(r.at), msf = snowflakeMs(String(r.msg ?? ""));
-      if (Number.isFinite(msf) ? newest - msf > ISSUED_KEEP_MS : (Number.isFinite(at) && now - at > ISSUED_KEEP_MS)) continue;
+      // Round 18: a key without a card snowflake is never aged by the Pi's clock: it goes only once a key logged after
+      // it in the same file (so issued no earlier) has a card snowflake ISSUED_KEEP_MS behind the newest card's.
+      const later = Number.isFinite(msf) ? msf : laterSf.get(r) ?? NaN;
+      if (Number.isFinite(later) && newest - later > ISSUED_KEEP_MS) continue;
       if (!keys.has(r.kid)) keys.set(r.kid, { kid: r.kid, item: r.item, kind: r.kind, ...(typeof r.label === "string" ? { label: r.label } : {}),
         ...(typeof r.msg === "string" ? { msg: r.msg } : {}), ...(r.target && typeof r.target.item === "string" && Array.isArray(r.target.writes) ? { target: r.target } : {}),
         at: Number.isFinite(at) ? at : now, ...(Number.isInteger(r.run) ? { run: r.run } : {}), ...(typeof r.nonce === "string" ? { nonce: r.nonce } : {}),
@@ -951,7 +992,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // The ledger's generation never comes down: each write is one above both the file's and
       // the keeper's own count.
       const generation = () => Math.max(S.generation ?? 0, generationOf(t.read(CHECKS_PATH)));
-      const ctx = (at: Date) => ({ at, holds: S.holds, downtime: S.downtime, tz: cfg.tz, maxCheckDays: maxCheckDays(cfg.maxCheckDays),
+      const ctx = (at: Date) => ({ at, holds: S.holds, downtime: S.downtime, lapsed: (k: string, h: Hold) => holdLapsed(cfg, k, h, at, S.downtime), tz: cfg.tz, maxCheckDays: maxCheckDays(cfg.maxCheckDays),
         clockSynced: cv!.synced, ...(cv!.source ? { clockSource: cv!.source } : { clockWhy: cv!.diagnostic }), generation: generation() });
       const outcomeOf = (req: Request, at: Date) => ({ id: req.id, from: clean(req.from, 80), kind: req.kind, summary: clean(req.summary, 200), at: at.toISOString() });
       // A planned change: its files, then its holds. A failed write, the holds' included,
@@ -1025,7 +1066,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
 
       // Holds that went a day without a word from their holder end.
       const now = clock();
-      const ended = Object.keys(S.holds).filter((k) => expired(S.holds[k], now, S.downtime));
+      const ended = Object.keys(S.holds).filter((k) => holdLapsed(cfg, k, S.holds[k], now, S.downtime));
       if (ended.length) {
         const who = ended.map((k) => `${k} (${S.holds[k].holder})`).join(", ");
         for (const k of ended) delete S.holds[k];
@@ -1304,6 +1345,13 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           o = { ...base, state: "rejected", reason: clean(r ? `${tapWhy}. The tap key isn't used up: send the write its card allows with the same tap key, or route any other write as an ordinary request with "tap": "none" and its source check redone` : tapWhy, 600) };
           // Round 11: a request whose target doesn't match its key's: he hears one line on the card.
           if (r) notice({ tap: k, why: "refused", reason: o.reason!, ...(r.msg ? { msg: r.msg } : {}) });
+        }
+        else if (tapK && supersededNow(cfg, tapK)) {
+          // Round 18: the link superseded the key after this round's mirror: refused all the same, never consumed.
+          const r = reg.keys.get(tapK);
+          o = { ...base, state: "rejected", reason: `tap key ${tapK} was superseded: no request for it came within 10 minutes of its replay, so his card asked him to answer again on a fresh card. Record nothing from it, and ask again with --checked if it still needs him` };
+          notice({ tap: tapK, why: "superseded", reason: o.reason!, ...(r?.msg ? { msg: r.msg } : {}) });
+          log(`tap key ${tapK} refused: superseded (read from the link's issued-key log just before consuming it)`);
         }
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
         else o = decide(it.req!, !!it.local, base);
@@ -1600,6 +1648,8 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       ...(st.floorWhy ? { link_state: { readable: false, why: st.floorWhy } } : {}),
       ...(st.epochWait ? { epoch_wait: st.epochWait } : {}),
       ...(st.tapNotices?.length ? { tap_notices: st.tapNotices } : {}),
+      // Round 18: the supersede records mirrored so far (the link's line asking him again waits for its own here).
+      ...((): { superseded?: string[] } => { const x = mirroredSupersedes(cfg); return x.length ? { superseded: x } : {}; })(),
       ...(st.linkRestore ? { link_restore: st.linkRestore } : {}),
       ...(st.rebuild ? { consumed_unverified: { since: st.rebuild.since, why: st.rebuild.why, tries: st.rebuild.tries } } : {}),
       // Round 16: the keeper's current start, and the fresh fetch that verified its consumed set in it.

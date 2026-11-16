@@ -315,7 +315,8 @@ describe("4. claims compare on a per-start nonce", () => {
     const st = r.state();
     expect(st.run).toBe(1);
     expect(st.taps![key]).toMatchObject({ run: 1, nonce: st.runNonce });
-    // Restored to an older counter: the next start makes run 1 again, equal to the claim's run.
+    // Restored to an older counter. Round 18: the next start takes its run from the issued-key log's highest run plus
+    // one, so it makes run 2, never run 1 again; the claim is still an earlier-run claim by its nonce.
     st.run = 0;
     r.setState(st);
     const ledger = JSON.parse(r.files.checks!);
@@ -323,7 +324,7 @@ describe("4. claims compare on a per-start nonce", () => {
     r.files.checks = JSON.stringify(ledger);
     r.restart();
     await r.link.sweep();
-    expect(r.state().run).toBe(1);
+    expect(r.state().run).toBe(2);
     expect(r.state().runNonce).not.toBe(st.runNonce);
     expect(r.relayed.filter((x) => x.includes("Dane tapped"))).toHaveLength(0);
     expect(notActedLines(r)).toHaveLength(1);
@@ -422,6 +423,7 @@ describe("6. tap keys registered by the link and checked by the keeper", () => {
     st.unresolved = { [skey]: { since: r.t.now, fails: 1, last: "x", next: r.t.now + DAY * 30, what: "orphan" } };
     r.setState(st);
     r.later(TAP_ISSUED_KEEP_MS + DAY);
+    (r.link as any).noteStamp(r.snowflake());                           // round 18: a Discord stamp at the new time
     await r.link.sweep();
     expect(r.state().issued?.[tapKid(key)]).toBeUndefined();
     expect(r.state().issued?.[tapKid(skey)]).toBeDefined();
