@@ -803,21 +803,27 @@ function chromeVersionReadNow(o: Opts, inst: Install): ChromeRead | null {
   try { v = readFileSync(join(inst.profile.user_data_dir, "Last Version"), "utf8").trim(); } catch { v = ""; }
   return OK.test(v) ? { version: v, source: "last_version_file" } : null;
 }
-// The version hold (version-hold.json, 0.12.0, twenty-first and twenty-second rounds): an update pending or
-// more than one version folder seen at a run's preflight, or after its session, holds every run (its code)
-// until a new probe has been confirmed. The hold records when it was made and the versions it saw (the
-// extension's loaded version, Chrome's and where that was read from). It clears only for a confirmation whose
-// probe ran after the hold was made (its probed_at, the probe evidence's own time) and whose probed versions
-// are the ones loaded now: never on a mere change of the confirmation file's bytes. So an auto-update always
+// The version hold (version-hold.json, 0.12.0, twenty-first to twenty-third rounds): an update pending or
+// more than one version folder seen at a run's preflight, or after its session, or a version that changed
+// during a session (versions_changed, twenty-third round), holds every run (its code) until a new probe has
+// been confirmed. The hold records when it was made and the versions it saw (the extension's loaded version,
+// Chrome's and where that was read from). It clears only on validated probe evidence (holdCleared): the
+// confirmation's evidence_sha256 (confirm-profile's hash of the probe evidence file, bound to its time and to
+// the confirmation's guard hash) checked against the evidence file as it is now, that evidence's own time
+// after the hold was made, and the probed versions compared explicitly with the versions loaded now (the
+// hold's own recorded versions are compared with them too, and named in the log line that clears it). Never on
+// a mere change of the confirmation file's bytes, and never on a timestamp alone. So an auto-update always
 // needs a new probe, even once Chrome has settled on one folder again. While the installed versions differ
 // from the confirmation's, probe_stale says so instead (it needs the same). The hold is written whole: a
-// temporary file, flushed, then renamed into place. A write that fails refuses this run and every later one
-// (version_hold_unwritable) until it succeeds: the hold it couldn't write is kept beside it
-// (version-hold.pending, and in this process) and written again first at each preflight.
-export type HoldCode = "update_pending" | "extension_versions_ambiguous";
+// temporary file, flushed, then renamed into place. A write that fails refuses this run, and the refusal is
+// made durable before any browser work (persistHold): the hold is kept beside it (version-hold.json.pending,
+// written again first at each preflight); failing that, the confirmation is broken (its guard hash zeroed, so
+// every later run is probe_stale until a new probe) or, failing that too, removed. Only when none of that can
+// be kept does this run refuse alone, before starting: nothing is kept in memory across runs.
+export type HoldCode = "update_pending" | "extension_versions_ambiguous" | "versions_changed";
 export interface HoldSeen { extension_version: string | null; chrome_version: string | null; chrome_version_source: ChromeVersionSource | null }
 export interface VersionHold { at: string; code: HoldCode; folders: string[]; seen: HoldSeen }
-const holdCode = (x: unknown): x is HoldCode => x === "update_pending" || x === "extension_versions_ambiguous";
+const holdCode = (x: unknown): x is HoldCode => x === "update_pending" || x === "extension_versions_ambiguous" || x === "versions_changed";
 function parseHold(x: any): VersionHold | null {
   if (!x || typeof x.at !== "string" || !Number.isFinite(Date.parse(x.at)) || !holdCode(x.code)) return null;
   const s = x.seen && typeof x.seen === "object" ? x.seen : {};
@@ -828,54 +834,91 @@ function parseHold(x: any): VersionHold | null {
 }
 export function readVersionHold(o: Opts): VersionHold | null { return parseHold(readJson(P.versionHold(o))); }
 const holdPendingFile = (o: Opts) => `${P.versionHold(o)}.pending`;
-const holdsUnwritten = new Map<string, VersionHold>();     // this process's holds it couldn't write, by path
 // Written whole: a temporary file, flushed to disk, then renamed into place. false when any step fails.
-export function writeVersionHold(o: Opts, h: VersionHold): boolean {
-  const f = P.versionHold(o), tmp = `${f}.tmp`;
+function writeWhole(f: string, text: string): boolean {
+  const tmp = `${f}.tmp`;
   try {
     const fd = openSync(tmp, "w");
-    try { writeSync(fd, JSON.stringify(h) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+    try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(tmp, f);
     return true;
   } catch { try { rmSync(tmp, { force: true }); } catch { /* left */ } return false; }
 }
-function unwrittenHold(o: Opts): VersionHold | null {
-  return holdsUnwritten.get(P.versionHold(o)) ?? parseHold(readJson(holdPendingFile(o)));
+export function writeVersionHold(o: Opts, h: VersionHold): boolean { return writeWhole(P.versionHold(o), JSON.stringify(h) + "\n"); }
+// How a hold that couldn't be written is still kept (twenty-third round): "written" (the hold itself),
+// "pending" (version-hold.json.pending), "confirmation_broken" (the confirmation's guard hash zeroed: probe_stale
+// until a new probe), "confirmation_removed", or "none" (nothing could be kept: this run refuses alone).
+export type HoldKept = "written" | "pending" | "confirmation_broken" | "confirmation_removed" | "none";
+export const BROKEN_GUARD = "0".repeat(64);
+export function persistHold(o: Opts, want: VersionHold, now: Date): HoldKept {
+  if (writeVersionHold(o, want)) { rmSync(holdPendingFile(o), { force: true }); return "written"; }
+  let kept: HoldKept = "none";
+  if (writeWhole(holdPendingFile(o), JSON.stringify(want) + "\n")) kept = "pending";
+  else {
+    const c = readJson(P.confirmed(o));
+    if (c && typeof c === "object" && !Array.isArray(c) && writeWhole(P.confirmed(o), JSON.stringify({ ...c, guard_sha256: BROKEN_GUARD }, null, 2) + "\n")) kept = "confirmation_broken";
+    else if (existsSync(P.confirmed(o))) { try { rmSync(P.confirmed(o), { force: true }); kept = existsSync(P.confirmed(o)) ? "none" : "confirmation_removed"; } catch { kept = "none"; } }
+    else kept = "confirmation_removed";                          // no confirmation to break: nothing runs without one
+  }
+  try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_unwritable ${want.code} kept=${kept}\n`); } catch { /* never stops it */ }
+  return kept;
 }
-export function versionHold(o: Opts, inst: Install, now: Date): HoldCode | "version_hold_unwritable" | null {
+const holdSeenNow = (o: Opts, inst: Install): HoldSeen => {
+  const chrome = chromeVersionRead(o, inst);
+  return { extension_version: activeExtensionVersion(inst), chrome_version: chrome?.version ?? null, chrome_version_source: chrome?.source ?? null };
+};
+// The probe evidence's hash as confirm-profile records it (evidence_sha256): the evidence file's bytes, with
+// the probe's own time and the confirmation's guard hash, so neither the time nor the evidence can be edited
+// alone, and a confirmation broken by persistHold never matches.
+export const evidenceSha = (bytes: Buffer | string, probedAt: string, guard: string | null) =>
+  createHash("sha256").update("pc-worker probe evidence v1\0").update(guard ?? "").update("\0").update(probedAt).update("\0").update(bytes).digest("hex");
+const versionSame = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && vcmp(a, b) === 0;
+// Whether a hold clears: validated probe evidence, after the hold, of the versions loaded now. why: what was
+// compared, for the log line (the hold's recorded versions against the probed ones included).
+export function holdCleared(o: Opts, inst: Install, had: VersionHold): { cleared: boolean; why: string } {
+  const c = readConfirmed(o);
+  if (!c || !c.probed_at || !c.evidence_sha256) return { cleared: false, why: "no confirmation with probe evidence" };
+  let bytes: Buffer;
+  try { bytes = readFileSync(P.evidence(o)); } catch { return { cleared: false, why: "the probe evidence can't be read" }; }
+  if (evidenceSha(bytes, c.probed_at, c.guard_sha256) !== c.evidence_sha256) return { cleared: false, why: "the probe evidence doesn't match the confirmation's hash of it" };
+  let ev: any;
+  try { ev = JSON.parse(bytes.toString("utf8")); } catch { return { cleared: false, why: "the probe evidence doesn't parse" }; }
+  if (typeof ev?.at !== "string" || ev.at !== c.probed_at) return { cleared: false, why: "the probe evidence's time isn't the confirmation's" };
+  if (!(Date.parse(ev.at) > Date.parse(had.at))) return { cleared: false, why: "the probe ran before the hold was made" };
+  const probed = ev.fingerprint, fp = fingerprint(o, inst);
+  if (!probed || !fp) return { cleared: false, why: "the probed or loaded versions can't be read" };
+  if (probed.extension_id !== fp.extension_id || probed.extension_version !== fp.extension_version || !versionSame(probed.chrome_version, fp.chrome_version)
+    || c.fingerprint.extension_version !== probed.extension_version || c.fingerprint.chrome_version !== probed.chrome_version)
+    return { cleared: false, why: `the probe saw Claude in Chrome ${probed.extension_version} and Chrome ${probed.chrome_version}; loaded now are ${fp.extension_version} and ${fp.chrome_version}` };
+  const vsHold = [`Claude in Chrome: the hold saw ${had.seen.extension_version ?? "none"}, the probe ${probed.extension_version}${versionSame(had.seen.extension_version, probed.extension_version) ? " (same)" : " (changed since the hold)"}`,
+    `Chrome: the hold saw ${had.seen.chrome_version ?? "none"}, the probe ${probed.chrome_version}${versionSame(had.seen.chrome_version, probed.chrome_version) ? " (same)" : " (changed since the hold)"}`];
+  return { cleared: true, why: vsHold.join("; ") };
+}
+export function versionHold(o: Opts, inst: Install, now: Date, after: HoldCode | null = null): HoldCode | "version_hold_unwritable" | null {
   const folders = extensionFolders(inst);
-  const code: HoldCode | null = updatePending(inst) ? "update_pending" : folders.length > 1 ? "extension_versions_ambiguous" : null;
+  const code: HoldCode | null = updatePending(inst) ? "update_pending" : folders.length > 1 ? "extension_versions_ambiguous" : after;
   let had = readVersionHold(o);
-  const owed = unwrittenHold(o);
+  const owed = parseHold(readJson(holdPendingFile(o)));
   // A hold to write: a new condition (none kept, or another code), or one an earlier write couldn't keep.
-  const want: VersionHold | null = code && (!had || had.code !== code)
-    ? { at: now.toISOString(), code, folders, seen: { extension_version: activeExtensionVersion(inst), chrome_version: chromeVersionRead(o, inst)?.version ?? null,
-      chrome_version_source: chromeVersionRead(o, inst)?.source ?? null } }
+  const want: VersionHold | null = code && (!had || had.code !== code) ? { at: now.toISOString(), code, folders, seen: holdSeenNow(o, inst) }
     : !had && owed ? owed : null;
   if (want) {
-    if (!writeVersionHold(o, want)) {
-      holdsUnwritten.set(P.versionHold(o), want);
-      try { writeFileSync(holdPendingFile(o), JSON.stringify(want) + "\n"); } catch { /* this process still holds it */ }
-      try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_unwritable ${want.code}\n`); } catch { /* never stops it */ }
-      return "version_hold_unwritable";
-    }
+    if (persistHold(o, want, now) !== "written") return "version_hold_unwritable";
     had = want;
   }
-  if (had && owed) { holdsUnwritten.delete(P.versionHold(o)); rmSync(holdPendingFile(o), { force: true }); }
   if (code) return code;
   if (!had) return null;
-  // Cleared only by a confirmation of a probe run after the hold, of the versions loaded now.
-  const c = readConfirmed(o), fp = fingerprint(o, inst);
-  const probed = c?.probed_at ? Date.parse(c.probed_at) : NaN;
-  if (c && fp && Number.isFinite(probed) && probed > Date.parse(had.at) && c.fingerprint.extension_id === fp.extension_id
-    && c.fingerprint.extension_version === fp.extension_version && c.fingerprint.chrome_version === fp.chrome_version) {
+  const cl = holdCleared(o, inst, had);
+  if (cl.cleared) {
     rmSync(P.versionHold(o), { force: true });
+    try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_cleared ${had.code}: ${cl.why}\n`); } catch { /* never stops it */ }
     return null;
   }
   if (versionMismatch(o, inst)) return null;           // probe_stale refuses next, naming what changed
   return had.code;
 }
 export const VERSION_HOLD_UNWRITABLE_HINT = "the worker couldn't write its version hold (version-hold.json in the worker folder): no run starts until it can. Free disk space, or check that the worker folder can be written, then run again; the hold is then kept and asks for a new probe";
+export const VERSIONS_CHANGED_HINT = "Claude in Chrome or Chrome changed version during a run, so its report was thrown away: an auto-update needs a new probe. Restart the Cain jobs Chrome, then run the probe again and confirm-profile";
 export const VERSION_HOLD_HINT = "Claude in Chrome's version in the Cain jobs profile can't be bound to the probe (an update waiting, or more than one version folder): an auto-update needs a new probe. Restart the Cain jobs Chrome, then run the probe again and confirm-profile";
 
 // The claude executable's SHA-256, read in pieces (it is large), or null when it can't be read.
@@ -1219,10 +1262,11 @@ export interface Confirmed {
   v: 1; at: string; fingerprint: Fingerprint; settings_sha256: string; prompt_sha256: string; config_sha256: string; deny_check: boolean;
   read_context: boolean; live_extension_version: boolean; deny_cli_version: string; cli_sha256: string; boundary_version: string | null;
   worker_sha256: string | null; cain_version: string | null; policy_version: string | null; fragment_strip: boolean; guard_sha256: string | null;
-  probed_at: string | null;          // the probe's own time (its evidence's at), 0.12.0 twenty-second round: what clears a version hold
+  probed_at: string | null;          // the probe's own time (its evidence's at), 0.12.0 twenty-second round
+  evidence_sha256: string | null;    // the probe evidence's hash with that time and the guard hash (evidenceSha), twenty-third round: what clears a version hold
 }
 const CONFIRMED_KEYS = ["v", "at", "fingerprint", "settings_sha256", "prompt_sha256", "config_sha256", "deny_check", "read_context", "live_extension_version",
-  "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version", "fragment_strip", "guard_sha256", "probed_at"];
+  "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version", "fragment_strip", "guard_sha256", "probed_at", "evidence_sha256"];
 const HEX64 = /^[0-9a-f]{64}$/;
 // The hook's policy version: raised whenever what nav-guard or read-guard allows or refuses changes,
 // or the pinned settings do (18: read-guard's strict parser refuses a byte order mark, lone
@@ -1261,6 +1305,8 @@ export function readConfirmed(o: Opts): Confirmed | null {
   if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "fragment_strip")) c = { ...c, fragment_strip: false };
   if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "probed_at")) c = { ...c, probed_at: null };
   if (c && !(c.probed_at === null || (typeof c.probed_at === "string" && Number.isFinite(Date.parse(c.probed_at))))) return null;
+  if (c && typeof c === "object" && !Array.isArray(c) && !Object.hasOwn(c, "evidence_sha256")) c = { ...c, evidence_sha256: null };
+  if (c && !(c.evidence_sha256 === null || (typeof c.evidence_sha256 === "string" && HEX64.test(c.evidence_sha256)))) return null;
   if (c && typeof c.fragment_strip !== "boolean") return null;
   if (c && !(c.worker_sha256 === null || (typeof c.worker_sha256 === "string" && HEX64.test(c.worker_sha256)))) return null;
   if (c && !(c.cain_version === null || (typeof c.cain_version === "string" && /^\d+\.\d+\.\d+$/.test(c.cain_version)))) return null;
@@ -4315,8 +4361,11 @@ export const inventoryGate = (tools: string[], denied: string[]): Gate => (init)
 // pin: the job's allowlist entry, whose domain patterns (entryDomains) and query parameter
 // patterns bound every navigation and every page read of the session (none: nothing but the
 // check page opens). The job's own fields never add to them.
+// base: the versions the session is checked against afterwards (versionsAfter): the confirmation's for a run;
+// the probe passes the ones its own preflight read, since a probe runs exactly when they differ from the old
+// confirmation's (twenty-third round: before, a re-probe after an update failed its own browser step).
 async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof sessionHashes>>, job: Job, limit: number, leftovers: number[], contextAfterRead = false,
-  pin: Allow | null = null) {
+  pin: Allow | null = null, base: Fingerprint | null = null) {
   const markerSha = readMarker(o);
   const canary = await startCanary(inst.profile.extension_id, job.attempt!, { markerSha });
   // The claude executable is hashed before and after the session: a CLI that changed under
@@ -4335,7 +4384,7 @@ async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof 
   const expected = expectedOf(canary, inst.profile.extension_id, job.attempt!);
   return { s, stream, expected, log: readNavLog(P.navLog(o)), canaryUrl: canary.url,
     checks: { cliChanged: !before || before !== after, diskExtension: activeExtensionVersion(inst), workerPaths: wallOf(o).paths, wallTokens: wallOf(o).tokens,
-      ...((v) => ({ versionsChanged: v.changed, versionsNote: v.note }))(versionsAfter(o, inst)) } };
+      ...((v) => ({ versionsChanged: v.changed, versionsNote: v.note }))(versionsAfter(o, inst, base)) } };
 }
 
 // The extension's version as the session saw it (its init data), against the one on disk:
@@ -4383,31 +4432,44 @@ export interface Verdict { bad: Code | null; given: unknown; guard: GuardCheck; 
 // workerPaths: the worker folder and its config folder, for the second wall (guardCheck).
 export interface SessionChecks { cliChanged: boolean; diskExtension: string | null; contextAfterRead?: boolean; needLive?: boolean; confirmedExtension?: string | null;
   workerPaths?: string[]; wallTokens?: string[]; versionsChanged?: string | null; versionsNote?: string | null }
-// Both versions rechecked once the session has ended (0.12.0, twenty-first and twenty-second rounds), with
+// Both versions rechecked once the session has ended (0.12.0, twenty-first to twenty-third rounds), with
 // Chrome's version read once for the check (inChromePhase). First the hold step (versionHold), which writes the
 // hold whenever an update is pending or a second version folder shows, whatever else is wrong: update_pending
 // and extension_versions_ambiguous by their own codes. Then the loaded extension's id and version and Chrome's
-// version against the confirmation, like with like: Chrome's read from another source than the probe's is a
-// note (versionsNote, in the run log and the run's detail), never versions_changed on a format difference.
-// Any change: the run fails versions_changed, its report discarded, naming what changed.
-export function versionsAfter(o: Opts, inst: Install): { changed: string | null; note: string | null } {
+// version against the confirmation. Chrome's versions compare by their numbers (vcmp: 131.0.6778.086 is
+// 131.0.6778.86). A source difference never overrides evidence of a version difference (twenty-third round):
+// read from another source than the probe's, a version that differs by number is versions_changed like any
+// other; only a source difference with an equal version is a note (versionsNote, in the run log and the run's
+// detail). Any change: the run fails versions_changed, its report discarded, naming what changed, and the hold
+// is written (code versions_changed), so no later run goes until a new probe of the versions loaded then.
+export function versionsAfter(o: Opts, inst: Install, base: Fingerprint | null = null): { changed: string | null; note: string | null } {
   return inChromePhase(() => {
+    // The hold step writes the hold for a condition seen now; a hold that already stood before the session (the
+    // probe's own sessions run under one: the probe is what clears it) is not a change during this session.
     const held = versionHold(o, inst, clock(o));
-    if (held === "update_pending") return { changed: "update_pending: a Claude in Chrome update was unpacked during the session: an auto-update needs a new probe", note: null };
-    if (held === "extension_versions_ambiguous") return { changed: `extension_versions_ambiguous: version folders ${extensionFolders(inst).join(", ")}: an auto-update needs a new probe`, note: null };
+    const now0: HoldCode | null = updatePending(inst) ? "update_pending" : extensionFolders(inst).length > 1 ? "extension_versions_ambiguous" : null;
+    if (held === "update_pending" && now0 === "update_pending") return { changed: "update_pending: a Claude in Chrome update was unpacked during the session: an auto-update needs a new probe", note: null };
+    if (held === "extension_versions_ambiguous" && now0 === "extension_versions_ambiguous") return { changed: `extension_versions_ambiguous: version folders ${extensionFolders(inst).join(", ")}: an auto-update needs a new probe`, note: null };
     if (held === "version_hold_unwritable") return { changed: "version_hold_unwritable: the version hold couldn't be written: no run until it can be", note: null };
-    const c = readConfirmed(o), fp = fingerprint(o, inst);
+    const conf = readConfirmed(o), fp = fingerprint(o, inst);
+    const c = base ? { fingerprint: base } : conf;
     if (!c || !fp) return { changed: null, note: null };
-    const said: string[] = [];
-    if (c.fingerprint.extension_id !== fp.extension_id) said.push(`the extension's id is ${fp.extension_id}, the probe saw ${c.fingerprint.extension_id}`);
-    if (c.fingerprint.extension_version !== fp.extension_version) said.push(`Claude in Chrome is ${fp.extension_version} as the profile's preferences load it, the probe saw ${c.fingerprint.extension_version}`);
+    const said: string[] = [], saw = base ? "the session started on" : "the probe saw";
+    if (c.fingerprint.extension_id !== fp.extension_id) said.push(`the extension's id is ${fp.extension_id}, ${saw} ${c.fingerprint.extension_id}`);
+    if (c.fingerprint.extension_version !== fp.extension_version) said.push(`Claude in Chrome is ${fp.extension_version} as the profile's preferences load it, ${saw} ${c.fingerprint.extension_version}`);
     const was = c.fingerprint.chrome_version_source, now = fp.chrome_version_source;
+    const sourceDiffers = !!was && !!now && was !== now;
     let note: string | null = null;
-    if (was && now && was !== now) {
-      if (c.fingerprint.chrome_version !== fp.chrome_version) note = `chrome_version_source: Chrome reads ${fp.chrome_version} after the session${sourceNote(c.fingerprint, fp)}; the probe saw ${c.fingerprint.chrome_version}`;
-    } else if (c.fingerprint.chrome_version !== fp.chrome_version) said.push(`Chrome is ${fp.chrome_version}, the probe saw ${c.fingerprint.chrome_version}`);
+    if (!sourceDiffers ? c.fingerprint.chrome_version !== fp.chrome_version : !versionSame(c.fingerprint.chrome_version, fp.chrome_version))
+      said.push(`Chrome is ${fp.chrome_version}, ${saw} ${c.fingerprint.chrome_version}${sourceNote(c.fingerprint, fp)}`);
+    else if (sourceDiffers) note = `chrome_version_source: Chrome reads ${fp.chrome_version} after the session${sourceNote(c.fingerprint, fp)}; ${saw} ${c.fingerprint.chrome_version}, the same version`;
     if (note) try { appendFileSync(P.log(o), `${clock(o).toISOString()} ${note}\n`); } catch { /* never stops it */ }
-    return { changed: said.length ? `version_mismatch: ${said.join("; ")}: an auto-update needs a new probe: run the probe again, then confirm-profile` : null, note };
+    if (!said.length) return { changed: null, note };
+    const changed = `version_mismatch: ${said.join("; ")}: an auto-update needs a new probe: run the probe again, then confirm-profile`;
+    // The hold, so the change is kept past this run whatever Chrome reads next.
+    if (versionHold(o, inst, clock(o), "versions_changed") === "version_hold_unwritable")
+      return { changed: `version_hold_unwritable: the version hold couldn't be written: no run until it can be; ${changed}`, note: null };
+    return { changed, note: null };
   });
 }
 export function verdict(s: Session, st: Stream, log: Decision[], tools: string[], denied: string[], canaryUrl: string,
@@ -4468,6 +4530,7 @@ export async function run(o: Opts): Promise<RunOut> {
     if (n.code === "probe_stale") try { detail = versionMismatch(o, mustInstall(o)); } catch { detail = null; }
     if (n.code === "update_pending" || n.code === "extension_versions_ambiguous") detail = VERSION_HOLD_HINT;
     if (n.code === "version_hold_unwritable") detail = VERSION_HOLD_UNWRITABLE_HINT;
+    if (n.code === "versions_changed") detail = VERSIONS_CHANGED_HINT;
     return { code: n.code, job: null, closed: n.closed, ...(detail ? { detail } : {}) };
   }
   const c = n.claim;
@@ -5515,7 +5578,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const leftovers = readLeftovers(o);
     // With the hook's tab-context order after every read on, as on a PC whose reads don't
     // report their address: how often this honest chore trips it is counted (context_trips).
-    const { s, stream, expected, log, canaryUrl, checks } = await session(o, inst, h, job, limit, leftovers, true, pin);
+    const { s, stream, expected, log, canaryUrl, checks } = await session(o, inst, h, job, limit, leftovers, true, pin, fp);
     const context_trips = log.filter((x) => x.why === "context_owed").length;
     const v = verdict(s, stream, log, tools, denied, canaryUrl, pin, leftovers, checks);
     if (v.end?.tab_id !== null && v.end?.tab_id !== undefined) writeLeftovers(o, v.end.leftovers);
@@ -5818,7 +5881,10 @@ export function probeCases(ev: Evidence): { ran: string[]; unverified: string[] 
 
 export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}): Confirmed {
   const inst = mustInstall(o);
-  const ev = readJson(P.evidence(o)) as Evidence | null;
+  let evBytes: Buffer | null = null;
+  try { evBytes = readFileSync(P.evidence(o)); } catch { evBytes = null; }
+  let ev: Evidence | null = null;
+  try { ev = evBytes ? JSON.parse(evBytes.toString("utf8")) as Evidence : null; } catch { ev = null; }
   const now = clock(o);
   if (!ev || ev.v !== 1 || !ev.stop_ok || ev.smoke !== "connected" || !ev.failed_preflight || !ev.canary_ok || ev.inventory_ok !== true
     || ev.restart?.chrome_restarted !== true || ev.restart?.cookie_kept !== true || ev.signin?.passed !== true
@@ -5899,7 +5965,8 @@ export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}):
     // context after each read, and that is what lets unattended runs on (read_unverified otherwise).
     read_context: ev.structured_address?.passed !== true, live_extension_version: ev.live_extension_version === true,
     deny_cli_version: ev.slow_hook.cli_version, cli_sha256: cli, boundary_version: boundary.version, ...workerNow(),
-    fragment_strip: ev.fragment_strip?.passed === true, probed_at: ev.at };
+    fragment_strip: ev.fragment_strip?.passed === true, probed_at: ev.at, evidence_sha256: null };
+  c.evidence_sha256 = evidenceSha(evBytes!, ev.at, c.guard_sha256);
   writeFileSync(P.confirmed(o), JSON.stringify(c, null, 2) + "\n");
   rmSync(P.killFailed(o), { force: true });
   lockDown(o, P.confirmed(o));

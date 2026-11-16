@@ -10,9 +10,9 @@ import { describe, expect, test } from "bun:test";
 import { CODES_WHY, SHIP_WORDS_WHY } from "../rootfs/opt/cain/gate/cain";
 import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, REVIEW_READ, unlabeled } from "../rootfs/opt/cain/link/core";
 import { watchFile } from "../rootfs/opt/cain/link/merge";
-import { acceptedFor, supersede, keepWatch, otherLive } from "../rootfs/opt/cain/link/shipgate";
+import { acceptedFor, supersede, keepWatch, otherLive, takeLock, beat, letGo, LOCK_STALE_MS, CRITICAL_MAX_MS } from "../rootfs/opt/cain/link/shipgate";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -505,4 +505,83 @@ describe("twenty-second review: one live acceptance per pull request, made true 
     expect(outs.filter((o) => o.failure === "live_acceptance").length).toBe(1);
     expect(acceptedFor(dir, 5).length).toBe(1);
   }, 30_000);
+});
+
+describe("twenty-third review: the gate lock made true", () => {
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  const mod = join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts");
+  test("the stale threshold sits well above the bounded critical section", () => {
+    expect(CRITICAL_MAX_MS * 4).toBeLessThanOrEqual(LOCK_STALE_MS);
+  });
+  test("two concurrent stale takeovers in two processes: exactly one proceeds", async () => {
+    for (let round = 0; round < 3; round++) {
+      const dir = mkdtempSync(join(tmpdir(), "ship-gate23-"));
+      const lock = join(dir, "ship-gate-pr-5.lock");
+      writeFileSync(lock, JSON.stringify({ pid: 99999, token: "dead-watch", at: "2026-01-01T00:00:00Z" }));
+      const old = new Date(Date.now() - 5 * 60_000);
+      utimesSync(lock, old, old);
+      const go = Date.now() + 1_500;
+      const one = () => Bun.spawn(["bun", "-e", `const { takeLock, letGo } = await import(${JSON.stringify(mod)});
+        while (Date.now() < ${go}) {}
+        const l = takeLock(${JSON.stringify(lock)}, 300);
+        const got = "token" in l;
+        if (got) { const t = Date.now() + 1_500; while (Date.now() < t) {} letGo(l); }
+        console.log(JSON.stringify({ got }));`], { stdout: "pipe", stderr: "pipe" });
+      const ps = [one(), one()];
+      const outs = await Promise.all(ps.map(async (p) => { await p.exited; return JSON.parse((await new Response(p.stdout).text()).trim()); }));
+      expect(outs.filter((o) => o.got).length).toBe(1);
+      expect(readdirSync(dir).filter((n) => n.includes(".stale-"))).toEqual([]);      // the taken-over lock is cleared away
+      expect(existsSync(lock)).toBe(false);                                            // and the winner let go of its own
+    }
+  }, 60_000);
+  test("a slow live holder is never taken over: its heartbeat keeps the lock fresh past the stale threshold", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate23-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    const holder = Bun.spawn(["bun", "-e", `const { takeLock, beat, letGo } = await import(${JSON.stringify(mod)});
+      const l = takeLock(${JSON.stringify(lock)}, 1000);
+      console.log("held");
+      const t = Date.now() + 4_000;
+      while (Date.now() < t) { beat(l); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); }
+      letGo(l);
+      console.log("done");`], { stdout: "pipe", stderr: "pipe" });
+    while (!existsSync(lock)) await Bun.sleep(20);
+    const t0 = Date.now();
+    const got = takeLock(lock, 2_500, { staleMs: 1_000 });                         // a stale threshold far under the hold
+    expect("miss" in got && got.miss).toBe("held");
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(2_400);
+    await holder.exited;
+    expect((await new Response(holder.stdout).text()).trim().split("\n")).toEqual(["held", "done"]);
+    // A watch kept at the same time as a slow live holder is never an acceptance.
+    const h2 = takeLock(lock, 100) as any;
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 300 })).toMatchObject({ accepted_head: null, passed: false, failure: "live_acceptance" });
+    letGo(h2);
+  }, 30_000);
+  test("an unreadable lock counts as held: it fails by the deadline as lock_unavailable, with a notice, and is never taken over", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate23-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    mkdirSync(lock);                                                                // exists, can't be read as a lock
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+    const errs: string[] = [];
+    const was = console.error;
+    console.error = (...a: unknown[]) => { errs.push(a.join(" ")); };
+    const t0 = Date.now();
+    let kept: any;
+    try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 600 }); } finally { console.error = was; }
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(kept).toMatchObject({ accepted_head: null, passed: false, failure: "lock_unavailable" });
+    expect(kept.failure_why).toContain("ship-gate-pr-5.lock");
+    expect(errs.join("\n")).toContain("couldn't be taken or kept");
+    expect(statSync(lock).isDirectory()).toBe(true);                                // left as it was
+    expect(acceptedFor(dir, 5)).toEqual([]);
+  });
+  test("a holder that finds its lock no longer its own writes no acceptance and leaves the other's lock alone", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate23-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    const kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { beforeWrite: () => { writeFileSync(lock, JSON.stringify({ pid: 1, token: "someone-else", at: "x" })); } });
+    expect(kept).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+    expect(JSON.parse(readFileSync(lock, "utf8")).token).toBe("someone-else");
+  });
 });

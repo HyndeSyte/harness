@@ -636,6 +636,8 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
     return `The PC stopped taking jobs because Chrome has a Claude in Chrome update waiting, and an auto-update needs a new probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   if (h?.code === "extension_versions_ambiguous")
     return `The PC stopped taking jobs because the Cain jobs profile holds more than one Claude in Chrome version, so the one Chrome runs can't be bound to the probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
+  if (h?.code === "versions_changed")
+    return `The PC stopped taking jobs because Claude in Chrome or Chrome changed version during a run, and a version change needs a new probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   if (h?.code === "version_hold_unwritable")
     return "The PC stopped taking jobs because its worker couldn't write a note that Claude in Chrome's version changed. At the PC: free disk space or check the worker folder can be written, then start a run; it then asks for a new probe.";
   if (h?.code === "worker_signin_missing")

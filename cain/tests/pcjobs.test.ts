@@ -45,6 +45,7 @@ import {
   HOOK_START_DEADLINE_MS, marginAbort, callStart, noteHookStart, readHookStarts, coldSampleHint, extraAddressPaths, probeGateHint, STRUCTURED_PATH, removeCommand, probeVarScopes, VERSION_HOLD_HINT, chromeVersionRead, extensionFolders, readVersionHold, exeOf,
   newCallTable, trackCall, watchCalls, readHookLog, CALL_TABLE_CAP, startDeadlineMs, HOOK_LIMITS, guardMatchers, hookedBy, pinnedHooked, versionHold, versionsAfter,
   VERSION_HOLD_UNWRITABLE_HINT, addressListing, probeTail, runPreflight, inChromePhase,
+  evidenceSha, persistHold, holdCleared, BROKEN_GUARD, VERSIONS_CHANGED_HINT, writeVersionHold,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -6518,8 +6519,7 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), ${en
     expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
     expect(readVersionHold(q.opts())).toMatchObject({ code: "extension_versions_ambiguous", folders: ["1.2.2_0", "1.2.3_0"] });
     expect(q.launches).toEqual([]);
-    const cf = join(q.home, "confirmed.json");                                      // a new probe's confirmation (confirm-profile rewrites it, with the probe's time)
-    writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), at: new Date(T0.getTime() + 60_000).toISOString(), probed_at: new Date(T0.getTime() + 30_000).toISOString() }, null, 2));
+    probeConfirmed(q, new Date(Date.parse(readVersionHold(q.opts())!.at) + 30_000).toISOString());   // a new probe's evidence, confirmed (twenty-third round: what clears it)
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
     expect(readVersionHold(q.opts())).toBeNull();
   });
@@ -6659,11 +6659,13 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 7000
     writeFileSync(cf, JSON.stringify({ ...conf, at: at(120_000), probed_at: at(-60_000) }, null, 2));
     expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
     // A fresh probe of other versions than the loaded ones: still held (probe_stale would name them).
-    writeFileSync(cf, JSON.stringify({ ...conf, at: at(120_000), probed_at: at(60_000), fingerprint: { ...conf.fingerprint, extension_version: "1.2.2" } }, null, 2));
+    probeConfirmed(q, at(60_000));
+    writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), fingerprint: { ...conf.fingerprint, extension_version: "1.2.2" } }, null, 2));
     expect(versionHold(q.opts(), q.inst, new Date(at(180_000)))).toBe(null);          // a mismatch: probe_stale refuses instead
     expect(readVersionHold(q.opts())).not.toBeNull();
-    // A fresh probe of the loaded versions, confirmed after it: cleared.
-    writeFileSync(cf, JSON.stringify({ ...conf, at: at(120_000), probed_at: at(60_000) }, null, 2));
+    // A fresh probe of the loaded versions, its evidence confirmed after it: cleared.
+    writeFileSync(cf, JSON.stringify(conf, null, 2));
+    probeConfirmed(q, at(60_000));
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
     expect(readVersionHold(q.opts())).toBeNull();
   });
@@ -6767,3 +6769,130 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 7000
     expect(tail.hint).toContain("read_page (fails)");
   }, 120_000);
 });
+
+describe("twenty-third review: version evidence over its source, the hold made durable and cleared only by validated probe evidence", () => {
+  test("the fallback reporting a newer version after a binary-source probe fails the run versions_changed, with the hold written and no report queued", async () => {
+    const { q, id } = oneJob();
+    const cf = join(q.home, "confirmed.json");
+    const conf = JSON.parse(readFileSync(cf, "utf8"));
+    writeFileSync(cf, JSON.stringify({ ...conf, fingerprint: { ...conf.fingerprint, chrome_version_source: "chrome_exe" } }, null, 2));
+    let after = false;
+    q.during(() => { after = true; writeFileSync(join(q.udd, "Last Version"), "132.0.6834.57"); });
+    const out = await run(q.opts({ ...attended, exeVersion: () => (after ? null : "131.0.6778.86") }));
+    expect(out).toMatchObject({ code: "versions_changed", job: id });
+    expect(out.detail).toContain("Chrome is 132.0.6834.57, the probe saw 131.0.6778.86");
+    expect(out.detail).toContain("a source difference");
+    expect(readVersionHold(q.opts())).toMatchObject({ code: "versions_changed", seen: { chrome_version: "132.0.6834.57", chrome_version_source: "last_version_file" } });
+    const r = result(q, id);
+    expect(r.code).toBe("versions_changed");
+    expect(r.facts ?? {}).toEqual({});
+    expect(q.remoteHas(`reports/${id}.json`)).toBe(false);
+    // Only a source difference with an equal version (by its numbers) is a note.
+    writeFileSync(join(q.udd, "Last Version"), "131.0.6778.086");
+    rmSync(join(q.home, "version-hold.json"));
+    const v = inChromePhase(() => versionsAfter(q.opts({ exeVersion: () => null }), q.inst));
+    expect(v.changed).toBeNull();
+    expect(v.note).toContain("the same version");
+    expect(readVersionHold(q.opts())).toBeNull();
+    // The hold stands even once Chrome reads the probed version again: a later run waits for a new probe.
+    writeFileSync(join(q.udd, "Last Version"), "131.0.6778.86");
+    expect(inChromePhase(() => versionsAfter(q.opts({ exeVersion: () => "131.0.7000.1" }), q.inst)).changed).toContain("Chrome is 131.0.7000.1");
+    expect(inChromePhase(() => versionHold(q.opts({ exeVersion: () => "131.0.6778.86" }), q.inst, T0))).toBe("versions_changed");
+    expect(VERSIONS_CHANGED_HINT).toContain("needs a new probe");
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "versions_changed", job: null, stale_lock: false, skew_ms: null, reason: null })).toContain("restart the Cain jobs Chrome");
+  });
+
+  test("both writes failing: the confirmation is broken before any browser work, and once Chrome settles the run is still refused", async () => {
+    const { q } = oneJob();
+    const extra = join(q.udd, "Default", "Extensions", EXT, "1.2.2_0");
+    mkdirSync(extra);
+    const holdFile = join(q.home, "version-hold.json");
+    mkdirSync(join(holdFile, "blocked"), { recursive: true });                      // the hold's rename fails
+    mkdirSync(join(`${holdFile}.pending`, "blocked"), { recursive: true });         // and so does the pending file's
+    expect((await run(q.opts(attended))).code).toBe("version_hold_unwritable");
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("version_hold_unwritable extension_versions_ambiguous kept=confirmation_broken");
+    expect(JSON.parse(readFileSync(join(q.home, "confirmed.json"), "utf8")).guard_sha256).toBe(BROKEN_GUARD);
+    rmSync(extra, { recursive: true });                                             // Chrome settles on one folder
+    const again = await run(q.opts(attended));                                      // a fresh process: nothing kept in memory
+    expect(again.code).not.toBe("ok");
+    expect(["probe_stale", "version_hold_unwritable"]).toContain(again.code);
+    expect(q.launches.length).toBe(0);
+    // Nothing can be kept at all (no confirmation to break, nothing writable): refused all the same.
+    const q2 = queueRig();
+    const want = { at: T0.toISOString(), code: "update_pending" as const, folders: [], seen: { extension_version: null, chrome_version: null, chrome_version_source: null } };
+    rmSync(join(q2.home, "confirmed.json"));
+    mkdirSync(join(q2.home, "version-hold.json", "x"), { recursive: true });
+    mkdirSync(join(q2.home, "version-hold.json.pending", "x"), { recursive: true });
+    expect(persistHold(q2.opts(), want, T0)).toBe("confirmation_removed");
+  });
+
+  test("a hold clears only on validated probe evidence: an edited probe time or an edited evidence file never clears it", async () => {
+    const { q } = oneJob();
+    const hold = { at: new Date(T0.getTime() - 60_000).toISOString(), code: "update_pending" as const, folders: ["1.2.3_0"],
+      seen: { extension_version: "1.2.2", chrome_version: "131.0.6778.86", chrome_version_source: "last_version_file" as const } };
+    expect(writeVersionHold(q.opts(), hold)).toBe(true);
+    const at = (ms: number) => new Date(Date.parse(hold.at) + ms).toISOString();
+    // A timestamp alone: a confirmation whose probe time is after the hold but with no evidence hash.
+    const cf = join(q.home, "confirmed.json");
+    const conf = JSON.parse(readFileSync(cf, "utf8"));
+    writeFileSync(cf, JSON.stringify({ ...conf, probed_at: at(30_000) }, null, 2));
+    expect(versionHold(q.opts(), q.inst, T0)).toBe("update_pending");
+    // A probe from before the hold, its time edited in the confirmation to after it: not cleared.
+    probeConfirmed(q, at(-30_000));
+    writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), probed_at: at(30_000) }, null, 2));
+    expect(holdCleared(q.opts(), q.inst, hold)).toMatchObject({ cleared: false, why: "the probe evidence doesn't match the confirmation's hash of it" });
+    expect(versionHold(q.opts(), q.inst, T0)).toBe("update_pending");
+    // The evidence file's time edited to after the hold: not cleared.
+    const { bytes } = probeConfirmed(q, at(-30_000));
+    writeFileSync(join(q.home, "probe-evidence.json"), bytes.replace(at(-30_000), at(30_000)));
+    expect(holdCleared(q.opts(), q.inst, hold).cleared).toBe(false);
+    expect(versionHold(q.opts(), q.inst, T0)).toBe("update_pending");
+    // A valid probe from after the hold, then its evidence edited by a byte: not cleared.
+    probeConfirmed(q, at(30_000));
+    expect(holdCleared(q.opts(), q.inst, hold).cleared).toBe(true);
+    writeFileSync(join(q.home, "probe-evidence.json"), readFileSync(join(q.home, "probe-evidence.json"), "utf8") + " ");
+    expect(holdCleared(q.opts(), q.inst, hold).cleared).toBe(false);
+    expect(versionHold(q.opts(), q.inst, T0)).toBe("update_pending");
+    // Valid evidence whose probed versions aren't the loaded ones: not cleared, named.
+    probeConfirmed(q, at(30_000), { fingerprint: { ...fingerprint(q.opts(), q.inst)!, extension_version: "1.2.4" } });
+    expect(holdCleared(q.opts(), q.inst, hold)).toMatchObject({ cleared: false });
+    expect(holdCleared(q.opts(), q.inst, hold).why).toContain("the probe saw Claude in Chrome 1.2.4");
+    // Valid, and of the loaded versions: cleared, the hold's own versions compared with the probed ones in the log.
+    probeConfirmed(q, at(30_000));
+    expect(versionHold(q.opts(), q.inst, T0)).toBeNull();
+    expect(readVersionHold(q.opts())).toBeNull();
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("version_hold_cleared update_pending: Claude in Chrome: the hold saw 1.2.2, the probe 1.2.3 (changed since the hold); Chrome: the hold saw 131.0.6778.86, the probe 131.0.6778.86 (same)");
+  });
+
+  test("a real probe after an update, under a standing hold and an older confirmation, passes its browser step; confirmed, it clears the hold", async () => {
+    const q = queueRig();
+    const cf = join(q.home, "confirmed.json");
+    const conf = JSON.parse(readFileSync(cf, "utf8"));
+    writeFileSync(cf, JSON.stringify({ ...conf, fingerprint: { ...conf.fingerprint, extension_version: "1.2.2" } }, null, 2));   // confirmed before the update
+    const hold = { at: new Date(T0.getTime() - 60_000).toISOString(), code: "update_pending" as const, folders: ["1.2.2_0", "1.2.3_0"],
+      seen: { extension_version: "1.2.2", chrome_version: "131.0.6778.86", chrome_version_source: "last_version_file" as const } };
+    expect(writeVersionHold(q.opts(), hold)).toBe(true);
+    q.say((_ins, canary) => ({ canary, outcome: "needs_login", final_url: "https://example.com/login" }));
+    q.allow([{ ...PIN, login_paths: ["/login"] }, { site: "example.com", action: "read_account_settings", url: "https://example.com/settings", match: "exact", login_paths: ["/login"], domains: ["example.com"] }]);
+    const ev = await probe(q.opts(attended));
+    expect(ev.browser).toBe("needs_login");                                          // not versions_changed against the old confirmation
+    const c = confirmProfile(q.opts(), ACCEPT);
+    expect(c.probed_at).toBe(ev.at);
+    expect(c.evidence_sha256).toBe(evidenceSha(readFileSync(join(q.home, "probe-evidence.json")), ev.at, c.guard_sha256));
+    expect(versionHold(q.opts(), q.inst, T0)).toBeNull();
+    expect(readVersionHold(q.opts())).toBeNull();
+  }, 120_000);
+});
+
+// A probe's evidence and its confirmation, as probe and confirm-profile leave them (twenty-third round): the
+// evidence file with its own time and the loaded versions, and the confirmation holding that time and the
+// evidence's hash (evidenceSha) bound to its guard hash.
+function probeConfirmed(q: { home: string; opts: (o?: Partial<Opts>) => Opts; inst: Install }, probedAt: string, over: Record<string, unknown> = {}) {
+  const cf = join(q.home, "confirmed.json");
+  const conf = JSON.parse(readFileSync(cf, "utf8"));
+  const bytes = JSON.stringify({ v: 1, at: probedAt, fingerprint: fingerprint(q.opts(), q.inst), ...over }, null, 2) + "\n";
+  writeFileSync(join(q.home, "probe-evidence.json"), bytes);
+  writeFileSync(cf, JSON.stringify({ ...conf, at: new Date(Date.parse(probedAt) + 60_000).toISOString(), probed_at: probedAt,
+    evidence_sha256: evidenceSha(bytes, probedAt, conf.guard_sha256) }, null, 2));
+  return { cf, bytes };
+}
