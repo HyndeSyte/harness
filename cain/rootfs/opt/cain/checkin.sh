@@ -14,6 +14,7 @@ TM="${TMUX_CMD:-tmux}"   # not TMUX: tmux reads that name itself
 export TZ="${CHECKIN_TZ:-America/New_York}"
 dir="${CHECKIN_DIR:-/data/checkins}"
 queue="${RELAY_QUEUE:-/data/relay.queue}"
+bad="${RELAY_BAD:-/data/relay.bad}"          # relayed records that couldn't be read, kept (never dropped)
 state="${CHECKIN_STATE:-/run/cain/checkin}"     # this container's: his prompt's steadiness, a try in his box
 PS="${PROMPT_STATE:-/opt/cain/prompt-state.sh}"
 mkdir -p "$dir"
@@ -55,6 +56,32 @@ ours() {   # ours <draft's first line> <the try's mark>
   local seen
   seen=$(printf '%s' "$1" | tr -d ' \t')
   [ -n "$2" ] && [ "${seen:0:$(( ${#2} + 2 ))}" = "[$2]" ]
+}
+# The text as the App types it: as it is, but for control characters, which typing would turn into
+# keys (a tab, a line end, an Esc): a tab or line end is a space, any other is left out. Nothing else
+# is changed: a long address or code goes as written (outside round 19).
+keyless() { printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   '; }
+# Whether a draft's lines (prompt-state.sh's PROMPT_DRAFT_TEXT, one drawn line a line) are exactly
+# the text as his box wraps it at a width of w columns of text (the window's width less 4, as a real
+# Claude Code 2.1.317 drew it at 60 and 120): each line the next stretch of the text; between lines,
+# the blanks a wrap at a space took, or, where a word too long for a line was cut, nothing, which
+# only a full line of plain letters shows. Anything else, and nothing is sent (outside round 19).
+whole() {   # whole <lines> <text> <w>
+  printf '%s\n' "$1" | WANT="$2" W="$3" awk '
+    BEGIN { rest = ENVIRON["WANT"]; w = ENVIRON["W"] + 0; ok = 1 }
+    ok && NF {
+      if (substr(rest, 1, length($0)) != $0) { ok = 0; next }
+      rest = substr(rest, length($0) + 1)
+      if (rest ~ /^ /) sub(/^ +/, "", rest)
+      else if (rest != "" && !(length($0) == w && $0 !~ /[^\001-\177]/)) ok = 0
+    }
+    END { exit !(ok && rest ~ /^ *$/) }'
+}
+# The width his box wraps at: the window as tmux has it now, less 4; 0 when it can't be read.
+width() {
+  local c
+  c=$(timeout 10 $TM -u display -p -t cain '#{pane_width}' 2>/dev/null | tr -cd '0-9')
+  [ -n "$c" ] && [ "$c" -gt 4 ] && echo $((c - 4)) || echo 0
 }
 screen=$(read_screen) || { rm -f "$state/ready"; exit 0; }
 last=$(printf '%s\n' "$screen" | tail -n 12)
@@ -130,15 +157,23 @@ type_in() {
   [ "${#mark}" = 6 ] || { echo "[cain] no random mark for a try: nothing typed"; return 1; }
   printf '%s\n%s\n' "$(date +%s)" "$mark" > "$state/typed" 2>/dev/null \
     || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
-  if ! timeout 10 $TM -u send-keys -t cain -l "[$mark] $1"; then return 1; fi
+  local want
+  want=$(keyless "[$mark] $1")
+  if ! timeout 10 $TM -u send-keys -t cain -l "$want"; then return 1; fi
   sleep 1
-  local after word
-  after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null)
-  if [ "${after%%$'\n'*}" = ready ]; then sleep 2; after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null); fi   # slow to draw
-  word="${after%%$'\n'*}"
+  # All of it, mark first, as his box holds it: read up to three times a second apart while it
+  # draws (his box still empty, or holding only part of it), never past a question or anything else.
+  local after word got i wide
+  for i in 1 2 3; do
+    after=$(read_screen | PROMPT_DRAFT_TEXT=1 "$PS" 2>/dev/null); wide=$(width)
+    word="${after%%$'\n'*}"; got=$(printf '%s\n' "$after" | sed 1d)
+    [ "$word" = draft ] && whole "$got" "$want" "$wide" && break
+    [ "$word" = ready ] || { [ "$word" = draft ] && [ "${got:0:8}" = "[$mark]" ]; } || break
+    [ "$i" = 3 ] || sleep 1
+  done
   rm -f "$state/ready"
-  if [ "$word" != draft ] || ! ours "$(printf '%s\n' "$after" | sed -n 2p)" "$mark"; then
-    echo "[cain] his input box didn't hold what was typed (${word:-unread}): nothing sent, tried again later"
+  if [ "$word" != draft ] || ! whole "$got" "$want" "$wide"; then
+    echo "[cain] his input box didn't hold all that was typed (${word:-unread}): nothing sent, tried again later"
     return 1
   fi
   timeout 10 $TM -u send-keys -t cain Enter || return 1
@@ -154,7 +189,19 @@ work="$queue.work"
 if [ ! -s "$work" ] && [ -s "$queue" ]; then mv "$queue" "$work"; fi
 if [ -s "$work" ]; then
   line=$(head -n 1 "$work")
-  text=$(printf '%s' "$line" | jq -r '.text // empty' 2>/dev/null | tr -d '\r\n')
+  # Read whole: a JSON object whose text is a string, its text as written (line ends kept for
+  # keyless to make spaces; outside round 20). One that can't be read is set aside, kept in $bad,
+  # and Cain hears at the next check-in; it leaves the queue only once it's kept there.
+  if ! text=$(printf '%s' "$line" | jq -j 'if type == "object" and (.text | type) == "string" then .text else error("not a relayed record") end' 2>/dev/null); then
+    if ! printf '%s\n' "$line" >> "$bad" 2>/dev/null; then
+      echo "[cain] a relayed record couldn't be read, nor set aside ($bad): it stays first"
+      exit 1
+    fi
+    echo 1 >> "$state/unread" 2>/dev/null
+    echo "[cain] a relayed record couldn't be read: set aside in $bad, and Cain hears at the next check-in"
+    tail -n +2 "$work" > "$work.tmp" && mv "$work.tmp" "$work"
+    exit 0
+  fi
   if [ -n "$text" ] && ! type_in "Relayed by the add-on: $text"; then
     sum=$(printf '%s' "$line" | cksum | cut -d' ' -f1)
     tries=$(awk -v s="$sum" '$1 == s { print $2 }' "$state/tries" 2>/dev/null)
@@ -168,10 +215,11 @@ if [ -s "$work" ]; then
       exit 1
     fi
     rm -f "$state/tries"
-    echo "[cain] a relayed line couldn't be typed three times running: it goes after the newer ones"
+    echo "[cain] a relayed line couldn't be confirmed in his box three times running: it goes after the newer ones"
+    echo 1 >> "$state/unconfirmed" 2>/dev/null
   else
     rm -f "$state/tries"
-    [ -n "$text" ] && echo "[cain] relayed a tap or reaction"
+    if [ -n "$text" ]; then echo "[cain] relayed a tap or reaction"; else echo "[cain] a relayed record with no text: nothing to type"; fi
   fi
   tail -n +2 "$work" > "$work.tmp" && mv "$work.tmp" "$work"
   exit 0
@@ -263,6 +311,12 @@ if [ -n "$rows" ]; then
     lead="${lead} "
   fi
 fi
+# Relayed lines waiting because their typing couldn't be confirmed in his box: said, so none waits
+# unknown to him (outside round 19).
+held_back=$(wc -l < "$state/unconfirmed" 2>/dev/null | tr -cd '0-9')
+[ "${held_back:-0}" -gt 0 ] && lead="${lead}Relayed lines the App couldn't confirm in your input box when it typed them: ${held_back}. Each waits in its queue behind newer ones and comes again. "
+unread=$(wc -l < "$state/unread" 2>/dev/null | tr -cd '0-9')
+[ "${unread:-0}" -gt 0 ] && lead="${lead}Relayed records the App couldn't read: ${unread}, set aside unread in its own files. A tap or reaction of his may be among them: if he mentions one you never heard of, that's why. "
 if [ "$slot" = 0710 ]; then
   msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else
@@ -271,5 +325,7 @@ fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
 for cand in "${named[@]}"; do touch "$dir/$cand.missed"; done
+[ "${held_back:-0}" -gt 0 ] && rm -f "$state/unconfirmed"
+[ "${unread:-0}" -gt 0 ] && rm -f "$state/unread"
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"

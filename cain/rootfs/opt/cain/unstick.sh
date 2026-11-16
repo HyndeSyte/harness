@@ -125,7 +125,12 @@ if [ -z "$esc" ]; then
   [ $((now - since)) -ge "$wait_s" ] || exit 0
   # The try is kept first: if it can't be, no Esc goes (nothing could stop a repeat), and Dane hears.
   if ! put esc "$now"; then tell_dane "$cant"; exit 0; fi
-  # Each Esc is counted, the last hour's kept: the third within an hour tells Dane.
+  # Each Esc is counted, the last hour's kept: the third within an hour tells Dane. A history there
+  # that isn't a file of times, one a line, can't be counted on: Dane hears (outside round 17).
+  if [ -e "$DIR/escs" ] && { [ ! -f "$DIR/escs" ] || [ ! -r "$DIR/escs" ] || [ ! -s "$DIR/escs" ] \
+       || grep -qvE '^[0-9]+$' "$DIR/escs"; }; then   # never written empty: an empty one was cut
+    tell_dane "$cant"
+  fi
   recent="$(awk -v t=$((now - 3600)) '$1 ~ /^[0-9]+$/ && $1 >= t' "$DIR/escs" 2>/dev/null; echo "$now")"
   if ! { printf '%s\n' "$recent" > "$DIR/.escs" 2>/dev/null && mv -fT "$DIR/.escs" "$DIR/escs" 2>/dev/null; }; then
     rm -f "$DIR/.escs" 2>/dev/null
