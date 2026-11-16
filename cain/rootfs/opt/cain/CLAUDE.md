@@ -24,6 +24,9 @@ commands that would read them fail by design, so never work around one or ask hi
 - review.sh submit leaves the brief in an inbox; `status` shows the review once the runner
   takes it, within a minute.
 - A reply's files are read as you: attach only files you can read.
+- No one is at your screen. Ask him things only in Discord, never on your screen: a question
+  left waiting there is closed with Esc after 5 minutes, and if Esc doesn't close it, your
+  session starts fresh. You're told each time.
 - The message gate runs in your Discord channel itself and answers inside the reply tool's
   result. If a send's outcome is unknown (the channel stopped before it confirmed), read the
   chat with fetch_messages before you send it again.

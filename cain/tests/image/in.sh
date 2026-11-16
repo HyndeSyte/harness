@@ -178,6 +178,19 @@ final)
   # Claude Code's own empty prompt line: the mark and a no-break space (U+00A0, octal 302 240).
   [ "$(seen '──────\n❯\302\240\n──────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n')" = ready ] \
     || fail "prompt-state: his empty prompt with its no-break space isn't read as ready"
+  # The panel's and the App's one reading of his screen (screen-state.sh), and the App's way out of
+  # a question no one answers (unstick.sh), with the image's own tools and a stand-in tmux: a
+  # question that has waited 5 minutes gets one Esc and a line for him.
+  u="$(mktemp -d)"
+  printf '> /auto-mode-setup\n  Teach auto mode about your environment?\n  Enter to continue · Esc to cancel\n' > "$u/screen"
+  printf '#!/bin/bash\n[ "$2" = capture-pane ] && exec cat "%s/screen"\necho "$*" >> "%s/sent"\n' "$u" "$u" > "$u/tmux"
+  chmod +x "$u/tmux"
+  [ "$("$OPT/screen-state.sh" < "$u/screen")" = dialog ] || fail "screen-state: the auto mode offer isn't read as a question waiting"
+  unstick() { TMUX_CMD="$u/tmux" UNSTICK_DIR="$u/state" RELAY_QUEUE="$u/queue" UNSTICK_GAP_S=600 UNSTICK_NOW="$1" "$OPT/unstick.sh"; }
+  [ -z "$(unstick 1000)" ] && [ ! -e "$u/sent" ] && [ -z "$(unstick 1300)" ] \
+    && [ "$(cat "$u/sent")" = "-u send-keys -t cain Escape" ] && grep -q "pressed Esc" "$u/queue" \
+    || fail "unstick: a question that waited 5 minutes didn't get one Esc and a line for him"
+  rm -rf "$u"
   holder cain; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
   printf '%s' "$out" | jq -e '.ok == false and (.failed | any(test("carries the bot token")))' >/dev/null \

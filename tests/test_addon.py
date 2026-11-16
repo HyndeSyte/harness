@@ -1028,7 +1028,7 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
 
     # Every alarm: plain words for him, the way back, nothing he can't read; a cause in its words.
     for kind in ("breach", "switch-stopped", "switch-blocked", "damaged", "setup", "restart", "switch-restart", "exited", "session", "held",
-                 "switch-failed", "switch-waits"):
+                 "switch-failed", "switch-waits", "waiting"):
         title, text = call("text", kind, "the smoke test failed").splitlines()
         for words in (title, text):
             assert "—" not in words and "add-on" not in words.lower(), kind
@@ -1114,6 +1114,21 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     (stub / "ha-up").touch()
     call("tick")
     assert not (groups / "switch").exists() and posted()["title"] == "Cain moved to his own user"
+    # A question that keeps coming back on his screen (unstick.sh): its own group, which neither his
+    # running again nor his move clears, only his prompt back (clear screen).
+    call("tell", "waiting")
+    assert field("screen", "kind") == "waiting" and (posted()["group"], posted()["alarm"]) == ("screen", "waiting")
+    assert read("discord")[-1].endswith("| Cain isn't answering: a question keeps coming up on his screen, where no one answers it, "
+                                        "and pressing Esc and a fresh start of his session didn't clear it. The App starts his session "
+                                        "fresh once an hour by itself. If he isn't back within an hour, restart the Cain App: Settings, "
+                                        "Apps, Cain, Restart. The Cain App's log has the details.")
+    call("clear", "running")
+    call("clear", "switched")
+    assert field("screen", "kind") == "waiting"
+    call("clear", "screen")
+    assert not (groups / "screen").exists() and (posted()["state"], posted()["group"], posted()["title"]) == ("clear", "screen", "Cain is back")
+    assert read("discord")[-1].endswith("| Cain is answering again: nothing waits on his screen.")
+    call("clear", "other", want=2)
     # A clearing with no hook to take it down stays, said, until one can.
     call("tell", "session")
     options.write_text(json.dumps({"notice_hook": "../x"}))
@@ -1503,8 +1518,12 @@ def _checkin(tmp_path, now, screen):
                CHECKIN_DIR=str(tmp_path / "done"), CHECKIN_NOW=now, CHECKIN_DAY="2026-11-08",
                STUB_SCREEN=screen, STUB_SENT=str(sent),
                PROMPT_STATE=(CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix())
-    script = (CAIN / "rootfs/opt/cain/checkin.sh").read_text().replace("\r\n", "\n")
-    subprocess.run([bash, "-c", script], env=env, check=True, timeout=20)
+    # Run from a file with plain line ends: a long script passed whole on Windows' command line can
+    # lose a quote on its way to Git Bash (never on the Pi or the CI runner).
+    script = tmp_path / "checkin.sh"
+    script.write_text((CAIN / "rootfs/opt/cain/checkin.sh").read_text(encoding="utf-8").replace("\r\n", "\n"),
+                      encoding="utf-8", newline="\n")
+    subprocess.run([bash, script.as_posix()], env=env, check=True, timeout=20)
     return sent.read_text() if sent.exists() else ""
 
 
@@ -2088,19 +2107,22 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
 
 def test_the_status_page_tells_a_waiting_screen_from_his_prompt():
     """The panel's /status reads the screen as checkin.sh does (prompt-state.sh, Nov 16): ready only
-    at his prompt, a dialog for a screen waiting for an answer. Its loop runs under errexit and
-    pipefail, and an empty capture (no session, tmux down) leaves it running (round 9)."""
+    at his prompt, a dialog for a screen waiting for an answer. It reads it through screen-state.sh,
+    which unstick.sh reads too, so the panel shows what the App acts on. Its loop runs under errexit
+    and pipefail, and an empty capture (no session, tmux down) leaves it running (round 9)."""
     import shutil
     import subprocess
     bash = shutil.which("bash")
     if not bash:
         pytest.skip("no bash")
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
-    block = _run_fns(run, "    last=$(printf '%s\\n' \"$screen\" | tail -n 30)", "    printf '{\"signed_in\"")
+    block = _run_fns(run, "    # His screen in one word, as unstick.sh reads it", "    printf '{\"signed_in\"")
+    assert '"$OPT/screen-state.sh"' in block and "prompt-state.sh\"" not in block
     opt = (CAIN / "rootfs/opt/cain").as_posix()
 
     def state(screen):
-        script = f'set -o errexit -o nounset -o pipefail\nOPT="{opt}"\nscreen="$1"\n' + block + 'echo "$state"\n'
+        script = (f'set -o errexit -o nounset -o pipefail\nOPT="{opt}"\nexport PROMPT_STATE="{opt}/prompt-state.sh"\n'
+                  'screen="$1"\n' + block + 'echo "$state"\n')
         out = subprocess.run([bash, "-c", script, "state", screen],
                              capture_output=True, text=True, encoding="utf-8", timeout=20)
         assert out.returncode == 0, out.stderr
@@ -2109,7 +2131,101 @@ def test_the_status_page_tells_a_waiting_screen_from_his_prompt():
     assert state(IDLE) == "ready" and state(WORKING) == "ready" and state(IDLE_WITH_TASKS) == "ready"
     assert state("Earlier he said auto mode was on.\n\n  Choose an option\n  > Yes") == "unknown"
     assert state("Invalid API key · Please run /login") == "login_needed"
+    assert state("Paste code here if prompted >\n  Esc to cancel") == "waiting_for_code"
+    assert state("  Select login method:\n  ❯ 1. Claude account with subscription\n  Enter to confirm · Esc to cancel") == "first_run_menu"
+    assert state("  Do you trust the files in this folder?\n  ❯ 1. Yes, proceed\n  Enter to confirm · Esc to exit") == "trust_prompt"
     assert state("") == "unknown" and state("\n \n") == "unknown"      # and the loop goes on
+
+
+def _unstick(tmp_path, now, screen, **more):
+    """unstick.sh once, at `now`, with his screen as given: the real screen readers, a stand-in tmux
+    that notes the keys sent, and a stand-in notice.sh that notes its calls ($NOTICE_RC its answer).
+    Returns what it printed ("restart" or nothing)."""
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if not bash or not shutil.which("jq"):
+        pytest.skip("no bash or jq")
+    stub, opt = tmp_path / "bin", tmp_path / "opt"
+    if not opt.exists():
+        stub.mkdir()
+        opt.mkdir()
+        (stub / "tmux").write_text('#!/bin/bash\nif [ "$2" = capture-pane ]; then [ -z "${STUB_DOWN:-}" ] || exit 1\n'
+                                   '  printf "%s\\n" "$STUB_SCREEN"; exit 0; fi\nprintf "%s\\n" "$*" >> "$STUB_SENT"\n', newline="\n")
+        (opt / "notice.sh").write_text('#!/bin/bash\necho "$NOTICE_LOCK_S $*" >> "$STUB_NOTICE"\nexit "${NOTICE_RC:-0}"\n', newline="\n")
+        for f in ("screen-state.sh", "prompt-state.sh", "unstick.sh"):
+            (opt / f).write_text((CAIN / "rootfs/opt/cain" / f).read_text(encoding="utf-8").replace("\r\n", "\n"),
+                                 encoding="utf-8", newline="\n")
+        for f in (stub / "tmux", *opt.iterdir()):
+            f.chmod(0o755)
+    env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}", UNSTICK_OPT=opt.as_posix(),
+               UNSTICK_DIR=(tmp_path / "state").as_posix(), RELAY_QUEUE=(tmp_path / "queue").as_posix(),
+               UNSTICK_NOW=str(now), STUB_SCREEN=screen, STUB_SENT=(tmp_path / "sent").as_posix(),
+               STUB_NOTICE=(tmp_path / "notice").as_posix(), PROMPT_STATE=(opt / "prompt-state.sh").as_posix(), **more)
+    out = subprocess.run([bash, (opt / "unstick.sh").as_posix()], env=env, capture_output=True, text=True,
+                         encoding="utf-8", timeout=30)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip()
+
+
+def test_a_question_no_one_answers_is_closed_and_then_his_session_starts_fresh(tmp_path):
+    """unstick.sh (Nov 16: Claude Code's offer to set up auto mode sat on his screen from 4:57 to 7:53
+    AM, and nothing reached him): a question that has waited 5 minutes gets one Esc and a line for
+    Cain; still there 5 minutes after the Esc, his session starts fresh (the run script ends it on
+    "restart"), with a line telling him to read what Dane sent meanwhile. At most one fresh start an
+    hour: one that would come sooner tells Dane instead, once, and the fresh start waits for the
+    hour. His prompt back 5 minutes takes the alarm down, once a stretch. Nothing ever goes into
+    his prompt, a draft, a sign-in or a screen it can't read; a gap of over a minute counts again."""
+    import json
+    read = lambda f: (tmp_path / f).read_text(encoding="utf-8").splitlines() if (tmp_path / f).exists() else []
+    lines = lambda: [json.loads(l)["text"] for l in read("queue")]
+    t = 1_000_000
+    run = lambda dt, screen=AUTO_MODE_OFFER, **more: _unstick(tmp_path, t + dt, screen, **more)
+
+    # His prompt, working or not, a draft, a sign-in, an unreadable screen: nothing, however long.
+    for screen in (IDLE, WORKING, DRAFT, "Paste code here if prompted >\n  Esc to cancel",
+                   "  Select login method:\n  ❯ 1. Claude account with subscription\n  Enter to confirm · Esc to cancel"):
+        assert [run(dt, screen) for dt in (0, 400, 800)] == ["", "", ""], screen
+    assert run(900, STUB_DOWN="1") == "" and read("sent") == [] and lines() == []
+    assert not [c for c in read("notice") if "tell" in c]          # at most a clearing of nothing raised
+    (tmp_path / "notice").unlink(missing_ok=True)
+
+    # A question: nothing for 5 minutes, then one Esc and a line for Cain.
+    t += 2000
+    assert [run(dt) for dt in (0, 50, 100, 150, 200, 250)] == [""] * 6 and read("sent") == []
+    assert run(300) == "" and read("sent") == ["-u send-keys -t cain Escape"]
+    assert len(lines()) == 1 and "pressed Esc" in lines()[0] and "Ask him things in Discord" in lines()[0]
+    assert lines()[0].endswith("Nothing to tell him.") and "—" not in lines()[0]
+    # Still there: no second Esc, and 5 minutes after the Esc, his session starts fresh.
+    assert [run(dt) for dt in (350, 400, 450, 500, 550)] == [""] * 5 and len(read("sent")) == 1
+    assert run(600) == "restart" and len(read("sent")) == 1
+    assert "started fresh" in lines()[-1] and "fetch_messages" in lines()[-1] and read("notice") == []
+
+    # It comes back after the fresh start: counted again from its first sight, Esc at 5 minutes;
+    # 5 minutes on, within the hour of the fresh start, Dane hears once and nothing restarts.
+    assert [run(dt) for dt in (650, 700, 750, 800, 850, 900)] == [""] * 6 and len(read("sent")) == 1
+    assert run(950) == "" and len(read("sent")) == 2
+    assert [run(dt) for dt in (1000, 1050, 1100, 1150, 1200)] == [""] * 5 and read("notice") == []
+    assert run(1250) == "" and read("notice") == ["5 tell waiting"]
+    assert [run(dt) for dt in (1300, 1350)] == ["", ""] and read("notice") == ["5 tell waiting"]
+    # The hour since the fresh start is up: the next one.
+    assert run(1400, UNSTICK_GAP_S="5000") == "" and run(4199, UNSTICK_GAP_S="5000") == ""
+    assert run(4200, UNSTICK_GAP_S="5000") == "restart"
+
+    # His prompt back: the alarm comes down after 5 minutes of it, once in that stretch.
+    assert [run(dt, IDLE) for dt in (4300, 4500, 4599)] == ["", "", ""] and read("notice") == ["5 tell waiting"]
+    assert run(4600, IDLE) == "" and read("notice")[-1] == "5 clear screen"
+    assert run(4900, IDLE) == "" and len(read("notice")) == 2
+    # A clearing that couldn't have the lock is tried again; once through, not again.
+    assert run(5000, DRAFT) == "" and run(5010, IDLE) == "" and run(5310, IDLE, NOTICE_RC="75") == ""
+    assert run(5320, IDLE) == "" and run(5330, IDLE) == "" and read("notice")[-3:] == ["5 clear screen"] * 3
+
+    # A gap of over a minute between waiting screens starts the count again: no Esc at 5 minutes.
+    t += 10_000
+    assert [run(dt) for dt in (0, 50, 100)] == ["", "", ""] and run(170, IDLE) == ""
+    sent = len(read("sent"))
+    assert [run(dt) for dt in (240, 290, 340, 390, 440, 490)] == [""] * 6 and len(read("sent")) == sent
+    assert run(540) == "" and len(read("sent")) == sent + 1
 
 
 def test_cain_checks_in_on_his_own_record():
