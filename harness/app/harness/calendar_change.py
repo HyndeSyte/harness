@@ -1272,7 +1272,7 @@ class CalendarChange:
             done.set()
             if late:
                 self._late.put((pid, fence, calendar, box.get("out"), type(box["err"]).__name__
-                                if "err" in box else ""))
+                                if "err" in box else "", getattr(call, "__name__", "")))
 
         t = threading.Thread(target=run, name=f"calendar-write-{calendar}", daemon=True)
         t.start()
@@ -1302,10 +1302,12 @@ class CalendarChange:
         written."""
         while True:
             try:
-                pid, fence, calendar, out, err = self._late.get_nowait()
+                pid, fence, calendar, out, err, name = self._late.get_nowait()
             except queue.Empty:
                 return
             kind = getattr(out, "kind", "") or ("error" if err else "unknown")
+            if name == "put_new" and kind == "changed":
+                kind = "exists"                  # iCloud's 412 for an address already written
             if pid is None:
                 log.info("an abandoned undo write to %s answered late (%s); its reads settle it", calendar, kind)
                 continue
