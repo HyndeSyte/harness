@@ -1166,6 +1166,38 @@ What Cain's link enforces:
   The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
   issue 24. You have nothing to set up beyond the smoke test's one option change.
 
+  Round 20 (the twentieth review's fixes, to defects in round 19's own additions; the design stays frozen
+  for the combined fault scenario, which is unchanged, and no new durable store: the landed marks and the
+  unlanded drops are record types in the existing consumed-key log). The table in
+  `cain/docs/source-check-invariants.md` is updated for every row this round touches.
+
+  Every append to a shared log is serialised by an OS advisory lock (flock) on a file beside it, held
+  through the torn-tail repair, the append and the fsync; the kernel frees it when its holder dies, so the
+  next waiter to get it carries on and no two waiters ever both take over. Records are cut against a byte
+  budget for the whole serialised record, on code-point boundaries, nested values included; a record still
+  too long is refused with a short reason and nothing written.
+
+  A consuming intent resolves as consumed only from a commit carrying both its tap key and its own request
+  id: an earlier request's commit on the same key never resolves a newer intent. A consumption whose
+  commit is later found unreachable (discarded by a reset or a rebuild, or not on GitHub two hours after it
+  with the copy in step) is dropped explicitly: you get one line on the card saying the change didn't land,
+  and Cain hears it and asks again on a new card if it still needs you. Each link path reads "consumed or
+  consuming" from one function: a live tap on a key the keeper is acting on now does nothing and says it
+  settles by itself, its buttons kept; a held tap on such a key stays held; if the keeper can't resolve an
+  intent for three rounds, Cain gets a notice and the card one waiting line.
+
+  The forgetting day is judged by the tap's snowflake against the card's post snowflake plus a constant
+  retention (35 days), never two wall-clock readings. A legacy card whose check's keeper date can't be read,
+  or whose check isn't the card's own request, has no trustworthy anchor: withdrawn with the new-check line;
+  an open claim on such a card is not acted, and its key's open landing claim is settled as voided with the
+  reason, so the key isn't left blocked. The keeper answers the link's per-key replay question a page of 500
+  a round, continuing where the last status stopped, so every open replay gets its answer. A keeper status
+  without a run number counts as unverified. A post or tap that measures the Pi's clock off after the
+  restore sweep was marked done reopens the sweep (a read only bounds the clock from below, so an ahead
+  clock goes undetected until measured). The unstamped refusal covers every button that carries a tap key,
+  Ship cards included. A Ship landing voided before its push whose ledger file couldn't be marked settled is
+  kept unresolved, retried each sweep, said once under its card, and settleable by your settle line.
+
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap
   predicate. A reset of the record that wins before that point (checked right before the claim)

@@ -207,6 +207,7 @@ export interface Shown {
   kind?: Kind;                       // absent on records from before 0.7.0 until the first sweep
   item?: string; question?: string;  // what the card is about: a PENDING id (or "none") and a question id
   posted?: number;
+  keep?: number;                     // round 20: how long it is kept (REMEMBER_MS when first recorded): a duration, no clock
   liveDigest?: string;               // round 18: its digest while live, kept when the sweep expired it
   expires?: number | null;           // when its buttons stop mattering; null: no time of its own
   ship?: { pr: string; head: string };
@@ -317,7 +318,7 @@ export interface TapClaim { at: number; msg: string; label: string; stage: "clai
   nonce?: string;                    // that run's nonce (round 10): a claim whose nonce isn't the current run's is an earlier-run claim
   why?: string;                      // stage "lost": why (a reset, or not acted after a restart)
   it?: string }                      // round 18: the tap's interaction id: Discord's time for it, by which a claim is judged after a restart
-export interface Unresolved { since: number; fails: number; last: string; next: number; what: "orphan" | "ledger"; msg?: string; told?: boolean;
+export interface Unresolved { since: number; fails: number; last: string; next: number; what: "orphan" | "ledger" | "void"; msg?: string; told?: boolean;
   toldAt?: number; reminded?: number; alerted?: number }   // round 11: when he was first told, last reminded, and Cain alerted (7 days)
 // Round 11: an issued tap key's structured target: the card's item and the kinds of write its tap allows.
 export type TapWrite = "row-close" | "ship-take" | "decision";
@@ -428,6 +429,15 @@ export const TAP_UNISSUED = "Not acted: this answer can't be matched to a card C
 // Round 19: one line on a replayed tap's card when the record keeper's answer for it is late; it asks nothing of him.
 export const TAP_REPLAY_WAITING = "Cain's record hasn't confirmed this answer yet. It settles by itself, so there's nothing to do.";
 export const TAP_REPLAY_ACTED = "Your answer here was acted on after all, so there's nothing to answer again.";
+// Round 20: a tap on a card whose key the record keeper is acting on now (an open consuming intent): it does nothing
+// and the card keeps its buttons; the keeper's outcome settles it.
+export const TAP_CONSUMING = "Cain's record is still acting on an answer from this card, so this tap did nothing. It settles by itself, so there's nothing to do.";
+// Round 20: a tap's change whose commit never landed in Cain's record (lost to a reset, or never reached GitHub).
+export const TAP_UNLANDED = "Not done: the change from your answer here didn't reach Cain's record, so it didn't land. Cain asks again on a new card if it still needs you.";
+// Round 20: a claim on a legacy card whose check can't be dated: not acted.
+export const CHECK_UNANCHORED_WHY = "its check can't be dated by Discord's time, so a new source check is needed";
+// Round 20: a Ship claim voided (nothing pushed) whose ledger file couldn't be marked settled: kept as unresolved, retried.
+export const VOID_UNSETTLED = "This Ship didn't go ahead, so nothing was pushed. The App couldn't note that in its landing record yet; it keeps trying by itself.";
 // Round 18: a tap the link can't place in Discord's time (no interaction id on its held record, or no card id to
 // date the card's expiry from) is refused, never judged by the Pi's clock.
 export const TAP_UNSTAMPED = "Not acted: Discord's time for this answer couldn't be read, so it can't be judged. Cain asks again if it still needs you.";
@@ -1179,6 +1189,15 @@ export class Link {
     if (!/^\d{15,22}$/.test(x)) return;
     this.skew = this.d.now() - snowflakeTime(x);
     if (this.newestSf === null || BigInt(x) > BigInt(this.newestSf)) this.newestSf = x;
+    if (Math.abs(this.skew) > CLOCK_TOLERANCE_MS) this.reopenSweep();
+  }
+  // Round 20: the restore sweep's done mark was written while the clock read as in step; a later measurement finds it
+  // off, so the mark is cleared (the cursor rewritten, fsynced) and the sweep reads again from the newest message.
+  private reopenSweep(): void {
+    const cur = this.sweepCursor();
+    if (!cur?.done) return;
+    try { this.saveCursor({ restore: cur.restore, before: "", done: false }); this.restoreSwept = false; this.log("the Pi's clock was measured off after the restore sweep was marked done: the done mark is cleared and the sweep reads again"); }
+    catch (e) { this.log(`couldn't reopen the restore sweep: ${String(e).slice(0, 80)}`); }
   }
   // Round 18: Discord's time now as the link best knows it, from the Pi's clock and the offset measured against
   // Discord's stamps in this run. It decides only when something is posted or a card's buttons come off, never
@@ -1187,7 +1206,10 @@ export class Link {
   // Round 19: a message read back from Discord (the start mark's last message id, the newest message of each restore
   // sweep page) is a clock comparison too: its snowflake is a time Discord had already reached, so the Pi's clock at
   // receipt more than CLOCK_TOLERANCE_MS before it is off (behind); at or after it, the comparison finds nothing off.
-  // Only a measured skew (a post or a tap) sets the offset; a read alone never moves it.
+  // Round 20: a read that finds the Pi's clock behind sets the offset to that gap (a lower bound of how far behind it is)
+  // unless a larger one was measured; a read that finds nothing off only marks the clock compared. A read can't see a
+  // Pi clock that is ahead: that goes undetected until a post or a tap measures it (noteStamp), and a measurement that
+  // then finds the clock off clears the restore sweep's done mark and reopens the sweep (reopenSweep).
   private bounded = false;
   private noteBound(id: unknown): void {
     const x = String(id ?? "");
@@ -1487,7 +1509,7 @@ export class Link {
     this.prune(s, now);
     const id = String(msg.id);
     s.messages[id] = { ...(s.messages[id] ?? {}), ...extra,
-      digest: digest(msg.content ?? "", msg.components), until: now + REMEMBER_MS };
+      digest: digest(msg.content ?? "", msg.components), until: now + REMEMBER_MS, keep: s.messages[id]?.keep ?? REMEMBER_MS };
     const gen = extra.checked?.gen;
     if (typeof gen === "number" && gen > (s.postedGen ?? 0)) s.postedGen = gen;
     if (typeof gen === "number" && gen > this.highWater) this.highWater = gen;
@@ -2039,6 +2061,28 @@ export class Link {
     }
     return u.next;
   }
+  // Round 20: a voided claim (nothing pushed) whose ledger file couldn't be marked settled stays open and would block its
+  // key: it is kept as unresolved ("void"), so the owner's settle line can settle it by hand (his reminders list it),
+  // he gets one line on the card now, Cain is told, and each sweep tries the settle again (retryVoids).
+  private async voidUnsettled(key: string, msg: string): Promise<void> {
+    const now = this.d.now(), s = this.d.load();
+    if (s.unresolved?.[key]) return;
+    (s.unresolved ??= {})[key] = { since: now, fails: 1, last: "a voided claim couldn't be marked settled in the landing ledger", next: now, what: "void", msg, told: true, toldAt: now };
+    this.d.save(s);
+    this.d.relay(`Landing voided but not yet settled: the Ship tap's landing for tap key ${tapKid(key)} was voided before any push (the record was reset meanwhile), but the landing ledger couldn't mark it settled, so the link retries each sweep. Nothing was pushed. If it can't, it is listed under unresolved_landings and his settle line settles it. Nothing to do: his card says so.`);
+    try { await this.post(VOID_UNSETTLED, [], { replyTo: msg }); } catch (e) { this.log(`couldn't tell him on card ${msg} that its voided landing isn't settled yet: ${String(e).slice(0, 80)}`); }
+    this.log(`voided landing claim ${tapKid(key)} couldn't be marked settled: kept unresolved, retried each sweep, and settleable by hand`);
+  }
+  private retryVoids(): void {
+    const L = this.d.landings;
+    if (!L) return;
+    for (const [k, u] of Object.entries(this.d.load().unresolved ?? {})) {
+      if (u.what !== "void") continue;
+      const open = L.entries()?.find((e) => e.key === k);
+      if (open && !open.settled && L.settle(k, "not landed", new Date(this.d.now()).toISOString(), { voided: true }) === false) continue;
+      this.unresolvedClear(k);
+    }
+  }
   private unresolvedClear(key: string): void {
     const s = this.d.load();
     const u = s.unresolved?.[key];
@@ -2121,6 +2165,8 @@ export class Link {
       landings_by_head: (this.d.landings?.reconcile?.() ?? []).map((h) => ({ pr: h.pr, head: h.head, landed: h.landed ? tapKid(h.landed) : null,
         keys: h.keys.map(tapKid), forced: h.forced.map(tapKid), open: h.open.map(tapKid) })),
       pi_clock: this.piClock(),
+      // Round 20: how many replayed held taps are still open (the keeper answers them a page a round).
+      replay_open: Number((keeperStatus(this.files().status) as any)?.replay_open ?? 0),
       recheck_queue: Object.entries(this.d.load().recheck ?? {}).map(([item, r]) => ({ item, why: r.why, since: new Date(r.at).toISOString() })),
     };
   }
@@ -2930,10 +2976,12 @@ export class Link {
     if (m.q?.used) return "answered";
     if (m.expires != null && this.tappedAfterExpiry(msgId, m.expires, now, tapSf, m)) return "expired";
     // Round 19: past the card's forgetting day, judged for a tap by its own snowflake against the card's post snowflake
-    // plus its retention (until less posted, fixed when it was recorded); a card the link can't place (no post time or
-    // no snowflake id) falls back to the Pi's clock: the one Pi-clock refusal, listed in the invariant table.
-    if (tapSf !== null && /^\d{15,22}$/.test(msgId) && typeof m.posted === "number" && Number.isFinite(m.posted)) {
-      if (tapSf >= snowflakeTime(msgId) + (m.until - m.posted) - DAY) return "forgetting";
+    // plus its retention. Round 20: the retention is a configured constant (REMEMBER_MS, kept on the record as keep, a
+    // duration), never derived from two wall-clock readings, so a clock step between recordings changes nothing; only
+    // a card the link can't place (no snowflake id) falls back to the Pi's clock: the one Pi-clock refusal, listed in
+    // the invariant table.
+    if (tapSf !== null && /^\d{15,22}$/.test(msgId)) {
+      if (tapSf >= snowflakeTime(msgId) + (typeof m.keep === "number" && m.keep > 0 ? m.keep : REMEMBER_MS) - DAY) return "forgetting";
     } else if (m.until - DAY <= now) return "forgetting";
     const item = boundItem(m);
     if (item) {
@@ -3005,7 +3053,8 @@ export class Link {
     }
     // Round 19: a tap on a question or Ship card without Discord's time for it (a missing or malformed interaction id)
     // is refused with a line on the card and a line to Cain, never judged at Discord's time now.
-    if (cid.startsWith("q:") && tapSf === null) {
+    // Round 20: every component that carries a tap key (any "q:" button, and any button the issued-key log keys).
+    if (tapSf === null && (cid.startsWith("q:") || !!this.logCards().get(msgId)?.keys.some((k: any) => k.cid === cid))) {
       await this.answer(it, ACK);
       if (SNOWFLAKE.test(msgId)) { try { await this.post(TAP_UNSTAMPED, [], { replyTo: msgId }); } catch (e) { this.log(`couldn't tell him on card ${msgId} that his tap couldn't be judged: ${String(e).slice(0, 80)}`); } }
       this.d.relay(`Tap not acted: a tap on a card of yours (Discord message ${msgId}) came without Discord's time for it, so it can't be judged and nothing was done for it. He was told on the card. Record nothing from it; ask again with --checked if it still needs him.`);
@@ -3029,7 +3078,9 @@ export class Link {
       }
       // Round 14: a key the record keeper already consumed (its consumed-key log): told, nothing again.
       const kid = logged?.keys.find((k) => k.cid === cid)?.kid;
-      if (kid && this.consumedKids().has(kid)) {
+      const use = kid ? this.keyUse(kid) : null;
+      if (use === "consuming") return this.refuseConsuming(it, msgId, kid!);
+      if (use === "consumed") {
         const out = await this.deadTap(it, msgId, "consumed", TAP_CONSUMED);
         this.log(`tap on card ${msgId} refused: its tap key ${kid} was already acted on (the keeper's consumed-key log)`);
         return out;
@@ -3219,7 +3270,9 @@ export class Link {
     }
     // Round 14: a key the record keeper already consumed (a restore of this state forgot the tap): told on
     // the card, nothing again.
-    if (key && cid.startsWith("q:") && this.consumedKids().has(tapKid(key))) {
+    const use = key && cid.startsWith("q:") ? this.keyUse(tapKid(key)) : null;
+    if (use === "consuming") return this.refuseConsuming(it, msgId, tapKid(key!));
+    if (use === "consumed") {
       const out = await this.deadTap(it, msgId, "consumed", TAP_CONSUMED);
       this.log(`tap on card ${msgId} refused: its tap key ${tapKid(key)} was already acted on (the keeper's consumed-key log)`);
       return out;
@@ -3966,8 +4019,9 @@ export class Link {
             ...(typeof mark === "number" ? { epoch: mark } : {}) });
           if (c === null) { await this.settleLanding(msgId, { ok: false, why: "the link's landing ledger couldn't be written", again: true }); return; }
           if (c === true && this.epochMark() !== mark) {
-            L.settle(key, "not landed", new Date(this.d.now()).toISOString(), { voided: true });
+            const ok = L.settle(key, "not landed", new Date(this.d.now()).toISOString(), { voided: true }) !== false;
             this.log(`the landing claim for tap key ${tapKid(key)} was voided: the record keeper's reset epoch changed between the last check and the claim's fsync (${String(mark)} to ${String(this.epochMark())}); nothing pushed`);
+            if (!ok) await this.voidUnsettled(key, msgId);
             await this.loseShipTap(msgId);
             return;
           }
@@ -4463,7 +4517,7 @@ export class Link {
     const st = keeperStatus(this.files().status);
     const list = Array.isArray((st as any)?.tap_notices) ? (st as any).tap_notices as { tap: string; why: string; msg?: string }[] : [];
     for (const n of list) {
-      if (!n || typeof n.tap !== "string" || (n.why !== "refused" && n.why !== "lost" && n.why !== "expired" && n.why !== "time" && n.why !== "hold" && n.why !== "superseded" && n.why !== "unstamped")) continue;
+      if (!n || typeof n.tap !== "string" || !["refused", "lost", "expired", "time", "hold", "superseded", "unstamped", "unlanded", "waiting"].includes(n.why)) continue;
       const id = `${n.tap}:${n.why}`;
       const s = this.d.load();
       if (s.tapNoticed?.[id]) continue;
@@ -4471,10 +4525,12 @@ export class Link {
       this.d.save(s);
       // Round 12: the card's message id from the keeper's notice, the state, or else the issued-key log.
       const msg = (typeof n.msg === "string" && /^\d{15,22}$/.test(n.msg) ? n.msg : undefined) ?? s.issued?.[n.tap]?.msg ?? this.issuedKid(n.tap)?.msg;
-      const text = n.why === "lost" ? TAP_RESTORE_LOST : n.why === "expired" ? TAP_EXPIRED : n.why === "time" ? TAP_TIME_DISAGREE : n.why === "hold" ? TAP_HOLD_FLOOR : n.why === "superseded" ? TAP_SUPERSEDED : n.why === "unstamped" ? TAP_UNSTAMPED : TAP_REFUSED;
+      // Round 20: a change that didn't land (unlanded), and an intent the keeper couldn't resolve for rounds (waiting).
+      const text = n.why === "lost" ? TAP_RESTORE_LOST : n.why === "expired" ? TAP_EXPIRED : n.why === "time" ? TAP_TIME_DISAGREE : n.why === "hold" ? TAP_HOLD_FLOOR : n.why === "superseded" ? TAP_SUPERSEDED : n.why === "unstamped" ? TAP_UNSTAMPED
+        : n.why === "unlanded" ? TAP_UNLANDED : n.why === "waiting" ? TAP_REPLAY_WAITING : TAP_REFUSED;
       try {
         if (msg) await this.post(text, [], { replyTo: msg }); else await this.notice(text);
-        this.log(`told him the record keeper ${n.why === "lost" ? "lost" : n.why === "expired" ? "refused as expired" : n.why === "time" ? "refused (the clocks disagreed about his tap's time)" : n.why === "hold" ? "refused (its hold, across a restart, began after its card expired)" : n.why === "superseded" ? "refused (superseded: he was asked to answer again)" : "refused"} the request from tap key ${n.tap}`);
+        this.log(`told him the record keeper ${n.why === "unlanded" ? "found the change didn't land for" : n.why === "waiting" ? "is still resolving" : n.why === "lost" ? "lost" : n.why === "expired" ? "refused as expired" : n.why === "time" ? "refused (the clocks disagreed about his tap's time)" : n.why === "hold" ? "refused (its hold, across a restart, began after its card expired)" : n.why === "superseded" ? "refused (superseded: he was asked to answer again)" : "refused"} the request from tap key ${n.tap}`);
       } catch (e) { this.log(`couldn't tell him about tap key ${n.tap}: ${String(e).slice(0, 80)}`); }
     }
     const s = this.d.load();
@@ -5248,10 +5304,12 @@ export class Link {
     const st = keeperStatus(this.files().status);
     if (!st || st.consumed_unverified) return false;
     const nonce = this.runNonce || (this.runNo(), this.runNonce);
-    // Round 19: keyed on this run's number and nonce together (a status from a keeper before round 19 names the nonce alone).
+    // Round 19: keyed on this run's number and nonce together. Round 20: a status without a run number (a keeper before
+    // round 19) counts as unverified: a fresh verification naming the keeper's start, this run and its nonce is needed
+    // before cards are released or armed.
     const run = (st.verified as any)?.run;
     return typeof st.start?.nonce === "string" && !!st.verified && st.verified.start === st.start.nonce && st.verified.link === nonce
-      && (run === undefined || run === this.runN) && Number(st.verified.fetches) >= 1;
+      && typeof run === "number" && run === this.runN && Number(st.verified.fetches) >= 1;
   }
   // Round 16: whether a tap is held: the keeper's status says its consumed set is unverified, or names a start
   // that no verified fetch covers yet. (A keeper with no status at all is left to its own hold of tap-derived
@@ -5312,7 +5370,7 @@ export class Link {
   private verifyTuple(): string | null {
     if (!this.consumedVerified()) return null;
     const st = keeperStatus(this.files().status)!;
-    return `${st.start!.nonce}|${st.verified!.link}|${Number(st.verified!.fetches)}`;
+    return `${st.start!.nonce}|${st.verified!.link}|${(st.verified as any).run}|${Number(st.verified!.fetches)}`;
   }
   private verifyCheckedMem: string | null = null;
   private verifiedChecked(): string | null {
@@ -5396,6 +5454,9 @@ export class Link {
     // Round 17: a card in the removal queue counts as withdrawn.
     if (this.stripsOpen().has(msg)) return "its buttons are queued for removal";
     if (keys.some((k) => typeof k.exp === "number" && k.exp <= now) || (rec.expires != null && rec.expires <= now)) return "expired";
+    const uses = this.keyUses();
+    // Round 20: a key the keeper is consuming now: decided later, once its intent resolves.
+    if (keys.some((k) => uses.get(k.kid) === "consuming")) return "later";
     const consumed = this.consumedKids();
     // A card still showing buttons (live) may carry a tap's record that kept them (busy, waiting): only a key
     // the keeper consumed withdraws it.
@@ -5428,23 +5489,40 @@ export class Link {
   // Round 14: the keeper's consumed tap keys (its consumed-key log, read only), empty when unreadable.
   // Round 19: only consumed records count (a "consuming" intent and its "dropped" resolution don't), and every key
   // with an open landing claim (not settled against the remote main yet) is blocked: treated as consumed.
+  // Round 20: every path reads a key's use from keyUses alone: "consumed" (a consumed record, or an open landing claim)
+  // or "consuming" (an open intent: the keeper may be acting on it now).
+  private keyUses(): Map<string, "consumed" | "consuming"> {
+    const out = this.consumeStates();
+    try { for (const e of this.d.landings?.entries() ?? []) if (!e.settled) out.set(tapKid(e.key), "consumed"); } catch { /* the ledger unreadable: the log alone */ }
+    return out;
+  }
+  private keyUse(kid: string): "consumed" | "consuming" | null { return this.keyUses().get(kid) ?? null; }
   private consumedKids(): Set<string> {
     const out = new Set<string>();
-    for (const [k, v] of this.consumeStates()) if (v === "consumed") out.add(k);
-    try { for (const e of this.d.landings?.entries() ?? []) if (!e.settled) out.add(tapKid(e.key)); } catch { /* the ledger unreadable: the log alone */ }
+    for (const [k, v] of this.keyUses()) if (v === "consumed") out.add(k);
     return out;
+  }
+  // Round 20: a live tap on a key the keeper is consuming now: nothing is done, the card keeps its buttons, and he gets
+  // the waiting line.
+  private async refuseConsuming(it: any, msgId: string, kid: string): Promise<string> {
+    if (this.deferred.has(it)) await this.restoreCard(it, msgId); else await this.answer(it, ACK);
+    await this.ephemeral(it, TAP_CONSUMING);
+    this.log(`tap on card ${msgId} refused: the record keeper is acting on its tap key ${kid} now (an open consuming intent); the card keeps its buttons`);
+    return "refused: consuming";
   }
   // Round 19: each key's place in the consumed-key log: consumed, or consuming (an open intent: the keeper may be
   // acting on it now, so nothing asks him again until it resolves).
   private consumeStates(): Map<string, "consumed" | "consuming"> {
     const out = new Map<string, "consumed" | "consuming">();
     if (!this.d.consumedLog) return out;
-    const open = new Map<string, string>();
+    const open = new Map<string, string>(), by = new Map<string, string>();
     try {
       for (const r of readLog<any>(this.d.consumedLog, { repair: false }).records) {
         if (typeof r?.tap !== "string") continue;
-        if (r.t === undefined) { out.set(r.tap, "consumed"); open.delete(r.tap); }
+        if (r.t === undefined) { out.set(r.tap, "consumed"); if (!by.has(r.tap)) by.set(r.tap, String(r.id)); open.delete(r.tap); }
         else if (r.t === "consuming" && typeof r.id === "string") open.set(r.tap, r.id);
+        // Round 20: a consumed record whose commit didn't land (an "unlanded" drop for the same request) no longer counts.
+        else if (r.t === "dropped" && r.unlanded === true && by.get(r.tap) === r.id) { out.delete(r.tap); by.delete(r.tap); }
         else if (r.t === "dropped" && open.get(r.tap) === r.id) open.delete(r.tap);
       }
     } catch { /* none */ }
@@ -5569,8 +5647,12 @@ export class Link {
     try { ledger = parseChecks(f.checks); } catch { return; }
     const keyOf = new Map<string, any>(), logged = new Set<string>();
     for (const c of this.logCards().values()) for (const k of c.keys) { logged.add(k.kid); if (typeof k.exp === "number") keyOf.set(k.kid, k); }
-    const consumed = this.consumedKids();
+    const uses = this.keyUses();
+    const consumed = new Set([...uses].filter(([, v]) => v === "consumed").map(([k]) => k));
     for (const h of open) {
+      // Round 20: a key the record keeper is consuming now (an open intent): the tap stays held, its card keeps its held
+      // line, until the intent resolves (the keeper tells him on the card if that takes rounds).
+      if (uses.get(h.kid) === "consuming") { this.log(`held tap ${h.kid} stays held: the record keeper is acting on its key now (an open consuming intent)`); continue; }
       const k = keyOf.get(h.kid);
       // Round 16: the tap's time and its card's expiry are Discord's alone when the held record has the
       // interaction id: its snowflake against the card's post snowflake plus the key's lifetime. The Pi's clock
@@ -5690,7 +5772,7 @@ export class Link {
       // supersede just before consuming any key), and the key is still absent from the consumed-key log. A key the
       // keeper consumed meanwhile gets the outcome of that tap on the card instead: exactly one of the two.
       const ans = answers[r.kid];
-      const where = this.consumeStates().get(r.kid);
+      const where = this.keyUse(r.kid);
       if (!ans?.mirrored || where === "consuming" || ans.consumed === "consuming") {
         // Round 19: waiting on the keeper's answer: one line on the card once the wait passes REPLAY_WAIT_MS more (on the
         // monotonic clock, from when this process first waited), asking nothing of him.
@@ -5956,6 +6038,7 @@ export class Link {
   private async ledgerUpkeep(): Promise<void> {
     const L = this.d.landings;
     if (!L) return;
+    this.retryVoids();
     const s = this.d.load();
     const why = L.untrusted(s.landingCount);
     if (why) {
@@ -6091,9 +6174,14 @@ export class Link {
       if (e?.checked_sf) return undefined;                           // the ledger has its own anchor: nothing to backfill
       const c = cards.get(msg);
       if (!c || c.void || !c.keys.length || !SNOWFLAKE.test(msg)) return null;
+      // Round 20: the check's keeper date must be usable and its request must be the card's own; otherwise the card
+      // has no trustworthy anchor (never the post snowflake alone).
+      if (!e || !e.checked_req || e.checked_req !== ref.req) return null;
+      const kept = Date.parse(String(e.checked_at ?? ""));
+      if (!Number.isFinite(kept) || kept < DISCORD_EPOCH) return null;
       let a = BigInt(msg);
-      const kept = e && e.checked_req && e.checked_req === ref.req ? Date.parse(String(e.checked_at ?? "")) : NaN;
-      if (Number.isFinite(kept) && kept >= DISCORD_EPOCH) { const k = (BigInt(Math.floor(kept)) - BigInt(DISCORD_EPOCH)) << 22n; if (k < a) a = k; }
+      const k = (BigInt(Math.floor(kept)) - BigInt(DISCORD_EPOCH)) << 22n;
+      if (k < a) a = k;
       return String(a);
     };
     for (const [msg, m] of live) {
@@ -6112,7 +6200,18 @@ export class Link {
     }
     for (const [k, t] of claims) {
       const a = anchorFor(t.msg, t.item ?? "none", t.ref!);
-      if (!a) continue;
+      if (a === undefined) continue;
+      if (a === null) {
+        // Round 20: an open claim with no trustworthy anchor is not acted (a line on its card, and Cain told), and a
+        // landing ledger claim of its key still open is settled as not landed, voided, with the reason, so its key
+        // doesn't stay blocked.
+        const L = this.d.landings;
+        const open = L?.entries()?.find((e) => e.key === k && !e.settled);
+        if (open && L!.settle(k, "not landed", new Date(this.d.now()).toISOString(), { voided: true, why: CHECK_UNANCHORED_WHY }) === false) { this.log(`couldn't settle the landing claim of tap key ${tapKid(k)} (no trustworthy anchor): tried again next sweep`); continue; }
+        await this.notActedTap(k, t, CHECK_UNANCHORED_WHY);
+        this.log(`claim ${tapKid(k)} on card ${t.msg} not acted at its migration: ${CHECK_UNANCHORED_WHY}${open ? "; its landing claim settled as voided" : ""}`);
+        continue;
+      }
       const s = this.d.load(), c = s.taps?.[k];
       if (c?.ref && !c.ref.sf) { c.ref.sf = a; this.d.save(s, true); }
     }

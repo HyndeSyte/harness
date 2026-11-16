@@ -78,6 +78,11 @@
 - A tap on a question whose check has gone stale now says so on the card ("The check behind this is more than 7 days old"), and Cain checks it again and asks on a new card if it still needs you.
 - A Ship whose landing hasn't been settled with GitHub yet can't be tapped into counting twice, even after a restore.
 - The App's logs keep every record whole, even with a long message from GitHub or a power cut in the middle of a write.
+- If a change from your tap ever didn't land in Cain's record (say the record had to start over before it saved it), you get one line under that card saying so, and Cain asks again on a new card if it still needs you.
+- A tap on a card whose earlier answer Cain's record is still acting on does nothing, keeps the buttons, and says it settles by itself.
+- A Ship that didn't go ahead because the record had to start over, and that the App couldn't note in its landing record right away, says so under its card; the App keeps trying by itself, and the daily settle reminder covers it if it can't.
+- A question already up when you install this whose check can't be dated reliably (its date unreadable, or not the check the card was asked on) says a new check is needed instead.
+- The App's logs take turns properly even if something dies in the middle of writing one, and long messages with emoji or accents are cut cleanly.
 - One known gap, said plainly: if a tap was used while GitHub was down, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 

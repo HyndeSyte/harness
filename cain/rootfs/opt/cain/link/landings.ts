@@ -28,7 +28,7 @@ export const SETTLED_LOG = "settled.log";   // round 12: the hand settles, appen
 // epoch: the record keeper's reset epoch the link read right before the claim (round 10): re-read after
 // the claim's fsync, and a change voids the claim before any push.
 export interface LandingEntry { key: string; pr: string; head: string; at: string; base?: string; epoch?: number;
-  settled?: { how: "landed" | "not landed"; at: string; voided?: boolean; forced?: boolean; said?: string };
+  settled?: { how: "landed" | "not landed"; at: string; voided?: boolean; forced?: boolean; said?: string; why?: string };
   // Round 11: a forced (hand-settled) entry later followed by a landing of the same head names that
   // landing's key, so the reconciliation shows one landing per head.
   linked?: string }
@@ -37,7 +37,8 @@ export interface LandingEntry { key: string; pr: string; head: string; at: strin
 export interface HeadLanding { head: string; pr: string; landed: string | null; keys: string[]; forced: string[]; open: string[] }
 export interface Landings {
   claim(key: string, what: { pr: string; head: string; at: string; base?: string; epoch?: number }): boolean | null;
-  settle(key: string, how: "landed" | "not landed", at: string, note?: { voided?: boolean; forced?: boolean; said?: string }): void;
+  // Round 20: false when the key's file couldn't be written (the claim stays open); true otherwise.
+  settle(key: string, how: "landed" | "not landed", at: string, note?: { voided?: boolean; forced?: boolean; said?: string; why?: string }): boolean | void;
   reconcile?(): HeadLanding[];
   // Round 12: a hand settle, as one framed record appended and fsynced to the ledger's settle log
   // (settled.log in its directory) before any effect, then mirrored on the key's own file; false when it
@@ -118,10 +119,10 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
     settle(key, how, at, note) {
       const file = join(dir, `${keyName(key)}.json`);
       const j = readJson(file);
-      if (!j || j.settled) return;
+      if (!j || j.settled) return true;
       try { writeDurable(file, JSON.stringify({ ...j, settled: { how, at, ...(note?.voided ? { voided: true } : {}), ...(note?.forced ? { forced: true } : {}),
-        ...(note?.said ? { said: note.said } : {}) } }) + "\n"); }
-      catch (e: any) { log(`couldn't mark landing ${keyName(key).slice(0, 12)} settled: ${String(e?.message ?? e).slice(0, 80)}`); return; }
+        ...(note?.said ? { said: note.said } : {}), ...(note?.why ? { why: String(note.why).slice(0, 300) } : {}) } }) + "\n"); }
+      catch (e: any) { log(`couldn't mark landing ${keyName(key).slice(0, 12)} settled: ${String(e?.message ?? e).slice(0, 80)}`); return false; }
       // Round 11: a real landing of a head that a forced entry settled earlier is linked from it.
       if (how === "landed" && !note?.forced)
         for (const e of api.entries() ?? []) {
@@ -129,6 +130,7 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
           try { writeDurable(join(dir, `${keyName(e.key)}.json`), JSON.stringify({ ...e, linked: key }) + "\n"); log(`landing ${keyName(e.key).slice(0, 12)} (settled by hand) linked to the later landing ${keyName(key).slice(0, 12)} of the same head`); }
           catch (x: any) { log(`couldn't link landing ${keyName(e.key).slice(0, 12)}: ${String(x?.message ?? x).slice(0, 80)}`); }
         }
+      return true;
     },
     settleHand(key, how, at, said) {
       try {

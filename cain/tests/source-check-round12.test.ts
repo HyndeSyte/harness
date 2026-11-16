@@ -373,7 +373,8 @@ describe("9. framed append-only logs", () => {
     appendFileSync(tapsLogFile(k.cfg), '61:deadbeef:{"tap":"tap-00000000f902","id":"x"');   // cut short
     k.cain({ id: "cain-r9", ops: [{ op: "note", item: "P44", text: "a round" }] });
     expect(cycle(k.cfg).ok).toBe(true);
-    expect(readFileSync(tapsLogFile(k.cfg), "utf8")).toBe(good);
+    // Round 20: the keeper's landed marks for consumed keys aside (a record type of its own), the torn record is gone.
+    expect(readFileSync(tapsLogFile(k.cfg), "utf8").split("\n").filter((l) => !l.includes('"t":"landed"')).join("\n")).toBe(good);
     expect(lines.filter((l) => l.includes("TORN:"))).toHaveLength(1);
     expect(k.relayed().split(" / ").filter((l) => l.includes("torn final record"))).toHaveLength(1);
     k.cain({ id: "cain-r9b", ops: [{ op: "note", item: "P44", text: "another round" }] });

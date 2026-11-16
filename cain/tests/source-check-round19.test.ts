@@ -224,7 +224,7 @@ describe("3. no Pi-clock decision about whether a tap counts (invariants: the li
     r.keeperVerified();
     const id = await askCard(r);
     const st = r.state(), m = st.messages[id];
-    m.until = m.posted! + DAY + 2 * HOUR;                             // a retention that ends two hours after the post
+    (m as any).keep = DAY + 2 * HOUR;                                  // round 20: the retention, persisted as a duration
     r.setState(st);
     stepPi(r, 3 * DAY);                                               // the Pi's clock alone is far past it
     r.keeperVerified();
@@ -233,7 +233,7 @@ describe("3. no Pi-clock decision about whether a tap counts (invariants: the li
     r2.keeperVerified();
     const id2 = await askCard(r2);
     const st2 = r2.state();
-    st2.messages[id2].until = st2.messages[id2].posted! + DAY + 2 * HOUR;
+    (st2.messages[id2] as any).keep = DAY + 2 * HOUR;
     r2.setState(st2);
     expect(await tapAt(r2, id2, r2.msg(id2), sfTime(id2) + 3 * HOUR)).toBe("dead: forgetting");   // the Pi's clock in step: still the snowflake decides
   });
@@ -344,7 +344,8 @@ describe("6. append logs: free text cut to fit, short writes undone, torn tails 
     const f = join(mkdtempSync(join(tmpdir(), "r19-log-")), "settled.log");
     appendLog(f, { key: "k", how: "not landed", reason: "GitHub said: ".concat("x".repeat(3 * MAX_RECORD_BYTES)), at: "x" });
     const rec = readLog<any>(f).records[0];
-    expect(rec.reason.length).toBe(FREE_TEXT_BUDGET);
+    expect(Buffer.byteLength(rec.reason)).toBeLessThanOrEqual(FREE_TEXT_BUDGET);   // round 20: a byte budget
+    expect(rec.reason.endsWith("\u2026")).toBe(true);
     expect(readFileSync(f).length).toBeLessThan(MAX_RECORD_BYTES);
   });
 
@@ -375,12 +376,9 @@ describe("6. append logs: free text cut to fit, short writes undone, torn tails 
     expect(after.records.map((x) => x.kid ?? x.n)).toEqual(["a", 2]);
   }, 30_000);
 
-  test("shared-log writers are serialised: two processes' appends all land whole; a lock its holder left is taken over", async () => {
+  // Round 20: the folder lock and its takeover are gone (an flock now: round 20's tests cover a dead holder).
+  test("shared-log writers are serialised: two processes' appends all land whole", async () => {
     const dir = mkdtempSync(join(tmpdir(), "r19-log-")), f = join(dir, "record-install.log");
-    mkdirSync(`${f}.lock`);
-    writeFileSync(join(`${f}.lock`, "pid"), "999999");                // a writer that died holding it
-    appendLog(f, { t: "flag", how: "off", by: "keeper", at: "x" });
-    expect(existsSync(`${f}.lock`)).toBe(false);
     const script = join(dir, "many.ts");
     writeFileSync(script, `import { appendLog } from ${JSON.stringify(join(import.meta.dir, "../rootfs/opt/cain/applog.ts"))};\nfor (let i = 0; i < 40; i++) appendLog(process.argv[2], { t: "once-used", by: "w-" + process.argv[3], n: i, why: "x".repeat(900) });\n`);
     const run = (who: string) => new Promise<number>((ok) => spawn("bun", [script, f, who], { stdio: "ignore" }).on("exit", (c) => ok(c ?? 1)));

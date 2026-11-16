@@ -77,6 +77,13 @@
 #                                        restore sweep page) counts as a comparison too, so pi_clock reads in
 #                                        step after a quiet restart; consumed_verified needs the keeper's
 #                                        verified status to name this link run's number and nonce together
+#                                        Round 20: a status without a run number reads as unverified;
+#                                        replay_open (how many replayed held taps are still open: the keeper
+#                                        answers them a page of 500 a round, continuing where it stopped);
+#                                        a voided Ship landing the ledger couldn't mark settled is listed
+#                                        under unresolved_landings too, so his settle line settles it; pi_clock
+#                                        goes back to off (and the restore sweep reads again) once a post or
+#                                        a tap measures the Pi's clock off
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or

@@ -687,7 +687,13 @@ its card aged out says on the card "The check behind this is more than N days ol
 the item's re-check: check it again at its source and ask again with --checked if it still needs him. A card already up
 when this version was installed keeps working; one whose check can't be dated by Discord's time loses its buttons and
 says a new source check is needed, and you hear it: check that item again and ask again with --checked. If you hear the
-record keeper won't verify the link's run, taps stay held until the App restarts: nothing to tell him.
+record keeper won't verify the link's run, taps stay held until the App restarts: nothing to tell him. A line starting
+"Tap not landed" means a change you recorded from a tap never reached the record (its commit was lost to a reset, or
+never reached GitHub): treat it as not done, he was told on the card; check the item again at its source and ask again
+with --checked if it still needs him. A line saying the record keeper couldn't resolve whether tap requests were acted
+on: nothing to do, the link holds those taps and he was told it settles by itself. "Landing voided but not yet
+settled": nothing was pushed; nothing to do unless it later shows under unresolved_landings, then it is settled as any
+unresolved landing is.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:
