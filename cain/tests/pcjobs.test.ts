@@ -40,6 +40,7 @@ import {
   jobHelperState, cscCandidates, systemRoot, readStamp, JOB_HELPER_SOURCE, KILL_INTERMEDIARY, blocker, hostAllowed, jobScopeProblem, queryAllowed, entryRegistrable,
   ABORT_HOLD_MS, ABORT_KILL_MS, HOOK_TIMEOUT_S, escalateAbort, markKillFailed, ADDRESS_BLOCK, ADDRESS_KEY, parseStrict, judgeForged, judgeFragmentStrip, killLatency, notReady,
   FORGED_PROMPT, FRAGMENT_PROMPT, FRAGMENT_MARK, READY_WAIT_MS, holdForEnd, FRAGMENT_PATH, RECORDED_ONLY, hookBudget, HOOK_BUDGET_MS, HOOK_MARGIN_MS, HOOK_REPLY_MS, awaitInventory,
+  HOOK_GAP_MARGIN_MS, hookTimingStep, judgeHookTiming, timingGaps, payloadReplay, fragmentReport,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -396,6 +397,16 @@ interface Browser { group: { id: number; url: string }[]; events: unknown[]; use
 // The worker's own environment in these tests: what a clean Windows or POSIX shell has, and nothing of Claude Code's.
 const TEST_ENV: Record<string, string> = { PATH: "/usr/bin", HOME: "/home/owner", SystemRoot: "C:\\Windows", TEMP: "C:\\Temp" };
 const stream = (events: unknown[]) => events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+// A page's own script, as a browser runs it (the fragment check page's): window.location as the
+// tab has it, the fragment included, and fetch against the page's own address.
+async function runPageScript(html: string, href: string): Promise<void> {
+  const script = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? "";
+  const u = new URL(href);
+  const calls: Promise<unknown>[] = [];
+  const f = (path: string, init: RequestInit) => { const p = fetch(new URL(path, href).href, init).catch(() => null); calls.push(p); return p; };
+  new Function("window", "fetch", script)({ location: { href: u.href, hash: u.hash } }, f);
+  await Promise.all(calls);
+}
 // The stand-in profile's cookie for 127.0.0.1 (the profile marker), as Chrome keeps it.
 // blocked: a profile that keeps no cookies (so a bind there never sticks).
 // The cookie's path is /pcw: it goes only with requests under it, as Chrome sends it.
@@ -559,7 +570,9 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
       if (!url.startsWith("http://127.0.0.1:")) { await open(url); return ""; }
       const res = await bget(url).catch(() => null);
       if (!res) return "";
-      tab.url = res.url;
+      // The browser keeps the address's fragment in the tab (fetch's response address drops it), unless a redirect moved it.
+      const frag = (() => { try { return new URL(url).hash; } catch { return ""; } })();
+      tab.url = res.url + (frag && !res.redirected && !res.url.includes("#") ? frag : "");
       const html = await res.text();
       const rel = (x: string) => new URL(x, res.url).href;
       const pop = /window\.open\("([^"]+)"\)/.exec(html)?.[1];
@@ -743,7 +756,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
       await b.use("navigate", { tabId: tab.id, url });
       // The page's own script, as Chrome runs it: it reports the address the tab was opened at.
       if (/^http:\/\/127\.0\.0\.1:/.test(tab.url) && tab.url.includes("/fragment-check"))
-        await fetch(`${tab.url.replace(/\/fragment-check.*$/, "")}/opened?u=${encodeURIComponent(tab.url)}`).catch(() => null);
+        await runPageScript(await (await bget(tab.url)).text(), tab.url);
       await b.use("tabs_context_mcp");
       events.push(fin("done"));
       return { code: 0, out: stream(events), timedOut: false };
@@ -793,7 +806,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
     acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), managed: [], managedDirs: [],
     policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
-    shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
+    shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, hookTiming: async () => TIMING_OK, payloadReplay: () => REPLAY_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
     readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string; fragment?: boolean } = {}) => {
@@ -832,6 +845,10 @@ const attended = { attended: true };
 const configLeft = (dir: string) => (existsSync(dir) ? readdirSync(dir) : []).filter((n) => !CONFIG_KEEP.includes(n)).sort();
 const ACCEPT = { acceptBoundary: true };
 // The probe's process-end check, as a healthy PC answers it.
+// The probe's hook_timing and payload_replay steps as a healthy PC records them (their own tests drive the real steps).
+const TIMING_OK = { cold_gap_ms: 900, warm_gaps_ms: [300], max_gap_ms: 900, budget_ms: 26_000, timeout_ms: 40_000, margin_ms: 4_000,
+  full_budget: { tried: true, answered_ms: 25_950, blocked: true }, overrun: { tried: true, cli: "refused" as const }, why: null, passed: true };
+const REPLAY_OK = { captured: 6, parsed: 6, agreed: 6, failures: [], passed: true };
 const PROCESS_OK = { platform: "win32", tree_kill: { passed: true, left: 0, polls: 1 }, signals: [{ signal: "SIGINT", handler_ran: false, passed: false }],
   job_object: { helper: true, descendant_started: true, descendant_left: false, kill_tree_gone: true, passed: true } };
 
@@ -1441,7 +1458,7 @@ describe("the PC worker: what the model saw", () => {
     expect(navDecide(call("navigate", "https://example.com/account/settings"), allow)).toEqual({ id: "toolu_1", tool: "navigate", url: "https://example.com/account/settings", decision: "allow", why: "run_address" });
     // The session's settings pin exactly this hook: a catch-all matcher on the prefix, this command, a timeout past nav-guard's own deadline.
     const settings = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
-    expect(settings.hooks.PreToolUse).toEqual([{ matcher: GUARD_MATCHER, hooks: [{ type: "command", command: HOOK_COMMAND, timeout: 30 }] }]);
+    expect(settings.hooks.PreToolUse).toEqual([{ matcher: GUARD_MATCHER, hooks: [{ type: "command", command: HOOK_COMMAND, timeout: HOOK_TIMEOUT_S }] }]);
     expect(GUARD_MATCHER).toBe(".*");
     // Every tool gets a logged decision, the built-in ones too (refused: not the extension's).
     expect(navDecide(JSON.stringify({ tool_use_id: "toolu_8", tool_name: "Bash", tool_input: { command: "ls" } }), allow))
@@ -4995,7 +5012,7 @@ describe("fourteenth review: the read-time drift check, what counts as a trip, t
     expect(JSON.parse(r.stdout).hookSpecificOutput.updatedMCPToolOutput).toBe(READ_DRIFT_MESSAGE);
     // The pinned settings carry it, and a settings file without it is untrusted.
     const settings = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
-    expect(settings.hooks.PostToolUse).toEqual([{ matcher: READ_MATCHER, hooks: [{ type: "command", command: READ_GUARD_COMMAND, timeout: 30 }] }]);
+    expect(settings.hooks.PostToolUse).toEqual([{ matcher: READ_MATCHER, hooks: [{ type: "command", command: READ_GUARD_COMMAND, timeout: HOOK_TIMEOUT_S }] }]);
     expect(allowedTools(settings)).not.toBeNull();
     expect(allowedTools({ ...settings, hooks: { PreToolUse: settings.hooks.PreToolUse } })).toBeNull();
     expect(allowedTools({ ...settings, hooks: { ...settings.hooks, PostToolUse: [{ matcher: ".*", hooks: [{ type: "command", command: READ_GUARD_COMMAND, timeout: 30 }] }] } })).toBeNull();
@@ -5352,7 +5369,7 @@ say({ type: "result", subtype: "success", result: "{}" });`);
     expect(helperBuild(q.opts({ platform: "win32", jobHelper: undefined, csc: () => null }))).toEqual({ applies: true, code: "helper_compiler_missing", passed: false });
     // The gates, in order, by name. session_ids and fragment_strip never gate.
     const good = { redirect_read: { session_ended: true, passed: true }, structured_address: { passed: true }, forged_address: { passed: true }, kill_latency: { passed: true },
-      not_ready: { passed: true }, job_readback: { passed: true }, helper_build: { passed: true }, session_ids: { passed: false }, fragment_strip: { passed: false } } as any;
+      not_ready: { passed: true }, hook_timing: { passed: true }, payload_replay: { passed: true }, job_readback: { passed: true }, helper_build: { passed: true }, session_ids: { passed: false }, fragment_strip: { passed: false } } as any;
     expect(PROBE_GATES).not.toContain("session_ids");
     expect(probeGate(good, "win32")).toBeNull();
     for (const k of PROBE_GATES) expect([k, probeGate({ ...good, [k]: { passed: false, session_ended: false } }, "win32")]).toEqual([k, k]);
@@ -5512,8 +5529,8 @@ describe("sixteenth review: the read guard's bounded hold and the kill escalatio
     const k = await startCanary("ext", "a-frag", { fragment: true });
     try {
       const page = await (await fetch(`${k.url}${FRAGMENT_PATH}`)).text();
-      expect(page).toContain(`fetch("${k.base}/opened?u=" + encodeURIComponent(location.href))`);
-      await fetch(`${k.url}/opened?u=${encodeURIComponent(`${k.url}${FRAGMENT_PATH}#x`)}`);
+      expect(page).toContain("var href = String(window.location.href), hash = String(window.location.hash);");
+      await runPageScript(page, `${k.url}${FRAGMENT_PATH}#x`);
       expect(k.opened()).toEqual([`${k.url}${FRAGMENT_PATH}#x`]);
     } finally { await k.close(); }
     const plain = await startCanary("ext", "a-plain");
@@ -5729,7 +5746,7 @@ describe("seventeenth review: one time budget per hook run, duplicate keys seen 
 
   test("no gating step reads a recorded-only value: each is flipped and no verdict moves", () => {
     const good = { redirect_read: { session_ended: true, secret_withheld: true, passed: true }, structured_address: { passed: true }, forged_address: { passed: true },
-      kill_latency: { passed: true }, not_ready: { passed: true }, job_readback: { applies: true, passed: true }, helper_build: { applies: true, passed: true },
+      kill_latency: { passed: true }, not_ready: { passed: true }, hook_timing: { passed: true }, payload_replay: { passed: true }, job_readback: { applies: true, passed: true }, helper_build: { applies: true, passed: true },
       session_ids: { passed: true, match: true }, fragment_strip: { passed: true, stripped: true, tab_bare: true } } as any;
     const flip = (ev: any, path: string, v: boolean) => { const c = JSON.parse(JSON.stringify(ev)); const [a, b] = path.split("."); c[a][b] = v; return c; };
     for (const plat of ["win32", "linux"])
@@ -5751,4 +5768,212 @@ describe("seventeenth review: one time budget per hook run, duplicate keys seen 
     expect(RECORDED_ONLY).toContain("redirect_read.secret_withheld");
     expect(PROBE_GATES).not.toContain("fragment_strip");
   });
+});
+
+describe("eighteenth review: the hook's margin measured on the PC, a strict parser that names what it refuses, and the fragment check from the page's own script", () => {
+  const CANARY_URL = "http://127.0.0.1:5000/pcw/tok";
+  const sc = { domains: ["example.com"], canary: [CANARY_URL], query: [] as string[] };
+  const FAKE_CLI = join(import.meta.dir, "fake-cli-timing.ts");
+  // The test's scale: the budget 1.5 s, the CLI's hook timeout 3.5 s, the gap allowed 1.5 s.
+  const LIM = { budget: 1_500, timeout: 3_500, margin: 500, stall: 4_200 };
+
+  test("the settings need a hook timeout of at least 40 seconds for both hooks, with the budget at 26", () => {
+    expect([HOOK_TIMEOUT_S, HOOK_BUDGET_MS, HOOK_MARGIN_MS, HOOK_GAP_MARGIN_MS]).toEqual([40, 26_000, 14_000, 4_000]);
+    const settings = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
+    expect(allowedTools(settings)).not.toBeNull();
+    const at = (pre: number, post: number) => {
+      const x = JSON.parse(JSON.stringify(settings));
+      x.hooks.PreToolUse[0].hooks[0].timeout = pre;
+      x.hooks.PostToolUse[0].hooks[0].timeout = post;
+      return allowedTools(x) !== null;
+    };
+    expect([at(40, 40), at(60, 45), at(30, 40), at(40, 30), at(39, 40), at(40, 39), at(61, 40), at(40.5, 40)]).toEqual([true, true, false, false, false, false, false, false]);
+    expect(HOOK_STALL_MS).toBeGreaterThan(HOOK_TIMEOUT_S * 1000);
+    expect(PROBE_GATES).toContain("hook_timing");
+    expect(PROBE_GATES).toContain("payload_replay");
+    expect(POLICY_VERSION).toBe("18");
+  });
+
+  // The step's four sessions, each a real session process (the stand-in CLI) running the real nav-guard.
+  const timingWorld = (fake: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), "hook-timing-"));
+    const capture = join(dir, "capture");
+    mkdirSync(capture);
+    let k = 0;
+    const run = (prompt: string, env: Record<string, string>) => realLaunch([process.execPath, FAKE_CLI, prompt], dir, 30_000, {
+      PATH: process.env.PATH ?? "", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}), ...(process.env.TEMP ? { TEMP: process.env.TEMP } : {}),
+      FAKE_WORKER: WORKER_FILE, FAKE_TIMEOUT_MS: String(LIM.timeout), PCW_HOOK_BUDGET_MS: String(LIM.budget), PCW_NAV_ALLOW: "[]",
+      PCW_NAV_LOG: join(dir, `nav-${++k}.jsonl`), PCW_ABORT_FILE: join(dir, `abort-${k}`), ...fake, ...env });
+    return { dir, capture, step: () => hookTimingStep(run, join(dir, "timing.jsonl"), capture, LIM) };
+  };
+
+  test("hook_timing with a fake CLI: a small gap passes, the held hook's deny reaches the CLI, the overrun navigation is refused; the captured payloads replay clean", async () => {
+    const w = timingWorld({});
+    const line = await w.step();
+    expect(line).toMatchObject({ why: null, passed: true, budget_ms: LIM.budget, timeout_ms: LIM.timeout, margin_ms: LIM.margin,
+      full_budget: { tried: true, blocked: true }, overrun: { tried: true, cli: "refused" } });
+    expect(line.cold_gap_ms).not.toBeNull();
+    expect(line.warm_gaps_ms.length).toBeGreaterThan(0);
+    expect(line.max_gap_ms! + LIM.budget + LIM.margin).toBeLessThanOrEqual(LIM.timeout);
+    // The held hook answered at its hard stop, near the budget's end, inside it.
+    expect(line.full_budget.answered_ms!).toBeGreaterThanOrEqual(LIM.budget - 400);
+    expect(line.full_budget.answered_ms!).toBeLessThan(LIM.budget + 200);
+    // The real PreToolUse payloads the stand-in CLI sent, replayed through the strict parser.
+    expect(readdirSync(w.capture).length).toBe(2);
+    expect(payloadReplay(w.capture)).toEqual({ captured: 2, parsed: 2, agreed: 2, failures: [], passed: true });
+    expect(existsSync(w.capture)).toBe(false);                                // replayed, then deleted
+  }, 60_000);
+
+  test("hook_timing with a fake CLI: a cold start that eats the margin fails the step", async () => {
+    const line = await timingWorld({ FAKE_DELAY_MS: "1700" }).step();
+    expect(line.max_gap_ms!).toBeGreaterThanOrEqual(1_700);
+    expect(line).toMatchObject({ why: "gap_too_long", passed: false });
+  }, 60_000);
+
+  test("hook_timing with a fake CLI: a hook that overruns the CLI's timeout lets an allowed call run, and a CLI that runs the stalled navigation, both fail", async () => {
+    // The CLI's timeout below the budget: the held hook overruns it, the CLI gives up on it and runs tabs_context_mcp.
+    const short = await timingWorld({ FAKE_TIMEOUT_MS: "1000" }).step();
+    expect(short.full_budget).toMatchObject({ tried: true, blocked: false });
+    expect(short.passed).toBe(false);
+    expect(["full_budget_not_blocked", "gap_too_long"]).toContain(short.why);
+    // A CLI that runs a navigation whose hook never answered: recorded as ran, and the step fails.
+    const open = await timingWorld({ FAKE_RUN_ON_TIMEOUT: "1" }).step();
+    expect(open.overrun).toEqual({ tried: true, cli: "ran" });
+    expect(open).toMatchObject({ why: "overrun_ran", passed: false });
+  }, 90_000);
+
+  test("judgeHookTiming: no measurement fails closed; a hook that started before its call was printed can't be measured", () => {
+    const session = (useAt: Record<string, number>, out = "") => ({ code: 0, out, timedOut: false, useAt });
+    const stamp = (id: string, t0: number) => ({ hook: "nav-guard", t0, id, read_at: t0 + 5, answered_at: t0 + 10, answer: "deny" });
+    expect(timingGaps(session({ a: 1_000 }), [stamp("a", 1_250)])).toEqual([250]);
+    expect(timingGaps(session({ a: 1_000 }), [stamp("a", 900)])).toEqual([]);             // started before its call was printed
+    expect(timingGaps(session({}), [stamp("a", 1_250)])).toEqual([]);                      // no call event seen
+    expect(judgeHookTiming({ cold: null, warm: null, full: null, overrun: null })).toMatchObject({ why: "gap_unmeasured", passed: false });
+  });
+
+  test("payload_replay: a byte order mark, a lone surrogate, an unsafe integer and a duplicate key each fail it by name", () => {
+    const dir = mkdtempSync(join(tmpdir(), "replay-"));
+    const good = JSON.stringify({ session_id: SID, tool_use_id: "t1", tool_name: `${CH}navigate`, tool_input: { url: "https://example.com/a", tabId: 5 } });
+    writeFileSync(join(dir, "a.json"), good);
+    writeFileSync(join(dir, "b.json"), good.replace(/}$/, "}\r\n"));
+    expect(payloadReplay(dir)).toEqual({ captured: 2, parsed: 2, agreed: 2, failures: [], passed: true });
+    const bad = mkdtempSync(join(tmpdir(), "replay-bad-"));
+    writeFileSync(join(bad, "1.json"), "﻿" + good);
+    writeFileSync(join(bad, "2.json"), good.replace('"t1"', '"\\ud800"'));
+    writeFileSync(join(bad, "3.json"), good.replace('"tabId":5', '"tabId":9007199254740993'));
+    writeFileSync(join(bad, "4.json"), good.replace('{"session_id"', '{"tool_use_id":"x","session_id"'));
+    expect(payloadReplay(bad)).toEqual({ captured: 4, parsed: 0, agreed: 0, failures: ["bom", "lone_surrogate", "unsafe_integer", "duplicate_key"], passed: false });
+    expect(payloadReplay(join(bad, "none"))).toMatchObject({ captured: 0, passed: false });   // nothing captured: fails closed
+  });
+
+  test("the probe refuses confirmation by name when hook_timing or payload_replay didn't pass", async () => {
+    for (const [over, step] of [[{ hookTiming: async () => ({ ...TIMING_OK, why: "gap_too_long", passed: false }) }, "hook_timing"],
+      [{ payloadReplay: () => ({ ...REPLAY_OK, failures: ["bom"], parsed: 0, agreed: 0, passed: false }) }, "payload_replay"]] as const) {
+      const q = queueRig({ confirmed: false });
+      const ev1 = await probe(q.opts({ ...attended, ...over } as Partial<Opts>));
+      expect((ev1 as any)[step].passed).toBe(false);
+      let err: any;
+      try { confirmProfile(q.opts(), ACCEPT); } catch (e) { err = e; }
+      expect(err?.code).toBe("probe_required");
+      expect(err?.detail?.step).toBe(step);
+      expect(probeCases(ev1).unverified).toContain(step);
+    }
+  }, 120_000);
+
+  test("parseStrict: a BOM is rejected, CRLF and trailing whitespace accepted, lone surrogates and unsafe integers rejected by name", () => {
+    const why = (t: string) => { try { parseStrict(t); return "ok"; } catch (e) { return (e as Error).message; } };
+    expect(why('﻿{"a":1}')).toBe("bom");
+    expect(why('{"a":1}﻿')).toBe("not strict JSON");
+    expect(why('{\r\n  "a": 1,\r\n  "b": [2, 3]\r\n}\r\n  \t\r\n')).toBe("ok");
+    expect(why('  {"a":1}  ')).toBe("ok");
+    // Lone surrogates, escaped or raw, either half, or a high one followed by the wrong escape.
+    for (const t of ['{"a":"\\ud800"}', '{"a":"\\udc00"}', '{"a":"\\ud800x"}', '{"a":"\\ud800\\u0041"}', '{"a":"\\ud800\\ud800"}', '{"\\udfff":1}', '{"a":"\ud800"}', '{"a":"\udc00x"}'])
+      expect([t, why(t)]).toEqual([t, "lone_surrogate"]);
+    expect((parseStrict('{"a":"\\ud83d\\ude00","b":"😀"}').value as any)).toEqual({ a: "\u{1F600}", b: "\u{1F600}" });
+    // Integers past the safe range, either way: rejected, never rounded or kept as text.
+    for (const t of ['{"a":9007199254740992}', '{"a":-9007199254740992}', '{"a":123456789012345678901234567890}']) expect([t, why(t)]).toEqual([t, "unsafe_integer"]);
+    expect((parseStrict('{"a":9007199254740991,"b":-9007199254740991,"c":1.5e300,"d":1e20}').value as any)).toEqual({ a: 9007199254740991, b: -9007199254740991, c: 1.5e300, d: 1e20 });
+    expect(why('{"a":1e400}')).toBe("number_range");
+    // The read guard reads each of those as unplaced.
+    const head = `{"tool_use_id":"r1","tool_name":"${CH}get_page_text","tool_input":{"tabId":1},"tool_response":`;
+    const good = `${head}{"content":[],"structuredContent":{"tabUrl":"https://example.com/a"}}}`;
+    expect(readDecide(good + "\r\n", sc)).toMatchObject({ decision: "allow", why: "read_on_scope" });
+    for (const bad of ["﻿" + good, good.replace('"tabId":1', '"tabId":9007199254740993'), good.replace('"content":[]', '"content":["\\udead"]')])
+      expect(readDecide(bad, sc).why).toBe("read_unplaced");
+  });
+
+  test("parseStrict compares decoded keys code unit by code unit, and folds only ASCII letters in address names, as the gating path reads its one field", () => {
+    expect(parseStrict('{"TABURL":"x","a":{"PageUrl":"y"}}').addressKeys).toBe(2);
+    // Keys that differ in any code unit are different keys: no duplicate, and only the exact tabUrl is the address field.
+    const zw = parseStrict('{"structuredContent":{"tabUrl":"https://example.com/a","tabUrl\\u200b":"https://evil.example/"}}');
+    expect(zw).toMatchObject({ dup: false, addressKeys: 1 });
+    expect(structuredUrl(zw.value, zw)).toBe("https://example.com/a");
+    // The same key spelled two ways decodes to the same code units: a duplicate.
+    expect(parseStrict('{"t\\u0061bUrl":1,"tabUrl":2}')).toMatchObject({ dup: true, addressKeys: 2 });
+    // A non-ASCII letter never folds into an address name (no Unicode case mapping): the dotted capital I stays itself.
+    expect(parseStrict('{"locat\\u0130on":1}').addressKeys).toBe(0);
+    expect(parseStrict('{"LOCATION":1}').addressKeys).toBe(1);
+  });
+
+  test("fragment_strip: a page loaded with its fragment reports the hash, so the step fails; the bare page passes", async () => {
+    const k = await startCanary("ext", "a-frag18", { fragment: true });
+    const PAGE = `${k.url}${FRAGMENT_PATH}`;
+    const st = parseStream(stream([ev.init(GIVEN)]));
+    const nav = [{ id: "n1", tool: "navigate", url: PAGE, decision: "allow" as const, why: "run_address", fragment_stripped: true as const }];
+    try {
+      const html = await (await fetch(PAGE)).text();
+      // Loaded with its fragment (the hook's stripped address never reached the browser): the page's own report shows it.
+      await runPageScript(html, `${PAGE}#${FRAGMENT_MARK}`);
+      expect(k.opened()).toEqual([`${PAGE}#${FRAGMENT_MARK}`]);
+      const failed = judgeFragmentStrip(st, k, nav);
+      expect(failed).toMatchObject({ received: [`${PAGE}#${FRAGMENT_MARK}`], received_bare: false, passed: false });
+    } finally { await k.close(); }
+    const b = await startCanary("ext", "a-bare18", { fragment: true });
+    try {
+      await runPageScript(await (await fetch(`${b.url}${FRAGMENT_PATH}`)).text(), `${b.url}${FRAGMENT_PATH}`);
+      expect(judgeFragmentStrip(st, b, [{ ...nav[0], url: `${b.url}${FRAGMENT_PATH}` }])).toMatchObject({ received_bare: true, passed: true });
+    } finally { await b.close(); }
+  });
+
+  test("the check server takes the address only from the page's report body, never from a request line", async () => {
+    const k = await startCanary("ext", "a-line18", { fragment: true });
+    const PAGE = `${k.url}${FRAGMENT_PATH}`;
+    try {
+      // An address in the report's query is ignored: the body says the hash was there.
+      await fetch(`${k.url}/opened?u=${encodeURIComponent(PAGE)}`, { method: "POST", body: JSON.stringify({ href: `${PAGE}#${FRAGMENT_MARK}`, hash: `#${FRAGMENT_MARK}` }) });
+      // A GET with an address in its request line records nothing.
+      await fetch(`${k.url}/opened?u=${encodeURIComponent(PAGE)}`);
+      // A report whose href lost the "#" its hash shows keeps the hash.
+      await fetch(`${k.url}/opened`, { method: "POST", body: JSON.stringify({ href: PAGE, hash: "#x" }) });
+      // A body that isn't a report records nothing usable: never the bare page.
+      await fetch(`${k.url}/opened?u=${encodeURIComponent(PAGE)}`, { method: "POST", body: "not json" });
+      // The page's own request, with an address in its query, records nothing either.
+      await fetch(`${PAGE}?u=${encodeURIComponent(PAGE)}`);
+      expect(k.opened()).toEqual([`${PAGE}#${FRAGMENT_MARK}`, `${PAGE}#x`, ""]);
+      expect(judgeFragmentStrip(parseStream(stream([ev.init(GIVEN)])), k, []).passed).toBe(false);
+    } finally { await k.close(); }
+    expect(fragmentReport(JSON.stringify({ href: "https://a/b", hash: "" }))).toBe("https://a/b");
+    expect(fragmentReport(JSON.stringify({ hash: "#x" }))).toBe("");
+  });
+
+  // In a real Chromium where one is installed (Playwright): the page's own script, as the browser runs it.
+  const pw = (() => {
+    for (const at of ["playwright", ...(process.env.NODE_PATH ?? "").split(WIN ? ";" : ":").filter(Boolean).map((d) => join(d, "playwright"))])
+      try { return require(at); } catch { /* not there */ }
+    return null;
+  })();
+  test.skipIf(!pw || WIN)("fragment_strip in a real browser: opened with its fragment the page reports it, opened bare it doesn't", async () => {
+    const k = await startCanary("ext", "a-chrome18", { fragment: true });
+    const browser = await pw.chromium.launch();
+    try {
+      const page = await browser.newPage();
+      const PAGE = `${k.url}${FRAGMENT_PATH}`;
+      await page.goto(`${PAGE}#${FRAGMENT_MARK}`);
+      for (let t = 0; t < 3_000 && k.opened().length < 1; t += 50) await new Promise((ok) => setTimeout(ok, 50));
+      await page.goto(PAGE);
+      for (let t = 0; t < 3_000 && k.opened().length < 2; t += 50) await new Promise((ok) => setTimeout(ok, 50));
+      expect(k.opened()).toEqual([`${PAGE}#${FRAGMENT_MARK}`, PAGE]);
+      expect(judgeFragmentStrip(parseStream(stream([ev.init(GIVEN)])), k, []).passed).toBe(false);
+    } finally { await browser.close(); await k.close(); }
+  }, 60_000);
 });

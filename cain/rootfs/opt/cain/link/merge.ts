@@ -276,6 +276,8 @@ export function judgeChecks(runs: any[], windows = false): CheckState[] {
 // One answer from GitHub's API, tried twice: its body, "missing" (GitHub says there's no
 // such thing), or null (no answer). A 403 or 429 (a rate limit, or a refusal) isn't asked
 // again: the link shares 60 unauthenticated reads an hour, and asking at once won't mend it.
+// It is a failed page (null), whatever its body holds: the listing isn't whole, and the landing,
+// the Ship card and the gate's report all hold on it.
 async function read(d: Pick<MergeDeps, "api">, path: string): Promise<any | "missing" | null> {
   for (let i = 0; i < 2; i++) {
     try {
@@ -382,10 +384,16 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
 export type GateDecision = "accept" | "hold" | "refuse";
 export interface GateReport { head: string; at: string; decision: GateDecision; why: string; windows: CheckState["state"] | "not_required" | null;
   workflow: HeadDetail["workflow"] | null; attempts: { id: number; status: string; conclusion: string | null; run_id?: number; run_attempt?: number; via: string[] }[] }
+// A rate-limit page (HTTP 403 or 429) anywhere in the reading counts as a failed page (0.12.0,
+// eighteenth round): the report holds, whatever the rest of the reading said, and never accepts.
+export const RATE_LIMITED = [403, 429];
 export async function gateReport(d: Pick<MergeDeps, "api">, repo: string, head: string, now = () => new Date()): Promise<GateReport> {
   const at = now().toISOString();
   if (!SHA.test(head)) return { head, at, decision: "refuse", why: "that isn't a full commit sha", windows: null, workflow: null, attempts: [] };
-  const h = await headDetail(d, repo, head);
+  let limited = false;
+  const seen: Pick<MergeDeps, "api"> = { api: async (path) => { const r = await d.api(path); if (RATE_LIMITED.includes(r.status)) limited = true; return r; } };
+  const h = await headDetail(seen, repo, head);
+  if (limited) return { head, at, decision: "hold", why: "GitHub's rate limit (HTTP 403 or 429) stopped a page of the reading, so nothing is judged on it", windows: null, workflow: null, attempts: [] };
   if (h === "missing") return { head, at, decision: "refuse", why: "GitHub doesn't have that commit", windows: null, workflow: null, attempts: [] };
   if (h === null) return { head, at, decision: "hold", why: "GitHub didn't answer about its checks, or a listing wasn't whole", windows: null, workflow: null, attempts: [] };
   const w = h.checks.windows ? judgeChecks(h.checks.runs, true).find((c) => c.name === WINDOWS_CHECK)!.state : "not_required";

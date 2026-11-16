@@ -22,7 +22,7 @@
 //   bun main.ts result <id>     a job's result, checked, as fixed lines (each fact a quoted string, labelled untrusted)
 //   bun main.ts worker          the PC worker's last heartbeat
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createHmac } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
   DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type OwnerReuse, type Result } from "./core.ts";
@@ -35,6 +35,7 @@ export type Config = {
   verifyReuse?: ReuseCheck;      // the tests' stand-in for the link
   used?: string;                 // the append-only file of the owner-reuse taps already spent (default /data/pc-jobs-reuse-used.jsonl)
   afterPush?: () => void;        // the tests' stand-in for the keeper being killed between the push and the finalise
+  pushWaitMs?: number;           // the wait between push tries (default PUSH_WAIT_MS; the tests' shorter)
 };
 
 // ---- His yes to reusing a reported value, checked by the link ----------------------
@@ -82,20 +83,36 @@ export function linkReuse(cfg: Pick<Config, "link" | "discordEnv">): ReuseCheck 
 // own outside the queue copy (which is rebuilt from GitHub), one JSON line each, only ever
 // appended to and flushed to disk (fsync) line by line, so a keeper restart, a queue copy made
 // afresh or a crash at any point doesn't free a tap for a second job (0.12.0, seventeenth round):
-//   1. before the job is pushed, the tap goes in as pending, with its job id and request id;
-//      a tap that can't be written so stops the round: nothing is pushed;
-//   2. the job is pushed;
+//   1. before the job is pushed, the tap goes in as pending, with its job id, its request id and
+//      the keeper's commit that carries the job; a tap that can't be written so stops the round:
+//      nothing is pushed;
+//   2. the job is pushed, tried up to PUSH_TRIES times with short waits (PUSH_WAIT_MS);
 //   3. the tap is finalised (final).
 // A pending tap counts as spent. At the start of each round, once the queue copy is brought up
-// to date from GitHub (sync), every pending tap is reconciled against the queue: its job there
-// (the push went through, whatever the keeper saw) finalises it, and its request, if still
-// waiting, gets its "queued" outcome; its job not there (the push never went through) rolls it
-// back, and the request, still waiting, is checked afresh. The keeper deletes no job file, so no
-// keep-list can drop a job whose tap isn't final in this file and so let it roll back.
+// to date from GitHub (sync, whose every error stops the round), every pending tap is settled
+// against the queue as that fetch gave it (0.12.0, eighteenth round). It rolls back only on
+// positive evidence that its push never reached GitHub, all of:
+//   - the queue's branch was fetched whole this round (sync), and the keeper's push commit
+//     named in the tap is not in that branch's history;
+//   - nothing in the queue names the job id or the request id: no job file, no report, no
+//     worker record, nothing else in the copy.
+// Then the request, still waiting, is checked afresh. Anything else keeps the tap spent: the
+// commit in the branch, or the job or request named anywhere in the queue (the worker took the
+// job, or moved it into a report), finalises it (and its request, if still waiting, gets its
+// "queued" outcome); a sync that failed, a branch that wasn't there to fetch, a git answer that
+// says neither yes nor no, or a pending line without its commit stops the round and leaves the
+// tap pending. The keeper deletes no job file, so no keep-list can drop one whose tap isn't final.
 // A line without a state (written before 0.12.0's seventeenth round) is final.
+// The file's folder is flushed to disk (fsync) too whenever the file or a folder above it is
+// made, so the file's own entry survives a power cut; the file is only appended to, never
+// renamed or rewritten. A folder that can't be flushed throws (the round stops before the push),
+// except on Windows, where a folder can't be opened to flush (the Pi runs Linux).
 export const USED_REUSE = "/data/pc-jobs-reuse-used.jsonl";
+export const PUSH_TRIES = 3;
+export const PUSH_WAIT_MS = 2_000;
 export type ReuseState = "pending" | "final" | "rolled_back";
-export interface ReuseLine { m: string; job: string; state: ReuseState; rid?: string }
+export interface ReuseLine { m: string; job: string; state: ReuseState; rid?: string; commit?: string }
+const COMMIT = /^[0-9a-f]{40}$/;
 // Every tap's latest line, by message id.
 export function reuseLedger(cfg: Pick<Config, "used">): Map<string, ReuseLine> {
   const out = new Map<string, ReuseLine>();
@@ -107,7 +124,7 @@ export function reuseLedger(cfg: Pick<Config, "used">): Map<string, ReuseLine> {
       if (typeof o?.m !== "string" || typeof o?.job !== "string") continue;
       const state: ReuseState = o.state === undefined ? "final" : o.state;
       if (!["pending", "final", "rolled_back"].includes(state)) continue;
-      out.set(o.m, { m: o.m, job: o.job, state, ...(typeof o.rid === "string" ? { rid: o.rid } : {}) });
+      out.set(o.m, { m: o.m, job: o.job, state, ...(typeof o.rid === "string" ? { rid: o.rid } : {}), ...(typeof o.commit === "string" && COMMIT.test(o.commit) ? { commit: o.commit } : {}) });
     } catch { /* a torn line */ }
   }
   return out;
@@ -118,32 +135,82 @@ export function usedReuse(cfg: Pick<Config, "used">): Map<string, string> {
   for (const [m, l] of reuseLedger(cfg)) if (l.state !== "rolled_back") out.set(m, l.job);
   return out;
 }
+// A folder's entries flushed to disk.
+export function fsyncDir(d: string, plat = process.platform): void {
+  if (plat === "win32") return;
+  const fd = openSync(d, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
 // One line, appended and flushed to disk before it returns; it throws when it can't be.
-export function recordReuse(cfg: Pick<Config, "used">, m: string, job: string, state: ReuseState = "final", rid?: string): void {
+export function recordReuse(cfg: Pick<Config, "used">, m: string, job: string, state: ReuseState = "final", rid?: string, commit?: string): void {
   const f = cfg.used ?? USED_REUSE;
   const fresh = !existsSync(f);
+  // The folders made for it, outermost first: each one's parent is flushed once it holds them.
+  const made: string[] = [];
+  for (let d = dirname(f); !existsSync(d) && dirname(d) !== d; d = dirname(d)) made.unshift(d);
   mkdirSync(dirname(f), { recursive: true });
   const fd = openSync(f, "a");
-  try { writeSync(fd, JSON.stringify({ m, job, state, ...(rid ? { rid } : {}) }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
-  if (fresh) { try { const d = openSync(dirname(f), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* not every system syncs a folder */ } }
+  try { writeSync(fd, JSON.stringify({ m, job, state, ...(rid ? { rid } : {}), ...(commit ? { commit } : {}) }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+  if (fresh) { for (const d of made) fsyncDir(dirname(d)); fsyncDir(dirname(f)); }
 }
+// Whether the queue as fetched this round says the tap's push reached GitHub: "landed" (its
+// commit is in the branch, or the job or request is named anywhere in the queue), "absent" (the
+// positive evidence that it never did, above), or "unknown" (anything else).
+export type PushSeen = "landed" | "absent" | "unknown";
+export function pushSeen(cfg: Config, l: ReuseLine, fetched: string | null): PushSeen {
+  if (named(cfg.dir, [l.job, ...(l.rid ? [l.rid] : [])], resolve(cfg.used ?? USED_REUSE))) return "landed";
+  if (!fetched || !l.commit) return "unknown";
+  // Is the keeper's commit in the branch as fetched? git answers 0 (yes) or 1 (no) for a commit it
+  // has; one it doesn't have at all was never fetched, so it is in no part of the branch.
+  const has = Bun.spawnSync(["git", "cat-file", "-e", `${l.commit}^{commit}`], { cwd: cfg.dir, stdout: "ignore", stderr: "ignore" });
+  if (has.exitCode !== 0) {
+    // Not here: the fetch brought the branch's whole history, so the branch doesn't hold it, as
+    // long as the copy is a full clone (a shallow one can't tell).
+    return existsSync(join(cfg.dir, ".git", "shallow")) ? "unknown" : "absent";
+  }
+  const a = Bun.spawnSync(["git", "merge-base", "--is-ancestor", l.commit, fetched], { cwd: cfg.dir, stdout: "ignore", stderr: "ignore" });
+  return a.exitCode === 0 ? "landed" : a.exitCode === 1 ? "absent" : "unknown";
+}
+// Whether any file of the queue copy (the job files, reports, worker records, cancels, anything
+// but git's own folder) names one of these ids. A file that can't be read is an ambiguity: it throws.
+function named(dir: string, ids: string[], skip: string): boolean {
+  const walk = (d: string): boolean => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (e.name === ".git") continue;
+      const p = join(d, e.name);
+      if (resolve(p) === skip) continue;                 // the used-tap store itself, were it ever kept in the copy
+      if (e.isDirectory()) { if (walk(p)) return true; continue; }
+      if (ids.some((id) => e.name.includes(id))) return true;
+      const t = readFileSync(p, "utf8");
+      if (ids.some((id) => t.includes(id))) return true;
+    }
+    return false;
+  };
+  return existsSync(dir) ? walk(dir) : false;
+}
+export class ReuseUnsettled extends Error {}
 // Step 0 of a round, after sync: every pending tap settled against the queue as GitHub has it.
-export function reconcileReuse(cfg: Config, jobs: Job[]): { finalised: string[]; rolledBack: string[] } {
+// fetched: the branch's commit this round's fetch brought (sync), or null when it brought none.
+// A tap that can't be settled either way throws ReuseUnsettled: the round stops, the tap stays pending.
+export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null = null): { finalised: string[]; rolledBack: string[] } {
   const finalised: string[] = [], rolledBack: string[] = [];
   for (const l of reuseLedger(cfg).values()) {
     if (l.state !== "pending") continue;
-    if (jobs.some((j) => j.id === l.job && j.owner_reuse?.message_id === l.m)) {
-      recordReuse(cfg, l.m, l.job, "final", l.rid);
+    const seen = jobs.some((j) => j.id === l.job && j.owner_reuse?.message_id === l.m) ? "landed" : pushSeen(cfg, l, fetched);
+    if (seen === "landed") {
+      recordReuse(cfg, l.m, l.job, "final", l.rid, l.commit);
       finalised.push(l.job);
       if (l.rid && RID.test(l.rid) && existsSync(join(cfg.queue, `${l.rid}.json`))) {
         writeOutcome(cfg, { request: l.rid, state: "queued", id: l.job });
         rmSync(join(cfg.queue, `${l.rid}.json`), { force: true });
       }
-      log(`settled the reuse tap for ${l.job}: the job is in the queue`);
-    } else {
-      recordReuse(cfg, l.m, l.job, "rolled_back", l.rid);
+      log(`settled the reuse tap for ${l.job}: its push reached the queue`);
+    } else if (seen === "absent") {
+      recordReuse(cfg, l.m, l.job, "rolled_back", l.rid, l.commit);
       rolledBack.push(l.job);
-      log(`rolled back the reuse tap for ${l.job}: the job never reached the queue`);
+      log(`rolled back the reuse tap for ${l.job}: its commit isn't in the queue and nothing there names it`);
+    } else {
+      throw new ReuseUnsettled(`the reuse tap for ${l.job} can't be settled yet (the queue doesn't show whether its push landed); it stays pending, so spent`);
     }
   }
   return { finalised, rolledBack };
@@ -171,7 +238,9 @@ function git(cfg: Config, args: string[], cwd = cfg.dir): string {
   return out;
 }
 
-export function sync(cfg: Config) {
+// The queue copy brought up to date from GitHub: the branch's commit as fetched, or null when
+// the remote has no branch yet (nothing to fetch). Every git error throws.
+export function sync(cfg: Config): string | null {
   if (!existsSync(join(cfg.dir, ".git"))) {
     mkdirSync(dirname(cfg.dir), { recursive: true });
     git(cfg, ["clone", "--quiet", "-c", "core.symlinks=false", cfg.remote, cfg.dir], dirname(cfg.dir));
@@ -179,11 +248,26 @@ export function sync(cfg: Config) {
   rmSync(join(cfg.dir, ".git", "index.lock"), { force: true });
   // A queue that is still empty has no branch yet: nothing to fetch.
   const has = git(cfg, ["ls-remote", "--heads", "origin", cfg.branch]).length > 0;
-  if (!has) return;
+  if (!has) return null;
   git(cfg, ["fetch", "--quiet", "origin", cfg.branch]);
   git(cfg, ["checkout", "--quiet", "-B", cfg.branch, `origin/${cfg.branch}`]);
   git(cfg, ["reset", "--quiet", "--hard", `origin/${cfg.branch}`]);
   git(cfg, ["clean", "-qfd"]);
+  const at = git(cfg, ["rev-parse", "--verify", `origin/${cfg.branch}^{commit}`]).trim();
+  if (!COMMIT.test(at)) throw new GitError("git rev-parse: no commit for the fetched branch");
+  return at;
+}
+
+// The push, tried up to PUSH_TRIES times with a short wait between (the same commit each time).
+export function push(cfg: Config): void {
+  for (let i = 1; ; i++) {
+    try { git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]); return; } catch (e) {
+      if (i >= PUSH_TRIES) throw e;
+      log(`push ${i} of ${PUSH_TRIES} didn't go through, trying again: ${(e as Error).message}`);
+      const ms = cfg.pushWaitMs ?? PUSH_WAIT_MS;
+      if (ms > 0) Bun.sleepSync(ms);
+    }
+  }
 }
 
 // Every job file in the copy that parses; the rest are left out.
@@ -335,7 +419,7 @@ export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: 
 export function round(cfg: Config): { ok: boolean; queued: number; refused: number } {
   const names = existsSync(cfg.queue) ? readdirSync(cfg.queue).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort() : [];
   try {
-    sync(cfg);
+    const fetched = sync(cfg);
     const now = cfg.now?.() ?? new Date();
     const over = stale(readJobs(cfg.dir), now);
     if (over.length) {
@@ -346,11 +430,12 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
         git(cfg, ["add", `results/${job.id}.json`, `jobs/${job.id}.json`]);
       }
       git(cfg, ["commit", "--quiet", "-m", `Cain: close ${over.map((o) => `${o.job.id} (${o.result.code})`).join(", ")}`.slice(0, 200)]);
-      git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
+      push(cfg);
       for (const o of over) log(`closed ${o.job.id}: ${o.result.code}`);
     }
     // Every reuse tap left pending by a round that didn't finish, settled against the queue as GitHub has it.
-    reconcileReuse(cfg, readJobs(cfg.dir));
+    // A tap that can't be settled stops the round here (it stays pending, so spent).
+    reconcileReuse(cfg, readJobs(cfg.dir), fetched);
     if (!names.length) return { ok: true, queued: 0, refused: 0 };
     const jobs = readJobs(cfg.dir);
     const made: { rid: string; file: string; job?: Job; cancel?: string }[] = [];
@@ -391,14 +476,16 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     }
     const what = made.map((m) => m.job ? `${m.job.step} ${m.job.action} on ${m.job.site}` : `cancel ${m.cancel}`).join("; ");
     git(cfg, ["commit", "--quiet", "-m", `Cain: ${what}`.slice(0, 200)]);
-    // Each reuse tap spent before the push, flushed to disk (a failure here stops the round: nothing is pushed).
-    for (const m of made) if (m.job?.owner_reuse) recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id, "pending", m.rid);
-    git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
+    // Each reuse tap spent before the push, flushed to disk, with the commit that carries its job
+    // (a failure here stops the round: nothing is pushed).
+    const commit = git(cfg, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+    for (const m of made) if (m.job?.owner_reuse) recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id, "pending", m.rid, commit);
+    push(cfg);
     cfg.afterPush?.();
     for (const m of made) {
       if (m.job) {
         if (m.job.owner_reuse) {
-          try { recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id, "final", m.rid); }
+          try { recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id, "final", m.rid, commit); }
           catch (e) { log(`couldn't finalise the reuse tap for ${m.job.id} (it stays pending, so still spent; the next round settles it): ${(e as Error).message}`); }
         }
         writeOutcome(cfg, { request: m.rid, state: "queued", id: m.job.id });

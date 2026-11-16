@@ -87,6 +87,10 @@
 - A tap you gave to reuse a value is written down on the Pi before its job is sent, so even if Cain's App stops at the wrong moment the same tap can't be used for a second job.
 - The Ship card's Windows check now reads every run and every re-run of the PC worker's tests, across every page GitHub lists, and waits when it can't read them all. Cain can show you what that check would decide for a change without acting on it, and you can watch it once on a fresh change as a last step of your setup.
 - Your probe's check that the PC drops an address's "#" part now goes only by what the page itself saw it was opened at.
+- A tap you gave to reuse a value is freed only when the Pi can prove its job never reached the PC's queue; if it can't tell (GitHub not answering, the job already taken by your PC), the tap stays used. Sending a job is tried three times before giving up, and the tap record now survives a power cut.
+- Claude Code now gives the PC's page checks 40 seconds, up from 30, and the probe measures how long they take to start on your PC, cold and warm, and refuses to confirm if that leaves too little room. Run the probe first thing after restarting the PC.
+- The page check now refuses page answers it can't read exactly (a hidden mark at the start, broken characters, numbers too long to keep), and the probe replays what your Claude Code really sends through it. This update needs a new probe and confirmation.
+- The Ship card's Windows check now waits when GitHub limits how often it can be read, and the setup step that watches it now starts before the change is sent.
 
 ## 0.11.0
 

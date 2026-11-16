@@ -47,10 +47,12 @@ flaky Windows run needs a new commit; a run for another commit doesn't count, an
 all refuses; GitHub not answering holds). It reads every run and every attempt: the head's
 check runs of that name with every attempt listed, and GitHub Actions' workflow runs for the
 head with each attempt's jobs, each listing followed page by page until it is whole; a page
-that fails or a listing that isn't whole holds. `/opt/cain/keeper.sh ship-gate <full head
+that fails or a listing that isn't whole holds, and so does a rate-limit page from GitHub (HTTP
+403 or 429), whatever it holds. `/opt/cain/keeper.sh ship-gate <full head
 sha>` on the Pi reads that gate for a head without acting and prints what it would decide and
 why, the workflow file it read and every attempt it saw (`--watch` keeps watching a fresh
-head until its Windows run is done: the PC probe's `ship_gate` step). Run it once on a head
+head until its Windows run is done: the PC probe's `ship_gate` step, started before that head
+is pushed so it sees the Windows run pending). Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
   Run it before pushing (needs PyYAML):

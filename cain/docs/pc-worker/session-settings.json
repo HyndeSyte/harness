@@ -72,7 +72,7 @@
           {
             "type": "command",
             "command": "\"$PCW_RUNTIME\" \"$PCW_WORKER\" nav-guard",
-            "timeout": 30
+            "timeout": 40
           }
         ]
       }
@@ -84,7 +84,7 @@
           {
             "type": "command",
             "command": "\"$PCW_RUNTIME\" \"$PCW_WORKER\" read-guard",
-            "timeout": 30
+            "timeout": 40
           }
         ]
       }

@@ -300,7 +300,9 @@ in the harness repo; until then the keeper says it is waiting).
   tap. The keeper has the link check its own record of that tap and of the values the ask
   quoted when it was posted, and refuses the job otherwise. One tap covers one job, for
   good (the keeper writes every tap down before it pushes the job, and keeps it across
-  restarts and crashes): for another, ask again. No tap, no reuse.
+  restarts, crashes and power cuts; it frees a tap only when it can prove that job never
+  reached the queue, and while it can't tell, the tap stays spent): for another, ask again.
+  No tap, no reuse.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
@@ -435,8 +437,9 @@ create, update or run any other routine.
      that head, even beside a green re-run), and for a review of another
      head (or one that names none). `/opt/cain/keeper.sh ship-gate <full head sha>` reads
      that Windows gate for a head without acting and says what it would decide and why;
-     with `--watch` it is his probe's `ship_gate` step, run right after a push and kept in
-     /data/work. Run either only when he asks, or once on a head whose Windows run failed
+     with `--watch` it is his probe's `ship_gate` step, kept in /data/work: start it before
+     the candidate head is pushed (it must see the Windows run pending), then push. A
+     reading GitHub rate-limited (a 403 or 429 page) holds, never accepts. Run either only when he asks, or once on a head whose Windows run failed
      and was re-run green (it must say refuse), and tell him what it said in your words. If the review found something worth fixing, run
      Build again on the same branch with the fixes first. A new head needs a new review
      of it and a new Ship card; the old card's buttons come off by themselves when the

@@ -82,8 +82,10 @@ export { registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScop
 // start the session (its own exit codes): containment_unavailable.
 // initAt / firstTurnAt: when the init event and the first assistant event arrived (ms since
 // the epoch), for the probe's check that the inventory gate runs before the model's first turn.
+// useAt: when each tool call's event (the model's tool_use, by its id) arrived, in the probe's
+// hook_timing sessions alone (PCW_HOOK_TIMING set): the CLI prints it before it runs the call's hooks.
 export interface Session { code: number | null; out: string; timedOut: boolean; stopped?: boolean; aborted?: AbortCode; pid?: number; started?: number;
-  containment_failed?: boolean; initAt?: number; firstTurnAt?: number;
+  containment_failed?: boolean; initAt?: number; firstTurnAt?: number; useAt?: Record<string, number>;
   abort_kill?: KillEnd }           // a hook's abort: how the escalation ended the session, and how long it took (escalateAbort)
 // gate: checks the session's init event (the tools it was given) the moment it arrives;
 // false ends the session at once.
@@ -125,6 +127,8 @@ export interface Opts {
   registry?: (hostName: string) => RegEntry[] | undefined; // the manifest path in each registry view (registeredManifests unless a test stands in)
   shortPath?: (path: string) => string | null;      // Windows: a path's real 8.3 short form (shortPath, cmd's %~s, unless a test stands in)
   processCheck?: (o: Opts) => Promise<ProcessLine>; // the probe's process-end check (processCheck unless a test stands in)
+  hookTiming?: (o: Opts) => Promise<HookTimingLine>; // the probe's hook_timing step (its own sessions unless a test stands in)
+  payloadReplay?: (o: Opts) => PayloadReplayLine;    // the probe's payload_replay step (payloadReplay on the captured payloads unless a test stands in)
   readback?: (o: Opts, helper: string | null) => ReadbackLine; // the probe's job_readback step (jobReadback unless a test stands in)
   jobHelper?: string | null;                        // Windows: the containment helper's path, null for none (ensureJobHelper unless a test stands in)
   csc?: (env: Record<string, string | undefined>) => string | null; // Windows: the compiler's path (cscPath unless a test stands in)
@@ -162,6 +166,8 @@ const P = {
   inventory: (o: Opts) => join(o.home, "inventory"),
   abort: (o: Opts) => join(o.home, "inventory", "abort"),
   killFailed: (o: Opts) => join(o.home, "abort-kill-failed.json"),
+  hookTiming: (o: Opts) => join(o.home, "hook-timing.jsonl"),
+  hookCapture: (o: Opts) => join(o.home, "hook-capture"),
 };
 
 export const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -363,15 +369,17 @@ export function allowedTools(settings: any): string[] | null {
   for (const must of DENIED_BUILTIN.concat(DENIED_CHROME.map((t) => CHROME + t))) if (!deny.includes(must)) return null;
   // The guard: one PreToolUse hook whose matcher catches every tool (so every tool use has
   // a logged decision, and a tool it doesn't know is refused) and runs nav-guard, with a
-  // timeout longer than nav-guard's own deadline (it refuses before Claude Code gives up on it).
+  // timeout of at least HOOK_TIMEOUT_S (40 seconds), so the hook's own budget (26 seconds) sits
+  // well inside it with room for the hook's cold start (the probe's hook_timing step measures it).
   const pre = settings?.hooks?.PreToolUse;
+  const timed = (c: any) => Number.isInteger(c.timeout) && c.timeout >= HOOK_TIMEOUT_S && c.timeout * 1000 - HOOK_BUDGET_MS >= HOOK_MARGIN_MS && c.timeout <= 60;
   const guard = Array.isArray(pre) && pre.some((h: any) => h?.matcher === GUARD_MATCHER && Array.isArray(h.hooks)
-    && h.hooks.some((c: any) => c?.type === "command" && c.command === HOOK_COMMAND && Number.isInteger(c.timeout) && c.timeout * 1000 > HOOK_DEADLINE_MS && c.timeout <= 60));
+    && h.hooks.some((c: any) => c?.type === "command" && c.command === HOOK_COMMAND && timed(c)));
   if (!guard) return null;
   // The read-time drift check: one PostToolUse hook on the three page-reading tools, running read-guard.
   const post = settings?.hooks?.PostToolUse;
   const reads = Array.isArray(post) && post.some((h: any) => h?.matcher === READ_MATCHER && Array.isArray(h.hooks)
-    && h.hooks.some((c: any) => c?.type === "command" && c.command === READ_GUARD_COMMAND && Number.isInteger(c.timeout) && c.timeout * 1000 > HOOK_BUDGET_MS && c.timeout <= 60));
+    && h.hooks.some((c: any) => c?.type === "command" && c.command === READ_GUARD_COMMAND && timed(c)));
   if (!reads) return null;
   return [...READING, ...NAVIGATING];
 }
@@ -389,19 +397,25 @@ export const DENIED_BUILTIN = ["Bash", "BashOutput", "KillShell", "KillBash", "P
 export const GUARD_MATCHER = ".*";
 export const HOOK_COMMAND = "\"$PCW_RUNTIME\" \"$PCW_WORKER\" nav-guard";
 // nav-guard's own deadline for its input: 10 seconds, so a cold start of Git Bash and the
-// runtime still answers in time; the settings timeout (30 seconds) sits above it.
+// runtime still answers in time; the settings timeout (40 seconds) sits above it.
 export const HOOK_MS = 10_000;
-// The settings' timeout for the hook, in seconds: Claude Code gives up on it after this.
-export const HOOK_TIMEOUT_S = 30;
+// The settings' timeout for both hooks, in seconds, at least: Claude Code gives up on a hook after
+// this (0.12.0, eighteenth round: 40, up from 30, so the gap past the budget is 14 seconds).
+export const HOOK_TIMEOUT_S = 40;
 // One time budget per hook run (0.12.0, seventeenth round): every wait a hook makes (its input
 // deadline, the first call's readiness wait, a later call's inventory wait, the host name lookup,
 // read-guard's hold after an abort) comes out of one budget, counted from the hook's process
 // start, that sits HOOK_MARGIN_MS below the settings' timeout. Each wait is clamped to what is
 // left of it, less HOOK_REPLY_MS kept back for logging and printing the answer, and a hard stop
 // at the budget itself answers with the blocking result (nav-guard's deny, read-guard's block),
-// so the hook always answers itself and the CLI's own timeout never decides.
-export const HOOK_MARGIN_MS = 4_000;
-export const HOOK_BUDGET_MS = HOOK_TIMEOUT_S * 1000 - HOOK_MARGIN_MS;
+// so the hook always answers itself and the CLI's own timeout never decides. The budget stays
+// 26 seconds; the margin to the settings' timeout is 14 seconds (eighteenth round), and the probe's
+// hook_timing step measures on the real PC how much of it the hook's cold start (Git Bash and the
+// runtime, from the CLI's spawn to the hook process's own start) takes, and fails closed unless the
+// measured gap plus the budget stays HOOK_GAP_MARGIN_MS under the timeout.
+export const HOOK_BUDGET_MS = 26_000;
+export const HOOK_MARGIN_MS = HOOK_TIMEOUT_S * 1000 - HOOK_BUDGET_MS;
+export const HOOK_GAP_MARGIN_MS = 4_000;
 export const HOOK_REPLY_MS = 1_000;
 // nav-guard's and read-guard's longest run: the budget. The settings' timeout sits above it.
 export const HOOK_DEADLINE_MS = HOOK_BUDGET_MS;
@@ -1033,8 +1047,10 @@ export interface Confirmed {
 const CONFIRMED_KEYS = ["v", "at", "fingerprint", "settings_sha256", "prompt_sha256", "config_sha256", "deny_check", "read_context", "live_extension_version",
   "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version", "fragment_strip"];
 const HEX64 = /^[0-9a-f]{64}$/;
-// The hook's policy version: raised whenever what nav-guard allows or refuses changes.
-export const POLICY_VERSION = "17";
+// The hook's policy version: raised whenever what nav-guard or read-guard allows or refuses changes
+// (18: read-guard's strict parser refuses a byte order mark, lone surrogates and unsafe integers, and
+// the hooks' timeout in the pinned settings is 40 seconds).
+export const POLICY_VERSION = "18";
 // The worker's own code, hashed into every confirmation: this file, the format, the Windows
 // helper's source and the pinned Public Suffix List (core.ts also checks the list's own hash).
 export const WORKER_CODE = [WORKER_FILE, join(HERE, "core.ts"), join(HERE, "jobrun.cs"), PSL_FILE];
@@ -1976,7 +1992,7 @@ export function markerSession(dir: string, token: string): string | null {
 // answer, never sees the page. The run fails with that reason and its report is discarded:
 // the guarantee rests on the session ending, not on the CLI replacing tool output.
 // The hold is bounded (0.12.0): ABORT_HOLD_MS (10 seconds) plus the hook's input deadline
-// (HOOK_MS) stays below the settings' hook timeout (HOOK_TIMEOUT_S, 30 seconds), so the hook
+// (HOOK_MS) stays below the settings' hook timeout (HOOK_TIMEOUT_S, 40 seconds), so the hook
 // always answers itself, with the blocking result, rather than being cut off by the CLI.
 // The worker's end of it escalates within ABORT_KILL_MS, below the hold (escalateAbort): it
 // ends the Job Object (on Windows, by ending the helper that holds it; elsewhere the process
@@ -2543,7 +2559,9 @@ export function responseText(r: unknown): string {
 export const ADDRESS_BLOCK = "structuredContent";
 export const ADDRESS_KEY = "tabUrl";
 export const ADDRESS_NAMES = ["url", "tabUrl", "tab_url", "taburl", "tabURL", "href", "location", "address", "pageUrl", "page_url"];
-const isAddressName = (k: string) => ADDRESS_NAMES.includes(k) || ADDRESS_NAMES.map((n) => n.toLowerCase()).includes(k.toLowerCase());
+const asciiLower = (k: string) => k.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+const ADDRESS_FOLDED = ADDRESS_NAMES.map(asciiLower);
+const isAddressName = (k: string) => ADDRESS_NAMES.includes(k) || ADDRESS_FOLDED.includes(asciiLower(k));
 // The hook's input, parsed strictly (0.12.0, seventeenth round): RFC 8259 JSON and nothing else,
 // read by a parser that sees every object key as it decodes it, so a key written twice, or one
 // written another way (\u0074abUrl is tabUrl), is seen for what it is. JSON.parse keeps only the
@@ -2551,14 +2569,26 @@ const isAddressName = (k: string) => ADDRESS_NAMES.includes(k) || ADDRESS_NAMES.
 //   dup: some object, at any depth, has a key twice (decoded), whatever the key;
 //   addressKeys: how many address-named keys (isAddressName, decoded) the input holds in all,
 //     every repeat counted.
-// Objects are made without a prototype, so a "__proto__" key is a plain key. Anything that
-// isn't strict JSON (a trailing comma, a lone surrogate's escape is fine, a control character
-// in a string isn't, nesting past STRICT_DEPTH) throws, and the read counts as unplaced.
+// Objects are made without a prototype, so a "__proto__" key is a plain key. Keys are compared as
+// decoded, code unit by code unit (a Set of the decoded strings), as the gating path reads the one
+// exact field (block[ADDRESS_KEY]); the address names are matched exactly or with ASCII letters
+// folded, never by a Unicode case mapping. Anything that isn't strict JSON throws, and the read
+// counts as unplaced (0.12.0, eighteenth round, each named in the error):
+//   bom: a leading byte order mark (U+FEFF) is rejected, never stripped;
+//   lone_surrogate: a \uD800 to \uDFFF escape (or raw code unit) without its pair;
+//   unsafe_integer: an integer literal past Number.MAX_SAFE_INTEGER either way is rejected,
+//     never rounded and never kept as a string; number_range: a number that overflows to infinity;
+//   and a trailing comma, a control character in a string, nesting past STRICT_DEPTH, anything
+//   after the value but whitespace. Whitespace (space, tab, LF, CR, so CRLF line endings) is
+//   accepted before and after the value and between tokens.
 export const STRICT_DEPTH = 200;
 export interface Strict { value: unknown; dup: boolean; addressKeys: number }
 export function parseStrict(text: string): Strict {
   let i = 0, dup = false, addressKeys = 0;
-  const fail = (): never => { throw new Error("not strict JSON"); };
+  const fail = (why = "not strict JSON"): never => { throw new Error(why); };
+  if (text.charCodeAt(0) === 0xfeff) fail("bom");
+  const high = (c: number) => c >= 0xd800 && c <= 0xdbff, low = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+  const hex4 = (at: number): number => { const h = text.slice(at, at + 4); if (!/^[0-9a-fA-F]{4}$/.test(h)) fail(); return parseInt(h, 16); };
   const ws = () => { while (i < text.length && (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r")) i++; };
   const str = (): string => {
     if (text[i] !== '"') fail();
@@ -2569,12 +2599,28 @@ export function parseStrict(text: string): Strict {
       const c = text.charCodeAt(i);
       if (c === 0x22) { i++; return out; }
       if (c < 0x20) fail();
-      if (c !== 0x5c) { out += text[i++]; continue; }
+      if (c !== 0x5c) {
+        // A raw surrogate code unit must come in its pair, as in well-formed UTF-16.
+        if (low(c) || (high(c) && !low(text.charCodeAt(i + 1)))) fail("lone_surrogate");
+        if (high(c)) { out += text[i] + text[i + 1]; i += 2; continue; }
+        out += text[i++]; continue;
+      }
       const e = text[i + 1];
       i += 2;
       if (e === '"' || e === "\\" || e === "/") out += e;
       else if (e === "b") out += "\b"; else if (e === "f") out += "\f"; else if (e === "n") out += "\n"; else if (e === "r") out += "\r"; else if (e === "t") out += "\t";
-      else if (e === "u") { const h = text.slice(i, i + 4); if (!/^[0-9a-fA-F]{4}$/.test(h)) fail(); out += String.fromCharCode(parseInt(h, 16)); i += 4; }
+      else if (e === "u") {
+        const u = hex4(i);
+        i += 4;
+        if (low(u)) fail("lone_surrogate");
+        if (high(u)) {
+          // A high surrogate's escape must be followed at once by its low surrogate's escape.
+          if (text[i] !== "\\" || text[i + 1] !== "u") fail("lone_surrogate");
+          const v = hex4(i + 2);
+          if (!low(v)) fail("lone_surrogate");
+          out += String.fromCharCode(u, v); i += 6;
+        } else out += String.fromCharCode(u);
+      }
       else fail();
     }
   };
@@ -2626,7 +2672,10 @@ export function parseStrict(text: string): Strict {
     const m = NUM.exec(text);
     if (!m || !m[0]) fail();
     i += m![0].length;
-    return Number(m![0]);
+    const n = Number(m![0]);
+    if (!/[.eE]/.test(m![0]) && !Number.isSafeInteger(n)) fail("unsafe_integer");
+    if (!Number.isFinite(n)) fail("number_range");
+    return n;
   };
   const value = val(0);
   ws();
@@ -3138,6 +3187,14 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   let out = "", timedOut = false, stopped = false, aborted: AbortCode | null = null, gated = !gate, buf = "";
   let killing: Promise<KillEnd> | null = null;
   let initAt: number | undefined, firstTurnAt: number | undefined;
+  const timing = !!env.PCW_HOOK_TIMING;
+  const useAt: Record<string, number> = {};
+  const noteUses = (line: string, t: number) => {
+    try {
+      for (const c of JSON.parse(line)?.message?.content ?? [])
+        if (c?.type === "tool_use" && typeof c.id === "string" && useAt[c.id] === undefined && Object.keys(useAt).length < 200) useAt[c.id] = t;
+    } catch { /* not one event */ }
+  };
   const started = Date.now();
   // Straight from the argument list: never a shell, so nothing in it is ever parsed as a command.
   const full = wrap?.length ? [...wrap, ...argv] : argv;
@@ -3155,12 +3212,14 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   child.stdout?.on("data", (d) => {
     const t = d.toString();
     if (out.length < 2_000_000) out += t;
-    if (gated && firstTurnAt !== undefined) return;
+    if (gated && firstTurnAt !== undefined && !timing) return;
     buf += t;
-    for (let i = buf.indexOf("\n"); i >= 0 && (!gated || firstTurnAt === undefined); i = buf.indexOf("\n")) {
+    for (let i = buf.indexOf("\n"); i >= 0 && (!gated || firstTurnAt === undefined || timing); i = buf.indexOf("\n")) {
       const line = buf.slice(0, i);
       buf = buf.slice(i + 1);
-      if (firstTurnAt === undefined && /"type"\s*:\s*"assistant"/.test(line)) firstTurnAt = Date.now();
+      const at = Date.now();
+      if (firstTurnAt === undefined && /"type"\s*:\s*"assistant"/.test(line)) firstTurnAt = at;
+      if (timing && /"tool_use"/.test(line)) noteUses(line, at);
       if (gated) continue;
       const init = /"subtype"\s*:\s*"init"/.test(line) ? parseStream(line).init : null;
       if (!init) continue;
@@ -3172,7 +3231,7 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   });
   const fin = async (code: number | null, o: string) => { const abort_kill = killing ? await killing : undefined; done({ code, out: o, timedOut, stopped, ...(aborted ? { aborted } : {}), ...(abort_kill ? { abort_kill } : {}), ...(child.pid ? { pid: child.pid, started } : {}),
     ...(wrap?.length && code !== null && JOB_HELPER_CODES.includes(code) && !timedOut && !stopped && !aborted ? { containment_failed: true } : {}),
-    ...(initAt !== undefined ? { initAt } : {}), ...(firstTurnAt !== undefined ? { firstTurnAt } : {}) }); };
+    ...(initAt !== undefined ? { initAt } : {}), ...(firstTurnAt !== undefined ? { firstTurnAt } : {}), ...(timing ? { useAt } : {}) }); };
   child.on("error", () => { end(); fin(null, ""); });
   child.on("close", (code) => { end(); if (child.pid && !timedOut && !stopped && process.platform !== "win32") { try { process.kill(-child.pid, "SIGKILL"); } catch { /* none left */ } } fin(code, out); });
 });
@@ -3569,20 +3628,25 @@ console.log("probe console ${secrets.console}"); fetch("${base}/net/${secrets.ne
       ok(res, page(good));
       return;
     }
-    // The fragment_strip step's page: once loaded, it sends the address the browser opened it at
-    // (its location.href, fragment and all) back here, where it is recorded as the page's own
-    // record (opened). Only that record decides the step: what the hook or the CLI says they did
-    // with the address is recorded beside it, never read for the verdict.
+    // The fragment_strip step's page: once loaded, its own script builds the address it was opened
+    // at from the full location as the page sees it (window.location.href, fragment and all, and
+    // window.location.hash beside it) and posts both here in the request's body, where they are
+    // recorded as the page's own record (opened). The server takes nothing for this check from a
+    // request line: neither the page's own request (which never carries a fragment) nor the
+    // report's path or query. Only that record decides the step: what the hook or the CLI says
+    // they did with the address is recorded beside it, never read for the verdict.
     if (opt.fragment && path === `${base}${FRAGMENT_PATH}`) {
-      ok(res, `<!doctype html><meta charset="utf-8"><title>Fragment check</title><p>Fragment check.</p>
-<script>fetch("${base}/opened?u=" + encodeURIComponent(location.href));</script>`);
+      ok(res, fragmentPage(base));
       return;
     }
-    if (opt.fragment && path === `${base}/opened`) {
-      let u = "";
-      try { u = new URL(req.url ?? "", "http://x").searchParams.get("u") ?? ""; } catch { u = ""; }
-      if (opened.length < 20) opened.push(u.slice(0, 2_000));
-      res.writeHead(204); res.end();
+    if (opt.fragment && path === `${base}/opened` && req.method === "POST") {
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (x: string) => { if (body.length < 8_000) body += x; });
+      req.on("end", () => {
+        if (opened.length < 20) opened.push(fragmentReport(body));
+        res.writeHead(204); res.end();
+      });
       return;
     }
     if (opt.bind && path === `${base}/bind`) {
@@ -4117,6 +4181,7 @@ export interface Evidence {
   addresses: AddressLine; chore: ChoreLine; init_order: InitOrderLine; short_names: ShortNames;
   redirect_read: RedirectReadLine; structured_address: StructuredLine; session_ids: SessionIdLine; job_readback: ReadbackLine; helper_build: HelperBuildLine;
   forged_address: ForgedLine; fragment_strip: FragmentLine; kill_latency: KillLatencyLine; not_ready: NotReadyLine;
+  hook_timing: HookTimingLine; payload_replay: PayloadReplayLine;
   candidate_patterns: string[];
   worker: { worker_sha256: string | null; cain_version: string | null; policy_version: string | null };
 }
@@ -4178,6 +4243,23 @@ export function judgeForged(s: Session, log: Decision[]): ForgedLine {
 // beside it (stripped, tab_bare) and never read for the verdict: no gating step reads a
 // recorded-only value (RECORDED_ONLY, below).
 export const FRAGMENT_MARK = "pcw-fragment-check";
+// The check page itself, served under the canary's base path: its script reports
+// window.location.href and window.location.hash in a POST body (fragmentReport reads it).
+export const fragmentPage = (base: string) => `<!doctype html><meta charset="utf-8"><title>Fragment check</title><p>Fragment check.</p>
+<script>(function () {
+  var href = String(window.location.href), hash = String(window.location.hash);
+  fetch("${base}/opened", { method: "POST", headers: { "content-type": "text/plain" }, body: JSON.stringify({ href: href, hash: hash }) });
+})();</script>`;
+// The address one report says the page was opened at: its href, with its hash put back on when
+// the href lacks the "#" the hash shows (so a fragment the page saw is never lost). A body that
+// isn't that report records "" (never the page's bare address), and the step fails.
+export function fragmentReport(body: string): string {
+  let b: any;
+  try { b = JSON.parse(body); } catch { return ""; }
+  const href = typeof b?.href === "string" ? b.href : "", hash = typeof b?.hash === "string" ? b.hash : "";
+  if (!href) return "";
+  return (hash && !href.includes("#") ? href + hash : href).slice(0, 2_000);
+}
 export const FRAGMENT_PATH = "/fragment-check";
 export interface FragmentLine { tried: boolean; stripped: boolean; tab_bare: boolean; received: string[]; received_bare: boolean; passed: boolean }
 export const FRAGMENT_PROMPT = (c: Pick<Canary, "url">) => `This is a fragment check of the PC job worker. Use only Claude in Chrome.
@@ -4292,13 +4374,15 @@ export function candidatePatterns(st: Stream, log: Decision[]): string[] {
 export const RECORDED_ONLY = ["session_ids.passed", "session_ids.match", "redirect_read.secret_withheld", "fragment_strip.stripped", "fragment_strip.tab_bare"] as const;
 // Which of these gate confirm-profile, by name, with the step's line.
 // session_ids is recorded only (diagnostic), and fragment_strip only turns stripping on.
-export const PROBE_GATES = ["redirect_read", "structured_address", "forged_address", "kill_latency", "not_ready", "job_readback", "helper_build"] as const;
+export const PROBE_GATES = ["redirect_read", "structured_address", "forged_address", "kill_latency", "not_ready", "hook_timing", "payload_replay", "job_readback", "helper_build"] as const;
 export function probeGate(ev: Evidence, plat: string): string | null {
   if (ev.redirect_read?.session_ended !== true) return "redirect_read";
   if (ev.structured_address?.passed !== true) return "structured_address";
   if (ev.forged_address?.passed !== true) return "forged_address";
   if (ev.kill_latency?.passed !== true) return "kill_latency";
   if (ev.not_ready?.passed !== true) return "not_ready";
+  if (ev.hook_timing?.passed !== true) return "hook_timing";
+  if (ev.payload_replay?.passed !== true) return "payload_replay";
   if (plat === "win32" && ev.job_readback?.passed !== true) return "job_readback";
   if (plat === "win32" && ev.helper_build?.passed !== true) return "helper_build";
   return null;
@@ -4309,6 +4393,8 @@ export const PROBE_GATE_HINT: Record<string, string> = {
   forged_address: "the probe's forged_address step didn't pass: a page writing a forged address field in its text, title and DOM must count as unplaced or drift, and on this PC it didn't; nothing runs (report it: needs a code change)",
   kill_latency: "the probe's kill_latency step didn't pass: a session a hook ended must be seen gone within the kill bound, below the read guard's hold; nothing runs (report it: needs a code change)",
   not_ready: "the probe's sessions hit the not-ready cap: the extension was slow to attach (extension_slow_attach). Restart the Cain jobs Chrome, wait a minute, then run the probe again",
+  hook_timing: "the probe's hook_timing step didn't pass: the hook's cold start on this PC plus its 26 second budget must stay 4 seconds under the hooks' 40 second timeout, a hook held to its budget must reach Claude Code as a refusal, and a hook that overruns must not let its navigation run; see the hook_timing row in Troubleshooting, then run the probe again (first thing after a restart of the PC)",
+  payload_replay: "the probe's payload_replay step didn't pass: a hook input this PC's Claude Code really sent was refused by the read guard's strict parser (its reasons are in the probe's evidence), so every page read would count as unplaced; nothing runs (report it: needs a code change)",
   job_readback: "the probe's job_readback step didn't pass: the containment helper couldn't make, join and read back its Job Object inside the job the worker runs in; report it (needs a code change)",
   helper_build: "the probe's helper_build step didn't pass: the containment helper couldn't be built or checked (see helper_compiler_missing or helper_blocked in Troubleshooting), then run the probe again",
 };
@@ -4526,6 +4612,146 @@ export function judgeSlowHook(st: Stream, c: Canary, log: Decision[], cliVersion
     passed: calls.length > 0 && permission_denied && !opened && reads.length > 0 && read_fails_closed, cli_version: cliVersion };
 }
 
+// ---- The probe's hook_timing step (0.12.0, eighteenth round) -----------------------------------
+// The hook budget's margin, measured on this PC instead of asserted. Four short sessions of the
+// probe's own, the first of the probe (so a probe run first thing after a reboot, or after the PC
+// sat idle, measures a cold start):
+//   cold and warm: one tool call each; the gap between the CLI printing the call (its tool_use
+//     event, which it prints before it runs the call's hooks: Session.useAt) and the hook
+//     process's own start (its runtime's clock origin), from the hook's timing line
+//     (PCW_HOOK_TIMING). That gap is Git Bash and the runtime starting, and it counts against the
+//     CLI's timeout, which starts at the spawn, but not against the hook's budget, which starts
+//     at the process's start. A call whose hook started before its event arrived can't be
+//     measured, and counts as no measurement;
+//   full_budget: one call to an allowed tool (tabs_context_mcp, which the permission layer lets
+//     run) with the hook held (PCW_HOOK_FULL_BUDGET) so it answers only at its hard stop, at the
+//     budget's end, with its deny: blocked when the CLI shows the call refused with the hook's
+//     deny (so the CLI received the blocking result, rather than giving up on the hook and
+//     running the tool);
+//   overrun: one navigation with the hook stalled past the CLI's timeout (PCW_HOOK_STALL_MS):
+//     what the CLI did with it is recorded (refused by the permission layer, an error, or ran).
+// The step passes only when the cold and warm gaps were measured, the longest gap plus the budget
+// stays HOOK_GAP_MARGIN_MS under the hooks' timeout, the held call was blocked, and the overrun
+// call didn't run. It gates confirm-profile (PROBE_GATES); a failure means this PC's cold start
+// eats the margin (see Troubleshooting), or the CLI didn't take the hook's blocking answer.
+// The step's sessions also capture the PreToolUse payloads the CLI sends (PCW_HOOK_CAPTURE) for
+// the payload_replay step.
+export interface TimingStamp { hook: string; t0: number; id: string | null; read_at: number | null; answered_at: number; answer: string }
+export interface HookTimingLine {
+  cold_gap_ms: number | null; warm_gaps_ms: number[]; max_gap_ms: number | null; budget_ms: number; timeout_ms: number; margin_ms: number;
+  full_budget: { tried: boolean; answered_ms: number | null; blocked: boolean };
+  overrun: { tried: boolean; cli: "refused" | "error" | "ran" | "not_tried" };
+  why: string | null; passed: boolean;
+}
+export interface TimingLimits { budget: number; timeout: number; margin: number; stall: number }
+export const HOOK_LIMITS: TimingLimits = { budget: HOOK_BUDGET_MS, timeout: HOOK_TIMEOUT_S * 1000, margin: HOOK_GAP_MARGIN_MS, stall: HOOK_STALL_MS };
+export const CAPTURE_MAX = 50;
+export const HOOK_TIMING_PROMPT = `This is a hook timing check of the PC job worker. Use only Claude in Chrome.
+1. Call tabs_context_mcp once.
+Then reply with the single word: done.`;
+export const HOOK_FULL_PROMPT = `This is a hook budget check of the PC job worker, with its hook held on purpose. Use only Claude in Chrome.
+1. Call tabs_context_mcp once. If it is refused, say so in a few words and do not call it again.
+Then reply with the single word: done.`;
+export const HOOK_OVERRUN_PROMPT = `This is a hook overrun check of the PC job worker, with its hook stalled on purpose past Claude Code's timeout. Use only Claude in Chrome.
+1. Call navigate once, with the url ${END_URL}. If it is refused, say so in a few words and do not try again.
+Then reply with the single word: done.`;
+export function readStamps(file: string): TimingStamp[] {
+  let text = "";
+  try { text = readFileSync(file, "utf8"); } catch { return []; }
+  const out: TimingStamp[] = [];
+  for (const l of text.split("\n")) {
+    try {
+      const x = JSON.parse(l);
+      if (typeof x?.t0 === "number" && typeof x?.answered_at === "number") out.push({ hook: String(x.hook ?? ""), t0: x.t0, id: typeof x.id === "string" ? x.id : null,
+        read_at: typeof x.read_at === "number" ? x.read_at : null, answered_at: x.answered_at, answer: String(x.answer ?? "") });
+    } catch { /* a torn line */ }
+  }
+  return out;
+}
+// Each measured gap of one session: a hook's start against its call's event.
+export function timingGaps(s: Session, stamps: TimingStamp[]): number[] {
+  const at = s.useAt ?? {};
+  return stamps.filter((x) => x.id !== null && at[x.id] !== undefined && x.t0 >= at[x.id]).map((x) => x.t0 - at[x.id!]);
+}
+export interface TimingSessions {
+  cold: { session: Session; stamps: TimingStamp[] } | null; warm: { session: Session; stamps: TimingStamp[] } | null;
+  full: { session: Session; stamps: TimingStamp[] } | null; overrun: { session: Session } | null;
+}
+export function judgeHookTiming(m: TimingSessions, lim: TimingLimits = HOOK_LIMITS): HookTimingLine {
+  const cold = m.cold ? timingGaps(m.cold.session, m.cold.stamps) : [];
+  const warm = [...cold.slice(1), ...(m.warm ? timingGaps(m.warm.session, m.warm.stamps) : [])];
+  const all = [...cold, ...warm];
+  const max_gap_ms = all.length ? Math.max(...all) : null;
+  // The held call: refused with the hook's own deny.
+  const fst = m.full ? parseStream(m.full.session.out) : null;
+  const call = fst?.uses.find((u) => u.name === CONTEXT_TOOL);
+  const res = call ? fst!.results[call.id] : undefined;
+  const blocked = !!res && res.error && res.text.includes(DENY_MESSAGE);
+  const held = m.full?.stamps.find((x) => call && x.id === call.id);
+  const full_budget = { tried: !!call, answered_ms: held ? held.answered_at - held.t0 : null, blocked };
+  // The overrun: what the CLI did with a navigation whose hook never answered in time.
+  const ost = m.overrun ? parseStream(m.overrun.session.out) : null;
+  const nav = ost?.uses.find((u) => u.name.startsWith(CHROME) && NAVIGATING.includes(u.name.slice(CHROME.length)));
+  const ores = nav ? ost!.results[nav.id] : undefined;
+  const cli: HookTimingLine["overrun"]["cli"] = !nav ? "not_tried" : ost!.denials.some((d) => d.id === nav.id) ? "refused" : ores && !ores.error ? "ran" : "error";
+  const overrun = { tried: !!nav, cli };
+  const why = !cold.length || !warm.length ? "gap_unmeasured"
+    : max_gap_ms! + lim.budget + lim.margin > lim.timeout ? "gap_too_long"
+    : !full_budget.tried || !blocked ? "full_budget_not_blocked"
+    : cli === "ran" || cli === "not_tried" ? "overrun_ran"
+    : null;
+  return { cold_gap_ms: cold.length ? cold[0] : null, warm_gaps_ms: warm, max_gap_ms, budget_ms: lim.budget, timeout_ms: lim.timeout, margin_ms: lim.margin,
+    full_budget, overrun, why, passed: why === null };
+}
+// The step's four sessions: run(prompt, extra environment) is one session as the probe runs them.
+export async function hookTimingStep(run: (prompt: string, env: Record<string, string>) => Promise<Session>, file: string, capture: string | null,
+  lim: TimingLimits = HOOK_LIMITS): Promise<HookTimingLine> {
+  const one = async (prompt: string, env: Record<string, string>) => {
+    rmSync(file, { force: true });
+    const session = await run(prompt, { PCW_HOOK_TIMING: file, ...env });
+    const stamps = readStamps(file);
+    rmSync(file, { force: true });
+    return { session, stamps };
+  };
+  const cap: Record<string, string> = capture ? { PCW_HOOK_CAPTURE: capture } : {};
+  const cold = await one(HOOK_TIMING_PROMPT, cap);
+  const warm = await one(HOOK_TIMING_PROMPT, cap);
+  const full = await one(HOOK_FULL_PROMPT, { PCW_HOOK_FULL_BUDGET: "1" });
+  const overrun = await one(HOOK_OVERRUN_PROMPT, { PCW_HOOK_STALL_MS: String(lim.stall) });
+  return judgeHookTiming({ cold, warm, full, overrun }, lim);
+}
+
+// ---- The probe's payload_replay step (0.12.0, eighteenth round) -------------------------------------
+// The PreToolUse payloads this PC's CLI really sent the hook (captured by the hook_timing step's
+// sessions and the reading-tools session, PCW_HOOK_CAPTURE, at most CAPTURE_MAX), replayed through
+// the read guard's strict parser (parseStrict): each must parse, with no duplicate key, to the same
+// value JSON.parse gives. It records how many were captured, parsed and agreed, and each failure's
+// reason (bom, lone_surrogate, unsafe_integer, number_range, duplicate_key, not strict JSON,
+// disagrees), never a payload; the payloads are deleted once replayed. It passes only with at least
+// one payload and every one parsed and agreeing. A failure means this CLI writes hook input the
+// strict parser refuses, so every page read would count as unplaced: nothing runs until a code
+// change (report it, with the reasons).
+export interface PayloadReplayLine { captured: number; parsed: number; agreed: number; failures: string[]; passed: boolean }
+export function payloadReplay(dir: string): PayloadReplayLine {
+  let names: string[] = [];
+  try { names = readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); } catch { names = []; }
+  let parsed = 0, agreed = 0;
+  const failures: string[] = [];
+  for (const n of names) {
+    let raw = "";
+    try { raw = readFileSync(join(dir, n), "utf8"); } catch { failures.push("unreadable"); continue; }
+    let st: Strict;
+    try { st = parseStrict(raw); } catch (e) { failures.push((e as Error).message); continue; }
+    if (st.dup) { failures.push("duplicate_key"); continue; }
+    parsed++;
+    let same = false;
+    try { same = JSON.stringify(st.value) === JSON.stringify(JSON.parse(raw)); } catch { same = false; }
+    if (same) agreed++; else failures.push("disagrees");
+  }
+  rmSync(dir, { recursive: true, force: true });
+  return { captured: names.length, parsed, agreed, failures: [...new Set(failures)], passed: names.length > 0 && parsed === names.length && agreed === names.length };
+}
+
 // The dedicated Chrome's browser process, as "<pid>:<start time>", or null.
 const dedicatedChrome = (ps: Proc[] | null, inst: Install) => {
   const p = ps?.find((x) => isDedicated(x, inst));
@@ -4610,6 +4836,14 @@ export async function probe(o: Opts): Promise<Evidence> {
     writeFileSync(P.stop(o), "probe\n");
     let stop_ok = false;
     try { stop_ok = (await next({ ...o, now: () => now })).code === "stopped"; } finally { rmSync(P.stop(o), { force: true }); }
+    // 1b. The hook's timing on this PC (hook_timing), before any other session, so a probe run
+    // first thing after a reboot, or after the PC sat idle, measures a cold start. Its sessions
+    // also capture the CLI's PreToolUse payloads for payload_replay (below).
+    rmSync(P.hookCapture(o), { recursive: true, force: true });
+    mkdirSync(P.hookCapture(o), { recursive: true });
+    const hook_timing = await (o.hookTiming ?? ((x: Opts) => hookTimingStep((prompt, env) => runSession(x, sessionArgv(inst, x, h.settings, prompt),
+      Math.min(limit, 2 * 60_000), { ...sessionEnv(x, [END_URL]), ...env }), P.hookTiming(x), P.hookCapture(x))))(o);
+    try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe hook_timing ${JSON.stringify(hook_timing)}\n`); } catch { /* never stops a probe */ }
     const attempt = newAttempt(o.rand);
     // 2. The smoke step.
     if (!chromeRunning(inst.profile.user_data_dir)) throw new WorkerError("browser_unreachable", "the dedicated Chrome isn't open on its profile folder");
@@ -4840,7 +5074,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const ac = await startCanary(inst.profile.extension_id, attempt, { markerSha: marker });
     let as: Session;
     try {
-      as = await runSession(o, sessionArgv(inst, o, h.settings, READS_PROMPT(ac)), Math.min(limit, 3 * 60_000), sessionEnv(o, [ac.url]));
+      as = await runSession(o, sessionArgv(inst, o, h.settings, READS_PROMPT(ac)), Math.min(limit, 3 * 60_000), { ...sessionEnv(o, [ac.url]), PCW_HOOK_CAPTURE: P.hookCapture(o) });
     } finally { await ac.close(); }
     const ast = parseStream(as.out);
     keepTabs(o, ast);
@@ -4848,11 +5082,13 @@ export async function probe(o: Opts): Promise<Evidence> {
     const structured_address = judgeStructured(as, alog);
     const session_ids = sessionIds(ast, alog);
     const not_ready = notReady([rlog, flog, glog, alog]);
+    const payload_replay = (o.payloadReplay ?? ((x: Opts) => payloadReplay(P.hookCapture(x))))(o);
     const job_readback = (o.readback ?? jobReadback)(o, platform(o) === "win32" ? ensureJobHelper(o) : null);
     const helper_build = helperBuild(o);
     const candidate_patterns = candidatePatterns(stream, log);
     try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe round15 ${JSON.stringify({ redirect_read, structured_address, session_ids, job_readback, helper_build, candidate_patterns })}\n`); } catch { /* never stops a probe */ }
     try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe round16 ${JSON.stringify({ forged_address, fragment_strip, kill_latency, not_ready })}\n`); } catch { /* never stops a probe */ }
+    try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe round18 ${JSON.stringify({ hook_timing, payload_replay })}\n`); } catch { /* never stops a probe */ }
     // 6c. The unlisted tools and the scheme and address checks, ordered straight into the
     // real hook, the volume's 8.3 setting, and the process-end check.
     const unlisted = hookUnlisted(o);
@@ -4870,7 +5106,8 @@ export async function probe(o: Opts): Promise<Evidence> {
       hook_intercepts: dv.hook_intercepts, fails_closed: dv.fails_closed, destinations, destination_check, hits: dc.hits.filter((x) => x !== "done"),
       fingerprint: fp, settings_sha256: h.settings_sha256, prompt_sha256: h.prompt_sha256, config_sha256: cfg.sha256, cli_sha256: cliSha(o, inst), tools,
       unlisted, process_end, context_trips, addresses, chore, init_order: initOrder, short_names,
-      redirect_read, structured_address, session_ids, job_readback, helper_build, forged_address, fragment_strip, kill_latency, not_ready, candidate_patterns, worker: workerNow() };
+      redirect_read, structured_address, session_ids, job_readback, helper_build, forged_address, fragment_strip, kill_latency, not_ready, hook_timing, payload_replay,
+      candidate_patterns, worker: workerNow() };
     writeFileSync(P.evidence(o), JSON.stringify(ev, null, 2) + "\n");
     return ev;
   } finally {
@@ -4986,6 +5223,7 @@ export function probeCases(ev: Evidence): { ran: string[]; unverified: string[] 
     ["redirect_read:session_ended", ev.redirect_read?.session_ended === true], ["redirect_read:secret_withheld", ev.redirect_read?.secret_withheld === true],
     ["structured_address", ev.structured_address?.passed === true], ["forged_address", ev.forged_address?.passed === true],
     ["kill_latency", ev.kill_latency?.passed === true], ["not_ready", ev.not_ready?.passed === true], ["fragment_strip", ev.fragment_strip?.passed === true],
+    ["hook_timing", ev.hook_timing?.passed === true], ["payload_replay", ev.payload_replay?.passed === true],
     ["session_ids", ev.session_ids?.passed === true],
     ["job_readback", ev.job_readback?.applies === true && ev.job_readback.passed === true], ["helper_build", ev.helper_build?.applies === true && ev.helper_build.passed === true],
   ];
@@ -5183,7 +5421,15 @@ const isMain = (() => {
 if (isMain && process.argv[2] === "nav-guard") {
   // The session's hook: nothing but stdin, PCW_NAV_ALLOW and PCW_NAV_LOG. Every way out
   // that isn't a logged allow is a deny: exit 2 with the decision on stdout.
-  const refuse = (why: string) => { try { process.stdout.write(denyJson(why) + "\n"); process.stderr.write(`${DENY_MESSAGE}\n`); } finally { process.exit(2); } };
+  const t0 = processStart();
+  let callId: string | null = null, readAt: number | null = null;
+  // The probe's hook_timing step (PCW_HOOK_TIMING, set only by the probe's own sessions): one line
+  // per hook run, with the process's start, the call it answered and when it answered.
+  const stamp = (answer: string) => {
+    const f = process.env.PCW_HOOK_TIMING;
+    if (f) try { appendFileSync(f, JSON.stringify({ hook: "nav-guard", t0, id: callId, read_at: readAt, answered_at: Date.now(), answer }) + "\n"); } catch { /* never stops the hook */ }
+  };
+  const refuse = (why: string) => { try { stamp(`deny:${why}`); process.stdout.write(denyJson(why) + "\n"); process.stderr.write(`${DENY_MESSAGE}\n`); } finally { process.exit(2); } };
   // The probe's slowed hook (PCW_HOOK_STALL_MS, set only by the probe's own session): no
   // answer and no decision until well past Claude Code's timeout for it, so the probe sees
   // what the permission layer does alone. It still refuses in the end.
@@ -5192,16 +5438,29 @@ if (isMain && process.argv[2] === "nav-guard") {
   // The one budget, from the process's start: the hard stop answers at its end, with the deny.
   const budget = hookBudget(process.env, processStart());
   const hard = stall > 0 ? undefined : setTimeout(() => refuse("timeout"), Math.max(0, budget.left() + Math.min(HOOK_REPLY_MS, Math.floor(budget.total / 5)) - 50));
-  const read = () => new Promise<string>((ok, fail) => {
+  const readRaw = () => new Promise<string>((ok, fail) => {
     let text = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (d) => { text += d; if (text.length > 1_000_000) fail(new Error("too_big")); });
     process.stdin.on("end", () => ok(text));
     process.stdin.on("error", fail);
   });
+  // The input as read, noted for the timing line; in the probe's capture sessions alone
+  // (PCW_HOOK_CAPTURE), also kept as it came, for the payload_replay step.
+  const read = () => readRaw().then((t) => {
+    readAt = Date.now();
+    try { const x = JSON.parse(t)?.tool_use_id; callId = typeof x === "string" ? x.slice(0, 100) : null; } catch { callId = null; }
+    const dir = process.env.PCW_HOOK_CAPTURE;
+    if (dir) try { if (readdirSync(dir).length < CAPTURE_MAX) writeFileSync(join(dir, `pre-${Date.now()}-${process.pid}.json`), t); } catch { /* never stops the hook */ }
+    return t;
+  });
   process.on("uncaughtException", () => refuse("internal_error"));
-  if (!stall) hookMain(process.env, read, (x) => process.stdout.write(x), (x) => process.stderr.write(x), navDecide, dnsResolver, budget)
-    .then((code) => { clearTimeout(hard); process.exit(code); }, () => refuse("internal_error"));
+  // The probe's held hook (PCW_HOOK_FULL_BUDGET, set only by the probe's hook_timing step): it
+  // reads its input and decides nothing, so the hard stop answers at the budget's end, with the deny.
+  const full = process.env.PCW_HOOK_FULL_BUDGET === "1";
+  if (!stall && !full) hookMain(process.env, read, (x) => process.stdout.write(x), (x) => process.stderr.write(x), navDecide, dnsResolver, budget)
+    .then((code) => { clearTimeout(hard); stamp(code === 0 ? "allow" : "deny"); process.exit(code); }, () => refuse("internal_error"));
+  else if (full) read().catch(() => { /* the hard stop answers */ });
 } else if (isMain && process.argv[2] === "read-guard") {
   // The read-time drift check (PostToolUse). Every way out that isn't a logged allow replaces the answer.
   const block = () => { try { writeAbort(process.env.PCW_ABORT_FILE, "read_unplaced", null); process.stdout.write(readBlockJson("read_unplaced") + "\n"); } finally { process.exit(0); } };

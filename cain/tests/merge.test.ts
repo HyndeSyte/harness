@@ -620,6 +620,32 @@ describe("seventeenth review: the Windows gate reads every run and every attempt
     expect(await headChecks(a, REPO, H1)).toBeNull();
   });
 
+  test("eighteenth review: a rate-limit page (403 or 429) anywhere in the reading holds, never accepts, even with a listing-shaped body", async () => {
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 1 }];
+    const green = () => fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [[job(902, "success")]] } });
+    expect(await gateReport(green(), REPO, H1)).toMatchObject({ decision: "accept" });
+    const where = ["check_name=pytest", "check_name=pcjobs-windows", "/actions/runs?", "/attempts/1/jobs", "tests.yml"];
+    for (const status of [403, 429]) for (const w of where) {
+      // The limited page carries a body shaped like a good listing: it still counts as failed.
+      const body = { total_count: 1, check_runs: [win(902, "success")], workflow_runs: runs, jobs: [job(902, "success")], encoding: "base64", content: "" };
+      const d = { api: async (p: string) => p.includes(w) ? { status, body } : green().api(p) };
+      const r = await gateReport(d, REPO, H1);
+      expect([status, w, r.decision]).toEqual([status, w, "hold"]);
+      expect(r.why).toContain("rate limit");
+      expect(await headChecks(d, REPO, H1)).toBeNull();                         // the landing and the Ship card wait on it too
+    }
+    // A limited page on the second page of a listing that is otherwise whole: hold.
+    const two = { api: async (p: string) => p.includes("check_name=pcjobs-windows") && p.endsWith("page=2") ? { status: 429, body: null }
+      : fake({ checkPages: [Array.from({ length: 100 }, (_, i) => win(1000 + i, "success")), [win(5, "success")]] }).api(p) };
+    expect(await gateReport(two, REPO, H1)).toMatchObject({ decision: "hold" });
+    // The watch keeps watching through a limited reading and accepts only on a whole one.
+    let i = 0;
+    const flaky = { api: async (p: string) => i === 1 && p.includes("/actions/runs?") ? { status: 403, body: null } : fake({ checkPages: i === 0 ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] }).api(p) };
+    const line = await watchShipGate(flaky, REPO, H1, { everyMs: 1, untilMs: 1_000, sleep: async () => { i++; } });
+    expect(line.reports.map((r) => r.decision)).toEqual(["hold", "hold", "accept"]);
+    expect(line.passed).toBe(true);
+  });
+
   test("the dry run names the head, the workflow file it read and every attempt, and changes nothing", async () => {
     const r = await gateReport(fake({ checkPages: [[win(3, null, "in_progress")]] }), REPO, H1, () => new Date("2026-11-16T10:00:00Z"));
     expect(r).toEqual({ head: H1, at: "2026-11-16T10:00:00.000Z", decision: "hold", why: "CI is still running pcjobs-windows on it", windows: "running",
