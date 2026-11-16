@@ -14,9 +14,12 @@
 #     for each stretch his prompt is back; the alarm itself is notice.sh's, kept across restarts).
 # A question counts from when it's first seen: any other screen, or a gap of over a minute between
 # reads, starts the count again, so a new question gets its own 5 minutes and its own Esc. A
-# sign-in in progress on his panel is left alone. Nothing is typed but Esc. Its state is root's, in
-# $UNSTICK_DIR, for this container; a step whose state can't be kept isn't taken (Dane is told
-# instead), so no limit is ever skipped. Prints "restart" or nothing; always exits 0.
+# sign-in or his folder's trust question on screen is left alone (its own lines starting a line in
+# the bottom 16): his to answer on the panel; one that stands 30 minutes tells Dane. Nothing is
+# typed but Esc. Its state is root's, in $UNSTICK_DIR, for this container; a step whose state
+# can't be kept isn't taken (Dane is told instead), so no limit is ever skipped, and with no
+# place for its state a question on screen is told at once. Prints "restart" or nothing; always
+# exits 0.
 set -u
 TM="${TMUX_CMD:-tmux}"   # Cain's own user and socket the new way (the run script sets it)
 OPT="${UNSTICK_OPT:-/opt/cain}"
@@ -24,6 +27,7 @@ DIR="${UNSTICK_DIR:-/run/cain/unstick}"
 QUEUE="${RELAY_QUEUE:-/data/relay.queue}"
 ESC_S="${UNSTICK_ESC_S:-300}"; AGAIN_S="${UNSTICK_AGAIN_S:-300}"; HOURLY_S="${UNSTICK_HOURLY_S:-3600}"
 GAP_S="${UNSTICK_GAP_S:-60}"; CALM_S="${UNSTICK_CALM_S:-300}"; TMUX_S="${UNSTICK_TMUX_S:-10}"
+SIGNIN_S="${UNSTICK_SIGNIN_S:-1800}"
 now="${UNSTICK_NOW:-$(date +%s)}"
 say() { echo "[cain] $*" >&2; }
 # A kept number: printed (nothing when there's none); 1 when it's there but can't be read as one.
@@ -66,15 +70,28 @@ tell_dane() {   # the waiting alarm, once until it comes down; logged once, with
   say "Dane is told a question waits on Cain's screen: $1"
 }
 
-mkdir -p "$DIR" 2>/dev/null || { say "no place for the state of the way out of a question on his screen ($DIR)"; exit 0; }
 screen=$(timeout -k 2 "$TMUX_S" $TM -u capture-pane -p -J -t cain -S -400 2>/dev/null) || exit 0   # unread: nothing known
 at=$(printf '%s\n' "$screen" | "${PROMPT_STATE:-$OPT/prompt-state.sh}" 2>/dev/null) || at=other
-# A sign-in or the folder's trust question, on screen now (its own words in the bottom lines, not
-# older words higher up): his to answer on the panel, never closed here.
-if [ "$at" = dialog ] && printf '%s\n' "$screen" | awk 'NF' | tail -n 12 \
-     | grep -Eqi 'paste code here|select login method|oauth/authorize|do you trust the files|choose the text style'; then
-  at=signin
+if ! mkdir -p "$DIR" 2>/dev/null; then
+  # No count can be kept: a question on screen now is told at once, and taken down once his prompt
+  # is back (notice.sh keeps its own state). Never silent (outside review, round 15).
+  say "no place for the state of the way out of a question on his screen ($DIR)"
+  case "$at" in dialog) alarm tell waiting ;; ready) alarm clear screen ;; esac
+  exit 0
 fi
+# A sign-in or the folder's trust question on screen now: one of their own lines starting a line
+# (past the box's edge) in the bottom 16, not words quoted in older output. Never closed here; one
+# that stands 30 minutes tells Dane.
+if [ "$at" = dialog ] && printf '%s\n' "$screen" | awk 'NF' | tail -n 16 | sed 's/^[[:space:]│]*//' \
+     | grep -Eqi '^(paste code here|select login method|do you trust the files|choose the text style)'; then
+  forget || true
+  drop calm; drop cleared
+  signin=$(stamp signin) || signin=""
+  if [ -z "$signin" ]; then put signin "$now" || true; signin=$now; fi
+  [ $((now - signin)) -lt "$SIGNIN_S" ] || tell_dane "a sign-in or his folder's trust question has stood 30 minutes on his screen"
+  exit 0
+fi
+drop signin
 
 if [ "$at" != dialog ]; then
   forget || say "a question's count couldn't be cleared ($DIR)"

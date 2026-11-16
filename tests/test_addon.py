@@ -1518,15 +1518,15 @@ def _checkin(tmp_path, now, screen, runs=None, checked=True, after=None, day="20
         'esac\n', encoding="utf-8", newline="\n")
     (stub / "tmux").chmod(0o755)
     mark = tmp_path / "session-checked"
-    if checked:
+    if checked and not mark.exists():
         mark.touch()
-    elif mark.exists():
+    elif not checked and mark.exists():
         mark.unlink()
     sent = tmp_path / "sent.txt"
     env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
                CHECKIN_DIR=str(tmp_path / "done"), CHECKIN_NOW=now, CHECKIN_DAY=day,
                STUB_SCREEN=screen, STUB_SENT=str(sent), STUB_BOX=box.as_posix(),
-               CHECKIN_STATE=str(tmp_path / "state"), SESSION_CHECKED=str(mark),
+               CHECKIN_STATE=str(tmp_path / "state"), SESSION_CHECKED=str(mark), CHECKIN_STEADY_S="0",
                PROMPT_STATE=(CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix(), **more)
     env.pop("STUB_AFTER", None)
     if after is not None:
@@ -1714,14 +1714,14 @@ BOX_LONG_DRAFT = (f"╭{RULE}╮\n│ > Relayed by the add-on: Dane tapped \"Shi
 BOX_BAR_DRAFT = f"╭{RULE}╮\n│ > │ {' ' * 54}│\n╰{RULE}╯\n  ? for shortcuts"
 
 
-def _prompt_state(screen):
+def _prompt_state(screen, **env):
     import shutil
     import subprocess
     bash = shutil.which("bash")
     if not bash:
         pytest.skip("no bash")
     out = subprocess.run([bash, (CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix()], input=screen,
-                         capture_output=True, text=True, encoding="utf-8", timeout=20)
+                         capture_output=True, text=True, encoding="utf-8", timeout=20, env={**os.environ, **env})
     assert out.returncode == 0
     return out.stdout.strip()
 
@@ -1745,6 +1745,11 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
     assert _prompt_state(f"{RULE}\n> \n  a warning\n  ? for shortcuts") == "other"      # a row, no border under the box
     assert _prompt_state(f"{RULE}\n> \n{RULE}\n  one\n  two\n  three\n  four\n  ? for shortcuts") == "other"   # over three
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
+    for screen, first in ((REAL_NOTICE_DRAFT, "held by others, skip these: p33."), (BOX_LONG_DRAFT, "relayed by the add-on:"),
+                          (DRAFT, "/permissions"), (LONG_DRAFT, "relayed by the add-on: dane tapped")):
+        out = _prompt_state(screen, PROMPT_DRAFT_LINE="1").split("\n")
+        assert out[0] == "draft" and out[1].startswith(first), (screen, out)
+    assert _prompt_state(IDLE, PROMPT_DRAFT_LINE="1") == "ready"                     # nothing more when empty
     assert _prompt_state("He said: auto mode on, ? for shortcuts.\n" + AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("  Select model\n  > Opus\n  Enter to confirm · Esc to exit") == "dialog"
     assert _prompt_state(OPTION_SCREEN) == "dialog"
@@ -1837,7 +1842,8 @@ def _unstick(tmp_path, now, screen, **more):
     env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}", UNSTICK_OPT=opt.as_posix(),
                UNSTICK_DIR=(tmp_path / "state").as_posix(), RELAY_QUEUE=(tmp_path / "queue").as_posix(),
                UNSTICK_NOW=str(now), STUB_SCREEN=screen, STUB_SENT=(tmp_path / "sent").as_posix(),
-               STUB_NOTICE=(tmp_path / "notice").as_posix(), PROMPT_STATE=(opt / "prompt-state.sh").as_posix(), **more)
+               STUB_NOTICE=(tmp_path / "notice").as_posix(), PROMPT_STATE=(opt / "prompt-state.sh").as_posix())
+    env.update(more)
     out = subprocess.run([bash, (opt / "unstick.sh").as_posix()], env=env, capture_output=True, text=True,
                          encoding="utf-8", timeout=30)
     assert out.returncode == 0, out.stderr
@@ -1949,14 +1955,24 @@ def test_the_way_out_of_a_question_holds_when_its_own_steps_fail(tmp_path):
     assert read("notice") == ["5 tell waiting"] * 2
     (state / "esc").rmdir()
 
-    # A sign-in on screen now: never closed. Old sign-in words above a question: no matter.
+    # A sign-in on screen now: never closed; one that stands 30 minutes tells Dane (round 15). Words of
+    # one in older output, even right above a question, don't count.
     signin = "  Browser didn't open? Use the url below to sign in:\n  Paste code here if prompted >\n  Esc to cancel"
     t += 10_000
-    assert [run(dt, signin) for dt in (0, 300, 600, 900)] == ["", "", "", ""]
-    old = "Earlier: Paste code here if prompted >\n" + "\n".join(f"  his work, line {i}" for i in range(12)) + "\n"
+    (state / "told").unlink(missing_ok=True)
+    told = len(read("notice"))
     sent = len(read("sent"))
-    assert run(1000, old + AUTO_MODE_OFFER) == "" and run(1300, old + AUTO_MODE_OFFER) == ""
+    assert [run(dt, signin) for dt in (0, 300, 600, 900, 1799)] == [""] * 5 and len(read("notice")) == told
+    assert run(1800, signin) == "" and read("notice")[told:] == ["5 tell waiting"] and len(read("sent")) == sent
+    old = "Earlier output: Paste code here if prompted >\n"
+    assert run(2000, old + AUTO_MODE_OFFER) == "" and run(2300, old + AUTO_MODE_OFFER) == ""
     assert len(read("sent")) == sent + 1
+    # No place for its state: a question on screen is told at once, and taken down at his prompt.
+    (tmp_path / "file").write_text("x")
+    nowhere = (tmp_path / "file" / "state").as_posix()
+    told = len(read("notice"))
+    assert run(3000, UNSTICK_DIR=nowhere) == "" and read("notice")[told:] == ["5 tell waiting"]
+    assert run(3010, IDLE, UNSTICK_DIR=nowhere) == "" and read("notice")[-1] == "5 clear screen"
 
 
 def test_nothing_is_typed_into_a_session_before_its_check_passes():
@@ -1975,7 +1991,7 @@ def test_nothing_is_typed_into_a_session_before_its_check_passes():
     assert marks == ['if [ -n "$checked" ]; then checked_now; else unchecked; fi', "0) checked=1; checked_now ;;"]
     assert run.index('[ "$mode" = own ] || checked=1\nif [ -n "$checked" ]; then checked_now; else unchecked; fi') > 0
     checkin = (CAIN / "rootfs/opt/cain/checkin.sh").read_text(encoding="utf-8")
-    gate = checkin.index('[ -f "${SESSION_CHECKED:-/run/cain/session-checked}" ] || exit 0')
+    gate = checkin.index('checked_mark="${SESSION_CHECKED:-/run/cain/session-checked}"\n[ -f "$checked_mark" ] || exit 0')
     assert gate < checkin.index("screen=$(read_screen)") and gate < checkin.index("type_in() {")
 
 
@@ -2061,8 +2077,42 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         _checkin(tmp_path, "0300", IDLE, runs=6, after=IDLE, CHECKIN_TYPED_GRACE_S="0")
         (tmp_path / "box/typed").unlink(missing_ok=True)               # it never landed
         assert work.read_text() == '{"text": "second"}\n' and q.read_text() == '{"text": "first"}\n'
-        out = [l for l in _checkin(tmp_path, "0300", IDLE, runs=6).splitlines() if " -l " in l]
+        out = [l for l in _checkin(tmp_path, "0300", IDLE, runs=6, CHECKIN_TYPED_GRACE_S="0").splitlines() if " -l " in l]
         assert [l.split(": ", 1)[1] for l in out[-2:]] == ["second", "first"]
+        # After a delivery, the next waits for two reads again; a read from before his session's check
+        # doesn't count (outside review, round 15).
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "one"}\n{"text": "two"}\n', newline="\n")
+        assert "one" in _checkin(tmp_path, "0300", IDLE, runs=1)       # steady already: in
+        assert "two" not in _checkin(tmp_path, "0300", IDLE, runs=1)   # the read after a delivery only counts as one
+        (tmp_path / "session-checked").unlink()                         # his session checked anew since that read:
+        assert "two" not in _checkin(tmp_path, "0300", IDLE, runs=1)   # it doesn't count
+        assert "two" in _checkin(tmp_path, "0300", IDLE, runs=1)
+        # His box holding a draft that isn't what was typed: no Enter (outside review, round 15).
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "three"}\n', newline="\n")
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after=DRAFT)
+        assert "three" in out and "Enter" not in out and "three" in work.read_text()
+        (tmp_path / "box/typed").unlink(missing_ok=True)
+        _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
+        assert work.read_text().strip() == ""
+        # A tap that can't be put after the newer ones (its queue can't be written) stays first, kept
+        # (outside review, round 15).
+        q.write_text('{"text": "stuck"}\n', newline="\n")
+        _checkin(tmp_path, "0300", IDLE, runs=1, after=IDLE, CHECKIN_TYPED_GRACE_S="0")   # moved aside; a first try fails
+        (tmp_path / "box/typed").unlink(missing_ok=True)
+        q.unlink(missing_ok=True)
+        q.mkdir()
+        _checkin(tmp_path, "0300", IDLE, runs=8, after=IDLE, CHECKIN_TYPED_GRACE_S="0")
+        (tmp_path / "box/typed").unlink(missing_ok=True)
+        assert work.read_text().splitlines()[0] == '{"text": "stuck"}'
+        q.rmdir()
+        # A draft in his box that isn't the App's try (its prompt line begins otherwise) is left be:
+        # no Ctrl+U, and the try taken as gone (outside review, round 15).
+        (tmp_path / "state").mkdir(exist_ok=True)
+        (tmp_path / "state/typed").write_text("9999999999\nRelayed by the add-on: Dane tapped \"Ship\"\n", newline="\n")
+        before = (tmp_path / "sent.txt").read_text(encoding="utf-8")
+        assert _checkin(tmp_path, "0300", DRAFT, runs=2) == before and not (tmp_path / "state/typed").exists()
     finally:
         del os.environ["RELAY_QUEUE"]
 
@@ -2075,10 +2125,15 @@ def test_a_checkin_that_missed_its_hour_is_named_in_the_next(tmp_path):
     assert "Scheduled check-in" in first and "didn't reach you" not in first        # the first ever
     assert _checkin(tmp_path, "0712", AUTO_MODE_OFFER) == first                    # not at his prompt
     out = _checkin(tmp_path, "1240", IDLE).splitlines()[-2]
-    assert "The 7:10 AM check-in didn't reach you: your screen wasn't at your prompt within its hour." in out
-    assert "(1230)" in out
+    assert ("Check-ins that didn't reach you (your screen wasn't at your prompt within their hour): today at 7:10 AM."
+            in out) and "(1230)" in out
     assert "didn't reach you" not in _checkin(tmp_path, "1740", IDLE).splitlines()[-2]   # once
     assert "didn't reach you" not in _checkin(tmp_path, "0712", IDLE, day="2026-11-09").splitlines()[-2]
+    # Two missed in a row: both named, each once (outside review, round 15).
+    assert _checkin(tmp_path, "1240", AUTO_MODE_OFFER, day="2026-11-09").count(" -l ") == 4
+    out = _checkin(tmp_path, "0712", IDLE, day="2026-11-10").splitlines()[-2]
+    assert "didn't reach you (your screen wasn't at your prompt within their hour): yesterday at 12:30 PM, yesterday at 5:30 PM." in out
+    assert "didn't reach you" not in _checkin(tmp_path, "1240", IDLE, day="2026-11-10").splitlines()[-2]
 
 
 def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):

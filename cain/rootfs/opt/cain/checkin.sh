@@ -44,10 +44,19 @@ send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
 
 # Nothing goes into a session that hasn't passed its check of his own user: the run script takes
 # the mark away before every start of his session and sets it when the check passes.
-[ -f "${SESSION_CHECKED:-/run/cain/session-checked}" ] || exit 0
+checked_mark="${SESSION_CHECKED:-/run/cain/session-checked}"
+[ -f "$checked_mark" ] || exit 0
 
 read_screen() { timeout 10 $TM -u capture-pane -p -J -t cain 2>/dev/null; }
-screen=$(read_screen) || exit 0
+# Whether a draft's first line (prompt-state.sh's, lower case) begins as the App's text did: their
+# first 40 letters, spaces aside, and at least 10 of them (outside review, round 15).
+ours() {
+  local seen own
+  seen=$(printf '%s' "$1" | tr -d ' \t' | cut -c1-40)
+  own=$(printf '%s' "$2" | tr 'A-Z' 'a-z' | tr -d ' \t' | cut -c1-40)
+  [ -n "$own" ] && [ "${#seen}" -ge 10 ] && [ "${own:0:${#seen}}" = "$seen" ]
+}
+screen=$(read_screen) || { rm -f "$state/ready"; exit 0; }
 last=$(printf '%s\n' "$screen" | tail -n 12)
 # Only at his prompt (prompt-state.sh): never into a screen waiting for an answer, which typing
 # would answer. Nov 16, Claude Code's "Teach auto mode about your environment?" offer said "auto
@@ -61,7 +70,7 @@ at=$(printf '%s\n' "$screen" | "$PS" 2>/dev/null)
 # empty counts as the try gone only 30 seconds after it (one slow to draw turns up meanwhile). Given
 # up after 30 minutes, said, so a try that's gone some other way never blocks the rest.
 if [ -f "$state/typed" ]; then
-  typed_at=$(head -c 20 "$state/typed" 2>/dev/null | tr -cd '0-9')
+  typed_at=$(head -n 1 "$state/typed" 2>/dev/null | tr -cd '0-9')
   age=$(( $(date +%s) - ${typed_at:-0} ))
   if [ "$age" -gt 1800 ]; then
     rm -f "$state/typed"
@@ -73,6 +82,15 @@ if [ -f "$state/typed" ]; then
     ready) [ "$age" -ge "${CHECKIN_TYPED_GRACE_S:-30}" ] || exit 0
            rm -f "$state/typed" ;;
     draft)
+      # Only a draft that begins as the try did (its first 40 letters, spaces aside, from his box's
+      # own prompt line) is the App's to take out; anyone else's is left be, and the try taken as
+      # gone (outside review, round 15).
+      if ! ours "$(printf '%s\n' "$screen" | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null | sed -n 2p)" \
+                "$(sed -n 2p "$state/typed" 2>/dev/null)"; then
+        rm -f "$state/typed"
+        echo "[cain] a draft in his input box isn't the App's try: left as it is"
+        exit 0
+      fi
       for _ in 1 2 3; do
         timeout 10 $TM -u send-keys -t cain $(printf 'C-u %.0s' $(seq 20)) 2>/dev/null
         sleep 1
@@ -86,13 +104,21 @@ if [ -f "$state/typed" ]; then
     *) exit 0 ;;   # a question, or a screen not known: later
   esac
 fi
-# His prompt, empty, and steady: read so now and at the run before, so a question Claude Code
-# opens as a turn ends has time to show before anything is typed.
+# His prompt, empty, and steady: read so now and at a run 3 to 30 seconds before, in this same
+# session (the mark newer than the run script's check of it), so a question Claude Code opens as a
+# turn ends has time to show before anything is typed. Read afresh after every delivery and every
+# failed read (outside review, round 15).
 if [ "$at" != ready ] || printf '%s' "$last" | grep -Eqi 'esc to interrupt'; then   # working: later
   rm -f "$state/ready"
   exit 0
 fi
-if [ ! -f "$state/ready" ] && touch "$state/ready" 2>/dev/null; then exit 0; fi
+now_s=$(date +%s)
+ready_at=$(head -n 1 "$state/ready" 2>/dev/null | tr -cd '0-9')
+if [ -n "$ready_at" ] && [ "$state/ready" -nt "$checked_mark" ] && [ $((now_s - ready_at)) -le 30 ]; then
+  [ $((now_s - ready_at)) -ge "${CHECKIN_STEADY_S:-3}" ] || exit 0
+elif printf '%s\n' "$now_s" > "$state/ready" 2>/dev/null; then
+  exit 0
+fi
 
 # Typed, then the screen read again: Enter only while his input area is still there, holding
 # what was typed (prompt-state.sh: draft), with no question opened since (Cain's third service
@@ -100,15 +126,17 @@ if [ ! -f "$state/ready" ] && touch "$state/ready" 2>/dev/null; then exit 0; fi
 # marked until a later read shows his box empty, so one that turns up late, or sits under a
 # question, is taken back out before anything new is typed (above).
 type_in() {
-  date +%s > "$state/typed" 2>/dev/null || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
+  printf '%s\n%s\n' "$(date +%s)" "$1" > "$state/typed" 2>/dev/null \
+    || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
   if ! timeout 10 $TM -u send-keys -t cain -l "$1"; then return 1; fi
   sleep 1
-  local after
-  after=$(read_screen | "$PS" 2>/dev/null)
-  if [ "$after" = ready ]; then sleep 2; after=$(read_screen | "$PS" 2>/dev/null); fi   # slow to draw: once more
-  if [ "$after" != draft ]; then
-    rm -f "$state/ready"
-    echo "[cain] his screen changed before Enter (now ${after:-unread}): nothing sent, tried again later"
+  local after word
+  after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null)
+  if [ "${after%%$'\n'*}" = ready ]; then sleep 2; after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null); fi   # slow to draw
+  word="${after%%$'\n'*}"
+  rm -f "$state/ready"
+  if [ "$word" != draft ] || ! ours "$(printf '%s\n' "$after" | sed -n 2p)" "$1"; then
+    echo "[cain] his input box didn't hold what was typed (${word:-unread}): nothing sent, tried again later"
     return 1
   fi
   timeout 10 $TM -u send-keys -t cain Enter || return 1
@@ -133,8 +161,11 @@ if [ -s "$work" ]; then
       printf '%s %s\n' "$sum" "$tries" > "$state/tries"
       exit 1
     fi
+    if ! printf '%s\n' "$line" >> "$queue"; then
+      echo "[cain] a relayed line couldn't be typed three times running, nor put after the newer ones: it stays first"
+      exit 1
+    fi
     rm -f "$state/tries"
-    printf '%s\n' "$line" >> "$queue"
     echo "[cain] a relayed line couldn't be typed three times running: it goes after the newer ones"
   else
     rm -f "$state/tries"
@@ -168,19 +199,22 @@ for s in 0710 1230 1730; do
 done
 [ -n "$slot" ] || exit 0
 [ -f "$dir/$day-$slot" ] && exit 0
-# The slot before this one (yesterday's last, for the morning): if it never went in within its
-# hour, this one says so, once, so a missed check-in is never silent.
-case "$slot" in
-  0710) prev=1730; prevday=$(date -d "$day -1 day" +%F 2>/dev/null) || prevday="" ;;
-  1230) prev=0710; prevday=$day ;;
-  *) prev=1230; prevday=$day ;;
-esac
-missed=""
-if [ -n "$prevday" ] && [ -d "$dir" ] && [ ! -f "$dir/$prevday-$prev" ] && [ ! -f "$dir/$prevday-$prev.missed" ] \
-   && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
-  case "$prev" in 0710) when="7:10 AM" ;; 1230) when="12:30 PM" ;; *) when="5:30 PM" ;; esac
-  missed="The $when check-in didn't reach you: your screen wasn't at your prompt within its hour. "
-fi
+# Every slot in the day before this one that never went in within its hour (no mark of it sent,
+# none of it named yet): named in this one, each once, so a missed check-in is never silent
+# (outside review, round 15). Only slots after the first check-in this App sent count, so a first
+# start names none.
+first=$(ls "$dir" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' | sort | head -n 1)
+yday=$(date -d "$day -1 day" +%F 2>/dev/null) || yday=""
+missed=""; named=()
+for cand in "$yday-0710" "$yday-1230" "$yday-1730" "$day-0710" "$day-1230" "$day-1730"; do
+  [ -n "$yday" ] && [ -n "$first" ] || break
+  [[ "$cand" > "$yday-$slot" && "$cand" < "$day-$slot" && "$cand" > "$first" ]] || continue
+  [ -f "$dir/$cand" ] || [ -f "$dir/$cand.missed" ] && continue
+  case "${cand##*-}" in 0710) when="7:10 AM" ;; 1230) when="12:30 PM" ;; *) when="5:30 PM" ;; esac
+  [ "${cand%-*}" = "$day" ] && when="today at $when" || when="yesterday at $when"
+  missed="${missed:+$missed, }$when"; named+=("$cand")
+done
+[ -z "$missed" ] || missed="Check-ins that didn't reach you (your screen wasn't at your prompt within their hour): $missed. "
 # Items someone other than Cain holds (a laptop session), from the record keeper's own
 # holds file (written whole, once its push is on GitHub): first in the check-in, to skip.
 holds="${HOLDS_FILE:-/data/record-holds.json}"
@@ -222,7 +256,7 @@ else
 fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
-[ -n "$missed" ] && touch "$dir/$prevday-$prev.missed"
+for cand in "${named[@]}"; do touch "$dir/$cand.missed"; done
 [ -n "$newest" ] && printf '%s' "$newest" > "$seen"      # listed: never again
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"
