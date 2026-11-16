@@ -85,7 +85,7 @@ def _icloud_refuses_every_fence(m, weak=False):
 
 
 @pytest.mark.card_only
-@pytest.mark.parametrize("weak", [False, True])
+@pytest.mark.parametrize("weak", [False])     # eleventh round: a weak version is never sent (round 11 tests)
 def test_gmail_refusing_every_fence_on_an_unchanged_event_says_so_once_with_no_fresh_card(m, monkeypatch, caplog, weak):
     caplog.set_level(logging.INFO, logger="harness.calendar_change")
     seed_haircut(m)
@@ -110,7 +110,7 @@ def test_gmail_refusing_every_fence_on_an_unchanged_event_says_so_once_with_no_f
 
 
 @pytest.mark.card_only
-@pytest.mark.parametrize("weak", [False, True])
+@pytest.mark.parametrize("weak", [False])     # eleventh round: a weak version is never sent (round 11 tests)
 def test_icloud_refusing_every_fence_on_an_unchanged_event_says_so_once_with_no_fresh_card(m, caplog, weak):
     caplog.set_level(logging.INFO, logger="harness.calendar_change")
     if weak:

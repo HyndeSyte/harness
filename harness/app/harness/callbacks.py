@@ -49,6 +49,7 @@ class Callbacks:
         self.policy_version = policy_version
         self.settings_fn = settings_fn     # (change_id, "approve"|"decline") -> message
         self.family_add = family_add       # family_add.FamilyAdd, or None
+        self.migration_fn: Callable[[str, str], str] | None = None   # (kind, target) -> message (eleventh round)
 
     def handle(self, inc) -> str:
         """Returns what happened, for tests and the event log."""
@@ -111,6 +112,8 @@ class Callbacks:
         if kind in ("settings_approve", "settings_decline") and self.settings_fn:
             return render.escape(self.settings_fn(
                 target, "approve" if kind == "settings_approve" else "decline"))
+        if kind in ("migration_check", "migration_override") and self.migration_fn is not None:
+            return self.migration_fn(kind, target)            # the ledger's own migration (eleventh round)
         if kind.startswith("family_add_") and self.family_add is not None:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
         if kind.startswith("calendar_change_") and self.calendar_change is not None:

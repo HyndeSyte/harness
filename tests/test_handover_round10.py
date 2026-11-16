@@ -105,7 +105,7 @@ def test_an_install_with_a_matching_dry_run_proceeds_with_a_backup_first(ledger,
     assert not got.get("waiting")
     assert json.loads(ledger.get_meta(calendar_change.INSTALLED))["build"] == "b-new"
     copy = pathlib.Path(got["backup"])
-    assert copy.is_file() and copy.parent == tmp_path and copy.name.startswith("harness-before-bnew-")
+    assert copy.is_file() and copy.parent == tmp_path and copy.name.startswith("harness-before-s1-bnew-")
     # The backup is the ledger as it was just before: no install recorded in it, and it opens.
     db = sqlite3.connect(copy)
     assert db.execute("SELECT value FROM meta WHERE key=?", (calendar_change.INSTALLED,)).fetchone() is None
@@ -114,41 +114,25 @@ def test_an_install_with_a_matching_dry_run_proceeds_with_a_backup_first(ledger,
 
 
 @pytest.mark.migrate_gate
-def test_an_install_without_a_dry_run_refuses_and_says_so(ledger):
+def test_an_install_without_a_dry_run_runs_its_own_and_moves(ledger):
+    # Eleventh round: no dry run recorded, so the specialist runs one itself on a copy and, passing, moves.
     got = migrate.run_live(ledger, None, OWNER, version="0.24.0", build="b-none")
-    assert got["waiting"] is True and "no migration dry run is recorded for build b-none" in got["why"]
-    assert ledger.get_meta(calendar_change.INSTALLED) is None and ledger.get_meta(migrate.DONE) is None
-    notices = [r[0] for r in ledger.db.execute("SELECT text FROM outbox WHERE kind='notice'")]
-    assert len(notices) == 1 and "hasn't moved its records over yet" in notices[0]
-    migrate.run_live(ledger, None, OWNER, version="0.24.0", build="b-none")                  # told once
-    assert ledger.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='notice'").fetchone()[0] == 1
-    # A failed dry run doesn't count either.
-    migrate.record_dry_run(ledger, {"build": "b-none", "ok": False})
-    assert "failed" in migrate.dry_run_missing(ledger, "b-none")
+    assert not got.get("waiting") and got["backup"]
+    assert migrate.dry_run_for(ledger, "b-none")["self_serve"] is True
+    assert json.loads(ledger.get_meta(calendar_change.INSTALLED))["build"] == "b-none"
+    assert ledger.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='notice'").fetchone()[0] == 0
+    # A failed dry run doesn't count.
+    migrate.record_dry_run(ledger, {"build": "b-other", "ok": False, "schema_before": 2})
+    assert "failed" in migrate.dry_run_missing(ledger, "b-other")
 
 
 @pytest.mark.migrate_gate
-def test_the_live_specialist_waits_tells_cain_and_moves_after_its_own_dry_run(m):
-    assert migrate.waiting(m.ledger)                              # nothing recorded for this build
-    m.c.outbox.flush()
-    assert told(m, "Harness ") and "hasn't moved its records over yet" in told(m, "Harness ")[-1]
-    out = m.tells("add the dentist at 3 today", ask(DENTIST))
-    assert out["status"] == "refused" and "keeper.sh fastpath migrate-check" in out["said"]
-    assert "migrate-override" in out["said"]
-    out = m.send(Handover(kind="fastpath", state="migrate-check"))
-    assert out["status"] == "ok" and "records are moved now" in out["said"]
+def test_the_live_specialist_moves_its_records_at_startup_with_no_command(m):
     assert not migrate.waiting(m.ledger)
     assert json.loads(m.ledger.get_meta(calendar_change.INSTALLED))["build"] == calendar_change.app_build()
     assert pathlib.Path(json.loads(m.ledger.get_meta(migrate.BACKUP))["path"]).is_file()
-
-
-@pytest.mark.migrate_gate
-def test_cains_override_is_logged_and_moves_the_records_with_a_backup(m):
-    out = m.send(Handover(kind="fastpath", state="migrate-override"))
-    assert out["status"] == "ok" and "kept in the log" in out["said"]
-    row = m.ledger.db.execute("SELECT detail FROM events WHERE kind='migration_override'").fetchone()
-    assert json.loads(row[0])["by"] == "cain" and json.loads(row[0])["build"] == calendar_change.app_build()
-    assert not migrate.waiting(m.ledger) and m.ledger.get_meta(migrate.BACKUP)
+    out = m.send(Handover(kind="fastpath", state="migrate-check"))
+    assert out["status"] == "ok"
     again = m.send(Handover(kind="fastpath", state="migrate-override"))
     assert again["status"] == "refused" and "Nothing is waiting" in again["said"]
 
@@ -329,20 +313,22 @@ def _weak_etags(m):
 
 @pytest.mark.card_only
 @pytest.mark.install_gate
-def test_a_refused_fresh_edit_is_said_as_an_incompatibility_with_test_again_and_no_override(m):
+def test_a_refused_fresh_edit_is_said_as_an_incompatibility_with_test_again_and_open_without_protection(m):
+    # Eleventh round: never a dead end. Told once that it can't be changed safely, with Open without protection
+    # (his tap) and Test again; Cain's gate-open only sends him that card again.
     run = start(m)
     seen_both(m, "family")
     real = _weak_etags(m)
     out = conform(m, run, "family")
     assert out["result"] == "unknown" and out["kinds"]["edit"] == "incompatible"
-    assert "don't agree on versions" in out["said"] and "gate-open is refused" in out["said"]
-    msg = told(m, "Harness and Family don't agree on event versions.")
+    assert "don't agree on versions" in out["said"]
+    msg = told(m, "Harness can't change Family safely.")
     assert len(msg) == 1 and "the fresh edit was answered changed (412)" in msg[0]
-    assert "Test again" in m.labels() and "Open cards without the check" not in m.labels()
-    refused = m.send(Handover(kind="fastpath", state="gate-open", calendar="family"))
-    assert "Not opened" in refused["said"] and "family" in calendar_change.closed_providers(m.ledger)
-    assert m.ledger.db.execute("SELECT 1 FROM events WHERE kind='calendar_card_gate_override_refused'").fetchone()
-    assert "Not opened" in m.cc.open_gate("family", by="owner tap")
+    assert "by hand in the calendar app" in msg[0]
+    assert "Test again" in m.labels() and "Open without protection" in m.labels()
+    asked = m.send(Handover(kind="fastpath", state="gate-open", calendar="family"))
+    assert "his call" in asked["said"] and "family" in calendar_change.closed_providers(m.ledger)
+    assert len(told(m, "Harness can't change Family safely.")) == 2
     # Test again once iCloud's versions behave: it passes and the cards open.
     m.icloud.request = real
     m.tap("Test again")
@@ -486,7 +472,8 @@ def test_a_calendar_that_once_enforced_and_then_takes_a_write_without_a_new_vers
     m.c.tick()
     assert "gmail" in calendar_change.closed_providers(m.ledger)
     assert calendar_change.conformance_of(m.ledger, "gmail") == "ignored"
-    assert len(told(m, "Gmail doesn't protect against edits made at the same time.")) == 1
+    msg = told(m, "Harness can't change Gmail safely.")
+    assert len(msg) == 1 and "the move of “Haircut” changed an event on Gmail" in msg[0]
 
 
 # -- 8. CI builds the image and compares its build id -------------------------------------------------------------

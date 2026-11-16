@@ -707,12 +707,17 @@ class FamilyCalDav:
             return Outcome("auth", r.status)
         return Outcome("unknown" if r.status >= 500 else "failed", r.status)
 
-    def replace(self, href: str, etag: str, ics: str) -> Outcome:
-        """Only over the version just read."""
+    def replace(self, href: str, etag: str | None, ics: str) -> Outcome:
+        """Only over the version just read. None (eleventh round): a read-compare-write the caller has
+        already compared (a weak version, or a calendar he opened without protection): no If-Match."""
+        if etag is None:
+            return self._write("PUT", href, {}, ics)
         return self._write("PUT", href, {"If-Match": etag}, ics) if etag else Outcome("failed")
 
-    def remove_at(self, href: str, etag: str) -> Outcome:
-        """Only the version just read."""
+    def remove_at(self, href: str, etag: str | None) -> Outcome:
+        """Only the version just read; None as for replace."""
+        if etag is None:
+            return self._write("DELETE", href, {})
         return self._write("DELETE", href, {"If-Match": etag}) if etag else Outcome("failed")
 
     def put_new(self, href: str, ics: str) -> Outcome:

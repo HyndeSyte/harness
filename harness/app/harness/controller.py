@@ -209,6 +209,7 @@ class Controller:
                                              calendar_change=self.calendar_change,
                                              mail_dates=self.mail_dates,
                                              meaning_live=self.meaning_live)
+        self.callbacks.migration_fn = self._migration_choice
 
     def _still_his(self, p) -> tuple[str, str]:
         """At the moment a change goes through with no tap (calendar_change._execute): ("", the
@@ -657,12 +658,13 @@ class Controller:
             return
         held = migrate.waiting(self.ledger)
         if held:
-            # Tenth round: the live ledger waits for a dry run of this build; nothing is taken meanwhile.
-            h.finish("refused", "Not taken: the specialist was updated, and it moves its records to the new build "
-                                f"only after a migration dry run of that build ({held.get('why', 'none recorded')}). "
-                                "Run keeper.sh fastpath migrate-check; it rehearses this build on a copy of the "
-                                "ledger, records it, and then the records are moved. Only on Dane's say: keeper.sh "
-                                "fastpath migrate-override. Nothing changed.")
+            # Tenth and eleventh rounds: the live ledger waits because its own dry run of this build failed;
+            # nothing is taken meanwhile. He has Run check; keeper.sh fastpath migrate-check is the same.
+            h.finish("refused", "Not taken: the specialist was updated, and its rehearsal of moving its records to "
+                                f"the new build on a copy of them didn't pass ({held.get('why', 'see the log')}). He "
+                                "has a message with Run check, which rehearses it again; keeper.sh fastpath "
+                                "migrate-check does the same. keeper.sh fastpath migrate-override only sends him "
+                                "a card to move them unrehearsed, on his tap. Nothing changed.")
             return
         if h.smoke_run:
             # Tenth round: a handover only ever reads his own messages, so one naming the smoke run cites a
@@ -961,22 +963,25 @@ class Controller:
             h.finish("ok" if got.get("ok") else "refused", said, result=got)
             return
         if h.state == "migrate-override":
-            # Tenth round: only on Dane's say. This build's migration runs on the live ledger without a dry
-            # run, logged with who and when, and still with a backup first.
-            if not migrate.waiting(self.ledger):
-                h.finish("refused", "Nothing is waiting for a migration, so nothing changed.")
-                return
-            migrate.override(self.ledger, by="cain")
-            moved = self._migrate_if_waiting()
-            h.finish("ok" if moved else "refused",
-                     "Moved without a dry run, as overridden; that's kept in the log, and a backup was taken first."
-                     if moved else "The override is kept, but the records couldn't be moved: "
-                     + (migrate.waiting(self.ledger).get("why") or "see the log") + ".")
+            # Eleventh round: the override is his alone. Cain's command only posts him a card saying the
+            # migration is unrehearsed, why the dry run failed and that a backup is taken first; it runs only
+            # on his tap, once, for this build (migrate.override_tapped).
+            status, said = migrate.request_override(self.ledger, self.config.owner_user_id, by="cain")
+            h.finish(status, said)
             return
         now = fast_path(self.ledger)
         h.finish("unknown", "Say smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open "
                  "<gmail|family>, migrate-check [path] [candidate] or migrate-override. "
                  "It's " + ("on" if now.get("on") else "off (card only)") + " now.")
+
+    def _migration_choice(self, kind: str, target: str) -> str:
+        """His Run check, or his tap on the override card (eleventh round)."""
+        owner = self.config.owner_user_id
+        if kind == "migration_check":
+            said = migrate.check_tapped(self.ledger, self.calendar_change, owner, target)
+        else:
+            said = migrate.override_tapped(self.ledger, self.calendar_change, owner, target)
+        return said
 
     def _migrate_if_waiting(self) -> bool:
         """Tenth round: the live ledger was waiting for a dry run of this build (or an override); once one

@@ -196,6 +196,7 @@ SMOKE_PROP = "harness_smoke"           # Google's private extended property; on 
 INSTALLED = "calendar_installed"       # {"version", "build", "schema", "at"}: the install this ledger is on
 CARD_GATE = "calendar_card_gate"       # {"version", "build", "at", "verified", "seen", "blocked", "override"}
 HELD = "calendar_change_held:"          # + proposal: a card held for the check after installing (eighth round)
+PASSED_BACK = "calendar_change_passed_back:"   # + proposal: its ready-to-copy summary went to him (eleventh round)
 HELD_DAY_TOLD = "calendar_change_held_day:"   # + proposal: told on its day while held (tenth round)
 RELEASE_SUMMARY = 3                     # more held changes than this coming back at once: one message first
 LEFTOVERS = "calendar_smoke_leftovers:"  # + run id: what its one-tap removal takes off
@@ -539,6 +540,59 @@ def _list(days: list[date]) -> str:
 
 def _dates(text: str) -> list[date]:
     return sorted({date.fromisoformat(x) for x in text.split(",") if x})
+
+
+def _copy_line(c: dict, tz: str) -> str:
+    """One requested change as a ready-to-copy line (eleventh round): calendar, what, title, when."""
+    name = provider_name(c.get("calendar", ""))
+    what = {"add": "Add", "add_series": "Add, repeating", "move": "Move", "remove": "Take off",
+            "end": "End the series"}.get(c.get("op", ""), "Change")
+    when = ""
+    try:
+        zone = ZoneInfo(tz)
+        if c.get("start"):
+            s_ = _when(str(c["start"]))
+            e_ = _when(str(c["end"])) if c.get("end") else None
+            if isinstance(s_, datetime):
+                s_ = s_.astimezone(zone) if s_.tzinfo else s_
+                when = s_.strftime("%a %d %b %Y, %H:%M")
+                if isinstance(e_, datetime):
+                    when += " to " + (e_.astimezone(zone) if e_.tzinfo else e_).strftime("%H:%M")
+            else:
+                when = s_.strftime("%a %d %b %Y")
+        elif c.get("dates"):
+            when = str(c["dates"]).replace(",", ", ")
+    except (ValueError, TypeError):
+        when = str(c.get("start") or c.get("dates") or "")
+    extra = []
+    if c.get("days"):
+        extra.append(f"on {c['days']}")
+    if c.get("until"):
+        extra.append(f"until {str(c['until'])[:10]}")
+    if c.get("location"):
+        extra.append(f"at {c['location']}")
+    return " | ".join(x for x in (name, what, f"\u201c{c.get('title', '')}\u201d", when, " ".join(extra)) if x)
+
+
+def _weak(etag: str | None) -> bool:
+    """A weak entity tag (RFC 9110 8.8.3): If-Match compares strongly, so a weak one never matches there."""
+    return bool(etag) and str(etag).startswith("W/")
+
+
+def _etag_same(a: str | None, b: str | None) -> bool:
+    """The weak comparison (RFC 9110 8.8.3.2), used for reads: the opaque tags match, weak or not."""
+    if not a or not b:
+        return False
+    return str(a).removeprefix("W/") == str(b).removeprefix("W/")
+
+
+_ICS_VOLATILE = re.compile(r"^(?:DTSTAMP|LAST-MODIFIED|SEQUENCE|CREATED)[;:]", re.I)
+
+
+def _ics_content(body: str) -> str:
+    """An iCalendar body as content: unfolded, without the stamps a server rewrites on any write."""
+    text = (body or "").replace("\r\n", "\n").replace("\n ", "").replace("\n\t", "")
+    return "\n".join(line.strip() for line in text.split("\n") if line.strip() and not _ICS_VOLATILE.match(line))
 
 
 def _when(text: str) -> datetime | date:
@@ -1394,7 +1448,7 @@ class CalendarChange:
             x["href"] = entry["href"]
         if x["cal"] not in SMOKE_PROVIDERS or len(x) < 2:
             return
-        for k in ("nonce", "day"):              # tenth round: found by its exact nonce if not by its id
+        for k in ("nonce", "day", "until"):     # tenth round: found by its exact nonce if not by its id
             if entry.get(k):
                 x[k] = str(entry[k])
         try:
@@ -1409,6 +1463,26 @@ class CalendarChange:
         else:
             with self.ledger.tx() as d:
                 self.ledger.set_meta(SMOKE_CREATED + run_id, json.dumps(got), d)
+
+    def _smoke_days(self, c: dict) -> dict:
+        """Eleventh round: the day a run's event is on, in his time zone (not the day its UTC time falls on),
+        and for a series its last day ("until", or as far as a series is looked for), so a search by nonce
+        covers it all."""
+        raw = str(c.get("start") or c.get("dates") or "")
+        try:
+            when = _when(raw)
+            day = when.astimezone(ZoneInfo(self.tz)).date() if isinstance(when, datetime) and when.tzinfo \
+                else (when.date() if isinstance(when, datetime) else when)
+        except (ValueError, TypeError, AttributeError):
+            return {"day": raw[:10]}
+        out = {"day": day.isoformat()}
+        if c.get("op") == "add_series":
+            try:
+                last = date.fromisoformat(str(c.get("until") or "")[:10])
+            except ValueError:
+                last = day + END_AHEAD
+            out["until"] = max(day, last).isoformat()
+        return out
 
     def created_by(self, run_id: str) -> list[dict]:
         try:
@@ -1498,46 +1572,102 @@ class CalendarChange:
                            "again.", extra)
 
     def _tell_unprotected(self, db, provider: str, result: str) -> None:
-        """His message when the conformance item found a calendar takes a stale write (ignored), or a stale
-        removal (partial): what it risks, with Open cards without the check (logged)."""
+        """His message when the conformance item found a calendar takes a stale write (ignored: eleventh
+        round, the specialist can't change it safely, _tell_cannot_protect), or a stale removal (partial):
+        what it risks, with Open cards without the check (logged)."""
+        if result == "ignored":
+            self._tell_cannot_protect(db, provider, "ignored")
+            return
         name = provider_name(provider)
         nonce = choices.mint(self.ledger, kind="calendar_change_gate_open", target=provider,
                              chat_id=self.chat_id, ttl_s=TURN_OFF_TTL_S, db=db)
-        if result == "ignored":
-            text = (f"<b>{name} doesn't protect against edits made at the same time.</b> During the check "
-                    f"after installing, {name} accepted a change sent with an out of date version of the "
-                    f"check's own test event, so it won't refuse a write that would overwrite an edit made "
-                    f"elsewhere in between. Calendar cards for {name} stay waiting with no Approve. Open "
-                    f"cards without the check lets them through anyway, but edits on {name} may then "
-                    "overwrite changes made elsewhere (on your phone, or by someone else) between your "
-                    "card and your tap; that tap is kept in the log.")
-        else:
-            text = (f"<b>{name} doesn't protect removals against edits made at the same time.</b> During the "
-                    f"check after installing, {name} refused out of date edits of the check's own test events, "
-                    "but took a removal sent with an out of date version. Calendar cards for "
-                    f"{name} stay waiting with no Approve. Open cards without the check lets moves and adds "
-                    f"through; removals on {name} stay waiting even then, since one could take off an event "
-                    "someone changed in between. That tap is kept in the log.")
+        text = (f"<b>{name} doesn't protect removals against edits made at the same time.</b> During the "
+                f"check after installing, {name} refused out of date edits of the check's own test events, "
+                "but took a removal sent with an out of date version. Calendar cards for "
+                f"{name} stay waiting with no Approve. Open cards without the check lets moves and adds "
+                f"through; removals on {name} stay waiting even then, since one could take off an event "
+                "someone changed in between. That tap is kept in the log.")
         self._say(db, self.chat_id, None, text, buttons=[[("Open cards without the check", choices.callback_data(nonce))]],
                   binds=[{"type": "choice", "nonce": nonce}])
 
     def _tell_incompatible(self, db, provider: str, record: dict) -> None:
-        """Tenth round: the calendar turned down the check's fresh edit, sent with the version it had just
-        given. Said as what was observed, with Test again (that step of the check run once more). No
-        Open cards without the check: an override would only produce refusals."""
+        """Tenth round: the calendar turned down the check's fresh edit. Eleventh round: told as a calendar
+        the specialist can't change safely (_tell_cannot_protect), with Test again as well."""
+        self._tell_cannot_protect(db, provider, "incompatible", record=record)
+
+    def cannot_protect(self, provider: str) -> bool:
+        """Eleventh round: the conformance item found this calendar incompatible (it turned down a fresh
+        edit) or ignoring stale writes, and he hasn't opened it."""
+        gate = card_gate(self.ledger)
+        rec = (gate.get("conformance") or {}).get(provider) or {}
+        if not gate or (gate.get("override") or {}).get(provider) or (gate.get("verified") or {}).get(provider):
+            return False
+        return rec.get("result") == "ignored" or bool(rec.get("fresh_failed"))
+
+    def _tell_cannot_protect(self, db, provider: str, kind: str, record: dict | None = None,
+                             seen_in: str = "") -> None:
+        """Eleventh round: once per install and calendar, in plain words: the specialist can't change this
+        calendar safely, and he can edit it by hand; each request held for it is passed back, ready to copy;
+        and Open without protection (open_gate) lets changes there go as a read-compare-write, every receipt
+        labelled unprotected. Never a dead end: that button is always offered."""
+        gate = card_gate(self.ledger)
+        told = gate.setdefault("cannot_told", {})
+        if told.get(provider):
+            return
+        told[provider] = iso(self.ledger.now())
+        self.ledger.set_meta(CARD_GATE, json.dumps(gate), db)
         name = provider_name(provider)
-        nonce = choices.mint(self.ledger, kind="calendar_change_conform_again", target=provider,
-                             chat_id=self.chat_id, ttl_s=SMOKE_TTL_S, db=db)
-        self._say(db, self.chat_id, None,
-                  f"<b>Harness and {name} don't agree on event versions.</b> During the check after installing, "
-                  f"{name} turned down an edit of the check's own test event that was sent with the version {name} "
-                  f"had just given for it ({_answer_words(record.get('answers') or {})}). Every guarded change "
-                  f"there would be turned down the same way, so calendar cards for {name} stay waiting, and "
-                  "opening them without the check wouldn't help. Test again runs that step of the check once "
-                  "more; if it's turned down again, changes on " + name + " need making in the calendar app "
-                  "until Harness is fixed for it.",
-                  buttons=[[("Test again", choices.callback_data(nonce))]],
-                  binds=[{"type": "choice", "nonce": nonce}])
+        if kind == "incompatible":
+            why = (f"{name} turned down an edit of a test event that was sent with the version {name} had just "
+                   f"given for it ({_answer_words((record or {}).get('answers') or {})}), so every protected "
+                   "change there would be turned down the same way")
+        elif seen_in:
+            why = (f"{seen_in} changed an event on {name} and left its version as it was, so {name} would also "
+                   "take a change sent with an out of date version")
+        else:
+            why = (f"during the check after installing, {name} accepted a change sent with an out of date version "
+                   "of a test event, so it won't refuse a change that would overwrite an edit made elsewhere")
+        nonce = choices.mint(self.ledger, kind="calendar_change_gate_open", target=provider,
+                             chat_id=self.chat_id, ttl_s=TURN_OFF_TTL_S, db=db)
+        rows = [[("Open without protection", choices.callback_data(nonce))]]
+        binds = [{"type": "choice", "nonce": nonce}]
+        again = ""
+        if kind == "incompatible":
+            n2 = choices.mint(self.ledger, kind="calendar_change_conform_again", target=provider,
+                              chat_id=self.chat_id, ttl_s=SMOKE_TTL_S, db=db)
+            rows.append([("Test again", choices.callback_data(n2))])
+            binds.append({"type": "choice", "nonce": n2})
+            again = " Test again runs that test once more."
+        lines = [f"<b>Harness can't change {name} safely.</b> {render.escape(why)}. So Harness won't change "
+                 f"{name} for now, and you can make changes there by hand in the calendar app.",
+                 f"Open without protection lets Harness change {name} anyway: each change is read just before "
+                 "it's written and compared with your card, but it's sent without the calendar's own version "
+                 f"check, so an edit made elsewhere in that moment could be overwritten. Every receipt for "
+                 f"{name} then says Unprotected, and that tap is kept in the log." + again]
+        held = self._pass_back_lines(provider, db)
+        if held:
+            lines.append(f"Waiting for {name}, ready to copy into the calendar app:")
+            lines += held
+        self._say(db, self.chat_id, None, "\n".join(lines), buttons=rows, binds=binds)
+        self.ledger.event("calendar_cannot_protect", {"calendar": provider, "kind": kind, "held": len(held)}, db=db)
+
+    def _pass_back_lines(self, provider: str, db, pids: list[str] | None = None) -> list[str]:
+        """Each request held for this calendar (or just `pids`), as a ready-to-copy summary, passed back once
+        (eleventh round): it stays held, so Open without protection still brings it back on a card."""
+        out = []
+        for pid, held, p in self._held_rows():
+            if provider not in (held.get("providers") or []) or (pids is not None and pid not in pids):
+                continue
+            if self.ledger.get_meta(f"{PASSED_BACK}{pid}") is not None:
+                continue
+            try:
+                changes = json.loads(p["params_json"])["changes"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            self.ledger.set_meta(f"{PASSED_BACK}{pid}", iso(self.ledger.now()), db)
+            for c in changes:
+                out.append("• " + render.escape(_copy_line(c, self.tz)))
+        return out
 
     def conform_again(self, provider: str) -> str:
         """His Test again (tenth round): that conformance step once more, under the live smoke run."""
@@ -1597,7 +1727,8 @@ class CalendarChange:
             return old
 
         self._note_created(run_id, {"cal": "gmail", "id": uid, "nonce": nonce, "day": start.date().isoformat()})
-        self._note_created(run_id, {"cal": "gmail", "id": sid, "nonce": nonce, "day": start.date().isoformat()})
+        self._note_created(run_id, {"cal": "gmail", "id": sid, "nonce": nonce, "day": start.date().isoformat(),
+                                    "until": (start + timedelta(days=2)).date().isoformat()})
         try:
             out = self.google.insert(address, {"id": uid, "summary": title, "status": "confirmed",
                                                "transparency": "transparent", "start": side(start), "end": side(end),
@@ -1685,7 +1816,8 @@ class CalendarChange:
 
         day = start.date().isoformat()
         self._note_created(run_id, {"cal": "family", "href": href, "nonce": nonce, "day": day})   # before sending
-        self._note_created(run_id, {"cal": "family", "href": shref, "nonce": nonce, "day": day})
+        self._note_created(run_id, {"cal": "family", "href": shref, "nonce": nonce, "day": day,
+                                    "until": (start + timedelta(days=2)).date().isoformat()})
         try:
             out = self.client.put_new(href, one)
             if out.kind != "ok":
@@ -1792,7 +1924,7 @@ class CalendarChange:
         log.warning("the card gate on %s stays closed: the calendar refused the safety check on an unchanged event "
                     "during the smoke run", provider)
 
-    def _version_unmoved(self, provider: str) -> None:
+    def _version_unmoved(self, provider: str, what: str = "a write") -> None:
         """Tenth round: seen in normal operation, a write the calendar took left the event's version as it
         was, so a write sent with that version later would be taken too: the calendar no longer protects
         against edits made at the same time. A calendar the conformance item found enforcing after this
@@ -1803,16 +1935,16 @@ class CalendarChange:
         if not gate or rec.get("result") != "enforced":
             return
         now = iso(self.ledger.now())
-        gate["conformance"][provider] = {**rec, "result": "ignored", "seen_in_use": now,
-                                         "why": "a write it took left the event's version unchanged"}
+        gate["conformance"][provider] = {**rec, "result": "ignored", "seen_in_use": now, "write": what,
+                                         "why": f"{what} changed the event and left its version unchanged"}
         (gate.get("verified") or {}).pop(provider, None)
         (gate.get("override") or {}).pop(provider, None)
         with self.ledger.tx() as db:
             self.ledger.set_meta(CARD_GATE, json.dumps(gate), db)
-            self.ledger.event("calendar_card_gate_reclosed", {"calendar": provider}, db=db)
-            self._tell_unprotected(db, provider, "ignored")
-        log.warning("the card gate on %s closed again: a write it took in normal use left the event's version "
-                    "unchanged, so it would take a stale write", provider)
+            self.ledger.event("calendar_card_gate_reclosed", {"calendar": provider, "write": what}, db=db)
+            self._tell_cannot_protect(db, provider, "ignored", seen_in=what)
+        log.warning("the card gate on %s closed again: %s changed the event in normal use and left its version "
+                    "unchanged, so it would take a stale write", provider, what)
 
     def open_gate(self, provider: str, by: str) -> str:
         """His Open cards without the check, or Cain's keeper.sh fastpath gate-open (eighth round): that
@@ -1825,16 +1957,34 @@ class CalendarChange:
         if provider not in closed_providers(self.ledger):
             return f"{name} cards aren't waiting for the check, so nothing changed."
         record = (gate.get("conformance") or {}).get(provider) or {}
-        if record.get("fresh_failed"):
-            # Tenth round: the calendar turned down the check's fresh edit, so an override would only
-            # produce refusals. Refused, and logged.
+        unprotected = record.get("result") == "ignored" or bool(record.get("fresh_failed"))
+        if unprotected and by == "cain":
+            # Eleventh round: Open without protection is his tap alone, and never refused outright: Cain's
+            # gate-open on such a calendar sends him that card again.
             with self.ledger.tx() as db:
-                self.ledger.event("calendar_card_gate_override_refused", {"calendar": provider, "by": by}, db=db)
-            log.warning("opening %s without the check was refused (asked by %s): it turned down the check's fresh "
-                        "edit", provider, by)
-            return (f"Not opened: {name} turned down the check's own edit sent with the version it had just given, "
-                    f"so every change there would be turned down too; opening {name} cards without the check would "
-                    "only bring refusals. Test again runs that step once more. Nothing changed.")
+                gate = card_gate(self.ledger)
+                (gate.get("cannot_told") or {}).pop(provider, None)
+                self.ledger.set_meta(CARD_GATE, json.dumps(gate), db)
+                self._tell_cannot_protect(db, provider, "incompatible" if record.get("fresh_failed") else "ignored",
+                                          record=record, seen_in=record.get("write", ""))
+                self.ledger.event("calendar_card_gate_unprotected_asked", {"calendar": provider, "by": by}, db=db)
+            return (f"{name} can't be changed safely by Harness, so opening it is his call: he has a card with Open "
+                    f"without protection, which lets changes there go unprotected, each receipt saying so. Nothing "
+                    "changed yet.")
+        if unprotected:
+            gate.setdefault("override", {})[provider] = {"by": by, "at": iso(self.ledger.now()), "unprotected": True}
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(CARD_GATE, json.dumps(gate), db)
+                self.ledger.event("calendar_card_gate_override", {"calendar": provider, "by": by,
+                                                                  "unprotected": True}, db=db)
+            log.warning("%s opened without protection, by %s: its writes go as read-compare-write with no If-Match",
+                        provider, by)
+            held = self.release_held()
+            return (f"{name} is open without protection, as you asked; that's kept in the log. Each change there "
+                    "is read just before it's written and compared with your card, then sent without the "
+                    f"calendar's version check, and its receipt says Unprotected. "
+                    + (f"{held} waiting change{'s' * (held != 1)} came back on a fresh card for your tap."
+                       if held else "Nothing was waiting."))
         gate.setdefault("override", {})[provider] = {"by": by, "at": iso(self.ledger.now())}
         with self.ledger.tx() as db:
             self.ledger.set_meta(CARD_GATE, json.dumps(gate), db)
@@ -1886,6 +2036,17 @@ class CalendarChange:
         self.ledger.set_meta(f"{HELD}{pid}", json.dumps({"job": job_id, "providers": providers,
                                                         "at": iso(self.ledger.now())}), db)
         self.ledger.event("calendar_change_held", {"proposal": pid, "calendars": providers}, db=db)
+        # Eleventh round: held for a calendar the specialist can't change safely, and he's been told so: this
+        # one is passed back at once, ready to copy, rather than left to wait.
+        told = card_gate(self.ledger).get("cannot_told") or {}
+        for provider in providers:
+            if told.get(provider) and self.cannot_protect(provider):
+                lines = self._pass_back_lines(provider, db, [pid])
+                if lines:
+                    self._say(db, self.chat_id, job_id,
+                              f"<b>Waiting for {provider_name(provider)}</b>, which Harness can't change safely "
+                              "for now (the earlier message says why, with Open without protection). Ready to copy "
+                              "into the calendar app:\n" + "\n".join(lines))
         # Tenth round: one held on its own day was told so at hold time (its card and the calendar's message
         # say what happens when the day passes), so no second reminder that same day.
         row = db.execute("SELECT params_json FROM proposals WHERE id=?", (pid,)).fetchone()
@@ -1990,8 +2151,11 @@ class CalendarChange:
                     f"later check passing for {name}")
         if rec.get("fresh_failed"):
             return (f"{name} turned down the check's own edit sent with the version it had just given",
-                    "Test again on the message about it, or a fix to Harness for it")
-        if rec.get("result") in ("ignored", "partial"):
+                    "Open without protection or Test again, on the message about it")
+        if rec.get("result") == "ignored":
+            return (f"{name} takes a change sent with an out of date version, so Harness can't change it safely",
+                    "Open without protection, on the message about it; or make the change by hand there")
+        if rec.get("result") == "partial":
             return (f"during the check after installing, {name} took a write sent with an out of date version",
                     "your Open cards without the check, from the message about it, which is kept in the log")
         if (gate.get("blocked") or {}).get(provider):
@@ -2009,6 +2173,10 @@ class CalendarChange:
         if not gate:
             return
         told = gate.setdefault("held_told", {})
+        cannot = gate.get("cannot_told") or {}
+        for p in providers:                 # eleventh round: passed back instead (note_held)
+            if cannot.get(p) and self.cannot_protect(p):
+                told.setdefault(p, iso(self.ledger.now()))
         new = [p for p in dict.fromkeys(providers) if not told.get(p)]
         if not new:
             return
@@ -2317,17 +2485,25 @@ class CalendarChange:
             day = date.fromisoformat(str(entry.get("day") or "")[:10])
         except ValueError:
             return None
+        try:
+            last = date.fromisoformat(str(entry.get("until") or "")[:10])
+        except ValueError:
+            last = day
         nonce = str(entry["nonce"])
-        lo, hi = self._bounds([day - timedelta(days=1), day + timedelta(days=1)])
+        # Eleventh round: from the day before the recorded day to the day after (a step near midnight in his
+        # zone lands on either side of it), and for a series the whole of it, to the day after its last.
+        days = [day - timedelta(days=1), max(day, last) + timedelta(days=1)]
+        lo, hi = self._bounds(days)
         try:
             if entry.get("cal") == "gmail":
                 for ev in self.google.events_between(self._gmail_address(), lo, hi, fresh=True) or []:
                     tags = (ev.get("extendedProperties") or {}).get("private") or {}
                     if ev.get("status") != "cancelled" and tags.get(SMOKE_PROP) == run_id \
                             and tags.get(SMOKE_NONCE_PROP) == nonce and ev.get("id"):
-                        return {"cal": "gmail", "id": ev["id"], "title": ev.get("summary", ""), "nonce": nonce}
+                        ident = ev.get("recurringEventId") or ev["id"]     # a series: the series, not one day
+                        return {"cal": "gmail", "id": ident, "title": ev.get("summary", ""), "nonce": nonce}
             elif entry.get("cal") == "family":
-                found, _ = self._read("family", [day - timedelta(days=1), day, day + timedelta(days=1)], fresh=True)
+                found, _ = self._read("family", days, fresh=True)
                 for f in found:
                     href = getattr(f.raw, "href", "")
                     if not href:
@@ -3284,7 +3460,7 @@ class CalendarChange:
                 # with the step's nonce and its day, so it's found by that exact nonce if not by its id.
                 c = (rec.get("spec") or {}).get("c") or {}
                 self._note_created(plan["smoke"], {**entry, "nonce": c.get("smoke_nonce", ""),
-                                                   "day": str(c.get("start") or c.get("dates") or "")[:10]}, db)
+                                                   **self._smoke_days(c)}, db)
 
     def _bounded(self, calendar: str, call, *args):
         """One write to Google or iCloud, given write_timeout_s (30 seconds, well under the lease)
@@ -3371,9 +3547,9 @@ class CalendarChange:
             return card
         printed = same is not None and bool(bound) and all(b.get("print") for b in bound)
         fields_same = printed and all(same(b) for b in bound)
-        if card == fresh and (not printed or fields_same):
+        if _etag_same(card, fresh) and (not printed or fields_same):
             return fresh
-        if card != fresh and shared and fields_same:
+        if not _etag_same(card, fresh) and shared and fields_same:
             log.info("%s event's version moved on since its card, and every field the card bound reads the "
                      "same: guarded by the version just read", calendar)
             return fresh
@@ -4150,6 +4326,17 @@ class CalendarChange:
                 buttons, binds = (buttons or [[]]), (binds or [])
                 buttons = [buttons[0] + more[0]]
                 binds = binds + more_binds
+            try:
+                cals = self.providers_of(json.loads(p["params_json"]))
+            except (ValueError, KeyError, TypeError):
+                cals = []
+            unprot = [x for x in cals if self._unprotected(x)]
+            if unprot:
+                # Eleventh round: every receipt on a calendar opened without protection says so.
+                lines.append("<i>Unprotected: " + " and ".join(provider_name(x) for x in unprot) + " was changed "
+                             "without the calendar's version check, as you chose; it was read and compared just "
+                             "before writing, but an edit made elsewhere in that moment could have been "
+                             "overwritten.</i>")
             self._say(db, self.chat_id, p["job_id"], "\n".join(lines), buttons=buttons, binds=binds)
             if weak:
                 self._weak_fence(db, weak)
@@ -5460,7 +5647,28 @@ class CalendarChange:
             raise Stopped("failed", out.status, "iCloud gave no version of that event to guard the change")
         return FamilyRead(href, body, out.etag)
 
-    def _guard_for(self, read: "FamilyRead") -> str:
+    def _unprotected(self, provider: str) -> bool:
+        """Eleventh round: he opened this calendar without protection (Open without protection)."""
+        return bool(((card_gate(self.ledger).get("override") or {}).get(provider) or {}).get("unprotected"))
+
+    def _send_guard(self, calendar: str, guard: str | None) -> str | None:
+        """The If-Match actually sent (eleventh round). Sent only when the calendar gave a strong version:
+        a weak one never matches under If-Match's strong comparison, so where only a weak one exists, and on
+        a calendar he opened without protection, the fence is a read-compare-write: the read just before the
+        write was compared with the card (_card_etag, weakly), the compare is logged, and the write goes with
+        no If-Match (None)."""
+        unprotected = self._unprotected(calendar)
+        if not guard or not (unprotected or _weak(guard)):
+            return guard
+        log.info("%s: read-compare-write (%s): the read just before the write gave version %s and was compared "
+                 "with the card's; sent without If-Match", calendar,
+                 "opened without protection" if unprotected else "it gives only a weak version", guard)
+        rec = self._recording
+        if rec is not None:
+            rec[2].update(rcw=True, compared=guard, unprotected=unprotected)
+        return None
+
+    def _guard_for(self, read: "FamilyRead") -> str | None:
         """The If-Match a move or removal on Family sends (_card_etag): always the version of the read the
         write's body was built from (seventh round), or nothing is sent (eighth round: the event changed
         since the card, so the stale path instead)."""
@@ -5492,7 +5700,7 @@ class CalendarChange:
         guard = self._card_etag("family", ident, read.etag, same, self._shared("family", body))
         if guard != read.etag:
             raise Stopped("failed", words="the write's version didn't come from the read it was built from")
-        return guard
+        return self._send_guard("family", guard)
 
     def _occurrences(self, ics: str, start: datetime, end: datetime) -> list[ical.Occurrence]:
         return ical.window(ics, start=start, end=end, tz=self.tz, fallback_name="Family").occurrences
@@ -5553,8 +5761,9 @@ class CalendarChange:
         if back.kind != "ok":
             raise Stopped("unknown", back.status, undo=entry)
         entry["etag"] = back.etag or entry["etag"]
-        if etag and back.etag and back.etag == etag and body != before:
-            self._version_unmoved("family")
+        if etag and back.etag and back.etag == etag and _ics_content(body) != _ics_content(before):
+            # Eleventh round: only changed content under the same version; a no-op write keeping it never.
+            self._version_unmoved("family", self._write_words(entry, title))
         entry["after"] = body or new        # as the server keeps it, so a later undo can match it
         try:
             shows = self._family_shows(check, body)
@@ -5705,11 +5914,33 @@ class CalendarChange:
         if kind != "ok":
             raise Stopped("unknown", undo=entry)
         entry["etag"] = now.get("etag")
-        if entry.get("how") == "change" and entry.get("was") and now.get("etag") == entry["was"]:
-            self._version_unmoved("gmail")
+        if entry.get("how") == "change" and entry.get("was") and now.get("etag") == entry["was"] \
+                and self._gmail_content_moved(entry, now):
+            # Eleventh round: only a write whose read back shows changed content under the same version.
+            self._version_unmoved("gmail", self._write_words(entry, now.get("summary", "")))
         if not self._gmail_shows(entry["check"], now):
             raise Stopped("unknown", undo=entry)
         return entry
+
+    def _gmail_content_moved(self, entry: dict, now: dict) -> bool:
+        """Whether a write's read back shows its fields changed from what they were before it (eleventh
+        round): a write that left the event as it was may rightly keep its version."""
+        old = entry.get("fields") or {}
+        for key in (entry.get("wrote") or {}):
+            was, got = old.get(key), now.get(key)
+            if key in ("start", "end"):
+                if not _same_start(self._gmail_when(was), self._gmail_when(got)):
+                    return True
+            elif (was or None) != (got or None):
+                return True
+        return False
+
+    def _write_words(self, entry: dict, title: str = "") -> str:
+        """The write, named for his message: what it did and to which event."""
+        kind = (entry.get("check") or {}).get("kind", "")
+        what = {"starts": "the move", "rrule": "the end of the series", "ends": "the end of the series",
+                "days_off": "the removal of a day", "there": "the add"}.get(kind, "the change")
+        return f"{what} of \u201c{_safe(title)}\u201d" if title else what
 
     def _gmail_send(self, out, entry: dict) -> None:
         """A write's answer: "no" means it never landed; a lost one leaves it to a read."""
@@ -5756,8 +5987,8 @@ class CalendarChange:
 
     def _gmail_guard(self, e: dict) -> str:
         """The If-Match for a Gmail move or removal of `e`, the event as just read (_card_etag)."""
-        return self._card_etag("gmail", e["id"], e.get("etag") or "", self._gmail_same(e),
-                               self._shared("gmail", e)) or e.get("etag")
+        return self._send_guard("gmail", self._card_etag("gmail", e["id"], e.get("etag") or "", self._gmail_same(e),
+                                                         self._shared("gmail", e)) or e.get("etag"))
 
     def _gmail_drop(self, address: str, e: dict) -> dict:
         entry = {"cal": "gmail", "how": "restore", "id": e["id"], "was": e.get("etag"),
@@ -5822,7 +6053,8 @@ class CalendarChange:
                      "wrote": {"recurrence": after}, "was": master.get("etag"),
                      "check": {"kind": "rrule", "value": after}}
             self._attempt(entry)
-            self._gmail_send(self._bounded("gmail", self.google.change, address, series, {"recurrence": after}, master.get("etag")), entry)
+            self._gmail_send(self._bounded("gmail", self.google.change, address, series, {"recurrence": after},
+                                           self._send_guard("gmail", master.get("etag"))), entry)
             return self._gmail_reread(address, series, entry)
         return Step(f"Gmail: {_safe(f.title)} ends, with nothing on or after {_day_words(day)}.", run,
                     [("gmail", series, "*", f.title, day)], what="Gmail",
@@ -6815,9 +7047,10 @@ class CalendarChange:
         if not self._undo_attempt(step):
             return "not_landed"
         if step["how"] == "delete":
-            kind = self._bounded("family", self.client.remove_at, href, out.etag or "").kind
+            kind = self._bounded("family", self.client.remove_at, href, self._send_guard("family", out.etag or "")).kind
             return "ok" if kind == "gone" else kind
-        return self._after_undo(self._bounded("family", self.client.replace, href, out.etag or "", step["before"]), href, latest)
+        return self._after_undo(self._bounded("family", self.client.replace, href,
+                                              self._send_guard("family", out.etag or ""), step["before"]), href, latest)
 
     def _after_undo(self, out, href: str, latest: dict[str, str]) -> str:
         if out.kind == "ok":
@@ -6874,8 +7107,9 @@ class CalendarChange:
                 return "changed"
             if not self._undo_attempt(step):
                 return "not_landed"
-            out = (self._bounded("gmail", self.google.drop, address, uid, cur.get("etag")) if step["how"] == "drop"
-                   else self._bounded("gmail", self.google.change, address, uid, step["fields"], cur.get("etag")))
+            guard = self._send_guard("gmail", cur.get("etag"))
+            out = (self._bounded("gmail", self.google.drop, address, uid, guard) if step["how"] == "drop"
+                   else self._bounded("gmail", self.google.change, address, uid, step["fields"], guard))
         if out.kind == "ok":
             latest[uid] = (self.google.look(address, uid)[1] or {}).get("etag") or ""
         return out.kind

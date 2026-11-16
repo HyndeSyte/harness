@@ -734,7 +734,7 @@ def test_a_listing_lag_past_an_hour_is_refused(m):
 # -- 7. etags byte for byte, a cancelled event is gone, and the If-Match is logged -------------------------
 
 @pytest.mark.card_only
-def test_an_icloud_weak_etag_is_kept_and_sent_byte_for_byte(m, caplog):
+def test_an_icloud_weak_etag_is_kept_byte_for_byte_and_never_sent_as_if_match(m, caplog):
     import logging
     caplog.set_level(logging.INFO, logger="harness.calendar_change")
     m.icloud._etag = lambda ics, n=iter(range(1, 99)): f'W/"weak-{next(n)}"'
@@ -744,12 +744,15 @@ def test_an_icloud_weak_etag_is_kept_and_sent_byte_for_byte(m, caplog):
     assert [b["etag"] for b in m.cc.bound_of(pid)["bound"]] == [weak]
     m.tap("Approve")
     sent = [h.get("If-Match") for meth, path, h, _ in m.icloud.log if meth == "DELETE" and path == SWIM_PATH]
-    assert sent == [weak] and swim_at(m) is None
-    assert f"family removal sent with If-Match {weak}: answered ok" in caplog.text
+    # Eleventh round: a weak version never matches under If-Match, so the write is a read-compare-write.
+    assert sent == [None] and swim_at(m) is None
+    assert f"read-compare-write (it gives only a weak version): the read just before the write gave version {weak}" \
+        in caplog.text
+    assert "family removal sent with If-Match (none): answered ok" in caplog.text
 
 
 @pytest.mark.card_only
-def test_a_google_etag_is_sent_as_given_and_the_answer_is_logged(m, monkeypatch, caplog):
+def test_a_google_weak_etag_is_compared_not_sent_and_the_answer_is_logged(m, monkeypatch, caplog):
     import logging
     caplog.set_level(logging.INFO, logger="harness.calendar_change")
     seed_haircut(m)
@@ -759,8 +762,10 @@ def test_a_google_etag_is_sent_as_given_and_the_answer_is_logged(m, monkeypatch,
     monkeypatch.setattr(m.gmail, "change", lambda a, uid, f, etag: sent.append(etag) or real(a, uid, f, etag))
     card_for(m, "haircut moved to 10:30 today", ask(MOVE_HAIRCUT))
     m.tap("Approve")
-    assert sent == ['W/"MTcz"'] and haircut_at(m) == "10:30"
-    assert 'gmail move sent with If-Match W/"MTcz": answered ok' in caplog.text
+    assert sent == [None] and haircut_at(m) == "10:30"
+    assert 'read-compare-write (it gives only a weak version): the read just before the write gave version W/"MTcz"' \
+        in caplog.text
+    assert "gmail move sent with If-Match (none): answered ok" in caplog.text
 
 
 @pytest.mark.card_only

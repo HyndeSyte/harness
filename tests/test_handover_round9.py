@@ -233,15 +233,15 @@ def test_a_calendar_that_ignores_if_match_never_opens_and_he_is_told(m, monkeypa
     assert sent and all(any(o in str(x) for o in own) for x in sent)
     assert HAIRCUT not in " ".join(map(str, sent)) and haircut_at(m) == "10:00"
     name = "Gmail" if calendar == "gmail" else "Family"
-    told = [t for t in m.seen() if t.startswith(f"{name} doesn't protect against edits made at the same time.")]
-    assert len(told) == 1 and "may then overwrite changes made elsewhere" in told[0]
+    told = [t for t in m.seen() if t.startswith(f"Harness can't change {name} safely.")]     # eleventh round
+    assert len(told) == 1 and "could be overwritten" in told[0] and "by hand in the calendar app" in told[0]
     _, missing, _ = m.cc.smoke_evidence(run)
     assert any(x.startswith(f"{calendar}.conformance: the calendar accepted a write sent with an out of date version")
                for x in missing)
-    m.tap("Open cards without the check")
+    m.tap("Open without protection")
     assert calendar not in calendar_change.closed_providers(m.ledger)
     said = m.seen()[-1]
-    assert "edits there may overwrite changes made elsewhere" in said
+    assert "open without protection" in said and "Unprotected" in said
 
 
 @pytest.mark.card_only
@@ -251,7 +251,8 @@ def test_keeper_gate_open_on_a_calendar_that_ignores_if_match_says_what_it_risks
     _gmail_takes_any_if_match(m, monkeypatch)
     m.send(Handover(kind="fastpath", state="smoke-step", run=run, step="conformance-gmail"))
     out = m.send(Handover(kind="fastpath", state="gate-open", calendar="gmail"))
-    assert "edits there may overwrite changes made elsewhere" in out["said"]
+    # Eleventh round: Open without protection is his tap alone; Cain's gate-open sends him the card again.
+    assert "his call" in out["said"] and "gmail" in calendar_change.closed_providers(m.ledger)
 
 
 # -- 3. refusals on unchanged events after an override ------------------------------------------------------------
