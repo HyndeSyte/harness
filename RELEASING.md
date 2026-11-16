@@ -44,7 +44,14 @@ card is refused, and a landing refused or held, unless every run of it GitHub li
 that exact head commit passed, in whatever order ("CI is still running pcjobs-windows on
 it" waits; a failed, cancelled or skipped attempt refuses even beside a green re-run, so a
 flaky Windows run needs a new commit; a run for another commit doesn't count, and none at
-all refuses; GitHub not answering holds).
+all refuses; GitHub not answering holds). It reads every run and every attempt: the head's
+check runs of that name with every attempt listed, and GitHub Actions' workflow runs for the
+head with each attempt's jobs, each listing followed page by page until it is whole; a page
+that fails or a listing that isn't whole holds. `/opt/cain/keeper.sh ship-gate <full head
+sha>` on the Pi reads that gate for a head without acting and prints what it would decide and
+why, the workflow file it read and every attempt it saw (`--watch` keeps watching a fresh
+head until its Windows run is done: the PC probe's `ship_gate` step). Run it once on a head
+with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.

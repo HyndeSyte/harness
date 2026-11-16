@@ -3,14 +3,15 @@
 // link (link/core.ts reuseProof) finds that message is his recorded "Use it" tap on an ask
 // that quoted exactly those values when posted. A reply he typed never counts. The keeper
 // (pcjobs/main.ts check) refuses the job otherwise, fail closed, and one tap answers for one
-// job across restarts (main.ts usedReuse).
+// job across restarts and crashes (main.ts usedReuse: written as pending before the push,
+// finalised after, settled from the queue at the start of each round).
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { check, readJobs, recordReuse, reuseAnswer, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { check, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
 import { askValues } from "../rootfs/opt/cain/link/core";
 
@@ -210,7 +211,7 @@ describe("the keeper: owner_reuse is taken only with the link's proof", () => {
     // The tap: accepted once.
     const first = check({ ...cfg, verifyReuse: viaLink(seen) }, ask({ ...carry, owner_reuse: reuse({ message_id: id }) }), jobs, T0) as { job: Job };
     expect(first.job.owner_reuse?.message_id).toBe(id);
-    recordReuse(cfg, id, first.job.id);                                          // round() records it once the job is pushed
+    recordReuse(cfg, id, first.job.id);                                          // round() writes it (pending before the push, final after)
     // A keeper restart: a fresh copy of the queue without that job file, the same used-tap file. The tap stays spent.
     const fresh = queue();
     const restarted: Config = { ...fresh.cfg, used: cfg.used };
@@ -291,4 +292,96 @@ describe("the keeper asks the link over its local API", () => {
     } finally { server.stop(true); }
     expect(await run(join(dir, ".env"), url, id, [VALUE])).toEqual({ ok: false, why: "the link didn't answer" });
   }, 30_000);
+});
+
+describe("seventeenth review: the used-tap store is written before the push, finalised after, and settled at start", () => {
+  const WIN = process.platform === "win32";
+  const git = (args: string[], cwd: string) => { const p = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" }); if (p.exitCode !== 0) throw new Error(p.stderr.toString()); return p.stdout.toString(); };
+  // A real queue: a bare repository, the keeper's copy, its request folder and its used-tap file.
+  const world = () => {
+    const root = mkdtempSync(join(tmpdir(), "pcjobs-tap-"));
+    const remote = join(root, "pc-jobs.git");
+    git(["init", "--quiet", "--bare", "-b", "main", remote], root);
+    const used = join(root, "state", "reuse-used.jsonl");
+    const cfg = (copy: string, over: Partial<Config> = {}): Config => ({ remote, dir: join(root, copy), queue: join(root, "queue"), outcomes: join(root, "outcomes"),
+      branch: "main", pub: "", now: () => T0, used, verifyReuse: yes, ...over });
+    mkdirSync(join(root, "queue"), { recursive: true });
+    let n = 0;
+    const request = (job: any) => { const rid = `pc-${String(++n).padStart(4, "0")}`; writeFileSync(join(root, "queue", `${rid}.json`), ask(job)); return rid; };
+    const outcome = (rid: string) => { try { return JSON.parse(readFileSync(join(root, "outcomes", `${rid}.json`), "utf8")); } catch { return null; } };
+    const remoteJobs = () => { const c = join(root, `look-${++n}`); git(["clone", "--quiet", remote, c], root); return readJobs(c); };
+    return { root, remote, used, cfg, request, outcome, remoteJobs };
+  };
+
+  test("the keeper killed between the push and the finalise: on restart the tap is settled from the queue, and replaying it is refused", () => {
+    const w = world();
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    // The push goes through; the keeper dies before it can finalise the tap.
+    expect(round(w.cfg("pi-1", { afterPush: () => { throw new Error("killed"); } })).ok).toBe(false);
+    const [pushed] = w.remoteJobs();
+    expect(pushed.owner_reuse?.message_id).toBe(MSG);
+    // On disk before the push: pending, with its job and request.
+    expect(reuseLedger({ used: w.used }).get(MSG)).toEqual({ m: MSG, job: pushed.id, state: "pending", rid });
+    expect(usedReuse({ used: w.used }).get(MSG)).toBe(pushed.id);                 // a pending tap is spent already
+    expect(w.outcome(rid)).toBeNull();                                            // its request never heard back
+    // Restart: a fresh copy of the queue. The round settles the pending tap from the queue first: finalised, and the request told.
+    const again = w.cfg("pi-2");
+    expect(round(again)).toMatchObject({ ok: true });
+    expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject({ job: pushed.id, state: "final" });
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: pushed.id });
+    expect(existsSync(join(w.root, "queue", `${rid}.json`))).toBe(false);
+    // Replay the tap for another job: refused, by the queue and by the store alone.
+    const replay = w.request({ ...READ, start_url: "https://example.com/account/settings", owner_reuse: reuse() });
+    expect(round(again)).toMatchObject({ ok: true, refused: 1, queued: 0 });
+    expect(w.outcome(replay)).toEqual({ request: replay, state: "refused", reason: `owner_reuse refused: that tap of his already answered for ${pushed.id}; ask him again for this job` });
+    expect(check(again, ask({ ...READ, owner_reuse: reuse() }), [], T0)).toEqual({ why: `owner_reuse refused: that tap of his already answered for ${pushed.id}; ask him again for this job` });
+    expect(w.remoteJobs().length).toBe(1);
+  });
+
+  test("a push that never went through: the pending tap is rolled back at the next round, and the waiting request is queued afresh", () => {
+    if (WIN) return;                                                               // the refusing hook below is a shell script
+    const w = world();
+    // The first round makes the branch, so the hook below only refuses the next push.
+    w.request({ ...READ });
+    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
+    const hook = join(w.remote, "hooks", "pre-receive");
+    writeFileSync(hook, "#!/bin/sh\nexit 1\n"); chmodSync(hook, 0o755);
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    expect(round(w.cfg("pi-1")).ok).toBe(false);
+    const pending = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(pending).toMatchObject({ state: "pending", rid });
+    expect(w.remoteJobs().some((j) => j.id === pending.job)).toBe(false);
+    // GitHub takes pushes again: the next round rolls the tap back first, then checks the request afresh.
+    rmSync(hook);
+    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
+    const now = reuseLedger({ used: w.used }).get(MSG)!;
+    expect(now.state).toBe("final");
+    expect(now.job).not.toBe(pending.job);
+    expect(readFileSync(w.used, "utf8").trim().split("\n").map((l) => JSON.parse(l).state)).toEqual(["pending", "rolled_back", "pending", "final"]);
+    expect(w.outcome(rid)).toEqual({ request: rid, state: "queued", id: now.job });
+    expect(w.remoteJobs().filter((j) => j.owner_reuse?.message_id === MSG).map((j) => j.id)).toEqual([now.job]);
+  });
+
+  test("a tap that can't be written before the push stops the round: nothing is pushed", () => {
+    if (WIN) return;
+    const w = world();
+    w.request({ ...READ });
+    expect(round(w.cfg("pi-1"))).toMatchObject({ ok: true, queued: 1 });
+    mkdirSync(w.used, { recursive: true });                                       // the file can't be opened for appending
+    const rid = w.request({ ...READ, owner_reuse: reuse() });
+    expect(round(w.cfg("pi-1")).ok).toBe(false);
+    expect(w.remoteJobs().some((j) => j.owner_reuse)).toBe(false);
+    expect(w.outcome(rid)).toBeNull();
+  });
+
+  test("lines from before this round (no state) are final; a rolled-back tap is free again; reconcile reads the queue, never the request", () => {
+    const { cfg } = queue();
+    mkdirSync(join(cfg.dir, "state"), { recursive: true });
+    writeFileSync(cfg.used!, JSON.stringify({ m: MSG, job: "j-20261115-aaaaaa" }) + "\n");
+    expect(reuseLedger(cfg).get(MSG)).toMatchObject({ state: "final" });
+    recordReuse(cfg, "123456789012345678", "j-20261115-bbbbbb", "pending");
+    expect(reconcileReuse(cfg, [])).toEqual({ finalised: [], rolledBack: ["j-20261115-bbbbbb"] });
+    expect(usedReuse(cfg).has("123456789012345678")).toBe(false);
+    expect(usedReuse(cfg).get(MSG)).toBe("j-20261115-aaaaaa");
+  });
 });

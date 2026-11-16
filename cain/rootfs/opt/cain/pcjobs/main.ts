@@ -21,7 +21,7 @@
 //   bun main.ts list            the PC worker's last heartbeat, then one line per job, newest first
 //   bun main.ts result <id>     a job's result, checked, as fixed lines (each fact a quoted string, labelled untrusted)
 //   bun main.ts worker          the PC worker's last heartbeat
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHmac } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
@@ -34,6 +34,7 @@ export type Config = {
   discordEnv?: string;           // the bot token's file, for the link's key (the token itself is never kept or printed)
   verifyReuse?: ReuseCheck;      // the tests' stand-in for the link
   used?: string;                 // the append-only file of the owner-reuse taps already spent (default /data/pc-jobs-reuse-used.jsonl)
+  afterPush?: () => void;        // the tests' stand-in for the keeper being killed between the push and the finalise
 };
 
 // ---- His yes to reusing a reported value, checked by the link ----------------------
@@ -76,26 +77,76 @@ export function linkReuse(cfg: Pick<Config, "link" | "discordEnv">): ReuseCheck 
   };
 }
 
-// ---- The taps already spent on a reuse: an append-only file -------------------------------
-// One "Use it" tap answers for one job. The keeper records each tap it accepted, with its job,
-// one JSON line each, in a file of its own outside the queue copy (which is rebuilt from
-// GitHub), only ever appended to, so a keeper restart, a queue copy made afresh or a job file
-// gone from the queue doesn't free a tap for a second job. The queue's own job files are read
-// too (check, below), which covers a crash between the push and the line.
+// ---- The taps already spent on a reuse: an append-only file, written before the push ---------
+// One "Use it" tap answers for one job. The keeper keeps every tap it accepted in a file of its
+// own outside the queue copy (which is rebuilt from GitHub), one JSON line each, only ever
+// appended to and flushed to disk (fsync) line by line, so a keeper restart, a queue copy made
+// afresh or a crash at any point doesn't free a tap for a second job (0.12.0, seventeenth round):
+//   1. before the job is pushed, the tap goes in as pending, with its job id and request id;
+//      a tap that can't be written so stops the round: nothing is pushed;
+//   2. the job is pushed;
+//   3. the tap is finalised (final).
+// A pending tap counts as spent. At the start of each round, once the queue copy is brought up
+// to date from GitHub (sync), every pending tap is reconciled against the queue: its job there
+// (the push went through, whatever the keeper saw) finalises it, and its request, if still
+// waiting, gets its "queued" outcome; its job not there (the push never went through) rolls it
+// back, and the request, still waiting, is checked afresh. The keeper deletes no job file, so no
+// keep-list can drop a job whose tap isn't final in this file and so let it roll back.
+// A line without a state (written before 0.12.0's seventeenth round) is final.
 export const USED_REUSE = "/data/pc-jobs-reuse-used.jsonl";
-export function usedReuse(cfg: Pick<Config, "used">): Map<string, string> {
-  const out = new Map<string, string>();
+export type ReuseState = "pending" | "final" | "rolled_back";
+export interface ReuseLine { m: string; job: string; state: ReuseState; rid?: string }
+// Every tap's latest line, by message id.
+export function reuseLedger(cfg: Pick<Config, "used">): Map<string, ReuseLine> {
+  const out = new Map<string, ReuseLine>();
   let text = "";
   try { text = readFileSync(cfg.used ?? USED_REUSE, "utf8"); } catch { return out; }
   for (const l of text.split("\n")) {
-    try { const o = JSON.parse(l); if (typeof o?.m === "string" && typeof o?.job === "string" && !out.has(o.m)) out.set(o.m, o.job); } catch { /* a torn line */ }
+    try {
+      const o = JSON.parse(l);
+      if (typeof o?.m !== "string" || typeof o?.job !== "string") continue;
+      const state: ReuseState = o.state === undefined ? "final" : o.state;
+      if (!["pending", "final", "rolled_back"].includes(state)) continue;
+      out.set(o.m, { m: o.m, job: o.job, state, ...(typeof o.rid === "string" ? { rid: o.rid } : {}) });
+    } catch { /* a torn line */ }
   }
   return out;
 }
-export function recordReuse(cfg: Pick<Config, "used">, m: string, job: string): void {
+// The taps spent (pending or final), with the job each answered for.
+export function usedReuse(cfg: Pick<Config, "used">): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [m, l] of reuseLedger(cfg)) if (l.state !== "rolled_back") out.set(m, l.job);
+  return out;
+}
+// One line, appended and flushed to disk before it returns; it throws when it can't be.
+export function recordReuse(cfg: Pick<Config, "used">, m: string, job: string, state: ReuseState = "final", rid?: string): void {
   const f = cfg.used ?? USED_REUSE;
+  const fresh = !existsSync(f);
   mkdirSync(dirname(f), { recursive: true });
-  appendFileSync(f, JSON.stringify({ m, job }) + "\n");
+  const fd = openSync(f, "a");
+  try { writeSync(fd, JSON.stringify({ m, job, state, ...(rid ? { rid } : {}) }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+  if (fresh) { try { const d = openSync(dirname(f), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* not every system syncs a folder */ } }
+}
+// Step 0 of a round, after sync: every pending tap settled against the queue as GitHub has it.
+export function reconcileReuse(cfg: Config, jobs: Job[]): { finalised: string[]; rolledBack: string[] } {
+  const finalised: string[] = [], rolledBack: string[] = [];
+  for (const l of reuseLedger(cfg).values()) {
+    if (l.state !== "pending") continue;
+    if (jobs.some((j) => j.id === l.job && j.owner_reuse?.message_id === l.m)) {
+      recordReuse(cfg, l.m, l.job, "final", l.rid);
+      finalised.push(l.job);
+      if (l.rid && RID.test(l.rid) && existsSync(join(cfg.queue, `${l.rid}.json`))) {
+        writeOutcome(cfg, { request: l.rid, state: "queued", id: l.job });
+        rmSync(join(cfg.queue, `${l.rid}.json`), { force: true });
+      }
+      log(`settled the reuse tap for ${l.job}: the job is in the queue`);
+    } else {
+      recordReuse(cfg, l.m, l.job, "rolled_back", l.rid);
+      rolledBack.push(l.job);
+      log(`rolled back the reuse tap for ${l.job}: the job never reached the queue`);
+    }
+  }
+  return { finalised, rolledBack };
 }
 
 const KEEPER = "Cain's PC job keeper";
@@ -298,6 +349,8 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
       git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
       for (const o of over) log(`closed ${o.job.id}: ${o.result.code}`);
     }
+    // Every reuse tap left pending by a round that didn't finish, settled against the queue as GitHub has it.
+    reconcileReuse(cfg, readJobs(cfg.dir));
     if (!names.length) return { ok: true, queued: 0, refused: 0 };
     const jobs = readJobs(cfg.dir);
     const made: { rid: string; file: string; job?: Job; cancel?: string }[] = [];
@@ -338,12 +391,15 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     }
     const what = made.map((m) => m.job ? `${m.job.step} ${m.job.action} on ${m.job.site}` : `cancel ${m.cancel}`).join("; ");
     git(cfg, ["commit", "--quiet", "-m", `Cain: ${what}`.slice(0, 200)]);
+    // Each reuse tap spent before the push, flushed to disk (a failure here stops the round: nothing is pushed).
+    for (const m of made) if (m.job?.owner_reuse) recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id, "pending", m.rid);
     git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
+    cfg.afterPush?.();
     for (const m of made) {
       if (m.job) {
         if (m.job.owner_reuse) {
-          try { recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id); }
-          catch (e) { log(`couldn't record the reuse tap for ${m.job.id} (the queue's job file still holds it): ${(e as Error).message}`); }
+          try { recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id, "final", m.rid); }
+          catch (e) { log(`couldn't finalise the reuse tap for ${m.job.id} (it stays pending, so still spent; the next round settles it): ${(e as Error).message}`); }
         }
         writeOutcome(cfg, { request: m.rid, state: "queued", id: m.job.id });
         log(`queued ${m.job.id} (${m.job.step} ${m.job.action} on ${m.job.site})`);

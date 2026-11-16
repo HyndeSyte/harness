@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, bumpsAt, checkRuns, facts, headChecks, inMain, judgeChecks, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
@@ -52,6 +52,8 @@ function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; 
         const mine = name ? runs.filter((r: any) => r?.name === name) : runs;
         return { status: 200, body: { total_count: mine.length, check_runs: mine } };
       }
+      // GitHub Actions' workflow runs for the head: none listed here (the check runs carry every attempt).
+      if (path.startsWith(`/repos/${REPO}/actions/runs?head_sha=${H1}`)) return { status: 200, body: { total_count: 0, workflow_runs: [] } };
       return { status: 404, body: null };
     },
     git: async (args, o) => {
@@ -170,7 +172,7 @@ describe("landing his Ship tap", () => {
     const req = ["pytest", "bun", "pr"].map((n) => run(n));
     expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pcjobs-windows: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: true });
     expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pytest: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: false });
-    expect(await headChecks(gh({ runs: [...req, run("pcjobs-windows")] }).d, REPO, H1)).toEqual({ runs: [...req, run("pcjobs-windows")], windows: true });
+    expect(await headChecks(gh({ runs: [...req, run("pcjobs-windows")] }).d, REPO, H1)).toEqual({ runs: [...req, { ...run("pcjobs-windows"), via: ["check_runs"] }], windows: true });
     expect(await headChecks(gh({ runs: req, yml: 0 }).d, REPO, H1)).toBeNull();
     expect(await headChecks(gh({ runs: req }).d, REPO, H2)).toBe("missing");
   });
@@ -310,7 +312,7 @@ describe("landing, with real git", () => {
           const name = new URL(`http://x${path}`).searchParams.get("check_name");
           const mine = runs.filter((r) => r.name === name);
           return { status: 200, body: { total_count: mine.length, check_runs: mine } };
-        })() : { status: 404, body: null },
+        })() : path.includes("/actions/runs?") ? { status: 200, body: { total_count: 0, workflow_runs: [] } } : { status: 404, body: null },
       git: async (args) => {
         const p = Bun.spawn(["git", "-C", link, ...args], { stdout: "pipe", stderr: "pipe", env });
         const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
@@ -532,5 +534,126 @@ describe("review fixes (Fable, Nov 13)", () => {
     const missing = gh();
     missing.d.api = async () => ({ status: 404, body: { message: "Not Found" } });
     expect(await land(missing.d, L)).toEqual({ ok: false, why: "GitHub has no such pull request", again: false });
+  });
+});
+
+describe("seventeenth review: the Windows gate reads every run and every attempt, page by page, and can be read without acting", () => {
+  const YML = "jobs:\n  pytest: {}\n  bun: {}\n  pcjobs-windows:\n    runs-on: windows-latest\n";
+  const ok = (name: string, id: number) => ({ id, name, status: "completed", conclusion: "success", head_sha: H1, app: { id: ACTIONS_APP } });
+  const win = (id: number, conclusion: string | null, status = "completed") => ({ id, name: "pcjobs-windows", status, conclusion, head_sha: H1, app: { id: ACTIONS_APP } });
+  const job = (id: number, conclusion: string | null, status = "completed", name = "pcjobs-windows") => ({ id, name, status, conclusion, head_sha: H1 });
+  // A fake GitHub: the required checks, pcjobs-windows's check runs (each page's list given), the
+  // workflow runs for the head, and each run attempt's jobs (each page's list given). A page given as
+  // a number is that HTTP status instead.
+  type Page = any[] | number;
+  const fake = (o: { checkPages?: Page[]; checkTotal?: number; runs?: any[]; jobs?: Record<string, Page[]>; jobTotal?: Record<string, number>; yml?: string; seen?: string[] }) => ({
+    api: async (path: string) => {
+      o.seen?.push(path);
+      const u = new URL(`http://x${path}`);
+      const page = Number(u.searchParams.get("page") ?? 1);
+      if (path.startsWith(`/repos/${REPO}/contents/.github/workflows/tests.yml?ref=${H1}`))
+        return { status: 200, body: { encoding: "base64", content: Buffer.from(o.yml ?? YML).toString("base64") } };
+      if (path.startsWith(`/repos/${REPO}/commits/${H1}/check-runs`)) {
+        const name = u.searchParams.get("check_name")!;
+        if (name !== "pcjobs-windows") return { status: 200, body: { total_count: 1, check_runs: [ok(name, { pytest: 1, bun: 2, pr: 3 }[name] ?? 9)] } };
+        expect(u.searchParams.get("filter")).toBe("all");
+        const pages = o.checkPages ?? [[]];
+        const p = pages[page - 1];
+        if (typeof p === "number") return { status: p, body: { message: "Server Error" } };
+        return { status: 200, body: { total_count: o.checkTotal ?? pages.reduce((n: number, x) => n + (Array.isArray(x) ? x.length : 0), 0), check_runs: p ?? [] } };
+      }
+      if (path.startsWith(`/repos/${REPO}/actions/runs?head_sha=${H1}`)) return { status: 200, body: { total_count: (o.runs ?? []).length, workflow_runs: o.runs ?? [] } };
+      const m = /^\/repos\/[^/]+\/[^/]+\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs/.exec(path);
+      if (m) {
+        const key = `${m[1]}/${m[2]}`;
+        const pages = o.jobs?.[key] ?? [[]];
+        const p = pages[page - 1];
+        if (typeof p === "number") return { status: p, body: { message: "Server Error" } };
+        return { status: 200, body: { total_count: o.jobTotal?.[key] ?? pages.reduce((n: number, x) => n + (Array.isArray(x) ? x.length : 0), 0), jobs: p ?? [] } };
+      }
+      return { status: 404, body: null };
+    },
+  });
+  const filler = (n: number, from: number) => Array.from({ length: n }, (_, i) => job(from + i, "success", "completed", `other-${from + i}`));
+
+  test("a failed attempt on the second page of the check runs refuses, beside a green re-run on the first", async () => {
+    const d = fake({ checkPages: [[...Array.from({ length: 99 }, (_, i) => win(1000 + i, "success")), win(2000, "success")], [win(5, "failure")]] });
+    const a = await windowsAttempts(d, REPO, H1);
+    expect(Array.isArray(a) ? a.length : a).toBe(101);
+    const r = await gateReport(d, REPO, H1);
+    expect(r).toMatchObject({ decision: "refuse", windows: "failed", why: "CI's pcjobs-windows check didn't pass on it (failure)" });
+    expect(await land(gh({ runs: [] }).d, L)).toMatchObject({ ok: false });   // the plain fake still lands nothing without runs
+  });
+
+  test("a failed earlier attempt seen only in the per-attempt jobs refuses, even when the check runs list only the green re-run", async () => {
+    // Run 77 was run twice: attempt 1 failed, attempt 2 passed. The check runs list only the green one.
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 2, path: ".github/workflows/tests.yml" }];
+    // Attempt 1's jobs come over two pages, the Windows job on the second.
+    const seen: string[] = [];
+    const d = fake({ checkPages: [[win(902, "success")]], runs, seen, jobs: { "77/1": [filler(100, 1), [job(901, "failure")]], "77/2": [[job(902, "success")]] } });
+    const r = await gateReport(d, REPO, H1);
+    expect(r).toMatchObject({ decision: "refuse", windows: "failed" });
+    expect(r.attempts.map((a) => [a.id, a.conclusion]).sort()).toEqual([[901, "failure"], [902, "success"]]);
+    expect(r.attempts.find((a) => a.id === 902)!.via).toEqual(["check_runs", "run 77 attempt 2"]);
+    expect(seen).toContain(`/repos/${REPO}/actions/runs/77/attempts/1/jobs?per_page=100&page=2`);
+    // The same with every attempt green: accepted.
+    const g = fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [filler(100, 1), [job(901, "success")]], "77/2": [[job(902, "success")]] } });
+    expect(await gateReport(g, REPO, H1)).toMatchObject({ decision: "accept", windows: "passed", workflow: { file: ".github/workflows/tests.yml", read: "named" } });
+  });
+
+  test("a page that fails, or a listing that isn't whole, holds: nothing is judged on part of it", async () => {
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 2 }];
+    // The check runs' second page fails.
+    const a = fake({ checkPages: [Array.from({ length: 100 }, (_, i) => win(1000 + i, "success")), 500], checkTotal: 101 });
+    expect(await windowsAttempts(a, REPO, H1)).toBeNull();
+    expect(await gateReport(a, REPO, H1)).toMatchObject({ decision: "hold" });
+    // An attempt's jobs' second page fails.
+    const b = fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [filler(100, 1), 502], "77/2": [[job(902, "success")]] }, jobTotal: { "77/1": 101 } });
+    expect(await gateReport(b, REPO, H1)).toMatchObject({ decision: "hold" });
+    // A short page before the total: not whole.
+    const c = fake({ checkPages: [[win(1, "success")]], checkTotal: 3 });
+    expect(await gateReport(c, REPO, H1)).toMatchObject({ decision: "hold" });
+    // A rate limit (403) on the workflow runs: hold.
+    const d = { api: async (p: string) => p.includes("/actions/runs?") ? { status: 403, body: { message: "rate limit" } } : fake({ checkPages: [[win(1, "success")]] }).api(p) };
+    expect(await gateReport(d, REPO, H1)).toMatchObject({ decision: "hold" });
+    // The landing holds on the same reading.
+    expect(await headChecks(a, REPO, H1)).toBeNull();
+  });
+
+  test("the dry run names the head, the workflow file it read and every attempt, and changes nothing", async () => {
+    const r = await gateReport(fake({ checkPages: [[win(3, null, "in_progress")]] }), REPO, H1, () => new Date("2026-11-16T10:00:00Z"));
+    expect(r).toEqual({ head: H1, at: "2026-11-16T10:00:00.000Z", decision: "hold", why: "CI is still running pcjobs-windows on it", windows: "running",
+      workflow: { file: ".github/workflows/tests.yml", read: "named" }, attempts: [{ id: 3, status: "in_progress", conclusion: null, via: ["check_runs"] }] });
+    expect(await gateReport(fake({}), REPO, "nope")).toMatchObject({ decision: "refuse", why: "that isn't a full commit sha" });
+    expect(await gateReport(fake({}), REPO, H1)).toMatchObject({ decision: "refuse", windows: "missing", why: "CI hasn't run pcjobs-windows on it" });
+    expect(await gateReport(fake({ yml: "jobs:\n  pytest: {}\n" }), REPO, H1)).toMatchObject({ decision: "accept", windows: "not_required", workflow: { read: "not_named" } });
+  });
+
+  test("the probe's ship_gate step: refused while the Windows run is pending, accepted only once it passed", async () => {
+    // GitHub as it moves: no run yet, then running, then passed.
+    const states: Page[][] = [[[]], [[win(5, null, "queued")]], [[win(5, null, "in_progress")]], [[win(5, "success")]]];
+    let i = 0;
+    const d = { api: async (p: string) => fake({ checkPages: states[Math.min(i, states.length - 1)] }).api(p) };
+    const line = await watchShipGate(d, REPO, H1, { everyMs: 1, untilMs: 1_000, sleep: async () => { i++; } });
+    expect(line.reports.map((r) => r.decision)).toEqual(["refuse", "hold", "hold", "accept"]);
+    expect(line).toMatchObject({ step: "ship_gate", head: H1, workflow: { file: ".github/workflows/tests.yml", read: "named" }, attempts_seen: [5],
+      refused_while_pending: true, accepted_early: false, accepted_after_pass: true, passed: true });
+    // Never seen pending: not shown, so it doesn't pass.
+    const g = (rs: Partial<GateReport>[]) => judgeShipGate(H1, rs.map((r) => ({ head: H1, at: "", why: "", workflow: null, attempts: [], windows: null, decision: "hold", ...r }) as GateReport));
+    const done = { id: 5, status: "completed", conclusion: "success", via: [] };
+    const going = { id: 5, status: "in_progress", conclusion: null, via: [] };
+    expect(g([{ decision: "accept", windows: "passed", attempts: [done] }]).passed).toBe(false);
+    // Accepted while an attempt was still going: fails, whatever came after.
+    expect(g([{ decision: "accept", windows: "running", attempts: [going] }, { decision: "accept", windows: "passed", attempts: [done] }])).toMatchObject({ accepted_early: true, passed: false });
+    // A failed attempt: refused at the end, never accepted.
+    expect(g([{ decision: "hold", windows: "running", attempts: [going] }, { decision: "refuse", windows: "failed", attempts: [{ ...done, conclusion: "failure" }] }])).toMatchObject({ accepted_after_pass: false, passed: false });
+    // Watching stops on a failure and on its time.
+    let j = 0;
+    const f = { api: async (p: string) => fake({ checkPages: j++ < 4 ? [[win(5, null, "in_progress")]] : [[win(5, "failure")]] }).api(p) };
+    expect((await watchShipGate(f, REPO, H1, { everyMs: 1, untilMs: 1_000, sleep: async () => {} })).reports.at(-1)).toMatchObject({ decision: "refuse", windows: "failed" });
+    let t = 0;
+    const slow = await watchShipGate(fake({ checkPages: [[win(5, null, "in_progress")]] }), REPO, H1, { everyMs: 10, untilMs: 35, sleep: async () => { t += 10; }, now: () => new Date(t) });
+    expect(slow.reports.length).toBe(4);                                  // at 0, 10, 20 and 30: the next would pass 35
+    expect(slow.passed).toBe(false);
   });
 });

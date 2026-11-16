@@ -139,21 +139,74 @@ async function versionAt(d: Pick<MergeDeps, "api">, repo: string, path: string, 
 // the runs, or on a list that shifted while it was read. The runs, "missing" (GitHub has no
 // such commit), or null (no answer, or a list that isn't whole: then nothing is judged).
 const RUN_PAGES = 10;                 // 1,000 runs of one check: past that it can't be judged, and the landing waits
-async function runsOf(d: Pick<MergeDeps, "api">, repo: string, head: string, name: string): Promise<any[] | "missing" | null> {
+async function runsOf(d: Pick<MergeDeps, "api">, repo: string, head: string, name: string, filter: "latest" | "all" = "latest"): Promise<any[] | "missing" | null> {
+  return pagesOf(d, (page) => `/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(name)}&app_id=${ACTIONS_APP}&filter=${filter}&per_page=100&page=${page}`, "check_runs");
+}
+// One listing of GitHub's, followed page by page until it is whole (0.12.0, shared by every
+// listing the checks read): each page gives the same total, no item comes twice, and the
+// pages add up to that total. A page that fails, a total that shifts, a short page before the
+// total is reached, or more than RUN_PAGES pages: null, so nothing is judged on part of it.
+// "missing" only when the very first page says there's no such thing.
+async function pagesOf(d: Pick<MergeDeps, "api">, path: (page: number) => string, key: string): Promise<any[] | "missing" | null> {
   const got: any[] = [];
   let total: number | null = null;
   for (let page = 1; page <= RUN_PAGES; page++) {
-    const r = await read(d, `/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(name)}&app_id=${ACTIONS_APP}&filter=latest&per_page=100&page=${page}`);
+    const r = await read(d, path(page));
     if (r === "missing") return page === 1 ? "missing" : null;
-    if (!r || !Array.isArray(r.check_runs)) return null;
+    if (!r || !Array.isArray(r[key])) return null;
     const t = Number(r.total_count);
-    if (!Number.isInteger(t) || (total !== null && t !== total)) return null;
+    if (!Number.isInteger(t) || t < 0 || (total !== null && t !== total)) return null;
     total = t;
-    got.push(...r.check_runs);
-    if (got.length >= total || r.check_runs.length < 100) break;
+    got.push(...r[key]);
+    if (got.length >= total || r[key].length < 100) break;
   }
   const ids = new Set(got.map((x) => x?.id));
   return got.length === total && ids.size === got.length ? got : null;
+}
+
+// Every attempt of pcjobs-windows GitHub lists for the head (0.12.0, seventeenth round), read two
+// ways and joined, so neither listing alone decides:
+//   - the head's check runs of that name from GitHub Actions with filter=all (every attempt,
+//     not only the newest), every page;
+//   - GitHub Actions' workflow runs for the head, every page, and for each run every attempt
+//     (1 to its run_attempt), that attempt's jobs, every page; a job named pcjobs-windows is
+//     an attempt (a job's id is its check run's id, so the two listings join by id).
+// Any listing that isn't whole, a page that fails, or more than ATTEMPT_LISTS attempt listings:
+// null, and the gate holds. trace, when given, gets every path read, for the dry run.
+const ATTEMPT_LISTS = 30;
+export interface WindowsAttempt { id: number; name: string; status: string; conclusion: string | null; head_sha: string; app: { id: number }; run_id?: number; run_attempt?: number; via: string[] }
+export async function windowsAttempts(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<WindowsAttempt[] | "missing" | null> {
+  const checks = await runsOf(d, repo, head, WINDOWS_CHECK, "all");
+  if (checks === "missing") return "missing";
+  if (checks === null) return null;
+  const runs = await pagesOf(d, (page) => `/repos/${repo}/actions/runs?head_sha=${head}&per_page=100&page=${page}`, "workflow_runs");
+  if (runs === null || runs === "missing") return null;
+  const out = new Map<number, WindowsAttempt>();
+  // Failed over still going over passed: where the two listings disagree on an attempt, the worse reading stands.
+  const rank = (z: { status: string; conclusion: string | null }) => z.status !== "completed" ? 1 : z.conclusion === "success" ? 0 : 2;
+  const add = (x: any, via: string, extra: Partial<WindowsAttempt> = {}) => {
+    const id = Number(x?.id);
+    if (!Number.isFinite(id)) return;
+    const prev = out.get(id);
+    const a: WindowsAttempt = { id, name: String(x?.name ?? ""), status: String(x?.status ?? ""), conclusion: x?.conclusion ?? null,
+      head_sha: String(x?.head_sha ?? ""), app: { id: Number(x?.app?.id ?? extra.app?.id) }, ...extra, via: [...(prev?.via ?? []), via] };
+    out.set(id, prev && rank(prev) >= rank(a) ? { ...prev, ...extra, status: prev.status, conclusion: prev.conclusion, via: a.via } : prev ? { ...prev, ...a } : a);
+  };
+  for (const c of checks) if (c?.name === WINDOWS_CHECK && c?.app?.id === ACTIONS_APP) add(c, "check_runs");
+  let lists = 0;
+  for (const r of runs) {
+    if (r?.head_sha !== head) continue;
+    const n = Number(r?.run_attempt ?? 1);
+    if (!Number.isInteger(n) || n < 1) return null;
+    for (let a = 1; a <= n; a++) {
+      if (++lists > ATTEMPT_LISTS) return null;
+      const jobs = await pagesOf(d, (page) => `/repos/${repo}/actions/runs/${r.id}/attempts/${a}/jobs?per_page=100&page=${page}`, "jobs");
+      if (jobs === null || jobs === "missing") return null;
+      for (const j of jobs) if (j?.name === WINDOWS_CHECK)
+        add({ ...j, head_sha: j?.head_sha ?? head }, `run ${r.id} attempt ${a}`, { app: { id: ACTIONS_APP }, run_id: Number(r.id), run_attempt: a });
+    }
+  }
+  return [...out.values()];
 }
 export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<any[] | "missing" | null> {
   const each = await Promise.all(CHECKS.map((name) => runsOf(d, repo, head, name)));
@@ -170,7 +223,15 @@ export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: s
 // when tests.yml can't be read, so nothing is judged without knowing whether it's defined.
 export interface HeadChecks { runs: any[]; windows: boolean }
 export async function headChecks(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<HeadChecks | "missing" | null> {
-  const [req, win, yml] = await Promise.all([checkRuns(d, repo, head), runsOf(d, repo, head, WINDOWS_CHECK), read(d, `/repos/${repo}/contents/${TESTS_YML}?ref=${head}`)]);
+  const h = await headDetail(d, repo, head);
+  return h === "missing" || h === null ? h : h.checks;
+}
+// The same reading with what it rests on, for the dry run and the probe's ship_gate step
+// (shipGate, below): the workflow file read at the head (named: it names pcjobs-windows;
+// absent: the head has no tests.yml) and every Windows attempt seen.
+export interface HeadDetail { checks: HeadChecks; workflow: { file: string; read: "named" | "not_named" | "absent" }; attempts: WindowsAttempt[] }
+export async function headDetail(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<HeadDetail | "missing" | null> {
+  const [req, win, yml] = await Promise.all([checkRuns(d, repo, head), windowsAttempts(d, repo, head), read(d, `/repos/${repo}/contents/${TESTS_YML}?ref=${head}`)]);
   if (req === "missing" || win === "missing") return "missing";
   if (req === null || win === null || yml === null) return null;
   let named = false;
@@ -183,7 +244,8 @@ export async function headChecks(d: Pick<MergeDeps, "api">, repo: string, head: 
   // head_sha is this very head counts.
   const mine = win.filter((r) => r?.head_sha === head);
   const ran = mine.some((r) => r?.name === WINDOWS_CHECK && r?.app?.id === ACTIONS_APP);
-  return { runs: [...req, ...mine], windows: named || ran };
+  return { checks: { runs: [...req, ...mine], windows: named || ran },
+    workflow: { file: TESTS_YML, read: yml === "missing" ? "absent" : named ? "named" : "not_named" }, attempts: mine };
 }
 
 // Each required check's newest run from GitHub Actions: passed (success only), still
@@ -264,7 +326,7 @@ export async function inMain(d: MergeDeps, repo: string, head: string): Promise<
 }
 
 // The first check, in order, that keeps it from landing.
-function failedChecks(h: HeadChecks): Landed | null {
+export function failedChecks(h: HeadChecks): Landed | null {
   for (const c of judgeChecks(h.runs, h.windows)) {
     if (c.state === "missing") return no(`CI hasn't run ${c.name} on it`);
     if (c.state === "running") return no(`CI is still running ${c.name} on it`, true);
@@ -309,4 +371,63 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
   if (KEY_REFUSED.test(said) || /read.only|key is not/i.test(said)) return no(DEPLOY_KEY_REFUSED);
   if (/rule violation|protected branch|GH0\d\d/i.test(said)) return no(`GitHub refused it (${first(push.err)})`);
   return no(`the push to GitHub failed (${first(push.err) || `git exit ${push.code}`})`, true);
+}
+
+// ---- The Windows gate, read without acting: the dry run and the probe's ship_gate step ----------
+// The very reading the landing and the Ship card make (headDetail, judgeChecks, failedChecks),
+// for one head, with nothing posted, landed or written to GitHub: what the gate would decide
+// ("accept": a card and a landing may go on; "hold": it waits, as for a check still running or
+// GitHub not answering; "refuse": it won't), and why, with the workflow file it read and every
+// Windows attempt it saw. Run by keeper.sh ship-gate (shipgate.ts) against the real repository.
+export type GateDecision = "accept" | "hold" | "refuse";
+export interface GateReport { head: string; at: string; decision: GateDecision; why: string; windows: CheckState["state"] | "not_required" | null;
+  workflow: HeadDetail["workflow"] | null; attempts: { id: number; status: string; conclusion: string | null; run_id?: number; run_attempt?: number; via: string[] }[] }
+export async function gateReport(d: Pick<MergeDeps, "api">, repo: string, head: string, now = () => new Date()): Promise<GateReport> {
+  const at = now().toISOString();
+  if (!SHA.test(head)) return { head, at, decision: "refuse", why: "that isn't a full commit sha", windows: null, workflow: null, attempts: [] };
+  const h = await headDetail(d, repo, head);
+  if (h === "missing") return { head, at, decision: "refuse", why: "GitHub doesn't have that commit", windows: null, workflow: null, attempts: [] };
+  if (h === null) return { head, at, decision: "hold", why: "GitHub didn't answer about its checks, or a listing wasn't whole", windows: null, workflow: null, attempts: [] };
+  const w = h.checks.windows ? judgeChecks(h.checks.runs, true).find((c) => c.name === WINDOWS_CHECK)!.state : "not_required";
+  const bad = failedChecks(h.checks);
+  const attempts = h.attempts.map((a) => ({ id: a.id, status: a.status, conclusion: a.conclusion, ...(a.run_id ? { run_id: a.run_id, run_attempt: a.run_attempt } : {}), via: a.via }));
+  if (!bad || bad.ok) return { head, at, decision: "accept", why: w === "passed" ? "every required check passed, and every pcjobs-windows attempt on it passed" : "every required check passed; pcjobs-windows isn't named in its tests.yml and never ran on it", windows: w, workflow: h.workflow, attempts };
+  return { head, at, decision: bad.again ? "hold" : "refuse", why: bad.why, windows: w, workflow: h.workflow, attempts };
+}
+// The probe's ship_gate step: the gate's reports for one candidate head, taken over time from
+// just after its push until its Windows run has finished. It passes only when the gate was seen
+// not accepting (hold or refuse) while a Windows attempt was still going, never accepted while
+// any attempt was going or had failed, and accepted at the end, once every attempt it saw had
+// passed. Every attempt seen in any report is listed.
+export interface ShipGateLine { step: "ship_gate"; head: string; workflow: HeadDetail["workflow"] | null; reports: GateReport[]; attempts_seen: number[];
+  refused_while_pending: boolean; accepted_early: boolean; accepted_after_pass: boolean; passed: boolean }
+export function judgeShipGate(head: string, reports: GateReport[]): ShipGateLine {
+  const going = (r: GateReport) => r.attempts.some((a) => a.status !== "completed");
+  const failed = (r: GateReport) => r.attempts.some((a) => a.status === "completed" && a.conclusion !== "success");
+  const refused_while_pending = reports.some((r) => going(r) && r.decision !== "accept");
+  const accepted_early = reports.some((r) => r.decision === "accept" && (going(r) || failed(r) || r.windows !== "passed"));
+  const last = reports.at(-1);
+  const accepted_after_pass = !!last && last.decision === "accept" && last.windows === "passed" && last.attempts.length > 0
+    && last.attempts.every((a) => a.status === "completed" && a.conclusion === "success");
+  const attempts_seen = [...new Set(reports.flatMap((r) => r.attempts.map((a) => a.id)))].sort((a, b) => a - b);
+  return { step: "ship_gate", head, workflow: [...reports].reverse().find((r) => r.workflow)?.workflow ?? null, reports, attempts_seen,
+    refused_while_pending, accepted_early, accepted_after_pass, passed: refused_while_pending && !accepted_early && accepted_after_pass };
+}
+// Watches one head: a report now, then one every everyMs until the gate accepts, refuses for
+// good, or untilMs passes; the line is judged on every report taken.
+export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, head: string, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<ShipGateLine> {
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((ok) => setTimeout(ok, ms)));
+  const now = o.now ?? (() => new Date());
+  const t0 = now().getTime();
+  const reports: GateReport[] = [];
+  while (true) {
+    const r = await gateReport(d, repo, head, now);
+    reports.push(r);
+    o.each?.(r);
+    // A run not listed yet (just after the push) is watched on; a failed attempt settles it.
+    const settled = r.decision === "accept" || r.windows === "failed" || (r.decision === "refuse" && r.windows !== "missing");
+    if (settled || now().getTime() - t0 + o.everyMs > o.untilMs) break;
+    await sleep(o.everyMs);
+  }
+  return judgeShipGate(head, reports);
 }

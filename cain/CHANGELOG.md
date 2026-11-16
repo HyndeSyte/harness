@@ -82,6 +82,11 @@
 - The probe has new steps, and confirming needs each one: a page that redirects off the job's sites is read and the session must end before its next step, every reading tool must say which address it read in its one exact field, a page that fakes an address in its text, title or layout must never count as placed, the PC must end a stopped session within its time limit, Claude in Chrome must attach in time, and on Windows the helper must build and its Job Object must hold inside any outer job. Whether the redirected page's text was also kept from the session is recorded and picks which of two boundary texts you sign. Whether the session ids agree is only noted now. It also lists the sites a sign-in went through, for your allowlist. You accept new boundary words once more, since what is promised when a page is read off-site changed.
 - A Ship card now waits until the PC worker's Windows tests have passed for that exact change, every attempt of them: one that failed blocks it even after a green re-run, so a flaky run needs a new change.
 - If a session the PC ended doesn't stop in time, the PC stops taking jobs until you probe again, and says why.
+- The PC's page checks now always answer within one fixed time limit, safely under Claude Code's own, even when Claude in Chrome is slow to attach on the first step: they never leave the decision to Claude Code timing out.
+- A page answer that repeats its address field, however it is spelled, now always counts as unplaced and ends the session.
+- A tap you gave to reuse a value is written down on the Pi before its job is sent, so even if Cain's App stops at the wrong moment the same tap can't be used for a second job.
+- The Ship card's Windows check now reads every run and every re-run of the PC worker's tests, across every page GitHub lists, and waits when it can't read them all. Cain can show you what that check would decide for a change without acting on it, and you can watch it once on a fresh change as a last step of your setup.
+- Your probe's check that the PC drops an address's "#" part now goes only by what the page itself saw it was opened at.
 
 ## 0.11.0
 

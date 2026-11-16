@@ -35,7 +35,15 @@ tap (you, in your DM, Cain paired to you); the keeper has the link check the job
 are exactly the ones that ask quoted and that you tapped its "Use it". One tap covers one
 job: the keeper records every tap it accepted in an append-only file
 (`/data/pc-jobs-reuse-used.jsonl` on the Pi) that survives restarts, so a second job
-citing the same tap is refused.
+citing the same tap is refused. The tap goes in **before** the job is pushed: as pending,
+with its job, flushed to disk; the job is pushed; then the tap is marked final. A pending
+tap is already spent. At the start of each round, once its copy of the queue is up to date
+with GitHub, the keeper settles every pending tap against the queue: its job there (the
+push went through, even if the keeper died before marking it) makes it final; its job not
+there (the push never went through) rolls it back, and the request, still waiting, is
+checked afresh. A tap that can't be written stops the round before anything is pushed.
+The keeper deletes no job file, so nothing can drop a job whose tap isn't final and so
+free it.
 
 **You accept that boundary once, in words** (its text names the domains as the control and the report-value check as a mitigation, says a page read off the job's sites or one it can't place ends the session and throws its report away, and says that where the probe hasn't shown Claude Code keeping a refused page from the model, the promise is only that the session ends before its next tool call; this release has two boundary texts, versions 4 and 5, and the probe's redirect check picks which one you sign, so confirm again). `confirm-profile` refuses
 (`boundary_not_accepted`, printing the boundary's text) until you run it with
@@ -338,7 +346,14 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   marker isn't there yet** (the init event and the model's first call can race, or the
   extension is slow to attach), the hook waits on readiness itself before the session's
   first call is answered, polling for the marker for up to 15 seconds, so a slow attach
-  costs time rather than the model's retries; a later call waits up to 5 seconds. Only then
+  costs time rather than the model's retries; a later call waits up to 5 seconds. **Every
+  wait a hook makes comes out of one time budget** per hook run: 26 seconds from the hook's
+  process start, 4 seconds below the 30 second timeout the settings give it. Its input
+  deadline (10 seconds), the readiness wait, a later call's wait, the host name lookup and
+  read-guard's hold (below) are each clamped to what is left of that budget, less a second
+  kept back to log and print the answer, and a hard stop at the budget itself answers with
+  the blocking result (nav-guard's deny, read-guard's block). So a first call whose input
+  came late still gets its answer from the hook, never from Claude Code giving up on it. Only then
   does it refuse, with its own message asking the model to make the same call again
   (`inventory_not_ready`). Each wait is logged with its time (`waited_ms`). **At most three of those per
   session**: the fourth ends the session (`inventory_never_ready`, its own failure code).
@@ -476,7 +491,8 @@ check reads what the parser made of it, each refusing on its own: (1) the scheme
   carrying the address without it as the call's updated input; the log line says
   `fragment_stripped`) stays in the code but is off by default, and is turned on only by a
   confirmation whose probe `fragment_strip` step showed the browser really received the
-  stripped address, under the same hook policy version. A query is refused (`query_not_allowed`) unless the entry names
+  stripped address (the check page's own report of the address it was opened at), under the
+  same hook policy version. A query is refused (`query_not_allowed`) unless the entry names
   `query_params` and every parameter matches one of them by its name and by its value's
   character class and maximum length, capped at 200 characters in all (`query_too_long`).
   **An allowed query on a site you are signed in to is still a request that site acts
@@ -525,8 +541,12 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   hook input's `tool_response.structuredContent.tabUrl` (the MCP result's structured block,
   never a text block), **never from the answer's text, title or DOM**, which are strings no
   key is ever read from. An answer with any other address-named field beside it (`url`,
-  `href`, `location` and the like, anywhere in the answer), or that key written twice, is
-  unplaced too, so nothing a page writes can place it, and checks it against the run's domains
+  `href`, `location` and the like, anywhere in the input), or any key written twice in one
+  object, is unplaced too, so nothing a page writes can place it. The hook reads its input
+  with its own strict JSON parser, which sees every key as it decodes it: `"tab\u0055rl"` is
+  `tabUrl`, a repeat is a repeat however its escapes spell it, and anything that isn't
+  strict JSON is unplaced (JSON.parse would quietly keep only the last of two equal keys, so
+  the hook never uses it on its input). It checks the address against the run's domains
   as it would a navigation (the check page and the end page pass). **Both failures end the
   run at once, with no fallback**: a page that moved its tab off the job's sites after an
   allowed navigation (a redirect, a script) is `read_drift`; an answer with no address in
@@ -535,8 +555,9 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   abort file, the worker (which watches it every 100 ms) ends the session's whole process
   tree, and on Windows its Job Object, the moment the decision is made; nav-guard refuses
   every call once the file exists (`session_aborted`); read-guard holds its answer back
-  until the session is gone, for at most 10 seconds (with its 10 second input deadline, well
-  inside its 30 second timeout, so it always answers itself), and on expiry returns the
+  until the session is gone, for at most 10 seconds and never past what is left of the hook's
+  one time budget (above: its input deadline and the hold together stay inside 26 seconds,
+  below its 30 second timeout, so it always answers itself), and on expiry returns the
   one-line refusal explicitly. The worker's side escalates within 8 seconds: it ends the
   Job Object (on Windows, by ending the helper that holds it; elsewhere the process group),
   then kills the session's process itself, and if the session still isn't seen gone it
@@ -554,8 +575,8 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   page's text was kept from the model on this PC; where it didn't, the text says the promise
   is only that the session ends before its next tool call. Any error inside it, input it can't read, or no input within its 10 second
   deadline (headroom for a cold start of Git Bash and the runtime) is refused too (exit
-  code 2 and a deny decision in JSON); its settings timeout (30 seconds) is longer than
-  that deadline, so it refuses before Claude Code would give up on it. A test in the
+  code 2 and a deny decision in JSON); its settings timeout (30 seconds) sits 4 seconds
+  above its one time budget, so it refuses before Claude Code would give up on it. A test in the
   Windows CI job runs this very hook command line through Git Bash with a sample
   PreToolUse payload: an allowed call, a refused one and malformed input. It logs every decision, keyed by the tool-use id, to `nav-decisions.jsonl`.
   A refused address is never written there: its line keeps only its registrable domain
@@ -1152,12 +1173,16 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       the not-ready cap is named for what it means, the extension slow to attach
       (`extension_slow_attach`), and the confirmation refuses: restart the Cain jobs Chrome,
       wait a minute, probe again.
-    - `fragment_strip` (recorded, not a gate): with stripping on for that session alone, a
-      navigation to the check page with a fragment, then the tab list. It passes only when
-      the hook stripped the fragment and the tab shows the check page without it: the browser
-      received the stripped address. Only then does the confirmation turn stripping on
-      (`fragment_strip` in `confirmed.json`); otherwise every address with a fragment stays
-      refused.
+    - `fragment_strip` (not a confirmation gate; the one gate on stripping): with stripping
+      on for that session alone, a navigation to the check page's `/fragment-check` with a
+      fragment, then the tab list. That page reports the address it was opened at (its own
+      `location.href`) back to the check server, and the step passes **only on that observed
+      received address**: every address the page reported is its own, with no `#` part at
+      all, and it reported at least one (`received`, `received_bare`). Whether the hook
+      logged the allow as stripped (the updated input it handed Claude Code, `stripped`) and
+      whether the tab list showed the bare address (`tab_bare`) are recorded beside it and
+      never read for the verdict. Only a pass turns stripping on (`fragment_strip` in
+      `confirmed.json`); otherwise every address with a fragment stays refused.
     - `session_ids` (recorded, a diagnostic, not a gate): whether the init event's session
       id equals the one the hook's input carries, in every decision of that session. The
       barrier uses the worker's own token, never either id.
@@ -1168,6 +1193,11 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       `jobrun.cs` with the compiler in the Windows folder; a missing compiler or one your
       security software blocks refuses with that code (`helper_compiler_missing`,
       `helper_blocked`).
+    **No gating step reads a recorded-only value.** The recorded-only values are
+    `session_ids`, `redirect_read`'s `secret_withheld` (it only picks the boundary text you
+    sign) and `fragment_strip`'s `stripped` and `tab_bare`. A test walks every gating step
+    (each `confirm-profile` gate above, and the stripping gate) with each of them flipped
+    both ways and checks that no verdict moves.
     The probe also lists every host its browser step showed (in a tab context or an allowed
     navigation), in ASCII, as `candidate_patterns`: when you sign in to the probe site
     during that step, those are the hosts the sign-in went through, for you to copy into the
@@ -1209,8 +1239,35 @@ them takes admin rights a build session doesn't have. Cain's link holds Ship to 
 instead: a Ship card and the landing count only `pcjobs-windows` runs for that very head
 commit, every attempt GitHub lists, in whatever order: one still going holds, one that
 didn't pass refuses even beside a green re-run (a flaky Windows run needs a new commit),
-no run or a run for another commit refuses, and GitHub not answering holds. Tests run that
-gate against a fake GitHub for each case.
+no run or a run for another commit refuses, and GitHub not answering holds. **It reads every
+run and every attempt**, two ways, and joins them by id: the head's check runs of that name
+with every attempt listed (not only the newest), and GitHub Actions' workflow runs for the
+head with, for each, every attempt's jobs; each listing is followed page by page until it
+is whole. A page that fails, a total that shifts between pages, or a listing that stops
+short holds the gate (it waits), so a failed attempt on a page it didn't read can never
+pass as green. Tests run that gate against a fake GitHub for each case, a failed attempt
+on a second page and a page error among them.
+
+**Read the gate without acting, once, before relying on it** (Cain, or you through him):
+`/opt/cain/keeper.sh ship-gate <full head sha>` on the Pi reads the real repository for that
+head exactly as the Ship card and the landing do and prints what the gate would decide
+(`accept`, `hold` or `refuse`) and why, the workflow file it read (`.github/workflows/tests.yml`,
+and whether it names `pcjobs-windows`) and every Windows attempt it saw, with the listing
+each came from. It posts nothing, lands nothing and writes nothing to GitHub; it uses
+GitHub's public API without a key, from the same 60 reads an hour the link has. Run it
+once on a head whose Windows run failed and was then re-run green: it must say `refuse`.
+
+13. **Watch the Ship gate once (the probe's `ship_gate` step).** Right after a build pushes
+    a candidate head, run `/opt/cain/keeper.sh ship-gate <full head sha> --watch` on the Pi
+    (or have Cain run it and show you its lines). It reads the gate now and then every 10
+    minutes (`--every`) for up to 2 hours (`--hours`), printing one line per reading, and
+    keeps the step in `/data/work/ship-gate-<head>.json`: the workflow file read, the head
+    judged, every reading with its decision and every attempt seen. It passes only when the
+    gate was seen refusing (`hold` or `refuse`) while the Windows run was still going, never
+    accepted while an attempt was going or had failed, and accepted at the end, once every
+    attempt it saw had passed. If the Windows run hasn't been listed yet when you start,
+    it is watched on until it is. It doesn't gate a Ship by itself: it shows you the real
+    gate doing what it says on a real head.
 
 **What the tests show, and what they don't.** The worker's tests (`cain/tests/pcjobs.test.ts`)
 run against a stand-in browser and a stand-in `claude` command that emulate the

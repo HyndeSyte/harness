@@ -299,8 +299,8 @@ in the harness repo; until then the keeper says it is waiting).
   that quotes the value or answers the ask. If he answers in words, ask again and let him
   tap. The keeper has the link check its own record of that tap and of the values the ask
   quoted when it was posted, and refuses the job otherwise. One tap covers one job, for
-  good (the keeper keeps every tap it used, across restarts): for another, ask again. No
-  tap, no reuse.
+  good (the keeper writes every tap down before it pushes the job, and keeps it across
+  restarts and crashes): for another, ask again. No tap, no reuse.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
@@ -431,8 +431,13 @@ create, update or run any other routine.
      CI words, no GitHub, job, status or result words (passed, green, success), and no
      review, verdict or AI names: the link refuses them. It also
      refuses the card while a check failed or hasn't run yet (the PC worker's Windows
-     check too, while it is still running), and for a review of another
-     head (or one that names none). If the review found something worth fixing, run
+     check too, while it is still running, and for good once any attempt of it failed on
+     that head, even beside a green re-run), and for a review of another
+     head (or one that names none). `/opt/cain/keeper.sh ship-gate <full head sha>` reads
+     that Windows gate for a head without acting and says what it would decide and why;
+     with `--watch` it is his probe's `ship_gate` step, run right after a push and kept in
+     /data/work. Run either only when he asks, or once on a head whose Windows run failed
+     and was re-run green (it must say refuse), and tell him what it said in your words. If the review found something worth fixing, run
      Build again on the same branch with the fixes first. A new head needs a new review
      of it and a new Ship card; the old card's buttons come off by themselves when the
      head moves, and you're told.

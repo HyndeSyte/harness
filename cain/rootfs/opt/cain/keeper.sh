@@ -37,6 +37,10 @@
 #                                        on a fix, a refusal and a clean reply; sends nothing
 #   keeper.sh replay [days]              the gate's rules over his DM (default 14 days), reading only;
 #                                        you hear one line when it's done
+#   keeper.sh ship-gate <full head sha> [--watch]
+#                                        the Windows Ship gate read for that head without acting: what it
+#                                        would decide and why, the workflow file it read and every
+#                                        pcjobs-windows attempt it saw; --watch is the probe's ship_gate step
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
@@ -48,6 +52,8 @@ hooks="${CAIN_HOOKS:-/opt/cain/hooks}"
 cmd="${1:-handover}"; shift || true
 # Needs no key and no link: it runs the hook itself.
 if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
+# Needs no key and no link either: it reads GitHub's public API only, and changes nothing.
+if [ "$cmd" = ship-gate ]; then exec bun "${CAIN_LINK_DIR:-/opt/cain/link}/shipgate.ts" "$@"; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
