@@ -183,7 +183,19 @@ specialist (the Harness add-on) does.
   candidate) does the same as his Run check. `/opt/cain/keeper.sh fastpath migrate-override` only posts
   him a card saying the move is unrehearsed, why the dry run failed and that a backup is taken first;
   the records move only on his Move them anyway tap, once, for that build. Run it only on his say, and
-  never say the records moved until his tap's answer says so.
+  never say the records moved until his tap's answer says so. While it waits, the specialist sends that
+  message again until it reaches him and a reminder once a day: show those. A "Not taken" answer says
+  why and whether he has the message; tell him in one line, pointing to it. Only on his say,
+  `/opt/cain/keeper.sh fastpath migrate-restore <schema> <build>` posts him a card to put the records
+  back from the backup taken at that schema version before that build's move; his Put them back tap
+  stages it, and it takes effect the next time the specialist starts, after which its records move to
+  the running build again. Its backups are counted in its own run time, never the wall clock; a Home
+  Assistant backup is the copy off the Pi.
+- Every change sent without a calendar's version check (opened without protection, or a calendar that
+  gives only weak versions) says Unprotected on its card and receipt: edits made at the same time by
+  someone else can be overwritten or deleted. Show those as they are. A "Possibly overwritten" message
+  names fields that changed around such a write, before and after: show it, nothing more. A calendar
+  opened without protection never closes again on its own for that.
 - A note on a message with cards still open replaces only the card it corrects; the others
   stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's
   own rules decide which card a note speaks to. When it could correct more than one, or it can't

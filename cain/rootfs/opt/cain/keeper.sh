@@ -76,6 +76,14 @@
 #   keeper.sh fastpath migrate-override  only on Dane's say: posts him a card to move the records
 #                                        without a rehearsal (why it failed, a backup first); they
 #                                        move only on his tap, once, for that build. Nothing more
+#   keeper.sh fastpath migrate-restore <schema> <build>
+#                                        only on Dane's say: posts him a card to put the records back
+#                                        from the backup taken at that schema version before that
+#                                        build's move (harness-before-s<schema>-<build>-...sqlite);
+#                                        his Put them back tap stages it, checked, and it replaces the
+#                                        records the next time Harness starts (the ones replaced are
+#                                        kept beside them), then they move to the running build again.
+#                                        A Home Assistant backup is the copy off the Pi
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
@@ -169,7 +177,9 @@ if [ "$cmd" = fastpath ]; then
         { [ -z "$mc_candidate" ] && { [ "${2:-}" != --candidate ] && [ "${3:-}" != --candidate ]; } || [[ "$mc_candidate" =~ ^/[A-Za-z0-9/._-]{1,255}$ ]]; } \
           || { echo '{"status":"error","said":"--candidate takes the absolute path of the incoming build: its source tree (the harness App folder) or its image path (/opt/harness)"}'; exit 2; } ;;
     migrate-override) [ $# -eq 1 ] || { echo '{"status":"error","said":"fastpath migrate-override takes nothing more"}'; exit 2; } ;;
-    *) echo '{"status":"error","said":"fastpath takes smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open <gmail|family>, migrate-check [path] [--candidate <path>] or migrate-override"}'; exit 2 ;;
+    migrate-restore) { [ $# -eq 3 ] && [[ "${2:-}" =~ ^[0-9]{1,4}$ ]] && [[ "${3:-}" =~ ^[0-9A-Za-z._-]{4,64}$ ]]; } \
+          || { echo '{"status":"error","said":"fastpath migrate-restore takes the backup'"'"'s schema version and build: fastpath migrate-restore <schema> <build>"}'; exit 2; } ;;
+    *) echo '{"status":"error","said":"fastpath takes smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open <gmail|family>, migrate-check [path] [--candidate <path>], migrate-override or migrate-restore <schema> <build>"}'; exit 2 ;;
   esac
 fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -239,6 +249,7 @@ case "$cmd" in
                             + (if $c == "" then {} else {script: ({calendar: $c, kind: $k, day: $d, title: $n}
                                + (if $w == "" then {} else {times: $w} end))} end)') ;;
               gate-open) body=$(jq -nc --arg c "$2" '{state: "gate-open", calendar: $c}') ;;
+              migrate-restore) body=$(jq -nc --arg r "$2 $3" '{state: "migrate-restore", restore: $r}') ;;
               migrate-check) body=$(jq -nc --arg p "$mc_path" --arg c "$mc_candidate" '{state: "migrate-check"}
                                + (if $p == "" then {} else {path: $p} end) + (if $c == "" then {} else {candidate: $c} end)') ;;
               *) body=$(jq -nc --arg s "$1" '{state: $s}') ;;

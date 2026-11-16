@@ -20,6 +20,8 @@
 - Cain shows the specialist's messages about held requests, Test again when a calendar and the specialist don't agree on versions, and the daily reminder while requests wait.
 - After a calendar specialist update, its records move by themselves once its own rehearsal passes; only a failed one waits, with your Run check. Moving them without a rehearsal is only ever your tap on a card Cain can send you.
 - When the specialist can't change a calendar safely, Cain shows its message with your requests ready to copy and Open without protection, and leaves that choice to you; receipts there say Unprotected.
+- Cain shows the specialist's Possibly overwritten messages and cards that say Unprotected as they are, and tells you why a calendar request waits when the specialist's records haven't moved yet, pointing to its Run check message.
+- On your say, Cain can send you a card to restore the specialist's records from a backup by its version; only your Put them back tap does it, and it takes effect the next time the specialist starts.
 
 ## 0.11.0
 

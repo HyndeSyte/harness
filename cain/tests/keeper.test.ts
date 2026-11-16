@@ -239,6 +239,11 @@ describe("keeper.sh against a fake link", () => {
       expect(await keeper("fastpath", "migrate-check", "--candidate", "relative/tree")).toMatchObject({ code: 2 });
       expect(await keeper("fastpath", "migrate-check", "/data/harness.sqlite", "/extra")).toMatchObject({ code: 2 });
       expect(await keeper("fastpath", "migrate-override", "now")).toMatchObject({ code: 2 });
+      // Twelfth round: a restore names the backup's schema version and build, nothing else.
+      expect(await keeper("fastpath", "migrate-restore")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "migrate-restore", "one", "b1234")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "migrate-restore", "1", "b 1")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "migrate-restore", "1", "b1234", "now")).toMatchObject({ code: 2 });
       expect(seen.length).toBe(0);
       await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add", "gmail", "add", "2026-11-17", "Piano lesson", "13:00-14:00");
       await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "family-remove", "family", "remove", "2026-11-18", "Swim");
@@ -263,10 +268,12 @@ describe("keeper.sh against a fake link", () => {
       await keeper("fastpath", "migrate-check", "--candidate", "/tmp/next/harness");
       await keeper("fastpath", "migrate-check", "/backup/copy.sqlite", "--candidate", "/opt/next/harness");
       await keeper("fastpath", "migrate-override");
+      await keeper("fastpath", "migrate-restore", "1", "b1234abcd");
       expect(seen).toEqual([
         { path: "/fastpath", keyed: true, body: { state: "migrate-check", candidate: "/tmp/next/harness" } },
         { path: "/fastpath", keyed: true, body: { state: "migrate-check", path: "/backup/copy.sqlite", candidate: "/opt/next/harness" } },
         { path: "/fastpath", keyed: true, body: { state: "migrate-override" } },
+        { path: "/fastpath", keyed: true, body: { state: "migrate-restore", restore: "1 b1234abcd" } },
       ]);
       expect(JSON.parse(readFileSync(marker, "utf8"))).toMatchObject({ ok: true, build: "b2", candidate: "/tmp/next/harness" });
       answer = { status: "refused", said: "The dry run failed.", result: { ok: false } };
@@ -276,6 +283,7 @@ describe("keeper.sh against a fake link", () => {
       expect(usage).toContain("keeper.sh fastpath smoke-step <run id> <step> <gmail|family> <add|move|remove> <YYYY-MM-DD> <title> [HH:MM-HH:MM]");
       expect(usage).toContain("keeper.sh fastpath migrate-check [path] [--candidate <path>]");
       expect(usage).toContain("keeper.sh fastpath migrate-override");
+      expect(usage).toContain("keeper.sh fastpath migrate-restore <schema> <build>");
       expect(usage).toContain("harness-migrate-check.json");
     } finally { server.stop(true); }
   }, 30_000);
