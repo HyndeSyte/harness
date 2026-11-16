@@ -1,10 +1,12 @@
 #!/bin/bash
 # Cain's tools for his specialists and for talking to Dane with buttons. Prints JSON.
-#   keeper.sh handover [--message <id>] [suggestion]
+#   keeper.sh handover [--message <id>] [--smoke <run id>] [suggestion]
 #                                        hand his calendar request to the calendar specialist
 #                                        (it reads his message itself); answers with card ids.
 #                                        --message: the id in the tag of the message it rests on
-#                                        (its last 30 minutes); without it, his newest message
+#                                        (its last 30 minutes); without it, his newest message.
+#                                        --smoke: only for a smoke run's step you just opened with
+#                                        fastpath smoke-step; refused when no step is open
 #   keeper.sh fastpath smoke-start      start the post-install smoke run: the specialist issues its
 #                                        id (answers with "run") and records every change approved
 #                                        while it's live under that id. Run the checklist through the
@@ -12,8 +14,16 @@
 #                                        bound to the specialist's version and ledger, lasts 24 hours,
 #                                        gives one Turn on, and ends at Turn on, Turn off, a new
 #                                        smoke-start, an update or its expiry; its adds are titled
-#                                        "Smoke test: ...". After an update, other cards wait until the
-#                                        run has read back a change on Gmail and on Family
+#                                        "Smoke test: ...". Only a step's own request is the run's: a
+#                                        request that just arrives while the run is live is an ordinary
+#                                        one, and after an update a closed gate holds it like any other
+#   keeper.sh fastpath smoke-step <run id> <step>
+#                                        open one step of the run (a short name: lowercase letters,
+#                                        digits, dashes), for 30 minutes and one handover: the next
+#                                        handover --smoke <run id> is that step's. conformance-gmail and
+#                                        conformance-family run at once: the run edits its own test
+#                                        event with a version it made out of date, which the calendar
+#                                        must refuse; one that takes it never opens its cards
 #   keeper.sh fastpath on <run id>       ask for that run's result. The specialist builds every item
 #                                        from its own record (event ids, request and read-back times,
 #                                        the writes refused for an older version, two listing-lag
@@ -43,7 +53,10 @@
 #                                        ledger), never the file itself, and print what it found: the
 #                                        schema version, no-card paths off, the gate set, open Turn on
 #                                        cards (0 expected) and rows touched. Run it before a Ship card
-#                                        for a specialist update
+#                                        for a specialist update: the specialist keeps the result in its
+#                                        ledger (by build and the copy's checksum), and this writes it to
+#                                        the marker file /data/markers/harness-migrate-check.json, which
+#                                        a Ship card for the specialist needs (ok, under 24 hours old)
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
@@ -114,19 +127,21 @@ esac
 if [ "$cmd" = fastpath ]; then
   case "${1:-}" in
     smoke-start|off) ;;
+    smoke-step) [[ "${2:-}" =~ ^[0-9a-f]{6,32}$ ]] && [[ "${3:-}" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] \
+          || { echo '{"status":"error","said":"fastpath smoke-step takes the run id and a step name: fastpath smoke-step <run id> <step>"}'; exit 2; } ;;
     on) [[ "${2:-}" =~ ^[0-9a-f]{6,32}$ ]] \
           || { echo '{"status":"error","said":"fastpath on takes the smoke run id that fastpath smoke-start gave: fastpath on <run id>"}'; exit 2; } ;;
     gate-open) case "${2:-}" in gmail|family) ;;
                  *) echo '{"status":"error","said":"fastpath gate-open takes gmail or family"}'; exit 2 ;; esac ;;
     migrate-check) [ -z "${2:-}" ] || [[ "$2" =~ ^/[A-Za-z0-9/._-]{1,255}$ ]] \
           || { echo '{"status":"error","said":"fastpath migrate-check takes an absolute ledger path, or none for the live ledger"}'; exit 2; } ;;
-    *) echo '{"status":"error","said":"fastpath takes smoke-start, on <run id>, off, gate-open <gmail|family> or migrate-check [path]"}'; exit 2 ;;
+    *) echo '{"status":"error","said":"fastpath takes smoke-start, smoke-step <run id> <step>, on <run id>, off, gate-open <gmail|family> or migrate-check [path]"}'; exit 2 ;;
   esac
 fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review="" message=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" message="" smoke=""
 case "$cmd" in
   handover)
     rest=()
@@ -136,6 +151,10 @@ case "$cmd" in
           [ $# -ge 2 ] || { echo '{"status":"error","said":"--message needs a value"}'; exit 2; }
           case "$2" in ''|*[!0-9]*) echo '{"status":"error","said":"--message takes a Discord message id, digits only"}'; exit 2 ;; esac
           message="$2"; shift 2 ;;
+        --smoke)
+          [ $# -ge 2 ] || { echo '{"status":"error","said":"--smoke needs the smoke run id"}'; exit 2; }
+          [[ "$2" =~ ^[0-9a-f]{6,32}$ ]] || { echo '{"status":"error","said":"--smoke takes the smoke run id that fastpath smoke-start gave"}'; exit 2; }
+          smoke="$2"; shift 2 ;;
         *) rest+=("$1"); shift ;;
       esac
     done
@@ -175,11 +194,13 @@ trap 'rm -f "$hdr"' EXIT
 printf 'X-Harness-Key: %s\nContent-Type: application/json\n' "$key" > "$hdr"
 unset key
 case "$cmd" in
-  handover) body=$(jq -nc --arg s "${1:-}" --arg p "$owner" --arg m "$message" \
-              '{suggestion: $s, paired: $p} + (if $m == "" then {} else {message: $m} end)') ;;
+  handover) body=$(jq -nc --arg s "${1:-}" --arg p "$owner" --arg m "$message" --arg k "$smoke" \
+              '{suggestion: $s, paired: $p} + (if $m == "" then {} else {message: $m} end)
+               + (if $k == "" then {} else {smoke_run: $k} end)') ;;
   digest)   body='{}' ;;
   fastpath) case "$1" in
               on) body=$(jq -nc --arg r "$2" '{state: "on", run: $r}') ;;
+              smoke-step) body=$(jq -nc --arg r "$2" --arg t "$3" '{state: "smoke-step", run: $r, step: $t}') ;;
               gate-open) body=$(jq -nc --arg c "$2" '{state: "gate-open", calendar: $c}') ;;
               migrate-check) body=$(jq -nc --arg p "${2:-}" '{state: "migrate-check"} + (if $p == "" then {} else {path: $p} end)') ;;
               *) body=$(jq -nc --arg s "$1" '{state: $s}') ;;
@@ -230,3 +251,15 @@ esac
 out=$(curl -sS -m 45 -H "@$hdr" -d "$body" "$url" 2>&1) \
   || { jq -nc --arg e "$out" '{status: "error", said: ("No answer: " + $e)}'; exit 1; }
 echo "$out"
+# The migration dry run's marker (ninth round): Cain's rules need it, ok and fresh, before a Ship card
+# for the specialist. Rewritten on every migrate-check, so a failed one replaces an older pass.
+if [ "$cmd" = fastpath ] && [ "${1:-}" = migrate-check ]; then
+  markers="${CAIN_MARKERS:-/data/markers}"
+  mkdir -p "$markers" 2>/dev/null
+  printf '%s' "$out" | jq -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{at: $at, ok: (.status == "ok" and (.result.ok // false)), status: .status,
+      build: (.result.build // ""), checksum: (.result.checksum // ""), result: (.result // {})}' \
+    > "$markers/harness-migrate-check.json" 2>/dev/null \
+    || jq -nc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{at: $at, ok: false, status: "unreadable"}' \
+         > "$markers/harness-migrate-check.json" 2>/dev/null
+fi

@@ -2,7 +2,7 @@
 // Cain's link with the link's key: keeper.sh run for real against a fake link.
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -112,7 +112,7 @@ describe("keeper.sh against a fake link", () => {
       ]);
       const none = await keeper();
       expect(none.code).toBe(2);
-      expect(none.out).toContain("keeper.sh handover [--message <id>] [suggestion]");
+      expect(none.out).toContain("keeper.sh handover [--message <id>] [--smoke <run id>] [suggestion]");
       expect(await keeper("handover", "--message")).toMatchObject({ code: 2 });          // a flag needs its value
       expect(await keeper("handover", "--message", "P31")).toMatchObject({ code: 2 });   // digits only
       expect(seen.length).toBe(3);                                                        // none of those handed over
@@ -200,6 +200,56 @@ describe("keeper.sh against a fake link", () => {
       const usage = (await keeper("help")).out;
       expect(usage).toContain("keeper.sh fastpath gate-open <gmail|family>");
       expect(usage).toContain("keeper.sh fastpath migrate-check [path]");
+    } finally { server.stop(true); }
+  }, 30_000);
+
+  test.skipIf(!ready)("smoke-step opens one step of a run, handover --smoke names the run, and migrate-check writes its marker", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-"));
+    const markers = mkdtempSync(join(tmpdir(), "markers-"));
+    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
+    const key = createHmac("sha256", TOKEN).update("harness-handover-v1").digest("hex");
+    const seen: { path: string; keyed: boolean; body: any }[] = [];
+    let answer: any = { status: "ok", result: { ok: true, build: "b1", checksum: "c".repeat(64), open_turn_on_cards: 0 } };
+    const server = Bun.serve({ port: 0, async fetch(req) {
+      seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body: JSON.parse(await req.text()) });
+      return Response.json(answer);
+    } });
+    const env = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_KEEPER_TEST: "1",
+                  CAIN_DISCORD_DIR: dir, CAIN_MARKERS: markers };
+    const keeper = async (...args: string[]) => {
+      const p = Bun.spawn(["bash", KEEPER, ...args], { env, stdout: "pipe", stderr: "pipe" });
+      const out = (await new Response(p.stdout).text()).trim();
+      return { code: await p.exited, out };
+    };
+    try {
+      expect(await keeper("fastpath", "smoke-step")).toMatchObject({ code: 2 });                          // names the run
+      expect(await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6")).toMatchObject({ code: 2 });          // and the step
+      expect(await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "Gmail Add")).toMatchObject({ code: 2 });   // a slug
+      expect(await keeper("fastpath", "smoke-step", "not-a-run", "gmail-add")).toMatchObject({ code: 2 });
+      expect(await keeper("handover", "--message", "1439000000000000002", "--smoke")).toMatchObject({ code: 2 });
+      expect(await keeper("handover", "--message", "1439000000000000002", "--smoke", "P31")).toMatchObject({ code: 2 });
+      expect(seen.length).toBe(0);
+      await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add");
+      await keeper("handover", "--message", "1439000000000000002", "--smoke", "a1b2c3d4e5f6");
+      await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "conformance-family");
+      expect(seen).toEqual([
+        { path: "/fastpath", keyed: true, body: { state: "smoke-step", run: "a1b2c3d4e5f6", step: "gmail-add" } },
+        { path: "/handover", keyed: true, body: { suggestion: "", paired: "4242", message: "1439000000000000002", smoke_run: "a1b2c3d4e5f6" } },
+        { path: "/fastpath", keyed: true, body: { state: "smoke-step", run: "a1b2c3d4e5f6", step: "conformance-family" } },
+      ]);
+      const marker = join(markers, "harness-migrate-check.json");
+      expect(existsSync(marker)).toBe(false);                     // only migrate-check writes it
+      await keeper("fastpath", "migrate-check");
+      const ok = JSON.parse(readFileSync(marker, "utf8"));
+      expect(ok).toMatchObject({ ok: true, status: "ok", build: "b1", checksum: "c".repeat(64) });
+      expect(Date.now() - Date.parse(ok.at)).toBeLessThan(60_000);
+      answer = { status: "refused", said: "The dry run failed.", result: { ok: false } };
+      await keeper("fastpath", "migrate-check");                  // a failed one replaces the pass
+      expect(JSON.parse(readFileSync(marker, "utf8"))).toMatchObject({ ok: false, status: "refused" });
+      const usage = (await keeper("help")).out;
+      expect(usage).toContain("keeper.sh fastpath smoke-step <run id> <step>");
+      expect(usage).toContain("harness-migrate-check.json");
     } finally { server.stop(true); }
   }, 30_000);
 

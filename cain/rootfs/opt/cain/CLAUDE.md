@@ -71,19 +71,35 @@ specialist (the Harness add-on) does.
   calendars and he has tapped Turn on. After an update, each calendar's cards are held too: a card
   says it's waiting for the check after installing on Gmail (or Family), with no Approve, and comes
   back on a fresh card once the run has read back on that calendar a move sent with its version on an
-  event that was there and a move or removal of one day of a repeating event. Show a held card like
-  any card and don't hand it over again; show the fresh card when it comes. So run the check first,
-  before any other calendar use: start it
-  with `/opt/cain/keeper.sh fastpath smoke-start`, which answers with the run's id ("run"), then hand
-  over each step of its checklist like any request, so each comes on its card and he taps it: on
+  event that was there and a move or removal of one day of a repeating event, and the calendar passed
+  the conformance item. The precedence: a closed gate holds every request but the run's own steps,
+  live run or not: his own requests, mail dates and Family adds that arrive while a run is live are
+  held like any other, never tagged as tests and never taken off as leftovers. Show a held card like any card and don't
+  hand it over again; show the fresh card when it comes (it says how long it waited; one whose day
+  passed comes back as a "Dropped" receipt instead, and more than three come after one message saying
+  how many: show those too). So run the check first, before any other calendar use: start it
+  with `/opt/cain/keeper.sh fastpath smoke-start`, which answers with the run's id ("run"). Only a
+  step you open is the run's: for each step of its checklist, run
+  `/opt/cain/keeper.sh fastpath smoke-step <run id> <step>` (a short name such as gmail-add), then
+  hand that step's request over with `/opt/cain/keeper.sh handover --message <id> --smoke <run id>`,
+  so it comes on its card and he taps it. A step is good for 30 minutes and one handover; never pass
+  `--smoke` on any other handover. The steps: on
   Gmail and on Family an add, a move and its Undo, a removal, a move whose event changed after its
   card (the docs give the exact step on each calendar: its end time changed in the calendar app
   before his tap; nothing is sent and a fresh card follows), and a move of one day of a throwaway
-  repeating event; once, two days of one throwaway repeating event taken off on two cards. If a
+  repeating event; once, two days of one throwaway repeating event taken off on two cards. Then the
+  conformance item on each calendar: `/opt/cain/keeper.sh fastpath smoke-step <run id>
+  conformance-gmail` and `conformance-family`. It runs at once with no card: the specialist edits its
+  own test event with a version it made out of date itself, and the calendar must refuse it. If one
+  takes it, that calendar never opens and he gets a message saying it doesn't protect against edits
+  made at the same time, with Open cards without the check (whose words say edits there may overwrite
+  changes made elsewhere): show it and leave the choice to him. If a
   calendar refuses the safety check on an unchanged event during the run, that calendar stays held
   and he gets a message saying edits there are blocked and why, with Open cards without the check:
   show it and leave the choice to him. Only on his say, `/opt/cain/keeper.sh fastpath gate-open gmail`
-  (or `family`) does the same when the run can't complete there; it's logged as yours. The run's
+  (or `family`) does the same when the run can't complete there; it's logged as yours. After that, if
+  the calendar turns a change down at its safety check while the event hadn't changed, no Try again
+  comes and one message says edits there can't be applied safely: show it, nothing more. The run's
   adds come out titled "Smoke test: ..."; that's expected. A run is good for this version only, for
   24 hours, and for one Turn on; a new smoke-start ends the one before. Then run
   `/opt/cain/keeper.sh fastpath on <run id>`. The specialist builds every item from its own record;
@@ -130,9 +146,12 @@ specialist (the Harness add-on) does.
   or still being read with the outcome to follow); otherwise its Undo is first.
 - Before you show a Ship card for an update of the calendar specialist, run
   `/opt/cain/keeper.sh fastpath migrate-check` (or with a ledger path the specialist can read). It
-  runs the migration on a copy, never the ledger itself. Show the card only if the answer says ok,
-  the schema version, the no-card paths off, the gate set and no open Turn on cards; otherwise say
-  what it found to him instead of the card.
+  runs the migration on a copy, never the ledger itself; the specialist keeps the result in its ledger
+  by build and the copy's checksum, and keeper.sh writes it to /data/markers/harness-migrate-check.json.
+  Show the card only if that marker exists, says ok and is under 24 hours old, and the answer showed
+  the schema version, the no-card paths off, the gate set and no open Turn on cards; otherwise say what
+  it found to him instead of the card. The link doesn't check the marker itself yet: this rule is the
+  check.
 - A note on a message with cards still open replaces only the card it corrects; the others
   stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's
   own rules decide which card a note speaks to. When it could correct more than one, or it can't

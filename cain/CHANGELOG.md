@@ -12,6 +12,9 @@
 - After every update of the calendar specialist, Cain runs the check on your real calendars first: until it has read back on Gmail (or Family) a guarded move and an edit of one day of a repeating event, cards for that calendar wait with no Approve and come back once it's done. If the check can't finish on one, you get Open cards without the check, and Cain can open it only on your say. Each check is good for that build, for a day and for one Turn on, its test events are titled "Smoke test:", and Cain shows the message that offers to take any leftovers off.
 - Before a Ship card for a calendar specialist update, Cain runs its update on a copy of its records first, and shows the card only if that came out right.
 - Turning the no-card changes off ends the check behind them, so turning them on again takes a new one.
+- During the check on your real calendars, only the steps Cain opens for it count as the check. Your own requests that come in meanwhile are held like any other and come back on their own card, never treated as test events.
+- The check also makes each calendar prove it turns down an out of date write; one that doesn't stays on hold, and you get a message saying so with the choice to open it anyway.
+- Before a Ship card for the calendar specialist, Cain needs a fresh, passing dry run of its update on a copy of its records, kept in a file he checks.
 
 ## 0.11.0
 
