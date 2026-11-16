@@ -646,8 +646,8 @@ class Runner:
                 return                      # the controller writes it this tick
             # Eighth round: after an install, a card for a calendar whose check hasn't finished is held:
             # it says so, with no Approve, and comes back on a fresh card once that calendar's gate opens.
-            held = self.calendar_change.held_by_gate(params, seen.bound if seen is not None else None) \
-                if change else []
+            held = self.calendar_change.held_by_gate(params, seen.bound if seen is not None else None,
+                                                     job_id=job["id"]) if change else []
             if held:
                 self.calendar_change.note_held(pid, job["id"], held, db)
                 from .calendar_change import provider_name

@@ -41,6 +41,7 @@ import hmac
 import json
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -78,6 +79,12 @@ def _calendar(value) -> str:
     return text if text in ("gmail", "family") else ""
 
 
+def _step_name(value) -> str:
+    """smoke-step's step name (ninth round): a short slug of lowercase letters, digits and dashes, or nothing."""
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", text) else ""
+
+
 def _ledger_path(value) -> str:
     """migrate-check's ledger file: an absolute path of plain characters, or nothing (the live ledger)."""
     text = str(value or "").strip()
@@ -104,6 +111,8 @@ class Handover:
     record: dict = field(default_factory=dict)   # /fastpath: a pass or fail record from before the sixth round: ignored
     calendar: str = ""                   # /fastpath gate-open: "gmail" or "family" (eighth round)
     path: str = ""                       # /fastpath migrate-check: a ledger file to copy and migrate (eighth round)
+    step: str = ""                       # /fastpath smoke-step: the step's name (ninth round)
+    smoke_run: str = ""                  # /handover: the smoke run whose open step this request is (ninth round)
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
@@ -211,6 +220,8 @@ def _handler(inbox: Inbox, wait_s: float):
                          record=body.get("record") if isinstance(body.get("record"), dict) else {},
                          calendar=_calendar(body.get("calendar")),
                          path=_ledger_path(body.get("path")),
+                         step=_step_name(body.get("step")),
+                         smoke_run=_run_id(body.get("smoke_run")),
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
             inbox.submit(h)

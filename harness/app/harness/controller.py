@@ -653,6 +653,13 @@ class Controller:
             h.finish("refused", "The specialist won't act: you're paired with a different "
                                 "Discord account than the bot's owner.")
             return
+        if h.smoke_run:
+            # Ninth round: a handover naming the smoke run is its open step's, and only with one open.
+            why = self.calendar_change.step_problem(h.smoke_run) if self.calendar_change is not None \
+                else "calendar changes aren't set up in the calendar specialist"
+            if why:
+                h.finish("refused", f"Not handed over as the smoke run's step: {why}. Nothing changed.")
+                return
         if time.monotonic() - h.arrived > FRESH_S:      # the window runs from the handover
             h.finish("stale", "That handover waited here over 2 minutes before it could be read, "
                               "so nothing was done with it. Nothing changed. Hand it over again.")
@@ -741,6 +748,10 @@ class Controller:
             self.ledger.set_meta(f"job_origin:{job_id}", json.dumps(origin))   # how many after it, now
             if note:
                 self._note_for_question(job_id, note, flags)
+        if h.smoke_run and self.calendar_change is not None:
+            why = self.calendar_change.claim_step(h.smoke_run, job_id)
+            if why:
+                log.info("a handover named the smoke run, but it isn't its step: %s", why)
         h.job = render.short(job_id)                       # for the log only
         self._handover_jobs.setdefault(job_id, []).append(h)
 
@@ -851,7 +862,8 @@ class Controller:
 
     def _fastpath(self, h) -> None:
         """Cain's keeper.sh fastpath (0.24.0, fourth to sixth rounds). "smoke-start" starts a smoke run
-        under an id issued here; each change approved after it is recorded under that id. "on" names
+        under an id issued here; "smoke-step" opens one step of it (ninth round), and only the next handover
+        naming the run is recorded under that id, never anything else that arrives meanwhile. "on" names
         the run: its checklist is built here from this ledger alone (event ids, request and read-back
         times, the refusals for an older version, the listing lag), anything with no evidence is
         refused by name and nothing changes, and anything Cain sends as passed is ignored. A full one
@@ -859,14 +871,29 @@ class Controller:
         paths. "off" turns them off at once. Until his tap, every calendar change comes on a card."""
         from .calendar_change import fast_path, set_fast_path
         cc = self.calendar_change
-        if h.state in ("smoke-start", "on") and cc is None:
+        if h.state in ("smoke-start", "on", "smoke-step") and cc is None:
             h.finish("off", "Calendar changes aren't set up in the calendar specialist.")
             return
         if h.state == "smoke-start":
             run = cc.smoke_start()
             log.info("a smoke run started")
-            h.finish("ok", f"Smoke run {run['id']} started. Run its checklist through the normal card path, each "
-                           f"change on its card and tapped, then send keeper.sh fastpath on {run['id']}.", run=run["id"])
+            h.finish("ok", f"Smoke run {run['id']} started. For each step of its checklist, open the step with keeper.sh "
+                           f"fastpath smoke-step {run['id']} <step>, then hand that step's request over with keeper.sh "
+                           f"handover --message <id> --smoke {run['id']}, its card tapped; only those are the run's. "
+                           f"Run keeper.sh fastpath smoke-step {run['id']} conformance-gmail and conformance-family "
+                           f"too. Then send keeper.sh fastpath on {run['id']}.", run=run["id"])
+            return
+        if h.state == "smoke-step":
+            # Ninth round: only a change made under a step Cain opens is the run's.
+            if commands.is_paused(self.ledger):
+                h.finish("refused", "I'm stopped, so no smoke step was opened or run. Nothing changed.")
+                return
+            if not h.run:
+                h.finish("refused", "Name the smoke run and the step: keeper.sh fastpath smoke-step <run id> <step>. "
+                                    "Nothing changed.")
+                return
+            status, said, extra = cc.smoke_step(h.run, h.step)
+            h.finish(status, said, **extra)
             return
         if h.state == "on":
             if h.record:
@@ -910,12 +937,16 @@ class Controller:
             path = h.path or self.ledger.path
             got = migrate.dry_run(path)
             log.info("migration dry run on a copy of %s: %s", path, "ok" if got.get("ok") else got.get("said"))
+            # Ninth round: the result is kept in the live ledger, keyed by this build and the checksum of
+            # the copy it ran on; the install step logs whether one was kept for its build.
+            got["recorded"] = migrate.record_dry_run(self.ledger, got)
             h.finish("ok" if got.get("ok") else "refused",
                      "The migration ran on a copy; the ledger itself wasn't touched." if got.get("ok")
                      else got.get("said", "The dry run failed."), result=got)
             return
         now = fast_path(self.ledger)
-        h.finish("unknown", "Say smoke-start, on <run id>, off, gate-open <gmail|family> or migrate-check [path]. "
+        h.finish("unknown", "Say smoke-start, smoke-step <run id> <step>, on <run id>, off, gate-open <gmail|family> "
+                 "or migrate-check [path]. "
                  "It's " + ("on" if now.get("on") else "off (card only)") + " now.")
 
     def _meanings(self, h) -> None:

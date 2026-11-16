@@ -102,8 +102,8 @@ MOVE_POOL = change("family", "move", "Pool", start=at(17, 30).isoformat(), end=a
 DROP_POOL = change("family", "remove", "Pool")
 
 
-def card_for(m, words, *outputs):
-    out = m.tells(words, *outputs)
+def card_for(m, words, *outputs, **kw):
+    out = m.tells(words, *outputs, **kw)
     assert out["status"] == "waiting for his tap", out
     return last_pid(m)
 
@@ -544,8 +544,23 @@ def test_a_restart_on_the_same_ledger_offers_a_paused_change_again(m):
 from test_handover_round5 import DROP_SWIM, PASSING  # noqa: E402
 
 
-def _approve(m, words, output, done="Done."):
-    card_for(m, words, ask(output))
+def smoke_step(m, run, step):
+    """Ninth round: Cain opens one step of the run; only the next handover naming the run is its."""
+    out = m.send(Handover(kind="fastpath", state="smoke-step", run=run, step=step))
+    assert out["status"] == "ok", out
+    return out
+
+
+def step_card(m, run, step, words, *outputs):
+    smoke_step(m, run, step)
+    return card_for(m, words, *outputs, smoke_run=run)
+
+
+def _approve(m, words, output, done="Done.", run="", step="step"):
+    if run:
+        step_card(m, run, step, words, ask(output))
+    else:
+        card_for(m, words, ask(output))
     m.tap("Approve")
     m.c.outbox.flush()
     assert m.seen()[-1].startswith(done) or done is None, m.seen()[-1]
@@ -562,37 +577,43 @@ def run_smoke(m):
     m.icloud.seed(POOL_PATH, pool_ics())
     # Gmail: an add (the run's first: its answer let go, read back a minute on), a move and its Undo, a
     # removal, and a card for an event that changed since it (nothing sent).
-    card_for(m, "add the dentist at 3 today", ask(DENTIST))
+    step_card(m, run, "gmail-add", "add the dentist at 3 today", ask(DENTIST))
     m.tap("Approve")
     m.cc.join_abandoned()
     settle(m)
     m.c.outbox.flush()
     assert m.seen()[-1].startswith("Done.") and "Added Smoke test: Dentist" in m.seen()[-1]   # a test event
-    _approve(m, "haircut moved to 10:30 today", MOVE_HAIRCUT)
+    _approve(m, "haircut moved to 10:30 today", MOVE_HAIRCUT, run=run, step="gmail-move")
     m.tap("Undo")
     m.c.tick()
     m.c.outbox.flush()
     assert m.seen()[-1].startswith("Undone.")
-    _approve(m, "no haircut today", DROP_HAIRCUT)
-    card_for(m, "yoga at 6:30 today", ask(MOVE_YOGA))
+    _approve(m, "no haircut today", DROP_HAIRCUT, run=run, step="gmail-remove")
+    step_card(m, run, "gmail-stale", "yoga at 6:30 today", ask(MOVE_YOGA))
     m.gmail.events[yoga_id(11)]["description"] = "Bring a towel"
     m.gmail._bump(yoga_id(11))
     m.tap("Approve")
     assert any(t.startswith("Not applied.") for t in m.seen())
     # Family: an add, a move and its Undo, a removal, a refused write, and two days of one series.
     _approve(m, "add piano at 1 today to family", change("family", "add", "Piano", dates="",
-                                                         start=at(13).isoformat(), end=at(14).isoformat()))
-    _approve(m, "swim moved to 5 today", SWIM)
+                                                         start=at(13).isoformat(), end=at(14).isoformat()),
+             run=run, step="family-add")
+    _approve(m, "swim moved to 5 today", SWIM, run=run, step="family-move")
     m.tap("Undo")
     m.c.tick()
     m.c.outbox.flush()
     assert m.seen()[-1].startswith("Undone.")
-    _approve(m, "no swim today", DROP_SWIM)
-    card_for(m, "pool at 5:30 today", ask(MOVE_POOL))
+    _approve(m, "no swim today", DROP_SWIM, run=run, step="family-remove")
+    step_card(m, run, "family-stale", "pool at 5:30 today", ask(MOVE_POOL))
     m.icloud.seed(POOL_PATH, pool_ics(LOCATION="LOCATION:Pool B"))
     m.tap("Approve")
-    _approve(m, "no pool next wednesday", change("family", "remove", "Pool", dates="2026-11-18"))
-    _approve(m, "no pool on the 25th", change("family", "remove", "Pool", dates="2026-11-25"))
+    _approve(m, "no pool next wednesday", change("family", "remove", "Pool", dates="2026-11-18"),
+             run=run, step="series-1")
+    _approve(m, "no pool on the 25th", change("family", "remove", "Pool", dates="2026-11-25"),
+             run=run, step="series-2")
+    # Ninth round: each calendar refuses the run's own stale write to its own test event.
+    smoke_step(m, run, "conformance-gmail")
+    smoke_step(m, run, "conformance-family")
     return run
 
 

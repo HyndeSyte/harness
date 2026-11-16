@@ -23,7 +23,7 @@ from test_handover_round4 import DENTIST, dentists
 from test_handover_round5 import (DROP_SWIM, HAIRCUT, MOVE_HAIRCUT, SWIM_PATH, haircut_at, seed_haircut, settle,
                                   swim_ics)
 from test_handover_round6 import (MOVE_POOL, MOVE_YOGA, POOL_PATH, card_for, correct_haircut, last_pid,
-                                  pool_ics, seed_yoga, state, yoga_at)
+                                  pool_ics, seed_yoga, smoke_step, state, step_card, yoga_at)
 from test_handover_round7 import (_declined_add_lands, _gmail_refuses_every_fence, _icloud_refuses_every_fence,
                                   fresh_cards, not_applied)
 from fake_caldav import no_network  # noqa: F401  (autouse)
@@ -187,26 +187,30 @@ def test_a_request_during_the_gate_is_held_with_no_approve_then_offered_again_on
     m.c.tick()
     assert m.ledger.db.execute("SELECT state FROM proposals WHERE id=?", (held,)).fetchone()[0] == "proposed"
     m.clock.t -= calendar_change.timedelta(hours=30)
-    # The smoke run: on Gmail a fenced move of an event that was there, then a move of one day of a series.
+    # The smoke run: on Gmail a fenced move of an event that was there, then a move of one day of a series,
+    # each a step of the run (ninth round), then the conformance item.
     run = m.send(Handover(kind="fastpath", state="smoke-start"))["run"]
     assert run
-    card_for(m, "haircut moved to 10:30 today", ask(MOVE_HAIRCUT))
+    step_card(m, run, "gmail-move", "haircut moved to 10:30 today", ask(MOVE_HAIRCUT))
     m.tap("Approve")
     assert _gate_seen(m)["gmail"].get("fenced") and not _gate_seen(m)["gmail"].get("series")
     assert "gmail" in calendar_change.closed_providers(m.ledger)
-    card_for(m, "yoga at 6:30 today", ask(MOVE_YOGA))
+    step_card(m, run, "gmail-series", "yoga at 6:30 today", ask(MOVE_YOGA))
     m.tap("Approve")
     assert yoga_at(m) == "18:30"
+    assert "gmail" in calendar_change.closed_providers(m.ledger)              # the conformance item still to come
+    smoke_step(m, run, "conformance-gmail")
     assert calendar_change.closed_providers(m.ledger) == ["family"]          # Gmail open, Family still held
     m.c.tick()
     again = last_card(m)
-    assert "it waited for the check after installing, which is done on Gmail" in again["text"]
+    assert "for the check after installing, which is done on Gmail" in again["text"]
     assert "Approve" in labels_of(again)
     assert m.ledger.db.execute("SELECT state FROM proposals WHERE id=?", (held,)).fetchone()[0] == "superseded"
     m.tap("Approve")
     m.cc.join_abandoned()                              # the run's first add: its answer let go, read back
     settle(m)
-    assert m.seen()[-1].startswith("Done.") and "Dentist" in m.seen()[-1]    # tagged as the live run's test
+    assert m.seen()[-1].startswith("Done.") and "Dentist" in m.seen()[-1]
+    assert "Smoke test" not in m.seen()[-1]          # his own request, never the live run's (ninth round)
     # Once the run is over: a Gmail card is a normal card, a Family one is held.
     m.clock.t += calendar_change.timedelta(hours=25)
     m.c.tick()
@@ -240,8 +244,8 @@ def test_a_card_from_before_the_install_tapped_during_the_gate_is_held_not_appli
 def test_a_refused_safety_check_during_the_run_keeps_that_calendar_held_and_says_so_with_the_override(m):
     m.icloud.seed(SWIM_PATH, swim_ics("20261111T210000Z", "20261111T220000Z"))
     _icloud_refuses_every_fence(m)
-    m.send(Handover(kind="fastpath", state="smoke-start"))
-    pid = card_for(m, "no swim today", ask(DROP_SWIM))
+    run = m.send(Handover(kind="fastpath", state="smoke-start"))["run"]
+    pid = step_card(m, run, "family-remove", "no swim today", ask(DROP_SWIM))
     m.tap("Approve")
     assert state(m, pid) == "fence_refused"
     m.c.outbox.flush()

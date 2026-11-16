@@ -8,8 +8,14 @@ FROM ${BUILD_FROM}
 # Python standard library, so the build on the Pi is a copy, not a fetch.
 COPY app /opt/harness
 COPY rootfs /
+# The build identifier (ninth round): one hash over every shipped file, this Dockerfile, config.yaml
+# and rootfs included, kept in /opt/harness/BUILD_ID so the install step runs once per build.
+COPY Dockerfile config.yaml /tmp/harness-build/
+COPY rootfs /tmp/harness-build/rootfs
 
-RUN chmod a+x /etc/services.d/harness/run /etc/services.d/harness/finish \
+RUN python3 /opt/harness/harness/buildid.py /tmp/harness-build /opt/harness > /opt/harness/BUILD_ID \
+    && rm -rf /tmp/harness-build \
+    && chmod a+x /etc/services.d/harness/run /etc/services.d/harness/finish \
     && python3 -c "import sys; sys.path.insert(0, '/opt/harness'); import harness.controller, harness.setup_web"
 
 LABEL \

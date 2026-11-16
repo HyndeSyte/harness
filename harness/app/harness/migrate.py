@@ -39,6 +39,8 @@ HANDOVER = 2
 DONE = "migration_done:handover_sweep"
 LISTED = "migration_listed:"       # + the batch: the proposals its Propose again brings back
 PROPOSE_TTL_S = 7 * 24 * 3600
+DRY_RUN = "migration_dry_run:"     # + build: the dry run's result for that build (ninth round)
+DRY_RUN_LATEST = "migration_dry_run_latest"   # the newest dry run, whichever build ran it
 
 
 def schema(ledger: Ledger) -> int:
@@ -69,6 +71,29 @@ def run(ledger: Ledger, cc, chat_id: int, version: str | None = None, build: str
     return out
 
 
+def record_dry_run(ledger: Ledger, got: dict) -> dict:
+    """keeper.sh fastpath migrate-check's result, kept in the live ledger (ninth round): keyed by the build
+    that ran it, with the checksum of the ledger copy it ran on, whether it passed and when. What was kept."""
+    from . import calendar_change as cal
+    kept = {"build": got.get("build") or cal.app_build(), "version": got.get("version") or cal.app_version(),
+            "checksum": got.get("checksum", ""), "ok": bool(got.get("ok")), "at": iso(ledger.now()),
+            "copy_of": got.get("copy_of", "")}
+    with ledger.tx() as db:
+        ledger.set_meta(DRY_RUN + kept["build"], json.dumps(kept), db)
+        ledger.set_meta(DRY_RUN_LATEST, json.dumps(kept), db)
+        ledger.event("migration_dry_run", kept, db=db)
+    return kept
+
+
+def dry_run_for(ledger: Ledger, build: str) -> dict:
+    """The dry run kept for a build (record_dry_run), {} when none."""
+    try:
+        got = json.loads(ledger.get_meta(DRY_RUN + build) or "{}")
+    except ValueError:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
 def install(ledger: Ledger, cc, version: str | None = None, build: str | None = None) -> dict:
     """Once per build the ledger starts under (0.24.0, seventh and eighth rounds), keyed to the version and
     the build identifier kept in the ledger (calendar_change.INSTALLED), so every install gets it, a
@@ -84,8 +109,12 @@ def install(ledger: Ledger, cc, version: str | None = None, build: str | None = 
     if kept.get("version") == version and kept.get("build") == build:
         return {}
     now = iso(ledger.now())
+    dry = dry_run_for(ledger, build)
+    latest = cal._meta_json(ledger, DRY_RUN_LATEST)
     out = {"version": version, "build": build, "from": kept.get("version", ""), "from_build": kept.get("build", ""),
-           "fast_path_off": False, "run_closed": False, "cards_retired": 0}
+           "fast_path_off": False, "run_closed": False, "cards_retired": 0,
+           "dry_run": bool(dry.get("ok")), "dry_run_checksum": dry.get("checksum", ""),
+           "latest_dry_run": {k: latest.get(k) for k in ("build", "ok", "at", "checksum")} if latest else {}}
     with ledger.tx() as db:
         if cal.fast_path(ledger).get("on") is True:
             cal.set_fast_path(ledger, False, cal.fast_path(ledger).get("smoke", ""), by="install", db=db)
@@ -106,6 +135,17 @@ def install(ledger: Ledger, cc, version: str | None = None, build: str | None = 
     log.info("installed %s (build %s): no-card paths %s, smoke run %s, %d Turn on button(s) off; cards are held "
              "for the smoke run", version, build, "off" if out["fast_path_off"] else "unchanged",
              "ended" if out["run_closed"] else "none open", out["cards_retired"])
+    # Ninth round: whether a migration dry run was recorded in this ledger for this very build.
+    if out["dry_run"]:
+        log.info("a migration dry run was recorded for build %s (ledger copy checksum %s, %s)", build,
+                 dry.get("checksum", "")[:16], dry.get("at", ""))
+    elif latest:
+        # The dry run runs the migration of the build installed when it ran, so before an update it's
+        # usually the build before's: said with its build, its result and when.
+        log.warning("no migration dry run was recorded for build %s itself; the latest was by build %s, %s, at %s",
+                    build, latest.get("build", ""), "ok" if latest.get("ok") else "not ok", latest.get("at", ""))
+    else:
+        log.warning("no migration dry run was recorded before build %s was installed", build)
     return out
 
 
@@ -132,6 +172,9 @@ def dry_run(path: str, version: str | None = None, build: str | None = None) -> 
             dst.close()
         finally:
             src.close()
+        import hashlib
+        with open(copy, "rb") as f:
+            checksum = hashlib.sha256(f.read()).hexdigest()   # the copy as it was before the migration ran
         led = Ledger(copy)
         before_schema = schema(led)
         before = led.db.total_changes
@@ -141,7 +184,8 @@ def dry_run(path: str, version: str | None = None, build: str | None = None) -> 
         gate = cal.card_gate(led)
         open_turn_on = led.db.execute("SELECT COUNT(*) FROM choices WHERE kind='calendar_change_fast_on' AND"
                                       " consumed_at IS NULL").fetchone()[0]
-        result = {"ok": True, "copy_of": path, "schema_before": before_schema, "schema": schema(led),
+        result = {"ok": True, "copy_of": path, "checksum": checksum, "build": build or cal.app_build(),
+                  "version": version or cal.app_version(), "schema_before": before_schema, "schema": schema(led),
                   "fast_path_on": cal.fast_path_on(led), "gate_set": bool(gate),
                   "gate_closed": cal.closed_providers(led) if gate else [],
                   "open_turn_on_cards": open_turn_on, "rows_touched": touched,
