@@ -191,47 +191,63 @@ the update. `/data/trust/c1check.json` holds the check that runs as `cain` at ev
 Nothing of Cain's runs unchecked, and no stop is silent. The App stops him when a check of
 his own user finds a breach, when the move stops part way, when his start state is damaged,
 or when its safety setup doesn't check out at start; it pauses him (not a breach) when that
-check can't finish, and tries it again every 10 minutes until it does. If a try of the move
-fails, he keeps running the old way and the App says so. Each time, the App tells you itself,
-from outside his session (`/opt/cain/notice.sh`), what happened and the way back:
+check can't finish, and tries it again every 10 minutes until it does. If his session keeps
+ending soon after it starts, the App keeps starting it again, and says so at the third time.
+If a try of the move fails, he keeps running the old way and the App says so. Each time, the
+App tells you itself, from outside his session (`/opt/cain/notice.sh`), what happened and the
+way back:
 
 - in Discord, from his bot, once;
 - in Home Assistant, as a notification and a push to your phone, again each day until it's
-  fixed, and taken down (with "Cain is back") when it is.
+  fixed, and taken down (with "Cain is back") once he has run two minutes.
 
 The Home Assistant side is one automation with a webhook trigger. The App has no Home
 Assistant API access, on purpose: the Supervisor's route to a notification would give every
 process of the App the run of all of Home Assistant, and this webhook can only show a notice.
-Put a long random id (32 to 128 letters, digits, `-` or `_`) in this App's `notice_hook`
-option, and the same id in the automation:
+Its id is made from `owner_user_id`, the Home Assistant user id the panel already opens for:
+`cain-` and the first 40 hex digits of the SHA-256 of `cain alarms <owner_user_id>`. So the
+channel works from the first start after the update, with nothing to set in the App. To use
+another id instead, put it (32 to 128 letters, digits, `-` or `_`) in the `notice_hook`
+option. The App also posts a probe (`state: test`) at each start and daily, which notifies no
+one: the automation notes its time in a helper, so you can see from Home Assistant that the
+channel works.
 
 ```yaml
 alias: Cain App alarms
 mode: queued
 triggers:
   - trigger: webhook
-    webhook_id: <the notice_hook id>
+    webhook_id: <the id>
     allowed_methods: [POST]
     local_only: true
 actions:
-  - if: "{{ trigger.json.state == 'clear' }}"
-    then:
-      - action: persistent_notification.dismiss
-        data: {notification_id: cain_app}
-    else:
+  - choose:
+      - conditions: "{{ trigger.json.state == 'test' }}"
+        sequence:
+          - action: input_datetime.set_datetime
+            target: {entity_id: input_datetime.cain_alarms_checked}
+            data: {timestamp: "{{ now().timestamp() }}"}
+      - conditions: "{{ trigger.json.state == 'clear' }}"
+        sequence:
+          - action: persistent_notification.dismiss
+            data: {notification_id: cain_app}
+          - action: notify.mobile_app_<your phone>
+            data: {title: "{{ trigger.json.title }}", message: "{{ trigger.json.message }}"}
+    default:
       - action: persistent_notification.create
         data:
           notification_id: cain_app
           title: "{{ trigger.json.title }}"
           message: "{{ trigger.json.message }}"
-  - action: notify.mobile_app_<your phone>
-    data:
-      title: "{{ trigger.json.title }}"
-      message: "{{ trigger.json.message }}"
+      - action: notify.mobile_app_<your phone>
+        data: {title: "{{ trigger.json.title }}", message: "{{ trigger.json.message }}"}
 ```
 
-With `notice_hook` empty, the alarms go to Discord only. An alarm raised before the hook is
-set reaches Home Assistant as soon as it is.
+`input_datetime.cain_alarms_checked` is a date-and-time helper. An alarm raised while Home
+Assistant can't be reached is sent once it can; one that clears while it can't stays to be
+taken down. Home Assistant answers every webhook post alike, found or not, so the probe's time
+in the helper is the only proof the channel works end to end: it should move at each start of
+the App.
 
 **The way back** (the alarms say which applies): restart the Cain App (Settings, Apps,
 Cain, Restart); or restore two backups from just before the update, Cain's first and then the

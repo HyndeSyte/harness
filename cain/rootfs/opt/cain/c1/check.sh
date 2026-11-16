@@ -11,12 +11,15 @@
 #   <what>"), ends his session and tells Dane it's a pause, not a breach. The start then tries
 #   the check every 10 minutes without his session (C1_HELD=1: one try, no session to end) and
 #   starts him once it finishes; a new version starts afresh.
+# A stop or a hold that can't be kept in /data/c1 is kept in /run/cain instead, so this
+# container doesn't start him again (the start reads both); it says so in the App log.
 # Exits 0 when everything held, 3 on a breach, 4 when he's held.
 set -uo pipefail
 OPT="${C1_OPT:-/opt/cain}"
 OUT="${C1_CHECK_OUT:-/data/trust/c1check.json}"
 MARK="${C1_CHECK_FAILED:-/data/c1/check-failed}"
 HELD="${C1_CHECK_HELD:-/data/c1/check-held}"
+RUNMARKS="${C1_RUN_MARKS:-/run/cain}"
 VERSION="${C1_VERSION:-unknown}"
 SOCK_TMUX="${SOCK_TMUX:-/run/cain/tmux/cain.sock}"
 TRIES="${C1_CHECK_TRIES:-5}"
@@ -28,7 +31,14 @@ once() {
     printf '%s' "$raw"
   else printf '%s' "$NOANSWER"; fi
 }
-mark() { printf '%s %s\n' "$VERSION" "$2" > "$1.tmp" && chmod 0600 "$1.tmp" && mv "$1.tmp" "$1"; }
+mark() {   # mark <file> <what>: in /data/c1, else in /run/cain for this container
+  if { printf '%s %s\n' "$VERSION" "$2" > "$1.tmp" && chmod 0600 "$1.tmp" && mv "$1.tmp" "$1"; } 2>/dev/null; then return 0; fi
+  rm -f "$1.tmp" 2>/dev/null
+  echo "[c1] couldn't keep $1, so it's kept in $RUNMARKS/${1##*/} for this container" >&2
+  { printf '%s %s\n' "$VERSION" "$2" > "$RUNMARKS/${1##*/}" && chmod 0600 "$RUNMARKS/${1##*/}"; } 2>/dev/null \
+    || echo "[c1] couldn't keep it in $RUNMARKS either" >&2
+}
+unmark() { rm -f "$1" "$RUNMARKS/${1##*/}" 2>/dev/null; }
 end_session() { [ "${C1_HELD:-}" = 1 ] || "$OPT/as-cain" tmux -u -S "$SOCK_TMUX" kill-session -t cain 2>/dev/null || true; }
 try=0
 while :; do
@@ -44,7 +54,7 @@ printf '%s\n' "$body" > "$OUT.tmp" && chmod 0644 "$OUT.tmp" && mv "$OUT.tmp" "$O
 n="$(printf '%s' "$body" | jq -r .checks)"
 if [ "$(printf '%s' "$body" | jq -r .ok)" != true ]; then
   why="$(printf '%s' "$body" | jq -r '.failed | join("; ")' | tr -d '\n' | cut -c1-300)"
-  mark "$MARK" "$why"; rm -f "$HELD"
+  mark "$MARK" "$why"; unmark "$HELD"
   end_session
   "$OPT/notice.sh" tell breach >&2 || true
   echo "[c1] check FAILED: $why. Cain is stopped until a new version is installed"
@@ -57,6 +67,6 @@ elif [ "$(printf '%s' "$body" | jq '.unchecked | length')" != 0 ]; then
   echo "[c1] check: $n held; not tried after $try tries: $not. His session is held (not a breach) until it can be"
   exit 4
 else
-  rm -f "$HELD"
+  unmark "$HELD"
   echo "[c1] check: all $n held"
 fi

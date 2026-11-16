@@ -229,12 +229,22 @@ alarm)
   "$OPT/notice.sh" clear running >/dev/null
   grep -q "\"state\":\"clear\",\"alarm\":\"breach\",\"title\":\"Cain is back\"" /fp/hook.log || fail "the alarm didn't come down"
   [ ! -e $D/c1/notice ] || fail "a cleared alarm stayed on record"
+  # The probe: Home Assistant's automation only notes its time, nobody is notified.
+  "$OPT/notice.sh" probe >/dev/null 2>&1 || fail "the probe didn't go"
+  grep -q "\"state\":\"test\",\"alarm\":\"probe\"" /fp/hook.log && [ -s $D/c1/notice-probed ] || fail "the probe isn't in Home Assistant's log or on record"
   sleep 0.2; kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
   ! grep -qF "$hook" /fp/cmdlines || fail "the hook was on a command line"
   grep -q "18123" /fp/cmdlines || fail "the command lines weren't watched"
+  # While it's set, the hook is a secret value like the App's keys: uid 1000 can read it nowhere,
+  # by the start's own check (which counts it among them) and by a search of its own.
+  command -v flock >/dev/null || fail "no flock in the image: the alarms take its lock"
+  mv /fp/discord.env.away $D/link/discord.env
+  "$OPT/c1/lock.sh" verify || fail "the start's check doesn't hold with the hook set"
+  hits="$(setpriv --reuid=1000 --regid=1000 --init-groups grep -rlF -D skip -e "$hook" $D /run /tmp /var/tmp /etc /root /home 2>/dev/null || true)"
+  [ -z "$hits" ] || fail "uid 1000 can read the hook in $(printf '%s' "$hits" | head -n 2 | tr '\n' ' ')"
   # Back as it was, for the final checks.
-  mv /fp/discord.env.away $D/link/discord.env; cp /fp/options.before $D/options.json && chmod 0600 $D/options.json
-  rm -f $D/c1/check-held /fp/hook.log
+  cp /fp/options.before $D/options.json && chmod 0600 $D/options.json
+  rm -f $D/c1/check-held $D/c1/notice-probed /fp/hook.log
   note "alarms reached Home Assistant with Discord down ($(wc -l < /fp/check.out) lines from the check)"
   ;;
 plant-connector)

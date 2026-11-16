@@ -8,6 +8,7 @@
 - The first start after the calendar App's update moves him over by itself: the App restarts once, checks the new setup on the Pi (the Discord login, and a test message that goes nowhere), and only then switches. If a check fails he keeps running as before and tries again later, and you hear so; nothing for you to do. If the move ever stops part way, or a safety check of his own user fails after an update, the App stops him and tells you how to get him back: restore both Apps' backups from just before the update.
 - If that safety check can't finish (rather than failing), Cain pauses instead of running unchecked, and comes back by himself once it finishes; you hear it's a pause, not a breach.
 - Whenever Cain is stopped or paused, for any reason, the App tells you itself, with the way back: in Discord, and as a Home Assistant notification and a push to your phone, again each day until it's fixed. The Home Assistant one comes through a one-time automation (the App's documentation, "If Cain stops"), which can only show a notice: the App still has no access to Home Assistant itself.
+- If his session stops on its own, the App starts it again right away instead of stopping, and tells you if it keeps happening.
 - How it was checked: the design went through six rounds of outside review, and tests interrupt the move at every step and check that nothing secret is ever readable by Cain's user.
 
 ## 0.11.0
