@@ -101,7 +101,8 @@ def test_gmail_refusing_every_fence_on_an_unchanged_event_says_so_once_with_no_f
     assert haircut_at(m) == "10:00" and state(m, pid) == "fence_refused"
     said = not_applied(m)
     assert len(said) == 1 and "turned down the write at its safety check" in said[0]
-    assert "unchanged since your card, so nothing was changed" in said[0]
+    assert "shows the very version the write was guarded by, so nothing was changed" in said[0]
+    assert "Try again makes a new card from a fresh read" in said[0] and "Try again" in m.labels()
     assert not fresh_cards(m) and not [c for c in list(m.link.cards)[cards:]
                                        if "Approve" in str(m.link.cards[c]["rows"])]   # no new card to tap
     assert len(sent) == 1                                                 # sent once, never again
@@ -146,7 +147,9 @@ def test_a_second_stale_refusal_in_one_change_family_ends_with_a_plain_receipt(m
     m.c.outbox.flush()
     assert len(fresh_cards(m)) == 1                  # no second fresh card
     last = not_applied(m)[-1]
-    assert "That was already its fresh card, so nothing was changed and there's no other card for it." in last
+    assert "That was already its fresh card, so nothing was changed." in last
+    assert "its start time and end time changed since your card" in last           # what changed since
+    assert "Start again from now" in last and "Start again from now" in m.labels()
     assert haircut_at(m) == "08:00" and state(m, fresh) == "stale"
 
 
@@ -196,7 +199,7 @@ def test_a_family_series_write_keeps_another_days_override_exception_and_alarm(m
 def test_a_family_write_whose_version_isnt_its_reads_is_never_sent(m, monkeypatch):
     m.icloud.seed(POOL_PATH, pool_ics())
     pid = card_for(m, "pool at 5:30 today", ask(MOVE_POOL))
-    monkeypatch.setattr(m.cc, "_guard_for", lambda href, fresh, body="": '"from-another-read"')
+    monkeypatch.setattr(m.cc, "_card_etag", lambda *a, **k: '"from-another-read"')
     before = dict(m.icloud.events)
     m.tap("Approve")
     assert m.icloud.events == before and state(m, pid) != "done"
@@ -432,9 +435,11 @@ def _declined_add_lands(m, monkeypatch, edit_after=None):
 def test_a_plain_add_landing_after_his_decline_is_taken_off_again_by_itself(m, monkeypatch):
     first, newer = _declined_add_lands(m, monkeypatch)
     said = [t for t in m.seen() if t.startswith("Applied despite your Decline")]
-    assert len(said) == 1 and "I'm taking it off again now, only if it's still that version" in said[0]
+    # Eighth round: the revert's own outcome is on that same receipt.
+    assert len(said) == 1 and "I took it off again, only over that version" in said[0]
+    assert "it's off your calendar now, and a read of it by its id shows it gone" in said[0]
     assert not dentists(m)                                     # taken off again
-    assert any(t.startswith("Undone.") for t in m.seen())
+    assert not any(t.startswith("Undone.") for t in m.seen())  # one receipt, not two
     row = m.ledger.db.execute("SELECT undo_state FROM calendar_changes WHERE proposal_id=?", (first,)).fetchone()
     assert row[0] == "undone"
 
@@ -542,40 +547,12 @@ def test_the_measured_lag_sends_a_no_card_change_to_a_card_after_a_fresh_write(m
 def test_the_docs_give_the_manual_step_for_the_refused_item_on_each_calendar():
     from pathlib import Path
     docs = (Path(__file__).resolve().parents[1] / "harness" / "DOCS.md").read_text()
-    assert "To produce the Gmail refusal" in docs and "To produce the Family refusal" in docs
+    assert "To produce the Gmail stale card" in docs and "To produce the Family stale card" in docs
 
 
 # -- 8. the card gate after an install ----------------------------------------------------------------------
 
-@pytest.mark.card_only
-@pytest.mark.install_gate
-def test_after_an_install_a_card_waits_for_the_smoke_run_to_read_back_on_each_calendar(m):
-    assert calendar_change.card_gate(m.ledger) and not calendar_change.card_gate_open(m.ledger)
-    m.tells("add the dentist at 3 today", ask(DENTIST))
-    m.tap("Approve")
-    m.c.outbox.flush()
-    assert not dentists(m)
-    assert m.seen()[-1].startswith("Nothing changed: after an update, calendar changes on cards wait until the "
-                                   "check after installing has read back a change on Gmail and on Family.")
-    run = m.send(Handover(kind="fastpath", state="smoke-start"))["run"]
-    assert run
-    card_for(m, "add the vet at 6 today", ask(change("gmail", "add", "Vet", dates="", start=at(18).isoformat(),
-                                                     end=at(19).isoformat())))
-    m.tap("Approve")
-    m.cc.join_abandoned()
-    settle(m)
-    assert calendar_change.card_gate(m.ledger)["verified"].get("gmail") and not calendar_change.card_gate_open(m.ledger)
-    card_for(m, "add piano at 1 today to family", ask(change("family", "add", "Piano", dates="",
-                                                             start=at(13).isoformat(), end=at(14).isoformat())))
-    m.tap("Approve")
-    assert calendar_change.card_gate_open(m.ledger)
-    m.clock.t += timedelta(hours=25)                           # the run is over; normal cards go now
-    m.c.tick()
-    card_for(m, "add the dentist at 3 tomorrow", ask(change("gmail", "add", "Dentist", dates="",
-                                                            start=at(15, day=12).isoformat(),
-                                                            end=at(16, day=12).isoformat())))
-    m.tap("Approve")
-    assert len(dentists(m)) == 1
+# Eighth round: the gate holds cards per calendar instead of refusing them (test_handover_round8.py).
 
 
 def test_a_restart_on_the_same_version_keeps_the_gate_and_doesnt_install_again(m):

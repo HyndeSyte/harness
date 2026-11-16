@@ -893,9 +893,30 @@ class Controller:
             log.info("the no-card path is off")
             h.finish("ok", "Off: every calendar change comes on a card.")
             return
+        if h.state == "gate-open":
+            # Eighth round: a calendar's gate after an install opened without the check, when the check
+            # can't complete there. Logged, with who; its held changes come back on fresh cards.
+            if cc is None:
+                h.finish("off", "Calendar changes aren't set up in the calendar specialist.")
+                return
+            if not h.calendar:
+                h.finish("refused", "Name the calendar: keeper.sh fastpath gate-open gmail, or family. Nothing changed.")
+                return
+            said = cc.open_gate(h.calendar, by="cain")
+            h.finish("ok", render.plain(said))
+            return
+        if h.state == "migrate-check":
+            # Eighth round: the migration on a copy of a ledger file, never the file itself.
+            path = h.path or self.ledger.path
+            got = migrate.dry_run(path)
+            log.info("migration dry run on a copy of %s: %s", path, "ok" if got.get("ok") else got.get("said"))
+            h.finish("ok" if got.get("ok") else "refused",
+                     "The migration ran on a copy; the ledger itself wasn't touched." if got.get("ok")
+                     else got.get("said", "The dry run failed."), result=got)
+            return
         now = fast_path(self.ledger)
-        h.finish("unknown", "Say smoke-start, on <run id> or off. It's " + ("on" if now.get("on") else "off (card only)")
-                 + " now.")
+        h.finish("unknown", "Say smoke-start, on <run id>, off, gate-open <gmail|family> or migrate-check [path]. "
+                 "It's " + ("on" if now.get("on") else "off (card only)") + " now.")
 
     def _meanings(self, h) -> None:
         """What he told Cain kinds of Family events mean, from his record, already checked

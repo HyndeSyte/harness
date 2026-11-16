@@ -48,7 +48,7 @@ def schema(ledger: Ledger) -> int:
         return 1
 
 
-def run(ledger: Ledger, cc, chat_id: int, version: str | None = None) -> dict:
+def run(ledger: Ledger, cc, chat_id: int, version: str | None = None, build: str | None = None) -> dict:
     """Every step not done yet, in order, then the install step. What it did, for the log and tests."""
     if ledger.get_meta(DONE) is not None:
         if schema(ledger) < HANDOVER:
@@ -63,27 +63,29 @@ def run(ledger: Ledger, cc, chat_id: int, version: str | None = None) -> dict:
             ledger.set_meta(SCHEMA, str(max(schema(ledger), HANDOVER)), db)
         log.info("ledger schema %d: %d card(s) replaced, %d change(s) read back done, %d unverified",
                  HANDOVER, out["replaced"], out["done"], out["unverified"])
-    done = install(ledger, cc, version)
+    done = install(ledger, cc, version, build)
     if done:
         out = {**out, "install": done}
     return out
 
 
-def install(ledger: Ledger, cc, version: str | None = None) -> dict:
-    """Once per App version the ledger starts under (0.24.0, seventh round), keyed to the version kept in
-    the ledger (calendar_change.INSTALLED), so every install gets it and a restart doesn't: the no-card
-    paths go off if they were on, a smoke run started before ends (its id gives no Turn on), every Turn
-    on card still open comes off, and the card path's gate is set: cards that aren't the smoke run's are
-    refused until the run has read back a change on each calendar (calendar_change.card_gate_open). {}
-    when this version was already installed here."""
+def install(ledger: Ledger, cc, version: str | None = None, build: str | None = None) -> dict:
+    """Once per build the ledger starts under (0.24.0, seventh and eighth rounds), keyed to the version and
+    the build identifier kept in the ledger (calendar_change.INSTALLED), so every install gets it, a
+    rebuild of the same version included, and a restart doesn't: the no-card paths go off if they were on,
+    a smoke run started before ends (its id gives no Turn on), every Turn on card still open comes off,
+    and the card path's gate is set: each calendar's cards are held until the smoke run has read back a
+    fenced edit and a series-day edit there (calendar_change.closed_providers). {} when this build was
+    already installed here."""
     from . import calendar_change as cal
     version = version or cal.app_version()
+    build = build or cal.app_build()
     kept = cal._meta_json(ledger, cal.INSTALLED)
-    if kept.get("version") == version:
+    if kept.get("version") == version and kept.get("build") == build:
         return {}
     now = iso(ledger.now())
-    out = {"version": version, "from": kept.get("version", ""), "fast_path_off": False, "run_closed": False,
-           "cards_retired": 0}
+    out = {"version": version, "build": build, "from": kept.get("version", ""), "from_build": kept.get("build", ""),
+           "fast_path_off": False, "run_closed": False, "cards_retired": 0}
     with ledger.tx() as db:
         if cal.fast_path(ledger).get("on") is True:
             cal.set_fast_path(ledger, False, cal.fast_path(ledger).get("smoke", ""), by="install", db=db)
@@ -95,17 +97,70 @@ def install(ledger: Ledger, cc, version: str | None = None) -> dict:
                 run["late_probe"] = ""
             ledger.set_meta(cal.SMOKE_RUN, json.dumps(run), db)
             out["run_closed"] = True
-        if cc is not None:
-            out["cards_retired"] = cc.retire_turn_on(db)
-        else:
-            db.execute("DELETE FROM meta WHERE key=?", (cal.FAST_OFFER,))
-        ledger.set_meta(cal.CARD_GATE, json.dumps({"version": version, "at": now, "verified": {}}), db)
-        ledger.set_meta(cal.INSTALLED, json.dumps({"version": version, "schema": schema(ledger), "at": now}), db)
+        out["cards_retired"] = cal.retire_turn_on(ledger, db)
+        ledger.set_meta(cal.CARD_GATE, json.dumps({"version": version, "build": build, "at": now, "verified": {},
+                                                   "seen": {}, "blocked": {}, "override": {}}), db)
+        ledger.set_meta(cal.INSTALLED, json.dumps({"version": version, "build": build, "schema": schema(ledger),
+                                                   "at": now}), db)
         ledger.event("calendar_install", out, db=db)
-    log.info("installed %s: no-card paths %s, smoke run %s, %d Turn on button(s) off; cards wait for the smoke run",
-             version, "off" if out["fast_path_off"] else "unchanged", "ended" if out["run_closed"] else "none open",
-             out["cards_retired"])
+    log.info("installed %s (build %s): no-card paths %s, smoke run %s, %d Turn on button(s) off; cards are held "
+             "for the smoke run", version, build, "off" if out["fast_path_off"] else "unchanged",
+             "ended" if out["run_closed"] else "none open", out["cards_retired"])
     return out
+
+
+def dry_run(path: str, version: str | None = None, build: str | None = None) -> dict:
+    """The migration run on a copy of the ledger at `path`, never on the file itself (eighth round: a gate
+    Cain runs on the Pi before a Ship card). The file is opened read only and copied with SQLite's own
+    backup into a temporary file, which is migrated with no calendars (a change left in flight is counted,
+    not read) and then deleted. What it found: the schema version, whether the no-card paths are off,
+    the gate as set, how many Turn on cards are still open, and how many rows it touched."""
+    import os
+    import sqlite3
+    import tempfile
+    from . import calendar_change as cal
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "said": f"no ledger file at {path or '(none given)'}"}
+    tmp = tempfile.mkdtemp(prefix="harness-migrate-check-")
+    copy = os.path.join(tmp, "ledger-copy.sqlite")
+    try:
+        src = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(copy)
+            with dst:
+                src.backup(dst)
+            dst.close()
+        finally:
+            src.close()
+        led = Ledger(copy)
+        before_schema = schema(led)
+        before = led.db.total_changes
+        in_flight = len(_in_flight(led.db))
+        out = run(led, None, 0, version=version, build=build)
+        touched = led.db.total_changes - before
+        gate = cal.card_gate(led)
+        open_turn_on = led.db.execute("SELECT COUNT(*) FROM choices WHERE kind='calendar_change_fast_on' AND"
+                                      " consumed_at IS NULL").fetchone()[0]
+        result = {"ok": True, "copy_of": path, "schema_before": before_schema, "schema": schema(led),
+                  "fast_path_on": cal.fast_path_on(led), "gate_set": bool(gate),
+                  "gate_closed": cal.closed_providers(led) if gate else [],
+                  "open_turn_on_cards": open_turn_on, "rows_touched": touched,
+                  "cards_replaced": (out.get("replaced") or 0), "in_flight_not_read": in_flight,
+                  "install": out.get("install") or {}}
+        led.db.close()
+        return result
+    except sqlite3.Error as e:
+        return {"ok": False, "said": f"the ledger copy couldn't be read: {type(e).__name__}"}
+    finally:
+        for f in os.listdir(tmp):
+            try:
+                os.remove(os.path.join(tmp, f))
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
 
 
 def _in_flight(db) -> list:
@@ -195,3 +250,13 @@ def listed(ledger: Ledger, batch: str) -> list[str]:
     except ValueError:
         return []
     return [str(x) for x in got] if isinstance(got, list) else []
+
+
+if __name__ == "__main__":                       # python3 -m harness.migrate <ledger path>: the dry run
+    import sys
+    if len(sys.argv) != 2:
+        print(json.dumps({"ok": False, "said": "usage: python3 -m harness.migrate <ledger file path>"}))
+        sys.exit(2)
+    got = dry_run(sys.argv[1])
+    print(json.dumps(got, indent=1, sort_keys=True))
+    sys.exit(0 if got.get("ok") else 1)

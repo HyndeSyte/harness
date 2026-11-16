@@ -38,6 +38,9 @@ MACHINE_VALUE = re.compile(r"(?i)\b(?:job|http|uid|nonce)\s*\{\}")
 
 # (file, words in the literal, why it may stay). Kept short: each one is a decision.
 ALLOWED = [
+    ("calendar_change.py", "Try again",
+     "the button after a calendar refused its own safety check: a new card read from the calendar just now, for "
+     "his tap, a decision, not a resend ask (eighth round)"),
     ("drive.py", "addon", "the HTTP User-Agent to OpenStreetMap: a header, never a message"),
     ("watch.py", "Restarting it should bring it back: Settings > Apps > Cain > Restart.",
      "the 30-minute line: sent once, only while Cain is still down, with the exact path"),

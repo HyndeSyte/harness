@@ -186,9 +186,11 @@ def test_a_one_off_whose_version_moved_on_with_nothing_else_changed_is_still_ref
     pid = card_for(m, "haircut moved to 10:30 today", ask(MOVE_HAIRCUT))
     m.gmail._bump(HAIRCUT)
     m.tap("Approve")
-    # Seventh round: every field the card bound reads the same, so the event didn't change and the
-    # refusal is the calendar's own: not applied, one plain receipt, no fresh card.
-    assert haircut_at(m) == "10:00" and state(m, pid) == "fence_refused"
+    # Eighth round: its version differs from the card's and it isn't part of a series, so the read just
+    # before the write calls it changed since the card: nothing is sent, and one fresh card follows.
+    assert haircut_at(m) == "10:00" and state(m, pid) == "stale"
+    receipt = next(t for t in m.seen() if t.startswith("Not applied."))
+    assert "its version on the calendar changed since your card" in receipt and "nothing was sent" in receipt
 
 
 # -- 2. a refused stale write is not unverified ---------------------------------------------------------
@@ -219,7 +221,8 @@ def test_a_refusal_whose_read_doesnt_match_is_not_applied_with_one_fresh_card_an
     new = [m.link.cards[c]["text"] for c in sorted(m.link.cards)[cards:]]
     assert len([t for t in new if "changed since your earlier card, so this is a fresh card" in t]) == 1
     receipt = next(t for t in m.seen() if t.startswith("Not applied."))
-    assert "The event changed since your card" in receipt and "a read of it by its id" in receipt
+    assert "The event changed since your card" in receipt and "a read just before writing shows" in receipt
+    assert "so nothing was sent to the calendar" in receipt
     assert state(m, pid) == "stale"
     plan = json.loads(m.ledger.db.execute("SELECT settle_json FROM calendar_changes WHERE proposal_id=?",
                                           (pid,)).fetchone()[0])
@@ -558,7 +561,7 @@ def run_smoke(m):
     m.icloud.seed(SWIM_PATH, swim_ics("20261111T210000Z", "20261111T220000Z"))
     m.icloud.seed(POOL_PATH, pool_ics())
     # Gmail: an add (the run's first: its answer let go, read back a minute on), a move and its Undo, a
-    # removal, and a write refused for an older version.
+    # removal, and a card for an event that changed since it (nothing sent).
     card_for(m, "add the dentist at 3 today", ask(DENTIST))
     m.tap("Approve")
     m.cc.join_abandoned()
@@ -621,8 +624,8 @@ def test_the_card_shows_the_ledgers_evidence_and_every_no_card_path(m):
     card = next(t for t in reversed(m.seen()) if t.startswith("The check after installing passed."))
     for words in ("Gmail: An add, id ending", "Gmail: A move, id ending", "Gmail: A removal, id ending",
                   "Gmail: An Undo, id ending", "Family: An add, id ending", "Family: An Undo, id ending",
-                  "Gmail: A write sent with an older version", "Family: A write sent with an older version",
-                  "the calendar turned it down", "Two days of one series on Family, “Pool”",
+                  "Gmail: A card for an event that changed since it", "Family: A card for an event that changed since it",
+                  "so nothing was sent and it was not applied", "Two days of one series on Family, “Pool”",
                   "A write whose answer came late, Gmail", "within 0 seconds", "asked 7:30 AM Wed Nov 11",
                   "Your own newest message, under 2 minutes old", "A date from your mail you tap Add to Family on",
                   "Family calendar adds: none yet"):

@@ -159,11 +159,12 @@ def test_the_card_keeps_the_events_version_and_a_tap_after_a_correction_is_refus
     assert [b["etag"] for b in m.cc.bound_of(pid)["bound"]] == ['"h"']
     correct_haircut(m, 9, 30)                        # a correction lands before his tap
     m.tap("Approve")
-    assert sent == ['"h"'] and haircut_at(m) == "09:30"       # sent with the card's version, refused
-    # Sixth round: refused, so not applied (never unverified), and a fresh card follows.
+    # Eighth round: the read just before the write finds it changed since the card, so nothing is sent.
+    assert sent == [] and haircut_at(m) == "09:30"
+    # Not applied (never unverified), and a fresh card follows.
     receipt = next(t for t in m.seen() if t.startswith("Not applied."))
-    assert "The event changed since your card" in receipt
-    assert "a read of it by its id shows “Haircut” at 9:30" in receipt
+    assert "The event changed since your card" in receipt and "so nothing was sent to the calendar" in receipt
+    assert "its start time and end time changed" in receipt and "it now shows “Haircut” at 9:30" in receipt
     assert m.ledger.db.execute("SELECT state FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()[0] == "stale"
     assert "fresh card with it as it is now" in m.seen()[-1] and "Undo" not in m.labels()
 

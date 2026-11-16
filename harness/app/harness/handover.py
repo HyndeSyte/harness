@@ -72,6 +72,20 @@ def _run_id(value) -> str:
     return text if text and len(text) <= 32 and all(c in "0123456789abcdef" for c in text) else ""
 
 
+def _calendar(value) -> str:
+    """gate-open's calendar: gmail or family, or nothing."""
+    text = str(value or "").strip().lower()
+    return text if text in ("gmail", "family") else ""
+
+
+def _ledger_path(value) -> str:
+    """migrate-check's ledger file: an absolute path of plain characters, or nothing (the live ledger)."""
+    text = str(value or "").strip()
+    if not text or len(text) > 256 or not text.startswith("/") or ".." in text.split("/"):
+        return ""
+    return text if all(c.isalnum() or c in "/._-" for c in text) else ""
+
+
 def key_for(token: str) -> str:
     return hmac.new(token.encode(), KEY_CONTEXT, hashlib.sha256).hexdigest()
 
@@ -88,6 +102,8 @@ class Handover:
     run: str = ""                        # /fastpath on: the smoke run's id, from smoke-start
     smoke: str = ""                      # /fastpath: free text from before 0.24.0's fifth round: refused
     record: dict = field(default_factory=dict)   # /fastpath: a pass or fail record from before the sixth round: ignored
+    calendar: str = ""                   # /fastpath gate-open: "gmail" or "family" (eighth round)
+    path: str = ""                       # /fastpath migrate-check: a ledger file to copy and migrate (eighth round)
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
@@ -193,6 +209,8 @@ def _handler(inbox: Inbox, wait_s: float):
                          run=_run_id(body.get("run")),
                          smoke=str(body.get("smoke") or "")[:MAX_SUGGESTION].strip(),
                          record=body.get("record") if isinstance(body.get("record"), dict) else {},
+                         calendar=_calendar(body.get("calendar")),
+                         path=_ledger_path(body.get("path")),
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
             inbox.submit(h)

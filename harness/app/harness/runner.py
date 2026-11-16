@@ -166,6 +166,7 @@ class Runner:
             calendar_change.to_card = self.card_instead
             calendar_change.reoffer = self.reoffer
             calendar_change.recard = self.recard
+            calendar_change.start_again = self.start_again
 
     # -- budget -----------------------------------------------------------
     def _budget_ok(self, provider: str) -> bool:
@@ -588,7 +589,7 @@ class Runner:
                     replaced=bool(replaced_keys) or None if change else None)
 
     def _offer(self, job, d, params, receipt, warnings, lines, *, seen=None, head=(),
-               replaced: bool | None = None, keep_versions: bool = True) -> None:
+               replaced: bool | None = None, keep_versions: bool = True, new_family: bool = False) -> None:
         """The proposal, and the card that tells him about it, or its run with no tap. Only his
         own newest message, under 2 minutes old, with nothing of Cain's and not split, runs with
         no tap: anything else carries a flag (_provenance) and comes on a card."""
@@ -619,8 +620,10 @@ class Runner:
             if warnings and family:
                 self.family_add.note_warned(pid, db)
             if change:
-                # A change offered again keeps the fixed id of its first offer (0.24.0, fourth round).
-                olds = self.calendar_change.inherit_keys(pid, params["changes"], self._earlier_keys(job), db)
+                # A change offered again keeps the fixed id of its first offer (0.24.0, fourth round); one he
+                # started again is a new change family and keeps nothing (eighth round).
+                olds = self.calendar_change.inherit_keys(pid, params["changes"],
+                                                         {} if new_family else self._earlier_keys(job), db)
             if change:                      # what it says it will do, for his tap and the record
                 self.calendar_change.note_lines(
                     pid, lines or [render.change_line(c, self.config.timezone, self.ledger.now())
@@ -641,6 +644,25 @@ class Runner:
                 self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
                                                "receipt": receipt}, db=db)
                 return                      # the controller writes it this tick
+            # Eighth round: after an install, a card for a calendar whose check hasn't finished is held:
+            # it says so, with no Approve, and comes back on a fresh card once that calendar's gate opens.
+            held = self.calendar_change.held_by_gate(params, seen.bound if seen is not None else None) \
+                if change else []
+            if held:
+                self.calendar_change.note_held(pid, job["id"], held, db)
+                from .calendar_change import provider_name
+                names = " and ".join(provider_name(x) for x in held)
+                body = lines or [render.change_line(c, self.config.timezone, self.ledger.now())
+                                 for c in params["changes"]]
+                text = (f"<b>Waiting for the check after installing on {names}.</b> Harness was updated, and "
+                        f"calendar changes on {names} wait until that check has finished there, so this has no "
+                        "Approve yet. Nothing has changed. Once it's done, this comes back on a fresh card, read "
+                        "again then, for your tap.\n" + "\n".join(top + [render.escape(x) for x in head] + body))
+                self.ledger.event("proposal", {"job": job["id"], "proposal": pid, "receipt": receipt,
+                                               "held": held}, db=db)
+                self.ledger.enqueue(chat_id=job["chat_id"], kind="card", text=render.fit(text), job_id=job["id"],
+                                    db=db)
+                return
             loose = bool(change and seen is not None and seen.loose and len(params["changes"]) == 1)
             nonce = approvals.mint(self.ledger, proposal_id=pid,
                                    owner_user_id=self.config.owner_user_id,
@@ -698,6 +720,16 @@ class Runner:
             return ""
         return self._offer_new(old, {"changes": list(changes)}, why, replaced=True if keep_versions else False,
                                keep_versions=keep_versions)
+
+    def start_again(self, p, changes: list, why: str) -> str:
+        """His Try again or Start again from now (eighth round): the change on a new card for the same
+        message, read anew and bound to the event as it is now, as a new change family: it inherits no
+        fixed ids or versions, so it has its own one fresh card. Its request's id, or ""."""
+        old = self.ledger.job(p["job_id"])
+        if old is None or not changes:
+            return ""
+        return self._offer_new(old, {"changes": list(changes)}, why, replaced=False, keep_versions=False,
+                               new_family=True)
 
     def _again(self, p, why: str) -> str:
         """One earlier request's change, as a new request of the same message, on a card."""
@@ -1067,7 +1099,8 @@ class Runner:
         self._offer_new(job, params, why, replaced=won)
         return "The correction is on a new card." + (" That card is off." if won else "")
 
-    def _offer_new(self, src, params: dict, why: str, *, replaced: bool, keep_versions: bool = True) -> str:
+    def _offer_new(self, src, params: dict, why: str, *, replaced: bool, keep_versions: bool = True,
+                   new_family: bool = False) -> str:
         """A change for the same message as `src` (its quote, flags and fixed ids kept), as a new
         request, on a card: never applied without his tap. Its request's id."""
         root = self.ledger.get_meta(f"job_parent:{src['id']}") or src["id"]
@@ -1084,7 +1117,8 @@ class Runner:
         seen = self.calendar_change.preview_quiet(job, params)
         warnings = [why] + (seen.checks if seen else [])
         self._offer(job, effects.REGISTRY[effects.CALENDAR_CHANGE], params, {"reason": "offered_again"}, warnings,
-                    seen.lines if seen else None, seen=seen, replaced=replaced, keep_versions=keep_versions)
+                    seen.lines if seen else None, seen=seen, replaced=replaced, keep_versions=keep_versions,
+                    new_family=new_family)
         return new
 
     def _newer_note(self, job, pids: list[str]) -> str:

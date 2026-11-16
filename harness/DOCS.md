@@ -367,54 +367,56 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   time you asked and how it was approved (your tap on its card, or with no card from your own fresh
   message), and says how old the request is when it's more than a day. If you'd declined the card
   that offered it again, it's titled "Applied despite your Decline". A plain add that still reads
-  exactly as it was written is then taken off again by itself, through Undo's own reads and only if
-  the event is still at that version, and Undo's receipt follows. Anything else (a move, a removal,
+  exactly as it was written is then taken off again by itself, guarded by the version just read, and
+  that same receipt says how it went: off your calendar (a read by its id shows it gone); turned
+  down, so it's still there, with *Undo* first for 30 days; or not known yet, still being read, with
+  the outcome to follow. Anything else (a move, a removal,
   or an add changed since it was written) comes with *Undo* first, and that *Undo* lasts 30 days
   instead of the usual week. *Undo* of a late one is sent with the event's version as it is now; if
   the event was changed since, it's left as it is and the message says how it reads now. A late
   landing of any card in one change's family (its first card, a card offered again, or the fresh
   card after a refusal) takes every open card of that family off, so there's one Done.
-- **A stale move or removal is turned down by the calendar itself.** The card keeps each event's
+- **A move or removal is never sent over a change since its card.** The card keeps each event's
   version as its read found it (Google's etag, or the iCloud resource's), byte for byte, quotes and a
-  weak marker included, and the move or removal is sent with exactly that version (If-Match), so if a
-  correction, an *Undo* or anyone's edit changed the event since, Google or iCloud refuses the write
-  rather than applying it. The card also keeps what it showed of the event: title, start, end, all
-  day or not, the series's rule, location, notes, each attendee with their answer, the organiser,
-  and whether it shows as busy or free. Notes are compared with only line endings and trailing spaces
-  evened out, so any other edit, a doubled space included, counts as a change. One exception, so a second card on the same
-  series isn't refused because of the first one's write elsewhere in it (two days of one Family
-  series are one iCloud resource, and a Google series edit can give a day a new version): only for a
-  day of a Google series or an iCloud resource holding a series or several events, and only when a
-  read just before the write shows the event the card targets with every one of those fields the
-  same, the version from that read is sent instead, so anything newer than it is still refused. Any
-  difference (an end time, the series's rule, the notes, the location) sends the card's version, and
-  the calendar refuses it. Each move or removal's If-Match and the calendar's answer code are in the
-  log. Every Family write is built from the read made just before it: that read's own text with only
-  the asked change made, so another day's changes, exception dates, reminders and everything else in the
-  resource stay as that read had them, and the If-Match is that same read's version (the only other
-  version ever sent is the card's older one, when the event changed since the card, and the calendar
-  must refuse that write; one that takes it anyway goes in the log). A day of a Google series is
-  written as that day's own event, with only its start and end sent, never the series, so other days'
-  changes, cancellations and attendees stay; a day that reads as the whole series isn't written.
-  A write refused for its version is read by the event's id and compared with the change (title,
-  start, end, all day or not, repeating or not; a Google event read back cancelled counts as gone):
-  when it already shows the change as asked, it's Done (with nothing of Harness's there to undo,
-  unless an earlier approval of the same change has a write that never answered: then that write is
-  read back, and it's "Done after all" with its *Undo*). Otherwise it's **Not applied**: the receipt
-  says the event changed since your card and what the read found, and one fresh card follows, read
-  anew so it's bound to the event as it is now. That fresh card is one of the change's family: a late
-  landing of any earlier write takes it off, and a refusal reads every earlier write of the family
-  before calling the change stale. At most one fresh card per request: if the fresh card is refused
-  as stale too, its receipt says so and no other card follows. When the read by id gives back the very
-  version that was sent, or every field the card kept still reads the same, the event didn't change:
-  the calendar refused the safety check itself (a weak version under a strong compare, or a version it
-  rewrites). Then the receipt says "Not applied" once, that the calendar turned the write down at its
-  safety check and the event is unchanged, and no fresh card follows; both versions are in the log. A
-  refused write is never "Not confirmed", never read
-  for again and never "Not seen yet" or "Not found"; those are only for writes whose outcome is
-  unknown (no answer, or a lapsed deadline). A late add whose fixed address turns out to be taken
-  (Google's 409, iCloud's 412) is never assumed to be Harness's own write: the event there is read
-  and compared the same way, and only a match counts as there.
+  weak marker included, and what it showed of the event: title, start, end, all day or not, the
+  series's rule, location, notes, each attendee with their answer, the organiser, and whether it shows
+  as busy or free. Notes are compared with only line endings and trailing spaces evened out, so any
+  other edit, a doubled space included, counts as a change. Just before the write, the event is read
+  again. If any of those fields reads otherwise, or its version differs from the card's (unless it's a
+  day of a Google series or an iCloud resource holding a series or several events, and every field the
+  card kept reads the same: another day's edit), nothing is sent at all: the receipt says **Not
+  applied**, that the event changed since your card, which fields changed and what it shows now, and
+  that nothing was sent to the calendar; the card is replaced and one fresh card follows, read anew so
+  it's bound to the event as it is now. Harness never sends a write it expects the calendar to refuse,
+  so a calendar that ignored If-Match couldn't apply it either. Otherwise the write is sent with the
+  version that read gave (If-Match), so anything newer than that read is still refused by Google or
+  iCloud. Each move or removal's If-Match and the calendar's answer code are in the log. Every Family
+  write is built from that same read: its own text with only the asked change made, so another day's
+  changes, exception dates, reminders and everything else in the resource stay as that read had them.
+  A day of a Google series is written as that day's own event, with only its start and end sent, never
+  the series, so other days' changes, cancellations and attendees stay. A day whose read gives back the
+  whole series isn't written: the receipt says "Not applied", that the calendar returned the whole
+  series for that day so nothing was changed, and to say to Cain whether you mean only that day or the
+  whole series, so a new card follows.
+  A write the calendar still refuses for its version (an edit between the read and the write) is read
+  by the event's id and compared with the change (title, start, end, all day or not, repeating or not;
+  a Google event read back cancelled counts as gone): when it already shows the change as asked, it's
+  Done (with nothing of Harness's there to undo, unless an earlier approval of the same change has a
+  write that never answered: then that write is read back, and it's "Done after all" with its *Undo*).
+  When the read gives back the very version that was sent, the event didn't change and the calendar
+  refused its own safety check (a weak version under a strong compare, or a version it rewrites): one
+  "Not applied" receipt that says so, both versions in the log, no fresh card, and a *Try again* button
+  that makes a new card from a fresh read of the event, for your tap (a new change family). Any other
+  version, even with every field the same, is a change since: "Not applied" and one fresh card. That
+  fresh card is one of the change's family: a late landing of any earlier write takes it off, and a
+  refusal reads every earlier write of the family before calling the change stale. At most one fresh
+  card per change family: if the fresh card is stale too, its receipt says what changed on the event
+  since your card and offers *Start again from now*, which makes a new card from the event as it is
+  now, for your tap, as a new change family with its own one fresh card. A refused or unsent write is
+  never "Not confirmed", never read for again and never "Not seen yet" or "Not found"; those are only
+  for writes whose outcome is unknown (no answer, or a lapsed deadline). A late add whose fixed address
+  turns out to be taken (Google's 409, iCloud's 412) is never assumed to be Harness's own write: the
+  event there is read and compared the same way, and only a match counts as there.
 - **Bound to the event the card names.** A removal or a move is bound to the very event its card or
   receipt names (calendar, id, and for a repeating event which day of it): a different event found
   later is never changed in its place, and nothing changes if the event isn't that one any more.
@@ -458,12 +460,22 @@ Cain doesn't pass your words on: Harness reads your DM itself.
   a write of Harness's on that calendar is younger than the listing lag the smoke test measured,
   since the reads that judge duplicates may not show it yet; an add of the same event read back
   within that lag is looked for by its own id first.
-- **After every install, cards wait for the smoke test.** Until the smoke run has read back at least
-  one change on Gmail and one on Family, a calendar card that isn't the run's own is not applied when
-  you tap it: the receipt says "Nothing changed: after an update, calendar changes on cards wait
-  until the check after installing has read back a change on Gmail and on Family." So the card path's
-  first use after each install is the smoke run. (A ledger made new, with nothing in it, counts as an
-  install too.)
+- **After every install, cards are held per calendar until the smoke test has passed there.** Until
+  the smoke run has read back, on that calendar, a move or removal sent with If-Match on an event that
+  was there and an edit of one day of a repeating event, a request for that calendar comes on a card
+  that says it's waiting for the check after installing, with no *Approve*, and nothing changes. A card
+  offered before the install and tapped meanwhile is held the same way. Held cards don't run out. Once
+  that calendar's check is done, each held change comes back on a fresh card, read again then, through
+  the usual checks, for your tap. Gmail and Family open separately: one can be open while the other is
+  held. While a smoke run is live, its checklist goes through the card path as usual. If, during the
+  run, a calendar refuses the safety check on an event that hadn't changed, that calendar stays held
+  and you're told plainly that edits there are blocked and why, with an *Open cards without the check*
+  button. That tap, or Cain's `keeper.sh fastpath gate-open gmail` (or `family`) on your say, opens that
+  calendar's cards without the check, for when the run can't complete there; who did it and when is
+  kept in the log, its held changes come back on fresh cards, and the paths without a tap stay off. An
+  install is each new build: the ledger keeps the version and a build identifier (a hash of the App's
+  code), so a rebuild of the same version counts as an install too, and a restart doesn't. (A ledger
+  made new, with nothing in it, counts as an install too.)
   Even with the bake-in tap already given,
   a Family add is a normal card while the switch is off. Each path is checked against the switch
   again at the moment of the write. Once on, each is also checked again then: for your message,
@@ -563,8 +575,9 @@ Cain doesn't pass your words on: Harness reads your DM itself.
 ### After every install: a smoke test on the real calendars
 
 The read back is tested against fake calendars; Google and iCloud can list a change a little
-late. So after every install the three paths without a tap stay off, and calendar cards other than
-the smoke run's are not applied, until this has been run once, with throwaway events on a day with
+late. So after every install the three paths without a tap stay off, and each calendar's cards are
+held (no *Approve*) until the run has read back there a fenced edit and an edit of one day of a series,
+or until it has been run once, with throwaway events on a day with
 nothing else on it (each name below is an example; use anything unmistakable). Cain starts it with
 `keeper.sh fastpath smoke-start`: Harness issues the run's id and records every change approved while
 the run is live under it. Every step goes through the normal card path: Cain hands it over, and you
@@ -572,10 +585,11 @@ tap *Approve* on its card. The run's first add is let go at once, so its answer 
 read back a minute later like any lost answer: that's the late landing item. That is the only write
 Harness ever lets go on purpose, and only for an add of a live run.
 
-A run is bound to this build: it keeps the App version, the ledger's schema and when it started. It
+A run is bound to this build: it keeps the App version, the build identifier, the ledger's schema and
+when it started. It
 runs out after 24 hours, and stops recording at *Turn on*, at *Turn off*, at a new smoke-start or when
 it runs out. It gives one *Turn on*. A run that's used, ran out, was started under another version or
-schema, or is older than the install is refused by name: start a new one. Each add of the run is a
+schema, under another build, or is older than the install is refused by name: start a new one. Each add of the run is a
 test event: its title starts "Smoke test: " and it carries the run's id as a private property (on
 Gmail, the event's private extended property `harness_smoke`; on Family, an `X-HARNESS-SMOKE` line).
 
@@ -586,15 +600,18 @@ On Gmail, and then the same on Family:
 2. A move: "move Smoke test: Pool test to 4 PM". Done, and it shows at 4 only. Then *Undo* on it:
    "Undone".
 3. A removal: "take off Smoke test: Pool test tomorrow". Done, and it's gone.
-4. A write refused for an older version. To produce the Gmail refusal: add a throwaway one-off event
-   in Google Calendar on the web (not a series), ask Cain to move it, and when its card comes, open
-   the event in Google Calendar and change its end time by 15 minutes, save, then tap *Approve*.
-   To produce the Family refusal: add a throwaway one-off event to the Family calendar in the
-   iPhone's Calendar app, ask Cain to move it, and when its card comes, open it on the iPhone and change its
-   end time by 15 minutes, save, then tap *Approve*. Each time the receipt says "Not applied", and a
-   fresh card follows (tap *Decline* on it). The log shows the If-Match sent and the answer code (412
-   on both calendars). Changing only the version (an edit that leaves every field the same) isn't
-   enough: that's read as the calendar refusing the safety check, not as a change.
+4. A card for an event that changed since it. To produce the Gmail stale card: add a throwaway
+   one-off event in Google Calendar on the web (not a series), ask Cain to move it, and when its card
+   comes, open the event in Google Calendar and change its end time by 15 minutes, save, then tap
+   *Approve*. To produce the Family stale card: add a throwaway one-off event to the Family calendar in
+   the iPhone's Calendar app, ask Cain to move it, and when its card comes, open it on the iPhone and
+   change its end time by 15 minutes, save, then tap *Approve*. Each time the receipt says "Not
+   applied" and "nothing was sent to the calendar", and a fresh card follows (tap *Decline* on it). The
+   log shows the card's version and the version just read; no write goes out.
+5. The gate's two edits, each read back: a move (step 2 counts, since it's sent with If-Match on an
+   event that was there) and a move or removal of one day of a throwaway repeating event (the series
+   step below counts on Family; on Gmail, move one day of a throwaway weekly event). Once both are
+   read back on a calendar, its held cards come back.
 
 And once, on either calendar: two days of one throwaway repeating event taken off on two cards, both
 Done. The listing lag is measured from the record itself: from each write's read back by its id to
@@ -602,7 +619,8 @@ the days, read as you'd see them, showing it. It needs at least two samples on e
 steps above give more), each from 0 to 300 seconds, the most the duplicate and no-card checks allow.
 
 Then Cain runs `keeper.sh fastpath on <run id>`. Harness builds each item from its own record: the
-event ids, when each was asked and read back, the refused writes with their answer, the two days of
+event ids, when each was asked and read back, the stale cards whose write was never sent, each
+calendar's gate (its fenced edit and series-day edit, or the override), the two days of
 the series, the late landing and the lag samples on each calendar. Anything Cain says passed is
 ignored, and an item with no evidence in the record is refused by name, and nothing changes. A full
 run sizes the longer read window from the lag and keeps the lag for the duplicate and no-card checks,
@@ -618,6 +636,18 @@ listed in one message with *Take them off*, which removes each one only if it's 
 left it (sent with its version as If-Match). If a step says "Not confirmed" while the calendar does
 show the change, the log has both reads ("read back of gmail (first)" and "(fresh)"): that's the
 case to report, and the paths without a tap stay off. Nothing else to set up.
+
+### Before a Ship card: the migration on a copy of the ledger
+
+Before Cain shows a Ship card for a Harness update, he runs `keeper.sh fastpath migrate-check` (the
+live ledger) or `keeper.sh fastpath migrate-check <path>` (a ledger file at that path, as Harness sees
+it). Harness opens that file read only, copies it with SQLite's own backup into a temporary file, runs
+this version's migration and install step on the copy with no calendars, deletes the copy, and answers
+with what it found: the schema version, whether the paths without a tap are off (they must be), whether
+the gate is set and which calendars it holds, how many *Turn on* cards are still open (none), how many
+rows it touched, and how many changes left in flight it would read from the calendars on the real run.
+The ledger itself is never touched. The same dry run works by hand inside the App:
+`python3 -m harness.migrate <ledger path>` prints it as JSON.
 
 ## Dates from your mail
 

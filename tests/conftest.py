@@ -79,6 +79,8 @@ ASK = re.compile(r"""(?imx)
 # Asks that may stay, each a decision: (words, why). Checked against what he sees (below) and
 # against the literals (test_message_text.py).
 ASK_ALLOWED = [
+    ("Try again makes a new card", "names the button that offers the change on a new card read from the calendar "
+                                   "just now, for his tap: a decision, not a resend ask (eighth round)"),
     ("Check before approving:", "a card's own warning, read before the tap it asks for: part of "
                                 "that decision, not a chore after it"),
     ("you asked to check these with", "says what his own /checkadds asked for: a tap on each change"),
@@ -202,10 +204,10 @@ def smoke_test_passed(request, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def card_path_verified(request, monkeypatch):
-    """After an install, cards that aren't the smoke run's wait until the run reads back a change on each
-    calendar (0.24.0, seventh round). Tests written before that run as on a Pi where it has: the gate is
+    """After an install, a calendar's cards are held until the smoke run reads back a fenced edit and a
+    series-day edit there (0.24.0, seventh and eighth rounds). Tests written before that run as on a Pi where it has: the gate is
     open. A test marked install_gate sees the ledger as installed, gate and all."""
     if request.node.get_closest_marker("install_gate"):
         return
     from harness import calendar_change
-    monkeypatch.setattr(calendar_change, "card_gate_open", lambda ledger: True)
+    monkeypatch.setattr(calendar_change, "closed_providers", lambda ledger: [])
