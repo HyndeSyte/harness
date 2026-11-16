@@ -295,7 +295,9 @@ function itemOpProblem(o: any): string | null {
       if (!(o.row === null || (typeof o.row === "string" && ROW_ID.test(o.row)))) return `check ${o.item}: needs row, the row's ledger id as read (null when it had none)`;
       if (!Number.isInteger(o.version) || o.version < 0 || (o.row === null) !== (o.version === 0))
         return `check ${o.item}: needs version, the row's version as read (0 when it had no ledger id)`;
-      if (o.sf !== undefined && !(typeof o.sf === "string" && /^\d{15,22}$/.test(o.sf))) return `check ${o.item}: sf must be a Discord snowflake`;
+      // Round 19: a new check needs its Discord anchor: one without is refused, never anchored later by a guess.
+      if (o.sf === undefined) return `check ${o.item}: a check without its Discord anchor (sf) isn't taken: the link hands every check over with one`;
+      if (!(typeof o.sf === "string" && /^\d{15,22}$/.test(o.sf))) return `check ${o.item}: sf must be a Discord snowflake`;
       return null;
     }
     case "note": {

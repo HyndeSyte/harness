@@ -345,7 +345,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       (link as any).runNo();
       const nonce = `k${(++seq).toString(16)}`, at = new Date(t.now).toISOString();
       (files as any).status = JSON.stringify({ clock: { synced: true, source: "the rig", diagnostic: "", at }, start: { nonce, at },
-        verified: { start: nonce, at, link: state.runNonce ?? null, fetches: 1 }, ...extra });
+        verified: { start: nonce, at, link: state.runNonce ?? null, ...(Number.isInteger(state.run) ? { run: state.run } : {}), fetches: 1 }, ...extra });
     },
     later: (ms: number) => { t.now += ms; },
   };

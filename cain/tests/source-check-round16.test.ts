@@ -59,11 +59,11 @@ const remoteBack = (k: K) => renameSync(`${k.remote}.away`, k.remote);
 const linkLog = (k: K) => join(k.root, "pi/link-issued.log");
 const localLog = (k: K, n = 8) => sh(["git", "log", "--format=%B", `-${n}`], k.cfg.dir);
 const shipTake = (id: string, tap: string) => ({ id, tap, ops: [{ op: "take", item: "P33", for: "his Ship tap", job: "ship Cain 0.12.0" }] });
-const linkRun = (k: K, nonce: string) => {
+const linkRun = (k: K, nonce: string, run?: number) => {
   const f = join(k.root, "pi/link/state.json");
   let j: any = { messages: {}, issued: {} };
   try { j = JSON.parse(readFileSync(f, "utf8")); } catch { /* none yet */ }
-  writeFileSync(f, JSON.stringify({ ...j, run: (j.run ?? 2) + 1, runNonce: nonce }));
+  writeFileSync(f, JSON.stringify({ ...j, run: run ?? (j.run ?? 2) + 1, runNonce: nonce }));
 };
 
 describe("1. nothing an owner line or a held tap counts on is judged against the Pi's clock", () => {
@@ -113,7 +113,7 @@ describe("1. nothing an owner line or a held tap counts on is judged against the
 
       // The remote back: a fresh fetch verifies, for the keeper's start and the link's current run.
       remoteBack(k);
-      linkRun(k, r.state().runNonce!);
+      linkRun(k, r.state().runNonce!, r.state().run);
       expect(cycle(k.cfg).ok).toBe(true);
       const ok = status(k);
       expect(ok.consumed_unverified).toBeUndefined();
@@ -314,7 +314,7 @@ describe("5. held releases resolve only once verified, and a replay with no keep
     await r.link.sweep();
     // Round 18: the line waits for the keeper's status to show the supersede mirrored.
     const sup = readLog<any>(r.issuedLog!, { repair: false }).records.find((x) => x.t === "supersede");
-    r.keeperVerified({ superseded: [sup.kid] });
+    r.keeperVerified({ superseded: [sup.kid], replay_keys: { [sup.kid]: { mirrored: true, consumed: "no" } } });   // round 19: the per-key answer
     await r.link.sweep();
     expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(1);
     expect(r.relayed.filter((x) => x.startsWith("No request came for replayed held tap key"))).toHaveLength(1);

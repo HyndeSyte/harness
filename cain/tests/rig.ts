@@ -95,7 +95,10 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
         const item = String(((req.ops as any[]) ?? []).find((x) => typeof x?.item === "string")?.item ?? "none").toUpperCase();
         r.issue(tap, { item, kind: t.ship ? "ship" : "ask", label: t.ship ? "Ship" : "Filed" }, false);
       }
-      writeFileSync(join(cfg.queue, `${String(++n).padStart(4, "0")}.json`), JSON.stringify({ from: "cain", kind: "change", summary: "s", ...auto, ...req }));
+      // Round 19: a check op gets the Discord anchor the link always hands it over with (now, as a snowflake), unless the
+      // test gives one (or says sf: null, to send one without).
+      const ops = Array.isArray(req.ops) ? (req.ops as any[]).map((x) => (x?.op === "check" && !("sf" in x) ? { ...x, sf: String((BigInt(now.getTime()) - 1420070400000n) << 22n) } : x?.op === "check" && x.sf === null ? (({ sf: _s, ...rest }) => rest)(x) : x)) : req.ops;
+      writeFileSync(join(cfg.queue, `${String(++n).padStart(4, "0")}.json`), JSON.stringify({ from: "cain", kind: "change", summary: "s", ...auto, ...req, ...(ops ? { ops } : {}) }));
     },
     // A tap key in the link's state's issued list (round 10); replace: overwrite one already there.
     issue(tap: string, what: { item: string; kind: string; label?: string }, replace = true) {

@@ -73,6 +73,10 @@
 #                                        Round 18: pi_clock (unknown until the link has compared a Discord
 #                                        stamp with the Pi's clock in this run, then in step or off; the restore
 #                                        sweep is marked done only while in step)
+#                                        Round 19: a message read back from Discord (the start mark, each
+#                                        restore sweep page) counts as a comparison too, so pi_clock reads in
+#                                        step after a quiet restart; consumed_verified needs the keeper's
+#                                        verified status to name this link run's number and nonce together
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or

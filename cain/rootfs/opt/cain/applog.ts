@@ -5,8 +5,8 @@
 // is new). On read, a final record that is cut short, or whose length or checksum doesn't match (a
 // write a power cut tore), is truncated off the file and reported as torn, once: what came before
 // it stands. A bad record before the last one is skipped and counted. No log is ever rewritten.
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, truncateSync, writeSync } from "node:fs";
-import { dirname } from "node:path";
+import { closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const TABLE = (() => {
   const t = new Uint32Array(256);
@@ -63,8 +63,22 @@ export function readLog<T = any>(file: string, o: { repair?: boolean } = {}): Lo
     else out.bad++;
     pos = end + 1;
   }
+  if (out.torn) reportTorn(file, out.tornBytes, buf.length);
   if (out.torn && o.repair !== false) truncateSync(file, good);
   return out;
+}
+
+// Round 19: every reader skips a torn final line (above) and reports it: one line per file and torn length, so a
+// reader that doesn't repair (repair: false) still says what it skipped. A test may watch it (tornSpy).
+export const tornSpy: { on: null | ((file: string, bytes: number) => void) } = { on: null };
+const tornTold = new Set<string>();
+function reportTorn(file: string, bytes: number, size: number): void {
+  tornSpy.on?.(file, bytes);
+  const k = `${file}\u0000${size}\u0000${bytes}`;
+  if (tornTold.has(k)) return;
+  tornTold.add(k);
+  if (tornTold.size > 500) tornTold.delete(tornTold.values().next().value!);
+  console.error(`[applog] a torn final record (${bytes} bytes) in ${file} was skipped; the records before it stand`);
 }
 
 // Appends one record and fsyncs it (and its directory when the file is new). Throws on failure:
@@ -75,22 +89,85 @@ export const syncSpy: { on: null | ((what: string) => void) } = { on: null };
 // they are fsynced (an append here, and the whole-file writers: the link's writeDurable, the landing ledger's, the
 // keeper's writeAtomic). A test throws from it to kill the write there and checks the dependent effect hadn't happened.
 export const crashSpy: { on: null | ((file: string) => void) } = { on: null };
+// Round 19: the whole-file writers' second crash point, after the rename and before the folder's fsync: crashSpy is
+// called with the file's name plus this suffix (a power cut there may keep the old file at the name).
+export const AFTER_RENAME = "#after-rename";
 // Round 18: the interleaving rule for logs two processes append to (the install log: the link and the keeper): each
 // record is one framed write, opened for append, under MAX_RECORD_BYTES (below the 4096 bytes a single append is
 // written whole in), so two writers' records never interleave; a longer record is refused before anything is written.
 export const MAX_RECORD_BYTES = 4000;
+// Round 19: free-text fields (a settle reason from GitHub, a notice's reason, an error) are cut to a fixed budget before
+// the record is serialised, so every record fits under MAX_RECORD_BYTES; anything else over the limit is still refused.
+export const FREE_TEXT_FIELDS = ["why", "reason", "error", "last", "detail", "note"];
+export const FREE_TEXT_BUDGET = 600;
+export function fitRecord<T>(rec: T): T {
+  if (!rec || typeof rec !== "object" || Array.isArray(rec)) return rec;
+  const out: any = { ...(rec as any) };
+  for (const k of Object.keys(out)) {
+    const v = out[k];
+    if (FREE_TEXT_FIELDS.includes(k) && typeof v === "string" && v.length > FREE_TEXT_BUDGET) out[k] = `${v.slice(0, FREE_TEXT_BUDGET - 1)}\u2026`;
+    else if (v && typeof v === "object" && !Array.isArray(v)) out[k] = fitRecord(v);
+  }
+  return out;
+}
+// Round 19: shared-log writers are serialised by a lock beside the log (a directory made atomically, holding the
+// writer's pid): the link and the keeper both append to some logs. A lock whose holder is gone is taken over.
+export const LOCK_WAIT_MS = 5_000;
+const sleepSync = (ms: number) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* spin */ } };
+function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } }
+export function withLogLock<T>(file: string, fn: () => T): T {
+  const lock = `${file}.lock`;
+  const until = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try { mkdirSync(lock); break; }
+    catch (e: any) {
+      if (e?.code === "ENOENT") { mkdirSync(dirname(file), { recursive: true }); continue; }
+      if (e?.code !== "EEXIST") throw e;
+      let pid = NaN;
+      try { pid = Number(readFileSync(join(lock, "pid"), "utf8")); } catch { /* being written */ }
+      let age = 0;
+      try { age = Date.now() - statSync(lock).mtimeMs; } catch { continue; }
+      if ((Number.isInteger(pid) && pid > 0 && !alive(pid)) || (!Number.isInteger(pid) && age > LOCK_WAIT_MS)) { try { rmSync(lock, { recursive: true, force: true }); } catch { /* raced */ } continue; }
+      if (Date.now() > until) throw new Error(`the log ${file} is locked by another writer (pid ${pid || "unknown"})`);
+      sleepSync(5);
+    }
+  }
+  try { writeFileSync(join(lock, "pid"), String(process.pid)); } catch { /* the lock stands without it */ }
+  try { return fn(); } finally { try { rmSync(lock, { recursive: true, force: true }); } catch { /* the next writer takes it over */ } }
+}
+// Round 19: a test's short write: returns how many bytes the write puts down (null: all of them).
+export const shortWriteSpy: { on: null | ((file: string) => number | null) } = { on: null };
 export function appendLog(file: string, rec: unknown): void {
-  const buf = Buffer.from(frame(rec), "utf8");
+  const buf = Buffer.from(frame(fitRecord(rec)), "utf8");
   if (buf.length > MAX_RECORD_BYTES) throw new Error(`a log record over ${MAX_RECORD_BYTES} bytes (${buf.length}) isn't written: one record is one write`);
   const fresh = !existsSync(file);
   if (fresh) mkdirSync(dirname(file), { recursive: true });
-  const fd = openSync(file, "a", 0o600);
-  try {
-    const n = writeSync(fd, buf);
-    if (n !== buf.length) throw new Error(`a log record was written short (${n} of ${buf.length} bytes)`);
-    crashSpy.on?.(file);
-    fsyncSync(fd); syncSpy.on?.(`file ${file}`);
-  } finally { closeSync(fd); }
+  withLogLock(file, () => {
+    const fd = openSync(file, "a+", 0o600);
+    try {
+      // Round 19: a torn final line (a write cut short) is cut off before this record goes on, so the new record never
+      // lands glued to it (where every reader would skip it as torn too).
+      let pre = fstatSync(fd).size;
+      if (pre > 0) {
+        const last = Buffer.alloc(1);
+        readSync(fd, last, 0, 1, pre - 1);
+        if (last[0] !== 0x0a) {
+          const all = readFileSync(file);
+          const keep = all.lastIndexOf(0x0a) + 1;
+          reportTorn(file, pre - keep, pre);
+          ftruncateSync(fd, keep);
+          pre = keep;
+        }
+      }
+      let n = 0;
+      try { const cut = shortWriteSpy.on?.(file); n = writeSync(fd, typeof cut === "number" ? buf.subarray(0, Math.max(0, Math.min(cut, buf.length))) : buf); }
+      catch (e) { try { ftruncateSync(fd, pre); } catch { /* the reader skips it as torn */ } throw e; }
+      // Round 19: a short write is truncated back to the file's length before it, then refused.
+      if (n !== buf.length) { try { ftruncateSync(fd, pre); } catch { /* the reader skips it as torn */ } throw new Error(`a log record was written short (${n} of ${buf.length} bytes)`); }
+      crashSpy.on?.(file);
+      fsyncSync(fd); syncSpy.on?.(`file ${file}`);
+    } finally { closeSync(fd); }
+  });
   // A new log's directory entry is fsynced too, so a power cut can't lose the whole file.
   if (fresh) syncDir(dirname(file));
 }

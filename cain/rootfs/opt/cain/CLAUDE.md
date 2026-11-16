@@ -680,7 +680,14 @@ hear "Replayed held tap key ... was acted on", and nothing more is asked or need
 own times, never the Pi's clock; if the Pi's clock is off, his card says "The Pi's clock is off by about N
 minutes, waiting for time sync." Nothing to do or tell him about it. A held tap refused because its hold
 began after its card expired, or because Discord's time for it can't be read, comes back as "Tap not acted: ..."
-too: record nothing, and ask again with --checked if it still needs him.
+too: record nothing, and ask again with --checked if it still needs him. So does a held tap whose tap key isn't in the link's
+issued-key log, and any tap (one cut off by a restart included) that came without Discord's time for it. If the record keeper is
+slow to confirm a replayed tap, his card says it settles by itself: nothing to do. A tap refused because the check behind
+its card aged out says on the card "The check behind this is more than N days old ...", and you get a line starting with
+the item's re-check: check it again at its source and ask again with --checked if it still needs him. A card already up
+when this version was installed keeps working; one whose check can't be dated by Discord's time loses its buttons and
+says a new source check is needed, and you hear it: check that item again and ask again with --checked. If you hear the
+record keeper won't verify the link's run, taps stay held until the App restarts: nothing to tell him.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:

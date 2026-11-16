@@ -54,11 +54,11 @@ const status = (k: K) => JSON.parse(readFileSync(join(k.root, "pi/record-ledger.
 const remoteDown = (k: K) => renameSync(k.remote, `${k.remote}.away`);
 const remoteBack = (k: K) => renameSync(`${k.remote}.away`, k.remote);
 const linkLog = (k: K) => join(k.root, "pi/link-issued.log");
-const linkRun = (k: K, nonce: string) => {
+const linkRun = (k: K, nonce: string, run?: number) => {
   const f = join(k.root, "pi/link/state.json");
   let j: any = { messages: {}, issued: {} };
   try { j = JSON.parse(readFileSync(f, "utf8")); } catch { /* none yet */ }
-  writeFileSync(f, JSON.stringify({ ...j, run: (j.run ?? 2) + 1, runNonce: nonce }));
+  writeFileSync(f, JSON.stringify({ ...j, run: run ?? (j.run ?? 2) + 1, runNonce: nonce }));
 };
 
 describe("1. the hold's start is a Discord-stamped id, never the keeper's status time (invariants: the held log)", () => {
@@ -133,7 +133,7 @@ describe("3. a link restart is verified by the keeper's next fresh fetch, withou
     const k = keeperRig();
     const r = shipRig();
     await r.link.sweep();
-    linkRun(k, r.state().runNonce!);
+    linkRun(k, r.state().runNonce!, r.state().run);
     expect(cycle(k.cfg).ok).toBe(true);
     const first = status(k);
     r.files.status = JSON.stringify(first);
@@ -143,7 +143,7 @@ describe("3. a link restart is verified by the keeper's next fresh fetch, withou
     r.restart();
     await r.link.sweep();
     expect(r.msg(card).content).toContain(CARD_CHECKING);
-    linkRun(k, r.state().runNonce!);                                      // the link's new run, in its state
+    linkRun(k, r.state().runNonce!, r.state().run);                                      // the link's new run, in its state
     return { k, r, card, first };
   };
 
@@ -387,7 +387,7 @@ describe("8. the replay bound is monotonic, and the prompt supersedes the old ke
     const kid = kidOf(r, id);
     // Round 18: the line asking him again waits for the keeper's status to show the supersede mirrored.
     expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(0);
-    r.keeperVerified({ superseded: [kid] });
+    r.keeperVerified({ superseded: [kid], replay_keys: { [kid]: { mirrored: true, consumed: "no" } } });   // round 19: the per-key answer
     await r.link.sweep();
     expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(1);
     const sup = logged(r).findIndex((x) => x.t === "supersede" && x.kid === kid);
@@ -401,7 +401,7 @@ describe("8. the replay bound is monotonic, and the prompt supersedes the old ke
     const key = logged(r).find((x) => x.t === "key" && x.kid === kid);
     appendLog(linkLog(k), key);
     appendLog(linkLog(k), logged(r)[sup]);
-    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: { [kid]: { item: key.item, kind: key.kind, label: key.label, msg: id, at: key.at } } }));
+    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: { [kid]: { item: key.item, kind: key.kind, label: key.label, msg: id, at: key.at, it: String(((BigInt(key.at + MIN) - 1420070400000n) << 22n) + 5n) } } }));
     k.at(new Date(key.at + MIN));
     k.cain({ id: "cain-r17-8-1", tap: kid, ops: [{ op: "note", item: "P08", text: "his tap" }] }, { issue: false });
     expect(cycle(k.cfg).ok).toBe(true);
@@ -455,7 +455,7 @@ describe("9. the invariant document, and the code against it", () => {
     // No whether decided by the Pi's clock: the settle line's age and the keeper's recover file.
     expect(core).not.toContain("this.d.now() - snowflakeTime(said) > DAY");
     expect(keeper).not.toContain("now - at > 86_400_000");
-    expect(keeper).toMatch(/function writeAtomic[\s\S]{0,300}fsyncSync\(fd\)[\s\S]{0,80}renameSync\(tmp, file\);\s*syncDir/);
+    expect(keeper).toMatch(/function writeAtomic[\s\S]{0,300}fsyncSync\(fd\)[\s\S]{0,80}renameSync\(tmp, file\);\s*(?:crashSpy\.on\?\.\([^\n]*\n\s*)?syncDir/);   // round 19: a crash point after the rename
     // The link state's saves that are relied on: fsynced.
     // Round 18: every save is the durable one.
     expect(pub).toContain("save(s: State, _sync = false): void { this.saveDurable(s); }");

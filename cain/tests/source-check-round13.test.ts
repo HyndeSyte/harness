@@ -265,7 +265,7 @@ describe("2. the high-water refusal never bricks the keeper", () => {
     appendLog(f, { a: 2 });
     expect(seen).toEqual([`file ${f}`, `dir ${dir}`, `file ${f}`]);
     const k = consumedOnce();
-    expect(k.kept().logHigh).toEqual({ consumed: readLog(tapsLogFile(k.cfg)).records.length, issued: readLog(issuedMirrorFile(k.cfg)).records.length, install: 0 });
+    expect(k.kept().logHigh).toEqual({ consumed: readLog<any>(tapsLogFile(k.cfg)).records.filter((x) => x?.t === undefined).length, issued: readLog(issuedMirrorFile(k.cfg)).records.length, install: 0 });
   }, 30_000);
 });
 

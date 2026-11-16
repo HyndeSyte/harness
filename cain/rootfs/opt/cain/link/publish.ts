@@ -30,7 +30,7 @@ export type StateIo = {
   open: (p: string, flags: string, mode?: number) => number; write: (fd: number, text: string) => void; fsync: (fd: number) => void;
   close: (fd: number) => void; rename: (a: string, b: string) => void; read: (p: string) => string; crash?: (where: string) => void;
 };
-const realIo: StateIo = { open: (p, f, m) => openSync(p, f, m), write: (fd, t) => { writeSync(fd, t); }, fsync: (fd) => fsyncSync(fd),
+export const realIo: StateIo = { open: (p, f, m) => openSync(p, f, m), write: (fd, t) => { writeSync(fd, t); }, fsync: (fd) => fsyncSync(fd),
   close: (fd) => closeSync(fd), rename: (a, b) => renameSync(a, b), read: (p) => readFileSync(p, "utf8") };
 export function stateFile(path: string, onSave: () => void = () => {}, io: StateIo = realIo) {
   return {

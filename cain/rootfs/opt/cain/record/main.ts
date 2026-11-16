@@ -22,7 +22,7 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
-import { appendLog, crashSpy, readLog, syncDir } from "../applog.ts";
+import { AFTER_RENAME, appendLog, crashSpy, readLog, syncDir } from "../applog.ts";
 import { installState } from "../installflag.ts";
 
 export type Config = {
@@ -58,6 +58,8 @@ export type Config = {
   installLog?: string;     // round 13: the install-taps log the keeper owns (default /data/record-install.log)
   recover?: string;        // round 13: the owner's accepted recover-logs line (default /data/record-recover.json)
   onItem?: (id: string) => void;   // round 13: the tests' hook, run as each request comes up for its decision
+  onDecided?: (id: string) => void;   // round 19: the tests' hook, run once a request's outcome is decided, before its commit
+  crashPoint?: (where: string) => void;   // round 19: the tests' crash point (throws to kill the round there)
   landings?: string;       // round 14: the link's landing ledger, read only (default /data/record-landings): a key it shows started counts as consumed
   linkHeld?: string;       // round 14: the link's held-tap log, read only (default /data/link-held.log): a held tap's tap time
 };
@@ -358,6 +360,8 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // go into the status file for it to tell him once each.
   issuedSeen?: Record<string, IssuedTap & { at: string }>;   // before round 12; the mirror log replaces it
   linkSeen?: { run: number; nonce: string };
+  runRefused?: string;
+  verifiedRuns?: { run: number; nonce: string }[];   // round 19: the link runs a fresh fetch verified, each with its nonce (newest last)
   // Round 12: how many records each of the keeper's append-only logs held after its last round (the
   // high-water count): a log missing or shorter than that refuses the keeper's start.
   logHigh?: { consumed?: number; issued?: number; install?: number };
@@ -408,8 +412,59 @@ export const ISSUED_KEEP_MS = 100 * 86_400_000;
 export function readConsumed(cfg: Config): Map<string, string> {
   const out = new Map<string, string>();
   // Round 14: a request's id wins over the landing ledger's mark (the Ship take that follows a landing).
+  // Round 19: only consumed records ({tap, id, at}, no t); a "consuming" intent and its "dropped" resolution aren't.
   for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records)
-    if (TAP_KEY.test(j?.tap) && typeof j.id === "string" && (!out.has(j.tap) || out.get(j.tap) === LEDGER_CONSUMER)) out.set(j.tap, j.id);
+    if (j?.t === undefined && TAP_KEY.test(j?.tap) && typeof j.id === "string" && (!out.has(j.tap) || out.get(j.tap) === LEDGER_CONSUMER)) out.set(j.tap, j.id);
+  return out;
+}
+// Round 19: supersede and consumption meet at one durable arbitration point, the consumed-key log. Before the keeper
+// reads the link's log for a supersede of a tap key, and before the request's local commit, it appends and fsyncs a
+// "consuming" intent for the key ({t: "consuming", tap, id, at}); the request then ends with a consumed record (done)
+// or a "dropped" one (anything else). The link counts an open intent as consumed in its check before asking him again,
+// so it never asks while the keeper may be acting on the key. Open intents (no consumed or dropped record for the same
+// request after them) are the ones a crash left: resolved at the next round from the commit's Tap-Key trailer.
+export function openIntents(cfg: Config): Map<string, string> {
+  const open = new Map<string, string>();
+  let recs: any[] = [];
+  try { recs = readLog<any>(tapsLogFile(cfg), { repair: false }).records; } catch { return open; }
+  for (const j of recs) {
+    if (!TAP_KEY.test(j?.tap) || typeof j.id !== "string") continue;
+    if (j.t === "consuming") open.set(j.tap, j.id);
+    else if ((j.t === undefined || j.t === "dropped") && open.get(j.tap) === j.id) open.delete(j.tap);
+  }
+  return open;
+}
+function intendConsume(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { t: "consuming", tap, id, at }); }
+function dropIntent(cfg: Config, tap: string, id: string, at: string, why: string) { appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, at, why }); }
+// Round 19: each intent a crash left open is resolved from the record's history: consumed when a commit carries its
+// Tap-Key trailer (the request's local commit happened), else dropped. A crash after the commit never leads to a re-ask.
+export function resolveIntents(cfg: Config, nowIso: string): { consumed: string[]; dropped: string[] } {
+  const out = { consumed: [] as string[], dropped: [] as string[] };
+  const open = openIntents(cfg);
+  if (!open.size) return out;
+  // The history must be readable to tell: without it, every intent stays open (the link keeps waiting) until a round can.
+  try { git(cfg, ["rev-parse", "--verify", "HEAD"]); } catch { return out; }
+  const hist = historyTaps(cfg);
+  const have = readConsumed(cfg);
+  for (const [tap, id] of open) {
+    if (hist.has(tap) || have.has(tap)) { if (!have.has(tap)) appendConsumed(cfg, tap, id, nowIso); else dropIntent(cfg, tap, id, nowIso, "consumed already"); out.consumed.push(tap); }
+    else { dropIntent(cfg, tap, id, nowIso, "no commit carries its Tap-Key trailer"); out.dropped.push(tap); }
+  }
+  return out;
+}
+// Round 19: the tap keys of the link's open landing claims (a claim not settled yet). Until the link settles a claim
+// against the remote main, its key is blocked: treated as consumed (a request for it is refused, the link refuses a
+// tap on it), never written to the consumed-key log; once settled, ledgerStarted takes it into the rebuild.
+export function ledgerOpen(cfg: Config): Set<string> {
+  const out = new Set<string>();
+  let names: string[] = [];
+  try { names = readdirSync(landingsDir(cfg)).filter((n) => /^[0-9a-f]{32}\.json$/.test(n)); } catch { return out; }
+  for (const n of names) {
+    try {
+      const j = JSON.parse(readFileSync(join(landingsDir(cfg), n), "utf8"));
+      if (typeof j?.key === "string" && !j.settled) out.add(`tap-${createHash("sha256").update(j.key).digest("hex").slice(0, 12)}`);
+    } catch { /* a file mid-write: the next round */ }
+  }
   return out;
 }
 // Round 14: the tap keys the link's landing ledger shows a started landing for (a claim not voided).
@@ -488,6 +543,24 @@ export function supersededNow(cfg: Config, kid: string): boolean {
 function mirroredSupersedes(cfg: Config): string[] {
   try { return [...new Set(readLog<any>(issuedMirrorFile(cfg), { repair: false }).records.filter((r) => r?.t === "supersede" && typeof r.kid === "string").map((r) => r.kid as string))].slice(-200); }
   catch { return []; }
+}
+
+// Round 19: a per-key answer for the link's check before it asks him again: for each replayed held tap the link's
+// held log shows still open (released as a replay, no replay-done yet), whether the keeper's mirror has its supersede
+// and where the key stands in the consumed-key log ("consumed", "consuming": an open intent, or "no"). Read from the
+// whole mirror and the whole consumed-key log, never a newest-N list.
+export function replayAnswers(cfg: Config): Record<string, { mirrored: boolean; consumed: "consumed" | "consuming" | "no" }> {
+  const out: Record<string, { mirrored: boolean; consumed: "consumed" | "consuming" | "no" }> = {};
+  let held: any[] = [];
+  try { held = readLog<any>(linkHeldFile(cfg), { repair: false }).records; } catch { return out; }
+  const done = new Set(held.filter((r) => r?.t === "replay-done").map((r) => r.kid));
+  const kids = [...new Set(held.filter((r) => r?.t === "released" && r.replay === true && TAP_KEY.test(r.kid) && !done.has(r.kid)).map((r) => r.kid as string))];
+  if (!kids.length) return out;
+  let mirror = new Set<string>();
+  try { mirror = new Set(readLog<any>(issuedMirrorFile(cfg), { repair: false }).records.filter((r) => r?.t === "supersede" && typeof r.kid === "string").map((r) => r.kid)); } catch { /* none */ }
+  const consumed = readConsumed(cfg), open = openIntents(cfg);
+  for (const k of kids.slice(-500)) out[k] = { mirrored: mirror.has(k), consumed: consumed.has(k) ? "consumed" : open.has(k) ? "consuming" : "no" };
+  return out;
 }
 
 // Round 12: the issued keys the keeper knows, from the link's issued-key log and its own mirror of it,
@@ -597,7 +670,7 @@ const rebuilt = new Set<string>();
 // current start, after a fetch that saw the link's current run: a status left from before a restart, or
 // restored with the image, names an older start or link run and reads as unverified.
 const starts = new Map<string, { nonce: string; at: string }>();
-const verifiedBy = new Map<string, { start: string; at: string; link: string | null; fetches: number }>();
+const verifiedBy = new Map<string, { start: string; at: string; link: string | null; run?: number; fetches: number }>();
 // Round 17: a new link run the keeper saw that no fresh fetch has verified for yet.
 const verifyPending = new Map<string, { link: string; since: string }>();
 export function forgetRebuild(cfg: Config) { rebuilt.delete(cfg.dir); starts.delete(cfg.dir); verifiedBy.delete(cfg.dir); verifyPending.delete(cfg.dir); }
@@ -634,8 +707,10 @@ export function logsCheck(cfg: Config, st: State): { lost: string[]; installLost
     catch (e) { if (!out.fatal) { out.fatal = `its log of ${what} (${f}) can't be read (${(e as Error).message.slice(0, 120)})`; out.fatalFile = f; } continue; }
     if (r.bad) { if (!out.fatal) { out.fatal = `its log of ${what} (${f}) has ${r.bad} damaged record(s) before its end, which no power cut explains`; out.fatalFile = f; } continue; }
     if (!high) continue;
+    // Round 19: the consumed-key log's count is of consumed records alone (its intents and their drops are transient).
+    const count = f === tapsLogFile(cfg) ? r.records.filter((x: any) => x?.t === undefined).length : r.records.length;
     if (r.missing) out.lost.push(`its log of ${what} is missing, but its state says it held ${high} records`);
-    else if (r.records.length < high) out.lost.push(`its log of ${what} holds ${r.records.length} records, fewer than the ${high} its state says it held`);
+    else if (count < high) out.lost.push(`its log of ${what} holds ${count} records, fewer than the ${high} its state says it held`);
     else continue;
     if (f === installLogFile(cfg)) out.installLost = true;
   }
@@ -644,7 +719,8 @@ export function logsCheck(cfg: Config, st: State): { lost: string[]; installLost
 // The high-water counts as the logs stand now (each record counted only once its append was fsynced).
 function logCounts(cfg: Config): NonNullable<State["logHigh"]> {
   const n = (f: string) => { try { return readLog(f, { repair: false }).records.length; } catch { return 0; } };
-  return { consumed: n(tapsLogFile(cfg)), issued: n(issuedMirrorFile(cfg)), install: n(installLogFile(cfg)) };
+  const c = () => { try { return readLog<any>(tapsLogFile(cfg), { repair: false }).records.filter((x) => x?.t === undefined).length; } catch { return 0; } };
+  return { consumed: c(), issued: n(issuedMirrorFile(cfg)), install: n(installLogFile(cfg)) };
 }
 // Round 13: the owner's accepted recover-logs line (keeper.sh recover-logs, written by the link), not used before.
 // Round 17: no longer aged by the Pi's clock (the link judged his line by Discord's times before writing the file,
@@ -670,12 +746,13 @@ let refusedWhy = "";
 
 // Round 17: fsynced (the file, then its folder), so the keeper's state and status are durable before anything
 // is relied on after them.
-function writeAtomic(file: string, text: string) {
+export function writeAtomic(file: string, text: string) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   const fd = openSync(tmp, "w");
   try { writeSync(fd, text); crashSpy.on?.(file); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, file);
+  crashSpy.on?.(`${file}${AFTER_RENAME}`);
   syncDir(dirname(file));
 }
 
@@ -716,6 +793,8 @@ function revive(j: any): State | null {
     ...(j.issuedSeen && typeof j.issuedSeen === "object" && !Array.isArray(j.issuedSeen)
       ? { issuedSeen: Object.fromEntries(Object.entries<any>(j.issuedSeen).filter(([k, v]) => TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string" && typeof v.at === "string")) } : {}),
     ...(j.linkSeen && Number.isInteger(j.linkSeen.run) && typeof j.linkSeen.nonce === "string" ? { linkSeen: { run: j.linkSeen.run, nonce: j.linkSeen.nonce } } : {}),
+    ...(typeof j.runRefused === "string" ? { runRefused: j.runRefused } : {}),
+    ...(Array.isArray(j.verifiedRuns) ? { verifiedRuns: j.verifiedRuns.filter((x: any) => x && Number.isInteger(x.run) && typeof x.nonce === "string").map((x: any) => ({ run: x.run, nonce: x.nonce })).slice(-200) } : {}),
     ...(span(j.linkRestore) ? { linkRestore: span(j.linkRestore)! } : {}),
     ...(j.logHigh && typeof j.logHigh === "object" ? { logHigh: { ...(Number.isInteger(j.logHigh.consumed) ? { consumed: j.logHigh.consumed } : {}), ...(Number.isInteger(j.logHigh.issued) ? { issued: j.logHigh.issued } : {}),
       ...(Number.isInteger(j.logHigh.install) ? { install: j.logHigh.install } : {}) } } : {}),
@@ -1171,6 +1250,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           if (r.torn) { log(`TORN: a torn final record (${r.tornBytes} bytes) in the log of ${what} was truncated; the records before it stand`); relay(cfg, `The record keeper found a torn final record in its log of ${what} (a write cut short, as by a power cut) and truncated it; every record before it stands. Nothing to tell him.`); }
         } catch (e) { log(`couldn't read the log of ${what}: ${(e as Error).message}`); }
       }
+      // Round 19: intents a crash left open are resolved first, from the commit's Tap-Key trailer.
+      try { const r = resolveIntents(cfg, nowIso); for (const k of r.consumed) log(`tap key ${k}: an open consuming intent resolved as consumed (its commit carries the Tap-Key trailer)`); for (const k of r.dropped) log(`tap key ${k}: an open consuming intent resolved as dropped (no commit carries it)`); }
+      catch (e) { log(`couldn't resolve the open consuming intents: ${(e as Error).message}`); }
       try { const n = mirrorIssued(cfg); if (n) log(`mirrored ${n} issued tap key(s) from the link's issued-key log`); }
       catch (e) { log(`couldn't mirror the link's issued-key log: ${(e as Error).message}`); }
       let reg = readIssued(cfg, clock().getTime());
@@ -1237,12 +1319,22 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // Round 17: the keeper watches the link state's run nonce each round: when it differs from the one its verified
       // status names (the link restarted), a fresh fetch (every round fetches) writes a new verified for that run;
       // while the fetch fails, its status says verification for the new link run is pending.
-      { const sNow = starts.get(cfg.dir), runNow = linkTaps?.nonce ?? null;
-        if (sNow && !S.rebuild && rebuilt.has(cfg.dir) && synced0.fetched && runNow === linkRun0) {
+      // Round 19: verification is keyed on the link's run and nonce together: the keeper refuses to verify a run whose
+      // number it already verified under another nonce (a restored link state reusing a run), and keeps the runs it
+      // verified in its state, so its status names the highest (verified_high), from which the link seeds its next run.
+      { const sNow = starts.get(cfg.dir), runNow = linkTaps?.nonce ?? null, runNo = linkTaps?.run ?? null;
+        const reused = runNo !== null && runNow !== null && (S.verifiedRuns ?? []).some((x) => x.run === runNo && x.nonce !== runNow);
+        if (reused && S.runRefused !== `${runNo}|${runNow}`) {
+          S.runRefused = `${runNo}|${runNow}`;
+          log(`the link's run ${runNo} was verified before under another nonce: not verified again under nonce ${runNow} (a restored link state reusing a run); its taps stay held until it starts a new run`);
+          relay(cfg, `The record keeper won't verify the link's run ${runNo}: that run number was verified before under another nonce, so the link's state looks restored from an older copy. Taps stay held until the link starts a new run (restart the App). Nothing to tell him.`);
+        }
+        if (sNow && !S.rebuild && rebuilt.has(cfg.dir) && synced0.fetched && runNow === linkRun0 && !reused) {
           const was = verifiedBy.get(cfg.dir);
           if (was?.start === sNow.nonce && was.link !== runNow) log(`the link's run changed (${was.link ?? "none"} to ${runNow ?? "none"}): verified for its new run by this round's fresh fetch`);
-          verifiedBy.set(cfg.dir, { start: sNow.nonce, at: nowIso, link: runNow, fetches: (was?.start === sNow.nonce ? was.fetches : 0) + 1 });
-        } else if (S.rebuild) verifiedBy.delete(cfg.dir);
+          verifiedBy.set(cfg.dir, { start: sNow.nonce, at: nowIso, link: runNow, ...(runNo !== null ? { run: runNo } : {}), fetches: (was?.start === sNow.nonce ? was.fetches : 0) + 1 });
+          if (runNo !== null && runNow !== null && !(S.verifiedRuns ?? []).some((x) => x.run === runNo)) S.verifiedRuns = [...(S.verifiedRuns ?? []), { run: runNo, nonce: runNow }].slice(-200);
+        } else if (S.rebuild || reused) verifiedBy.delete(cfg.dir);
         const vb = verifiedBy.get(cfg.dir);
         if (sNow && vb && vb.start === sNow.nonce && runNow && vb.link !== runNow) {
           if (verifyPending.get(cfg.dir)?.link !== runNow) {
@@ -1274,8 +1366,11 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           if (h.sf > e) return "expired";
           return h.holdSf !== null && h.holdSf > e ? "floor" : null;
         }
-        const it = own?.it ? snowflakeMs(own.it) : NaN;
-        if (!Number.isFinite(it)) return null;
+        // Round 19: the link's tap record without an interaction id is refused (unstamped), never skipped: no Pi clock
+        // and no Discord-now decides whether it counts. No tap record at all is the lost path below.
+        if (!own) return null;
+        const it = own.it ? snowflakeMs(own.it) : NaN;
+        if (!Number.isFinite(it)) return "unstamped";
         const e = expirySf(rec, own?.msg);
         if (e === null) return "unstamped";
         return it > e ? "expired" : null;
@@ -1312,8 +1407,19 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           try { if (mirrorIssued(cfg)) reg = readIssued(cfg, clock().getTime()); } catch (e) { log(`couldn't read the link's issued-key log again: ${(e as Error).message}`); }
           linkTaps = readLinkTaps(cfg) ?? linkTaps;
         }
+        // Round 19: the consuming intent, appended and fsynced before the supersede read and before the local commit.
+        let intent = false;
+        if (tapK && !it.error && !seen.has(id)) {
+          try { intendConsume(cfg, tapK, id, at.toISOString()); intent = true; }
+          catch (e) { log(`couldn't append the consuming intent for tap key ${tapK} (${(e as Error).message}): ${id} waits for the next round`); held.add(it.name); outcomes.push(null); continue; }
+        }
+        const blocked = tapK ? ledgerOpen(cfg) : new Set<string>();
         let o: Outcome;
         if (it.error) o = { ...base, state: "rejected", reason: clean(it.error) };
+        else if (tapK && blocked.has(tapK) && !consumed.has(tapK) && !S.taps?.[tapK])
+          // Round 19: a key with an open landing claim is blocked (treated as consumed) until the link settles the claim
+          // against the remote main.
+          o = { ...base, state: "rejected", reason: `tap key ${tapK} has a landing the link hasn't settled against GitHub's main yet, so it counts as acted on: act on a tap key once` };
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
         else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && (S.taps?.[it.req!.tap] ?? consumed.get(it.req!.tap)) !== undefined
           && (S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)) !== id
@@ -1384,6 +1490,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         }
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
         else o = decide(it.req!, !!it.local, base);
+        cfg.onDecided?.(id);
         if (it.repoPath && existsSync(join(cfg.dir, it.repoPath))) rmSync(join(cfg.dir, it.repoPath), { force: true });
         logOutcome(cfg, o);
         seen.add(id);
@@ -1396,10 +1503,15 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         owed.push(owe(o, !!it.local, it.req, !!it.error));
         if (o.state === "done" && it.req?.tap && TAP_KEY.test(it.req.tap)) {
           S.taps = { ...(S.taps ?? {}), [it.req.tap]: { id, at: at.toISOString() } };
+          cfg.crashPoint?.("consumed:before-append");
           try { appendConsumed(cfg, it.req.tap, id, at.toISOString()); }
-          catch (e) { log(`couldn't append consumed tap key ${it.req.tap} to its log (${(e as Error).message}); the state keeps it`); }
+          catch (e) { log(`couldn't append consumed tap key ${it.req.tap} to its log (${(e as Error).message}); the state keeps it, and its intent is resolved from the commit next round`); }
           const keys = Object.keys(S.taps);
           if (keys.length > TAPS_KEPT) for (const k of keys.slice(0, keys.length - TAPS_KEPT)) delete S.taps[k];
+        }
+        else if (intent && tapK) {
+          try { dropIntent(cfg, tapK, id, at.toISOString(), o.state); }
+          catch (e) { log(`couldn't drop the consuming intent for tap key ${tapK} (${(e as Error).message}): resolved from the record's history next round`); }
         }
         // A hold that ended or moved may let a waiting take through, before anything newer.
         if (o.state === "done" && S.waiting.length) settle();
@@ -1679,12 +1791,15 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       ...(st.tapNotices?.length ? { tap_notices: st.tapNotices } : {}),
       // Round 18: the supersede records mirrored so far (the link's line asking him again waits for its own here).
       ...((): { superseded?: string[] } => { const x = mirroredSupersedes(cfg); return x.length ? { superseded: x } : {}; })(),
+      // Round 19: the per-key answer the link's check before asking him again reads.
+      ...((): { replay_keys?: ReturnType<typeof replayAnswers> } => { const x = replayAnswers(cfg); return Object.keys(x).length ? { replay_keys: x } : {}; })(),
       ...(st.linkRestore ? { link_restore: st.linkRestore } : {}),
       ...(st.rebuild ? { consumed_unverified: { since: st.rebuild.since, why: st.rebuild.why, tries: st.rebuild.tries } } : {}),
       // Round 16: the keeper's current start, and the fresh fetch that verified its consumed set in it.
       ...(starts.has(cfg.dir) ? { start: starts.get(cfg.dir) } : {}),
       ...(!st.rebuild && verifiedBy.get(cfg.dir)?.start === starts.get(cfg.dir)?.nonce && verifiedBy.has(cfg.dir) ? { verified: verifiedBy.get(cfg.dir) } : {}),
       ...(verifyPending.has(cfg.dir) ? { verify_pending: verifyPending.get(cfg.dir) } : {}),
+      ...(st.verifiedRuns?.length ? { verified_high: Math.max(...st.verifiedRuns.map((x) => x.run)) } : {}),
       ...(st.historyCards?.length ? { history_cards: st.historyCards.slice(-500) } : {}),
       ...((st.linesDone?.length || st.historyLines?.length) ? { used_lines: [...new Set([...(st.linesDone ?? []), ...(st.historyLines ?? [])])].slice(-200) } : {}),
       recheck_pending: recheckPending(cfg),

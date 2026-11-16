@@ -1122,6 +1122,47 @@ What Cain's link enforces:
   table whose fsync point matters has a crash-injection test (a kill after the write and before its fsync),
   and the table lists them.
 
+  Round 19 (the nineteenth review's fixes, to defects in round 18's own additions; the design stays frozen
+  for the combined fault scenario, which is unchanged, and no new durable store). The table in
+  `cain/docs/source-check-invariants.md` is updated for every row this round touches.
+
+  Supersede and consumption meet at one durable point, the consumed-key log. Before the keeper reads the
+  link's log for a supersede of a tap key, and before the request's local commit, it appends and fsyncs a
+  consuming intent for the key; the request ends with a consumed record or a dropped one. The link counts an
+  open intent as consumed before asking you again, so it never asks while the keeper may be acting on the
+  key. An intent a crash left open is resolved at the keeper's next round from the commit's Tap-Key trailer
+  (consumed if the commit exists, else dropped), so a crash after the commit never leads to a second ask.
+  The link's check before asking again reads the keeper's per-key answer in its status (`replay_keys`),
+  never a newest-200 list; if that answer is late, the card gets one line saying it settles by itself. A
+  held tap whose key isn't in the issued-key log is refused at the link with a line on the card.
+
+  The expired-key index records why a card was retired: unarmed, or swept as expired. Only a swept card
+  with an armed record, not queued for removal as withdrawn, is judged again by a tap's own stamp, and then
+  goes through the usual checks. Its longest lifetime for old records comes from the configuration.
+
+  No Pi-clock decision about whether a tap counts: a tap or a restarted claim without a well-formed
+  interaction id is refused with a line on the card and a line to Cain; the keeper refuses a request whose
+  tap record has no interaction id; a card's forgetting day is judged by the tap's snowflake against its
+  post plus its retention. The one Pi-clock refusal left (a card the link can't place in Discord's time,
+  past its forgetting day) is listed in the table.
+
+  Cards live at the upgrade are migrated explicitly: a card resting on a check with no Discord anchor gets
+  the lesser of its own post snowflake and one made from the check's keeper date, so a check never counts
+  longer than its limit; a card with no trustworthy anchor is withdrawn with a line saying a new source check
+  is needed. The keeper refuses a new check without an anchor. A tap refused because its check aged out says
+  so on the card ("The check behind this is more than 7 days old"), and Cain gets the re-check.
+
+  An open landing claim keeps its key blocked (treated as consumed) through a rebuild until the link settles
+  it against GitHub's main. Verification is keyed on the link's run and nonce together: the keeper refuses
+  a run number it verified before under another nonce, and its status names the highest run it verified
+  (`verified_high`), which the link starts above. A message read back from Discord (the start mark, each
+  restore sweep page) counts as a clock comparison, so the restore sweep completes after a quiet restart.
+
+  Append logs: free-text fields are cut to a fixed budget so every record fits; a short write is undone
+  before it is refused; every reader skips and reports a torn final line, and an append cuts one off first;
+  appends are serialised by a lock beside each log. The crash tests also run each store's writer in a child
+  process killed at the crash point.
+
   The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
   issue 24. You have nothing to set up beyond the smoke test's one option change.
 

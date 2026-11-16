@@ -15,7 +15,7 @@
 //   the marker's (or the link's state's), or that is missing while the marker isn't, came back
 //   from a backup: it isn't trusted (claims answer null) until each of its keys was looked for on
 //   the remote main by its head (the landing's token), and settled by what the remote said.
-import { appendLog, crashSpy, readLog } from "../applog";
+import { AFTER_RENAME, appendLog, crashSpy, readLog } from "../applog";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -75,6 +75,7 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
     const fd = openSync(tmp, "w");
     try { writeSync(fd, text); crashSpy.on?.(file); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(tmp, file);
+    crashSpy.on?.(`${file}${AFTER_RENAME}`);
     fsyncPath(dirname(file), "dir");
   };
   const readJson = (f: string): any => { try { return JSON.parse(readFileSync(f, "utf8")); } catch { return null; } };

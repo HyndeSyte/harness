@@ -72,6 +72,12 @@
 - If Cain's re-ask after a lost tap and your old answer cross, only one of them counts, and the card says which.
 - A tap the App can't place in Discord's own time does nothing and says so on the card, instead of being judged by the Pi's clock.
 - The App's saved state is written safely on every save, so a power cut can't undo a tap it already took.
+- If Cain's re-ask and your old answer cross while the box restarts, still only one counts: the record marks an answer it is about to act on before anything else, and the App waits for that before asking you again. If the record is slow to confirm, the card says it settles by itself.
+- A tap the App can't date by Discord's own time does nothing and says so on the card, including one cut off by a restart; nothing about a tap is decided by the Pi's clock.
+- A question already up when you install this keeps working; one whose check is too old by then, or can't be dated, says a new check is needed instead.
+- A tap on a question whose check has gone stale now says so on the card ("The check behind this is more than 7 days old"), and Cain checks it again and asks on a new card if it still needs you.
+- A Ship whose landing hasn't been settled with GitHub yet can't be tapped into counting twice, even after a restore.
+- The App's logs keep every record whole, even with a long message from GitHub or a power cut in the middle of a write.
 - One known gap, said plainly: if a tap was used while GitHub was down, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 

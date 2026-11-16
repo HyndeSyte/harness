@@ -90,7 +90,7 @@ describe("1. a tap's freshness is Discord's time against the check's anchor (inv
         ledger.P08.checked_sf = sf(at - age);                         // the check's anchor, by Discord's times
         r.files.checks = JSON.stringify(ledger);
         const out = await tapAt(r, id, r.msg(id), at);
-        expect(out).toBe(acts ? "to Cain" : "dead: status changed");
+        expect(out).toBe(acts ? "to Cain" : "dead: check stale");               // round 19: a freshness refusal says the check is stale
         expect(tapLines(r)).toHaveLength(acts ? 1 : 0);
       }
     });
@@ -207,7 +207,7 @@ describe("3. supersede ordered against consumption (invariants: the issued-key l
     const consumed = join(mkdtempSync(join(tmpdir(), "r18-consumed-")), "record-taps.jsonl");
     appendLog(consumed, { tap: kid, id: "cain-late", at: new Date(r.t.now).toISOString() });
     (r.deps as any).consumedLog = consumed;
-    r.keeperVerified({ superseded: [kid] });
+    r.keeperVerified({ superseded: [kid], replay_keys: { [kid]: { mirrored: true, consumed: "consumed" } } });   // round 19: the per-key answer
     await r.link.sweep();
     await r.link.sweep();
     expect(onThread(r, id, TAP_REPLAY_ACTED)).toHaveLength(1);
@@ -381,8 +381,11 @@ describe("8. the Pi's clock is unknown until compared in this run (invariants: t
     (r.files as any).status = JSON.stringify({ ...JSON.parse(r.files.status!), consumed_unverified: { since: new Date(r.t.now).toISOString(), why: "its log of consumed tap keys is missing", tries: 0 } });
     r.restart();
     expect((r.link.clockReport() as any).pi_clock).toBe("unknown");
+    // Round 19: the start mark's read is a comparison of its own (cain/tests/source-check-round19.test.ts, item 9): a
+    // quiet restart finds the Pi's clock not behind its DM's last message, so the restore sweep completes.
     await r.link.sweep();
-    expect(JSON.parse(readFileSync(side(r, "link-sweep.json"), "utf8")).done).toBe(false);
+    expect((r.link.clockReport() as any).pi_clock).toBe("in step");
+    expect(JSON.parse(readFileSync(side(r, "link-sweep.json"), "utf8")).done).toBe(true);
     expect(r.cards().filter((m: any) => /^The Pi's clock is off/.test(String(m.content)))).toHaveLength(0);
     await r.link.recoverLogs({});                                     // a post: Discord's stamp compared
     expect((r.link.clockReport() as any).pi_clock).toBe("in step");
@@ -423,7 +426,7 @@ describe("10. the table's rebuild and interleaving rows (invariants: the consume
     const f = join(mkdtempSync(join(tmpdir(), "r18-log-")), "record-install.log");
     appendLog(f, { t: "flag", how: "off", by: "keeper", at: "x" });
     const size = readFileSync(f).length;
-    expect(() => appendLog(f, { t: "flag", why: "x".repeat(MAX_RECORD_BYTES) })).toThrow(`over ${MAX_RECORD_BYTES} bytes`);
+    expect(() => appendLog(f, { t: "flag", blob: "x".repeat(MAX_RECORD_BYTES) })).toThrow(`over ${MAX_RECORD_BYTES} bytes`);
     expect(readFileSync(f).length).toBe(size);
   });
 
