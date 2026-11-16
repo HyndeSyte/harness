@@ -124,6 +124,7 @@ export interface Opts {
   registry?: (hostName: string) => RegEntry[] | undefined; // the manifest path in each registry view (registeredManifests unless a test stands in)
   shortPath?: (path: string) => string | null;      // Windows: a path's real 8.3 short form (shortPath, cmd's %~s, unless a test stands in)
   processCheck?: (o: Opts) => Promise<ProcessLine>; // the probe's process-end check (processCheck unless a test stands in)
+  readback?: (o: Opts, helper: string | null) => ReadbackLine; // the probe's job_readback step (jobReadback unless a test stands in)
   jobHelper?: string | null;                        // Windows: the containment helper's path, null for none (ensureJobHelper unless a test stands in)
   csc?: (env: Record<string, string | undefined>) => string | null; // Windows: the compiler's path (cscPath unless a test stands in)
   holders?: (files: string[]) => Holder[];          // what holds files a sweep couldn't delete (fileHolders unless a test stands in)
@@ -4470,7 +4471,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const alog = readNavLog(P.navLog(o));
     const structured_address = judgeStructured(as, alog);
     const session_ids = sessionIds(ast, alog);
-    const job_readback = jobReadback(o, platform(o) === "win32" ? ensureJobHelper(o) : null);
+    const job_readback = (o.readback ?? jobReadback)(o, platform(o) === "win32" ? ensureJobHelper(o) : null);
     const helper_build = helperBuild(o);
     const candidate_patterns = candidatePatterns(stream, log);
     try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe round15 ${JSON.stringify({ redirect_read, structured_address, session_ids, job_readback, helper_build, candidate_patterns })}\n`); } catch { /* never stops a probe */ }

@@ -774,7 +774,8 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
     acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), managed: [], managedDirs: [],
     policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
-    shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe", holders: () => [],
+    shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
+    readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
