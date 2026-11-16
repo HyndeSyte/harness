@@ -34,8 +34,11 @@
 - Shipping something that is already in main now says so on the card ("Already in main, so nothing was pushed") and pushes nothing; installing it is still next.
 - If GitHub was unreachable when a restart cut a Ship off, the App asks GitHub about that Ship first once it answers again. If it landed, you get the usual "Shipped" words and Cain installs it, with no new card; only if it didn't land does a new card follow.
 - A restart of the record that slips in just before a Ship's push now stops that push too, and you get the "Lost to the record's reset" line.
-- If GitHub can never say whether a Ship landed (say main was rewritten), you can settle it yourself: tell Cain in his DM whether it landed, and he settles it on your message with a new command. Nothing else to set up.
-- A tap's record entry must match the question you tapped: the record refuses one that names another item or comes from another kind of card.
+- If GitHub can never say whether a Ship landed (say main was rewritten), you can settle it yourself: send Cain exactly "settle" with that Ship's tap key and "landed" or "not-landed" (the App gives you both lines ready to copy), and he settles it on that message. A message that names another Ship, says both, or says "not landed" as two words is turned down with the reason, and each message settles one Ship once. Nothing else to set up.
+- While such a Ship stays unsettled you get a reminder under its card once a day with those two lines. After 7 days Cain is alerted; after 90 days it is kept on file as a tombstone and no longer stops a new Ship card for the same change.
+- A tap's record entry must match what you tapped: each tap now carries what it may do (close that item, start that Ship, or record your answer), and the record checks that, not the wording. If it turns one down, Cain gets the reason and you get one line under the card.
+- Taps already used are kept in a log that only grows, so even restoring the App's saved state can't make one count twice. A tap lost that way gets one line under its card asking you to answer again.
+- A Ship you settled by hand and later shipped for real shows as one landing, and a record restart during the push never undoes a landing.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 
 ## 0.11.0

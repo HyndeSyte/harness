@@ -222,8 +222,8 @@ describe("3. settlement, the owner's settle, and pruning", () => {
     // Not his message, words that don't match, a key that isn't unresolved: refused, nothing settled.
     await expect(r.link.settleKey({ tap: kid, how: "landed", said: id })).rejects.toThrow("isn't his");
     const vague = r.his("hmm, maybe");
-    await expect(r.link.settleKey({ tap: kid, how: "landed", said: vague.id })).rejects.toThrow("doesn't say it landed");
-    const says = r.his("It landed: I looked at main on GitHub and the change is there.");
+    await expect(r.link.settleKey({ tap: kid, how: "landed", said: vague.id })).rejects.toThrow("isn't of the exact form");
+    const says = r.his(`settle ${kid} landed`);
     await expect(r.link.settleKey({ tap: "tap-000000000000", how: "landed", said: says.id })).rejects.toThrow("isn't an unresolved landing");
     await expect(r.link.settleKey({ tap: kid, how: "landed" })).rejects.toThrow("the owner's alone");
     r.later(2 * DAY);
@@ -247,7 +247,7 @@ describe("3. settlement, the owner's settle, and pruning", () => {
   test("keeper.sh settle not-landed: the abandoned outcome, and a new card may follow", async () => {
     const r = shipRig();
     const { id, key } = await downPast15(r, false);
-    const says = r.his("It did not land, main doesn't have it.");
+    const says = r.his(`settle ${tapKid(key)} not-landed`);
     await r.link.settleKey({ tap: tapKid(key), how: "not-landed", said: says.id });
     await r.link.whenLanded();
     expect(r.state().messages[id].shipping).toMatchObject({ state: "not landed", abandoned: true });
@@ -450,8 +450,8 @@ describe("6. tap keys registered by the link and checked by the keeper", () => {
     expect(k.reason("cain-kind-1")).toContain("a question, not a Ship card, so it can't start a Ship job");
     expect(k.states("cain-kind-2")).toEqual(["rejected"]);
     expect(k.reason("cain-kind-2")).toContain(`a "Not now" tap on a Ship card`);
-    expect(k.states("cain-dec-1")).toEqual(["rejected"]);
-    expect(k.reason("cain-dec-1")).toContain("its text doesn't mention P11");
+    // Round 11: matched on the key's target, never on the text: a decision from a question passes.
+    expect(k.states("cain-dec-1")).toEqual(["done"]);
     expect(k.states("cain-dec-2")).toEqual(["done"]);
     expect(k.states("cain-ship-2")).toEqual(["done"]);
     expect(k.states("cain-none-1")).toEqual(["done"]);

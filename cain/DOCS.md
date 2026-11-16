@@ -548,7 +548,10 @@ What Cain's link enforces:
   forgets one; the request's own replay after a reset is not a second request. A consumed key is
   pruned once it is older than `TAP_KEEP_MS` (3 days: the longest card lifetime, until the morning
   check-in after next, under two days, plus a margin), except a key whose landing the link still
-  lists as unresolved.
+  lists as unresolved. Since round 11 each consumed key is also appended, fsynced, to the keeper's
+  own append-only log (`/data/record-taps.jsonl`, one line per key with its request and time, outside
+  the working copy and apart from the link's state). That log is never pruned or rewritten, so a key is
+  refused a second time whatever happens to the state file or to the link's state.
 
   The link's issued tap keys (round 10). Each tap key the link issues is listed in its state file
   (`/data/link/state.json`, `issued`, by the key's short form) with its card's item (NONE for a
@@ -560,6 +563,27 @@ What Cain's link enforces:
   whose key isn't a Ship card's Ship tap. While the list can't be read, a request with a tap key is
   refused and sent again under a new id. Only `"tap": "none"` (no tap) stays on Cain's word. The link
   lists an issued key for `TAP_ISSUED_KEEP_MS` (4 days), longer while its landing is unresolved.
+
+  Structured targets (round 11). With each issued key the link also records its card's message id
+  and a target: the card's item and the writes its tap allows. A Ship card's Ship tap allows
+  `ship-take` (the take for the Ship job); its Not now, and a question about no open item, allow
+  `decision` (a write to a `decisions.md`); a question about an item allows `row-close` on that item
+  and `decision`. The keeper matches a request with a tap key on that target, never on the request's
+  text: each tap-derived op must be a write the target allows, on the target's item, and any other op
+  naming an item must name the target's. So a decision written in Cain's own words passes, while a
+  row closed from a Ship tap, or a Ship take from a question, is refused. A refusal gives Cain the
+  specific reason in the keeper's usual line, and you get one line on the card's thread ("Your tap
+  couldn't be recorded as it was; Cain has the reason and will sort it out."), through the keeper's
+  status file (`tap_notices`), which the link reads and tells once.
+
+  Taps lost to a restore of the link's state (round 11). The keeper remembers the issued keys it has
+  seen (3 days, inside the link's own 4) and the link's run counter and per-start nonce. A link state with a lower run than it
+  last saw, or the same run with another nonce, came back from an older copy. A request whose key the
+  keeper saw issued but the restored state no longer lists is not refused as unknown: it is marked
+  lost ("tap key ... was lost: the link's state was restored from an older copy ..."), Cain hears so
+  with what to do (record nothing from that tap, ask again once the item's re-check is accepted), and
+  you get one line on the card's thread ("Your tap was lost when the App's state was restored from an
+  older copy, please answer again.").
 
   The landing ledger. A Ship tap's landing carries the key to the link's landing ledger
   (`/data/record-landings/`, outside the record's working copy, one file per key, made with an
@@ -608,15 +632,36 @@ What Cain's link enforces:
   2. How to decide: landed if main has the change (the commit, or the same content landed another
      way); not landed if it doesn't. If in doubt, not landed: a new Ship card for the same head
      finds anything already in main and pushes nothing.
-  3. The command: you tell Cain in his DM, in your own words, "it landed" or "it did not land", and
-     he runs `keeper.sh settle <tap key> landed|not-landed --said <his message id>` with the id of
-     that message of yours. It is yours alone: the link reads that message from your DM itself and
-     settles only on a message of yours under a day old that says it landed (or did not land) to
-     match. The link's log gets an audit line (the key, the verdict, your message and the key's
+  3. The command: you send Cain in his DM exactly `settle <tap key> landed` or `settle <tap key>
+     not-landed` (round 11: that form only, naming that key, with not-landed as one word; the daily
+     reminder gives you both lines ready to copy), and he runs `keeper.sh settle <tap key>
+     landed|not-landed --said <his message id>` with the id of that message of yours. It is yours
+     alone: the link reads that message from your DM itself and settles only on a message of yours
+     under a day old of that exact form, naming the same key and verdict as the command. A message
+     naming another key, saying both verdicts, or writing "not landed" as two words where the command
+     says landed is refused with the reason. Each message settles one key once: its id is recorded as
+     consumed (in the link's state and in the ledger's settled entry, so a restore of the link's state
+     doesn't forget it) and refused on reuse. The link's log gets an audit line (the key, the verdict, your message and the key's
      failures), and Cain gets a "Landing settled by Dane" line, then the usual outcome line: landed,
      with the Ship token while your tap is under 2 hours old, or not landed, with "a new card
-     follows". A key the link doesn't list as unresolved can't be settled this way. Ledger pruning
-     at 30 days and tap-key pruning at 3 days never remove an unresolved key.
+     follows". A key the link doesn't list as unresolved (or as a tombstone) can't be settled this
+     way. Ledger pruning at 30 days and tap-key pruning at 3 days never remove an unresolved key or a
+     tombstone.
+
+  Unresolved keys over days (round 11). After the first "Landing unconfirmed" line, you are told
+  again once a day on the card's thread while the key stays unresolved, with the exact settle lines
+  and a pointer to this section ("Reconciling a landing by hand"). `keeper.sh clock` lists each one
+  under `unresolved_landings` with its two settle lines. Past 7 days Cain gets one alert line. Past
+  90 days the key becomes a tombstone: it keeps its record (its entry in the link's state, its ledger
+  file and its issued key), `keeper.sh clock` lists it under `tombstoned_landings`, it is no longer
+  looked for on the remote, and it no longer blocks a new Ship card for that pull request and head.
+  You can still settle a tombstone by hand.
+
+  One landing per head (round 11). When a key you settled by hand is followed by a real landing of
+  the same head, the ledger links the forced entry to that landing, and the reconciliation
+  (`keeper.sh clock`, `landings_by_head`) shows one landing per head: the real landing over the
+  forced one. Also, a reset that arrives during the push does not undo the landing and is reported as
+  landed: once the claim is made the push goes on, and the outcome is what main says.
 
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap
@@ -898,7 +943,7 @@ after any rebase, from the repository root, `bash cain/tests/fixtures/regenerate
 origin/main)" <the version on that main>` rewrites `link-<version>` and `keeper-<version>` from that
 commit (the header of each file names it), and a test checks the committed copies match. After any
 rebase onto a version bump (pull request 20, pull request 21 and pull request 23 also bump this
-App's version; pull request 20 lands first and this rebases onto it),
+App's version; pull request 20 lands first and this rebases onto it, regenerating the fixture),
 both test suites and the rollback test run again on the new head before Ship. There is no switch that lets cards through without a
 check. The previous version's record keeper (as of 0.11.0) ignores state/checks.json, the
 `Checked` column and `state/one-off-audit.md` without error (tested): it reads and edits the

@@ -14,7 +14,7 @@
 // Holds (who holds which item) are the keeper's own: its copy in /data is the one
 // that counts, and the record's state/holds.json is put back to it if it drifts.
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
   maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, checksText, parseChecks, type OneOff, type WaitTimeout,
@@ -49,6 +49,7 @@ export type Config = {
   leakCheck?: string;      // the smoke test's leak check (default /data/record-leak-check): see leakCheck()
   logFile?: string;        // the keeper's log copy (RECORD_LOG, /data/work/record-keeper.log), which the leak check reads
   workDir?: string;        // the folder the leak check reads whole (default: the log copy's folder, /data/work)
+  tapsLog?: string;        // round 11: the append-only log of consumed tap keys (default /data/record-taps.jsonl, next to the queue)
 };
 
 // Whether the system clock is synchronized by the box's own sources (../clock.ts: the kernel's
@@ -334,7 +335,17 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // Tap keys already acted on (0.12.0): a request carrying a tap key (its optional tap field) is
   // taken once per key; a second request citing a consumed key is refused. Kept here, outside the
   // working copy, so no reset or re-clone forgets one. The newest TAPS_KEPT.
-  taps?: Record<string, { id: string; at: string }> };
+  taps?: Record<string, { id: string; at: string }>;
+  // Round 11: the link's issued tap keys as the keeper has seen them (kept TAP_KEEP_MS, inside the link's four days), so a key
+  // a restored link state no longer lists is told as lost, never silently refused; the link's run and
+  // nonce last seen (a lower run, or the same run with another nonce, is a restore of its state), and the
+  // latest restore seen; and the tap notices for the link (a refused or lost tap-derived request), which
+  // go into the status file for it to tell him once each.
+  issuedSeen?: Record<string, IssuedTap & { at: string }>;
+  linkSeen?: { run: number; nonce: string };
+  linkRestore?: { at: string; why: string };
+  tapNotices?: TapNotice[] };
+type TapNotice = { tap: string; why: "refused" | "lost"; reason: string; msg?: string; at: string };
 const TAPS_KEPT = 1000;
 // Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
 // Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
@@ -351,6 +362,26 @@ export function pruneTaps(taps: Record<string, { id: string; at: string }> | und
 }
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
+// Round 11: consumed tap keys, one JSON line each ({tap, id, at}), only ever appended to and fsynced, in
+// the keeper's own folder (/data/record-taps.jsonl), outside the working copy and apart from the link's
+// state, so neither a reset of the copy nor a restore of the link's state forgets one. Never pruned.
+export const tapsLogFile = (cfg: Config) => cfg.tapsLog ?? join(dirname(cfg.queue), "record-taps.jsonl");
+export function readConsumed(cfg: Config): Map<string, string> {
+  const out = new Map<string, string>();
+  try {
+    for (const line of readFileSync(tapsLogFile(cfg), "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try { const j = JSON.parse(line); if (TAP_KEY.test(j?.tap) && typeof j.id === "string" && !out.has(j.tap)) out.set(j.tap, j.id); } catch { /* a torn last line */ }
+    }
+  } catch { /* none yet */ }
+  return out;
+}
+function appendConsumed(cfg: Config, tap: string, id: string, at: string) {
+  const f = tapsLogFile(cfg);
+  mkdirSync(dirname(f), { recursive: true });
+  const fd = openSync(f, "a");
+  try { writeSync(fd, JSON.stringify({ tap, id, at }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+}
 
 function writeAtomic(file: string, text: string) {
   mkdirSync(dirname(file), { recursive: true });
@@ -392,7 +423,13 @@ function revive(j: any): State | null {
     ...(span(j.epochWait) ? { epochWait: span(j.epochWait)! } : {}),
     ...(typeof j.floorWhy === "string" && j.floorWhy ? { floorWhy: j.floorWhy } : {}),
     ...(j.taps && typeof j.taps === "object" && !Array.isArray(j.taps)
-      ? { taps: Object.fromEntries(Object.entries<any>(j.taps).filter(([k, v]) => TAP_KEY.test(k) && v && typeof v.id === "string" && typeof v.at === "string").map(([k, v]) => [k, { id: v.id, at: v.at }])) } : {}) };
+      ? { taps: Object.fromEntries(Object.entries<any>(j.taps).filter(([k, v]) => TAP_KEY.test(k) && v && typeof v.id === "string" && typeof v.at === "string").map(([k, v]) => [k, { id: v.id, at: v.at }])) } : {}),
+    ...(j.issuedSeen && typeof j.issuedSeen === "object" && !Array.isArray(j.issuedSeen)
+      ? { issuedSeen: Object.fromEntries(Object.entries<any>(j.issuedSeen).filter(([k, v]) => TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string" && typeof v.at === "string")) } : {}),
+    ...(j.linkSeen && Number.isInteger(j.linkSeen.run) && typeof j.linkSeen.nonce === "string" ? { linkSeen: { run: j.linkSeen.run, nonce: j.linkSeen.nonce } } : {}),
+    ...(span(j.linkRestore) ? { linkRestore: span(j.linkRestore)! } : {}),
+    ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && (n.why === "refused" || n.why === "lost") && typeof n.at === "string")
+      .map((n: any) => ({ tap: n.tap, why: n.why, reason: String(n.reason ?? ""), ...(typeof n.msg === "string" ? { msg: n.msg } : {}), at: n.at })) } : {}) };
 }
 
 function publishedHolds(cfg: Config): string | null {
@@ -735,6 +772,26 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       const linkTaps = readLinkTaps(cfg);
       { const pruned = pruneTaps(S.taps, clock().getTime(), linkTaps?.unresolved); if (pruned) log(`pruned ${pruned} consumed tap key(s) older than ${TAP_KEEP_MS / 86_400_000} days`); }
       let tapWhy: string | null = null;
+      // Round 11: consumed keys from the append-only log (never pruned); a restore of the link's state
+      // (its run lower than last seen, or the same run with another nonce); the issued keys seen so far.
+      const consumed = readConsumed(cfg);
+      const nowIso = clock().toISOString();
+      if (linkTaps) {
+        if (linkTaps.run !== null) {
+          const seen = S.linkSeen;
+          if (seen && (linkTaps.run < seen.run || (linkTaps.run === seen.run && linkTaps.nonce !== seen.nonce))) {
+            S.linkRestore = { at: nowIso, why: `its run went from ${seen.run} to ${linkTaps.run}${linkTaps.run === seen.run ? " with a new nonce" : ""}` };
+            log(`the link's state was restored from an older copy (${S.linkRestore.why}): tap requests whose keys it no longer lists are lost, and told`);
+          }
+          S.linkSeen = { run: linkTaps.run, nonce: linkTaps.nonce ?? "" };
+        }
+        S.issuedSeen ??= {};
+        for (const [k, v] of Object.entries(linkTaps.issued)) if (!S.issuedSeen[k]) S.issuedSeen[k] = { ...v, at: nowIso };
+      }
+      for (const [k, v] of Object.entries(S.issuedSeen ?? {}))
+        if (clock().getTime() - Date.parse(v.at) > TAP_KEEP_MS && !linkTaps?.unresolved.has(k)) delete S.issuedSeen![k];   // inside the link's own 4 days
+      S.tapNotices = (S.tapNotices ?? []).filter((n) => clock().getTime() - Date.parse(n.at) <= TAP_KEEP_MS + 86_400_000);
+      const notice = (n: Omit<TapNotice, "at">) => { if (!S.tapNotices!.some((x) => x.tap === n.tap && x.why === n.why)) S.tapNotices!.push({ ...n, at: nowIso }); };
       for (const it of items) {
         const at = clock();
         const id = it.req?.id ?? `unreadable-${it.name}`;
@@ -746,10 +803,23 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         let o: Outcome;
         if (it.error) o = { ...base, state: "rejected", reason: clean(it.error) };
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
-        else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && S.taps?.[it.req!.tap] && S.taps[it.req!.tap].id !== id)
-          o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps[it.req!.tap].id}; act on a tap key once` };
-        else if ((tapWhy = tapIssuedProblem(it.req!, linkTaps ? linkTaps.issued : null)))
+        else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && (S.taps?.[it.req!.tap] ?? consumed.get(it.req!.tap)) !== undefined
+          && (S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)) !== id)
+          o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)}; act on a tap key once` };
+        else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && linkTaps && !linkTaps.issued[it.req!.tap] && S.issuedSeen?.[it.req!.tap]) {
+          // Round 11: a key the keeper saw issued that the link's state no longer lists: lost, told to him
+          // (on the card's thread, by the link) and to Cain (this line), never silently refused.
+          const k = it.req!.tap, seen = S.issuedSeen[k];
+          o = { ...base, state: "rejected", reason: clean(`tap key ${k} was lost: the link's state was restored from an older copy${S.linkRestore ? ` (${S.linkRestore.why})` : ""} and no longer lists it, so nothing was recorded from it. He is told on the card; record nothing from that tap, and once ${seen.item === "NONE" ? "it" : `${seen.item}'s re-check`} is accepted ask again with --checked if it still needs him`) };
+          notice({ tap: k, why: "lost", reason: o.reason!, ...(seen.msg ? { msg: seen.msg } : {}) });
+          log(`tap key ${k} lost to a restore of the link's state: request ${id} told as lost`);
+        }
+        else if ((tapWhy = tapIssuedProblem(it.req!, linkTaps ? linkTaps.issued : null))) {
           o = { ...base, state: "rejected", reason: clean(tapWhy) };
+          // Round 11: a request whose target doesn't match its key's: he hears one line on the card.
+          const k = it.req!.tap!, reg = linkTaps?.issued[k];
+          if (reg) notice({ tap: k, why: "refused", reason: o.reason!, ...(reg.msg ? { msg: reg.msg } : {}) });
+        }
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
         else o = decide(it.req!, !!it.local, base);
         if (it.repoPath && existsSync(join(cfg.dir, it.repoPath))) rmSync(join(cfg.dir, it.repoPath), { force: true });
@@ -760,6 +830,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         owed.push(owe(o, !!it.local, it.req, !!it.error));
         if (o.state === "done" && it.req?.tap && TAP_KEY.test(it.req.tap)) {
           S.taps = { ...(S.taps ?? {}), [it.req.tap]: { id, at: at.toISOString() } };
+          try { appendConsumed(cfg, it.req.tap, id, at.toISOString()); }
+          catch (e) { log(`couldn't append consumed tap key ${it.req.tap} to its log (${(e as Error).message}); the state keeps it`); }
           const keys = Object.keys(S.taps);
           if (keys.length > TAPS_KEPT) for (const k of keys.slice(0, keys.length - TAPS_KEPT)) delete S.taps[k];
         }
@@ -876,7 +948,7 @@ export function linkFloor(cfg: Config): number { return readLinkFloor(cfg).floor
 // Round 10: the tap keys the link issued (its state's issued) and the short forms of the tap keys whose
 // landing it lists as unresolved (its state's unresolved, by full key: hashed here the way the link's
 // tapKid does). null: the link's state can't be read.
-export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap>; unresolved: Set<string> } | null {
+export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap>; unresolved: Set<string>; run: number | null; nonce: string | null } | null {
   const f = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
   try {
     if (!existsSync(f) || lstatSync(f).size > 20_000_000) return null;
@@ -884,9 +956,12 @@ export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap>; 
     if (!j || typeof j !== "object" || Array.isArray(j)) return null;
     const issued: Record<string, IssuedTap> = {};
     for (const [k, v] of Object.entries<any>(j.issued ?? {}))
-      if (TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string") issued[k] = { item: v.item, kind: v.kind, ...(typeof v.label === "string" ? { label: v.label } : {}) };
-    const unresolved = new Set(Object.keys(j.unresolved ?? {}).map((k) => `tap-${createHash("sha256").update(k).digest("hex").slice(0, 12)}`));
-    return { issued, unresolved };
+      if (TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string")
+        issued[k] = { item: v.item, kind: v.kind, ...(typeof v.label === "string" ? { label: v.label } : {}), ...(typeof v.msg === "string" ? { msg: v.msg } : {}),
+          ...(v.target && typeof v.target.item === "string" && Array.isArray(v.target.writes) ? { target: { item: v.target.item, writes: v.target.writes.filter((w: any) => typeof w === "string") } } : {}) };
+    // Round 11: a tombstone keeps its consumed key too.
+    const unresolved = new Set([...Object.keys(j.unresolved ?? {}), ...Object.keys(j.tombstones ?? {})].map((k) => `tap-${createHash("sha256").update(k).digest("hex").slice(0, 12)}`));
+    return { issued, unresolved, run: Number.isInteger(j.run) ? j.run : null, nonce: typeof j.runNonce === "string" ? j.runNonce : null };
   } catch { return null; }
 }
 
@@ -1004,6 +1079,8 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       ...(st.epoch ? { epoch: { n: st.epoch.n, at: st.epoch.at, generation: st.epoch.generation, voided: st.epoch.voided === true } } : {}),
       ...(st.floorWhy ? { link_state: { readable: false, why: st.floorWhy } } : {}),
       ...(st.epochWait ? { epoch_wait: st.epochWait } : {}),
+      ...(st.tapNotices?.length ? { tap_notices: st.tapNotices } : {}),
+      ...(st.linkRestore ? { link_restore: st.linkRestore } : {}),
       recheck_pending: recheckPending(cfg),
       clock: { synced: v.synced, source: v.source, diagnostic: v.diagnostic, at: now.toISOString() },
     }) + "\n");

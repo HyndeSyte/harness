@@ -81,7 +81,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // the link's state file on disk (corrupt: what it holds instead of the saved state), hung reads
   // killed at the ceiling, and what Discord answers to a webhook patch of @original (another id).
   const survive = { fn: null as null | ((id: string) => boolean | null) };
-  const landLedger = { keys: new Set<string>(), broken: false, what: new Map<string, { pr: string; head: string; at: string; base?: string }>(), settled: new Map<string, string>(),
+  const landLedger = { keys: new Set<string>(), broken: false, what: new Map<string, { pr: string; head: string; at: string; base?: string }>(), settled: new Map<string, string>(), said: new Map<string, string>(),
     untrusted: null as string | null, pruned: 0 };
   const disk = { corrupt: null as string | null, writes: 0 };
   const kills = { n: 0 };
@@ -195,9 +195,12 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
         if (landLedger.keys.has(key)) return false;
         landLedger.keys.add(key); landLedger.what.set(key, what); return true;
       },
-      settle: (key: string, how: string) => { if (!landLedger.settled.has(key)) landLedger.settled.set(key, how); },
+      settle: (key: string, how: string, at?: string, note?: { said?: string }) => {
+        if (!landLedger.settled.has(key)) { landLedger.settled.set(key, how); if (note?.said) landLedger.said.set(key, note.said); }
+      },
       entries: () => [...landLedger.keys].map((key) => ({ key, ...(landLedger.what.get(key) ?? { pr: "", head: "", at: "" }),
-        ...(landLedger.settled.has(key) ? { settled: { how: landLedger.settled.get(key) as any, at: "" } } : {}) })),
+        ...(landLedger.settled.has(key) ? { settled: { how: landLedger.settled.get(key) as any, at: new Date(t.now).toISOString(),
+          ...(landLedger.said.has(key) ? { said: landLedger.said.get(key) } : {}) } } : {}) })),
       prune: () => { landLedger.pruned++; return 0; },
       untrusted: () => landLedger.untrusted,
       trust: () => { landLedger.untrusted = null; },

@@ -63,12 +63,19 @@
 #                                        satisfied it, and the box's own), the ledger's generation, whether
 #                                        a push or a reset is outstanding, how many rows are pending re-check
 #                                        (recheck_pending), whether Ship taps are held, and the last tap's read time
+#                                        unresolved_landings (each with the exact settle messages and its age),
+#                                        tombstoned_landings (unresolved past 90 days: kept, no longer blocking)
+#                                        and landings_by_head (the ledger's reconciliation, one landing per head)
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
-#                                        settle (keeper.sh clock lists it under unresolved_landings), on
-#                                        his own message in his DM, under a day old, saying it landed or did
-#                                        not land; the link reads that message itself. An audit line goes
-#                                        to the link's log, and the usual outcome line follows
+#                                        settle (keeper.sh clock lists it under unresolved_landings, or
+#                                        tombstoned_landings past 90 days), on his own message in his DM,
+#                                        under a day old, that says exactly "settle <tap key> landed" or
+#                                        "settle <tap key> not-landed" for this very key and verdict; the link
+#                                        reads that message itself. One message settles one key once (its id
+#                                        is consumed); one that says both, or "not landed" as two words, is
+#                                        refused with the reason. An audit line goes to the link's log, and
+#                                        the usual outcome line follows
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"

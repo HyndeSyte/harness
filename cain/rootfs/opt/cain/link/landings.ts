@@ -26,10 +26,17 @@ const META = ".ledger.json";
 // epoch: the record keeper's reset epoch the link read right before the claim (round 10): re-read after
 // the claim's fsync, and a change voids the claim before any push.
 export interface LandingEntry { key: string; pr: string; head: string; at: string; base?: string; epoch?: number;
-  settled?: { how: "landed" | "not landed"; at: string; voided?: boolean; forced?: boolean } }
+  settled?: { how: "landed" | "not landed"; at: string; voided?: boolean; forced?: boolean; said?: string };
+  // Round 11: a forced (hand-settled) entry later followed by a landing of the same head names that
+  // landing's key, so the reconciliation shows one landing per head.
+  linked?: string }
+// Round 11: the reconciliation, one row per head: the key that landed it (the real landing over a forced
+// one when both exist), every key for that head, and which are forced or still open.
+export interface HeadLanding { head: string; pr: string; landed: string | null; keys: string[]; forced: string[]; open: string[] }
 export interface Landings {
   claim(key: string, what: { pr: string; head: string; at: string; base?: string; epoch?: number }): boolean | null;
-  settle(key: string, how: "landed" | "not landed", at: string, note?: { voided?: boolean; forced?: boolean }): void;
+  settle(key: string, how: "landed" | "not landed", at: string, note?: { voided?: boolean; forced?: boolean; said?: string }): void;
+  reconcile?(): HeadLanding[];
   entries(): LandingEntry[] | null;
   // keep: keys never pruned whatever their age (the link's unresolved keys).
   prune(now: number, keepMs?: number, keep?: Set<string>): number;
@@ -97,8 +104,16 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
       const file = join(dir, `${keyName(key)}.json`);
       const j = readJson(file);
       if (!j || j.settled) return;
-      try { writeDurable(file, JSON.stringify({ ...j, settled: { how, at, ...(note?.voided ? { voided: true } : {}), ...(note?.forced ? { forced: true } : {}) } }) + "\n"); }
-      catch (e: any) { log(`couldn't mark landing ${keyName(key).slice(0, 12)} settled: ${String(e?.message ?? e).slice(0, 80)}`); }
+      try { writeDurable(file, JSON.stringify({ ...j, settled: { how, at, ...(note?.voided ? { voided: true } : {}), ...(note?.forced ? { forced: true } : {}),
+        ...(note?.said ? { said: note.said } : {}) } }) + "\n"); }
+      catch (e: any) { log(`couldn't mark landing ${keyName(key).slice(0, 12)} settled: ${String(e?.message ?? e).slice(0, 80)}`); return; }
+      // Round 11: a real landing of a head that a forced entry settled earlier is linked from it.
+      if (how === "landed" && !note?.forced)
+        for (const e of api.entries() ?? []) {
+          if (e.key === key || e.head !== j.head || !e.settled?.forced || e.linked) continue;
+          try { writeDurable(join(dir, `${keyName(e.key)}.json`), JSON.stringify({ ...e, linked: key }) + "\n"); log(`landing ${keyName(e.key).slice(0, 12)} (settled by hand) linked to the later landing ${keyName(key).slice(0, 12)} of the same head`); }
+          catch (x: any) { log(`couldn't link landing ${keyName(e.key).slice(0, 12)}: ${String(x?.message ?? x).slice(0, 80)}`); }
+        }
     },
     entries() {
       if (!existsSync(dir)) return [];
@@ -146,6 +161,16 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
       } catch (e: any) { log(`couldn't mark the landing ledger trusted: ${String(e?.message ?? e).slice(0, 80)}`); }
     },
     count() { return meta()?.count ?? 0; },
+    reconcile() {
+      const by = new Map<string, LandingEntry[]>();
+      for (const e of api.entries() ?? []) by.set(e.head, [...(by.get(e.head) ?? []), e]);
+      return [...by.entries()].map(([head, es]) => {
+        const real = es.find((e) => e.settled?.how === "landed" && !e.settled.forced);
+        const forced = es.find((e) => e.settled?.how === "landed" && e.settled.forced && !e.linked);
+        return { head, pr: es[0].pr, landed: (real ?? forced)?.key ?? null, keys: es.map((e) => e.key),
+          forced: es.filter((e) => e.settled?.forced).map((e) => e.key), open: es.filter((e) => !e.settled).map((e) => e.key) };
+      });
+    },
   };
   return api;
 }

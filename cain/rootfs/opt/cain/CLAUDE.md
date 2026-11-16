@@ -160,8 +160,15 @@ specialist (the Harness add-on) does.
   say `"tap": "none"`; a Ship take always carries its Ship tap's key. The keeper checks a tap key
   against the link's list of the keys it issued: one the link didn't issue is refused ("isn't one
   the link issued"), and so is one from a card for another item, and one that isn't a Ship card's
-  Ship tap on a take for a Ship job. A decision written from a tap names its item (P08 Q2) in its
-  text. A Ship tap lands at most once.
+  Ship tap on a take for a Ship job. Each issued key carries what its tap allows: a Ship card's Ship
+  tap a take for its Ship job, a question about an item closing that row or a decision, any other
+  tap a decision. The keeper matches on that, never on your wording; a refusal comes to you with its
+  reason and he gets one line on the card, so act on the reason (usually: use the right tap key, or
+  `"tap": "none"` when it didn't come from a tap). A request whose key was lost because the link's
+  state was restored from an older copy comes back "was lost": record nothing from that tap, and
+  once the item's re-check is accepted ask again with --checked if it still needs him (he was told
+  on the card). A decision written from a tap still names its item (P08 Q2) in its text, for the
+  lookup. A Ship tap lands at most once.
   A tap claimed just before a restart is finished after it only if its card still passes the same
   check a live tap gets; otherwise you get "Tap not acted: ..." with its tap key, he gets one line on
   the card, nothing was done for it: record nothing from it, and once the item's re-check is accepted
@@ -462,11 +469,21 @@ create, update or run any other routine.
    - A landing GitHub can never settle (it stays in `keeper.sh clock`'s unresolved_landings for
      hours, its last error saying main was rewritten): only he can decide it. Tell him in one
      line that the App can't tell whether that Ship landed and that he can check main on GitHub
-     from his PC. Once he says in his own words in his DM that it landed (or did not land), run
+     from his PC. The link reminds him once a day on the card with the two exact lines he can
+     send, `settle <tap key> landed` and `settle <tap key> not-landed` (keeper.sh clock lists them
+     too). Only once he sends one of those exactly, run
      `/opt/cain/keeper.sh settle <tap key> landed --said <his message id>` (or `not-landed`)
-     with the id of that message of his. The link reads his message itself and settles only on
-     his words; you get "Landing settled by Dane: ..." and then the usual landed or abandoned
-     line. Never run it on your own judgment or without his message.
+     with the same key and verdict and the id of that message of his. The link reads his message
+     itself and settles only on that exact form for that key: a message naming another key, saying
+     both, or writing "not landed" as two words where you say landed is refused with the reason, and
+     a message already used for a settle is refused on reuse. If he answers in other words, point
+     him to the reminder under the card instead of guessing. You get "Landing settled by Dane: ..." and then the
+     usual landed or abandoned line. Never run it on your own judgment or without his message.
+     He is reminded once a day while it stays unresolved; past 7 days you get one "Landing
+     unresolved for over 7 days" line (nothing new to do: he decides it). Past 90 days it becomes a
+     tombstone ("Landing tombstoned: ..."): kept on file, listed under tombstoned_landings, and no
+     longer blocking a new Ship card for that pull request and head; he can still settle it the same
+     way.
    - A reset of the record that comes before the landing starts stops the push, and the tap is
      lost to the reset (the usual lost line). Once the landing has started, a reset no longer
      revokes it: it settles as it really went.

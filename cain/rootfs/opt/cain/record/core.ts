@@ -62,33 +62,46 @@ export function tapDerived(req: { ops?: any[] }): { names: string[]; ship: boole
 }
 
 // Round 10: the tap keys the link issued (its state's issued, by tap-<12 hex>): each with its card's
-// item (NONE for a one-off), kind (ask or ship) and the label tapped. A request citing a tap key is
-// refused when the link didn't issue it, when it names an item other than the card's (or, for ops
-// that name no item, when its text doesn't mention the card's item), or when its kind doesn't match:
-// a take for a Ship job needs a Ship card's Ship tap. Only "none" (no tap) stays on Cain's word.
-export type IssuedTap = { item: string; kind: string; label?: string };
+// item (NONE for a one-off), kind (ask or ship) and the label tapped. Only "none" (no tap) stays on
+// Cain's word.
+// Round 11: each also carries a structured target, the card's item and the writes its tap allows
+// (row-close, ship-take, decision; derived from kind and label for a key listed before round 11). A
+// request citing the key is matched on that target, never on its text: each tap-derived op must be a
+// write the target allows, on the target's item; any other op that names an item must name the target's.
+// A paraphrased decision passes; a row-close from a Ship tap, or a Ship take from a question, doesn't.
+export type TapWrite = "row-close" | "ship-take" | "decision";
+export type IssuedTap = { item: string; kind: string; label?: string; msg?: string; target?: { item: string; writes: string[] } };
+export function targetOf(reg: IssuedTap): { item: string; writes: string[] } {
+  if (reg.target && typeof reg.target.item === "string" && Array.isArray(reg.target.writes)) return { item: reg.target.item.toUpperCase(), writes: reg.target.writes };
+  const item = String(reg.item ?? "NONE").toUpperCase();
+  if (reg.kind === "ship") return { item, writes: (reg.label ?? "Ship") === "Ship" ? ["ship-take"] : ["decision"] };
+  return { item, writes: item === "NONE" ? ["decision"] : ["row-close", "decision"] };
+}
+const WRITE_WORDS: Record<string, string> = { "row-close": "closing its row", "ship-take": "a take for its Ship job", decision: "a decision" };
 export function tapIssuedProblem(req: { tap?: string; ops?: any[] }, issued: Record<string, IssuedTap> | null): string | null {
   const k = req.tap;
   if (!k || !TAP_KEY.test(k)) return null;
   if (!issued) return `tap key ${k} can't be checked: the link's list of issued tap keys can't be read now; send the request again in a minute under a new id`;
   const reg = issued[k];
   if (!reg) return `tap key ${k} isn't one the link issued (or it is over four days old): use the tap key the relayed tap line ended with`;
-  const want = String(reg.item ?? "NONE").toUpperCase();
-  const ops = req.ops ?? [];
-  const named = ops.map((o) => o?.item).filter((x): x is string => typeof x === "string").map((x) => x.toUpperCase());
-  if (want === "NONE") {
-    if (named.length) return `tap key ${k} is from a card about no open item, but the request names ${named[0]}`;
-  } else {
-    const other = named.find((x) => x !== want);
-    if (other) return `tap key ${k} is from a card for ${want}, but the request names ${other}`;
-    if (!named.length) {
-      const re = new RegExp(`(?<![A-Za-z0-9])${escapeRe(want)}(?![A-Za-z0-9])`, "i");
-      if (!ops.some((o) => re.test(String(o?.text ?? o?.content ?? ""))))
-        return `tap key ${k} is from a card for ${want}, but the request names no item and its text doesn't mention ${want}`;
+  const t = targetOf(reg);
+  const allows = t.writes.length ? t.writes.map((w) => WRITE_WORDS[w] ?? w).join(" or ") : "no write";
+  const from = reg.kind === "ship" ? `a "${reg.label ?? "Ship"}" tap on a Ship card` : t.item === "NONE" ? "a question about no open item" : "a question";
+  for (const o of req.ops ?? []) {
+    const item = typeof o?.item === "string" ? o.item.toUpperCase() : null;
+    let write: TapWrite | null = null;
+    if (o?.op === "row-close") write = "row-close";
+    else if (o?.op === "take" && typeof o.job === "string" && /^ship\b/i.test(o.job.trim())) write = "ship-take";
+    else if ((o?.op === "put" || o?.op === "append") && typeof o.path === "string" && /(^|\/)decisions\.md$/.test(o.path)) write = "decision";
+    if (item) {
+      if (t.item === "NONE") return `tap key ${k} is from a card about no open item, but the request names ${item}`;
+      if (item !== t.item) return `tap key ${k} is from a card for ${t.item}, but the request names ${item}`;
+    }
+    if (write && !t.writes.includes(write)) {
+      if (write === "ship-take") return `tap key ${k} is from ${reg.kind === "ship" ? `a "${reg.label}" tap on a Ship card` : "a question, not a Ship card"}, so it can't start a Ship job (it allows ${allows}${t.item === "NONE" ? "" : ` on ${t.item}`})`;
+      return `tap key ${k} is from ${from}, which allows ${allows}${t.item === "NONE" ? "" : ` on ${t.item}`}, not ${WRITE_WORDS[write]}`;
     }
   }
-  if (tapDerived(req).ship && !(reg.kind === "ship" && (reg.label ?? "Ship") === "Ship"))
-    return `tap key ${k} is from ${reg.kind === "ship" ? `a "${reg.label}" tap on a Ship card` : "a question, not a Ship card"}, so it can't start a Ship job`;
   return null;
 }
 
