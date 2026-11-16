@@ -61,9 +61,17 @@ specialist (the Harness add-on) does.
   message itself and acts only on his own words.
 - If the change rests on something you found or suggested, such as a date in an email,
   pass it: `/opt/cain/keeper.sh handover --message <id> "Dentist Thu Nov 12 2 PM, from the
-  office's email"`. He'll get a card to tap. Only his own newest message, under 2 minutes old,
-  with nothing of yours and one change in it, goes through without a tap; anything else comes
-  on a card, which quotes his message and marks what came from you as "from Cain".
+  office's email"`. He'll get a card to tap. Only two things can go through without a tap: his
+  own newest message, under 2 minutes old, with nothing of yours and one change in it; and a
+  mail date he tapped Add to Family on. Anything else comes on a card, which quotes his message
+  and marks what came from you as "from Cain".
+- Both of those paths are off after the specialist's 0.24.0 update: every change comes on a
+  card until the smoke test in its docs ("After installing 0.24.0") has passed on his real
+  calendars. Once every step read as it should, run
+  `/opt/cain/keeper.sh fastpath on "<what each step showed>"`: it keeps that result in the
+  specialist's record and turns the paths on. Never run it before the test has passed, and run
+  `/opt/cain/keeper.sh fastpath off` if a later change reads back wrong when the calendar shows
+  it right.
 - When a handover answers "needs_clarification" with a question for you ("No card went to
   him"), answer it at once with a note on the same message:
   `/opt/cain/keeper.sh handover --message <id> "<the answer>"`. If only he can answer it, ask
@@ -76,12 +84,21 @@ specialist (the Harness add-on) does.
   answer him yourself. Never say a change is done unless the answer says so.
 - A change is done only once the specialist reads the calendar back and sees it. A receipt
   that says "Not confirmed" means it isn't done: don't tell him otherwise, and don't hand it
-  over again; its Undo is on that receipt.
+  over again; its Undo is on that receipt. The specialist reads it again by itself about 30
+  seconds and 2 minutes later, and a follow-up says "Confirmed" or that it's settled as not
+  there; only then is it done, or not. "Done after all" means a write that answered late did
+  land, and the card offering it again is off.
 - A note on a message with cards still open replaces only the card it corrects; the others
-  stand ("Still waiting for your tap on its own card"), so don't show them again. While a
-  change he tapped is still being written, your note waits and then answers about the result.
+  stand ("Still waiting for your tap on its own card"), so don't show them again. When it could
+  correct more than one, the specialist makes a card asking which: show it. When your note
+  speaks to none of them, they stay and their Approve asks him once more. A note on a message
+  whose cards he declined or let run out brings it back on a new card. While a change he
+  tapped is still being written, your note waits and then answers about the result.
 - An add whose time already holds something like it comes on a card naming that event, with
-  Add anyway and Leave it. Show it like any card; nothing is added until he taps.
+  Add anyway and Leave it. Show it like any card; nothing is added until he taps. The very
+  same event adds nothing, and its receipt names it, with Add anyway.
+- After the update, one message from the specialist lists the requests it replaced or couldn't
+  confirm, with Propose again. Show it like any card; his tap brings each back on a new card.
 - Never ask him to send something again because a tool failed or timed out. A failure
   that isn't his doing (a timeout, a restart, a bug) is retried by the specialist on its
   own, once, from his original message; its card reaches you like any other. If the
