@@ -19,11 +19,11 @@
 //
 //   bun main.ts                 the keeper's loop (started by the App)
 //   bun main.ts list            the PC worker's last heartbeat, then one line per job, newest first
-//   bun main.ts result <id>     a job's result, checked, as JSON
+//   bun main.ts result <id>     a job's result, checked, as fixed lines (each fact a quoted string, labelled untrusted)
 //   bun main.ts worker          the PC worker's last heartbeat
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
+import { carriesReport, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
   DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type Result } from "./core.ts";
 
 export type Config = {
@@ -106,6 +106,8 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
     return "The PC isn't taking jobs because the worker's own Claude Code isn't signed in. At the PC: run the setup step that signs in claude-config, then start a run.";
   if (h?.code === "session_cleanup_failed")
     return "The PC stopped taking jobs because it couldn't delete a session's transcripts. At the PC: run worker.ts check-cli and follow its Troubleshooting row.";
+  if (h?.code === "containment_unavailable")
+    return "The PC isn't taking jobs because it couldn't build or start its Windows Job Object helper. At the PC: follow the containment_unavailable row in Troubleshooting, then start a run.";
   if (h?.code === "host_parent_gone")
     return "The PC isn't taking jobs because Claude in Chrome's helper lost its Chrome. At the PC: restart the Cain jobs Chrome.";
   if (h?.code === "extra_extension")
@@ -176,6 +178,12 @@ export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: 
     if (existsSync(join(cfg.dir, "cancels", `${j.id}.json`))) return { why: `${req.cancel} is being cancelled already` };
     return { cancel: j.id };
   }
+  // A report's values never come back as queue content: a job carrying one is refused.
+  // An address Cain itself wrote into a job before (any job's start address) is his own, not the page's.
+  const own = new Set(jobs.map((j) => normalUrl(j.start_url, true)));
+  const values = jobs.flatMap((j) => { const r = readResult(cfg.dir, j.id); return r && r !== "bad" ? reportValues(r, j) : []; })
+    .filter((v) => !(/^https?:/i.test(v) && own.has(normalUrl(v, true))));
+  if (carriesReport(req.job, values)) return { why: "a job can't carry a value from a PC result (an address or account a page showed): write it from the owner's words or the allowlist instead" };
   let id = newId(now, cfg.rand);
   while (jobs.some((j) => j.id === id)) id = newId(now, cfg.rand);
   const made = jobFromAsk(req.job, now, id);
@@ -301,7 +309,7 @@ if (import.meta.main) {
     const r = readResult(cfg.dir, arg ?? "");
     if (r === null) console.log("no result yet");
     else if (r === "bad") { console.log("no readable result (the file breaks the format)"); process.exit(1); }
-    else console.log(JSON.stringify(r));
+    else console.log(resultLines(r).join("\n"));
   } else if (cmd) {
     console.error("usage: main.ts [list | result <id> | worker]"); process.exit(2);
   } else {

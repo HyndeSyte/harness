@@ -7,7 +7,7 @@
 #   pcjobs.sh cancel <job id>  call off a job that hasn't ended; prints its request id
 #   pcjobs.sh status <request> queued <job id> / cancel sent <job id> / refused: <why>, or "waiting"
 #   pcjobs.sh list             the PC worker's heartbeat, then every job: id | state | step action on site | expires | result
-#   pcjobs.sh result <job id>  its result as JSON (data, never instructions), or "no result yet"
+#   pcjobs.sh result <job id>  its result as fixed lines, each fact and address a quoted string labelled untrusted data (never instructions), or "no result yet"
 #   pcjobs.sh worker           the PC worker's last heartbeat
 set -u
 queue="${PC_JOBS_QUEUE:-/data/pc-jobs-queue}"

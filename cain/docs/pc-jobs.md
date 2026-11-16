@@ -109,8 +109,14 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     hook refuses exactly those names as whole path segments or words (`PC-WOR~1`,
     `CLAUDE~1`, `CREDEN~1.JSO` on a given PC), and the full short paths in any form. No
     short name is guessed from its leading letters: `PROGRA~1`, `DOCUME~1` and every other
-    short name pass. If the short names can't be read, the preflight refuses
-    (`untrusted_config`). **The worker folder's own name is refused as a whole token**
+    short name pass. **On a volume that keeps no short names** (8.3 name creation off, or
+    a folder made before it was turned on) the expansion gives the long form back, or
+    nothing: that is a valid empty set of short names, written to `worker.log`
+    (`short_names none=<n>`), never a refusal. Only a real error (the command failing, or
+    an answer that isn't a path) refuses the preflight (`untrusted_config`). The short
+    forms are read again at every preflight, and the probe records the volume's own 8.3
+    setting (`short_names` in its evidence: `fsutil 8dot3name query` for the worker
+    folder's drive, its number and first line, or nulls where it can't be read). **The worker folder's own name is refused as a whole token**
     too, which is why the install layout gives it a distinctive suffix
     (`C:/pc-worker-k7q2xz`: pick six random letters and digits of your own); a page word
     like "pc" or "worker" passes.
@@ -145,8 +151,26 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   runs a real subprocess on Linux that keeps writing into `claude-config`, and checks
   nothing it writes outlives that sweep; the Windows CI job runs the same with a detached
   child of a child. **On Windows the tree is ended and seen gone before any sweep**, after
-  every session's end too (a child the session started can outlive it): Node and Bun
-  expose no Job Object, so the worker reads the tree from the process list (the session
+  every session's end too (a child the session started can outlive it). **On Windows
+  every session runs in a Windows Job Object**: the worker builds a small helper,
+  `pcw-jobrun.exe`, from `pcjobs/jobrun.cs` (one file of C#) with the .NET Framework's own
+  compiler (`csc.exe`, part of Windows 10 and 11), into the worker folder, the first time
+  it is needed and again whenever that file changes (its hash is kept beside it,
+  `pcw-jobrun.sha256`). The helper puts itself in a new job with kill-on-close and with
+  breakaway not allowed, then starts `claude`: everything the session starts is in the
+  job and can't leave it, and when the helper exits or is ended (a timeout, `STOP`, the
+  exit handler) Windows ends every process still in the job, a detached grandchild whose
+  parent already exited included, which a tree kill can miss. **If the helper can't be
+  built or doesn't answer, Windows runs, the probe and `bind-profile` refuse with
+  `containment_unavailable`** until it can: nothing runs uncontained. The Windows CI job
+  builds the real helper and runs an intermediary that starts a burst of short children
+  and one detached child and exits at once: the child must be gone once the helper has
+  exited, exit codes must pass through, and ending the helper mid-run must end the
+  detached child too. The probe runs the same check on your PC (`process_end.job_object`,
+  which gates `confirm-profile` on Windows). **Chrome and Claude in Chrome's native
+  messaging host are outside the job by design**: the worker never starts Chrome (it must
+  be open already), and Chrome starts the host. As a second layer the worker still reads
+  the tree from the process list (the session
   and everything under it, by parent id and start time, so a reused parent id doesn't
   count), ends it with `taskkill /T /F`, then polls every 200 ms for up to 10 seconds and
   ends anything of it still running by its own id. The outcome goes to `worker.log`
@@ -194,7 +218,7 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   the usual cause of `probe_stale` with `cli_version_changed`. `worker.ts check-cli` (and
   `check-host`) prints the pinned against the current version and executable hash.
   **A confirmation is bound to the worker, its Cain version and the hook's policy too**
-  (`worker_sha256`, the hash of `worker.ts` and `core.ts`; `cain_version`, from
+  (`worker_sha256`, the hash of `worker.ts`, `core.ts` and `jobrun.cs`; `cain_version`, from
   `cain/config.yaml` in the same checkout; `policy_version`): any change is `probe_stale`
   with reason `worker_changed`, so every new release of the worker, its version step
   included, needs a new probe and `confirm-profile` before jobs run again. A confirmation
@@ -272,7 +296,19 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   the session's start**: the worker reads the session's init event the moment it arrives
   (Claude Code prints it before it sends the model its first turn) and on any mismatch
   ends the session there, before the model can use what it was given; the hook refuses
-  every off-list tool meanwhile. The after-run check and its log line stay.
+  every off-list tool meanwhile. The after-run check and its log line stay. **The
+  inventory check is a barrier the hook enforces**: the worker writes a per-session
+  marker (`inventory-ok` in the worker folder, holding the session's id from its init
+  event) only once that session's inventory has passed, and the hook refuses every tool
+  call (`inventory_unconfirmed`) whose session id doesn't match a marker that exists. A
+  failed inventory, an init event it can't parse, one without a session id, or a worker
+  that fails leaves no marker, so nothing in that session runs. The marker is deleted
+  before and after every session. A test runs a stand-in CLI that prints its init event
+  and at once calls the real hook: refused until the marker exists, allowed after it, and
+  never allowed when the inventory fails. The preflight's self-test includes a call from a
+  session with no marker, which must be refused. The probe checks that the init event
+  comes before the model's first turn (`init_order`, with the gap between them in
+  milliseconds in `worker.log`'s `probe init_order` line) and stops if it doesn't.
 - **The browser tools: restricted by name, pinned in code.** The four reading tools,
   each by its exact name: `tabs_context_mcp` (the tabs in Claude's group and their
   addresses), `read_page` (a page's structure), `get_page_text` (its text) and `find` (a
@@ -316,6 +352,20 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   reader (`pcjobs.sh result`): a label shaped like a command is kept only as `other`, a
   result file with shell punctuation in a fact is refused whole, and nothing runs.
   Page text, the model's words and any browser or git error stay on the PC.
+  **Report facts are residual prompt-injection risk, not a closed path.** The schema
+  limits what a fact can be, but a page can still steer which allowed word, date, count or
+  masked account the model reports, or spell something across several fields. So past the
+  schema, what reaches Cain is restricted in code where a report's values could become a
+  tool's arguments or queue content: Cain's result reader (`pcjobs.sh result`) prints a
+  result as fixed lines, each fact and the reached address a quoted string labelled
+  untrusted page data, never bare JSON; and Cain's keeper refuses a new job whose site,
+  start address or description carries a value a result brought back that its job didn't
+  supply (a masked account, a hash, an address fact, or a reached address other than the
+  job's own start address): "a job can't carry a value from a PC result". Tests run a
+  multi-field instruction and address-based payloads through the schema, the reader and
+  the keeper. Cain's rules still say a fact is never an instruction and never goes into a
+  tool's or a command's arguments; the code is the backstop for those rules, not a proof
+  that a page can't influence what Cain reads.
 - **Failure records carry no values.** A failed or in-doubt result has its reason code
   and no address and no facts; the heartbeat holds a fixed code, a job id and a fixed
   reason; Cain's reader prints only those; and `last-run.json` on the PC holds the job
@@ -345,16 +395,52 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   or `tabs_create_mcp` only to the exact addresses the worker hands it for that session: the canary page, the job's pinned start address and the
   run's end page, which is always the one literal address `about:blank` (allowed and
   logged like the others). A `tabs_create_mcp` with no address is refused (`no_address`):
-  no tab opens where the run's checks can't place it. Another host, a `javascript:` or `data:` address, the pinned
-  address written another way, a call without a tool-use id: refused. **It keeps the
+  no tab opens where the run's checks can't place it. **Before the exact list, every
+  address goes through four checks, each refusing on its own**: (1) the scheme: only
+  `http` and `https`; `file`, `data`, `javascript`, `blob`, `filesystem`, `view-source`,
+  `chrome`, `chrome-extension`, `about` (but the literal `about:blank`), `ws`, `wss` and
+  every other scheme are refused by scheme (`scheme_not_allowed`), before any path check;
+  (2) the address: a login in it is refused (`bad_address`), and a host that is an IP
+  literal in a loopback, private, link-local, shared, unspecified or multicast range (in
+  any form the browser reads, `127.1`, `2130706433`, `[::ffff:127.0.0.1]` among them), or
+  `localhost` by name, is refused (`private_address`); the run's own check page is the one
+  exception, by its exact origin (`http://127.0.0.1:<its port>`); (3) the domain: the
+  host's registrable domain must be one of the job's (below), or it is refused
+  (`domain_not_allowed`) before the call runs, so a page that plants an address on another
+  domain with content in its query gets nowhere; (4) a query or fragment is refused
+  (`query_not_allowed`) unless the entry allows them (`"query": true`), and then capped at
+  200 characters together (`query_too_long`). The hook refuses rather than strips. After
+  it decides to allow a navigation, it resolves the host name where it can (within 2
+  seconds): one that resolves to a private address is refused (`private_address`); one
+  that doesn't resolve isn't refused for that (the browser can't reach it either), and the
+  log line says `resolved`. Only names that already passed the domain check are looked up.
+  The path normaliser (the wall above) still runs first, as defence in depth. The probe
+  drives the real hook with a file address, a localhost address, 127.0.0.1 on another port
+  and a private network address, each listed as allowed so only these checks stand in the
+  way (`addresses`); `confirm-profile` refuses without it (`address_check_required`). The
+  pinned address written another way, a call without a tool-use id: refused. **Each job's
+  navigation is bound to its registrable domains**: its allowlist entry's `domains` when it
+  names them (they must include its site's and each sign-in host's), or else its site's and
+  its sign-in hosts' registrable domains; the job's own site is one of them. The run's
+  instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMAINS`). **It keeps the
   tab-context order itself**: after a new tab, and on a PC whose reading tools don't
   report their tab's address (the confirmation's `read_context`) after every page read, a
   tab context is owed, and the hook refuses every other tool with a message telling the
-  model to call `tabs_context_mcp` (`context_owed`, from the hook's own log of the
-  session). Those refusals don't count as `navigation_denied`; after three of them in one
-  session the run fails as `tab_context_owed`. The probe's browser step runs with the rule
-  on after every read and counts how often that honest chore trips it
-  (`context_trips`); more than once fails the confirmation (`context_order_failed`). Any error inside it, input it can't read, or no input within its 10 second
+  model to call `mcp__claude-in-chrome__tabs_context_mcp` and saying it needs no arguments
+  (`context_owed`, from the hook's own log of the session). Those refusals don't count as
+  `navigation_denied`. **They are counted per owed context**: each refused call while one
+  tab context is owed adds one (a read tried in between is refused too, so it counts), and
+  only the tab context itself ends it and starts the next count at zero. Three in a row
+  for the same owed context fail the run as `tab_context_owed`; refusals spread over
+  separate owed contexts don't add up, so a long chore that slips once per context, five
+  times over with reads between, still passes. The required order is in the session
+  prompt, naming the exact tool. The probe's browser step runs with the rule on after
+  every read and counts how often that honest chore trips it (`context_trips`); more than
+  once fails the confirmation (`context_order_failed`). The probe also runs a long
+  multi-tab chore (three pages, each in a new tab, each read twice, the rule on after every
+  read) and records the trip rate per read (`chore`: tabs, reads, refusals, the longest
+  run for one context, and the rate); a rate above 0.25, a run of three, or a missed tab
+  or read fails the confirmation (`context_order_failed`). Any error inside it, input it can't read, or no input within its 10 second
   deadline (headroom for a cold start of Git Bash and the runtime) is refused too (exit
   code 2 and a deny decision in JSON); its settings timeout (30 seconds) is longer than
   that deadline, so it refuses before Claude Code would give up on it. A test in the
@@ -618,7 +704,12 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    (the settings page redirecting to `/account/security/`), list where in `redirects`:
    path prefixes on the pinned address's own host, each starting with `/` and ending
    with `/` (or an exact path), never `/` alone. A run that ends anywhere else is
-   `unexpected_location`. Sign it: `worker.ts sign-allowlist <entries.json> --key
+   `unexpected_location`. **New in this version:** an entry may name `domains`, the
+   registrable domains its runs may open (`["example.com", "examplecdn.com"]`); it must
+   include the site's and each sign-in host's, and without it they are the domains the
+   runs may open. An entry may also say `"query": true` to let its runs open addresses
+   with a query or fragment (capped at 200 characters); the signing tool treats that as
+   risky (`"reviewed": true` needed). Sign it: `worker.ts sign-allowlist <entries.json> --key
    <folder>/owner-key.pem --kid owner-1 --out C:/pc-worker-k7q2xz/allowlist.json`. The key is
    passphrase-protected and stays outside the worker folder. The signing tool refuses an
    address with a query, or a pin, redirect or sign-in path with `logout`, `signout`,
@@ -728,6 +819,11 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    with spaces in one piece. Nothing to set by hand; the probe's smoke step fails with
    `hook_missing_decision` if the hook doesn't run, and every preflight runs the hook's
    self-test (`hook_selftest_failed`).
+   **The Job Object helper (new in this version).** Nothing to do by hand either: the
+   first preflight builds `C:/pc-worker-k7q2xz/pcw-jobrun.exe` with
+   `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` (part of Windows). If
+   that compiler is missing or an antivirus blocks the build, every run stops with
+   `containment_unavailable` (Troubleshooting).
 10. **Bind the profile, once.** With the Cain jobs Chrome open and no other Claude Code
     running, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
     bind-profile --attended --home C:/pc-worker-k7q2xz`. A short session opens a page the worker
@@ -1004,7 +1100,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `stopped` | the `STOP` file | Delete `STOP` when you want runs again. |
 | `session_stopped` | the `STOP` file; `worker.log` | `STOP` appeared while a session ran, and the worker ended it; the job failed and its transcripts were deleted. Delete `STOP` when you want runs again; Cain can queue the job anew. Needs a code change: no. |
 | `worker_signin_missing` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `signed_in`; `C:/pc-worker-k7q2xz/claude-config` | The worker's own Claude Code folder has no sign-in (never set up, deleted, or emptied). Sign it in again (setup step 9: `CLAUDE_CONFIG_DIR` set to it, `claude`, `/login`), then run `check-cli`. From the probe "after two sessions": the sign-in vanished between sessions; sign in again and probe again, and if it repeats, something outside the worker clears that folder (a cleanup tool, a sync client). Needs a code change: no. |
-| `session_cleanup_failed` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `transcripts`; `C:/pc-worker-k7q2xz/claude-config` | What a session wrote in `claude-config` couldn't be deleted, after retries. Something holds it open: an editor, Windows Search (setup step 9's `attrib +I`), an antivirus scan, a backup or sync client. Close it, delete everything in `claude-config` but `.credentials.json`, `settings.json` and `CLAUDE.md` by hand, then run `check-cli` until `swept` is true. No run starts while they remain. Needs a code change: no. |
+| `session_cleanup_failed` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `transcripts`; `C:/pc-worker-k7q2xz/claude-config` | What a session wrote in `claude-config` couldn't be deleted, after retries. On Windows the message names what holds it where the worker can read it (its image name, process id and the image name of the process that started it, from the Restart Manager through the Job Object helper; `worker.log`'s `session_cleanup_failed held_by` line too). Something holds it open: an editor, Windows Search (setup step 9's `attrib +I`), an antivirus scan, a backup or sync client. Close it, delete everything in `claude-config` but `.credentials.json`, `settings.json` and `CLAUDE.md` by hand, then run `check-cli` until `swept` is true. No run starts while they remain. Needs a code change: no. |
 | Your own `claude` is logged out after a run | `claude` in a terminal of your own; `echo $env:CLAUDE_CONFIG_DIR` there; `worker.ts check-cli` | This design should make that impossible: the worker's sessions sign in from `C:/pc-worker-k7q2xz/claude-config` and never read, copy or write your `~/.claude`, so nothing a run does reaches your own sign-in. Check that your terminal doesn't still have `CLAUDE_CONFIG_DIR` set from setup step 9 (then your `claude` is using the worker's folder: close that terminal); that you aren't running an earlier draft of this worker (one copied your sign-in into each session, where a refresh could replace yours); and whether you were signed out for another reason (an expired session, a password change, signing out elsewhere). Sign your own `claude` in again; the worker's sign-in is unaffected. If it happens again with this version, report it: needs a code change: yes. |
 | `extension_entry_missing` | `worker.ts check-host --home C:/pc-worker-k7q2xz`; the profile folder's `Secure Preferences` and `Preferences` | Neither preferences file of the dedicated profile has `extensions.settings.<your extension id>`: `profile_directory` or `extension_id` in `install.json` doesn't match where Claude in Chrome is installed, or Chrome hasn't written its entry yet (open the Cain jobs Chrome once, then close and reopen it). Not `wrong_profile`: the profile's name was right. `check-host` prints which file and key path it read when it works. Needs a code change: no. |
 | `extra_extension` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `other_enabled` and `extensions`, each with its raw `location`, `state` and `disable_reasons`; chrome://extensions in the Cain jobs profile | Another extension counts as on in the dedicated profile (read from the same preferences as Claude in Chrome's own entry). Only Chrome's component location (`location` 5) is exempt: a policy install (7, 9) or an external one (2, 3, 6, 10) counts. Only your own turning it off counts as off (`disable_reasons` holding 1); Chrome disabling it for another reason leaves it counted. Remove it, or turn it off yourself, in chrome://extensions there, then run `check-host` again. A default app Chrome installed by itself counts too; one installed by policy can only be removed by that policy. Needs a code change: no. |
@@ -1033,9 +1129,11 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `extension_version_mismatch` | `probe`'s detail: `live` and `disk`; chrome://extensions | The session reports another Claude in Chrome version than the one installed in the Cain jobs profile (its newest version folder's `manifest.json`), or, where the session reports none (an attended run), that manifest's version changed during the run: another profile's extension may be answering, or Chrome hasn't finished an update. Restart that Chrome, then probe again. Needs a code change: no. |
 | `navigation_unguarded` | `nav-decisions.jsonl` against the session's navigations | A navigation's logged allow didn't match its own tool and address. Run the probe. |
 | `hook_missing_decision` from the probe's smoke step (the Windows hook quoting case) | `nav-decisions.jsonl` is missing or empty | The hook command didn't start. Claude Code runs it through Git Bash: `"$PCW_RUNTIME" "$PCW_WORKER" nav-guard`, both paths with forward slashes, set by the worker. Check `bun` (or `node`) runs from that path in Git Bash (`"C:/Users/you/.bun/bin/bun.exe" --version`) and that the worker's folder path has no `"` in it. |
-| `navigation_denied` | `nav-decisions.jsonl`: the `deny` lines and their `why` | The session tried an address or tool it may not (`address_not_allowed`, whose line has only the address's registrable `domain` and the keyed hashes `host_hmac` and `url_hmac`, never the address; `no_address`, a new tab without one; `tool_not_allowed`, a tool name not on the hook's list), or nav-guard couldn't decide (`timeout`, `internal_error`, `unreadable_input`, `log_failed`). A page talking the model into a detour shows up here: look at the job's site. A `tool_not_allowed` after an extension update means the extension added or renamed a tool. `context_owed` lines aren't counted here (see `tab_context_owed`). |
-| `tab_context_owed` | `nav-decisions.jsonl`: the `deny` lines with `why` `context_owed` | The hook refused three or more calls in one session because a tab context was owed (after a new tab, or after a read on a PC whose reads don't report their address) and the model didn't call `tabs_context_mcp` when told to. Run again once; if it repeats, the session prompt or the reading tools changed: report it. Needs a code change: maybe. |
-| `unlisted_check_required`, `process_end_required` or `context_order_failed` from `confirm-profile` | `probe-evidence.json`: `unlisted`, `process_end`, `context_trips`; `worker.log`'s `probe process_end` and `tree_end` lines | `unlisted`: the real hook let a tool not on its list through (a damaged or old harness copy: update it, probe again). `process_end`: a process tree was still running 10 seconds after it was ended (`tree_kill.left`): something keeps restarting it or Windows refused to end it (an antivirus hold); close it and probe again. `context_order_failed`: an honest chore tripped the tab-context order more than once: report it. Needs a code change: no, no, yes. |
+| `navigation_denied` | `nav-decisions.jsonl`: the `deny` lines and their `why` | The session tried an address or tool it may not (`address_not_allowed`, whose line has only the address's registrable `domain` and the keyed hashes `host_hmac` and `url_hmac`, never the address; `no_address`, a new tab without one; `tool_not_allowed`, a tool name not on the hook's list; `scheme_not_allowed`, an address that isn't http or https; `private_address`, this computer or its network, or a name that resolves to one; `domain_not_allowed`, a registrable domain the job's entry doesn't name, the usual sign of a page planting an address; `query_not_allowed` or `query_too_long`; `inventory_unconfirmed`, a call before the session's inventory passed), or nav-guard couldn't decide (`timeout`, `internal_error`, `unreadable_input`, `log_failed`). A page talking the model into a detour shows up here: look at the job's site. A `tool_not_allowed` after an extension update means the extension added or renamed a tool. `context_owed` lines aren't counted here (see `tab_context_owed`). |
+| `tab_context_owed` | `nav-decisions.jsonl`: the `deny` lines with `why` `context_owed` | The hook refused three calls in a row for the same owed tab context (after a new tab, or after a read on a PC whose reads don't report their address) and the model didn't call `mcp__claude-in-chrome__tabs_context_mcp` when told to. Refusals for separate owed contexts don't add up. Run again once; if it repeats, the session prompt or the reading tools changed: report it. Needs a code change: maybe. |
+| `containment_unavailable` | `C:/pc-worker-k7q2xz/pcw-jobrun.exe` there? `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` there? Your antivirus's log | The worker couldn't build or start the Windows Job Object helper, so nothing runs uncontained. Make sure the .NET Framework 4 compiler above exists (it ships with Windows 10 and 11), allow the build in your antivirus, delete `pcw-jobrun.exe` and `pcw-jobrun.sha256` so it is built again, then run `worker.ts run --attended` once more. From `confirm-profile`: the probe's Job Object check saw a detached process outlive its job: report it. Needs a code change: no, or yes from `confirm-profile`. |
+| `address_check_required` from `confirm-profile` | `probe-evidence.json`: `addresses` | The real hook let a file address, a localhost address, 127.0.0.1 on another port or a private network address through. A damaged or old harness copy: update it and probe again. Needs a code change: no. |
+| `unlisted_check_required`, `process_end_required` or `context_order_failed` from `confirm-profile` | `probe-evidence.json`: `unlisted`, `process_end`, `context_trips`; `worker.log`'s `probe process_end` and `tree_end` lines | `unlisted`: the real hook let a tool not on its list through (a damaged or old harness copy: update it, probe again). `process_end`: a process tree was still running 10 seconds after it was ended (`tree_kill.left`): something keeps restarting it or Windows refused to end it (an antivirus hold); close it and probe again. `context_order_failed`: an honest chore tripped the tab-context order more than once, or the probe's multi-tab chore (`chore` in the evidence: its `rate_per_read` and `longest`) slipped too often: report it. Needs a code change: no, no, yes. |
 | `tree_end ended=false` in `worker.log` | the line's `left`; Task Manager, Details | A session's process tree hadn't ended 10 seconds after the worker ended it. The sweep after it then usually reports `session_cleanup_failed`. End the leftover `claude.exe` or `node.exe` by hand, then run `check-cli` until `swept` is true. Needs a code change: no. |
 | `unexpected_location` | `diagnostics.log` with `--diagnose`: `final_url`, `off_url`, `off_kind` (the result and `last-run.json` keep no address) | The run's tab showed an address off its pin, midway (`off_url`, and `off_kind` the kind of observation it showed in; `about:blank` before the end step counts) or at the end (`final_url`). If the site really moves you on to a fixed place, add it to the entry's `redirects` and sign again; if it went to a sign-in page, add it to `login_hosts` or `login_paths`. Both addresses `-`: the tab context couldn't be read (an extension update may have changed its answer): run the probe. |
 | `tabs_unexpected` (and the leftover-tab case) | `diagnostics.log` with `--diagnose`: `other_tabs`; `leftover-tabs.json` | A tab beyond the run's own sat in Claude's tab group: a popup, or a tab you opened there. Close every tab in that group but the one the worker left (or close them all, and delete `leftover-tabs.json`), and run again. A `leftover_tab` warning alone is normal: the reading tools can't close the run's tab, and the next run reuses it. |
@@ -1175,7 +1273,7 @@ Cain reads them as facts, and nothing in one tells him or the worker what to do.
 - `cancels/<id>.json` (Cain), `nonces/<nonce>.json` (the confirm path, unused),
   `worker/heartbeat.json` (the worker), `.gitattributes` (`*.json text eol=lf` and the rest).
 - The PC's allowlist, `allowlist.json`: `{"v": 1, "kid", "allow": [{"site", "action",
-  "url", "match", "login_hosts"?, "login_paths"?, "alternatives"?, "redirects"?, "reviewed"?}], "sig"}`, signed with your key;
+  "url", "match", "login_hosts"?, "login_paths"?, "alternatives"?, "redirects"?, "reviewed"?, "domains"?, "query"?}], "sig"}`, signed with your key;
   `owner.pub`: `<kid> <public key>`, matching `owner_fpr` in `install.json`.
 - On the PC only: `install.json` (yours, with `native_host_manifest`), `confirmed.json` and `probe-evidence.json`
   (the probe and `confirm-profile`), `profile-marker.json` (the hash of the profile's
