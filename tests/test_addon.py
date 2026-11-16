@@ -2267,6 +2267,16 @@ def test_a_relayed_record_is_typed_as_written_or_set_aside(tmp_path):
         line = _typed(_checkin(tmp_path, "0712", IDLE, day="2026-11-09").splitlines()[-2])
         assert "Relayed records the App couldn't read: 1, set aside unread" in line
         assert "couldn't read" not in _checkin(tmp_path, "1240", IDLE, day="2026-11-09").splitlines()[-2]
+        # Named ones move on, kept; what's set aside after, even with the file emptied meanwhile, is
+        # still named (round 22).
+        assert bad.read_text() == "" and len((tmp_path / "relay.bad.named").read_text().splitlines()) == 2
+        bad.write_text("")
+        q.write_text('{"text": 5}\n', newline="\n")
+        _checkin(tmp_path, "0300", IDLE, day="2026-11-09", runs=3)
+        assert bad.read_text() == '{"text": 5}\n'
+        line = _typed(_checkin(tmp_path, "1740", IDLE, day="2026-11-09").splitlines()[-2])
+        assert "Relayed records the App couldn't read: 1, set aside unread" in line and bad.read_text() == ""
+        assert (tmp_path / "relay.bad.named").read_text().splitlines()[-1] == '{"text": 5}'
     finally:
         del os.environ["RELAY_QUEUE"], os.environ["RELAY_BAD"]
 

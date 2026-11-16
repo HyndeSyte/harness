@@ -14,8 +14,8 @@ TM="${TMUX_CMD:-tmux}"   # not TMUX: tmux reads that name itself
 export TZ="${CHECKIN_TZ:-America/New_York}"
 dir="${CHECKIN_DIR:-/data/checkins}"
 queue="${RELAY_QUEUE:-/data/relay.queue}"
-bad="${RELAY_BAD:-/data/relay.bad}"          # relayed records that couldn't be read, kept (never dropped);
-                                              # $bad.told: how many of them a check-in has named
+bad="${RELAY_BAD:-/data/relay.bad}"          # relayed records that couldn't be read and aren't named yet;
+                                              # once named, they move to $bad.named (both kept, never dropped)
 state="${CHECKIN_STATE:-/run/cain/checkin}"     # this container's: his prompt's steadiness, a try in his box
 PS="${PROMPT_STATE:-/opt/cain/prompt-state.sh}"
 mkdir -p "$dir"
@@ -304,12 +304,10 @@ fi
 # unknown to him (outside round 19).
 held_back=$(wc -l < "$state/unconfirmed" 2>/dev/null | tr -cd '0-9')
 [ "${held_back:-0}" -gt 0 ] && lead="${lead}Relayed lines the App couldn't confirm in your input box when it typed them: ${held_back}. Each waits in its queue behind newer ones and comes again. "
-# Relayed records set aside unread and not yet named: counted against $bad.told, both kept in /data,
-# so a restart can't leave one unnamed (outside round 21).
-set_aside=$(wc -l < "$bad" 2>/dev/null | tr -cd '0-9'); set_aside=${set_aside:-0}
-named_before=$(head -c 20 "$bad.told" 2>/dev/null | tr -cd '0-9'); named_before=${named_before:-0}
-[ "$named_before" -le "$set_aside" ] || named_before=0
-unread=$((set_aside - named_before))
+# Relayed records set aside unread and not yet named: all that $bad holds, since a check-in that
+# names them moves them on to $bad.named. Kept in /data, so a restart can't leave one unnamed, and
+# with no count, so emptying or refilling $bad can't hide one (outside rounds 21 and 22).
+unread=$(wc -l < "$bad" 2>/dev/null | tr -cd '0-9'); unread=${unread:-0}
 [ "$unread" -gt 0 ] && lead="${lead}Relayed records the App couldn't read: ${unread}, set aside unread in its own files. A tap or reaction of his may be among them: if he mentions one you never heard of, that's why. "
 if [ "$slot" = 0710 ]; then
   msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
@@ -320,7 +318,14 @@ type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
 for cand in "${named[@]}"; do touch "$dir/$cand.missed"; done
 [ "${held_back:-0}" -gt 0 ] && rm -f "$state/unconfirmed"
-[ "$unread" -gt 0 ] && { printf '%s\n' "$set_aside" > "$bad.told.tmp" && mv -f "$bad.told.tmp" "$bad.told"; } 2>/dev/null
+if [ "$unread" -gt 0 ]; then   # the ones just named move on, kept; any after them stay to be named
+  if head -n "$unread" "$bad" >> "$bad.named" 2>/dev/null \
+     && tail -n +"$((unread + 1))" "$bad" > "$bad.tmp" 2>/dev/null && mv -f "$bad.tmp" "$bad" 2>/dev/null; then :
+  else
+    rm -f "$bad.tmp" 2>/dev/null
+    echo "[cain] records set aside and named couldn't be moved on from $bad: they're named again next time"
+  fi
+fi
 [ -n "$newest" ] && printf '%s' "$newest" > "$seen"      # listed: never again
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"
