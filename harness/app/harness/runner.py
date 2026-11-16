@@ -23,7 +23,7 @@ import re
 import time
 from concurrent.futures import Executor, Future
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from . import approvals, choices, commands, effects, policy, prompts, provenance, render, rules, schema
@@ -167,6 +167,7 @@ class Runner:
             calendar_change.reoffer = self.reoffer
             calendar_change.recard = self.recard
             calendar_change.start_again = self.start_again
+            calendar_change.script_card = self.script_card
 
     # -- budget -----------------------------------------------------------
     def _budget_ok(self, provider: str) -> bool:
@@ -650,6 +651,7 @@ class Runner:
                                                      job_id=job["id"]) if change else []
             if held:
                 self.calendar_change.note_held(pid, job["id"], held, db)
+                self.calendar_change.tell_held(held, db)      # tenth round: once per calendar, why and what unblocks
                 from .calendar_change import provider_name
                 names = " and ".join(provider_name(x) for x in held)
                 body = lines or [render.change_line(c, self.config.timezone, self.ledger.now())
@@ -720,6 +722,20 @@ class Runner:
             return ""
         return self._offer_new(old, {"changes": list(changes)}, why, replaced=True if keep_versions else False,
                                keep_versions=keep_versions)
+
+    def script_card(self, chat_id: int, text: str, params: dict, own: Callable[[str, Any], None]) -> str:
+        """A smoke run's step, from its own script (tenth round): a request the specialist makes itself
+        (never from his DM), owned by the run (`own`, in the same transaction), on a card for his Approve.
+        Its request's id."""
+        with self.ledger.tx() as db:
+            new = self.ledger.made_job(chat_id, text, kind="smoke_step", db=db)
+            own(new, db)
+        job = self.ledger.job(new)
+        seen = self.calendar_change.preview_quiet(job, params)
+        self._offer(job, effects.REGISTRY[effects.CALENDAR_CHANGE], params, {"reason": "smoke_step"},
+                    seen.checks if seen else [], seen.lines if seen else None, seen=seen, replaced=False,
+                    keep_versions=False, new_family=True)
+        return new
 
     def start_again(self, p, changes: list, why: str) -> str:
         """His Try again or Start again from now (eighth round): the change on a new card for the same

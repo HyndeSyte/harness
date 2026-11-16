@@ -41,6 +41,12 @@ LISTED = "migration_listed:"       # + the batch: the proposals its Propose agai
 PROPOSE_TTL_S = 7 * 24 * 3600
 DRY_RUN = "migration_dry_run:"     # + build: the dry run's result for that build (ninth round)
 DRY_RUN_LATEST = "migration_dry_run_latest"   # the newest dry run, whichever build ran it
+# Tenth round: the install step won't migrate the live ledger without a dry run recorded for its own build.
+WAITING = "migration_waiting"      # {"build", "version", "at", "told"}: the live ledger waits for a dry run
+OVERRIDE = "migration_override:"   # + build: Cain's keeper.sh fastpath migrate-override, logged with who and when
+BACKUP = "migration_backup"        # {"path", "build", "at"}: the copy taken just before the last migration
+BACKUP_KEEP = 3                    # backups kept beside the ledger, newest first
+CANDIDATE_TIMEOUT_S = 120
 
 
 def schema(ledger: Ledger) -> int:
@@ -48,6 +54,125 @@ def schema(ledger: Ledger) -> int:
         return int(ledger.get_meta(SCHEMA) or 1)
     except ValueError:
         return 1
+
+
+def needed(ledger: Ledger, version: str | None = None, build: str | None = None) -> bool:
+    """Whether a migration would change this ledger: a step not done yet, or the install step for a build
+    this ledger hasn't been installed under."""
+    from . import calendar_change as cal
+    kept = cal._meta_json(ledger, cal.INSTALLED)
+    return ledger.get_meta(DONE) is None or kept.get("version") != (version or cal.app_version()) \
+        or kept.get("build") != (build or cal.app_build())
+
+
+def dry_run_missing(ledger: Ledger, build: str) -> str:
+    """Why the live ledger may not be migrated for this build (tenth round), or "": no dry run of this very
+    build recorded (or it failed), and no logged override for it."""
+    if dry_run_for(ledger, build).get("ok") or ledger.get_meta(OVERRIDE + build) is not None:
+        return ""
+    got = dry_run_for(ledger, build)
+    return (f"the migration dry run recorded for build {build} failed" if got else
+            f"no migration dry run is recorded for build {build}")
+
+
+def waiting(ledger: Ledger) -> dict:
+    from . import calendar_change as cal
+    return cal._meta_json(ledger, WAITING)
+
+
+def run_live(ledger: Ledger, cc, chat_id: int, version: str | None = None, build: str | None = None) -> dict:
+    """The install step on the live ledger (tenth round): it migrates only once a dry run of this very build
+    is recorded in this ledger (keeper.sh fastpath migrate-check, of the candidate before it ships or of
+    this build once it runs), or Cain's logged override (keeper.sh fastpath migrate-override); until then
+    nothing is migrated, calendar changes wait, and he and Cain are told why. Just before migrating, a
+    restorable copy of the ledger is taken beside it (backup)."""
+    from . import calendar_change as cal
+    version, build = version or cal.app_version(), build or cal.app_build()
+    if not needed(ledger, version, build):
+        _clear_waiting(ledger)
+        return run(ledger, cc, chat_id, version, build)
+    why = dry_run_missing(ledger, build)
+    if why:
+        kept = waiting(ledger)
+        with ledger.tx() as db:
+            if kept.get("build") != build:
+                ledger.set_meta(WAITING, json.dumps({"build": build, "version": version, "at": iso(ledger.now()),
+                                                     "why": why}), db)
+                ledger.event("migration_waiting", {"build": build, "why": why}, db=db)
+                if chat_id:
+                    ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(
+                        f"<b>Harness {render.escape(version)} is installed, but hasn't moved its records over yet.</b> "
+                        "Its records are only moved after a rehearsal of this very update on a copy of them, and "
+                        "none is recorded for it, so nothing was moved. Until it's done, calendar changes wait "
+                        "and nothing on your calendars changes. Cain has been told: he runs the rehearsal (or, "
+                        "only on your say, moves them without it), and they're moved then."), db=db)
+        log.warning("the live ledger wasn't migrated for build %s: %s; calendar changes wait for keeper.sh "
+                    "fastpath migrate-check, or migrate-override", build, why)
+        return {"waiting": True, "build": build, "why": why}
+    copy = backup(ledger, build)
+    if not copy:
+        with ledger.tx() as db:
+            ledger.set_meta(WAITING, json.dumps({"build": build, "version": version, "at": iso(ledger.now()),
+                                                 "why": "the ledger couldn't be backed up first"}), db)
+        log.error("the live ledger wasn't migrated for build %s: the backup before it failed", build)
+        return {"waiting": True, "build": build, "why": "the ledger couldn't be backed up first"}
+    _clear_waiting(ledger)
+    out = run(ledger, cc, chat_id, version, build)
+    return {**out, "backup": copy}
+
+
+def _clear_waiting(ledger: Ledger) -> None:
+    if ledger.get_meta(WAITING) is not None:
+        with ledger.tx() as db:
+            db.execute("DELETE FROM meta WHERE key=?", (WAITING,))
+
+
+def override(ledger: Ledger, by: str) -> dict:
+    """Cain's keeper.sh fastpath migrate-override (tenth round): this build's migration may run on the live
+    ledger without a dry run, logged with who and when. Only on Dane's say."""
+    from . import calendar_change as cal
+    build = cal.app_build()
+    kept = {"build": build, "by": by, "at": iso(ledger.now())}
+    with ledger.tx() as db:
+        ledger.set_meta(OVERRIDE + build, json.dumps(kept), db)
+        ledger.event("migration_override", kept, db=db)
+    log.warning("the migration of build %s may run on the live ledger without a dry run: override by %s", build, by)
+    return kept
+
+
+def backup(ledger: Ledger, build: str) -> str:
+    """A restorable copy of the live ledger, taken with SQLite's own backup just before a migration (tenth
+    round): beside the ledger file, named for the build and the time; the newest BACKUP_KEEP are kept. Its
+    path, or "" when it couldn't be made (then nothing is migrated). To restore: stop the App, copy it over
+    the ledger file (harness.sqlite), start the App (DOCS.md)."""
+    import glob
+    import os
+    import sqlite3
+    if not ledger.path or ledger.path == ":memory:":
+        return ""
+    folder = os.path.dirname(os.path.abspath(ledger.path))
+    stamp = ledger.now().strftime("%Y%m%dT%H%M%SZ")
+    safe = "".join(c for c in build if c.isalnum())[:32] or "unknown"
+    dest = os.path.join(folder, f"harness-before-{safe}-{stamp}.sqlite")
+    try:
+        dst = sqlite3.connect(dest)
+        with dst:
+            ledger.db.backup(dst)
+        dst.close()
+    except (sqlite3.Error, OSError) as e:
+        log.error("the ledger backup before the migration failed: %s", type(e).__name__)
+        return ""
+    old = sorted(glob.glob(os.path.join(folder, "harness-before-*.sqlite")), key=os.path.getmtime, reverse=True)
+    for extra in old[BACKUP_KEEP:]:
+        try:
+            os.remove(extra)
+        except OSError:
+            pass
+    with ledger.tx() as db:
+        ledger.set_meta(BACKUP, json.dumps({"path": dest, "build": build, "at": iso(ledger.now())}), db)
+        ledger.event("migration_backup", {"path": os.path.basename(dest), "build": build}, db=db)
+    log.info("ledger backed up before the migration of build %s: %s", build, os.path.basename(dest))
+    return dest
 
 
 def run(ledger: Ledger, cc, chat_id: int, version: str | None = None, build: str | None = None) -> dict:
@@ -77,7 +202,8 @@ def record_dry_run(ledger: Ledger, got: dict) -> dict:
     from . import calendar_change as cal
     kept = {"build": got.get("build") or cal.app_build(), "version": got.get("version") or cal.app_version(),
             "checksum": got.get("checksum", ""), "ok": bool(got.get("ok")), "at": iso(ledger.now()),
-            "copy_of": got.get("copy_of", "")}
+            "copy_of": got.get("copy_of", ""), "candidate": got.get("candidate", ""),
+            "ran_by": cal.app_build()}
     with ledger.tx() as db:
         ledger.set_meta(DRY_RUN + kept["build"], json.dumps(kept), db)
         ledger.set_meta(DRY_RUN_LATEST, json.dumps(kept), db)
@@ -207,6 +333,51 @@ def dry_run(path: str, version: str | None = None, build: str | None = None) -> 
             pass
 
 
+def candidate_layout(path: str) -> tuple[str, str] | None:
+    """Where a candidate build's package is (tenth round): (the folder holding the harness package, the App
+    folder or ""). A source tree is the App folder (harness/, with app/harness/migrate.py); an image path
+    is its /opt/harness (harness/migrate.py and BUILD_ID beside it). None when neither."""
+    import os
+    if os.path.isfile(os.path.join(path, "app", "harness", "migrate.py")):
+        return os.path.join(path, "app"), path
+    if os.path.isfile(os.path.join(path, "harness", "migrate.py")):
+        return path, ""
+    return None
+
+
+def candidate_dry_run(path: str, candidate: str) -> dict:
+    """The incoming build's own migration rehearsed on a copy of the ledger at `path` (tenth round): the
+    candidate's package (a source tree or an image path, candidate_layout) is run in a separate Python,
+    isolated from this one (-I), as python3 -m harness.migrate <path>, which copies the ledger and migrates
+    only the copy. Its answer carries the candidate's own build id, computed by its own code, which is what
+    that build's install step looks for. The ledger file itself is only read."""
+    import os
+    import subprocess
+    import sys
+    where = candidate_layout(candidate) if candidate and os.path.isdir(candidate) else None
+    if where is None:
+        return {"ok": False, "said": f"no build to rehearse at {candidate or '(none given)'}: give the App folder "
+                                     "of a source tree, or an image's /opt/harness"}
+    app, _ = where
+    code = ("import sys, runpy; sys.path.insert(0, sys.argv[1]); sys.argv = ['harness.migrate', sys.argv[2]]; "
+            "runpy.run_module('harness.migrate', run_name='__main__', alter_sys=True)")
+    try:
+        done = subprocess.run([sys.executable, "-I", "-c", code, app, path], capture_output=True, text=True,
+                              timeout=CANDIDATE_TIMEOUT_S, cwd=app)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"ok": False, "said": f"the candidate's migration couldn't be run ({type(e).__name__})"}
+    try:
+        got = json.loads(done.stdout or "{}")
+    except ValueError:
+        got = {}
+    if not isinstance(got, dict) or not got.get("build"):
+        return {"ok": False, "said": "the candidate's migration gave no answer it could read (exit "
+                                     f"{done.returncode})", "candidate": candidate}
+    got["candidate"] = candidate
+    got["ok"] = bool(got.get("ok")) and done.returncode == 0
+    return got
+
+
 def _in_flight(db) -> list:
     """Changes the version before left approved (not started) or mid-write."""
     return db.execute(
@@ -296,11 +467,19 @@ def listed(ledger: Ledger, batch: str) -> list[str]:
     return [str(x) for x in got] if isinstance(got, list) else []
 
 
-if __name__ == "__main__":                       # python3 -m harness.migrate <ledger path>: the dry run
+if __name__ == "__main__":
+    # python3 -m harness.migrate <ledger path>: this build's dry run on a copy. Tenth round:
+    # python3 -m harness.migrate <ledger path> --candidate <tree or image path>: the candidate's own.
     import sys
-    if len(sys.argv) != 2:
-        print(json.dumps({"ok": False, "said": "usage: python3 -m harness.migrate <ledger file path>"}))
+    args = sys.argv[1:]
+    if len(args) == 3 and args[1] == "--candidate":
+        got = candidate_dry_run(args[0], args[2])
+        print(json.dumps(got, indent=1, sort_keys=True))
+        sys.exit(0 if got.get("ok") else 1)
+    if len(args) != 1:
+        print(json.dumps({"ok": False, "said": "usage: python3 -m harness.migrate <ledger file path> "
+                                               "[--candidate <source tree or image path>]"}))
         sys.exit(2)
-    got = dry_run(sys.argv[1])
+    got = dry_run(args[0])
     print(json.dumps(got, indent=1, sort_keys=True))
     sys.exit(0 if got.get("ok") else 1)

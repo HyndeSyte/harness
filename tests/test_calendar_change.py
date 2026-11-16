@@ -95,7 +95,27 @@ class FakeGmail:
         if self.down:
             return "unknown", None
         e = self.events.get(uid)
+        if e is None and "_" in uid and uid.rsplit("_", 1)[0] in self.events:
+            e = self._instance(uid)
         return ("ok", copy.deepcopy(e)) if e is not None else ("gone", None)
+
+    def _instance(self, uid):
+        """One day of a series read by its instance id, as Google gives it (made on first read)."""
+        base, stamp = uid.rsplit("_", 1)
+        master = self.events[base]
+        try:
+            when = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        if not master.get("recurrence") or master.get("status") == "cancelled" or not master["start"].get("dateTime"):
+            return None
+        span = datetime.fromisoformat(master["end"]["dateTime"]) - datetime.fromisoformat(master["start"]["dateTime"])
+        inst = {k: copy.deepcopy(v) for k, v in master.items() if k != "recurrence"}
+        inst.update(id=uid, recurringEventId=base, originalStartTime={"dateTime": when.isoformat()},
+                    start={"dateTime": when.isoformat()}, end={"dateTime": (when + span).isoformat()})
+        self.events[uid] = inst
+        self._bump(uid)
+        return inst
 
     def really_gone(self, address, uid):
         e = self.events.get(uid)
@@ -114,7 +134,7 @@ class FakeGmail:
     def change(self, address, uid, fields, etag):
         self.log.append(("change", uid, fields))
         if self._stale(uid, etag):
-            return caldav.Outcome("changed")
+            return caldav.Outcome("changed", 412)
         if self.answer == "ok":
             self.events[uid].update(fields)
             self._bump(uid)
@@ -123,7 +143,7 @@ class FakeGmail:
     def drop(self, address, uid, etag):
         self.log.append(("drop", uid))
         if self._stale(uid, etag):
-            return caldav.Outcome("changed")
+            return caldav.Outcome("changed", 412)
         if self.answer == "ok":
             self.events[uid]["status"] = "cancelled"
             self._bump(uid)

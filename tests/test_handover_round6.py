@@ -544,16 +544,35 @@ def test_a_restart_on_the_same_ledger_offers_a_paused_change_again(m):
 from test_handover_round5 import DROP_SWIM, PASSING  # noqa: E402
 
 
-def smoke_step(m, run, step):
-    """Ninth round: Cain opens one step of the run; only the next handover naming the run is its."""
-    out = m.send(Handover(kind="fastpath", state="smoke-step", run=run, step=step))
+def script_of(change):
+    """Tenth round: a step's script, from the change a test would once have handed over."""
+    from datetime import datetime
+    day = (change.get("dates") or change.get("start") or "")[:10]
+    script = {"calendar": change["calendar"], "kind": change["op"], "title": change["title"], "day": day}
+    if change.get("start") and change.get("end"):
+        script["times"] = (f"{datetime.fromisoformat(change['start']):%H:%M}-"
+                           f"{datetime.fromisoformat(change['end']):%H:%M}")
+    return script
+
+
+def smoke_step(m, run, step, script=None):
+    """Cain offers one step of the run (tenth round: with its script, on a card for his Start step tap);
+    a conformance step runs at once."""
+    out = m.send(Handover(kind="fastpath", state="smoke-step", run=run, step=step, script=script or {}))
     assert out["status"] == "ok", out
     return out
 
 
 def step_card(m, run, step, words, *outputs):
-    smoke_step(m, run, step)
-    return card_for(m, words, *outputs, smoke_run=run)
+    """Tenth round: the step's change is built from its script after his Start step tap, never from a DM:
+    `words` and the model's output only supply the script a test once handed over."""
+    change = outputs[0].output["params"]["changes"][0]
+    out = smoke_step(m, run, step, script_of(change))
+    m.c.outbox.flush()
+    m.tap(f"Start step {out['n']}")
+    m.c.tick()
+    m.c.outbox.flush()
+    return last_pid(m)
 
 
 def _approve(m, words, output, done="Done.", run="", step="step"):

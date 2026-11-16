@@ -346,7 +346,9 @@ class Controller:
         # (migrate.py), before anything else reads what the version before left: cards left open
         # are replaced, changes left in flight are read back and recorded (never written again), and
         # one message lists what was replaced, with Propose again.
-        swept = migrate.run(self.ledger, self.calendar_change, self.config.owner_user_id)
+        # Tenth round: only once a dry run of this very build is recorded in the ledger (or Cain's logged
+        # override), and with a backup taken just before (migrate.run_live).
+        swept = migrate.run_live(self.ledger, self.calendar_change, self.config.owner_user_id)
         if swept:
             log.info("ledger migrated: %s", swept)
         self.runner.reconcile_after_restart()
@@ -653,13 +655,22 @@ class Controller:
             h.finish("refused", "The specialist won't act: you're paired with a different "
                                 "Discord account than the bot's owner.")
             return
+        held = migrate.waiting(self.ledger)
+        if held:
+            # Tenth round: the live ledger waits for a dry run of this build; nothing is taken meanwhile.
+            h.finish("refused", "Not taken: the specialist was updated, and it moves its records to the new build "
+                                f"only after a migration dry run of that build ({held.get('why', 'none recorded')}). "
+                                "Run keeper.sh fastpath migrate-check; it rehearses this build on a copy of the "
+                                "ledger, records it, and then the records are moved. Only on Dane's say: keeper.sh "
+                                "fastpath migrate-override. Nothing changed.")
+            return
         if h.smoke_run:
-            # Ninth round: a handover naming the smoke run is its open step's, and only with one open.
-            why = self.calendar_change.step_problem(h.smoke_run) if self.calendar_change is not None \
-                else "calendar changes aren't set up in the calendar specialist"
-            if why:
-                h.finish("refused", f"Not handed over as the smoke run's step: {why}. Nothing changed.")
-                return
+            # Tenth round: a handover only ever reads his own messages, so one naming the smoke run cites a
+            # real request of his: it's never the run's (steps run from their script on his Start step tap).
+            # It goes on as an ordinary request, held like any other while a gate is closed, his title kept.
+            log.info("a handover named the smoke run; it cites his own message, so it's an ordinary request")
+            with self.ledger.tx() as db:
+                self.ledger.event("calendar_smoke_handover_ordinary", {"run": h.smoke_run}, db=db)
         if time.monotonic() - h.arrived > FRESH_S:      # the window runs from the handover
             h.finish("stale", "That handover waited here over 2 minutes before it could be read, "
                               "so nothing was done with it. Nothing changed. Hand it over again.")
@@ -748,10 +759,6 @@ class Controller:
             self.ledger.set_meta(f"job_origin:{job_id}", json.dumps(origin))   # how many after it, now
             if note:
                 self._note_for_question(job_id, note, flags)
-        if h.smoke_run and self.calendar_change is not None:
-            why = self.calendar_change.claim_step(h.smoke_run, job_id)
-            if why:
-                log.info("a handover named the smoke run, but it isn't its step: %s", why)
         h.job = render.short(job_id)                       # for the log only
         self._handover_jobs.setdefault(job_id, []).append(h)
 
@@ -877,11 +884,12 @@ class Controller:
         if h.state == "smoke-start":
             run = cc.smoke_start()
             log.info("a smoke run started")
-            h.finish("ok", f"Smoke run {run['id']} started. For each step of its checklist, open the step with keeper.sh "
-                           f"fastpath smoke-step {run['id']} <step>, then hand that step's request over with keeper.sh "
-                           f"handover --message <id> --smoke {run['id']}, its card tapped; only those are the run's. "
-                           f"Run keeper.sh fastpath smoke-step {run['id']} conformance-gmail and conformance-family "
-                           f"too. Then send keeper.sh fastpath on {run['id']}.", run=run["id"])
+            h.finish("ok", f"Smoke run {run['id']} started. Offer each step of its checklist with keeper.sh fastpath "
+                           f"smoke-step {run['id']} <step> <gmail|family> <add|move|remove> <YYYY-MM-DD> <test title> "
+                           "[HH:MM-HH:MM]: he gets a card showing its script with Start step N, and his tap puts "
+                           "the step's change on a card built from the script, for his Approve. Hand nothing over "
+                           f"for a step. Run keeper.sh fastpath smoke-step {run['id']} conformance-gmail and "
+                           f"conformance-family too. Then send keeper.sh fastpath on {run['id']}.", run=run["id"])
             return
         if h.state == "smoke-step":
             # Ninth round: only a change made under a step Cain opens is the run's.
@@ -892,7 +900,7 @@ class Controller:
                 h.finish("refused", "Name the smoke run and the step: keeper.sh fastpath smoke-step <run id> <step>. "
                                     "Nothing changed.")
                 return
-            status, said, extra = cc.smoke_step(h.run, h.step)
+            status, said, extra = cc.smoke_step(h.run, h.step, h.script)
             h.finish(status, said, **extra)
             return
         if h.state == "on":
@@ -933,21 +941,53 @@ class Controller:
             h.finish("ok", render.plain(said))
             return
         if h.state == "migrate-check":
-            # Eighth round: the migration on a copy of a ledger file, never the file itself.
+            # Eighth round: the migration on a copy of a ledger file, never the file itself. Tenth round: with
+            # a candidate (a source tree or an image path), the incoming build's own migration, recorded
+            # under its own build id, which its install step looks for before touching the live ledger.
             path = h.path or self.ledger.path
-            got = migrate.dry_run(path)
-            log.info("migration dry run on a copy of %s: %s", path, "ok" if got.get("ok") else got.get("said"))
-            # Ninth round: the result is kept in the live ledger, keyed by this build and the checksum of
-            # the copy it ran on; the install step logs whether one was kept for its build.
-            got["recorded"] = migrate.record_dry_run(self.ledger, got)
-            h.finish("ok" if got.get("ok") else "refused",
-                     "The migration ran on a copy; the ledger itself wasn't touched." if got.get("ok")
-                     else got.get("said", "The dry run failed."), result=got)
+            got = migrate.candidate_dry_run(path, h.candidate) if h.candidate else migrate.dry_run(path)
+            log.info("migration dry run%s on a copy of %s: %s", " of a candidate build" if h.candidate else "", path,
+                     "ok" if got.get("ok") else got.get("said"))
+            # Ninth round: the result is kept in the live ledger, keyed by the build that ran it and the
+            # checksum of the copy it ran on.
+            got["recorded"] = migrate.record_dry_run(self.ledger, got) if got.get("build") or not h.candidate else {}
+            moved = self._migrate_if_waiting()
+            said = ((f"The migration of build {got.get('build')} ran on a copy; the ledger itself wasn't touched, "
+                     "and the result is recorded for that build." if h.candidate else
+                     "The migration ran on a copy; the ledger itself wasn't touched.") if got.get("ok")
+                    else got.get("said", "The dry run failed."))
+            if moved:
+                said += " This build was waiting for it, so the records are moved now, with a backup taken first."
+            h.finish("ok" if got.get("ok") else "refused", said, result=got)
+            return
+        if h.state == "migrate-override":
+            # Tenth round: only on Dane's say. This build's migration runs on the live ledger without a dry
+            # run, logged with who and when, and still with a backup first.
+            if not migrate.waiting(self.ledger):
+                h.finish("refused", "Nothing is waiting for a migration, so nothing changed.")
+                return
+            migrate.override(self.ledger, by="cain")
+            moved = self._migrate_if_waiting()
+            h.finish("ok" if moved else "refused",
+                     "Moved without a dry run, as overridden; that's kept in the log, and a backup was taken first."
+                     if moved else "The override is kept, but the records couldn't be moved: "
+                     + (migrate.waiting(self.ledger).get("why") or "see the log") + ".")
             return
         now = fast_path(self.ledger)
-        h.finish("unknown", "Say smoke-start, smoke-step <run id> <step>, on <run id>, off, gate-open <gmail|family> "
-                 "or migrate-check [path]. "
+        h.finish("unknown", "Say smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open "
+                 "<gmail|family>, migrate-check [path] [candidate] or migrate-override. "
                  "It's " + ("on" if now.get("on") else "off (card only)") + " now.")
+
+    def _migrate_if_waiting(self) -> bool:
+        """Tenth round: the live ledger was waiting for a dry run of this build (or an override); once one
+        is recorded, the records are moved now (migrate.run_live, backup first). Whether it moved them."""
+        if not migrate.waiting(self.ledger):
+            return False
+        swept = migrate.run_live(self.ledger, self.calendar_change, self.config.owner_user_id)
+        if swept.get("waiting"):
+            return False
+        log.info("ledger migrated after its dry run: %s", swept)
+        return True
 
     def _meanings(self, h) -> None:
         """What he told Cain kinds of Family events mean, from his record, already checked

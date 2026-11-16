@@ -467,25 +467,41 @@ Cain doesn't pass your words on: Harness reads your DM itself.
 - **After every install, cards are held per calendar until the smoke test has passed there.** Until
   the smoke run has read back, on that calendar, a move or removal sent with If-Match on an event that
   was there and an edit of one day of a repeating event, and the calendar has passed the conformance
-  item (it refused the run's own stale write, below), a request for that calendar comes on a card
-  that says it's waiting for the check after installing, with no *Approve*, and nothing changes. A card
+  item (it refused the run's own stale edit, removal and edit of one day of a series, below), a request
+  for that calendar comes on a card
+  that says it's waiting for the check after installing, with no *Approve*, and nothing changes. The
+  first time a request is held on a calendar after an install, one message for that calendar says
+  "Calendar changes on Gmail are held for now" (or Family), why (the check hasn't finished there yet, or
+  what it found) and what lets them through (Cain finishing the check, your *Open cards without the
+  check*, or *Test again*); further holds there aren't told one by one. While any wait, one reminder a
+  day gives the count per calendar, and a held request whose day comes gets a reminder that day. A card
   offered before the install and tapped meanwhile is held the same way. Held cards don't run out. Once
   that calendar's check is done, each held change comes back on a fresh card, read again then, through
   the usual checks, for your tap: the card says how long it waited and quotes your message as every card
-  does. One whose day has passed meanwhile isn't offered again: a "Dropped" receipt says so, and nothing
-  changes. When more than three come back at once, one message saying how many comes first. Gmail and
+  does. Only an add whose day has passed meanwhile isn't offered again: a "Dropped" receipt says so, and
+  nothing changes. A move or removal of an event whose day has passed comes back on a fresh card like
+  any other, read again then. When more than three come back at once, one message saying how many comes first. Gmail and
   Family open separately: one can be open while the other is held. A closed gate holds every request
   except the smoke run's own steps, live run or not: your own requests, dates from your mail and Family
   adds that arrive while a run is live are held like any other, never tagged as tests and never taken
-  off by the run's cleanup. Only a step Cain opens with `keeper.sh fastpath smoke-step <run id> <step>`
-  and then hands over with `keeper.sh handover --message <id> --smoke <run id>` is the run's. If, during the
+  off by the run's cleanup. Only a step Cain offers with its script (`keeper.sh fastpath smoke-step <run
+  id> <step> ...`) and you start with *Start step N* is the run's, its change built from the script by
+  Harness itself; a handover naming the run (`keeper.sh handover --message <id> --smoke <run id>`) cites
+  your own message, so it's an ordinary request, held with your title, never tagged. If, during the
   run, a calendar refuses the safety check on an event that hadn't changed, that calendar stays held
   and you're told plainly that edits there are blocked and why, with an *Open cards without the check*
   button. That tap, or Cain's `keeper.sh fastpath gate-open gmail` (or `family`) on your say, opens that
   calendar's cards without the check, for when the run can't complete there; who did it and when is
   kept in the log, its held changes come back on fresh cards, and the paths without a tap stay off. On a
   calendar that failed the conformance item, that override also says edits there may overwrite changes
-  made elsewhere between your card and your tap. An
+  made elsewhere between your card and your tap; on one that refused stale edits but took a stale
+  removal, removals there stay held even after the override, and it says so. On one that turned down
+  the check's own fresh edit, there's no override at all (it would only bring refusals): *Test again*
+  runs that step once more. After an override, the first change turned down at the safety check while
+  the event hadn't changed gets a "Not applied" receipt quoting your request with *Start again from now*
+  (one new card from a fresh read); later ones there get no button. A calendar that passed the
+  conformance item and later, in normal use, takes a write without giving the event a new version (so
+  it would take a stale one too) closes again, with the same message as a failed conformance item. An
   install is each new build: the ledger keeps the version and a build identifier (a hash of every file
   the App ships: its code, the Dockerfile, config.yaml and the run scripts in rootfs, computed when the
   image is built), so a rebuild of the same version, or a change to any of those files, counts as an
@@ -593,14 +609,17 @@ late. So after every install the three paths without a tap stay off, and each ca
 held (no *Approve*) until the run has read back there a fenced edit and an edit of one day of a series,
 or until it has been run once, with throwaway events on a day with
 nothing else on it (each name below is an example; use anything unmistakable). Cain starts it with
-`keeper.sh fastpath smoke-start`: Harness issues the run's id. The run owns only its own steps: for each
-one, Cain opens the step with `keeper.sh fastpath smoke-step <run id> <step>` (a short name, such as
-`gmail-add`), good for 30 minutes and one handover, then hands its request over with `keeper.sh
-handover --message <id> --smoke <run id>`. Only that request (and its fresh cards) is recorded under the
-run, titled as a test and judged; a handover naming the run with no step open is refused. Anything else
-that arrives while the run is live is an ordinary request: a closed gate holds every request but the
-run's own steps, live run or not. Every step goes through the normal card path: you tap *Approve* on
-its card. The run's first add is let go at once, so its answer comes late and is
+`keeper.sh fastpath smoke-start`: Harness issues the run's id. The run owns only its own steps, and
+step ownership never rests on a model reading a message: for each one, Cain offers the step with its
+script, `keeper.sh fastpath smoke-step <run id> <step> <gmail|family> <add|move|remove> <YYYY-MM-DD>
+"<test title>" [HH:MM-HH:MM]` (the step a short name such as `gmail-add`; times for an add or a move).
+You get a card showing that script with *Start step N*; only your tap opens the step, within 30
+minutes and once, and then Harness builds the step's change from the script itself, never from your
+DM, and puts it on a card for your *Approve*. Only that request (and its fresh cards) is recorded
+under the run, titled as a test and judged. A handover naming the run (`--smoke`) is never the run's:
+a handover only reads your own messages, so it cites a real request of yours, which goes on as an
+ordinary request with your title, held like any other: a closed gate holds every request but the
+run's own steps, live run or not. The run's first add is let go at once, so its answer comes late and is
 read back a minute later like any lost answer: that's the late landing item. That is the only write
 Harness ever lets go on purpose, and only for an add of a live run.
 
@@ -610,9 +629,12 @@ runs out after 24 hours, and stops recording at *Turn on*, at *Turn off*, at a n
 it runs out. It gives one *Turn on*. A run that's used, ran out, was started under another version or
 schema, under another build, or is older than the install is refused by name: start a new one. Each add of the run is a
 test event: its title starts "Smoke test: " and it carries the run's id as a private property (on
-Gmail, the event's private extended property `harness_smoke`; on Family, an `X-HARNESS-SMOKE` line).
-The run keeps the id of every event it creates, before the write goes out; its leftover cleanup only
-ever takes off those, by id.
+Gmail, the event's private extended property `harness_smoke`; on Family, an `X-HARNESS-SMOKE` line),
+and the step's own nonce beside it (`harness_smoke_nonce`, or `X-HARNESS-SMOKE-NONCE`). The run keeps
+the id it chose for every event it creates (both calendars take an id the client chooses), with that
+nonce and its day, before the write goes out; its leftover cleanup only ever takes off those: by id,
+or, when a read by that id doesn't find it (a create whose answer was lost, an id the calendar
+changed), by that exact nonce on its day, never by the run's tag alone.
 
 On Gmail, and then the same on Family:
 
@@ -633,13 +655,24 @@ On Gmail, and then the same on Family:
    event that was there) and a move or removal of one day of a throwaway repeating event (the series
    step below counts on Family; on Gmail, move one day of a throwaway weekly event).
 6. The conformance item: Cain runs `keeper.sh fastpath smoke-step <run id> conformance-gmail` (and
-   `conformance-family`). Harness adds its own test event, edits it itself (so the version it read
-   first is now out of date), then sends an edit guarded by that out of date version: the calendar must
-   refuse it. Only the run's own test event is ever written this way, and it's taken off after. A
-   calendar that takes that write never opens its cards: you're told plainly that it doesn't protect
-   against edits made at the same time, and its *Open cards without the check* says edits there may
-   overwrite changes made elsewhere. Once the two edits are read back and the conformance item passed
-   on a calendar, its held cards come back.
+   `conformance-family`). It covers every write kind Harness sends with a version:
+   an edit, a removal and an edit of one day of a series. Harness adds its own one-off test event and its own short
+   series (three days), edits each with the version it had just read (the fresh edit, which must go
+   through), then sends a stale edit with the version from before that (a counter in its note, so its
+   body differs from both earlier versions), a stale removal of the one-off, and a stale edit of one day
+   of the series. Each counts as enforced only when the calendar gave its documented stale answer (412,
+   or Gmail's 409 for that case) and a read afterwards shows the stale write wasn't applied. Any other
+   answer (sign-in, a refused body, too many requests, unsupported) is unknown and keeps the gate
+   closed; Cain runs the step again. Only the run's own test events are ever written this way, and
+   they're taken off after. The gate opens only when all three are enforced. A calendar that takes a
+   stale edit never opens its cards: you're told plainly that it doesn't protect against edits made at
+   the same time, and its *Open cards without the check* says edits there may overwrite changes made
+   elsewhere. One that refuses stale edits but takes the stale removal stays closed too, with a
+   message saying removals there aren't protected; after its override, removals there stay held. One
+   that turns down the fresh edit itself (it gives weak versions and compares them strictly, say) is
+   said as what was seen: Harness and that calendar don't agree on event versions, with *Test again*
+   and no override. The item runs again after every install. Once the two edits are read back and the
+   conformance item passed on a calendar, its held cards come back.
 
 And once, on either calendar: two days of one throwaway repeating event taken off on two cards, both
 Done. The listing lag is measured from the record itself: from each write's read back by its id to
@@ -668,23 +701,47 @@ case to report, and the paths without a tap stay off. Nothing else to set up.
 
 ### Before a Ship card: the migration on a copy of the ledger
 
-Before Cain shows a Ship card for a Harness update, he runs `keeper.sh fastpath migrate-check` (the
-live ledger) or `keeper.sh fastpath migrate-check <path>` (a ledger file at that path, as Harness sees
-it). Harness opens that file read only, copies it with SQLite's own backup into a temporary file, runs
-this version's migration and install step on the copy with no calendars, deletes the copy, and answers
-with what it found: the schema version, whether the paths without a tap are off (they must be), whether
-the gate is set and which calendars it holds, how many *Turn on* cards are still open (none), how many
-rows it touched, and how many changes left in flight it would read from the calendars on the real run.
-The ledger itself is never touched. The same dry run works by hand inside the App:
-`python3 -m harness.migrate <ledger path>` prints it as JSON.
+Before Cain shows a Ship card for a Harness update, he rehearses the incoming build's own migration:
+`keeper.sh fastpath migrate-check --candidate <path>`, where the path is the incoming build's source
+tree (the `harness` App folder of a checkout of the pull request's head) or its image path (the
+image's `/opt/harness`), as Harness sees it; add a ledger path first to use a ledger file other than
+the live one (`keeper.sh fastpath migrate-check <path> --candidate <path>`). Harness runs the
+candidate's own code in a separate, isolated Python (`python3 -m harness.migrate <ledger path>` from
+that tree): it opens the ledger read only, copies it with SQLite's own backup into a temporary file,
+runs that build's migration and install step on the copy with no calendars, deletes the copy, and
+answers with what it found: the candidate's build id (computed by the candidate itself, as its image
+will), the schema version, whether the paths without a tap are off (they must be), whether the gate is
+set and which calendars it holds, how many *Turn on* cards are still open (none), how many rows it
+touched, and how many changes left in flight it would read from the calendars on the real run. The
+ledger itself is never touched. Without `--candidate`, the running build rehearses its own migration. Harness maps no folders, so a candidate path has to be one Harness itself can read (under its own
+`/data`, say); where none can be put, the install step below is the backstop: the new build moves
+nothing until it has rehearsed itself on a copy.
+By hand inside the App: `python3 -m harness.migrate <ledger path> [--candidate <path>]` prints it as
+JSON.
 
-The result is kept in the live ledger, keyed by the build that ran it and the SHA-256 checksum of the
-ledger copy it ran on, and `keeper.sh` writes it to the marker file
+The result is kept in the live ledger, keyed by the build it rehearsed, with the SHA-256 checksum of
+the ledger copy it ran on and which build ran it, and `keeper.sh` writes it to the marker file
 `/data/markers/harness-migrate-check.json` in Cain's App. Cain's rules need that marker, saying ok and
-under 24 hours old, before a Ship card for Harness (the link itself doesn't check it yet). The install
-step logs whether a dry run was kept for its own build, and otherwise the latest one, with its build and
-when: the dry run runs the migration of the build installed when it runs, so before an update it's
-usually the build before's.
+under 24 hours old, before a Ship card for Harness (the link itself doesn't check it yet).
+
+### At install: the migration needs its dry run, and a backup comes first
+
+When a new build starts, it migrates the live ledger only if a dry run of its very build id is
+recorded there and passed, or Cain logged an override for it. Otherwise nothing is migrated: calendar
+changes wait (no writes, and a handover is refused with what to run), you get one message saying
+Harness is installed but hasn't moved its records over yet, and Cain is told on his next handover.
+Cain then runs `keeper.sh fastpath migrate-check` (the running build rehearses itself on a copy and
+records it), and the records are moved right after. Only on your say, `keeper.sh fastpath
+migrate-override` moves them without a dry run; who and when are kept in the log.
+
+Just before it migrates, Harness takes a restorable copy of the ledger with SQLite's own backup,
+beside it in `/data`, named `harness-before-<build>-<time>.sqlite`; the newest three are kept. To
+restore one: stop the Harness App; copy that file over `/data/harness.sqlite` (from the host, the
+App's data folder is `/mnt/data/supervisor/addons/data/0fcc2575_harness/`; or restore the Home
+Assistant backup the Ship job takes before installing, which holds it too); delete any
+`harness.sqlite-wal` and `harness.sqlite-shm` beside it; start the App. The restored ledger is the
+one from before the migration, so the same build migrates it again on start, with its dry run still
+recorded.
 
 ## Dates from your mail
 
@@ -825,7 +882,8 @@ stays. Uninstalling the add-on also starts over, and deletes the ledger.
 ## Backups
 
 Backups include `/data` (the ledger, the keys, the app-specific password, the calendar
-addresses and the last Family push). The add-on stops briefly during a
+addresses and the last Family push, and the three newest ledger copies taken before a migration,
+`harness-before-<build>-<time>.sqlite`). The add-on stops briefly during a
 backup so the database is copied whole. After a restore, anything done after the
 backup was taken is gone.
 

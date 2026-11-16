@@ -26,7 +26,7 @@ from test_handover_round5 import (DROP_SWIM, HAIRCUT, MOVE_HAIRCUT, SWIM_PATH, h
                                   swim_ics)
 from test_handover_round6 import (MOVE_POOL, MOVE_YOGA, POOL_PATH, SWIM, YOGA, _gmail_lapse, _lapse, _wait_for,
                                   card_for, dones, last_pid, pool_ics, run_smoke, seed_yoga, state, yoga_at,
-                                  yoga_id, smoke_step)
+                                  yoga_id, step_card)
 from fake_caldav import no_network  # noqa: F401  (autouse)
 
 
@@ -495,8 +495,7 @@ def test_a_test_event_changed_since_is_left_by_take_them_off(m):
 @pytest.mark.card_only
 def test_a_refused_or_expired_run_lists_its_test_events(m):
     run = m.send(Handover(kind="fastpath", state="smoke-start"))["run"]
-    smoke_step(m, run, "gmail-add")
-    m.tells("add the dentist at 3 today", ask(DENTIST), smoke_run=run)
+    step_card(m, run, "gmail-add", "add the dentist at 3 today", ask(DENTIST))    # tenth round: from its script
     m.tap("Approve")
     m.cc.join_abandoned()
     settle(m)

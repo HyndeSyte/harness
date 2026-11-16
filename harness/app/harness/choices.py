@@ -32,7 +32,8 @@ KINDS = frozenset({"rule_undo", "rule_keep_new", "rule_keep_old",
                    "calendar_change_propose_again", "calendar_change_which",
                    "calendar_change_fast_on", "calendar_change_fast_keep", "calendar_change_fast_off",
                    "calendar_change_smoke_clear", "calendar_change_try_again", "calendar_change_restart",
-                   "calendar_change_gate_open"})
+                   "calendar_change_gate_open", "calendar_change_conform_again",
+                   "calendar_change_step_start"})
 PREFIX = "c"
 
 

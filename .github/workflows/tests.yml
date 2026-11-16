@@ -32,3 +32,20 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests
+
+  # The specialist's image, built as Home Assistant builds it, and its embedded build id compared with
+  # the source tree's (0.24.0, tenth round): the install step keys its migration and the dry run to that
+  # id, so the image and the tree must agree. Not a required check; it reports on every push.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the specialist's image
+        run: docker build -t harness-ci harness
+      - name: The image's build id equals the source tree's
+        run: |
+          tree=$(python3 harness/app/harness/buildid.py harness harness/app)
+          image=$(docker run --rm --entrypoint cat harness-ci /opt/harness/BUILD_ID)
+          echo "source tree: $tree"
+          echo "image:       $image"
+          test -n "$tree" && test "$tree" = "$image"

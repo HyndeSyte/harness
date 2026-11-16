@@ -72,7 +72,9 @@ def test_restore_drill(tmp_path, clock):
     ledger.close()
     backup = tmp_path / "backup"
     shutil.copytree(data, backup)
-    assert sorted(p.name for p in backup.iterdir()) == ["harness.sqlite", "secrets.json"]
+    # Tenth round: plus the copies taken just before a migration (harness-before-<build>-<time>.sqlite).
+    assert sorted(p.name for p in backup.iterdir() if not p.name.startswith("harness-before-")) \
+        == ["harness.sqlite", "secrets.json"]
 
     # --- life goes on after the backup (this work will be lost)
     c, ledger, _, _ = boot(data, clock, SyncExecutor(), FakeBot([[msg(4, "after backup")]]),

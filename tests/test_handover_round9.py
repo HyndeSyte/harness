@@ -41,13 +41,19 @@ def last_card(m):
     return m.link.cards[max(m.link.cards)]
 
 
+def approve_card(m):
+    m.c.outbox.flush()
+    return next(m.link.cards[c] for c in sorted(m.link.cards, reverse=True)
+                if "Approve" in labels_of(m.link.cards[c]))
+
+
 def labels_of(card):
     return [c["label"] for r in card["rows"] for c in r["components"]]
 
 
 def start(m):
     out = m.send(Handover(kind="fastpath", state="smoke-start"))
-    assert out["status"] == "ok" and "smoke-step" in out["said"] and "--smoke" in out["said"]
+    assert out["status"] == "ok" and "smoke-step" in out["said"] and "Start step" in out["said"]   # tenth round
     return out["run"]
 
 
@@ -62,12 +68,14 @@ def live_gmail(m, title):
 def test_a_real_add_during_a_live_run_is_held_untagged_survives_the_cleanup_and_comes_back(m):
     run = start(m)
     m.tells("add the dentist at 3 today", ask(DENTIST))             # his own request, while the run is live
-    held = last_card(m)
+    m.c.outbox.flush()
+    held = next(m.link.cards[c] for c in sorted(m.link.cards, reverse=True)
+                if m.link.cards[c]["text"].startswith("**Waiting for the check"))
     assert held["text"].startswith("**Waiting for the check after installing on Gmail.**")
     assert "Approve" not in labels_of(held)
     # A step of the run: its add is tagged and let go at once, as the run's.
     step_card(m, run, "gmail-add", "add piano at 1 today", ask(PIANO))
-    assert "Approve" in labels_of(last_card(m))
+    assert "Smoke test step 1" in approve_card(m)["text"] or "Piano" in approve_card(m)["text"]
     m.tap("Approve")
     m.cc.join_abandoned()
     settle(m)
@@ -107,29 +115,44 @@ def test_a_request_during_a_live_run_is_never_the_runs_even_when_its_calendar_is
 
 @pytest.mark.card_only
 @pytest.mark.install_gate
-def test_a_handover_naming_the_run_needs_an_open_step_and_takes_it_once(m):
+def test_a_step_is_offered_with_its_script_and_only_his_start_tap_takes_it_once(m):
+    """Tenth round (replaces the ninth round's open step taken by a handover): Cain offers a step with its
+    script; his Start step tap builds the change from that script, owned by the run; single use."""
+    from test_handover_round6 import script_of
     run = start(m)
-    out = m.tells("add the dentist at 3 today", ask(DENTIST), smoke_run=run)
-    assert out["status"] == "refused" and "no smoke step is open" in out["said"]
-    smoke_step(m, run, "gmail-add")
-    assert m.tells("add piano at 1 today", ask(PIANO), smoke_run=run)["status"] == "waiting for his tap"
-    assert m.cc.owned_run(m.ledger.db.execute("SELECT job_id FROM proposals WHERE id=?",
-                                              (last_pid(m),)).fetchone()[0]) == run
-    again = m.tells("add the vet at 6 today", ask(change("gmail", "add", "Vet", dates="", start=at(18).isoformat(),
-                                                         end=at(19).isoformat())), smoke_run=run)
-    assert again["status"] == "refused"                           # the step was single use
-    bad = m.send(Handover(kind="fastpath", state="smoke-step", run="0123456789ab", step="gmail-add"))
+    out = m.send(Handover(kind="fastpath", state="smoke-step", run=run, step="gmail-add", script=script_of(PIANO)))
+    assert out["status"] == "ok" and out["n"] == 1
+    offer = last_card(m)
+    assert "Start step 1" in labels_of(offer) and "Smoke test: Piano" in offer["text"]
+    assert not m.cc.owned_run("anything")
+    m.tap("Start step 1")
+    m.c.tick()
+    pid = last_pid(m)
+    assert m.cc.owned_run(m.ledger.db.execute("SELECT job_id FROM proposals WHERE id=?", (pid,)).fetchone()[0]) == run
+    assert "Piano" in approve_card(m)["text"]
+    cards = len(m.link.cards)
+    assert "Start step 1" not in m.labels()                       # its button came off with the tap
+    assert "isn't waiting" in m.cc.start_step(f"{run}:1")         # and the step is taken: nothing more
+    assert last_pid(m) == pid and len(m.link.cards) == cards
+    bad = m.send(Handover(kind="fastpath", state="smoke-step", run="0123456789ab", step="gmail-add",
+                          script=script_of(PIANO)))
     assert bad["status"] == "refused" and "no smoke run with that id" in bad["said"].lower()
+    none = m.send(Handover(kind="fastpath", state="smoke-step", run=run, step="gmail-add"))
+    assert none["status"] == "refused" and "needs its script" in none["said"]
 
 
 @pytest.mark.card_only
 @pytest.mark.install_gate
-def test_a_step_runs_out_after_thirty_minutes(m):
+def test_a_step_offer_runs_out_after_thirty_minutes(m):
+    from test_handover_round6 import script_of
     run = start(m)
-    smoke_step(m, run, "gmail-add")
+    m.send(Handover(kind="fastpath", state="smoke-step", run=run, step="gmail-add", script=script_of(PIANO)))
+    m.c.outbox.flush()
     m.clock.t += calendar_change.timedelta(minutes=31)
-    out = m.tells("add piano at 1 today", ask(PIANO), smoke_run=run)
-    assert out["status"] == "refused" and "no smoke step is open" in out["said"]
+    cards = len(m.link.cards)
+    m.tap("Start step 1")
+    m.c.outbox.flush()
+    assert not any("Approve" in labels_of(m.link.cards[c]) for c in sorted(m.link.cards)[cards:])
 
 
 def test_held_by_gate_holds_every_request_but_the_runs_own(m, monkeypatch):
@@ -177,7 +200,7 @@ def test_a_calendar_that_enforces_if_match_passes_the_conformance_item(m, calend
     assert out["status"] == "ok" and out["result"] == "enforced"
     assert calendar_change.conformance_of(m.ledger, calendar) == "enforced"
     created = m.cc.created_by(run)
-    assert len(created) == 1 and created[0]["cal"] == calendar
+    assert len(created) == 2 and {x["cal"] for x in created} == {calendar}   # tenth round: a one-off and a series
     assert not m.cc.smoke_leftovers(run)                         # its test event is taken off after
     gate = calendar_change.card_gate(m.ledger)
     assert calendar in calendar_change.closed_providers(m.ledger)   # the fenced and series-day edits still to come
@@ -206,8 +229,8 @@ def test_a_calendar_that_ignores_if_match_never_opens_and_he_is_told(m, monkeypa
     assert "doesn't protect against concurrent edits" in out["said"]
     assert calendar in calendar_change.closed_providers(m.ledger)
     # Only the run's own test event was written with the stale version, never one of his.
-    own = m.cc.created_by(run)[0]
-    assert sent and all((own.get("id") or own.get("href")) in str(x) for x in sent)
+    own = [x.get("id") or x.get("href") for x in m.cc.created_by(run)]   # tenth round: a one-off and a series
+    assert sent and all(any(o in str(x) for o in own) for x in sent)
     assert HAIRCUT not in " ".join(map(str, sent)) and haircut_at(m) == "10:00"
     name = "Gmail" if calendar == "gmail" else "Family"
     told = [t for t in m.seen() if t.startswith(f"{name} doesn't protect against edits made at the same time.")]
@@ -243,7 +266,9 @@ def test_after_an_override_a_refused_safety_check_offers_no_try_again_and_says_w
     m.tap("Approve")
     assert state(m, first) == "fence_refused"
     receipts = [t for t in m.seen() if t.startswith("Not applied.")]
-    assert "Edits on Gmail can't be applied safely" in receipts[-1] and "Try again" not in m.labels()
+    # Tenth round: the first refusal there quotes his request and offers Start again from now, once.
+    assert "most likely can't be applied safely" in receipts[-1] and "Try again" not in m.labels()
+    assert "haircut moved to 10:30 today" in receipts[-1] and "Start again from now" in m.labels()
     told = [t for t in m.seen() if t.startswith("Edits on Gmail can't be applied safely.")]
     assert len(told) == 1 and "weak or rewritten version (etag)" in told[0]
     second = card_for(m, "haircut moved to 10:45 today", ask(change("gmail", "move", "Haircut",
@@ -251,6 +276,8 @@ def test_after_an_override_a_refused_safety_check_offers_no_try_again_and_says_w
                                                                     end=at(11, 15).isoformat())))
     m.tap("Approve")
     assert state(m, second) == "fence_refused" and "Try again" not in m.labels()
+    receipt = [m.link.cards[c] for c in sorted(m.link.cards) if m.link.cards[c]["text"].startswith("**Not applied.**")][-1]
+    assert "Start again from now" not in labels_of(receipt)
     assert len([t for t in m.seen() if t.startswith("Edits on Gmail can't be applied safely.")]) == 1
     assert calendar_change.card_gate(m.ledger)["override_refused"]["gmail"] == 2
     assert haircut_at(m) == "10:00"

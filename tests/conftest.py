@@ -19,6 +19,8 @@ def pytest_configure(config):
                                        "(a test of escaping or of the rules themselves)")
     config.addinivalue_line("markers", "card_only: the ledger as installed, with the no-card paths off "
                                        "until the smoke test is recorded")
+    config.addinivalue_line("markers", "migrate_gate: the live ledger is migrated only after a dry run of its "
+                                       "own build is recorded (tenth round)")
     config.addinivalue_line("markers", "install_gate: the ledger as installed, with cards that aren't the smoke "
                                        "run's refused until the run reads back a change on each calendar")
 
@@ -211,3 +213,13 @@ def card_path_verified(request, monkeypatch):
         return
     from harness import calendar_change
     monkeypatch.setattr(calendar_change, "closed_providers", lambda ledger: [])
+
+
+@pytest.fixture(autouse=True)
+def migration_dry_run_recorded(request, monkeypatch):
+    """Tenth round: the live ledger is migrated only once a dry run of this very build is recorded in it.
+    Tests written before that run as on a Pi where it was. A test marked migrate_gate sees it as installed."""
+    if request.node.get_closest_marker("migrate_gate"):
+        return
+    from harness import migrate
+    monkeypatch.setattr(migrate, "dry_run_missing", lambda ledger, build: "")
