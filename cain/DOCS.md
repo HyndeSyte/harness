@@ -193,17 +193,32 @@ his own user finds a breach, when the move stops part way, when his start state 
 or when its safety setup doesn't check out at start; it pauses him (not a breach) when that
 check can't finish, and tries it again every 10 minutes until it does. If his session keeps
 ending soon after it starts, the App keeps starting it again, and says so at the third time.
+If a question waits on his screen, where no one answers it (one of Claude Code's own, or his
+own asked there by mistake), he can't take a message until it's answered: the App presses Esc
+after 5 minutes (15 for what looks like a sign-in or his folder's trust question, yours to answer
+on the panel if you're at it), and if that doesn't close it, starts his session fresh 5 minutes
+later (at most once an hour, and he's told to read your messages he may have missed). You hear
+only when that can't clear it (a question back within the hour of a fresh start, three closed
+with Esc within an hour, or a step the App can't keep track of), and it comes down once his
+prompt has been back 5 minutes.
+The App types your taps and his check-ins into his session only after that session has passed
+its check of his own user (at every start, and every start is the App's: when Claude Code ends,
+his session ends and the App starts it again), only at his prompt, empty and steady, and it
+presses Enter only once what it typed sits in his input box. A tap that can't go in waits, never
+lost, and a check-in that misses its hour is named in the next one.
 If a try of the move fails, he keeps running the old way (after a restart of the App, when the
 try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
 session (`/opt/cain/notice.sh`), what happened and the way back:
 
 - in Discord, from his bot, once;
 - as a push to your phone, through Home Assistant, again each day until it's fixed, and
-  replaced (with "Cain is back") once he has run two minutes and passed his check. It goes to
-  your phone only: no Home Assistant notification, which everyone in the house would see.
+  replaced (with "Cain is back") once he has run two minutes and passed his check (for a
+  question on his screen, once his prompt has been back 5 minutes). It goes to your phone
+  only: no Home Assistant notification, which everyone in the house would see.
 
 Alarms are kept apart by what they're about (whether he's running, whether his session keeps
-ending, whether his move went through), so one never takes down another.
+ending, whether his move went through, whether a question keeps coming back on his screen),
+so one never takes down another.
 
 The Home Assistant side is one automation with a webhook trigger. The App has no Home
 Assistant API access, on purpose: the Supervisor's route to a notification would give every

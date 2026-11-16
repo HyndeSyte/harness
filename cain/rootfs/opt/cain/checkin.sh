@@ -1,9 +1,12 @@
 #!/bin/bash
-# Types into Cain's session, only when he is idle at his prompt (never mid-task):
+# Types into Cain's session, only when he is idle at his prompt (never mid-task), and only once
+# his session has passed its check of his own user (the run script's mark):
 # 1. his taps and reactions, relayed by the calendar specialist (relay.ts queues them);
 # 2. scheduled check-ins, so open work moves without Dane starting it. Each slot
 #    fires once a day, within an hour of its time.
 # Both say they come from the add-on, so Cain never mistakes a check-in for Dane.
+# Nothing is lost when typing doesn't go through: a tap stays queued until it's in, and a check-in
+# that missed its hour is named in the next one (Cain's third service review).
 set -u
 # Every tmux call goes through this (C1): Cain's own user and his socket the new way (the run
 # script sets TMUX_CMD), so root is never a client of his tmux server; plain tmux the old way.
@@ -11,7 +14,10 @@ TM="${TMUX_CMD:-tmux}"   # not TMUX: tmux reads that name itself
 export TZ="${CHECKIN_TZ:-America/New_York}"
 dir="${CHECKIN_DIR:-/data/checkins}"
 queue="${RELAY_QUEUE:-/data/relay.queue}"
+state="${CHECKIN_STATE:-/run/cain/checkin}"     # this container's: his prompt's steadiness, a try in his box
+PS="${PROMPT_STATE:-/opt/cain/prompt-state.sh}"
 mkdir -p "$dir"
+mkdir -p "$state" 2>/dev/null
 
 # 0. What Dane has said Family events mean, and his place book, from Cain's record, go to
 #    the calendar specialist whenever the file changes: by the add-on, not by Cain
@@ -36,33 +42,138 @@ send_table meanings "${MEANINGS_FILE:-/data/record/areas/family/calendar-meaning
 send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
   "${PLACES_SENT:-/data/places.sent}" "${PLACES_TRIED:-/data/places.tried}" "place book"
 
-screen=$($TM -u capture-pane -p -J -t cain 2>/dev/null) || exit 0
+# Nothing goes into a session that hasn't passed its check of his own user: the run script takes
+# the mark away before every start of his session and sets it when the check passes.
+checked_mark="${SESSION_CHECKED:-/run/cain/session-checked}"
+[ -f "$checked_mark" ] || exit 0
+
+read_screen() { timeout 10 $TM -u capture-pane -p -J -t cain 2>/dev/null; }
+# Every try the App types starts with its own mark, six random hex digits in brackets, kept with
+# the try. A draft is the App's only when its first line (prompt-state.sh's, lower case) starts
+# with that try's mark: no other text, however alike, passes (outside review, round 16).
+ours() {   # ours <draft's first line> <the try's mark>
+  local seen
+  seen=$(printf '%s' "$1" | tr -d ' \t')
+  [ -n "$2" ] && [ "${seen:0:$(( ${#2} + 2 ))}" = "[$2]" ]
+}
+screen=$(read_screen) || { rm -f "$state/ready"; exit 0; }
 last=$(printf '%s\n' "$screen" | tail -n 12)
 # Only at his prompt (prompt-state.sh): never into a screen waiting for an answer, which typing
 # would answer. Nov 16, Claude Code's "Teach auto mode about your environment?" offer said "auto
 # mode", the old test here took it for his prompt, and for three hours his taps, the cloud job
 # checks and the morning check-in went into the offer (each with an Enter) and not to him.
-at=$(printf '%s\n' "$screen" | "${PROMPT_STATE:-/opt/cain/prompt-state.sh}" 2>/dev/null)
-[ "$at" = ready ] || exit 0                                            # at his prompt
-printf '%s' "$last" | grep -Eqi 'esc to interrupt' && exit 0           # working: later
+at=$(printf '%s\n' "$screen" | "$PS" 2>/dev/null)
 
+# A try of ours left in his input box (typed, and then the screen changed before its Enter): taken
+# back out with Ctrl+U once his input area is back, before anything new is typed. Ctrl+U takes one
+# drawn line at a time (seen on a real Claude Code 2.1.317), so it goes in batches of 20. His box read
+# empty counts as the try gone only 30 seconds after it (one slow to draw turns up meanwhile). Given
+# up after 30 minutes, said, so a try that's gone some other way never blocks the rest.
+if [ -f "$state/typed" ]; then
+  typed_at=$(head -n 1 "$state/typed" 2>/dev/null | tr -cd '0-9')
+  age=$(( $(date +%s) - ${typed_at:-0} ))
+  if [ "$age" -gt 1800 ]; then
+    rm -f "$state/typed"
+    echo "[cain] an unsent try of the App's couldn't be taken back out of his input box within 30 minutes; going on"
+  fi
+fi
+if [ -f "$state/typed" ]; then
+  case "$at" in
+    ready) [ "$age" -ge "${CHECKIN_TYPED_GRACE_S:-30}" ] || exit 0
+           rm -f "$state/typed" ;;
+    draft)
+      # Only a draft that starts with the try's own mark (on his box's own prompt line) is the App's
+      # to take out; anyone else's is left be, and the try taken as gone (outside rounds 15, 16).
+      if ! ours "$(printf '%s\n' "$screen" | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null | sed -n 2p)" \
+                "$(sed -n 2p "$state/typed" 2>/dev/null)"; then
+        rm -f "$state/typed"
+        echo "[cain] a draft in his input box isn't the App's try: left as it is"
+        exit 0
+      fi
+      for _ in 1 2 3; do
+        timeout 10 $TM -u send-keys -t cain $(printf 'C-u %.0s' $(seq 20)) 2>/dev/null
+        sleep 1
+        if [ "$(read_screen | "$PS" 2>/dev/null)" = ready ]; then
+          rm -f "$state/typed"
+          echo "[cain] took an unsent try of the App's back out of his input box"
+          break
+        fi
+      done
+      exit 0 ;;
+    *) exit 0 ;;   # a question, or a screen not known: later
+  esac
+fi
+# His prompt, empty, and steady: read so now and at a run 3 to 30 seconds before, in this same
+# session (the mark newer than the run script's check of it), so a question Claude Code opens as a
+# turn ends has time to show before anything is typed. Read afresh after every delivery and every
+# failed read (outside review, round 15).
+if [ "$at" != ready ] || printf '%s' "$last" | grep -Eqi 'esc to interrupt'; then   # working: later
+  rm -f "$state/ready"
+  exit 0
+fi
+now_s=$(date +%s)
+ready_at=$(head -n 1 "$state/ready" 2>/dev/null | tr -cd '0-9')
+if [ -n "$ready_at" ] && [ "$state/ready" -nt "$checked_mark" ] && [ $((now_s - ready_at)) -le 30 ]; then
+  [ $((now_s - ready_at)) -ge "${CHECKIN_STEADY_S:-3}" ] || exit 0
+elif printf '%s\n' "$now_s" > "$state/ready" 2>/dev/null; then
+  exit 0
+fi
+
+# Typed, then the screen read again: Enter only while his input area is still there, holding
+# what was typed (prompt-state.sh: draft), with no question opened since (Cain's third service
+# review). Otherwise no Enter, and 1: the caller keeps what it typed for later. The try stays
+# marked until a later read shows his box empty, so one that turns up late, or sits under a
+# question, is taken back out before anything new is typed (above).
 type_in() {
-  $TM -u send-keys -t cain -l "$1" && sleep 1 && $TM -u send-keys -t cain Enter
+  local mark
+  mark=$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -cd '0-9a-f')
+  [ "${#mark}" = 6 ] || { echo "[cain] no random mark for a try: nothing typed"; return 1; }
+  printf '%s\n%s\n' "$(date +%s)" "$mark" > "$state/typed" 2>/dev/null \
+    || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
+  if ! timeout 10 $TM -u send-keys -t cain -l "[$mark] $1"; then return 1; fi
+  sleep 1
+  local after word
+  after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null)
+  if [ "${after%%$'\n'*}" = ready ]; then sleep 2; after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null); fi   # slow to draw
+  word="${after%%$'\n'*}"
+  rm -f "$state/ready"
+  if [ "$word" != draft ] || ! ours "$(printf '%s\n' "$after" | sed -n 2p)" "$mark"; then
+    echo "[cain] his input box didn't hold what was typed (${word:-unread}): nothing sent, tried again later"
+    return 1
+  fi
+  timeout 10 $TM -u send-keys -t cain Enter || return 1
+  rm -f "$state/typed"
 }
 
 # 1. A relayed tap or reaction, one at a time, oldest first. The link and the record
 #    keeper append to the queue at any moment, so the whole queue is first moved aside
-#    to a work file (new lines start a fresh queue), and lines are taken from that.
+#    to a work file (new lines start a fresh queue), and lines are taken from that. A line
+#    leaves the work file only once it's in; one that can't be typed three times running goes
+#    after the newer ones, said, so it never holds them up.
 work="$queue.work"
 if [ ! -s "$work" ] && [ -s "$queue" ]; then mv "$queue" "$work"; fi
 if [ -s "$work" ]; then
   line=$(head -n 1 "$work")
   text=$(printf '%s' "$line" | jq -r '.text // empty' 2>/dev/null | tr -d '\r\n')
-  tail -n +2 "$work" > "$work.tmp" && mv "$work.tmp" "$work"
-  if [ -n "$text" ]; then
-    type_in "Relayed by the add-on: $text" || exit 1
-    echo "[cain] relayed a tap or reaction"
+  if [ -n "$text" ] && ! type_in "Relayed by the add-on: $text"; then
+    sum=$(printf '%s' "$line" | cksum | cut -d' ' -f1)
+    tries=$(awk -v s="$sum" '$1 == s { print $2 }' "$state/tries" 2>/dev/null)
+    tries=$(( ${tries:-0} + 1 ))
+    if [ "$tries" -lt 3 ]; then
+      printf '%s %s\n' "$sum" "$tries" > "$state/tries"
+      exit 1
+    fi
+    if ! printf '%s\n' "$line" >> "$queue"; then
+      echo "[cain] a relayed line couldn't be typed three times running, nor put after the newer ones: it stays first"
+      exit 1
+    fi
+    rm -f "$state/tries"
+    echo "[cain] a relayed line couldn't be typed three times running: it goes after the newer ones"
+  else
+    rm -f "$state/tries"
+    [ -n "$text" ] && echo "[cain] relayed a tap or reaction"
   fi
+  tail -n +2 "$work" > "$work.tmp" && mv "$work.tmp" "$work"
   exit 0
 fi
 
@@ -90,6 +201,22 @@ for s in 0710 1230 1730; do
 done
 [ -n "$slot" ] || exit 0
 [ -f "$dir/$day-$slot" ] && exit 0
+# Every slot in the day before this one that never went in within its hour (no mark of it sent,
+# none of it named yet): named in this one, each once, so a missed check-in is never silent
+# (outside review, round 15). Only slots after the first check-in this App sent count, so a first
+# start names none.
+first=$(ls "$dir" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$' | sort | head -n 1)
+yday=$(date -d "$day -1 day" +%F 2>/dev/null) || yday=""
+missed=""; named=()
+for cand in "$yday-0710" "$yday-1230" "$yday-1730" "$day-0710" "$day-1230" "$day-1730"; do
+  [ -n "$yday" ] && [ -n "$first" ] || break
+  [[ "$cand" > "$yday-$slot" && "$cand" < "$day-$slot" && "$cand" > "$first" ]] || continue
+  [ -f "$dir/$cand" ] || [ -f "$dir/$cand.missed" ] && continue
+  case "${cand##*-}" in 0710) when="7:10 AM" ;; 1230) when="12:30 PM" ;; *) when="5:30 PM" ;; esac
+  [ "${cand%-*}" = "$day" ] && when="today at $when" || when="yesterday at $when"
+  missed="${missed:+$missed, }$when"; named+=("$cand")
+done
+[ -z "$missed" ] || missed="Check-ins that didn't reach you (your screen wasn't at your prompt within their hour): $missed. "
 # Items someone other than Cain holds (a laptop session), from the record keeper's own
 # holds file (written whole, once its push is on GitHub): first in the check-in, to skip.
 holds="${HOLDS_FILE:-/data/record-holds.json}"
@@ -137,11 +264,12 @@ if [ -n "$rows" ]; then
   fi
 fi
 if [ "$slot" = 0710 ]; then
-  msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
+  msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else
-  msg="${lead}Scheduled check-in from the Cain add-on ($slot). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md. Post to Dane only if something finished or needs his decision."
+  msg="${lead}${missed}Scheduled check-in from the Cain add-on ($slot). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md. Post to Dane only if something finished or needs his decision."
 fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
+for cand in "${named[@]}"; do touch "$dir/$cand.missed"; done
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"
