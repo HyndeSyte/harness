@@ -15,8 +15,9 @@
 #     shows from Home Assistant's side that the channel works. Until notice_hook is set, alarms
 #     go to Discord only, and reach Home Assistant once it is.
 # Alarms are kept per group, so one never erases another: "stop" (why he isn't running now:
-# stopped, paused, or restarting), "session" (his session keeps ending), and "switch" (his move
-# to his own user failed; he runs the old way). Within a group a newer alarm replaces the last.
+# stopped, paused, or restarting), "session" (his session keeps ending), "switch" (his move to his
+# own user failed; he runs the old way), and "screen" (a question keeps coming back on his screen,
+# where no one answers it: unstick.sh). Within a group a newer alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
 # is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
@@ -24,7 +25,8 @@
 # alarm is raised again by its caller or the next tick.
 #   notice.sh tell <alarm> [cause]   raise it; raised already, only its repeats and retries run
 #   notice.sh clear running          Cain runs again: the stop and session groups clear
-#   notice.sh clear switched         Cain runs as his own user: every group clears
+#   notice.sh clear switched         Cain runs as his own user: those and the switch group clear
+#   notice.sh clear screen           his prompt is back (unstick.sh): the screen group clears
 #   notice.sh tick                   the repeats, retries and the daily probe (every 10 minutes)
 #   notice.sh probe                  the probe, now
 #   notice.sh text <alarm> [cause]   an alarm's title and text, one line each (tests, docs)
@@ -39,7 +41,7 @@ PROBED="${NOTICE_PROBED:-$D/c1/notice-probed}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch"
+GROUPS_ALL="stop session switch screen"
 
 BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
 RESTART="restart the Cain App: Settings, Apps, Cain, Restart"
@@ -49,6 +51,7 @@ group_of() {
     breach|switch-stopped|switch-blocked|damaged|setup|restart|switch-restart|exited|held) echo stop ;;
     session) echo session ;;
     switch-failed|switch-waits) echo switch ;;
+    waiting) echo screen ;;
     *) return 1 ;;
   esac
 }
@@ -79,11 +82,14 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain's move to his own user didn't pass its checks three times${2:+ (the last: ${2})}, so his App went back to the old way and waits six hours before it tries again. Nothing for you to do. If he doesn't answer you, you'll hear that too." ;;
     switch-blocked) T="Cain is stopped"
       M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
+    waiting) T="Cain isn't answering"
+      M="Cain isn't answering: a question keeps coming up on his screen, where no one answers it, and pressing Esc and a fresh start of his session didn't clear it. The App starts his session fresh once an hour by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
 cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
   case "$1" in switch) CT="Cain moved to his own user"; CM="Cain now runs as his own user, the safer setup in his update." ;;
+    screen) CT="Cain is back"; CM="Cain is answering again: nothing waits on his screen." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
 # A cause, as it may go to him: one line, plain, short.
@@ -172,7 +178,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|switch-waits|waiting) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -190,9 +196,10 @@ tell() {   # tell <kind> [cause]
   G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0
   deliver
 }
-clear_groups() {   # clear_groups running|switched
+clear_groups() {   # clear_groups running|switched|screen
   local groups g rc=0
-  case "$1" in running) groups="stop session" ;; switched) groups="$GROUPS_ALL" ;; *) echo "notice: clear running or switched" >&2; return 2 ;; esac
+  case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
+    *) echo "notice: clear running, switched or screen" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -223,7 +230,7 @@ tick() {
 }
 
 case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}")" || exit 2; printf '%s\n%s\n' "$T" "$M"; exit 0 ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched | tick | probe | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen | tick | probe | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \
