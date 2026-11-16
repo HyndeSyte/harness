@@ -1,4 +1,5 @@
 {
+  "skillOverrides": { "auto-mode-setup": "off" },
   "permissions": {
     "allow": [
       "Bash(/opt/cain/keeper.sh)",

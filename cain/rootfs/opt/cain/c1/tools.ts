@@ -119,7 +119,7 @@ export function secretValues(d = process.env.C1_DATA ?? "/data", s6 = "/run/s6/c
   let o: any;
   try { o = JSON.parse(optionsText); } catch { throw new Error("options.json doesn't parse"); }
   if (!o || typeof o !== "object") throw new Error("options.json isn't an object");
-  for (const k of ["github_token", "gemini_api_key", "perplexity_api_key", "anthropic_api_key"]) add(o[k]);
+  for (const k of ["github_token", "gemini_api_key", "perplexity_api_key", "anthropic_api_key", "notice_hook"]) add(o[k]);
   for (const f of ["link/ship.key", "link/deploy_key"])
     for (const l of (readIfThere(join(d, f)) ?? "").split("\n")) if (!l.startsWith("-----") && l.trim().length >= 40) add(l);
   const walk = (v: unknown): void => { if (typeof v === "string") { if (v.length >= 32 && !/\s/.test(v)) add(v); } else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x); };

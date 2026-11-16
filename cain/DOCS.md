@@ -186,6 +186,78 @@ switches (`/opt/cain/c1/cutover.sh`, with its journal in `/data/c1`). Until then
 0.11.0 did. After the move there is no way back to root but restoring the backup taken before
 the update. `/data/trust/c1check.json` holds the check that runs as `cain` at every start.
 
+### If Cain stops
+
+Nothing of Cain's runs unchecked, and no stop is silent. The App stops him when a check of
+his own user finds a breach, when the move stops part way, when his start state is damaged,
+or when its safety setup doesn't check out at start; it pauses him (not a breach) when that
+check can't finish, and tries it again every 10 minutes until it does. If his session keeps
+ending soon after it starts, the App keeps starting it again, and says so at the third time.
+If a try of the move fails, he keeps running the old way (after a restart of the App, when the
+try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
+session (`/opt/cain/notice.sh`), what happened and the way back:
+
+- in Discord, from his bot, once;
+- as a push to your phone, through Home Assistant, again each day until it's fixed, and
+  replaced (with "Cain is back") once he has run two minutes and passed his check. It goes to
+  your phone only: no Home Assistant notification, which everyone in the house would see.
+
+Alarms are kept apart by what they're about (whether he's running, whether his session keeps
+ending, whether his move went through), so one never takes down another.
+
+The Home Assistant side is one automation with a webhook trigger. The App has no Home
+Assistant API access, on purpose: the Supervisor's route to a notification would give every
+process of the App the run of all of Home Assistant, and this webhook can only pass an alarm on
+to your phone.
+Its id is a long random one (32 to 128 letters, digits, `-` or `_`) in this App's
+`notice_hook` option, which only the App's root and Home Assistant's admins can read, never
+Cain's own user: an id he could work out would let him send or take down an alarm. Until it's
+set, the alarms go to Discord only, and those still standing reach Home Assistant once it is
+(the App reads it at its next start). The App also posts a probe (`state: test`) at each start
+and daily, which notifies no one: the automation notes its time in a helper, the proof from
+Home Assistant's side that the channel works.
+
+```yaml
+alias: Cain App alarms
+mode: queued
+max: 20
+triggers:
+  - trigger: webhook
+    webhook_id: <the notice_hook id>
+    allowed_methods: [POST]
+    local_only: true
+actions:
+  - choose:
+      - conditions: "{{ trigger.json.state == 'test' }}"
+        sequence:
+          - action: input_datetime.set_datetime
+            target: {entity_id: input_datetime.cain_alarms_checked}
+            data: {timestamp: "{{ now().timestamp() }}"}
+      - conditions: "{{ trigger.json.state in ['on', 'clear'] }}"
+        sequence:
+          - action: notify.mobile_app_<your phone>
+            data:
+              title: "{{ trigger.json.title }}"
+              message: "{{ trigger.json.message }}"
+              data:
+                tag: "cain_app_{{ trigger.json.group }}"
+                push:
+                  interruption-level: "{{ 'time-sensitive' if trigger.json.state == 'on' else 'active' }}"
+```
+
+The tag is what lets "Cain is back", or a newer alarm about the same thing, replace the one on
+your phone. `input_datetime.cain_alarms_checked` is a date-and-time helper. An alarm raised while Home
+Assistant can't be reached is sent once it can; one that clears while it can't stays to be
+taken down. Home Assistant answers every webhook post alike, found or not, so the probe's time
+in the helper is the only proof the channel works end to end: after an update, set
+`notice_hook`, restart the App if it hasn't restarted since, and see the helper move.
+
+**The way back** (the alarms say which applies): restart the Cain App (Settings, Apps,
+Cain, Restart); or restore two backups from just before the update, Cain's first and then the
+calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
+while the other is on its old version, it waits. After a restore, the calendar App may send
+again a card it sent after its backup was taken; the newest card is the one to answer.
+
 ## Your record: one hand on each item (since 0.6.0)
 
 The record keeper (`/opt/cain/record/main.ts`) is the record's only writer. Every

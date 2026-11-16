@@ -117,6 +117,15 @@ rc="$(step -- switch | rc_of)"
 sudo rm -rf "$d" "$fp"; ran=$((ran + 1))
 echo "three failures wait 6 hours"
 
+# The App's alarms with Discord down (C1 second review): a check of his own user that can't
+# finish holds his session and Home Assistant hears it, a breach's alarm replaces it, his return
+# takes it down, and the webhook's id is on no command line (in.sh alarm).
+fresh
+settle
+step -- alarm
+finish
+echo "a check that can't finish holds him, and the alarms reach Home Assistant with Discord down"
+
 # The old root session ran in this container: the switch doesn't begin (exit 3).
 fresh
 rc="$(step -- legacy-here | rc_of)"

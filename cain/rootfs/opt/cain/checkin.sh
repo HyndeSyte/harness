@@ -38,7 +38,12 @@ send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
 
 screen=$($TM -u capture-pane -p -J -t cain 2>/dev/null) || exit 0
 last=$(printf '%s\n' "$screen" | tail -n 12)
-printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode' || exit 0     # at his prompt
+# Only at his prompt (prompt-state.sh): never into a screen waiting for an answer, which typing
+# would answer. Nov 16, Claude Code's "Teach auto mode about your environment?" offer said "auto
+# mode", the old test here took it for his prompt, and for three hours his taps, the cloud job
+# checks and the morning check-in went into the offer (each with an Enter) and not to him.
+at=$(printf '%s\n' "$screen" | "${PROMPT_STATE:-/opt/cain/prompt-state.sh}" 2>/dev/null)
+[ "$at" = ready ] || exit 0                                            # at his prompt
 printf '%s' "$last" | grep -Eqi 'esc to interrupt' && exit 0           # working: later
 
 type_in() {

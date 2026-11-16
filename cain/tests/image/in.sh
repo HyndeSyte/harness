@@ -159,6 +159,25 @@ final)
   holder discord; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
   [ "$(printf '%s' "$out" | jq -r .ok)" = true ] || fail "the check of his own user failed: $out"
+  # Its inventory: 35 checks need nothing running, and the 10 of the Supervisor, the sockets and
+  # the link make the 45 check.sh requires of a pass (C1_CHECK_MIN). A change here changes both.
+  [ "$(printf '%s' "$out" | jq -r .checks)" = 35 ] || fail "the check's inventory isn't 35 without the link: $out"
+  grep -q 'MIN="${C1_CHECK_MIN:-45}"' "$OPT/c1/check.sh" || fail "check.sh doesn't require the 45 checks of a pass"
+  # His screen, read with the image's own awk (prompt-state.sh, outside review round 10): his input
+  # area, with a background task row under it, is ready; the auto mode offer is a dialog; words
+  # that only quote a footer, and an empty screen, are neither.
+  seen() { printf "$1" | "$OPT/prompt-state.sh"; }
+  [ "$(seen '──────\n> \n──────\n  ⏵⏵ auto mode on (shift+tab to cycle)   ● high\n  ● Explore 40s · ↓ to manage\n')" = ready ] \
+    || fail "prompt-state: his input area isn't read as ready"
+  [ "$(seen '> /auto-mode-setup\n  Teach auto mode about your environment?\n    Continue\n  ←/→ to change · Enter to continue · Esc to cancel\n')" = dialog ] \
+    || fail "prompt-state: the auto mode offer isn't read as a dialog"
+  [ "$(seen 'Claude said:\n  For shortcuts, press ?\n')" = other ] && [ "$(seen '')" = other ] \
+    || fail "prompt-state: words quoting a footer, or an empty screen, read as more than other"
+  [ "$(seen '❯ /permissions\n  ? for shortcuts\n')" = other ] && [ "$(seen '❯ │\n  ? for shortcuts\n')" = other ] \
+    || fail "prompt-state: a draft in his input box read as ready"
+  # Claude Code's own empty prompt line: the mark and a no-break space (U+00A0, octal 302 240).
+  [ "$(seen '──────\n❯\302\240\n──────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n')" = ready ] \
+    || fail "prompt-state: his empty prompt with its no-break space isn't read as ready"
   holder cain; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
   printf '%s' "$out" | jq -e '.ok == false and (.failed | any(test("carries the bot token")))' >/dev/null \
@@ -219,6 +238,66 @@ final)
   if slow 'del(.env.CLAUDE_CODE_SYNC_PLUGIN_INSTALL)' without; then without=kept; else without=lost; fi
   note "final checks held ($other couldn't be installed; loaded: $loaded; his standards: 3 parts; a slow start-up hook leaves the plugin in; without loading plugins at once, it was $without)"
   ;;
+alarm)
+  # The App's alarms with Discord down (C1 second review, must-fixes 1 and 2), on the switched
+  # /data: the check of his own user can't finish here (no link runs, so its routes don't answer):
+  # a try the start makes again writes nothing, and the last holds his session and tells Dane. His
+  # bot can't post (its token is away), yet Home Assistant's webhook (a stand-in on this machine,
+  # at the notice_hook option's id) gets the alarm, with the way back, and never sees the hook on
+  # a command line. A breach's alarm replaces it in its group, a failed switch's stands beside
+  # it, and each comes down when what it's about clears.
+  prepare
+  [ "$("$OPT/c1/state.sh")" = cut ] || fail "not cut over: $("$OPT/c1/state.sh")"
+  hook="imagetest$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  cp $D/options.json /fp/options.before
+  jq --arg h "$hook" '.notice_hook = $h' /fp/options.before > $D/options.json && chmod 0600 $D/options.json
+  mv $D/link/discord.env /fp/discord.env.away
+  : > /fp/hook.log; : > /fp/cmdlines
+  bun -e 'const fs = require("fs"); Bun.serve({ hostname: "127.0.0.1", port: 18123, async fetch(r) {
+    fs.appendFileSync("/fp/hook.log", new URL(r.url).pathname + " " + (await r.text()) + "\n"); return new Response(""); } });' >/dev/null 2>&1 &
+  srv=$!
+  # Every command line while the alarms go out, to show the hook is on none of them.
+  ( while kill -0 "$srv" 2>/dev/null; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\0' ' ' >> /fp/cmdlines; sleep 0.05; done ) &
+  sleep 1
+  export NOTICE_URL=http://127.0.0.1:18123
+  # One try, as the start makes its first four: not yet, nothing written. Then the start's fifth.
+  C1_VERSION=9.9.9 C1_UNTRIED=retry "$OPT/c1/check.sh" > /fp/check.out 2>&1; rc=$?
+  [ "$rc" = 5 ] && [ ! -e $D/c1/check-held ] || fail "a first try that couldn't finish gave $rc, not 5 (try again), or held him"
+  C1_VERSION=9.9.9 "$OPT/c1/check.sh" > /fp/check.out 2>&1; rc=$?
+  [ "$rc" = 4 ] || fail "a check that couldn't finish gave $rc, not 4 (held): $(tail -n 2 /fp/check.out | tr '\n' ' ')"
+  grep -q "held (not a breach)" /fp/check.out || fail "the check didn't say he's held: $(tail -n 1 /fp/check.out)"
+  [ "$(cut -d' ' -f1 $D/c1/check-held)" = 9.9.9 ] && grep -q "the link didn't answer" $D/c1/check-held \
+    || fail "the hold isn't on record for this version: $(cat $D/c1/check-held 2>/dev/null)"
+  grep -q "^/api/webhook/$hook {\"state\":\"on\",\"group\":\"stop\",\"alarm\":\"held\",\"title\":\"Cain is paused\"" /fp/hook.log \
+    || fail "Home Assistant didn't get the pause: $(head -c 300 /fp/hook.log)"
+  grep -q "This isn't a breach" /fp/hook.log && grep -q "Settings, System, Backups" /fp/hook.log || fail "the pause didn't say what it is and the way back"
+  grep -qx "discord 0" $D/c1/notice.d/stop || fail "his bot posted, with its token away"
+  "$OPT/notice.sh" tell switch-failed "the smoke test failed" >/dev/null
+  "$OPT/notice.sh" tell breach >/dev/null
+  grep -q "\"group\":\"stop\",\"alarm\":\"breach\",\"title\":\"Cain is stopped\"" /fp/hook.log || fail "Home Assistant didn't get the breach's alarm"
+  "$OPT/notice.sh" clear running >/dev/null
+  grep -q "\"state\":\"clear\",\"group\":\"stop\",\"alarm\":\"breach\",\"title\":\"Cain is back\"" /fp/hook.log || fail "the alarm didn't come down"
+  [ ! -e $D/c1/notice.d/stop ] && [ -f $D/c1/notice.d/switch ] || fail "clearing the stop took the wrong alarms down"
+  "$OPT/notice.sh" clear switched >/dev/null
+  [ ! -e $D/c1/notice.d/switch ] || fail "the failed switch's alarm stayed once he switched"
+  # The probe: Home Assistant's automation only notes its time, nobody is notified.
+  "$OPT/notice.sh" probe >/dev/null 2>&1 || fail "the probe didn't go"
+  grep -q "\"state\":\"test\",\"group\":\"probe\",\"alarm\":\"probe\"" /fp/hook.log && [ -s $D/c1/notice-probed ] || fail "the probe isn't in Home Assistant's log or on record"
+  sleep 0.2; kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
+  ! grep -qF "$hook" /fp/cmdlines || fail "the hook was on a command line"
+  grep -q "18123" /fp/cmdlines || fail "the command lines weren't watched"
+  # While it's set, the hook is a secret value like the App's keys: uid 1000 can read it nowhere,
+  # by the start's own check (which counts it among them) and by a search of its own.
+  command -v flock >/dev/null || fail "no flock in the image: the alarms take its lock"
+  mv /fp/discord.env.away $D/link/discord.env
+  "$OPT/c1/lock.sh" verify || fail "the start's check doesn't hold with the hook set"
+  hits="$(setpriv --reuid=1000 --regid=1000 --init-groups grep -rlF -D skip -e "$hook" $D /run /tmp /var/tmp /etc /root /home 2>/dev/null || true)"
+  [ -z "$hits" ] || fail "uid 1000 can read the hook in $(printf '%s' "$hits" | head -n 2 | tr '\n' ' ')"
+  # Back as it was, for the final checks.
+  cp /fp/options.before $D/options.json && chmod 0600 $D/options.json
+  rm -f $D/c1/check-held $D/c1/notice-probed /fp/hook.log
+  note "alarms reached Home Assistant with Discord down ($(wc -l < /fp/check.out) lines from the check)"
+  ;;
 plant-connector)
   # The old way recorded a claude.ai connector of his (the run script's connector check): CI has
   # no sign-in, so it can't load under his new rules, and the switch must undo itself.
@@ -237,5 +316,5 @@ legacy-here)
   [ ! -e $D/c1/journal ] || fail "a journal was begun in the old session's container"
   echo "rc=$rc"
   ;;
-*) fail "usage: in.sh points|template|switch [point]|final|plant-connector|unplant-connector|unlist-connectors|journal-there|legacy-here" ;;
+*) fail "usage: in.sh points|template|switch [point]|final|alarm|plant-connector|unplant-connector|unlist-connectors|journal-there|legacy-here" ;;
 esac

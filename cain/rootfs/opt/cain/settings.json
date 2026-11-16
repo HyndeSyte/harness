@@ -62,6 +62,8 @@
   },
   "syncClaudeAiPlugins": false,
   "env": { "CLAUDE_CODE_SYNC_PLUGIN_INSTALL": "1" },
+  "skillOverrides": { "auto-mode-setup": "off" },
+  "promptSuggestionEnabled": false,
   "hooks": {
     "PreToolUse": [
       {

@@ -24,15 +24,44 @@ cd /
 export TMPDIR=/run/cain/root-tmp CAIN_ROOT_TMP=/run/cain/root-tmp
 OPT=/opt/cain
 SOCK_TMUX=/run/cain/tmux/cain.sock
+# Should this start ever end (a step it can't get past, or a fault in it), the finish script
+# halts the container: Dane hears it from root first (notice.sh; C1 second review). Not when a
+# signal ends it, as when the Supervisor stops or updates the App.
+trap 'rc=$?; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
 
 relay() { printf '%s\n' "$(jq -cn --arg t "$1" '{text: $t}')" >> /data/relay.queue; }
-stopped_why=""; switch_stopped=""; restart_first=""; check_stopped=""
+# Each failed try of the switch reaches Dane from root (notice.sh; C1 second review: the first
+# included, not only the third) and Cain for the laptop session, once, and as he really runs
+# after it: the old way (told), or as his own user (a later try went through: Cain only).
+# /data/c1/failed-told counts the tries told, and moves on only once the alarm was kept, so a
+# try whose alarm couldn't be (the lock busy, a write failed) is told again: by the old way's
+# loop every 10 minutes, and at the next start. 1 when it couldn't be told yet.
+tell_failed_switch() {
+  local now=0 told why kind
+  case "$mode" in old|own) ;; *) return 0 ;; esac            # stopped: his stop's own alarm says why
+  [ ! -f /data/c1/failed ] || now="$(wc -l < /data/c1/failed 2>/dev/null | tr -cd '0-9')"; [ -n "$now" ] || now=0
+  told="$(head -c 20 /data/c1/failed-told 2>/dev/null | tr -cd '0-9' || true)"
+  [ "$now" -gt "${told:-0}" ] || return 0
+  why="$(tail -n 1 /data/c1/failed 2>/dev/null | cut -d' ' -f2- | tr -d '\r\n' | cut -c1-200 || true)"
+  if [ "$mode" = old ]; then
+    if bun "$OPT/c1/tools.ts" may-retry /data/c1/failed; then kind=switch-failed; else kind=switch-waits; fi
+    "$OPT/notice.sh" tell "$kind" "$why" || return 1
+    relay "The Cain App tried to switch you to your own user and it didn't pass its checks ($why), so you run the old way for now; the App told Dane itself. File it as a note on P33 for the laptop session. Nothing to tell him."
+  elif [ "$mode" = own ]; then
+    relay "The Cain App switched you to your own user after a try that didn't pass its checks ($why). File it as a note on P33 for the laptop session. Nothing to tell him."
+  fi
+  printf '%s\n' "$now" > /data/c1/failed-told
+}
+# Why he isn't started, when he isn't: stopped_why for the log, stop_kind for Dane's alarm
+# (notice.sh: every stop tells him, from root, with the way back). held: his session waits for
+# the check of his own user to finish (c1/check.sh), everything else running.
+stopped_why=""; stop_kind=""; stop_cause=""; switch_stopped=""; restart_first=""; check_stopped=""; held=""
 # This App's version, for a failed check of his own user (c1/check.sh): it keeps him stopped only
 # on the version it failed on. bashio asks the Supervisor; "unknown" if it can't say.
 version="$(bashio::addon.version 2>/dev/null || true)"; [ -n "$version" ] || version=unknown
 if ! "$OPT/c1/lock.sh" run; then
   bashio::log.error "Couldn't set up /run/cain; Cain doesn't start until that's fixed"
-  mode=none
+  mode=none; stop_kind=setup; stopped_why="the App couldn't set up /run/cain"
 else
   # bashio runs this with errexit: every status is caught where it's read ("|| rc=$?",
   # "|| true"), or one non-zero answer would end the whole start (tests/test_addon.py).
@@ -44,41 +73,61 @@ else
          if [ -f /data/c1/check-failed ]; then
            failed_on="$(head -c 200 /data/c1/check-failed | cut -d' ' -f1)"
            if [ "$failed_on" = "$version" ] || [ "$version" = unknown ]; then
-             mode=none; check_stopped=1
+             mode=none; check_stopped=1; stop_kind=breach
              stopped_why="a check of his own user found a breach: $(head -c 400 /data/c1/check-failed | cut -d' ' -f2-)"
-           else rm -f /data/c1/check-failed /data/c1/check-told; fi
+           else rm -f /data/c1/check-failed; fi
+         fi
+         # A check that couldn't finish holds his session (c1/check.sh; not a breach): everything
+         # runs as the new way does but his session and check-ins, and the check is tried again
+         # every 10 minutes until it finishes (hold, below). A new version starts afresh.
+         if [ "$mode" = own ] && [ -f /data/c1/check-held ]; then
+           held_on="$(head -c 200 /data/c1/check-held | cut -d' ' -f1)"
+           if [ "$held_on" = "$version" ] || [ "$version" = unknown ]; then held=1
+           else rm -f /data/c1/check-held; fi
          fi ;;
     fresh|switching)
       mode=old
       if [ "$state" = switching ] || [ -f /data/link/specialist-signs ]; then
         bashio::log.info "Switching Cain to his own user (state $state)"
-        tries_before="$(wc -l < /data/c1/failed 2>/dev/null || echo 0)"
         for try in 1 2 3; do
           rc=0; "$OPT/c1/cutover.sh" || rc=$?
           case "$rc" in
             0) mode=own; break ;;
-            2) mode=none; switch_stopped=1; stopped_why="the switch to his own user stopped part way"; break ;;
+            2) mode=none; switch_stopped=1; stop_kind=switch-stopped; stopped_why="the switch to his own user stopped part way"; break ;;
             3) mode=old; break ;;
-            4) mode=none; restart_first=1; stopped_why="a validation ran as his user in this container, so it waits for a new one"; break ;;
+            4) mode=none; restart_first=1; stop_kind=switch-restart; stopped_why="a validation ran as his user in this container, so it waits for a new one"
+               stop_cause="$(tail -n 1 /data/c1/failed 2>/dev/null | cut -d' ' -f2- | tr -d '\r\n' | cut -c1-200 || true)"; break ;;
+            1) ;;
+            # Any other end (it couldn't run, or was killed: C1 fourth outside round). Begun and
+            # not undone, the state isn't fresh, and that stops him (below). Still fresh, nothing
+            # was begun, so the old way is whole: he runs it, and the try is on record as failed,
+            # so Dane hears it as any failed try, with its cause, and it isn't tried again here.
+            *) if [ "$("$OPT/c1/state.sh")" = fresh ]; then
+                 # Its record is what tells Dane: a try that can't be put on record stops him
+                 # instead, with its own alarm (C1 fifth outside round).
+                 if [ -f /data/c1/failed ] || [ ! -e /data/c1/failed ]; then
+                   { printf '%s the switch ended with %s before it began\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" >> /data/c1/failed; } 2>/dev/null \
+                     && { bashio::log.warning "The switch ended with $rc before it began: Cain runs the old way for now"; break; }
+                 fi
+                 mode=none; switch_stopped=1; stop_kind=switch-blocked; stop_cause="the switch ended with $rc before it began"
+                 stopped_why="the switch ended with $rc before it began, and that couldn't be put on record"; break
+               fi ;;
           esac
           # Not switched: the old layout is whole again. Once more only while it may be tried.
-          if [ "$("$OPT/c1/state.sh")" != fresh ]; then mode=none; switch_stopped=1; stopped_why="the switch was undone but the state isn't fresh"; break; fi
+          if [ "$("$OPT/c1/state.sh")" != fresh ]; then mode=none; switch_stopped=1; stop_kind=switch-stopped; stopped_why="the switch was undone but the state isn't fresh"; break; fi
           [ -f /data/link/specialist-signs ] && bun "$OPT/c1/tools.ts" may-retry /data/c1/failed || break
         done
-        if [ "$mode" = old ] && [ "$rc" = 1 ]; then
-          bashio::log.warning "Not switched (above): Cain runs the old way for now"
-          # Told once per attempt that ran and failed, not at every start that only waits.
-          if [ "$(wc -l < /data/c1/failed 2>/dev/null || echo 0)" -gt "$tries_before" ]; then
-            relay "The Cain App tried to switch you to your own user and it didn't pass its checks, so you run the old way for now (the App log says why; it tries again by itself, at most three times in six hours). File it as a note on P33 for the laptop session. Nothing to tell him."
-          fi
-        fi
+        [ "$mode" != old ] || [ "$rc" != 1 ] || bashio::log.warning "Not switched (above): Cain runs the old way for now"
+        # A failed try is told once the way he runs has passed its checks (below). A try that
+        # waits for a new container (exit 4) raises its own stop alarm, with the cause, at once;
+        # the start in the next container tells the failed try as he then runs.
       fi ;;
-    *) mode=none; stopped_why="Cain's start state is damaged (/data/c1)" ;;
+    *) mode=none; stop_kind=damaged; stopped_why="Cain's start state is damaged (/data/c1)" ;;
   esac
 fi
 case "$mode" in
   own) if ! "$OPT/c1/lock.sh" managed || ! "$OPT/c1/lock.sh" data || ! "$OPT/c1/lock.sh" verify; then
-         mode=none; stopped_why="his rules, file modes or what he can read didn't check out"
+         mode=none; held=""; stop_kind=setup; stopped_why="his rules, file modes or what he can read didn't check out"
        fi ;;
   old) # The old root session may run only once this container is on record as one it ran in:
        # the switch never begins in such a container (c1/cutover.sh), so no process of the old
@@ -86,18 +135,29 @@ case "$mode" in
        # uid 1000 ran (a validation): what it left behind mustn't meet the old root session.
        cid="$(bun "$OPT/c1/tools.ts" container-id 2>/dev/null || true)"
        if [ -z "$cid" ] || { [ -f /data/c1/uid1000-ran ] && [ "$(head -c 200 /data/c1/uid1000-ran)" = "$cid" ]; }; then
-         mode=none; restart_first=1; stopped_why="a validation ran as his user in this container, so the old way waits for a new one"
+         mode=none; restart_first=1; stop_kind=restart; stopped_why="a validation ran as his user in this container, so the old way waits for a new one"
        elif ! "$OPT/c1/lock.sh" old; then
-         mode=none; stopped_why="the old way's rules couldn't be set up and checked"
+         mode=none; stop_kind=setup; stopped_why="the old way's rules couldn't be set up and checked"
        elif ! { install -d -m 0700 -o root -g root /data/c1 \
                 && bun "$OPT/c1/tools.ts" write-state /data/c1/legacy-ran "$cid"; }; then
-         mode=none; stopped_why="this container couldn't be put on record before the old way"
+         mode=none; stop_kind=setup; stopped_why="this container couldn't be put on record before the old way"
        fi
        [ "$mode" != old ] || [ -f /data/c1/a-since ] || date +%s > /data/c1/a-since ;;
 esac
+# A failed try of the switch is told only now the way he runs has passed its checks, the old way
+# or as his own user (C1 fifth outside round: never "he still answers" before that's so).
+if [ "$mode" = old ] || [ "$mode" = own ]; then
+  tell_failed_switch || bashio::log.warning "A failed try of the switch couldn't be told yet: tried again in 10 minutes"
+fi
 [ -z "$stopped_why" ] || bashio::log.error "Cain isn't started: $stopped_why (above)"
-printf '%s\n' "$mode" > /run/cain/mode.tmp && chmod 0644 /run/cain/mode.tmp && mv /run/cain/mode.tmp /run/cain/mode
-bashio::log.info "Cain's start: ${mode/own/as his own user}"
+# A stop is told at once, before any later step here can fail and end the start first (C1
+# second review), a stop that waits for the Supervisor's restart included.
+if [ "$mode" = none ]; then "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_cause" || true; fi
+{ printf '%s\n' "$mode" > /run/cain/mode.tmp && chmod 0644 /run/cain/mode.tmp && mv /run/cain/mode.tmp /run/cain/mode; } \
+  || bashio::log.error "Couldn't write /run/cain/mode"
+bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session held until the check of his own user finishes}"
+# The App's alarms to Dane (notice.sh): their daily repeats and retries, whatever the mode.
+( while true; do sleep 600; "$OPT/notice.sh" tick 2>&1 || true; done ) &
 
 # What each way of running reads where. The old way keeps 0.11.0's places; the new one the
 # places of C1's section 3.2.
@@ -151,28 +211,91 @@ if [ "$mode" = own ]; then
   ( while true; do bun "$OPT/discord/broker-main.ts" 2>&1; sleep 2; done ) &
 fi
 
+# Every tmux call is bounded: a hung tmux can't hold the start, or keep him running past a stop.
 start_session() {
   if [ "$mode" = own ]; then
-    "$OPT/as-cain" env CAIN_MODE=own tmux -u -S "$SOCK_TMUX" kill-session -t cain 2>/dev/null || true
-    "$OPT/as-cain" env CAIN_MODE=own tmux -u -S "$SOCK_TMUX" new-session -d -s cain -x 120 -y 40 "$OPT/session.sh"
+    timeout 20 "$OPT/as-cain" env CAIN_MODE=own tmux -u -S "$SOCK_TMUX" kill-session -t cain 2>/dev/null || true
+    timeout 20 "$OPT/as-cain" env CAIN_MODE=own tmux -u -S "$SOCK_TMUX" new-session -d -s cain -x 120 -y 40 "$OPT/session.sh"
   else
-    tmux -u kill-session -t cain 2>/dev/null || true   # bashio runs with errexit
-    CAIN_MODE=old tmux -u new-session -d -s cain -x 120 -y 40 "$OPT/session.sh"
+    timeout 20 tmux -u kill-session -t cain 2>/dev/null || true   # bashio runs with errexit
+    CAIN_MODE=old timeout 20 tmux -u new-session -d -s cain -x 120 -y 40 "$OPT/session.sh"
   fi
 }
-has_session() { $TMUX_CMD -u has-session -t cain 2>/dev/null; }
-
-if [ "$mode" != none ]; then
+# His user's processes, as /proc has them: what shows nothing of his runs, with no need of tmux's
+# answer (a tmux that fails or hangs is no proof of anything: C1 third outside round).
+his_procs() {
+  local p st
+  for p in "${C1_PROC_ROOT:-/proc}"/[0-9]*; do
+    # A process whose status can't be read while it's still there counts as one of his: no
+    # proof it isn't (C1 fourth outside round). One that went away meanwhile doesn't.
+    st="$(cat "$p/status" 2>/dev/null)" || { [ ! -e "$p" ] || echo "${p##*/}?"; continue; }
+    case " $(printf '%s\n' "$st" | awk '/^Uid:/{print $2, $3, $4, $5; exit}') " in
+      *" 1000 "*) case "$(printf '%s\n' "$st" | awk '/^State:/{print $2; exit}')" in Z|X) ;; *) echo "${p##*/}" ;; esac ;;
+    esac
+  done
+}
+# His session ended, and shown ended. His own user's session (the new way, or stopped after it):
+# tmux first, then every process of his user (which takes his tmux server with it), until /proc
+# shows none of his, three tries. The old way's root session: tmux, which must then answer that
+# there is no such session. 1 when it can't be shown ended.
+end_his_session() {
+  timeout 10 $TMUX_CMD -u kill-session -t cain 2>/dev/null || true
+  if [ "$TMUX_CMD" != tmux ]; then
+    local i
+    for i in 1 2 3; do
+      [ -n "$(his_procs)" ] || return 0
+      timeout 10 setpriv --reuid=1000 --regid=1000 --clear-groups bash -c 'kill -9 -1' 2>/dev/null || true
+      sleep 1
+    done
+    [ -n "$(his_procs)" ] || return 0
+    bashio::log.error "Processes of his user still run after his session was ended: $(his_procs | head -n 3 | tr '\n' ' ')"
+    return 1
+  fi
+  local rc=0
+  timeout 10 tmux -u has-session -t cain 2>/dev/null || rc=$?
+  [ "$rc" != 1 ] || return 0                     # tmux answered: no such session, or no server
+  bashio::log.error "His session can't be shown ended (tmux answered $rc)"
+  return 1
+}
+# When his session can't be shown ended, nothing of the App goes on: the start ends, its exit
+# trap tells Dane, and the finish script halts the container, so no process of his outlives it.
+# The one exit of the start, and on purpose.
+fail_closed() { bashio::log.error "Cain couldn't be shown stopped, so the App stops itself"; exit 1; }
+# Whether his session runs, for the start's own loops: yes only on tmux's yes. A no counts once
+# no process of his user is left over (those are ended, as for a stop). Anything else, a hung or
+# failed tmux included, is no proof either way (C1 fourth outside round): his session is ended
+# and shown ended (or the App stops), and it counts as ended, so it's started again and checked
+# again, never left running unchecked.
+session_up() {
+  local rc=0
+  timeout 10 $TMUX_CMD -u has-session -t cain 2>/dev/null || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) if [ "$TMUX_CMD" != tmux ] && [ -n "$(his_procs)" ]; then
+         bashio::log.warning "Processes of his user run with no session of his: ending them"
+         end_his_session || fail_closed
+       fi
+       return 1 ;;
+    *) bashio::log.warning "tmux didn't say whether his session runs ($rc): ending it"
+       end_his_session || fail_closed
+       return 1 ;;
+  esac
+}
+# His session. A start that doesn't take returns 1, never ends this script: the foreground loop
+# below starts it again, later each time, and tells Dane if it keeps failing (session_ended).
+start_his_session() {
   bashio::log.info "Starting Cain"
-  if ! start_session; then bashio::log.error "tmux could not start"; exit 1; fi
+  if ! start_session; then bashio::log.error "tmux could not start"; return 1; fi
   sleep 3
-  if ! has_session; then
+  if ! session_up; then
     bashio::log.error "Cain's session ended at once. Its last output:"
-    bun "$OPT/owned.ts" tail /data/session.log 20 2>/dev/null || tail -n 20 /data/session.log 2>/dev/null
-    exit 1
+    bun "$OPT/owned.ts" tail /data/session.log 20 2>/dev/null || tail -n 20 /data/session.log 2>/dev/null || true
+    return 1
   fi
   bashio::log.info "Cain is running"
-fi
+}
+
+if [ "$mode" != none ] && [ -z "$held" ]; then start_his_session || true; fi
 
 # The message gate's self-test, once at each start: the old way runs the reply hook as
 # Claude Code does; the new way runs the broker's gate.
@@ -199,11 +322,13 @@ list_connectors() {
   { echo listed; [ -z "$names" ] || printf '%s\n' "$names"; } > /data/c1/connectors-before.tmp && chmod 0600 /data/c1/connectors-before.tmp \
     && mv /data/c1/connectors-before.tmp /data/c1/connectors-before || echo "[cain] connector: couldn't keep the listing for the switch"
 }
-if [ "$mode" != none ]; then
+# What runs with his session, each time it starts (again after a hold too): the listing of his
+# connectors. The new way's check of his own user runs in the foreground loop below, one try at
+# a time, for the session it started with.
+with_session() {
   ( sleep 30; list_connectors ) &
-  # The c1 check (the new way): root runs it as cain and keeps its result (c1/check.sh).
-  if [ "$mode" = own ]; then ( sleep 45; SOCK_TMUX="$SOCK_TMUX" C1_VERSION="$version" "$OPT/c1/check.sh" 2>&1 | tail -n 1 ) & fi
-fi
+}
+if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
 ( while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done ) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the
@@ -232,10 +357,16 @@ fi
   while true; do bun "$OPT/review/main.ts" 2>&1; sleep 10; done
 ) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM. checkin.sh decides when, and
-# only types into an idle session (through as-cain, the new way).
-if [ "$mode" != none ]; then ( while true; do "$OPT/checkin.sh" || true; sleep 5; done ) & fi
+# only types into an idle session (through as-cain, the new way). Started once, with his session.
+checking_in=""
+checkins() {
+  if [ -n "$checking_in" ]; then return 0; fi
+  checking_in=1; ( while true; do "$OPT/checkin.sh" || true; sleep 5; done ) &
+}
+if [ "$mode" != none ] && [ -z "$held" ]; then checkins; fi
 # The sign-in page and the yes/no status page, for the panel: root's, served by nginx only.
-printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /run/cain/www/signin.html
+printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /run/cain/www/signin.html \
+  || bashio::log.error "Couldn't write the sign-in page"
 (
   while true; do
     screen=$($TMUX_CMD -u capture-pane -p -J -t cain -S -400 2>/dev/null || true)
@@ -247,12 +378,16 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     flag() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
     paired() { tr -d ' \n' < "$ACCESS_FILE" | grep -q '"allowFrom":\["'; }
     last=$(printf '%s\n' "$screen" | tail -n 30)
+    # His prompt or a screen waiting for an answer, read as checkin.sh reads it (prompt-state.sh,
+    # which never fails; || for an unforeseen one, since this loop runs under errexit).
+    at=$(printf '%s\n' "$screen" | "$OPT/prompt-state.sh" 2>/dev/null) || at=other
     state=unknown
     if printf '%s\n' "$last" | tail -n 12 | grep -Eqi 'run /login|token has expired|authentication_error|invalid api key|not logged in'; then state=login_needed
     elif printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
     elif printf '%s' "$last" | grep -Eqi 'do you trust|trust the files'; then state=trust_prompt
     elif printf '%s' "$last" | grep -Eqi 'select login|login method|choose the text style|dark mode'; then state=first_run_menu
-    elif printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode'; then state=ready
+    elif [ "$at" = ready ]; then state=ready
+    elif [ "$at" = dialog ]; then state=dialog
     fi
     printf '{"signed_in": %s, "discord_token": %s, "paired": %s, "allowlist": %s, "screen": "%s", "mode": "%s"}\n' \
       "$(flag test -s "$CRED")" \
@@ -280,39 +415,143 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
   done
 ) &
 
-if [ "$mode" = none ]; then
-  # Nothing of Cain's runs; the services above keep going (the link takes the specialist's
-  # signed cards and posts them by itself). A switch that stopped part way can't be fixed from
-  # here: his own notice, once, with the fix, which is the backup from before the update.
-  if [ -n "$check_stopped" ] && [ ! -f /data/c1/check-told ]; then
-    if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain is stopped: a safety check of his own user failed after his update, so he won't run until a fixed update arrives. To get him back now, restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups."; then
-      touch /data/c1/check-told
-    fi
-  fi
-  if [ -n "$switch_stopped" ] && [ ! -f /data/c1/stopped-told ] && [ -d /data/c1 ]; then
-    if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain is stopped: his move to a safer setup didn't finish. To get him back, restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups."; then
-      touch /data/c1/stopped-told
-    fi
-  fi
-  # Waiting for a new container: ask the Supervisor for it, every 10 minutes until it comes.
+# A stop or a hold the check of his own user recorded at an earlier start: in /data/c1, or, when
+# /data couldn't be written, in /run/cain for this container (c1/check.sh). Within a start, the
+# check's exit status is the authority (run_check).
+mark_why() { { head -c 400 "/data/c1/$1" 2>/dev/null || head -c 400 "/run/cain/$1" 2>/dev/null; } | cut -d' ' -f2- | tr -d '\r\n' || true; }
+breach_stop() {
+  held=""; mode=none; check_stopped=1; stop_kind=breach; stop_cause=""
+  stopped_why="a check of his own user found a breach: $(mark_why check-failed)"
+  bashio::log.error "Cain isn't started: $stopped_why"
+}
+# No session of his may run while he's stopped or held: ended, and checked ended, again at every
+# turn of the loops below, should one have survived.
+no_session() { end_his_session || fail_closed; }
+# Held by the start itself: the check answered something other than all held or a breach, and
+# not a try to make again within its five (a check that didn't run, or ran wrong: C1 third
+# outside round). His session ended and shown ended; the hold recorded with why, as the check
+# would have (it didn't).
+held_now() {   # held_now <why, when the check didn't record it>
+  end_his_session || fail_closed
+  held=1
+  [ -n "$1" ] || return 0
+  bashio::log.error "His session is held: $1"
+  { printf '%s %s\n' "$version" "$1" > /data/c1/check-held.tmp && chmod 0600 /data/c1/check-held.tmp \
+      && mv /data/c1/check-held.tmp /data/c1/check-held; } 2>/dev/null \
+    || { printf '%s %s\n' "$version" "$1" > /run/cain/check-held; } 2>/dev/null || true
+}
+# Not started: nothing of Cain's runs; the services above keep going (the link takes the
+# specialist's signed cards and posts them by itself). Every stop tells Dane why and the way
+# back, from root, through his bot and Home Assistant (notice.sh; C1 second review): no stop is
+# silent. It's raised again at every turn (every 10 minutes while it waits for the Supervisor's
+# restart, else hourly), so an alarm whose state couldn't be kept, or whose lock was busy, isn't
+# lost. Never returns.
+stopped() {
+  no_session
+  "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_cause" || true
   if [ -n "$restart_first" ]; then
     while true; do
       bashio::log.info "Asking the Supervisor to restart this App: $stopped_why"
       bashio::addon.restart || bashio::log.warning "The Supervisor didn't take the restart; asking again in 10 minutes"
       sleep 600
+      no_session
+      "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_cause" || true
     done
   fi
   # Stay up, so the App isn't restarted over and over, and say so hourly.
-  while true; do sleep 3600; bashio::log.warning "Cain still isn't started: ${stopped_why:-see the start of this log}"; done
-fi
-# Stay in the foreground while his session lives. The new way restarts his session when its
-# channel has been down 90 seconds (the broker says so in discord.state). The old way:
+  while true; do
+    sleep 3600
+    bashio::log.warning "Cain still isn't started: ${stopped_why:-see the start of this log}"
+    no_session
+    "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_cause" || true
+  done
+}
+# His session held: the check of his own user couldn't finish (c1/check.sh; not a breach). Dane
+# hears it's a pause, from root. The check is tried again every 10 minutes without his session
+# (the first a minute in, once the link is up); when it finishes, the loop below starts his
+# session, and the full check runs again with it. A breach found meanwhile stops him here.
+hold() {
+  local why wait="${C1_HELD_FIRST_S:-60}" line hrc
+  why="$(mark_why check-held)"
+  bashio::log.warning "Cain's session is held: the check of his own user couldn't finish (${why:-see above})"
+  no_session
+  "$OPT/notice.sh" tell held || true
+  while true; do
+    sleep "$wait"; wait="${C1_HELD_EVERY_S:-600}"
+    no_session
+    hrc=0
+    line="$(SOCK_TMUX="$SOCK_TMUX" C1_VERSION="$version" C1_HELD=1 C1_CHECK_TRIES=1 "$OPT/c1/check.sh" 2>&1)" || hrc=$?
+    echo "${line##*$'\n'}"
+    case "$hrc" in
+      3) breach_stop; return 0 ;;
+      0) held=""; bashio::log.info "The check of his own user finished: his session starts again"
+         relay "Your session was held because the check of your own user couldn't finish (${why:-see the App log}); it has now, and you're back. The App told Dane itself. File it as a note on P33 for the laptop session. Nothing to tell him."
+         return 0 ;;
+    esac
+    "$OPT/notice.sh" tell held || true
+  done
+}
+# The check of his own user, for the session it runs with (the new way), one try at a time:
+# first 45 seconds after the session starts, then a minute apart while what it tries isn't there
+# yet (the link starting), five tries in all; the fifth that still can't try everything holds
+# him. Run here, in the foreground, never in the background, so a check always belongs to the
+# session it checks and never overlaps another. Sets crc: 0 all held, 3 a breach, 4 held, 5 try
+# again.
+run_check() {   # run_check <the last try: 0 or 1>
+  local line untried=retry
+  [ "$1" = 1 ] && untried=hold
+  crc=0
+  line="$(SOCK_TMUX="$SOCK_TMUX" C1_VERSION="$version" C1_UNTRIED="$untried" C1_CHECK_TRIES=1 "$OPT/c1/check.sh" 2>&1)" || crc=$?
+  echo "${line##*$'\n'}"
+}
+# His session ended, or wouldn't start, for a reason of its own (not the check's): it's started
+# again here, never by ending this script, 10 seconds later, doubling while it keeps ending within
+# two minutes, up to 10 minutes; at the third such end in a row Dane hears it (the App keeps
+# trying), and a session that has run two minutes (and passed its check) takes the alarm down.
+quick=0
+session_ended() {
+  quick=$((quick + 1))
+  if [ "$quick" -ge 3 ]; then "$OPT/notice.sh" tell session || true; fi
+  local wait=10 i
+  for ((i = 1; i < quick && wait < 600; i++)); do wait=$((wait * 2)); done
+  [ "$wait" -le 600 ] || wait=600
+  bashio::log.warning "Starting his session again in $wait seconds"
+  sleep "$wait"
+}
+# Stay in the foreground while he runs, his session started again whenever it ends. The check of
+# his own user runs here (run_check), and its answer acts at once: a breach stops him and a check
+# that can't finish holds him, with his session ended and checked ended (end_his_session), in
+# this container. The new way also restarts his session when its channel has been down 90
+# seconds since it started (the broker says so in discord.state). The old way:
 #   - once the specialist signs, asks the Supervisor to restart this App (a new container, so
 #     nothing of the old root session survives into the switch), every 10 minutes until it does;
 #   - 30 minutes after this App first ran the old way with no signed request, tells Cain once
 #     that the calendar App's update didn't happen, with the fix.
-asked=0; listed_at=$(date +%s)
-while has_session; do
+# After two minutes of running, and his check passed (the new way), a stop's or a pause's alarm
+# comes down (as his own user, any alarm).
+asked=0; listed_at=$(date +%s); told_at=$(date +%s)
+while true; do
+if [ -n "$held" ]; then hold; fi
+if [ "$mode" = none ]; then stopped; fi
+if ! session_up; then
+  if start_his_session; then with_session; checkins; else session_ended; continue; fi
+fi
+up_since=$(date +%s); cleared=""; check_tries=0; check_due=$(( up_since + ${C1_CHECK_FIRST_S:-45} )); checked=""
+[ "$mode" = own ] || checked=1
+while session_up; do
+  if [ -z "$checked" ] && [ "$(date +%s)" -ge "$check_due" ]; then
+    check_tries=$((check_tries + 1))
+    if [ "$check_tries" -ge 5 ]; then run_check 1; else run_check 0; fi
+    case "$crc" in
+      0) checked=1 ;;
+      3) "$OPT/notice.sh" tell breach || true                         # first: a stop that fails closed keeps it
+         end_his_session || fail_closed; breach_stop; break ;;
+      4) held_now ""; break ;;
+      5) if [ "$check_tries" -lt 5 ]; then check_due=$(( $(date +%s) + ${C1_CHECK_EVERY_S:-60} ))
+         else held_now "the check still asked to be tried again after its fifth try"; break; fi ;;
+      *) held_now "the check ended with $crc"; break ;;
+    esac
+  fi
   # The old way: no listing of his connectors went through yet, so it lists again (above).
   if [ "$mode" = old ] && [ "$(head -n 1 /data/c1/connectors-before 2>/dev/null || true)" != listed ] \
      && [ $(( $(date +%s) - listed_at )) -ge 600 ]; then
@@ -331,18 +570,27 @@ while has_session; do
     relay "The calendar App still uses its old key 30 minutes after this App's update, so its update didn't happen or didn't finish. Its cards wait at the link, none lost, and you stay on the old way until it updates. Show him a new Ship card for the same pull request and head (this App's part is already installed, so his tap installs the calendar App's), and file a note on P33 for the laptop session."
     touch /data/c1/a-relayed
   fi
+  # A failed try of the switch whose alarm couldn't be kept at the start: tried again every 10
+  # minutes until it is (tell_failed_switch).
+  if [ "$mode" = old ] && [ $(( $(date +%s) - told_at )) -ge 600 ]; then told_at=$(date +%s); tell_failed_switch || true; fi
   if [ "$mode" = own ] && [ -f /run/cain/discord.state ]; then
     st=""; at=""
     read -r st at < /run/cain/discord.state || true
     at="$(printf '%s' "$at" | tr -cd '0-9')"
-    if [ "$st" = down ] && [ -n "$at" ] && [ $(( $(date +%s) - at )) -gt 90 ]; then
+    if [ "$st" = down ] && [ -n "$at" ] && [ $(( $(date +%s) - at )) -gt 90 ] && [ $(( $(date +%s) - up_since )) -gt 90 ]; then
       bashio::log.warning "Cain's Discord channel has been down 90 seconds: restarting his session"
-      $TMUX_CMD -u kill-session -t cain 2>/dev/null || true
+      end_his_session || fail_closed
       break
     fi
   fi
+  if [ -z "$cleared" ] && [ -n "$checked" ] && [ $(( $(date +%s) - up_since )) -ge 120 ]; then
+    cleared=1; quick=0
+    if [ "$mode" = own ]; then "$OPT/notice.sh" clear switched || true; else "$OPT/notice.sh" clear running || true; fi
+  fi
   sleep 10
 done
+if [ "$mode" = none ] || [ -n "$held" ]; then continue; fi
 bashio::log.warning "Cain's session ended. Its last output:"
 bun "$OPT/owned.ts" tail /data/session.log 20 2>/dev/null || true
-exit 1
+session_ended
+done
