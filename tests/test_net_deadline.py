@@ -77,3 +77,14 @@ def test_no_deadline_outside_a_write():
         with net.deadline(10):
             assert net.remaining() <= 5                  # an inner deadline never extends the outer
     assert net.remaining() is None
+
+
+def test_a_connect_that_times_out_is_a_timeout_even_with_no_deadline(monkeypatch):
+    # Eleventh round: urllib wraps a connect timeout in URLError; it was said as a network failure unless the
+    # deadline's timer happened to fire first (a race CI hit).
+    def times_out(address, timeout=None, *rest, **kw):
+        raise socket.timeout("timed out")
+    monkeypatch.setattr(socket, "create_connection", times_out)
+    with pytest.raises(TransportError) as e:
+        UrllibTransport(use_env_proxy=False).request("PUT", "http://calendar.invalid/x", body=b"x", timeout=20)
+    assert e.value.kind == "timeout"

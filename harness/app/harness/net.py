@@ -263,6 +263,10 @@ class UrllibTransport:
             raise TransportError("tls", type(e).__name__) from None
         except urllib.error.URLError as e:
             reason = e.reason
+            if isinstance(reason, (socket.timeout, TimeoutError)):
+                # urllib wraps a connect that timed out: it's a timeout, whichever ends first, the
+                # connect or the deadline's timer (eleventh round: CI saw that race).
+                raise TransportError("timeout") from None
             raise TransportError("network", type(reason).__name__
                                  if not isinstance(reason, str) else "unreachable") from None
         except (ConnectionError, OSError) as e:
