@@ -62,6 +62,10 @@
 - After a restart, held taps, late buttons and the "Not taken yet" line wait until the record has checked with GitHub again since that restart; an old "checked" note left from before a restart or a restore no longer counts. Your recover line never counts as that check, and "install taps on" waits for it too.
 - Once the record has checked, every card still showing buttons is checked again before any waiting line clears; one that no longer holds up says it was withdrawn.
 - A held tap that may not have reached Cain after a restart gets one line on its card asking you to answer again on a fresh card, if nothing came of it within 10 minutes.
+- That line now goes after 10 minutes by the App's own stopwatch, not the Pi's clock, and once it is up the old answer can't be acted on late: if Cain tries, the card says so.
+- If you send your "recover logs" or "install taps on" line while the App was offline, you get one line saying it arrived while the App was offline, with a fresh code. A line that came too late always gets its fresh code too, even when the Pi's clock is off.
+- After a restart of the App while GitHub is out of reach, a card whose buttons wait gets one line saying it is still waiting (after 5 minutes), and its buttons come back by themselves once the record has checked, with no restart of the record needed.
+- A question's or Ship card's time limit is fixed when it goes out, so a jump of the Pi's clock no longer moves it, and a tap is timed by Discord.
 - After a restore from a backup, a Ship card from before the restore loses its buttons and says Cain sends a new one; the look back over your messages picks up where it stopped after a restart, and old messages it reads never get a reply.
 - A held tap that a restart cut off in the middle of being passed to Cain reaches him once more only marked as a repeat, or not at all if it was already acted on. After a restore, the App looks back over the last 100 days of your DM for cards it no longer knows.
 - One known gap, said plainly: if a tap was used while GitHub was down, and then the whole App is restored from a backup taken before it, a tap on that card can count again.

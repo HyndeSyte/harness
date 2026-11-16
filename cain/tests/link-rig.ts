@@ -82,7 +82,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const harnessDown = { down: false };                // the calendar specialist doesn't take taps
   // now: the Pi's clock (the link's); discord: how far Discord's own clock is from it (round 16: a Pi with no
   // real-time clock can be hours off until time sync), which every new message and interaction id carries.
-  const t = { now: opts.now ?? NOV11_8AM, discord: 0 };
+  // mono (round 17): the link's monotonic clock; null: it follows the Pi's clock (a test that steps the Pi's clock
+  // sets it on its own).
+  const t = { now: opts.now ?? NOV11_8AM, discord: 0, mono: null as number | null };
   const files: { pending: string | null; holds: string | null; checks?: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null, checks: null };
   const submitted: any[] = [];                    // requests the link handed the record keeper (source checks, one-offs)
   const outcomes: Record<string, { state: string; reason?: string }> = {};   // the keeper's outcome per request, once settled
@@ -210,7 +212,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     return null;
   };
   const deps = {
-    rest, load: () => (disk.corrupt !== null ? emptyState() : copy(state)),
+    rest, load: () => (disk.corrupt !== null ? emptyState() : copy(state)), mono: () => t.mono ?? t.now,
     save: (s: State) => { if (disk.failSaves > 0) { disk.failSaves--; throw new Error("ENOSPC: no space left on device"); } state = copy(s); disk.corrupt = null; disk.writes++; }, now: () => t.now,
     saveDurable: (s: State) => { durable.push({ run: s.run, nonce: s.runNonce }); state = copy(s); disk.corrupt = null; disk.writes++; },
     issuedLog, installLog, installResults, recoverFile, keeperMirror: opts.keeperMirror,

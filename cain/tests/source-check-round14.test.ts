@@ -143,7 +143,7 @@ describe("1. the start-time re-arm re-runs every arming check", () => {
     const id = await unarmedAsk(r);
     r.restart();
     verified(r);  // round 16: verified for the new link run
-    r.disk.failSaves = 1;
+    r.disk.failSaves = 2;  // round 17: the verification tuple's save comes first (it fails too, and is retried)
     await r.link.sweep();
     expect(r.buttons(id)).toEqual([]);
     expect(r.msg(id).content).toContain(CARD_WITHDRAWN);

@@ -375,7 +375,7 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // recover line accepted at the start check, waiting for its trailer.
   linesDone?: string[]; historyLines?: string[]; recoverLines?: { nonce: string; said: string }[];
   tapNotices?: TapNotice[] };
-type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold"; reason: string; msg?: string; at: string };
+type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold" | "superseded"; reason: string; msg?: string; at: string };
 const TAPS_KEPT = 1000;
 // Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
 // Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
@@ -439,15 +439,20 @@ function heldTap(cfg: Config, kid: string): { at: number; sf: number | null; hol
     const r = readLog<any>(linkHeldFile(cfg), { repair: false }).records.find((x) => x?.t === "held" && x.kid === kid);
     if (!r || !Number.isFinite(Number(r.at))) return null;
     const sf = typeof r.it === "string" ? snowflakeMs(r.it) : NaN;
-    const hs = Number(r.hold?.sf);
+    // Round 17: the hold's start is the snowflake of the Discord-stamped id the held record carries (the hold's
+    // first held interaction), never a time the link computed from a clock: a record without one has no floor.
+    const hs = typeof r.hold?.id === "string" ? snowflakeMs(r.hold.id) : NaN;
     return { at: Number(r.at), sf: Number.isFinite(sf) ? sf : null, holdSf: Number.isFinite(hs) ? hs : null };
   } catch { return null; }
 }
 // Round 16: a key's expiry as a snowflake time: its card's post snowflake plus the lifetime its record
 // carries (expiry less the time it was logged, both by the link's one clock); without a card id, its expiry.
-export function expirySf(k: { msg?: string; at?: number; exp?: number }): number | null {
+// Round 17: with the explicit lifetime (life, a duration fixed at issuance) its key record carries, the expiry is
+// the post snowflake plus that duration; only a key logged before round 17 falls back to expiry less logged time.
+export function expirySf(k: { msg?: string; at?: number; exp?: number; life?: number }): number | null {
   if (typeof k.exp !== "number" || !Number.isFinite(k.exp)) return null;
   const m = snowflakeMs(String(k.msg ?? ""));
+  if (Number.isFinite(m) && typeof k.life === "number" && Number.isFinite(k.life)) return m + k.life;
   return Number.isFinite(m) && typeof k.at === "number" && Number.isFinite(k.at) ? m + (k.exp - k.at) : k.exp;
 }
 function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }); }
@@ -455,27 +460,40 @@ function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appe
 // Round 12: the issued keys the keeper knows, from the link's issued-key log and its own mirror of it,
 // each with its card's item, kind, label, message id and target; keys older than ISSUED_KEEP_MS are
 // stale. runs: the link's run records ({run, nonce}) in the order logged.
-export type IssuedRec = IssuedTap & { kid: string; at: number; run?: number; nonce?: string; voided?: boolean; exp?: number };
+export type IssuedRec = IssuedTap & { kid: string; at: number; run?: number; nonce?: string; voided?: boolean; exp?: number; life?: number; superseded?: boolean };
 export function readIssued(cfg: Config, now: number): { keys: Map<string, IssuedRec>; runs: { run: number; nonce: string }[] } {
   const keys = new Map<string, IssuedRec>(), runs: { run: number; nonce: string }[] = [];
+  const files: [string, any[]][] = [];
   for (const f of [issuedMirrorFile(cfg), linkIssuedFile(cfg)]) {
     let recs: any[] = [];
     try { recs = readLog<any>(f, { repair: f === issuedMirrorFile(cfg) ? undefined : false }).records; } catch { /* unreadable: the other file */ }
+    files.push([f, recs]);
+  }
+  // Round 17: a key ages out by Discord's times (its card's post snowflake more than ISSUED_KEEP_MS before the newest
+  // card's in the logs), never by the Pi's clock; only a key with no card snowflake falls back to its logged time.
+  let newest = -Infinity;
+  for (const [, recs] of files) for (const r of recs) if (r?.t === "key") { const m = snowflakeMs(String(r.msg ?? "")); if (Number.isFinite(m) && m > newest) newest = m; }
+  for (const [f, recs] of files) {
     for (const r of recs) {
       if (r?.t === "run" && Number.isInteger(r.run) && typeof r.nonce === "string") { if (f === linkIssuedFile(cfg)) runs.push({ run: r.run, nonce: r.nonce }); continue; }
       if (r?.t !== "key" || !TAP_KEY.test(r.kid) || typeof r.item !== "string" || typeof r.kind !== "string") continue;
-      const at = Number(r.at);
-      if (Number.isFinite(at) && now - at > ISSUED_KEEP_MS) continue;
+      const at = Number(r.at), msf = snowflakeMs(String(r.msg ?? ""));
+      if (Number.isFinite(msf) ? newest - msf > ISSUED_KEEP_MS : (Number.isFinite(at) && now - at > ISSUED_KEEP_MS)) continue;
       if (!keys.has(r.kid)) keys.set(r.kid, { kid: r.kid, item: r.item, kind: r.kind, ...(typeof r.label === "string" ? { label: r.label } : {}),
         ...(typeof r.msg === "string" ? { msg: r.msg } : {}), ...(r.target && typeof r.target.item === "string" && Array.isArray(r.target.writes) ? { target: r.target } : {}),
         at: Number.isFinite(at) ? at : now, ...(Number.isInteger(r.run) ? { run: r.run } : {}), ...(typeof r.nonce === "string" ? { nonce: r.nonce } : {}),
-        ...(typeof r.exp === "number" && Number.isFinite(r.exp) ? { exp: r.exp } : {}) });
+        ...(typeof r.exp === "number" && Number.isFinite(r.exp) ? { exp: r.exp } : {}), ...(typeof r.life === "number" && Number.isFinite(r.life) ? { life: r.life } : {}) });
     }
   }
   // Round 13: a card the link voided (its record never saved after its keys were logged): withdrawn.
   for (const f of [issuedMirrorFile(cfg), linkIssuedFile(cfg)]) {
-    try { for (const r of readLog<any>(f, { repair: false }).records) if (r?.t === "void" && typeof r.msg === "string") for (const k of keys.values()) if (k.msg === r.msg) k.voided = true; }
-    catch { /* unreadable: the other file */ }
+    try {
+      for (const r of readLog<any>(f, { repair: false }).records) {
+        if (r?.t === "void" && typeof r.msg === "string") for (const k of keys.values()) if (k.msg === r.msg) k.voided = true;
+        // Round 17: a key the link superseded (his card asked him to answer again after a replay went unanswered).
+        if (r?.t === "supersede" && typeof r.kid === "string" && keys.has(r.kid)) keys.get(r.kid)!.superseded = true;
+      }
+    } catch { /* unreadable: the other file */ }
   }
   return { keys, runs };
 }
@@ -491,6 +509,9 @@ function mirrorIssued(cfg: Config): number {
   // Round 13: the link's void records too, once each.
   const voided = new Set(mine.filter((r) => r?.t === "void").map((r) => r.msg));
   for (const r of link) if (r?.t === "void" && typeof r.msg === "string" && !voided.has(r.msg)) { appendLog(issuedMirrorFile(cfg), r); voided.add(r.msg); n++; }
+  // Round 17: and its supersede records, once each.
+  const superseded = new Set(mine.filter((r) => r?.t === "supersede").map((r) => r.kid));
+  for (const r of link) if (r?.t === "supersede" && typeof r.kid === "string" && !superseded.has(r.kid)) { appendLog(issuedMirrorFile(cfg), r); superseded.add(r.kid); n++; }
   return n;
 }
 
@@ -529,7 +550,9 @@ const rebuilt = new Set<string>();
 // restored with the image, names an older start or link run and reads as unverified.
 const starts = new Map<string, { nonce: string; at: string }>();
 const verifiedBy = new Map<string, { start: string; at: string; link: string | null; fetches: number }>();
-export function forgetRebuild(cfg: Config) { rebuilt.delete(cfg.dir); starts.delete(cfg.dir); verifiedBy.delete(cfg.dir); }
+// Round 17: a new link run the keeper saw that no fresh fetch has verified for yet.
+const verifyPending = new Map<string, { link: string; since: string }>();
+export function forgetRebuild(cfg: Config) { rebuilt.delete(cfg.dir); starts.delete(cfg.dir); verifiedBy.delete(cfg.dir); verifyPending.delete(cfg.dir); }
 // Round 16: a new keeper start is written into the status at once (its nonce, consumed_unverified, and no
 // verified fetch), before anything else in the round, so a status from an earlier start never stands.
 function markStart(cfg: Config, nowIso: string) {
@@ -575,23 +598,27 @@ function logCounts(cfg: Config): NonNullable<State["logHigh"]> {
   const n = (f: string) => { try { return readLog(f, { repair: false }).records.length; } catch { return 0; } };
   return { consumed: n(tapsLogFile(cfg)), issued: n(issuedMirrorFile(cfg)), install: n(installLogFile(cfg)) };
 }
-// Round 13: the owner's accepted recover-logs line (keeper.sh recover-logs, written by the link), under a
-// day old and not used before.
-function recoverAsked(cfg: Config, st: State, now: number): { said: string; nonce?: string } | null {
+// Round 13: the owner's accepted recover-logs line (keeper.sh recover-logs, written by the link), not used before.
+// Round 17: no longer aged by the Pi's clock (the link judged his line by Discord's times before writing the file,
+// and the keeper deletes the file once it takes it): it counts once, by its message id.
+function recoverAsked(cfg: Config, st: State, _now: number): { said: string; nonce?: string } | null {
   try {
     const j = JSON.parse(readFileSync(recoverFile(cfg), "utf8"));
-    const at = Date.parse(String(j?.at ?? ""));
-    if (typeof j?.said !== "string" || !/^\d{15,22}$/.test(j.said) || !Number.isFinite(at) || now - at > 86_400_000 || (st.recovered ?? []).includes(j.said)) return null;
+    if (typeof j?.said !== "string" || !/^\d{15,22}$/.test(j.said) || (st.recovered ?? []).includes(j.said)) return null;
     return { said: j.said, ...(typeof j.nonce === "string" && /^[a-z][0-9a-f]{5}$/.test(j.nonce) ? { nonce: j.nonce } : {}) };
   } catch { return null; }
 }
 let refusedWhy = "";
 
+// Round 17: fsynced (the file, then its folder), so the keeper's state and status are durable before anything
+// is relied on after them.
 function writeAtomic(file: string, text: string) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, text);
+  const fd = openSync(tmp, "w");
+  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, file);
+  syncDir(dirname(file));
 }
 
 function revive(j: any): State | null {
@@ -797,6 +824,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
     const outcomes: (Outcome | null)[] = [];
     let book = new Map<string, Outcome>();
     let synced0: Synced;
+    // Round 17: the link run the link's state names before this round's fetch: a verified status names a link run
+    // only for a fetch made after the keeper saw that run, so a link restart mid-round waits for the next round.
+    let linkRun0: string | null = null;
     try {
       // Round 12: a log missing or shorter than its high-water count refuses the round (and the start).
       // Round 13: one missing or shorter is a detected restore: a degraded start that rebuilds; only a case
@@ -861,6 +891,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         } }
       // Round 16: a recover line or a detected restore above forgot the start: a new one is marked now.
       markStart(cfg, clock().toISOString());
+      linkRun0 = readLinkTaps(cfg)?.nonce ?? null;
       synced0 = sync(cfg, () => clock().getTime());
       st = loadState(cfg);
       { const sr = startRebuild.get(cfg.dir);
@@ -1129,11 +1160,22 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // Round 16: verified only by a fresh fetch merged in this keeper start, never by a recover line or a
       // local rebuild: each round whose fetch answered, with the consumed set rebuilt and no hold, renews it,
       // naming the link run the keeper reads in the link's state now.
-      { const sNow = starts.get(cfg.dir);
-        if (sNow && !S.rebuild && rebuilt.has(cfg.dir) && synced0.fetched) {
+      // Round 17: the keeper watches the link state's run nonce each round: when it differs from the one its verified
+      // status names (the link restarted), a fresh fetch (every round fetches) writes a new verified for that run;
+      // while the fetch fails, its status says verification for the new link run is pending.
+      { const sNow = starts.get(cfg.dir), runNow = linkTaps?.nonce ?? null;
+        if (sNow && !S.rebuild && rebuilt.has(cfg.dir) && synced0.fetched && runNow === linkRun0) {
           const was = verifiedBy.get(cfg.dir);
-          verifiedBy.set(cfg.dir, { start: sNow.nonce, at: nowIso, link: linkTaps?.nonce ?? null, fetches: (was?.start === sNow.nonce ? was.fetches : 0) + 1 });
-        } else if (S.rebuild) verifiedBy.delete(cfg.dir); }
+          if (was?.start === sNow.nonce && was.link !== runNow) log(`the link's run changed (${was.link ?? "none"} to ${runNow ?? "none"}): verified for its new run by this round's fresh fetch`);
+          verifiedBy.set(cfg.dir, { start: sNow.nonce, at: nowIso, link: runNow, fetches: (was?.start === sNow.nonce ? was.fetches : 0) + 1 });
+        } else if (S.rebuild) verifiedBy.delete(cfg.dir);
+        const vb = verifiedBy.get(cfg.dir);
+        if (sNow && vb && vb.start === sNow.nonce && runNow && vb.link !== runNow) {
+          if (verifyPending.get(cfg.dir)?.link !== runNow) {
+            verifyPending.set(cfg.dir, { link: runNow, since: nowIso });
+            log(`the link's run changed to ${runNow}, and no fresh fetch has verified for it yet (GitHub didn't answer): verification for the new link run is pending`);
+          }
+        } else verifyPending.delete(cfg.dir); }
       const consumed = readConsumed(cfg);
       delete S.issuedSeen;
       S.tapNotices = (S.tapNotices ?? []).filter((n) => clock().getTime() - Date.parse(n.at) <= TAP_KEEP_MS + 86_400_000);
@@ -1142,7 +1184,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // floored by the hold start its durable held record carries, against its card's expiry as a snowflake
       // time; the keeper's own clock and its restarts play no part. Without Discord's time, the link's logged
       // time against the key's expiry as before; without a held record, the link's issued time, else now.
-      const pastExpiry = (k: string, rec: { msg?: string; at?: number; exp?: number }): null | "expired" | "floor" => {
+      const pastExpiry = (k: string, rec: { msg?: string; at?: number; exp?: number; life?: number }): null | "expired" | "floor" => {
         const h = heldTap(cfg, k);
         if (h && h.sf !== null) {
           const e = expirySf(rec);
@@ -1214,6 +1256,14 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         else if (tapK && reg.keys.get(tapK)?.voided) {
           // Round 13: a key of a card the link withdrew (its record never saved): told, never used up.
           o = { ...base, state: "rejected", reason: `tap key ${tapK} is from a card the link withdrew (its record couldn't be saved after its keys were logged), so no tap on it counts: record nothing from it, and ask again with --checked if it still needs him` };
+        }
+        else if (tapK && reg.keys.get(tapK)?.superseded) {
+          // Round 17: a replayed held tap whose card asked him to answer again: the old key is withdrawn, so a late
+          // request for it is refused without using it up, and he is told on the card.
+          const r = reg.keys.get(tapK)!;
+          o = { ...base, state: "rejected", reason: `tap key ${tapK} was superseded: no request for it came within 10 minutes of its replay, so his card asked him to answer again on a fresh card. Record nothing from it, and ask again with --checked if it still needs him` };
+          notice({ tap: tapK, why: "superseded", reason: o.reason!, ...(r.msg ? { msg: r.msg } : {}) });
+          log(`tap key ${tapK} refused: superseded after his card asked him to answer again`);
         }
         else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && linkTaps && !linkTaps.issued[it.req!.tap] && reg.keys.has(it.req!.tap)) {
           // Round 11: a key the keeper saw issued that the link's state no longer lists: lost, told to him
@@ -1531,6 +1581,7 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       // Round 16: the keeper's current start, and the fresh fetch that verified its consumed set in it.
       ...(starts.has(cfg.dir) ? { start: starts.get(cfg.dir) } : {}),
       ...(!st.rebuild && verifiedBy.get(cfg.dir)?.start === starts.get(cfg.dir)?.nonce && verifiedBy.has(cfg.dir) ? { verified: verifiedBy.get(cfg.dir) } : {}),
+      ...(verifyPending.has(cfg.dir) ? { verify_pending: verifyPending.get(cfg.dir) } : {}),
       ...(st.historyCards?.length ? { history_cards: st.historyCards.slice(-500) } : {}),
       ...((st.linesDone?.length || st.historyLines?.length) ? { used_lines: [...new Set([...(st.linesDone ?? []), ...(st.historyLines ?? [])])].slice(-200) } : {}),
       recheck_pending: recheckPending(cfg),

@@ -168,11 +168,11 @@ describe("1. nothing an owner line or a held tap counts on is judged against the
       r2.t.now = E2 - 10 * MIN;
       unverified(r2);
       const late = r2.snowflake(E2 - off + 5 * MIN);                    // Discord: five minutes past the card's expiry
-      expect(await r2.tap(structuredClone(r2.msg(id2)), r2.ids(id2)[0], { id: late })).toBe("held");
+      // Round 17: a live tap's expiry is Discord's time too, so it is refused as expired at once, never held.
+      expect(await r2.tap(structuredClone(r2.msg(id2)), r2.ids(id2)[0], { id: late })).toBe("dead: expired");
       r2.keeperVerified();
       await r2.link.sweep();
       expect(tapLines(r2)).toHaveLength(0);
-      expect(onThread(r2, id2, TAP_EXPIRED)).toHaveLength(1);
     });
   }
 
@@ -355,8 +355,12 @@ describe("6. only live messages are answered as commands", () => {
     await r.link.sweep();
     expect(r.reads()).toBeGreaterThanOrEqual(2);
     expect(r.posts()).toBe(posts);
+    // Round 17: this old line answers a proposal still within 30 minutes of it by Discord's times, so it is answered
+    // once (sent while the App was offline, with a fresh code); it never acts, and a second run draws nothing.
+    expect(await r.link.recoverLogs({ said: old.id })).toMatchObject({ status: "proposed" });
+    expect(r.posts()).toBe(posts + 1);
     await expect(r.link.recoverLogs({ said: old.id })).rejects.toThrow("it is history, not a live line");
-    expect(r.posts()).toBe(posts);
+    expect(r.posts()).toBe(posts + 1);
     expect(existsSync(r.recoverFile)).toBe(false);
   });
 });
@@ -414,7 +418,7 @@ describe("8. the keeper floors a held tap by its durable held record, not its ow
     expect(cycle(k.cfg).ok).toBe(true);
     appendLog(linkLog(k), { t: "key", kid: "tap-00000000d801", item: "P11", kind: "ask", label: "Filed", msg: card, target: { item: "P11", writes: ["row-close", "decision"] }, at, exp: at + 10 * MIN });
     writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: { "tap-00000000d801": { item: "P11", kind: "ask", label: "Filed", msg: card, at: at + 5 * MIN } } }));
-    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000d801", msg: card, at: at + 5 * MIN, it: sf(at + 5 * MIN, 9), hold: { since: new Date(at + 4 * MIN).toISOString(), sf: at + 4 * MIN } });
+    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000d801", msg: card, at: at + 5 * MIN, it: sf(at + 5 * MIN, 9), hold: { period: "k-start-1", id: sf(at + 4 * MIN, 8), from: "interaction" } });   // round 17: a Discord-stamped hold start
     // The keeper restarts at +20 minutes with the remote away, then the remote returns.
     k.at(new Date(at + 20 * MIN));
     forgetRebuild(k.cfg);
@@ -434,7 +438,7 @@ describe("8. the keeper floors a held tap by its durable held record, not its ow
     expect(cycle(k.cfg).ok).toBe(true);
     appendLog(linkLog(k), { t: "key", kid: "tap-00000000d802", item: "P11", kind: "ask", label: "Filed", msg: card, target: { item: "P11", writes: ["row-close", "decision"] }, at, exp: at + 10 * MIN });
     writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: { "tap-00000000d802": { item: "P11", kind: "ask", label: "Filed", msg: card, at: at + 5 * MIN } } }));
-    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000d802", msg: card, at: at + 5 * MIN, it: sf(at + 5 * MIN, 9), hold: { since: "x", sf: at + 12 * MIN } });
+    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000d802", msg: card, at: at + 5 * MIN, it: sf(at + 5 * MIN, 9), hold: { period: "k-start-1", id: sf(at + 12 * MIN, 8), from: "interaction" } });   // round 17: a Discord-stamped hold start
     k.cain({ id: "cain-k8b-1", tap: "tap-00000000d802", ops: [{ op: "note", item: "P11", text: "his tap" }] }, { issue: false });
     expect(cycle(k.cfg).ok).toBe(true);
     expect(k.reason("cain-k8b-1")).toContain("held across a restart");
@@ -449,15 +453,16 @@ describe("8. the keeper floors a held tap by its durable held record, not its ow
     expect(onThread(r, id, TAP_HOLD_FLOOR)).toHaveLength(1);
   }, 60_000);
 
-  test("the link writes the hold's start into the held record, as a snowflake time", async () => {
+  test("the link writes the hold's start into the held record, as a Discord-stamped id (round 17)", async () => {
     const r = shipRig();
     r.t.discord = -2 * HOUR;
     const id = await askCard(r);
     unverified(r);
     await r.tap(structuredClone(r.msg(id)), r.ids(id)[0]);
     const h = readLog<any>(side(r, "link-held.log")).records[0];
-    expect(h.hold.since).toBe(JSON.parse(r.files.status!).consumed_unverified.since);
-    expect(h.hold.sf).toBe(Number((BigInt(h.it) >> 22n) + 1420070400000n) - MIN);
+    // Round 17: the hold's start is the first held interaction's own id (Discord's stamp), never the keeper's
+    // status time: no Pi clock reading in it.
+    expect(h.hold).toEqual({ period: JSON.parse(r.files.status!).consumed_unverified.since, id: h.it, from: "interaction" });
   });
 });
 

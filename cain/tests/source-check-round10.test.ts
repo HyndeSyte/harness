@@ -226,8 +226,11 @@ describe("3. settlement, the owner's settle, and pruning", () => {
     const says = r.his(`settle ${kid} landed`);
     await expect(r.link.settleKey({ tap: "tap-000000000000", how: "landed", said: says.id })).rejects.toThrow("isn't an unresolved landing");
     await expect(r.link.settleKey({ tap: kid, how: "landed" })).rejects.toThrow("the owner's alone");
+    // Round 17: a day old by Discord's times (against the newest message in his DM), never the Pi's clock.
     r.later(2 * DAY);
+    const newer = r.his("two days on");
     await expect(r.link.settleKey({ tap: kid, how: "landed", said: says.id })).rejects.toThrow("over a day old");
+    delete r.posted[newer.id];
     r.later(-2 * DAY);
     expect(r.state().messages[id].shipping!.state).toBe("landing");
     expect(await r.link.settleKey({ tap: kid, how: "landed", said: says.id })).toMatchObject({ status: "settled" });

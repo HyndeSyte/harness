@@ -80,7 +80,7 @@
 //   Turn back on, the notice's own Stop is the one until it's out of reach; when the moving
 //   Stop then goes onto a newer message, the notice's comes off.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Landings } from "./landings";
 import { cainReasons, type CainHit, claimsReview, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
@@ -260,6 +260,12 @@ export interface State {
   // Round 14: the owner-line proposals (install taps on <nonce>, recover logs <nonce>): each bound to a fresh
   // nonce, the keeper's epoch and this start's run nonce; used: the message of his that used it.
   ownerProposals?: { kind: "install" | "recover"; nonce: string; epoch: number; run: string; at: number; msg?: string; used?: string }[];
+  // Round 17: his history lines (sent while the link was down) already answered as offline, by message id.
+  offlineTold?: Record<string, number>;
+  // Round 17: the verification tuple (keeper start, link run, fetch count) whose arming re-checks last completed.
+  verifyChecked?: string;
+  // Round 17: the link run whose pending verification Cain was told about (VERIFY_PENDING_MS).
+  pendingTold?: string;
   expiredLandings?: Record<string, { since: number; at: number }>;   // round 13: tombstones past 100 days, by tap key id
   // The generation of the card about to be posted, written durably before the post (0.12.0), so the
   // keeper's floor covers a card whose post went out but whose record never got saved.
@@ -406,6 +412,16 @@ export const TAP_REPLAY_AGAIN = "Your held answer may not have reached Cain afte
 export const SHIP_RESTORE_REISSUE = "Its buttons are off after a restore of the App: a Ship card from before the restore isn't tappable. Cain sends a new one if it still needs you.";
 // Round 16: a held tap refused because its hold began after its card expired (by the held record).
 export const TAP_HOLD_FLOOR = "Not acted: your answer was held across a restart of Cain's record, and by then its card had expired. Cain asks again if it still needs you.";
+// Round 17: once his card asks him to answer again (TAP_REPLAY_AGAIN), the old tap key is superseded: a late
+// request of Cain's for it is refused by the keeper, and the card says so.
+export const TAP_SUPERSEDED = "Not acted: this answer was replaced by the request above to answer again on a fresh card. Nothing to do here.";
+// Round 17: a new link run not verified within VERIFY_PENDING_MS (measured on the monotonic clock): one line on
+// each waiting card, and Cain told once that verification for the new link run is pending.
+export const VERIFY_PENDING_MS = 5 * 60_000;
+export const VERIFY_WAITING = "Still waiting: the App restarted, and Cain's record hasn't reached GitHub since to check which taps were already acted on. This card goes on by itself once it has. Nothing to do.";
+// Round 17: his owner line read back from history (sent while the link was down) that answers a proposal still
+// within OWNER_LINE_MS by Discord's times: told once, with a fresh code from this run; the old line never acts.
+export const OFFLINE_CAUSE = "it arrived while the App was offline, so it can't count as it is";
 export const TAP_TIME_DISAGREE = "Not acted: the App's clock and Discord's disagreed about when you tapped, so your held answer was not used. Cain asks again if it still needs you.";
 // Round 15: a line taken off a card's text again (the inverse of withLine).
 export function withoutLine(content: string, line: string): string {
@@ -697,6 +713,14 @@ export const PUSH_QUIET_MS = 2 * 60_000;
 const shortDay = (ms: number, tz = "America/New_York") =>
   new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: tz }).format(ms);
 
+// Round 17: a small file written whole and fsynced (the file, then its folder) before it is relied on.
+function writeDurable(f: string, text: string): void {
+  const tmp = `${f}.tmp`;
+  const fd = openSync(tmp, "w", 0o600);
+  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, f);
+  try { const d = openSync(dirname(f), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* a folder that can't be synced */ }
+}
 export class Refusal extends Error {}
 // Round 15: an owner line whose code no longer counts (a proposal from an earlier start, another record
 // epoch, or one already used): cause is the plain words he is told, with a fresh code at once.
@@ -852,7 +876,10 @@ class Unsure extends Error {}
 export interface Deps {
   rest: Rest;
   load: () => State;
-  save: (s: State) => void;
+  // Round 17: sync true fsyncs the save (the file, then its folder) before it returns: a save something is
+  // relied on after (a tap's claim before its relay, a card's record before its buttons go on, an owner
+  // proposal and its use, the verification tuple).
+  save: (s: State, sync?: boolean) => void;
   now: () => number;
   relay: (text: string) => void;                                   // a line typed in to Cain
   toHarness: (path: string, body: unknown) => Promise<boolean>;     // a tap on its card
@@ -912,6 +939,9 @@ export interface Deps {
   issuedLog?: string;
   // Round 12: a save that is fsynced before it returns (the run counter and nonce); save when absent.
   saveDurable?: (s: State) => void;
+  // Round 17: a monotonic clock in ms (performance.now when absent): bounds measured in this process only
+  // (the 10-minute replay wait, the 5-minute wait for verification of a new link run), never the Pi's clock.
+  mono?: () => number;
   // Round 12: the tests' crash injection, called at named points (hand settle); absent in production.
   crashPoint?: (where: string) => void;
   // Round 13: the compact expired-key index (/data/link-expired.log: one framed {msg, at} per card whose
@@ -1106,10 +1136,21 @@ export class Link {
   constructor(private d: Deps) {
     // Every call to Discord, noting a rate limit: the moving Stop waits a minute after one.
     this.rest = async (...a) => {
-      try { return await d.rest(...a); }
+      let r: any;
+      try { r = await d.rest(...a); }
       catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
+      if (a[0] === "POST" && r && typeof r === "object") this.noteStamp((r as any).id);
+      return r;
     };
   }
+  // Round 17: the Pi's clock against Discord's, from the newest Discord-stamped id the link saw (a message it
+  // posted, or an interaction). It only flags the Pi's clock off: it decides what is posted and whether the
+  // restore sweep's done mark is written, never whether a tap or a line counts.
+  private skew: number | null = null;
+  private noteStamp(id: unknown): void { const x = String(id ?? ""); if (/^\d{15,22}$/.test(x)) this.skew = this.d.now() - snowflakeTime(x); }
+  private piClockOff(): boolean { return this.skew !== null && Math.abs(this.skew) > CLOCK_TOLERANCE_MS; }
+  // Round 17: the monotonic clock (this process only), for bounds that must not follow a step of the Pi's clock.
+  private mono(): number { return this.d.mono ? this.d.mono() : performance.now(); }
   // Round 16: the newest message in his DM when this link started (its channel's last message id, by
   // snowflake, never a clock), taken at the first sweep, which runs at the start: a message of his is live only
   // when it is newer. Lines read back from older history draw no reply and no code. Until it is taken (no
@@ -1972,6 +2013,8 @@ export class Link {
       expired_landings: Object.entries(this.d.load().expiredLandings ?? {}).map(([kid, x]) => ({ tap_key: kid, since: new Date(x.since).toISOString(), expired: new Date(x.at).toISOString() })),
       consumed_unverified: (st as any)?.consumed_unverified ?? null,
       consumed_verified: this.consumedVerified(),
+      // Round 17: the keeper saw a new link run that no fresh fetch has verified for yet (the remote away).
+      verify_pending: (keeperStatus(this.files().status) as any)?.verify_pending ?? null,
       // Landings the remote can't settle yet (round 9): each key with its age and last error.
       unresolved_landings: Object.entries(this.d.load().unresolved ?? {}).map(([k, u]) => ({ tap_key: tapKid(k), what: u.what,
         since: new Date(u.since).toISOString(), age_min: Math.round((this.d.now() - u.since) / 60_000), failures: u.fails, last_error: u.last,
@@ -2785,9 +2828,11 @@ export class Link {
   }
 
   // Why a card that looks live has stopped mattering, or "".
-  private async deadReason(m: Shown, now: number): Promise<string> {
+  // Round 17: a tap's expiry is judged by Discord's time for it (tapSf) against its card's expiry as a Discord
+  // time, never the Pi's clock, when both are known.
+  private async deadReason(m: Shown, now: number, msgId = "", tapSf: number | null = null): Promise<string> {
     if (m.q?.used) return "answered";
-    if (m.expires != null && m.expires <= now) return "expired";
+    if (m.expires != null && this.tappedAfterExpiry(msgId, m.expires, now, tapSf)) return "expired";
     if (m.until - DAY <= now) return "forgetting";
     const item = boundItem(m);
     if (item) {
@@ -2823,6 +2868,10 @@ export class Link {
     }
     const msgId = String(it.message?.id ?? "");
     const now = this.d.now();
+    // Round 17: Discord's time for the tap, from its interaction id; it also tells the link how far the Pi's
+    // clock is from Discord's (for what is posted, never for whether the tap counts).
+    const tapSf = /^\d{15,22}$/.test(String(it?.id ?? "")) ? snowflakeTime(String(it.id)) : null;
+    this.noteStamp(it?.id);
     const s = this.d.load();
     const rec = s.messages[msgId];
     // A card whose post never heard back may be the one he tapped: then it's up after all.
@@ -2877,7 +2926,7 @@ export class Link {
       }
       // Round 14: past the expiry its issued keys carry, whatever the buttons show.
       const exp = logged?.keys.find((k) => typeof k.exp === "number")?.exp;
-      if (cid.startsWith("q:") && (this.expiredCards().has(msgId) || (typeof exp === "number" && exp <= now))) {
+      if (cid.startsWith("q:") && (this.expiredCards().has(msgId) || (typeof exp === "number" && this.tappedAfterExpiry(msgId, exp, now, tapSf)))) {
         const out = await this.deadTap(it, msgId, "expired", TAP_EXPIRED);
         this.log(`tap on card ${msgId} refused: its keys expired`);
         return out;
@@ -2963,7 +3012,7 @@ export class Link {
       if (await this.answer(it, ACK)) this.deferred.add(it);
     }
     if (cid !== RESUME) {
-      const why = await this.deadReason(rec, now);
+      const why = await this.deadReason(rec, now, msgId, /^\d{15,22}$/.test(String(it?.id ?? "")) ? snowflakeTime(String(it.id)) : null);
       // The ledger, the keeper's status or the check's outcome couldn't be read, or the ledger
       // is behind the card's generation: the tap is rejected with the status-changed reason, and
       // the card keeps its buttons for the sweep to judge. A read over its limit is "busy, tap
@@ -3659,7 +3708,8 @@ export class Link {
           try { this.issueKeys(msgId, m, q.options); } catch (e) { this.log(`couldn't log card ${msgId}'s tap keys at its tap: ${String(e).slice(0, 80)}`); } }
       this.tapsNow.add(key);
     }
-    this.d.save(s);
+    // Round 17: fsynced before the relay: the claim is what a restart finishes from, never redoes.
+    this.d.save(s, true);
     try {
       // Cain hears it the moment it's saved as answered: if the link stopped now, a tap
       // can't be marked answered and never reach him. A landing tells him when it settles
@@ -3841,7 +3891,12 @@ export class Link {
     try { msg = await this.rest("GET", `/channels/${dm}/messages/${said}`); }
     catch (e) { throw new Refusal(`his message ${said} couldn't be read from his DM (${String(e).slice(0, 80)}): nothing settled`); }
     if (String(msg?.author?.id ?? "") !== owner) throw new Refusal("that message isn't his: settle is the owner's alone, nothing settled");
-    if (this.d.now() - snowflakeTime(said) > DAY) throw new Refusal("his message is over a day old: ask him again, nothing settled");
+    // Round 17: a day old by Discord's times alone (his message against the newest message in his DM now), never
+    // the Pi's clock.
+    let newest = NaN;
+    try { const ch = await this.rest("GET", `/channels/${dm}`); if (/^\d{15,22}$/.test(String(ch?.last_message_id ?? ""))) newest = snowflakeTime(String(ch.last_message_id)); }
+    catch (e) { throw new Refusal(`his DM couldn't be read to date his message (${String(e).slice(0, 80)}): nothing settled, run it again in a minute`); }
+    if (Number.isFinite(newest) && newest - snowflakeTime(said) > DAY) throw new Refusal("his message is over a day old: ask him again, nothing settled");
     const bad = settleWordsProblem(String(msg?.content ?? ""), tap, how);
     if (bad) throw new Refusal(`${bad}: nothing settled`);
     // Round 12: the settled entry, with his consumed message id, goes to the landing ledger's settle log
@@ -4007,6 +4062,7 @@ export class Link {
     catch (e) {
       if (!(e instanceof StaleLine) || !e.late) throw e;
       const p = await this.propose("install", (line, epoch) => `Your line didn't count: ${e.cause}. Here is a fresh one. To let your Ship taps install, send this line, exactly, as a new message:\n\`\`\`\n${line}\n\`\`\`\nIt counts once, and only until the App restarts or its record is reset (record epoch ${epoch}).`);
+      await this.tellPiClock();
       this.log(`install taps on line on his message ${said} didn't count (${e.message}); he was told why and sent a fresh line "${p.line}"`);
       return { status: "proposed", install_taps: installState(this.d.installLog).how, said: `His line didn't count (${e.cause}); he was told so and sent a fresh line "${p.line}". Once he sends it, run keeper.sh install-taps on --said <his message id>.` };
     }
@@ -4028,11 +4084,11 @@ export class Link {
     const line = `${kind === "install" ? INSTALL_LINE : RECOVER_LINE} ${nonce}`;
     const s = this.d.load();
     s.ownerProposals = [...(s.ownerProposals ?? []).filter((p) => this.d.now() - p.at < 30 * DAY), { kind, nonce, epoch, run: this.runNonce, at: this.d.now() }];
-    this.d.save(s);
+    this.d.save(s, true);
     const id = await this.notice(text(line, epoch));
     const s2 = this.d.load();
     const p = s2.ownerProposals?.find((x) => x.nonce === nonce);
-    if (p) { p.msg = String(id); this.d.save(s2); }
+    if (p) { p.msg = String(id); this.d.save(s2, true); }
     return { line, epoch };
   }
 
@@ -4055,9 +4111,16 @@ export class Link {
     const mark = await this.startMark();
     const live = (mark !== null && BigInt(said) > BigInt(mark))
       || (this.d.load().ownerProposals ?? []).some((x) => x.run === this.runNonce && !!x.msg && /^\d{15,22}$/.test(x.msg) && BigInt(said) > BigInt(x.msg));
-    if (!live) throw new Refusal(mark === null
-      ? `his message ${said} can't be told live yet (no start mark in his DM yet, and no proposal of this start before it): nothing done and nothing sent him, run it again after the next sweep`
-      : `his message ${said} was sent before the link's current start, so it is history, not a live line: nothing done and nothing sent him`);
+    if (!live) {
+      // Round 17: a line read back from history that answers a durable proposal still within OWNER_LINE_MS of it by
+      // Discord's times (he sent it while the link was down) is answered once: he is told it arrived while the App
+      // was offline and gets a fresh code from this run; the old line never acts. Only a line with no matching
+      // proposal gets the silent refusal.
+      if (mark !== null && await this.offlineLine(said, line)) throw new StaleLine(`his message ${said} answers a proposal of the App's but was sent while the link was down (before its current start): it doesn't count as it is; he is told so once, with a fresh code`, OFFLINE_CAUSE, true);
+      throw new Refusal(mark === null
+        ? `his message ${said} can't be told live yet (no start mark in his DM yet, and no proposal of this start before it): nothing done and nothing sent him, run it again after the next sweep`
+        : `his message ${said} was sent before the link's current start, so it is history, not a live line: nothing done and nothing sent him`);
+    }
     const { owner, dm } = await this.identity();
     let msg: any;
     try { msg = await this.rest("GET", `/channels/${dm}/messages/${said}`); }
@@ -4090,8 +4153,37 @@ export class Link {
         `by Discord's times the code went out at ${clockTime(snowflakeTime(p.msg), tz)} and your line came at ${clockTime(snowflakeTime(said), tz)}, over the ${OWNER_LINE_MS / 60_000} minutes a code counts`, true);
     }
     p.used = said;
-    this.d.save(s);
+    this.d.save(s, true);
     return { msg, nonce, skew: this.d.now() - snowflakeTime(said) };
+  }
+  // Round 17: whether a history line of his answers a durable proposal (in the state, fsynced when made) within
+  // OWNER_LINE_MS of it by snowflakes, and hasn't been answered as offline already; marked answered (fsynced)
+  // and the proposal marked used before he is told, so it draws one reply and never acts.
+  private async offlineLine(said: string, line: string): Promise<boolean> {
+    const kind = line === INSTALL_LINE ? "install" : "recover";
+    const s0 = this.d.load();
+    if (s0.offlineTold?.[said]) return false;
+    let msg: any;
+    try { const { dm } = await this.identity(); msg = await this.rest("GET", `/channels/${dm}/messages/${said}`); } catch { return false; }
+    const { owner } = await this.identity();
+    if (String(msg?.author?.id ?? "") !== owner) return false;
+    const m = new RegExp(`^${line} ([a-z][0-9a-f]{5})$`).exec(settleNormalise(String(msg?.content ?? "")).replace(/[.!]+$/, ""));
+    if (!m) return false;
+    const s = this.d.load();
+    const p = (s.ownerProposals ?? []).find((x) => x.kind === kind && x.nonce === m[1]);
+    if (!p || p.used || !p.msg || !/^\d{15,22}$/.test(p.msg) || !(BigInt(said) > BigInt(p.msg))) return false;
+    if (snowflakeTime(said) - snowflakeTime(p.msg) > OWNER_LINE_MS) return false;
+    p.used = said;
+    (s.offlineTold ??= {})[said] = this.d.now();
+    this.d.save(s, true);
+    this.log(`his ${kind} line (message ${said}) was sent while the link was down: told once, with a fresh code; it doesn't act`);
+    return true;
+  }
+  // Round 17: with a fresh code for a stale line, the Pi's clock line goes too when the Pi's clock is flagged off
+  // (by the fresh code's own post against Discord's stamp for it): information only, never a gate on the code.
+  private async tellPiClock(): Promise<void> {
+    if (!this.piClockOff()) return;
+    try { await this.notice(clockOffLine(this.skew!)); } catch (e) { this.log(`couldn't tell him the Pi's clock is off: ${String(e).slice(0, 80)}`); }
   }
   // Round 16: when the Pi's clock is the outlier against Discord's time for his line, he is told so plainly,
   // with both times, once per line; nothing waits on it.
@@ -4127,13 +4219,15 @@ export class Link {
     catch (e) {
       if (!(e instanceof StaleLine)) throw e;
       const p = await offer(`Your recover line didn't count: ${e.cause}. Here is a fresh one. `);
+      await this.tellPiClock();
       this.log(`recover-logs line on his message ${said} didn't count (${e.message}); he was told why and sent a fresh line "${p.line}" (record epoch ${p.epoch})`);
       return { status: "proposed", said: `His line didn't count (${e.cause}); he was told so and sent a fresh line "${p.line}". Once he sends it, run keeper.sh recover-logs --said <his message id>.` };
     }
     const { msg, nonce, skew } = got;
     const at = new Date(this.d.now()).toISOString();
     if (!this.d.landings?.ownerLine?.("recover", said, at)) throw new Refusal("the landing ledger couldn't take his line (or it was used already): nothing done");
-    try { writeFileSync(this.d.recoverFile, JSON.stringify({ said, nonce, at }) + "\n", { mode: 0o600 }); }
+    // Round 17: fsynced (written whole, then renamed, then its folder synced) before "ok" is answered.
+    try { writeDurable(this.d.recoverFile, JSON.stringify({ said, nonce, at }) + "\n"); }
     catch (e) { throw new Refusal(`the recover file couldn't be written (${String(e).slice(0, 80)}): nothing done`); }
     this.log(`recover-logs accepted on the owner's message ${said} ("${excerpt(String(msg?.content ?? ""), 40)}"): the record keeper rebuilds its logs on its next round`);
     const off = await this.tellClockOff(skew, said);
@@ -4159,6 +4253,38 @@ export class Link {
     this.log(`told him the record keeper can't verify which taps were acted on yet (${u.why})`);
   }
 
+  // Round 17: after a link restart the keeper's verified status names the old link run until a fresh fetch sees
+  // the new one. While it hasn't (the remote away), once VERIFY_PENDING_MS has passed on the monotonic clock since
+  // this process first saw it, each waiting card (a waiting line on it, or a held tap) gets one line saying so, and
+  // Cain is told once per link run that verification for the new link run is pending.
+  private verifyPendingSince: number | null = null;
+  private async pendingVerify(): Promise<void> {
+    const st = keeperStatus(this.files().status);
+    const run = this.runNonce || (this.runNo(), this.runNonce);
+    const pending = !!st && !st.consumed_unverified && !!st.start && !!st.verified && st.verified.start === st.start.nonce && st.verified.link !== run;
+    if (!pending) { this.verifyPendingSince = null; return; }
+    if (this.verifyPendingSince === null) this.verifyPendingSince = this.mono();
+    if (this.mono() - this.verifyPendingSince < VERIFY_PENDING_MS) return;
+    const s = this.d.load();
+    const waiting = new Set<string>(Object.entries(s.messages).filter(([, m]) => !m.outcome && !!m.checking).map(([id]) => id));
+    for (const h of this.heldOpen()) if (typeof h.msg === "string") waiting.add(h.msg);
+    for (const msg of waiting) {
+      const id = `${msg}:pending:${run}`;
+      const s2 = this.d.load();
+      if (s2.tapNoticed?.[id]) continue;
+      (s2.tapNoticed ??= {})[id] = this.d.now();
+      this.d.save(s2);
+      try { await this.post(VERIFY_WAITING, [], { replyTo: msg }); } catch (e) { this.log(`couldn't put the waiting line on card ${msg}: ${String(e).slice(0, 80)}`); }
+    }
+    if (s.pendingTold !== run) {
+      const s3 = this.d.load();
+      s3.pendingTold = run;
+      this.d.save(s3);
+      this.d.relay(`Verification for the link's new run is pending: the App restarted over ${VERIFY_PENDING_MS / 60_000} minutes ago and the record keeper hasn't reached GitHub since to check which taps were already acted on, so taps wait (${waiting.size} waiting card${waiting.size === 1 ? "" : "s"}, each told on the card). It goes on by itself once a fetch answers. Nothing to tell him.`);
+      this.log(`verification for link run ${run} still pending after ${VERIFY_PENDING_MS / 60_000} minutes: ${waiting.size} waiting card(s) told, Cain told`);
+    }
+  }
+
   // Round 12: one line on a card's thread saying a tap on it was lost to a restore of the link's state.
   private async tellRestoreLost(msgId: string, what: string): Promise<void> {
     const id = `${msgId}:lost`;
@@ -4178,7 +4304,7 @@ export class Link {
     const st = keeperStatus(this.files().status);
     const list = Array.isArray((st as any)?.tap_notices) ? (st as any).tap_notices as { tap: string; why: string; msg?: string }[] : [];
     for (const n of list) {
-      if (!n || typeof n.tap !== "string" || (n.why !== "refused" && n.why !== "lost" && n.why !== "expired" && n.why !== "time" && n.why !== "hold")) continue;
+      if (!n || typeof n.tap !== "string" || (n.why !== "refused" && n.why !== "lost" && n.why !== "expired" && n.why !== "time" && n.why !== "hold" && n.why !== "superseded")) continue;
       const id = `${n.tap}:${n.why}`;
       const s = this.d.load();
       if (s.tapNoticed?.[id]) continue;
@@ -4186,10 +4312,10 @@ export class Link {
       this.d.save(s);
       // Round 12: the card's message id from the keeper's notice, the state, or else the issued-key log.
       const msg = (typeof n.msg === "string" && /^\d{15,22}$/.test(n.msg) ? n.msg : undefined) ?? s.issued?.[n.tap]?.msg ?? this.issuedKid(n.tap)?.msg;
-      const text = n.why === "lost" ? TAP_RESTORE_LOST : n.why === "expired" ? TAP_EXPIRED : n.why === "time" ? TAP_TIME_DISAGREE : n.why === "hold" ? TAP_HOLD_FLOOR : TAP_REFUSED;
+      const text = n.why === "lost" ? TAP_RESTORE_LOST : n.why === "expired" ? TAP_EXPIRED : n.why === "time" ? TAP_TIME_DISAGREE : n.why === "hold" ? TAP_HOLD_FLOOR : n.why === "superseded" ? TAP_SUPERSEDED : TAP_REFUSED;
       try {
         if (msg) await this.post(text, [], { replyTo: msg }); else await this.notice(text);
-        this.log(`told him the record keeper ${n.why === "lost" ? "lost" : n.why === "expired" ? "refused as expired" : n.why === "time" ? "refused (the clocks disagreed about his tap's time)" : n.why === "hold" ? "refused (its hold, across a restart, began after its card expired)" : "refused"} the request from tap key ${n.tap}`);
+        this.log(`told him the record keeper ${n.why === "lost" ? "lost" : n.why === "expired" ? "refused as expired" : n.why === "time" ? "refused (the clocks disagreed about his tap's time)" : n.why === "hold" ? "refused (its hold, across a restart, began after its card expired)" : n.why === "superseded" ? "refused (superseded: he was asked to answer again)" : "refused"} the request from tap key ${n.tap}`);
       } catch (e) { this.log(`couldn't tell him about tap key ${n.tap}: ${String(e).slice(0, 80)}`); }
     }
     const s = this.d.load();
@@ -4691,6 +4817,7 @@ export class Link {
       await this.uncertainTaps();
       await this.outageNotice();
       await this.unverifiedNotice();
+      await this.pendingVerify();
       await this.releaseHeldTaps();
       await this.replayWatch();
       await this.clearChecking();
@@ -4769,17 +4896,20 @@ export class Link {
       await this.stripAll(replaced);
       return msg;
     }
+    // Round 17: the card's lifetime, an explicit duration fixed here once, goes into its key records: its expiry
+    // is its post snowflake plus that duration, never a difference of two readings of the Pi's clock.
+    const life = typeof meta.expires === "number" ? Math.max(0, meta.expires - this.d.now()) : undefined;
     const msg = await this.postCard(text, [], opts);
     const id = String(msg.id);
     this.d.crashPoint?.("issue:after-post");
     const cids: string[] = comps.flatMap((r: any) => (r.components ?? []).map((b: any) => String(b.custom_id)));
-    try { this.issueKeys(id, meta as any, options, cids, meta.expires); } catch (x) { await this.unissuable(id, x, String(msg.content ?? text)); }
+    try { this.issueKeys(id, meta as any, options, cids, meta.expires, life); } catch (x) { await this.unissuable(id, x, String(msg.content ?? text)); }
     this.d.crashPoint?.("issue:after-log");
     let replaced: string[] = [];
     try {
       const s = this.d.load();
       replaced = record(s, { ...msg, components: comps });
-      this.d.save(s);
+      this.d.save(s, true);
     } catch (x) { await this.voidCard(id, x, String(msg.content ?? text)); }
     this.d.crashPoint?.("issue:after-save");
     await this.armCard(id, comps, false);
@@ -4791,15 +4921,34 @@ export class Link {
   // appended to the issued-key log and fsynced before the card's record is saved, so no tap on it can
   // count before its key is durable. Throws when they can't be written. Round 13: with each button's
   // custom id and the card's expiry, so its buttons can be put on, or taken off at expiry, from the log.
-  private issueKeys(msgId: string, m: Pick<Shown, "checked" | "item" | "kind">, options: string[], cids?: string[], exp?: number): void {
+  private issueKeys(msgId: string, m: Pick<Shown, "checked" | "item" | "kind">, options: string[], cids?: string[], exp?: number, life?: number): void {
     if (!this.d.issuedLog) return;
     const run = this.runNo();
     options.forEach((label, i) => {
       const key = [msgId, m.checked?.gen ?? "none", m.checked?.req ?? "none", (m.item ?? "none").toUpperCase(), label].join("|");
       const item = (m.item ?? "none").toUpperCase(), kind = m.kind ?? "ask";
       appendLog(this.d.issuedLog!, { t: "key", kid: tapKid(key), item, kind, label, msg: msgId, target: tapTarget(item, kind, label), run, nonce: this.runNonce, at: this.d.now(),
-        ...(cids?.[i] ? { cid: cids[i] } : {}), ...(typeof exp === "number" ? { exp } : {}) });
+        ...(cids?.[i] ? { cid: cids[i] } : {}), ...(typeof exp === "number" ? { exp } : {}), ...(typeof life === "number" ? { life } : {}) });
     });
+  }
+  // Round 17: a key's card expiry as a Discord time: its card's post snowflake plus the lifetime its key record
+  // carries (an explicit duration fixed at issuance); a key logged before round 17 has none, and is read as its
+  // expiry less its logged time. null: no expiry, or no card snowflake.
+  private keyExpirySf(k: any): number | null {
+    if (typeof k?.exp !== "number" || !/^\d{15,22}$/.test(String(k.msg ?? ""))) return null;
+    const m = snowflakeTime(String(k.msg));
+    if (typeof k.life === "number" && Number.isFinite(k.life)) return m + k.life;
+    return typeof k.at === "number" && Number.isFinite(k.at) ? m + (k.exp - k.at) : null;
+  }
+  // Round 17: whether a tap came after its card's expiry: Discord's time for the tap (its interaction snowflake)
+  // against the card's expiry as a Discord time. Only a tap with no snowflake, or a card with no logged key,
+  // falls back to the Pi's clock against the card's expiry.
+  private tappedAfterExpiry(msgId: string, expires: number | null | undefined, now: number, tapSf: number | null): boolean {
+    const k = this.logCards().get(msgId)?.keys.find((x) => typeof x.exp === "number");
+    const e = k ? this.keyExpirySf(k) : null;
+    if (tapSf !== null && e !== null) return tapSf > e;
+    const exp = typeof k?.exp === "number" ? k.exp : expires;
+    return exp != null && exp <= now;
   }
   // Round 12: one key's record in the issued-key log.
   private issuedKid(kid: string): any | null {
@@ -4931,12 +5080,18 @@ export class Link {
   // they are, its record's digest following), so his next tap on it counts.
   private async clearChecking(): Promise<void> {
     const marked = Object.entries(this.d.load().messages).filter(([, m]) => m.checking === "ship");
-    if (!marked.length || !this.consumedVerified() || !this.verifiedSeen) return;
+    const tuple = this.verifiedChecked();
+    if (!marked.length || !tuple) return;
     for (const [msg] of marked) {
+      // Round 17: a card in the removal queue keeps its line; the status is re-read just before each clear, and
+      // the clear is abandoned (the card left waiting) if the verification tuple changed.
+      if (this.stripsOpen().has(msg)) continue;
+      if (this.verifyTuple() !== tuple) { this.log("the record keeper's verification changed before a waiting line was cleared: the cards stay waiting until it is checked again"); return; }
       try {
         const dm = this.d.load().dm ?? (await this.identity()).dm;
         const cur = await this.rest("GET", `/channels/${dm}/messages/${msg}`);
         const content = withoutLine(String(cur?.content ?? ""), SHIP_CHECKING), comps = cur?.components ?? [];
+        if (this.verifyTuple() !== tuple) { this.log(`card ${msg}'s waiting line kept: the record keeper's verification changed just before its clear`); return; }
         if (content !== String(cur?.content ?? "")) await this.rest("PATCH", `/channels/${dm}/messages/${msg}`, { content, allowed_mentions: { parse: [] } });
         const s = this.d.load(), m = s.messages[msg];
         if (m) { if (!m.outcome) m.digest = digest(content, comps); delete m.checking; this.d.save(s); }
@@ -4952,25 +5107,46 @@ export class Link {
   // arming checks again (round 14's: not expired, none of its keys consumed, its source check accepted for its
   // row now); one that fails is withdrawn or expired, its waiting line replaced by that line, before any
   // waiting line is cleared. A check that can't decide now waits for the next sweep, lines kept.
-  private verifiedSeen = false;
+  // Round 17: keyed to the verification tuple (keeper start, link run, fetch count), recorded durably in the
+  // link's state once its checks complete, so a keeper restart under the same link run (a new start) runs them
+  // again. Every arming check runs on every card that would become tappable (a waiting line, buttonless waiting
+  // cards included, or never armed); a card in the removal queue counts as withdrawn.
+  private verifyTuple(): string | null {
+    if (!this.consumedVerified()) return null;
+    const st = keeperStatus(this.files().status)!;
+    return `${st.start!.nonce}|${st.verified!.link}|${Number(st.verified!.fetches)}`;
+  }
+  private verifyCheckedMem: string | null = null;
+  private verifiedChecked(): string | null {
+    const t = this.verifyTuple();
+    return t !== null && (this.verifyCheckedMem === t || this.d.load().verifyChecked === t) ? t : null;
+  }
   private async verifyObserved(): Promise<void> {
-    if (!this.consumedVerified()) { this.verifiedSeen = false; return; }
-    if (this.verifiedSeen || !this.d.issuedLog) return;
+    const tuple = this.verifyTuple();
+    if (!tuple || !this.d.issuedLog || this.verifiedChecked() === tuple) return;
     const cards = this.logCards();
     let later = false;
     for (const [msg, rec] of Object.entries(this.d.load().messages)) {
-      if (rec.outcome || !rec.buttons || (rec.kind !== "ask" && rec.kind !== "ship")) continue;
+      if (rec.outcome || (!rec.buttons && !rec.checking) || (rec.kind !== "ask" && rec.kind !== "ship")) continue;
       const c = cards.get(msg);
       if (!c || c.void || !c.keys.length) continue;
-      // A card with a waiting line gets every check; any other card still showing buttons is withdrawn here only
-      // for a key the keeper consumed (the sweep's own paths take its buttons off when it expires, its item
-      // changes or the record is reset, each with its own line).
+      // A card that would become tappable gets every check; any other card still showing buttons is withdrawn here
+      // only for a key the keeper consumed or its removal queued (the sweep's own paths take its buttons off when
+      // it expires, its item changes or the record is reset, each with its own line).
+      const waiting = !!rec.checking || !c.armed;
       let why = this.rearmProblem(msg, c.keys, rec, true);
-      if (!rec.checking && why !== "one of its tap keys was used already") why = null;
+      if (!waiting && why !== "one of its tap keys was used already" && why !== "its buttons are queued for removal") why = null;
       if (why === "later") { later = true; continue; }
       if (why) { await this.retireUnarmed(msg, why); this.log(`card ${msg} failed its arming checks once verification was observed: ${why}`); }
     }
-    if (!later) this.verifiedSeen = true;
+    if (later) return;
+    // Re-read just before it is recorded: a tuple that changed meanwhile is checked again next sweep.
+    if (this.verifyTuple() !== tuple) { this.log("the record keeper's verification changed during the arming re-checks: checked again next sweep"); return; }
+    // Recorded in this process, and durably in the link's state (a failed save is retried next sweep; a restart
+    // without it only runs the checks again).
+    this.verifyCheckedMem = tuple;
+    try { const s = this.d.load(); s.verifyChecked = tuple; this.d.save(s, true); }
+    catch (e) { this.log(`couldn't record the verification tuple the arming re-checks completed for: ${String(e).slice(0, 80)}`); }
   }
   private async recoverIssuance(): Promise<void> {
     if (this.issuanceChecked || !this.d.issuedLog) return;
@@ -4986,7 +5162,9 @@ export class Link {
     // Round 15: no card is re-armed until the keeper's status says its consumed set is verified: until then a
     // card that would be re-armed stays buttonless with the checking line, and the re-arm (every check) runs
     // at the first sweep after.
-    const verified = this.consumedVerified();
+    // Round 17: re-armed only once the arming re-checks completed for the current verification tuple, and that
+    // tuple re-read just before each arm: one that changed leaves the card waiting.
+    const verified = this.verifiedChecked();
     for (const [msg, c] of cards) {
       if (c.armed || c.void || !ours(c)) continue;
       const rec = this.d.load().messages[msg];
@@ -5008,6 +5186,7 @@ export class Link {
         continue;
       }
       if (why) { await this.retireUnarmed(msg, why); continue; }
+      if (this.verifyTuple() !== verified) { later = true; this.log(`card ${msg} left waiting: the record keeper's verification changed just before its re-arm`); continue; }
       await this.armCard(msg, rows([c.keys.map((k) => [String(k.label), String(k.cid)] as [string, string])], "q:"), true);
     }
     if (later) this.issuanceChecked = false;
@@ -5016,6 +5195,8 @@ export class Link {
   // or what withdraws it (a key consumed or tapped already, its source check not accepted for its row now).
   private rearmProblem(msg: string, keys: any[], rec: Shown, live = false): string | null {
     const now = this.d.now();
+    // Round 17: a card in the removal queue counts as withdrawn.
+    if (this.stripsOpen().has(msg)) return "its buttons are queued for removal";
     if (keys.some((k) => typeof k.exp === "number" && k.exp <= now) || (rec.expires != null && rec.expires <= now)) return "expired";
     const consumed = this.consumedKids();
     // A card still showing buttons (live) may carry a tap's record that kept them (busy, waiting): only a key
@@ -5080,16 +5261,20 @@ export class Link {
     return true;
   }
   private async retryStrips(): Promise<void> {
-    const f = this.stripFile();
-    if (!f || !existsSync(f)) return;
-    let recs: any[] = [];
-    try { recs = readLog<any>(f, { repair: false }).records; } catch { return; }
+    for (const [msg, line] of this.stripsOpen()) await this.runStrip(msg, line);
+  }
+  // Round 17: the cards in the removal queue whose edit hasn't been done yet, with their lines.
+  private stripsOpen(): Map<string, string> {
     const open = new Map<string, string>();
+    const f = this.stripFile();
+    if (!f || !existsSync(f)) return open;
+    let recs: any[] = [];
+    try { recs = readLog<any>(f, { repair: false }).records; } catch { return open; }
     for (const r of recs) {
       if (r?.t === "strip" && typeof r.msg === "string") open.set(r.msg, String(r.line ?? ""));
       else if (r?.t === "done") open.delete(r.msg);
     }
-    for (const [msg, line] of open) await this.runStrip(msg, line);
+    return open;
   }
 
   // Round 14: a tap held while the keeper's consumed set is unverified: the held record (tap time, the
@@ -5098,13 +5283,15 @@ export class Link {
   private async holdTap(it: any, cid: string, msgId: string, rec: Shown, key: string, now: number): Promise<string> {
     const label = rec.q?.options[Number(cid.split(":")[2])] ?? "";
     const kid = tapKid(key), item = (rec.item ?? "none").toUpperCase(), kind = rec.kind ?? "ask";
-    // Round 16: the hold's start goes into the durable held record, as the keeper's status gave it and as a
-    // snowflake time (the tap's interaction time less how long before the tap the hold began, both by the
-    // Pi's one clock), so the keeper floors the tap's time by this record and never by its own later restart.
+    // Round 17: the hold's start goes into the durable held record as a Discord-stamped id, never a Pi clock
+    // reading: the first held interaction of this hold (the keeper start the status names; the held line is put on
+    // the card by that interaction's own answer, so Discord's stamp for it is the interaction id), read back from
+    // the held log for every later tap held in the same hold. The keeper floors by that id's snowflake alone.
     const iid = /^\d{15,22}$/.test(String(it?.id ?? "")) ? String(it.id) : null;
     const ks = keeperStatus(this.files().status);
-    const since = String(ks?.consumed_unverified?.since ?? ks?.start?.at ?? ""), sinceMs = Date.parse(since);
-    const hold = iid && Number.isFinite(sinceMs) ? { since, sf: snowflakeTime(iid) - Math.max(0, now - sinceMs) } : null;
+    const period = String(ks?.start?.nonce ?? ks?.consumed_unverified?.since ?? "");
+    const first = period ? this.holdAnchor(period) : null;
+    const hold = first ?? (iid ? { period, id: iid, from: "interaction" } : null);
     try {
       // Round 15: with the interaction's id, whose snowflake time is Discord's own record of when he tapped.
       appendLog(this.heldFile()!, { t: "held", kid, msg: msgId, label, item, kind, row: rec.checked?.row ?? null, version: rec.checked?.version ?? 0,
@@ -5127,6 +5314,16 @@ export class Link {
     this.d.relay(`Dane tapped "${label}" on a card of yours (Discord message ${msgId}), but the record keeper can't verify yet which taps were already acted on, so the link holds it: record nothing yet. It comes to you again by itself once the keeper has verified, with its tap key, or you hear why it wasn't acted on. Nothing to tell him.`);
     await this.unverifiedNotice(true);
     return "held";
+  }
+  // Round 17: the hold's Discord-stamped start for a hold (its period: the keeper start it is under), from the
+  // first held record of that hold in the held log; null: none yet.
+  private holdAnchor(period: string): { period: string; id: string; from: string } | null {
+    const f = this.heldFile();
+    if (!f || !existsSync(f)) return null;
+    try {
+      const r = readLog<any>(f, { repair: false }).records.find((x) => x?.t === "held" && x.hold?.period === period && /^\d{15,22}$/.test(String(x.hold?.id ?? "")));
+      return r ? { period, id: String(r.hold.id), from: String(r.hold.from ?? "interaction") } : null;
+    } catch { return null; }
   }
   // Round 14: held taps not yet released or dropped.
   private heldOpen(): any[] {
@@ -5162,18 +5359,22 @@ export class Link {
       // interaction id: its snowflake against the card's post snowflake plus the key's lifetime. The Pi's clock
       // plays no part; when it is off from Discord's by more than CLOCK_TOLERANCE_MS, the card says so plainly.
       const sf = /^\d{15,22}$/.test(String(h.it ?? "")) ? snowflakeTime(String(h.it)) : null;
-      const expAt = k ? (sf !== null && /^\d{15,22}$/.test(String(k.msg ?? "")) && typeof k.at === "number" ? snowflakeTime(String(k.msg)) + (k.exp - k.at) : k.exp) : null;
+      const expAt = k ? (sf !== null ? (this.keyExpirySf(k) ?? k.exp) : k.exp) : null;
       const tapAt = sf ?? Number(h.at);
-      let why: "expired" | "changed" | null = null;
+      let why: "expired" | "changed" | "floor" | null = null;
       const quoted = "";
       if (sf !== null && Math.abs(Number(h.at) - sf) > CLOCK_TOLERANCE_MS) await this.tellCardClockOff(h.msg, Number(h.at) - sf);
+      // Round 17: the hold's start is a Discord-stamped id in the held record (never the keeper's status time).
+      const holdSf = /^\d{15,22}$/.test(String(h.hold?.id ?? "")) ? snowflakeTime(String(h.hold.id)) : null;
       if (typeof expAt === "number" && tapAt > expAt) why = "expired";
+      else if (sf !== null && holdSf !== null && typeof expAt === "number" && holdSf > expAt) why = "floor";
       else if (h.item !== "NONE") { const e = ledger[h.item]; if (!e || e.id !== h.row || e.version !== h.version) why = "changed"; }
       if (why) {
         try { appendLog(this.heldFile()!, { t: "dropped", kid: h.kid, why, at: this.d.now() }); } catch (e) { this.log(`couldn't drop held tap ${h.kid}: ${String(e).slice(0, 80)}`); continue; }
-        const line = why === "changed" ? TAP_NOT_ACTED_CHANGED : TAP_EXPIRED;
+        const line = why === "changed" ? TAP_NOT_ACTED_CHANGED : why === "floor" ? TAP_HOLD_FLOOR : TAP_EXPIRED;
         try { await this.post(line, [], { replyTo: h.msg }); } catch (e) { this.log(`couldn't tell him held tap ${h.kid} wasn't acted on: ${String(e).slice(0, 80)}`); }
         const because = why === "changed" ? `wasn't acted on because ${h.item} changed after his tap`
+          : why === "floor" ? "wasn't acted on because its hold began after its card had expired (by Discord's times)"
           : "wasn't acted on because its card had expired when he tapped (by Discord's times)";
         this.d.relay(`Tap not acted: Dane's held tap "${h.label}" (Discord message ${h.msg}) ${because}. He was told on the card. Record nothing from it; check its item again at its source and ask again with --checked if it still needs him. Tap key ${h.kid}.`);
         this.log(`held tap ${h.kid} dropped: ${why}${quoted ? ` (${quoted})` : ""}`);
@@ -5220,6 +5421,7 @@ export class Link {
   // Round 16: after a flagged replay of a held tap, the keeper's request for its key should follow: a key
   // consumed, or a request the keeper refused (its tap notices). If none appears within REPLAY_WAIT_MS, his
   // card gets one line asking him to answer again on a fresh card, and Cain hears it.
+  private replaySeen = new Map<string, number>();
   private async replayWatch(): Promise<void> {
     const f = this.heldFile();
     if (!f || !existsSync(f) || !this.consumedVerified()) return;
@@ -5236,11 +5438,20 @@ export class Link {
         try { appendLog(f, { t: "replay-done", kid: r.kid, how: "the keeper has a request for it", at: this.d.now() }); } catch { /* the next sweep */ }
         continue;
       }
-      if (this.d.now() - Number(r.at) < REPLAY_WAIT_MS) continue;
+      // Round 17: the 10-minute bound runs on the monotonic clock, from when this process first saw the replay
+      // (a restart starts it again, so it is never shorter), never on the Pi's clock.
+      if (!this.replaySeen.has(r.kid)) this.replaySeen.set(r.kid, this.mono());
+      if (this.mono() - this.replaySeen.get(r.kid)! < REPLAY_WAIT_MS) continue;
       const held = recs.find((x) => x?.t === "held" && x.kid === r.kid);
+      // Round 17: the old key is superseded (fsynced in the issued-key log, which the keeper reads) before the line
+      // asking him again goes, so a late request of Cain's for it is refused, with a line on the card.
+      if (this.d.issuedLog) {
+        try { appendLog(this.d.issuedLog, { t: "supersede", kid: r.kid, ...(held?.msg ? { msg: held.msg } : {}), at: this.d.now() }); }
+        catch (e) { this.log(`couldn't supersede replayed tap key ${r.kid} (${String(e).slice(0, 80)}): asked again next sweep`); continue; }
+      }
       try { appendLog(f, { t: "replay-done", kid: r.kid, how: "no request: asked again", at: this.d.now() }); } catch { continue; }
       if (held?.msg) { try { await this.post(TAP_REPLAY_AGAIN, [], { replyTo: held.msg }); } catch (e) { this.log(`couldn't ask him again on card ${held.msg}: ${String(e).slice(0, 80)}`); } }
-      this.d.relay(`No request came for replayed held tap key ${r.kid} within ${REPLAY_WAIT_MS / 60_000} minutes, so it may never have been acted on. He was asked on the card to answer again: check its item again at its source and ask again with --checked if it still needs him. Nothing more to tell him.`);
+      this.d.relay(`No request came for replayed held tap key ${r.kid} within ${REPLAY_WAIT_MS / 60_000} minutes, so it may never have been acted on. He was asked on the card to answer again, and tap key ${r.kid} is superseded: the record keeper refuses a request for it now, so send none. Check its item again at its source and ask again with --checked if it still needs him. Nothing more to tell him.`);
       this.log(`replayed held tap ${r.kid}: no keeper request within ${REPLAY_WAIT_MS / 60_000} minutes; he was asked again on the card`);
     }
   }
@@ -5281,9 +5492,8 @@ export class Link {
   private saveCursor(c: { restore: string; before: string; done: boolean }): void {
     const f = this.sweepFile();
     if (!f) return;
-    const tmp = `${f}.tmp`;
-    writeFileSync(tmp, JSON.stringify(c) + "\n", { mode: 0o600 });
-    renameSync(tmp, f);
+    // Round 17: fsynced (the file, then its folder) before the rename is relied on: done is never lost to a power cut.
+    writeDurable(f, JSON.stringify(c) + "\n");
   }
   private async restoreSweep(): Promise<void> {
     if (this.restoreSwept || !this.d.issuedLog || !this.restoreDetected()) return;
@@ -5305,7 +5515,11 @@ export class Link {
     const sleep = this.d.sleep ?? ((ms: number) => new Promise<void>((ok) => setTimeout(ok, ms)));
     let id: { owner: string; dm: string; bot: string };
     try { id = await this.identity(); } catch (e) { this.log(`couldn't look over his DM after a restore: ${String(e).slice(0, 80)}`); this.restoreSwept = false; return; }
-    const horizon = this.d.now() - TAP_ISSUED_KEEP_MS;
+    // Round 17: the horizon is a Discord time: the start mark's snowflake time less 100 days, never the Pi's clock.
+    // Done is written only on reaching it or the end of history, and never while the Pi's clock is flagged off.
+    const mark = await this.startMark();
+    if (mark === null) { this.log("the restore sweep waits for this start's mark in his DM"); this.restoreSwept = false; return; }
+    const horizon = (mark === "0" ? -Infinity : snowflakeTime(mark)) - TAP_ISSUED_KEEP_MS;
     let lost = 0;
     for (let n = 0; n < 1000; n++) {
       let got: any;
@@ -5328,13 +5542,15 @@ export class Link {
       let past = false;
       const page: any[] = [];
       for (const m of batch) { if (snowflakeTime(String(m?.id ?? "0")) < horizon) { past = true; break; } page.push(m); }
-      lost += await this.sweepPage(page, id.bot);
+      lost += await this.sweepPage(page, id.bot, horizon);
       const oldest = String(batch.at(-1)?.id ?? "");
-      const done = past || batch.length < 100 || !oldest;
-      cur = { restore: key, before: oldest || cur.before, done };
+      const end = past || batch.length < 100 || !oldest;
+      const off = end && this.piClockOff();
+      cur = { restore: key, before: oldest || cur.before, done: end && !off };
       try { this.saveCursor(cur); } catch (e) { this.log(`couldn't save the restore sweep's cursor: ${String(e).slice(0, 80)}`); }
       this.d.crashPoint?.("sweep:after-page");
-      if (done) break;
+      if (off) { this.log("the restore sweep reached its horizon, but the Pi's clock is flagged off: not marked done, read again next start"); this.restoreSwept = false; }
+      if (end) break;
     }
     if (lost) this.tellLostCards(lost);
   }
@@ -5343,7 +5559,7 @@ export class Link {
   }
   // One page of the restore sweep: any bot card with buttons that neither this state nor the issued-key log
   // knows live gets its buttons off; returns how many were lost (not expired).
-  private async sweepPage(page: any[], bot: string): Promise<number> {
+  private async sweepPage(page: any[], bot: string, horizon: number): Promise<number> {
     const known = this.d.load().messages, cards = this.logCards(), now = this.d.now();
     const hist = keeperStatus(this.files().status)?.history_cards ?? [];
     const indexed = this.expiredCards();
@@ -5354,7 +5570,7 @@ export class Link {
       const cids = (m.components ?? []).flatMap((r: any) => (r.components ?? []).map((b: any) => String(b.custom_id ?? "")));
       if (!cids.some((c: string) => c.startsWith("q:"))) continue;
       const exp = cards.get(id)?.keys.find((k) => typeof k.exp === "number")?.exp;
-      const old = now - snowflakeTime(id) > TAP_ISSUED_KEEP_MS;
+      const old = snowflakeTime(id) < horizon;
       const expired = (typeof exp === "number" && exp <= now) || (hist.includes(id) && old) || old;
       if (expired) {
         const f = this.expiredFile();

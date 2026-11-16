@@ -208,12 +208,12 @@ describe("3. a held tap's time is Discord's", () => {
   });
 
   test("the link's clock behind, within the tolerance: the snowflake says after the expiry, so it is not acted", async () => {
-    const { r, id, out } = await heldAt(-60_000, 30_000);              // the link says a minute before expiry, Discord 30 s after
-    expect(out).toBe("held");
+    const { r, out } = await heldAt(-60_000, 30_000);                  // the link says a minute before expiry, Discord 30 s after
+    // Round 17: a live tap's expiry is judged by Discord's time for it too, so it is refused as expired at once.
+    expect(out).toBe("dead: expired");
     verified(r);
     await r.link.sweep();
     expect(tapLines(r)).toHaveLength(0);
-    expect(onThread(r, id, TAP_EXPIRED)).toHaveLength(1);
   });
 
   test("the clocks apart beyond the tolerance: round 16 judges it by Discord's time alone, so it acts, and the card says the Pi's clock is off", async () => {

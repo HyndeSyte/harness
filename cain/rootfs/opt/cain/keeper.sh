@@ -66,7 +66,10 @@
 #                                        unresolved_landings (each with the exact settle messages and its age),
 #                                        tombstoned_landings (unresolved past 90 days: kept, no longer blocking)
 #                                        and landings_by_head (the ledger's reconciliation, one landing per head),
-#                                        and install_taps (on, once or off: whether his Ship taps land yet)
+#                                        and install_taps (on, once or off: whether his Ship taps land yet).
+#                                        Round 17: verify_pending (a new link run the keeper's fresh fetch
+#                                        hasn't verified yet, the remote away; after 5 minutes on the link's
+#                                        monotonic clock each waiting card says so and Cain is told once)
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or
@@ -114,7 +117,12 @@
 #                                        with a fresh code at once. Round 16: only a live message counts (one
 #                                        after the link's start); one read back from history draws no reply
 #                                        and no code. It never marks anything verified: only a fresh fetch
-#                                        does. If the Pi's clock is off from Discord's, he is told so
+#                                        does. If the Pi's clock is off from Discord's, he is told so.
+#                                        Round 17: a line read back from history that answers a
+#                                        proposal within 30 minutes of it by Discord's times (he sent it
+#                                        while the App was offline) answers "proposed" once, with a fresh
+#                                        code; a stale line always gets its fresh code, whatever the Pi's
+#                                        clock says (the clock line is information only)
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"

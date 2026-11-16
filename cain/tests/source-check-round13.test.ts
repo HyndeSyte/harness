@@ -247,10 +247,9 @@ describe("2. the high-water refusal never bricks the keeper", () => {
     expect(out.refused).toContain("can't be read");
     expect(k.relayed()).toContain(`he sends exactly "${RECOVER_LINE}"`);
     expect(k.relayed()).toContain("keeper.sh recover-logs --said");
-    // An old line doesn't count; a fresh one does, once.
-    writeFileSync(recoverFile(k.cfg), JSON.stringify({ said: "1570000000000000951", at: new Date(k.cfg.now!().getTime() - 2 * DAY).toISOString() }));
-    expect((cycle(k.cfg) as any).refused).toBeDefined();
-    writeFileSync(recoverFile(k.cfg), JSON.stringify({ said: "1570000000000000952", at: k.cfg.now!().toISOString() }));
+    // Round 17: the keeper doesn't age his line by the Pi's clock (the link judged it by Discord's times): it counts
+    // once, by its message id.
+    writeFileSync(recoverFile(k.cfg), JSON.stringify({ said: "1570000000000000952", at: new Date(k.cfg.now!().getTime() - 2 * DAY).toISOString() }));
     expect(cycle(k.cfg).ok).toBe(true);
     expect(existsSync(recoverFile(k.cfg))).toBe(false);
     expect(k.kept().recovered).toEqual(["1570000000000000952"]);

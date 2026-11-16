@@ -126,7 +126,7 @@ function paired(): string {
 const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) => console.log(`[cain] link: ${line}`));
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
-function save(s: State): void { stateStore.save(s); }
+function save(s: State, sync = false): void { stateStore.save(s, sync); }
 function saveDurable(s: State): void { stateStore.saveDurable(s); }
 // Round 12: the issued-key log, outside the link's restorable state (../applog.ts).
 const ISSUED_LOG = process.env.LINK_ISSUED_LOG ?? "/data/link-issued.log";
@@ -237,7 +237,7 @@ const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${
 
 const link = new Link({
   rest, load, save, saveDurable, issuedLog: ISSUED_LOG, expiredLog: EXPIRED_LOG, installLog: INSTALL_LOG, installResults: INSTALL_RESULTS,
-  keeperMirror: KEEPER_MIRROR, recoverFile: RECOVER_FILE, consumedLog: CONSUMED_LOG, heldLog: HELD_LOG, stripLog: STRIP_LOG, now: Date.now, paired, toHarness,
+  keeperMirror: KEEPER_MIRROR, recoverFile: RECOVER_FILE, consumedLog: CONSUMED_LOG, heldLog: HELD_LOG, stripLog: STRIP_LOG, now: Date.now, mono: () => performance.now(), paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`), status: readOr(RECORD_STATUS) }),

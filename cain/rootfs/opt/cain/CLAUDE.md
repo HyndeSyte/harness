@@ -650,9 +650,16 @@ clock is off by about N minutes, waiting for time sync."): say nothing more abou
 only lets the keeper rebuild: it never marks the taps verified and never turns install taps on; taps stay
 held, and `keeper.sh install-taps on` is refused, until a fresh fetch from GitHub verifies (keeper.sh clock
 shows consumed_verified true). Run `--said` only for a message he sent after the App's start: one read
-back from older history is refused and nothing is sent him. If it answers "proposed" with the cause (his code
-was from before a restart, another record epoch, or used already), he was already told in one line and sent
-a fresh code: wait for his new line and run it again with that message's id.
+back from older history is refused and nothing is sent him, unless it answers a proposal within 30 minutes of
+it by Discord's times (he sent it while the App was down): then it answers "proposed" once, he is told it
+arrived while the App was offline and gets a fresh code, and the old line never acts. If it answers "proposed"
+with the cause (his code was from before a restart, another record epoch, used already, too late, or it
+arrived while the App was offline), he was already told in one line and sent a fresh code (always, whatever
+the Pi's clock says): wait for his new line and run it again with that message's id.
+After a restart of the App the record has to check with GitHub again for the App's new run; if GitHub is out
+of reach for over 5 minutes, each card whose buttons wait gets one line saying so and you hear that
+verification for the link's new run is pending (keeper.sh clock shows verify_pending): nothing to do or tell
+him, it goes on by itself.
 Every start of the record keeper checks its taps against GitHub first, so right after a restart (or while
 GitHub can't be reached) his tap on a question is Held: his card says so, and you hear it is held; record
 nothing from it. It comes to you again by itself, with its tap key, once the keeper has checked, and then
@@ -664,8 +671,9 @@ A released held tap whose line starts "Replay of held tap key" may have reached 
 restart: look its tap key up in the record keeper's record (its consumed-key log and request log, under
 log/requests/) and in state/decisions.md, and act on it only if the key is in none of them, never from
 memory (the keeper refuses a second request for a key anyway). If no request of yours for that key reaches
-the keeper within 10 minutes, the link asks him on the card to answer again on the fresh card you send:
-check the item again and ask again with --checked if it still needs him. Held taps are judged by Discord's
+the keeper within 10 minutes, the link asks him on the card to answer again on the fresh card you send, and
+that tap key is superseded: the keeper refuses a request for it from then on (he is told on the card), so send
+none; check the item again and ask again with --checked if it still needs him. Held taps are judged by Discord's
 own times, never the Pi's clock; if the Pi's clock is off, his card says "The Pi's clock is off by about N
 minutes, waiting for time sync." Nothing to do or tell him about it. A held tap refused because its hold
 began after its card expired comes back as "Tap not acted: ..." too: record nothing, and ask again with

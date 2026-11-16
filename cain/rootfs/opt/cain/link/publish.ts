@@ -27,7 +27,9 @@ export function stateFile(path: string, onSave: () => void = () => {}) {
     load(): State {
       try { return JSON.parse(readFileSync(path, "utf8")); } catch { return emptyState(); }
     },
-    save(s: State): void {
+    // Round 17: sync fsyncs it like saveDurable (a save something is relied on after).
+    save(s: State, sync = false): void {
+      if (sync) return this.saveDurable(s);
       writeFileSync(`${path}.tmp`, JSON.stringify(s), { mode: 0o600 });
       renameSync(`${path}.tmp`, path);
       onSave();

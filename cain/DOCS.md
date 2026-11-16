@@ -953,7 +953,7 @@ What Cain's link enforces:
   expiry expressed as a snowflake time (the card's post snowflake plus the lifetime its key record
   carries). When the Pi's clock is the outlier against Discord's (over 2 minutes), the reply to your line,
   or the card of a held tap, says so plainly that the Pi's clock is off by about N minutes, waiting for
-  time sync ("The Pi's clock is off by about N minutes, waiting for time sync."). Nothing waits on it and no fresh code is issued that would fail the same way.
+  time sync ("The Pi's clock is off by about N minutes, waiting for time sync."). Nothing waits on it and no fresh code is issued that would fail the same way. (Round 17: a stale line always gets its fresh code; the clock line is information only.)
 
   The keeper's verified status is bound to the keeper's current start. Each start of the keeper mints a
   start nonce and writes it into its status at once, with the consumed set unverified; a fresh fetch in that
@@ -993,7 +993,7 @@ What Cain's link enforces:
   reads the page again.
 
   The keeper floors a held tap's time by the hold start the held record carries (written by the link when it
-  held the tap, as a snowflake time), never by a hold start it observes again after its own restart, so a
+  held the tap, as a snowflake time; round 17: as the hold's first held interaction id), never by a hold start it observes again after its own restart, so a
   keeper restart between hold and release no longer moves it. A refusal that does come from the floor (a
   hold its record says began after the card expired) puts a line on the card naming the restart.
 
@@ -1007,6 +1007,56 @@ What Cain's link enforces:
   unreachable, Cain proposes the recover line, you send it, and it counts by Discord's times; you are told
   the Pi's clock is off; the keeper's status stays unverified, no card re-arms and install taps stay off
   until the network is back and a fresh fetch verifies.
+
+  Round 17 (the seventeenth review's fixes, to the sixteenth round's own additions; the design stays frozen
+  for the combined fault scenario, and no new durable store). Every durable store, its writer, its fsync
+  point, its rebuild source, what it decides and the clock behind each time it holds are in one table:
+  `cain/docs/source-check-invariants.md`. The code was read against it and fixed where they differed.
+
+  The hold's start in the held record is a Discord-stamped id: the hold's first held interaction (its held
+  line is put on the card by that interaction's own answer), shared by every tap held in the same hold. The
+  keeper's status time is gone from it, and the keeper floors only by that id's snowflake, so a multi-hour
+  Pi clock skew either way changes nothing: a hold spanning the card's expiry acts, a hold that began after
+  the expiry doesn't.
+
+  A stale owner line always gets its fresh code, whatever the Pi's clock says: validity is snowflakes alone.
+  The line saying the Pi's clock is off by about N minutes still goes when it is, as information only, never
+  a gate on the code.
+
+  After a link restart the keeper's verified status names the old link run. The keeper watches the link
+  state's run nonce each round and verifies for the new run with that round's fresh fetch (no keeper restart
+  needed; the nonce is read before the fetch, so a restart mid-round waits a round). While the remote is
+  away its status says verification for the new link run is pending, and once 5 minutes have passed on the
+  link's monotonic clock each waiting card gets one line ("Still waiting: ...") and Cain is told once.
+
+  A card's key records carry its lifetime as an explicit duration fixed at issuance, so its expiry is its
+  post snowflake plus that duration, never a difference of two Pi clock readings; a clock step between the
+  card's post and its key log moves nothing. A live tap's expiry is judged the same way: its interaction
+  snowflake against that expiry.
+
+  A line of yours read back from history (sent while the link was down) that answers a proposal still within
+  30 minutes of it by snowflake is answered once: you are told it arrived while the App was offline and get
+  a fresh code from this run; the old line never acts. Only a history line that answers no proposal gets the
+  silent refusal to Cain.
+
+  The restore sweep's horizon is the start mark's time less 100 days, a snowflake time; it is marked done
+  only on reaching it or the end of history, and never while the Pi's clock is flagged off (then the next
+  start reads from the cursor again).
+
+  The arming re-checks are keyed to the verification tuple (the keeper's start, the link run, the fetch
+  count), recorded durably in the link's state, so a keeper restart under the same link run runs them again.
+  They run every arming check on every card that would become tappable, buttonless waiting cards included; a
+  card in the removal queue counts as withdrawn; and the status is read again just before each clear or
+  re-arm, which is abandoned (the card left waiting) if the tuple changed.
+
+  The 10-minute replay bound runs on the monotonic clock, never the Pi's clock. When the line asking you to
+  answer again goes up, the old tap key is superseded in the link's issued-key log first, so the keeper
+  refuses a late request of Cain's for it, and the card gets one line saying so.
+
+  The combined fault scenario, round 17. It adds a link restart with the remote away: with a card's buttons
+  waiting, restart the link (`pkill -f /opt/cain/link/main.ts`) while the Pi is off its network; after 5
+  minutes the card gets the waiting line and Cain hears verification is pending; once the network is back
+  the keeper's next round verifies for the new link run without a keeper restart, and the card arms.
 
   The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
   issue 24. You have nothing to set up beyond the smoke test's one option change.
