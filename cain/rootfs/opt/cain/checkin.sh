@@ -14,6 +14,7 @@ TM="${TMUX_CMD:-tmux}"   # not TMUX: tmux reads that name itself
 export TZ="${CHECKIN_TZ:-America/New_York}"
 dir="${CHECKIN_DIR:-/data/checkins}"
 queue="${RELAY_QUEUE:-/data/relay.queue}"
+bad="${RELAY_BAD:-/data/relay.bad}"          # relayed records that couldn't be read, kept (never dropped)
 state="${CHECKIN_STATE:-/run/cain/checkin}"     # this container's: his prompt's steadiness, a try in his box
 PS="${PROMPT_STATE:-/opt/cain/prompt-state.sh}"
 mkdir -p "$dir"
@@ -188,7 +189,19 @@ work="$queue.work"
 if [ ! -s "$work" ] && [ -s "$queue" ]; then mv "$queue" "$work"; fi
 if [ -s "$work" ]; then
   line=$(head -n 1 "$work")
-  text=$(printf '%s' "$line" | jq -r '.text // empty' 2>/dev/null | tr -d '\r\n')
+  # Read whole: a JSON object whose text is a string, its text as written (line ends kept for
+  # keyless to make spaces; outside round 20). One that can't be read is set aside, kept in $bad,
+  # and Cain hears at the next check-in; it leaves the queue only once it's kept there.
+  if ! text=$(printf '%s' "$line" | jq -j 'if type == "object" and (.text | type) == "string" then .text else error("not a relayed record") end' 2>/dev/null); then
+    if ! printf '%s\n' "$line" >> "$bad" 2>/dev/null; then
+      echo "[cain] a relayed record couldn't be read, nor set aside ($bad): it stays first"
+      exit 1
+    fi
+    echo 1 >> "$state/unread" 2>/dev/null
+    echo "[cain] a relayed record couldn't be read: set aside in $bad, and Cain hears at the next check-in"
+    tail -n +2 "$work" > "$work.tmp" && mv "$work.tmp" "$work"
+    exit 0
+  fi
   if [ -n "$text" ] && ! type_in "Relayed by the add-on: $text"; then
     sum=$(printf '%s' "$line" | cksum | cut -d' ' -f1)
     tries=$(awk -v s="$sum" '$1 == s { print $2 }' "$state/tries" 2>/dev/null)
@@ -206,7 +219,7 @@ if [ -s "$work" ]; then
     echo 1 >> "$state/unconfirmed" 2>/dev/null
   else
     rm -f "$state/tries"
-    [ -n "$text" ] && echo "[cain] relayed a tap or reaction"
+    if [ -n "$text" ]; then echo "[cain] relayed a tap or reaction"; else echo "[cain] a relayed record with no text: nothing to type"; fi
   fi
   tail -n +2 "$work" > "$work.tmp" && mv "$work.tmp" "$work"
   exit 0
@@ -290,6 +303,8 @@ fi
 # unknown to him (outside round 19).
 held_back=$(wc -l < "$state/unconfirmed" 2>/dev/null | tr -cd '0-9')
 [ "${held_back:-0}" -gt 0 ] && lead="${lead}Relayed lines the App couldn't confirm in your input box when it typed them: ${held_back}. Each waits in its queue behind newer ones and comes again. "
+unread=$(wc -l < "$state/unread" 2>/dev/null | tr -cd '0-9')
+[ "${unread:-0}" -gt 0 ] && lead="${lead}Relayed records the App couldn't read: ${unread}, set aside unread in its own files. A tap or reaction of his may be among them: if he mentions one you never heard of, that's why. "
 if [ "$slot" = 0710 ]; then
   msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else
@@ -299,6 +314,7 @@ type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
 for cand in "${named[@]}"; do touch "$dir/$cand.missed"; done
 [ "${held_back:-0}" -gt 0 ] && rm -f "$state/unconfirmed"
+[ "${unread:-0}" -gt 0 ] && rm -f "$state/unread"
 [ -n "$newest" ] && printf '%s' "$newest" > "$seen"      # listed: never again
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"

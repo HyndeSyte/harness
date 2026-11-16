@@ -2233,6 +2233,32 @@ def test_a_checkin_that_missed_its_hour_is_named_in_the_next(tmp_path):
     assert "didn't reach you" not in _checkin(tmp_path, "1240", IDLE, day="2026-11-10").splitlines()[-2]
 
 
+def test_a_relayed_record_is_typed_as_written_or_set_aside(tmp_path):
+    """Outside round 20: a relayed record's text goes as written, a line end in it a space, never
+    words run together; a record that can't be read is never dropped: set aside, kept in relay.bad,
+    and Cain hears at the next check-in, once."""
+    import json
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        pytest.skip("no jq")
+    q, work, bad = tmp_path / "relay.queue", tmp_path / "relay.queue.work", tmp_path / "relay.bad"
+    os.environ["RELAY_QUEUE"], os.environ["RELAY_BAD"] = str(q), str(bad)
+    try:
+        q.write_text(json.dumps({"text": "Approve\nNOT approve"}) + "\n", newline="\n")
+        out = _checkin(tmp_path, "0300", IDLE)
+        assert _typed(out.splitlines()[-2]) == "Relayed by the add-on: Approve NOT approve"
+        q.write_text('{"text": "Ship PR 18"\n{"text": "after it"}\n', newline="\n")
+        out = _checkin(tmp_path, "0300", IDLE, runs=4)
+        assert bad.read_text() == '{"text": "Ship PR 18"\n' and work.read_text().strip() == ""
+        assert "after it" in out and "Ship PR 18" not in out
+        line = _typed(_checkin(tmp_path, "1240", IDLE).splitlines()[-2])
+        assert "Relayed records the App couldn't read: 1, set aside unread" in line
+        assert "couldn't read" not in _checkin(tmp_path, "1740", IDLE).splitlines()[-2]
+    finally:
+        del os.environ["RELAY_QUEUE"], os.environ["RELAY_BAD"]
+
+
 def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):
     import shutil
     if not shutil.which("jq"):
