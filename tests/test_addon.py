@@ -1638,8 +1638,17 @@ OPTION_SCREEN = ("  Permission mode\n  ❯ 1. auto mode on\n    2. default\n"
 # His input area holding a draft not sent (round 11): typing would add to it and send it.
 DRAFT = "❯ /permissions\n  ? for shortcuts"
 BOX_DRAFT = f"╭{RULE}╮\n│ > unfinished draft {' ' * 41}│\n╰{RULE}╯\n  ? for shortcuts"
-# Claude Code's gray start-up example in an empty box, which typing replaces.
-STARTUP_EXAMPLE = '> Try "fix the lint errors in app.ts"\n  ? for shortcuts'
+# Text shaped like Claude Code's gray start-up example (round 12): a plain capture can't tell it
+# from a draft typed that way, so it counts as a draft.
+LOOKALIKE_DRAFT = '❯ Try "rm -rf /data"\n  ? for shortcuts'
+# A fresh session's screen on Claude Code 2.1.317 (Nov 16), as it drew it: a no-break space after
+# the prompt mark, and rows under the footer. With CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false the
+# box is empty; without it, the gray start-up example fills it.
+_START = ("  Fable 5.2 is here for your longest and toughest coding tasks.\n\n{rule}\n❯ {box}\n{rule}\n"
+          "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents{gap}◐ medium · /effort\n"
+          "{gap}Update available! Run: winget upgrade Anthropic.ClaudeCode")
+REAL_START_OFF = _START.format(rule=RULE, box="", gap=" " * 40)
+REAL_START_ON = _START.format(rule=RULE, box='Try "how does <filepath> work?"', gap=" " * 40)
 
 
 def _prompt_state(screen):
@@ -1659,11 +1668,12 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
     with Claude Code's footer, right under the prompt line (borders between), in the bottom lines,
     with no dialog's key hints below it. Rows under the footer (background tasks) don't matter;
     words that only look like a footer or a hint count for nothing. Never fails."""
-    for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE, STARTUP_EXAMPLE,
+    for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE, REAL_START_OFF,
                    "To stop it, press Esc to cancel.\n" + IDLE):
         assert _prompt_state(screen) == "ready", screen
-    for screen in (DRAFT, BOX_DRAFT, "> Try this instead\n  ? for shortcuts"):     # a draft not sent
-        assert _prompt_state(screen) == "other", screen
+    for screen in (DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, REAL_START_ON, "> Try this instead\n  ? for shortcuts",
+                   "❯ x \n  ? for shortcuts"):
+        assert _prompt_state(screen) == "other", screen                             # a draft not sent
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("He said: auto mode on, ? for shortcuts.\n" + AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("  Select model\n  > Opus\n  Enter to confirm · Esc to exit") == "dialog"
@@ -1685,7 +1695,7 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
     and his taps wait for it, as the check-in does within its hour."""
     import os
     import shutil
-    for screen in (AUTO_MODE_OFFER, QUOTED_FOOTER, OPTION_SCREEN, DRAFT, BOX_DRAFT, WORKING):
+    for screen in (AUTO_MODE_OFFER, QUOTED_FOOTER, OPTION_SCREEN, DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, WORKING):
         assert _checkin(tmp_path, "0712", screen) == "", screen       # (WORKING: at work, later)
     assert list((tmp_path / "done").glob("*")) == []                  # the morning one still to come
     out = _checkin(tmp_path, "0712", "To stop it, press Esc to cancel.\n" + IDLE_WITH_TASKS)
@@ -1696,7 +1706,7 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
         os.environ["RELAY_QUEUE"] = str(q)
         try:
             (tmp_path / "sent.txt").unlink()
-            for screen in (AUTO_MODE_OFFER, DRAFT, BOX_DRAFT):        # his tap waits for him,
+            for screen in (AUTO_MODE_OFFER, DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT):   # his tap waits for him,
                 assert _checkin(tmp_path, "0712", screen) == "", screen
                 assert q.exists() and not (tmp_path / "relay.queue.work").exists()   # untouched
             assert 'Dane tapped "Ship"' in _checkin(tmp_path, "0712", IDLE)

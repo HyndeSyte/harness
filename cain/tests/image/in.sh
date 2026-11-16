@@ -175,6 +175,9 @@ final)
     || fail "prompt-state: words quoting a footer, or an empty screen, read as more than other"
   [ "$(seen '❯ /permissions\n  ? for shortcuts\n')" = other ] \
     || fail "prompt-state: a draft in his input box read as ready"
+  # Claude Code's own empty prompt line: the mark and a no-break space (U+00A0, octal 302 240).
+  [ "$(seen '──────\n❯\302\240\n──────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n')" = ready ] \
+    || fail "prompt-state: his empty prompt with its no-break space isn't read as ready"
   holder cain; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
   printf '%s' "$out" | jq -e '.ok == false and (.failed | any(test("carries the bot token")))' >/dev/null \
