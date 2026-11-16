@@ -126,6 +126,38 @@ describe("keeper.sh against a fake link", () => {
     } finally { server.stop(true); }
   }, 30_000);
 
+  test.skipIf(!ready)("fastpath records the smoke test and turns the no-card path on, or off; nothing else is sent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-"));
+    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
+    const key = createHmac("sha256", TOKEN).update("harness-handover-v1").digest("hex");
+    const seen: { path: string; keyed: boolean; body: any }[] = [];
+    const server = Bun.serve({ port: 0, async fetch(req) {
+      seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body: JSON.parse(await req.text()) });
+      return Response.json({ status: "ok" });
+    } });
+    const env = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_KEEPER_TEST: "1", CAIN_DISCORD_DIR: dir };
+    const keeper = async (...args: string[]) => {
+      const p = Bun.spawn(["bash", KEEPER, ...args], { env, stdout: "pipe", stderr: "pipe" });
+      const out = (await new Response(p.stdout).text()).trim();
+      return { code: await p.exited, out };
+    };
+    try {
+      expect(await keeper("fastpath")).toMatchObject({ code: 2 });             // on or off, nothing else
+      expect(await keeper("fastpath", "on")).toMatchObject({ code: 2 });       // on needs what the smoke test showed
+      expect(await keeper("fastpath", "maybe")).toMatchObject({ code: 2 });
+      expect(seen.length).toBe(0);
+      await keeper("fastpath", "on", "Added, moved and removed a test event on both calendars; each read back");
+      await keeper("fastpath", "off");
+      expect(seen).toEqual([
+        { path: "/fastpath", keyed: true, body: { state: "on", smoke: "Added, moved and removed a test event on both calendars; each read back" } },
+        { path: "/fastpath", keyed: true, body: { state: "off", smoke: "" } },
+      ]);
+      const usage = (await keeper("help")).out;
+      expect(usage).toContain('keeper.sh fastpath on "<what the smoke test showed>"');
+    } finally { server.stop(true); }
+  }, 30_000);
+
   test.skipIf(!ready)("the specialist's address moves only with the test flag, and an ignored one is logged", async () => {
     const dir = mkdtempSync(join(tmpdir(), "keeper-"));
     writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
