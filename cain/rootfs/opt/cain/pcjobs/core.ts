@@ -48,7 +48,7 @@ export const CODES = [
   "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab", "tab_context_owed",
   "containment_unavailable", "domain_not_allowed", "read_drift", "helper_compiler_missing", "helper_blocked",
   "read_unplaced", "inventory_never_ready", "refusal_cap", "abort_kill_failed", "extension_slow_attach", "hook_margin_low",
-  "extension_versions_ambiguous", "versions_changed", "version_hold_unwritable", "nav_log_unset",
+  "extension_versions_ambiguous", "versions_changed", "version_hold_unwritable", "nav_log_unset", "chrome_version_timeout",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];

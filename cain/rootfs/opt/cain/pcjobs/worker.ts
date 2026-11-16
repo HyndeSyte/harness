@@ -88,7 +88,8 @@ export { registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScop
 // hook_timing sessions alone (PCW_HOOK_TIMING set): the CLI prints it before it runs the call's hooks.
 export interface Session { code: number | null; out: string; timedOut: boolean; stopped?: boolean; aborted?: AbortCode; pid?: number; started?: number;
   containment_failed?: boolean; initAt?: number; firstTurnAt?: number; useAt?: Record<string, number>; useCliAt?: Record<string, number>;
-  abort_kill?: KillEnd }           // a hook's abort: how the escalation ended the session, and how long it took (escalateAbort)
+  abort_kill?: KillEnd;            // a hook's abort: how the escalation ended the session, and how long it took (escalateAbort)
+  abort_why?: string }             // hook_margin_low (twenty-third round): which call, and why (never_started, late_start, table_full with its own reason)
 // gate: checks the session's init event (the tools it was given) the moment it arrives;
 // false ends the session at once.
 export type Gate = (init: Stream["init"]) => boolean;
@@ -123,6 +124,7 @@ export interface Opts {
   env?: Record<string, string | undefined>;         // the worker's own environment (process.env unless a test stands in)
   envRegistry?: (name: string) => ("user" | "machine")[] | null; // Windows: the registry scopes that set a variable, null when the lookup failed (registryEnvScopes unless a test stands in)
   exeVersion?: (exe: string) => string | null;      // a test's stand-in for an executable's file version (Windows reads it with chromeExeVersions)
+  chromePs?: () => string;                          // a test's stand-in for chromeExeVersions' PowerShell output (throws as execFileSync would)
   procs?: () => Proc[] | null;                      // the running processes (listProcs unless a test stands in)
   killPid?: (pid: number) => void;                  // ends one process (a stuck bridge's), killTree unless a test stands in
   platform?: string;
@@ -760,48 +762,70 @@ export const exeOf = (cmd: string): string | null => { const m = /^\s*(?:"([^"]+
 // (a probe step, confirm-profile) each read is its own. The Last Version file, the fallback, is named in the
 // run log (chrome_version_fallback) whenever a run's phase uses it.
 export interface ChromeRead { version: string; source: ChromeVersionSource }
-let chromePhase: { key: string; read: ChromeRead | null } | null = null;
+// The phase's reading, with whether the PowerShell call ran out of time (twenty-third round: chrome_version_timeout).
+let chromePhase: { key: string; read: ChromeRead | null; timedOut: boolean } | null = null;
 let chromePhaseOn = 0;
-export function inChromePhase<T>(fn: () => T): T {
-  if (chromePhaseOn === 0) chromePhase = null;
+let lastPhase: { key: string; read: ChromeRead | null; timedOut: boolean } | null = null;
+let lastTimedOut = false;
+// reuse: start this phase from the last phase's reading (twenty-third round: a run refused probe_stale names
+// the versions from its preflight's reading, never a third read).
+export function inChromePhase<T>(fn: () => T, reuse = false): T {
+  if (chromePhaseOn === 0) chromePhase = reuse ? lastPhase : null;
   chromePhaseOn++;
-  try { return fn(); } finally { chromePhaseOn--; if (chromePhaseOn === 0) chromePhase = null; }
+  try { return fn(); } finally { chromePhaseOn--; if (chromePhaseOn === 0) { if (chromePhase) lastPhase = chromePhase; chromePhase = null; } }
 }
+export const forgetChromePhase = () => { lastPhase = null; };
+// Whether the last reading of Chrome's version (this phase's) failed because PowerShell ran out of time.
+export const chromeReadTimedOut = () => lastTimedOut;
 export function chromeVersionRead(o: Opts, inst: Install): ChromeRead | null {
   const key = resolve(inst.profile.user_data_dir);
-  if (chromePhaseOn && chromePhase?.key === key) return chromePhase.read;
-  const read = chromeVersionReadNow(o, inst);
-  if (chromePhaseOn) chromePhase = { key, read };
-  if (chromePhaseOn && read?.source === "last_version_file" && (platform(o) === "win32" || o.exeVersion))
+  if (chromePhaseOn && chromePhase?.key === key) { lastTimedOut = chromePhase.timedOut; return chromePhase.read; }
+  const { read, timedOut } = chromeVersionReadNow(o, inst);
+  lastTimedOut = timedOut;
+  if (chromePhaseOn) chromePhase = { key, read, timedOut };
+  if (timedOut) try { appendFileSync(P.log(o), `${clock(o).toISOString()} chrome_version_timeout: the PowerShell call that reads chrome.exe's version ran out of its ${CHROME_PS_TIMEOUT_MS / 1000} seconds\n`); } catch { /* never stops it */ }
+  if (chromePhaseOn && read?.source === "last_version_file" && (platform(o) === "win32" || o.exeVersion || o.chromePs))
     try { appendFileSync(P.log(o), `${clock(o).toISOString()} chrome_version_fallback last_version_file ${read.version}: chrome.exe's file version couldn't be read\n`); } catch { /* never stops it */ }
   return read;
 }
 // The dedicated Chrome's executable versions, in one PowerShell call: each chrome.exe process's id, parent,
-// command line and its executable's file version. null when the call fails.
-export const chromeExeVersions = (): { proc: Proc; version: string }[] | null => {
+// start time, its executable's file version and its command line (twenty-third round: the start time too, as
+// the general process listing has it). The dedicated one is matched by the profile path its command line names
+// (isDedicated: --user-data-dir). Under a hard time limit (CHROME_PS_TIMEOUT_MS, then killed): "timeout" fails
+// the phase by its own code (chrome_version_timeout), never the fallback. null when the call fails otherwise.
+export const CHROME_PS_TIMEOUT_MS = 20_000;
+export const CHROME_PS_COMMAND = "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { $v = ''; try { $v = (Get-Item -LiteralPath $_.ExecutablePath).VersionInfo.FileVersion } catch { }; \"$($_.ProcessId)|$($_.ParentProcessId)|$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') })|$v|$($_.CommandLine)\" }";
+export interface ChromeExeLine { proc: Proc; version: string }
+export function parseChromeExeListing(out: string): ChromeExeLine[] {
+  return out.split(/\r?\n/).map((l) => /^\s*(\d+)\|(\d+)\|([^|]*)\|([^|]*)\|(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
+    .map((m) => { const t = Date.parse(m[3]); return { proc: { pid: Number(m[1]), ppid: Number(m[2]), created: Number.isFinite(t) ? t : null, cmd: m[5].trim() }, version: m[4].trim() }; });
+}
+const timedOutErr = (e: unknown) => { const x = e as NodeJS.ErrnoException & { signal?: string }; return x?.code === "ETIMEDOUT" || x?.signal === "SIGKILL"; };
+export const chromeExeVersions = (run?: () => string): ChromeExeLine[] | null | "timeout" => {
+  let out: string;
   try {
-    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-      "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | ForEach-Object { $v = ''; try { $v = (Get-Item -LiteralPath $_.ExecutablePath).VersionInfo.FileVersion } catch { }; \"$($_.ProcessId)|$($_.ParentProcessId)|$v|$($_.CommandLine)\" }"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
-    return out.split(/\r?\n/).map((l) => /^\s*(\d+)\|(\d+)\|([^|]*)\|(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
-      .map((m) => ({ proc: { pid: Number(m[1]), ppid: Number(m[2]), created: null, cmd: m[4].trim() }, version: m[3].trim() }));
-  } catch { return null; }
+    out = run ? run() : execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", CHROME_PS_COMMAND],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: CHROME_PS_TIMEOUT_MS, killSignal: "SIGKILL", windowsHide: true });
+  } catch (e) { return timedOutErr(e) ? "timeout" : null; }
+  return parseChromeExeListing(out);
 };
-function chromeVersionReadNow(o: Opts, inst: Install): ChromeRead | null {
+function chromeVersionReadNow(o: Opts, inst: Install): { read: ChromeRead | null; timedOut: boolean } {
   const OK = /^\d+(\.\d+){1,3}$/;
   if (o.exeVersion) {
     // A test's stand-in: the process list and one version read of the dedicated Chrome's executable.
     const ps = (o.procs ?? (() => listProcs(platform(o))))() ?? [];
     const exe = exeOf(ps.find((p) => isDedicated(p, inst))?.cmd ?? "");
     const v = exe ? o.exeVersion(exe)?.trim() ?? null : null;
-    if (v && OK.test(v)) return { version: v, source: "chrome_exe" };
-  } else if (platform(o) === "win32") {
-    const v = (chromeExeVersions() ?? []).find((x) => isDedicated(x.proc, inst))?.version ?? null;
-    if (v && OK.test(v)) return { version: v, source: "chrome_exe" };
+    if (v && OK.test(v)) return { read: { version: v, source: "chrome_exe" }, timedOut: false };
+  } else if (platform(o) === "win32" || o.chromePs) {
+    const lines = chromeExeVersions(o.chromePs);
+    if (lines === "timeout") return { read: null, timedOut: true };
+    const v = (lines ?? []).find((x) => isDedicated(x.proc, inst))?.version ?? null;
+    if (v && OK.test(v)) return { read: { version: v, source: "chrome_exe" }, timedOut: false };
   }
   let v = "";
   try { v = readFileSync(join(inst.profile.user_data_dir, "Last Version"), "utf8").trim(); } catch { v = ""; }
-  return OK.test(v) ? { version: v, source: "last_version_file" } : null;
+  return { read: OK.test(v) ? { version: v, source: "last_version_file" } : null, timedOut: false };
 }
 // The version hold (version-hold.json, 0.12.0, twenty-first to twenty-third rounds): an update pending or
 // more than one version folder seen at a run's preflight, or after its session, or a version that changed
@@ -918,6 +942,7 @@ export function versionHold(o: Opts, inst: Install, now: Date, after: HoldCode |
   return had.code;
 }
 export const VERSION_HOLD_UNWRITABLE_HINT = "the worker couldn't write its version hold (version-hold.json in the worker folder): no run starts until it can. Free disk space, or check that the worker folder can be written, then run again; the hold is then kept and asks for a new probe";
+export const CHROME_VERSION_TIMEOUT_HINT = "the worker couldn't read Chrome's version in time (the PowerShell call that lists chrome.exe ran out of its time): nothing ran. Close heavy programs or restart the PC, then run again";
 export const VERSIONS_CHANGED_HINT = "Claude in Chrome or Chrome changed version during a run, so its report was thrown away: an auto-update needs a new probe. Restart the Cain jobs Chrome, then run the probe again and confirm-profile";
 export const VERSION_HOLD_HINT = "Claude in Chrome's version in the Cain jobs profile can't be bound to the probe (an update waiting, or more than one version folder): an auto-update needs a new probe. Restart the Cain jobs Chrome, then run the probe again and confirm-profile";
 
@@ -1341,6 +1366,9 @@ function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code |
   // probe (versionHold); the probe itself refuses while either is seen.
   if (bypassConfirm) { if (updatePending(inst)) return "update_pending"; if (extensionFolders(inst).length > 1) return "extension_versions_ambiguous"; }
   else { const held = versionHold(o, inst, clock(o)); if (held) return held; }
+  // Chrome's version, read once for the phase: a PowerShell call that ran out of time fails it by name.
+  chromeVersionRead(o, inst);
+  if (chromeReadTimedOut()) return "chrome_version_timeout";
   const fp = fingerprint(o, inst);
   if (!fp) return "wrong_profile";
   if (!bypassConfirm && !readMarker(o)) return "wrong_profile";
@@ -1676,7 +1704,7 @@ export async function next(o: Opts): Promise<NextOut> {
     let code: Heartbeat["code"] = "idle";
     if (candidate) {
       const pre = browserPreflight(o, inst) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o) ?? await bridgeCheck(o, inst);
-      if (pre === "probe_stale") st.reason = staleReason(o, inst);
+      if (pre === "probe_stale") st.reason = inChromePhase(() => staleReason(o, inst), true);     // the preflight's own reading
       if (pre === "extension_version_unknown") st.reason = "extension_version_unknown";
       if (pre) code = pre;
       else {
@@ -3496,7 +3524,7 @@ export const containmentProblem = (o: Opts): Code | null => {
 // there (aborted), so a session given a tool it shouldn't have doesn't go on to use it; the
 // hook refuses any off-list tool meanwhile.
 export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate, wrap) => new Promise((done) => {
-  let out = "", timedOut = false, stopped = false, aborted: AbortCode | null = null, gated = !gate, buf = "";
+  let out = "", timedOut = false, stopped = false, aborted: AbortCode | null = null, abortWhy: string | null = null, gated = !gate, buf = "";
   let killing: Promise<KillEnd> | null = null;
   let initAt: number | undefined, firstTurnAt: number | undefined;
   // Every session notes when each tool call was printed (0.12.0, nineteenth round: runs record their hooks' gaps).
@@ -3511,10 +3539,13 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   // A table found full is checked and its finished calls evicted at once, then the call tried again; still
   // full (or the check failed), it stays marked full and the next check ends the session.
   const track = (id: string, start: number, wall: number) => {
-    if (trackCall(calls, id, start, wall) || !env.PCW_NAV_LOG) return;
+    if (trackCall(calls, id, start, wall)) return;
+    if (!env.PCW_NAV_LOG) { calls.fullWhy = `${CALL_TABLE_CAP} unfinished calls when hooked call ${calls.seen} came`; return; }
     calls.full = false;
-    const lg = readHookLog(env.PCW_NAV_LOG);
-    if (watchCalls(calls, lg.starts, lg.finished, performance.now()) || !trackCall(calls, id, start, wall)) calls.full = true;
+    const lg = readHookLog(env.PCW_NAV_LOG), now = performance.now();
+    const why = watchCalls(calls, lg.starts, lg.finished, now);
+    if (why) { calls.full = true; calls.fullWhy = `the table's check, when hooked call ${calls.seen} came, found ${callWhy(calls, why, lg.starts, now)}`; }
+    else if (!trackCall(calls, id, start, wall, CALL_TABLE_CAP, calls.seen)) { calls.full = true; calls.fullWhy = `${CALL_TABLE_CAP} unfinished calls when hooked call ${calls.seen} came`; }
   };
   const noteUses = (line: string, t: number, mono: number) => {
     try {
@@ -3554,8 +3585,9 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   // session at once (hook_margin_low). Finished calls leave the table after the check.
   const marginWatch = env.PCW_SESSION_KIND === "run" ? setInterval(() => {
     if (aborted) return;
-    const log = readHookLog(env.PCW_NAV_LOG!);
-    if (watchCalls(calls, log.starts, log.finished, performance.now())) { aborted = "hook_margin_low"; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
+    const log = readHookLog(env.PCW_NAV_LOG!), now = performance.now();
+    const why = watchCalls(calls, log.starts, log.finished, now);
+    if (why) { aborted = "hook_margin_low"; abortWhy = callWhy(calls, why, log.starts, now); if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
   }, MARGIN_POLL_MS) : undefined;
   const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); if (abortWatch) clearInterval(abortWatch); if (marginWatch) clearInterval(marginWatch); if (liveChild === child.pid) setLiveChild(null); };
   child.stdout?.on("data", (d) => {
@@ -3578,7 +3610,7 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
     }
     if (buf.length > 1_000_000) buf = "";
   });
-  const fin = async (code: number | null, o: string) => { const abort_kill = killing ? await killing : undefined; done({ code, out: o, timedOut, stopped, ...(aborted ? { aborted } : {}), ...(abort_kill ? { abort_kill } : {}), ...(child.pid ? { pid: child.pid, started } : {}),
+  const fin = async (code: number | null, o: string) => { const abort_kill = killing ? await killing : undefined; done({ code, out: o, timedOut, stopped, ...(aborted ? { aborted } : {}), ...(abortWhy ? { abort_why: abortWhy } : {}), ...(abort_kill ? { abort_kill } : {}), ...(child.pid ? { pid: child.pid, started } : {}),
     ...(wrap?.length && code !== null && JOB_HELPER_CODES.includes(code) && !timedOut && !stopped && !aborted ? { containment_failed: true } : {}),
     ...(initAt !== undefined ? { initAt } : {}), ...(firstTurnAt !== undefined ? { firstTurnAt } : {}), useAt, ...(Object.keys(useCliAt).length ? { useCliAt } : {}) }); };
   child.on("error", () => { end(); fin(null, ""); });
@@ -4281,12 +4313,28 @@ export function marginAbort(calls: Record<string, number>, useAt: Record<string,
 // take (CALL_TABLE_CAP unfinished calls already in it) marks it full, and a full table ends the session
 // (hook_margin_low, table_full), never an untimed call.
 export const CALL_TABLE_CAP = 200;
-export interface CallTable { mono: Record<string, number>; wall: Record<string, number>; full: boolean }
-export const newCallTable = (): CallTable => ({ mono: {}, wall: {}, full: false });
-export function trackCall(t: CallTable, id: string, mono: number, wall: number, cap = CALL_TABLE_CAP): boolean {
+// fullWhy (twenty-third round): why the table filled, kept beside the flag: the check that found a call with
+// no start or a late start on hooked call N, or CALL_TABLE_CAP unfinished calls when call N came. seen: the
+// hooked calls counted so far (their order numbers, from 1), and order: each tracked call's number.
+export interface CallTable { mono: Record<string, number>; wall: Record<string, number>; full: boolean; fullWhy?: string | null; seen?: number; order?: Record<string, number> }
+export const newCallTable = (): CallTable => ({ mono: {}, wall: {}, full: false, fullWhy: null, seen: 0, order: {} });
+// The reason a check ended the session, in words for the run's detail and worker.log.
+export function callWhy(t: CallTable, why: "never_started" | "late_start" | "table_full", starts: { id: string; t0: number }[] = [], nowMono = performance.now(),
+  lim: TimingLimits = HOOK_LIMITS): string {
+  if (why === "table_full") return `table_full: ${t.fullWhy ?? `${CALL_TABLE_CAP} unfinished calls`}`;
+  const began = new Set(starts.map((x) => x.id));
+  const id = why === "never_started" ? Object.entries(t.mono).find(([i, m]) => !began.has(i) && nowMono - m >= startDeadlineMs(lim))?.[0]
+    : Object.keys(t.mono).find((i) => began.has(i));
+  const n = id !== undefined ? t.order?.[id] : undefined;
+  return `${why === "never_started" ? "no start" : "a late start"} on hooked call ${n ?? "unknown"}`;
+}
+// n: the call's order number when it is being tried again (track); otherwise the next one.
+export function trackCall(t: CallTable, id: string, mono: number, wall: number, cap = CALL_TABLE_CAP, n?: number): boolean {
   if (Object.hasOwn(t.mono, id)) return true;
+  const k = n ?? (t.seen = (t.seen ?? 0) + 1);
   if (Object.keys(t.mono).length >= cap) { t.full = true; return false; }
   t.mono[id] = mono; t.wall[id] = wall;
+  (t.order ??= {})[id] = k;
   return true;
 }
 // One check of the table: a full table, then each call's start (marginAbort); only then the finished
@@ -4296,7 +4344,7 @@ export function watchCalls(t: CallTable, starts: { id: string; t0: number }[], f
   if (t.full) return "table_full";
   const why = marginAbort(t.mono, t.wall, starts, nowMono, lim);
   if (why) return why;
-  for (const id of finished) if (Object.hasOwn(t.mono, id)) { delete t.mono[id]; delete t.wall[id]; }
+  for (const id of finished) if (Object.hasOwn(t.mono, id)) { delete t.mono[id]; delete t.wall[id]; if (t.order) delete t.order[id]; }
   return null;
 }
 // Which tool names the pinned PreToolUse guard (nav-guard) runs for (twenty-second round): the deadline
@@ -4384,7 +4432,7 @@ async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof 
   const expected = expectedOf(canary, inst.profile.extension_id, job.attempt!);
   return { s, stream, expected, log: readNavLog(P.navLog(o)), canaryUrl: canary.url,
     checks: { cliChanged: !before || before !== after, diskExtension: activeExtensionVersion(inst), workerPaths: wallOf(o).paths, wallTokens: wallOf(o).tokens,
-      ...((v) => ({ versionsChanged: v.changed, versionsNote: v.note }))(versionsAfter(o, inst, base)) } };
+      ...((v) => ({ versionsChanged: v.changed, versionsNote: v.note, ...(v.code ? { versionsCode: v.code } : {}) }))(versionsAfter(o, inst, base)) } };
 }
 
 // The extension's version as the session saw it (its init data), against the one on disk:
@@ -4431,7 +4479,7 @@ export interface Verdict { bad: Code | null; given: unknown; guard: GuardCheck; 
 // tab's address, so each read needs a tab context after it. needLive: an unattended run.
 // workerPaths: the worker folder and its config folder, for the second wall (guardCheck).
 export interface SessionChecks { cliChanged: boolean; diskExtension: string | null; contextAfterRead?: boolean; needLive?: boolean; confirmedExtension?: string | null;
-  workerPaths?: string[]; wallTokens?: string[]; versionsChanged?: string | null; versionsNote?: string | null }
+  workerPaths?: string[]; wallTokens?: string[]; versionsChanged?: string | null; versionsNote?: string | null; versionsCode?: Code }
 // Both versions rechecked once the session has ended (0.12.0, twenty-first to twenty-third rounds), with
 // Chrome's version read once for the check (inChromePhase). First the hold step (versionHold), which writes the
 // hold whenever an update is pending or a second version folder shows, whatever else is wrong: update_pending
@@ -4442,8 +4490,11 @@ export interface SessionChecks { cliChanged: boolean; diskExtension: string | nu
 // other; only a source difference with an equal version is a note (versionsNote, in the run log and the run's
 // detail). Any change: the run fails versions_changed, its report discarded, naming what changed, and the hold
 // is written (code versions_changed), so no later run goes until a new probe of the versions loaded then.
-export function versionsAfter(o: Opts, inst: Install, base: Fingerprint | null = null): { changed: string | null; note: string | null } {
+export function versionsAfter(o: Opts, inst: Install, base: Fingerprint | null = null): { changed: string | null; note: string | null; code?: Code } {
   return inChromePhase(() => {
+    // Chrome's version for this phase first: a PowerShell call that ran out of time fails the run by its own code.
+    chromeVersionRead(o, inst);
+    if (chromeReadTimedOut()) return { changed: `chrome_version_timeout: Chrome's version couldn't be read after the session (PowerShell ran out of its ${CHROME_PS_TIMEOUT_MS / 1000} seconds), so whether it changed can't be told`, note: null, code: "chrome_version_timeout" as Code };
     // The hold step writes the hold for a condition seen now; a hold that already stood before the session (the
     // probe's own sessions run under one: the probe is what clears it) is not a change during this session.
     const held = versionHold(o, inst, clock(o));
@@ -4477,7 +4528,7 @@ export function verdict(s: Session, st: Stream, log: Decision[], tools: string[]
   // A session a hook ended (or the inventory gate did) has its report discarded unread.
   let given = s.aborted ? null : reportFrom(s.out);
   const guard = guardCheck(st, log, checks.workerPaths ?? [], checks.wallTokens, true);
-  let bad: Code | null = guard.walled.length ? guard.code : (checks.cliChanged ? "cli_changed" : null) ?? (checks.versionsChanged ? "versions_changed" : null) ?? sessionCode(s, st, tools, denied, checks.diskExtension, !!checks.needLive, checks.confirmedExtension ?? null)
+  let bad: Code | null = guard.walled.length ? guard.code : (checks.cliChanged ? "cli_changed" : null) ?? (checks.versionsChanged ? checks.versionsCode ?? "versions_changed" : null) ?? sessionCode(s, st, tools, denied, checks.diskExtension, !!checks.needLive, checks.confirmedExtension ?? null)
     ?? guard.code;
   let field: string | null = null;
   if (!bad && given && typeof given === "object" && !Array.isArray(given)) {
@@ -4522,12 +4573,15 @@ export function driftLine(code: Code, log: Decision[]): string | null {
 }
 
 export async function run(o: Opts): Promise<RunOut> {
+  forgetChromePhase();
   runPreflight(o);
   const n = await next(o);
   if (!n.claim) {
     // A version the probe didn't see (the extension's id or version, Chrome's): named on the owner's line.
     let detail: string | null = null;
-    if (n.code === "probe_stale") try { detail = versionMismatch(o, mustInstall(o)); } catch { detail = null; }
+    // From the preflight's own reading of Chrome's version (inChromePhase reuse): never a third read.
+    if (n.code === "probe_stale") try { const inst = mustInstall(o); detail = inChromePhase(() => versionMismatch(o, inst), true); } catch { detail = null; }
+    if (n.code === "chrome_version_timeout") detail = CHROME_VERSION_TIMEOUT_HINT;
     if (n.code === "update_pending" || n.code === "extension_versions_ambiguous") detail = VERSION_HOLD_HINT;
     if (n.code === "version_hold_unwritable") detail = VERSION_HOLD_UNWRITABLE_HINT;
     if (n.code === "versions_changed") detail = VERSIONS_CHANGED_HINT;
@@ -4577,8 +4631,12 @@ export async function run(o: Opts): Promise<RunOut> {
         missing: v.guard.missing.length });
     v.given = stripCanary(v.given);
     beat(o, final.code, mine.id, now, c.st, warnings);
+    // A late or missing hook start, or a full call table: which call, and why (twenty-third round), in the detail and the log.
+    const marginWhy = final.code === "hook_margin_low" && s.abort_why ? `hook_margin_low: ${s.abort_why}` : null;
+    if (marginWhy) try { appendFileSync(P.log(o), `${now.toISOString()} ${marginWhy}\n`); } catch { /* never stops a run */ }
     return { code: final.code, job: mine.id, closed: n.closed, state: stateAfter(mine, final), ...(warnings.length ? { warnings } : {}), ...(drift && drift !== "read_drift" ? { drift } : {}),
-      ...(unplaced.length ? { unplaced } : {}), ...(hook_denied.length ? { hook_denied } : {}), ...(final.code === "versions_changed" && checks.versionsChanged ? { detail: checks.versionsChanged } : checks.versionsNote ? { detail: checks.versionsNote } : {}) };
+      ...(unplaced.length ? { unplaced } : {}), ...(hook_denied.length ? { hook_denied } : {}), ...(marginWhy ? { detail: marginWhy }
+        : (final.code === "versions_changed" || final.code === "chrome_version_timeout") && checks.versionsChanged ? { detail: checks.versionsChanged } : checks.versionsNote ? { detail: checks.versionsNote } : {}) };
   } catch (e) {
     // The session's own folders failed it (its transcripts couldn't be deleted, or the
     // worker's sign-in went missing): the job fails with that code, loudly, and the
@@ -6127,15 +6185,21 @@ const USER_ENV_KEY = "HKCU\\Environment";
 const MACHINE_ENV_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
 // null: a lookup failed. reg answers 0 when the value is there and 1 with "unable to find" when it isn't;
 // anything else (no reg, a refusal, a timeout, another message) is a failed lookup, never "not set".
+// Keyed on reg's exit codes, never its wording (0.12.0, twenty-third round): the key itself is queried first
+// (0: it exists and can be read); only then does the value's exit code tell found (0) from not found (1),
+// on a Windows in any language. Anything else, or a call that fails to run, is a failed lookup.
+export function regAnswer(keyStatus: number | null, valueStatus: number | null): boolean | null {
+  if (keyStatus !== 0) return null;
+  return valueStatus === 0 ? true : valueStatus === 1 ? false : null;
+}
 export const registryEnvScopes = (name: string): ("user" | "machine")[] | null => {
-  const has = (key: string): boolean | null => {
+  const status = (args: string[]): number | null => {
     try {
-      const r = spawnSync("reg", ["query", key, "/v", name], { stdio: ["ignore", "ignore", "pipe"], encoding: "utf8", timeout: 10_000, windowsHide: true });
-      if (r.error || r.status === null) return null;
-      if (r.status === 0) return true;
-      return r.status === 1 && /unable to find/i.test(String(r.stderr ?? "")) ? false : null;
+      const r = spawnSync("reg", args, { stdio: ["ignore", "ignore", "ignore"], timeout: 10_000, windowsHide: true });
+      return r.error ? null : r.status;
     } catch { return null; }
   };
+  const has = (key: string): boolean | null => { const k = status(["query", key]); return k !== 0 ? null : regAnswer(k, status(["query", key, "/v", name])); };
   const u = has(USER_ENV_KEY), m = has(MACHINE_ENV_KEY);
   if (u === null || m === null) return null;
   return [...(u ? ["user" as const] : []), ...(m ? ["machine" as const] : [])];

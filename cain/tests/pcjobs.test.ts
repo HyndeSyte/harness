@@ -46,6 +46,7 @@ import {
   newCallTable, trackCall, watchCalls, readHookLog, CALL_TABLE_CAP, startDeadlineMs, HOOK_LIMITS, guardMatchers, hookedBy, pinnedHooked, versionHold, versionsAfter,
   VERSION_HOLD_UNWRITABLE_HINT, addressListing, probeTail, runPreflight, inChromePhase,
   evidenceSha, persistHold, holdCleared, BROKEN_GUARD, VERSIONS_CHANGED_HINT, writeVersionHold,
+  regAnswer, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -6882,6 +6883,133 @@ describe("twenty-third review: version evidence over its source, the hold made d
     expect(versionHold(q.opts(), q.inst, T0)).toBeNull();
     expect(readVersionHold(q.opts())).toBeNull();
   }, 120_000);
+});
+
+describe("twenty-third review: the dedicated Chrome's listing, its time limit, one read on a stale probe, and why a call table filled", () => {
+  // A listing in the format CHROME_PS_COMMAND prints (pid|ppid|start|file version|command line): the dedicated
+  // browser process, one of its renderers, and the owner's everyday Chrome.
+  const sample = (udd: string) => [
+    `11204|8812|2026-11-15T13:58:02.1234567Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}" --profile-directory=Default`,
+    `11388|11204|2026-11-15T13:58:03.0000000Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --type=renderer --user-data-dir="${udd}" --lang=en-US`,
+    `9020|4400|2026-11-14T08:00:00.0000000Z|131.0.6778.70|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"`,
+    "", "not a line"].join("\r\n");
+  test("the listing parses with each process's start time, and the dedicated Chrome is matched by the profile path its command line names", () => {
+    const q = queueRig();
+    const lines = parseChromeExeListing(sample(q.udd));
+    expect(lines.length).toBe(3);
+    expect(lines[0]).toMatchObject({ version: "131.0.6778.86", proc: { pid: 11204, ppid: 8812, created: Date.parse("2026-11-15T13:58:02.123Z") } });
+    expect(lines.filter((l) => isDedicated(l.proc, q.inst)).map((l) => l.proc.pid)).toEqual([11204]);     // not the renderer, not the everyday Chrome
+    expect(chromeVersionRead(q.opts({ exeVersion: undefined, chromePs: () => sample(q.udd) }), q.inst)).toEqual({ version: "131.0.6778.86", source: "chrome_exe" });
+    expect(CHROME_PS_COMMAND).toContain("CreationDate");
+    expect(CHROME_PS_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
+  });
+
+  test("a PowerShell call that runs out of time fails the phase by its own code, never the fallback", async () => {
+    const { q, id } = oneJob();
+    const late = () => { const e: any = new Error("spawnSync powershell.exe ETIMEDOUT"); e.code = "ETIMEDOUT"; throw e; };
+    expect(chromeExeVersions(late)).toBe("timeout");
+    expect(chromeExeVersions(() => { throw new Error("not found"); })).toBeNull();
+    const out = await run(q.opts({ ...attended, exeVersion: undefined, chromePs: late }));
+    expect(out).toEqual({ code: "chrome_version_timeout", job: null, closed: [], detail: CHROME_VERSION_TIMEOUT_HINT });
+    expect(q.launches.length).toBe(0);
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("chrome_version_timeout:");
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "chrome_version_timeout", job: null, stale_lock: false, skew_ms: null, reason: null })).toContain("restart the PC");
+    // After the session: the run fails by the same code, its report not kept.
+    let after = false;
+    q.during(() => { after = true; });
+    const out2 = await run(q.opts({ ...attended, exeVersion: undefined, chromePs: () => (after ? late() : sample(q.udd)) }));
+    expect(out2).toMatchObject({ code: "chrome_version_timeout", job: id });
+    expect(out2.detail).toContain("couldn't be read after the session");
+    expect(q.remoteHas(`reports/${id}.json`)).toBe(false);
+  });
+
+  test("a run refused probe_stale names the versions from its preflight's one read: no third read", async () => {
+    const { q } = oneJob();
+    const cf = join(q.home, "confirmed.json");
+    const conf = JSON.parse(readFileSync(cf, "utf8"));
+    writeFileSync(cf, JSON.stringify({ ...conf, fingerprint: { ...conf.fingerprint, chrome_version: "130.0.1.1", chrome_version_source: "chrome_exe" } }, null, 2));
+    let reads = 0;
+    const out = await run(q.opts({ ...attended, exeVersion: () => { reads++; return "131.0.6778.86"; } }));
+    expect(out.code).toBe("probe_stale");
+    expect(out.detail).toContain("Chrome is 131.0.6778.86");
+    expect(reads).toBe(1);
+  });
+
+  test.skipIf(process.platform !== "win32")("Windows: the real PowerShell listing of a running chrome.exe parses, its profile path and start time with it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "chrome-ps23-"));
+    const fake = join(dir, "chrome.exe");
+    writeFileSync(fake, readFileSync(process.execPath));                               // a stand-in chrome.exe: this runtime, copied
+    const udd = join(dir, "profile");
+    const child = spawn(fake, ["-e", "setTimeout(() => {}, 60000)", `--user-data-dir=${udd}`], { stdio: "ignore", windowsHide: true });
+    try {
+      await new Promise((r) => setTimeout(r, 1500));
+      const lines = chromeExeVersions();
+      expect(Array.isArray(lines)).toBe(true);
+      const mine = (lines as any[]).find((l) => l.proc.pid === child.pid);
+      expect(mine).toBeDefined();
+      expect(mine.proc.cmd).toContain(udd);
+      expect(Number.isFinite(mine.proc.created)).toBe(true);
+      expect(isDedicated(mine.proc, { profile: { user_data_dir: udd } } as any)).toBe(true);
+    } finally { child.kill(); }
+  }, 60_000);
+
+  test("the registry lookup reads reg's exit codes, never its wording: the key first, then the value", () => {
+    expect(regAnswer(0, 0)).toBe(true);
+    expect(regAnswer(0, 1)).toBe(false);                                            // the key read, the value not there
+    expect(regAnswer(1, 1)).toBeNull();                                             // the key itself couldn't be read: a failed lookup
+    expect(regAnswer(0, 2)).toBeNull();
+    expect(regAnswer(null, 0)).toBeNull();
+    expect(regAnswer(0, null)).toBeNull();
+  });
+
+  test("why a call table filled is recorded beside the flag: the reason, with the call's number", () => {
+    const t = newCallTable();
+    for (let i = 0; i < CALL_TABLE_CAP; i++) expect(trackCall(t, `c${i}`, 0, 0)).toBe(true);
+    expect(t.order!.c199).toBe(200);
+    expect(trackCall(t, "c200", 0, 0)).toBe(false);
+    t.fullWhy = `${CALL_TABLE_CAP} unfinished calls when hooked call 201 came`;
+    expect(callWhy(t, "table_full")).toBe("table_full: 200 unfinished calls when hooked call 201 came");
+    const u = newCallTable();
+    trackCall(u, "a", 0, 0); trackCall(u, "b", 10, 10);
+    expect(callWhy(u, "never_started", [{ id: "a", t0: 1 }], 36_010)).toBe("no start on hooked call 2");
+    expect(callWhy(u, "late_start", [{ id: "a", t0: 31_000 }], 31_100)).toBe("a late start on hooked call 1");
+  });
+
+  test("a run session whose table fills: the poll sees the flag and kills it well within the 36 second bound, saying why", async () => {
+    const home = mkdtempSync(join(tmpdir(), "full23-"));
+    const log = join(home, "log.jsonl");
+    const script = join(home, "session.js");
+    writeFileSync(script, `const fs = require("node:fs");
+const log = ${JSON.stringify(log)};
+const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const use = (id) => say({ type: "assistant", message: { content: [{ type: "tool_use", id, name: "${CH}navigate", input: {} }] } });
+say({ type: "system", subtype: "init", session_id: "sess-fl-0023", tools: [], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
+let i = 0;
+const tick = setInterval(() => {
+  for (let k = 0; k < 10 && i < ${CALL_TABLE_CAP}; k++, i++) { use("h" + i); fs.appendFileSync(log, JSON.stringify({ start: "nav-guard", id: "h" + i, t0: Date.now() }) + "\\n"); }
+  if (i >= ${CALL_TABLE_CAP}) { clearInterval(tick); setTimeout(() => { fs.writeFileSync(${JSON.stringify(join(home, "at"))}, String(Date.now())); use("over"); }, 500); }
+}, 20);
+setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 70000);`);
+    const env = cleanEnv({ PCW_NAV_LOG: log, PCW_ABORT_FILE: join(home, "abort"), PCW_SESSION_KIND: "run" });
+    const s = await realLaunch([process.execPath, script], home, 80_000, env as Record<string, string>);
+    const ended = Date.now();
+    expect(s.aborted).toBe("hook_margin_low");
+    expect(s.abort_why).toBe(`table_full: ${CALL_TABLE_CAP} unfinished calls when hooked call ${CALL_TABLE_CAP + 1} came`);
+    const at = Number(readFileSync(join(home, "at"), "utf8"));
+    expect(ended - at).toBeLessThan(HOOK_START_DEADLINE_MS);
+    expect(ended - at).toBeLessThan(10_000);
+  }, 120_000);
+
+  test("a run ended by a late or missing hook start says which call and why, in its detail and worker.log", async () => {
+    const { q, id } = oneJob();
+    const o = q.opts({ ...attended, launch: async (argv, cwd, ms, env, stop, gate) => {
+      const s = await q.opts().launch!(argv, cwd, ms, env, stop, gate);
+      return env.PCW_SESSION_KIND === "run" ? { ...s, aborted: "hook_margin_low", abort_why: "table_full: 200 unfinished calls when hooked call 201 came" } : s;
+    } });
+    const out = await run(o);
+    expect(out).toMatchObject({ code: "hook_margin_low", job: id, detail: "hook_margin_low: table_full: 200 unfinished calls when hooked call 201 came" });
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("hook_margin_low: table_full: 200 unfinished calls when hooked call 201 came");
+  });
 });
 
 // A probe's evidence and its confirmation, as probe and confirm-profile leave them (twenty-third round): the
