@@ -1534,7 +1534,7 @@ describe("the PC worker: what the model saw", () => {
       q.during(() => { if (++k === 2) q.hookRuns(false); });       // the bridge check's hook ran; the run's doesn't
       expect(await run(q.opts({ ...attended, diagnose: true }))).toMatchObject({ code: "hook_missing_decision", job: id, state: "failed" });
       expect(readFileSync(join(q.home, "diagnostics.log"), "utf8")).toContain(" missing=8");
-      expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toEqual({ at: T0.toISOString(), job: id, code: "hook_missing_decision", field: null, domain: null });
+      expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toEqual({ at: T0.toISOString(), job: id, code: "hook_missing_decision", field: null, domain: null, hook: expect.objectContaining({ samples: expect.any(Number) }) });
       expect(result(q, id)).toMatchObject({ facts: {}, final_url: null });
       expect(q.history()).not.toContain('"signed_in": true');
     }
