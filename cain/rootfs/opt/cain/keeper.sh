@@ -30,6 +30,20 @@
 #                                        with Take them off
 #   keeper.sh fastpath off               every calendar change on a card again; the run is over and
 #                                        any Turn on card comes off, so turning on needs a new run
+#   keeper.sh fastpath gate-open <gmail|family>
+#                                        after an update, that calendar's cards are held (no Approve)
+#                                        until the smoke run reads back there a fenced edit of an event
+#                                        that was there and an edit of one day of a series. When the run
+#                                        can't complete on it, this opens that calendar without the check,
+#                                        logged as yours; its held changes come back on fresh cards. Dane's
+#                                        Open cards without the check tap does the same. Only on his say
+#   keeper.sh fastpath migrate-check [path]
+#                                        run the specialist's ledger migration on a copy of the ledger
+#                                        file at path (the specialist's own path; default its live
+#                                        ledger), never the file itself, and print what it found: the
+#                                        schema version, no-card paths off, the gate set, open Turn on
+#                                        cards (0 expected) and rows touched. Run it before a Ship card
+#                                        for a specialist update
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
@@ -102,7 +116,11 @@ if [ "$cmd" = fastpath ]; then
     smoke-start|off) ;;
     on) [[ "${2:-}" =~ ^[0-9a-f]{6,32}$ ]] \
           || { echo '{"status":"error","said":"fastpath on takes the smoke run id that fastpath smoke-start gave: fastpath on <run id>"}'; exit 2; } ;;
-    *) echo '{"status":"error","said":"fastpath takes smoke-start, on <run id> or off"}'; exit 2 ;;
+    gate-open) case "${2:-}" in gmail|family) ;;
+                 *) echo '{"status":"error","said":"fastpath gate-open takes gmail or family"}'; exit 2 ;; esac ;;
+    migrate-check) [ -z "${2:-}" ] || [[ "$2" =~ ^/[A-Za-z0-9/._-]{1,255}$ ]] \
+          || { echo '{"status":"error","said":"fastpath migrate-check takes an absolute ledger path, or none for the live ledger"}'; exit 2; } ;;
+    *) echo '{"status":"error","said":"fastpath takes smoke-start, on <run id>, off, gate-open <gmail|family> or migrate-check [path]"}'; exit 2 ;;
   esac
 fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -160,8 +178,12 @@ case "$cmd" in
   handover) body=$(jq -nc --arg s "${1:-}" --arg p "$owner" --arg m "$message" \
               '{suggestion: $s, paired: $p} + (if $m == "" then {} else {message: $m} end)') ;;
   digest)   body='{}' ;;
-  fastpath) if [ "$1" = on ]; then body=$(jq -nc --arg r "$2" '{state: "on", run: $r}')
-            else body=$(jq -nc --arg s "$1" '{state: $s}'); fi ;;
+  fastpath) case "$1" in
+              on) body=$(jq -nc --arg r "$2" '{state: "on", run: $r}') ;;
+              gate-open) body=$(jq -nc --arg c "$2" '{state: "gate-open", calendar: $c}') ;;
+              migrate-check) body=$(jq -nc --arg p "${2:-}" '{state: "migrate-check"} + (if $p == "" then {} else {path: $p} end)') ;;
+              *) body=$(jq -nc --arg s "$1" '{state: $s}') ;;
+            esac ;;
   meanings)
     # The whole table each time: the specialist stores only what's new.
     if jq -e 'type == "array" or type == "object"' "$1" >/dev/null 2>&1; then

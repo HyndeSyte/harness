@@ -167,6 +167,42 @@ describe("keeper.sh against a fake link", () => {
     } finally { server.stop(true); }
   }, 30_000);
 
+  test.skipIf(!ready)("fastpath gate-open names one calendar, and migrate-check sends a ledger path or none", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-"));
+    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
+    const key = createHmac("sha256", TOKEN).update("harness-handover-v1").digest("hex");
+    const seen: { path: string; keyed: boolean; body: any }[] = [];
+    const server = Bun.serve({ port: 0, async fetch(req) {
+      seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body: JSON.parse(await req.text()) });
+      return Response.json({ status: "ok", result: { schema: 2, open_turn_on_cards: 0 } });
+    } });
+    const env = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_KEEPER_TEST: "1", CAIN_DISCORD_DIR: dir };
+    const keeper = async (...args: string[]) => {
+      const p = Bun.spawn(["bash", KEEPER, ...args], { env, stdout: "pipe", stderr: "pipe" });
+      const out = (await new Response(p.stdout).text()).trim();
+      return { code: await p.exited, out };
+    };
+    try {
+      expect(await keeper("fastpath", "gate-open")).toMatchObject({ code: 2 });            // names a calendar
+      expect(await keeper("fastpath", "gate-open", "outlook")).toMatchObject({ code: 2 }); // gmail or family only
+      expect(await keeper("fastpath", "migrate-check", "data/harness.sqlite")).toMatchObject({ code: 2 });   // absolute
+      expect(await keeper("fastpath", "migrate-check", "/data/x;rm")).toMatchObject({ code: 2 });            // plain characters
+      expect(seen.length).toBe(0);
+      await keeper("fastpath", "gate-open", "family");
+      await keeper("fastpath", "migrate-check");
+      expect((await keeper("fastpath", "migrate-check", "/backup/harness-copy.sqlite")).out).toContain("open_turn_on_cards");
+      expect(seen).toEqual([
+        { path: "/fastpath", keyed: true, body: { state: "gate-open", calendar: "family" } },
+        { path: "/fastpath", keyed: true, body: { state: "migrate-check" } },
+        { path: "/fastpath", keyed: true, body: { state: "migrate-check", path: "/backup/harness-copy.sqlite" } },
+      ]);
+      const usage = (await keeper("help")).out;
+      expect(usage).toContain("keeper.sh fastpath gate-open <gmail|family>");
+      expect(usage).toContain("keeper.sh fastpath migrate-check [path]");
+    } finally { server.stop(true); }
+  }, 30_000);
+
   test.skipIf(!ready)("the specialist's address moves only with the test flag, and an ignored one is logged", async () => {
     const dir = mkdtempSync(join(tmpdir(), "keeper-"));
     writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);

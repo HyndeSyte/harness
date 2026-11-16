@@ -8,8 +8,9 @@
 - The specialist's address can only be moved by a test, and that is logged.
 - Cain says a calendar change is done only when the specialist's read of the calendar shows it, and a note correcting one card no longer replaces the others.
 - After the calendar specialist's update, every calendar change comes on a card until a check on your real calendars has passed and you tap Turn on. Cain starts the check and hands each step over on its card; the specialist judges it from its own record, never from what Cain says, and a full one comes to you on a card showing what it saw, with Turn on and Keep cards, and a Turn off button there after.
-- When the calendar turns a change down because the event changed since its card, Cain shows the fresh card that follows and doesn't hand it over again.
-- After every update of the calendar specialist, Cain runs the check on your real calendars first: until it has read a change back on Gmail and on Family, other calendar cards wait. Each check is good for that version, for a day and for one Turn on, its test events are titled "Smoke test:", and Cain shows the message that offers to take any leftovers off.
+- When the event changed since its card, nothing is sent and Cain shows the fresh card that follows without handing it over again. Try again and Start again from now on a receipt are your taps; Cain leaves them to you.
+- After every update of the calendar specialist, Cain runs the check on your real calendars first: until it has read back on Gmail (or Family) a guarded move and an edit of one day of a repeating event, cards for that calendar wait with no Approve and come back once it's done. If the check can't finish on one, you get Open cards without the check, and Cain can open it only on your say. Each check is good for that build, for a day and for one Turn on, its test events are titled "Smoke test:", and Cain shows the message that offers to take any leftovers off.
+- Before a Ship card for a calendar specialist update, Cain runs its update on a copy of its records first, and shows the card only if that came out right.
 - Turning the no-card changes off ends the check behind them, so turning them on again takes a new one.
 
 ## 0.11.0
