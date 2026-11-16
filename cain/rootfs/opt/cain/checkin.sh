@@ -48,13 +48,13 @@ checked_mark="${SESSION_CHECKED:-/run/cain/session-checked}"
 [ -f "$checked_mark" ] || exit 0
 
 read_screen() { timeout 10 $TM -u capture-pane -p -J -t cain 2>/dev/null; }
-# Whether a draft's first line (prompt-state.sh's, lower case) begins as the App's text did: their
-# first 40 letters, spaces aside, and at least 10 of them (outside review, round 15).
-ours() {
-  local seen own
-  seen=$(printf '%s' "$1" | tr -d ' \t' | cut -c1-40)
-  own=$(printf '%s' "$2" | tr 'A-Z' 'a-z' | tr -d ' \t' | cut -c1-40)
-  [ -n "$own" ] && [ "${#seen}" -ge 10 ] && [ "${own:0:${#seen}}" = "$seen" ]
+# Every try the App types starts with its own mark, six random hex digits in brackets, kept with
+# the try. A draft is the App's only when its first line (prompt-state.sh's, lower case) starts
+# with that try's mark: no other text, however alike, passes (outside review, round 16).
+ours() {   # ours <draft's first line> <the try's mark>
+  local seen
+  seen=$(printf '%s' "$1" | tr -d ' \t')
+  [ -n "$2" ] && [ "${seen:0:$(( ${#2} + 2 ))}" = "[$2]" ]
 }
 screen=$(read_screen) || { rm -f "$state/ready"; exit 0; }
 last=$(printf '%s\n' "$screen" | tail -n 12)
@@ -82,9 +82,8 @@ if [ -f "$state/typed" ]; then
     ready) [ "$age" -ge "${CHECKIN_TYPED_GRACE_S:-30}" ] || exit 0
            rm -f "$state/typed" ;;
     draft)
-      # Only a draft that begins as the try did (its first 40 letters, spaces aside, from his box's
-      # own prompt line) is the App's to take out; anyone else's is left be, and the try taken as
-      # gone (outside review, round 15).
+      # Only a draft that starts with the try's own mark (on his box's own prompt line) is the App's
+      # to take out; anyone else's is left be, and the try taken as gone (outside rounds 15, 16).
       if ! ours "$(printf '%s\n' "$screen" | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null | sed -n 2p)" \
                 "$(sed -n 2p "$state/typed" 2>/dev/null)"; then
         rm -f "$state/typed"
@@ -126,16 +125,19 @@ fi
 # marked until a later read shows his box empty, so one that turns up late, or sits under a
 # question, is taken back out before anything new is typed (above).
 type_in() {
-  printf '%s\n%s\n' "$(date +%s)" "$1" > "$state/typed" 2>/dev/null \
+  local mark
+  mark=$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -cd '0-9a-f')
+  [ "${#mark}" = 6 ] || { echo "[cain] no random mark for a try: nothing typed"; return 1; }
+  printf '%s\n%s\n' "$(date +%s)" "$mark" > "$state/typed" 2>/dev/null \
     || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
-  if ! timeout 10 $TM -u send-keys -t cain -l "$1"; then return 1; fi
+  if ! timeout 10 $TM -u send-keys -t cain -l "[$mark] $1"; then return 1; fi
   sleep 1
   local after word
   after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null)
   if [ "${after%%$'\n'*}" = ready ]; then sleep 2; after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null); fi   # slow to draw
   word="${after%%$'\n'*}"
   rm -f "$state/ready"
-  if [ "$word" != draft ] || ! ours "$(printf '%s\n' "$after" | sed -n 2p)" "$1"; then
+  if [ "$word" != draft ] || ! ours "$(printf '%s\n' "$after" | sed -n 2p)" "$mark"; then
     echo "[cain] his input box didn't hold what was typed (${word:-unread}): nothing sent, tried again later"
     return 1
   fi

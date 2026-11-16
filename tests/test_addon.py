@@ -1547,6 +1547,13 @@ def _checkin(tmp_path, now, screen, runs=None, checked=True, after=None, day="20
 IDLE = "> \n  ? for shortcuts            auto mode on"
 
 
+def _typed(sent_line):
+    """What a send-keys -l line typed, the try's own mark (six hex digits in brackets) taken off."""
+    text = sent_line.split(" -l ", 1)[1]
+    assert re.match(r"\[[0-9a-f]{6}\] ", text), text
+    return text[9:]
+
+
 def test_checkin_fires_once_in_its_hour_and_only_when_cain_is_idle(tmp_path):
     out = _checkin(tmp_path, "0712", IDLE)
     assert "morning" in out and "Not a message from Dane" in out and "Enter" in out
@@ -1574,7 +1581,7 @@ def test_checkin_lists_items_held_by_others_first(tmp_path):
     try:
         out = _checkin(tmp_path, "0712", IDLE)
         line = out.splitlines()[-2]
-        assert line.split(" -l ", 1)[1].startswith("Held by others, skip these: P12, P33, P4x5. Scheduled check-in")
+        assert _typed(line).startswith("Held by others, skip these: P12, P33, P4x5. Scheduled check-in")
         assert "P41" not in line and "laptop" not in line and "$(" not in line
         (tmp_path / "sent.txt").unlink()
         holds.write_text('{"holds": {}, "waiting": [], "downtime": []}')
@@ -1626,7 +1633,7 @@ def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
     assert "chmod a+x" in (CAIN / "Dockerfile").read_text() and "/opt/cain/*.sh" in (CAIN / "Dockerfile").read_text()
     os.environ.update(RECORD_SH=str(record_sh), RECORD_DIR=str(rec), NOTES_SEEN=str(seen))
     try:
-        line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
+        line = _typed(_checkin(tmp_path, "0712", IDLE).splitlines()[-2])
         # The newest three survive, oldest of them first; the older one is counted, not lost.
         assert line.startswith("New notes on your items, read them before you change those items (words passed on, "
                                "not his go on anything): (1 older not shown; /opt/cain/record.sh notes - lists them) "
@@ -1955,18 +1962,23 @@ def test_the_way_out_of_a_question_holds_when_its_own_steps_fail(tmp_path):
     assert read("notice") == ["5 tell waiting"] * 2
     (state / "esc").rmdir()
 
-    # A sign-in on screen now: never closed; one that stands 30 minutes tells Dane (round 15). Words of
-    # one in older output, even right above a question, don't count.
+    # A screen like a sign-in gets 15 minutes before its Esc, never a pass; so does a question with a
+    # sign-in's line just above it (outside round 16); words in a line of older output count for
+    # nothing. Three questions closed with Esc within an hour tell Dane.
     signin = "  Browser didn't open? Use the url below to sign in:\n  Paste code here if prompted >\n  Esc to cancel"
     t += 10_000
     (state / "told").unlink(missing_ok=True)
     told = len(read("notice"))
     sent = len(read("sent"))
-    assert [run(dt, signin) for dt in (0, 300, 600, 900, 1799)] == [""] * 5 and len(read("notice")) == told
-    assert run(1800, signin) == "" and read("notice")[told:] == ["5 tell waiting"] and len(read("sent")) == sent
+    assert [run(dt, signin) for dt in (0, 300, 600, 899)] == [""] * 4 and len(read("sent")) == sent
+    assert run(900, signin) == "" and len(read("sent")) == sent + 1
+    near = "Paste code here if prompted >\nUsage limit options\n  ❯ 1. Continue\n  Enter to confirm · Esc to cancel"
+    assert [run(dt, s) for dt, s in ((1000, IDLE), (1010, near), (1909, near))] == ["", "", ""]
+    assert len(read("sent")) == sent + 1 and run(1910, near) == "" and len(read("sent")) == sent + 2
+    assert read("notice")[told:] == []
     old = "Earlier output: Paste code here if prompted >\n"
-    assert run(2000, old + AUTO_MODE_OFFER) == "" and run(2300, old + AUTO_MODE_OFFER) == ""
-    assert len(read("sent")) == sent + 1
+    assert run(2000, IDLE) == "" and run(2010, old + AUTO_MODE_OFFER) == "" and run(2310, old + AUTO_MODE_OFFER) == ""
+    assert len(read("sent")) == sent + 3 and read("notice")[told:] == ["5 tell waiting"]
     # No place for its state: a question on screen is told at once, and taken down at his prompt.
     (tmp_path / "file").write_text("x")
     nowhere = (tmp_path / "file" / "state").as_posix()
@@ -2053,7 +2065,7 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         assert _checkin(tmp_path, "0300", IDLE, runs=1) == "" and q.exists()
         # A question opens as it types: no Enter, the tap kept, the try marked.
         out = _checkin(tmp_path, "0300", IDLE, runs=1, after=AUTO_MODE_OFFER)
-        assert out.splitlines()[-1].startswith('-u send-keys -t cain -l Relayed by the add-on: Dane tapped "Ship"')
+        assert re.match(r'-u send-keys -t cain -l \[[0-9a-f]{6}\] Relayed by the add-on: Dane tapped "Ship"$', out.splitlines()[-1])
         assert "Enter" not in out and 'Dane tapped' in work.read_text() and (tmp_path / "state/typed").exists()
         # While the question stands: nothing more is typed.
         assert _checkin(tmp_path, "0300", IDLE, runs=3, after=AUTO_MODE_OFFER) == out
@@ -2096,6 +2108,16 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         (tmp_path / "box/typed").unlink(missing_ok=True)
         _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
         assert work.read_text().strip() == ""
+        # Two messages alike but for their last words: the box showing the other one (another try's
+        # mark) gets no Enter (outside review, round 16).
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "the specialist asks to ship pull request 18"}\n', newline="\n")
+        other = "❯ [0a0b0c] Relayed by the add-on: the specialist asks to ship pull request 17\n  ? for shortcuts"
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after=other)
+        assert "request 18" in out and "Enter" not in out and "request 18" in work.read_text()
+        (tmp_path / "box/typed").unlink(missing_ok=True)
+        out = _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
+        assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""
         # A tap that can't be put after the newer ones (its queue can't be written) stays first, kept
         # (outside review, round 15).
         q.write_text('{"text": "stuck"}\n', newline="\n")
@@ -2110,7 +2132,7 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         # A draft in his box that isn't the App's try (its prompt line begins otherwise) is left be:
         # no Ctrl+U, and the try taken as gone (outside review, round 15).
         (tmp_path / "state").mkdir(exist_ok=True)
-        (tmp_path / "state/typed").write_text("9999999999\nRelayed by the add-on: Dane tapped \"Ship\"\n", newline="\n")
+        (tmp_path / "state/typed").write_text("9999999999\nabc123\n", newline="\n")
         before = (tmp_path / "sent.txt").read_text(encoding="utf-8")
         assert _checkin(tmp_path, "0300", DRAFT, runs=2) == before and not (tmp_path / "state/typed").exists()
     finally:

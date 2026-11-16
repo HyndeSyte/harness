@@ -6,7 +6,11 @@
 # The run script calls this every 10 seconds while his session runs (bounded by a timeout, as is
 # every tmux call here). It reads his screen as checkin.sh does (prompt-state.sh: "dialog"), and:
 #   - a question has waited 5 minutes: Esc, once, and a line for Cain. The try is kept before the
-#     key is sent, so one that doesn't go through still leads on to the next step;
+#     key is sent, so one that doesn't go through still leads on to the next step. A screen that
+#     looks like a sign-in or his folder's trust question (one of their own lines starting a line
+#     in the bottom 16) gets 15 minutes instead: his to answer on the panel, if he's at it;
+#   - three questions closed with Esc within an hour tell Dane (notice.sh tell waiting): something
+#     keeps asking, such as a trust question whose Esc ends his session each time;
 #   - still a question 5 minutes after the Esc: prints "restart", and the run script starts his
 #     session fresh, at most once an hour. One that would come sooner tells Dane instead
 #     (notice.sh tell waiting), and the fresh start follows once the hour is up;
@@ -14,8 +18,7 @@
 #     for each stretch his prompt is back; the alarm itself is notice.sh's, kept across restarts).
 # A question counts from when it's first seen: any other screen, or a gap of over a minute between
 # reads, starts the count again, so a new question gets its own 5 minutes and its own Esc. A
-# sign-in or his folder's trust question on screen is left alone (its own lines starting a line in
-# the bottom 16): his to answer on the panel; one that stands 30 minutes tells Dane. Nothing is
+# sign-in or trust question is given longer, never forever (outside review, round 16). Nothing is
 # typed but Esc. Its state is root's, in $UNSTICK_DIR, for this container; a step whose state
 # can't be kept isn't taken (Dane is told instead), so no limit is ever skipped, and with no
 # place for its state a question on screen is told at once. Prints "restart" or nothing; always
@@ -27,7 +30,7 @@ DIR="${UNSTICK_DIR:-/run/cain/unstick}"
 QUEUE="${RELAY_QUEUE:-/data/relay.queue}"
 ESC_S="${UNSTICK_ESC_S:-300}"; AGAIN_S="${UNSTICK_AGAIN_S:-300}"; HOURLY_S="${UNSTICK_HOURLY_S:-3600}"
 GAP_S="${UNSTICK_GAP_S:-60}"; CALM_S="${UNSTICK_CALM_S:-300}"; TMUX_S="${UNSTICK_TMUX_S:-10}"
-SIGNIN_S="${UNSTICK_SIGNIN_S:-1800}"
+SIGNIN_S="${UNSTICK_SIGNIN_S:-900}"; ESCS_N="${UNSTICK_ESCS_N:-3}"
 now="${UNSTICK_NOW:-$(date +%s)}"
 say() { echo "[cain] $*" >&2; }
 # A kept number: printed (nothing when there's none); 1 when it's there but can't be read as one.
@@ -79,19 +82,14 @@ if ! mkdir -p "$DIR" 2>/dev/null; then
   case "$at" in dialog) alarm tell waiting ;; ready) alarm clear screen ;; esac
   exit 0
 fi
-# A sign-in or the folder's trust question on screen now: one of their own lines starting a line
-# (past the box's edge) in the bottom 16, not words quoted in older output. Never closed here; one
-# that stands 30 minutes tells Dane.
+# A screen that looks like a sign-in or the folder's trust question (one of their own lines starting
+# a line, past the box's edge, in the bottom 16): 15 minutes before its Esc instead of 5. A line
+# like one left in older output only gives a question longer, never a pass (outside round 16).
+wait_s=$ESC_S
 if [ "$at" = dialog ] && printf '%s\n' "$screen" | awk 'NF' | tail -n 16 | sed 's/^[[:space:]│]*//' \
      | grep -Eqi '^(paste code here|select login method|do you trust the files|choose the text style)'; then
-  forget || true
-  drop calm; drop cleared
-  signin=$(stamp signin) || signin=""
-  if [ -z "$signin" ]; then put signin "$now" || true; signin=$now; fi
-  [ $((now - signin)) -lt "$SIGNIN_S" ] || tell_dane "a sign-in or his folder's trust question has stood 30 minutes on his screen"
-  exit 0
+  wait_s=$SIGNIN_S
 fi
-drop signin
 
 if [ "$at" != dialog ]; then
   forget || say "a question's count couldn't be cleared ($DIR)"
@@ -124,9 +122,17 @@ put seen "$now" || { tell_dane "$cant"; exit 0; }
 waited=$(( (now - since) / 60 ))
 
 if [ -z "$esc" ]; then
-  [ $((now - since)) -ge "$ESC_S" ] || exit 0
+  [ $((now - since)) -ge "$wait_s" ] || exit 0
   # The try is kept first: if it can't be, no Esc goes (nothing could stop a repeat), and Dane hears.
   if ! put esc "$now"; then tell_dane "$cant"; exit 0; fi
+  # Each Esc is counted, the last hour's kept: the third within an hour tells Dane.
+  recent="$(awk -v t=$((now - 3600)) '$1 ~ /^[0-9]+$/ && $1 >= t' "$DIR/escs" 2>/dev/null; echo "$now")"
+  if ! { printf '%s\n' "$recent" > "$DIR/.escs" 2>/dev/null && mv -fT "$DIR/.escs" "$DIR/escs" 2>/dev/null; }; then
+    rm -f "$DIR/.escs" 2>/dev/null
+    tell_dane "$cant"
+  elif [ "$(printf '%s\n' "$recent" | wc -l)" -ge "$ESCS_N" ]; then
+    tell_dane "$ESCS_N questions closed with Esc within an hour: something keeps asking on his screen"
+  fi
   if timeout -k 2 "$TMUX_S" $TM -u send-keys -t cain Escape 2>/dev/null; then
     say "A question has waited $waited minutes on Cain's screen, where no one answers it: pressed Esc"
     tell_cain "A question waited $waited minutes on your screen, where no one answers it, so the App pressed Esc to close it. Ask him things in Discord, never on your screen. If it stopped something you were doing, pick it up again. Nothing to tell him."

@@ -195,10 +195,12 @@ check can't finish, and tries it again every 10 minutes until it does. If his se
 ending soon after it starts, the App keeps starting it again, and says so at the third time.
 If a question waits on his screen, where no one answers it (one of Claude Code's own, or his
 own asked there by mistake), he can't take a message until it's answered: the App presses Esc
-after 5 minutes, and if that doesn't close it, starts his session fresh 5 minutes later (at
-most once an hour, and he's told to read your messages he may have missed). You hear only when
-that can't clear it (a question back within the hour of a fresh start, or a step the App can't
-keep track of), and it comes down once his prompt has been back 5 minutes.
+after 5 minutes (15 for what looks like a sign-in or his folder's trust question, yours to answer
+on the panel if you're at it), and if that doesn't close it, starts his session fresh 5 minutes
+later (at most once an hour, and he's told to read your messages he may have missed). You hear
+only when that can't clear it (a question back within the hour of a fresh start, three closed
+with Esc within an hour, or a step the App can't keep track of), and it comes down once his
+prompt has been back 5 minutes.
 The App types your taps and his check-ins into his session only after that session has passed
 its check of his own user (at every start, and every start is the App's: when Claude Code ends,
 his session ends and the App starts it again), only at his prompt, empty and steady, and it
