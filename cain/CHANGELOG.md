@@ -31,6 +31,8 @@
 - Those taps now say whether each was carried out, not carried out, or the specialist can't tell, and one already on your calendar comes with no button.
 - A specialist's card that names a button it doesn't carry no longer reaches you: the link holds it back and Cain hears why.
 - A tap card the specialist can't safely offer again comes with no Go ahead and says so, and Cain leaves it at that.
+- The link now holds back a specialist's card only when it tells you to tap or press a button it doesn't carry; a card that merely mentions one goes out, and one held back still reaches you from the specialist without that sentence.
+- After a tap cut off by an error, Cain shows the specialist's note on when it will look at your calendar again, and the card that follows.
 
 ## 0.11.0
 

@@ -199,10 +199,13 @@ specialist (the Harness add-on) does.
   button), then one message counts them by state (carried out, can't tell, not carried out) and the
   newest ten come as one card each, any older ones listed in a second message; show them as they come
   and leave the taps to him. A card has Go ahead only where it's safe: one for a change since taken
-  off his calendar, or for a kind of tap the specialist can't look for there, says so and has none;
-  one for a change partly there says which parts, and its Go ahead does only the rest. A tap cut off
-  by an error in the specialist is answered that it can't tell yet, and comes back the same way at its
-  next start; never hand it over again. While the
+  off his calendar, one gone from where it was added (the specialist can't tell whether it was added
+  and taken off), an Undo whose event he changed since, or a kind of tap the specialist can't look for
+  there, says so and has none; one for a change partly there says which parts, and its Go ahead does
+  only the rest. A tap cut off by an error in the specialist is answered that it can't tell yet; the
+  specialist reads his calendar for it again within minutes, says once when it will look again if it
+  still can't tell, and then sends its card (with Go ahead only if the tap never ran). Show those as
+  they come; never hand it over again. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it
   degraded, saying why, with the files beside its records listed on its page (sorting them is Dane's,
@@ -260,7 +263,7 @@ specialist (the Harness add-on) does.
   per place as Family names it, so his events there get their address and drive blocks.
   The calendar specialist looks a new place up by name on the map near home first; when
   that finds nothing that matches, it asks where it is once, on a card: "Where is HMLC? (for
-  Skating HMLC, Fri Nov 20) Reply with an address, or tap Skip." It has a button: show it
+  Skating HMLC, Fri Nov 20) Reply with an address, or skip it with the button below." It has a button: show it
   right away. When he answers with where it is, write the row through the record keeper:
   the place name exactly as the card says it, the street address with its town and state
   ("12 Rink Rd, Leesburg, VA"), or "lat, lon" if that's all there is, dated the day he said
@@ -354,8 +357,10 @@ the review service gave it, and no record codes. They act, and every hit is logg
   link fixes "add-on" before it posts (keeper.sh's answer says so) and refuses an em dash
   and the rest with what to change, a Reviewed line included. Rewrite it and send it
   again. On a Ship card your line may claim no checks or review: the link adds those.
-- A specialist's card is refused only when it names a button it doesn't carry: nothing reaches
-  him, and you hear once ("the link refused it"); nothing to tell him. Otherwise the link fixes
+- A specialist's card is refused only when it tells him to tap or press a button it doesn't carry
+  ("tap Go ahead", "the Go ahead button"); a card that only mentions one goes out. You hear once ("the
+  link refused it"), it's logged in the gate report, and the specialist sends it again by itself
+  without that sentence, which reaches you like any card; nothing to tell him. Otherwise the link fixes
   its "add-on", and an em dash only between plain words (one near a number, a day, a month, a
   time, a symbol or a link stays as it is), and the line about the card says what else the gate
   flags. Show it as usual; if it matters, set it right in one line of your own after it.

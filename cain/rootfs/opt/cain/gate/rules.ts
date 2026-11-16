@@ -321,6 +321,18 @@ function named(seen: string, label: string): { at: number; end: number }[] {
   return out;
 }
 
+// Whether a button hit (its label at text[at, end)) tells him to use a button: "tap X",
+// "press X", "click X", "hit X" (and their -ing forms, "tap on the X"), "the X button" or
+// "X button", any case, with quotes or bold markup around X. The link refuses a
+// specialist's card only for one of these; any other naming of a label ("there's no Go
+// ahead", "pick Undo", "with Undo") is flagged, and the card goes out as it is.
+const IMPERATIVE_BEFORE = new RegExp(`(?<![A-Za-z])(?:tap|tapping|press|pressing|click|clicking|hit|hitting)\\s+(?:on\\s+)?(?:the\\s+)?${Q}$`, "i");
+const IMPERATIVE_AFTER = new RegExp(`^${Q}\\s+buttons?(?![A-Za-z])`, "i");
+export function imperative(text: string, at: number, end: number): boolean {
+  const t = String(text ?? "");
+  return IMPERATIVE_BEFORE.test(t.slice(0, at)) || IMPERATIVE_AFTER.test(t.slice(end));
+}
+
 // Spans found so far, in order and none overlapping: a new one is taken only if it overlaps
 // none, which its neighbours alone can tell.
 class Taken {

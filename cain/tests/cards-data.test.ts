@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, Refusal, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
+import { appendGate, GATE_LOG } from "../rootfs/opt/cain/gate/log";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
@@ -299,16 +300,28 @@ describe("the gate at the link's send points", () => {
     expect(r.last().content).toBe("## Thu Nov 12\n• The App restarts at 4:30");
   });
 
-  test("a specialist card naming a button it lacks is refused: nothing posted, logged, and Cain told once", async () => {
+  test("a specialist card naming a button it lacks only in passing is posted as it is: the dash fixed, logged, and Cain told once", async () => {
+    const r = rig();
+    const card = await r.link.addCard({ text: "Three blocks added — each on its own card with Undo.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
+    expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Undo" isn\'t one of its buttons. It goes out as it is');
+    const id = await r.link.show(card, { item: "none" });
+    expect(r.msg(id).content).toBe("Three blocks added, each on its own card with Undo.");   // the dash fixed, the rest as it was
+    expect(r.state().cards[String(card)].text).toBe("Three blocks added, each on its own card with Undo.");
+    expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", did: "posted as it is", hits: [{ rule: "dash" }, { rule: "button", label: "Undo" }] }]);
+    expect(r.relayed.filter((l) => l.includes("flags its words"))).toHaveLength(1);
+  });
+
+  test("a specialist card telling him to tap a button it lacks is refused: nothing posted, logged as refused, and Cain told once", async () => {
     const r = rig();
     const before = Object.keys(r.state().cards).length;
     let refused: unknown = null;
     try {
-      await r.link.addCard({ text: "Three blocks added — each on its own card with Undo.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
+      await r.link.addCard({ text: "Three blocks added — tap Undo on each card.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
     } catch (e) { refused = e; }
     expect(refused).toBeInstanceOf(Refusal);
-    expect(String((refused as Error).message)).toContain('"Undo"');
+    expect((refused as Error).message).toBe('the card names "Undo", which it doesn\'t carry');
     expect(Object.keys(r.state().cards)).toHaveLength(before);                 // nothing kept, nothing to show
+    expect(r.posts()).toBe(0);
     expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", did: "refused", hits: [{ rule: "dash" }, { rule: "button", label: "Undo" }] }]);
     expect(r.relayed.filter((l) => l.includes("the link refused it"))).toHaveLength(1);
   });
@@ -377,6 +390,61 @@ describe("the gate at the link's send points", () => {
     expect(() => r.link.checkSend({ text: "x", replyTo: "abc" })).toThrow("Discord id");
     expect(r.posts()).toBe(posts);
     expect(r.reports.filter((x) => x.point === "reply")).toEqual([]);
+  });
+});
+
+// A tap of his from before a restore comes back on a card; Go ahead only where it's safe. One
+// whose change was since taken off his calendar says so, with no buttons, while another card's
+// Go ahead is up. Only telling him to use a button the card lacks refuses it.
+describe("a specialist card that mentions a live card's button", () => {
+  const GO = [{ type: 1, components: [btn("Go ahead", "k:c:ga1")] }];
+  const TAKEN_OFF = "A tap of yours from Mon 3:00 PM. Harness can't tell whether it was carried out. It was on your calendar and has since been taken off, so it isn't done again.";
+  const withGoAhead = async (r: ReturnType<typeof rig>) => {
+    const id = await r.link.show(await r.link.addCard({ text: "A tap of yours from Mon 2:00 PM was not carried out. Go ahead does it now.", rows: GO, kind: "card" }), { item: "none" });
+    expect(r.buttons(id)).toEqual(["Go ahead"]);                         // live: its label is known
+    return id;
+  };
+
+  test("a buttonless card that says there's no Go ahead, or names none, goes out while a Go ahead card is live", async () => {
+    const r = rig();
+    await withGoAhead(r);
+    for (const text of [TAKEN_OFF, TAKEN_OFF.replace(/\.$/, " and there's no Go ahead.")]) {
+      const card = await r.link.addCard({ text, rows: [], kind: "card" });
+      const id = await r.link.show(card, { item: "none" });
+      expect(r.msg(id).content).toBe(text);
+      expect(r.state().cards[String(card)].text).toBe(text);
+    }
+    expect(r.reports.filter((x) => x.did === "refused")).toEqual([]);
+    expect(r.relayed.filter((l) => l.includes("the link refused it"))).toEqual([]);
+  });
+
+  test("a buttonless card telling him to tap Go ahead is refused and logged; the specialist's fallback without that sentence goes out", async () => {
+    const r = rig();
+    await withGoAhead(r);
+    const posts = r.posts();
+    const told = `${TAKEN_OFF.replace(" It was on your calendar and has since been taken off, so it isn't done again.", "")} Tap Go ahead to do it now.`;
+    let refused: unknown = null;
+    try { await r.link.addCard({ text: told, rows: [], kind: "card" }); } catch (e) { refused = e; }
+    expect(refused).toBeInstanceOf(Refusal);
+    expect((refused as Error).message).toBe('the card names "Go ahead", which it doesn\'t carry');
+    expect([...(refused as Error).message.matchAll(/"([^"]+)"/g)].map((m) => m[1])).toEqual(["Go ahead"]);   // what the specialist parses
+    expect(r.posts()).toBe(posts);
+    // The gate's report holds the refusal, so the relay's "logged for a fix" is true.
+    const entry = r.reports.find((x) => x.did === "refused");
+    expect(entry).toMatchObject({ point: "card", writer: "specialist", did: "refused", hits: [{ rule: "button", result: "refuse", label: "Go ahead" }] });
+    expect(r.relayed.filter((l) => l.includes("the link refused it"))).toEqual([
+      'The calendar specialist sent a card naming "Go ahead", which isn\'t on it, so the link refused it and nothing went to him. Nothing to tell him; it\'s logged for a fix.']);
+    // In production the link's report goes to the gate's log file, one JSON line per entry.
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    expect(main).toContain("report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX");
+    expect(GATE_LOG).toBe("/data/work/gate-report.jsonl");
+    const log = join(mkdtempSync(join(tmpdir(), "gate-log-")), "gate-report.jsonl");
+    await appendGate({ at: r.t.now, ...entry }, log);
+    expect(JSON.parse(readFileSync(log, "utf8").trim())).toMatchObject({ point: "card", writer: "specialist", did: "refused" });
+    // The specialist's fallback: the same words with that sentence taken off, no buttons.
+    const fallback = told.replace(" Tap Go ahead to do it now.", "");
+    const card = await r.link.addCard({ text: fallback, rows: [], kind: "card" });
+    expect(r.msg(await r.link.show(card, { item: "none" })).content).toBe(fallback);
   });
 });
 
