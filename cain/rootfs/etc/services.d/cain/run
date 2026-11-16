@@ -378,16 +378,16 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     flag() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
     paired() { tr -d ' \n' < "$ACCESS_FILE" | grep -q '"allowFrom":\["'; }
     last=$(printf '%s\n' "$screen" | tail -n 30)
-    # The bottom line on screen, read as checkin.sh reads it: his prompt's own footer when he's
-    # at it. A screen above it that only mentions auto mode is not his prompt (Nov 16).
-    foot=$(printf '%s\n' "$screen" | grep -v '^[[:space:]]*$' | tail -n 1)
+    # His prompt or a screen waiting for an answer, read as checkin.sh reads it (prompt-state.sh,
+    # which never fails; || for an unforeseen one, since this loop runs under errexit).
+    at=$(printf '%s\n' "$screen" | "$OPT/prompt-state.sh" 2>/dev/null) || at=other
     state=unknown
     if printf '%s\n' "$last" | tail -n 12 | grep -Eqi 'run /login|token has expired|authentication_error|invalid api key|not logged in'; then state=login_needed
     elif printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
     elif printf '%s' "$last" | grep -Eqi 'do you trust|trust the files'; then state=trust_prompt
     elif printf '%s' "$last" | grep -Eqi 'select login|login method|choose the text style|dark mode'; then state=first_run_menu
-    elif printf '%s' "$foot" | grep -Eqi 'for shortcuts|auto mode on'; then state=ready
-    elif printf '%s' "$foot" | grep -Eqi 'esc to cancel|enter to (continue|confirm|select)'; then state=dialog
+    elif [ "$at" = ready ]; then state=ready
+    elif [ "$at" = dialog ]; then state=dialog
     fi
     printf '{"signed_in": %s, "discord_token": %s, "paired": %s, "allowlist": %s, "screen": "%s", "mode": "%s"}\n' \
       "$(flag test -s "$CRED")" \

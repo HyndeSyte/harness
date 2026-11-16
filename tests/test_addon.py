@@ -1490,7 +1490,8 @@ def _checkin(tmp_path, now, screen):
     sent = tmp_path / "sent.txt"
     env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
                CHECKIN_DIR=str(tmp_path / "done"), CHECKIN_NOW=now, CHECKIN_DAY="2026-11-08",
-               STUB_SCREEN=screen, STUB_SENT=str(sent))
+               STUB_SCREEN=screen, STUB_SENT=str(sent),
+               PROMPT_STATE=(CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix())
     script = (CAIN / "rootfs/opt/cain/checkin.sh").read_text().replace("\r\n", "\n")
     subprocess.run([bash, "-c", script], env=env, check=True, timeout=20)
     return sent.read_text() if sent.exists() else ""
@@ -1618,21 +1619,52 @@ AUTO_MODE_OFFER = (
     "    Also scan your other repos false\n\n"
     "    Continue\n\n"
     "  ←/→ to change · Enter to continue · Esc to cancel\n\n\n")
-# His prompt at work, as Claude Code draws it: the footer is still the bottom line.
+# His prompt at work, as Claude Code draws it.
 WORKING = "> \n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt      ● high · /effort"
+# His prompt up, with Claude Code's panel of background tasks drawn under its footer (round 9).
+IDLE_WITH_TASKS = ("❯ \n  ? for shortcuts            auto mode on\n"
+                   "  ● Explore Reading repository files 40s · ↓ to manage")
+
+
+def _prompt_state(screen):
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("no bash")
+    out = subprocess.run([bash, (CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix()], input=screen,
+                         capture_output=True, text=True, encoding="utf-8", timeout=20)
+    assert out.returncode == 0
+    return out.stdout.strip()
+
+
+def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
+    """prompt-state.sh: ready only with his prompt's footer in the bottom lines and no dialog's key
+    hints below it; rows under the footer (background tasks) don't matter, and words higher up,
+    a footer's or a hint's, count for nothing either way. Never fails."""
+    assert _prompt_state(IDLE) == "ready" and _prompt_state(WORKING) == "ready"
+    assert _prompt_state(IDLE_WITH_TASKS) == "ready"
+    assert _prompt_state("To stop it, press Esc to cancel.\n" + IDLE) == "ready"
+    assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
+    assert _prompt_state("He said: auto mode on, ? for shortcuts.\n" + AUTO_MODE_OFFER) == "dialog"
+    assert _prompt_state("  Select model\n  > Opus\n  Enter to confirm · Esc to exit") == "dialog"
+    assert _prompt_state("  ? for shortcuts  Esc to cancel") == "dialog"           # both on one line: no
+    assert _prompt_state(IDLE + "\n" + "\n".join(f"line {i}" for i in range(12))) == "other"   # footer gone by
+    assert _prompt_state("") == "other" and _prompt_state("\n  \n") == "other"
+    assert _prompt_state("Welcome to Claude Code\n Select login method:") == "other"
 
 
 def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
-    """Nov 16: Claude Code's auto mode offer said "auto mode" above its own bottom line, the check
-    took it for his prompt, and his taps, the cloud job checks and the morning check-in went into
-    the offer, each with an Enter, for three hours. Only his prompt's own footer, as the bottom line
-    on screen, lets anything be typed; words of his higher up don't count either way."""
+    """Nov 16: Claude Code's auto mode offer said "auto mode" in its own text, the check took it for
+    his prompt, and his taps, the cloud job checks and the morning check-in went into the offer,
+    each with an Enter, for three hours. Now only his prompt lets anything be typed (prompt-state.sh),
+    and his taps wait for it, as the check-in does within its hour."""
     import os
     import shutil
     assert _checkin(tmp_path, "0712", AUTO_MODE_OFFER) == ""
     assert list((tmp_path / "done").glob("*")) == []                  # the morning one still to come
     assert _checkin(tmp_path, "0712", WORKING) == ""                  # at work: later
-    out = _checkin(tmp_path, "0712", "To stop it, press Esc to cancel.\n" + IDLE)
+    out = _checkin(tmp_path, "0712", "To stop it, press Esc to cancel.\n" + IDLE_WITH_TASKS)
     assert "morning" in out and "Enter" in out                        # back at his prompt: it goes in
     if shutil.which("jq"):
         q = tmp_path / "relay.queue"
@@ -1648,8 +1680,9 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
 
 
 def test_the_status_page_tells_a_waiting_screen_from_his_prompt():
-    """The panel's /status reads the screen the way checkin.sh does (Nov 16): ready only with his
-    prompt's footer as the bottom line; a screen waiting for an answer is a dialog."""
+    """The panel's /status reads the screen as checkin.sh does (prompt-state.sh, Nov 16): ready only
+    at his prompt, a dialog for a screen waiting for an answer. Its loop runs under errexit and
+    pipefail, and an empty capture (no session, tmux down) leaves it running (round 9)."""
     import shutil
     import subprocess
     bash = shutil.which("bash")
@@ -1657,15 +1690,19 @@ def test_the_status_page_tells_a_waiting_screen_from_his_prompt():
         pytest.skip("no bash")
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
     block = _run_fns(run, "    last=$(printf '%s\\n' \"$screen\" | tail -n 30)", "    printf '{\"signed_in\"")
+    opt = (CAIN / "rootfs/opt/cain").as_posix()
 
     def state(screen):
-        out = subprocess.run([bash, "-c", 'screen="$1"\n' + block + 'echo "$state"\n', "state", screen],
+        script = f'set -o errexit -o nounset -o pipefail\nOPT="{opt}"\nscreen="$1"\n' + block + 'echo "$state"\n'
+        out = subprocess.run([bash, "-c", script, "state", screen],
                              capture_output=True, text=True, encoding="utf-8", timeout=20)
+        assert out.returncode == 0, out.stderr
         return out.stdout.strip()
     assert state(AUTO_MODE_OFFER) == "dialog"
-    assert state(IDLE) == "ready" and state(WORKING) == "ready"
+    assert state(IDLE) == "ready" and state(WORKING) == "ready" and state(IDLE_WITH_TASKS) == "ready"
     assert state("Earlier he said auto mode was on.\n\n  Choose an option\n  > Yes") == "unknown"
     assert state("Invalid API key · Please run /login") == "login_needed"
+    assert state("") == "unknown" and state("\n \n") == "unknown"      # and the loop goes on
 
 
 def test_cain_checks_in_on_his_own_record():
