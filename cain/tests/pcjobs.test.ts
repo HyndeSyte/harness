@@ -6462,7 +6462,7 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), ${en
     expect(err.detail.hint).toContain("schema mismatch");
     expect(err.detail.hint).toContain("not a forged answer");
     expect(err.detail.hint).toContain("policy change");
-    expect(err.detail.hint).toContain("read_page: tool_response.content[].url");
+    expect(err.detail.hint).toContain("read_page (fails): tool_response.content[].url");
     // Without extra paths the old words stand.
     writeFileSync(file, JSON.stringify({ ...ev, address_paths: { find: [STRUCTURED_PATH] }, structured_address: { ...ev.structured_address, passed: false } }));
     err = null;
