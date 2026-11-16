@@ -553,3 +553,77 @@ def test_a_note_on_a_request_whose_cards_were_all_declined_runs_it_again(m):
     assert "Your message: “add the dentist at 3 today”" in m.seen()[-1]      # its provenance kept
     m.tap("Approve")
     assert [e["start"]["dateTime"] for e in dentists(m)] == [at(16).isoformat()]
+
+
+# -- 7. the fast path's re-check ------------------------------------------------------------------
+
+def _snowflake(when, n=0):
+    return str(((int(when.timestamp() * 1000) - 1_420_070_400_000) << 22) + n)
+
+
+def test_the_claim_records_his_newest_message_and_the_dm_is_read_again_after_the_write(m, monkeypatch):
+    real = m.gmail.insert
+    later = []
+
+    def he_corrects_during_the_write(address, event):
+        out = real(address, event)
+        later.append(m.he_says("make it 4 actually", ago=0))
+        return out
+    monkeypatch.setattr(m.gmail, "insert", he_corrects_during_the_write)
+    m.claude.script = [ask(DENTIST)]
+    mid = m.he_says("add the dentist at 3 today")
+    out = m.handover(paired=OWNER, message=mid)
+    pid = rows(m)[-1]["proposal_id"]
+    assert m.ledger.get_meta(f"calendar_change_fast_seen:{pid}") == mid       # recorded with the claim
+    said = m.seen()[-1]
+    assert out["status"] == "executed" and said.startswith("Done.") and "Undo" in m.labels()
+    assert "You sent another message while this was being made, so I'm reading it as a correction" in said
+    root = m.ledger.db.execute("SELECT job_id FROM proposals WHERE id=?", (pid,)).fetchone()[0]
+    assert m.ledger.get_meta(f"correction_of:{later[0]}") == root
+    # Cain hands that message over: it's a correction of the change just made, on a card.
+    m.claude.script = [ask(change("gmail", "move", "Dentist", dates="2026-11-11", start=at(16).isoformat(),
+                                  end=at(17).isoformat()))]
+    out = m.handover(paired=OWNER, message=later[0])
+    assert out["status"] == "waiting for his tap"
+    job = m.ledger.db.execute("SELECT job_id FROM proposals WHERE state='proposed'").fetchone()[0]
+    assert m.ledger.get_meta(f"job_parent:{job}") == root
+    assert "read as a correction of that change" in m.seen()[-1]
+    assert "Your message: “make it 4 actually”" in m.seen()[-1]
+
+
+def _his_message_timed(m, *, stamp_ago, id_ago):
+    sent_stamp = m.clock() - timedelta(seconds=stamp_ago)
+    mid = _snowflake(m.clock() - timedelta(seconds=id_ago), len(m.d.hist))
+    m.d.hist.insert(0, {"id": mid, "content": "add the dentist at 3 today", "timestamp": sent_stamp.isoformat(),
+                        "author": {"id": OWNER}})
+    return mid
+
+
+def test_his_messages_age_comes_from_its_discord_id_against_the_pi_clock(m):
+    mid = _his_message_timed(m, stamp_ago=5, id_ago=180)     # its timestamp says fresh; its id says 3 minutes
+    m.claude.script = [ask(DENTIST)]
+    m.handover(paired=OWNER, message=mid)
+    assert not dentists(m) and "over 2 minutes old now" in m.seen()[-1]
+
+
+def test_the_clock_tolerance_is_counted_against_the_message(m):
+    from harness import controller
+    assert controller.CLOCK_TOLERANCE_S == 5
+    mid = _his_message_timed(m, stamp_ago=5, id_ago=117)     # 1:57: inside 2 minutes, not inside 2 minutes less 5 s
+    m.claude.script = [ask(DENTIST)]
+    m.handover(paired=OWNER, message=mid)
+    assert not dentists(m) and "over 2 minutes old now" in m.seen()[-1]
+
+
+def test_a_message_from_ahead_of_the_pi_clock_cannot_be_timed_and_comes_on_a_card(m):
+    mid = _his_message_timed(m, stamp_ago=5, id_ago=-30)     # Discord says 30 s in the future
+    m.claude.script = [ask(DENTIST)]
+    m.handover(paired=OWNER, message=mid)
+    assert not dentists(m) and "the Pi's clock and Discord's disagree" in m.seen()[-1]
+
+
+def test_a_fresh_message_inside_the_tolerance_still_goes_through(m):
+    mid = _his_message_timed(m, stamp_ago=5, id_ago=100)
+    m.claude.script = [ask(DENTIST)]
+    out = m.handover(paired=OWNER, message=mid)
+    assert out["status"] == "executed" and len(dentists(m)) == 1

@@ -50,6 +50,26 @@ NAMED_FRESH_S = 30 * 60    # a message Cain names, or one his suggestion rests o
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
 PROBE_S = 5                # the watch's check of Cain and its message: short, never a stuck loop
 HEARD_FLOOR_S = 1_420_070_400   # 2015-01-01: an older "last heard from Discord" is nonsense
+# 0.24.0, fourth round: the fast path's re-check measures his message's age from the time inside its
+# Discord id (a snowflake) against the Pi's clock, allowing them this far apart: fresh means under
+# 2 minutes less this, and a message that seems to come from more than this ahead of the Pi's clock
+# can't be timed, so it comes on a card.
+DISCORD_EPOCH_MS = 1_420_070_400_000
+CLOCK_TOLERANCE_S = 5
+SNOWFLAKE_FLOOR = datetime(2020, 1, 1).timestamp()
+
+
+def snowflake_time(message_id) -> datetime | None:
+    """When Discord made a message, from its id. None when the id isn't a snowflake of this decade
+    (a test's or a broken id), and then the message's own timestamp is used instead."""
+    try:
+        ms = (int(str(message_id)) >> 22) + DISCORD_EPOCH_MS
+    except (TypeError, ValueError):
+        return None
+    if ms / 1000 < SNOWFLAKE_FLOOR:
+        return None
+    from datetime import timezone
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 
 NOTE_HEAD = "\n\n[A suggestion from Cain"        # every fence starts so (calendar_change._his_words)
@@ -169,6 +189,7 @@ class Controller:
                              calendar_change=self.calendar_change)
         if self.calendar_change is not None:
             self.calendar_change.fast_check = self._still_his
+            self.calendar_change.after_fast = self._newer_since
         if self.mail_dates is not None:
             self.mail_dates.to_family = self._mail_to_family if self.calendar_change is not None else None
             cc = self.calendar_change
@@ -189,38 +210,68 @@ class Controller:
                                              mail_dates=self.mail_dates,
                                              meaning_live=self.meaning_live)
 
-    def _still_his(self, p) -> str:
-        """At the moment a change goes through with no tap (calendar_change._execute): "" when the
-        message it rests on is still his newest in the DM and under 2 minutes old, or why not. A
-        request that rests on no Discord message of his (his tap on a mail card) has nothing to
+    def _still_his(self, p) -> tuple[str, str]:
+        """At the moment a change goes through with no tap (calendar_change._execute): ("", the
+        newest message of his in the DM) when the message it rests on is still his newest and under
+        2 minutes old, or (why not, ...). Its age is measured from the time inside its Discord id
+        against the Pi's clock, with CLOCK_TOLERANCE_S allowed (0.24.0, fourth round). The newest id
+        is recorded with the claim, and the DM is read again right after the write (_newer_since).
+        A request that rests on no Discord message of his (his tap on a mail card) has nothing to
         check. A DM that can't be read is no pass."""
         job = self.ledger.job(p["job_id"])
         if job is None:
-            return "its request is gone"
+            return "its request is gone", ""
         root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
         try:
-            origin = json.loads(self.ledger.get_meta(f"job_origin:{root}") or "{}")
+            origin = json.loads(self.ledger.get_meta(f"job_origin:{job['id']}")
+                                or self.ledger.get_meta(f"job_origin:{root}") or "{}")
         except ValueError:
             origin = {}
         if not origin.get("message"):
-            return ""
+            return "", ""
+        sent = snowflake_time(origin["message"])
         try:
-            age = (self.ledger.now() - datetime.fromisoformat(origin["sent_at"])).total_seconds()
+            sent = sent or datetime.fromisoformat(origin["sent_at"])
+            age = (self.ledger.now() - sent).total_seconds()
         except (KeyError, ValueError, TypeError):
             age = FRESH_S + 1
-        if age > FRESH_S:
-            return "your message is over 2 minutes old now"
+        if age < -CLOCK_TOLERANCE_S:
+            return "the Pi's clock and Discord's disagree, so I can't tell how old your message is", ""
+        if age > FRESH_S - CLOCK_TOLERANCE_S:
+            return "your message is over 2 minutes old now", ""
         if not self._discord_mode():
-            return "I couldn't read the DM to see that it's still your newest message"
+            return "I couldn't read the DM to see that it's still your newest message", ""
         try:
             msgs = self.discord.api.history(self.discord.dm(), 10)
         except DiscordError:
-            return "I couldn't read the DM to see that it's still your newest message"
+            return "I couldn't read the DM to see that it's still your newest message", ""
         owner = str(self.config.owner_user_id if self.config else self.base_config.owner_user_id)
         mine = [m for m in msgs if str((m.get("author") or {}).get("id")) == owner]
-        if mine and str(mine[0].get("id")) != str(origin["message"]):
-            return "you sent another message after it"
-        return ""
+        newest = str(mine[0].get("id")) if mine else str(origin["message"])
+        if mine and newest != str(origin["message"]):
+            return "you sent another message after it", newest
+        return "", newest
+
+    def _newer_since(self, p, seen: str) -> list[str]:
+        """Right after a no-tap change is written: his messages that came in after the one recorded
+        with its claim, newest first (0.24.0, fourth round). Each is read as a correction of that
+        change (_handover). A DM that can't be read gives none, and that is logged."""
+        if not self._discord_mode() or not seen:
+            return []
+        try:
+            msgs = self.discord.api.history(self.discord.dm(), 10)
+        except DiscordError as e:
+            log.warning("after a no-tap change, the DM couldn't be read again (%s)", e.code)
+            return []
+        owner = str(self.config.owner_user_id if self.config else self.base_config.owner_user_id)
+        out = []
+        for m in msgs:
+            if str((m.get("author") or {}).get("id")) != owner:
+                continue
+            if str(m.get("id")) == seen:
+                break
+            out.append(str(m.get("id")))
+        return out
 
     def _mail_to_family(self, title: str, day, start) -> bool:
         """A date from his mail he tapped Add to Family on (mail_dates.py): one add on Family, as a
@@ -664,6 +715,16 @@ class Controller:
         jobs = self.ledger.ingest([Decision(inc, True, None, "message")])
         if jobs:
             job_id = jobs[0]
+            fixed = self.ledger.get_meta(f"correction_of:{m['id']}")
+            if fixed:
+                # Sent while a no-tap change of his was being written (calendar_change._finish): a
+                # correction of that change, never a request of its own, and on a card.
+                flags.append("correction")
+                root = self.ledger.get_meta(f"job_parent:{fixed}") or fixed
+                parts = json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(f"job_parent:{job_id}", root, db)
+                    self.ledger.set_meta(f"job_parts:{root}", json.dumps(parts + [job_id]), db)
             if flags:
                 self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flags))))
             self.ledger.set_meta(f"job_origin:{job_id}", json.dumps(origin))

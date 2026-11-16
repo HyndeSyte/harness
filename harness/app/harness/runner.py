@@ -91,6 +91,7 @@ PROVENANCE = {
     "repaired": "my first reading of your message needed tidying before it fit.",
     "not_newest": "it acts on an earlier message of yours, not your newest.",
     "split": "it's one of several changes in one message, so each comes on its own card.",
+    "correction": "you sent it while the change just before it was being made, so it's read as a correction of that change.",
 }
 
 # Flags that mean Cain's words came with the request: a question for him goes to Cain first, who
@@ -737,7 +738,7 @@ class Runner:
         he sent after it, and each change field by field, with what came from Cain marked so.
         (lines, HTML-safe; whether any field is Cain's and not his)."""
         root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
-        raw = self.ledger.get_meta(f"job_origin:{root}")
+        raw = self.ledger.get_meta(f"job_origin:{job['id']}") or self.ledger.get_meta(f"job_origin:{root}")
         try:
             origin = json.loads(raw) if raw else {}
         except ValueError:

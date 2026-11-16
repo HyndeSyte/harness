@@ -164,9 +164,11 @@ class Morning:
 
     # -- what he does ---------------------------------------------------------------------------
     def he_says(self, text, *, ago=5, **extra):
-        mid = str(80000 + len(self.d.hist))
-        when = (self.clock() - timedelta(seconds=ago)).isoformat()
-        self.d.hist.insert(0, {"id": mid, "content": text, "timestamp": when, "author": {"id": OWNER}, **extra})
+        """His message, with a real Discord id: a snowflake whose time is when he sent it."""
+        sent = self.clock() - timedelta(seconds=ago)
+        mid = str(((int(sent.timestamp() * 1000) - 1_420_070_400_000) << 22) + len(self.d.hist))
+        self.d.hist.insert(0, {"id": mid, "content": text, "timestamp": sent.isoformat(), "author": {"id": OWNER},
+                               **extra})
         return mid
 
     def send(self, h):

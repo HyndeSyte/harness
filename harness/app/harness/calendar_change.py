@@ -431,7 +431,11 @@ class CalendarChange:
         self.abandoned: list[threading.Thread] = []
         # The fast path's check at the moment of the write (controller._still_his): "" when his
         # message is still his newest and fresh, or why not. None: nothing to check (no Discord).
-        self.fast_check: Callable[[Any], str] | None = None
+        self.fast_check: Callable[[Any], Any] | None = None
+        # Right after a no-tap change is written: his messages since the newest one its claim
+        # recorded (controller._newer_since), each read as a correction of it.
+        self.after_fast: Callable[[Any, str], list[str]] | None = None
+        self._fast_seen: dict[str, str] = {}
         # A fast-path change that can't go without a tap after all becomes his card (runner).
         self.to_card: Callable[[Any, str], None] | None = None
         # His Propose again, and his pick of which card a note corrects, become cards (runner).
@@ -1102,7 +1106,11 @@ class CalendarChange:
         if self.fast_check is None:
             return ""
         try:
-            return self.fast_check(p) or ""
+            got = self.fast_check(p)
+            why, newest = got if isinstance(got, tuple) else (got or "", "")
+            if newest:
+                self._fast_seen[p["id"]] = newest
+            return why or ""
         except Exception as e:                  # a check that can't be made isn't a pass
             log.warning("fast path check failed: %s", type(e).__name__)
             return "I couldn't read the DM to see that it's still your newest message"
@@ -1143,6 +1151,11 @@ class CalendarChange:
             else:
                 took = db.execute("UPDATE proposals SET state='executing' WHERE id=? AND state=?",
                                   (p["id"], p["state"])).rowcount == 1
+            if took and p["state"] == "auto_approved":
+                # The newest message of his the re-check saw, recorded with the claim itself: the DM
+                # read right after the write is measured against it (_finish).
+                self.ledger.set_meta(f"calendar_change_fast_seen:{p['id']}",
+                                     self._fast_seen.pop(p["id"], "") or "-", db)
             if took:
                 db.execute("INSERT INTO calendar_changes(proposal_id, job_id, state, undo_state,"
                            " undo_json, created_at, updated_at, settle_json) VALUES(?,?,?,?,?,?,?,?)",
@@ -1499,6 +1512,7 @@ class CalendarChange:
         changed" when something did (Nov 11). Only known outcomes come here: one a read hasn't
         settled waits for it (_settle)."""
         results, notes = self._read_back(results, list(notes))
+        newer = self._newer_after_write(p)
         failed = [(part, landed, s, at) for part, landed, s, at in results if s is not None]
         done = [part for part, _, s, _ in results if s is None]
         ok = not failed
@@ -1573,6 +1587,13 @@ class CalendarChange:
             read_as = self._read_as(p)
             if read_as and done:
                 lines.append("Read from your words: " + "; ".join(read_as) + ".")
+            if newer:
+                root = self.ledger.get_meta(f"job_parent:{p['job_id']}") or p["job_id"]
+                for mid in newer:
+                    self.ledger.set_meta(f"correction_of:{mid}", root, db)
+                lines.append("You sent another message while this was being made, so I'm reading it as a "
+                             "correction of this change, not a new request." + (" Undo is here if it "
+                                                                                "should come off." if undo else ""))
             buttons, binds = self._undo_button(db, p["id"]) if undo else (None, None)
             if any(part.already and part.change.get("op") == "add" for part in done):
                 # Never silent on a duplicate (0.24.0, fourth round): the event that's there is
@@ -1624,6 +1645,24 @@ class CalendarChange:
                         + (" Undo puts back what did go through." if undo else ""), buttons=buttons, binds=binds)
                 else:
                     self._save_plan(row["proposal_id"], plan, db)
+
+    def _newer_after_write(self, p) -> list[str]:
+        """A no-tap change, just written: the DM read again at once (0.24.0, fourth round). His
+        messages since the one recorded with its claim, or none."""
+        seen = self.ledger.get_meta(f"calendar_change_fast_seen:{p['id']}")
+        if not seen or self.after_fast is None or self.ledger.get_meta(f"calendar_change_fast_read:{p['id']}"):
+            return []
+        try:
+            newer = self.after_fast(p, "" if seen == "-" else seen) or []
+        except Exception as e:                  # a read that fails is logged, never a pass or a stop
+            log.warning("after a no-tap change, the DM read failed: %s", type(e).__name__)
+            newer = []
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(f"calendar_change_fast_read:{p['id']}", iso(self.ledger.now()), db)
+        if newer:
+            log.info("calendar change %s: %d message(s) came in during its write: read as a correction",
+                     render.short(p["id"]), len(newer))
+        return newer
 
     def _read_as(self, p) -> list[str]:
         """Each day his own words named by a relative word, as it was read (provenance.resolutions),
