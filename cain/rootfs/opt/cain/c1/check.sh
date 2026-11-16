@@ -34,10 +34,17 @@ TRIES="${C1_CHECK_TRIES:-1}"
 MIN="${C1_CHECK_MIN:-45}"
 NOANSWER='{"ok": true, "failed": [], "unchecked": ["the check gave no answer"], "checks": 0}'
 once() {
-  local raw n
-  raw="$(timeout 60 "$OPT/as-cain" bun "$OPT/c1/check.ts" 2>/dev/null | tail -n 1)"
+  local raw n rc=0
+  raw="$(timeout 60 "$OPT/as-cain" bun "$OPT/c1/check.ts" 2>/dev/null | tail -n 1)" || rc=$?
   if ! printf '%s' "$raw" | jq -e 'type == "object" and (.ok | type == "boolean") and (.failed | type == "array") and (.unchecked | type == "array") and (.checks | type == "number")' >/dev/null 2>&1; then
     printf '%s' "$NOANSWER"; return
+  fi
+  # A breach it reported stands, however it ended; anything else counts only from a check that
+  # ended well (one that printed a pass and then failed, or ran out of time, didn't pass: C1
+  # fourth outside round).
+  if [ "$rc" != 0 ] && [ "$(printf '%s' "$raw" | jq -r .ok)" = true ]; then
+    jq -nc --arg u "the check ended with $rc after its answer" --arg c 0 '{ok: true, failed: [], unchecked: [$u], checks: ($c | tonumber)}'
+    return
   fi
   n="$(printf '%s' "$raw" | jq -r .checks)"; n="${n%%.*}"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
   if [ "$(printf '%s' "$raw" | jq -r .ok)" = true ] && [ "$(printf '%s' "$raw" | jq '.unchecked | length')" = 0 ] && [ "$n" -lt "$MIN" ]; then

@@ -96,6 +96,16 @@ else
             3) mode=old; break ;;
             4) mode=none; restart_first=1; stop_kind=switch-restart; stopped_why="a validation ran as his user in this container, so it waits for a new one"
                stop_cause="$(tail -n 1 /data/c1/failed 2>/dev/null | cut -d' ' -f2- | tr -d '\r\n' | cut -c1-200 || true)"; break ;;
+            1) ;;
+            # Any other end (it couldn't run, or was killed: C1 fourth outside round). Begun and
+            # not undone, the state isn't fresh, and that stops him (below). Still fresh, nothing
+            # was begun, so the old way is whole: he runs it, and the try is on record as failed,
+            # so Dane hears it as any failed try, with its cause, and it isn't tried again here.
+            *) if [ "$("$OPT/c1/state.sh")" = fresh ]; then
+                 printf '%s the switch ended with %s before it began\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" >> /data/c1/failed || true
+                 bashio::log.warning "The switch ended with $rc before it began: Cain runs the old way for now"
+                 break
+               fi ;;
           esac
           # Not switched: the old layout is whole again. Once more only while it may be tried.
           if [ "$("$OPT/c1/state.sh")" != fresh ]; then mode=none; switch_stopped=1; stop_kind=switch-stopped; stopped_why="the switch was undone but the state isn't fresh"; break; fi
@@ -201,14 +211,16 @@ start_session() {
     CAIN_MODE=old timeout 20 tmux -u new-session -d -s cain -x 120 -y 40 "$OPT/session.sh"
   fi
 }
-has_session() { timeout 10 $TMUX_CMD -u has-session -t cain 2>/dev/null; }
 # His user's processes, as /proc has them: what shows nothing of his runs, with no need of tmux's
 # answer (a tmux that fails or hangs is no proof of anything: C1 third outside round).
 his_procs() {
-  local p
+  local p st
   for p in "${C1_PROC_ROOT:-/proc}"/[0-9]*; do
-    case " $(awk '/^Uid:/{print $2, $3, $4, $5; exit}' "$p/status" 2>/dev/null) " in
-      *" 1000 "*) case "$(awk '/^State:/{print $2; exit}' "$p/status" 2>/dev/null)" in Z|X|"") ;; *) echo "${p##*/}" ;; esac ;;
+    # A process whose status can't be read while it's still there counts as one of his: no
+    # proof it isn't (C1 fourth outside round). One that went away meanwhile doesn't.
+    st="$(cat "$p/status" 2>/dev/null)" || { [ ! -e "$p" ] || echo "${p##*/}?"; continue; }
+    case " $(printf '%s\n' "$st" | awk '/^Uid:/{print $2, $3, $4, $5; exit}') " in
+      *" 1000 "*) case "$(printf '%s\n' "$st" | awk '/^State:/{print $2; exit}')" in Z|X) ;; *) echo "${p##*/}" ;; esac ;;
     esac
   done
 }
@@ -239,13 +251,33 @@ end_his_session() {
 # trap tells Dane, and the finish script halts the container, so no process of his outlives it.
 # The one exit of the start, and on purpose.
 fail_closed() { bashio::log.error "Cain couldn't be shown stopped, so the App stops itself"; exit 1; }
+# Whether his session runs, for the start's own loops: yes only on tmux's yes. A no counts once
+# no process of his user is left over (those are ended, as for a stop). Anything else, a hung or
+# failed tmux included, is no proof either way (C1 fourth outside round): his session is ended
+# and shown ended (or the App stops), and it counts as ended, so it's started again and checked
+# again, never left running unchecked.
+session_up() {
+  local rc=0
+  timeout 10 $TMUX_CMD -u has-session -t cain 2>/dev/null || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) if [ "$TMUX_CMD" != tmux ] && [ -n "$(his_procs)" ]; then
+         bashio::log.warning "Processes of his user run with no session of his: ending them"
+         end_his_session || fail_closed
+       fi
+       return 1 ;;
+    *) bashio::log.warning "tmux didn't say whether his session runs ($rc): ending it"
+       end_his_session || fail_closed
+       return 1 ;;
+  esac
+}
 # His session. A start that doesn't take returns 1, never ends this script: the foreground loop
 # below starts it again, later each time, and tells Dane if it keeps failing (session_ended).
 start_his_session() {
   bashio::log.info "Starting Cain"
   if ! start_session; then bashio::log.error "tmux could not start"; return 1; fi
   sleep 3
-  if ! has_session; then
+  if ! session_up; then
     bashio::log.error "Cain's session ended at once. Its last output:"
     bun "$OPT/owned.ts" tail /data/session.log 20 2>/dev/null || tail -n 20 /data/session.log 2>/dev/null || true
     return 1
@@ -286,7 +318,7 @@ list_connectors() {
 with_session() {
   ( sleep 30; list_connectors ) &
 }
-if [ "$mode" != none ] && [ -z "$held" ] && has_session; then with_session; fi
+if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
 ( while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done ) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the
@@ -487,18 +519,19 @@ asked=0; listed_at=$(date +%s); told_at=$(date +%s)
 while true; do
 if [ -n "$held" ]; then hold; fi
 if [ "$mode" = none ]; then stopped; fi
-if ! has_session; then
+if ! session_up; then
   if start_his_session; then with_session; checkins; else session_ended; continue; fi
 fi
 up_since=$(date +%s); cleared=""; check_tries=0; check_due=$(( up_since + ${C1_CHECK_FIRST_S:-45} )); checked=""
 [ "$mode" = own ] || checked=1
-while has_session; do
+while session_up; do
   if [ -z "$checked" ] && [ "$(date +%s)" -ge "$check_due" ]; then
     check_tries=$((check_tries + 1))
     if [ "$check_tries" -ge 5 ]; then run_check 1; else run_check 0; fi
     case "$crc" in
       0) checked=1 ;;
-      3) end_his_session || fail_closed; breach_stop; break ;;
+      3) "$OPT/notice.sh" tell breach || true                         # first: a stop that fails closed keeps it
+         end_his_session || fail_closed; breach_stop; break ;;
       4) held_now ""; break ;;
       5) if [ "$check_tries" -lt 5 ]; then check_due=$(( $(date +%s) + ${C1_CHECK_EVERY_S:-60} ))
          else held_now "the check still asked to be tried again after its fifth try"; break; fi ;;

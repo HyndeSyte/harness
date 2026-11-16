@@ -164,11 +164,24 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
   return 1
 }
 
+# Within a group, an alarm doesn't give way to a lesser one while it stands: a breach isn't
+# replaced by the App stopping itself after it, say (C1 fourth outside round). Its repeats run
+# instead. The same rank, or a greater, replaces it.
+rank() {
+  case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
+    held|switch-restart|session|switch-waits) echo 1 ;; *) echo 0 ;; esac
+}
 tell() {   # tell <kind> [cause]
   local g c
   g="$(group_of "$1")" || { echo "notice: no alarm called '$1'" >&2; return 2; }
   c="$(plain "${2:-}")"
-  if load "$g" && [ "$kind" = "$1" ] && [ "$cause" = "$c" ] && [ "$clear" != 1 ]; then deliver; return; fi
+  if load "$g" && [ "$clear" != 1 ]; then
+    if [ "$kind" = "$1" ] && [ "$cause" = "$c" ]; then deliver; return; fi
+    if [ "$(rank "$1")" -lt "$(rank "$kind")" ]; then
+      echo "[cain] alarm '$1' kept back: '$kind' stands" >&2
+      deliver; return
+    fi
+  fi
   # A new alarm for the group: delivered afresh, but what Home Assistant shows for the group is
   # kept (shown), so a notification of the alarm it replaces still comes down when it clears.
   G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0
