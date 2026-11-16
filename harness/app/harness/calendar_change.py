@@ -460,6 +460,9 @@ class Part:
     expect: list[dict] = field(default_factory=list)
     loose: str = ""
     change: dict = field(default_factory=dict)       # an add's change as asked, for Add anyway
+    # 0.24.0, fifth round: an add already there, when the calendar was made: the provider's own
+    # created field (Google's "created", iCloud's CREATED), "" when it has none (migrate.py).
+    created: str = ""
 
 
 @dataclass
@@ -1138,11 +1141,14 @@ class CalendarChange:
         return "unread" if unread_any else "done"
 
     # -- the ledger migration (migrate.py): changes the version before left in flight ----------
-    def read_in_flight(self, p) -> tuple[str, list[dict]]:
+    def read_in_flight(self, p) -> tuple[str, list[dict], list[dict]]:
         """A change the version before left approved or mid-write, read back from the calendar and
-        never written: ("done", the writes a read found landed) when the calendar shows all of it,
-        else ("unverified", what landed). One never started is done only if the calendar already
-        shows it as asked (an add's very event there, a move already at its time)."""
+        never written: ("done", the writes a read found landed, its parts) when the calendar shows all
+        of it, else ("unverified", what landed, its parts). One never started kept no event id of its
+        own (0.24.0, fifth round): it's done only if every part is an add whose very event is there
+        and the calendar made that event after the approval (the provider's created field); a move
+        found at its time, or an event made before the approval, could be anyone's, so unverified.
+        Its parts are kept, so an unverified one joins the same follow-up reads."""
         try:
             plan = json.loads(p["settle_json"] or "{}") if p["x_state"] else {}
         except (ValueError, TypeError):
@@ -1151,8 +1157,12 @@ class CalendarChange:
             try:
                 parts, _ = self._plan_all(json.loads(p["params_json"]), p["id"])
             except (Refuse, ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
-                return "unverified", []
-            return ("done" if parts and all(part.already for part in parts) else "unverified"), []
+                return "unverified", [], []
+            approved = self._approved_at(p)
+            ours = bool(parts) and all(part.already and part.change.get("op") == "add" and part.created
+                                       and approved is not None
+                                       and datetime.fromisoformat(part.created) > approved for part in parts)
+            return ("done" if ours else "unverified"), [], [self._part_record(part) for part in parts]
         landed, whole = [], bool(plan.get("parts"))
         for part in plan.get("parts") or []:
             for rec in part.get("steps", []):
@@ -1165,15 +1175,50 @@ class CalendarChange:
                         landed.append(entry)
                         continue
                 whole = False
-        return ("done" if whole else "unverified"), landed
+        return ("done" if whole else "unverified"), landed, list(plan.get("parts") or [])
 
-    def record_in_flight(self, db, p, verdict: str, landed: list[dict]) -> None:
+    def found_now(self, proposal_id: str) -> bool:
+        """Before Propose again (migrate.py): a read of the request's slot. A change kept as unverified
+        whose parts the calendar now shows is confirmed, with "Confirmed."; True then, and it isn't
+        offered again. Anything else (a replaced card, a read that can't tell) is False."""
+        row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (proposal_id,)).fetchone()
+        if row is None or row["state"] not in ("unverified", "absent"):
+            return False
+        plan = _plan(row)
+        parts = [part for part in plan.get("parts") or [] if part.get("expect") and not part.get("already")]
+        if not parts or self._reads_done(parts) != "done":
+            return False
+        plan.pop("recheck", None)
+        plan.pop("watch_next", None)
+        if row["state"] == "absent":
+            self._done_after_all(proposal_id, plan, self._sent_entries(plan, row))
+        else:
+            self._confirmed(row, plan, parts)
+        return True
+
+    def _approved_at(self, p) -> datetime | None:
+        stamps = [r[0] for r in self.ledger.db.execute(
+            "SELECT consumed_at FROM approvals WHERE proposal_id=? AND consumed_at IS NOT NULL", (p["id"],))]
+        stamps = stamps or [p["created_at"]]
+        try:
+            return min(datetime.fromisoformat(x) for x in stamps if x)
+        except ValueError:
+            return None
+
+    def record_in_flight(self, db, p, verdict: str, landed: list[dict], parts: list[dict] | None = None) -> None:
         """migrate.py: a change in flight from the version before, recorded as the read found it,
-        with its receipt and Undo for what landed. Nothing of it is written again."""
+        with its receipt and Undo for what landed. Nothing of it is written again. One unverified
+        joins the follow-up reads (30 seconds, 2 minutes, the long window, then watched by id)."""
         now = iso(self.ledger.now())
         row = db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (p["id"],)).fetchone()
         plan = _plan(row) if row is not None else {}
         plan["migrated"] = verdict
+        if not plan.get("parts") and parts:
+            plan["parts"] = parts
+        if verdict != "done" and plan.get("parts"):
+            followed = [i for i, part in enumerate(plan["parts"]) if part.get("expect") and not part.get("already")]
+            if followed:
+                self._schedule_reads(plan, followed)
         undo = (json.loads(row["undo_json"] or "[]") if row is not None else [])
         undo += [e for e in landed if e not in undo]
         state = "done" if verdict == "done" else "unverified"
@@ -1210,6 +1255,8 @@ class CalendarChange:
         else:
             words = (f"<b>Not confirmed:</b> {_safe(said)}. It was approved when Harness updated, and a read of "
                      "the calendar after the update doesn't show it done, so nothing of it was written again."
+                     + (" I'll read the calendar for it again, and you'll hear if it shows up."
+                        if plan.get("recheck") else "")
                      + (" Undo puts back the part that went through." if undo else ""))
         buttons, binds = self._undo_button(db, p["id"]) if undo else (None, None)
         self._say(db, self.chat_id, p["job_id"], words, buttons=buttons, binds=binds)
@@ -2878,7 +2925,8 @@ class CalendarChange:
                 words = (f"Already there, nothing added: \u201c{_safe(same.title)}\u201d, "
                          f"{self._when_words(same.start, same.end) if same.end is not None else _day_words(same.first)}, "
                          f"is on your {cal} calendar. Add anyway adds a second one")
-                return Part(words, words, [], name=_safe(c["title"]), already=words, change=dict(c))
+                return Part(words, words, [], name=_safe(c["title"]), already=words, change=dict(c),
+                            created=self._created_of(same))
             if like is not None:
                 # One only like it (one name holds the other's words, it's on the other calendar, or
                 # its end, all-day or repeating differs): his decision, on a card that names it, and
@@ -2895,6 +2943,25 @@ class CalendarChange:
                    "start": _text(start), "end": _text(end), "repeats": bool(rule)}]
         return Part(f"Add {text}{where}", f"Added {text}{where}", [step], name=_safe(c["title"]), adds=True,
                     expect=expect, loose=loose, change=dict(c))
+
+    def _created_of(self, f: Found) -> str:
+        """When the calendar says this event was made: Google's "created", or the CREATED line of its
+        iCloud resource (read by its address when the list didn't carry its text). "" when unknown."""
+        try:
+            if f.calendar == "gmail":
+                when = datetime.fromisoformat(str((f.raw or {}).get("created") or "").replace("Z", "+00:00"))
+                return when.astimezone(timezone.utc).isoformat()
+            body = getattr(f.raw, "data", "") or ""
+            if "CREATED" not in body.upper():
+                out, body = self.client.fetch(f.raw.href)
+                if out.kind != "ok":
+                    return ""
+            m = re.search(r"(?im)^CREATED[^:\r\n]*:(\d{8}T\d{6})Z?\s*$", body or "")
+            if not m:
+                return ""
+            return datetime.strptime(m.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc).isoformat()
+        except (ValueError, TypeError, AttributeError):
+            return ""
 
     def _unsettled_ids(self, c: dict, start, end) -> list[str]:
         """The fixed ids of earlier adds of this very event (calendar, title, start, end) that were

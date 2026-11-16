@@ -644,16 +644,21 @@ class Runner:
         if kind == "calendar_change_which":
             return self._which_picked(target)
         from . import migrate
-        n = 0
+        n = found = 0
         for pid in migrate.listed(self.ledger, target):
             p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
             if p is None or p["state"] not in ("superseded", "failed"):
+                continue
+            # A read of its slot first (0.24.0, fifth round): one the calendar now shows is said as
+            # confirmed, not offered again.
+            if self.calendar_change.found_now(pid):
+                found += 1
                 continue
             if self._again(p, "you tapped Propose again after Harness updated, so this is your request from "
                               "before, on a new card."):
                 n += 1
         if not n:
-            return "Nothing to bring back there."
+            return "Already on the calendar, so nothing to bring back." if found else "Nothing to bring back there."
         return f"Back on {n} new card{'s' * (n != 1)}, each waiting for your tap."
 
     def _again(self, p, why: str) -> str:

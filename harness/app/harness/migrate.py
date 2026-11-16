@@ -18,7 +18,11 @@ Step 2, the handover sweep:
     recorded as done (with its receipt and Undo) or unverified (with a receipt saying so and Undo
     for what it wrote), and never written again;
   * then one message lists each request that was replaced or left unverified, a sentence each,
-    with one Propose again button that puts each back on a new card for his tap.
+    with one Propose again button that puts each back on a card of its own, approved or declined
+    on its own (after a read of its slot: one the calendar now shows is said as confirmed instead). An
+    unverified one also joins the follow-up reads (calendar_change._recheck_unverified). One
+    never started counts as done only if each part is an add whose event the calendar made after
+    the approval (calendar_change.read_in_flight).
 """
 from __future__ import annotations
 
@@ -94,10 +98,10 @@ def _sweep(ledger: Ledger, cc, chat_id: int, reads: dict, db) -> dict:
         if p["effect_type"] == effects.CALENDAR_CHANGE:
             listed.append((p["id"], _sentence(ledger, p, cc, "its card was replaced")))
     for p in _in_flight(db):
-        verdict, landed = reads.get(p["id"], ("unverified", []))
+        verdict, landed, parts = reads.get(p["id"], ("unverified", [], []))
         if cc is None:
             continue
-        cc.record_in_flight(db, p, verdict, landed)
+        cc.record_in_flight(db, p, verdict, landed, parts)
         if verdict == "done":
             done += 1
         else:
@@ -124,6 +128,10 @@ def _sentence(ledger: Ledger, p, cc, why: str) -> str:
 
 
 def _listing(ledger: Ledger, chat_id: int, listed: list[tuple[str, str]], db) -> None:
+    """One message listing each request, with one Propose again button: a tap consumes every button on
+    its message (choices.py), so the choice per request is on the cards it brings back (0.24.0, fifth
+    round): each request comes back on its own card, approved or declined on its own, and the listing
+    says so."""
     batch = f"{len(listed)}-{iso(ledger.now())}"
     ledger.set_meta(LISTED + batch, json.dumps([pid for pid, _ in listed]), db)
     nonce = choices.mint(ledger, kind="calendar_change_propose_again", target=batch, chat_id=chat_id,
@@ -131,7 +139,8 @@ def _listing(ledger: Ledger, chat_id: int, listed: list[tuple[str, str]], db) ->
     lines = ["<b>Harness updated.</b> These calendar requests were left from the version before, and "
              "nothing more was done with them:"]
     lines += [f"{i}. {s}" for i, (_, s) in enumerate(listed, 1)]
-    lines.append("Propose again puts each one back on a new card for your tap.")
+    lines.append("Propose again puts each one back on a card of its own, so you can approve one and decline "
+                 "another. One the calendar already shows by then is said as confirmed instead.")
     ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit("\n".join(lines)),
                    buttons=[[("Propose again", choices.callback_data(nonce))]],
                    binds=[{"type": "choice", "nonce": nonce}], db=db)

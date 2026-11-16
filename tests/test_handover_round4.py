@@ -364,7 +364,7 @@ def test_an_upgrade_from_the_current_release_sweeps_once_and_lists_what_it_repla
     assert len(listing) == 1
     assert "1. Your message “PT moved to 11:30”: Move PT" in listing[0] and "(its card was replaced)" in listing[0]
     assert "2. Your message “swim lesson at 5 today”: Add Swim lesson" in listing[0]
-    assert "Propose again puts each one back on a new card" in listing[0] and "Propose again" in m.labels()
+    assert "Propose again puts each one back on a card of its own, so you can approve one and decline" in listing[0]
     m.tap("Propose again")
     m.c.outbox.flush()
     new_cards = [t for t in m.seen() if "you tapped Propose again after Harness updated" in t]

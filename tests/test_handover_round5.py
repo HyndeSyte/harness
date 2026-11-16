@@ -537,3 +537,113 @@ def test_a_card_for_an_older_record_turns_nothing_on(m):
     from test_handover_round2 import press
     press(m, old, "Turn on")
     assert not calendar_change.fast_path_on(m.ledger)
+
+
+# -- 6. migration reporting --------------------------------------------------------------------------
+
+from test_handover_round4 import _landed_dentist, _old_ledger, state_of  # noqa: E402
+
+
+def _swim_on_gmail(monkeypatch, uid, created):
+    """His Swim lesson is on Gmail when the update runs, made at `created`."""
+    real = Morning.seed
+
+    def seed(self):
+        real(self)
+        self.gmail.events[uid] = {"id": uid, "summary": "Swim lesson", "status": "confirmed", "etag": '"s"',
+                                  "created": created, "organizer": {"email": GMAIL, "self": True},
+                                  "start": {"dateTime": at(17).isoformat(), "timeZone": TZ},
+                                  "end": {"dateTime": at(18).isoformat(), "timeZone": TZ}}
+    monkeypatch.setattr(Morning, "seed", seed)
+
+
+def _row(ledger, pid):
+    return ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()
+
+
+def test_a_legacy_add_found_there_but_made_before_the_approval_is_unverified(tmp_path, clock, monkeypatch):
+    old, ids = _old_ledger(tmp_path, clock)
+    _landed_dentist(monkeypatch, ids["entry"])
+    _swim_on_gmail(monkeypatch, "swimbyhand1", "2026-11-01T10:00:00Z")      # made by hand, long before
+    m = Morning(old, tmp_path, clock)
+    assert _row(old, ids["swim"])["state"] == "unverified"
+    assert not [e for e in m.gmail.log if e[0] == "insert"]
+
+
+def test_a_legacy_add_found_there_and_made_after_the_approval_is_done(tmp_path, clock, monkeypatch):
+    old, ids = _old_ledger(tmp_path, clock)
+    _landed_dentist(monkeypatch, ids["entry"])
+    _swim_on_gmail(monkeypatch, "swimafter1", "2026-11-11T12:30:20Z")       # made after the approval
+    m = Morning(old, tmp_path, clock)
+    assert _row(old, ids["swim"])["state"] == "done"
+    assert any(t.startswith("Done. Add Swim lesson") for t in m.seen())
+
+
+def _expect_id(ledger, pid):
+    plan = json.loads(_row(ledger, pid)["settle_json"])
+    return plan, plan["parts"][0]["expect"][0]["id"]
+
+
+def test_a_migrated_unverified_change_joins_the_follow_up_reads(tmp_path, clock, monkeypatch):
+    old, ids = _old_ledger(tmp_path, clock)
+    _landed_dentist(monkeypatch, ids["entry"])
+    m = Morning(old, tmp_path, clock)
+    plan, uid = _expect_id(old, ids["swim"])
+    assert len(plan["recheck"]) == 3
+    assert any(t.startswith("Not confirmed: Add Swim lesson") and "you'll hear if it shows up" in t for t in m.seen())
+    m.gmail.events[uid] = {"id": uid, "summary": "Swim lesson", "status": "confirmed", "etag": '"s"',
+                           "start": {"dateTime": at(17).isoformat(), "timeZone": TZ},
+                           "end": {"dateTime": at(18).isoformat(), "timeZone": TZ}}
+    settle(m, minutes=0.6, ticks=1)
+    assert _row(old, ids["swim"])["state"] == "done"
+    assert m.seen()[-1].startswith("Confirmed. A later read of the calendar shows it as asked: Add Swim lesson")
+
+
+def test_propose_again_reads_the_slot_first_and_drops_one_now_found(tmp_path, clock, monkeypatch):
+    old, ids = _old_ledger(tmp_path, clock)
+    _landed_dentist(monkeypatch, ids["entry"])
+    m = Morning(old, tmp_path, clock)
+    _, uid = _expect_id(old, ids["swim"])
+    listing = [t for t in m.seen() if t.startswith("Harness updated.")][0]
+    assert "approve one and decline another" in listing
+    m.gmail.events[uid] = {"id": uid, "summary": "Swim lesson", "status": "confirmed", "etag": '"s"',
+                           "start": {"dateTime": at(17).isoformat(), "timeZone": TZ},
+                           "end": {"dateTime": at(18).isoformat(), "timeZone": TZ}}
+    m.tap("Propose again")
+    m.c.outbox.flush()
+    new_cards = [t for t in m.seen() if "you tapped Propose again after Harness updated" in t]
+    assert len(new_cards) == 1 and "PT" in new_cards[0]                      # only the one not found
+    assert any(t.startswith("Confirmed.") and "Swim lesson" in t for t in m.seen())
+    m.tap("Decline")                                                         # that card, on its own
+    assert state_of(old, ids["swim"]) == "executed"
+
+
+def _apply_pull_request_20(old, clock):
+    """What pull request 20 (Harness 0.24.0 there, read from its diff) does to a ledger: it has no
+    schema step; its outbox drops a row unsent after 7 days as dead, with a delivery_expired event,
+    and gives each row one request id at the link when it sends. Applied to the current release's
+    shape the way its outbox._send would on its first flush."""
+    with old.tx() as db:
+        row = old.enqueue(chat_id=1, kind="reply", text="An old reply from before", db=db)
+        db.execute("UPDATE outbox SET created_at=? WHERE id=?",
+                   ((clock() - timedelta(days=8)).isoformat(), row))
+        db.execute("UPDATE outbox SET state='dead', last_error=? WHERE id=?",
+                   ("unsent after 7 days: dropped, never retried as new", row))
+        old.event("delivery_expired", {"outbox": row, "kind": "reply"}, db=db)
+    return row
+
+
+def test_the_upgrade_after_pull_request_20s_migration_sweeps_once_and_leaves_its_rows(tmp_path, clock, monkeypatch):
+    from harness import migrate
+    old, ids = _old_ledger(tmp_path, clock)
+    dead = _apply_pull_request_20(old, clock)
+    assert old.get_meta("ledger_schema") is None                             # pull request 20 keeps no schema mark
+    _landed_dentist(monkeypatch, ids["entry"])
+    m = Morning(old, tmp_path, clock)
+    assert migrate.schema(old) == 2 and old.get_meta("migration_done:handover_sweep")
+    assert state_of(old, ids["card"]) == "superseded"
+    assert _row(old, ids["mid"])["state"] == "done" and _row(old, ids["swim"])["state"] == "unverified"
+    assert old.db.execute("SELECT state FROM outbox WHERE id=?", (dead,)).fetchone()[0] == "dead"
+    assert not any("An old reply from before" in t for t in m.seen())        # never sent as new
+    assert len([t for t in m.seen() if t.startswith("Harness updated.")]) == 1
+    assert migrate.run(old, m.cc, 1) == {}
