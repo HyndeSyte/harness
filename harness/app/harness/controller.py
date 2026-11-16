@@ -850,26 +850,39 @@ class Controller:
         h.finish("ok", render.plain(self.ledger.get_meta("last_digest_text") or ""))
 
     def _fastpath(self, h) -> None:
-        """Cain's keeper.sh fastpath (0.24.0, fourth and fifth rounds). "on" carries the post-install
-        smoke test's record, a fixed checklist (calendar_change.SMOKE_ITEMS), pass or fail each: one
-        short of every pass is refused, naming what failed, and nothing changes; a passing one goes to
-        him on a card with Turn on and Keep cards, and only his Turn on tap turns on the no-card paths.
-        "off" turns them off at once. Until his tap, every calendar change comes on a card."""
-        from .calendar_change import fast_path, set_fast_path, smoke_problems
+        """Cain's keeper.sh fastpath (0.24.0, fourth to sixth rounds). "smoke-start" starts a smoke run
+        under an id issued here; each change approved after it is recorded under that id. "on" names
+        the run: its checklist is built here from this ledger alone (event ids, request and read-back
+        times, the refusals for an older version, the listing lag), anything with no evidence is
+        refused by name and nothing changes, and anything Cain sends as passed is ignored. A full one
+        goes to him on a card with Turn on and Keep cards; only his Turn on tap turns on the no-card
+        paths. "off" turns them off at once. Until his tap, every calendar change comes on a card."""
+        from .calendar_change import fast_path, set_fast_path
+        cc = self.calendar_change
+        if h.state in ("smoke-start", "on") and cc is None:
+            h.finish("off", "Calendar changes aren't set up in the calendar specialist.")
+            return
+        if h.state == "smoke-start":
+            run = cc.smoke_start()
+            log.info("a smoke run started")
+            h.finish("ok", f"Smoke run {run['id']} started. Run its checklist through the normal card path, each "
+                           f"change on its card and tapped, then send keeper.sh fastpath on {run['id']}.", run=run["id"])
+            return
         if h.state == "on":
-            cc = self.calendar_change
-            if cc is None:
-                h.finish("off", "Calendar changes aren't set up in the calendar specialist.")
+            if h.record:
+                log.info("a pass or fail record from Cain was ignored: the run is judged from the ledger")
+            if not h.run:
+                h.finish("refused", "Name the smoke run: keeper.sh fastpath on <run id>, from fastpath smoke-start. "
+                                    "Nothing changed; every change still comes on a card.")
                 return
-            problems = smoke_problems(h.record) if h.record else ["no result file: keeper.sh fastpath on <result.json>"]
-            if problems:
-                log.info("the smoke test record was refused: %d item(s) short", len(problems))
-                h.finish("refused", "Not all passed, so nothing changed and every change still comes on a card: "
-                         + "; ".join(problems) + ".")
+            missing = cc.offer_fast_path(h.run)
+            if missing:
+                log.info("the smoke run was refused: %d item(s) with no evidence in the ledger", len(missing))
+                h.finish("refused", "Not all shown in the record, so nothing changed and every change still comes on "
+                                    "a card. No evidence for: " + "; ".join(missing) + ".")
                 return
-            cc.offer_fast_path(h.record)
-            log.info("the smoke test passed: its card is with him")
-            h.finish("ok", "All passed. He has a card showing the result with Turn on and Keep cards; changes "
+            log.info("the smoke run passed on the ledger's evidence: its card is with him")
+            h.finish("ok", "All shown in the record. He has a card with the evidence, Turn on and Keep cards; changes "
                            "still come on a card until he taps Turn on.")
             return
         if h.state == "off":
@@ -878,7 +891,7 @@ class Controller:
             h.finish("ok", "Off: every calendar change comes on a card.")
             return
         now = fast_path(self.ledger)
-        h.finish("unknown", "Say on <result.json> or off. It's " + ("on" if now.get("on") else "off (card only)")
+        h.finish("unknown", "Say smoke-start, on <run id> or off. It's " + ("on" if now.get("on") else "off (card only)")
                  + " now.")
 
     def _meanings(self, h) -> None:

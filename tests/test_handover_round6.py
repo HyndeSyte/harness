@@ -476,3 +476,264 @@ def test_undo_of_a_late_landing_changed_since_shows_how_it_reads_now(m, monkeypa
     said = m.seen()[-1]
     assert said.startswith("Not undone:") and "after it went through late" in said
     assert "It reads now: “Haircut” at 11:00" in said
+
+
+# -- 6. paused writes come back ---------------------------------------------------------------------------
+
+from test_handover_round4 import DENTIST, dentists  # noqa: E402
+
+
+def _pause(m):
+    hold = threading.Event()
+    for _ in range(calendar_change.MAX_ABANDONED):
+        t = threading.Thread(target=hold.wait, args=(10,), daemon=True)
+        t.start()
+        m.cc.abandoned.append(t)
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert not dentists(m) and "writes to your calendars are paused" in m.seen()[-1]
+    return hold
+
+
+def test_the_paused_count_is_only_writes_still_running(m):
+    hold = _pause(m)
+    assert m.cc.live_abandoned() == calendar_change.MAX_ABANDONED
+    hold.set()
+    m.cc.join_abandoned()
+    assert m.cc.live_abandoned() == 0
+
+
+def test_once_writes_end_the_paused_change_comes_back_on_a_fresh_card(m):
+    hold = _pause(m)
+    paused_card = card_with(m, "Approve")
+    m.c.tick()
+    assert m.link.cards[paused_card]["rows"]                 # still paused: the card stands
+    hold.set()
+    m.cc.join_abandoned()
+    m.c.tick()
+    m.c.outbox.flush()
+    assert "writes to your calendars have resumed, so here it is again" in m.seen()[-1]
+    assert m.link.cards[paused_card]["rows"] == []           # the paused card is replaced
+    m.tap("Approve")
+    assert len(dentists(m)) == 1 and m.seen()[-1].startswith("Done.")
+
+
+def test_a_restart_on_the_same_ledger_offers_a_paused_change_again(m):
+    hold = _pause(m)
+    from harness.calendar_change import CalendarChange
+    cc = CalendarChange(m.ledger, m.client, m.gmail, enabled=lambda: True, address=lambda: GMAIL, tz=TZ)
+    cc.bind(OWNER)
+    cc.recard = m.cc.recard                                  # the same runner, as wired at start
+    assert cc.live_abandoned() == 0                          # a new instance: none of its own running
+    cc.run_pending(paused=False)
+    m.c.outbox.flush()
+    assert "writes to your calendars have resumed, so here it is again" in m.seen()[-1]
+    hold.set()
+    m.cc.join_abandoned()
+    m.c.tick()
+    m.c.outbox.flush()
+    assert len([t for t in m.seen() if "have resumed" in t]) == 1    # offered again once
+
+
+# -- 3. the Turn on record is built from the specialist's own ledger ---------------------------------------
+
+from test_handover_round5 import DROP_SWIM, PASSING  # noqa: E402
+
+
+def _approve(m, words, output, done="Done."):
+    card_for(m, words, ask(output))
+    m.tap("Approve")
+    m.c.outbox.flush()
+    assert m.seen()[-1].startswith(done) or done is None, m.seen()[-1]
+
+
+def run_smoke(m):
+    """The post-install smoke test, every change through the normal card path and his tap."""
+    out = m.send(Handover(kind="fastpath", state="smoke-start"))
+    assert out["status"] == "ok"
+    run = out["run"]
+    seed_haircut(m)
+    seed_yoga(m)
+    m.icloud.seed(SWIM_PATH, swim_ics("20261111T210000Z", "20261111T220000Z"))
+    m.icloud.seed(POOL_PATH, pool_ics())
+    # Gmail: an add (the run's first: its answer let go, read back a minute on), a move and its Undo, a
+    # removal, and a write refused for an older version.
+    card_for(m, "add the dentist at 3 today", ask(DENTIST))
+    m.tap("Approve")
+    m.cc.join_abandoned()
+    settle(m)
+    m.c.outbox.flush()
+    assert m.seen()[-1].startswith("Done.") and "Add Dentist" in m.seen()[-1] or "Added Dentist" in m.seen()[-1]
+    _approve(m, "haircut moved to 10:30 today", MOVE_HAIRCUT)
+    m.tap("Undo")
+    m.c.tick()
+    m.c.outbox.flush()
+    assert m.seen()[-1].startswith("Undone.")
+    _approve(m, "no haircut today", DROP_HAIRCUT)
+    card_for(m, "yoga at 6:30 today", ask(MOVE_YOGA))
+    m.gmail.events[yoga_id(11)]["description"] = "Bring a towel"
+    m.gmail._bump(yoga_id(11))
+    m.tap("Approve")
+    assert any(t.startswith("Not applied.") for t in m.seen())
+    # Family: an add, a move and its Undo, a removal, a refused write, and two days of one series.
+    _approve(m, "add piano at 1 today to family", change("family", "add", "Piano", dates="",
+                                                         start=at(13).isoformat(), end=at(14).isoformat()))
+    _approve(m, "swim moved to 5 today", SWIM)
+    m.tap("Undo")
+    m.c.tick()
+    m.c.outbox.flush()
+    assert m.seen()[-1].startswith("Undone.")
+    _approve(m, "no swim today", DROP_SWIM)
+    card_for(m, "pool at 5:30 today", ask(MOVE_POOL))
+    m.icloud.seed(POOL_PATH, pool_ics(LOCATION="LOCATION:Pool B"))
+    m.tap("Approve")
+    _approve(m, "no pool next wednesday", change("family", "remove", "Pool", dates="2026-11-18"))
+    _approve(m, "no pool on the 25th", change("family", "remove", "Pool", dates="2026-11-25"))
+    return run
+
+
+@pytest.mark.card_only
+def test_a_run_with_no_ledger_evidence_is_refused(m):
+    run = m.send(Handover(kind="fastpath", state="smoke-start"))["run"]
+    cards = len(m.link.cards)
+    out = m.send(Handover(kind="fastpath", state="on", run=run))
+    assert out["status"] == "refused" and "No evidence for: gmail.add" in out["said"] and "listing_lag" in out["said"]
+    assert len(m.link.cards) == cards and not calendar_change.fast_path_on(m.ledger)
+
+
+@pytest.mark.card_only
+def test_passes_sent_by_cain_are_ignored(m):
+    run = m.send(Handover(kind="fastpath", state="smoke-start"))["run"]
+    out = m.send(Handover(kind="fastpath", state="on", run=run, record=PASSING))
+    assert out["status"] == "refused" and not calendar_change.fast_path_on(m.ledger)
+    out = m.send(Handover(kind="fastpath", state="on", record=PASSING))         # no run named at all
+    assert out["status"] == "refused" and "Name the smoke run" in out["said"]
+    out = m.send(Handover(kind="fastpath", state="on", run="0123456789ab"))     # not the run it issued
+    assert out["status"] == "refused" and "no smoke run with that id" in out["said"]
+
+
+@pytest.mark.card_only
+def test_the_card_shows_the_ledgers_evidence_and_every_no_card_path(m):
+    run = run_smoke(m)
+    out = m.send(Handover(kind="fastpath", state="on", run=run))
+    assert out["status"] == "ok", out
+    card = m.seen()[-1]
+    assert card.startswith("The check after installing passed.")
+    for words in ("Gmail: An add, id ending", "Gmail: A move, id ending", "Gmail: A removal, id ending",
+                  "Gmail: An Undo, id ending", "Family: An add, id ending", "Family: An Undo, id ending",
+                  "Gmail: A write sent with an older version", "Family: A write sent with an older version",
+                  "the calendar turned it down", "Two days of one series on Family, “Pool”",
+                  "A write whose answer came late, Gmail", "within 0 seconds", "asked 7:30 AM Wed Nov 11",
+                  "Your own newest message, under 2 minutes old", "A date from your mail you tap Add to Family on",
+                  "Family calendar adds: none yet"):
+        assert words in card, words
+    assert {"Turn on", "Keep cards"} <= set(m.labels())
+    assert not calendar_change.fast_path_on(m.ledger)
+
+
+@pytest.mark.card_only
+def test_a_stored_bake_in_opt_in_is_named_by_calendar_and_date(m):
+    from harness.family_add import LOOSENED
+    with m.ledger.tx() as db:
+        m.ledger.set_meta(LOOSENED, json.dumps({"policy": "p1"}), db)
+        m.ledger.event("family_add_loosened", {"adds": 5}, db=db)
+    assert "Family calendar adds: you said to stop checking each one on Wed Nov 11, so they go too." in \
+        m.cc._no_card_paths()
+
+
+@pytest.mark.card_only
+def test_turn_on_then_a_turn_off_button_on_the_same_card(m):
+    run = run_smoke(m)
+    m.send(Handover(kind="fastpath", state="on", run=run))
+    card = max(m.link.cards)
+    m.tap("Turn on")
+    m.c.outbox.flush()
+    kept = calendar_change.fast_path(m.ledger)
+    assert kept["on"] is True and kept["by"] == str(OWNER) and kept["smoke"]["run"] == run
+    shown = [c["label"] for r in m.link.cards[card]["rows"] for c in r["components"]]
+    assert "Turn off" in shown and "Turn on" not in shown and "Keep cards" not in shown
+    out = m.tells("add the dentist again at 5 today", ask(change("gmail", "add", "Dentist again", dates="",
+                                                                start=at(17).isoformat(), end=at(18).isoformat())))
+    assert out["status"] == "executed"
+    m.tap("Turn off")
+    assert not calendar_change.fast_path_on(m.ledger)
+    out = m.tells("add the vet at 6 today", ask(change("gmail", "add", "Vet", dates="",
+                                                       start=at(18).isoformat(), end=at(19).isoformat())))
+    assert out["status"] == "waiting for his tap"
+
+
+def test_turn_off_sends_a_fast_path_write_in_flight_back_to_a_card(m, monkeypatch):
+    real = m.cc.auto_approve
+
+    def then_off(proposal_id, job_id, db):
+        real(proposal_id, job_id, db)
+        calendar_change.set_fast_path(m.ledger, False, "", by=str(OWNER), db=db)   # his Turn off tap
+    monkeypatch.setattr(m.cc, "auto_approve", then_off)
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert not dentists(m) and "Approve" in m.labels()
+    assert any("only once the check after installing has passed" in t for t in m.seen())
+
+
+@pytest.mark.card_only
+def test_a_listing_lag_past_an_hour_is_refused(m):
+    run = run_smoke(m)
+    row = m.ledger.db.execute("SELECT proposal_id, settle_json FROM calendar_changes WHERE state='done' LIMIT 1").fetchone()
+    plan = json.loads(row[1])
+    from datetime import datetime
+    plan["listed_at"] = (datetime.fromisoformat(plan["listed_at"]) + timedelta(hours=2)).isoformat()
+    with m.ledger.tx() as db:
+        db.execute("UPDATE calendar_changes SET settle_json=? WHERE proposal_id=?", (json.dumps(plan), row[0]))
+    out = m.send(Handover(kind="fastpath", state="on", run=run))
+    assert out["status"] == "refused" and "listing_lag: 7200 seconds is outside 0 to 3600" in out["said"]
+
+
+# -- 7. etags byte for byte, a cancelled event is gone, and the If-Match is logged -------------------------
+
+@pytest.mark.card_only
+def test_an_icloud_weak_etag_is_kept_and_sent_byte_for_byte(m, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="harness.calendar_change")
+    m.icloud._etag = lambda ics, n=iter(range(1, 99)): f'W/"weak-{next(n)}"'
+    m.icloud.seed(SWIM_PATH, swim_ics("20261111T210000Z", "20261111T220000Z"))
+    weak = m.icloud.events[SWIM_PATH][0]
+    pid = card_for(m, "no swim today", ask(DROP_SWIM))
+    assert [b["etag"] for b in m.cc.bound_of(pid)["bound"]] == [weak]
+    m.tap("Approve")
+    sent = [h.get("If-Match") for meth, path, h, _ in m.icloud.log if meth == "DELETE" and path == SWIM_PATH]
+    assert sent == [weak] and swim_at(m) is None
+    assert f"family removal sent with If-Match {weak}: answered ok" in caplog.text
+
+
+@pytest.mark.card_only
+def test_a_google_etag_is_sent_as_given_and_the_answer_is_logged(m, monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="harness.calendar_change")
+    seed_haircut(m)
+    m.gmail.events[HAIRCUT]["etag"] = 'W/"MTcz"'
+    sent = []
+    real = m.gmail.change
+    monkeypatch.setattr(m.gmail, "change", lambda a, uid, f, etag: sent.append(etag) or real(a, uid, f, etag))
+    card_for(m, "haircut moved to 10:30 today", ask(MOVE_HAIRCUT))
+    m.tap("Approve")
+    assert sent == ['W/"MTcz"'] and haircut_at(m) == "10:30"
+    assert 'gmail move sent with If-Match W/"MTcz": answered ok' in caplog.text
+
+
+@pytest.mark.card_only
+def test_a_google_event_read_back_cancelled_counts_as_gone_for_a_refused_removal(m, monkeypatch):
+    seed_haircut(m)
+    card_for(m, "no haircut today", ask(DROP_HAIRCUT))
+    real = m.gmail.drop
+
+    def someone_first(address, uid, etag):
+        m.gmail.events[HAIRCUT]["status"] = "cancelled"          # taken off elsewhere: Google keeps it, cancelled
+        m.gmail._bump(HAIRCUT)
+        return real(address, uid, etag)
+    monkeypatch.setattr(m.gmail, "drop", someone_first)
+    m.tap("Approve")
+    receipt = m.seen()[-1]
+    assert receipt.startswith("Done.") and "nothing of mine there to undo" in receipt
+    assert not any(t.startswith("Not applied.") for t in m.seen())
+
+
+def test_the_checklist_has_a_refusal_per_calendar_and_two_days_of_one_series():
+    assert {"gmail.stale", "family.stale", "series", "late_landing", "listing_lag"} <= set(calendar_change.SMOKE_ITEMS)

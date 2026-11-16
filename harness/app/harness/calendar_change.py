@@ -108,6 +108,7 @@ WRITE_DEADLINE_S = 45
 # Writes abandoned and still running at once, at most: at this many, new writes wait, and the change
 # comes back on a card saying writes are paused.
 MAX_ABANDONED = 3
+PAUSED = "calendar_change_paused:"     # + the request id of a change that came back on a paused card
 # A change the read back doesn't show, or one whose lease ran out, is read again in the background
 # this long after: about 30 seconds and 2 minutes on, then once more after the long window
 # (LATE_READ_S, which the smoke test's record sizes from the listing lag it saw; 10 minutes until
@@ -140,44 +141,41 @@ WORDS = {"unknown": "I couldn't confirm it yet",
          "not_made": "that event was there before the add, so Undo leaves it",
          "read_back": "the calendar doesn't read back that way",
          "unverified": "the calendar doesn't read back that way"}
-# 0.24.0, fourth and fifth rounds: the three paths that apply with no card (his own fresh, clear
-# words; a date from his mail he tapped Add to Family on; Family adds after his tap on the bake-in
-# card, family_add.tapless) are off after every install. Cain sends the post-install smoke test's
-# record (keeper.sh fastpath on <result.json>); only a record with every item passed is shown to him,
-# on a card with Turn on and Keep cards, and only his Turn on tap sets the flag, with who and when.
-# Off when nothing is recorded, so every change comes on a card.
+# 0.24.0, fourth to sixth rounds: the three paths that apply with no card (his own fresh, clear words;
+# a date from his mail he tapped Add to Family on; Family adds after his tap on the bake-in card,
+# family_add.tapless) are off after every install. Sixth round: the specialist judges the post-install
+# smoke test from its own ledger. Cain starts a smoke run (keeper.sh fastpath smoke-start), the run's
+# checklist goes through the normal card path, each change in it recorded under the run's id, and
+# keeper.sh fastpath on <run id> asks for the result: every item is built here from what the ledger
+# recorded (event ids, request and read-back times, the refusals for an older version, the listing lag),
+# an item with no evidence is a fail, and anything Cain says passed is ignored. Only a run with every
+# item shown is offered to him, on a card with Turn on and Keep cards; only his Turn on tap sets the
+# flag, with who and when, and a Turn off button then sits on that card. Off when nothing is recorded.
 FAST_PATH = "calendar_fast_path"
 FAST_OFFER = "calendar_fast_path_offer"
+SMOKE_RUN = "calendar_smoke_run"
 SMOKE_MAX = 300
-# The smoke test's record, a fixed checklist: for each calendar an add, a move, a removal and an Undo,
-# each read back; a write landing late (or a lapse) caught and read back; and the listing lag it saw.
 SMOKE_PROVIDERS = ("gmail", "family")
-SMOKE_STEPS = ("add", "move", "remove", "undo")
+SMOKE_STEPS = ("add", "move", "remove", "undo", "stale")
+SMOKE_SERIES = "series"
 SMOKE_LATE = "late_landing"
-SMOKE_LAG = "listing_lag_seconds"
-SMOKE_ITEMS = tuple(f"{p}.{s}" for p in SMOKE_PROVIDERS for s in SMOKE_STEPS) + (SMOKE_LATE,)
+SMOKE_LAG = "listing_lag"
+SMOKE_ITEMS = tuple(f"{p}.{s}" for p in SMOKE_PROVIDERS for s in SMOKE_STEPS) + (SMOKE_SERIES, SMOKE_LATE,
+                                                                                  SMOKE_LAG)
+LAG_MAX_S = 3600                       # a listing lag past this isn't a lag: the item fails
+TURN_OFF_TTL_S = 365 * 24 * 3600
+_STEP_FN = {"gmail_add": ("gmail", "add"), "family_add": ("family", "add"), "gmail_move": ("gmail", "move"),
+            "family_move": ("family", "move"), "gmail_remove": ("gmail", "remove"),
+            "family_remove_one": ("family", "remove"), "family_remove_days": ("family", "remove")}
 
 
-def smoke_problems(record) -> list[str]:
-    """What keeps a smoke test's record from counting: each item that isn't "pass" (failed, missing
-    or anything else), a listing lag that isn't a number of seconds from 0 to 3600, or a record that
-    isn't the checklist at all. [] only when every item passed."""
-    if not isinstance(record, dict):
-        return ["the record isn't the checklist"]
-    out = []
-    for item in SMOKE_ITEMS:
-        provider, _, step = item.partition(".")
-        got = (record.get(provider) or {}).get(step) if step else record.get(provider)
-        if got != "pass":
-            out.append(f"{item}: {got if isinstance(got, str) and got else 'missing'}"[:60])
-    lag = record.get(SMOKE_LAG)
-    if isinstance(lag, bool) or not isinstance(lag, (int, float)) or not 0 <= lag <= 3600:
-        out.append(f"{SMOKE_LAG}: not a number of seconds")
-    return out
-
-
-def smoke_lag(record: dict) -> int:
-    return int(round(float(record.get(SMOKE_LAG) or 0)))
+def smoke_run(ledger: Ledger) -> dict:
+    """The smoke run Cain started, {} when none."""
+    try:
+        got = json.loads(ledger.get_meta(SMOKE_RUN) or "{}")
+    except ValueError:
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def fast_path(ledger: Ledger) -> dict:
@@ -500,6 +498,7 @@ class CalendarChange:
         # put here by the write's own thread and handled on the controller's (_drain_late).
         self._late: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
         self.abandoned: list[threading.Thread] = []
+        self._late_probe = False                 # the smoke run's first add is being written (_bounded)
         # The fast path's check at the moment of the write (controller._still_his): "" when his
         # message is still his newest and fresh, or why not. None: nothing to check (no Discord).
         self.fast_check: Callable[[Any], Any] | None = None
@@ -513,7 +512,7 @@ class CalendarChange:
         self.reoffer: Callable[[str, str], str] | None = None
         # A change the calendar refused for its version, offered again on a fresh card (sixth round):
         # runner.recard(proposal, changes, why).
-        self.recard: Callable[[Any, list, str], str] | None = None
+        self.recard: Callable[[Any, list, str, bool], str] | None = None
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -933,54 +932,220 @@ class CalendarChange:
                     return True
         return False
 
-    def offer_fast_path(self, record: dict) -> str:
-        """Cain's smoke test record (keeper.sh fastpath on <result.json>), already found all passed:
-        the listing lag it saw sizes the long window's read (LATE_READ), and one card shows him the
-        record in plain words with Turn on and Keep cards. Nothing turns on here."""
-        lag = smoke_lag(record)
-        offer = {"id": canonical_hash(record)[:16], "record": record, "at": iso(self.ledger.now())}
-        steps = ", ".join(f"{s}" for s in ("an add", "a move", "a removal"))
-        text = ("<b>The check after installing passed.</b>\n"
-                f"On your Gmail calendar and on Family: {steps} and an Undo each read back as asked.\n"
-                "A write that landed late was caught and read back.\n"
-                f"New events showed in the calendar's listing within {lag} second{'s' * (lag != 1)}.\n"
-                "Turn on lets these go through without a card, each still with its receipt and Undo: your "
-                "own newest message, under 2 minutes old, with one clear change; a date from your mail you "
-                "tap Add to Family on; and Family adds, once you've said to stop checking each one. Keep "
-                "cards leaves every change on a card.")
+    # -- the smoke run, judged from the ledger (sixth round) ----------------------------------
+    def smoke_start(self) -> dict:
+        """Cain's keeper.sh fastpath smoke-start: a new smoke run under an id issued here. Every change
+        approved from now on is recorded under it, and its first add is let go at once, so its answer
+        comes late and is read back like any lost answer (the late landing item). A run started before
+        is replaced."""
+        import secrets
+        run = {"id": secrets.token_hex(6), "at": iso(self.ledger.now()), "late_probe": "pending"}
         with self.ledger.tx() as db:
-            self.ledger.set_meta(LATE_READ, str(min(3600, max(LATE_READ_S, 5 * lag))), db)
+            self.ledger.set_meta(SMOKE_RUN, json.dumps(run), db)
+            db.execute("DELETE FROM meta WHERE key=?", (FAST_OFFER,))
+            self.ledger.event("calendar_smoke_start", {"run": run["id"]}, db=db)
+        return run
+
+    def _smoke_tag(self, p) -> str:
+        """The smoke run a change belongs to: the open run, when it was approved after the run began."""
+        run = smoke_run(self.ledger)
+        if not run.get("id") or run.get("closed"):
+            return ""
+        try:
+            return run["id"] if datetime.fromisoformat(p["created_at"]) >= datetime.fromisoformat(run["at"]) else ""
+        except (ValueError, TypeError, KeyError):
+            return ""
+
+    def smoke_evidence(self, run_id: str) -> tuple[list[dict], list[str], int | None]:
+        """The smoke run's checklist, every item built from what this ledger recorded of the run's
+        changes (sixth round): ([{"item", "words"}], [what has no evidence], the listing lag seen). An
+        item without matching evidence is a fail; nothing anyone says about the run counts."""
+        run = smoke_run(self.ledger)
+        if not run_id or run.get("id") != run_id:
+            return [], ["no smoke run with that id: start one with keeper.sh fastpath smoke-start"], None
+        rows = [r for r in self.ledger.db.execute(
+            "SELECT c.*, p.created_at AS asked FROM calendar_changes c JOIN proposals p ON p.id=c.proposal_id"
+            " WHERE c.created_at>=? ORDER BY c.created_at", (run["at"],)).fetchall()
+            if _plan(r).get("smoke") == run_id]
+        found: dict[str, dict] = {}
+        lags: list[float] = []
+        series: dict[tuple, dict] = {}
+        for r in rows:
+            plan = _plan(r)
+            read_ok = r["state"] in ("done", "landed_late")
+            for part in plan.get("parts", []):
+                for rec in part.get("steps", []):
+                    provider, op = _STEP_FN.get((rec.get("spec") or {}).get("fn", ""), ("", ""))
+                    entry = rec.get("entry") or {}
+                    tail = _tail(entry.get("id") or entry.get("href") or "")
+                    if not provider:
+                        continue
+                    if read_ok and rec.get("status") == "landed" and entry:
+                        found.setdefault(f"{provider}.{op}", {
+                            "id": tail, "asked": r["asked"], "back": rec.get("back") or r["updated_at"]})
+                        if rec.get("abandoned"):
+                            found.setdefault(SMOKE_LATE, {"provider": provider, "id": tail,
+                                                          "back": rec.get("back") or r["updated_at"]})
+                    if r["state"] == "stale" and rec.get("kind") == "stale" and rec.get("answer") == "changed":
+                        found.setdefault(f"{provider}.stale", {"id": tail or _tail(_bound_id(part)),
+                                                               "sent": rec.get("sent") or r["updated_at"],
+                                                               "code": rec.get("code")})
+                if read_ok and part.get("change", {}).get("op") in ("move", "remove"):
+                    for b in part.get("bound") or []:
+                        if b.get("recurrence"):
+                            series.setdefault((b["calendar"], b["series"]), {}).setdefault(
+                                b["instance"], {"title": b.get("title", ""), "start": b.get("start", ""),
+                                                "row": r["proposal_id"]})
+            if r["undo_state"] == "undone" and plan.get("undone_at"):     # read back as it was (_undo)
+                for e in plan.get("undone_entries", []):
+                    if e.get("cal") in SMOKE_PROVIDERS:
+                        found.setdefault(f"{e['cal']}.undo", {"id": _tail(e.get("id") or e.get("href") or ""),
+                                                             "back": plan["undone_at"]})
+            if read_ok and plan.get("listed_at"):
+                # From the write read back by its id to the days, read as he'd see them, showing it.
+                back = [rec.get("back") for part in plan.get("parts", []) for rec in part.get("steps", [])
+                        if rec.get("back")]
+                if back:
+                    lags.append((datetime.fromisoformat(plan["listed_at"]) - datetime.fromisoformat(max(back)))
+                                .total_seconds())
+        for (cal, _), days in series.items():
+            if len({d["row"] for d in days.values()}) >= 2:
+                two = sorted(days.values(), key=lambda d: d["start"])[:2]
+                found.setdefault(SMOKE_SERIES, {"provider": cal, "title": two[0]["title"],
+                                                "days": [d["start"] for d in two]})
+        lag = int(round(max(lags))) if lags else None
+        if lag is not None and 0 <= lag <= LAG_MAX_S:
+            found[SMOKE_LAG] = {"seconds": max(0, lag)}
+        items, missing = [], []
+        for item in SMOKE_ITEMS:
+            if item in found:
+                items.append({"item": item, "words": self._evidence_words(item, found[item]), **found[item]})
+            else:
+                missing.append(item if item != SMOKE_LAG or lag is None else
+                               f"{SMOKE_LAG}: {lag} seconds is outside 0 to {LAG_MAX_S}")
+        return items, missing, (min(max(lag, 0), LAG_MAX_S) if lag is not None else None)
+
+    def _local(self, stamp: str) -> str:
+        try:
+            t = datetime.fromisoformat(stamp).astimezone(ZoneInfo(self.tz))
+        except (ValueError, TypeError):
+            return "an unknown time"
+        return f"{render.clock_words(t, suffix=True)} {t:%a %b} {t.day}"
+
+    def _evidence_words(self, item: str, ev: dict) -> str:
+        cal = {"gmail": "Gmail", "family": "Family"}
+        provider, _, step = item.partition(".")
+        idw = f"id ending {ev['id']}" if ev.get("id") else "its id"
+        if step in ("add", "move", "remove"):
+            what = {"add": "An add", "move": "A move", "remove": "A removal"}[step]
+            return (f"{cal[provider]}: {what}, {idw}, asked {self._local(ev['asked'])}, read back as asked "
+                    f"{self._local(ev['back'])}.")
+        if step == "undo":
+            return f"{cal[provider]}: An Undo, {idw}, read back as it was {self._local(ev['back'])}."
+        if step == "stale":
+            code = f" ({ev['code']})" if ev.get("code") else ""
+            return (f"{cal[provider]}: A write sent with an older version, {idw}, at {self._local(ev['sent'])}: "
+                    f"the calendar turned it down{code}, and it was not applied.")
+        if item == SMOKE_SERIES:
+            days = ", ".join(self._local(d).split(" ", 2)[-1] for d in ev["days"])
+            return (f"Two days of one series on {cal.get(ev['provider'], ev['provider'])}, "
+                    f"\u201c{_safe(ev['title'])}\u201d, {days}: both read back as asked.")
+        if item == SMOKE_LATE:
+            return (f"A write whose answer came late, {cal.get(ev['provider'], '')} {idw}: read back as landed "
+                    f"{self._local(ev['back'])}.")
+        n = ev["seconds"]
+        return f"New events showed in the calendar's listing within {n} second{'s' * (n != 1)}."
+
+    def _no_card_paths(self) -> list[str]:
+        """Every path Turn on lets go through without a card, the stored bake-in opt-in by calendar and
+        date included."""
+        from .family_add import LOOSENED
+        out = ["Your own newest message, under 2 minutes old, with one clear change.",
+               "A date from your mail you tap Add to Family on."]
+        if self.ledger.get_meta(LOOSENED):
+            when = self.ledger.db.execute("SELECT at FROM events WHERE kind='family_add_loosened' ORDER BY id DESC"
+                                          " LIMIT 1").fetchone()
+            day = ""
+            if when is not None:
+                t = datetime.fromisoformat(when[0]).astimezone(ZoneInfo(self.tz))
+                day = f" on {t:%a %b} {t.day}"
+            out.append(f"Family calendar adds: you said to stop checking each one{day}, so they go too.")
+        else:
+            out.append("Family calendar adds: none yet, since you haven't said to stop checking each one.")
+        return out
+
+    def offer_fast_path(self, run_id: str) -> list[str]:
+        """keeper.sh fastpath on <run id>: the run's checklist, judged from this ledger. Anything with no
+        evidence is returned and nothing is offered. A full one goes to him on one card: each item's
+        evidence in plain words, every path Turn on enables, with Turn on and Keep cards. The listing lag
+        it saw (capped) sizes the long window's read (LATE_READ). Nothing turns on here."""
+        items, missing, lag = self.smoke_evidence(run_id)
+        if missing:
+            return missing
+        offer = {"id": canonical_hash({"run": run_id, "items": items})[:16], "run": run_id, "items": items,
+                 "lag": lag, "at": iso(self.ledger.now())}
+        text = ("<b>The check after installing passed.</b> What this specialist's own record shows for it:\n"
+                + "\n".join(f"\u2022 {render.escape(i['words'])}" for i in items)
+                + "\nTurn on lets these go through without a card, each still with its receipt and Undo:\n"
+                + "\n".join(f"\u2022 {render.escape(x)}" for x in self._no_card_paths())
+                + "\nKeep cards leaves every change on a card. After Turn on, Turn off here puts them back on cards.")
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(LATE_READ, str(min(3600, max(LATE_READ_S, 5 * (lag or 0)))), db)
             self.ledger.set_meta(FAST_OFFER, json.dumps(offer), db)
             on = choices.mint(self.ledger, kind="calendar_change_fast_on", target=offer["id"],
                               chat_id=self.chat_id, ttl_s=UNDO_TTL_S, db=db)
             keep = choices.mint(self.ledger, kind="calendar_change_fast_keep", target=offer["id"],
                                 chat_id=self.chat_id, ttl_s=UNDO_TTL_S, db=db)
-            self.ledger.event("calendar_fast_path_offered", {"lag": lag}, db=db)
+            self.ledger.event("calendar_fast_path_offered", {"run": run_id, "lag": lag}, db=db)
             self._say(db, self.chat_id, None, text,
                       buttons=[[("Turn on", choices.callback_data(on)), ("Keep cards", choices.callback_data(keep))]],
                       binds=[{"type": "choice", "nonce": on}, {"type": "choice", "nonce": keep}])
-        return offer["id"]
+        return []
 
     def fast_path_tapped(self, on: bool, target: str) -> str:
-        """His tap on the smoke test's card: only Turn on, on the card for the record still current, sets
-        the flag, with the record, who tapped and when."""
+        """His tap on the smoke run's card: only Turn on, on the card for the run still current and with
+        its evidence still in the ledger, sets the flag, with the run, who tapped and when; then a Turn
+        off button sits on that card."""
         try:
             offer = json.loads(self.ledger.get_meta(FAST_OFFER) or "{}")
         except ValueError:
             offer = {}
-        if not offer or offer.get("id") != target or smoke_problems(offer.get("record")):
+        if not offer or offer.get("id") != target:
             return "That card is for an older check, so nothing changed. Every change still comes on a card."
         if not on:
             with self.ledger.tx() as db:
                 self.ledger.event("calendar_fast_path_kept", {"by": str(self.chat_id), "at": iso(self.ledger.now())},
                                   db=db)
             return "Kept: every calendar change still comes on a card for your tap."
+        _, missing, _ = self.smoke_evidence(offer.get("run", ""))
+        if missing:
+            return "The record for that check changed since its card, so nothing changed. Every change still comes on a card."
+        mid = self.ledger.db.execute("SELECT message_id FROM choices WHERE kind='calendar_change_fast_on' AND target=?",
+                                     (target,)).fetchone()
         with self.ledger.tx() as db:
-            set_fast_path(self.ledger, True, offer["record"], by=str(self.chat_id), db=db)
+            set_fast_path(self.ledger, True, {"run": offer["run"], "items": [i["item"] for i in offer["items"]],
+                                              "lag": offer.get("lag")}, by=str(self.chat_id), db=db)
             db.execute("DELETE FROM meta WHERE key=?", (FAST_OFFER,))
+            run = smoke_run(self.ledger)
+            if run.get("id") == offer["run"]:
+                run["closed"] = iso(self.ledger.now())
+                self.ledger.set_meta(SMOKE_RUN, json.dumps(run), db)
+            if mid is not None and mid[0]:
+                off = choices.mint(self.ledger, kind="calendar_change_fast_off", target=offer["run"],
+                                   chat_id=self.chat_id, ttl_s=TURN_OFF_TTL_S, db=db)
+                db.execute("UPDATE choices SET message_id=? WHERE nonce=?", (mid[0], off))
+                self.ledger.enqueue(chat_id=self.chat_id, kind="rebutton", text=str(mid[0]),
+                                    buttons=[[("Turn off", choices.callback_data(off))]], db=db)
         return ("Turned on: your own fresh, clear words, a mail date you tap Add to Family on, and Family adds "
                 "after the stop-checking tap now go through without a card, each with its receipt and Undo. "
-                "Anything else still comes on a card.")
+                "Turn off on that card puts every change back on a card.")
+
+    def fast_path_off_tapped(self) -> str:
+        """His Turn off on the smoke run's card: off at once. A change approved for the no-card path
+        and not yet written comes back as his card (_fast_path_holds, at the write)."""
+        set_fast_path(self.ledger, False, fast_path(self.ledger).get("smoke", ""), by=str(self.chat_id))
+        return ("Turned off: every calendar change comes on a card for your tap again, including any approved "
+                "a moment ago and not written yet.")
 
     def fast_path_ok(self) -> bool:
         """Whether a change may go through with no card at all (FAST_PATH)."""
@@ -1005,6 +1170,8 @@ class CalendarChange:
         self._expire_offers()
         self._fail_orphans()
         self._drain_late()
+        if not paused:
+            self._resume_paused()
         for p in self._approved():
             self._execute(p, paused)
         if not paused:
@@ -1422,6 +1589,10 @@ class CalendarChange:
         if why:
             log.info("calendar change job %s: no longer for the fast path (%s): his card instead",
                      render.short(p["job_id"]), why)
+            if why.startswith("writes to your calendars are paused"):
+                # Kept in the ledger (sixth round), so once fewer writes are running, this one or a
+                # restart offers it again on a fresh card (_resume_paused).
+                self.ledger.set_meta(f"{PAUSED}{p['job_id']}", iso(self.ledger.now()))
             if self.to_card is not None:
                 self.to_card(p, why)
             else:
@@ -1449,6 +1620,11 @@ class CalendarChange:
         # by step, never guessed at and never run twice (_fail_orphans, _settle).
         plan = {"notes": notes, "since": None, "read_at": None, "passes": 0, "told": False,
                 "retried": False, "parts": [self._part_record(part) for part in parts]}
+        smoke = self._smoke_tag(p)
+        if smoke:
+            plan["smoke"] = smoke                    # judged later from this record (smoke_evidence)
+        self._late_probe = bool(smoke) and smoke_run(self.ledger).get("late_probe") == "pending" \
+            and any(part.adds for part in parts)
         self._save_plan(p["id"], plan)
         undo, results, unsure = [], [], False
         for pi, part in enumerate(parts):
@@ -1470,9 +1646,11 @@ class CalendarChange:
                 break                                # the rest of this part needs this step; other parts go on
             results.append((part, landed, stopped, at))
         self.touched = self.touched or bool(undo) or unsure
+        self._late_probe = False
         if unsure:
             self._wait_for_read(p["id"], plan)       # he hears once a read settles it (_settle)
             return
+        self._late_probe = False
         adopted = self._adopt_late(p, parts, plan)
         if adopted:
             undo = undo + [e for e in adopted if e not in undo]
@@ -1613,7 +1791,7 @@ class CalendarChange:
         # write that answers after its change lapsed carries a token that isn't current any more.
         fence = f"{pid}#{plan['seq']}"
         entry["fence"] = fence
-        rec.update(status="trying", entry=dict(entry), seq=plan["seq"], fence=fence)
+        rec.update(status="trying", entry=dict(entry), seq=plan["seq"], fence=fence, sent=iso(self.ledger.now()))
         plan["read_at"] = iso(self.ledger.now())       # sent now: read a minute on, if it comes to that
         with self.ledger.tx() as db:
             self._save_plan(pid, plan, db)
@@ -1647,10 +1825,15 @@ class CalendarChange:
 
         t = threading.Thread(target=run, name=f"calendar-write-{calendar}", daemon=True)
         t.pid = pid                              # type: ignore[attr-defined]
+        # The smoke run's first add is let go at once (sixth round): its answer comes late and a read
+        # settles it, as for any lost answer. That's the run's late landing, read from the ledger.
+        probe = self._late_probe and rec is not None and getattr(call, "__name__", "") in ("insert", "put_new")
+        if probe:
+            box["late"] = True                   # its answer, whenever it comes, goes the late way
         t.start()
-        if not done.wait(self.write_timeout_s):
+        if probe or not done.wait(self.write_timeout_s):
             with lock:
-                abandoned = not box.get("finished")
+                abandoned = probe or not box.get("finished")
                 if abandoned:
                     box["late"] = True
             if abandoned:
@@ -1659,6 +1842,11 @@ class CalendarChange:
                             calendar, self.write_timeout_s, render.short(pid or "") or "undo")
                 if rec is not None:
                     rec[2]["abandoned"] = iso(self.ledger.now())
+                if probe:
+                    self._late_probe = False
+                    run = smoke_run(self.ledger)
+                    run["late_probe"] = pid or ""
+                    self.ledger.set_meta(SMOKE_RUN, json.dumps(run))
                 return caldav.Outcome("unknown")
         if "err" in box:
             raise box["err"]
@@ -1912,6 +2100,35 @@ class CalendarChange:
                 f" That request is {int(age.total_seconds() // 3600)} hours old."
         return out
 
+    def _resume_paused(self) -> None:
+        """Changes that came back on a card because writes were paused (sixth round): once fewer than
+        MAX_ABANDONED writes are still running (only threads still alive count, so the number drops as
+        each ends at its deadline, and a restart starts from none), each card still open is replaced by
+        a fresh one saying writes have resumed, for his tap. One he already answered is left alone."""
+        keys = [r[0] for r in self.ledger.db.execute("SELECT key FROM meta WHERE key LIKE ?", (f"{PAUSED}%",))]
+        if not keys or self.live_abandoned() >= MAX_ABANDONED:
+            return
+        for key in keys:
+            job_id = key[len(PAUSED):]
+            open_ = self.ledger.db.execute(
+                "SELECT * FROM proposals WHERE job_id=? AND effect_type=? AND state='proposed' ORDER BY created_at"
+                " DESC LIMIT 1", (job_id, effects.CALENDAR_CHANGE)).fetchone()
+            with self.ledger.tx() as db:
+                db.execute("DELETE FROM meta WHERE key=?", (key,))
+                took = False
+                if open_ is not None and self.recard is not None:
+                    from . import approvals
+                    took = approvals.supersede(self.ledger, open_["id"], db=db, outcome="replaced")
+            if not took:
+                continue
+            log.info("calendar change job %s: writes have resumed: its paused card offered again",
+                     render.short(job_id))
+            try:
+                self.recard(open_, json.loads(open_["params_json"])["changes"],
+                            "writes to your calendars have resumed, so here it is again", True)
+            except (Refuse, ValueError, KeyError, TypeError) as e:
+                log.warning("offering a paused change again failed: %s", type(e).__name__)
+
     def live_abandoned(self, pid: str | None = None) -> int:
         """Abandoned writes still running (of one change, given `pid`)."""
         self.abandoned = [t for t in self.abandoned if t.is_alive()]
@@ -1961,6 +2178,8 @@ class CalendarChange:
         # Its records are kept as if it landed even while unsure, so a read from before the write
         # can't undo it; a read that finds it didn't land puts them back (_unapply).
         rec.update(status="landed" if stopped is None else "unsure", entry=full, kind="", words="", applied=True)
+        if stopped is None:
+            rec["back"] = iso(self.ledger.now())     # read back as asked: when (the smoke run's evidence)
         with self.ledger.tx() as db:     # a crash after this still knows what to read or undo
             self._save_plan(pid, plan, db)
             self._note_removed(db, step.removed)
@@ -2144,6 +2363,11 @@ class CalendarChange:
             if ok:
                 db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
                 self.ledger.event("calendar_change_done", {"steps": len(undo)}, db=db)
+                row = db.execute("SELECT settle_json FROM calendar_changes WHERE proposal_id=?", (p["id"],)).fetchone()
+                kept = json.loads(row[0]) if row and row[0] else {}
+                if kept.get("parts"):
+                    kept["listed_at"] = now          # the days read as he'd see them show it (the listing lag)
+                    self._save_plan(p["id"], kept, db)
                 head = ("<b>Done after all.</b>" if after_all
                         else "<b>Nothing added.</b>" if done and all(part.already for part in done) else "<b>Done.</b>")
             else:
@@ -2225,7 +2449,7 @@ class CalendarChange:
             if changes:
                 try:
                     self.recard(p, changes, "the event changed since your earlier card, so this is a fresh card "
-                                            "with it as it is now")
+                                            "with it as it is now", False)
                 except (Refuse, ValueError, KeyError, TypeError) as e:
                     log.warning("the fresh card after a refused write failed: %s", type(e).__name__)
 
@@ -2307,6 +2531,7 @@ class CalendarChange:
 
     def _confirmed(self, row, plan: dict, parts: list[dict]) -> None:
         now = self.ledger.now()
+        plan["listed_at"] = iso(now)
         with self.ledger.tx() as db:
             db.execute("UPDATE calendar_changes SET state='done', settle_json=?, updated_at=? WHERE"
                        " proposal_id=? AND state='unverified'", (json.dumps(plan), iso(now), row["proposal_id"]))
@@ -3878,6 +4103,7 @@ class CalendarChange:
             if entry.get("cal") == "family" and entry.get("how") in ("put", "delete") and read.get("body"):
                 entry["after"] = read["body"]
         rec["status"] = "landed"
+        rec["back"] = iso(self.ledger.now())
         with self.ledger.tx() as db:
             if not rec.get("applied"):
                 self._note_removed(db, rec.get("removed", []))
@@ -4239,6 +4465,8 @@ class CalendarChange:
     def on_choice(self, kind: str, target: str) -> str:
         if kind in ("calendar_change_fast_on", "calendar_change_fast_keep"):
             return self.fast_path_tapped(kind == "calendar_change_fast_on", target)
+        if kind == "calendar_change_fast_off":
+            return self.fast_path_off_tapped()
         if kind == "calendar_change_add_anyway":
             return self.add_anyway(target)
         if kind in ("calendar_change_propose_again", "calendar_change_which") and self.reoffer is not None:
@@ -4371,6 +4599,9 @@ class CalendarChange:
                          "the calendar afterward didn't answer.")
             else:
                 words = "<b>Undone.</b> It's back the way it was."
+                plan["undone_at"] = iso(self.ledger.now())          # read back as it was (the smoke run)
+                plan["undone_entries"] = [{"cal": st.get("cal"), "id": st.get("id", ""), "href": st.get("href", "")}
+                                          for st in first.values()]
             with self.ledger.tx() as db:
                 db.execute("UPDATE calendar_changes SET undo_state='undone', settle_json=?, updated_at=?"
                            " WHERE proposal_id=?", (json.dumps(plan) if plan else "", iso(self.ledger.now()),
@@ -4851,6 +5082,16 @@ def _moment(when) -> str:
 def _text(when) -> str:
     """A time as family_copy.py keeps it."""
     return when.isoformat()
+
+
+def _tail(ident: str) -> str:
+    """The last six letters and digits of an event id or address, as a card names it."""
+    return re.sub(r"[^0-9A-Za-z]", "", caldav.href_path(ident or "").rsplit("/", 1)[-1].removesuffix(".ics"))[-6:]
+
+
+def _bound_id(part: dict) -> str:
+    bound = part.get("bound") or []
+    return bound[0].get("id", "") if bound else ""
 
 
 def _print(title: str, start, end, rule: list, location: str, notes: str) -> dict:

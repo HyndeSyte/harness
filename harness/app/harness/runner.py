@@ -687,14 +687,17 @@ class Runner:
             return "Already on the calendar, so nothing to bring back." if found else "Nothing to bring back there."
         return f"Back on {n} new card{'s' * (n != 1)}, each waiting for your tap."
 
-    def recard(self, p, changes: list, why: str) -> str:
-        """A change the calendar refused for its version (calendar_change._finish, sixth round): its
-        changes on one fresh card for the same message, read anew so the card is bound to the event's
-        version now, never to the old card's. Its request's id, or "" when there's none to offer."""
+    def recard(self, p, changes: list, why: str, keep_versions: bool = False) -> str:
+        """A change on a fresh card for the same message (sixth round): one the calendar refused for
+        its version (calendar_change._finish), read anew so the card is bound to the event's version
+        now, never to the old card's; or one that waited on a card while writes were paused
+        (calendar_change._resume_paused), keeping the version its card was bound to. Its request's id,
+        or "" when there's none to offer."""
         old = self.ledger.job(p["job_id"])
         if old is None or not changes:
             return ""
-        return self._offer_new(old, {"changes": list(changes)}, why, replaced=False, keep_versions=False)
+        return self._offer_new(old, {"changes": list(changes)}, why, replaced=True if keep_versions else False,
+                               keep_versions=keep_versions)
 
     def _again(self, p, why: str) -> str:
         """One earlier request's change, as a new request of the same message, on a card."""

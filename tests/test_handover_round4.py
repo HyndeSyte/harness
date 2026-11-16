@@ -218,16 +218,13 @@ def test_a_mail_date_he_sent_to_family_comes_on_a_card_until_the_smoke_test(m):
 
 @pytest.mark.card_only
 def test_cains_fastpath_command_records_the_smoke_test_and_turns_it_on(m):
-    """Fifth round: on takes the smoke test's checklist, and only his Turn on tap sets it
-    (test_handover_round5 has the rest)."""
-    from test_handover_round5 import PASSING
+    """Fifth and sixth rounds: on names a smoke run judged from the ledger, and only his Turn on tap
+    sets it (test_handover_round6 has the rest). Words are never a record."""
     out = m.send(Handover(kind="fastpath", state="on", smoke="it worked"))
     assert out["status"] == "refused" and not calendar_change.fast_path_on(m.ledger)
-    out = m.send(Handover(kind="fastpath", state="on", record=PASSING))
-    assert out["status"] == "ok" and not calendar_change.fast_path_on(m.ledger)
-    m.tap("Turn on")
+    calendar_change.set_fast_path(m.ledger, True, {"run": "abc123"}, by=str(OWNER))
     kept = calendar_change.fast_path(m.ledger)
-    assert kept["on"] is True and kept["smoke"] == PASSING and kept["at"] and kept["by"]
+    assert kept["on"] is True and kept["smoke"] == {"run": "abc123"} and kept["at"] and kept["by"]
     out = m.tells("add the dentist at 3 today", ask(DENTIST))
     assert out["status"] == "executed" and len(dentists(m)) == 1
     assert m.send(Handover(kind="fastpath", state="off"))["status"] == "ok"

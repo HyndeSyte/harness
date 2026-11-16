@@ -66,6 +66,12 @@ def _message_id(value) -> str:
     return text if text.isdigit() and len(text) <= 24 else ""
 
 
+def _run_id(value) -> str:
+    """A smoke run's id (calendar_change.smoke_start: hex), or nothing."""
+    text = str(value or "").strip().lower()
+    return text if text and len(text) <= 32 and all(c in "0123456789abcdef" for c in text) else ""
+
+
 def key_for(token: str) -> str:
     return hmac.new(token.encode(), KEY_CONTEXT, hashlib.sha256).hexdigest()
 
@@ -78,9 +84,10 @@ class Handover:
     press: dict = field(default_factory=dict)
     paired: str = ""                     # the Discord user Cain is paired with
     message: str = ""                    # the Discord message of his it rests on, when Cain names one
-    state: str = ""                      # /fastpath: "on" or "off"
+    state: str = ""                      # /fastpath: "smoke-start", "on" or "off"
+    run: str = ""                        # /fastpath on: the smoke run's id, from smoke-start
     smoke: str = ""                      # /fastpath: free text from before 0.24.0's fifth round: refused
-    record: dict = field(default_factory=dict)   # /fastpath: the smoke test's checklist, pass or fail each
+    record: dict = field(default_factory=dict)   # /fastpath: a pass or fail record from before the sixth round: ignored
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
@@ -182,7 +189,8 @@ def _handler(inbox: Inbox, wait_s: float):
                          suggestion=str(body.get("suggestion") or "")[:MAX_SUGGESTION].strip(),
                          paired=str(body.get("paired") or "").strip(),
                          message=_message_id(body.get("message")),
-                         state=str(body.get("state") or "").strip().lower()[:8],
+                         state=str(body.get("state") or "").strip().lower()[:16],
+                         run=_run_id(body.get("run")),
                          smoke=str(body.get("smoke") or "")[:MAX_SUGGESTION].strip(),
                          record=body.get("record") if isinstance(body.get("record"), dict) else {},
                          press={k: str(body.get(k, "")) for k in
