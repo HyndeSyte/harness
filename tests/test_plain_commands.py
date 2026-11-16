@@ -69,7 +69,7 @@ DROP_OFF = change("family", "remove", "school drop-off")          # as the model
 class Gmail(FakeGmail):
     """His Gmail calendar as the Google API gives it, all-day events too."""
 
-    def events_between(self, address, start, end):
+    def events_between(self, address, start, end, fresh=False):
         out = []
         for e in self.events.values():
             if e.get("status") == "cancelled":

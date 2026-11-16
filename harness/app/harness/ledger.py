@@ -613,7 +613,7 @@ class Ledger:
 
     def made_job(self, chat_id: int, text: str, *, kind: str, db, reply_to: int | None = None,
                  created_at: str | None = None, engine: str | None = None,
-                 started_at: str | None = None) -> str:
+                 started_at: str | None = None, state: str = "running") -> str:
         """A request the harness makes itself, under an id no Discord message can have: one part of
         a message (part_job), or a date from his mail he sent to Family (controller). Born running,
         so it goes on to proposed like any request; never run on a model."""
@@ -623,7 +623,7 @@ class Ledger:
         db.execute("INSERT INTO jobs(id, bot_id, chat_id, message_id, kind, state, text_hash,"
                    " reply_to_message_id, created_at, updated_at, engine, started_at)"
                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (new, self.bot_id(), chat_id, -(n + 1), kind, "running", canonical_hash(text),
+                   (new, self.bot_id(), chat_id, -(n + 1), kind, state, canonical_hash(text),
                     reply_to, created_at or now, now, engine, started_at))
         db.execute("INSERT INTO job_text(job_id, text) VALUES(?, ?)", (new, text))
         return new

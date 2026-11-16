@@ -408,8 +408,10 @@ class GoogleCalendar:
         return token, None
 
     def _call(self, token: str, method: str, url: str, *, body: dict | None = None,
-              etag: str | None = None):
+              etag: str | None = None, fresh: bool = False):
         headers = {"Authorization": "Bearer " + token}
+        if fresh:                       # a read back read once more: past any cache on the way
+            headers["Cache-Control"] = "no-cache"
         if etag:
             headers["If-Match"] = etag
         if body is not None:
@@ -550,9 +552,10 @@ class GoogleCalendar:
         return Outcome("ok", r.status) if r.status == 200 else self._answer(r)
 
     # -- what he asks for (calendar_change.py): the one way to touch an event not ours -------
-    def events_between(self, address: str, start: datetime, end: datetime) -> list[dict] | None:
+    def events_between(self, address: str, start: datetime, end: datetime, *,
+                       fresh: bool = False) -> list[dict] | None:
         """Everything in this window, each day of a series on its own. None when that can't
-        be said."""
+        be said. `fresh`: asked past any cache (calendar_change's read back, read once more)."""
         url = self._events(address)
         token, _ = self._access()
         if url is None or token is None:
@@ -563,7 +566,7 @@ class GoogleCalendar:
                  "timeMax": end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
         for _ in range(MAX_PAGES):
             try:
-                r = self._call(token, "GET", f"{url}?{urlencode(query)}")
+                r = self._call(token, "GET", f"{url}?{urlencode(query)}", fresh=fresh)
                 if r.status != 200:
                     self._shut_out(r, url)
                     return None

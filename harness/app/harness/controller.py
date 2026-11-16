@@ -39,7 +39,7 @@ from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
 from .engines import Engine
 from .ledger import Ledger, iso
 from .outbox import Outbox
-from .runner import Runner
+from .runner import CLARIFY_WAIT_S, Runner
 from .vault import LABELS, Vault
 
 log = logging.getLogger("harness.controller")
@@ -47,7 +47,6 @@ log = logging.getLogger("harness.controller")
 SETTINGS_TTL_S = 15 * 60
 FRESH_S = 120              # a handed-over message must be this new, or the handover itself
 NAMED_FRESH_S = 30 * 60    # a message Cain names, or one his suggestion rests on, this new
-CLARIFY_WAIT_S = 10 * 60   # a question for Cain he hasn't answered by then goes to the owner, on a card
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
 PROBE_S = 5                # the watch's check of Cain and its message: short, never a stuck loop
 HEARD_FLOOR_S = 1_420_070_400   # 2015-01-01: an older "last heard from Discord" is nonsense
@@ -168,6 +167,8 @@ class Controller:
                              sleep=self.sleep, monotonic=self.monotonic,
                              budgets_ok=self._budget_ok, family_add=self.family_add,
                              calendar_change=self.calendar_change)
+        if self.calendar_change is not None:
+            self.calendar_change.fast_check = self._still_his
         if self.mail_dates is not None:
             self.mail_dates.to_family = self._mail_to_family if self.calendar_change is not None else None
             cc = self.calendar_change
@@ -187,6 +188,39 @@ class Controller:
                                              calendar_change=self.calendar_change,
                                              mail_dates=self.mail_dates,
                                              meaning_live=self.meaning_live)
+
+    def _still_his(self, p) -> str:
+        """At the moment a change goes through with no tap (calendar_change._execute): "" when the
+        message it rests on is still his newest in the DM and under 2 minutes old, or why not. A
+        request that rests on no Discord message of his (his tap on a mail card) has nothing to
+        check. A DM that can't be read is no pass."""
+        job = self.ledger.job(p["job_id"])
+        if job is None:
+            return "its request is gone"
+        root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
+        try:
+            origin = json.loads(self.ledger.get_meta(f"job_origin:{root}") or "{}")
+        except ValueError:
+            origin = {}
+        if not origin.get("message"):
+            return ""
+        try:
+            age = (self.ledger.now() - datetime.fromisoformat(origin["sent_at"])).total_seconds()
+        except (KeyError, ValueError, TypeError):
+            age = FRESH_S + 1
+        if age > FRESH_S:
+            return "your message is over 2 minutes old now"
+        if not self._discord_mode():
+            return "I couldn't read the DM to see that it's still your newest message"
+        try:
+            msgs = self.discord.api.history(self.discord.dm(), 10)
+        except DiscordError:
+            return "I couldn't read the DM to see that it's still your newest message"
+        owner = str(self.config.owner_user_id if self.config else self.base_config.owner_user_id)
+        mine = [m for m in msgs if str((m.get("author") or {}).get("id")) == owner]
+        if mine and str(mine[0].get("id")) != str(origin["message"]):
+            return "you sent another message after it"
+        return ""
 
     def _mail_to_family(self, title: str, day, start) -> bool:
         """A date from his mail he tapped Add to Family on (mail_dates.py): one add on Family, as a
@@ -262,6 +296,12 @@ class Controller:
             self.family_add.reconcile_after_restart()
         if self.calendar_change is not None:
             self.calendar_change.reconcile_after_restart()
+        # 0.24.0, third round: cards left open by the version before are replaced, once, with their
+        # buttons taken off; a tap on one is answered that it was replaced when Harness updated.
+        replaced = approvals.replace_from_before(self.ledger)
+        if replaced:
+            log.info("replaced %d card(s) left open by the version before", replaced)
+        self._clarify_timeouts(restart=True)
 
     # -- the loop --------------------------------------------------------------
     def _beat(self) -> None:
@@ -327,7 +367,7 @@ class Controller:
         self.outbox.flush()
         self._publish()
 
-    def _clarify_timeouts(self) -> None:
+    def _clarify_timeouts(self, *, restart: bool = False) -> None:
         """A question that went to Cain (runner._on_clarify) and that no note from him has answered
         in 10 minutes goes to the owner after all, as the card it would have been: his message
         quoted, what Cain passed, and the question, which his reply answers. Once a request."""
@@ -342,12 +382,25 @@ class Controller:
                 continue
             if not isinstance(detail, dict) or not detail.get("said_to_cain"):
                 continue
+            # 0.24.0, third round: its deadline is stored when the question goes to Cain
+            # (runner._on_clarify) and checked every tick and at the first tick after a restart, so
+            # a stalled tick can't lose it. A question from before kept none: its deadline is set
+            # from when it was asked.
+            due_raw = self.ledger.get_meta(f"clarify_due:{job['id']}")
+            if due_raw is None:
+                try:
+                    asked = datetime.fromisoformat(receipts[-1]["created_at"])
+                except (KeyError, ValueError, TypeError):
+                    asked = datetime.fromisoformat(job["updated_at"])
+                due_raw = iso(asked + timedelta(seconds=CLARIFY_WAIT_S))
+                self.ledger.set_meta(f"clarify_due:{job['id']}", due_raw)
             try:
-                asked = datetime.fromisoformat(receipts[-1]["created_at"])
-            except (KeyError, ValueError, TypeError):
-                asked = datetime.fromisoformat(job["updated_at"])
-            if (now - asked).total_seconds() < CLARIFY_WAIT_S:
+                due = datetime.fromisoformat(due_raw)
+            except ValueError:
+                due = now
+            if now < due:
                 continue
+            late = (now - due).total_seconds()
             text = self.ledger.job_text(job["id"])
             his, _, note = text.partition(NOTE_HEAD)
             root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
@@ -370,8 +423,9 @@ class Controller:
                                     text=render.fit("\n".join(lines)), db=db)
                 self.ledger.release_held(db=db)
                 self.ledger.event("clarify_to_owner", {"job": job["id"]}, db=db)
-            log.info("job %s: Cain didn't answer its question in 10 minutes; asked the owner",
-                     render.short(job["id"]))
+            log.info("job %s: Cain didn't answer its question in 10 minutes; asked the owner, %ds after "
+                     "its deadline%s", render.short(job["id"]), int(late),
+                     " (the first tick after a restart)" if restart else "")
 
     def _watch_inputs(self) -> None:
         """What the clients saw goes into the ledger, and an input that stopped is told, once an
@@ -628,49 +682,54 @@ class Controller:
 
     def _note_for_question(self, job_id: str, note: str, flags: list[str]) -> None:
         """A note from Cain for a request of his reaches it: one waiting on its question, one
-        answered "not a change" to Cain alone, or one with a card still open (one of its parts,
-        when it was split). The request runs again with the note, fenced as Cain's (Nov 11: a
-        second handover with the missing fact got the same question back; Nov 15: a later handover
-        got the same cached answer). Every card still open for that message is replaced: its
-        buttons come off, so a tap binds only to what the newest card shows. What's already done
-        isn't done again: the rerun says it's done and offers only the rest (runner._not_yet_done).
-        A note it already has changes nothing, and any change resting on it still gets his tap."""
+        answered "not a change" to Cain alone, or one with a card still open or a change being done
+        (one of its parts, when it was split). The note is fenced as Cain's (Nov 11: a second
+        handover with the missing fact got the same question back; Nov 15: a later handover got the
+        same cached answer). A request with no card open runs again with it. Beside open cards it
+        runs as a request of its own, for the same message, and replaces only the cards whose change
+        it addresses: the others stand, still offered (runner._address_open, 0.24.0, third round).
+        While a change of that message is being done under its lease, it waits, then reads the
+        result. What's already done isn't done again (runner._not_yet_done). A note it already has
+        changes nothing, and any change resting on it still gets his tap."""
         job = self.ledger.job(job_id)
         if job is None:
             return
         parts = json.loads(self.ledger.get_meta(f"job_parts:{job_id}") or "[]")
         family = [job_id] + parts
-        target = None
-        if job["state"] in ("needs_clarification", "proposed") or (
-                job["state"] in ("no_action", "answered") and self._answered_to_cain(job_id)):
-            target = job_id
-        else:
-            target = next((j for j in parts if (self.ledger.job(j) or {"state": ""})["state"] == "proposed"), None)
-        if target is None:
-            return                       # a card he saw (a rule, a refusal) isn't sent again
-        text = self.ledger.job_text(target)
-        if note in text:
+        if any(note in self.ledger.job_text(j) for j in family):
             return
-        flagged = json.loads(self.ledger.get_meta(f"job_flags:{target}") or "[]")
+        states = {j: (self.ledger.job(j) or {"state": ""})["state"] for j in family}
+        in_place = job["state"] == "needs_clarification" or (
+            job["state"] in ("no_action", "answered") and self._answered_to_cain(job_id))
+        beside = any(st in ("proposed", "approved") for st in states.values())
+        if not in_place and not beside:
+            return                       # a card he saw (a rule, a refusal) isn't sent again
         marks = ",".join("?" * len(family))
         last = self.ledger.db.execute(f"SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id IN ({marks})",
                                       tuple(family)).fetchone()[0]
-        was = self.ledger.job(target)["state"]
+        text = self.ledger.job_text(job_id)
+        flagged = json.loads(self.ledger.get_meta(f"job_flags:{job_id}") or "[]")
         with self.ledger.tx() as db:
-            approvals.supersede_open(self.ledger, family, db=db)
-            for j in family:             # its other open cards are offered again by the rerun
-                if j != target and (self.ledger.job(j) or {"state": ""})["state"] == "proposed":
-                    self.ledger.transition(j, "cancelled", db=db, receipt=json.dumps({"reason": "replaced"}))
-            db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, target))
-            self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
-            if was == "proposed":
-                self.ledger.transition(target, "cancelled", db=db, receipt=json.dumps({"reason": "replaced"}))
-            self.ledger.transition(target, "received", db=db)
+            if in_place:
+                target = job_id
+                db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, target))
+                self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
+                self.ledger.transition(target, "received", db=db)
+                db.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"job_rerun:{job_id}", f"clarify_due:{target}"))
+            else:
+                target = self.ledger.made_job(job["chat_id"], text + note, kind="message", db=db,
+                                              reply_to=job["reply_to_message_id"], created_at=job["created_at"],
+                                              state="received")
+                self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
+                self.ledger.set_meta(f"job_parent:{target}", job_id, db)
+                self.ledger.set_meta(f"job_parts:{job_id}", json.dumps(parts + [target]), db)
+                self.ledger.set_meta(f"job_rerun:{job_id}", target, db)
             self.ledger.event("job_note", {"job": target}, db=db)
             db.execute("DELETE FROM meta WHERE key=?", (f"clarify_card:{target}",))
             # Kept in the ledger, so every later answer about it, after a restart too, starts here.
             self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
-        log.info("handover: a note for job %s, which was %s: it runs again", render.short(target), was)
+        log.info("handover: a note for job %s: it runs again%s", render.short(job_id),
+                 "" if in_place else " beside its open cards")
 
     def _answered_to_cain(self, job_id: str) -> bool:
         """Its last answer went to Cain alone, so running it again shows him nothing twice."""
@@ -780,16 +839,18 @@ class Controller:
                 continue                                      # not with Cain yet
             sent = [r for r in rows if r["state"] == "sent"]
             said = [render.plain(r["text"]) for r in sent]
-            receipts = self.ledger.receipts(job_id)
+            # A note that ran as its own request (a rerun beside open cards) answers for it.
+            lead = self.ledger.job(self.ledger.get_meta(f"job_rerun:{job_id}") or job_id) or job
+            receipts = self.ledger.receipts(lead["id"])
             to_cain = ""
-            if receipts and job["state"] in ("answered", "no_action", "needs_clarification"):
+            if receipts and lead["state"] in ("answered", "no_action", "needs_clarification"):
                 try:
                     to_cain = json.loads(receipts[-1]["detail"] or "{}").get("said_to_cain", "")
                 except ValueError:
                     to_cain = ""
             status = {"answered": "not a change" if to_cain else "card",
                       "no_action": "not a change",
-                      "proposed": "waiting for his tap"}.get(job["state"], job["state"])
+                      "proposed": "waiting for his tap"}.get(lead["state"], lead["state"])
             if parts and "proposed" in states:
                 status = "waiting for his tap"
             words = to_cain or "\n\n".join(said) or "Done."

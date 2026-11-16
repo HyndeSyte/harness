@@ -174,3 +174,10 @@ def cb(update_id, data, *, message_id, user=OWNER, chat=OWNER, chat_type="privat
         "id": f"cq{update_id}", "data": data,
         "from": {"id": user, "is_bot": False},
         "message": {"message_id": message_id, "chat": {"id": chat, "type": chat_type}}}}
+
+
+@pytest.fixture(autouse=True)
+def no_read_back_pause(monkeypatch):
+    """A read back read once more waits a few seconds on the Pi; not in tests."""
+    from harness import calendar_change
+    monkeypatch.setattr(calendar_change, "READ_BACK_PAUSE_S", 0)

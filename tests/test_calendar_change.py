@@ -77,12 +77,16 @@ class FakeGmail:
     def configured(self):
         return True
 
-    def events_between(self, address, start, end):
+    def events_between(self, address, start, end, fresh=False):
         out = []
         for e in self.events.values():
             if e.get("status") == "cancelled":
                 continue
-            when = datetime.fromisoformat(e["start"]["dateTime"])
+            side = e["start"]
+            if side.get("dateTime"):
+                when = datetime.fromisoformat(side["dateTime"])
+            else:                          # an all-day day: midnight there
+                when = datetime.combine(date.fromisoformat(side["date"]), datetime.min.time(), start.tzinfo)
             if start <= when < end:
                 out.append(copy.deepcopy(e))
         return out
@@ -762,11 +766,14 @@ def test_a_stale_offset_gets_a_tap(r):
     assert r.with_button("Approve") and not [p for p in r.icloud.events if "/hm-" in p]
 
 
-def test_the_same_add_twice_gets_a_tap(r):
+def test_the_same_add_twice_adds_nothing_the_second_time(r):
+    """0.24.0, third round: the very same event already there (same calendar, title and start) is
+    "nothing to add", said without a card; a looser match would be his decision on a card."""
     add = change(op="add", title="Dentist", start="2026-11-23T09:00:00-05:00", end="2026-11-23T10:00:00-05:00")
     r.tell(add)
     r.tell(add)
-    assert len([p for p in r.icloud.events if "/hm-" in p]) == 1 and r.with_button("Approve")
+    assert len([p for p in r.icloud.events if "/hm-" in p]) == 1
+    assert "Already there, nothing to add: Dentist" in r.texts()[-1]
 
 
 def test_checkadds_brings_the_tap_back(r):
@@ -1873,7 +1880,10 @@ def test_a_gmail_add_he_changed_before_its_read_is_left_by_undo(r):
     r.gmail._bump(gid)
     r.advance(minutes=1)
     r.tick()
-    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    # 0.24.0, third round: Done only when the calendar shows it as asked. It shows his edit, so the
+    # receipt says what it shows, with Undo.
+    assert receipts(r)[-1].startswith("<b>Not confirmed.</b>")
+    assert "shows it as “Dentist (bring forms)” at 1:00 to 2:00 on Sat Nov 21 instead" in receipts(r)[-1]
     r.press(r.with_button("Undo"), "Undo")
     assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
     assert r.gmail.events[gid].get("status") != "cancelled" and r.gmail.events[gid]["summary"] == "Dentist (bring forms)"

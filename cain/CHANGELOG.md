@@ -6,6 +6,7 @@
 - A slip in Cain's tools can no longer pass a calendar request on by accident: run with nothing, the tool only lists what it does.
 - Cain names your message with every calendar request, answers the calendar specialist's questions himself on the same message, and never asks you to repeat a change you already made in words.
 - The specialist's address can only be moved by a test, and that is logged.
+- Cain says a calendar change is done only when the specialist's read of the calendar shows it, and a note correcting one card no longer replaces the others.
 
 ## 0.11.0
 

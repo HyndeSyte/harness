@@ -481,8 +481,9 @@ class FamilyCalDav:
                 return None
         return gone
 
-    def items_between(self, start: datetime, end: datetime, tz: str) -> Read | None:
-        """What is on Family in this window. Reads only. None when that can't be said."""
+    def items_between(self, start: datetime, end: datetime, tz: str, *, fresh: bool = False) -> Read | None:
+        """What is on Family in this window. Reads only. None when that can't be said. `fresh`:
+        asked past any cache (calendar_change's read back, read once more)."""
         ready = self._auth()
         if ready is None:
             return None
@@ -497,7 +498,8 @@ class FamilyCalDav:
                 "</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>")
         try:
             r = self._call(auth, "REPORT", url,
-                           {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}, body)
+                           {"Depth": "1", "Content-Type": "application/xml; charset=utf-8",
+                            **({"Cache-Control": "no-cache", "Pragma": "no-cache"} if fresh else {})}, body)
             if r.status != 207:
                 self._answered(r.status)
                 return None

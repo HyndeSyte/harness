@@ -55,16 +55,18 @@ def drops_on_gmail(m):
 
 def test_tonights_add_then_removal_replayed_ends_with_the_block_gone_and_true_receipts(m):
     before = set(m.gmail.events)
-    # The add into the slot that already holds the drop-off block: nothing to add, on a card.
+    # The add into the slot that already holds the drop-off block: only like it (third round), so
+    # his decision, on a card naming the block, and nothing written until he taps.
     out = m.tells("add the school drop-off at 8 today", ask(ADD_DROP))
-    assert out["status"] == "waiting for his tap"
+    assert out["status"] == "waiting for his tap" and set(m.gmail.events) == before
     card = m.seen()[-1]
-    assert "Already there, nothing to add" in card and "is already there at that time" in card
-    m.tap("Approve")
-    receipt = m.seen()[-1]
-    assert receipt.startswith("Nothing added.") and "Already there" in receipt
+    assert "Already on your Gmail calendar at that time: “Busy (school drop-off)”, today, 8:00 to 8:45" in card
+    assert "Add anyway" in m.labels() and "Leave it" in m.labels() and "Approve" not in m.labels()
+    m.tap("Leave it")
+    assert "Left as it is. Nothing was added." in m.seen()[-1] or any(
+        "Left as it is" in (a[1] or "") for a in m.link.answers)
     assert set(m.gmail.events) == before                     # no new event, nothing recorded as made
-    assert m.ledger.db.execute("SELECT undo_state FROM calendar_changes ORDER BY rowid DESC").fetchone()[0] == "none"
+    assert m.ledger.db.execute("SELECT COUNT(*) FROM calendar_changes").fetchone()[0] == 0
     # Then the removal: it takes off the real block, and the receipt says so only once it's gone.
     out = m.tells("not doing the 8:00 drop-off today", ask(TAKE_OFF))
     assert out["status"] == "executed" and m.block_state("drop") == "cancelled"
@@ -170,7 +172,9 @@ def test_a_stale_button_after_a_rerun_is_refused(m):
     m.claude.script = [ask(TAKE_OFF)]
     m.handover(paired=OWNER, message=mid, suggestion="He means today's drop-off.")
     old = card_with(m, "Approve")
-    m.claude.script = [ask(TAKE_OFF)]
+    # Third round: a rerun replaces the card whose change it addresses (the same event, asked
+    # differently); one repeating the very same change would leave that card standing.
+    m.claude.script = [ask(change("gmail", "remove", "Busy (school drop-off)"))]
     again = m.handover(paired=OWNER, message=mid, suggestion="It's the 8:00 drop-off on his Gmail, today.")
     assert len(m.claude.calls) == 2 and again["status"] == "waiting for his tap"
     new = card_with(m, "Approve")
@@ -265,10 +269,12 @@ def test_a_split_message_one_card_approved_then_a_note_reruns_with_no_duplicate(
     pt_card = card_with(m, "Approve")
     m.claude.script = [ask(MOVE_PT, DROP_OFF)]
     out = m.handover(paired=OWNER, message=mid, suggestion="PT moved to 11:30 today, from the clinic.")
+    # Third round: the drop-off is done (read back), and the PT card he hasn't tapped stands, still
+    # offered: the rerun repeats its change, so nothing is replaced and nothing offered twice.
     assert len(m.claude.calls) == 2 and out["status"] == "waiting for his tap"
-    card = m.seen()[-1]
-    assert "Already done: Take off today's 8:00 drop-off" in card and "Move PT to 11:30" in card
-    assert m.link.cards[pt_card]["rows"] == [] and m.labels().count("Approve") == 1
+    assert "Already done, nothing new to change: Take off today's 8:00 drop-off" in out["said"]
+    assert "Still waiting for your tap on its own card: Move PT to 11:30" in out["said"]
+    assert m.link.cards[pt_card]["rows"] != [] and m.labels().count("Approve") == 1
     drops = m.ledger.db.execute("SELECT COUNT(*) FROM proposals WHERE params_json LIKE '%drop-off%'"
                                 " AND state NOT IN ('superseded')").fetchone()[0]
     assert drops == 1                                   # the drop-off was never offered again

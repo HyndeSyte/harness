@@ -100,8 +100,20 @@ def bind_message(ledger: Ledger, nonce: str, message_id: int) -> None:
             raise ValueError("approval already bound or missing")
 
 
+class _Lost(Exception):
+    """The button was used up between the read and the write: nothing is kept."""
+
+
 def verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
                        policy_version: str) -> Verdict:
+    try:
+        return _verify_and_consume(ledger, inc, owner_user_id=owner_user_id, policy_version=policy_version)
+    except _Lost:
+        return Verdict(False, "already used")
+
+
+def _verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
+                        policy_version: str) -> Verdict:
     """Check every binding, then consume the approval and move the
     proposal in one transaction. Returns why, whichever way it goes."""
     parsed = parse_callback_data(inc.callback_data)
@@ -119,6 +131,8 @@ def verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
         if a["consumed_at"] is not None:
             if a["outcome"] == "replaced":           # its card was replaced by a newer one
                 return Verdict(False, "replaced", proposal_id=a["proposal_id"])
+            if a["outcome"] == "updated":            # replaced when this version was installed
+                return Verdict(False, "replaced_by_update", proposal_id=a["proposal_id"])
             return Verdict(False, "already used", proposal_id=a["proposal_id"])
         if a["message_id"] is None or a["message_id"] != inc.message_id:
             return Verdict(False, "tap is not on the card it belongs to",
@@ -140,15 +154,19 @@ def verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
         if p["policy_version"] != policy_version or a["policy_version"] != policy_version:
             return Verdict(False, "policy changed since the card was shown",
                            proposal_id=p["id"])
+        # One compare-and-set on the proposal decides it (0.24.0, third round): his tap and a
+        # newer card replacing this one (supersede_open) can't both win, nor two taps on one
+        # proposal. Only the winner uses up the button.
+        new_state = "approved" if action == "approve" else "declined"
+        if db.execute("UPDATE proposals SET state=? WHERE id=? AND state='proposed'",
+                      (new_state, p["id"])).rowcount != 1:
+            return Verdict(False, "proposal is no longer open", proposal_id=p["id"])
         cur = db.execute(
             "UPDATE approvals SET consumed_at=?, consumed_update_id=?, outcome=?"
             " WHERE nonce=? AND consumed_at IS NULL",
             (iso(now), inc.update_id, action, nonce))
         if cur.rowcount != 1:
-            return Verdict(False, "already used", proposal_id=p["id"])
-        new_state = "approved" if action == "approve" else "declined"
-        db.execute("UPDATE proposals SET state=? WHERE id=? AND state='proposed'",
-                   (new_state, p["id"]))
+            raise _Lost()                          # undone with the transaction: nothing moved
         if action == "approve":
             ledger.transition(p["job_id"], "approved", db=db)
         else:
@@ -169,28 +187,58 @@ def _expire(ledger: Ledger, db, a, now) -> None:
                           receipt="expired before it was approved", db=db)
 
 
+def supersede(ledger: Ledger, proposal_id: str, *, db, outcome: str = "replaced") -> bool:
+    """One card replaced, by one compare-and-set on its proposal (0.24.0, third round): True when
+    it was still open and is now replaced; False when his tap got there first (it's approved,
+    declined, or being done), and then nothing about it changes. A replaced card's buttons are used
+    up and come off (an "unbutton" in the outbox; a card not sent yet goes without them), and a tap
+    on it is refused as replaced. Its request isn't moved: whoever replaces it does that."""
+    if db.execute("UPDATE proposals SET state='superseded' WHERE id=? AND state='proposed'",
+                  (proposal_id,)).rowcount != 1:
+        return False
+    now = iso(ledger.now())
+    for a in db.execute("SELECT * FROM approvals WHERE proposal_id=? AND consumed_at IS NULL",
+                        (proposal_id,)).fetchall():
+        db.execute("UPDATE approvals SET consumed_at=?, outcome=? WHERE nonce=? AND consumed_at IS NULL",
+                   (now, outcome, a["nonce"]))
+        if a["message_id"]:
+            ledger.enqueue(chat_id=a["chat_id"], kind="unbutton", text=str(a["message_id"]), db=db)
+        else:
+            for o in db.execute("SELECT id, binds_json FROM outbox WHERE state IN ('queued','held')"
+                                " AND binds_json LIKE ?", (f'%{a["nonce"]}%',)).fetchall():
+                db.execute("UPDATE outbox SET buttons_json=NULL, binds_json=NULL WHERE id=?", (o["id"],))
+    ledger.event("proposal_replaced", {"proposal": proposal_id, "why": outcome}, db=db)
+    return True
+
+
 def supersede_open(ledger: Ledger, job_ids: list[str], *, db) -> int:
-    """Each card still open for these requests is replaced (0.24.0): its proposal can't be
-    approved any more, its buttons are used up, and they come off the card (an "unbutton" in the
-    outbox; a card not sent yet goes without them). A tap on it is refused as "Replaced by a newer
-    card". Its request isn't moved: whoever replaces it does that. How many were replaced."""
+    """Every card still open for these requests is replaced (supersede, one at a time). How many."""
     if not job_ids:
         return 0
-    now = iso(ledger.now())
     marks = ",".join("?" * len(job_ids))
     rows = db.execute(f"SELECT id FROM proposals WHERE state='proposed' AND job_id IN ({marks})",
                       tuple(job_ids)).fetchall()
-    for p in rows:
-        db.execute("UPDATE proposals SET state='superseded' WHERE id=? AND state='proposed'", (p["id"],))
-        for a in db.execute("SELECT * FROM approvals WHERE proposal_id=? AND consumed_at IS NULL",
-                            (p["id"],)).fetchall():
-            db.execute("UPDATE approvals SET consumed_at=?, outcome='replaced' WHERE nonce=?",
-                       (now, a["nonce"]))
-            if a["message_id"]:
-                ledger.enqueue(chat_id=a["chat_id"], kind="unbutton", text=str(a["message_id"]), db=db)
-            else:
-                for o in db.execute("SELECT id, binds_json FROM outbox WHERE state IN ('queued','held')"
-                                    " AND binds_json LIKE ?", (f'%{a["nonce"]}%',)).fetchall():
-                    db.execute("UPDATE outbox SET buttons_json=NULL, binds_json=NULL WHERE id=?", (o["id"],))
-        ledger.event("proposal_replaced", {"proposal": p["id"]}, db=db)
-    return len(rows)
+    return sum(1 for p in rows if supersede(ledger, p["id"], db=db))
+
+
+UPDATED = "open_cards_replaced_0.24.0"
+
+
+def replace_from_before(ledger: Ledger) -> int:
+    """Once, the first time 0.24.0 runs: every card still open from the version before is replaced
+    (0.24.0, third round). Its proposal was made by older rules, so it can't be approved any more;
+    its buttons come off through the outbox, and a tap on it is answered "Replaced, please ask
+    again." Its request is closed. How many were replaced."""
+    if ledger.get_meta(UPDATED) is not None:
+        return 0
+    n = 0
+    with ledger.tx() as db:
+        for p in db.execute("SELECT id, job_id FROM proposals WHERE state='proposed'").fetchall():
+            if supersede(ledger, p["id"], db=db, outcome="updated"):
+                n += 1
+                job = db.execute("SELECT state FROM jobs WHERE id=?", (p["job_id"],)).fetchone()
+                if job is not None and job["state"] == "proposed":
+                    ledger.transition(p["job_id"], "cancelled", db=db,
+                                      receipt=json.dumps({"reason": "replaced_by_update"}))
+        ledger.set_meta(UPDATED, iso(ledger.now()), db)
+    return n

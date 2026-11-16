@@ -27,6 +27,7 @@ REFUSALS = {
     "unknown choice": "That button isn't valid any more.",
     "proposal is no longer open": "That's no longer open.",
     "replaced": "Replaced by a newer card.",
+    "replaced_by_update": "Replaced when Harness updated. Nothing was done.",
     "proposal changed after the card was shown": "That changed after you saw it; not done.",
     "policy changed since the card was shown": "The rules changed since; not done.",
 }
@@ -74,8 +75,12 @@ class Callbacks:
             # His tap's reply says what will happen; the receipt says what did, once it's read back.
             said = (self.calendar_change.tap_words(v.proposal_id)
                     if v.action == "approve" and self.calendar_change is not None else None)
+            left = None
+            if v.action == "decline" and self.calendar_change is not None:
+                with self.ledger.tx() as db:
+                    left = self.calendar_change.decline_words(v.proposal_id, db)
             message = (said or "Approved. It will run now." if v.action == "approve"
-                       else "Declined. Nothing was done.")
+                       else left or "Declined. Nothing was done.")
         self._answer(inc, None)
         self._strip_buttons(inc)
         with self.ledger.tx() as db:
