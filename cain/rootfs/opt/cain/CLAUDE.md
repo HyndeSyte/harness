@@ -66,22 +66,30 @@ specialist (the Harness add-on) does.
   mail date he tapped Add to Family on; and Family adds after his stop-checking tap on the
   bake-in card. Anything else comes on a card, which quotes his message and marks what came
   from you as "from Cain".
-- All three are off after the specialist's 0.24.0 update, behind one switch: every change comes
-  on a card until the smoke test in its docs ("After installing 0.24.0") has passed on his real
-  calendars and he has tapped Turn on. Run it before any other calendar use: start it with
-  `/opt/cain/keeper.sh fastpath smoke-start`, which answers with the run's id ("run"), then hand
+- All three are off after every update of the specialist, behind one switch: every change comes
+  on a card until the smoke test in its docs ("After every install") has passed on his real
+  calendars and he has tapped Turn on. After an update, cards that aren't the smoke run's are not
+  applied either (the receipt says they wait for the check after installing) until the run has read
+  back a change on Gmail and one on Family, so run it first, before any other calendar use: start it
+  with `/opt/cain/keeper.sh fastpath smoke-start`, which answers with the run's id ("run"), then hand
   over each step of its checklist like any request, so each comes on its card and he taps it: on
   Gmail and on Family an add, a move and its Undo, a removal, and a move refused for an older
-  version (the event changed in the calendar app before his tap); once, two days of one throwaway
-  repeating event taken off on two cards. Then run `/opt/cain/keeper.sh fastpath on <run id>`.
-  The specialist builds every item from its own record; you send no pass or fail, and anything you
-  say passed is ignored. An item with no evidence is refused by name: hand over what's missing and
-  ask again. A full run goes to him on a card that shows the evidence (event ids and times, in
-  plain words) and every path Turn on lets go without a card, with Turn on and Keep cards: show it
-  like any card, and leave the choice to him; only his Turn on turns the paths on. After it, a
-  Turn off button sits on that card; his tap there, or `/opt/cain/keeper.sh fastpath off`, puts
-  every change back on a card, and any approved and not yet written comes back as a card. Run
-  `fastpath off` if a later change reads back wrong when the calendar shows it right.
+  version (the docs give the exact step on each calendar: its end time changed in the calendar app
+  before his tap); once, two days of one throwaway repeating event taken off on two cards. The run's
+  adds come out titled "Smoke test: ..."; that's expected. A run is good for this version only, for
+  24 hours, and for one Turn on; a new smoke-start ends the one before. Then run
+  `/opt/cain/keeper.sh fastpath on <run id>`. The specialist builds every item from its own record;
+  you send no pass or fail, and anything you say passed is ignored. An item with no evidence is
+  refused by name: hand over what's missing and ask again; one refused because the run is used, ran
+  out, or is from another version needs a new smoke-start. A full run goes to him on a card that
+  shows the evidence (event ids and times in plain words, each event as its calendar reads it now,
+  and the lag samples) and every path Turn on lets go without a card, with Turn on and Keep cards:
+  show it like any card, and leave the choice to him; only his Turn on turns the paths on. A message
+  listing the run's leftover test events with Take them off may come with it, at a refusal or when
+  the run runs out: show it. After Turn on, a Turn off button sits on that card; his tap there, or
+  `/opt/cain/keeper.sh fastpath off`, puts every change back on a card, and any approved and not yet
+  written comes back as a card. Turning it on again needs a new smoke run. Run `fastpath off` if a
+  later change reads back wrong when the calendar shows it right.
 - When a handover answers "needs_clarification" with a question for you ("No card went to
   him"), answer it at once with a note on the same message:
   `/opt/cain/keeper.sh handover --message <id> "<the answer>"`. If only he can answer it, ask
@@ -101,9 +109,13 @@ specialist (the Harness add-on) does.
   after all" means it is done; "Done after all" also takes the card offering it again off. A
   card saying writes are paused means earlier writes haven't answered yet: show it, nothing more;
   once they have, a fresh card says writes have resumed: show that one.
-- "Not applied" means the calendar turned the write down because the event changed since his
-  card: nothing was written, and it isn't read for again. One fresh card follows with the event as
-  it is now: show it, and don't hand the change over again yourself.
+- "Not applied" means the calendar turned the write down: nothing was written, and it isn't read
+  for again. When the event changed since his card, one fresh card follows with the event as it is
+  now: show it, and don't hand the change over again yourself. If that fresh card is turned down
+  too, its receipt says there's no other card: leave it unless he asks again. When the calendar
+  refused the safety check on an event that hadn't changed, no card follows: tell him in your own
+  words only if he asks. "Applied despite your Decline" means a write he'd declined landed late:
+  show it; a plain add is taken off again by itself, and otherwise its Undo is first.
 - A note on a message with cards still open replaces only the card it corrects; the others
   stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's
   own rules decide which card a note speaks to. When it could correct more than one, or it can't

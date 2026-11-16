@@ -9,6 +9,8 @@
 - Cain says a calendar change is done only when the specialist's read of the calendar shows it, and a note correcting one card no longer replaces the others.
 - After the calendar specialist's update, every calendar change comes on a card until a check on your real calendars has passed and you tap Turn on. Cain starts the check and hands each step over on its card; the specialist judges it from its own record, never from what Cain says, and a full one comes to you on a card showing what it saw, with Turn on and Keep cards, and a Turn off button there after.
 - When the calendar turns a change down because the event changed since its card, Cain shows the fresh card that follows and doesn't hand it over again.
+- After every update of the calendar specialist, Cain runs the check on your real calendars first: until it has read a change back on Gmail and on Family, other calendar cards wait. Each check is good for that version, for a day and for one Turn on, its test events are titled "Smoke test:", and Cain shows the message that offers to take any leftovers off.
+- Turning the no-card changes off ends the check behind them, so turning them on again takes a new one.
 
 ## 0.11.0
 

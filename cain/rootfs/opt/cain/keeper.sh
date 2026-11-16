@@ -7,20 +7,29 @@
 #                                        (its last 30 minutes); without it, his newest message
 #   keeper.sh fastpath smoke-start      start the post-install smoke run: the specialist issues its
 #                                        id (answers with "run") and records every change approved
-#                                        after it under that id. Run the checklist through the normal
-#                                        card path, each change on its card and tapped
+#                                        while it's live under that id. Run the checklist through the
+#                                        normal card path, each change on its card and tapped. A run is
+#                                        bound to the specialist's version and ledger, lasts 24 hours,
+#                                        gives one Turn on, and ends at Turn on, Turn off, a new
+#                                        smoke-start, an update or its expiry; its adds are titled
+#                                        "Smoke test: ...". After an update, other cards wait until the
+#                                        run has read back a change on Gmail and on Family
 #   keeper.sh fastpath on <run id>       ask for that run's result. The specialist builds every item
 #                                        from its own record (event ids, request and read-back times,
-#                                        the writes refused for an older version, the listing lag);
-#                                        an item with no evidence is refused by name, and nothing you
+#                                        the writes refused for an older version, two listing-lag
+#                                        samples per calendar of at most 300 seconds); a run that's
+#                                        used, ran out or is from another version is refused, an item
+#                                        with no evidence is refused by name, and nothing you
 #                                        send as passed counts. A full run goes to Dane on a card
 #                                        showing the evidence and every no-card path, with Turn on and
 #                                        Keep cards; only his Turn on tap lets his own fresh, clear
 #                                        words, a mail date he taps Add to Family on and Family adds
 #                                        after the bake-in tap go through without a card, and a Turn
 #                                        off button then sits on that card. Until then, every change
-#                                        comes on a card
-#   keeper.sh fastpath off               every calendar change on a card again
+#                                        comes on a card. Leftover test events come in one message
+#                                        with Take them off
+#   keeper.sh fastpath off               every calendar change on a card again; the run is over and
+#                                        any Turn on card comes off, so turning on needs a new run
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
