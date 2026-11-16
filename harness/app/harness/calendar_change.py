@@ -463,6 +463,9 @@ class Part:
     # 0.24.0, fifth round: an add already there, when the calendar was made: the provider's own
     # created field (Google's "created", iCloud's CREATED), "" when it has none (migrate.py).
     created: str = ""
+    # 0.24.0, sixth round: an add already there, the id of the event found (Google's id, or the
+    # iCloud UID), so a late write of an earlier approval found there is said as ours (_adopt_late).
+    found_id: str = ""
 
 
 @dataclass
@@ -508,6 +511,9 @@ class CalendarChange:
         self.to_card: Callable[[Any, str], None] | None = None
         # His Propose again, and his pick of which card a note corrects, become cards (runner).
         self.reoffer: Callable[[str, str], str] | None = None
+        # A change the calendar refused for its version, offered again on a fresh card (sixth round):
+        # runner.recard(proposal, changes, why).
+        self.recard: Callable[[Any, list, str], str] | None = None
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -625,8 +631,7 @@ class CalendarChange:
         return (f"the {cal} event \u201c{_safe(b['title'])}\u201d" + (f", {at}" if at else "")
                 + scope + (f", id ending {tail}" if tail else ""))
 
-    @staticmethod
-    def _bound_of(f: "Found", op: str = "remove", scope: str = "") -> list[dict]:
+    def _bound_of(self, f: "Found", op: str = "remove", scope: str = "") -> list[dict]:
         """An event and its copies, as a read found them now: which calendar, its id, the day of a
         series it is (its recurrence id) and whether the change is to that day or to the whole
         series (0.24.0, third round), so the run touches exactly that and Undo puts back exactly
@@ -637,13 +642,81 @@ class CalendarChange:
                 caldav.href_path(getattr(x.raw, "href", "") or "").rsplit("/", 1)[-1] or x.series)
             # 0.24.0, fifth round: the event's version as the card's read found it (Google's etag, or
             # the iCloud resource's), sent with the write as If-Match, so a stale move or removal is
-            # refused by the calendar itself (_card_etag).
+            # refused by the calendar itself (_card_etag). Kept byte for byte as the calendar gave it,
+            # quotes and a weak marker included (sixth round).
             etag = (x.raw.get("etag") if isinstance(x.raw, dict) else getattr(x.raw, "etag", "")) or ""
-            out.append({"calendar": x.calendar, "series": x.series, "instance": x.instance, "id": ident,
-                        "title": x.title, "start": _text(x.start) if x.start is not None else "",
-                        "op": op, "recurrence": x.instance if x.repeats else "",
-                        "scope": scope or ("occurrence" if x.repeats else "event"), "etag": etag})
+            b = {"calendar": x.calendar, "series": x.series, "instance": x.instance, "id": ident,
+                 "title": x.title, "start": _text(x.start) if x.start is not None else "",
+                 "op": op, "recurrence": x.instance if x.repeats else "",
+                 "scope": scope or ("occurrence" if x.repeats else "event"), "etag": etag}
+            # 0.24.0, sixth round: everything the card showed of the event it targets (title, start, end,
+            # all day or not, its series's rule, location and notes), so a version that moved on is only
+            # ever taken for the card's when all of it still reads the same (_card_etag).
+            shown = self._print_of(x)
+            if shown is not None:
+                b["print"] = shown
+            out.append(b)
         return out
+
+    def _print_of(self, x: "Found") -> dict | None:
+        try:
+            if x.calendar == "gmail":
+                if not isinstance(x.raw, dict):
+                    return None
+                return self._gmail_print(x.raw)
+            data = getattr(x.raw, "data", "") or ""
+            return self._family_print(data, x.instance, x.first) if data else None
+        except (Refuse, ValueError, KeyError, TypeError, AttributeError, ical.Unreadable):
+            return None
+
+    def _gmail_print(self, ev: dict, master: dict | None = None) -> dict | None:
+        """A Google event as the card showed it, for the version compare (_card_etag). A day of a
+        series carries its series's rule, read from the series itself. None when it can't be read."""
+        start, end = self._gmail_when(ev.get("start")), self._gmail_when(ev.get("end"))
+        if start is None or end is None:
+            return None
+        rule = ev.get("recurrence")
+        if ev.get("recurringEventId"):
+            if master is None:
+                kind, master = self.google.look(self._gmail_address(), ev["recurringEventId"])
+                if kind != "ok" or not master:
+                    return None
+            rule = master.get("recurrence")
+        return _print(ev.get("summary", ""), start, end, list(rule or []), ev.get("location", ""),
+                      ev.get("description", ""))
+
+    def _family_print(self, body: str, instance: str, day: date) -> dict | None:
+        """One occurrence of an iCloud resource as the card showed it (_card_etag): its own VEVENT
+        (an override for that day, or the series), and the series's RRULE. None when it isn't found
+        near that day."""
+        occs = self._occurrences(body, *self._bounds([day - timedelta(days=1), day + timedelta(days=1)]))
+        o = next((o for o in occs if o.instance == instance), None)
+        if o is None:
+            return None
+        _, events = ical.parse_calendar(body)
+        zone = ZoneInfo(self.tz)
+        master = next((e for e in events if e.first("RECURRENCE-ID") is None), None)
+        own = master
+        for e in events:
+            rid = e.first("RECURRENCE-ID")
+            if rid is not None and ical._key(ical.parse_when(rid, zone)) == instance:
+                own = e
+        rule = [p.value for p in master.all("RRULE")] if master is not None else []
+        notes = own.first("DESCRIPTION") if own is not None else None
+        place = own.first("LOCATION") if own is not None else None
+        return _print(o.summary, o.start, o.end, rule, place.value if place else "", notes.value if notes else "")
+
+    def _shared(self, calendar: str, now: Any) -> bool:
+        """An event whose version can move on with no change to it (sixth round): a day of a Google
+        series, or an iCloud resource holding a series or more than one event. Only then may a
+        version that moved on since the card stand for the card's."""
+        try:
+            if calendar == "gmail":
+                return bool((now or {}).get("recurringEventId"))
+            _, events = ical.parse_calendar(now or "")
+            return len(events) > 1 or ics_edit.is_series(now or "")
+        except (ValueError, TypeError, AttributeError, ical.Unreadable):
+            return False
 
     def _checks(self, job, parts: list[Part]) -> list[str]:
         """What a request found clear still can't do on its words alone. Not judging what he
@@ -1359,6 +1432,10 @@ class CalendarChange:
         try:
             parts, notes = self._plan_all(params, p["id"])
         except Refuse as why:
+            adopted = self._adopt_late(p, None, None)
+            if adopted:
+                self._done_by_earlier(p, adopted)
+                return
             self._refused(p, "not_found", f"Nothing changed: {_safe(str(why))}.")
             return
         except (ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
@@ -1396,7 +1473,110 @@ class CalendarChange:
         if unsure:
             self._wait_for_read(p["id"], plan)       # he hears once a read settles it (_settle)
             return
-        self._finish(p, results, undo, notes)
+        adopted = self._adopt_late(p, parts, plan)
+        if adopted:
+            undo = undo + [e for e in adopted if e not in undo]
+            notes = [n for n in notes if "nothing of mine there to undo" not in n] + [
+                "Your earlier approval's write went through late, so this one found it already on the calendar: "
+                "it's there once, and Undo puts it back."]
+        self._finish(p, results, undo, notes, after_all=bool(adopted))
+
+    def _earlier_cards(self, pid: str) -> list[str]:
+        """The proposals this one was offered again from (inherit_keys)."""
+        return [r[0].split(":", 1)[1] for r in self.ledger.db.execute(
+            "SELECT key FROM meta WHERE key LIKE 'calendar_change_reoffer:%' AND value=?", (pid,))]
+
+    def _adopt_late(self, p, parts: list[Part] | None, plan: dict | None) -> list[dict]:
+        """A change offered again that finds itself already done (an add at its fixed id, a move or
+        removal the calendar shows as asked, a write refused for its version whose read by id shows it
+        as asked, or the event to take off already gone): before saying nothing of ours is there, the
+        ledger is read for a write of the same change from the card it was offered again from,
+        abandoned or lapsed with no answer, and that write is read again (sixth round). One the
+        calendar shows landed is that earlier write, landed late: its change is recorded as landed
+        late, and its Undo moves to this receipt, which says Done after all. [] when there's none, and
+        then nothing changes. `parts` None: any of the earlier card's writes (the event wasn't found)."""
+        olds = self._earlier_cards(p["id"])
+        if not olds:
+            return []
+        targets: set[str] | None = None
+        if parts is not None:
+            targets = set()
+            for pi, part in enumerate(parts):
+                steps = plan["parts"][pi]["steps"] if plan and pi < len(plan.get("parts", [])) else []
+                if not (part.already or any(rec.get("kind") == "as_asked" for rec in steps)):
+                    continue
+                targets |= {b["id"] for b in part.bound if b.get("id")}
+                if part.found_id:
+                    targets |= {part.found_id, f"{part.found_id}.ics"}
+            if not targets:
+                return []
+
+        def hits(entry: dict) -> bool:
+            if targets is None:
+                return True
+            if entry.get("cal") == "gmail":
+                return entry.get("id") in targets
+            return caldav.href_path(entry.get("href") or "").rsplit("/", 1)[-1] in targets
+        found: dict[str, list[dict]] = {}
+        for old in olds:
+            row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (old,)).fetchone()
+            if row is None or row["state"] not in ("lapsed", "absent", "unverified"):
+                continue
+            mine = [rec["entry"] for part in _plan(row).get("parts", []) for rec in part.get("steps", [])
+                    if rec.get("entry") and rec.get("status") in ("trying", "unsure") and hits(rec["entry"])]
+            if mine and all(self._seen_as(e)[0] == "landed" for e in mine):
+                found[old] = mine
+        if not found:
+            return []
+        adopted: list[dict] = []
+        now = iso(self.ledger.now())
+        with self.ledger.tx() as db:
+            for old, mine in found.items():
+                row = db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (old,)).fetchone()
+                if row is None or row["state"] not in ("lapsed", "absent", "unverified"):
+                    continue
+                was = _plan(row)
+                was["landed_late"] = now
+                was["adopted_by"] = p["id"]
+                was.pop("recheck", None)
+                was.pop("watch_next", None)
+                db.execute("UPDATE calendar_changes SET state='landed_late', undo_state='none', undo_json='[]',"
+                           " settle_json=?, updated_at=? WHERE proposal_id=?", (json.dumps(was), now, old))
+                db.execute("UPDATE proposals SET state='executed' WHERE id=? AND state='failed'", (old,))
+                self.ledger.event("calendar_change_landed_late", {"proposal": old, "found_by": p["id"]}, db=db)
+                adopted += [dict(e) for e in mine if e not in adopted]
+            if adopted:
+                cur = db.execute("SELECT undo_json FROM calendar_changes WHERE proposal_id=?", (p["id"],)).fetchone()
+                have = json.loads((cur[0] if cur else "") or "[]")
+                db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
+                           (json.dumps(have + [e for e in adopted if e not in have]), p["id"]))
+        if adopted:
+            log.info("calendar change %s: an earlier approval's write landed late; its Undo moves here",
+                     render.short(p["id"]))
+            for part in parts or []:
+                if part.already and part.found_id:      # ours after all: no Add anyway
+                    part.done = part.done.split(". Add anyway")[0].replace("Already there, nothing added: ",
+                                                                           "On the calendar: ")
+                    part.already = ""
+        return adopted
+
+    def _done_by_earlier(self, p, adopted: list[dict]) -> None:
+        """The event to change wasn't found, and an earlier approval's write of the same change is
+        what took it (_adopt_late): Done after all, with that write's Undo, and nothing written."""
+        lines = [x for old in self._earlier_cards(p["id"])
+                 for x in json.loads(self.ledger.get_meta(f"calendar_change_lines:{old}") or "[]")][:3]
+        names = "; ".join(render.plain(x) for x in lines) or "that change"
+        with self.ledger.tx() as db:
+            now = iso(self.ledger.now())
+            db.execute("UPDATE proposals SET state='executed' WHERE id=?", (p["id"],))
+            db.execute("UPDATE calendar_changes SET state='done', undo_state='open', updated_at=? WHERE proposal_id=?",
+                       (now, p["id"]))
+            self.ledger.transition(p["job_id"], "executed", db=db, receipt=json.dumps(
+                {"effect": effects.CALENDAR_CHANGE, "outcome": "done_earlier", "steps": len(adopted)}))
+            buttons, binds = self._undo_button(db, p["id"])
+            self._say(db, self.chat_id, p["job_id"], f"<b>Done after all:</b> {_safe(names)}. Your earlier "
+                      "approval's write went through late, so there was nothing left for this one to do. Undo puts "
+                      "it back.", buttons=buttons, binds=binds)
 
     # -- each write, recorded so a read can settle it -----------------------------------------
     def _part_record(self, part: Part) -> dict:
@@ -1494,23 +1674,39 @@ class CalendarChange:
 
     def _card_etag(self, calendar: str, ident: str, fresh: str = "", same: Callable[[dict], bool] | None = None) -> str:
         """The If-Match a move or removal sends (0.24.0, fifth round): the version of the event the
-        card's read found, so a write made stale by a correction, an Undo or anyone's edit since the
-        card is refused by the calendar itself (then _fenced). One exception, so a second card on the
-        same event isn't refused for the first one's write elsewhere in it (two days of one Family
-        series are one iCloud resource, and a Google series edit can give a day a new version): when
-        a read just now shows this very event, by id, with the title and start the card showed, the
-        version just read is sent instead, so the calendar still refuses anything newer than that
-        read. "" when the card kept no version (an add, or a proposal from before) and no fresh one
-        is given."""
+        card's read found, byte for byte as the calendar gave it, so a write made stale by a
+        correction, an Undo or anyone's edit since the card is refused by the calendar itself (then
+        _fenced). One exception (sixth round), so a second card on the same event isn't refused for
+        the first one's write elsewhere in it (two days of one Family series are one iCloud resource,
+        and a Google series edit can give a day a new version): only for an event that's part of a
+        series or a shared resource (`same` is given only then, _shared), and only when the read just
+        before the write shows the event the card targets with every field the card bound still the
+        same (title, start, end, all day or not, its series's rule, location and notes), is the
+        version just read sent instead, so the calendar still refuses anything newer than that read.
+        Any difference, or a card that kept no fields, sends the card's version: the calendar refuses
+        it and the event is offered again as it is now (_fenced). "" when the card kept no version (an
+        add, or a proposal from before) and no fresh one is given."""
         bound = self._card_bound(calendar, ident)
         card = bound[0]["etag"] if bound else ""
         if not card or not fresh or card == fresh:
             return card or fresh
-        if same is not None and all(same(b) for b in bound):
-            log.info("%s event's version moved on since its card, and it reads as the card showed it: "
-                     "guarded by the version just read", calendar)
+        if same is not None and all(b.get("print") and same(b) for b in bound):
+            log.info("%s event's version moved on since its card, and every field the card bound reads the "
+                     "same: guarded by the version just read", calendar)
             return fresh
+        log.info("%s event's version moved on since its card, and it %s: the card's version is sent",
+                 calendar, "reads differently" if same is not None else "isn't part of a series")
         return card
+
+    def _sent(self, calendar: str, what: str, if_match: str | None, out) -> None:
+        """Each move or removal's If-Match, as sent, and the calendar's answer code, in the log and on
+        the write's record (sixth round: the smoke test reads both)."""
+        status = getattr(out, "status", None)
+        log.info("%s %s sent with If-Match %s: answered %s%s", calendar, what, if_match or "(none)",
+                 getattr(out, "kind", "?"), f" ({status})" if status else "")
+        rec = self._recording
+        if rec is not None:
+            rec[2].update(if_match=if_match or "", code=status, answer=getattr(out, "kind", ""))
 
     def _fenced(self, calendar: str, ident: str, want: dict, title: str, href: str = "") -> None:
         if self._recording is not None and self._recording[3] is not None:
@@ -1519,8 +1715,10 @@ class CalendarChange:
         event is read by its id and compared with the change: title, start, end, all day or not, and
         repeating or not (0.24.0, fifth round). It shows the change as asked (a correction got there
         first, or someone else took it off): Stopped("as_asked"), Done with nothing of ours to undo.
-        Anything else, or a read that can't answer: Stopped("fenced"), not confirmed, with what the
-        read shows on the receipt. Nothing is written again either way."""
+        Anything else, or a read that can't answer: Stopped("stale") (sixth round): not applied, since
+        the calendar refused it, with what the read found on the receipt and a fresh card for the event
+        as it is now (_finish). Never unverified, never read for again. Nothing is written again either
+        way."""
         log.info("a write to %s was refused for its version: reading the event by its id", calendar)
         shows = ""
         try:
@@ -1557,9 +1755,7 @@ class CalendarChange:
                     shows = "a read of it by its id shows it changed another way" if occs else ""
         except (Refuse, ValueError, KeyError, TypeError, AttributeError, IndexError, ical.Unreadable):
             shows = ""
-        raise Stopped("fenced", words=(
-            "someone changed that event since I read it for this change, so the calendar turned the write "
-            "down and I left it alone" + (f"; {shows}" if shows else "; a read of it by its id didn't answer")))
+        raise Stopped("stale", words=(shows or "a read of it by its id didn't answer"))
 
     def _drain_late(self) -> None:
         """Writes abandoned at their timeout that have answered since (0.24.0, fourth round). One whose
@@ -1618,23 +1814,36 @@ class CalendarChange:
     def _done_after_all(self, pid: str, plan: dict, entries: list[dict], already: bool = False) -> None:
         """A change that lapsed, or was said as not found, that the calendar now shows (a write that
         answered late, or a later read): Done after all, with Undo for what it wrote, and the card that
-        offered it again comes off, so there's never a second one (0.24.0, fourth and fifth rounds)."""
+        offered it again comes off, so there's never a second one (0.24.0, fourth and fifth rounds). A
+        card offered again that he has approved and that hasn't run yet is replaced the same way; one
+        already running or done says its own receipt, so this says nothing more. Sixth round: the
+        receipt quotes his request, the day he asked and how it was approved; one he declined when it
+        was offered again says it landed although he declined, with Undo first; and one more than a
+        day old says how old the request is."""
         row = self.ledger.db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()
         p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
         if row is None or p is None or row["state"] not in ("lapsed", "absent"):
             return
         newer = self.ledger.get_meta(f"calendar_change_reoffer:{pid}")
         with self.ledger.tx() as db:
-            took_card = False
+            took_card, declined, quiet = False, False, False
             if newer:
                 from . import approvals
+                st = (db.execute("SELECT state FROM proposals WHERE id=?", (newer,)).fetchone() or {"state": ""})["state"]
                 took_card = approvals.supersede(self.ledger, newer, db=db, outcome="landed")
+                if not took_card and st in ("approved", "auto_approved"):
+                    # Approved and not yet run: it never runs (one compare-and-set on its state).
+                    took_card = db.execute("UPDATE proposals SET state='superseded' WHERE id=? AND state=?",
+                                           (newer, st)).rowcount == 1
+                declined = st == "declined"
+                quiet = st in ("executing", "executed")
                 if took_card:
                     job = db.execute("SELECT job_id FROM proposals WHERE id=?", (newer,)).fetchone()
-                    st = db.execute("SELECT state FROM jobs WHERE id=?", (job[0],)).fetchone() if job else None
-                    if st is not None and st["state"] == "proposed":
-                        self.ledger.transition(job[0], "cancelled", db=db,
-                                               receipt=json.dumps({"reason": "landed_late"}))
+                    jst = db.execute("SELECT state FROM jobs WHERE id=?", (job[0],)).fetchone() if job else None
+                    if jst is not None and jst["state"] in ("proposed", "approved"):
+                        # Approved and not run: done all the same, by the earlier write.
+                        self.ledger.transition(job[0], "cancelled" if jst["state"] == "proposed" else "executed",
+                                               db=db, receipt=json.dumps({"reason": "landed_late"}))
             undo = json.loads(row["undo_json"] or "[]")
             undo += [e for e in entries if e not in undo]
             plan["landed_late"] = iso(self.ledger.now())
@@ -1645,18 +1854,63 @@ class CalendarChange:
                        (json.dumps(undo), "open" if undo else row["undo_state"], json.dumps(plan),
                         iso(self.ledger.now()), pid))
             db.execute("UPDATE proposals SET state='executed' WHERE id=? AND state='failed'", (pid,))
-            self.ledger.event("calendar_change_landed_late", {"proposal": pid, "card_off": took_card}, db=db)
-            if took_card or not already:
+            self.ledger.event("calendar_change_landed_late", {"proposal": pid, "card_off": took_card,
+                                                              "declined": declined}, db=db)
+            if quiet and not declined:
+                return
+            if took_card or declined or not already:
                 names = "; ".join(part["will"] for part in plan.get("parts", []) if part.get("will"))
-                if row["state"] == "absent":
+                asked = self._request_words(p)
+                if declined:
+                    words = (f"<b>It went through after all, though you declined it:</b> {names}. Undo comes "
+                             "first: it takes it off again. An earlier write of it landed late, after you "
+                             "declined it when I offered it again.")
+                elif row["state"] == "absent":
                     words = f"<b>Done after all:</b> {names}. A later read of the calendar shows it as asked."
                 else:
                     words = (f"<b>Done after all:</b> {names}. That went through late, after I'd offered it "
                              "again" + (", so the newer card is off and nothing is added twice." if took_card else
                                         "; the newer one found it there, so it's on the calendar once."
                                         if already else "."))
+                words += ("\n" + asked) if asked else ""
                 buttons, binds = self._undo_button(db, pid) if undo else (None, None)
                 self._say(db, self.chat_id, p["job_id"], words, buttons=buttons, binds=binds)
+
+    def _request_words(self, p) -> str:
+        """His request a late receipt is for (sixth round): his words quoted, the day he asked, how it
+        was approved, and how old it is when that's more than a day. HTML-safe; "" when none is kept."""
+        try:
+            job = self.ledger.job(p["job_id"])
+            root = self.ledger.get_meta(f"job_parent:{p['job_id']}") or p["job_id"]
+            origin = json.loads(self.ledger.get_meta(f"job_origin:{p['job_id']}")
+                                or self.ledger.get_meta(f"job_origin:{root}") or "{}")
+            his = self.ledger.job_text(p["job_id"]).split("\n\n[A suggestion from Cain", 1)[0]
+            quote = provenance.one_line(origin.get("quote") or his, 100)
+            sent = datetime.fromisoformat(origin.get("sent_at") or job["created_at"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return ""
+        local = sent.astimezone(ZoneInfo(self.tz))
+        when = f"{local:%a %b} {local.day} at {render.clock_words(local, suffix=True)}"
+        tapped = self.ledger.db.execute("SELECT consumed_at FROM approvals WHERE proposal_id=? AND consumed_at"
+                                        " IS NOT NULL AND outcome='approve' ORDER BY consumed_at LIMIT 1",
+                                        (p["id"],)).fetchone()
+        auto = self.ledger.db.execute("SELECT 1 FROM events WHERE kind='calendar_change_auto' AND detail LIKE ?",
+                                      (f'%{p["id"]}%',)).fetchone()
+        if tapped is not None:
+            t = datetime.fromisoformat(tapped[0]).astimezone(ZoneInfo(self.tz))
+            how = f"You approved it on its card at {render.clock_words(t, suffix=True)}."
+        elif auto is not None:
+            how = "It went without a card, from your own fresh message."
+        else:
+            how = ""
+        out = (f"Your request: \u201c{render.escape(quote)}\u201d, asked {when}." if quote
+               else f"Asked {when}.") + (f" {how}" if how else "")
+        age = self.ledger.now() - sent
+        if age > timedelta(days=1):
+            days = age.days
+            out += f" That request is {days} day{'s' * (days != 1)} old." if days >= 2 else \
+                f" That request is {int(age.total_seconds() // 3600)} hours old."
+        return out
 
     def live_abandoned(self, pid: str | None = None) -> int:
         """Abandoned writes still running (of one change, given `pid`)."""
@@ -1740,6 +1994,7 @@ class CalendarChange:
             more, said_here = self._plan(change, keys[index] if index < len(keys) else f"{pid}:{index}")
             notes += said_here
             for part in more:
+                part.change = part.change or dict(change)    # what to offer again on a fresh card
                 same = next((x for x in parts if part.key and x.key and x.key[0] & part.key[0]), None)
                 if same is None:
                     parts.append(part)
@@ -1757,18 +2012,45 @@ class CalendarChange:
             return []
         return [str(k) for k in got] if isinstance(got, list) else []
 
-    def inherit_keys(self, new_pid: str, changes: list[dict], earlier: dict, db) -> None:
+    def inherit_keys(self, new_pid: str, changes: list[dict], earlier: dict, db) -> list[str]:
         """A change offered again (after its lease ran out, as Not confirmed, or replaced when Harness
         updated) keeps the key of its first offer, so its add writes to the same fixed id and finds
         an earlier write that landed instead of making a second event. `earlier`: each change's
         key (runner._change_key) to the key it was first offered under."""
         keys = [earlier.get(_offer_key(c), f"{new_pid}:{i}") for i, c in enumerate(changes)]
+        olds: list[str] = []
         if any(k != f"{new_pid}:{i}" for i, k in enumerate(keys)):
             self.ledger.set_meta(f"calendar_change_keys:{new_pid}", json.dumps(keys), db)
             for k in keys:
                 old = k.rsplit(":", 1)[0]
                 if old != new_pid:
                     self.ledger.set_meta(f"calendar_change_reoffer:{old}", new_pid, db)
+                    if old not in olds:
+                        olds.append(old)
+        return olds
+
+    def inherit_versions(self, new_pid: str, olds: list[str], db) -> None:
+        """A move or removal offered again (sixth round) is bound to the version its first card was:
+        each event the new card names that the first card named too (same calendar, id and day) takes
+        the first card's version and fields, so whichever write lands first, the other is refused by
+        the calendar and nothing is done twice."""
+        kept = self.bound_of(new_pid)
+        if not kept or not kept.get("bound"):
+            return
+        firsts = [b for old in olds for b in (self.bound_of(old) or {}).get("bound", []) if b.get("etag")]
+        changed = False
+        for b in kept["bound"]:
+            if b.get("op") not in ("move", "remove"):
+                continue
+            first = next((x for x in firsts if (x["calendar"], x["id"], x.get("instance")) ==
+                          (b["calendar"], b["id"], b.get("instance"))), None)
+            if first is not None and first["etag"] != b.get("etag"):
+                b["etag"] = first["etag"]
+                if first.get("print"):
+                    b["print"] = first["print"]
+                changed = True
+        if changed:
+            self.ledger.set_meta(f"calendar_change_bound:{new_pid}", json.dumps(kept), db)
 
     def keys_by_change(self, pid: str) -> dict:
         """{change key: the key its fixed id is made from} for one proposal's changes."""
@@ -1821,7 +2103,7 @@ class CalendarChange:
             if r.get("gone"):                    # a read from before the undo shows it gone
                 family_copy.hold(self.ledger, r["key"], gone=True, db=db)
 
-    def _finish(self, p, results: list, undo: list[dict], notes: list[str]) -> None:
+    def _finish(self, p, results: list, undo: list[dict], notes: list[str], after_all: bool = False) -> None:
         """One receipt: what was done, and what wasn't, each by name with why. Never "Nothing
         changed" when something did (Nov 11). Only known outcomes come here: one a read hasn't
         settled waits for it (_settle)."""
@@ -1831,14 +2113,15 @@ class CalendarChange:
         done = [part for part, _, s, _ in results if s is None]
         ok = not failed
         kind = "done" if ok else failed[0][2].kind
-        whole_fenced = [s for _, landed, s, _ in failed if s.kind == "fenced" and not landed]
-        if kind in ("read_back", "fenced") and (kind == "read_back" or whole_fenced):
+        # Refused for its version, and read by id as something else (sixth round): not applied, since the
+        # calendar turned it down, and offered again on a fresh card. Never unverified, never read for.
+        stale = [part for part, landed, s, _ in failed if s.kind == "stale" and not landed]
+        if any(s.kind == "read_back" for _, _, s, _ in failed):
             # Written, and the calendar doesn't read back that way: kept as unverified, never as
-            # done, and never written again on its own (0.24.0, third round). Or refused for its
-            # version and read by id as something else (fenced, fifth round): unverified too.
+            # done, and never written again on its own (0.24.0, third round).
             kind = "unverified"
-        elif kind == "fenced":
-            kind = "changed"                     # partly through, then refused for its version: as before
+        elif kind == "stale":
+            kind = "stale" if stale and failed[0][0] in stale else "changed"
         with self.ledger.tx() as db:
             now = iso(self.ledger.now())
             db.execute("UPDATE proposals SET state=? WHERE id=?",
@@ -1856,17 +2139,19 @@ class CalendarChange:
                 plan = json.loads(row[0]) if row and row[0] else {}
                 if plan.get("parts") and len(plan["parts"]) == len(results):
                     self._schedule_reads(plan, [i for i, (_, lnd, st, _) in enumerate(results)
-                                                if st is not None and (st.kind == "read_back"
-                                                                       or (st.kind == "fenced" and not lnd))])
+                                                if st is not None and st.kind == "read_back"])
                     self._save_plan(p["id"], plan, db)
             if ok:
                 db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
                 self.ledger.event("calendar_change_done", {"steps": len(undo)}, db=db)
-                head = "<b>Nothing added.</b>" if done and all(part.already for part in done) else "<b>Done.</b>"
+                head = ("<b>Done after all.</b>" if after_all
+                        else "<b>Nothing added.</b>" if done and all(part.already for part in done) else "<b>Done.</b>")
             else:
                 self.ledger.set_meta(PROBLEM, "Calendar change: the last one didn't finish", db)
                 head = ("<b>Only part of that went through.</b>" if done
-                        else "<b>Not confirmed.</b>" if all(s.kind == "read_back" or (s.kind == "fenced" and not landed)
+                        else "<b>Not applied.</b>" if all(s.kind == "stale" and not landed
+                                                          for _, landed, s, _ in failed)
+                        else "<b>Not confirmed.</b>" if all(s.kind == "read_back" or (s.kind == "stale" and not landed)
                                                             for _, landed, s, _ in failed)
                         else "<b>That stopped partway.</b>" if any(landed for _, landed, _, _ in failed)
                         else "<b>Not confirmed.</b>" if any(s.kind in ("unconfirmed", "read_back")
@@ -1880,8 +2165,13 @@ class CalendarChange:
                 # never "on Family, not on Family".
                 if s.kind == "read_back":        # written, and the calendar read back says otherwise
                     lines.append(s.words)
-                elif s.kind == "fenced" and not landed:   # refused for its version, read by id as otherwise
-                    lines.append(f"Not confirmed: {part.will}. {s.words[:1].upper()}{s.words[1:]}.")
+                elif s.kind == "stale" and not landed:    # refused for its version, read by id as otherwise
+                    lines.append(f"Not applied: {part.will}. The event changed since your card, so the calendar "
+                                 f"turned the write down: {s.words}."
+                                 + (" A fresh card with it as it is now follows." if self.recard is not None else ""))
+                elif s.kind == "stale":
+                    lines.append(f"Partly done: {part.will}. It went through on {went}, not on {at.what}, because "
+                                 f"the event changed there since your card: {s.words}.")
                 elif s.kind == "unconfirmed":    # reads never could tell, and they've stopped
                     lines.append(f"Not confirmed: {part.will}. " + (
                         f"Part of it went through on {at.what}; reads couldn't tell whether the rest did"
@@ -1925,6 +2215,19 @@ class CalendarChange:
             self._say(db, self.chat_id, p["job_id"], "\n".join(lines), buttons=buttons, binds=binds)
         log.info("calendar change job %s: %s, %d of %d part(s) done, %d write(s)",
                  render.short(p["job_id"]), kind, len(done), len(results), len(undo))
+        if stale and self.recard is not None:
+            # One fresh card for what the calendar refused, read anew, so it's bound to the event's
+            # version now (sixth round). Never applied without his tap.
+            changes = []
+            for part in stale:
+                if part.change and part.change not in changes:
+                    changes.append(dict(part.change))
+            if changes:
+                try:
+                    self.recard(p, changes, "the event changed since your earlier card, so this is a fresh card "
+                                            "with it as it is now")
+                except (Refuse, ValueError, KeyError, TypeError) as e:
+                    log.warning("the fresh card after a refused write failed: %s", type(e).__name__)
 
     def _schedule_reads(self, plan: dict, parts: list[int]) -> None:
         """A change not confirmed, or whose lease ran out: read again about 30 seconds and 2 minutes on,
@@ -2926,7 +3229,7 @@ class CalendarChange:
                          f"{self._when_words(same.start, same.end) if same.end is not None else _day_words(same.first)}, "
                          f"is on your {cal} calendar. Add anyway adds a second one")
                 return Part(words, words, [], name=_safe(c["title"]), already=words, change=dict(c),
-                            created=self._created_of(same))
+                            created=self._created_of(same), found_id=same.series)
             if like is not None:
                 # One only like it (one name holds the other's words, it's on the other calendar, or
                 # its end, all-day or repeating differs): his decision, on a card that names it, and
@@ -3116,20 +3419,16 @@ class CalendarChange:
 
     def _guard_for(self, href: str, fresh: str, body: str = "") -> str:
         """The If-Match a move or removal on Family sends (_card_etag): the card's version of the
-        resource, or the version just read when that read shows each event the card named at the
-        title and start it showed."""
+        resource, or, for a resource that holds a series or more than one event, the version just
+        read when that read shows each event the card named with every field it bound the same."""
         ident = caldav.href_path(href or "").rsplit("/", 1)[-1]
 
         def same(b: dict) -> bool:
             try:
-                start = _when(b["start"])
-                day = self._day_of(b)
-                occs = self._occurrences(body, *self._bounds([day - timedelta(days=1), day + timedelta(days=1)]))
-            except (ValueError, KeyError, TypeError, ical.Unreadable):
+                return self._family_print(body, b["instance"], self._day_of(b)) == b.get("print")
+            except (ValueError, KeyError, TypeError, AttributeError, ical.Unreadable):
                 return False
-            return any(o.instance == b["instance"] and _same_start(o.start, start)
-                       and exact_title(o.summary) == exact_title(b["title"]) for o in occs)
-        return self._card_etag("family", ident, fresh, same if body else None)
+        return self._card_etag("family", ident, fresh, same if body and self._shared("family", body) else None)
 
     def _occurrences(self, ics: str, start: datetime, end: datetime) -> list[ical.Occurrence]:
         return ical.window(ics, start=start, end=end, tz=self.tz, fallback_name="Family").occurrences
@@ -3171,7 +3470,9 @@ class CalendarChange:
         entry = {"cal": "family", "how": "put", "href": href, "before": before, "after": new,
                  "sent": new, "etag": "", "was": etag, "check": check}
         self._attempt(entry)
-        out = self._bounded("family", self.client.replace, href, self._guard_for(href, etag, before), new)
+        guard = self._guard_for(href, etag, before)
+        out = self._bounded("family", self.client.replace, href, guard, new)
+        self._sent("family", check.get("kind") or "change", guard, out)
         if out.kind == "changed" and title:
             self._fenced("family", "", {"kind": check.get("kind"), "check": check}, title, href)
         if out.kind != "ok":
@@ -3208,7 +3509,9 @@ class CalendarChange:
     def _family_delete(self, href: str, etag: str, body: str, title: str = "") -> dict:
         entry = {"cal": "family", "how": "restore", "href": href, "before": body, "was": etag}
         self._attempt(entry)
-        out = self._bounded("family", self.client.remove_at, href, self._guard_for(href, etag, body))
+        guard = self._guard_for(href, etag, body)
+        out = self._bounded("family", self.client.remove_at, href, guard)
+        self._sent("family", "removal", guard, out)
         if out.kind == "changed" and title:
             self._fenced("family", "", {"kind": "gone"}, title, href)
         if out.kind != "ok":
@@ -3345,14 +3648,20 @@ class CalendarChange:
             raise Stopped("changed")
         return now
 
-    def _gmail_same(self, now: dict) -> Callable[[dict], bool]:
-        """Whether Google's event as just read is the event the card showed: title and start."""
+    def _gmail_same(self, now: dict) -> Callable[[dict], bool] | None:
+        """Whether Google's event as just read is the event the card showed, every field it bound
+        (_card_etag). None for an event that isn't a day of a series: its card's version stands."""
+        if not self._shared("gmail", now):
+            return None
+        got: dict = {}
+
         def same(b: dict) -> bool:
-            try:
-                return exact_title(now.get("summary", "")) == exact_title(b["title"]) \
-                    and _same_start(self._gmail_when(now.get("start")), _when(b["start"]))
-            except (ValueError, KeyError, TypeError):
-                return False
+            if "print" not in got:
+                try:
+                    got["print"] = self._gmail_print(now)
+                except (Refuse, ValueError, KeyError, TypeError, AttributeError):
+                    got["print"] = None
+            return got["print"] is not None and got["print"] == b.get("print")
         return same
 
     def _gmail_drop(self, address: str, e: dict) -> dict:
@@ -3361,8 +3670,9 @@ class CalendarChange:
         if e.get("recurringEventId"):
             entry["series"] = e["recurringEventId"]
         self._attempt(entry)
-        out = self._bounded("gmail", self.google.drop, address, e["id"],
-                            self._card_etag("gmail", e["id"], e.get("etag") or "", self._gmail_same(e)) or e.get("etag"))
+        guard = self._card_etag("gmail", e["id"], e.get("etag") or "", self._gmail_same(e)) or e.get("etag")
+        out = self._bounded("gmail", self.google.drop, address, e["id"], guard)
+        self._sent("gmail", "removal", guard, out)
         if out.kind == "changed":
             self._fenced("gmail", e["id"], {"kind": "gone"}, e.get("summary", ""))
         self._gmail_send(out, entry)
@@ -3438,9 +3748,9 @@ class CalendarChange:
             entry = {"cal": "gmail", "how": "change", "id": e["id"], "fields": old, "wrote": fields,
                      "was": now.get("etag"), "check": {"kind": "starts", "start": _text(start), "end": _text(end)}}
             self._attempt(entry)
-            out = self._bounded("gmail", self.google.change, address, e["id"], fields,
-                                self._card_etag("gmail", e["id"], now.get("etag") or "", self._gmail_same(now))
-                                or now.get("etag"))
+            guard = self._card_etag("gmail", e["id"], now.get("etag") or "", self._gmail_same(now)) or now.get("etag")
+            out = self._bounded("gmail", self.google.change, address, e["id"], fields, guard)
+            self._sent("gmail", "move", guard, out)
             if out.kind == "changed":
                 self._fenced("gmail", e["id"], {"kind": "starts", "start": _text(start), "end": _text(end),
                                                 "recurring": bool(e.get("recurringEventId") or e.get("recurrence"))},
@@ -4007,6 +4317,14 @@ class CalendarChange:
         if problem == "unknown":
             self._undo_not_yet(row)
             return
+        if problem == "changed" and row["state"] == "landed_late":
+            # A late landing's Undo is fenced by the event's version now (sixth round): changed since,
+            # it's left as it is, and he sees how it reads now.
+            shows = self._now_words(steps)
+            self._reopen(row, f"<b>Not undone:</b> {_safe(self._names(_plan(row)))} changed on the calendar after it "
+                              "went through late, so I left it as it is." + (f" It reads now: {shows}." if shows else "")
+                              + " Undo here won't work while it stays that way.")
+            return
         if problem is not None:
             again = (" Undo here won't work while it stays that way." if problem == "changed"
                      else " Undo tries again.")
@@ -4069,6 +4387,33 @@ class CalendarChange:
             self.ledger.set_meta(PROBLEM, "Calendar change: an undo didn't finish", db)
         self._reopen(row, f"<b>Not fully undone:</b> {_safe(WORDS.get(problem, 'the calendar refused it'))}. "
                           "Undo tries what's left again.")
+
+    def _now_words(self, steps: list) -> str:
+        """How the events a change wrote read now, for a card that can't undo it (sixth round)."""
+        out = []
+        for step in steps[-3:]:
+            try:
+                if step.get("cal") == "gmail":
+                    kind, ev = self.google.look(self.address(), step["id"])
+                    if kind == "gone" or (ev or {}).get("status") == "cancelled":
+                        out.append("that event is gone")
+                    elif kind == "ok" and ev:
+                        start, end = self._gmail_when(ev.get("start")), self._gmail_when(ev.get("end"))
+                        out.append(f"\u201c{_safe(ev.get('summary', ''))}\u201d at {self._at_words(start, end)}")
+                elif step.get("cal") == "family":
+                    got, body = self.client.fetch(step["href"])
+                    if got.kind == "gone":
+                        out.append("that event is gone")
+                    elif got.kind == "ok":
+                        today = self._today()
+                        occs = self._occurrences(body, *self._bounds([today - timedelta(days=1),
+                                                                     today + timedelta(days=60)]))
+                        if occs:
+                            o = occs[0]
+                            out.append(f"\u201c{_safe(o.summary)}\u201d at {self._at_words(o.start, o.end)}")
+            except (Refuse, ValueError, KeyError, TypeError, AttributeError, ical.Unreadable):
+                continue
+        return "; ".join(dict.fromkeys(out))
 
     def _undone_reads(self, step: dict) -> str:
         """An undone write, read again: "ok" when the calendar shows it as it was before the
@@ -4372,7 +4717,8 @@ class CalendarChange:
                 return there
             if not self._undo_attempt(step):
                 return "not_landed"
-            out = self._bounded("gmail", self.google.change, address, uid, step["fields"], None)
+            # Fenced by the version just read (sixth round): anyone's change since is refused.
+            out = self._bounded("gmail", self.google.change, address, uid, step["fields"], (cur or {}).get("etag") or None)
         else:
             if cancelled:
                 return "ok" if step["how"] == "drop" else "gone"
@@ -4505,6 +4851,17 @@ def _moment(when) -> str:
 def _text(when) -> str:
     """A time as family_copy.py keeps it."""
     return when.isoformat()
+
+
+def _print(title: str, start, end, rule: list, location: str, notes: str) -> dict:
+    """An event's shown fields, compared whole (_card_etag): title, start, end, all day or not, its
+    series's rule, location, and its notes (as a hash: they're compared, never kept)."""
+    def at(x) -> str:
+        return x.astimezone(timezone.utc).isoformat() if isinstance(x, datetime) else x.isoformat()
+    return {"title": exact_title(title), "start": at(start), "end": at(end),
+            "all_day": not isinstance(start, datetime), "rule": [str(r).strip() for r in rule],
+            "location": " ".join((location or "").split()),
+            "notes": hashlib.sha256(" ".join((notes or "").split()).encode()).hexdigest()[:16]}
 
 
 def _same_start(a, b) -> bool:

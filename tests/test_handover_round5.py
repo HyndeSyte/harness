@@ -159,10 +159,12 @@ def test_the_card_keeps_the_events_version_and_a_tap_after_a_correction_is_refus
     correct_haircut(m, 9, 30)                        # a correction lands before his tap
     m.tap("Approve")
     assert sent == ['"h"'] and haircut_at(m) == "09:30"       # sent with the card's version, refused
-    receipt = m.seen()[-1]
-    assert receipt.startswith("Not confirmed.") and "Someone changed that event since" in receipt
+    # Sixth round: refused, so not applied (never unverified), and a fresh card follows.
+    receipt = next(t for t in m.seen() if t.startswith("Not applied."))
+    assert "The event changed since your card" in receipt
     assert "a read of it by its id shows “Haircut” at 9:30" in receipt
-    assert rows(m)[-1]["state"] == "unverified" and "Undo" not in m.labels()
+    assert m.ledger.db.execute("SELECT state FROM calendar_changes WHERE proposal_id=?", (pid,)).fetchone()[0] == "stale"
+    assert "fresh card with it as it is now" in m.seen()[-1] and "Undo" not in m.labels()
 
 
 @pytest.mark.card_only

@@ -424,7 +424,10 @@ def test_someone_editing_in_between_stops_the_write(r):
     r.icloud.before_write = lambda: r.icloud.human_edit(PATH, "School Day", "School Days")
     r.tell(change(dates="2026-11-23"))
     assert "School Days" in r.body() and "2026-11-23" in days_of(r.body())
-    assert "changed that event" in r.texts()[-1]
+    # 0.24.0, sixth round: refused for its version, so not applied, and one fresh card follows.
+    receipt = next(t for t in r.texts() if t.startswith("<b>Not applied.</b>"))
+    assert "The event changed since your card" in receipt and "A fresh card" in receipt
+    assert "fresh card with it as it is now" in r.texts()[-1] and r.with_button("Approve")
 
 
 def test_a_lost_answer_is_read_and_the_receipt_follows(r):
@@ -478,6 +481,11 @@ def test_several_changes_that_need_a_tap_come_one_card_each(r):
     days = days_of(r.body())
     assert "2026-11-23" in days and "2027-03-08" not in days and "2027-03-03" in days
     r.press(day_card, "Approve")
+    # 0.24.0, sixth round: ending the series changed its rule since the day's card, so that card's
+    # version isn't taken for the one just read: refused, not applied, and offered again as it is now.
+    assert "2026-11-23" in days_of(r.body())
+    assert any(t.startswith("<b>Not applied.</b>") for t in r.texts())
+    r.approve()
     assert "2026-11-23" not in days_of(r.body())
     assert len([s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)]) == 2
 

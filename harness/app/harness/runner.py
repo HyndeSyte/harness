@@ -165,6 +165,7 @@ class Runner:
         if calendar_change is not None:
             calendar_change.to_card = self.card_instead
             calendar_change.reoffer = self.reoffer
+            calendar_change.recard = self.recard
 
     # -- budget -----------------------------------------------------------
     def _budget_ok(self, provider: str) -> bool:
@@ -587,7 +588,7 @@ class Runner:
                     replaced=bool(replaced_keys) or None if change else None)
 
     def _offer(self, job, d, params, receipt, warnings, lines, *, seen=None, head=(),
-               replaced: bool | None = None) -> None:
+               replaced: bool | None = None, keep_versions: bool = True) -> None:
         """The proposal, and the card that tells him about it, or its run with no tap. Only his
         own newest message, under 2 minutes old, with nothing of Cain's and not split, runs with
         no tap: anything else carries a flag (_provenance) and comes on a card."""
@@ -619,11 +620,16 @@ class Runner:
                 self.family_add.note_warned(pid, db)
             if change:
                 # A change offered again keeps the fixed id of its first offer (0.24.0, fourth round).
-                self.calendar_change.inherit_keys(pid, params["changes"], self._earlier_keys(job), db)
+                olds = self.calendar_change.inherit_keys(pid, params["changes"], self._earlier_keys(job), db)
             if change:                      # what it says it will do, for his tap and the record
                 self.calendar_change.note_lines(
                     pid, lines or [render.change_line(c, self.config.timezone, self.ledger.now())
                                    for c in params["changes"]], db, seen=seen)
+                if keep_versions and olds:
+                    # And, for a move or removal, the version its first card was bound to (sixth round),
+                    # so the first write landing just before or after this one's can't make two. Not
+                    # for the fresh card after a refused write: that one is bound to the event as it is.
+                    self.calendar_change.inherit_versions(pid, olds, db)
             # The no-card paths only once the smoke test is recorded as passed (keeper.sh fastpath
             # on, 0.24.0 fourth round); until then this is a normal card.
             if change and not warnings and self.calendar_change.fast_path_ok():
@@ -680,6 +686,15 @@ class Runner:
         if not n:
             return "Already on the calendar, so nothing to bring back." if found else "Nothing to bring back there."
         return f"Back on {n} new card{'s' * (n != 1)}, each waiting for your tap."
+
+    def recard(self, p, changes: list, why: str) -> str:
+        """A change the calendar refused for its version (calendar_change._finish, sixth round): its
+        changes on one fresh card for the same message, read anew so the card is bound to the event's
+        version now, never to the old card's. Its request's id, or "" when there's none to offer."""
+        old = self.ledger.job(p["job_id"])
+        if old is None or not changes:
+            return ""
+        return self._offer_new(old, {"changes": list(changes)}, why, replaced=False, keep_versions=False)
 
     def _again(self, p, why: str) -> str:
         """One earlier request's change, as a new request of the same message, on a card."""
@@ -1048,7 +1063,7 @@ class Runner:
         self._offer_new(job, params, why, replaced=won)
         return "The correction is on a new card." + (" That card is off." if won else "")
 
-    def _offer_new(self, src, params: dict, why: str, *, replaced: bool) -> str:
+    def _offer_new(self, src, params: dict, why: str, *, replaced: bool, keep_versions: bool = True) -> str:
         """A change for the same message as `src` (its quote, flags and fixed ids kept), as a new
         request, on a card: never applied without his tap. Its request's id."""
         root = self.ledger.get_meta(f"job_parent:{src['id']}") or src["id"]
@@ -1065,7 +1080,7 @@ class Runner:
         seen = self.calendar_change.preview_quiet(job, params)
         warnings = [why] + (seen.checks if seen else [])
         self._offer(job, effects.REGISTRY[effects.CALENDAR_CHANGE], params, {"reason": "offered_again"}, warnings,
-                    seen.lines if seen else None, seen=seen, replaced=replaced)
+                    seen.lines if seen else None, seen=seen, replaced=replaced, keep_versions=keep_versions)
         return new
 
     def _newer_note(self, job, pids: list[str]) -> str:

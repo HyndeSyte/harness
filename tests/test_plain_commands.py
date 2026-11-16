@@ -392,7 +392,7 @@ def test_a_copy_that_fails_says_where_it_went_through(m):
     assert m.gmail_times(PT_ID) == ("11:30", "12:30")
     assert receipt.startswith("That stopped partway.") or receipt.startswith("Only part")
     assert ("Partly done: Move PT to 11:30 to 12:30 today (Gmail and Family). It went through on Gmail, "
-            "not on the Family copy, because someone changed that event since") in receipt
+            "not on the Family copy, because the event changed there since your card") in receipt
 
 
 # -- g. a block Harness made is found where it is -----------------------------------------------
