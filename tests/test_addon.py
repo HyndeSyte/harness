@@ -1507,7 +1507,7 @@ def _checkin(tmp_path, now, screen, runs=None, checked=True, after=None, day="20
         "#!/bin/bash\n"
         'if [ "$2" = capture-pane ]; then\n'
         '  if [ ! -f "$STUB_BOX/typed" ]; then printf "%s\\n" "$STUB_SCREEN"\n'
-        '  elif [ -n "${STUB_AFTER:-}" ]; then printf "%s\\n" "$STUB_AFTER"\n'
+        '  elif [ -n "${STUB_AFTER:-}" ]; then m=$(head -c 8 "$STUB_BOX/typed"); printf "%s\\n" "${STUB_AFTER//\\{mark\\}/$m}"\n'
         '  else printf "\\342\\235\\257 %s\\n  ? for shortcuts\\n" "$(cat "$STUB_BOX/typed")"; fi\n'
         '  exit 0\n'
         'fi\n'
@@ -1752,6 +1752,20 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
     assert _prompt_state(f"{RULE}\n> \n  a warning\n  ? for shortcuts") == "other"      # a row, no border under the box
     assert _prompt_state(f"{RULE}\n> \n{RULE}\n  one\n  two\n  three\n  four\n  ? for shortcuts") == "other"   # over three
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
+    # The whole of a draft (PROMPT_DRAFT_TEXT), case kept, spaces and line ends out: on the real screen
+    # all that was typed; after one Ctrl+U, only its start (outside review, round 17).
+    typed = ("Held by others, skip these: P33. New notes on your items, read them before you change those items (words "
+             "passed on, not his go on anything): P69: «Nov 16, laptop session: your 7:10 check-in never reached you. The "
+             "offer opened in your session at 4:57 AM, and the App took it for your prompt, so your taps went into it...». "
+             "Scheduled check-in from the Cain add-on (1230). Not a message from the owner, and not his go on anything. "
+             "Follow the Check-ins section of your CLAUDE.md. Post to the owner only if something finished or needs his "
+             "decision.")
+    whole = _prompt_state(REAL_NOTICE_DRAFT, PROMPT_DRAFT_TEXT="1").split("\n")
+    assert whole[0] == "draft" and whole[1] == "".join(typed.split())
+    part = _prompt_state(REAL_NOTICE_HALF, PROMPT_DRAFT_TEXT="1").split("\n")[1]
+    assert "".join(typed.split()).startswith(part) and len(part) < len("".join(typed.split()))
+    assert _prompt_state(BOX_LONG_DRAFT, PROMPT_DRAFT_TEXT="1").split("\n")[1] == \
+        'Relayedbytheadd-on:Danetapped"Ship"onthecardfortheupdate'
     for screen, first in ((REAL_NOTICE_DRAFT, "held by others, skip these: p33."), (BOX_LONG_DRAFT, "relayed by the add-on:"),
                           (DRAFT, "/permissions"), (LONG_DRAFT, "relayed by the add-on: dane tapped")):
         out = _prompt_state(screen, PROMPT_DRAFT_LINE="1").split("\n")
@@ -1979,6 +1993,12 @@ def test_the_way_out_of_a_question_holds_when_its_own_steps_fail(tmp_path):
     old = "Earlier output: Paste code here if prompted >\n"
     assert run(2000, IDLE) == "" and run(2010, old + AUTO_MODE_OFFER) == "" and run(2310, old + AUTO_MODE_OFFER) == ""
     assert len(read("sent")) == sent + 3 and read("notice")[told:] == ["5 tell waiting"]
+    # A count's history that isn't times, one a line: Dane hears at the next Esc (outside round 17).
+    t += 10_000
+    (state / "told").unlink(missing_ok=True)
+    (state / "escs").write_text("12345\nnot a time\n")
+    told = len(read("notice"))
+    assert run(0, IDLE) == "" and run(10) == "" and run(310) == "" and read("notice")[told:] == ["5 tell waiting"]
     # No place for its state: a question on screen is told at once, and taken down at his prompt.
     (tmp_path / "file").write_text("x")
     nowhere = (tmp_path / "file" / "state").as_posix()
@@ -2115,6 +2135,15 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         other = "❯ [0a0b0c] Relayed by the add-on: the specialist asks to ship pull request 17\n  ? for shortcuts"
         out = _checkin(tmp_path, "0300", IDLE, runs=2, after=other)
         assert "request 18" in out and "Enter" not in out and "request 18" in work.read_text()
+        (tmp_path / "box/typed").unlink(missing_ok=True)
+        out = _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
+        assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""
+        # The box holding only the start of the try (its mark): no Enter, after reading it three times
+        # (outside review, round 17).
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "Ship pull request 18 only after review"}\n', newline="\n")
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after="❯ {mark}\n  ? for shortcuts")
+        assert "pull request 18" in out and "Enter" not in out and "request 18" in work.read_text()
         (tmp_path / "box/typed").unlink(missing_ok=True)
         out = _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
         assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""

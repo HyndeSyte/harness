@@ -56,6 +56,8 @@ ours() {   # ours <draft's first line> <the try's mark>
   seen=$(printf '%s' "$1" | tr -d ' \t')
   [ -n "$2" ] && [ "${seen:0:$(( ${#2} + 2 ))}" = "[$2]" ]
 }
+# Text as prompt-state.sh gives a whole draft: every space, no-break space and line end taken out.
+bare() { printf '%s' "$1" | tr -d ' \t\r\n' | sed 's/\xc2\xa0//g'; }
 screen=$(read_screen) || { rm -f "$state/ready"; exit 0; }
 last=$(printf '%s\n' "$screen" | tail -n 12)
 # Only at his prompt (prompt-state.sh): never into a screen waiting for an answer, which typing
@@ -132,13 +134,20 @@ type_in() {
     || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
   if ! timeout 10 $TM -u send-keys -t cain -l "[$mark] $1"; then return 1; fi
   sleep 1
-  local after word
-  after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null)
-  if [ "${after%%$'\n'*}" = ready ]; then sleep 2; after=$(read_screen | PROMPT_DRAFT_LINE=1 "$PS" 2>/dev/null); fi   # slow to draw
-  word="${after%%$'\n'*}"
+  # All of it, mark first, as his box holds it: read up to three times a second apart while it
+  # draws (his box still empty, or holding only part of it), never past a question or anything else.
+  local want after word got i
+  want=$(bare "[$mark] $1")
+  for i in 1 2 3; do
+    after=$(read_screen | PROMPT_DRAFT_TEXT=1 "$PS" 2>/dev/null)
+    word="${after%%$'\n'*}"; got=$(printf '%s\n' "$after" | sed -n 2p)
+    [ "$word" = draft ] && [ "$got" = "$want" ] && break
+    [ "$word" = ready ] || { [ "$word" = draft ] && [ "${got:0:8}" = "[$mark]" ]; } || break
+    [ "$i" = 3 ] || sleep 1
+  done
   rm -f "$state/ready"
-  if [ "$word" != draft ] || ! ours "$(printf '%s\n' "$after" | sed -n 2p)" "$mark"; then
-    echo "[cain] his input box didn't hold what was typed (${word:-unread}): nothing sent, tried again later"
+  if [ "$word" != draft ] || [ "$got" != "$want" ]; then
+    echo "[cain] his input box didn't hold all that was typed (${word:-unread}): nothing sent, tried again later"
     return 1
   fi
   timeout 10 $TM -u send-keys -t cain Enter || return 1
