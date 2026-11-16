@@ -62,6 +62,7 @@
   },
   "syncClaudeAiPlugins": false,
   "skillOverrides": { "auto-mode-setup": "off" },
+  "promptSuggestionEnabled": false,
   "hooks": {
     "PreToolUse": [
       {

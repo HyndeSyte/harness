@@ -10,6 +10,10 @@ if [ "${CAIN_MODE:-}" = own ]; then
 else
   export HOME=/data
 fi
+# No gray suggested prompts in his input box: no one is at his screen to take one, each costs a
+# request, and the App types only into an empty box (prompt-state.sh), which one would fill. The
+# variable outranks any setting (Claude Code's docs, "Turn prompt suggestions off").
+export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
 exec 2>>/data/session.log
 echo "$(date -Is) session.sh starting (${CAIN_MODE:-old})" >&2
 cd /data/work || { echo "no /data/work" >&2; exit 1; }

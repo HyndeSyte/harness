@@ -91,6 +91,13 @@ describe("nothing of his own adds to his rules (C1)", () => {
 // Claude Code's own offers that stop a session at a question can't stop his: no one is at his
 // screen to answer. Nov 16, its offer to set up auto mode sat in his session for three hours.
 describe("Claude Code's auto mode setup offer is off (Nov 16)", () => {
+  test("and no gray suggested prompts in his input box, which the App's typing would add to (round 11)", () => {
+    expect(settings.promptSuggestionEnabled).toBe(false);
+    const session = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/session.sh"), "utf8");
+    const off = session.indexOf("export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false");
+    expect(off).toBeGreaterThan(-1);
+    expect(off).toBeLessThan(session.indexOf("claude --permission-mode"));   // both ways, before it starts
+  });
   test("the new way and the old", () => {
     const legacy = JSON.parse(readFileSync(join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json"), "utf8"));
     expect(settings.skillOverrides).toEqual({ "auto-mode-setup": "off" });

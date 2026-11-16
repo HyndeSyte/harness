@@ -1635,6 +1635,11 @@ BOX_IDLE = f"╭{RULE}╮\n│ >  {' ' * 56}│\n╰{RULE}╯\n  ? for shortcuts
 QUOTED_FOOTER = "Claude said:\n  “For shortcuts, press ?”\n  Last message delivered."
 OPTION_SCREEN = ("  Permission mode\n  ❯ 1. auto mode on\n    2. default\n"
                  "  Enter to apply · Esc to exit")
+# His input area holding a draft not sent (round 11): typing would add to it and send it.
+DRAFT = "❯ /permissions\n  ? for shortcuts"
+BOX_DRAFT = f"╭{RULE}╮\n│ > unfinished draft {' ' * 41}│\n╰{RULE}╯\n  ? for shortcuts"
+# Claude Code's gray start-up example in an empty box, which typing replaces.
+STARTUP_EXAMPLE = '> Try "fix the lint errors in app.ts"\n  ? for shortcuts'
 
 
 def _prompt_state(screen):
@@ -1654,9 +1659,11 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
     with Claude Code's footer, right under the prompt line (borders between), in the bottom lines,
     with no dialog's key hints below it. Rows under the footer (background tasks) don't matter;
     words that only look like a footer or a hint count for nothing. Never fails."""
-    for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE,
+    for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE, STARTUP_EXAMPLE,
                    "To stop it, press Esc to cancel.\n" + IDLE):
         assert _prompt_state(screen) == "ready", screen
+    for screen in (DRAFT, BOX_DRAFT, "> Try this instead\n  ? for shortcuts"):     # a draft not sent
+        assert _prompt_state(screen) == "other", screen
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("He said: auto mode on, ? for shortcuts.\n" + AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("  Select model\n  > Opus\n  Enter to confirm · Esc to exit") == "dialog"
@@ -1678,8 +1685,8 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
     and his taps wait for it, as the check-in does within its hour."""
     import os
     import shutil
-    for screen in (AUTO_MODE_OFFER, QUOTED_FOOTER, OPTION_SCREEN, WORKING):   # at work: later
-        assert _checkin(tmp_path, "0712", screen) == "", screen
+    for screen in (AUTO_MODE_OFFER, QUOTED_FOOTER, OPTION_SCREEN, DRAFT, BOX_DRAFT, WORKING):
+        assert _checkin(tmp_path, "0712", screen) == "", screen       # (WORKING: at work, later)
     assert list((tmp_path / "done").glob("*")) == []                  # the morning one still to come
     out = _checkin(tmp_path, "0712", "To stop it, press Esc to cancel.\n" + IDLE_WITH_TASKS)
     assert "morning" in out and "Enter" in out                        # back at his prompt: it goes in
@@ -1689,8 +1696,9 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
         os.environ["RELAY_QUEUE"] = str(q)
         try:
             (tmp_path / "sent.txt").unlink()
-            assert _checkin(tmp_path, "0712", AUTO_MODE_OFFER) == ""  # his tap waits for him,
-            assert q.exists() and not (tmp_path / "relay.queue.work").exists()   # untouched
+            for screen in (AUTO_MODE_OFFER, DRAFT, BOX_DRAFT):        # his tap waits for him,
+                assert _checkin(tmp_path, "0712", screen) == "", screen
+                assert q.exists() and not (tmp_path / "relay.queue.work").exists()   # untouched
             assert 'Dane tapped "Ship"' in _checkin(tmp_path, "0712", IDLE)
         finally:
             del os.environ["RELAY_QUEUE"]

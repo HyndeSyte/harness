@@ -9,7 +9,7 @@
 - If that safety check can't finish (rather than failing), Cain pauses instead of running unchecked, and comes back by himself once it finishes; you hear it's a pause, not a breach.
 - Whenever Cain is stopped or paused, for any reason, the App tells you itself, with the way back: in Discord, and as a push to your phone only, again each day until it's fixed. The push comes through a one-time Home Assistant automation (the App's documentation, "If Cain stops"), which can only pass the alarm on to your phone: the App still has no access to Home Assistant itself.
 - If his session stops on its own, the App starts it again right away instead of stopping, and tells you if it keeps happening.
-- Cain no longer gets stuck behind Claude Code's offer to set up auto mode: the offer is off, and the App types his check-ins and your taps into his session only when his prompt is on screen, never into a question waiting there.
+- Cain no longer gets stuck behind Claude Code's offer to set up auto mode: the offer is off, and the App types his check-ins and your taps into his session only when his prompt is on screen and empty, never into a question waiting there or into something typed and not yet sent. Claude Code's gray suggested prompts are off in his session too.
 - How it was checked: the design went through six rounds of outside review, and tests interrupt the move at every step and check that nothing secret is ever readable by Cain's user.
 
 ## 0.11.0
