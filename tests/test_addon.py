@@ -1752,8 +1752,9 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
     assert _prompt_state(f"{RULE}\n> \n  a warning\n  ? for shortcuts") == "other"      # a row, no border under the box
     assert _prompt_state(f"{RULE}\n> \n{RULE}\n  one\n  two\n  three\n  four\n  ? for shortcuts") == "other"   # over three
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
-    # The whole of a draft (PROMPT_DRAFT_TEXT), case kept, spaces and line ends out: on the real screen
-    # all that was typed; after one Ctrl+U, only its start (outside review, round 17).
+    # The whole of a draft (PROMPT_DRAFT_TEXT), one drawn line a line, case and the spaces within kept:
+    # on the real screen, joined by single spaces, exactly what was typed; after one Ctrl+U, only its
+    # start (outside review, rounds 17 and 18).
     typed = ("Held by others, skip these: P33. New notes on your items, read them before you change those items (words "
              "passed on, not his go on anything): P69: «Nov 16, laptop session: your 7:10 check-in never reached you. The "
              "offer opened in your session at 4:57 AM, and the App took it for your prompt, so your taps went into it...». "
@@ -1761,11 +1762,13 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
              "Follow the Check-ins section of your CLAUDE.md. Post to the owner only if something finished or needs his "
              "decision.")
     whole = _prompt_state(REAL_NOTICE_DRAFT, PROMPT_DRAFT_TEXT="1").split("\n")
-    assert whole[0] == "draft" and whole[1] == "".join(typed.split())
-    part = _prompt_state(REAL_NOTICE_HALF, PROMPT_DRAFT_TEXT="1").split("\n")[1]
-    assert "".join(typed.split()).startswith(part) and len(part) < len("".join(typed.split()))
-    assert _prompt_state(BOX_LONG_DRAFT, PROMPT_DRAFT_TEXT="1").split("\n")[1] == \
-        'Relayedbytheadd-on:Danetapped"Ship"onthecardfortheupdate'
+    assert whole[0] == "draft" and " ".join(whole[1:]) == typed and len(whole) == 6
+    part = " ".join(_prompt_state(REAL_NOTICE_HALF, PROMPT_DRAFT_TEXT="1").split("\n")[1:])
+    assert typed.startswith(part) and len(part) < len(typed)
+    assert _prompt_state(BOX_LONG_DRAFT, PROMPT_DRAFT_TEXT="1").split("\n")[1:] == \
+        ['Relayed by the add-on: Dane tapped "Ship" on the card', "for the update"]
+    # Only what the box draws comes off: a bar ending a draft outside a box stays, spaces within stay.
+    assert _prompt_state("❯ a  draft ending in │\n  ? for shortcuts", PROMPT_DRAFT_TEXT="1").split("\n")[1] == "a  draft ending in │"
     for screen, first in ((REAL_NOTICE_DRAFT, "held by others, skip these: p33."), (BOX_LONG_DRAFT, "relayed by the add-on:"),
                           (DRAFT, "/permissions"), (LONG_DRAFT, "relayed by the add-on: dane tapped")):
         out = _prompt_state(screen, PROMPT_DRAFT_LINE="1").split("\n")
@@ -1999,6 +2002,11 @@ def test_the_way_out_of_a_question_holds_when_its_own_steps_fail(tmp_path):
     (state / "escs").write_text("12345\nnot a time\n")
     told = len(read("notice"))
     assert run(0, IDLE) == "" and run(10) == "" and run(310) == "" and read("notice")[told:] == ["5 tell waiting"]
+    # An empty one too: it's never written empty, so one was cut (outside round 18).
+    (state / "told").unlink(missing_ok=True)
+    (state / "escs").write_text("")
+    told = len(read("notice"))
+    assert run(400, IDLE) == "" and run(410) == "" and run(710) == "" and read("notice")[told:] == ["5 tell waiting"]
     # No place for its state: a question on screen is told at once, and taken down at his prompt.
     (tmp_path / "file").write_text("x")
     nowhere = (tmp_path / "file" / "state").as_posix()
@@ -2138,6 +2146,26 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         (tmp_path / "box/typed").unlink(missing_ok=True)
         out = _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
         assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""
+        # The box holding the try with a space more (alike once spaces are dropped): no Enter (outside
+        # review, round 18).
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "Ship PR 18"}\n', newline="\n")
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after="❯ {mark} Relayed by the add-on: Ship PR 1 8\n  ? for shortcuts")
+        assert "Ship PR 18" in out and "Enter" not in out and "PR 18" in work.read_text()
+        (tmp_path / "box/typed").unlink(missing_ok=True)
+        out = _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
+        assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""
+        # What the App types: its blanks one space each, and a run of over 80 letters broken, so his box
+        # can wrap it only at spaces; drawn over two lines, that goes in.
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "see  https://example.com/' + "a" * 90 + '\\tfor the plan"}\n', newline="\n")
+        typed = "Relayed by the add-on: see https://example.com/" + "a" * 60 + " " + "a" * 30 + " for the plan"
+        two = f"{RULE}\n❯ {{mark}} Relayed by the add-on: see https://example.com/" + "a" * 60 + \
+              f"\n  {'a' * 30} for the plan\n{RULE}\n  ? for shortcuts"
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after=two)
+        assert _typed(out.splitlines()[-2]) == typed and out.splitlines()[-1] == "-u send-keys -t cain Enter"
+        assert work.read_text().strip() == ""
+        (tmp_path / "box/typed").unlink(missing_ok=True)
         # The box holding only the start of the try (its mark): no Enter, after reading it three times
         # (outside review, round 17).
         (tmp_path / "sent.txt").unlink()

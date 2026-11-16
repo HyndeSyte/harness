@@ -56,8 +56,15 @@ ours() {   # ours <draft's first line> <the try's mark>
   seen=$(printf '%s' "$1" | tr -d ' \t')
   [ -n "$2" ] && [ "${seen:0:$(( ${#2} + 2 ))}" = "[$2]" ]
 }
-# Text as prompt-state.sh gives a whole draft: every space, no-break space and line end taken out.
-bare() { printf '%s' "$1" | tr -d ' \t\r\n' | sed 's/\xc2\xa0//g'; }
+# The text as the App types it: blanks one space each, none at the ends, and a run of more than 80
+# letters with no space broken with one, so his box wraps it only at spaces (outside round 18).
+plain() {
+  printf '%s' "$1" | tr '\t\r\n' '   ' | sed 's/\xc2\xa0/ /g' | tr -s ' ' | sed 's/^ //; s/ $//' \
+    | sed -E 's/([^ ]{80})([^ ])/\1 \2/g'
+}
+# Whether a draft's lines (prompt-state.sh's PROMPT_DRAFT_TEXT, one drawn line a line) are exactly
+# the text: joined by single spaces, the spaces his box's wrapping took, and nothing else.
+whole() { [ "$(printf '%s\n' "$1" | sed '/^$/d' | paste -sd ' ' -)" = "$2" ]; }
 screen=$(read_screen) || { rm -f "$state/ready"; exit 0; }
 last=$(printf '%s\n' "$screen" | tail -n 12)
 # Only at his prompt (prompt-state.sh): never into a screen waiting for an answer, which typing
@@ -132,21 +139,22 @@ type_in() {
   [ "${#mark}" = 6 ] || { echo "[cain] no random mark for a try: nothing typed"; return 1; }
   printf '%s\n%s\n' "$(date +%s)" "$mark" > "$state/typed" 2>/dev/null \
     || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
-  if ! timeout 10 $TM -u send-keys -t cain -l "[$mark] $1"; then return 1; fi
+  local want
+  want=$(plain "[$mark] $1")
+  if ! timeout 10 $TM -u send-keys -t cain -l "$want"; then return 1; fi
   sleep 1
   # All of it, mark first, as his box holds it: read up to three times a second apart while it
   # draws (his box still empty, or holding only part of it), never past a question or anything else.
-  local want after word got i
-  want=$(bare "[$mark] $1")
+  local after word got i
   for i in 1 2 3; do
     after=$(read_screen | PROMPT_DRAFT_TEXT=1 "$PS" 2>/dev/null)
-    word="${after%%$'\n'*}"; got=$(printf '%s\n' "$after" | sed -n 2p)
-    [ "$word" = draft ] && [ "$got" = "$want" ] && break
+    word="${after%%$'\n'*}"; got=$(printf '%s\n' "$after" | sed 1d)
+    [ "$word" = draft ] && whole "$got" "$want" && break
     [ "$word" = ready ] || { [ "$word" = draft ] && [ "${got:0:8}" = "[$mark]" ]; } || break
     [ "$i" = 3 ] || sleep 1
   done
   rm -f "$state/ready"
-  if [ "$word" != draft ] || [ "$got" != "$want" ]; then
+  if [ "$word" != draft ] || ! whole "$got" "$want"; then
     echo "[cain] his input box didn't hold all that was typed (${word:-unread}): nothing sent, tried again later"
     return 1
   fi

@@ -18,9 +18,12 @@
 #           service review: a question can open between the read and the Enter). With
 #           PROMPT_DRAFT_LINE set, the text on its prompt line (the first of it) follows on a
 #           second line, lower case, so checkin.sh takes out only a draft that is its own. With
-#           PROMPT_DRAFT_TEXT set, the whole draft follows instead, from its prompt line down to its
-#           last, as drawn (case kept) with every space, no-break space and line end taken out, so
-#           checkin.sh presses Enter only when all it typed is there (outside review, round 17).
+#           PROMPT_DRAFT_TEXT set, the whole draft follows instead, one drawn line a line, from its
+#           prompt line down to its last, as drawn (case and every space within kept), with only
+#           what the box draws taken off: the prompt mark and the space after it, each line's
+#           leading and trailing blanks (the wrap's indent), and the box's edges when it's boxed.
+#           checkin.sh presses Enter only when those lines, joined by single spaces, are exactly
+#           what it typed (outside review, rounds 17 and 18).
 #   dialog  no input area, and a screen showing key hints ("Esc to cancel", "Enter to continue",
 #           "Enter to confirm" and the like) in those lines: a screen waiting for an answer, which
 #           typing would answer. Nov 16, Claude Code's offer to set up auto mode said "auto mode"
@@ -54,13 +57,14 @@ awk '
     gsub(/\302\240/, " ", s); sub(/^ */, "", s)
     return s
   }
-  # A line of the draft as typed: the box edges, and on its first line the mark, taken off, and
-  # every space and no-break space.
-  function bare(s, first) {
-    sub(/^([[:space:]]|\302\240)*/, "", s); sub(/^│/, "", s)
-    if (first) { sub(/^([[:space:]]|\302\240)*/, "", s); sub(/^(>|❯)/, "", s) }
-    sub(/([[:space:]]|\302\240)*$/, "", s); sub(/│$/, "", s)
-    gsub(/[[:space:]]|\302\240/, "", s)
+  # A line of the draft as drawn, with only what the box draws taken off: blanks at its ends, the
+  # edges of the box when boxed, and on its first line the prompt mark. Spaces within stay.
+  function drawn(s, first, boxed) {
+    sub(/^([[:space:]]|\302\240)*/, "", s)
+    if (boxed) sub(/^│([[:space:]]|\302\240)*/, "", s)
+    if (first) { sub(/^(>|❯)/, "", s); sub(/^([[:space:]]|\302\240)*/, "", s) }
+    sub(/([[:space:]]|\302\240)*$/, "", s)
+    if (boxed) { sub(/│$/, "", s); sub(/([[:space:]]|\302\240)*$/, "", s) }
     return s
   }
   function footer(s) { return s ~ /^([[:space:]]|\302\240)*([?] for shortcuts|(⏵)+([[:space:]]|\302\240)*auto mode on)/ }
@@ -90,9 +94,8 @@ awk '
       print (empty ? "ready" : "draft")
       if (!empty && ENVIRON["PROMPT_DRAFT_LINE"] != "") print words(line[at])
       if (!empty && ENVIRON["PROMPT_DRAFT_TEXT"] != "") {
-        t = bare(orig[at], 1)
-        for (x = at + 1; x <= last; x++) t = t bare(orig[x], 0)
-        print t
+        s = orig[at]; sub(/^([[:space:]]|\302\240)*/, "", s); boxed = (s ~ /^│/)
+        for (x = at; x <= last; x++) print drawn(orig[x], x == at, boxed)
       }
     }
     else if (hint) print "dialog"

@@ -127,7 +127,8 @@ if [ -z "$esc" ]; then
   if ! put esc "$now"; then tell_dane "$cant"; exit 0; fi
   # Each Esc is counted, the last hour's kept: the third within an hour tells Dane. A history there
   # that isn't a file of times, one a line, can't be counted on: Dane hears (outside round 17).
-  if [ -e "$DIR/escs" ] && { [ ! -f "$DIR/escs" ] || [ ! -r "$DIR/escs" ] || grep -qvE '^[0-9]+$' "$DIR/escs"; }; then
+  if [ -e "$DIR/escs" ] && { [ ! -f "$DIR/escs" ] || [ ! -r "$DIR/escs" ] || [ ! -s "$DIR/escs" ] \
+       || grep -qvE '^[0-9]+$' "$DIR/escs"; }; then   # never written empty: an empty one was cut
     tell_dane "$cant"
   fi
   recent="$(awk -v t=$((now - 3600)) '$1 ~ /^[0-9]+$/ && $1 >= t' "$DIR/escs" 2>/dev/null; echo "$now")"
