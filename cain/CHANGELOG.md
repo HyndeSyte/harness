@@ -118,6 +118,11 @@
 - Two Ship gate watches of one pull request finishing together now keep only one accepted change.
 - The queue's messages about a job now name it by what it does and on which site, never by its queue id. A message whose delivery wasn't confirmed keeps being retried with the same id until it is. The message about a tap written by the earlier test version that can't be settled now comes on the third round instead of at once. Rounds that can't reach GitHub and can't read the tap record now lead to one message after three.
 - When a leftover probe setting's location can't be read, the run says so and gives all three commands that remove it. The probe ends its output with the same hint confirm-profile would give, listing extra address fields by tool.
+- A Chrome version that changed during a run now always fails it and holds later runs until a new probe, even when Chrome's version was read a different way; only a different way of reading the same version is a note. Probing after an update now works while runs are held.
+- A held run now clears only on the probe's own evidence, checked against what you confirmed; an edited time or evidence file never clears it. If the PC can't keep the hold on disk, it breaks its confirmation instead, so nothing runs until a new probe.
+- If reading Chrome's version takes too long, the PC stops with its own reason instead of guessing. A run that stops because a page check started late or never says which call it was.
+- Two Ship gate watches can't both take over a lock left by a stopped watch, a slow watch is never taken over, and a lock that can't be read stops the watch with a notice.
+- Messages from the queue keeper that an earlier version never delivered are sent after the update, or as one line saying an earlier message could not be delivered. A message Cain's App refuses for good is no longer retried and shows in the keeper's status. A job whose site can't be told is named by when it was queued.
 
 ## 0.11.0
 

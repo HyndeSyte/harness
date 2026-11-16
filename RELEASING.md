@@ -48,8 +48,11 @@ branch is up to date with `main` and these checks passed on it:
     prints the same hint at its end), and its result names the Claude in Chrome id and loaded
     version and Chrome's version (chrome.exe's file version, or the Last Version file as a
     named fallback, the source recorded) that every run then checks before and after its
-    session, like with like (an auto-update needs a new probe: a version hold clears only for
-    a confirmation of a probe run after the hold, of the versions loaded now);
+    session, comparing versions by their numbers (a source difference with an equal version
+    is only a note; any version change fails the run and writes the hold), and an
+    auto-update needs a new probe: a version hold clears only on validated probe evidence
+    (the confirmation's hash of the probe evidence, checked against the evidence file, a probe
+    run after the hold, of the versions loaded now);
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
     filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
     the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
@@ -83,7 +86,9 @@ refused while it stands, naming the accepted sha, and after a rebase
 `keeper.sh ship-gate --supersede <accepted sha>` records that the acceptance is replaced,
 only once the pull request's head differs from it; a pull request has one live acceptance at
 a time, and a watch refuses to accept while another stands, `live_acceptance`, checked and
-kept under the pull request's own lock file so two watches finishing together keep one). Run it once on a head
+kept under the pull request's own lock file so two watches finishing together keep one; a
+stale lock is taken over only by a rename one taker can win, and a lock that can't be read
+fails the watch as `lock_unavailable`). Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
   Run it before pushing (needs PyYAML):

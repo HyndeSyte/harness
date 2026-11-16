@@ -5,7 +5,6 @@ import { since } from "../stop";
 import { type Link, Refusal, SAID_MAX } from "./core";
 import { healthBody } from "./watch";
 
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -15,6 +14,7 @@ export interface HttpDeps {
   health: () => unknown;                                    // what /health adds for a keyed caller
   toHarness: (path: string, body: unknown) => Promise<boolean>;
   tz?: string;
+  localOnly: ReadonlySet<string>;                           // the routes only Cain's own scripts on this machine may call (main.ts LOCAL_ONLY)
 }
 export function linkFetch(d: HttpDeps) {
   const { link, toHarness } = d;
@@ -25,7 +25,7 @@ export function linkFetch(d: HttpDeps) {
       return json(healthBody(keyOk, d.health));
     if (!keyOk) return json({ status: "refused" }, 403);
     const ip = server.requestIP(req)?.address ?? "";
-    if (LOCAL_ONLY.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
+    if (d.localOnly.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
       return json({ status: "refused" }, 403);
     if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
     if (req.method === "GET" && url.pathname === "/cards") return json(await link.cardsFor());

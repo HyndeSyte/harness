@@ -312,10 +312,14 @@ in the harness repo; until then the keeper says it is waiting).
   shallow copy, the queue's branch missing, an empty queue with a tap pending, an
   unreadable tap record, a tap it can't settle, and a tap whose settling has waited three
   rounds on an unreadable record or a failed fetch from GitHub (that line names the job by
-  what it does, its action and site, and its code; never its id). Each is told once while it lasts, and again only if it clears for three rounds
+  what it does, its action and site, and its code; or, when the keeper can't tell those, by
+  when it was queued; never its id). Each is told once while it lasts, and again only if it clears for three rounds
   in a row and comes back; a code your App has no words for comes as "a stop
-  condition the App does not know" with its code. Don't repeat it; if he asks, the fix is in
-  that line and in the Troubleshooting table of cain/docs/pc-jobs.md.
+  condition the App does not know" with its code. After an update, a notice an earlier
+  keeper never delivered may come as "an earlier notice could not be delivered". Don't repeat it; if he asks, the fix is in
+  that line and in the Troubleshooting table of cain/docs/pc-jobs.md. If `pcjobs.sh worker`
+  or `list` says the link refused a notice for him for good, it won't be sent again: tell him
+  in your own words if it matters.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
@@ -338,8 +342,10 @@ in the harness repo; until then the keeper says it is waiting).
   again within 5 minutes), `probe_leftover` (a cut-off probe left files or a setting behind;
   the run didn't start: the refusal gives the command that removes each setting where it is
   set; he runs it, opens a new terminal and runs again), `versions_changed` (Claude in Chrome
-  or Chrome updated during the run; its report was thrown away: he restarts the Cain jobs
-  Chrome and probes again), `nav_log_unset` (the worker started a run session without its
+  or Chrome updated during the run; its report was thrown away, and the PC holds every run
+  until he restarts the Cain jobs Chrome and probes again), `chrome_version_timeout` (the PC
+  couldn't read Chrome's version in time, so nothing ran or the report was thrown away: he
+  closes heavy programs or restarts the PC, then runs again), `nav_log_unset` (the worker started a run session without its
   navigation log, so nothing ran: he starts the worker again from a new terminal), `refusal_cap` (the session was refused twelve times
   and ended), `domain_not_allowed` (the job named
   a host its allowlist entry doesn't allow; nothing ran), `containment_unavailable` (the
@@ -473,7 +479,8 @@ create, update or run any other routine.
      `/opt/cain/keeper.sh ship-gate --supersede <that sha>` (only once the new head is pushed:
      it refuses while the pull request's head is still that sha), then watch the new head the
      same way before its card. A pull request has one live acceptance at a time: a watch won't
-     accept while another stands (`live_acceptance`, naming it). One wait for GitHub is at most 15 minutes and a watch at most 2
+     accept while another stands (`live_acceptance`, naming it), and a watch that can't take or
+     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again. One wait for GitHub is at most 15 minutes and a watch at most 2
      hours; past either it ends unsettled (`rate_wait_cap`, `watch_cap`). A reading GitHub refused (a 403 or 429 page) holds,
      never accepts: it says rate limit only when GitHub said so (a 429, or a 403 with its
      rate-limit signs) and otherwise names the endpoint as a permission failure, and the

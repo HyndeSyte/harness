@@ -818,10 +818,18 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string; fragment?: boolean; probed?: string } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
     const h = sessionHashes(o)!;
+    // A probe time given: the probe's evidence too, as probe leaves it, and its hash as confirm-profile records it (twenty-third round).
+    const wn = workerNow();
+    let ev: Record<string, string> = {};
+    if (over.probed) {
+      const bytes = JSON.stringify({ v: 1, at: over.probed, fingerprint: fingerprint(o, inst) }, null, 2) + "\n";
+      writeFileSync(join(home, "probe-evidence.json"), bytes);
+      ev = { probed_at: over.probed, evidence_sha256: evidenceSha(bytes, over.probed, wn.guard_sha256) };
+    }
     fileOk(join(home, "confirmed.json"), JSON.stringify({ v: 1, at: T0.toISOString(), fingerprint: fingerprint(o, inst), settings_sha256: h.settings_sha256,
       prompt_sha256: h.prompt_sha256, config_sha256: outsideConfig(o).sha256, deny_check: over.deny_check ?? true, read_context: over.read_context ?? false,
       live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_ENDED.version,
-      ...workerNow(), fragment_strip: over.fragment ?? false, ...(over.probed ? { probed_at: over.probed } : {}) }, null, 2));
+      ...wn, fragment_strip: over.fragment ?? false, ...ev }, null, 2));
   };
   if (o.confirmed !== false) confirmNow();
   const remoteFile = (path: string) => sh(["git", "show", `main:${path}`], remote);

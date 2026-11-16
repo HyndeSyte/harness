@@ -274,11 +274,12 @@ setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
 // The routes themselves are in http.ts (linkFetch), so a test serves exactly this handler (0.12.0, twenty-third round).
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice"]);
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
   port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
   fetch: linkFetch({ link, keyOk: (h) => same(h, key("harness-relay-v1")),
-    health: () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() }), toHarness, tz: process.env.CHECKIN_TZ }),
+    health: () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() }), toHarness, tz: process.env.CHECKIN_TZ, localOnly: LOCAL_ONLY }),
 });
 console.log(`[cain] link listening on ${PORT}`);
 if (shipKey?.remade)

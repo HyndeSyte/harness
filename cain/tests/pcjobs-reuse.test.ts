@@ -922,7 +922,7 @@ describe("twenty-second review: the job named by what it does, a lost acknowledg
     const r = rig();
     const bodies: any[] = [];
     // The link's own HTTP handler (link/http.ts linkFetch, what link/main.ts serves), on a port of its own.
-    const handler = linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true });
+    const handler = linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true, localOnly: new Set(["/pc-notice"]) });
     const server = Bun.serve({ port: 0, hostname: "127.0.0.1", async fetch(req, srv) { bodies.push(await req.clone().json()); return handler(req, srv); } });
     const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
     const used = join(dir, "state", "used.jsonl");
@@ -993,7 +993,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
   const TOKEN = "not-a-real-token.for-the-notice-test-23";
   const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
   const serve = (r: ReturnType<typeof rig>) => {
-    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true }) });
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true, localOnly: new Set(["/pc-notice"]) }) });
     return server;
   };
   const envFile = () => { const d = mkdtempSync(join(tmpdir(), "pcjobs-env23-")); writeFileSync(join(d, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`); return join(d, ".env"); };
