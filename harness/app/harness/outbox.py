@@ -75,7 +75,10 @@ class Outbox:
             self._failed(row, e)
             return False
         now = self.ledger.now()
-        with self.ledger.tx() as db:
+        # Fourteenth round: the delivery marks are exempt from a staged restore's fence (the restart card goes
+        # out and isn't sent twice); a card's buttons aren't bound while fenced (they fail closed: taps are
+        # refused until the restart, which sets these records aside anyway).
+        with self.ledger.tx(fence_exempt=True) as db:
             db.execute("UPDATE outbox SET state='sent', sent_at=?, message_id=?,"
                        " attempts=attempts+1, last_error=NULL WHERE id=?",
                        (iso(now), mid, row["id"]))
@@ -87,6 +90,8 @@ class Outbox:
                 # message id 0: nothing can bind to it; leave the buttons dead
                 binds = []
                 self.ledger.event("unbindable_message", {"outbox": row["id"]}, db=db)
+        if self.ledger.fenced:
+            binds = []
         for b in binds:
             try:
                 if b["type"] == "approval":
@@ -110,7 +115,7 @@ class Outbox:
             return False
         except ValueError:
             pass
-        with self.ledger.tx() as db:
+        with self.ledger.tx(fence_exempt=True) as db:
             db.execute("UPDATE outbox SET state='sent', sent_at=?, attempts=attempts+1, last_error=NULL"
                        " WHERE id=?", (iso(self.ledger.now()), row["id"]))
         return True
@@ -138,7 +143,8 @@ class Outbox:
             # Every character is escaped by render, so a markup error means
             # a bug there. Deliver it plainly rather than not at all.
             if e.code == 400 and "parse" in e.description.lower():
-                self.ledger.event("html_fallback", {"error": e.description[:100]})
+                if not self.ledger.fenced:
+                    self.ledger.event("html_fallback", {"error": e.description[:100]})
                 return self.api.send_message(chat_id, _plain(text), buttons, html=False, kind=kind, **lapse)
             raise
 
@@ -149,12 +155,12 @@ class Outbox:
             # An outage delays a reply; it never loses one. Only a refusal
             # that will never change (blocked bot, bad request) is final.
             wait = max(e.retry_after or 0, _backoff(attempts))
-            with self.ledger.tx() as db:
+            with self.ledger.tx(fence_exempt=True) as db:
                 db.execute("UPDATE outbox SET attempts=?, last_error=?, not_before=?"
                            " WHERE id=?", (attempts, str(e)[:200],
                                            iso(now + timedelta(seconds=wait)), row["id"]))
             return
-        with self.ledger.tx() as db:
+        with self.ledger.tx(fence_exempt=True) as db:
             db.execute("UPDATE outbox SET state='dead', attempts=?, last_error=? WHERE id=?",
                        (attempts, str(e)[:200], row["id"]))
             self.ledger.event("delivery_failed", {"outbox": row["id"], "kind": row["kind"],

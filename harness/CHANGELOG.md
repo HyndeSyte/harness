@@ -49,7 +49,15 @@
 - **When the clock is behind Harness's own records,** its page names the record holding up backup pruning, and one card offers Use the clock as it is now.
 - **Fewer false Possibly overwritten messages.** The check after installing learns which fields each calendar rewrites by itself, and only those are left out; someone's real edit is still told.
 - **The check's write test on Family uses an event far in the past with no alarm,** titled as safe to delete, and removes it before it records the result.
-- **Taps are never kept waiting by moving your records:** they're taken at once and handled right after.
+- **Taps are never lost.** A tap is saved beside your records before Cain's link is told it was taken, and its answer comes once what it did is saved. A tap caught by a restart is taken when Harness is back, or you're told it wasn't; a tap made while a restore waits for the restart gets the restart ask at once.
+- **Putting your records back survives a power cut.** Each step of the swap is written to disk before the next, and a start after a cut at any point finishes it without repeating a step. Harness never opens your records beside a log that isn't theirs: it starts degraded and says why instead.
+- **The command line restore and Harness can't step on each other.** They share one lock, so a start waits for a restore being staged; when Harness runs degraded without its records, a restore can be staged without stopping it.
+- **Held requests in the records set aside all come back, once each,** even ones only in their log, one message per request after the restart. Older sets aside are cleared after that, the latest kept.
+- **A move that had finished before a stop is seen as finished,** so the next start is normal instead of waiting for your Run check.
+- **Possibly overwritten is told for a time zone or all-day change by someone else,** and for a real note or description removed, even on a calendar that tidies fields by itself.
+- **The check's write test event gets a fresh address each time** and is only ever created where nothing is; if it can't be shown gone, each start tries again and Harness's page shows it until it's gone.
+- **The receipt card's third button is now "Not this time"** (it was "Just this once"): it takes that one block off and remembers nothing.
+- **Mail you've said no to is skipped,** starting with Amazon's delivery management mail (Subscribe & Save cutoffs, last day to manage, delivery day changes). An order's return window still comes through. More kinds can be added by name in /data/mail_skip.json, no update needed.
 
 ## 0.23.0
 

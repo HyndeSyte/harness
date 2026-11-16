@@ -306,8 +306,9 @@ def test_the_hold_is_released_when_what_it_holds_fails(ledger):
 
 def test_a_tap_is_acknowledged_before_any_ledger_write_and_queued_while_the_hold_is_on(ledger, monkeypatch):
     monkeypatch.undo()                     # a loopback server only, as test_discord_keeper's handover tests use
+    monkeypatch.setattr(handover, "PRESS_WAIT_S", 1)   # fourteenth round: answered "working" once written down
     token = "test-bot-token"
-    inbox = handover.Inbox(lambda: token)
+    inbox = handover.Inbox(lambda: token, journal=str(pathlib.Path(ledger.path).parent / "taps.jsonl"))
     srv = handover.serve(inbox, port=0, host="127.0.0.1", wait_s=30)
     try:
         port = srv.server_address[1]
@@ -320,7 +321,8 @@ def test_a_tap_is_acknowledged_before_any_ledger_write_and_queued_while_the_hold
             with urllib.request.urlopen(req, timeout=10) as r:
                 answer = json.loads(r.read())
             assert time.monotonic() - t0 < 5
-        assert answer == {"status": "ok", "said": "", "queued": True}
+        assert answer == {"status": "working", "queued": True, "journaled": True}   # never a final "ok" yet
+        assert [r["press"]["id"] for r in inbox.journaled()] == ["1"]
         assert inbox.pending() == 1
         assert [h.kind for h in inbox.take()] == ["press"]
     finally:
@@ -354,7 +356,7 @@ def test_a_staged_restore_fences_writes_asks_for_a_restart_and_the_held_requests
     m.c.outbox.flush()
     try:
         m.tap("Put them back")
-        assert migrate.restore_staged(m.ledger.path) and m.ledger.writers_held()
+        assert migrate.restore_staged(m.ledger.path) and m.ledger.fenced          # fourteenth round: a mode flag
         m.c.tick()
         m.c.outbox.flush()
         card = [t for t in m.seen() if t.startswith("Restart Harness now")]
@@ -367,7 +369,7 @@ def test_a_staged_restore_fences_writes_asks_for_a_restart_and_the_held_requests
         assert m.c.status_box["migration"]["restore_staged"] is True
         assert m.c.handovers.health()["migration"]["restore_staged"] is True
     finally:
-        m.ledger.release_hold()
+        m.ledger.unfence()
     m.ledger.close()
     got = migrate.apply_staged_restore(m.ledger.path)                               # the restart
     assert got["ok"]

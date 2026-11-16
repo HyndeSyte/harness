@@ -153,6 +153,11 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
         held = (f' by the record {_e(stall.get("kind", ""))} (#{_e(stall.get("event"))}) stamped '
                 f'{_e(str(stall.get("at", ""))[:19])} UTC' if stall.get("event") is not None else "")
         parts.append(f'<div class="no">⚠ Old backups aren\'t pruned: {_e(stall.get("why", ""))}{held}.</div>')
+    for left in st.get("test_events_left") or []:
+        # Fourteenth round: the conformance item's test event (1 Jan 2001), retried at every start until gone.
+        parts.append(f'<div class="no">⚠ A Harness write test event is still on Family (from smoke run '
+                     f'{_e(left.get("run", ""))}, at {_e(left.get("href", ""))}); its removal is retried at every '
+                     f'start ({_e(left.get("tries", 0))} so far). It is safe to delete by hand.</div>')
     parts.append("</div>")
 
     parts.extend(_discord_section(st.get("discord")))

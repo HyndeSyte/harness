@@ -67,6 +67,8 @@ SWAP_MARKER = ".swap.json"         # beside the ledger while a swap is under way
 RESTORED = ".restored.json"        # beside the ledger after a swap, until the kept ledger's held requests are posted
 MIGRATING = ".migrating"           # beside the ledger while the migration's transaction is open
 LOCK_NAME = "harness.lock"         # the specialist holds it (flock) for as long as it runs
+LOCK_WAIT_S = 120                  # fourteenth round: how long a start waits for a restore being staged to finish
+POSTBACK = ".postback.json"        # beside a kept ledger: its held requests posted back, by key (fourteenth round)
 SPACE_MARGIN = 16 * 1024 * 1024    # free space kept spare beyond two copies of the ledger
 CLOCK_ACCEPTED = "migration_clock_accepted"   # {"at", "event_id"}: events up to that id don't count for the clock
 CLOCK_TOLD = "migration_clock_told"            # the event id the clock card was last posted for
@@ -210,6 +212,10 @@ def run_live(ledger: Ledger, cc, chat_id: int, version: str | None = None, build
 def _run_live(ledger: Ledger, cc, chat_id: int, version: str, build: str, tell: bool,
               retry: bool = False) -> dict:
     marker = _side(ledger, MIGRATING)
+    if marker and os.path.isfile(marker):
+        damaged = _settle_marker(ledger, marker)
+        if damaged:
+            return _wait(ledger, chat_id, version, build, damaged, tell, degraded=True)
     if not needed(ledger, version, build):
         _remove_file(marker)
         _clear_waiting(ledger)
@@ -231,6 +237,7 @@ def _run_live(ledger: Ledger, cc, chat_id: int, version: str, build: str, tell: 
         why = dry_run_missing(ledger, build)
     if why:
         return _wait(ledger, chat_id, version, build, why, tell)
+    checkpoint(ledger)
     room = space_problem(ledger.path)
     if room:
         return _wait(ledger, chat_id, version, build, room, tell)
@@ -247,7 +254,36 @@ def _run_live(ledger: Ledger, cc, chat_id: int, version: str, build: str, tell: 
         return _wait(ledger, chat_id, version, build, f"the migration failed ({type(e).__name__})", tell,
                      degraded=True)
     _remove_file(marker)
+    if marker:
+        prune_kept(os.path.dirname(marker))     # fourteenth round: older kept sets go once posted back and moved
     return {**out, "backup": copy}
+
+
+def _settle_marker(ledger: Ledger, marker: str) -> str:
+    """Fourteenth round: a migrating marker found at start. The ledger is checked whole (PRAGMA integrity_check);
+    then, when the move it names had committed before the stop (the ledger's schema version is at the last step's
+    and the install step is recorded for the marker's build), the marker is cleared and the start goes on as
+    normal. Otherwise the marker stays and the interrupted move is handled as before. Why the ledger can't be
+    used, or ""."""
+    import sqlite3
+    try:
+        rows = ledger.db.execute("PRAGMA integrity_check").fetchall()
+    except sqlite3.Error as e:
+        return f"the records couldn't be checked after an interrupted move ({type(e).__name__})"
+    if [r[0] for r in rows] != ["ok"]:
+        return "the records failed their integrity check after an interrupted move"
+    from . import calendar_change as cal
+    said = _read_json(marker)
+    target = max(n for n, _ in STEPS)
+    kept = cal._meta_json(ledger, cal.INSTALLED)
+    if schema(ledger) >= target and ledger.get_meta(DONE) is not None and said.get("build") \
+            and kept.get("build") == said.get("build"):
+        _remove_file(marker)
+        log.warning("the move of build %s had finished before the App stopped; its marker was cleared",
+                    said.get("build"))
+        with ledger.tx() as db:
+            ledger.event("migration_marker_settled", {"build": said.get("build")}, db=db)
+    return ""
 
 
 def _side(ledger: Ledger, suffix: str) -> str:
@@ -267,6 +303,21 @@ def _write_json(path: str, data: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(os.path.abspath(path)))     # fourteenth round: the rename itself survives power loss
+
+
+def _fsync_dir(folder: str) -> None:
+    """Fourteenth round: a rename or removal is durable only once its folder's entry is on disk."""
+    try:
+        fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _read_json(path: str) -> dict:
@@ -283,7 +334,8 @@ def _remove_file(path: str) -> None:
         try:
             os.remove(path)
         except OSError:
-            pass
+            return
+        _fsync_dir(os.path.dirname(os.path.abspath(path)))
 
 
 # -- free space (thirteenth round) ------------------------------------------------------------------------------
@@ -296,15 +348,12 @@ def _free_bytes(folder: str) -> int:
 def space_problem(ledger_path: str, folder: str | None = None) -> str:
     """Why a copy of the ledger can't be made in `folder` (beside the ledger when none), or "": checked before the
     dry run's copy and the backup, so a full disk is said plainly and never leaves a half-written file. Room for
-    two copies of the ledger and its log, plus SPACE_MARGIN."""
+    two copies of the ledger and its log, plus SPACE_MARGIN. Fourteenth round: the size is the main file plus its
+    -wal (callers checkpoint with TRUNCATE first, so the log is folded in and measured once), and the records set
+    aside by restores (kept sets) are counted and named, since they take room until they're pruned."""
     if not ledger_path or ledger_path == ":memory:":
         return ""
-    size = 0
-    for extra in ("", "-wal"):
-        try:
-            size += os.path.getsize(os.path.abspath(ledger_path) + extra)
-        except OSError:
-            pass
+    size = _set_size(os.path.abspath(ledger_path))
     need = 2 * size + SPACE_MARGIN
     where = folder or os.path.dirname(os.path.abspath(ledger_path))
     try:
@@ -312,9 +361,50 @@ def space_problem(ledger_path: str, folder: str | None = None) -> str:
     except OSError:
         return "the free space for a copy of the records couldn't be read"
     if free < need:
+        kept = sum(_set_size(p) for p in kept_sets(os.path.dirname(os.path.abspath(ledger_path))))
+        held = (f"; {-(-kept // (1024 * 1024))} MB of it is records set aside by a restore (harness-replaced-*)"
+                if kept else "")
         return (f"there isn't enough free space for a copy of the records ({free // (1024 * 1024)} MB free, "
-                f"{-(-need // (1024 * 1024))} MB needed)")
+                f"{-(-need // (1024 * 1024))} MB needed{held})")
     return ""
+
+
+def _set_size(path: str) -> int:
+    """A SQLite file with its -wal (fourteenth round: both, not the main file alone)."""
+    size = 0
+    for extra in ("", "-wal"):
+        try:
+            size += os.path.getsize(path + extra)
+        except OSError:
+            pass
+    return size
+
+
+def kept_sets(folder: str) -> list[str]:
+    """The ledgers a restore set aside beside the records (harness-replaced-<time>[-n].sqlite), oldest first."""
+    import glob
+    return sorted(p for p in glob.glob(os.path.join(folder, "harness-replaced-*.sqlite")) if os.path.isfile(p))
+
+
+def prune_kept(folder: str) -> list[str]:
+    """Fourteenth round: once the newest kept set's held requests are posted back (its post-back marker says
+    done) and a Run check or a move has succeeded since, every older kept set goes, with its -wal, -shm and
+    marker; the latest is kept. What was removed."""
+    sets = kept_sets(folder)
+    if len(sets) < 2 or not _read_json(sets[-1] + POSTBACK).get("done"):
+        return []
+    gone = []
+    for p in sets[:-1]:
+        for x in ("", "-wal", "-shm", POSTBACK):
+            try:
+                os.remove(p + x)
+            except OSError:
+                pass
+        gone.append(os.path.basename(p))
+    _fsync_dir(folder)
+    if gone:
+        log.info("records set aside by earlier restores were pruned: %s", ", ".join(gone))
+    return gone
 
 
 def _wait(ledger: Ledger, chat_id: int, version: str, build: str, why: str, tell: bool,
@@ -673,7 +763,8 @@ def checkpoint(ledger: Ledger) -> None:
         raise OrderError("the checkpoint runs before the migration's transaction, never inside it")
     with ledger.hold_writers():
         try:
-            row = ledger.db.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+            # Fourteenth round: TRUNCATE, so the log is folded in and emptied and the space check measures once.
+            row = ledger.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         except sqlite3.Error as e:
             log.warning("the ledger's checkpoint before its copy didn't run: %s", type(e).__name__)
             return
@@ -819,6 +910,7 @@ def backup(ledger: Ledger, build: str) -> str:
         return ""
     if ledger.db.in_transaction:
         raise OrderError("the backup is taken before the migration's transaction, never inside it")
+    checkpoint(ledger)                       # fourteenth round: the log folded in before the room is measured
     room = space_problem(ledger.path)
     if room:
         log.error("the ledger backup before the migration wasn't made: %s", room)
@@ -1224,22 +1316,40 @@ def listed(ledger: Ledger, batch: str) -> list[str]:
 _LOCK: dict = {}                   # folder -> the open lock file the specialist holds
 
 
-def hold_process_lock(ledger_path: str) -> bool:
-    """The specialist takes LOCK_NAME beside the ledger (an exclusive flock) before the swap and keeps it while it
-    runs, so the restore command line can tell it's running. Whether it has it."""
+def _try_lock(folder: str):
+    """The lock file beside the records, flocked exclusively, or None when another open file holds it."""
     import fcntl
-    folder = os.path.dirname(os.path.abspath(ledger_path))
-    if folder in _LOCK:
-        return True
     f = open(os.path.join(folder, LOCK_NAME), "a+")
     try:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         f.close()
-        log.error("another process holds %s beside the ledger", LOCK_NAME)
-        return False
-    _LOCK[folder] = f
-    return True
+        return None
+    return f
+
+
+def hold_process_lock(ledger_path: str, wait_s: float = 0) -> bool:
+    """The specialist takes LOCK_NAME beside the ledger (an exclusive flock) before it reads any marker or swaps,
+    and keeps it while it runs. Fourteenth round: the restore command line takes the same lock while it stages
+    (stage_restore), so a start waits up to `wait_s` for a staging under way to finish. Whether it has it."""
+    import time as _time
+    folder = os.path.dirname(os.path.abspath(ledger_path))
+    if folder in _LOCK:
+        return True
+    until = _time.monotonic() + max(0.0, wait_s)
+    told = False
+    while True:
+        f = _try_lock(folder)
+        if f is not None:
+            _LOCK[folder] = f
+            return True
+        if _time.monotonic() >= until:
+            log.error("another process holds %s beside the ledger", LOCK_NAME)
+            return False
+        if not told:
+            log.warning("a restore is being staged beside the records (%s is held): waiting for it", LOCK_NAME)
+            told = True
+        _time.sleep(0.2)
 
 
 def release_process_lock(ledger_path: str) -> None:
@@ -1249,21 +1359,22 @@ def release_process_lock(ledger_path: str) -> None:
 
 
 def specialist_running(ledger_path: str) -> bool:
-    """Whether a process holds the specialist's lock file beside this ledger (not this one's own hold)."""
-    import fcntl
+    """Whether a process holds the specialist's lock file beside this ledger (not this one's own hold). Only a
+    hint for status: stage_restore takes the lock itself rather than asking this first."""
     folder = os.path.dirname(os.path.abspath(ledger_path))
     if folder in _LOCK:
         return True
-    path = os.path.join(folder, LOCK_NAME)
-    if not os.path.isfile(path):
+    if not os.path.isfile(os.path.join(folder, LOCK_NAME)):
         return False
-    with open(path, "a+") as f:
-        try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    f = _try_lock(folder)
+    if f is None:
+        return True
+    f.close()
     return False
+
+
+def _stage_step(phase: str) -> None:
+    """A point in the staging a test can pause or stop at (fourteenth round). Nothing in production."""
 
 
 # -- restore (twelfth and thirteenth rounds) --------------------------------------------------------------------
@@ -1312,22 +1423,41 @@ def stage_restore(ledger_path: str, schema_n: int, build: str, cli: bool = False
     last. Thirteenth round: it never touches the live ledger (it only reads it, for find_backup), and all swapping
     is done by the specialist at its next start, before it opens the ledger (apply_staged_restore). From the
     command line (cli) it refuses while the specialist runs, which holds LOCK_NAME."""
-    import sqlite3
     try:
         n = int(schema_n)
     except (TypeError, ValueError):
         return {"ok": False, "said": "the schema version is a whole number"}
-    if cli and specialist_running(ledger_path):
+    # Fourteenth round: the same kernel lock as the specialist (an exclusive flock on harness.lock beside the
+    # records, so on the same volume), held from finding the backup until the marker is on disk. The specialist
+    # itself already holds it (its own tap); anyone else takes it or is refused, never only asks whether it's held.
+    folder = os.path.dirname(os.path.abspath(ledger_path))
+    if folder in _LOCK:
+        return _stage_locked(ledger_path, n, build)
+    lock = _try_lock(folder)
+    if lock is None:
         return {"ok": False, "said": "Harness is running (it holds harness.lock beside the records), so nothing was "
                                      "staged: while it runs, ask through Cain (keeper.sh fastpath migrate-restore), "
                                      "which puts a card to the owner; or stop the App first"}
+    try:
+        return _stage_locked(ledger_path, n, build)
+    finally:
+        lock.close()
+
+
+def _stage_locked(ledger_path: str, n: int, build: str) -> dict:
+    """stage_restore with harness.lock held."""
+    import sqlite3
+    base = os.path.abspath(ledger_path)
+    if os.path.isfile(base + SWAP_MARKER):
+        return {"ok": False, "said": "a restore swap beside the records hasn't finished; Harness finishes it when it "
+                                     "starts, so nothing new was staged"}
+    _stage_step("locked")
     chosen = find_backup(ledger_path, n, build)
     if not chosen:
         return {"ok": False, "said": f"no backup beside the ledger for schema {n} and build {build}"}
     problem = verify_copy(chosen)
     if problem:
         return {"ok": False, "said": f"that backup can't be used: {problem}", "backup": os.path.basename(chosen)}
-    base = os.path.abspath(ledger_path)
     staged, marker = base + RESTORE_SUFFIX, base + STAGE_MARKER
     _remove_file(marker)
     _remove(staged)
@@ -1341,7 +1471,9 @@ def stage_restore(ledger_path: str, schema_n: int, build: str, cli: bool = False
         if problem:
             raise OSError(problem)
         os.replace(part, staged)
-        _write_json(marker, {"from": os.path.basename(chosen), "schema": n, "build": build})
+        _fsync_dir(os.path.dirname(base))
+        _stage_step("staged")
+        _write_json(marker, {"from": os.path.basename(chosen), "schema": n, "build": build})   # fsynced, dir too
     except (sqlite3.Error, OSError) as e:
         _remove(part)
         _remove(staged)
@@ -1352,16 +1484,30 @@ def stage_restore(ledger_path: str, schema_n: int, build: str, cli: bool = False
                     "it replaces are kept beside them, and the restored ones move to this build again."}
 
 
+class SwapRefused(RuntimeError):
+    """Fourteenth round: the swap found files at the live name it doesn't own, or both ends of a move present. The
+    App then starts degraded with this reason instead of opening the records beside a log that isn't theirs."""
+
+
 def _swap_step(phase: str) -> None:
     """A point in the swap a test can stop at, as a crash would (thirteenth round). Nothing in production."""
 
 
+SIDECARS = ("", "-wal", "-shm")          # a SQLite file and its log, paired by name the way SQLite pairs them
+
+
 def apply_staged_restore(ledger_path: str, now: datetime | None = None) -> dict:
-    """At startup, before the ledger opens (thirteenth round): a staged restore is swapped in. A swap marker is
-    written first, so a stop between any two steps is finished at the next start. The staged file is checked
-    (PRAGMA integrity_check) at swap time; the ledger it replaces moves with its -wal and -shm files, together, to
-    harness-replaced-<time>.sqlite beside it (never a stale log left beside the restored file); then the staged
-    file is renamed into place, which is atomic. {} when nothing is staged."""
+    """At startup, with harness.lock held and before the ledger opens (thirteenth round): a staged restore is
+    swapped in. A swap marker is written first, so a stop between any two steps is finished at the next start.
+    The staged file is checked (PRAGMA integrity_check) at swap time; the ledger it replaces moves with its -wal
+    and -shm files to harness-replaced-<time>.sqlite beside it, each keeping SQLite's pairing (the kept name, then
+    the kept name with -wal and -shm); then the staged file is renamed into place, which is atomic. {} when nothing
+    is staged.
+
+    Fourteenth round: durable across power loss, not only a stop. The folder is fsynced after the marker's rename,
+    after each of the three moves, after the final rename and before the marker is cleared; each completed step is
+    recorded in the marker, so a resume never repeats a move. Raises SwapRefused rather than leave the records
+    beside a log they don't own."""
     from datetime import timezone as _tz
     base = os.path.abspath(ledger_path)
     staged, marker, swap = base + RESTORE_SUFFIX, base + STAGE_MARKER, base + SWAP_MARKER
@@ -1375,67 +1521,123 @@ def apply_staged_restore(ledger_path: str, now: datetime | None = None) -> dict:
     if not os.path.isfile(marker):
         log.error("a staged restore without its marker (staging stopped midway) wasn't used")
         os.replace(staged, staged + ".refused")
+        _fsync_dir(os.path.dirname(base))
         return {"ok": False, "said": "the staged restore wasn't finished being staged"}
     problem = verify_copy(staged)
     if problem:
         log.error("the staged restore wasn't used: %s", problem)
         os.replace(staged, staged + ".refused")
+        _fsync_dir(os.path.dirname(base))
         _remove_file(marker)
         return {"ok": False, "said": problem}
     stamp = (now or datetime.now(_tz.utc)).strftime("%Y%m%dT%H%M%SZ")
     folder = os.path.dirname(base)
     kept = os.path.join(folder, f"harness-replaced-{stamp}.sqlite")
     n = 1
-    while any(os.path.exists(kept + x) for x in ("", "-wal", "-shm")):
+    while any(os.path.lexists(kept + x) for x in SIDECARS + (POSTBACK,)):
         n += 1
         kept = os.path.join(folder, f"harness-replaced-{stamp}-{n}.sqlite")
-    plan = {"kept": kept, "from": _read_json(marker).get("from", ""), "at": stamp}
-    _write_json(swap, plan)
+    plan = {"kept": kept, "from": _read_json(marker).get("from", ""), "at": stamp, "done": []}
+    _write_json(swap, plan)                     # fsynced, and its folder
     _swap_step("marker")
     return _finish_swap(base, plan)
 
 
+def _record(swap: str, plan: dict, step: str) -> None:
+    """A step of the swap done, on disk: the folder first (the rename itself), then the marker that says so."""
+    _fsync_dir(os.path.dirname(swap))
+    plan.setdefault("done", []).append(step)
+    _write_json(swap, plan)
+
+
+def _move(src: str, dst: str) -> None:
+    """One rename of the swap, never over something: both ends present means a resume can't tell which is which."""
+    if os.path.lexists(dst):
+        raise SwapRefused(f"{os.path.basename(src)} can't move: {os.path.basename(dst)} is already there")
+    os.replace(src, dst)
+
+
+def _unowned(base: str) -> list[str]:
+    return [os.path.basename(base + x) for x in ("-wal", "-shm") if os.path.lexists(base + x)]
+
+
 def _finish_swap(base: str, plan: dict) -> dict:
-    """The swap from wherever it stopped: before the rename it's rolled forward (the old files moved, then the
-    staged file renamed into place), after it only the markers are left to clear. A staged file that fails its
-    check here is set aside and the old ledger moved back: rolled back."""
+    """The swap from wherever it stopped (thirteenth round), step by step from the marker's record (fourteenth):
+    before the rename it's rolled forward (the old files moved, then the staged file renamed into place), after it
+    only the markers are left to clear. A staged file that fails its check here is set aside and the old ledger
+    moved back: rolled back, also step by step."""
     staged, marker, swap = base + RESTORE_SUFFIX, base + STAGE_MARKER, base + SWAP_MARKER
+    folder = os.path.dirname(base)
     kept = str(plan.get("kept") or "")
-    if not kept:
+    if not kept or os.path.dirname(os.path.abspath(kept)) != folder:
         _remove_file(swap)
         return {"ok": False, "said": "the swap marker couldn't be read"}
-    if os.path.isfile(staged):
-        problem = verify_copy(staged)
-        if problem:
-            for x in ("", "-wal", "-shm"):
-                if os.path.exists(kept + x) and not os.path.exists(base + x):
-                    os.replace(kept + x, base + x)
-            os.replace(staged, staged + ".refused")
-            _remove_file(marker)
-            _remove_file(swap)
-            log.error("the staged restore failed its check at the swap (%s): rolled back to the ledger as it was",
-                      problem)
-            return {"ok": False, "said": problem, "rolled_back": True}
-        for x in ("", "-wal", "-shm"):          # the old ledger and its log move together
-            if os.path.exists(base + x):
-                os.replace(base + x, kept + x)
-            _swap_step("moved" + x)
-        os.replace(staged, base)                # atomic: the ledger is the old one or the restored one
+    done = set(plan.get("done") or [])
+    if plan.get("rollback"):
+        return _roll_back(base, plan, str(plan.get("why") or "the staged restore was set aside"))
+    if "renamed" not in done:
+        if os.path.isfile(staged):
+            problem = verify_copy(staged)
+            if problem:
+                return _roll_back(base, plan, problem)
+        elif not any("moved" + x in done for x in SIDECARS) and os.path.isfile(base):
+            return _roll_back(base, plan, "the staged restore was gone")
+        for x in SIDECARS:                      # the old ledger and its log move together, one recorded step each
+            step = "moved" + x
+            if step in done:
+                continue
+            if os.path.lexists(base + x):
+                _move(base + x, kept + x)
+            _record(swap, plan, step)
+            _swap_step(step)
+        if os.path.isfile(staged):
+            left = [os.path.basename(base + x) for x in SIDECARS if os.path.lexists(base + x)]
+            if left:                            # asserted before the final rename: nothing at the live name
+                raise SwapRefused(f"{', '.join(left)} appeared at the records' name during the swap")
+            os.replace(staged, base)            # atomic: the ledger is the old one or the restored one
+        elif not os.path.isfile(base):
+            return _roll_back(base, plan, "the staged restore was gone")
+        # else: the rename was done but not yet recorded when the App stopped
+        _record(swap, plan, "renamed")
         _swap_step("renamed")
-    elif not os.path.isfile(base):
-        for x in ("", "-wal", "-shm"):          # nothing to put in place: the old ledger goes back
-            if os.path.exists(kept + x):
-                os.replace(kept + x, base + x)
-        _remove_file(marker)
-        _remove_file(swap)
-        return {"ok": False, "said": "the staged restore was gone", "rolled_back": True}
+    left = _unowned(base)
+    if left:
+        # Nothing has opened the restored file since its rename (the marker is still here), so a log beside it
+        # isn't its own: never opened together.
+        raise SwapRefused(f"{', '.join(left)} beside the restored records isn't theirs")
     _write_json(base + RESTORED, {"from": plan.get("from", ""), "kept": os.path.basename(kept), "at": plan.get("at")})
     _remove_file(base + MIGRATING)              # a move interrupted on the old ledger isn't this one's
     _remove_file(marker)
+    _fsync_dir(folder)
     _remove_file(swap)
     log.warning("restored the ledger from %s; the one it replaced is %s", plan.get("from") or "a staged backup",
                 os.path.basename(kept))
     return {"ok": True, "from": plan.get("from", ""), "replaced": os.path.basename(kept)}
+
+
+def _roll_back(base: str, plan: dict, why: str) -> dict:
+    """The old ledger moved back from the kept name, each move recorded like the swap's own (fourteenth round)."""
+    staged, marker, swap = base + RESTORE_SUFFIX, base + STAGE_MARKER, base + SWAP_MARKER
+    kept = str(plan["kept"])
+    if not plan.get("rollback"):
+        plan["rollback"], plan["why"] = True, why
+        _write_json(swap, plan)
+    done = set(plan.get("done") or [])
+    for x in SIDECARS:
+        step = "back" + x
+        if step in done:
+            continue
+        if os.path.lexists(kept + x):
+            _move(kept + x, base + x)
+        _record(swap, plan, step)
+        _swap_step(step)
+    if os.path.lexists(staged):
+        os.replace(staged, staged + ".refused")
+    _remove_file(marker)
+    _fsync_dir(os.path.dirname(base))
+    _remove_file(swap)
+    log.error("the staged restore wasn't used (%s): rolled back to the ledger as it was", why)
+    return {"ok": False, "said": why, "rolled_back": True}
 
 
 def _lost_counts(ledger: Ledger, since: str) -> dict:
@@ -1512,10 +1714,10 @@ def request_restore(ledger: Ledger, chat_id: int, key: str, by: str) -> tuple[st
 
 
 def restore_tapped(ledger: Ledger, target: str, chat_id: int = 0) -> str:
-    """His tap on Put them back: stages it (stage_restore). Thirteenth round: then the writer hold engages until the
-    restart (nothing new is taken: the controller answers requests and taps plainly), and one card tells him to
-    restart the App now, with the backup's age and what the records set aside hold that it doesn't. What to tell
-    him."""
+    """His tap on Put them back: stages it (stage_restore). Thirteenth round: nothing new is taken until the
+    restart (the controller answers requests and taps plainly), and one card tells him to restart the App now,
+    with the backup's age and what the records set aside hold that it doesn't. Fourteenth round: that's the
+    controller's fence (a mode flag on the ledger), not a held lock. What to tell him."""
     try:
         n_text, build = (target or "").split(" ", 1)
     except ValueError:
@@ -1548,31 +1750,51 @@ def restore_tapped(ledger: Ledger, target: str, chat_id: int = 0) -> str:
                 f"{lost['watches']} write{'s' if lost['watches'] != 1 else ''} still being confirmed, and "
                 f"{lost['undoable']} change{'s' if lost['undoable'] != 1 else ''} you could still undo."), db=db)
             ledger.event("migration_restore_fenced", {"backup": got.get("backup", ""), **lost}, db=db)
-    try:
-        ledger.engage_hold()
-    except TimeoutError:
-        log.warning("the writer hold for the staged restore couldn't engage now; the controller still takes nothing")
+    # Fourteenth round: no writer hold. The controller fences the ledger (Ledger.fence, a mode flag: writes fail at
+    # once with a plain reason, the outbox's delivery marks excepted) as soon as this tap's own reply is recorded,
+    # and Cain's handover service answers taps at once from then on (restore_staged).
     log.warning("a restore is staged: nothing new is taken until the App restarts")
     return "Ready: restart Harness now and the records are put back from that backup. The message below says what's set aside."
 
 
-def held_in_kept(ledger: Ledger, kept_path: str, tz: str) -> list[str]:
-    """The requests held in a ledger a restore set aside (opened read only), as ready-to-copy lines."""
+POSTED = "migration_restored_item:"     # + kept file name + ":" + item key: that held request was posted back
+
+
+def held_items(kept_path: str, tz: str) -> list[tuple[str, list[str]]]:
+    """The requests held in a ledger a restore set aside, each with its key (the proposal id) and its
+    ready-to-copy lines. Fourteenth round: the kept ledger is opened read-write once to fold its -wal in
+    (wal_checkpoint TRUNCATE; its files keep SQLite's pairing), so a request committed only in the log comes back;
+    then it's read through a read-only connection."""
     import sqlite3
     from . import calendar_change as cal
-    out: list[str] = []
+    out: list[tuple[str, list[str]]] = []
+    if not os.path.isfile(kept_path):
+        return out
+    try:
+        rw = sqlite3.connect(kept_path)
+        try:
+            rw.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            rw.close()
+    except sqlite3.Error as e:
+        log.warning("the records a restore set aside couldn't be checkpointed (%s); read as they are",
+                    type(e).__name__)
     try:
         conn = sqlite3.connect(f"file:{kept_path}?mode=ro", uri=True)
     except sqlite3.Error:
         return out
     try:
-        for key, _ in conn.execute("SELECT key, value FROM meta WHERE key LIKE ?", (f"{cal.HELD}%",)).fetchall():
-            row = conn.execute("SELECT params_json FROM proposals WHERE id=?", (key[len(cal.HELD):],)).fetchone()
+        for key, _ in conn.execute("SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key",
+                                   (f"{cal.HELD}%",)).fetchall():
+            pid = key[len(cal.HELD):]
+            row = conn.execute("SELECT params_json FROM proposals WHERE id=?", (pid,)).fetchone()
             try:
                 changes = json.loads(row[0])["changes"] if row else []
             except (ValueError, KeyError, TypeError):
                 continue
-            out += ["• " + render.escape(cal._copy_line(c, tz)) for c in changes]
+            lines = ["• " + render.escape(cal._copy_line(c, tz)) for c in changes]
+            if lines:
+                out.append((pid, lines))
     except sqlite3.Error:
         pass
     finally:
@@ -1580,25 +1802,70 @@ def held_in_kept(ledger: Ledger, kept_path: str, tz: str) -> list[str]:
     return out
 
 
+def held_in_kept(ledger: Ledger, kept_path: str, tz: str) -> list[str]:
+    """The requests held in a ledger a restore set aside, as ready-to-copy lines."""
+    return [line for _, lines in held_items(kept_path, tz) for line in lines]
+
+
 def after_restore(ledger: Ledger, chat_id: int, tz: str) -> dict:
     """Once the restored ledger is open (thirteenth round): the requests held in the records it set aside are
-    posted back, ready to copy, once. {} when no swap was just done."""
+    posted back, ready to copy, once. {} when no swap was just done.
+
+    Fourteenth round: one message per held request, keyed by its id. A post-back marker beside the kept files
+    (<kept>.postback.json) names the item about to go before it's posted; the post and its record in the ledger
+    are one transaction, so after a stop at any point the marker and the ledger together say whether it went:
+    nothing is posted twice and nothing is lost. Once all are posted, older kept sets are pruned (the latest is
+    kept) if the records aren't waiting on a move."""
     side = _side(ledger, RESTORED)
     if not side or not os.path.isfile(side) or not chat_id:
         return {}
     info = _read_json(side)
-    kept = os.path.join(os.path.dirname(os.path.abspath(ledger.path)), str(info.get("kept") or ""))
-    lines = held_in_kept(ledger, kept, tz) if info.get("kept") else []
+    folder = os.path.dirname(os.path.abspath(ledger.path))
+    name = os.path.basename(str(info.get("kept") or ""))
+    kept = os.path.join(folder, name) if name else ""
+    items = held_items(kept, tz) if kept else []
+    mark_path = kept + POSTBACK if kept else ""
+    mark = _read_json(mark_path) if mark_path else {}
+    posted = list(mark.get("posted") or [])
+    sent = 0
+    for key, lines in [("summary", [])] + items:
+        if key in posted:
+            continue
+        flag = f"{POSTED}{name}:{key}"
+        if mark.get("pending") == key and ledger.get_meta(flag) is not None:
+            posted.append(key)                 # it went; the stop came before the marker said so
+            continue
+        mark = {"posted": posted, "pending": key, "done": False}
+        if mark_path:
+            _write_json(mark_path, mark)
+        with ledger.tx() as db:
+            if ledger.get_meta(flag) is None:
+                if key == "summary":
+                    text = (f"<b>Harness's records are back from the backup</b> "
+                            f"({render.escape(str(info.get('from') or 'a backup'))}). The records they replaced are "
+                            f"kept as {render.escape(name)}. "
+                            + (f"{len(items)} request{'s were' if len(items) != 1 else ' was'} waiting there; each "
+                               "follows, ready to copy into the calendar app." if items
+                               else "No requests were waiting there."))
+                else:
+                    text = "A request that was waiting in the records set aside; ready to copy into the calendar " \
+                           "app:\n" + "\n".join(lines)
+                ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(text), db=db)
+                ledger.set_meta(flag, iso(ledger.now()), db)
+                sent += key != "summary"
+        _swap_step("posted:" + key)
+        posted.append(key)
+        if mark_path:
+            _write_json(mark_path, {"posted": posted, "pending": None, "done": False})
     with ledger.tx() as db:
-        ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(
-            f"<b>Harness's records are back from the backup</b> ({render.escape(str(info.get('from') or 'a backup'))})."
-            f" The records they replaced are kept as {render.escape(str(info.get('kept') or ''))}. "
-            + ("These requests were waiting there; ready to copy into the calendar app:\n" + "\n".join(lines)
-               if lines else "No requests were waiting there.")), db=db)
-        ledger.event("migration_restored", {"from": info.get("from", ""), "kept": info.get("kept", ""),
-                                            "held_passed_back": len(lines)}, db=db)
+        ledger.event("migration_restored", {"from": info.get("from", ""), "kept": name,
+                                            "held_passed_back": len(items), "sent_now": sent}, db=db)
+    if mark_path:
+        _write_json(mark_path, {"posted": posted, "pending": None, "done": True})
     _remove_file(side)
-    return {"held": len(lines), **info}
+    if not waiting(ledger):
+        prune_kept(folder)
+    return {"held": len(items), **info}
 
 
 if __name__ == "__main__":

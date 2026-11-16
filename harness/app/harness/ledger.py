@@ -415,6 +415,15 @@ class LedgerBusy(TimeoutError):
     """A write waited WRITER_WAIT_MAX_S for another thread's hold on the ledger and gave up; nothing was written."""
 
 
+class LedgerFenced(RuntimeError):
+    """Fourteenth round: a restore is staged, so the ledger takes no write (Ledger.fence): it fails at once with
+    the plain reason, never waits. Only the outbox's delivery bookkeeping is exempt (tx(fence_exempt=True))."""
+
+
+# Fourteenth round: the staged restore's fence is a mode flag per ledger file, not a held lock.
+_FENCED: dict[str, str] = {}               # file -> the plain reason a write is refused
+
+
 def cross_thread_writes() -> list[dict]:
     """Writes another thread tried while a hold was on (thirteenth round): none is expected."""
     with _GATE:
@@ -522,12 +531,16 @@ class Ledger:
         return f"mem:{id(self)}" if not self.path or self.path == ":memory:" else os.path.abspath(self.path)
 
     @contextmanager
-    def tx(self):
+    def tx(self, *, fence_exempt: bool = False):
         """One write transaction. BEGIN IMMEDIATE so two writers can never
         interleave a read-check-write. Twelfth round: while another thread holds this ledger's
-        writers off (hold_writers, the migration), it waits until that's over."""
+        writers off (hold_writers, the migration), it waits until that's over. Fourteenth round: while a
+        restore is staged (fence) it fails at once with LedgerFenced, unless fence_exempt (the outbox's own
+        delivery bookkeeping, so the restart card and replies still go out)."""
         key, me = self._key(), threading.get_ident()
         with _GATE:
+            if key in _FENCED and not fence_exempt:
+                raise LedgerFenced(_FENCED[key])
             if _HELD.get(key, me) != me:
                 self._wait_for_hold(key, me)
             mine = _ACTIVE.setdefault(key, {})
@@ -578,6 +591,24 @@ class Ledger:
                 raise TimeoutError("another hold on the ledger is on")
             _HELD[key] = me
             _GATE.notify_all()
+
+    def fence(self, reason: str) -> None:
+        """Fourteenth round: a restore is staged. From now until the restart every write fails at once with
+        LedgerFenced(reason) (no lock is held, so nothing ever waits on it), except the outbox's delivery marks."""
+        with _GATE:
+            _FENCED[self._key()] = reason or "a restore is staged"
+            _GATE.notify_all()
+
+    def unfence(self) -> None:
+        with _GATE:
+            _FENCED.pop(self._key(), None)
+            _GATE.notify_all()
+
+    @property
+    def fenced(self) -> str:
+        """The fence's plain reason while a staged restore fences writes, else ""."""
+        with _GATE:
+            return _FENCED.get(self._key(), "")
 
     def release_hold(self) -> None:
         key, me = self._key(), threading.get_ident()

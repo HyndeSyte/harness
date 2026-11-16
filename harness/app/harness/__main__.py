@@ -62,11 +62,19 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     # held), and all swapping is done here, before the ledger opens.
     from . import migrate
     path = os.path.join(data_dir, "harness.sqlite")
-    migrate.hold_process_lock(path)
+    # Fourteenth round: the lock is taken before any marker is read, waiting while the restore command line
+    # stages (it holds the same lock); a swap that can't finish safely starts degraded rather than open the
+    # records beside a log that isn't theirs.
+    if not migrate.hold_process_lock(path, wait_s=migrate.LOCK_WAIT_S):
+        raise migrate.SwapRefused("another process holds harness.lock beside the records")
     try:
         migrate.apply_staged_restore(path)
+    except migrate.SwapRefused:
+        raise
     except OSError as e:
         logging.getLogger("harness").error("the staged restore couldn't be swapped in: %s", type(e).__name__)
+        if os.path.exists(path + migrate.SWAP_MARKER):
+            raise migrate.SwapRefused(f"a restore swap couldn't finish ({type(e).__name__})") from e
     ledger = Ledger(path)
     transport = UrllibTransport()
     # Discord, through Cain: cards go to Cain's link, which shows them when Cain says;
@@ -178,7 +186,11 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     # The mutual watch on Cain's add-on: told once if it's down 5 minutes, once when back.
     controller.cain_watch = watch.PeerWatch(store.get, store.set)
     # Cain hands calendar requests over here, keyed by the bot token both hold.
-    controller.handovers = handover.Inbox(discord_token, wake=keeper.wake)
+    # Fourteenth round: taps are written to a journal beside the ledger before Cain's link hears they're taken,
+    # and answered at once (not queued) while a restore is staged.
+    controller.handovers = handover.Inbox(discord_token, wake=keeper.wake, journal=path + handover.TAP_JOURNAL,
+                                          staged=lambda: migrate.restore_staged(path),
+                                          answer=chat.answer_callback)
     try:
         handover.serve(controller.handovers,
                        port=int(os.environ.get("HARNESS_HANDOVER_PORT", handover.PORT)))
@@ -194,6 +206,11 @@ def degraded(data_dir: str, port: int, why: str) -> int:
     Cain's health check (status "degraded", with why), so it's seen and said, and waits to be stopped. A restore
     staged by the command line (with the App stopped) or from a Home Assistant backup is the way back."""
     log = logging.getLogger("harness")
+    # Fourteenth round: nothing here touches the records, so the lock is let go: a restore can be staged from the
+    # command line (python3 -m harness.migrate <records> --restore <schema> <build>) without stopping the App,
+    # and the next start swaps it in.
+    from . import migrate
+    migrate.release_process_lock(os.path.join(data_dir, "harness.sqlite"))
     vault = Vault(os.path.join(data_dir, "secrets.json"))
     status: dict = {"notes": [f"Harness started degraded: {why}. Calendar work is off until it starts normally."],
                     "migration": {"degraded": True, "why": why}}
@@ -233,7 +250,10 @@ def main() -> int:
         controller, web, listener = build(data_dir, port=port)
     except Exception as e:                     # noqa: BLE001: thirteenth round, never a start that can't recover
         log.error("the specialist couldn't start (%s): serving the status page and health only", type(e).__name__)
-        return degraded(data_dir, port, f"the records couldn't be opened ({type(e).__name__})")
+        from . import migrate
+        why = (f"the records weren't opened: {e}" if isinstance(e, migrate.SwapRefused)
+               else f"the records couldn't be opened ({type(e).__name__})")
+        return degraded(data_dir, port, why)
 
     def stop(*_):
         raise Stop()
@@ -260,6 +280,10 @@ def main() -> int:
     except Stop:
         pass
     log.info("harness stopping")
+    try:
+        controller.drain_on_stop()             # fourteenth round: nothing queued is dropped silently
+    except Exception as e:                     # noqa: BLE001: stopping goes on
+        log.error("the queue couldn't be drained as it stopped: %s", type(e).__name__)
     web.shutdown()
     if listener is not None:
         listener.shutdown()

@@ -31,13 +31,13 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import (callbacks, choices, commands, daily, effects, ingress_filter, integrity, migrate,
-               policy, provenance, render, rules, watch)
+               handover, policy, provenance, render, rules, watch)
 from .chat import Decision, Incoming
 from .config import Config
 from .discord_api import DiscordError, escape
 from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
 from .engines import Engine
-from .ledger import Ledger, iso
+from .ledger import Ledger, LedgerBusy, LedgerFenced, iso
 from .outbox import Outbox
 from .runner import CLARIFY_WAIT_S, Runner
 from .vault import LABELS, Vault
@@ -362,6 +362,11 @@ class Controller:
             self.family_add.reconcile_after_restart()
         if self.calendar_change is not None:
             self.calendar_change.reconcile_after_restart()
+            # Fourteenth round: the conformance item's own test event, retried at every start until shown gone.
+            try:
+                self.status_box["test_events_left"] = self.calendar_change.sweep_test_events() or None
+            except Exception as e:             # noqa: BLE001: never stops the start
+                log.warning("the conformance test event sweep failed: %s", type(e).__name__)
         self._clarify_timeouts(restart=True)
 
     # -- the loop --------------------------------------------------------------
@@ -377,11 +382,12 @@ class Controller:
         posted again if Discord refused it, a reminder goes once a day, and the wait shows on the status page
         and in Cain's /health."""
         try:
-            migrate.heartbeat(self.ledger)
-            if migrate.waiting(self.ledger) and self.config is not None:
-                migrate.tend_waiting(self.ledger, self.config.owner_user_id, self.config.timezone)
-            if self.config is not None and not migrate.restore_staged(self.ledger.path):
-                migrate.post_clock_card(self.ledger, self.config.owner_user_id)   # thirteenth round
+            if not self.ledger.fenced:         # fourteenth round: a staged restore's fence takes no write
+                migrate.heartbeat(self.ledger)
+                if migrate.waiting(self.ledger) and self.config is not None:
+                    migrate.tend_waiting(self.ledger, self.config.owner_user_id, self.config.timezone)
+                if self.config is not None and not migrate.restore_staged(self.ledger.path):
+                    migrate.post_clock_card(self.ledger, self.config.owner_user_id)   # thirteenth round
             summary = migrate.migration_summary(self.ledger)
         except Exception as e:                 # never stops the loop
             log.warning("migration upkeep failed: %s", type(e).__name__)
@@ -539,14 +545,14 @@ class Controller:
             self._publish()
             self._wait(10)
             return
-        if migrate.restore_staged(self.ledger.path):
+        if self.handovers is not None and self.handovers.answer is None:
+            self.handovers.answer = lambda callback, text: self.api.answer_callback(callback, text)
+        if self.ledger.fenced or migrate.restore_staged(self.ledger.path):
+            self._fence()
             self._fenced_tick()
             return
-        for h in (self.handovers.take() if self.handovers is not None else []):
-            {"press": self._press, "digest": self._cain_digest,
-             "morning-posted": self._morning_posted,
-             "meanings": self._meanings, "places": self._places,
-             "fastpath": self._fastpath}.get(h.kind, self._handover)(h)
+        self._replay_taps()
+        self._take_handovers()
         self._beat()
         self._release_digest()
         self._link_health()
@@ -556,21 +562,123 @@ class Controller:
         self._finish_handovers()
         self._wait(0.3 if (self._busy() or self._handover_jobs) else 3)
 
-    FENCED = ("Not taken: Harness is waiting to restart so its records can be put back from a backup. Restart the "
-              "Harness App in Home Assistant now. Nothing changed.")
+    FENCED = handover.FENCED_TAP
+    TAP_REPLAY_S = 14 * 60       # a tap written down this recently is taken at the next start (Discord's 15 minutes)
+    BUSY_TAP = ("Your tap is waiting: Harness's records are busy for a moment. It goes through by itself once "
+                "they're free; nothing to do.")
+
+    def _fence(self) -> None:
+        """Fourteenth round: a staged restore fences the ledger (a mode flag: every write but the outbox's
+        delivery marks fails at once with the plain reason; no lock is held), and Cain's handover service answers
+        taps at once without queueing them."""
+        if not self.ledger.fenced:
+            self.ledger.fence(self.FENCED)
+        if self.handovers is not None:
+            self.handovers.fenced = self.FENCED
+
+    def _take_handovers(self) -> None:
+        """Fourteenth round: each handover and tap is taken on its own. One the ledger can't take now (busy past
+        the bounded wait) goes back to the front of the queue with everything after it, and a tap's owner is told
+        once that it waits: never dropped. One the fence refuses gets the fence's plain reason. Any other failure
+        is told, never silent."""
+        items = self.handovers.take() if self.handovers is not None else []
+        for i, h in enumerate(items):
+            if self.ledger.fenced:             # his Put them back tap just staged one: the rest are refused
+                self.handovers.give_back(items[i:])
+                return
+            try:
+                {"press": self._press, "digest": self._cain_digest,
+                 "morning-posted": self._morning_posted,
+                 "meanings": self._meanings, "places": self._places,
+                 "fastpath": self._fastpath}.get(h.kind, self._handover)(h)
+            except LedgerBusy:
+                log.warning("the ledger was busy past the bounded wait: %d item(s) stay queued", len(items) - i)
+                if h.kind == "press" and not h.told:
+                    h.told = self.handovers.tell(h, self.BUSY_TAP) or True
+                self.handovers.give_back(items[i:])
+                return
+            except LedgerFenced as e:
+                h.finish("refused", str(e) or self.FENCED, restore_staged=True)
+                if h.kind == "press":
+                    self.handovers.journal_done(h.press)
+            except Exception as e:             # noqa: BLE001: told, and the rest still taken
+                log.error("a %s couldn't be taken: %s: %s", h.kind, type(e).__name__, e)
+                h.finish("error", "That couldn't be taken (an error in Harness, logged). Nothing changed.")
+                if h.kind == "press":
+                    self.handovers.tell(h, "That tap couldn't be taken (an error in Harness, logged). Nothing "
+                                           "changed.")
+                    self.handovers.journal_done(h.press)
+            if h.kind == "press" and migrate.restore_staged(self.ledger.path):
+                self._fence()                  # fenced once the tap that staged it has its reply recorded
+
+    def _replay_taps(self) -> None:
+        """Fourteenth round, once per start: taps written to the journal that the last run never committed (it
+        stopped first). One from the last TAP_REPLAY_S is taken now (a tap already in the ledger isn't taken
+        twice); an older one is struck off and he's told it wasn't taken, so a tap is never silently lost."""
+        if getattr(self, "_taps_replayed", False) or self.handovers is None:
+            return
+        self._taps_replayed = True
+        queued = {(str(h.press.get("id", "")), str(h.press.get("custom_id", "")))
+                  for h in list(self.handovers._front) + list(self.handovers.queue.queue) if h.kind == "press"}
+        late = []
+        for row in self.handovers.journaled():
+            p = {k: str(v) for k, v in (row.get("press") or {}).items()}
+            if (p.get("id", ""), p.get("custom_id", "")) in queued:
+                continue
+            try:
+                age = time.time() - float(row.get("at") or 0)
+            except (TypeError, ValueError):
+                age = 1e9
+            if age <= self.TAP_REPLAY_S:
+                log.warning("a tap the last run didn't finish is taken now")
+                self.handovers.give_back([handover.Handover(kind="press", press=p, journaled=True)])
+            else:
+                late.append(p)
+        if late and self.config is not None:
+            with self.ledger.tx() as db:
+                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=(
+                    f"Harness stopped before it took {'a tap' if len(late) == 1 else f'{len(late)} taps'} of yours, "
+                    "so nothing changed from "
+                    f"{'it' if len(late) == 1 else 'them'}. A card still works until it runs out."))
+                self.ledger.event("taps_not_taken", {"count": len(late)}, db=db)
+            for p in late:
+                self.handovers.journal_done(p)
+
+    def drain_on_stop(self) -> dict:
+        """Fourteenth round, as the App stops: whatever is still queued is answered, so nothing is dropped
+        silently. A tap written down stays in the journal for the next start (and he's told it waits); one that
+        couldn't be written down is told it wasn't taken; a handover is answered that it wasn't taken."""
+        out = {"kept": 0, "told": 0, "refused": 0}
+        if self.handovers is None:
+            return out
+        for h in self.handovers.take():
+            if h.kind == "press":
+                if h.journaled:
+                    out["kept"] += 1
+                    self.handovers.tell(h, "Harness is restarting. Your tap is kept and goes through once it's "
+                                           "back.")
+                else:
+                    out["told"] += 1
+                    self.handovers.tell(h, "Not taken: Harness stopped before it took your tap. Nothing "
+                                           "changed.")
+                h.finish("working" if h.journaled else "refused", "Harness is stopping.")
+            else:
+                out["refused"] += 1
+                h.finish("refused", "Not taken: Harness is stopping. Nothing changed.")
+        if any(out.values()):
+            log.warning("stopping with queued items: %s", out)
+        return out
 
     def _fenced_tick(self) -> None:
         """Thirteenth round: a restore is staged, so nothing new is taken until the restart (whatever is recorded
         now is set aside by it). Each handover gets a plain answer, each tap an answer on its button; the outbox
-        still posts (the card that asks him to restart), and the page and Cain's /health say a restore waits."""
+        still posts (the card that asks him to restart), and the page and Cain's /health say a restore waits.
+        Fourteenth round: the fence is the ledger's mode flag, and the outbox's delivery marks are exempt."""
         for h in (self.handovers.take() if self.handovers is not None else []):
             if h.kind == "press":
-                h.finish("ok")
-                p = h.press
-                try:
-                    self.api.answer_callback(f"{p.get('app', '')}:{p.get('token', '')}", self.FENCED)
-                except Exception as e:         # noqa: BLE001: an answer that didn't go changes nothing
-                    log.info("a tap while the restore waits couldn't be answered: %s", type(e).__name__)
+                h.finish("refused", self.FENCED, restore_staged=True)
+                self.handovers.tell(h, self.FENCED)
+                self.handovers.journal_done(h.press)
             else:
                 h.finish("refused", self.FENCED, restore_staged=True)
         self._beat()
@@ -668,7 +776,13 @@ class Controller:
         """A tap on one of our cards, checked by Cain's link and passed back here. The
         card's own checks (that card, once, before it expires) are the ledger's."""
         p = h.press
+        self._press_inner(h, p)
+        # Fourteenth round: answered (and struck off the tap journal) only once what it did is committed.
         h.finish("ok")
+        if self.handovers is not None:
+            self.handovers.journal_done(p)
+
+    def _press_inner(self, h, p) -> None:
         owner = self.config.owner_user_id
         cid = str(p.get("custom_id", ""))
         if not cid.startswith(DISCORD_PREFIX):
@@ -689,6 +803,10 @@ class Controller:
                            callback_data=cid[len(DISCORD_PREFIX):])
         except (KeyError, ValueError, TypeError):
             return
+        if h.journaled and self.ledger.db.execute(
+                "SELECT 1 FROM updates WHERE bot_id=? AND update_id=? AND kind='callback'",
+                (self.ledger.bot_id(), inc.update_id)).fetchone():
+            return                             # a journaled tap the last run already took: not taken twice
         self.ledger.ingest([Decision(inc, True, None, None)])
         self.callbacks.handle(inc)
 

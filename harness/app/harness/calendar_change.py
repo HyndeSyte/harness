@@ -208,6 +208,10 @@ LEFTOVERS = "calendar_smoke_leftovers:"  # + run id: what its one-tap removal ta
 SMOKE_STEP_TTL_S = 30 * 60
 SMOKE_OWN = "calendar_smoke_own:"          # + a change family's root job: {"run", "step", "at"}
 SMOKE_CREATED = "calendar_smoke_created:"  # + run id: every event the run itself created, by id
+# Fourteenth round: the unguarded PUT's own test event on Family, by URL, written before it's created and kept
+# until a read shows it gone: {href: {"run", "nonce", "at", "tries"}}. Each start retries the removal
+# (sweep_test_events); one still there shows on the status page.
+UNGUARDED_LEFT = "calendar_unguarded_test_left"
 _STEP_FN = {"gmail_add": ("gmail", "add"), "family_add": ("family", "add"), "gmail_move": ("gmail", "move"),
             "family_move": ("family", "move"), "gmail_remove": ("gmail", "remove"),
             "family_remove_one": ("family", "remove"), "family_remove_days": ("family", "remove")}
@@ -251,6 +255,15 @@ def _meta_json(ledger: Ledger, key: str) -> dict:
     except ValueError:
         return {}
     return got if isinstance(got, dict) else {}
+
+
+def test_events_left(ledger: Ledger) -> list[dict]:
+    """Fourteenth round: the unguarded PUT's test events not yet shown gone (UNGUARDED_LEFT), oldest first, for
+    the status page: [{"href", "run", "at", "tries"}]."""
+    got = _meta_json(ledger, UNGUARDED_LEFT)
+    out = [{"href": h, "run": str(v.get("run", "")), "at": str(v.get("at", "")), "tries": int(v.get("tries") or 0)}
+           for h, v in got.items() if isinstance(v, dict)]
+    return sorted(out, key=lambda x: (x["at"], x["href"]))
 
 
 def card_gate(ledger: Ledger) -> dict:
@@ -673,35 +686,166 @@ def _canon(value) -> str:
     return " ".join(str(value).replace("\\", "").lower().split())
 
 
+# Fourteenth round: which fields a baseline may loosen, and which are compared by when they resolve to.
+_TEXT_FIELDS = {"SUMMARY", "DESCRIPTION", "LOCATION", "COMMENT", "CATEGORIES", "CONTACT", "RESOURCES",
+                "summary", "description", "location"}
+_TEMPORAL_FIELDS = {"DTSTART", "DTEND", "DUE", "RECURRENCE-ID", "EXDATE", "RDATE", "RRULE", "EXRULE",
+                    "start", "end", "originalStartTime", "recurrence"}
+
+
+def _prop(field) -> str:
+    """The property a field of _ics_fields or _gmail_fields is: the iCalendar name, or Google's key."""
+    return str(field[1]) if isinstance(field, (tuple, list)) else str(field)
+
+
+def _bare(value) -> list[str] | str:
+    """A value without its iCalendar name and parameters (an exact compare, nothing loosened)."""
+    if isinstance(value, list):
+        return sorted(re.sub(r"^[A-Z-]+(?:;[^:]*)?:", "", str(v)) for v in value)
+    return value
+
+
+def _ics_when(text: str, params: dict) -> tuple | None:
+    """One iCalendar date or date-time as (all-day, instant, zone): the UTC instant (or the date), so a time zone
+    or all-day change shows; None when it can't be resolved (an unknown zone, a period)."""
+    text = text.strip()
+    if params.get("VALUE", "").upper() == "DATE" or re.fullmatch(r"\d{8}", text):
+        return (True, text, "") if re.fullmatch(r"\d{8}", text) else None
+    m_ = re.fullmatch(r"(\d{8}T\d{6})(Z?)", text)
+    if not m_:
+        return None
+    naive = datetime.strptime(m_.group(1), "%Y%m%dT%H%M%S")
+    if m_.group(2):
+        return (False, naive.replace(tzinfo=timezone.utc).isoformat(), "UTC")
+    zone = params.get("TZID", "")
+    if not zone:
+        return (False, "floating " + naive.isoformat(), "")
+    try:
+        return (False, naive.replace(tzinfo=ZoneInfo(zone)).astimezone(timezone.utc).isoformat(), zone)
+    except (KeyError, ValueError, OSError):
+        return None
+
+
+def _rule(text: str) -> tuple | None:
+    """An RRULE as its parts in order, with UNTIL resolved (_ics_when)."""
+    parts = {}
+    for p in text.strip().split(";"):
+        if "=" not in p:
+            return None
+        k, v = p.split("=", 1)
+        parts[k.strip().upper()] = v.strip().upper()
+    if "UNTIL" in parts:
+        until = _ics_when(parts["UNTIL"], {})
+        if until is None:
+            return None
+        parts["UNTIL"] = repr(until[:2])
+    return tuple(sorted(parts.items()))
+
+
+def _resolved(field, value) -> tuple | None:
+    """Fourteenth round: a temporal field (_TEMPORAL_FIELDS) as what it means: (sorted resolved values, sorted
+    zones). None when any part can't be resolved, which counts as a real change."""
+    if value is None:
+        return None
+    whens: list = []
+    zones: set = set()
+    if isinstance(value, list):                                  # iCalendar lines
+        for line in value:
+            head, _, body = str(line).partition(":")
+            name, *raw = head.split(";")
+            params = {}
+            for p in raw:
+                k, _, v = p.partition("=")
+                params[k.strip().upper()] = v.strip().strip('"')
+            if name.upper() in ("RRULE", "EXRULE"):
+                r = _rule(body)
+                if r is None:
+                    return None
+                whens.append(("rule", r))
+                continue
+            for one in body.split(","):
+                w = _ics_when(one, params)
+                if w is None:
+                    return None
+                whens.append(w[:2])
+                zones.add(w[2])
+        return tuple(sorted(map(repr, whens))), tuple(sorted(zones))
+    try:                                                         # Google: a JSON value
+        v = json.loads(value) if isinstance(value, str) else value
+    except ValueError:
+        return None
+    if _prop(field) == "recurrence":
+        if not isinstance(v, list):
+            return None
+        return _resolved(("", "RRULE"), [str(x) for x in v])
+    if not isinstance(v, dict):
+        return None
+    if v.get("date"):
+        return (repr((True, str(v["date"]).replace("-", ""))),), ("",)
+    try:
+        at = datetime.fromisoformat(str(v.get("dateTime", "")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    zone = str(v.get("timeZone") or "")
+    if at.tzinfo is None:
+        if not zone:
+            return None
+        try:
+            at = at.replace(tzinfo=ZoneInfo(zone))
+        except (KeyError, ValueError, OSError):
+            return None
+    return (repr((False, at.astimezone(timezone.utc).isoformat())),), (zone or "offset",)
+
+
 def _baseline_of(diff: list[dict]) -> dict:
     """Thirteenth round: a no-op round trip's differences as a calendar's baseline: {field key: {"kind": "added",
-    "now": value} | {"kind": "removed"} | {"kind": "changed"}}."""
+    "now": value} | {"kind": "removed", "was": value} | {"kind": "changed", "now": value}}. Fourteenth round: a
+    removal keeps the value removed, a change keeps the value it became, and a change of a temporal field keeps
+    the zones it went from and to."""
     out = {}
     for x in diff:
+        key = _field_key(x["field"])
         if x["was"] is None:
-            out[_field_key(x["field"])] = {"kind": "added", "now": x["now"]}
+            out[key] = {"kind": "added", "now": x["now"]}
         elif x["now"] is None:
-            out[_field_key(x["field"])] = {"kind": "removed"}
+            out[key] = {"kind": "removed", "was": x["was"]}
         else:
-            out[_field_key(x["field"])] = {"kind": "changed"}
+            out[key] = {"kind": "changed", "now": x["now"]}
+            if _prop(x["field"]) in _TEMPORAL_FIELDS:
+                was, now = _resolved(x["field"], x["was"]), _resolved(x["field"], x["now"])
+                if was and now:
+                    out[key]["zones"] = [list(was[1]), list(now[1])]
     return out
 
 
 def _matches_baseline(x: dict, baseline: dict | None) -> bool:
     """Whether a difference after a write is only the calendar's own normalisation (thirteenth round): the same
-    field changed the same way in the baseline: added with the same value, removed, or changed to a value that's
-    the same once normalised (_canon). Anything else is someone's edit."""
+    field changed the same way in the baseline. Fourteenth round, narrower: added with the same value; removed
+    only when the value removed is the one the baseline showed removed (an empty or default one, never any
+    value); changed, for a text field the baseline showed changed, to a value that's the same once spacing,
+    case, escapes and parameters are set aside (_canon); for a temporal field (DTSTART, DTEND, RECURRENCE-ID,
+    EXDATE, RRULE, VALUE=DATE or DATE-TIME) to one that resolves to the same instant or date and all-day status,
+    in the same zone or with the very zone rewrite the baseline showed; for any other field, to the same value
+    the baseline's change gave. Anything else, or anything that can't be resolved, is someone's edit."""
     b = (baseline or {}).get(_field_key(x["field"]))
     if not b:
         return False
     kind = "added" if x["was"] is None else "removed" if x["now"] is None else "changed"
     if b.get("kind") != kind:
         return False
+    prop = _prop(x["field"])
     if kind == "added":
         return x["now"] == b.get("now")
-    if kind == "changed":
+    if kind == "removed":
+        return "was" in b and _bare(x["was"]) == _bare(b.get("was"))
+    if prop in _TEMPORAL_FIELDS:
+        was, now = _resolved(x["field"], x["was"]), _resolved(x["field"], x["now"])
+        if was is None or now is None or was[0] != now[0]:
+            return False
+        return was[1] == now[1] or [list(was[1]), list(now[1])] == b.get("zones")
+    if prop in _TEXT_FIELDS:
         return _canon(x["was"]) == _canon(x["now"])
-    return True
+    return "now" in b and _bare(x["now"]) == _bare(b.get("now"))
 
 
 def _gmail_fields(event: dict) -> dict:
@@ -1969,7 +2113,8 @@ class CalendarChange:
         try:
             # Twelfth round: a PUT with no If-Match, on a test event of its own, as a write opened without
             # protection (or on a weak version) sends it: recorded as taken or refused.
-            got["unguarded_put"], answers["unguarded_put"] = self._unguarded_put(phref, plain, fetch)
+            got["unguarded_put"], answers["unguarded_put"] = self._unguarded_put(phref, plain, fetch,
+                                                                                run_id=run_id, nonce=nonce)
             out = self.client.put_new(href, one)
             if out.kind != "ok":
                 return {**got, "why": "its test event couldn't be added"}
@@ -1997,13 +2142,18 @@ class CalendarChange:
                 if back.kind == "ok" and f"X-HARNESS-SMOKE:{run_id}\n" in flat + "\n" \
                         and f"X-HARNESS-SMOKE-NONCE:{nonce}" in flat:
                     cleared = self.client.remove_at(at, back.etag or "").kind == "ok" and cleared
+            self._settle_test(phref, fetch)
             got["cleared"] = cleared
 
-    def _unguarded_put(self, href: str, ics: str, fetch) -> tuple[str, str]:
+    def _unguarded_put(self, href: str, ics: str, fetch, run_id: str = "", nonce: str = "") -> tuple[str, str]:
         """Twelfth round: on Family, its own test event replaced with no If-Match: "taken" (the replace
         landed and reads back), "refused" (turned down), or "unknown". (result, its answer in words).
         Thirteenth round: the test event is far in the past with no alarm (UNGUARDED_AT, UNGUARDED_TITLE), and
-        it's removed and read back gone before the result counts: one that can't be shown gone is "unknown"."""
+        it's removed and read back gone before the result counts: one that can't be shown gone is "unknown".
+        Fourteenth round: its URL (random each run) is kept in the ledger before it's created (created only where
+        nothing is, If-None-Match: *, before the PUT with no If-Match), until a read shows it gone; every start
+        retries the removal (sweep_test_events)."""
+        self._track_test(href, run_id, nonce)
         if self.client.put_new(href, ics).kind != "ok":
             return "unknown", "its test event couldn't be added"
         back, body = fetch(href)
@@ -2051,12 +2201,79 @@ class CalendarChange:
         return _baseline_of(_lost_fields(_gmail_fields(ev), _gmail_fields(ev), _gmail_fields(now)))
 
     def _drop_test(self, href: str, fetch) -> bool:
-        """The unguarded PUT's test event removed and read back gone (thirteenth round). Whether it's gone."""
+        """The unguarded PUT's test event removed and read back gone (thirteenth round). Whether it's gone.
+        Fourteenth round: once shown gone it's no longer kept as left (UNGUARDED_LEFT)."""
         back, _ = fetch(href)
         if back.kind == "ok":
             self.client.remove_at(href, back.etag or "")
             back, _ = fetch(href)
+        if back.kind == "gone":
+            self._untrack_test(href)
         return back.kind == "gone"
+
+    # -- the unguarded PUT's test event, until it's shown gone (fourteenth round) ----------------------------------
+    def _tracked_tests(self) -> dict:
+        try:
+            got = json.loads(self.ledger.get_meta(UNGUARDED_LEFT) or "{}")
+        except ValueError:
+            return {}
+        return got if isinstance(got, dict) else {}
+
+    def _track_test(self, href: str, run_id: str, nonce: str) -> None:
+        left = self._tracked_tests()
+        left[href] = {"run": run_id, "nonce": nonce, "at": iso(self.ledger.now()), "tries": 0}
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(UNGUARDED_LEFT, json.dumps(left, sort_keys=True), db)
+
+    def _untrack_test(self, href: str) -> None:
+        left = self._tracked_tests()
+        if href in left:
+            del left[href]
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(UNGUARDED_LEFT, json.dumps(left, sort_keys=True), db)
+
+    def _settle_test(self, href: str, fetch) -> None:
+        """After the conformance item's own cleanup: a test event read back gone is no longer kept as left."""
+        if href in self._tracked_tests():
+            try:
+                back, _ = fetch(href)
+            except Exception:                     # noqa: BLE001: kept, and retried at the next start
+                return
+            if back.kind == "gone":
+                self._untrack_test(href)
+
+    def sweep_test_events(self) -> list[dict]:
+        """At every start (fourteenth round): each unguarded PUT test event still kept as left is read by its URL;
+        gone, it's forgotten; there and still carrying its run's tag and nonce, it's removed with the version just
+        read and read again, and forgotten once shown gone. Anything else (no answer, a removal turned down, a
+        body without its tag) keeps it, counted, for the next start. What's still left, for the status page."""
+        left = self._tracked_tests()
+        if not left or self.client is None:
+            return test_events_left(self.ledger)
+        for href, info in list(left.items()):
+            try:
+                back, body = self.client.fetch(href)
+                if back.kind == "ok":
+                    flat = (body or "").replace("\r\n", "\n")
+                    if f"X-HARNESS-SMOKE:{info.get('run', '')}\n" in flat + "\n" \
+                            and f"X-HARNESS-SMOKE-NONCE:{info.get('nonce', '')}" in flat:
+                        self.client.remove_at(href, back.etag or "")
+                        back, _ = self.client.fetch(href)
+            except Exception as e:                # noqa: BLE001: kept, and retried at the next start
+                log.warning("the conformance test event couldn't be read or removed: %s", type(e).__name__)
+                back = None
+            if back is not None and back.kind == "gone":
+                self._untrack_test(href)
+                log.info("the conformance test event left from run %s is gone now", info.get("run", ""))
+                continue
+            got = self._tracked_tests()
+            if href in got:
+                got[href]["tries"] = int(got[href].get("tries") or 0) + 1
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(UNGUARDED_LEFT, json.dumps(got, sort_keys=True), db)
+            log.warning("the conformance test event from run %s is still on Family; retried at the next start",
+                        info.get("run", ""))
+        return test_events_left(self.ledger)
 
     def _maybe_open(self, gate: dict, provider: str, now: str) -> bool:
         """A calendar's gate opens (ninth round) once the run has read back a fenced edit and a series-day

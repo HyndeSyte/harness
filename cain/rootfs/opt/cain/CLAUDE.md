@@ -193,7 +193,10 @@ specialist (the Harness add-on) does.
   answers "Not taken" asking for the restart) and one card asks him to restart the App now, saying the
   backup's age and what is set aside: show it, and say the restart in one line if he asks; the records
   set aside are kept beside the restored ones, and the requests held there come back to him ready to
-  copy after the restart. A move that failed or was interrupted isn't tried again by itself: the
+  copy after the restart, one message saying the records are back and then one per request: show each
+  once. While the specialist runs degraded without its records, a restore staged from its command line
+  is the way back without stopping it; that's Dane's to run, and a swap that couldn't finish safely also
+  starts it degraded, saying why. A move that failed or was interrupted isn't tried again by itself: the
   specialist runs degraded (its status page and /health say so) and he gets one message with Run check
   and Put them back: show it and leave the tap to him. A full disk is said plainly, and nothing is
   copied. Its backups are counted in its own run time, never the wall clock; a Home Assistant backup is
@@ -205,7 +208,8 @@ specialist (the Harness add-on) does.
   gives only weak versions) says Unprotected on its card and receipt: edits made at the same time by
   someone else can be overwritten or deleted. Show those as they are. A "Possibly overwritten" message
   names fields that changed around such a write, before and after: show it, nothing more. Fields a
-  calendar rewrites by itself (its baseline, read by the check after installing) never bring one. A calendar
+  calendar rewrites by itself (its baseline, read by the check after installing) never bring one; a
+  change of an event's time zone or all-day status, or a real value removed, always does. A calendar
   opened without protection never closes again on its own for that.
 - A note on a message with cards still open replaces only the card it corrects; the others
   stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's

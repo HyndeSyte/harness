@@ -44,8 +44,9 @@ ALLOWED = [
      "the one card after his Put them back tap: the restore is used only when the App starts (thirteenth round)"),
     ("migrate.py", "Ready: restart Harness now",
      "the answer on his Put them back tap, pointing at that card (thirteenth round)"),
-    ("controller.py", "Harness is waiting to restart so its records",
-     "what a request or tap gets while a staged restore waits for the restart (thirteenth round)"),
+    ("handover.py", "Harness is waiting to restart so its records",
+     "what a request or tap gets while a staged restore waits for the restart (thirteenth round); fourteenth "
+     "round: it lives in handover.py, since Cain's handover service answers a tap with it at once, unqueued"),
     ("setup_web.py", "A restore is staged: restart the App now",
      "the status page while a staged restore waits for the restart (thirteenth round)"),
     ("calendar_change.py", "Try again",

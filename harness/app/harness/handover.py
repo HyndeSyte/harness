@@ -40,6 +40,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -56,6 +57,10 @@ WAIT_S = 25
 MAX_BODY = 4096
 MAX_SUGGESTION = 1500
 MAX_MEANINGS_BODY = 16384             # up to 60 short rows, or the place book
+PRESS_WAIT_S = 8                      # a tap's answer to Cain's link waits this long at most (its own limit is 10 s)
+TAP_JOURNAL = ".taps.jsonl"           # beside the ledger: taps written down before they're taken (fourteenth round)
+FENCED_TAP = ("Not taken: Harness is waiting to restart so its records can be put back from a backup. Restart the "
+              "Harness App in Home Assistant now. Nothing changed.")
 ROUTES = ("/handover", "/digest", "/press", "/morning-posted", "/meanings", "/places", "/fastpath")
 BIG = ("/meanings", "/places")
 STUCK_S = 10 * 60
@@ -136,6 +141,8 @@ class Handover:
     arrived: float = field(default_factory=time.monotonic)
     age: float | None = None             # how old his message was when Cain handed it over
     job: str = ""                        # the job's short id: for the log, never for him
+    journaled: bool = False              # /press: written to the tap journal (fourteenth round)
+    told: bool = False                   # /press: he was told once that it waits (fourteenth round)
 
     def finish(self, status: str, said: str = "", **extra) -> None:
         if not self.done.is_set():
@@ -149,10 +156,21 @@ class Handover:
 
 
 class Inbox:
-    def __init__(self, token_fn: Callable[[], str], wake: threading.Event | None = None):
+    def __init__(self, token_fn: Callable[[], str], wake: threading.Event | None = None, *, journal: str = "",
+                 staged: Callable[[], bool] | None = None,
+                 answer: Callable[[str, str], None] | None = None):
         self._token_fn = token_fn
         self.queue: "queue.Queue[Handover]" = queue.Queue()
+        self._front: list[Handover] = []     # fourteenth round: items given back by the controller, taken first
+        self._lock = threading.Lock()
         self.wake = wake
+        # Fourteenth round: every tap is written to this journal (one JSON line, flushed to disk) before Cain's
+        # link hears it was taken, and struck off only once the controller has committed what it did; a tap
+        # left in it at the next start is taken then, or he is told (Controller._replay_taps). "" for none.
+        self.journal = journal
+        self.staged = staged or (lambda: False)   # a restore is staged: a tap is answered at once, not queued
+        self.fenced = ""                          # the controller's fence reason, once it has seen the staged restore
+        self.answer = answer                      # posts a short note to him on a tap (the link's /answer)
         self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
         self.migration: dict = {}            # twelfth round: the ledger waiting for its move (migrate.waiting_summary)
         self.degraded = ""                   # thirteenth round: why it started without its records, or ""
@@ -180,10 +198,93 @@ class Inbox:
 
     def pending(self) -> int:
         """Handovers and taps queued for the controller's thread, not taken yet (thirteenth round)."""
-        return self.queue.qsize()
+        with self._lock:
+            front = len(self._front)
+        return front + self.queue.qsize()
+
+    def give_back(self, items: list[Handover]) -> None:
+        """Fourteenth round: items the controller couldn't take now (the ledger busy) go back to the front of
+        the queue, in order, to be taken first next time. Never dropped."""
+        if not items:
+            return
+        with self._lock:
+            self._front[:0] = list(items)
+
+    # -- the tap journal (fourteenth round) --------------------------------------------------------------
+    def _journal_lines(self) -> list[dict]:
+        try:
+            with open(self.journal, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError):
+            log.error("the tap journal couldn't be read")
+            return []
+        return [r for r in rows if isinstance(r, dict)]
+
+    def journal_add(self, h: Handover) -> bool:
+        """Writes the tap down (appended, flushed and synced) before Cain's link hears it was taken. Whether it
+        was written."""
+        if not self.journal:
+            return False
+        row = {"press": {k: str(v) for k, v in h.press.items()}, "at": time.time()}
+        try:
+            with self._lock, open(self.journal, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as e:
+            log.error("a tap couldn't be written to the journal: %s", type(e).__name__)
+            return False
+        h.journaled = True
+        return True
+
+    def journal_done(self, press: dict) -> None:
+        """Strikes a tap off once what it did is committed (or he has been told it wasn't taken)."""
+        if not self.journal or not press:
+            return
+        key = (str(press.get("id", "")), str(press.get("custom_id", "")))
+        with self._lock:
+            rows = self._journal_lines()
+            keep = [r for r in rows if (str(r.get("press", {}).get("id", "")),
+                                        str(r.get("press", {}).get("custom_id", ""))) != key]
+            if len(keep) == len(rows):
+                return
+            try:
+                if not keep:
+                    os.remove(self.journal)
+                    return
+                tmp = self.journal + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write("".join(json.dumps(r) + "\n" for r in keep))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.journal)
+            except OSError as e:
+                log.error("the tap journal couldn't be updated: %s", type(e).__name__)
+
+    def journaled(self) -> list[dict]:
+        """The taps written down and not yet struck off: {"press", "at"} each, oldest first."""
+        if not self.journal:
+            return []
+        with self._lock:
+            return self._journal_lines()
+
+    def tell(self, h: Handover, text: str) -> bool:
+        """A short note to him on that tap (the link's follow-up to its deferred answer). Whether it went."""
+        p = h.press
+        if self.answer is None or not p.get("token"):
+            return False
+        try:
+            self.answer(f"{p.get('app', '')}:{p.get('token', '')}", text)
+            return True
+        except Exception as e:                 # noqa: BLE001: a note that didn't go changes nothing
+            log.info("a note on a tap couldn't be posted: %s", type(e).__name__)
+            return False
 
     def take(self) -> list[Handover]:
-        out = []
+        with self._lock:
+            out, self._front = self._front, []
         while True:
             try:
                 out.append(self.queue.get_nowait())
@@ -255,16 +356,32 @@ def _handler(inbox: Inbox, wait_s: float):
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
             if h.kind == "press":
-                # Thirteenth round: a tap is acknowledged here, before any ledger write, and queued in memory for
-                # the controller's thread (the only one that writes the ledger), however long a hold lasts.
-                h.finish("ok", queued=True)
-                inbox.submit(h)
-                return self._reply(200, h.result)
+                return self._press(h)
             inbox.submit(h)
             if not h.done.wait(wait_s):
                 return self._reply(202, {"status": "working", "said": (
                     "Still working on it. The keeper will post the result in the DM.")})
             self._reply(200, h.result)
+
+        def _press(self, h: Handover):
+            """Fourteenth round: Cain's link has already given Discord its deferred answer (the tap is seen,
+            nothing said yet). While a restore is staged the tap is answered at once that nothing is taken until
+            the restart, and never queued. Otherwise it's written to the tap journal first, then queued for the
+            controller's thread, and this answers once the controller has committed what it did (its note to
+            him is the follow-up), or after PRESS_WAIT_S with "working": the tap is then written down, so a stop
+            before the controller takes it loses nothing (the next start takes it, or tells him)."""
+            if inbox.fenced or inbox.staged():
+                said = inbox.fenced or FENCED_TAP
+                h.finish("refused", said, restore_staged=True)
+                inbox.tell(h, said)
+                return self._reply(200, h.result)
+            inbox.journal_add(h)
+            inbox.submit(h)
+            if not h.done.wait(min(wait_s, PRESS_WAIT_S)):
+                return self._reply(202, {"status": "working", "queued": True, "journaled": h.journaled})
+            if h.result.get("status") == "refused" and h.result.get("said"):
+                inbox.tell(h, str(h.result["said"]))
+            return self._reply(200, h.result)
 
         def do_GET(self):
             if self.path != "/health":
