@@ -42,7 +42,7 @@ export const CODES = [
   "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing", "extension_version_unknown", "read_unverified",
   "boundary_not_accepted", "update_pending",
   "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
-  "unattended_unsupported", "worker_folder_denied", "prefs_disagree",
+  "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -273,7 +273,7 @@ export function checkFacts(action: string, facts: unknown, ctx?: AddressCtx): Ch
   const out: Record<string, string | boolean | number> = {};
   for (const k of keys) {
     const t = Object.hasOwn(types, k) ? types[k] : undefined;
-    if (!t) return no(`a fact this action doesn't report (it reports ${Object.keys(types).join(", ")})`, /^[a-z_]{1,40}$/.test(k) ? k : "unknown_fact");
+    if (!t) return no(`a fact this action doesn't report (it reports ${Object.keys(types).join(", ")})`, "unknown_field");
     const v = factValue(t, facts[k], ctx);
     if (v === undefined) return no(`fact ${k} isn't ${factWhat(t)}`, k);
     out[k] = v;

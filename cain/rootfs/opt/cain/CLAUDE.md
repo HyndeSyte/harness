@@ -277,7 +277,8 @@ in the harness repo; until then the keeper says it is waiting).
   their own codes (`browser_unreachable`, `extension_unreachable`, `tool_inventory`,
   `wrong_profile`, `url_drift`, `unexpected_location`, `tabs_unexpected`,
   `navigation_unguarded`, `navigation_denied`, `hook_missing_decision`, `cli_changed`,
-  `extension_version_mismatch`, `worker_folder_denied` (the session tried to read the
+  `extension_version_mismatch`, `canary_first` and `other_tab` (the session read a page
+  before the run's check page, or on another tab), `worker_folder_denied` (the session tried to read the
   worker's own folder or its sign-in file; it was refused and the run failed), `schema_violation` (the report had a value outside its
   typed fields; nothing of it was kept), `canary_cookie_missing`, `result_rejected`,
   `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,

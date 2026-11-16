@@ -45,6 +45,12 @@
 - Fewer false alarms from Windows' coarse clock when the PC checks Claude in Chrome's helper belongs to your Chrome; the probe logs those times across its Chrome restart.
 - Setup now has the Cain jobs profile block pop-ups and redirects, and the PC warns (without stopping) if they're allowed.
 - New options: `pc_jobs_token` and `pc_jobs_repo`, both for the PC job queue.
+- A run you start without `--attended` now does nothing at all: it reads and writes nothing, not even the heartbeat or the queue.
+- The PC's last-run file names a failing field only when it is one of the job's own fields; anything else shows as unknown_field. An address the browser session was refused is logged by its site and a fingerprint only, never in full.
+- The guard around the worker's own folder also refuses inputs it can't read whole, addresses encoded more than once, and Windows short folder names.
+- A page read before the run's check page, or on another tab, fails the run (canary_first, other_tab), and a read whose answer doesn't show its address needs the tab list checked right after it. A new tab must have an address and be seen straight away.
+- Every built-in Claude Code tool is now denied by name, file search included, and the probe tries Glob, Grep and Read too. Any tool the session is given beyond the allowed ones stops the run, and the log lists what was expected and what was found.
+- If you close the worker mid-run, it ends the browser session first and then cleans up, so nothing the session writes is left behind.
 
 ## 0.11.0
 
