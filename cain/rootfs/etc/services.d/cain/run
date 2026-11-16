@@ -109,7 +109,7 @@ else
                    { printf '%s the switch ended with %s before it began\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" >> /data/c1/failed; } 2>/dev/null \
                      && { bashio::log.warning "The switch ended with $rc before it began: Cain runs the old way for now"; break; }
                  fi
-                 mode=none; switch_stopped=1; stop_kind=switch-stopped
+                 mode=none; switch_stopped=1; stop_kind=switch-blocked; stop_cause="the switch ended with $rc before it began"
                  stopped_why="the switch ended with $rc before it began, and that couldn't be put on record"; break
                fi ;;
           esac

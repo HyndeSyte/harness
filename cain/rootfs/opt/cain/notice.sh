@@ -45,7 +45,7 @@ RESTART="restart the Cain App: Settings, Apps, Cain, Restart"
 DETAILS="The Cain App's log has the details."
 group_of() {
   case "$1" in
-    breach|switch-stopped|damaged|setup|restart|switch-restart|exited|held) echo stop ;;
+    breach|switch-stopped|switch-blocked|damaged|setup|restart|switch-restart|exited|held) echo stop ;;
     session) echo session ;;
     switch-failed|switch-waits) echo switch ;;
     *) return 1 ;;
@@ -72,10 +72,12 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain is paused: the safety check of his own user couldn't finish, so his session is held. This isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. If he isn't back within an hour, $BACKUPS. $DETAILS" ;;
     session) T="Cain isn't answering"
       M="Cain isn't answering: his session keeps stopping soon after it starts. The App keeps starting it again by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
-    switch-failed) T="Cain runs the old way for now"
-      M="Cain's move to his own user, the safer setup in his update, didn't pass its checks${c}, so it was undone. He runs the old way for now and still answers you. Nothing for you to do: the App tries again by itself, at most three times in six hours." ;;
-    switch-waits) T="Cain runs the old way for now"
-      M="Cain's move to his own user didn't pass its checks three times${2:+ (the last: ${2})}, so the App waits six hours before it tries again. He runs the old way meanwhile and still answers you. Nothing for you to do." ;;
+    switch-failed) T="Cain is back on the old way for now"
+      M="Cain's move to his own user, the safer setup in his update, didn't pass its checks${c}, so it was undone and his App went back to the old way. Nothing for you to do: the App tries again by itself, at most three times in six hours. If he doesn't answer you, you'll hear that too." ;;
+    switch-waits) T="Cain is back on the old way for now"
+      M="Cain's move to his own user didn't pass its checks three times${2:+ (the last: ${2})}, so his App went back to the old way and waits six hours before it tries again. Nothing for you to do. If he doesn't answer you, you'll hear that too." ;;
+    switch-blocked) T="Cain is stopped"
+      M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -168,7 +170,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # replaced by the App stopping itself after it, say (C1 fourth outside round). Its repeats run
 # instead. The same rank, or a greater, replaces it.
 rank() {
-  case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
+  case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
     held|switch-restart|session|switch-waits) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]

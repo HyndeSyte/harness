@@ -651,7 +651,7 @@ def test_no_stop_is_silent(tmp_path):
     for line in sets:
         assert re.search(r"\bstop_kind=[a-z-]+", line), line
     kinds = set(re.findall(r"\bstop_kind=([a-z-]+)", run))
-    assert kinds == {"setup", "breach", "switch-stopped", "switch-restart", "restart", "damaged"}
+    assert kinds == {"setup", "breach", "switch-stopped", "switch-blocked", "switch-restart", "restart", "damaged"}
     told = set(re.findall(r'notice\.sh" tell ([a-z-]+)', run)) | set(re.findall(r"\bkind=(switch-[a-z]+)", run))
     assert told == {"exited", "switch-failed", "switch-waits", "held", "session", "breach"}
     for kind in kinds | told:
@@ -951,7 +951,7 @@ def test_each_failed_switch_reaches_dane_once_as_he_really_runs(tmp_path):
     # its own alarm, never the old way untold.
     fresh(127)
     (data / "c1/failed").mkdir()
-    assert _run_start(tmp_path, **env) == "mode=none kind=switch-stopped" and read(calls) == []
+    assert _run_start(tmp_path, **env) == "mode=none kind=switch-blocked" and read(calls) == []
     (data / "c1/failed").rmdir()
     # A try fails and is undone, but the old way doesn't pass its own checks: he's stopped (its
     # alarm says so), and the failed try isn't told as "he still answers", nor counted as told.
@@ -1022,7 +1022,7 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
         return ""
 
     # Every alarm: plain words for him, the way back, nothing he can't read; a cause in its words.
-    for kind in ("breach", "switch-stopped", "damaged", "setup", "restart", "switch-restart", "exited", "session", "held",
+    for kind in ("breach", "switch-stopped", "switch-blocked", "damaged", "setup", "restart", "switch-restart", "exited", "session", "held",
                  "switch-failed", "switch-waits"):
         title, text = call("text", kind, "the smoke test failed").splitlines()
         for words in (title, text):
@@ -1030,6 +1030,13 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
             assert not re.search(r"\b([PQ]\d+|[CDF]\d|wave \d)\b", words), kind
         assert "Settings, " in text or "Nothing for you to do" in text, kind
     assert "didn't pass its checks (the smoke test failed), so it was undone" in call("text", "switch-failed", "the smoke test failed")
+    # A failed switch is told before his session has started: it says where his App went, never
+    # that he answers (C1 sixth outside round); and a move that never began isn't "part way".
+    for kind in ("switch-failed", "switch-waits"):
+        assert "answers you" not in call("text", kind, "x") and "went back to the old way" in call("text", kind, "x"), kind
+    blocked = call("text", "switch-blocked", "the switch ended with 127 before it began")
+    assert "couldn't begin (the switch ended with 127 before it began)" in blocked and "The move changed nothing" in blocked
+    assert "part way" not in blocked
     assert "(the last: a, b, the App more)" in call("text", "switch-waits", "a — b, the add-on\nmore")
 
     # Raised while Discord is down and no hook is set: kept, nothing lost, and nothing is made
