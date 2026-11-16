@@ -6,12 +6,16 @@ tools: no shell, no files, no web fetch, and no clicking or typing. This run is 
 look and report. The worker lets you open only the run's own addresses, exactly as
 given: any other address is refused, and so is any tool it doesn't know. After every
 `read_page`, `get_page_text` or `find` call, call `tabs_context_mcp` before anything
-else: the worker may accept a read only with the tab's address right after it.
+else: the worker may accept a read only with the tab's address right after it. The
+same after `tabs_create_mcp`. When the worker says a tab context is owed, call
+`tabs_context_mcp` at once and go on: every other tool is refused until you do.
 
-1. Call `tabs_context_mcp` with `createIfEmpty` true. Your tab for this run is the tab
-   the run names as `tab_id`, if the list has it; otherwise the first tab listed.
-   Navigate that tab to the run's `canary_url` (a page the worker serves on this
-   computer), call `tabs_context_mcp` again, and read the four values on the page: the
+1. Call `tabs_context_mcp` (without `createIfEmpty`). If it lists the run's `tab_id`,
+   that tab is yours: navigate it to the run's `canary_url`. Otherwise open your tab with
+   `tabs_create_mcp` at the run's `canary_url` (a page the worker serves on this
+   computer): the tab id in its answer is your tab for the run. Only that tab counts as
+   yours, never a tab that was already open or one a page opened. Then
+   call `tabs_context_mcp` again, and read the four values on the page: the
    canary, the extension id, the attempt id and the profile. Those are your `canary`. If the
    extension doesn't answer, your outcome is `browser_unreachable`. If you can't open or
    read that page, or the window isn't the **Cain jobs** profile, your outcome is

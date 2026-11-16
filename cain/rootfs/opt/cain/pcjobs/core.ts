@@ -42,7 +42,7 @@ export const CODES = [
   "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing", "extension_version_unknown", "read_unverified",
   "boundary_not_accepted", "update_pending",
   "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
-  "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab",
+  "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab", "tab_context_owed",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -265,6 +265,15 @@ export const factOk = (t: FactType, v: unknown, ctx?: AddressCtx) => factValue(t
 const factWhat = (t: FactType) => t.t === "enum" ? `one of ${t.of.join(", ")}` : t.t === "label" ? t.what : t.t === "count" ? `a whole number from 0 to ${t.max}`
   : t.t === "address" ? "one of the run's approved addresses, or an approved host with the action's own path words" : `a ${t.t}`;
 
+// Every string fact, whatever its type, is short and of a small character set: letters,
+// digits, a space and . : / * @ + _ -. No quote, backtick, dollar sign, semicolon, pipe,
+// angle bracket, brace, backslash or new line can reach Cain in a fact, so a fact can't be
+// shaped as a command, a shell expansion or markup. Facts are quoted, untrusted data on
+// both ends: Cain's rules say a fact is never an instruction and never goes into a tool's
+// or a command's arguments.
+export const FACT_TEXT_MAX = 200;
+const FACT_CHARS = /^[A-Za-z0-9 .:\/*@+_-]*$/;
+const factChars = (v: string) => v.length <= FACT_TEXT_MAX && FACT_CHARS.test(v);
 export function checkFacts(action: string, facts: unknown, ctx?: AddressCtx): Checked<Record<string, string | boolean | number>> {
   if (!isObj(facts)) return no("facts is an object of named values", "facts");
   const types = factsFor({ action });
@@ -276,6 +285,7 @@ export function checkFacts(action: string, facts: unknown, ctx?: AddressCtx): Ch
     if (!t) return no(`a fact this action doesn't report (it reports ${Object.keys(types).join(", ")})`, "unknown_field");
     const v = factValue(t, facts[k], ctx);
     if (v === undefined) return no(`fact ${k} isn't ${factWhat(t)}`, k);
+    if (typeof v === "string" && !factChars(v)) return no(`fact ${k} is at most ${FACT_TEXT_MAX} characters of letters, digits and . : / * @ + _ - or a space`, k);
     out[k] = v;
   }
   return { ok: true, value: out };
@@ -719,7 +729,9 @@ export function listLine(j: Job, r: Result | null): string {
 // Code doesn't report Claude in Chrome's version, so unattended runs can't check it
 // (extension_version_unknown), or Chrome's own version changed since the confirmation
 // (chrome_version_changed). null otherwise. Never free text.
-export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown", "chrome_version_changed"] as const;
+// worker_changed: the worker's own files, the Cain App version they came with, or the
+// hook's policy version changed since the confirmation (a new release needs a new probe).
+export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown", "chrome_version_changed", "worker_changed"] as const;
 export type Reason = typeof REASONS[number];
 export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed";
   job: string | null; stale_lock: boolean; skew_ms: number | null; reason: Reason | null }

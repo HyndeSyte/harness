@@ -2,7 +2,7 @@
 // repo standing in for GitHub, the PC worker against the same repo, and pcjobs.sh.
 // Runs on Linux and on Windows (the pcjobs-windows job in tests.yml).
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -27,8 +27,11 @@ import {
   BOUNDARY_VERSION, BOUNDARY_TEXT, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
-  DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, shortNameHit, endChildThenSweep, setLiveChild, killTree,
-  type Install, type Instruction, type Opts, type Session,
+  DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
+  workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
+  descendants, endTree, sweepWait, hookUnlisted, UNLISTED_TOOLS, processCheck, POLICY_VERSION, workerSha, cainVersion, inventoryGate, launchSession as realLaunch,
+  PROBE_CONTEXT_TRIPS_MAX, pathish, shortPath,
+  type Install, type Instruction, type Opts, type Session, type Gate,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { spendNonce } from "../rootfs/opt/cain/pcjobs/confirm.ts";
 import { makeToken, publicKey as shipPublicKey, readToken } from "../rootfs/opt/cain/ship-token.ts";
@@ -415,7 +418,8 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     return rid;
   };
   const outcome = (rid: string) => JSON.parse(readFileSync(join(cfg.outcomes, `${rid}.json`), "utf8"));
-  const home = join(root, "pc");
+  // The worker folder, with a distinctive suffix as the install layout gives it (the wall refuses its name as a whole token).
+  const home = join(root, "pc-worker-t3st");
   const pc = join(home, "queue");
   mkdirSync(home, { recursive: true });
   if (!WIN) chmodSync(home, 0o755);
@@ -508,12 +512,14 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const launches: string[][] = [];
   const pending = new Map<number, string>();
   const envs: Record<string, string>[] = [];
-  const launch = async (argv: string[], _cwd: string, _ms: number, env: Record<string, string>): Promise<Session> => {
+  const launch = async (argv: string[], _cwd: string, _ms: number, env: Record<string, string>, _stop?: string, gate?: Gate): Promise<Session> => {
     launches.push(argv);
     envs.push(env);
     during();
     const prompt = argv[2];
     const events: unknown[] = [ev.init(tools(prompt), status, extVersion)];
+    // The worker's gate on the init event, as launchSession runs it: a mismatch ends the session before any tool call.
+    if (gate && !gate(parseStream(stream(events)).init)) return { code: null, out: stream(events), timedOut: false, aborted: "tool_inventory" };
     // Claude Code's permission layer, from the command line: the allowed tools, the mode.
     const cliAllowed = (argv[argv.indexOf("--allowedTools") + 1] ?? "").split(",");
     const mode = argv[argv.indexOf("--permission-mode") + 1];
@@ -567,7 +573,8 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
         } else if (name === `${CH}tabs_create_mcp`) {
           const t = { id: ++tabSeq, url: input.url ?? "chrome://newtab/" };
           group.push(t);
-          if (input.url) text = await visit(t, input.url);
+          if (input.url) await visit(t, input.url);
+          text = `Created new tab. Tab ID: ${t.id}`;
         } else if (name === `${CH}navigate`) {
           const t = group.find((x) => x.id === input.tabId) ?? group[0];
           if (t) text = land ? (t.url = land, "") : await visit(t, input.url);
@@ -584,20 +591,26 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     };
     const first = async () => { await b.use("tabs_context_mcp", { createIfEmpty: true }); return group[0]; };
     if (prompt.includes("bridge check")) {
-      const r = await b.use("tabs_context_mcp", { createIfEmpty: true });
-      if (bridgeFails > 0) { bridgeFails--; events.push(ev.res(r.id, true, "bridge stuck")); events.push(fin("ok")); return { code: 0, out: stream(events), timedOut: false }; }
-      const url = /first tab it lists to (\S+) and wait/.exec(prompt)![1];
-      await b.use("navigate", { tabId: group[0]?.id, url });
-      await bridgeRead(b, group[0]?.id);
+      if (bridgeFails > 0) { bridgeFails--; const id = "toolu_stuck"; events.push(ev.use(id, `${CH}tabs_context_mcp`, {}), ev.res(id, true, "bridge stuck")); events.push(fin("ok")); return { code: 0, out: stream(events), timedOut: false }; }
+      await b.use("tabs_context_mcp");
+      const url = /The bridge page is: (\S+)/.exec(prompt)![1];
+      const named = Number(/If it lists tab (\d+)/.exec(prompt)?.[1] ?? NaN);
+      let tab = group.find((t) => t.id === named);
+      if (tab) await b.use("navigate", { tabId: tab.id, url });
+      else { await b.use("tabs_create_mcp", { url }); tab = group.at(-1)!; }
+      await b.use("tabs_context_mcp");
+      await bridgeRead(b, tab.id);
       await b.use("tabs_context_mcp");
       events.push(fin("ok"));
       return { code: 0, out: stream(events), timedOut: false };
     }
     if (prompt.includes("## This run")) {
       const ins = JSON.parse(prompt.slice(prompt.indexOf("## This run") + 11)) as Instruction;
-      await b.use("tabs_context_mcp", { createIfEmpty: true });
-      const tab = group.find((t) => t.id === ins.tab_id) ?? group[0];
-      await b.use("navigate", { tabId: tab.id, url: ins.canary_url });
+      // As the session prompt says: the run's tab_id when the group has it, otherwise a new tab of its own at the canary page.
+      await b.use("tabs_context_mcp");
+      let tab = group.find((t) => t.id === ins.tab_id);
+      if (tab) await b.use("navigate", { tabId: tab.id, url: ins.canary_url });
+      else { await b.use("tabs_create_mcp", { url: ins.canary_url }); tab = group.at(-1)!; }
       await b.use("tabs_context_mcp");
       const r = say(ins, await readCanary(ins.canary_url));
       if (r === "timeout") return { code: null, out: stream(events), timedOut: true };
@@ -690,13 +703,15 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
     acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), managed: [], managedDirs: [],
     policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
+    shortPath: (p: string) => p, processCheck: async () => PROCESS_OK,
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
   const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
     const h = sessionHashes(o)!;
     fileOk(join(home, "confirmed.json"), JSON.stringify({ v: 1, at: T0.toISOString(), fingerprint: fingerprint(o, inst), settings_sha256: h.settings_sha256,
       prompt_sha256: h.prompt_sha256, config_sha256: outsideConfig(o).sha256, deny_check: over.deny_check ?? true, read_context: over.read_context ?? false,
-      live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_VERSION }, null, 2));
+      live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_VERSION,
+      ...workerNow() }, null, 2));
   };
   if (o.confirmed !== false) confirmNow();
   const remoteFile = (path: string) => sh(["git", "show", `main:${path}`], remote);
@@ -725,6 +740,8 @@ const attended = { attended: true };
 // What is in the worker's config folder besides what it keeps.
 const configLeft = (dir: string) => (existsSync(dir) ? readdirSync(dir) : []).filter((n) => !CONFIG_KEEP.includes(n)).sort();
 const ACCEPT = { acceptBoundary: true };
+// The probe's process-end check, as a healthy PC answers it.
+const PROCESS_OK = { platform: "win32", tree_kill: { passed: true, left: 0, polls: 1 }, signals: [{ signal: "SIGINT", handler_ran: false, passed: false }] };
 
 describe("Cain's keeper", () => {
   test("writes a good job, with the queue's .gitattributes, and refuses malformed ones", () => {
@@ -792,7 +809,8 @@ describe("the PC worker: one run", () => {
     // Claude in Chrome's reading tools can't close a tab: the run's tab is left on the end page, as a warning.
     expect(out).toEqual({ code: "ok", job: id, closed: [q.outcome(off).id], state: "done", warnings: ["leftover_tab"] });
     expect(Object.keys(seen!).sort()).toEqual(["action", "attempt", "canary_url", "done_url", "facts", "id", "look_for", "outcomes", "site", "start_url", "tab_id"]);
-    expect(seen!.tab_id).toBeNull();
+    // The bridge check's own new tab, recorded as the worker's: the run takes it over.
+    expect(typeof seen!.tab_id).toBe("number");
     expect(JSON.stringify(seen)).not.toMatch(/allowlist|git|queue/);
     expect(result(q, q.outcome(off).id).code).toBe("not_allowlisted");
     const r = result(q, id);
@@ -819,7 +837,7 @@ describe("the PC worker: one run", () => {
     expect(env.DISABLE_AUTOUPDATER).toBe("1");
     // An allowlisted environment: nothing of the worker's own but what is listed, forward
     // slashes in what the hook command expands, and the hook's own log for this session.
-    expect(Object.keys(env).sort()).toEqual(["CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "HOME", "PATH", "PCW_DENY_PATHS", "PCW_NAV_ALLOW", "PCW_NAV_LOG", "PCW_RUNTIME", "PCW_WORKER", "SystemRoot", "TEMP"]);
+    expect(Object.keys(env).sort()).toEqual(["CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "HOME", "PATH", "PCW_DENY_PATHS", "PCW_DENY_TOKENS", "PCW_HOOK_KEY_FILE", "PCW_NAV_ALLOW", "PCW_NAV_LOG", "PCW_RUNTIME", "PCW_WORKER", "SystemRoot", "TEMP"]);
     // The CLI's own config folder: the worker's own, under the worker folder, signed in once at setup.
     expect(env.CLAUDE_CONFIG_DIR).toBe(join(q.home, "claude-config"));
     // It stays (its sign-in persists); nothing a session left there does.
@@ -1320,7 +1338,7 @@ describe("the PC worker: what the model saw", () => {
     // Its matcher is the extension's whole prefix: the reading tools pass, a tool it doesn't
     // know is refused, and so is a call without a tool-use id (its decision couldn't be matched).
     for (const t of ["tabs_context_mcp", "read_page", "get_page_text", "find"]) expect([t, navGuard(call(t), allow)]).toEqual([t, true]);
-    for (const t of ["tabs_close_mcp", "computer", "navigate_back", "javascript_tool"]) expect([t, navDecide(call(t, "https://example.com/account/settings"), allow)]).toMatchObject([t, { decision: "deny", why: "unknown_tool" }]);
+    for (const t of ["tabs_close_mcp", "computer", "navigate_back", "javascript_tool"]) expect([t, navDecide(call(t, "https://example.com/account/settings"), allow)]).toMatchObject([t, { decision: "deny", why: "tool_not_allowed" }]);
     expect(navDecide(JSON.stringify({ tool_name: `${CH}navigate`, tool_input: { url: "https://example.com/account/settings" } }), allow)).toMatchObject({ decision: "deny", why: "no_tool_use_id" });
     expect(navDecide(call("navigate", "https://example.com/account/settings"), allow)).toEqual({ id: "toolu_1", tool: "navigate", url: "https://example.com/account/settings", decision: "allow", why: "run_address" });
     // The session's settings pin exactly this hook: a catch-all matcher on the prefix, this command, a timeout past nav-guard's own deadline.
@@ -1329,7 +1347,7 @@ describe("the PC worker: what the model saw", () => {
     expect(GUARD_MATCHER).toBe(".*");
     // Every tool gets a logged decision, the built-in ones too (refused: not the extension's).
     expect(navDecide(JSON.stringify({ tool_use_id: "toolu_8", tool_name: "Bash", tool_input: { command: "ls" } }), allow))
-      .toEqual({ id: "toolu_8", tool: "Bash", url: null, decision: "deny", why: "not_the_extension" });
+      .toEqual({ id: "toolu_8", tool: "Bash", url: null, decision: "deny", why: "tool_not_allowed" });
     expect(HOOK_COMMAND).toBe('"$PCW_RUNTIME" "$PCW_WORKER" nav-guard');
   });
 
@@ -1377,13 +1395,13 @@ describe("the PC worker: what the model saw", () => {
       ev.use("toolu_2", `${CH}read_page`, {}), ev.res("toolu_2", false, "ok")]));
     // Any tool use with no logged decision for its id went past the hook: hook_missing_decision, whatever else happened.
     const readAllow = { id: "toolu_2", tool: "read_page", url: null, decision: "allow" as const, why: "reads" };
-    expect(guardCheck(st, [])).toEqual({ code: "hook_missing_decision", missing: ["toolu_1", "toolu_2"], unguarded: [], denied: [], walled: [] });
+    expect(guardCheck(st, [])).toEqual({ code: "hook_missing_decision", missing: ["toolu_1", "toolu_2"], unguarded: [], denied: [], walled: [], context_refusals: [] });
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/x", decision: "allow", why: "run_address" }]))
-      .toEqual({ code: "hook_missing_decision", missing: ["toolu_2"], unguarded: [], denied: [], walled: [] });
+      .toEqual({ code: "hook_missing_decision", missing: ["toolu_2"], unguarded: [], denied: [], walled: [], context_refusals: [] });
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/other", decision: "allow", why: "run_address" }, readAllow]).code).toBe("navigation_unguarded");
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/x", decision: "allow", why: "run_address" }, readAllow]).code).toBeNull();
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/x", decision: "allow", why: "run_address" },
-      { id: "toolu_2", tool: "read_page", url: null, decision: "deny", why: "unknown_tool" }])).toEqual({ code: "navigation_denied", missing: [], unguarded: [], denied: ["toolu_2"], walled: [] });
+      { id: "toolu_2", tool: "read_page", url: null, decision: "deny", why: "tool_not_allowed" }])).toEqual({ code: "navigation_denied", missing: [], unguarded: [], denied: ["toolu_2"], walled: [], context_refusals: [] });
     // A built-in tool in the stream, with no decision: the hook didn't see it.
     const builtin = parseStream(stream([ev.init([]), ev.use("toolu_4", "Bash", { command: "ls" }), ev.res("toolu_4", true, "denied")]));
     expect(guardCheck(builtin, []).code).toBe("hook_missing_decision");
@@ -1641,7 +1659,8 @@ describe("hangs, locks and clocks", () => {
     expect(gone).toBe(true);
     // A session that finishes is read whole.
     const ok = await launchSession([process.execPath, "-e", "console.log(JSON.stringify({result: 'x'}))"], dir, 30_000, process.env as Record<string, string>);
-    expect(ok).toEqual({ code: 0, out: '{"result":"x"}\n', timedOut: false, stopped: false });
+    expect(ok).toMatchObject({ code: 0, out: '{"result":"x"}\n', timedOut: false, stopped: false });
+    expect(ok.aborted).toBeUndefined();
   });
 
   test("a lock left by a dead process, or older than a lease, is cleared and the heartbeat says so; a live one means busy", async () => {
@@ -2289,12 +2308,12 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
       expect(settings.permissions.deny).toContain(CH + t);
       expect(READING).not.toContain(t);
       expect(NAVIGATING).not.toContain(t);
-      expect(navDecide(call(t), "[]")).toMatchObject({ decision: "deny", why: "unknown_tool" });
+      expect(navDecide(call(t), "[]")).toMatchObject({ decision: "deny", why: "tool_not_allowed" });
       const widened = { ...settings, permissions: { ...settings.permissions, allow: [...settings.permissions.allow, CH + t] } };
       expect(allowedTools(widened)).toBeNull();
     }
     // A name that only starts like a reading tool is not one.
-    expect(navDecide(call("read_page_and_console"), "[]")).toMatchObject({ decision: "deny", why: "unknown_tool" });
+    expect(navDecide(call("read_page_and_console"), "[]")).toMatchObject({ decision: "deny", why: "tool_not_allowed" });
     expect(navDecide(call("find"), "[]")).toMatchObject({ decision: "allow", why: "reads" });
   });
 
@@ -2495,10 +2514,15 @@ describe("sixth review: the strict schema, two permission layers, the canary coo
     expect(ev1.destinations.find((d) => d.target === "move_and_return")).toMatchObject({ passed: true, caught_by: "tab_context" });
     const c = confirmProfile(q.opts(), ACCEPT);
     expect(c).toMatchObject({ read_context: true, deny_check: true });
-    // With that in place, a read with no tab context right after it isn't accepted: read_unverified.
+    // With that in place, a read with no tab context right after it is refused by the hook itself (context_owed) until the
+    // model calls one; once it does, the run goes on. Three such refusals fail the run (tab_context_owed).
     q.ask(READ); round(q.cfg); q.clonePc();
     q.runExtra(async (b) => { await b.use("find", { tabId: b.group[0].id, query: "x" }); await b.use("get_page_text", { tabId: b.group[0].id }); });
-    expect(await run(q.opts({ ...attended, launch: noUrl }))).toMatchObject({ code: "read_unverified", state: "failed" });
+    expect((await run(q.opts({ ...attended, launch: noUrl }))).code).toBe("ok");
+    expect(readNavLog(join(q.home, "nav-decisions.jsonl")).filter((d) => d.why === "context_owed")).toMatchObject([{ tool: "get_page_text", decision: "deny" }]);
+    q.ask(READ); round(q.cfg);
+    q.runExtra(async (b) => { await b.use("find", { tabId: b.group[0].id, query: "x" }); for (const t of ["get_page_text", "read_page", "find"]) await b.use(t, { tabId: b.group[0].id }); });
+    expect(await run(q.opts({ ...attended, launch: noUrl }))).toMatchObject({ code: "tab_context_owed", state: "failed" });
     // Each read followed by a tab context passes.
     q.ask(READ); round(q.cfg);
     q.runExtra(async (b) => { await b.use("find", { tabId: b.group[0].id, query: "x" }); await b.use("tabs_context_mcp"); });
@@ -3291,7 +3315,9 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     // A deny list it can't read fails closed; with none, names are still refused.
     expect(navDecide(call("find", { tabId: 1, query: "x" }), allow, "{")).toMatchObject({ decision: "deny", why: "no_deny_paths" });
     expect(navDecide(call("find", { tabId: 1, query: ".credentials.json" }), allow)).toMatchObject({ decision: "deny", why: "worker_folder" });
-    expect(mentionsWorker({ url: "https://example.com/c/pc-workers-guide" }, ["C:/pc-worker"])).toBe(true);     // a prefix match: refused, on the safe side
+    // A web address's path isn't a drive path; the folder's own name as a whole segment is still refused.
+    expect(mentionsWorker({ url: "https://example.com/c/pc-workers-guide" }, ["C:/pc-worker"])).toBe(false);
+    expect(mentionsWorker({ url: "https://example.com/c/pc-worker/guide" }, ["C:/pc-worker"])).toBe(true);
     expect(mentionsWorker({ url: "https://example.com/account" }, ["C:/pc-worker"])).toBe(false);
   });
 
@@ -3311,7 +3337,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     const denied = argv[argv.indexOf("--disallowedTools") + 1].split(",");
     for (const r of rules) expect(denied).toContain(r);
     expect(denied).toContain("Read");
-    expect(JSON.parse(q.envs.at(-1)!.PCW_DENY_PATHS)).toEqual(workerPaths(q.opts()).map((p) => p.replace(/\\/g, "/")));
+    expect(JSON.parse(q.envs.at(-1)!.PCW_DENY_PATHS)).toEqual(workerPaths(q.opts()).map((p) => canonPath(p)));
     // The real nav-guard, as the session starts it: its self-test includes the credential file by path, listed as allowed.
     expect(await hookSelfTest(q.opts())).toBeNull();
   });
@@ -3556,19 +3582,22 @@ describe("eleventh review: attended first, the last-run field, denied addresses,
     }
   });
 
-  test("a denied navigation's address is kept nowhere on disk: the log has its host and a hash only", async () => {
+  test("a denied navigation's address is kept nowhere on disk: the log has its registrable domain and keyed hashes only", async () => {
     const TOKEN = "PLANTEDTOKEN0123456789";
     const evil = `https://evil.example/reset/${TOKEN}?code=${TOKEN}#${TOKEN}`;
-    expect(deniedAddress(evil)).toEqual({ host: "evil.example", url_sha256: createHash("sha256").update(evil).digest("hex") });
-    expect(deniedAddress("javascript:alert(1)").host).toBeNull();
+    const key = Buffer.alloc(32, 7);
+    expect(deniedAddress(evil, key)).toEqual({ domain: "evil.example", host_hmac: createHmac("sha256", key).update("evil.example").digest("hex"),
+      url_hmac: createHmac("sha256", key).update(evil).digest("hex") });
+    expect(deniedAddress("javascript:alert(1)").domain).toBeNull();
     const d = navDecide(JSON.stringify({ tool_use_id: "toolu_1", tool_name: `${CH}navigate`, tool_input: { url: evil } }), JSON.stringify(["https://example.com/"]));
-    expect(d).toMatchObject({ decision: "deny", why: "address_not_allowed", url: null, host: "evil.example" });
+    expect(d).toMatchObject({ decision: "deny", why: "address_not_allowed", url: null, domain: "evil.example" });
     expect(JSON.stringify(d)).not.toContain(TOKEN);
     const { q, id } = oneJob();
     q.runExtra(async (b) => { await b.use("navigate", { tabId: b.group[0].id, url: evil }); });
     expect(await run(q.opts(attended))).toMatchObject({ code: "navigation_denied", job: id });
     const log = readNavLog(join(q.home, "nav-decisions.jsonl")).filter((x) => x.decision === "deny");
-    expect(log).toMatchObject([{ why: "address_not_allowed", url: null, host: "evil.example" }]);
+    expect(log).toMatchObject([{ why: "address_not_allowed", url: null, domain: "evil.example" }]);
+    expect(log[0].url_hmac).toMatch(/^[0-9a-f]{64}$/);
     const everywhere = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === ".git" ? [] : everywhere(join(dir, e.name)))
       : [readFileSync(join(dir, e.name), "latin1")]);
     for (const text of everywhere(q.home)) expect(text).not.toContain(TOKEN);
@@ -3578,11 +3607,11 @@ describe("eleventh review: attended first, the last-run field, denied addresses,
   test("the wall: an input the walk can't finish, a double encoding or an 8.3 short name counts as naming the worker folder", () => {
     const paths = ["C:/Users/owner/pc-worker", "C:/Users/owner/pc-worker/claude-config"];
     const target = "file:///C:/Users/owner/pc-worker/claude-config/.credentials.json";
-    // Junk keys past the walk's cap, or nesting past its depth, hide nothing: the input is refused.
+    // Path-shaped strings past the walk's cap, or one nested past its depth, hide nothing: the input is refused.
     const padded: Record<string, unknown> = {};
-    for (let i = 0; i < 300; i++) padded[`k${i}`] = "junk";
+    for (let i = 0; i < 300; i++) padded[`k${i}`] = "/junk/path";
     expect(mentionsWorker({ tabId: 1, ...padded }, paths)).toBe(true);
-    let deep: unknown = "harmless";
+    let deep: unknown = "/harmless/path";
     for (let i = 0; i < 12; i++) deep = { x: deep };
     expect(mentionsWorker(deep, paths)).toBe(true);
     expect(mentionsWorker({ a: { b: { c: "fine" } } }, paths)).toBe(false);
@@ -3595,14 +3624,13 @@ describe("eleventh review: attended first, the last-run field, denied addresses,
     let many = "https://example.com/";
     for (let i = 0; i < 7; i++) many = encodeURIComponent(many);
     expect(mentionsWorker({ url: many }, paths)).toBe(true);
-    // 8.3 short names of a denied folder or file.
-    for (const u of ["file:///C:/Users/owner/PC-WOR~1/x", "file:///C:/Users/OWNER~1/pc-worker/x", "CLAUDE~1", "file:///C:/x/CREDEN~1.JSO", "C:\\Users\\owner\\PCWORK~2\\a"])
-      expect([u, mentionsWorker({ url: u }, paths)]).toEqual([u, true]);
+    // The folder's own name is a whole token: the full path's other forms are caught by it too.
+    expect(mentionsWorker({ url: "file:///C:/Users/OWNER~1/pc-worker/x" }, paths)).toBe(true);
     for (const u of ["file:///C:/PROGRA~1/thing", "https://example.com/~1/", "https://example.com/account/settings"])
       expect([u, mentionsWorker({ url: u }, paths)]).toEqual([u, false]);
-    expect(shortNameHit(["c:/a/claude~3"], ["claude-config"])).toBe(true);
     // nav-guard refuses the padded call as the wall, and the run's guard check says worker_folder_denied.
     const call = { tool_use_id: "toolu_p", tool_name: `${CH}find`, tool_input: { tabId: 1, query: "x", ...padded } };
+    expect(tokenHit(["c:/a/claude~3"], ["claude~3"])).toBe(true);
     expect(navDecide(JSON.stringify(call), JSON.stringify([]), JSON.stringify(paths))).toMatchObject({ decision: "deny", why: "worker_folder" });
     const st = parseStream(stream([ev.init(GIVEN), ev.use("toolu_p", `${CH}find`, call.tool_input), ev.res("toolu_p", true, "Blocked")]));
     expect(guardCheck(st, [{ id: "toolu_p", tool: "find", url: null, decision: "deny", why: "address_not_allowed" }], paths).code).toBe("worker_folder_denied");
@@ -3650,6 +3678,376 @@ describe("eleventh review: attended first, the last-run field, denied addresses,
     expect(existsSync(late)).toBe(false);
     expect(b.signalCode).toBe("SIGKILL");
     setLiveChild(null);
+  });
+});
+
+describe("twelfth review: the hook's allow list, process trees, path forms, real short names, scoped limits, the tab-context order, own tabs, keyed hashes, quoted facts, bound confirmations", () => {
+  const call = (name: string, input: unknown = {}, id = "toolu_1") => JSON.stringify({ tool_use_id: id, tool_name: name, tool_input: input });
+
+  test("the hook is an allow list over every tool name: six names under their rules, every other name refused by the hook itself", () => {
+    expect([...HOOK_ALLOWED].sort()).toEqual([...READING, ...NAVIGATING].map((t) => CH + t).sort());
+    for (const name of ["Bash", "Read", "", "SomeNewBuiltin", "mcp__other-server__read", `${CH}computer`, `${CH}brand_new_tool`, CH, `${CH}tabs_context_mcp_v2`, "tabs_context_mcp"])
+      expect([name, navDecide(call(name, { url: "https://example.com/account/settings" }), JSON.stringify(["https://example.com/account/settings"]))])
+        .toMatchObject([name, { decision: "deny", why: "tool_not_allowed" }]);
+    for (const t of READING) expect(navDecide(call(CH + t, { tabId: 1 }), "[]")).toMatchObject({ decision: "allow" });
+  });
+
+  test("the real hook refuses every unlisted tool itself (the probe's step), and the preflight self-test includes one", async () => {
+    const q = queueRig();
+    const u = hookUnlisted(q.opts());
+    expect(u).toEqual({ tools: UNLISTED_TOOLS, refused: UNLISTED_TOOLS, passed: true });
+    expect(await hookSelfTest(q.opts())).toBeNull();
+    // A hook that lets an unlisted tool through fails both.
+    const broken = join(q.root, "broken-hook.ts");
+    writeFileSync(broken, "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));");
+    expect(hookUnlisted(q.opts(), [process.execPath, broken]).passed).toBe(false);
+  });
+
+  test("the tool inventory is checked on the init event, before any tool call: a mismatch ends the session there and logs it", async () => {
+    const { q, id } = oneJob();
+    q.tools(() => [...GIVEN, "Bash"]);
+    expect(await run(q.opts(attended))).toMatchObject({ code: "tool_inventory" });
+    expect(id).toBeTruthy();
+    // The bridge check (which has no gate) saw the extra tool first and stopped the run before the claim, or the run's gate did;
+    // either way no tool of the run's session was called.
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toMatch(/tool_inventory expected=.* found=.*Bash/);
+    const { q: q2, id: id2 } = oneJob();
+    let runs = 0;
+    q2.tools((p) => p.includes("## This run") && ++runs ? [...GIVEN, "WebFetch"] : [...GIVEN]);
+    expect(await run(q2.opts(attended))).toMatchObject({ code: "tool_inventory", job: id2 });
+    expect(readNavLog(join(q2.home, "nav-decisions.jsonl"))).toEqual([]);
+    expect(result(q2, id2)).toMatchObject({ status: "failed", code: "tool_inventory" });
+    // The real launcher: a session printing an init event with an extra tool is ended at once, not after its time limit.
+    const dir = mkdtempSync(join(tmpdir(), "gate-"));
+    const init = JSON.stringify({ type: "system", subtype: "init", tools: [...GIVEN, "Bash"], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
+    const t0 = Date.now();
+    const s = await realLaunch([process.execPath, "-e", `console.log(${JSON.stringify(init)}); setTimeout(() => console.log("late"), 20000)`], dir, 60_000,
+      process.env as Record<string, string>, undefined, inventoryGate(READING.concat(NAVIGATING), []));
+    expect(s.aborted).toBe("tool_inventory");
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(s.out).not.toContain("late");
+    // The CLI stays pinned: the autoupdater off in every session's environment, and a changed executable stops runs.
+    expect(baseEnv(q.opts()).DISABLE_AUTOUPDATER).toBe("1");
+    expect(sessionEnv(q.opts(), []).DISABLE_AUTOUPDATER).toBe("1");
+    const { q: q3 } = oneJob();
+    expect((await run(q3.opts({ ...attended, cliHash: () => "d".repeat(64) }))).code).toBe("probe_stale");
+  });
+
+  test("Windows process trees: ended, polled until nothing of the tree is left, with the outcome logged; a reused parent id is no child", () => {
+    const q = queueRig();
+    // The session (50), its child (51) and grandchild (52); 60 has 50 as its parent id but started before it (a reused id).
+    let ps = [{ pid: 50, ppid: 1, created: 1000, cmd: "claude.exe" }, { pid: 51, ppid: 50, created: 1100, cmd: "node mcp" }, { pid: 52, ppid: 51, created: 1200, cmd: "node x" },
+      { pid: 60, ppid: 50, created: 500, cmd: "unrelated.exe" }];
+    expect(descendants(ps, 50).map((p) => p.pid)).toEqual([51, 52]);
+    const killed: number[] = [];
+    // taskkill /T ends the session and its child, but the grandchild lives on (re-parented meanwhile): it is ended by its own id.
+    const kill = (pid: number) => { killed.push(pid); ps = ps.filter((p) => pid === 50 ? ![50, 51].includes(p.pid) : p.pid !== pid); };
+    const r = endTree(q.opts({ procs: () => ps, killPid: kill }), 50, "win32");
+    expect(r).toMatchObject({ ended: true, left: 0 });
+    expect(killed).toEqual([50, 52]);
+    expect(ps.map((p) => p.pid)).toEqual([60]);
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toMatch(/tree_end ended=true left=0/);
+    // Once the session itself is gone, what it started is still found by its parent id and start time.
+    expect(descendants([{ pid: 70, ppid: 50, created: 1300, cmd: "x" }, { pid: 71, ppid: 50, created: 900, cmd: "y" }], 50, 1000).map((p) => p.pid)).toEqual([70]);
+    // A tree that won't end: bounded, logged, and the sweep after it reports what it couldn't delete.
+    const stuck = [{ pid: 80, ppid: 1, created: 1000, cmd: "claude.exe" }, { pid: 81, ppid: 80, created: 1100, cmd: "node" }];
+    const r2 = endTree(q.opts({ procs: () => stuck, killPid: () => {} }), 80, "win32");
+    expect(r2).toMatchObject({ ended: false, left: 2 });
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toMatch(/tree_end ended=false left=2/);
+  });
+
+  test("the sweep retries with a growing wait, longer for a file Windows hasn't released yet (EPERM, EBUSY); a leftover is session_cleanup_failed", async () => {
+    expect(sweepWait(0, "EBUSY")).toBe(200);
+    expect(sweepWait(0, "ENOENT")).toBe(100);
+    expect(sweepWait(2, "EPERM")).toBe(800);
+    const q = queueRig();
+    const dir = join(q.home, "claude-config");
+    writeFileSync(join(dir, "held.jsonl"), "page");
+    const waits: number[] = [];
+    let n = 0;
+    const busy = (f: string) => { if (++n <= 2) throw Object.assign(new Error("busy"), { code: n === 1 ? "EBUSY" : "EPERM" }); rmSync(f, { force: true }); };
+    expect(sweepSession(q.opts({ remove: busy, sleep: (ms: number) => { waits.push(ms); } }))).toEqual({ found: ["held.jsonl"], ok: true });
+    expect(waits).toEqual([200, 400]);
+    writeFileSync(join(dir, "held.jsonl"), "page");
+    const never = () => { throw Object.assign(new Error("perm"), { code: "EPERM" }); };
+    expect(sweepSession(q.opts({ remove: never })).ok).toBe(false);
+    const { q: q2, id } = oneJob();
+    q2.during(() => writeFileSync(join(q2.home, "claude-config", "held.jsonl"), "page"));
+    expect(await run(q2.opts({ ...attended, remove: never }))).toMatchObject({ code: "session_cleanup_failed" });
+    expect(JSON.parse(q2.remoteFile(`jobs/${id}.json`)).state).not.toBe("done");
+  });
+
+  test.skipIf(!WIN)("Windows: a detached child writing into claude-config is ended with its whole tree before the sweep, which leaves nothing (a real subprocess)", async () => {
+    const q = queueRig();
+    const dir = join(q.home, "claude-config");
+    const late = join(dir, "late-transcript.jsonl");
+    const writer = `const f = ${JSON.stringify(late)}; setInterval(() => require("node:fs").appendFileSync(f, "page\\n"), 20)`;
+    const parent = spawn(process.execPath, ["-e", `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(writer)}], { detached: true, stdio: "ignore" }); setInterval(() => {}, 1000)`],
+      { stdio: "ignore", windowsHide: true });
+    for (let i = 0; i < 100 && !existsSync(late); i++) await Bun.sleep(100);
+    expect(existsSync(late)).toBe(true);
+    const o = q.opts({ killPid: undefined, procs: undefined, sleep: undefined });
+    setLiveChild(parent.pid!, Date.now() - 10_000);
+    expect(endChildThenSweep(o, parent.pid!, "win32")).toEqual({ killed: true, swept: true });
+    await Bun.sleep(500);
+    expect(existsSync(late)).toBe(false);
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toMatch(/tree_end ended=true/);
+    setLiveChild(null);
+  });
+
+  test("the probe's process-end check records tree ending and signal delivery on this platform, with pass or fail (real subprocesses)", async () => {
+    const q = queueRig();
+    const p = await processCheck(q.opts({ killPid: undefined, procs: undefined }));
+    expect(p.platform).toBe(process.platform);
+    expect(p.tree_kill.passed).toBe(true);
+    expect(p.signals.map((x) => x.signal)).toEqual(WIN ? ["SIGINT", "SIGTERM", "SIGBREAK"] : ["SIGINT", "SIGTERM", "SIGHUP"]);
+    for (const x of p.signals) expect(typeof x.handler_ran).toBe("boolean");
+    if (!WIN) expect(p.signals.every((x) => x.handler_ran && x.passed)).toBe(true);
+  });
+
+  test("path forms: POSIX, native, file:, Git Bash, WSL, Cygwin, \\\\?\\ and share forms of one path read as one, before the wall", () => {
+    const base = "c:/users/owner/work folder/claude-config";
+    for (const f of ["C:\\Users\\Owner\\Work Folder\\claude-config", "c:/users/owner/work folder/claude-config", "/c/Users/owner/Work Folder/claude-config",
+      "file:///C:/Users/owner/Work%20Folder/claude-config", "file://localhost/c:/users/owner/work folder/claude-config", "/mnt/c/users/owner/work folder/claude-config",
+      "/cygdrive/c/users/owner/work folder/claude-config", "\\\\?\\C:\\Users\\owner\\Work Folder\\claude-config", "\\\\localhost\\c$\\users\\owner\\work folder\\claude-config",
+      "C:\\Users\\owner\\.\\Work Folder\\x\\..\\claude-config", "C://Users//owner//Work Folder//claude-config"])
+      expect([f, canonPath(decodeURIComponent(f.replace(/%(?![0-9A-F]{2})/g, "%25")))]).toEqual([f, base]);
+    // Inside longer text too.
+    expect(canonPath("cat /c/users/owner/x && type C:\\Users\\owner\\x")).toBe("cat c:/users/owner/x && type c:/users/owner/x");
+    // A web address's path is left alone.
+    expect(canonPath("https://example.com/c/users")).toBe("https://example.com/c/users");
+    // The wall, by path alone (no token): every form of the config folder is refused; another folder isn't.
+    const paths = ["C:/Users/owner/Work Folder", "C:/Users/owner/Work Folder/claude-config"];
+    for (const f of ["/c/users/owner/work folder/notes.txt", "file:///C:/Users/owner/Work%20Folder/x", "\\\\?\\C:\\Users\\owner\\Work Folder\\x", "/mnt/c/Users/Owner/Work Folder"])
+      expect([f, mentionsWorker({ url: f }, paths, [])]).toEqual([f, true]);
+    for (const f of ["/c/users/owner/other folder/x", "https://example.com/account/settings"]) expect([f, mentionsWorker({ url: f }, paths, [])]).toEqual([f, false]);
+  });
+
+  test("short names: the real ones read at startup are refused, exactly; ordinary words and other short names pass; the folder's own name is a whole token", () => {
+    const q = queueRig();
+    const short = (p: string) => p.replace(q.home, join(dirname(q.home), "PC-WOR~1")).replace("claude-config", "CLAUDE~1").replace(".credentials.json", "CREDEN~1.JSO");
+    const o = q.opts({ shortPath: short });
+    const w = wallOf(o);
+    expect(w.tokens.sort()).toEqual(["claude~1", "creden~1.jso", "pc-worker-t3st", "pc-wor~1"].sort());
+    expect(w.unreadable).toBe(false);
+    const env = sessionEnv(o, []);
+    expect(JSON.parse(env.PCW_DENY_TOKENS).sort()).toEqual(w.tokens.sort());
+    const decide = (input: unknown) => navDecide(call(`${CH}find`, input), "[]", env.PCW_DENY_PATHS, { tokens: JSON.parse(env.PCW_DENY_TOKENS) });
+    for (const x of ["CLAUDE~1", "file:///C:/x/PC-WOR~1/a", "C:\\data\\CREDEN~1.JSO", `${join(dirname(q.home), "PC-WOR~1")}/x`, "see pc-worker-t3st now"])
+      expect([x, decide({ tabId: 1, query: x }).why]).toEqual([x, "worker_folder"]);
+    for (const x of ["PROGRA~1", "C:/PROGRA~1/thing", "DOCUME~1", "CLAUDE~2", "MICROS~1.NET", "claude", "credentials", "programs", "pcw", "two-step pc settings", "~1", "PC-WOR~2", "pc-worker"])
+      expect([x, decide({ tabId: 1, query: x }).decision]).toEqual([x, "allow"]);
+    // A short name that can't be read on Windows: the preflight refuses (untrusted_config).
+    expect(browserPreflight(q.opts({ ...attended, shortPath: () => null }), q.inst)).toBe("untrusted_config");
+  });
+
+  test.skipIf(!WIN)("Windows: the real short name of a long folder name comes from the file system", () => {
+    const root = mkdtempSync(join(tmpdir(), "pcw-"));
+    const long = join(root, "pc-worker-long-name-k7q2xz");
+    mkdirSync(long);
+    const s = shortPath(long, "win32");
+    expect(s).not.toBeNull();
+    expect(s!.toLowerCase().startsWith(s!.slice(0, 2).toLowerCase())).toBe(true);
+  });
+
+  test("the walk's limits apply to path- and shell-shaped strings only: long page text and find queries are never refused for size", () => {
+    const paths = ["C:/Users/owner/pc-worker-k7q2xz", "C:/Users/owner/pc-worker-k7q2xz/claude-config"];
+    expect(pathish("two-step verification")).toBe(false);
+    expect(pathish("C:\\x")).toBe(true);
+    expect(pathish("a; b")).toBe(true);
+    expect(mentionsWorker({ tabId: 1, query: "word ".repeat(20_000) }, paths)).toBe(false);
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 1_000; i++) many[`field${i}`] = `plain words ${i}`;
+    expect(mentionsWorker(many, paths)).toBe(false);
+    let deep: unknown = "plain";
+    for (let i = 0; i < 40; i++) deep = { x: deep };
+    expect(mentionsWorker(deep, paths)).toBe(false);
+    // Still read whole: a path hidden after a thousand plain strings is found.
+    expect(mentionsWorker({ ...many, z: "C:\\Users\\owner\\pc-worker-k7q2xz\\x" }, paths)).toBe(true);
+    // More than 200 path-shaped strings, or one deeper than 8, can't be read whole: refused.
+    expect(mentionsWorker(Array.from({ length: 201 }, (_, i) => `/a/${i}`), paths)).toBe(true);
+    let deepPath: unknown = "/a/b";
+    for (let i = 0; i < 9; i++) deepPath = { x: deepPath };
+    expect(mentionsWorker(deepPath, paths)).toBe(true);
+    expect(navDecide(call(`${CH}find`, { tabId: 1, query: "settings ".repeat(5_000) }), "[]", JSON.stringify(paths))).toMatchObject({ decision: "allow", why: "reads" });
+  });
+
+  test("the tab-context order is enforced in the hook: after a new tab (and, where reads don't report their address, after every read) every other tool is refused until a tab context", async () => {
+    const allow = JSON.stringify(["http://127.0.0.1:5000/pcw/x"]);
+    const d = (tool: string, decision: "allow" | "deny" = "allow") => ({ id: "t", tool, url: null, decision, why: "x" });
+    expect(contextOwed([d("tabs_create_mcp")], false)).toBe(true);
+    expect(contextOwed([d("tabs_create_mcp"), d("tabs_context_mcp")], false)).toBe(false);
+    expect(contextOwed([d("get_page_text")], false)).toBe(false);
+    expect(contextOwed([d("get_page_text")], true)).toBe(true);
+    expect(contextOwed([d("get_page_text"), d("find", "deny")], true)).toBe(true);
+    // The real hook, with its own log as the session's history.
+    const dir = mkdtempSync(join(tmpdir(), "ctx-"));
+    const env = { PCW_NAV_ALLOW: allow, PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_DENY_PATHS: "[]" };
+    const hook = async (name: string, input: unknown, id: string) => { let out = ""; const code = await hookMain(env, async () => call(CH + name, input, id), (x) => { out += x; }, () => {}); return { code, out }; };
+    expect((await hook("tabs_create_mcp", { url: "http://127.0.0.1:5000/pcw/x" }, "t1")).code).toBe(0);
+    const refused = await hook("get_page_text", { tabId: 1 }, "t2");
+    expect(refused.code).toBe(2);
+    expect(JSON.parse(refused.out).hookSpecificOutput.permissionDecisionReason).toBe(CONTEXT_MESSAGE);
+    expect((await hook("navigate", { url: "http://127.0.0.1:5000/pcw/x" }, "t3")).code).toBe(2);
+    expect((await hook("tabs_context_mcp", {}, "t4")).code).toBe(0);
+    expect((await hook("get_page_text", { tabId: 1 }, "t5")).code).toBe(0);
+    // With reads owing a tab context (the confirmation's read_context): a second read is refused until one comes.
+    const env2 = { ...env, PCW_NAV_LOG: join(dir, "log2.jsonl"), PCW_CONTEXT_AFTER_READ: "1" };
+    for (const [name, id, want] of [["get_page_text", "r1", 0], ["find", "r2", 2], ["tabs_context_mcp", "r3", 0], ["read_page", "r4", 0]] as const) {
+      const code = await hookMain(env2, async () => call(CH + name, { tabId: 1 }, id), () => {}, () => {});
+      expect([id, code]).toEqual([id, want]);
+    }
+    // Refusals of this kind aren't navigation_denied; CONTEXT_REFUSALS_MAX of them fail the run.
+    expect(CONTEXT_REFUSALS_MAX).toBe(3);
+    const uses = ["c1", "c2", "c3"];
+    const st = parseStream(stream([ev.init(GIVEN), ...uses.flatMap((id) => [ev.use(id, `${CH}find`, { tabId: 1 }), ev.res(id, true, "Blocked")])]));
+    const owed = (id: string) => ({ id, tool: "find", url: null, decision: "deny" as const, why: "context_owed" });
+    expect(guardCheck({ ...st, uses: st.uses.slice(0, 2) }, [owed("c1"), owed("c2")])).toMatchObject({ code: null, context_refusals: ["c1", "c2"], denied: [] });
+    expect(guardCheck(st, uses.map(owed))).toMatchObject({ code: "tab_context_owed", context_refusals: uses });
+  });
+
+  test("the probe counts how often an honest chore trips the tab-context order; a high count fails the confirmation", async () => {
+    const q = queueRig({ confirmed: false });
+    const ev1 = await probe(q.opts(attended));
+    expect(ev1.context_trips).toBe(0);
+    expect(ev1.unlisted.passed).toBe(true);
+    expect(ev1.process_end.tree_kill.passed).toBe(true);
+    expect(probeCases(ev1).ran).toEqual(expect.arrayContaining(["unlisted_tools", "tree_kill", "context_order"]));
+    const file = join(q.home, "probe-evidence.json");
+    const good = JSON.parse(readFileSync(file, "utf8"));
+    writeFileSync(file, JSON.stringify({ ...good, context_trips: PROBE_CONTEXT_TRIPS_MAX + 1 }));
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("context_order_failed");
+    writeFileSync(file, JSON.stringify({ ...good, unlisted: { ...good.unlisted, passed: false } }));
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("unlisted_check_required");
+    writeFileSync(file, JSON.stringify({ ...good, process_end: { ...good.process_end, tree_kill: { passed: false, left: 1, polls: 50 } } }));
+    expect(() => confirmProfile(q.opts(), ACCEPT)).toThrow("process_end_required");
+    writeFileSync(file, JSON.stringify(good));
+    expect(confirmProfile(q.opts(), ACCEPT)).toMatchObject({ policy_version: POLICY_VERSION });
+  });
+
+  test("own tabs: only a tab id returned by this run's own allowed new-tab call (or its recorded tab) joins the run's tabs; pop-ups and opener tabs never do", () => {
+    const canary = "http://127.0.0.1:5000/pcw/tok";
+    const pin = "https://example.com/account/settings";
+    const ctx = (id: string, tabs: { id: number; url: string }[]) => [ev.use(id, `${CH}tabs_context_mcp`, {}), ev.res(id, false, JSON.stringify({ availableTabs: tabs.map((t) => ({ tabId: t.id, url: t.url })) }))];
+    const allowLog = (ids: string[], tool = "tabs_create_mcp") => ids.map((id) => ({ id, tool, url: canary, decision: "allow" as const, why: "run_address" }));
+    const flow = (createText: string, tabs: { id: number; url: string }[], end: { id: number; url: string }[]) => parseStream(stream([ev.init(GIVEN),
+      ev.use("n1", `${CH}tabs_create_mcp`, { url: canary }), ev.res("n1", false, createText), ...ctx("c1", tabs),
+      ev.use("g1", `${CH}get_page_text`, {}), ev.res("g1", false, `URL: ${pin}\n\ntext`), ...ctx("c2", end)]));
+    const ok = (u: string) => u === pin;
+    // The run's own new tab, by its answer's "Tab ID" or its JSON.
+    expect(createdTabId("Created new tab. Tab ID: 7")).toBe(7);
+    expect(createdTabId(JSON.stringify({ tabId: 7, url: canary }))).toBe(7);
+    expect(endCheck(flow("Created new tab. Tab ID: 7", [{ id: 7, url: canary }], [{ id: 7, url: pin }]), canary, ok, [], false, true, { ownTabs: true, log: allowLog(["n1"]) }).code).toBeNull();
+    // A pop-up the page opened, showing the canary: not the run's.
+    expect(endCheck(flow("Created new tab. Tab ID: 7", [{ id: 9, url: canary }], [{ id: 9, url: pin }]), canary, ok, [], false, true, { ownTabs: true, log: allowLog(["n1"]) }).code).toBe("tabs_unexpected");
+    // An opener-spawned tab alongside the run's own: another tab.
+    expect(endCheck(flow("Created new tab. Tab ID: 7", [{ id: 7, url: canary }], [{ id: 7, url: pin }, { id: 8, url: "https://example.com/" }]), canary, ok, [], false, true,
+      { ownTabs: true, log: allowLog(["n1"]) })).toMatchObject({ code: "tabs_unexpected", others: [8] });
+    // A new-tab call the hook didn't allow adds nothing, whatever its answer says.
+    expect(endCheck(flow("Created new tab. Tab ID: 7", [{ id: 7, url: canary }], [{ id: 7, url: pin }]), canary, ok, [], false, true, { ownTabs: true, log: [] }).code).toBe("tabs_unexpected");
+    // The run's recorded tab (its tab_id) is its own.
+    expect(endCheck(flow("no id here", [{ id: 5, url: canary }], [{ id: 5, url: pin }]), canary, ok, [5], false, true, { ownTabs: true, log: allowLog(["n1"]) }).code).toBeNull();
+  });
+
+  test("own tabs in a run: a tab already in Claude's group that the worker didn't open is another tab; a pop-up during the run is too", async () => {
+    const { q, id } = oneJob();
+    q.group.push({ id: 900, url: "https://example.com/" });
+    expect(await run(q.opts(attended))).toMatchObject({ code: "tabs_unexpected", job: id });
+    const { q: q2, id: id2 } = oneJob();
+    q2.runExtra(async (b) => { b.group.push({ id: 901, url: "https://example.com/popup" }); });
+    expect(await run(q2.opts(attended))).toMatchObject({ code: "tabs_unexpected", job: id2 });
+  });
+
+  test("a refused address: its registrable domain and keyed hashes, under a per-install key in the worker folder; the hook log never reaches the queue or Cain", async () => {
+    expect(registrableDomain("a.b.example.co.uk")).toBe("example.co.uk");
+    expect(registrableDomain("login.evil.example")).toBe("evil.example");
+    expect(registrableDomain("127.0.0.1")).toBeNull();
+    expect(registrableDomain("user.github.io")).toBe("user.github.io");
+    const TOKEN = "PLANTEDTOKEN9876543210";
+    const evil = `https://reset-${TOKEN.toLowerCase()}.evil.example/x?code=${TOKEN}`;
+    const { q, id } = oneJob();
+    q.runExtra(async (b) => { await b.use("navigate", { tabId: b.group[0].id, url: evil }); });
+    expect(await run(q.opts(attended))).toMatchObject({ code: "navigation_denied", job: id });
+    const keyText = readFileSync(join(q.home, "hook-key"), "utf8").trim();
+    expect(keyText).toMatch(/^[0-9a-f]{64}$/);
+    const key = Buffer.from(keyText, "hex");
+    const denied = readNavLog(join(q.home, "nav-decisions.jsonl")).find((d) => d.decision === "deny")!;
+    expect(denied).toMatchObject({ domain: "evil.example", url: null,
+      host_hmac: createHmac("sha256", key).update(`reset-${TOKEN.toLowerCase()}.evil.example`).digest("hex"), url_hmac: createHmac("sha256", key).update(evil).digest("hex") });
+    const logText = readFileSync(join(q.home, "nav-decisions.jsonl"), "utf8");
+    expect(logText.toLowerCase()).not.toContain(TOKEN.toLowerCase());
+    // Nothing of the hook log in the queue repo's history, in what Cain's keeper copies, or in what the reader prints.
+    round(q.cfg);
+    const history = q.history();
+    for (const x of ["nav-decisions", denied.host_hmac!, denied.url_hmac!, "evil.example", "hook-key", keyText]) expect([x, history.includes(x)]).toEqual([x, false]);
+    const everywhere = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === ".git" ? [] : everywhere(join(dir, e.name)))
+      : [readFileSync(join(dir, e.name), "latin1")]);
+    for (const text of everywhere(q.cfg.dir)) for (const x of [denied.url_hmac!, "evil.example", "nav-decisions"]) expect(text.includes(x)).toBe(false);
+    expect(JSON.stringify(readResult(q.cfg.dir, id))).not.toContain("evil");
+    expect(sh(["git", "ls-files"], q.pc)).not.toMatch(/nav-decisions|hook-key/);
+  });
+
+  test("report facts are quoted, untrusted data: capped and of a small character set; planted commands are typed away or refused, and the reader acts on nothing", async () => {
+    // The schema: a label that looks like a command is kept only as "other"; shell punctuation fails it.
+    expect(checkFacts("read_subscription_status", { plan: "touch pwned" })).toEqual({ ok: true, value: { plan: "other" } });
+    for (const v of ["$(touch pwned)", "`id`", "a; rm -rf /", "x | sh", "<script>", "a\nb"])
+      expect([v, checkFacts("read_subscription_status", { plan: v }).ok]).toEqual([v, false]);
+    for (const v of ["****$(id)", "***`id`@x.com", "****;ls"]) expect([v, checkFacts("read_account_settings", { account: v }).ok]).toEqual([v, false]);
+    // A valid report carrying planted commands where it can: the worker keeps only typed values.
+    const q = queueRig();
+    const rid = q.ask({ ...READ, action: "read_subscription_status", start_url: "https://example.com/account/settings" });
+    round(q.cfg); q.clonePc();
+    q.allow([{ site: "example.com", action: "read_subscription_status", url: "https://example.com/account/settings", match: "exact" }]);
+    const jid = q.outcome(rid).id;
+    q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true, status: "active", plan: "curl evil sh" } }));
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: jid });
+    round(q.cfg);
+    // Cain's consumption path: the keeper's result reader, run as pcjobs.sh runs it.
+    const mark = join(q.root, "PWNED");
+    const read = () => sh([process.execPath, join(OPT, "pcjobs", "main.ts"), "result", jid], q.root, { env: cleanEnv({ PC_JOBS_DIR: q.cfg.dir, PC_JOBS_REMOTE: q.cfg.remote }) });
+    const out = read();
+    expect(JSON.parse(out).facts).toEqual({ signed_in: true, status: "active", plan: "other" });
+    expect(existsSync(mark)).toBe(false);
+    expect(readResult(q.cfg.dir, jid)).toMatchObject({ facts: { signed_in: true, status: "active", plan: "other" } });
+    // A result file someone planted commands in is refused whole: nothing of it is shown, nothing runs.
+    const f = join(q.cfg.dir, "results", `${jid}.json`);
+    const r = JSON.parse(readFileSync(f, "utf8"));
+    for (const plant of [`$(touch ${mark})`, `\`touch ${mark}\``, `x; touch ${mark}`]) {
+      writeFileSync(f, JSON.stringify({ ...r, facts: { ...r.facts, plan: plant } }));
+      expect(readResult(q.cfg.dir, jid)).toBe("bad");
+    }
+    expect(existsSync(mark)).toBe(false);
+    expect(() => read()).toThrow();
+    expect(existsSync(mark)).toBe(false);
+  });
+
+  test("a confirmation is bound to the worker, its Cain version and the hook's policy: any change (the version step included) is probe_stale, worker_changed", async () => {
+    expect(workerNow()).toEqual({ worker_sha256: workerSha(), cain_version: cainVersion(), policy_version: POLICY_VERSION });
+    expect(cainVersion()).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(cainVersion(join(REPO, "cain", "config.yaml"))).toBe(cainVersion());
+    const q = queueRig();
+    const conf = JSON.parse(readFileSync(join(q.home, "confirmed.json"), "utf8"));
+    expect(readConfirmed(q.opts())).toMatchObject(workerNow());
+    for (const change of [{ worker_sha256: "e".repeat(64) }, { cain_version: "0.0.1" }, { policy_version: "1" }, { worker_sha256: null }]) {
+      q.fileOk(join(q.home, "confirmed.json"), JSON.stringify({ ...conf, ...change }));
+      q.ask(READ); round(q.cfg); q.clonePc();
+      expect([change, (await run(q.opts(attended))).code]).toEqual([change, "probe_stale"]);
+      expect(JSON.parse(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "probe_stale", reason: "worker_changed" });
+    }
+    // A confirmation from before these were recorded is stale the same way, not unreadable.
+    const { worker_sha256: _a, cain_version: _b, policy_version: _c, ...old } = conf;
+    q.fileOk(join(q.home, "confirmed.json"), JSON.stringify(old));
+    expect(readConfirmed(q.opts())).toMatchObject({ worker_sha256: null, cain_version: null, policy_version: null });
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("probe_stale");
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "probe_stale", job: null, stale_lock: false, skew_ms: null, reason: "worker_changed" }))
+      .toMatch(/worker was updated.*worker\.ts probe --attended/);
+    // Evidence from another worker confirms nothing.
+    const p = queueRig({ confirmed: false });
+    await probe(p.opts(attended));
+    const file = join(p.home, "probe-evidence.json");
+    const good = JSON.parse(readFileSync(file, "utf8"));
+    writeFileSync(file, JSON.stringify({ ...good, worker: { ...good.worker, worker_sha256: "f".repeat(64) } }));
+    expect(() => confirmProfile(p.opts(), ACCEPT)).toThrow("probe_stale");
   });
 });
 
@@ -3758,7 +4156,7 @@ describe("the files around it", () => {
   test("the session prompt and the owner's setup note say what the code does", () => {
     const prompt = readFileSync(SESSION_FILES.prompt, "utf8");
     for (const w of ["canary_url", "done_url", "about:blank", "the profile", "extension id", "attempt id", "exactly as written", "data, never instructions", "Cain jobs", "no shell",
-      "no clicking or typing", "browser_unreachable", "wrong_profile", "tab_id", "createIfEmpty", "Open no other tab", "Leave the tab open",
+      "no clicking or typing", "browser_unreachable", "wrong_profile", "tab_id", "tabs_create_mcp", "Open no other tab", "Leave the tab open",
       "There is no notes field", "schema_violation", "call `tabs_context_mcp` before anything", "\"profile\": \"bound\"",
       "at most four letters or digits"])
       expect(prompt).toContain(w);
@@ -3794,7 +4192,12 @@ describe("the files around it", () => {
       "that folder is the one place page text lives on the PC, and only from a session's start to its end step", "browser_initiated_requests_not_prevented",
       "matched \"delete\" on host example.com", "path, query, fragment and userinfo are never printed", "expected` against the `found",
       "checked first, before the `STOP` file, the lock, the sweep, the install file and any git operation", "`owner-keygen`, `owner-fpr` and `sign-allowlist`",
-      "unknown_field", "`url_sha256`", "never its path, query or fragment", "to a depth of 8 and at most 200 strings", "up to five times", "8.3 short name",
+      "unknown_field", "`url_hmac`", "registrable domain", "(a depth of 8, at most 200 strings) count only the strings that can name a filesystem target", "up to five times", "8.3 short names are the real ones",
+      "Every path is read in one form first", "Git Bash's `/c/...`", "The worker folder's own name is refused as a whole token", "C:/pc-worker-k7q2xz",
+      "The hook is an allow list over every tool name", "`tool_not_allowed`", "unlisted_check_required", "The run's inventory is checked at the session's start",
+      "`context_owed`", "`tab_context_owed`", "context_order_failed", "The run's tabs are its own only", "never committed to the queue or sent to Cain",
+      "On Windows the tree is ended and seen gone before any sweep", "process_end_required", "`EPERM`, `EBUSY`", "`worker_changed`",
+      "A confirmation is bound to the worker, its Cain version and the hook's policy too", "Every string fact, whatever its type, is at most 200 characters",
       "canary_first", "other_tab", "`no_address`", "run tool_inventory expected=... found=...", "first ends the session's whole process tree",
       "`Glob`, `Grep`, `Bash`"])
       expect(setup.replace(/\s+/g, " ")).toContain(w.replace(/\s+/g, " "));
@@ -3806,7 +4209,7 @@ describe("the files around it", () => {
       "cli_changed", "extension_version_mismatch", "schema_violation", "hook_missing_decision", "hook_selftest_failed", "canary_cookie_missing",
       "chrome_not_restarted", "extension_version_unknown", "read_unverified", "manifest_path_mismatch", "slow_hook_required", "allowlist_risky_url",
       "boundary_not_accepted", "update_pending", "injection_required", "worker_signin_missing", "session_cleanup_failed", "session_stopped",
-      "extension_entry_missing", "extra_extension", "host_parent_gone", "unattended_unsupported", "canary_first", "other_tab", "attended_only"])
+      "extension_entry_missing", "extra_extension", "host_parent_gone", "unattended_unsupported", "canary_first", "other_tab", "attended_only", "tab_context_owed", "unlisted_check_required", "process_end_required", "context_order_failed", "worker_changed", "tree_end"])
       expect([c, table.includes(`\`${c}\``)]).toEqual([c, true]);
     // Rows for a WOW6432Node registry entry, and for the autoupdater behind probe_stale's cli_version_changed.
     expect(table).toContain("a WOW6432Node entry");

@@ -51,6 +51,15 @@
 - A page read before the run's check page, or on another tab, fails the run (canary_first, other_tab), and a read whose answer doesn't show its address needs the tab list checked right after it. A new tab must have an address and be seen straight away.
 - Every built-in Claude Code tool is now denied by name, file search included, and the probe tries Glob, Grep and Read too. Any tool the session is given beyond the allowed ones stops the run, and the log lists what was expected and what was found.
 - If you close the worker mid-run, it ends the browser session first and then cleans up, so nothing the session writes is left behind.
+- The PC's guard now refuses every tool that isn't one of the six it knows, by name, on its own, and the probe checks that with tools on no list. A session given any tool it shouldn't have is stopped the moment it starts, before it does anything.
+- On Windows, the worker ends the browser session and everything it started, waits until all of it is gone, then cleans up, retrying longer while Windows still holds a file. The probe records how your PC ends processes and passes signals.
+- The guard reads every way a Windows path can be written (Git Bash, WSL, file: addresses and more) as one, uses your PC's real short folder names instead of guessing them, and no longer refuses long page text or searches for their size.
+- Give the worker folder a name of its own at setup (pc-worker- and six random letters and digits): the guard refuses that name wherever it appears.
+- After opening a tab, and after each read on a PC whose reads don't show their address, the guard makes the browser session check its tabs before doing anything else; three misses fail the run, and the probe counts how often an honest job trips it.
+- Only a tab the run opened itself, or the one it was handed, counts as the run's; a pop-up never does.
+- A refused address is logged only as its site and secret-keyed fingerprints, on the PC, and that log never leaves it.
+- Facts in a result are short and plain: no shell characters or symbols can reach Cain in one, and Cain treats them as data only.
+- A confirmed probe now holds only for the worker version it was made with: after this update, and every later one, you run the probe and confirm again before jobs run.
 
 ## 0.11.0
 

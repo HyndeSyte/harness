@@ -8,7 +8,7 @@
   "diagnostics": false,
   "native_host_manifest": "C:/Users/YOU/AppData/Roaming/Claude/ChromeNativeHost/com.anthropic.claude_browser_extension.json",
   "profile": {
-    "user_data_dir": "C:/pc-worker/chrome",
+    "user_data_dir": "C:/pc-worker-k7q2xz/chrome",
     "profile_directory": "Default",
     "profile_name": "Cain jobs",
     "extension_id": "abcdefghijklmnopabcdefghijklmnop"
