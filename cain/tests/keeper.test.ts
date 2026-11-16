@@ -229,12 +229,26 @@ describe("keeper.sh against a fake link", () => {
       expect(await keeper("fastpath", "smoke-step", "not-a-run", "gmail-add")).toMatchObject({ code: 2 });
       expect(await keeper("handover", "--message", "1439000000000000002", "--smoke")).toMatchObject({ code: 2 });
       expect(await keeper("handover", "--message", "1439000000000000002", "--smoke", "P31")).toMatchObject({ code: 2 });
+      // Tenth round: an ordinary step needs its script; a conformance step takes none.
+      expect(await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add", "outlook", "add", "2026-11-17", "Piano", "13:00-14:00")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add", "gmail", "add", "Nov 17", "Piano")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add", "gmail", "add", "2026-11-17", "Piano", "1pm")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "conformance-family", "gmail")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "migrate-check", "--candidate")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "migrate-check", "--candidate", "relative/tree")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "migrate-check", "/data/harness.sqlite", "/extra")).toMatchObject({ code: 2 });
+      expect(await keeper("fastpath", "migrate-override", "now")).toMatchObject({ code: 2 });
       expect(seen.length).toBe(0);
-      await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add");
+      await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "gmail-add", "gmail", "add", "2026-11-17", "Piano lesson", "13:00-14:00");
+      await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "family-remove", "family", "remove", "2026-11-18", "Swim");
       await keeper("handover", "--message", "1439000000000000002", "--smoke", "a1b2c3d4e5f6");
       await keeper("fastpath", "smoke-step", "a1b2c3d4e5f6", "conformance-family");
       expect(seen).toEqual([
-        { path: "/fastpath", keyed: true, body: { state: "smoke-step", run: "a1b2c3d4e5f6", step: "gmail-add" } },
+        { path: "/fastpath", keyed: true, body: { state: "smoke-step", run: "a1b2c3d4e5f6", step: "gmail-add",
+          script: { calendar: "gmail", kind: "add", day: "2026-11-17", title: "Piano lesson", times: "13:00-14:00" } } },
+        { path: "/fastpath", keyed: true, body: { state: "smoke-step", run: "a1b2c3d4e5f6", step: "family-remove",
+          script: { calendar: "family", kind: "remove", day: "2026-11-18", title: "Swim" } } },
         { path: "/handover", keyed: true, body: { suggestion: "", paired: "4242", message: "1439000000000000002", smoke_run: "a1b2c3d4e5f6" } },
         { path: "/fastpath", keyed: true, body: { state: "smoke-step", run: "a1b2c3d4e5f6", step: "conformance-family" } },
       ]);
@@ -244,11 +258,24 @@ describe("keeper.sh against a fake link", () => {
       const ok = JSON.parse(readFileSync(marker, "utf8"));
       expect(ok).toMatchObject({ ok: true, status: "ok", build: "b1", checksum: "c".repeat(64) });
       expect(Date.now() - Date.parse(ok.at)).toBeLessThan(60_000);
+      seen.length = 0;
+      answer = { status: "ok", result: { ok: true, build: "b2", checksum: "d".repeat(64), candidate: "/tmp/next/harness" } };
+      await keeper("fastpath", "migrate-check", "--candidate", "/tmp/next/harness");
+      await keeper("fastpath", "migrate-check", "/backup/copy.sqlite", "--candidate", "/opt/next/harness");
+      await keeper("fastpath", "migrate-override");
+      expect(seen).toEqual([
+        { path: "/fastpath", keyed: true, body: { state: "migrate-check", candidate: "/tmp/next/harness" } },
+        { path: "/fastpath", keyed: true, body: { state: "migrate-check", path: "/backup/copy.sqlite", candidate: "/opt/next/harness" } },
+        { path: "/fastpath", keyed: true, body: { state: "migrate-override" } },
+      ]);
+      expect(JSON.parse(readFileSync(marker, "utf8"))).toMatchObject({ ok: true, build: "b2", candidate: "/tmp/next/harness" });
       answer = { status: "refused", said: "The dry run failed.", result: { ok: false } };
       await keeper("fastpath", "migrate-check");                  // a failed one replaces the pass
       expect(JSON.parse(readFileSync(marker, "utf8"))).toMatchObject({ ok: false, status: "refused" });
       const usage = (await keeper("help")).out;
-      expect(usage).toContain("keeper.sh fastpath smoke-step <run id> <step>");
+      expect(usage).toContain("keeper.sh fastpath smoke-step <run id> <step> <gmail|family> <add|move|remove> <YYYY-MM-DD> <title> [HH:MM-HH:MM]");
+      expect(usage).toContain("keeper.sh fastpath migrate-check [path] [--candidate <path>]");
+      expect(usage).toContain("keeper.sh fastpath migrate-override");
       expect(usage).toContain("harness-migrate-check.json");
     } finally { server.stop(true); }
   }, 30_000);

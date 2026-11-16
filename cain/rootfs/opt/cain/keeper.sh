@@ -5,8 +5,9 @@
 #                                        (it reads his message itself); answers with card ids.
 #                                        --message: the id in the tag of the message it rests on
 #                                        (its last 30 minutes); without it, his newest message.
-#                                        --smoke: only for a smoke run's step you just opened with
-#                                        fastpath smoke-step; refused when no step is open
+#                                        --smoke: never makes a request a smoke step's; a handover
+#                                        naming the run is an ordinary request (it cites his own
+#                                        message), held like any other while a gate is closed
 #   keeper.sh fastpath smoke-start      start the post-install smoke run: the specialist issues its
 #                                        id (answers with "run") and records every change approved
 #                                        while it's live under that id. Run the checklist through the
@@ -17,13 +18,19 @@
 #                                        "Smoke test: ...". Only a step's own request is the run's: a
 #                                        request that just arrives while the run is live is an ordinary
 #                                        one, and after an update a closed gate holds it like any other
-#   keeper.sh fastpath smoke-step <run id> <step>
-#                                        open one step of the run (a short name: lowercase letters,
-#                                        digits, dashes), for 30 minutes and one handover: the next
-#                                        handover --smoke <run id> is that step's. conformance-gmail and
-#                                        conformance-family run at once: the run edits its own test
-#                                        event with a version it made out of date, which the calendar
-#                                        must refuse; one that takes it never opens its cards
+#   keeper.sh fastpath smoke-step <run id> <step> <gmail|family> <add|move|remove> <YYYY-MM-DD> <title> [HH:MM-HH:MM]
+#                                        offer one step of the run with its script (the step: lowercase
+#                                        letters, digits, dashes; the title in quotes; times for an add
+#                                        or a move). Dane gets a card showing the script with Start step
+#                                        N; his tap, within 30 minutes, makes the step's change from the
+#                                        script itself, on a card for his Approve. Hand nothing over for
+#                                        a step. conformance-gmail and conformance-family take no script
+#                                        and run at once: on the run's own test events, an edit, a
+#                                        removal and an edit of one day of a series, each sent with a
+#                                        version it made out of date, which the calendar must refuse
+#                                        with its stale answer and not apply; one that takes any never
+#                                        opens its cards, and one that refuses the fresh edit itself gets
+#                                        a Test again for Dane and no gate-open
 #   keeper.sh fastpath on <run id>       ask for that run's result. The specialist builds every item
 #                                        from its own record (event ids, request and read-back times,
 #                                        the writes refused for an older version, two listing-lag
@@ -47,16 +54,23 @@
 #                                        can't complete on it, this opens that calendar without the check,
 #                                        logged as yours; its held changes come back on fresh cards. Dane's
 #                                        Open cards without the check tap does the same. Only on his say
-#   keeper.sh fastpath migrate-check [path]
-#                                        run the specialist's ledger migration on a copy of the ledger
-#                                        file at path (the specialist's own path; default its live
-#                                        ledger), never the file itself, and print what it found: the
-#                                        schema version, no-card paths off, the gate set, open Turn on
-#                                        cards (0 expected) and rows touched. Run it before a Ship card
-#                                        for a specialist update: the specialist keeps the result in its
-#                                        ledger (by build and the copy's checksum), and this writes it to
-#                                        the marker file /data/markers/harness-migrate-check.json, which
-#                                        a Ship card for the specialist needs (ok, under 24 hours old)
+#   keeper.sh fastpath migrate-check [path] [--candidate <path>]
+#                                        run a ledger migration on a copy of the ledger file at path
+#                                        (the specialist's own path; default its live ledger), never
+#                                        the file itself, and print what it found: the schema version,
+#                                        no-card paths off, the gate set, open Turn on cards (0
+#                                        expected) and rows touched. --candidate: the incoming build's
+#                                        own migration, from its source tree (the harness App folder)
+#                                        or image path (its /opt/harness), recorded under that build's
+#                                        id. Run it before a Ship card for a specialist update: the
+#                                        specialist keeps the result in its ledger (by build and the
+#                                        copy's checksum), and this writes it to the marker file
+#                                        /data/markers/harness-migrate-check.json, which a Ship card for
+#                                        the specialist needs (ok, under 24 hours old). An installed
+#                                        build with no dry run of its own build id recorded moves
+#                                        nothing until one is: this, run then, records it and moves them
+#   keeper.sh fastpath migrate-override  only on Dane's say: the installed build moves its records
+#                                        without a dry run, logged as yours, still with a backup first
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
@@ -128,14 +142,29 @@ if [ "$cmd" = fastpath ]; then
   case "${1:-}" in
     smoke-start|off) ;;
     smoke-step) [[ "${2:-}" =~ ^[0-9a-f]{6,32}$ ]] && [[ "${3:-}" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] \
-          || { echo '{"status":"error","said":"fastpath smoke-step takes the run id and a step name: fastpath smoke-step <run id> <step>"}'; exit 2; } ;;
+          || { echo '{"status":"error","said":"fastpath smoke-step takes the run id and a step name: fastpath smoke-step <run id> <step> [script]"}'; exit 2; }
+        case "$3" in
+          conformance-*) [ $# -eq 3 ] || { echo '{"status":"error","said":"a conformance step takes no script"}'; exit 2; } ;;
+          *) { [[ "${4:-}" =~ ^(gmail|family)$ ]] && [[ "${5:-}" =~ ^(add|move|remove)$ ]] \
+                 && [[ "${6:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [[ "${7:-}" =~ ^[A-Za-z0-9][A-Za-z0-9\ \'\&.,:-]{0,59}$ ]] \
+                 && { [ -z "${8:-}" ] || [[ "$8" =~ ^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$ ]]; } && [ $# -le 8 ]; } \
+               || { echo '{"status":"error","said":"a step takes its script: fastpath smoke-step <run id> <step> <gmail|family> <add|move|remove> <YYYY-MM-DD> <title> [HH:MM-HH:MM]"}'; exit 2; } ;;
+        esac ;;
     on) [[ "${2:-}" =~ ^[0-9a-f]{6,32}$ ]] \
           || { echo '{"status":"error","said":"fastpath on takes the smoke run id that fastpath smoke-start gave: fastpath on <run id>"}'; exit 2; } ;;
     gate-open) case "${2:-}" in gmail|family) ;;
                  *) echo '{"status":"error","said":"fastpath gate-open takes gmail or family"}'; exit 2 ;; esac ;;
-    migrate-check) [ -z "${2:-}" ] || [[ "$2" =~ ^/[A-Za-z0-9/._-]{1,255}$ ]] \
-          || { echo '{"status":"error","said":"fastpath migrate-check takes an absolute ledger path, or none for the live ledger"}'; exit 2; } ;;
-    *) echo '{"status":"error","said":"fastpath takes smoke-start, smoke-step <run id> <step>, on <run id>, off, gate-open <gmail|family> or migrate-check [path]"}'; exit 2 ;;
+    migrate-check)
+        mc_path="" mc_candidate=""
+        if [ "${2:-}" = --candidate ]; then mc_candidate="${3:-}"; [ $# -le 3 ] || mc_candidate="!"
+        else mc_path="${2:-}"; if [ "${3:-}" = --candidate ]; then mc_candidate="${4:-}"; [ $# -le 4 ] || mc_candidate="!"; elif [ -n "${3:-}" ]; then mc_candidate="!"; fi
+        fi
+        { [ -z "$mc_path" ] || [[ "$mc_path" =~ ^/[A-Za-z0-9/._-]{1,255}$ ]]; } \
+          || { echo '{"status":"error","said":"fastpath migrate-check takes an absolute ledger path, or none for the live ledger"}'; exit 2; }
+        { [ -z "$mc_candidate" ] && { [ "${2:-}" != --candidate ] && [ "${3:-}" != --candidate ]; } || [[ "$mc_candidate" =~ ^/[A-Za-z0-9/._-]{1,255}$ ]]; } \
+          || { echo '{"status":"error","said":"--candidate takes the absolute path of the incoming build: its source tree (the harness App folder) or its image path (/opt/harness)"}'; exit 2; } ;;
+    migrate-override) [ $# -eq 1 ] || { echo '{"status":"error","said":"fastpath migrate-override takes nothing more"}'; exit 2; } ;;
+    *) echo '{"status":"error","said":"fastpath takes smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open <gmail|family>, migrate-check [path] [--candidate <path>] or migrate-override"}'; exit 2 ;;
   esac
 fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -200,9 +229,13 @@ case "$cmd" in
   digest)   body='{}' ;;
   fastpath) case "$1" in
               on) body=$(jq -nc --arg r "$2" '{state: "on", run: $r}') ;;
-              smoke-step) body=$(jq -nc --arg r "$2" --arg t "$3" '{state: "smoke-step", run: $r, step: $t}') ;;
+              smoke-step) body=$(jq -nc --arg r "$2" --arg t "$3" --arg c "${4:-}" --arg k "${5:-}" --arg d "${6:-}" \
+                            --arg n "${7:-}" --arg w "${8:-}" '{state: "smoke-step", run: $r, step: $t}
+                            + (if $c == "" then {} else {script: ({calendar: $c, kind: $k, day: $d, title: $n}
+                               + (if $w == "" then {} else {times: $w} end))} end)') ;;
               gate-open) body=$(jq -nc --arg c "$2" '{state: "gate-open", calendar: $c}') ;;
-              migrate-check) body=$(jq -nc --arg p "${2:-}" '{state: "migrate-check"} + (if $p == "" then {} else {path: $p} end)') ;;
+              migrate-check) body=$(jq -nc --arg p "$mc_path" --arg c "$mc_candidate" '{state: "migrate-check"}
+                               + (if $p == "" then {} else {path: $p} end) + (if $c == "" then {} else {candidate: $c} end)') ;;
               *) body=$(jq -nc --arg s "$1" '{state: $s}') ;;
             esac ;;
   meanings)
@@ -258,7 +291,8 @@ if [ "$cmd" = fastpath ] && [ "${1:-}" = migrate-check ]; then
   mkdir -p "$markers" 2>/dev/null
   printf '%s' "$out" | jq -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{at: $at, ok: (.status == "ok" and (.result.ok // false)), status: .status,
-      build: (.result.build // ""), checksum: (.result.checksum // ""), result: (.result // {})}' \
+      build: (.result.build // ""), checksum: (.result.checksum // ""), candidate: (.result.candidate // ""),
+      result: (.result // {})}' \
     > "$markers/harness-migrate-check.json" 2>/dev/null \
     || jq -nc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{at: $at, ok: false, status: "unreadable"}' \
          > "$markers/harness-migrate-check.json" 2>/dev/null

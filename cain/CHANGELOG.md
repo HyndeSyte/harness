@@ -15,6 +15,9 @@
 - During the check on your real calendars, only the steps Cain opens for it count as the check. Your own requests that come in meanwhile are held like any other and come back on their own card, never treated as test events.
 - The check also makes each calendar prove it turns down an out of date write; one that doesn't stays on hold, and you get a message saying so with the choice to open it anyway.
 - Before a Ship card for the calendar specialist, Cain needs a fresh, passing dry run of its update on a copy of its records, kept in a file he checks.
+- Each step of the check on your real calendars now starts with your tap on a card that shows exactly what it will do; Cain can't make anything part of the check by himself, and your own requests during it stay yours.
+- Before a Ship card for the calendar specialist, Cain rehearses the incoming version's own update on a copy of its records. If an update starts without one, Cain runs it then; he moves its records without it only on your say.
+- Cain shows the specialist's messages about held requests, Test again when a calendar and the specialist don't agree on versions, and the daily reminder while requests wait.
 
 ## 0.11.0
 
