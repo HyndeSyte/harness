@@ -71,11 +71,21 @@ export function readLog<T = any>(file: string, o: { repair?: boolean } = {}): Lo
 // the caller acts only once this returns.
 // Round 13: a test's view of each fsync, in order ("file <path>" or "dir <path>").
 export const syncSpy: { on: null | ((what: string) => void) } = { on: null };
+// Round 18: the interleaving rule for logs two processes append to (the install log: the link and the keeper): each
+// record is one framed write, opened for append, under MAX_RECORD_BYTES (below the 4096 bytes a single append is
+// written whole in), so two writers' records never interleave; a longer record is refused before anything is written.
+export const MAX_RECORD_BYTES = 4000;
 export function appendLog(file: string, rec: unknown): void {
+  const buf = Buffer.from(frame(rec), "utf8");
+  if (buf.length > MAX_RECORD_BYTES) throw new Error(`a log record over ${MAX_RECORD_BYTES} bytes (${buf.length}) isn't written: one record is one write`);
   const fresh = !existsSync(file);
   if (fresh) mkdirSync(dirname(file), { recursive: true });
   const fd = openSync(file, "a", 0o600);
-  try { writeSync(fd, frame(rec)); fsyncSync(fd); syncSpy.on?.(`file ${file}`); } finally { closeSync(fd); }
+  try {
+    const n = writeSync(fd, buf);
+    if (n !== buf.length) throw new Error(`a log record was written short (${n} of ${buf.length} bytes)`);
+    fsyncSync(fd); syncSpy.on?.(`file ${file}`);
+  } finally { closeSync(fd); }
   // A new log's directory entry is fsynced too, so a power cut can't lose the whole file.
   if (fresh) syncDir(dirname(file));
 }

@@ -229,10 +229,16 @@ describe("2. the consumed set: every ref, the remote and the landing ledger; unv
     const kid = `tap-${new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 12)}`;
     const dir = join(k.root, "pi/record-landings");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, `${new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 32)}.json`), JSON.stringify({ key, pr: PR, head: SHA1, at: "2026-11-11T13:00:00.000Z" }));
+    // Round 18: only a claim settled against the remote main is a source for the rebuild; an open one isn't.
+    const open = `1570000000000000202|1|cain-check|P33|Ship`;
+    const openKid = `tap-${new Bun.CryptoHasher("sha256").update(open).digest("hex").slice(0, 12)}`;
+    writeFileSync(join(dir, `${new Bun.CryptoHasher("sha256").update(key).digest("hex").slice(0, 32)}.json`), JSON.stringify({ key, pr: PR, head: SHA1, at: "2026-11-11T13:00:00.000Z",
+      settled: { how: "landed", at: "2026-11-11T13:01:00.000Z" } }));
+    writeFileSync(join(dir, `${new Bun.CryptoHasher("sha256").update(open).digest("hex").slice(0, 32)}.json`), JSON.stringify({ key: open, pr: PR, head: SHA1, at: "2026-11-11T13:00:00.000Z" }));
     k.cain({ id: "cain-l0", ops: [{ op: "note", item: "P44", text: "a round" }] });
     expect(cycle(k.cfg).ok).toBe(true);
     expect(readConsumed(k.cfg).get(kid)).toBe("the link's landing ledger (its landing started)");
+    expect(readConsumed(k.cfg).has(openKid)).toBe(false);
     k.cain(shipTake("cain-ship-g", kid));
     expect(cycle(k.cfg).ok).toBe(true);
     expect(k.states("cain-ship-g")).toEqual(["done"]);

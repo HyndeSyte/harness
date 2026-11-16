@@ -421,7 +421,10 @@ export function ledgerStarted(cfg: Config): Set<string> {
   for (const n of names) {
     try {
       const j = JSON.parse(readFileSync(join(landingsDir(cfg), n), "utf8"));
-      if (typeof j?.key === "string" && !j.settled?.voided) out.add(`tap-${createHash("sha256").update(j.key).digest("hex").slice(0, 12)}`);
+      // Round 18: only a claim the link settled against the remote main (landed or not landed, read from GitHub: not
+      // voided, not settled by hand) is a source for the rebuild; an open claim is settled from the remote main first.
+      if (typeof j?.key === "string" && j.settled && !j.settled.voided && !j.settled.forced && (j.settled.how === "landed" || j.settled.how === "not landed"))
+        out.add(`tap-${createHash("sha256").update(j.key).digest("hex").slice(0, 12)}`);
     } catch { /* a file mid-write: the next round */ }
   }
   return out;
@@ -646,12 +649,22 @@ function logCounts(cfg: Config): NonNullable<State["logHigh"]> {
 // Round 13: the owner's accepted recover-logs line (keeper.sh recover-logs, written by the link), not used before.
 // Round 17: no longer aged by the Pi's clock (the link judged his line by Discord's times before writing the file,
 // and the keeper deletes the file once it takes it): it counts once, by its message id.
+// Round 18: the keeper never acts on the file the link writes: it first renames it to a taken name (and fsyncs the
+// folder), then reads and acts on that, and deletes only the taken file. A line the link writes meanwhile lands as a
+// new file under the link's name and is taken next, never deleted unread or mixed with the one being acted on.
+export const recoverTaken = (cfg: Config) => `${recoverFile(cfg)}.taken`;
 function recoverAsked(cfg: Config, st: State, _now: number): { said: string; nonce?: string } | null {
-  try {
-    const j = JSON.parse(readFileSync(recoverFile(cfg), "utf8"));
-    if (typeof j?.said !== "string" || !/^\d{15,22}$/.test(j.said) || (st.recovered ?? []).includes(j.said)) return null;
-    return { said: j.said, ...(typeof j.nonce === "string" && /^[a-z][0-9a-f]{5}$/.test(j.nonce) ? { nonce: j.nonce } : {}) };
-  } catch { return null; }
+  const taken = recoverTaken(cfg);
+  for (let i = 0; i < 2; i++) {
+    try {
+      if (!existsSync(taken) && existsSync(recoverFile(cfg))) { renameSync(recoverFile(cfg), taken); syncDir(dirname(taken)); }
+      if (!existsSync(taken)) return null;
+      const j = JSON.parse(readFileSync(taken, "utf8"));
+      if (typeof j?.said !== "string" || !/^\d{15,22}$/.test(j.said) || (st.recovered ?? []).includes(j.said)) { rmSync(taken, { force: true }); continue; }
+      return { said: j.said, ...(typeof j.nonce === "string" && /^[a-z][0-9a-f]{5}$/.test(j.nonce) ? { nonce: j.nonce } : {}) };
+    } catch { try { rmSync(taken, { force: true }); } catch { /* the next round */ } }
+  }
+  return null;
 }
 let refusedWhy = "";
 
@@ -715,7 +728,7 @@ function revive(j: any): State | null {
     ...(Array.isArray(j.linesDone) ? { linesDone: j.linesDone.filter((x: any) => typeof x === "string").slice(-200) } : {}),
     ...(Array.isArray(j.historyLines) ? { historyLines: j.historyLines.filter((x: any) => typeof x === "string").slice(-200) } : {}),
     ...(Array.isArray(j.recoverLines) ? { recoverLines: j.recoverLines.filter((x: any) => typeof x?.nonce === "string" && typeof x?.said === "string").slice(-50) } : {}),
-    ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && ["refused", "lost", "expired", "time", "hold"].includes(n.why) && typeof n.at === "string")
+    ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && ["refused", "lost", "expired", "time", "hold", "superseded", "unstamped"].includes(n.why) && typeof n.at === "string")
       .map((n: any) => ({ tap: n.tap, why: n.why, reason: String(n.reason ?? ""), ...(typeof n.msg === "string" ? { msg: n.msg } : {}), at: n.at })) } : {}) };
 }
 
@@ -734,7 +747,23 @@ function publish(cfg: Config, holds: Holds) {
   writeFileSync(f, holdsText(holds));
 }
 
+// Round 18: the keeper's reset epoch never decreases: a keeper state restored from an older snapshot takes the higher
+// epoch its last status names (and that status's generation floor), so a new reset numbers past every epoch a card
+// could carry, and a card stamped with the newer epoch is never judged against an older one.
 function loadState(cfg: Config): State {
+  const st = loadState0(cfg);
+  try {
+    const j = JSON.parse(readFileSync(statusFile(cfg), "utf8"));
+    const e = j?.epoch;
+    if (e && Number.isInteger(e.n) && typeof e.at === "string" && Number.isInteger(e.generation) && e.n > (st.epoch?.n ?? 0)) {
+      log(`the keeper's state names reset epoch ${st.epoch?.n ?? 0}, but its last status names epoch ${e.n}: the higher one stands (a state restored from an older snapshot)`);
+      st.epoch = { n: e.n, at: e.at, generation: e.generation, ...(e.voided === true ? { voided: true } : {}) };
+      if ((st.generation ?? 0) < e.generation) st.generation = e.generation;
+    }
+  } catch { /* no status yet */ }
+  return st;
+}
+function loadState0(cfg: Config): State {
   const file = stateFile(cfg);
   let st: State | null = null;
   if (existsSync(file)) {
@@ -893,7 +922,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           catch (e) { try { rmSync(lc.fatalFile!, { recursive: true, force: true }); } catch { /* it stays: the next round refuses again */ } log(`couldn't move ${lc.fatalFile} aside (${(e as Error).message}); removed it instead`); }
           st0.recovered = [...(st0.recovered ?? []), asked.said].slice(-50);
           if (asked.nonce) st0.recoverLines = [...(st0.recoverLines ?? []), { nonce: asked.nonce, said: asked.said }].slice(-50);
-          rmSync(recoverFile(cfg), { force: true });
+          rmSync(recoverTaken(cfg), { force: true });
           lc.lost.push(`${lc.fatal}; moved aside on his recover-logs line (message ${asked.said})`);
           log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted: ${lc.fatalFile} moved aside, rebuilding`);
         }
@@ -909,7 +938,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
             st0.recovered = [...(st0.recovered ?? []), asked.said].slice(-50);
             if (asked.nonce) st0.recoverLines = [...(st0.recoverLines ?? []), { nonce: asked.nonce, said: asked.said }].slice(-50);
             writeAtomic(stateFile(cfg), JSON.stringify(st0));
-            rmSync(recoverFile(cfg), { force: true });
+            rmSync(recoverTaken(cfg), { force: true });
             forgetRebuild(cfg);
             log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted with no damaged log to move aside: the consumed set is rebuilt and verified against a fresh fetch`);
           }
