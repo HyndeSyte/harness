@@ -850,28 +850,36 @@ class Controller:
         h.finish("ok", render.plain(self.ledger.get_meta("last_digest_text") or ""))
 
     def _fastpath(self, h) -> None:
-        """Cain's keeper.sh fastpath (0.24.0, fourth round): once the post-install smoke test on the
-        real calendars has passed, "on" with what it showed turns on the two paths that apply with
-        no card, and the result is kept in the ledger; "off" turns them off again. Until "on",
-        every calendar change comes on a card."""
-        from .calendar_change import fast_path, set_fast_path
+        """Cain's keeper.sh fastpath (0.24.0, fourth and fifth rounds). "on" carries the post-install
+        smoke test's record, a fixed checklist (calendar_change.SMOKE_ITEMS), pass or fail each: one
+        short of every pass is refused, naming what failed, and nothing changes; a passing one goes to
+        him on a card with Turn on and Keep cards, and only his Turn on tap turns on the no-card paths.
+        "off" turns them off at once. Until his tap, every calendar change comes on a card."""
+        from .calendar_change import fast_path, set_fast_path, smoke_problems
         if h.state == "on":
-            if not h.smoke:
-                h.finish("refused", "Say what the smoke test showed: keeper.sh fastpath on \"<result>\". "
-                                    "Nothing changed; changes still come on a card.")
+            cc = self.calendar_change
+            if cc is None:
+                h.finish("off", "Calendar changes aren't set up in the calendar specialist.")
                 return
-            record = set_fast_path(self.ledger, True, h.smoke)
-            log.info("the no-card path is on: smoke test recorded")
-            h.finish("ok", "On: his own fresh, clear words and a mail date he tapped Add to Family on now "
-                           "go through without a card. Smoke test recorded: " + record["smoke"])
+            problems = smoke_problems(h.record) if h.record else ["no result file: keeper.sh fastpath on <result.json>"]
+            if problems:
+                log.info("the smoke test record was refused: %d item(s) short", len(problems))
+                h.finish("refused", "Not all passed, so nothing changed and every change still comes on a card: "
+                         + "; ".join(problems) + ".")
+                return
+            cc.offer_fast_path(h.record)
+            log.info("the smoke test passed: its card is with him")
+            h.finish("ok", "All passed. He has a card showing the result with Turn on and Keep cards; changes "
+                           "still come on a card until he taps Turn on.")
             return
         if h.state == "off":
-            set_fast_path(self.ledger, False, fast_path(self.ledger).get("smoke", ""))
+            set_fast_path(self.ledger, False, fast_path(self.ledger).get("smoke", ""), by="cain")
             log.info("the no-card path is off")
             h.finish("ok", "Off: every calendar change comes on a card.")
             return
         now = fast_path(self.ledger)
-        h.finish("unknown", "Say on or off. It's " + ("on" if now.get("on") else "off (card only)") + " now.")
+        h.finish("unknown", "Say on <result.json> or off. It's " + ("on" if now.get("on") else "off (card only)")
+                 + " now.")
 
     def _meanings(self, h) -> None:
         """What he told Cain kinds of Family events mean, from his record, already checked

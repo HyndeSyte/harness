@@ -29,7 +29,8 @@ KINDS = frozenset({"rule_undo", "rule_keep_new", "rule_keep_old",
                    "mail_dates_undo", "mail_dates_family", "mail_dates_gmail",
                    "mail_dates_skip", "cain_question", "meaning_answer", "meaning_undo",
                    "place_skip", "stopped_redo", "stopped_drop", "calendar_change_add_anyway",
-                   "calendar_change_propose_again", "calendar_change_which"})
+                   "calendar_change_propose_again", "calendar_change_which",
+                   "calendar_change_fast_on", "calendar_change_fast_keep"})
 PREFIX = "c"
 
 

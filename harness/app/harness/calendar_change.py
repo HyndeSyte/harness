@@ -140,12 +140,44 @@ WORDS = {"unknown": "I couldn't confirm it yet",
          "not_made": "that event was there before the add, so Undo leaves it",
          "read_back": "the calendar doesn't read back that way",
          "unverified": "the calendar doesn't read back that way"}
-# 0.24.0, fourth round: the two paths that apply with no card (his own fresh, clear words; a date
-# from his mail he tapped Add to Family on) are off until Cain records that the post-install smoke
-# test on the real calendars passed (keeper.sh fastpath on). Off when nothing is recorded, so every
-# install starts card-only, and every change comes on a card.
+# 0.24.0, fourth and fifth rounds: the three paths that apply with no card (his own fresh, clear
+# words; a date from his mail he tapped Add to Family on; Family adds after his tap on the bake-in
+# card, family_add.tapless) are off after every install. Cain sends the post-install smoke test's
+# record (keeper.sh fastpath on <result.json>); only a record with every item passed is shown to him,
+# on a card with Turn on and Keep cards, and only his Turn on tap sets the flag, with who and when.
+# Off when nothing is recorded, so every change comes on a card.
 FAST_PATH = "calendar_fast_path"
+FAST_OFFER = "calendar_fast_path_offer"
 SMOKE_MAX = 300
+# The smoke test's record, a fixed checklist: for each calendar an add, a move, a removal and an Undo,
+# each read back; a write landing late (or a lapse) caught and read back; and the listing lag it saw.
+SMOKE_PROVIDERS = ("gmail", "family")
+SMOKE_STEPS = ("add", "move", "remove", "undo")
+SMOKE_LATE = "late_landing"
+SMOKE_LAG = "listing_lag_seconds"
+SMOKE_ITEMS = tuple(f"{p}.{s}" for p in SMOKE_PROVIDERS for s in SMOKE_STEPS) + (SMOKE_LATE,)
+
+
+def smoke_problems(record) -> list[str]:
+    """What keeps a smoke test's record from counting: each item that isn't "pass" (failed, missing
+    or anything else), a listing lag that isn't a number of seconds from 0 to 3600, or a record that
+    isn't the checklist at all. [] only when every item passed."""
+    if not isinstance(record, dict):
+        return ["the record isn't the checklist"]
+    out = []
+    for item in SMOKE_ITEMS:
+        provider, _, step = item.partition(".")
+        got = (record.get(provider) or {}).get(step) if step else record.get(provider)
+        if got != "pass":
+            out.append(f"{item}: {got if isinstance(got, str) and got else 'missing'}"[:60])
+    lag = record.get(SMOKE_LAG)
+    if isinstance(lag, bool) or not isinstance(lag, (int, float)) or not 0 <= lag <= 3600:
+        out.append(f"{SMOKE_LAG}: not a number of seconds")
+    return out
+
+
+def smoke_lag(record: dict) -> int:
+    return int(round(float(record.get(SMOKE_LAG) or 0)))
 
 
 def fast_path(ledger: Ledger) -> dict:
@@ -171,14 +203,21 @@ def fast_path_on(ledger: Ledger) -> bool:
     return fast_path(ledger).get("on") is True
 
 
-def set_fast_path(ledger: Ledger, on: bool, smoke: str = "") -> dict:
-    """Cain's command after the smoke test (controller._fastpath): on only with what the smoke test
-    showed, kept in the ledger with when; off at any time."""
-    record = {"on": bool(on), "smoke": " ".join(str(smoke or "").split())[:SMOKE_MAX],
-              "at": iso(ledger.now())}
-    with ledger.tx() as db:
-        ledger.set_meta(FAST_PATH, json.dumps(record), db)
-        ledger.event("calendar_fast_path", {"on": record["on"]}, db=db)
+def set_fast_path(ledger: Ledger, on: bool, smoke=None, by: str = "", db=None) -> dict:
+    """On only from his Turn on tap on the smoke test's card (CalendarChange.on_choice), with the
+    record it showed, who tapped and when, kept in the ledger; off at any time (Cain's keeper.sh
+    fastpath off, or Keep cards)."""
+    record = {"on": bool(on), "smoke": smoke if isinstance(smoke, dict) else
+              " ".join(str(smoke or "").split())[:SMOKE_MAX], "at": iso(ledger.now()), "by": str(by or "")}
+
+    def write(d) -> None:
+        ledger.set_meta(FAST_PATH, json.dumps(record), d)
+        ledger.event("calendar_fast_path", {"on": record["on"], "by": record["by"], "at": record["at"]}, db=d)
+    if db is not None:
+        write(db)
+    else:
+        with ledger.tx() as d:
+            write(d)
     return record
 
 
@@ -817,6 +856,55 @@ class CalendarChange:
                         and other["title"].strip().casefold() == c["title"].strip().casefold():
                     return True
         return False
+
+    def offer_fast_path(self, record: dict) -> str:
+        """Cain's smoke test record (keeper.sh fastpath on <result.json>), already found all passed:
+        the listing lag it saw sizes the long window's read (LATE_READ), and one card shows him the
+        record in plain words with Turn on and Keep cards. Nothing turns on here."""
+        lag = smoke_lag(record)
+        offer = {"id": canonical_hash(record)[:16], "record": record, "at": iso(self.ledger.now())}
+        steps = ", ".join(f"{s}" for s in ("an add", "a move", "a removal"))
+        text = ("<b>The check after installing passed.</b>\n"
+                f"On your Gmail calendar and on Family: {steps} and an Undo each read back as asked.\n"
+                "A write that landed late was caught and read back.\n"
+                f"New events showed in the calendar's listing within {lag} second{'s' * (lag != 1)}.\n"
+                "Turn on lets these go through without a card, each still with its receipt and Undo: your "
+                "own newest message, under 2 minutes old, with one clear change; a date from your mail you "
+                "tap Add to Family on; and Family adds, once you've said to stop checking each one. Keep "
+                "cards leaves every change on a card.")
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(LATE_READ, str(min(3600, max(LATE_READ_S, 5 * lag))), db)
+            self.ledger.set_meta(FAST_OFFER, json.dumps(offer), db)
+            on = choices.mint(self.ledger, kind="calendar_change_fast_on", target=offer["id"],
+                              chat_id=self.chat_id, ttl_s=UNDO_TTL_S, db=db)
+            keep = choices.mint(self.ledger, kind="calendar_change_fast_keep", target=offer["id"],
+                                chat_id=self.chat_id, ttl_s=UNDO_TTL_S, db=db)
+            self.ledger.event("calendar_fast_path_offered", {"lag": lag}, db=db)
+            self._say(db, self.chat_id, None, text,
+                      buttons=[[("Turn on", choices.callback_data(on)), ("Keep cards", choices.callback_data(keep))]],
+                      binds=[{"type": "choice", "nonce": on}, {"type": "choice", "nonce": keep}])
+        return offer["id"]
+
+    def fast_path_tapped(self, on: bool, target: str) -> str:
+        """His tap on the smoke test's card: only Turn on, on the card for the record still current, sets
+        the flag, with the record, who tapped and when."""
+        try:
+            offer = json.loads(self.ledger.get_meta(FAST_OFFER) or "{}")
+        except ValueError:
+            offer = {}
+        if not offer or offer.get("id") != target or smoke_problems(offer.get("record")):
+            return "That card is for an older check, so nothing changed. Every change still comes on a card."
+        if not on:
+            with self.ledger.tx() as db:
+                self.ledger.event("calendar_fast_path_kept", {"by": str(self.chat_id), "at": iso(self.ledger.now())},
+                                  db=db)
+            return "Kept: every calendar change still comes on a card for your tap."
+        with self.ledger.tx() as db:
+            set_fast_path(self.ledger, True, offer["record"], by=str(self.chat_id), db=db)
+            db.execute("DELETE FROM meta WHERE key=?", (FAST_OFFER,))
+        return ("Turned on: your own fresh, clear words, a mail date you tap Add to Family on, and Family adds "
+                "after the stop-checking tap now go through without a card, each with its receipt and Undo. "
+                "Anything else still comes on a card.")
 
     def fast_path_ok(self) -> bool:
         """Whether a change may go through with no card at all (FAST_PATH)."""
@@ -3772,6 +3860,8 @@ class CalendarChange:
         return "Adding it as a second event now."
 
     def on_choice(self, kind: str, target: str) -> str:
+        if kind in ("calendar_change_fast_on", "calendar_change_fast_keep"):
+            return self.fast_path_tapped(kind == "calendar_change_fast_on", target)
         if kind == "calendar_change_add_anyway":
             return self.add_anyway(target)
         if kind in ("calendar_change_propose_again", "calendar_change_which") and self.reoffer is not None:

@@ -79,7 +79,8 @@ class Handover:
     paired: str = ""                     # the Discord user Cain is paired with
     message: str = ""                    # the Discord message of his it rests on, when Cain names one
     state: str = ""                      # /fastpath: "on" or "off"
-    smoke: str = ""                      # /fastpath: what the post-install smoke test showed
+    smoke: str = ""                      # /fastpath: free text from before 0.24.0's fifth round: refused
+    record: dict = field(default_factory=dict)   # /fastpath: the smoke test's checklist, pass or fail each
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
@@ -183,6 +184,7 @@ def _handler(inbox: Inbox, wait_s: float):
                          message=_message_id(body.get("message")),
                          state=str(body.get("state") or "").strip().lower()[:8],
                          smoke=str(body.get("smoke") or "")[:MAX_SUGGESTION].strip(),
+                         record=body.get("record") if isinstance(body.get("record"), dict) else {},
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
             inbox.submit(h)

@@ -126,10 +126,15 @@ describe("keeper.sh against a fake link", () => {
     } finally { server.stop(true); }
   }, 30_000);
 
-  test.skipIf(!ready)("fastpath records the smoke test and turns the no-card path on, or off; nothing else is sent", async () => {
+  test.skipIf(!ready)("fastpath sends the smoke test's result file, or off; nothing else is sent", async () => {
     const dir = mkdtempSync(join(tmpdir(), "keeper-"));
     writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
     writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
+    const record = { gmail: { add: "pass", move: "pass", remove: "pass", undo: "pass" },
+                     family: { add: "pass", move: "pass", remove: "pass", undo: "fail" },
+                     late_landing: "pass", listing_lag_seconds: 12 };
+    writeFileSync(join(dir, "result.json"), JSON.stringify(record));
+    writeFileSync(join(dir, "words.txt"), "Added, moved and removed a test event; each read back");
     const key = createHmac("sha256", TOKEN).update("harness-handover-v1").digest("hex");
     const seen: { path: string; keyed: boolean; body: any }[] = [];
     const server = Bun.serve({ port: 0, async fetch(req) {
@@ -144,17 +149,19 @@ describe("keeper.sh against a fake link", () => {
     };
     try {
       expect(await keeper("fastpath")).toMatchObject({ code: 2 });             // on or off, nothing else
-      expect(await keeper("fastpath", "on")).toMatchObject({ code: 2 });       // on needs what the smoke test showed
+      expect(await keeper("fastpath", "on")).toMatchObject({ code: 2 });       // on needs the result file
+      expect(await keeper("fastpath", "on", "it all worked")).toMatchObject({ code: 2 });   // words aren't a record
+      expect(await keeper("fastpath", "on", join(dir, "words.txt"))).toMatchObject({ code: 2 });
       expect(await keeper("fastpath", "maybe")).toMatchObject({ code: 2 });
       expect(seen.length).toBe(0);
-      await keeper("fastpath", "on", "Added, moved and removed a test event on both calendars; each read back");
+      await keeper("fastpath", "on", join(dir, "result.json"));                // the specialist judges it
       await keeper("fastpath", "off");
       expect(seen).toEqual([
-        { path: "/fastpath", keyed: true, body: { state: "on", smoke: "Added, moved and removed a test event on both calendars; each read back" } },
-        { path: "/fastpath", keyed: true, body: { state: "off", smoke: "" } },
+        { path: "/fastpath", keyed: true, body: { state: "on", record } },
+        { path: "/fastpath", keyed: true, body: { state: "off" } },
       ]);
       const usage = (await keeper("help")).out;
-      expect(usage).toContain('keeper.sh fastpath on "<what the smoke test showed>"');
+      expect(usage).toContain("keeper.sh fastpath on <result.json>");
     } finally { server.stop(true); }
   }, 30_000);
 

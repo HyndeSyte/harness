@@ -14,6 +14,11 @@ from harness import calendar_change
 from test_family_add import (ask_cards, count_up, fresh, loose, on, rig, STOP)  # noqa: F401  (fixtures)
 
 
+PASSING = {"gmail": {"add": "pass", "move": "pass", "remove": "pass", "undo": "pass"},
+           "family": {"add": "pass", "move": "pass", "remove": "pass", "undo": "pass"},
+           "late_landing": "pass", "listing_lag_seconds": 40}
+
+
 # -- 1. every no-card path behind the flag ---------------------------------------------------------
 
 @pytest.mark.card_only
@@ -475,3 +480,60 @@ def test_unresolved_follow_ups_carry_on_after_a_restart(m, monkeypatch):
     m.clock.t += timedelta(minutes=8)
     cc.run_pending(paused=False)
     assert rows(m)[-1]["state"] == "absent"
+
+
+# -- 5. the flag turns on only with a passing record and his tap ------------------------------------
+
+from harness.handover import Handover  # noqa: E402
+
+
+@pytest.mark.card_only
+@pytest.mark.parametrize("broken, said", [
+    ({"family": {"add": "pass", "move": "fail", "remove": "pass", "undo": "pass"}}, "family.move: fail"),
+    ({"late_landing": None}, "late_landing: missing"),
+    ({"listing_lag_seconds": "soon"}, "listing_lag_seconds: not a number of seconds"),
+    ({"gmail": {"add": "pass", "move": "pass", "remove": "pass"}}, "gmail.undo: missing"),
+])
+def test_a_record_short_of_every_pass_is_refused_and_nothing_changes(m, broken, said):
+    record = {**PASSING, **broken}
+    cards = len(m.link.cards)
+    out = m.send(Handover(kind="fastpath", state="on", record=record))
+    assert out["status"] == "refused" and said in out["said"]
+    assert len(m.link.cards) == cards and calendar_change.fast_path(m.ledger) == {}
+
+
+@pytest.mark.card_only
+def test_a_passing_record_posts_his_card_and_his_turn_on_tap_sets_the_flag(m):
+    out = m.send(Handover(kind="fastpath", state="on", record=PASSING))
+    assert out["status"] == "ok" and not calendar_change.fast_path_on(m.ledger)
+    card = m.seen()[-1]
+    assert card.startswith("The check after installing passed.")
+    assert "an add, a move, a removal and an Undo each read back as asked" in card and "within 40 seconds" in card
+    assert {"Turn on", "Keep cards"} <= set(m.labels())
+    assert m.ledger.get_meta(calendar_change.LATE_READ) == "600"      # 5 x 40 s is under the default
+    m.tap("Turn on")
+    kept = calendar_change.fast_path(m.ledger)
+    assert kept["on"] is True and kept["by"] == str(OWNER) and kept["at"] == m.clock().isoformat()
+    logged = m.ledger.db.execute("SELECT detail FROM events WHERE kind='calendar_fast_path'"
+                                 " ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+    assert json.loads(logged)["by"] == str(OWNER)
+
+
+@pytest.mark.card_only
+def test_keep_cards_leaves_the_flag_off(m):
+    m.send(Handover(kind="fastpath", state="on", record={**PASSING, "listing_lag_seconds": 300}))
+    assert m.ledger.get_meta(calendar_change.LATE_READ) == "1500"
+    m.tap("Keep cards")
+    assert not calendar_change.fast_path_on(m.ledger)
+    out = m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert out["status"] == "waiting for his tap"
+
+
+@pytest.mark.card_only
+def test_a_card_for_an_older_record_turns_nothing_on(m):
+    m.send(Handover(kind="fastpath", state="on", record=PASSING))
+    old = max(m.link.cards)
+    m.send(Handover(kind="fastpath", state="on", record={**PASSING, "listing_lag_seconds": 5}))
+    from test_handover_round2 import press
+    press(m, old, "Turn on")
+    assert not calendar_change.fast_path_on(m.ledger)
