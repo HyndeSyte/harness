@@ -751,7 +751,7 @@ value that's the same once spacing, case, escapes and parameters are set aside. 
 way: they're compared by the instant or day they resolve to, whether they're all-day, and their time
 zone, so someone changing an event's time zone or making it all-day is told, unless it's exactly the
 zone rewrite the baseline showed. Anything ambiguous counts as a possible lost update and is told, as is
-anything else, such as someone's real edit of the same field. A field the baseline never saw (an alarm,
+anything else, such as someone's real edit of the same field. A field the baseline never saw (a reminder,
 a repeat rule) raises nothing when it comes back as it went. The pinned stamps below stay out as before.
 
 A calendar the conformance item passed closes its gate again only when a write that carried If-Match,
