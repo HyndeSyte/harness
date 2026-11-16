@@ -40,7 +40,7 @@ timeout: 30
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
 # notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
-# "If Cain stops"), hidden like a key. Empty: an id made from owner_user_id.
+# "If Cain stops"), a random id hidden like a key. Empty: the alarms go to Discord only.
 options:
   github_token: ""
   gemini_api_key: ""
