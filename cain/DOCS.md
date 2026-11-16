@@ -132,7 +132,8 @@ App can change it, with a key of its own (a deploy key) that never leaves the Pi
 Ship tap lands that one pull request at that one commit in `main`, right then: the App
 checks it's still open and at that commit, that its tests passed, and that nothing else
 landed meanwhile, then puts exactly that commit on `main`. The card says "Shipped" or
-why not. If GitHub doesn't answer, the card says it's waiting, and it lands by itself as
+why not, or "Already in main" when main had that commit before your tap (nothing is pushed
+then, and Ship only installs it). If GitHub doesn't answer, the card says it's waiting, and it lands by itself as
 soon as it can, for up to 2 hours. While everything is stopped, nothing lands, and a
 Stop after your Ship tap ends that tap for good, even once you turn things back on.
 
@@ -524,6 +525,13 @@ What Cain's link enforces:
   the link's own list of items whose tap was lost or not acted on; an item leaves it once a new
   check of it is accepted, and `keeper.sh clock` lists it (`recheck_queue`).
 
+  Claims compare on a per-start nonce (round 10), not on ordering. Each start also makes a random
+  nonce, saved with the run counter, and each claim records it. A claim whose nonce isn't the current
+  run's is an earlier-run claim, whatever its run number: a state file restored from a backup to an
+  older counter can make this run's number equal an outstanding claim's, but never its nonce, so such
+  a claim still goes through the live-tap predicate (tested with a state restored to an older counter
+  and an outstanding claim, both when its card no longer holds up and when it does).
+
   The key travels on. Cain's relayed line for the tap ends with its short form ("Tap key
   tap-1a2b3c4d5e6f."). A line relayed again from a claim after a restart (the link may have been
   cut off between telling Cain and recording that it did) starts "Repeat of tap key ...: if you
@@ -539,7 +547,19 @@ What Cain's link enforces:
   its own state file (`/data/record-holds.json`, outside the working copy), so no reset or re-clone
   forgets one; the request's own replay after a reset is not a second request. A consumed key is
   pruned once it is older than `TAP_KEEP_MS` (3 days: the longest card lifetime, until the morning
-  check-in after next, under two days, plus a margin).
+  check-in after next, under two days, plus a margin), except a key whose landing the link still
+  lists as unresolved.
+
+  The link's issued tap keys (round 10). Each tap key the link issues is listed in its state file
+  (`/data/link/state.json`, `issued`, by the key's short form) with its card's item (NONE for a
+  one-off), its kind (ask or ship) and the label he tapped, in the same save as the tap's claim,
+  before Cain hears of it. The record keeper reads that list (read only, as it reads the link's
+  generation) and refuses a request whose tap key the link didn't issue ("isn't one the link
+  issued"), one that names an item other than the card's (or, for ops that name no item, like an
+  append to a `decisions.md`, whose text doesn't mention the card's item), and a take for a Ship job
+  whose key isn't a Ship card's Ship tap. While the list can't be read, a request with a tap key is
+  refused and sent again under a new id. Only `"tap": "none"` (no tap) stays on Cain's word. The link
+  lists an issued key for `TAP_ISSUED_KEEP_MS` (4 days), longer while its landing is unresolved.
 
   The landing ledger. A Ship tap's landing carries the key to the link's landing ledger
   (`/data/record-landings/`, outside the record's working copy, one file per key, made with an
@@ -550,10 +570,12 @@ What Cain's link enforces:
   itself. The link pushes exactly that commit to main as a fast-forward, so it writes no trailer or
   commit of its own (one would change the commit the checks passed on); its claim records main's
   tip as GitHub had it just before the push (the base commit). How settlement looks for it
-  (`merge.ts` `settledFrom`): a fetch of main deep enough to search from the landing's recorded base
-  commit to the remote tip (the whole of main, no depth, and a shallow copy deepened to full
-  history), then: the base and the head both ancestors of the tip, landed; the base there and the
-  head not, did not land. If that range is unavailable (the fetch fails, a shallow copy that can't
+  (`merge.ts` `settledFrom`): a fetch of main, and first whether the head is reachable from the remote
+  tip: if it is, landed, and a landed verdict needs no base (the head commit is the token), so a
+  rewritten main that still has the head, or a shallow copy that holds it, settles as landed (round
+  10). Only to decide did not land does it search from the landing's recorded base commit to the
+  remote tip (the whole of main, no depth, and a shallow copy deepened to full history): the base an
+  ancestor of the tip and the head not, did not land. If that range is unavailable (the fetch fails, a shallow copy that can't
   be deepened, a rewritten main where the base is gone or is no longer an ancestor of the tip), the
   key stays unresolved, treated as below, never as did not land. In main: landed, with its Ship
   token. Not in main: the landing is abandoned, and you get one line on the card's thread ("The
@@ -570,17 +592,48 @@ What Cain's link enforces:
   range is the trouble) and Cain one "Landing unconfirmed" line, each once. `keeper.sh clock` lists
   each unresolved key (`unresolved_landings`: its tap key, age in minutes, failures and last error).
   When the remote comes back the key settles and the usual outcome follows: landed, or abandoned
-  with its told-once lines and a new card.
+  with its told-once lines and a new card. An abandoned key is settled against the remote before
+  anything else (round 10): first thing in each sweep once it is due on its backoff, and at once when
+  Cain asks for a new Ship card for that pull request and head. A landed result posts the landed
+  outcome (Cain's Ship token line and the card's landed words) and refuses the new card; only a
+  definite did-not-land lets a new card out.
+
+  Reconciling a landing by hand (round 10). If the range can never be searched again (main was
+  rewritten, so the base is gone and the head isn't there either), the key stays unresolved and
+  `keeper.sh clock` keeps listing it. Then:
+  1. What to look at: the key's line in `keeper.sh clock` (`unresolved_landings`: its tap key, age and
+     last error), the pull request and head from Cain's "Landing unconfirmed" line, and on GitHub
+     (from a laptop) whether main has that change: the pull request's page says merged or not, and
+     main's history shows the change's commit or its content.
+  2. How to decide: landed if main has the change (the commit, or the same content landed another
+     way); not landed if it doesn't. If in doubt, not landed: a new Ship card for the same head
+     finds anything already in main and pushes nothing.
+  3. The command: you tell Cain in his DM, in your own words, "it landed" or "it did not land", and
+     he runs `keeper.sh settle <tap key> landed|not-landed --said <his message id>` with the id of
+     that message of yours. It is yours alone: the link reads that message from your DM itself and
+     settles only on a message of yours under a day old that says it landed (or did not land) to
+     match. The link's log gets an audit line (the key, the verdict, your message and the key's
+     failures), and Cain gets a "Landing settled by Dane" line, then the usual outcome line: landed,
+     with the Ship token while your tap is under 2 hours old, or not landed, with "a new card
+     follows". A key the link doesn't list as unresolved can't be settled this way. Ledger pruning
+     at 30 days and tap-key pruning at 3 days never remove an unresolved key.
 
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap
   predicate. A reset of the record that wins before that point (checked right before the claim)
-  prevents the push, and the tap is lost as any tap whose check didn't survive a reset: one line on
+  prevents the push. The boundary is closed (round 10): the reset epoch the link read right before
+  the claim is recorded in the claim, and after the claim's fsync the epoch is read again before the
+  first push; if it changed (or a reset now stands), the claim is voided (settled not landed, marked
+  voided) without pushing, and the tap is lost as any tap whose check didn't survive a reset: one line on
   the card's thread, one to Cain, the item on the re-check queue. Once the claim is made, a reset
   does not revoke it: the landing settles truthfully, as landed with its ledger mark when GitHub took
-  the push, even if the check would now fail. Before any landing
-  starts, the link also looks for the token on the remote main, so a re-ship of content already
-  there pushes nothing and is reported as landed. A settled key is marked so in its file and pruned
+  the push, even if the check would now fail. Before the claim, the link also looks for the token
+  on the remote main (round 10): a head already reachable from main's tip claims no landing and
+  pushes nothing, the card says "Already in main as of 9:41 AM, so nothing was pushed.", and Cain
+  gets a line saying it is already in main (with the Ship token, so Ship only installs it). Here,
+  landed means the commit is present, not that this push put it there: this tap's push, an earlier
+  tap's or another push may have brought it. A head that arrives by another push while a claimed landing waits on an outage is settled as
+  landed on the next try, with no second push. A settled key is marked so in its file and pruned
   by the link after 30 days; an unsettled one is never pruned. The ledger is the link's alone: The
   record keeper never writes or cleans that directory. The link keeps a marker outside the ledger
   (`/data/link/landings-marker.json`, and a count in its own state) of how many keys it has

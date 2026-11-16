@@ -84,10 +84,25 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
     },
     // Cain's request, through his local queue.
     // Round 9: one that can act on a tap gets a stand-in tap key unless the test gives "tap" itself.
-    cain(req: Record<string, unknown>) {
+    // Round 10: a tap key it carries is listed as issued in the link's state (the card's item from its
+    // first op, a Ship card's Ship tap for a Ship take), unless the test says issue: false.
+    cain(req: Record<string, unknown>, o: { issue?: boolean } = {}) {
       const t = tapDerived({ ops: req.ops as any[] });
       const auto = !("tap" in req) && t.names.length ? { tap: t.ship ? `tap-${(++taps).toString(16).padStart(12, "0")}` : "none" } : {};
+      const tap = (auto as any).tap ?? req.tap;
+      if (o.issue !== false && typeof tap === "string" && /^tap-[0-9a-f]{12}$/.test(tap)) {
+        const item = String(((req.ops as any[]) ?? []).find((x) => typeof x?.item === "string")?.item ?? "none").toUpperCase();
+        r.issue(tap, { item, kind: t.ship ? "ship" : "ask", label: t.ship ? "Ship" : "Filed" }, false);
+      }
       writeFileSync(join(cfg.queue, `${String(++n).padStart(4, "0")}.json`), JSON.stringify({ from: "cain", kind: "change", summary: "s", ...auto, ...req }));
+    },
+    // A tap key in the link's state's issued list (round 10); replace: overwrite one already there.
+    issue(tap: string, what: { item: string; kind: string; label?: string }, replace = true) {
+      const f = join(root, "pi/link/state.json");
+      const st = JSON.parse(readFileSync(f, "utf8"));
+      st.issued ??= {};
+      if (replace || !st.issued[tap]) st.issued[tap] = { ...what, at: now.getTime() };
+      writeFileSync(f, JSON.stringify(st));
     },
     // Requests from laptop sessions, pushed to the record's inbox together in one commit.
     inbox(...reqs: [string, Record<string, unknown>][]) {

@@ -31,6 +31,11 @@
 - If GitHub can't be reached to confirm a Ship that a restart cut off, the App keeps asking by itself, a little less often each time. If that lasts (five tries or a quarter of an hour), you get one line under that card ("Landing unconfirmed: main's remote has been unreachable since 9:05 AM, retrying."), and the usual line follows once GitHub answers.
 - A tap the box was in the middle of when it restarted is finished afterwards only if the question still holds up the way a fresh tap would. Otherwise you get one line under it ("Your tap was not acted on after a restart; a new card follows.") and Cain asks again once he has checked again. Clock jumps don't change this.
 - A Ship tap that the record's restart beats to the push ships nothing, and you get the "Lost to the record's reset" line. Once the push has started, it settles as it really went.
+- Shipping something that is already in main now says so on the card ("Already in main, so nothing was pushed") and pushes nothing; installing it is still next.
+- If GitHub was unreachable when a restart cut a Ship off, the App asks GitHub about that Ship first once it answers again. If it landed, you get the usual "Shipped" words and Cain installs it, with no new card; only if it didn't land does a new card follow.
+- A restart of the record that slips in just before a Ship's push now stops that push too, and you get the "Lost to the record's reset" line.
+- If GitHub can never say whether a Ship landed (say main was rewritten), you can settle it yourself: tell Cain in his DM whether it landed, and he settles it on your message with a new command. Nothing else to set up.
+- A tap's record entry must match the question you tapped: the record refuses one that names another item or comes from another kind of card.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 
 ## 0.11.0

@@ -76,8 +76,8 @@ describe("2. orphaned landings settled against the remote main", () => {
     expect(await r.tap(structuredClone(r.msg(id)), r.ids(id)[0])).toBe("to Cain");
     await r.link.whenLanded();
     expect(r.github.landings).toHaveLength(0);
-    expect(shipLines(r)[0]).toContain("main has that commit now (it was there already)");
-    expect(r.logs.join("\n")).toContain("is in the remote main already: nothing pushed, reported as landed");
+    expect(shipLines(r)[0]).toContain("It is already in main: main had that commit when his tap came (it was there already)");   // round 10: no claim, no push
+    expect(r.logs.join("\n")).toContain("is in the remote main already at claim time: no landing claimed, nothing pushed");
   });
 });
 

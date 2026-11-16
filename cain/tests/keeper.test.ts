@@ -87,7 +87,7 @@ describe("keeper.sh against a fake link", () => {
 
   test("ship takes --review and sends it as review, only when given (read here too, for where jq is missing)", async () => {
     const text = (await Bun.file(KEEPER).text()).replace(/\r\n/g, "\n");
-    expect(text).toContain("--item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason)");
+    expect(text).toContain("--item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason|--said)");
     expect(text).toContain('--review) review="$2" ;;');
     expect(text).toContain('--checked) checked="$2" ;; --reason) reason="$2" ;;');
     // A one-off's reason goes with an ask, only when given.

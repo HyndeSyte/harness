@@ -23,7 +23,7 @@ export interface MergeDeps {
 }
 export interface Landing { repo: string; pr: number; head: string }
 export type Landed =
-  | { ok: true; already: boolean }
+  | { ok: true; already: boolean; unclaimed?: boolean }   // unclaimed: already in main at claim time, so no claim and no push (round 10)
   | { ok: false; why: string; again: boolean; stopped?: boolean };
 
 const no = (why: string, again = false): Landed => ({ ok: false, why, again });
@@ -226,10 +226,11 @@ export async function inMain(d: MergeDeps, repo: string, head: string): Promise<
 // landing's token is the pull request's head commit itself: the link pushes exactly that commit to
 // main as a fast-forward, so it writes no trailer or commit of its own (one would change the commit
 // the checks passed on). Its ledger claim records main's tip as the link last fetched it before the
-// push (base). Settlement fetches main from GitHub whole (no depth), deepens a shallow copy to full
-// history, and searches from base to the remote tip:
-//   - base is in that history and is an ancestor of the tip, and head is too: landed (true);
-//   - base is, head isn't: did not land (false);
+// push (base). Settlement fetches main from GitHub whole (no depth) and first asks whether head is
+// reachable from the remote tip: if it is, that is landed (true) and needs no base, since the head
+// commit is the token (round 10). Only to decide "did not land" does it deepen a shallow copy to full
+// history and search from base to the remote tip:
+//   - base is in that history and is an ancestor of the tip, and head isn't: did not land (false);
 //   - anything that leaves the range unsearchable (the fetch fails, a shallow copy that can't be
 //     deepened, base missing or no longer an ancestor of the tip: main was rewritten) answers
 //     unresolved, with why. Never "did not land" on a range it couldn't search.
@@ -240,6 +241,8 @@ export async function settledFrom(d: MergeDeps, repo: string, head: string, base
   const r = await d.git(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", where(d, repo), "+refs/heads/main:refs/ship/main"],
     { ssh: true, timeoutMs: 60_000 });
   if (r.code !== 0) return { unresolved: `GitHub couldn't be fetched from (${first(r.err) || `git exit ${r.code}`})` };
+  // Landed needs no base: the head reachable from the remote tip is the whole answer.
+  if ((await sha(d, head)) && (await ancestor(d, head, "refs/ship/main"))) return { inMain: true };
   const shallow = await d.git(["rev-parse", "--is-shallow-repository"]);
   if (shallow.code === 0 && shallow.out.trim() === "true") {
     const deep = await d.git(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--unshallow", where(d, repo), "+refs/heads/main:refs/ship/main"],

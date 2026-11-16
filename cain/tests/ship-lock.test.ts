@@ -211,7 +211,8 @@ describe("the link's own line on a Ship card, from GitHub", () => {
     r.github.main.push(SHA1);
     r.github.answers.push({ ok: true, already: true });
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
-    expect(r.relayed.at(-1)).toContain("The link landed it: main has that commit now (it was there already). Ship token: ship1.");
+    expect(r.relayed.at(-1)).toContain("It is already in main: main had that commit when his tap came (it was there already)");   // round 10: no claim, no push
+    expect(r.relayed.at(-1)).toContain("Ship token: ship1.");
     // Closed without landing, or landed at another head: taken off.
     const r2 = rig();
     const c = await ship(r2);

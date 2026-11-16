@@ -6,8 +6,10 @@
 //   before the link's first push attempt for that tap. true the first time, false ever after,
 //   null when the ledger can't be written or isn't trusted yet (no landing starts then).
 // - settle: once a landing is settled (landed, or not landed), the key's file says so, written
-//   whole and fsynced. A settled key is pruned by the link after the retention window
-//   (LANDING_KEEP_MS, 30 days); an unsettled one is never pruned.
+//   whole and fsynced (voided: a claim a reset beat to the first push, nothing pushed; forced: the
+//   owner settled it with keeper.sh settle). A settled key is pruned by the link after the retention
+//   window (LANDING_KEEP_MS, 30 days); an unsettled one, or one the link still lists as unresolved,
+//   is never pruned.
 // - restore: the link keeps a marker outside the ledger (/data/link/landings-marker.json) with the
 //   ledger's id and how many keys it has claimed. A ledger whose id differs, whose count is behind
 //   the marker's (or the link's state's), or that is missing while the marker isn't, came back
@@ -21,12 +23,16 @@ export const LANDING_KEEP_MS = 30 * 86_400_000;
 const META = ".ledger.json";
 
 // base: main's tip when the key was claimed (round 9): settlement searches from it to the remote tip.
-export interface LandingEntry { key: string; pr: string; head: string; at: string; base?: string; settled?: { how: "landed" | "not landed"; at: string } }
+// epoch: the record keeper's reset epoch the link read right before the claim (round 10): re-read after
+// the claim's fsync, and a change voids the claim before any push.
+export interface LandingEntry { key: string; pr: string; head: string; at: string; base?: string; epoch?: number;
+  settled?: { how: "landed" | "not landed"; at: string; voided?: boolean; forced?: boolean } }
 export interface Landings {
-  claim(key: string, what: { pr: string; head: string; at: string; base?: string }): boolean | null;
-  settle(key: string, how: "landed" | "not landed", at: string): void;
+  claim(key: string, what: { pr: string; head: string; at: string; base?: string; epoch?: number }): boolean | null;
+  settle(key: string, how: "landed" | "not landed", at: string, note?: { voided?: boolean; forced?: boolean }): void;
   entries(): LandingEntry[] | null;
-  prune(now: number, keepMs?: number): number;
+  // keep: keys never pruned whatever their age (the link's unresolved keys).
+  prune(now: number, keepMs?: number, keep?: Set<string>): number;
   // Why the ledger isn't trusted (it came back from a backup), or null when it is.
   untrusted(stateCount?: number): string | null;
   trust(): void;
@@ -87,11 +93,11 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
         return null;
       }
     },
-    settle(key, how, at) {
+    settle(key, how, at, note) {
       const file = join(dir, `${keyName(key)}.json`);
       const j = readJson(file);
       if (!j || j.settled) return;
-      try { writeDurable(file, JSON.stringify({ ...j, settled: { how, at } }) + "\n"); }
+      try { writeDurable(file, JSON.stringify({ ...j, settled: { how, at, ...(note?.voided ? { voided: true } : {}), ...(note?.forced ? { forced: true } : {}) } }) + "\n"); }
       catch (e: any) { log(`couldn't mark landing ${keyName(key).slice(0, 12)} settled: ${String(e?.message ?? e).slice(0, 80)}`); }
     },
     entries() {
@@ -105,9 +111,10 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
         return out;
       } catch { return null; }
     },
-    prune(now, keepMs = LANDING_KEEP_MS) {
+    prune(now, keepMs = LANDING_KEEP_MS, keep) {
       let n = 0;
       for (const e of api.entries() ?? []) {
+        if (keep?.has(e.key)) continue;
         const at = e.settled ? Date.parse(e.settled.at) : NaN;
         if (!Number.isFinite(at) || now - at < keepMs) continue;
         try { rmSync(join(dir, `${keyName(e.key)}.json`), { force: true }); n++; } catch { /* the next sweep tries again */ }

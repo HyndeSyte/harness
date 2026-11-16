@@ -343,7 +343,7 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook", "/settle"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -384,6 +384,7 @@ Bun.serve({
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/clock": return json(link.clockReport());
+        case "/settle": return json(await link.settleKey({ tap: b.tap, how: b.how, said: b.said }));
         case "/reads": return json(await link.probeReads(Number(b.n ?? 20)));
         case "/slowread": return json(link.slowRead());
         case "/failwebhook": return json(link.failWebhook());

@@ -63,6 +63,12 @@
 #                                        satisfied it, and the box's own), the ledger's generation, whether
 #                                        a push or a reset is outstanding, how many rows are pending re-check
 #                                        (recheck_pending), whether Ship taps are held, and the last tap's read time
+#   keeper.sh settle <tap key> landed|not-landed --said <his message id>
+#                                        the owner's alone: settles by hand a landing the remote can't
+#                                        settle (keeper.sh clock lists it under unresolved_landings), on
+#                                        his own message in his DM, under a day old, saying it landed or did
+#                                        not land; the link reads that message itself. An audit line goes
+#                                        to the link's log, and the usual outcome line follows
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
@@ -85,7 +91,7 @@ cmd="${1:-handover}"; shift || true
 if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock|reads) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock|reads|settle) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   slow-read) url="$link/slowread"; ctx=harness-relay-v1 ;;
   fail-webhook) url="$link/failwebhook"; ctx=harness-relay-v1 ;;
   stall-read) url="$link/stallread"; ctx=harness-relay-v1 ;;
@@ -95,18 +101,18 @@ esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review="" checked="" reason=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" checked="" reason="" said=""
 case "$cmd" in
-  show|ask|ship|answered|check|connector)
+  show|ask|ship|answered|check|connector|settle)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        --item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason)
+        --item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason|--said)
           [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
           case "$1" in
             --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
             --pr) pr="$2" ;; --head) head="$2" ;; --edit) edit="$2" ;; --review) review="$2" ;;
-            --checked) checked="$2" ;; --reason) reason="$2" ;;
+            --checked) checked="$2" ;; --reason) reason="$2" ;; --said) said="$2" ;;
           esac
           shift 2 ;;
         *) rest+=("$1"); shift ;;
@@ -177,6 +183,7 @@ case "$cmd" in
   check)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" --arg e "$edit" \
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
+  settle)   body=$(jq -nc --arg t "${1:-}" --arg h "${2:-}" --arg s "$said" '{tap: $t, how: $h, said: $s}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;

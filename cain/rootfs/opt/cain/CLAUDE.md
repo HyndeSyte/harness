@@ -157,7 +157,11 @@ specialist (the Harness add-on) does.
   refuses a second one citing a key already acted on. On a `row-close`, a `take` for a Ship job and
   a write to a decisions.md the tap key is required: the keeper rejects one without `tap`. When one
   of those didn't come from a tap (a row closed on its source's evidence, a decision in his words),
-  say `"tap": "none"`; a Ship take always carries its Ship tap's key. A Ship tap lands at most once.
+  say `"tap": "none"`; a Ship take always carries its Ship tap's key. The keeper checks a tap key
+  against the link's list of the keys it issued: one the link didn't issue is refused ("isn't one
+  the link issued"), and so is one from a card for another item, and one that isn't a Ship card's
+  Ship tap on a take for a Ship job. A decision written from a tap names its item (P08 Q2) in its
+  text. A Ship tap lands at most once.
   A tap claimed just before a restart is finished after it only if its card still passes the same
   check a live tap gets; otherwise you get "Tap not acted: ..." with its tap key, he gets one line on
   the card, nothing was done for it: record nothing from it, and once the item's re-check is accepted
@@ -428,7 +432,10 @@ create, update or run any other routine.
 4. On his Ship tap, the link lands the pull request in main itself, at once: main is
    locked so that only the link can change it. His card says how it went, and you hear
    once it's settled:
-   - Landed ("The link landed it ... Ship token: ..."): check Home Assistant first
+   - Landed ("The link landed it ... Ship token: ...", or "It is already in main ... Ship
+     token: ..." when main had that commit before his tap: nothing was pushed, and his card
+     says "Already in main"; landed means the commit is in main, not that this tap put it
+     there): check Home Assistant first
      (below), then `take` its item with
      `"job": "ship <title>"` and his Ship tap's key as the request's `"tap"`, and once that's done, RemoteTrigger `run` on Ship with
      body `{"text": "Install pull request <url>, landed in main at <full head sha>. Ship token: <the token, exactly as relayed>. Dane tapped Ship at <time>."}`;
@@ -448,7 +455,18 @@ create, update or run any other routine.
      and head, with `--checked`. While GitHub can't settle it, a new Ship card for that pull
      request and head is refused, and the link keeps looking by itself; if that lasts (5 tries
      or 15 minutes) you get one "Landing unconfirmed: ..." line and he gets one on the card.
-     Nothing to do or tell him: you hear how it settles.
+     Nothing to do or tell him: you hear how it settles. Asking for a new Ship card for that
+     pull request and head makes the link settle it against GitHub first: if it landed, the card
+     is refused and you get the landed line instead (act on that); only if it did not land does
+     the new card go out.
+   - A landing GitHub can never settle (it stays in `keeper.sh clock`'s unresolved_landings for
+     hours, its last error saying main was rewritten): only he can decide it. Tell him in one
+     line that the App can't tell whether that Ship landed and that he can check main on GitHub
+     from his PC. Once he says in his own words in his DM that it landed (or did not land), run
+     `/opt/cain/keeper.sh settle <tap key> landed --said <his message id>` (or `not-landed`)
+     with the id of that message of his. The link reads his message itself and settles only on
+     his words; you get "Landing settled by Dane: ..." and then the usual landed or abandoned
+     line. Never run it on your own judgment or without his message.
    - A reset of the record that comes before the landing starts stops the push, and the tap is
      lost to the reset (the usual lost line). Once the landing has started, a reset no longer
      revokes it: it settles as it really went.

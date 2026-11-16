@@ -78,7 +78,7 @@
 //   back on is kept within reach instead, even when the Stop state can't be read. After
 //   Turn back on, the notice's own Stop is the one until it's out of reach; when the moving
 //   Stop then goes onto a newer message, the notice's comes off.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Landings } from "./landings";
 import { cainReasons, type CainHit, claimsReview, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
@@ -117,6 +117,9 @@ const LANDING_TRY_MS = 2 * 3_600_000;
 export const UNRESOLVED_TELL_FAILS = 5;
 export const UNRESOLVED_TELL_MS = 15 * 60_000;
 const UNRESOLVED_BACKOFF_MAX_MS = 5 * 60_000;
+// How long an issued tap key stays listed for the record keeper (round 10): past the keeper's own
+// three days (TAP_KEEP_MS), unless its landing is unresolved.
+export const TAP_ISSUED_KEEP_MS = 4 * DAY;
     // while GitHub doesn't answer, a landing is tried again this long after his tap
 const KEY_CHECK_MS = DAY;                // how often the link asks GitHub whether it still knows the deploy key
 const LANDING_LINE = "You tapped Ship: landing it in main now.";
@@ -242,6 +245,12 @@ export interface State {
   // file times); landings the remote can't settle yet, by tap key; and the link's re-check queue,
   // items whose tap was lost or not acted on, until a new check of the item is accepted.
   run?: number;
+  runNonce?: string;
+  // Round 10: each tap key the link issued, by its short form (tap-<12 hex>), with its card's item, kind
+  // and tapped label, written in the same save as the tap's claim, before Cain hears of it. The record
+  // keeper reads it from this file and refuses a tap key it doesn't list, or one whose item or kind
+  // doesn't match the request. Kept TAP_ISSUED_KEEP_MS, and never pruned while its landing is unresolved.
+  issued?: Record<string, { item: string; kind: string; label: string; at: number }>;                 // round 10: a random nonce made on each start, kept with run; claims compare on it, never on ordering
   unresolved?: Record<string, Unresolved>;
   recheck?: Record<string, { at: number; why: string; key?: string }>;
 }
@@ -250,7 +259,8 @@ export interface State {
 // item, req, epoch and words: the card's item, the check it rested on, its reset epoch and its words.
 export interface TapClaim { at: number; msg: string; label: string; stage: "claimed" | "acted" | "edited" | "lost"; outcome: string; shown: string; line?: string;
   item?: string; req?: string | null; epoch?: number; words?: string; told?: boolean; ref?: Ref; kind?: string;
-  run?: number;                      // the link run the claim was made in (round 9)
+  run?: number;                      // the link run the claim was made in (round 9), for the log
+  nonce?: string;                    // that run's nonce (round 10): a claim whose nonce isn't the current run's is an earlier-run claim
   why?: string }                     // stage "lost": why (a reset, or not acted after a restart)
 export interface Unresolved { since: number; fails: number; last: string; next: number; what: "orphan" | "ledger"; msg?: string; told?: boolean }
 export interface Uncertain { gen: number | null; check: string | null; item: string; at: number; msg: string; label: string; told?: boolean; key?: string; epoch?: number; ref?: Ref; kind?: string }
@@ -2292,6 +2302,20 @@ export class Link {
     this.notReset();
     // A landing for this very pull request and head that isn't settled (GitHub couldn't be read to
     // settle one a restart cut off, or it is still trying): no new card until it is.
+    // Round 10: an abandoned key for it (an orphan the remote couldn't settle) is settled against the
+    // remote first, now: landed posts the landed outcome and no new card; only a definite did-not-land
+    // lets this card go out.
+    const pending = Object.entries(this.d.load().messages).find(([, x]) => x.ship?.pr === pr && x.ship?.head === head && x.shipping?.state === "landing");
+    if (pending && pending[1].shipping?.key && this.d.load().unresolved?.[pending[1].shipping.key]?.what === "orphan" && !this.landingNow.has(pending[0])) {
+      const [pid, pm] = pending, k = pm.shipping!.key!;
+      const s0 = this.d.load();
+      if (s0.unresolved?.[k]) { s0.unresolved[k].next = this.d.now(); this.d.save(s0); }
+      this.log(`a Ship card for ${pr} at a head whose landing is unresolved: settling tap key ${tapKid(k)} against the remote first`);
+      if (this.d.now() - pm.shipping!.at >= LANDING_TRY_MS) await this.lateSettle(pid); else await this.landShip(pid);
+      const after = this.d.load().messages[pid]?.shipping;
+      if (after?.state === "landed")
+        throw new Refusal("Nothing was posted: the earlier Ship tap's landing for this pull request and head has just settled against main as landed (it was there already). You have the landed line for it now; act on that line (it says whether there is a Ship token). No new card is needed.");
+    }
     if (Object.values(this.d.load().messages).some((x) => x.ship?.pr === pr && x.ship?.head === head && x.shipping?.state === "landing"))
       throw new Refusal("Nothing was posted: a Ship tap's landing for this pull request and head isn't settled yet (it is still trying, or GitHub couldn't be read to settle one a restart cut off). You'll hear when it settles; show a new card then if one is still needed.");
     const check = this.sourceCheck(meta.item, a.checked);
@@ -3236,7 +3260,8 @@ export class Link {
         // A claim from an earlier run of the link (this version before a restart, or another version
         // in between): completed only through the live-tap predicate, or discarded and told. Never
         // judged by file times or save stamps.
-        if (!judged && t.run !== this.runNo()) {
+        this.runNo();
+        if (!judged && t.nonce !== this.runNonce) {
           const live = this.claimLive(t);
           if (live === null) continue;
           if (!live.ok) { await this.notActedTap(k, t, live.why); continue; }
@@ -3266,7 +3291,11 @@ export class Link {
   private pruneTaps(): void {
     const s4 = this.d.load();
     let pruned = false;
-    for (const [k, t] of Object.entries(s4.taps ?? {})) if (t.stage === "edited" && !s4.messages[t.msg]) { delete s4.taps![k]; pruned = true; }
+    const unresolved = new Set(Object.keys(s4.unresolved ?? {}));
+    const kids = new Set([...unresolved].map(tapKid));
+    for (const [k, t] of Object.entries(s4.taps ?? {})) if (t.stage === "edited" && !s4.messages[t.msg] && !unresolved.has(k)) { delete s4.taps![k]; pruned = true; }
+    for (const [kid, v] of Object.entries(s4.issued ?? {}))
+      if (this.d.now() - v.at > TAP_ISSUED_KEEP_MS && !kids.has(kid)) { delete s4.issued![kid]; pruned = true; }
     if (pruned) this.d.save(s4);
   }
   private tapsNow = new Set<string>();
@@ -3307,7 +3336,8 @@ export class Link {
     if (key) {
       (s.taps ??= {})[key] = { at: this.d.now(), msg: msgId, label, stage: landing ? "acted" : "claimed", outcome: "to Cain", shown: content, ...(line ? { line } : {}),
         item: (m.item ?? "none").toUpperCase(), req: m.checked?.req ?? null, ...(m.checked?.epoch !== undefined ? { epoch: m.checked.epoch } : {}), words,
-        ...(m.checked ? { ref: { ...m.checked } } : {}), kind: m.kind, run };
+        ...(m.checked ? { ref: { ...m.checked } } : {}), kind: m.kind, run, nonce: this.runNonce };
+      (s.issued ??= {})[tapKid(key)] = { item: (m.item ?? "none").toUpperCase(), kind: m.kind ?? "ask", label, at: this.d.now() };
       this.tapsNow.add(key);
     }
     this.d.save(s);
@@ -3383,13 +3413,36 @@ export class Link {
           // is lost as any tap whose check didn't survive a reset. Once the claim is made, a reset no
           // longer revokes it: the landing settles truthfully, as landed when the remote has it.
           if (this.resetSinceTap(m)) { await this.loseShipTap(msgId); return; }
+          // Already in main at claim time (round 10): no claim and no push. Landed means the commit is
+          // in main, not that this tap put it there: the card says it is already in main, and Cain
+          // hears it (with the Ship token, so Ship only installs it).
+          if (this.d.landed) {
+            const pre = await this.remote(m.ship, null);
+            if (pre.v === true) {
+              this.log(`${m.ship.pr} at that head is in the remote main already at claim time: no landing claimed, nothing pushed`);
+              await this.settleLanding(msgId, { ok: true, already: true, unclaimed: true });
+              return;
+            }
+            if (pre.v === null) { await this.settleLanding(msgId, { ok: false, why: "GitHub didn't answer about main", again: true }); return; }
+          }
           // main's tip now: the base the claim records, from which settlement searches.
           const tip = this.d.mainTip ? await this.d.mainTip(m.ship.pr).catch(() => null) : undefined;
           if (tip === null) { await this.settleLanding(msgId, { ok: false, why: "GitHub didn't answer about main", again: true }); return; }
           if (this.resetSinceTap(m)) { await this.loseShipTap(msgId); return; }
           base = tip ?? null;
-          c = L.claim(key, { pr: m.ship.pr, head: m.ship.head, at: new Date(this.d.now()).toISOString(), ...(base ? { base } : {}) });
+          // The reset boundary closed (round 10): the epoch read right before the claim is recorded in
+          // it, and read again once the claim is fsynced, before the first push. A reset that came in
+          // between voids the claim: nothing is pushed, and the tap is lost as for any reset.
+          const mark = this.epochMark();
+          c = L.claim(key, { pr: m.ship.pr, head: m.ship.head, at: new Date(this.d.now()).toISOString(), ...(base ? { base } : {}),
+            ...(typeof mark === "number" ? { epoch: mark } : {}) });
           if (c === null) { await this.settleLanding(msgId, { ok: false, why: "the link's landing ledger couldn't be written", again: true }); return; }
+          if (c === true && this.epochMark() !== mark) {
+            L.settle(key, "not landed", new Date(this.d.now()).toISOString(), { voided: true });
+            this.log(`the landing claim for tap key ${tapKid(key)} was voided: the record keeper's reset epoch changed between the last check and the claim's fsync (${String(mark)} to ${String(this.epochMark())}); nothing pushed`);
+            await this.loseShipTap(msgId);
+            return;
+          }
         } else base = started.base ?? base;
         if (c === false) {
           // An orphan: a landing started before a restart. Settled against the remote main only, from
@@ -3433,6 +3486,54 @@ export class Link {
 
   // Whether the record keeper reset its copy since the Ship card's check (a reset standing, or an
   // epoch other than the card's): the boundary check, made only before the landing starts.
+  // keeper.sh settle (round 10): the owner force-settles an unresolved landing key, for a range the
+  // remote can never search again (DOCS.md, Reconciling a landing by hand). Owner-only: it needs his
+  // own message in his DM (said: its Discord id), under a day old, saying "landed" or "not landed" to
+  // match; the link reads it from Discord itself. An audit line goes to the link's log and a line to
+  // Cain. Landed posts the landed outcome (the Ship token line while his tap is under 2 hours old);
+  // not landed posts the abandoned outcome, and a new card may follow. Never for a key that isn't
+  // unresolved.
+  async settleKey(a: { tap?: unknown; how?: unknown; said?: unknown }): Promise<{ status: "settled"; said: string }> {
+    const tap = String(a.tap ?? "").trim(), how = String(a.how ?? "").trim(), said = String(a.said ?? "").trim();
+    if (!/^tap-[0-9a-f]{12}$/.test(tap)) throw new Refusal("settle needs the tap key as the lines name it (tap- and 12 hex digits)");
+    if (how !== "landed" && how !== "not-landed") throw new Refusal("settle needs landed or not-landed");
+    if (!/^\d{15,22}$/.test(said)) throw new Refusal("settle is the owner's alone: --said <the Discord id of his message saying it landed, or did not land>");
+    const s = this.d.load();
+    const key = Object.keys(s.unresolved ?? {}).find((k) => tapKid(k) === tap);
+    if (!key) throw new Refusal(`tap key ${tap} isn't an unresolved landing: nothing to settle (keeper.sh clock lists the unresolved ones)`);
+    const { owner, dm } = await this.identity();
+    let msg: any;
+    try { msg = await this.rest("GET", `/channels/${dm}/messages/${said}`); }
+    catch (e) { throw new Refusal(`his message ${said} couldn't be read from his DM (${String(e).slice(0, 80)}): nothing settled`); }
+    if (String(msg?.author?.id ?? "") !== owner) throw new Refusal("that message isn't his: settle is the owner's alone, nothing settled");
+    if (this.d.now() - snowflakeTime(said) > DAY) throw new Refusal("his message is over a day old: ask him again, nothing settled");
+    const words = String(msg?.content ?? "").toLowerCase();
+    const no = /\b(not landed|did not land|didn't land|didnt land|never landed)\b/.test(words);
+    const yes = !no && /\blanded\b/.test(words);
+    if (how === "landed" ? !yes : !no)
+      throw new Refusal(`his message doesn't say it ${how === "landed" ? "landed" : "did not land"} in those words: nothing settled`);
+    const u = s.unresolved![key];
+    const msgId = u.msg ?? Object.entries(s.messages).find(([, m]) => m.shipping?.key === key)?.[0];
+    const m = msgId ? s.messages[msgId] : undefined;
+    const at = new Date(this.d.now()).toISOString();
+    this.log(`settle: tap key ${tap} force-settled as ${how === "landed" ? "landed" : "not landed"} by the owner (his message ${said}: "${excerpt(String(msg?.content ?? ""), 80)}"), after ${u.fails} failed look(s) since ${new Date(u.since).toISOString()}; last error: ${u.last}`);
+    this.d.relay(`Landing settled by Dane: tap key ${tap}${m?.ship ? ` (${m.ship.pr} at ${m.ship.head})` : ""} was settled by hand as ${how === "landed" ? "landed" : "not landed"}, on his own message, since the remote couldn't settle it (${u.fails} tries; last error: ${u.last}). The usual outcome line follows. Nothing to tell him: he decided it.`);
+    this.d.landings?.settle(key, how === "landed" ? "landed" : "not landed", at, { forced: true });
+    this.unresolvedClear(key);
+    if (msgId && m?.shipping?.state === "landing")
+      await this.queue(msgId, () => this.settleLanding(msgId, how === "landed" ? { ok: true, already: true }
+        : { ok: false, why: "the owner settled it by hand as not landed", again: false, abandoned: true } as Landed));
+    return { status: "settled", said: `Tap key ${tap} settled as ${how === "landed" ? "landed" : "not landed"}.` };
+  }
+
+  // The keeper's reset epoch as read now (round 10): its number, "reset" while a reset stands, or
+  // "unknown" when its status can't be read. Compared before and after a landing's claim.
+  private epochMark(): number | "reset" | "unknown" {
+    const st = keeperStatus(this.files().status);
+    if (!st) return "unknown";
+    if (st.reset) return "reset";
+    return st.epoch && Number.isInteger(st.epoch.n) ? st.epoch.n : 0;
+  }
   private resetSinceTap(m: Shown): boolean {
     const st = keeperStatus(this.files().status);
     if (!st) return false;
@@ -3490,11 +3591,14 @@ export class Link {
     if (r.ok) {
       const stopped = this.stopped().stopped, voided = this.voided(tapped), late = now - tapped >= LANDING_TRY_MS;
       const token = voided || late ? null : this.signFor(m.ship);
-      shown = `Shipped: it's in main as of ${clockTime(now, this.d.tz)}. ${stopped ? "Installing it waits until you turn things back on."
+      const unclaimed = (r as any).unclaimed === true;
+      shown = `${unclaimed ? `Already in main as of ${clockTime(now, this.d.tz)}, so nothing was pushed.` : `Shipped: it's in main as of ${clockTime(now, this.d.tz)}.`} ${stopped ? "Installing it waits until you turn things back on."
         : voided ? "Installing it needs your tap again, since you tapped Stop meanwhile."
         : late ? "Installing it needs your tap again, since your tap is over 2 hours old."
         : token ? "Installing it is next." : "Installing it is down right now, so it isn't installed yet."}`;
-      line = `${tap} The link landed it: main has that commit now${r.already ? " (it was there already)" : ""}.` + (voided || late
+      line = (unclaimed
+        ? `${tap} It is already in main: main had that commit when his tap came (it was there already), so the link claimed no landing and pushed nothing. Landed means the commit is in main, not that this tap put it there.`
+        : `${tap} The link landed it: main has that commit now${r.already ? " (it was there already)" : ""}.`) + (voided || late
         ? ` There's no Ship token, ${voided ? "since he tapped Stop after his Ship tap" : "since his tap is over 2 hours old"}, so it isn't installed: ${stopped ? "once he taps Turn back on, " : ""}show a new Ship card for the same pull request and head, and his tap on it gives the token to install it.`
         : token
           ? ` Ship token: ${token} (good for 2 hours): start the Ship job now to install it, with that token in its text as it is.`
@@ -3518,7 +3622,7 @@ export class Link {
     m.digest = digest(withLine(words, shown), []);
     if (key) m.shipping!.key = key;
     this.d.save(s);
-    if (key && this.d.landings) this.d.landings.settle(key, r.ok ? "landed" : "not landed", new Date(now).toISOString());
+    if (key && this.d.landings && !(r.ok && (r as any).unclaimed === true)) this.d.landings.settle(key, r.ok ? "landed" : "not landed", new Date(now).toISOString());
     this.d.relay(line);
     this.log(r.ok ? `his Ship tap landed ${m.ship.pr} in main` : abandoned ? `his Ship tap's landing of ${m.ship.pr} was abandoned after a restart` : `his Ship tap didn't land ${m.ship.pr}: ${r.why}`);
     if (abandoned)
@@ -3564,22 +3668,45 @@ export class Link {
       if ((sh.next ?? sh.at + LANDING_STALE_MS) > now) continue;
       // Past 2 hours, main alone settles it, from the landing's base, on the unresolved backoff.
       if (now - sh.at >= LANDING_TRY_MS) {
-        const ship = m.ship, why = sh.why, key = sh.key, base = sh.base;
-        void this.queue(id, async () => {
-          const r = await this.remote(ship, base);
-          if (r.v === true) { if (key) this.unresolvedClear(key); await this.settleLanding(id, { ok: true, already: true }); }
-          else if (r.v === false) { if (key) this.unresolvedClear(key); await this.settleLanding(id, { ok: false, why: `it couldn't land within 2 hours of the tap${why ? `: ${why}` : ""}`, again: false }); }
-          else if (key) {                            // can't tell: looked for again on the backoff
-            const next = await this.unresolvedFail(key, r.why, "orphan", id);
-            const s1 = this.d.load();
-            if (s1.messages[id]?.shipping?.state === "landing") { s1.messages[id].shipping!.next = next; this.d.save(s1); }
-          }
-        });
+        void this.lateSettle(id);
         continue;
       }
       if (!this.d.land) { await this.settleLanding(id, { ok: false, why: "the link has no deploy key now", again: false }); continue; }
       void this.landShip(id);
     }
+  }
+
+  // An abandoned key (an orphaned landing the remote couldn't settle) is settled against the remote
+  // before anything else, each sweep, once it is due on its backoff (round 10): a landed result posts
+  // the landed outcome (the Ship token line to Cain, the card's landed words), and only a definite
+  // did-not-land lets a new card for that pull request and head go out.
+  private async settleAbandoned(): Promise<void> {
+    const s = this.d.load();
+    for (const [id, m] of Object.entries(s.messages)) {
+      const key = m.shipping?.state === "landing" ? m.shipping.key : undefined;
+      if (!key || !m.ship || s.unresolved?.[key]?.what !== "orphan" || this.landingNow.has(id) || !this.unresolvedDue(key)) continue;
+      if (this.voided(m.shipping!.at)) continue;                     // retryLandings settles a stopped one
+      if (this.d.now() - m.shipping!.at >= LANDING_TRY_MS) await this.lateSettle(id);
+      else await this.landShip(id);
+    }
+  }
+
+  // Past 2 hours, main alone settles a landing, from its base, on the unresolved backoff.
+  private lateSettle(id: string): Promise<void> {
+    return this.queue(id, async () => {
+      const m = this.d.load().messages[id];
+      const sh = m?.shipping;
+      if (!m?.ship || sh?.state !== "landing") return;
+      const ship = m.ship, why = sh.why, key = sh.key, base = sh.base;
+      const r = await this.remote(ship, base);
+      if (r.v === true) { if (key) this.unresolvedClear(key); await this.settleLanding(id, { ok: true, already: true }); }
+      else if (r.v === false) { if (key) this.unresolvedClear(key); await this.settleLanding(id, { ok: false, why: `it couldn't land within 2 hours of the tap${why ? `: ${why}` : ""}`, again: false }); }
+      else if (key) {                            // can't tell: looked for again on the backoff
+        const next = await this.unresolvedFail(key, r.why, "orphan", id);
+        const s1 = this.d.load();
+        if (s1.messages[id]?.shipping?.state === "landing") { s1.messages[id].shipping!.next = next; this.d.save(s1); }
+      }
+    });
   }
 
   // His Stop ends every landing still waiting; one under way checks again right before
@@ -3875,6 +4002,7 @@ export class Link {
       }
       this.backfillLabels();
       this.runNo();
+      await this.settleAbandoned();
       await this.sendOwedToggle();
       await this.ledgerUpkeep();
       await this.retryLandings();
@@ -3895,12 +4023,18 @@ export class Link {
   // an earlier run (this version before a restart, or a previous version's state in between) is
   // completed only through the live-tap predicate (claimLive) or discarded and told (notActedTap):
   // never judged by file times or save stamps, so a clock step either way changes nothing.
+  // Round 10: each start also makes a random nonce, saved with the counter, and claims compare on the
+  // nonce alone: a state file restored to an older counter can make this run's number equal an
+  // outstanding claim's, but never its nonce.
   private runN = 0;
+  private runNonce = "";
   private runNo(): number {
     if (this.runN) return this.runN;
     const s = this.d.load();
     s.run = (Number.isInteger(s.run) ? s.run! : 0) + 1;
+    s.runNonce = randomBytes(8).toString("hex");
     this.runN = s.run;
+    this.runNonce = s.runNonce;
     this.d.save(s);
     this.log(`link run ${this.runN} started: claims from earlier runs are judged by the live-tap predicate`);
     return this.runN;
@@ -3927,6 +4061,7 @@ export class Link {
       if (owed.some(([k]) => !this.unresolvedDue(k))) return;
       const results: [typeof entries[number], boolean][] = [];
       for (const e of entries) {
+        if (e.settled?.forced) { results.push([e, e.settled.how === "landed"]); continue; }   // the owner settled it (keeper.sh settle)
         const there = await this.remote({ pr: e.pr, head: e.head }, e.base);
         if (there.v === null) {
           const msg = Object.entries(s.messages).find(([, m]) => m.shipping?.key === e.key)?.[0];
@@ -3949,7 +4084,7 @@ export class Link {
     }
     const now = this.d.now();
     if (now - (s.ledgerPruned ?? 0) >= DAY) {
-      L.prune(now);
+      L.prune(now, undefined, new Set(Object.keys(this.d.load().unresolved ?? {})));   // an unresolved key is never pruned
       const s3 = this.d.load();
       s3.ledgerPruned = now;
       this.d.save(s3);

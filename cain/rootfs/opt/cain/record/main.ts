@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
   maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, checksText, parseChecks, type OneOff, type WaitTimeout,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
-import { projectChecked, TAP_KEY, voidChecks } from "./core.ts";
+import { projectChecked, TAP_KEY, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
 
@@ -339,9 +339,11 @@ const TAPS_KEPT = 1000;
 // Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
 // Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
 export const TAP_KEEP_MS = 3 * 86_400_000;
-export function pruneTaps(taps: Record<string, { id: string; at: string }> | undefined, now: number): number {
+// Round 10: never one whose landing the link still lists as unresolved (keep).
+export function pruneTaps(taps: Record<string, { id: string; at: string }> | undefined, now: number, keep?: Set<string>): number {
   let n = 0;
   for (const [k, v] of Object.entries(taps ?? {})) {
+    if (keep?.has(k)) continue;
     const at = Date.parse(v.at);
     if (Number.isFinite(at) && now - at > TAP_KEEP_MS) { delete taps![k]; n++; }
   }
@@ -729,7 +731,10 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         republish(`Holds: ${HOLDS_PATH} put back to the keeper's copy`);
 
       // Consumed tap keys older than TAP_KEEP_MS go (round 9).
-      { const pruned = pruneTaps(S.taps, clock().getTime()); if (pruned) log(`pruned ${pruned} consumed tap key(s) older than ${TAP_KEEP_MS / 86_400_000} days`); }
+      // Round 10: the link's issued tap keys, read once for the round, and never a key whose landing is unresolved.
+      const linkTaps = readLinkTaps(cfg);
+      { const pruned = pruneTaps(S.taps, clock().getTime(), linkTaps?.unresolved); if (pruned) log(`pruned ${pruned} consumed tap key(s) older than ${TAP_KEEP_MS / 86_400_000} days`); }
+      let tapWhy: string | null = null;
       for (const it of items) {
         const at = clock();
         const id = it.req?.id ?? `unreadable-${it.name}`;
@@ -743,6 +748,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
         else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && S.taps?.[it.req!.tap] && S.taps[it.req!.tap].id !== id)
           o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps[it.req!.tap].id}; act on a tap key once` };
+        else if ((tapWhy = tapIssuedProblem(it.req!, linkTaps ? linkTaps.issued : null)))
+          o = { ...base, state: "rejected", reason: clean(tapWhy) };
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
         else o = decide(it.req!, !!it.local, base);
         if (it.repoPath && existsSync(join(cfg.dir, it.repoPath))) rmSync(join(cfg.dir, it.repoPath), { force: true });
@@ -865,6 +872,23 @@ export function readLinkFloor(cfg: Config): { floor: number; why?: string } {
   return { floor: g > 0 ? g : 0 };
 }
 export function linkFloor(cfg: Config): number { return readLinkFloor(cfg).floor; }
+
+// Round 10: the tap keys the link issued (its state's issued) and the short forms of the tap keys whose
+// landing it lists as unresolved (its state's unresolved, by full key: hashed here the way the link's
+// tapKid does). null: the link's state can't be read.
+export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap>; unresolved: Set<string> } | null {
+  const f = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
+  try {
+    if (!existsSync(f) || lstatSync(f).size > 20_000_000) return null;
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    if (!j || typeof j !== "object" || Array.isArray(j)) return null;
+    const issued: Record<string, IssuedTap> = {};
+    for (const [k, v] of Object.entries<any>(j.issued ?? {}))
+      if (TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string") issued[k] = { item: v.item, kind: v.kind, ...(typeof v.label === "string" ? { label: v.label } : {}) };
+    const unresolved = new Set(Object.keys(j.unresolved ?? {}).map((k) => `tap-${createHash("sha256").update(k).digest("hex").slice(0, 12)}`));
+    return { issued, unresolved };
+  } catch { return null; }
+}
 
 // The run of rounds that ended with local commits unpushed or the copy reset: since when, and
 // how many (the link tells Dane once it passes 30 minutes or three rounds). Cleared once clean.
