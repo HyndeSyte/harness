@@ -1505,6 +1505,7 @@ def _checkin(tmp_path, now, screen, runs=None, checked=True, after=None, day="20
     box.mkdir(exist_ok=True)
     (stub / "tmux").write_text(
         "#!/bin/bash\n"
+        'if [ "$2" = display ]; then echo "${STUB_WIDTH:-120}"; exit 0; fi\n'
         'if [ "$2" = capture-pane ]; then\n'
         '  if [ ! -f "$STUB_BOX/typed" ]; then printf "%s\\n" "$STUB_SCREEN"\n'
         '  elif [ -n "${STUB_AFTER:-}" ]; then m=$(head -c 8 "$STUB_BOX/typed"); printf "%s\\n" "${STUB_AFTER//\\{mark\\}/$m}"\n'
@@ -2155,17 +2156,34 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         (tmp_path / "box/typed").unlink(missing_ok=True)
         out = _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
         assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""
-        # What the App types: its blanks one space each, and a run of over 80 letters broken, so his box
-        # can wrap it only at spaces; drawn over two lines, that goes in.
+        # What the App types is the text as it is: a long address goes as written, never broken
+        # (outside round 19). His box cuts it where it's too long for a line, at a full line (a real
+        # Claude Code 2.1.317 at 60 columns cut one at exactly 56, the width less 4): that goes in.
         (tmp_path / "sent.txt").unlink()
-        q.write_text('{"text": "see  https://example.com/' + "a" * 90 + '\\tfor the plan"}\n', newline="\n")
-        typed = "Relayed by the add-on: see https://example.com/" + "a" * 60 + " " + "a" * 30 + " for the plan"
-        two = f"{RULE}\n❯ {{mark}} Relayed by the add-on: see https://example.com/" + "a" * 60 + \
-              f"\n  {'a' * 30} for the plan\n{RULE}\n  ? for shortcuts"
-        out = _checkin(tmp_path, "0300", IDLE, runs=2, after=two)
+        url = "https://github.com/HyndeSyte/harness/pull/20/commits/5b04ee668bce81645c2439e3f0d5eb9b3aef342a"
+        q.write_text('{"text": "see  ' + url + ' for the head"}\n', newline="\n")
+        typed = "Relayed by the add-on: see  " + url + " for the head"
+        cut = f"{RULE}\n❯ {{mark}} Relayed by the add-on: see\n  {url[:56]}\n  {url[56:]} for the head\n{RULE}\n  ? for shortcuts"
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after=cut, STUB_WIDTH="60")
         assert _typed(out.splitlines()[-2]) == typed and out.splitlines()[-1] == "-u send-keys -t cain Enter"
         assert work.read_text().strip() == ""
         (tmp_path / "box/typed").unlink(missing_ok=True)
+        # The same cut where the line isn't full: a box that wrapped there would hold another text
+        # (a space where the try has none), so no Enter, and the tap stays.
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "Ship PR 18 after review"}\n', newline="\n")
+        early = f"{RULE}\n❯ {{mark}} Relayed by the add-on: Ship PR 1\n  8 after review\n{RULE}\n  ? for shortcuts"
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after=early, STUB_WIDTH="60")
+        assert "Ship PR 18" in out and "Enter" not in out and "PR 18" in work.read_text()
+        (tmp_path / "box/typed").unlink(missing_ok=True)
+        out = _checkin(tmp_path, "0300", IDLE, runs=4, CHECKIN_TYPED_GRACE_S="0")
+        assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""
+        # A control character is never typed (an Esc would be a key): left out, a tab a space.
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "Undo\\u001b the move,\\tplease"}\n', newline="\n")
+        out = _checkin(tmp_path, "0300", IDLE, runs=2)
+        assert _typed(out.splitlines()[-2]) == "Relayed by the add-on: Undo the move, please"
+        assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and "\x1b" not in out
         # The box holding only the start of the try (its mark): no Enter, after reading it three times
         # (outside review, round 17).
         (tmp_path / "sent.txt").unlink()

@@ -56,15 +56,32 @@ ours() {   # ours <draft's first line> <the try's mark>
   seen=$(printf '%s' "$1" | tr -d ' \t')
   [ -n "$2" ] && [ "${seen:0:$(( ${#2} + 2 ))}" = "[$2]" ]
 }
-# The text as the App types it: blanks one space each, none at the ends, and a run of more than 80
-# letters with no space broken with one, so his box wraps it only at spaces (outside round 18).
-plain() {
-  printf '%s' "$1" | tr '\t\r\n' '   ' | sed 's/\xc2\xa0/ /g' | tr -s ' ' | sed 's/^ //; s/ $//' \
-    | sed -E 's/([^ ]{80})([^ ])/\1 \2/g'
-}
+# The text as the App types it: as it is, but for control characters, which typing would turn into
+# keys (a tab, a line end, an Esc): a tab or line end is a space, any other is left out. Nothing else
+# is changed: a long address or code goes as written (outside round 19).
+keyless() { printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   '; }
 # Whether a draft's lines (prompt-state.sh's PROMPT_DRAFT_TEXT, one drawn line a line) are exactly
-# the text: joined by single spaces, the spaces his box's wrapping took, and nothing else.
-whole() { [ "$(printf '%s\n' "$1" | sed '/^$/d' | paste -sd ' ' -)" = "$2" ]; }
+# the text as his box wraps it at a width of w columns of text (the window's width less 4, as a real
+# Claude Code 2.1.317 drew it at 60 and 120): each line the next stretch of the text; between lines,
+# the blanks a wrap at a space took, or, where a word too long for a line was cut, nothing, which
+# only a full line of plain letters shows. Anything else, and nothing is sent (outside round 19).
+whole() {   # whole <lines> <text> <w>
+  printf '%s\n' "$1" | WANT="$2" W="$3" awk '
+    BEGIN { rest = ENVIRON["WANT"]; w = ENVIRON["W"] + 0; ok = 1 }
+    ok && NF {
+      if (substr(rest, 1, length($0)) != $0) { ok = 0; next }
+      rest = substr(rest, length($0) + 1)
+      if (rest ~ /^ /) sub(/^ +/, "", rest)
+      else if (rest != "" && !(length($0) == w && $0 !~ /[^\001-\177]/)) ok = 0
+    }
+    END { exit !(ok && rest ~ /^ *$/) }'
+}
+# The width his box wraps at: the window as tmux has it now, less 4; 0 when it can't be read.
+width() {
+  local c
+  c=$(timeout 10 $TM -u display -p -t cain '#{pane_width}' 2>/dev/null | tr -cd '0-9')
+  [ -n "$c" ] && [ "$c" -gt 4 ] && echo $((c - 4)) || echo 0
+}
 screen=$(read_screen) || { rm -f "$state/ready"; exit 0; }
 last=$(printf '%s\n' "$screen" | tail -n 12)
 # Only at his prompt (prompt-state.sh): never into a screen waiting for an answer, which typing
@@ -140,21 +157,21 @@ type_in() {
   printf '%s\n%s\n' "$(date +%s)" "$mark" > "$state/typed" 2>/dev/null \
     || { echo "[cain] no place to mark a try ($state): nothing typed"; return 1; }
   local want
-  want=$(plain "[$mark] $1")
+  want=$(keyless "[$mark] $1")
   if ! timeout 10 $TM -u send-keys -t cain -l "$want"; then return 1; fi
   sleep 1
   # All of it, mark first, as his box holds it: read up to three times a second apart while it
   # draws (his box still empty, or holding only part of it), never past a question or anything else.
-  local after word got i
+  local after word got i wide
   for i in 1 2 3; do
-    after=$(read_screen | PROMPT_DRAFT_TEXT=1 "$PS" 2>/dev/null)
+    after=$(read_screen | PROMPT_DRAFT_TEXT=1 "$PS" 2>/dev/null); wide=$(width)
     word="${after%%$'\n'*}"; got=$(printf '%s\n' "$after" | sed 1d)
-    [ "$word" = draft ] && whole "$got" "$want" && break
+    [ "$word" = draft ] && whole "$got" "$want" "$wide" && break
     [ "$word" = ready ] || { [ "$word" = draft ] && [ "${got:0:8}" = "[$mark]" ]; } || break
     [ "$i" = 3 ] || sleep 1
   done
   rm -f "$state/ready"
-  if [ "$word" != draft ] || ! whole "$got" "$want"; then
+  if [ "$word" != draft ] || ! whole "$got" "$want" "$wide"; then
     echo "[cain] his input box didn't hold all that was typed (${word:-unread}): nothing sent, tried again later"
     return 1
   fi
@@ -185,7 +202,8 @@ if [ -s "$work" ]; then
       exit 1
     fi
     rm -f "$state/tries"
-    echo "[cain] a relayed line couldn't be typed three times running: it goes after the newer ones"
+    echo "[cain] a relayed line couldn't be confirmed in his box three times running: it goes after the newer ones"
+    echo 1 >> "$state/unconfirmed" 2>/dev/null
   else
     rm -f "$state/tries"
     [ -n "$text" ] && echo "[cain] relayed a tap or reaction"
@@ -268,6 +286,10 @@ if [ -n "$rows" ]; then
   [ "$total" -gt 3 ] && notes=" ($((total - 3)) older not shown; /opt/cain/record.sh notes - lists them)$notes"
   [ -n "$notes" ] && lead="${lead}New notes on your items, read them before you change those items (words passed on, not his go on anything):$notes. "
 fi
+# Relayed lines waiting because their typing couldn't be confirmed in his box: said, so none waits
+# unknown to him (outside round 19).
+held_back=$(wc -l < "$state/unconfirmed" 2>/dev/null | tr -cd '0-9')
+[ "${held_back:-0}" -gt 0 ] && lead="${lead}Relayed lines the App couldn't confirm in your input box when it typed them: ${held_back}. Each waits in its queue behind newer ones and comes again. "
 if [ "$slot" = 0710 ]; then
   msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else
@@ -276,6 +298,7 @@ fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"
 for cand in "${named[@]}"; do touch "$dir/$cand.missed"; done
+[ "${held_back:-0}" -gt 0 ] && rm -f "$state/unconfirmed"
 [ -n "$newest" ] && printf '%s' "$newest" > "$seen"      # listed: never again
 find "$dir" -type f -mtime +7 -delete 2>/dev/null
 echo "[cain] check-in sent ($slot)"
