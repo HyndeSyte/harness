@@ -66,6 +66,13 @@
 - A refused address is logged only as its site and secret-keyed fingerprints, on the PC, and that log never leaves it.
 - Facts in a result are short and plain: no shell characters or symbols can reach Cain in one, and Cain treats them as data only.
 - A confirmed probe now holds only for the worker version it was made with: after this update, and every later one, you run the probe and confirm again before jobs run.
+- Every allowlist entry now names the exact sites its runs may open (a whole family of subdomains only where you write it that way). An entry without them is refused, so sign your allowlist again with them. The PC takes those sites from your signed entry, never from the job.
+- Site names are read the way a browser reads them and checked against a pinned list of public suffixes, so a disguised address (a number standing in for this computer, a look-alike letter, a trailing dot, another site on the same shared host) is refused.
+- If a page moves the browser off the job's sites after it opened, the PC refuses to read it there and the run fails, before any of that page reaches the browser session.
+- Address parameters stay off unless an entry names the ones it may send.
+- The PC's first tool call no longer fails if it comes a moment before the PC has checked the session's tools: it waits up to five seconds, then asks to try again. Only skipped tab checks count toward the three-in-a-row limit.
+- Plain words on reported values: Cain refusing a job that repeats one is a safety net, not a guarantee; your signed sites are the real limit. A follow-up job can reuse a reported value only after you say yes to Cain's question. You accept this new wording once when you confirm the probe.
+- On Windows the PC finds its compiler only in the Windows folder, rebuilds its helper whenever it changed, checks the helper really sits in its locked job, and says plainly when the compiler is missing or security software blocks it. The probe also ends the helper on purpose and checks nothing it started is left.
 
 ## 0.11.0
 

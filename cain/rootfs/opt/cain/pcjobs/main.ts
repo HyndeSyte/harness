@@ -23,7 +23,7 @@
 //   bun main.ts worker          the PC worker's last heartbeat
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { carriesReport, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
+import { unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
   DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type Result } from "./core.ts";
 
 export type Config = {
@@ -108,6 +108,10 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
     return "The PC stopped taking jobs because it couldn't delete a session's transcripts. At the PC: run worker.ts check-cli and follow its Troubleshooting row.";
   if (h?.code === "containment_unavailable")
     return "The PC isn't taking jobs because it couldn't build or start its Windows Job Object helper. At the PC: follow the containment_unavailable row in Troubleshooting, then start a run.";
+  if (h?.code === "helper_compiler_missing")
+    return "The PC isn't taking jobs because Windows has no C# compiler for its Job Object helper (the .NET Framework 4 feature is off). At the PC: follow the helper_compiler_missing row in Troubleshooting, then start a run.";
+  if (h?.code === "helper_blocked")
+    return "The PC isn't taking jobs because something on the PC, usually security software, stopped its Job Object helper from being built or started. At the PC: follow the helper_blocked row in Troubleshooting, then start a run.";
   if (h?.code === "host_parent_gone")
     return "The PC isn't taking jobs because Claude in Chrome's helper lost its Chrome. At the PC: restart the Cain jobs Chrome.";
   if (h?.code === "extra_extension")
@@ -183,7 +187,9 @@ export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: 
   const own = new Set(jobs.map((j) => normalUrl(j.start_url, true)));
   const values = jobs.flatMap((j) => { const r = readResult(cfg.dir, j.id); return r && r !== "bad" ? reportValues(r, j) : []; })
     .filter((v) => !(/^https?:/i.test(v) && own.has(normalUrl(v, true))));
-  if (carriesReport(req.job, values)) return { why: "a job can't carry a value from a PC result (an address or account a page showed): write it from the owner's words or the allowlist instead" };
+  // A mitigation, not a guarantee (core.ts): the pinned domains are the control. A value
+  // the owner said yes to reusing, recorded on the job as owner_reuse, goes through.
+  if (unapprovedValues(req.job, values).length) return { why: "a job can't carry a value from a PC result (an address or account a page showed): write it from the owner's words or the allowlist instead, or ask the owner and record his answer as owner_reuse" };
   let id = newId(now, cfg.rand);
   while (jobs.some((j) => j.id === id)) id = newId(now, cfg.rand);
   const made = jobFromAsk(req.job, now, id);

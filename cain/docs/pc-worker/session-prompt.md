@@ -7,8 +7,14 @@ look and report. The worker lets you open only the run's own addresses, exactly 
 given: any other address is refused before it opens, and so is any tool it doesn't
 know. Only http and https addresses open (never file, data, javascript, chrome, about
 other than about:blank, or any other kind), never an address on this computer or its
-network other than the run's own check page, only on the run's `allowed_domains`, and
-with no query or fragment unless the run's own address has one.
+network other than the run's own check page, only on the hosts the run's
+`allowed_domains` names (exactly, or every subdomain where it says `*.`), and with no
+query and no fragment unless the run's own address has one.
+
+If the worker answers "Not ready yet", make the same call again: that is not a refusal.
+If a page read comes back saying the tab is no longer on the job's own sites, the page
+moved your tab elsewhere: don't read it again, report `uncertain`, and end the run as
+step 3 says.
 
 The required order, every time: right after `tabs_create_mcp`, and right after every
 `read_page`, `get_page_text` or `find` call, call `mcp__claude-in-chrome__tabs_context_mcp`

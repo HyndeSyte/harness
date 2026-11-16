@@ -12,7 +12,13 @@
    A change to a repo-root release file (repository.yaml) needs at least one App
    bumped. Versions fail closed: a config.yaml that exists must parse, with no
    duplicate keys, and carry a top-level string version X.Y.Z.
-4. The required checks keep reporting: the pytest and bun jobs in tests.yml and
+4. The description is for this round: for each App that goes up a version, it carries
+   the line "Changelog: <App> <version> <hash>", the hash being the first 12 hex digits
+   of the SHA-256 of that App's newest CHANGELOG section (its heading through the line
+   before the next heading, LF line ends, trailing spaces dropped). Every round of fixes
+   changes the newest section, so a description left from an earlier round fails until
+   it is refreshed; the failure prints the line to add.
+5. The required checks keep reporting: the pytest and bun jobs in tests.yml and
    the pr job in pr.yml keep their names, with no path or branch filters and no
    `if` or `continue-on-error`, and no other workflow reuses those names.
 
@@ -27,6 +33,7 @@ Exit 0 when everything passes; otherwise one line per problem and exit 1.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -40,6 +47,8 @@ APPS = ("harness", "cain")
 NOT_SHIPPED = ("tests/", "tools/")
 # Files outside the Apps that Home Assistant reads from main when it installs.
 ROOT_RELEASE = ("repository.yaml",)
+# How a round marker names each App.
+APP_NAMES = {"harness": "Harness", "cain": "Cain"}
 HEADINGS = ("What changed", "How it was tested", "Not verified", "Anything Dane must do")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 # The required checks (RELEASING.md): workflow file -> job ids that must stay as they are.
@@ -108,6 +117,54 @@ def changelog_top(text: str | None) -> str | None:
         if line.startswith("## "):
             return line[3:].strip()
     return None
+
+
+def changelog_section(text: str | None) -> str | None:
+    """The newest section of a CHANGELOG: its "## " heading through the line before the
+    next one, LF line ends, trailing spaces dropped, blank lines at either end dropped."""
+    lines, inside = [], False
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = True
+        if inside:
+            lines.append(line.rstrip())
+    return "\n".join(lines).strip() or None
+
+
+def round_marker(app: str, version: str, changelog: str | None) -> str | None:
+    section = changelog_section(changelog)
+    if section is None:
+        return None
+    return f"Changelog: {app} {version} {hashlib.sha256(section.encode('utf-8')).hexdigest()[:12]}"
+
+
+def expected_markers(base: "Snapshot", head: "Snapshot") -> list[str]:
+    """The round marker of every App whose version on the branch differs from main's."""
+    out = []
+    for app in sorted(set(APPS) | set(head)):
+        old_cfg = base.get(app, (None, None))[0]
+        new_cfg, log = head.get(app, (None, None))
+        if new_cfg is None:
+            continue
+        try:
+            new = parse_version(new_cfg)
+            old = parse_version(old_cfg) if old_cfg is not None else None
+        except VersionError:
+            continue  # check_versions reports it
+        if new != old:
+            m = round_marker(APP_NAMES.get(app, app), show(new), log)
+            if m:
+                out.append(m)
+    return out
+
+
+def check_round(body: str, markers: list[str]) -> list[str]:
+    lines = {line.strip() for line in (body or "").replace("\r\n", "\n").split("\n")}
+    return [f'The description isn\'t for this round of changes: add the line "{m}" (it changes '
+            "whenever the newest CHANGELOG section does, so refresh the description with it)."
+            for m in markers if m not in lines]
 
 
 def shipped(app: str, path: str) -> bool:
@@ -328,14 +385,17 @@ def main(argv: list[str] | None = None) -> int:
     elif not is_up_to_date(a.base, head):
         problems.append(STALE)
     else:
-        problems += check_versions(changed_files(a.base, head), snapshot(a.base), snapshot(head))
+        base_snap, head_snap = snapshot(a.base), snapshot(head)
+        problems += check_versions(changed_files(a.base, head), base_snap, head_snap)
+        if body is not None:
+            problems += check_round(body, expected_markers(base_snap, head_snap))
         problems += check_workflows(workflows_at(head))
 
     for p in problems:
         print(f"::error::{p}" if os.environ.get("GITHUB_ACTIONS") else p)
     if not problems:
-        print("ok: up to date with main, the description follows the template, versions step up "
-              "where Apps changed, and the required checks are intact")
+        print("ok: up to date with main, the description follows the template and names this round, "
+              "versions step up where Apps changed, and the required checks are intact")
     return 1 if problems else 0
 
 

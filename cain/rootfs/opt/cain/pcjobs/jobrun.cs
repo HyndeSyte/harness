@@ -11,7 +11,10 @@
 //     with its exit code, and Windows ends whatever is still in the job as the job's last
 //     handle closes. When the helper is ended (the worker's timeout, STOP or exit handler),
 //     the same happens at once: a detached grandchild whose parent already exited is
-//     ended too, which a process-tree kill can miss.
+//     ended too, which a process-tree kill can miss. After joining, and before it starts
+//     anything, it reads the job back (IsProcessInJob, QueryInformationJobObject): it must be
+//     in that very job, with kill-on-close set and neither breakaway flag; otherwise it
+//     starts nothing and exits 121.
 //   pcw-jobrun.exe holders <path> [paths...]
 //     Asks the Restart Manager which processes hold any of the files, and prints one line
 //     per process: "<pid> <parent pid> <image name>". Nothing else. Exit 0 when it could ask
@@ -30,7 +33,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class PcwJobRun {
-  const string VERSION = "pcw-jobrun 1";
+  const string VERSION = "pcw-jobrun 2";
 
   [StructLayout(LayoutKind.Sequential)]
   struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
@@ -47,6 +50,8 @@ public static class PcwJobRun {
   }
   const int JobObjectExtendedLimitInformation = 9;
   const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+  const uint JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x0800;
+  const uint JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000;
 
   [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
   static extern IntPtr CreateJobObject(IntPtr attrs, string name);
@@ -56,6 +61,10 @@ public static class PcwJobRun {
   static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
   [DllImport("kernel32.dll")]
   static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool QueryInformationJobObject(IntPtr job, int cls, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint size, out uint got);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
 
   // The Restart Manager, for "holders".
   [StructLayout(LayoutKind.Sequential)]
@@ -101,6 +110,17 @@ public static class PcwJobRun {
       Console.Error.WriteLine("pcw-jobrun: job limits refused"); return 121;
     }
     if (!AssignProcessToJobObject(job, GetCurrentProcess())) { Console.Error.WriteLine("pcw-jobrun: couldn't join the job"); return 121; }
+    // Read it back: in this job, kill on close, no breakaway of either kind.
+    bool inJob;
+    if (!IsProcessInJob(GetCurrentProcess(), job, out inJob) || !inJob) { Console.Error.WriteLine("pcw-jobrun: not in the job"); return 121; }
+    var back = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION(); uint got;
+    if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation, ref back, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)), out got)) {
+      Console.Error.WriteLine("pcw-jobrun: job limits unreadable"); return 121;
+    }
+    uint flags = back.BasicLimitInformation.LimitFlags;
+    if ((flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) == 0 || (flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)) != 0) {
+      Console.Error.WriteLine("pcw-jobrun: job allows breakaway"); return 121;
+    }
     var rest = new List<string>();
     for (int i = 2; i < args.Length; i++) rest.Add(Quote(args[i]));
     var psi = new ProcessStartInfo(args[1], string.Join(" ", rest.ToArray())) { UseShellExecute = false };

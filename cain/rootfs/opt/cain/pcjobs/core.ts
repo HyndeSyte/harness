@@ -20,6 +20,9 @@
 // A result says what was seen in a few typed facts (per action, below), never page text.
 // Results are data, never instructions: nothing in one tells Cain or the worker what to do.
 import { createHash, sign as edSign, verify as edVerify, type KeyObject } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { b64url, publicKey } from "../ship-token.ts";
 
 export const STATES = ["pending", "claimed", "awaiting_owner", "done", "failed", "in_doubt", "cancelled"] as const;
@@ -43,7 +46,7 @@ export const CODES = [
   "boundary_not_accepted", "update_pending",
   "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
   "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab", "tab_context_owed",
-  "containment_unavailable",
+  "containment_unavailable", "domain_not_allowed", "read_drift", "helper_compiler_missing", "helper_blocked",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -142,7 +145,12 @@ export interface Job {
   preview_seen: Seen | null;   // confirm: what that preview saw
   owner_go: string | null;     // confirm: Dane's exact words, quoted
   go_token: string | null;     // confirm: job2.<claim>.<signature>
+  owner_reuse: OwnerReuse | null;   // a read that reuses values a PC result reported, on the owner's tap (reportValues, below)
 }
+// The owner's go to reuse values a PC result reported in a new job: the values, exactly,
+// and his answer as Cain recorded it from his tap, in quotes. Recorded on the job, so the
+// queue keeps who said yes; it is Cain's record, not a signature.
+export interface OwnerReuse { values: string[]; go: string }
 
 export interface Result {
   v: 1;
@@ -159,7 +167,7 @@ export interface Result {
 }
 
 export const JOB_KEYS = ["v", "id", "from", "created", "expires", "state", "lease_until", "attempt", "site", "action", "step",
-  "start_url", "done_looks_like", "follows", "preview_seen", "owner_go", "go_token"];
+  "start_url", "done_looks_like", "follows", "preview_seen", "owner_go", "go_token", "owner_reuse"];
 export const RESULT_KEYS = ["v", "id", "attempt", "status", "code", "handoff", "worker_clock", "final_url", "facts", "tools", "attended"];
 export const TOOL = /^[a-z][a-z0-9_]{1,39}$/;
 
@@ -297,6 +305,9 @@ function seenOk(s: unknown): s is Seen {
   return isObj(s) && exact(s, SEEN_KEYS) && checkFacts("delete_account", s).ok;
 }
 
+const reuseOk = (r: unknown): r is OwnerReuse => isObj(r) && exact(r, ["values", "go"]) && Array.isArray(r.values) && r.values.length >= 1 && r.values.length <= 3
+  && r.values.every((v: unknown) => line(v, 300) && (v as string).length >= 4) && typeof r.go === "string" && QUOTED.test(r.go);
+
 // ---- Jobs and results ---------------------------------------------------------------
 // A job file's text, checked for shape alone (what a job token says is checked apart).
 export function parseJob(text: string): Checked<Job> {
@@ -331,6 +342,7 @@ export function parseJob(text: string): Checked<Job> {
   } else if (j.follows !== null || j.preview_seen !== null || j.owner_go !== null || j.go_token !== null) {
     return no("only a confirm job has follows, preview_seen, owner_go and go_token");
   }
+  if (!(j.owner_reuse === null || reuseOk(j.owner_reuse))) return no("owner_reuse is null, or {values: 1 to 3 reported values, go: the owner's answer to Cain's ask, in quotes}");
   return { ok: true, value: j as Job };
 }
 
@@ -519,19 +531,67 @@ export function confirmGate(job: Job, live: unknown): Code | null {
   return canonical(live) === canonical(job.preview_seen) ? null : "preview_mismatch";
 }
 
-// A host's registrable domain (example.co.uk for a.b.example.co.uk): the last two labels,
-// or three under a common two-part public suffix. null for an address without a host name
-// (an IP address, javascript:, data:).
-const TWO_PART = new Set(["co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "com.au", "net.au", "org.au", "edu.au", "gov.au",
-  "co.nz", "org.nz", "net.nz", "co.jp", "ne.jp", "or.jp", "ac.jp", "co.kr", "co.in", "net.in", "org.in", "com.br", "net.br", "com.mx", "com.cn", "net.cn", "org.cn",
-  "com.tw", "com.hk", "com.sg", "co.za", "com.ar", "com.tr", "co.il", "github.io", "gitlab.io", "herokuapp.com", "vercel.app", "netlify.app", "pages.dev",
-  "workers.dev", "blogspot.com", "appspot.com", "cloudfront.net", "azurewebsites.net", "web.app", "firebaseapp.com"]);
-export function registrableDomain(host: string): string | null {
-  const h = host.toLowerCase().replace(/\.$/, "");
-  if (!/^[a-z0-9.-]{1,253}$/.test(h) || /^[\d.]+$/.test(h) || !/[a-z]/.test(h)) return null;
-  const parts = h.split(".").filter(Boolean);
-  if (parts.length <= 2) return parts.join(".");
-  return parts.slice(TWO_PART.has(parts.slice(-2).join(".")) ? -3 : -2).join(".");
+// A host's registrable domain (example.co.uk for a.b.example.co.uk; alice.github.io for
+// x.alice.github.io): its public suffix by the Public Suffix List, private section and all,
+// and one label more. The list is pinned: public_suffix_list.dat beside this file, checked
+// against PSL_SHA256 (its text with LF line endings) before it is used, and part of the
+// worker's own hash (WORKER_CODE in worker.ts), so a changed list is a new worker that
+// needs a new probe. A list that doesn't match fails closed: no host has a registrable
+// domain, and every navigation and entry that needs one is refused.
+// The host is taken as the WHATWG URL parser leaves it (lower case, IDN as punycode): null
+// for one that isn't plain ASCII labels, ends in a dot, is an IP address, or is itself a
+// public suffix (github.io, co.uk).
+export const PSL_FILE = join(dirname(fileURLToPath(import.meta.url)), "public_suffix_list.dat");
+export const PSL_SHA256 = "ec478ac8df88adf88c590f67ff540002cd32eb6e80cec9961e7e10995a540d29";
+interface Psl { rules: Set<string>; wild: Set<string>; except: Set<string> }
+let psl: Psl | null | undefined;
+export function pslText(file = PSL_FILE): string | null {
+  try {
+    const text = readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+    return createHash("sha256").update(text, "utf8").digest("hex") === PSL_SHA256 ? text : null;
+  } catch { return null; }
+}
+export function parsePsl(text: string): Psl {
+  const out: Psl = { rules: new Set(), wild: new Set(), except: new Set() };
+  for (const raw of text.split("\n")) {
+    const r = raw.trim().split(/\s/)[0]?.toLowerCase() ?? "";
+    if (!r || r.startsWith("//")) continue;
+    const ascii = (x: string) => x.split(".").map((l) => /^[\x00-\x7f]*$/.test(l) ? l : punycodeLabel(l)).join(".");
+    if (r.startsWith("!")) out.except.add(ascii(r.slice(1)));
+    else if (r.startsWith("*.")) out.wild.add(ascii(r.slice(2)));
+    else out.rules.add(ascii(r));
+  }
+  return out;
+}
+const pslNow = (): Psl | null => {
+  if (psl === undefined) { const t = pslText(); psl = t ? parsePsl(t) : null; }
+  return psl;
+};
+// A host is plain: ASCII letters, digits and hyphens in dot-separated labels, no empty
+// label, no trailing dot, not an IP address.
+const HOST_LABELS = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?))*$/;
+export const plainHost = (h: string) => HOST_LABELS.test(h) && !/^[\d.]+$/.test(h) && !/^0x/i.test(h.split(".").at(-1) ?? "") && /[a-z]/.test(h.split(".").at(-1) ?? "");
+export function registrableDomain(host: string, list: Psl | null = pslNow()): string | null {
+  if (!list || typeof host !== "string") return null;
+  const h = host.toLowerCase();
+  if (!plainHost(h)) return null;
+  const labels = h.split(".");
+  // The longest matching rule, an exception beating a wildcard; "*" when none matches.
+  let suffix = 1;
+  for (let i = 0; i < labels.length; i++) {
+    const tail = labels.slice(i).join(".");
+    const n = labels.length - i;
+    if (list.except.has(tail)) { suffix = Math.max(suffix, n - 1); break; }
+    if (list.rules.has(tail)) suffix = Math.max(suffix, n);
+    if (i > 0 && list.wild.has(tail)) suffix = Math.max(suffix, n + 1);
+  }
+  if (labels.length <= suffix) return null;
+  return labels.slice(-(suffix + 1)).join(".");
+}
+// One Unicode label as punycode (xn--...), as the URL parser writes it; the list's own
+// Unicode rules are read this way so they match what a parsed address holds.
+function punycodeLabel(label: string): string {
+  try { const h = new URL(`http://${label}.invalid/`).hostname; return h.split(".")[0]; } catch { return label; }
 }
 // ---- The PC's allowlist, signed by Dane --------------------------------------------
 // {"v": 1, "kid": "<his key id>", "allow": [{site, action, url, match, login_hosts?, login_paths?, alternatives?, redirects?}], "sig": "<base64url>"}
@@ -548,12 +608,24 @@ export function registrableDomain(host: string): string | null {
 // entry's `redirects` lists path prefixes on the pinned address's own host, each
 // starting and ending with "/" (or an exact path without the trailing "/"), and the end
 // check accepts a final address under one of them. `"reviewed": true` says the owner has
-// looked at an address the signing tool would otherwise refuse (riskyEntry, below). The signature is his Ed25519 key's, over the
+// looked at an address the signing tool would otherwise refuse (riskyEntry, below).
+// `domains` is required: the hosts a run of this entry may open, each one exactly
+// ("www.example.com" is that host only) or, only where the entry says so explicitly, a
+// subdomain wildcard ("*.example.com": any host under example.com, not example.com itself).
+// Each names a host with a registrable domain by the pinned Public Suffix List (so neither
+// "*.co.uk" nor "*.github.io" nor an IP address can be one), and together they must cover
+// the pin's host, the site, and every sign-in host (a ".host" sign-in entry needs "*.host"
+// and "host"). An internationalized host (punycode, xn--) is allowed only where an exact
+// entry names it. The worker takes a run's domains from this signed entry alone, never
+// from the job. `query_params` (optional, off by default) lets the run's navigations carry
+// a query whose every parameter name matches one of its patterns (a name, or a prefix
+// ending in "*"), within QUERY_MAX characters; without it any query is refused, and a
+// fragment always is. The signature is his Ed25519 key's, over the
 // canonical bytes of {v, kid, allow}; the worker checks it against owner.pub on the PC,
 // and owner.pub against the fingerprint pinned in his install config.
 export interface Allow {
   site: string; action: string; url: string; match: "exact" | "prefix"; login_hosts?: string[]; login_paths?: string[]; alternatives?: true;
-  redirects?: string[]; reviewed?: true; domains?: string[]; query?: true;
+  redirects?: string[]; reviewed?: true; domains: string[]; query_params?: string[];
 }
 
 export const allowBody = (kid: string, allow: Allow[]) => canonical({ v: 1, kid, allow });
@@ -566,55 +638,98 @@ const LOGIN_HOST = /^\.?(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z
 const LOGIN_PATH = /^\/[A-Za-z0-9._~%\/-]{0,100}\*?$/;
 const listOf = (x: unknown, re: RegExp) => x === undefined || (Array.isArray(x) && x.length <= 8 && x.every((v) => typeof v === "string" && re.test(v)));
 const REDIRECT_PATH = /^\/(?:[A-Za-z0-9._~%-]+\/)*[A-Za-z0-9._~%-]*$/;
-const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives", "redirects", "reviewed", "domains", "query"];
-const DOMAIN = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
-// The longest query and fragment, together, a navigation may carry on an entry that allows
-// them ("query": true). Without it, an address with either is refused before it opens.
+const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives", "redirects", "reviewed", "domains", "query_params"];
+const QUERY_PARAM = /^[A-Za-z0-9_.-]{1,40}\*?$/;
+// The longest query a navigation may carry on an entry that allows one (query_params).
 export const QUERY_MAX = 200;
-// The registrable domains a run of this entry may navigate to: the entry's own "domains"
-// when it names them, or else the site's registrable domain and each sign-in host's. The
-// run's own check page (127.0.0.1) is allowed by its exact address, outside this list.
-export function entryDomains(a: Allow): string[] {
-  const derived = [a.site, ...(a.login_hosts ?? []).map((h) => h.replace(/^\./, ""))].map((h) => registrableDomain(h)).filter((d): d is string => !!d);
-  return [...new Set(a.domains ?? derived)].sort();
+// One domain pattern: an exact host, or "*." and a host, either with a registrable domain
+// of its own (not a public suffix, not an IP address, no trailing dot).
+export function domainPattern(p: unknown): boolean {
+  if (typeof p !== "string" || p.length > 120) return false;
+  const host = p.startsWith("*.") ? p.slice(2) : p;
+  if (host.includes("*") || !plainHost(host) || !registrableDomain(host)) return false;
+  // A wildcard never spans punycode: an internationalized host is named exactly.
+  return !(p.startsWith("*.") && host.split(".").some((l) => l.startsWith("xn--")));
 }
-// Every domain an entry needs is in its declared list: its site's and each sign-in host's.
+// A host as the URL parser leaves it, against an entry's patterns: an exact one, or a
+// wildcard whose base it is strictly under. A host with a punycode (xn--) label matches
+// only an exact pattern; a host that isn't plain (an IP address, a trailing dot) matches none.
+export function hostAllowed(host: string, patterns: readonly string[]): boolean {
+  const h = typeof host === "string" ? host.toLowerCase() : "";
+  if (!plainHost(h) || !registrableDomain(h)) return false;
+  if (patterns.includes(h)) return true;
+  if (h.split(".").some((l) => l.startsWith("xn--"))) return false;
+  return patterns.some((p) => p.startsWith("*.") && h.endsWith(`.${p.slice(2)}`));
+}
+// The domain patterns a run of this entry may navigate to: the entry's own, as signed.
+// The run's own check page (127.0.0.1) is allowed by its exact address, outside this list.
+export function entryDomains(a: Allow): string[] {
+  return [...new Set(Array.isArray(a.domains) ? a.domains : [])].sort();
+}
+// The registrable domains those patterns fall under, for the session's instruction.
+export const entryRegistrable = (a: Allow): string[] =>
+  [...new Set(entryDomains(a).map((p) => registrableDomain(p.replace(/^\*\./, ""))).filter((d): d is string => !!d))].sort();
+// Every host an entry needs is covered by its patterns: the pin's host, the site, each
+// sign-in host (".host": both host and *.host).
 const domainsCover = (e: any): boolean => {
-  if (e.domains === undefined) return true;
-  const need = [e.site, ...(Array.isArray(e.login_hosts) ? e.login_hosts : []).map((h: string) => h.replace(/^\./, ""))].map((h: string) => registrableDomain(h));
-  return need.every((d) => !!d && e.domains.includes(d));
+  if (!Array.isArray(e.domains)) return false;
+  let pin = "";
+  try { pin = new URL(e.url).hostname; } catch { return false; }
+  const need = [pin, e.site];
+  for (const h of Array.isArray(e.login_hosts) ? e.login_hosts : []) {
+    if (h.startsWith(".")) { if (!e.domains.includes(`*${h}`)) return false; need.push(h.slice(1)); } else need.push(h);
+  }
+  return need.every((h: string) => hostAllowed(h, e.domains));
 };
+// Why a job can't run under its entry, or null: every host the job names (its site and its
+// start address's host) must be one the entry's own domains allow. The job brings no
+// domains of its own; this only checks that what it names stays inside the entry's.
+export function jobScopeProblem(job: { site: string; start_url: string }, pin: Allow): "domain_not_allowed" | null {
+  let host = "";
+  try { host = new URL(job.start_url).hostname; } catch { return "domain_not_allowed"; }
+  const d = entryDomains(pin);
+  return d.length && hostAllowed(host, d) && hostAllowed(job.site, d) ? null : "domain_not_allowed";
+}
+// Whether an address's query may be sent under an entry's query_params: none at all, or
+// every parameter name matching one of the patterns, the whole within QUERY_MAX.
+export function queryAllowed(search: string, params: readonly string[] | undefined): boolean {
+  if (!search || search === "?") return search === "";
+  if (!params?.length || search.length > QUERY_MAX + 1) return false;
+  const names = search.slice(1).split("&").map((kv) => { try { return decodeURIComponent(kv.split("=")[0].replace(/\+/g, " ")); } catch { return "\u0000"; } });
+  return names.every((n) => n.length > 0 && params.some((p) => p.endsWith("*") ? n.startsWith(p.slice(0, -1)) : n === p));
+}
 
 function entriesOk(list: unknown): Checked<Allow[]> {
   if (!Array.isArray(list)) return no("allow is a list");
   const out: Allow[] = [];
   for (const e of list) {
     const keys = isObj(e) ? Object.keys(e) : [];
-    if (!isObj(e) || !["site", "action", "url", "match"].every((k) => keys.includes(k))
+    if (isObj(e) && ["site", "action", "url", "match"].every((k) => keys.includes(k)) && e.domains === undefined)
+      return no("each allowlist entry names its domains: the hosts its runs may open, each exact (www.example.com) or an explicit wildcard (*.example.com); this version refuses an entry without them");
+    if (!isObj(e) || !["site", "action", "url", "match", "domains"].every((k) => keys.includes(k))
       || keys.some((k) => !ENTRY_KEYS.includes(k))
       || typeof e.site !== "string" || !SITE.test(e.site)
       || typeof e.action !== "string" || !Object.hasOwn(READ_ACTIONS, e.action) || !plainOnSite(e.url, e.site)
       || (e.match !== "exact" && e.match !== "prefix") || !listOf(e.login_hosts, LOGIN_HOST) || !listOf(e.login_paths, LOGIN_PATH)
       || (e.alternatives !== undefined && e.alternatives !== true) || (e.reviewed !== undefined && e.reviewed !== true)
       || !(e.redirects === undefined || (listOf(e.redirects, REDIRECT_PATH) && e.redirects.every((r: string) => r !== "/" && r.length <= 100)))
-      || !(e.domains === undefined || (listOf(e.domains, DOMAIN) && e.domains.length > 0 && e.domains.every((d: string) => registrableDomain(d) === d)))
-      || (e.query !== undefined && e.query !== true) || !domainsCover(e))
-      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), and optionally login_hosts, login_paths, alternatives (true), redirects (path prefixes on its host), domains (the registrable domains its runs may open, its site's and its sign-in hosts' among them) and query (true)}");
-    const a: Allow = { site: e.site, action: e.action, url: e.url, match: e.match };
+      || !(Array.isArray(e.domains) && e.domains.length > 0 && e.domains.length <= 8 && e.domains.every(domainPattern))
+      || !(e.query_params === undefined || (listOf(e.query_params, QUERY_PARAM) && e.query_params.length > 0)) || !domainsCover(e))
+      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), domains (the hosts its runs may open: exact, or *.host where you mean every subdomain; covering the pin's host, the site and each sign-in host), and optionally login_hosts, login_paths, alternatives (true), redirects (path prefixes on its host) and query_params (the query parameter names its runs may send)}");
+    const a: Allow = { site: e.site, action: e.action, url: e.url, match: e.match, domains: [...e.domains] };
     if (e.login_hosts !== undefined) a.login_hosts = e.login_hosts;
     if (e.login_paths !== undefined) a.login_paths = e.login_paths;
     if (e.alternatives === true) a.alternatives = true;
     if (e.redirects !== undefined) a.redirects = e.redirects;
     if (e.reviewed === true) a.reviewed = true;
-    if (e.domains !== undefined) a.domains = [...e.domains];
-    if (e.query === true) a.query = true;
+    if (e.query_params !== undefined) a.query_params = [...e.query_params];
     out.push(a);
   }
   return { ok: true, value: out };
 }
 
 // What the signing tool refuses unless the entry says "reviewed": true: an address with a
-// query, an entry that lets its runs open addresses with a query ("query": true), or one whose path (the pin's, a redirect's or a sign-in path's) has a word that acts:
+// query, an entry that lets its runs open addresses with a query (query_params), or one whose path (the pin's, a redirect's or a sign-in path's) has a word that acts:
 // logout, signout, unsubscribe, confirm, delete, remove or cancel (with or without a
 // hyphen or underscore, in any case). The word found, or null.
 export const RISKY_PATH = /log[-_]?out|sign[-_]?out|unsubscribe|confirm|delete|remove|cancel/i;
@@ -629,7 +744,7 @@ export function riskyMatch(e: any): { word: string; host: string } | null {
   try { u = new URL(String(e.url)); } catch { return { word: "url", host: "unparsed" }; }
   const host = u.hostname || "none";
   if (u.search || u.href.includes("?")) return { word: "query", host };
-  if (e.query === true) return { word: "query", host };
+  if (e.query_params !== undefined) return { word: "query", host };
   for (const p of [u.pathname, ...(Array.isArray(e.redirects) ? e.redirects : []), ...(Array.isArray(e.login_paths) ? e.login_paths : [])] as unknown[]) {
     const m = RISKY_PATH.exec(String(p));
     if (m) return { word: m[0].toLowerCase(), host };
@@ -727,9 +842,9 @@ export function pinFor(job: Job, list: Allow[]): Allow | null {
 }
 
 // ---- What Cain sends his keeper ----------------------------------------------------
-// {site, action, step, start_url, done_looks_like, hours?, follows?, preview_seen?, owner_go?, go_token?}
+// {site, action, step, start_url, done_looks_like, hours?, follows?, preview_seen?, owner_go?, go_token?, owner_reuse?}
 // The keeper fills id, from, created, expires (hours, default 24), state, lease and attempt.
-export const ASK_KEYS = ["site", "action", "step", "start_url", "done_looks_like", "hours", "follows", "preview_seen", "owner_go", "go_token"];
+export const ASK_KEYS = ["site", "action", "step", "start_url", "done_looks_like", "hours", "follows", "preview_seen", "owner_go", "go_token", "owner_reuse"];
 
 export function jobFromAsk(ask: any, now: Date, id: string): Checked<Job> {
   if (!isObj(ask)) return no("a job request is a JSON object");
@@ -746,6 +861,7 @@ export function jobFromAsk(ask: any, now: Date, id: string): Checked<Job> {
     site: typeof ask.site === "string" ? ask.site.trim().toLowerCase() : ask.site,
     action: ask.action, step: ask.step, start_url: ask.start_url, done_looks_like: ask.done_looks_like,
     follows: ask.follows ?? null, preview_seen: ask.preview_seen ?? null, owner_go: ask.owner_go ?? null, go_token: ask.go_token ?? null,
+    owner_reuse: ask.owner_reuse ?? null,
   };
   return parseJob(JSON.stringify(job));
 }
@@ -764,6 +880,14 @@ export function jobFromAsk(ask: any, now: Date, id: string): Checked<Job> {
 //     description, is refused (check, in main.ts), so a page can't steer what the queue runs
 //     next by planting an address or a name in a report. An address that is some job's own
 //     start address (one Cain wrote himself) doesn't count.
+// That refusal is a mitigation, not a guarantee: it matches the values as written, so a
+// value reworded, split up or carried by meaning instead of by its letters gets past it.
+// The control that holds is the pinned domains: whatever a job says, its run can open only
+// the hosts its signed allowlist entry names (hostAllowed, and the hook in worker.ts).
+// When a follow-up job really needs a reported value (an address the owner wants checked
+// next), Cain asks the owner first and records his answer on the job as owner_reuse: the
+// values, exactly, and his answer in quotes. The keeper then lets exactly those values
+// through, and nothing else carried from a result.
 const quoted = (v: string | number | boolean) => typeof v === "string" ? JSON.stringify(v) : String(v);
 export function resultLines(r: Result): string[] {
   return [
@@ -787,6 +911,15 @@ export function reportValues(r: Result, job: Job | undefined): string[] {
 }
 // The first report-derived value a job request carries, or null.
 export function carriesReport(ask: unknown, values: string[]): string | null {
+  return carriedValues(ask, values)[0] ?? null;
+}
+// Every report-derived value a job request carries, past the ones its owner_reuse names.
+export function unapprovedValues(ask: unknown, values: string[]): string[] {
+  const ok = isObj(ask) && reuseOk(ask.owner_reuse) ? ask.owner_reuse.values.map((v) => v.toLowerCase()) : [];
+  return carriedValues(ask, values).filter((v) => !ok.includes(v.toLowerCase()));
+}
+// Every report-derived value a job request carries.
+export function carriedValues(ask: unknown, values: string[]): string[] {
   if (!isObj(ask)) return null;
   const text = [ask.site, ask.start_url, ask.done_looks_like].filter((x): x is string => typeof x === "string").join("\n").toLowerCase();
   const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -794,11 +927,11 @@ export function carriesReport(ask: unknown, values: string[]): string | null {
   // of a longer path (example.com/account is not in example.com/account/settings).
   const bounded = (x: string) => new RegExp(`${esc(x)}/?(?![a-z0-9._~%/-])`).test(text);
   const strip = (u: string) => u.toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
-  return values.find((v) => {
+  return values.filter((v) => {
     if (!/^https?:/i.test(v)) return text.includes(v.toLowerCase());
     const bare = strip(v);
     return (typeof ask.start_url === "string" && normalUrl(ask.start_url, true) === normalUrl(v, true)) || bounded(v.toLowerCase().replace(/\/+$/, "")) || (bare.length >= 4 && bounded(bare));
-  }) ?? null;
+  });
 }
 
 // What a job's line in a listing says. Only fixed words and checked fields: a result is

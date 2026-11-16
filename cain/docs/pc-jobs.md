@@ -18,7 +18,17 @@ addresses before any check sees them. The worker fails a run that shows them aft
 it can't stop them happening. Nor is it side-effect-free browsing: a page on an address
 you approved can still act when it loads (below).
 
-**You accept that boundary once, in words.** `confirm-profile` refuses
+**Where a run may go is set by your signed allowlist, and only by it.** Every entry names
+its `domains`, the hosts its runs may open (exact, or `*.host` only where you say every
+subdomain); the worker takes a run's domains from that signed entry, never from the job,
+and refuses any other host before a navigation and again when a page is read. That is the
+control. Cain's keeper also refuses a new job that repeats a value a result reported (an
+address or a masked account a page showed): **that is a mitigation, not a guarantee**,
+since a value reworded, split up or carried by meaning gets past a check that matches
+letters. A follow-up job may reuse a reported value only when you said yes to it: Cain
+asks you, and your answer is recorded on the job (`owner_reuse`).
+
+**You accept that boundary once, in words** (its text names the domains as the control and the report-value check as a mitigation; this release is boundary version 2, so confirm again). `confirm-profile` refuses
 (`boundary_not_accepted`, printing the boundary's text) until you run it with
 `--accept-boundary`; the confirmation records the version of the text you accepted
 (`boundary_version`), and every run refuses (`boundary_not_accepted`) until the
@@ -154,20 +164,29 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   every session's end too (a child the session started can outlive it). **On Windows
   every session runs in a Windows Job Object**: the worker builds a small helper,
   `pcw-jobrun.exe`, from `pcjobs/jobrun.cs` (one file of C#) with the .NET Framework's own
-  compiler (`csc.exe`, part of Windows 10 and 11), into the worker folder, the first time
-  it is needed and again whenever that file changes (its hash is kept beside it,
-  `pcw-jobrun.sha256`). The helper puts itself in a new job with kill-on-close and with
-  breakaway not allowed, then starts `claude`: everything the session starts is in the
-  job and can't leave it, and when the helper exits or is ended (a timeout, `STOP`, the
-  exit handler) Windows ends every process still in the job, a detached grandchild whose
-  parent already exited included, which a tree kill can miss. **If the helper can't be
-  built or doesn't answer, Windows runs, the probe and `bind-profile` refuse with
-  `containment_unavailable`** until it can: nothing runs uncontained. The Windows CI job
-  builds the real helper and runs an intermediary that starts a burst of short children
-  and one detached child and exits at once: the child must be gone once the helper has
-  exited, exit codes must pass through, and ending the helper mid-run must end the
-  detached child too. The probe runs the same check on your PC (`process_end.job_object`,
-  which gates `confirm-profile` on Windows). **Chrome and Claude in Chrome's native
+  compiler (`csc.exe`, part of Windows 10 and 11), into the worker folder. The compiler's
+  path is fixed under the system root (`%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`,
+  then the 32-bit `Framework` folder), never looked up on PATH. When it builds the helper
+  the worker records both the source's hash and the built executable's own hash
+  (`pcw-jobrun.sha256`), and at every preflight it checks both and builds it again when
+  either differs. The helper puts itself in a new job with kill-on-close and with
+  breakaway not allowed, **reads the job back** (it must be in that very job, with
+  kill-on-close and neither breakaway flag, or it starts nothing), then starts `claude`:
+  everything the session starts is in the job and can't leave it, and when the helper
+  exits or is ended (a timeout, `STOP`, the exit handler) Windows ends every process still
+  in the job, a detached grandchild whose parent already exited included, which a tree
+  kill can miss. **If the helper can't be built or doesn't answer, Windows runs, the probe
+  and `bind-profile` refuse** until it can, with a code that says why:
+  `helper_compiler_missing` (no `csc.exe` under the system root), `helper_blocked` (the
+  compiler or the built helper was stopped from running, usually by security software),
+  or `containment_unavailable`. Nothing runs uncontained. The Windows CI job builds the
+  real helper, checks both recorded hashes and a rebuild after the executable is changed,
+  and runs an intermediary that starts a burst of short children and one detached child
+  and exits at once: the child must be gone once the helper has exited, exit codes must
+  pass through, and ending the helper mid-run must end the detached child too. The probe
+  runs the same check on your PC (`process_end.job_object`, which gates `confirm-profile`
+  on Windows), and then ends the helper itself while its program and a detached child
+  still run, and checks both are gone (`kill_tree_gone`). **Chrome and Claude in Chrome's native
   messaging host are outside the job by design**: the worker never starts Chrome (it must
   be open already), and Chrome starts the host. As a second layer the worker still reads
   the tree from the process list (the session
@@ -298,15 +317,23 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   ends the session there, before the model can use what it was given; the hook refuses
   every off-list tool meanwhile. The after-run check and its log line stay. **The
   inventory check is a barrier the hook enforces**: the worker writes a per-session
-  marker (`inventory-ok` in the worker folder, holding the session's id from its init
-  event) only once that session's inventory has passed, and the hook refuses every tool
-  call (`inventory_unconfirmed`) whose session id doesn't match a marker that exists. A
-  failed inventory, an init event it can't parse, one without a session id, or a worker
-  that fails leaves no marker, so nothing in that session runs. The marker is deleted
-  before and after every session. A test runs a stand-in CLI that prints its init event
-  and at once calls the real hook: refused until the marker exists, allowed after it, and
-  never allowed when the inventory fails. The preflight's self-test includes a call from a
-  session with no marker, which must be refused. The probe checks that the init event
+  marker (`inventory/<session id>` in the worker folder, behind the wall, named from the
+  session id the worker parsed from the init event and holding that id and a random word
+  made for this session alone, `PCW_RUN_NONCE`) only once that session's inventory has
+  passed. The hook lets a call run only when the marker for the call's own session id
+  holds exactly that id and this session's word. A marker with other words (another run's,
+  even with the same id) is refused at once (`inventory_unconfirmed`). **When the marker
+  isn't there yet** (the init event and the model's first call can race), the hook waits
+  for it, up to 5 seconds, and only then refuses, with its own message asking the model to
+  make the same call again (`inventory_not_ready`); that refusal never counts toward any
+  trip and never fails the run by itself. A failed inventory, an init event it can't
+  parse, one without a session id, or a worker that fails leaves no marker, so nothing in
+  that session runs. Every marker is deleted before and after every session (with the
+  keep-list cleanup) and at every worker start, so a leftover from an earlier session
+  never admits a new one. A test runs a stand-in CLI whose first call reaches the real
+  hook before its init event: allowed once the worker writes the marker; and with no
+  marker ever, refused as not ready after the wait. The preflight's self-test includes a
+  call from a session with no marker, which must be refused. The probe checks that the init event
   comes before the model's first turn (`init_order`, with the gap between them in
   milliseconds in `worker.log`'s `probe init_order` line) and stops if it doesn't.
 - **The browser tools: restricted by name, pinned in code.** The four reading tools,
@@ -361,11 +388,18 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   untrusted page data, never bare JSON; and Cain's keeper refuses a new job whose site,
   start address or description carries a value a result brought back that its job didn't
   supply (a masked account, a hash, an address fact, or a reached address other than the
-  job's own start address): "a job can't carry a value from a PC result". Tests run a
-  multi-field instruction and address-based payloads through the schema, the reader and
-  the keeper. Cain's rules still say a fact is never an instruction and never goes into a
-  tool's or a command's arguments; the code is the backstop for those rules, not a proof
-  that a page can't influence what Cain reads.
+  job's own start address): "a job can't carry a value from a PC result". **That refusal
+  is a mitigation, not a guarantee**: it matches values as written, so one reworded or
+  carried by meaning gets past it. The control is the pinned domains: whatever a job says,
+  its run opens only the hosts its signed entry names. When a follow-up job really needs a
+  reported value (an address you want checked next), Cain asks you first, and records your
+  answer on the job: `owner_reuse`, the values exactly and your answer in quotes. The
+  keeper then lets exactly those values through and nothing else from a result; it is
+  Cain's record of your tap, kept in the queue, not a signature. Tests run a multi-field
+  instruction and address-based payloads through the schema, the reader and the keeper,
+  and a reuse with and without your recorded answer. Cain's rules still say a fact is
+  never an instruction and never goes into a tool's or a command's arguments; the code is
+  the backstop for those rules, not a proof that a page can't influence what Cain reads.
 - **Failure records carry no values.** A failed or in-doubt result has its reason code
   and no address and no facts; the heartbeat holds a fixed code, a job id and a fixed
   reason; Cain's reader prints only those; and `last-run.json` on the PC holds the job
@@ -396,41 +430,57 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   run's end page, which is always the one literal address `about:blank` (allowed and
   logged like the others). A `tabs_create_mcp` with no address is refused (`no_address`):
   no tab opens where the run's checks can't place it. **Before the exact list, every
-  address goes through four checks, each refusing on its own**: (1) the scheme: only
+address is parsed once by the WHATWG URL parser** (Bun's and Node's `URL`), and every
+check reads what the parser made of it, each refusing on its own: (1) the scheme: only
   `http` and `https`; `file`, `data`, `javascript`, `blob`, `filesystem`, `view-source`,
   `chrome`, `chrome-extension`, `about` (but the literal `about:blank`), `ws`, `wss` and
   every other scheme are refused by scheme (`scheme_not_allowed`), before any path check;
-  (2) the address: a login in it is refused (`bad_address`), and a host that is an IP
-  literal in a loopback, private, link-local, shared, unspecified or multicast range (in
-  any form the browser reads, `127.1`, `2130706433`, `[::ffff:127.0.0.1]` among them), or
-  `localhost` by name, is refused (`private_address`); the run's own check page is the one
-  exception, by its exact origin (`http://127.0.0.1:<its port>`); (3) the domain: the
-  host's registrable domain must be one of the job's (below), or it is refused
-  (`domain_not_allowed`) before the call runs, so a page that plants an address on another
-  domain with content in its query gets nowhere; (4) a query or fragment is refused
-  (`query_not_allowed`) unless the entry allows them (`"query": true`), and then capped at
-  200 characters together (`query_too_long`). The hook refuses rather than strips. After
+  (2) the address: a login in it is refused (`bad_address`); **every IP-literal host is
+  refused**, however it was written (`2130706433`, `0x7f.1`, `0177.0.0.1`,
+  `[::ffff:127.0.0.1]`, any bracketed IPv6: the parser turns each into its plain form
+  first): a loopback, private, link-local, shared, unspecified or multicast one, or
+  `localhost` by name, as `private_address`, any other as `ip_address`; the run's own
+  check page is the one exception, matched by scheme, address, port and path (its page
+  and the pages under it); a host ending in a dot is refused (`trailing_dot`); (3) the
+  domain: the host must be one the job's signed allowlist entry allows (below), with a
+  registrable domain by the **pinned Public Suffix List** (`pcjobs/public_suffix_list.dat`,
+  its private section included, checked against its hash in `core.ts` and part of the
+  worker's own hash, so a changed list fails closed and needs a new probe), or it is
+  refused (`domain_not_allowed`) before the call runs, so a page that plants an address on
+  another domain with content in its query gets nowhere, and a shared-hosting neighbour
+  (another `github.io` site) is another domain; an internationalized host (punycode,
+  `xn--`) passes only where the entry names it exactly (`idn_not_allowed`), so a homograph
+  of an allowed host is refused; (4) a fragment is always refused (`fragment_not_allowed`);
+  a query is refused (`query_not_allowed`) unless the entry names `query_params` and every
+  parameter's name matches one of them, capped at 200 characters (`query_too_long`). The
+  hook refuses rather than strips. After
   it decides to allow a navigation, it resolves the host name where it can (within 2
   seconds): one that resolves to a private address is refused (`private_address`); one
   that doesn't resolve isn't refused for that (the browser can't reach it either), and the
   log line says `resolved`. Only names that already passed the domain check are looked up.
   The path normaliser (the wall above) still runs first, as defence in depth. The probe
-  drives the real hook with a file address, a localhost address, 127.0.0.1 on another port
-  and a private network address, each listed as allowed so only these checks stand in the
+  drives the real hook with a file address, a localhost address, 127.0.0.1 on another port,
+  a private network address, `2130706433`, `0x7f.1`, `[::ffff:127.0.0.1]` and a host with a
+  trailing dot, each listed as allowed so only these checks stand in the
   way (`addresses`); `confirm-profile` refuses without it (`address_check_required`). The
   pinned address written another way, a call without a tool-use id: refused. **Each job's
-  navigation is bound to its registrable domains**: its allowlist entry's `domains` when it
-  names them (they must include its site's and each sign-in host's), or else its site's and
-  its sign-in hosts' registrable domains; the job's own site is one of them. The run's
-  instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMAINS`). **It keeps the
+  navigation is bound to its entry's domains**: the `domains` every entry must name (an
+  entry without them is refused when you sign it and when the worker loads the
+  allowlist), taken from the signed entry alone, never from the job. A job whose own hosts
+  (its site and its start address's host) aren't all inside them is refused before any
+  session (`domain_not_allowed`). The run's
+instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMAINS`). **It keeps the
   tab-context order itself**: after a new tab, and on a PC whose reading tools don't
   report their tab's address (the confirmation's `read_context`) after every page read, a
   tab context is owed, and the hook refuses every other tool with a message telling the
   model to call `mcp__claude-in-chrome__tabs_context_mcp` and saying it needs no arguments
   (`context_owed`, from the hook's own log of the session). Those refusals don't count as
-  `navigation_denied`. **They are counted per owed context**: each refused call while one
-  tab context is owed adds one (a read tried in between is refused too, so it counts), and
-  only the tab context itself ends it and starts the next count at zero. Three in a row
+  `navigation_denied`. **They are counted per owed context**: only a `context_owed`
+  refusal adds one (a read tried while the context is owed is refused that way, so it
+  counts); the tab context itself ends it and starts the next count at zero, and an
+  allowed page read sets the count back to zero too. No other refusal counts or resets
+  anything: a refused scheme, domain, address or unlisted tool, and the barrier's
+  not-ready answer, are never a trip. Three in a row
   for the same owed context fail the run as `tab_context_owed`; refusals spread over
   separate owed contexts don't add up, so a long chore that slips once per context, five
   times over with reads between, still passes. The required order is in the session
@@ -440,7 +490,21 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   multi-tab chore (three pages, each in a new tab, each read twice, the rule on after every
   read) and records the trip rate per read (`chore`: tabs, reads, refusals, the longest
   run for one context, and the rate); a rate above 0.25, a run of three, or a missed tab
-  or read fails the confirmation (`context_order_failed`). Any error inside it, input it can't read, or no input within its 10 second
+  or read fails the confirmation (`context_order_failed`). **It checks every page read as
+  it happens, too** (`read-guard`, a PostToolUse hook on `read_page`, `get_page_text` and
+  `find` in the pinned settings): before a reading tool's answer reaches the model, it
+  reads the tab's current address from the answer's own header and checks it against the
+  run's domains as it would a navigation (the check page and the end page pass). A page
+  that moved its tab off the job's sites after an allowed navigation (a redirect, a script)
+  is read there and refused: the answer is replaced by a one-line refusal, so none of that
+  page reaches the model, the decision is logged as `read_drift` with the address's
+  registrable domain and keyed hashes only, and the run fails (`read_drift`). Every page
+  read in a run needs that decision, or the run fails (`hook_missing_decision`). An answer
+  that doesn't report its address (a PC whose reading tools don't: `read_context`) is
+  logged as `read_unplaced` and left to the tab context the hook already demands after
+  every read there. Not verified on a real PC yet: that the installed Claude Code applies
+  a PostToolUse hook's replacement of an MCP tool's answer (`updatedMCPToolOutput`); if it
+  doesn't, the refused read still fails the run, but its text has reached the model. Any error inside it, input it can't read, or no input within its 10 second
   deadline (headroom for a cold start of Git Bash and the runtime) is refused too (exit
   code 2 and a deny decision in JSON); its settings timeout (30 seconds) is longer than
   that deadline, so it refuses before Claude Code would give up on it. A test in the
@@ -704,12 +768,18 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    (the settings page redirecting to `/account/security/`), list where in `redirects`:
    path prefixes on the pinned address's own host, each starting with `/` and ending
    with `/` (or an exact path), never `/` alone. A run that ends anywhere else is
-   `unexpected_location`. **New in this version:** an entry may name `domains`, the
-   registrable domains its runs may open (`["example.com", "examplecdn.com"]`); it must
-   include the site's and each sign-in host's, and without it they are the domains the
-   runs may open. An entry may also say `"query": true` to let its runs open addresses
-   with a query or fragment (capped at 200 characters); the signing tool treats that as
-   risky (`"reviewed": true` needed). Sign it: `worker.ts sign-allowlist <entries.json> --key
+   `unexpected_location`. **Every entry must name `domains`** (new in this version, and
+   an allowlist signed before it is refused until you sign it again with them): the hosts
+   its runs may open, each exactly (`"www.example.com"` is that host only) or, only where
+   you mean every subdomain, as a wildcard (`"*.example.com"`: any host under it, not
+   `example.com` itself). Together they must cover the pin's host, the site and every
+   sign-in host (a `.host` sign-in entry needs both `host` and `*.host`). A wildcard over a
+   public suffix (`*.co.uk`, `*.github.io`), an IP address and a host with a trailing dot
+   are refused, and an internationalized host is allowed only exactly. For example:
+   `"domains": ["example.com", "accounts.example.com"]`. Queries stay off by default; an
+   entry may name `query_params`, the parameter names its runs may send (`["tab",
+   "page*"]`, a trailing `*` for a prefix), and the signing tool treats that as risky
+   (`"reviewed": true` needed). The old `"query": true` is refused. Sign it: `worker.ts sign-allowlist <entries.json> --key
    <folder>/owner-key.pem --kid owner-1 --out C:/pc-worker-k7q2xz/allowlist.json`. The key is
    passphrase-protected and stays outside the worker folder. The signing tool refuses an
    address with a query, or a pin, redirect or sign-in path with `logout`, `signout`,
@@ -821,9 +891,11 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    self-test (`hook_selftest_failed`).
    **The Job Object helper (new in this version).** Nothing to do by hand either: the
    first preflight builds `C:/pc-worker-k7q2xz/pcw-jobrun.exe` with
-   `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` (part of Windows). If
-   that compiler is missing or an antivirus blocks the build, every run stops with
-   `containment_unavailable` (Troubleshooting).
+   `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe` (part of Windows; the
+   32-bit `Framework` folder if that one is missing), and rebuilds it whenever its source
+   or the built file no longer matches what it recorded. If that compiler is missing every
+   run stops with `helper_compiler_missing`; if security software stops the build or the
+   helper, `helper_blocked`; otherwise `containment_unavailable` (Troubleshooting).
 10. **Bind the profile, once.** With the Cain jobs Chrome open and no other Claude Code
     running, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
     bind-profile --attended --home C:/pc-worker-k7q2xz`. A short session opens a page the worker
@@ -1129,8 +1201,13 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `extension_version_mismatch` | `probe`'s detail: `live` and `disk`; chrome://extensions | The session reports another Claude in Chrome version than the one installed in the Cain jobs profile (its newest version folder's `manifest.json`), or, where the session reports none (an attended run), that manifest's version changed during the run: another profile's extension may be answering, or Chrome hasn't finished an update. Restart that Chrome, then probe again. Needs a code change: no. |
 | `navigation_unguarded` | `nav-decisions.jsonl` against the session's navigations | A navigation's logged allow didn't match its own tool and address. Run the probe. |
 | `hook_missing_decision` from the probe's smoke step (the Windows hook quoting case) | `nav-decisions.jsonl` is missing or empty | The hook command didn't start. Claude Code runs it through Git Bash: `"$PCW_RUNTIME" "$PCW_WORKER" nav-guard`, both paths with forward slashes, set by the worker. Check `bun` (or `node`) runs from that path in Git Bash (`"C:/Users/you/.bun/bin/bun.exe" --version`) and that the worker's folder path has no `"` in it. |
-| `navigation_denied` | `nav-decisions.jsonl`: the `deny` lines and their `why` | The session tried an address or tool it may not (`address_not_allowed`, whose line has only the address's registrable `domain` and the keyed hashes `host_hmac` and `url_hmac`, never the address; `no_address`, a new tab without one; `tool_not_allowed`, a tool name not on the hook's list; `scheme_not_allowed`, an address that isn't http or https; `private_address`, this computer or its network, or a name that resolves to one; `domain_not_allowed`, a registrable domain the job's entry doesn't name, the usual sign of a page planting an address; `query_not_allowed` or `query_too_long`; `inventory_unconfirmed`, a call before the session's inventory passed), or nav-guard couldn't decide (`timeout`, `internal_error`, `unreadable_input`, `log_failed`). A page talking the model into a detour shows up here: look at the job's site. A `tool_not_allowed` after an extension update means the extension added or renamed a tool. `context_owed` lines aren't counted here (see `tab_context_owed`). |
+| `navigation_denied` | `nav-decisions.jsonl`: the `deny` lines and their `why` | The session tried an address or tool it may not (`address_not_allowed`, whose line has only the address's registrable `domain` and the keyed hashes `host_hmac` and `url_hmac`, never the address; `no_address`, a new tab without one; `tool_not_allowed`, a tool name not on the hook's list; `scheme_not_allowed`, an address that isn't http or https; `private_address`, this computer or its network, or a name that resolves to one; `ip_address`, any other IP-literal host; `trailing_dot`; `domain_not_allowed`, a host the job's entry doesn't allow, the usual sign of a page planting an address; `idn_not_allowed`, an internationalized host the entry doesn't name exactly; `query_not_allowed`, `query_too_long` or `fragment_not_allowed`; `inventory_unconfirmed`, a call whose session marker isn't this session's), or nav-guard couldn't decide (`timeout`, `internal_error`, `unreadable_input`, `log_failed`). A page talking the model into a detour shows up here: look at the job's site. A `tool_not_allowed` after an extension update means the extension added or renamed a tool. `context_owed` lines aren't counted here (see `tab_context_owed`), nor `inventory_not_ready` lines (the model was asked to make the same call again). |
+| `read_drift` | `nav-decisions.jsonl`: the line with `why` `read_drift` and `phase` `post` (its registrable `domain` and keyed hashes, never the address) | A page read happened on a tab that had left the job's sites (a redirect after an allowed navigation, or a script moving the tab), and read-guard refused it before the model saw it. Look at the job's site: if it really sends you on to another host to show that page, add that host to the entry's `domains` and sign again. Needs a code change: no. |
+| `domain_not_allowed` (a job's result) | the job and your allowlist entry | The job names a host (its site or its start address's host) that its entry's `domains` don't allow, so no session ran. Write the job on the entry's own hosts, or add the host to the entry and sign again. Needs a code change: no. |
+| `allowlist_domains_missing` (`sign-allowlist`), or `allowlist_unverified` on every job | its detail: `entry <n>: name "domains" ...`; `worker.ts sign-allowlist` | An entry has no `domains` (every entry needs them from this version). Add the hosts its runs may open (setup step 5) and sign again. Needs a code change: no. |
 | `tab_context_owed` | `nav-decisions.jsonl`: the `deny` lines with `why` `context_owed` | The hook refused three calls in a row for the same owed tab context (after a new tab, or after a read on a PC whose reads don't report their address) and the model didn't call `mcp__claude-in-chrome__tabs_context_mcp` when told to. Refusals for separate owed contexts don't add up. Run again once; if it repeats, the session prompt or the reading tools changed: report it. Needs a code change: maybe. |
+| `helper_compiler_missing` | `%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe` and `%SystemRoot%\Microsoft.NET\Framework\v4.0.30319\csc.exe`: neither there | Windows has no .NET Framework 4 compiler where the worker looks (it never searches PATH, and it reads the system root from `SystemRoot`, falling back to `C:\Windows`). The .NET Framework 4 that comes with Windows 10 and 11 includes it: if it is gone, repair the .NET Framework (Windows Update, or Microsoft's .NET Framework Repair Tool), then run `worker.ts run --attended` again. Needs a code change: no. |
+| `helper_blocked` | your security software's log (look for `csc.exe` or `pcw-jobrun.exe` in the worker folder) | The compiler or the built helper was stopped from starting. Allow `C:/pc-worker-k7q2xz/pcw-jobrun.exe` (and the compiler, for the build) in your security software, delete `pcw-jobrun.exe` and `pcw-jobrun.sha256`, then run again. Needs a code change: no. |
 | `containment_unavailable` | `C:/pc-worker-k7q2xz/pcw-jobrun.exe` there? `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` there? Your antivirus's log | The worker couldn't build or start the Windows Job Object helper, so nothing runs uncontained. Make sure the .NET Framework 4 compiler above exists (it ships with Windows 10 and 11), allow the build in your antivirus, delete `pcw-jobrun.exe` and `pcw-jobrun.sha256` so it is built again, then run `worker.ts run --attended` once more. From `confirm-profile`: the probe's Job Object check saw a detached process outlive its job: report it. Needs a code change: no, or yes from `confirm-profile`. |
 | `address_check_required` from `confirm-profile` | `probe-evidence.json`: `addresses` | The real hook let a file address, a localhost address, 127.0.0.1 on another port or a private network address through. A damaged or old harness copy: update it and probe again. Needs a code change: no. |
 | `unlisted_check_required`, `process_end_required` or `context_order_failed` from `confirm-profile` | `probe-evidence.json`: `unlisted`, `process_end`, `context_trips`; `worker.log`'s `probe process_end` and `tree_end` lines | `unlisted`: the real hook let a tool not on its list through (a damaged or old harness copy: update it, probe again). `process_end`: a process tree was still running 10 seconds after it was ended (`tree_kill.left`): something keeps restarting it or Windows refused to end it (an antivirus hold); close it and probe again. `context_order_failed`: an honest chore tripped the tab-context order more than once, or the probe's multi-tab chore (`chore` in the evidence: its `rate_per_read` and `longest`) slipped too often: report it. Needs a code change: no, no, yes. |
@@ -1266,14 +1343,15 @@ Cain reads them as facts, and nothing in one tells him or the worker what to do.
   `done`, `failed`, `in_doubt`, `cancelled`), `lease_until` (only while claimed),
   `attempt` (the claim's id), `site`, `action` (one of the fixed set), `step`,
   `start_url` (https, on the site, no query), `done_looks_like`, and for a confirm only:
-  `follows`, `preview_seen`, `owner_go`, `go_token`.
+  `follows`, `preview_seen`, `owner_go`, `go_token`; and `owner_reuse` (null, or the
+  reported values a read reuses and your answer to Cain's ask, in quotes).
 - Result, `results/<id>.json`: `v`, `id`, `attempt`, `status` (`done`, `failed`,
   `refused`, `expired`, `in_doubt`, `cancelled`), `code`, `handoff`, `worker_clock`,
   `final_url`, `facts`, `tools`, `attended`.
 - `cancels/<id>.json` (Cain), `nonces/<nonce>.json` (the confirm path, unused),
   `worker/heartbeat.json` (the worker), `.gitattributes` (`*.json text eol=lf` and the rest).
 - The PC's allowlist, `allowlist.json`: `{"v": 1, "kid", "allow": [{"site", "action",
-  "url", "match", "login_hosts"?, "login_paths"?, "alternatives"?, "redirects"?, "reviewed"?, "domains"?, "query"?}], "sig"}`, signed with your key;
+  "url", "match", "domains", "login_hosts"?, "login_paths"?, "alternatives"?, "redirects"?, "reviewed"?, "query_params"?}], "sig"}`, signed with your key;
   `owner.pub`: `<kid> <public key>`, matching `owner_fpr` in `install.json`.
 - On the PC only: `install.json` (yours, with `native_host_manifest`), `confirmed.json` and `probe-evidence.json`
   (the probe and `confirm-profile`), `profile-marker.json` (the hash of the profile's

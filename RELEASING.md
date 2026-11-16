@@ -21,7 +21,11 @@ branch is up to date with `main` and these checks passed on it:
   so a pull request can't change the check it is judged by; it only reads the pull
   request with git and never runs its files):
   - the branch is up to date with `main` as it is when the check runs;
-  - the description, read live from GitHub, follows `.github/pull_request_template.md`;
+  - the description, read live from GitHub, follows `.github/pull_request_template.md`,
+    and is for this round: for each App that goes up a version it carries the line
+    `Changelog: <App> <version> <hash>` (the first 12 hex digits of the SHA-256 of that
+    App's newest CHANGELOG section), so a description left from an earlier round of fixes
+    fails until it is refreshed; the failure prints the line to add;
   - each App whose shipped files changed (anything in its folder but `tests/` and
     `tools/`, a move in or out counting at both ends) goes up exactly one version step
     from `main`, with a matching section at the top of its `CHANGELOG.md`. An App that
@@ -69,7 +73,9 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
    that expose a private email). Message: `<App> <version>: <what, in a line>`.
 6. Push the branch and open a pull request into `main`. The description follows the
    template's four sections: what changed, how it was tested, what is not verified, and
-   anything Dane must do (for example a new option to switch on). Its title,
+   anything Dane must do (for example a new option to switch on), and the round line the
+   `pr` check asks for (run check_pr.py by hand to get it). Refresh the whole description
+   whenever a new round of fixes changes the CHANGELOG. Its title,
    `<App> <version>: <what he'll notice>`, is plain words with no em dashes, shas or ids.
    Dane's Ship card doesn't show it: the link writes every line there but Cain's own.
 7. Wait for the `pytest`, `bun` and `pr` checks on the pull request to pass. Fix until

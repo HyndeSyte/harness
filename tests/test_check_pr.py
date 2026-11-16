@@ -345,16 +345,70 @@ def _commit(repo, files=None, moves=()):
     _git(repo, "commit", "-q", "-m", "change")
 
 
+def marked(body, *markers):
+    return body + "\n" + "\n".join(markers) + "\n"
+
+
 def test_end_to_end_on_git(repo, tmp_path, capsys):
     _commit(repo, {"cain/run.sh": "echo hello\n", "cain/config.yaml": cfg("0.4.6"),
                    "cain/CHANGELOG.md": log("0.4.6", "0.4.5")})
     body = tmp_path / "body.md"
-    body.write_text(GOOD_BODY)
+    body.write_text(marked(GOOD_BODY, check_pr.round_marker("Cain", "0.4.6", log("0.4.6", "0.4.5"))))
     assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 0
     assert capsys.readouterr().out.startswith("ok:")
-    body.write_text(GOOD_BODY.replace("## Not verified", "## Unverified"))
+    body.write_text(marked(GOOD_BODY, check_pr.round_marker("Cain", "0.4.6", log("0.4.6", "0.4.5"))).replace("## Not verified", "## Unverified"))
     assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 1
     assert '"## Not verified"' in capsys.readouterr().out
+
+
+# -- the round: the description matches the newest CHANGELOG section ----------------
+
+def test_the_marker_is_the_newest_sections_hash():
+    text = "# Changelog\n\n## 0.4.6\n\n- one   \r\n- two\n\n## 0.4.5\n\n- old\n"
+    assert check_pr.changelog_section(text) == "## 0.4.6\n\n- one\n- two"
+    m = check_pr.round_marker("Cain", "0.4.6", text)
+    assert re.fullmatch(r"Changelog: Cain 0\.4\.6 [0-9a-f]{12}", m)
+    # Line ends and trailing spaces don't matter; another bullet does.
+    assert check_pr.round_marker("Cain", "0.4.6", text.replace("\r\n", "\n").replace("one   ", "one")) == m
+    assert check_pr.round_marker("Cain", "0.4.6", text.replace("- two", "- two\n- three")) != m
+    assert check_pr.round_marker("Cain", "0.4.6", None) is None
+
+
+def test_only_bumped_apps_need_a_marker():
+    base = state()
+    head = {**state(cain=("0.4.6", "0.4.5"))}
+    marks = check_pr.expected_markers(base, head)
+    assert marks == [check_pr.round_marker("Cain", "0.4.6", log("0.4.6", "0.4.5"))]
+    assert check_pr.expected_markers(base, state()) == []
+
+
+def test_a_description_from_an_earlier_round_fails_and_says_what_to_add():
+    earlier = check_pr.round_marker("Cain", "0.4.6", log("0.4.6", "0.4.5"))
+    now_log = "# Changelog\n\n## 0.4.6\n\n- a change\n- a fix from the next round\n\n## 0.4.5\n\n- a change\n"
+    now = check_pr.round_marker("Cain", "0.4.6", now_log)
+    assert earlier != now
+    problems = check_pr.check_round(marked(GOOD_BODY, earlier), [now])
+    assert len(problems) == 1 and f'add the line "{now}"' in problems[0]
+    assert check_pr.check_round(marked(GOOD_BODY, now), [now]) == []
+    # The marker counts only as a line of its own, not inside other text.
+    assert check_pr.check_round(GOOD_BODY + f"\nsee {now} here\n", [now]) != []
+
+
+def test_a_stale_description_fails_on_git(repo, tmp_path, capsys):
+    first = log("0.4.6", "0.4.5")
+    _commit(repo, {"cain/run.sh": "echo hello\n", "cain/config.yaml": cfg("0.4.6"), "cain/CHANGELOG.md": first})
+    body = tmp_path / "body.md"
+    body.write_text(marked(GOOD_BODY, check_pr.round_marker("Cain", "0.4.6", first)))
+    assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 0
+    capsys.readouterr()
+    # The next round adds to the CHANGELOG; the description wasn't refreshed.
+    second = first.replace("## 0.4.6\n\n- a change\n", "## 0.4.6\n\n- a change\n- the next round's fix\n")
+    _commit(repo, {"cain/CHANGELOG.md": second})
+    assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 1
+    out = capsys.readouterr().out
+    assert "isn't for this round" in out and check_pr.round_marker("Cain", "0.4.6", second) in out
+    body.write_text(marked(GOOD_BODY, check_pr.round_marker("Cain", "0.4.6", second)))
+    assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 0
 
 
 def test_a_rename_into_tests_counts_on_git(repo, capsys):

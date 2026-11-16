@@ -28,6 +28,9 @@
 //   worker.ts nav-guard                 reads the tool call on stdin, logs its decision by tool-use id; exit 2 and a
 //                                       deny decision refuse it. Anything it can't decide (an error, input it can't
 //                                       read, no answer in time, a tool it doesn't know) is refused.
+//   worker.ts read-guard                after every page read (PostToolUse): checks the tab's address in the answer
+//                                       against the run's domains; a tab that left them has its answer replaced
+//                                       by a refusal before the model sees it, and is logged as read_drift.
 //
 // Every command takes --home <worker folder> (default PC_WORKER_HOME, else the current
 // folder), which holds: install.json (the owner's install config, written once at setup),
@@ -37,8 +40,8 @@
 // (the session's empty working folder), claude-config/ (the worker's own Claude Code folder:
 // its sign-in, made once at setup, and a session's transcripts only until its end step), and the worker's own STOP (the kill switch),
 // worker.lock, heartbeat.json, worker.log, nav-decisions.jsonl (the hook's decisions for
-// the last session), inventory-ok (the inventory barrier's marker, only while a session
-// runs), pcw-jobrun.exe and pcw-jobrun.sha256 (Windows: the Job Object helper, built from
+// the last session), inventory/ (the inventory barrier's markers, one per session id, only
+// while a session runs), pcw-jobrun.exe and pcw-jobrun.sha256 (Windows: the Job Object helper, built from
 // jobrun.cs), last-run.json (the last run's end check), leftover-tabs.json and,
 // only when asked, diagnostics.log. The per-run canary is served over HTTP on
 // 127.0.0.1, never written to a file.
@@ -61,11 +64,11 @@ import { createHash, createHmac, generateKeyPairSync, createPrivateKey, createPu
 import {
   addressCtxFor, canonical, checkFacts, factsFor, isReadOnly, jobText, keyFingerprint, LEASE_MS, newAttempt, onLogin, onPin, onRedirect, parseAllowlist,
   parseHeartbeat, parseJob, parseKeys, parseResult, pinFor, riskyMatch, resultText, sanitizeUrl, signAllowlist, signerOf, SKEW_MS, stateAfter,
-  attributesGood, KID, TOOL, registrableDomain, entryDomains, QUERY_MAX,
+  attributesGood, KID, TOOL, registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScopeProblem, queryAllowed, plainHost, PSL_FILE, PSL_SHA256, pslText, QUERY_MAX,
   type Allow, type Checked, type Code, type FactType, type Handoff, type Heartbeat, type Job, type Reason, type Result, type Status,
 } from "./core.ts";
 import { publicOf } from "../link/shipkey.ts";
-export { registrableDomain, entryDomains, QUERY_MAX };
+export { registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScopeProblem, queryAllowed, QUERY_MAX, PSL_FILE, PSL_SHA256, pslText };
 
 // ---- Options, paths, errors -----------------------------------------------------------
 // stopped: the owner's STOP file appeared while the session ran, and the worker ended it.
@@ -120,6 +123,7 @@ export interface Opts {
   shortPath?: (path: string) => string | null;      // Windows: a path's real 8.3 short form (shortPath, cmd's %~s, unless a test stands in)
   processCheck?: (o: Opts) => Promise<ProcessLine>; // the probe's process-end check (processCheck unless a test stands in)
   jobHelper?: string | null;                        // Windows: the containment helper's path, null for none (ensureJobHelper unless a test stands in)
+  csc?: (env: Record<string, string | undefined>) => string | null; // Windows: the compiler's path (cscPath unless a test stands in)
   holders?: (files: string[]) => Holder[];          // what holds files a sweep couldn't delete (fileHolders unless a test stands in)
   resolveHosts?: boolean;                           // false: the hook doesn't resolve host names (tests without a network); on otherwise
 }
@@ -151,7 +155,7 @@ const P = {
   tabs: (o: Opts) => join(o.home, "leftover-tabs.json"),
   marker: (o: Opts) => join(o.home, "profile-marker.json"),
   hookKey: (o: Opts) => join(o.home, "hook-key"),
-  inventory: (o: Opts) => join(o.home, "inventory-ok"),
+  inventory: (o: Opts) => join(o.home, "inventory"),
 };
 
 export const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -356,8 +360,13 @@ export function allowedTools(settings: any): string[] | null {
   // timeout longer than nav-guard's own deadline (it refuses before Claude Code gives up on it).
   const pre = settings?.hooks?.PreToolUse;
   const guard = Array.isArray(pre) && pre.some((h: any) => h?.matcher === GUARD_MATCHER && Array.isArray(h.hooks)
-    && h.hooks.some((c: any) => c?.type === "command" && c.command === HOOK_COMMAND && Number.isInteger(c.timeout) && c.timeout * 1000 > HOOK_MS && c.timeout <= 60));
+    && h.hooks.some((c: any) => c?.type === "command" && c.command === HOOK_COMMAND && Number.isInteger(c.timeout) && c.timeout * 1000 > HOOK_DEADLINE_MS && c.timeout <= 60));
   if (!guard) return null;
+  // The read-time drift check: one PostToolUse hook on the three page-reading tools, running read-guard.
+  const post = settings?.hooks?.PostToolUse;
+  const reads = Array.isArray(post) && post.some((h: any) => h?.matcher === READ_MATCHER && Array.isArray(h.hooks)
+    && h.hooks.some((c: any) => c?.type === "command" && c.command === READ_GUARD_COMMAND && Number.isInteger(c.timeout) && c.timeout * 1000 > HOOK_MS && c.timeout <= 60));
+  if (!reads) return null;
   return [...READING, ...NAVIGATING];
 }
 // The permission mode the session runs in: Claude Code refuses, without asking, any tool
@@ -378,6 +387,9 @@ export const HOOK_COMMAND = "\"$PCW_RUNTIME\" \"$PCW_WORKER\" nav-guard";
 export const HOOK_MS = 10_000;
 // The settings' timeout for the hook, in seconds: Claude Code gives up on it after this.
 export const HOOK_TIMEOUT_S = 30;
+// nav-guard's longest honest run: its input deadline, the inventory barrier's wait and the
+// host name lookup. Its own hard stop sits just past this, and the settings' timeout above it.
+export const HOOK_DEADLINE_MS = HOOK_MS + 5_000 + 2_000;
 // The allowed tools that only read, pinned by exact name: the tab context (the tabs in
 // Claude's group and their addresses), a page's structure (read_page), its text
 // (get_page_text) and a search in it (find). Nothing that reads the console or the
@@ -988,8 +1000,10 @@ const CONFIRMED_KEYS = ["v", "at", "fingerprint", "settings_sha256", "prompt_sha
   "deny_cli_version", "cli_sha256", "boundary_version", "worker_sha256", "cain_version", "policy_version"];
 const HEX64 = /^[0-9a-f]{64}$/;
 // The hook's policy version: raised whenever what nav-guard allows or refuses changes.
-export const POLICY_VERSION = "13";
-export const WORKER_CODE = [WORKER_FILE, join(HERE, "core.ts"), join(HERE, "jobrun.cs")];
+export const POLICY_VERSION = "14";
+// The worker's own code, hashed into every confirmation: this file, the format, the Windows
+// helper's source and the pinned Public Suffix List (core.ts also checks the list's own hash).
+export const WORKER_CODE = [WORKER_FILE, join(HERE, "core.ts"), join(HERE, "jobrun.cs"), PSL_FILE];
 export function workerSha(files: string[] = WORKER_CODE): string | null {
   try { const h = createHash("sha256"); for (const f of files) h.update(readFileSync(f)).update("\0"); return h.digest("hex"); } catch { return null; }
 }
@@ -1282,7 +1296,7 @@ const describe = (t: FactType) => t.t === "bool" ? "true or false" : t.t === "en
 export interface Instruction {
   id: string; attempt: string; site: string; action: string; start_url: string; look_for: string;
   facts: Record<string, string>; outcomes: readonly string[]; canary_url: string; done_url: string; tab_id: number | null;
-  allowed_domains: string[];   // the registrable domains this run may open (the hook refuses any other before the call runs)
+  allowed_domains: string[];   // the hosts this run may open, from its signed allowlist entry: exact, or *.host wildcards (the hook refuses any other before the call runs)
 }
 
 const instruction = (j: Job, c: Canary, tab: number | null, domains: string[] = []): Instruction => ({
@@ -1296,7 +1310,10 @@ const instruction = (j: Job, c: Canary, tab: number | null, domains: string[] = 
 export function blocker(job: Job, allow: Checked<Allow[]>): { status: Status; code: Code } | null {
   if (!isReadOnly(job)) return { status: "refused", code: "action_not_read_only" };
   if (!allow.ok) return { status: "refused", code: "allowlist_unverified" };
-  if (!pinFor(job, allow.value)) return { status: "refused", code: "not_allowlisted" };
+  const pin = pinFor(job, allow.value);
+  if (!pin) return { status: "refused", code: "not_allowlisted" };
+  // The run's domains are the entry's own; a job naming a host outside them never gets a session.
+  if (jobScopeProblem(job, pin)) return { status: "refused", code: "domain_not_allowed" };
   return null;
 }
 
@@ -1606,18 +1623,21 @@ export const mentionsWorker = (input: unknown, paths: string[], tokens?: string[
 // name and the short names as whole tokens) go to the hook as PCW_DENY_PATHS and
 // PCW_DENY_TOKENS; the hook key's file as PCW_HOOK_KEY_FILE; and contextAfterRead (the
 // confirmation's read_context, on in the probe) as PCW_CONTEXT_AFTER_READ. The navigation
-// scope: PCW_NAV_DOMAINS (the job's allowed registrable domains: its allowlist entry's, or
-// what the exact list implies), PCW_NAV_CANARY (the run's check page origins, the one IP
-// exception) and PCW_NAV_QUERY (the entry allows a query); PCW_RESOLVE has the hook resolve
-// an allowed host name; PCW_INVENTORY_MARKER is the inventory barrier's marker file.
-export interface EnvScope { domains?: string[]; query?: boolean }
+// scope: PCW_NAV_DOMAINS (the job's domain patterns, from its signed allowlist entry
+// alone, or what the exact list implies for the worker's own checks), PCW_NAV_CANARY (the
+// run's check page addresses, the one IP exception, matched by scheme, address, port and
+// path) and PCW_NAV_QUERY (the entry's query parameter patterns, [] for none);
+// PCW_RESOLVE has the hook resolve an allowed host name; PCW_INVENTORY_DIR is the inventory
+// barrier's marker folder and PCW_RUN_NONCE this session's own random word, which a
+// marker must hold (so a marker left from any earlier session never admits this one).
+export interface EnvScope { domains?: string[]; query?: string[] }
 export function sessionEnv(o: Opts, navAllow: string[], contextAfterRead = false, scope: EnvScope = {}): Record<string, string> {
   const wall = wallOf(o);
-  const sc = scopeOf(navAllow, scope.domains, scope.query === true);
+  const sc = scopeOf(navAllow, scope.domains, scope.query ?? []);
   return { ...baseEnv(o), CLAUDE_CONFIG_DIR: P.cliConfig(o), PCW_NAV_ALLOW: JSON.stringify(navAllow), PCW_NAV_LOG: fwd(P.navLog(o)),
     PCW_DENY_PATHS: JSON.stringify(wall.paths), PCW_DENY_TOKENS: JSON.stringify(wall.tokens), PCW_HOOK_KEY_FILE: fwd(hookKey(o)),
-    PCW_NAV_DOMAINS: JSON.stringify(sc.domains), PCW_NAV_CANARY: JSON.stringify(sc.canary), PCW_NAV_QUERY: sc.query ? "1" : "0",
-    PCW_RESOLVE: o.resolveHosts === false ? "0" : "1", PCW_INVENTORY_MARKER: fwd(P.inventory(o)),
+    PCW_NAV_DOMAINS: JSON.stringify(sc.domains), PCW_NAV_CANARY: JSON.stringify(sc.canary), PCW_NAV_QUERY: JSON.stringify(sc.query),
+    PCW_RESOLVE: o.resolveHosts === false ? "0" : "1", PCW_INVENTORY_DIR: fwd(P.inventory(o)), PCW_RUN_NONCE: randomBytes(16).toString("hex"),
     ...(contextAfterRead ? { PCW_CONTEXT_AFTER_READ: "1" } : {}) };
 }
 
@@ -1685,6 +1705,7 @@ export function sweepSession(o: Opts, tries = 6): { found: string[]; ok: boolean
 // The sweep at a worker's start: leftovers from a worker killed mid-run. Their names go to
 // worker.log (transcripts_swept); a sweep that fails is session_cleanup_failed.
 export function startSweep(o: Opts): { swept: boolean; code: "session_cleanup_failed" | null } {
+  clearMarkers(o);
   const sw = sweepSession(o);
   return { swept: sw.found.length > 0, code: sw.ok ? null : "session_cleanup_failed" };
 }
@@ -1707,7 +1728,14 @@ export const CLEANUP_HINT = "what a session left in claude-config couldn't be de
 // folder is deleted, transcripts and all. It is the one place page text lives on the PC,
 // and only for the session's duration. A delete that fails is session_cleanup_failed.
 export function endSession(o: Opts) {
+  clearMarkers(o);
   if (!sweepSession(o).ok) throw new WorkerError("session_cleanup_failed", cleanupHint(o));
+}
+// The inventory barrier's markers (inventory/ in the worker folder, behind the wall): all
+// of them go before every session, after it (with the keep-list sweep above) and at every
+// worker start, so none outlives the session it was written for.
+export function clearMarkers(o: Opts) {
+  try { rmSync(P.inventory(o), { recursive: true, force: true }); } catch { /* a marker left behind still can't admit another session: its nonce is that session's */ }
 }
 // The cleanup message, naming what holds what is left where the worker can read it: on
 // Windows the containment helper asks the Restart Manager (holders), each holder as its
@@ -1838,19 +1866,18 @@ function onExitSweep(o: Opts): () => void {
 export async function runSession(o: Opts, argv: string[], timeoutMs: number, env: Record<string, string>, gate?: Gate): Promise<Session> {
   prepareCwd(o);
   const off = onExitSweep(o);
-  const marker = env.PCW_INVENTORY_MARKER;
-  if (marker) rmSync(marker, { force: true });
+  clearMarkers(o);
   let s: Session | null = null;
   // On Windows, the session runs in the containment helper's Job Object; without it, nothing runs.
   const helper = platform(o) === "win32" ? ensureJobHelper(o) : null;
   try {
     if (platform(o) === "win32" && !helper) { s = { code: null, out: "", timedOut: false, containment_failed: true }; return s; }
-    s = await (o.launch ?? launchSession)(argv, P.cwd(o), timeoutMs, env, P.stop(o), markingGate(o, gate, marker), helper ? [helper, "run"] : undefined);
+    s = await (o.launch ?? launchSession)(argv, P.cwd(o), timeoutMs, env, P.stop(o), markingGate(o, gate, env.PCW_INVENTORY_DIR, env.PCW_RUN_NONCE), helper ? [helper, "run"] : undefined);
     return s;
   }
   finally {
     try {
-      if (marker) rmSync(marker, { force: true });
+      clearMarkers(o);
       if (s?.pid && platform(o) === "win32") endTree(o, s.pid, "win32", s.started ?? null);
       endSession(o);
     } finally { off(); }
@@ -1858,17 +1885,21 @@ export async function runSession(o: Opts, argv: string[], timeoutMs: number, env
 }
 // Every session's gate (the inventory barrier): the caller's inventory check, or, when it
 // names none, the pinned settings' own (an unreadable settings file passes nothing). Only
-// when it passes, on an init event that carries a session id, is the marker written, with
-// that id, for the hook to read; a failure, an init it can't parse or a write that fails
-// leaves it absent, so the hook refuses every call of the session.
-export function markingGate(o: Opts, gate: Gate | undefined, marker: string | undefined): Gate {
+// when it passes, on an init event that carries a session id the worker parsed itself, is a
+// marker written: inventory/<that id>, holding the id and the session's nonce, for the hook
+// to read. A failure, an init it can't parse or a write that fails leaves none, so the hook
+// refuses every call of the session. The file's name comes from the parsed id alone, after
+// SESSION_ID has checked it (letters, digits, - and _), so it can't name another path.
+export const markerPath = (dir: string, sid: string) => join(dir, sid);
+export function markingGate(o: Opts, gate: Gate | undefined, dir: string | undefined, nonce: string | undefined): Gate {
   const h = gate ? null : sessionHashes(o);
   const check: Gate = gate ?? (h && allowedTools(h.settings) ? inventoryGate(allowedTools(h.settings)!, h.settings.permissions?.deny ?? []) : () => false);
   return (init) => {
     let ok = false;
     try { ok = !!init && check(init) && typeof init.session_id === "string" && SESSION_ID.test(init.session_id); } catch { ok = false; }
-    if (!ok || !marker) return ok;
-    try { writeFileSync(marker, `${init!.session_id}\n`); return true; } catch { return false; }
+    if (!ok || !dir) return ok;
+    if (!nonce || !NONCE.test(nonce)) return false;
+    try { mkdirSync(dir, { recursive: true }); writeFileSync(markerPath(dir, init!.session_id!), `${init!.session_id} ${nonce}\n`); return true; } catch { return false; }
   };
 }
 
@@ -1888,8 +1919,10 @@ export function markingGate(o: Opts, gate: Gate | undefined, marker: string | un
 // address: it is one of the run's own, which the worker put in PCW_NAV_ALLOW itself. The
 // log stays on the PC: it is never committed to the queue or sent to Cain.
 // resolved: for an allowed navigation whose host name the hook looked up, what it found.
+// phase "post": read-guard's decision on a reading tool's answer, after the tool ran (the
+// read-time drift check, below); every other decision is nav-guard's, before the call.
 export interface Decision { id: string | null; tool: string; url: string | null; decision: "allow" | "deny"; why: string; domain?: string | null; host_hmac?: string | null; url_hmac?: string | null;
-  resolved?: "public" | "unresolved" }
+  resolved?: "public" | "unresolved"; phase?: "post" }
 // The per-install key for the hook log's hashes: 32 random bytes in the worker folder
 // (hook-key, inside its ACL, behind the wall), made on first use. Keyed, so the log's
 // hashes can't be checked against a guessed address by anyone without it.
@@ -1924,12 +1957,14 @@ export const HOOK_ALLOWED = [...READING, ...NAVIGATING].map((t) => CHROME + t);
 // tools don't report their tab's address (the confirmation's read_context; the probe runs
 // with it on) after every page read, a tab context is owed, and the hook refuses every
 // other tool until it comes (context_owed, with a message naming the exact tool and saying
-// it needs no arguments). The count is per owed context: each refused call while that one
-// context is owed adds one (a read tried in between is refused too, so it counts), and only
-// the tab context itself, allowed, ends it and starts the next count at zero. The run fails
-// (tab_context_owed) once one owed context collects CONTEXT_REFUSALS_MAX refusals in a row.
-// Refusals spread over separate owed contexts don't add up: a long chore that slips once
-// per context, five times over, still passes.
+// it needs no arguments). The count is per owed context: only a context_owed refusal adds
+// one (a read tried while the context is owed is refused that way, so it counts); the tab
+// context itself, allowed, ends it, and an allowed page read sets the count back to zero
+// too. No other refusal counts or resets anything: a refused scheme, domain, address or
+// unlisted tool, and the inventory barrier's not-ready answer, are never a trip. The run
+// fails (tab_context_owed) once one owed context collects CONTEXT_REFUSALS_MAX refusals in a
+// row. Refusals spread over separate owed contexts don't add up: a long chore that slips
+// once per context, five times over, still passes.
 export const CONTEXT_REFUSALS_MAX = 3;
 export const CONTEXT_TOOL = `${CHROME}tabs_context_mcp`;
 export const CONTEXT_MESSAGE = `Blocked by the PC worker: call ${CONTEXT_TOOL} now (it needs no arguments), before any other tool. Then go on.`;
@@ -1943,9 +1978,11 @@ export function contextOwed(history: Decision[], contextAfterRead: boolean): boo
 export function contextStreaks(history: Decision[], contextAfterRead: boolean): { owed: boolean; current: number; longest: number } {
   let owed = false, current = 0, longest = 0;
   for (const d of history) {
+    if (d.phase === "post") continue;
     if (d.decision === "deny") { if (d.why === "context_owed") { current++; longest = Math.max(longest, current); } continue; }
     if (d.tool === "tabs_context_mcp") { owed = false; current = 0; }
-    else if (d.tool === "tabs_create_mcp" || (contextAfterRead && PAGE_READING.includes(d.tool))) owed = true;
+    else if (PAGE_READING.includes(d.tool)) { current = 0; if (contextAfterRead) owed = true; }
+    else if (d.tool === "tabs_create_mcp") owed = true;
   }
   return { owed, current, longest };
 }
@@ -1956,22 +1993,30 @@ export interface HookCtx { tokens?: string[]; history?: Decision[]; contextAfter
 
 // ---- Where a navigation may go: scheme, address and domain, before the exact list ----------
 // Ahead of the exact allow list (the run's own addresses), every navigate and tabs_create_mcp
-// address goes through these checks, in this order, each refusing on its own:
+// address is parsed once by the WHATWG URL parser (Node's and Bun's URL), and every check
+// below reads what the parser made of it, in this order, each refusing on its own:
 //   1. scheme: http and https only. file, data, javascript, blob, filesystem, view-source,
 //      chrome, chrome-extension, ws, wss, about (but about:blank, the run's end page) and
 //      every other scheme are refused by scheme (scheme_not_allowed), before any path check.
-//   2. address: a login in the address is refused (bad_address); a host that is an IP
-//      literal in a loopback, private, link-local, shared, unspecified or multicast range, or
-//      localhost by name, is refused (private_address). The one exception is the run's own
-//      check page, by its exact origin (http://127.0.0.1:<its port>, PCW_NAV_CANARY). Any
-//      other IP literal has no registrable domain and fails the next step.
-//   3. domain: the host's registrable domain must be one the job's allowlist entry names
-//      (PCW_NAV_DOMAINS: its "domains", or its site's and its sign-in hosts'), or the
-//      navigation is refused before it runs (domain_not_allowed). A page that plants an
-//      address on another domain, with content in its query, is refused here.
-//   4. query and fragment: refused (query_not_allowed) unless the entry allows them
-//      ("query": true, PCW_NAV_QUERY), and then capped at QUERY_MAX characters together
-//      (query_too_long). The hook refuses rather than strips: nothing of either leaves.
+//   2. address: a login in the address is refused (bad_address). The run's own check page is
+//      the one exception to what follows, matched by scheme, address, port and path (its
+//      page and the pages under it, PCW_NAV_CANARY). Every other IP-literal host is refused,
+//      however it was written (2130706433, 0x7f.1, 0177.0.0.1, [::ffff:127.0.0.1], any
+//      bracketed IPv6): the parser turns each into its plain form first. A loopback,
+//      private, link-local, shared, unspecified or multicast one, and localhost by name, is
+//      private_address; any other is ip_address. A host that ends in a dot is refused
+//      (trailing_dot).
+//   3. domain: the host must be one the job's signed allowlist entry allows (PCW_NAV_DOMAINS:
+//      its domain patterns, exact hosts, and subdomain wildcards only where the entry says
+//      so), with a registrable domain by the pinned Public Suffix List, or the navigation is
+//      refused before it runs (domain_not_allowed). A punycode (xn--) host passes only where
+//      an exact pattern names it (idn_not_allowed): a homograph of an allowed host, or of
+//      anything under a wildcard, is refused. A shared-hosting neighbour (another github.io
+//      site) has its own registrable domain and is refused.
+//   4. query and fragment: a fragment is always refused (fragment_not_allowed). A query is
+//      refused (query_not_allowed) unless the entry names query parameter patterns
+//      (PCW_NAV_QUERY) and every parameter's name matches one; longer than QUERY_MAX it is
+//      query_too_long. The hook refuses rather than strips: nothing of either leaves.
 //   5. after the hook has decided to allow it, a host name is resolved where the hook can
 //      (PCW_RESOLVE, within RESOLVE_MS): one that resolves to a private address is refused
 //      (private_address). A name that doesn't resolve isn't refused for that: the browser
@@ -1979,20 +2024,45 @@ export interface HookCtx { tokens?: string[]; history?: Decision[]; contextAfter
 //      a page's own name never reaches the resolver.
 // The path normaliser (the wall, mentionsWorker) still runs first on every tool, as defence
 // in depth, and the exact list still runs last.
-export interface NavScope { domains: string[]; canary: string[]; query: boolean }
+export interface NavScope { domains: string[]; canary: string[]; query: string[] }
 export const NAV_SCHEMES = ["http:", "https:"];
 export const REFUSED_SCHEMES = ["file:", "data:", "javascript:", "blob:", "filesystem:", "view-source:", "chrome:", "chrome-extension:", "about:", "ws:", "wss:"];
 export const ADDRESS_MAX = 2_000;
 export const RESOLVE_MS = 2_000;
-// The scope a list of exact addresses implies, for callers that name none: their hosts'
-// registrable domains, their 127.0.0.1 origins as check pages, no query.
-export function scopeOf(allow: string[], domains?: string[], query = false): NavScope {
+// The scope a list of exact addresses implies, for callers that name none: their hosts,
+// exactly; their 127.0.0.1 addresses as check pages; no query.
+export function scopeOf(allow: string[], domains?: string[], query: string[] = []): NavScope {
   const hosts: string[] = [], canary: string[] = [];
   for (const a of allow) {
-    try { const u = new URL(a); if (!NAV_SCHEMES.includes(u.protocol)) continue; if (u.hostname === "127.0.0.1") canary.push(u.origin); else hosts.push(u.hostname); } catch { /* not an address */ }
+    try {
+      const u = new URL(a);
+      if (!NAV_SCHEMES.includes(u.protocol)) continue;
+      if (u.hostname === "127.0.0.1") canary.push(`${u.protocol}//${u.host}${u.pathname}`); else hosts.push(u.hostname);
+    } catch { /* not an address */ }
   }
-  const own = hosts.map((h) => registrableDomain(h)).filter((d): d is string => !!d);
-  return { domains: [...new Set(domains ?? own)].sort(), canary: [...new Set(canary)].sort(), query };
+  return { domains: [...new Set(domains ?? hosts)].sort(), canary: [...new Set(canary)].sort(), query: [...query] };
+}
+// A parsed address on one of the run's check pages: the same scheme, address and port, and
+// its path or one under it.
+export function onCanary(u: URL, canary: readonly string[]): boolean {
+  if (u.username || u.password) return false;
+  return canary.some((c) => {
+    let k: URL;
+    try { k = new URL(c); } catch { return false; }
+    const base = k.pathname.replace(/\/+$/, "");
+    return u.protocol === k.protocol && u.hostname === k.hostname && u.port === k.port && (u.pathname === k.pathname || u.pathname === base || u.pathname.startsWith(`${base}/`));
+  });
+}
+// The host checks (2 and 3 above) on a parsed host: the reason it is refused, or null.
+export function hostScope(hostname: string, scope: NavScope): string | null {
+  const h = hostname.toLowerCase();
+  const ip = ipKind(h);
+  if (ip === "private") return "private_address";
+  if (ip === "public" || h.startsWith("[") || /^[\d.]+$/.test(h)) return "ip_address";
+  if (h.endsWith(".")) return "trailing_dot";
+  if (!plainHost(h)) return "bad_address";
+  if (!hostAllowed(h, scope.domains)) return h.split(".").some((l) => l.startsWith("xn--")) ? "idn_not_allowed" : "domain_not_allowed";
+  return null;
 }
 // IPv4 as four numbers, or null.
 const v4 = (h: string): number[] | null => {
@@ -2052,16 +2122,14 @@ export function addressScope(url: string, scope: NavScope): string | null {
   try { u = new URL(url); } catch { return "bad_address"; }
   if (!NAV_SCHEMES.includes(u.protocol)) return "scheme_not_allowed";
   if (u.username || u.password || !u.hostname) return "bad_address";
-  if (scope.canary.includes(u.origin)) return null;
-  const ip = ipKind(u.hostname);
-  if (ip === "private") return "private_address";
-  if (ip === "public") return "domain_not_allowed";
-  const d = registrableDomain(u.hostname);
-  if (!d || !scope.domains.includes(d)) return "domain_not_allowed";
-  const extra = u.search.length + u.hash.length;
-  if (extra > 0 || /[?#]/.test(url)) {
-    if (!scope.query) return "query_not_allowed";
-    if (extra > QUERY_MAX) return "query_too_long";
+  if (onCanary(u, scope.canary)) return null;
+  const host = hostScope(u.hostname, scope);
+  if (host) return host;
+  if (u.hash || url.includes("#")) return "fragment_not_allowed";
+  if (u.search || url.includes("?")) {
+    if (!scope.query.length) return "query_not_allowed";
+    if (u.search.length > QUERY_MAX + 1) return "query_too_long";
+    if (!queryAllowed(u.search, scope.query)) return "query_not_allowed";
   }
   return null;
 }
@@ -2119,8 +2187,12 @@ export const DENY_MESSAGE = "Blocked by the PC worker: this run may open only it
 // A navigation the hook allows needs this explicit allow: the permission layer doesn't name it.
 export const allowJson = () => JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow",
   permissionDecisionReason: "The PC worker: one of this run's own addresses." } });
+// The inventory barrier's answer while the session's marker isn't there yet: not a refusal
+// of what was asked, a request to ask again. It never counts toward any trip.
+export const NOT_READY_MESSAGE = "Not ready yet: the PC worker is still checking this session's tools. Make the same call again.";
+const reasonFor = (why: string) => why === "context_owed" ? CONTEXT_MESSAGE : why === "inventory_not_ready" ? NOT_READY_MESSAGE : `${DENY_MESSAGE} (${why})`;
 export const denyJson = (why: string) => JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
-  permissionDecisionReason: why === "context_owed" ? CONTEXT_MESSAGE : `${DENY_MESSAGE} (${why})` } });
+  permissionDecisionReason: reasonFor(why) } });
 
 // The hook's whole run, failing closed: input that doesn't arrive within its deadline,
 // any error (in deciding, or in writing the log), anything it can't read is a deny: exit
@@ -2132,19 +2204,38 @@ export const denyJson = (why: string) => JSON.stringify({ hookSpecificOutput: { 
 // tokens (PCW_DENY_TOKENS), the install's hook key (PCW_HOOK_KEY_FILE) and the navigation
 // scope (PCW_NAV_DOMAINS, PCW_NAV_CANARY, PCW_NAV_QUERY).
 // The inventory barrier holds over every decision: every tool call is refused (a call the
-// rules would allow is refused as inventory_unconfirmed; one they refuse keeps its reason)
-// until the worker has recorded a passed inventory check for this very session, in the
-// marker file PCW_INVENTORY_MARKER names, holding the session's id as its init event gave
-// it. The call's own session_id must match it. No marker (the check hasn't passed yet,
-// failed, couldn't parse the init event, or the worker failed) means nothing runs.
+// rules would allow is refused; one they refuse keeps its reason) until the worker has
+// recorded a passed inventory check for this very session: the marker
+// PCW_INVENTORY_DIR/<the call's session_id>, holding that id and this session's nonce
+// (PCW_RUN_NONCE). A marker whose words aren't exactly those (another session's, or one
+// left from an earlier run with the same id) is inventory_unconfirmed at once. When there is
+// no marker yet (the init event and the model's first call can race), the hook waits for it,
+// up to INVENTORY_WAIT_MS, and only then refuses, as inventory_not_ready: NOT_READY_MESSAGE
+// asks the model to make the same call again, and that refusal never counts toward any trip.
 export const SESSION_ID = /^[A-Za-z0-9_-]{8,100}$/;
-export function inventoryConfirmed(env: Record<string, string | undefined>, input: string): boolean {
-  if (!env.PCW_INVENTORY_MARKER) return false;
+export const NONCE = /^[0-9a-f]{32}$/;
+export const INVENTORY_WAIT_MS = 5_000;
+export type InventoryState = "ok" | "absent" | "wrong";
+export function inventoryState(env: Record<string, string | undefined>, input: string): InventoryState {
+  const dir = env.PCW_INVENTORY_DIR, nonce = env.PCW_RUN_NONCE;
+  if (!dir || !nonce || !NONCE.test(nonce)) return "wrong";
   let sid: unknown;
-  try { sid = JSON.parse(input)?.session_id; } catch { return false; }
-  if (typeof sid !== "string" || !SESSION_ID.test(sid)) return false;
-  try { return readFileSync(env.PCW_INVENTORY_MARKER, "utf8").trim() === sid; } catch { return false; }
+  try { sid = JSON.parse(input)?.session_id; } catch { return "wrong"; }
+  if (typeof sid !== "string" || !SESSION_ID.test(sid)) return "wrong";
+  let text = "";
+  try { text = readFileSync(markerPath(dir, sid), "utf8").trim(); } catch { return "absent"; }
+  if (!text) return "absent";                      // being written
+  return text === `${sid} ${nonce}` ? "ok" : "wrong";
 }
+export const inventoryConfirmed = (env: Record<string, string | undefined>, input: string): boolean => inventoryState(env, input) === "ok";
+// The wait: the marker's state, read again every 100 ms while it is absent, up to waitMs.
+export async function awaitInventory(env: Record<string, string | undefined>, input: string, waitMs: number): Promise<InventoryState> {
+  const until = Date.now() + waitMs;
+  let st = inventoryState(env, input);
+  while (st === "absent" && Date.now() < until) { await new Promise((ok) => setTimeout(ok, 100)); st = inventoryState(env, input); }
+  return st;
+}
+export const inventoryWait = (env: Record<string, string | undefined>) => Math.min(Math.max(parseInt(env.PCW_INVENTORY_WAIT_MS ?? "", 10) || INVENTORY_WAIT_MS, 0), INVENTORY_WAIT_MS);
 // The navigation scope as the session's environment gives it; missing parts fall back to
 // what the exact list implies (scopeOf), never to anything wider.
 export function scopeFromEnv(env: Record<string, string | undefined>): NavScope {
@@ -2156,7 +2247,7 @@ export function scopeFromEnv(env: Record<string, string | undefined>): NavScope 
     if (!Array.isArray(j) || !j.every((v) => typeof v === "string")) throw new Error("scope");
     return j;
   };
-  const base = scopeOf(Array.isArray(allow) ? allow.filter((x): x is string => typeof x === "string") : [], list(env.PCW_NAV_DOMAINS), env.PCW_NAV_QUERY === "1");
+  const base = scopeOf(Array.isArray(allow) ? allow.filter((x): x is string => typeof x === "string") : [], list(env.PCW_NAV_DOMAINS), list(env.PCW_NAV_QUERY) ?? []);
   const canary = list(env.PCW_NAV_CANARY);
   return canary ? { ...base, canary } : base;
 }
@@ -2173,7 +2264,10 @@ export async function hookMain(env: Record<string, string | undefined>, read: ()
     d = decide(input, env.PCW_NAV_ALLOW, env.PCW_DENY_PATHS, { tokens: tokens as string[] | undefined, history: env.PCW_NAV_LOG ? readNavLog(env.PCW_NAV_LOG) : [],
       contextAfterRead: env.PCW_CONTEXT_AFTER_READ === "1", key: readKey(env.PCW_HOOK_KEY_FILE), scope });
     // The barrier: whatever was decided, nothing runs before this session's inventory passed.
-    if (d.decision === "allow" && !inventoryConfirmed(env, input)) d = { id: d.id, tool: d.tool, url: null, decision: "deny", why: "inventory_unconfirmed" };
+    if (d.decision === "allow") {
+      const inv = await awaitInventory(env, input, inventoryWait(env));
+      if (inv !== "ok") d = { id: d.id, tool: d.tool, url: null, decision: "deny", why: inv === "absent" ? "inventory_not_ready" : "inventory_unconfirmed" };
+    }
     // Step 5 of the scope: an allowed navigation's host name, resolved.
     if (d.decision === "allow" && d.url && NAVIGATING.includes(d.tool) && env.PCW_RESOLVE === "1") {
       const kind = await resolvedKind(d.url, scope, resolve, Math.min(RESOLVE_MS, ms));
@@ -2189,8 +2283,83 @@ export async function hookMain(env: Record<string, string | undefined>, read: ()
   } catch { if (d.decision === "allow") d = { ...d, decision: "deny", why: "log_failed" }; }
   if (d.decision === "allow") { if (NAVIGATING.includes(d.tool)) out(allowJson() + "\n"); return 0; }
   out(denyJson(d.why) + "\n");
-  err(`${d.why === "context_owed" ? CONTEXT_MESSAGE : DENY_MESSAGE}\n`);
+  err(`${d.why === "context_owed" ? CONTEXT_MESSAGE : d.why === "inventory_not_ready" ? NOT_READY_MESSAGE : DENY_MESSAGE}\n`);
   return 2;
+}
+
+// ---- The read-time drift check: read-guard, after every page read ----------------------------
+// A PostToolUse hook on the three page-reading tools (read_page, get_page_text, find), run
+// by the pinned settings. Before the answer reaches the model, it reads the tab's current
+// address from the answer itself (the header the reading tools give, reportedUrl) and checks
+// it against the run's scope as nav-guard would a navigation (scheme, IP literal, trailing
+// dot, the entry's domain patterns; the check page and the end page pass). A page that moved
+// its tab off the job's sites after an allowed navigation (a redirect, a script) is read
+// there and refused: the answer is replaced (updatedMCPToolOutput) by READ_DRIFT_MESSAGE, so
+// none of that page reaches the model, and the decision is logged as read_drift with the
+// address's registrable domain and keyed hashes only (deniedAddress). The run then fails
+// (read_drift). Every page read gets a logged decision here; a read without one fails the run
+// (hook_missing_decision). An answer that doesn't report its address (a PC whose reading tools
+// don't, the confirmation's read_context) is logged as read_unplaced and left to the tab
+// context the hook already demands after every read there. Anything read-guard can't read
+// or log is a refusal too.
+export const READ_GUARD_COMMAND = "\"$PCW_RUNTIME\" \"$PCW_WORKER\" read-guard";
+export const READ_MATCHER = `${CHROME}(read_page|get_page_text|find)`;
+export const READ_DRIFT_MESSAGE = "Blocked by the PC worker: this tab is no longer on the job's own sites, so its page wasn't read. Don't read it again; end the run.";
+export const readBlockJson = () => JSON.stringify({ decision: "block", reason: READ_DRIFT_MESSAGE,
+  hookSpecificOutput: { hookEventName: "PostToolUse", updatedMCPToolOutput: READ_DRIFT_MESSAGE } });
+// A tool's answer as text: a string, MCP content blocks, or an object holding either.
+export function responseText(r: unknown): string {
+  if (typeof r === "string") return r;
+  if (Array.isArray(r)) return r.map((x) => typeof x === "string" ? x : typeof x?.text === "string" ? x.text : "").join("\n");
+  if (r && typeof r === "object") {
+    const o = r as any;
+    if (o.content !== undefined) return responseText(o.content);
+    if (typeof o.text === "string") return o.text;
+    if (typeof o.result === "string") return o.result;
+  }
+  return "";
+}
+// Where a reported address may be: the end page, a check page, or a host the scope allows.
+export function readScope(url: string, scope: NavScope): string | null {
+  if (url === END_URL) return null;
+  let u: URL;
+  try { u = new URL(url); } catch { return "bad_address"; }
+  if (!NAV_SCHEMES.includes(u.protocol)) return "scheme_not_allowed";
+  if (u.username || u.password || !u.hostname) return "bad_address";
+  if (onCanary(u, scope.canary)) return null;
+  return hostScope(u.hostname, scope);
+}
+export function readDecide(input: string, scope: NavScope, key: Buffer | null = null): Decision {
+  let call: any;
+  try { call = JSON.parse(input); } catch { return { id: null, tool: "", url: null, decision: "deny", why: "unreadable_input", phase: "post" }; }
+  const id = typeof call?.tool_use_id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(call.tool_use_id) ? call.tool_use_id : null;
+  const name = typeof call?.tool_name === "string" ? call.tool_name : "";
+  const tool = (name.startsWith(CHROME) ? name.slice(CHROME.length) : name).slice(0, 100);
+  if (!name.startsWith(CHROME) || !PAGE_READING.includes(tool)) return { id, tool, url: null, decision: "allow", why: "not_a_read", phase: "post" };
+  const url = reportedUrl(responseText(call.tool_response));
+  if (!url) return { id, tool, url: null, decision: "allow", why: "read_unplaced", phase: "post" };
+  if (readScope(url, scope)) return { id, tool, url: null, decision: "deny", why: "read_drift", phase: "post", ...deniedAddress(url, key) };
+  return { id, tool, url: null, decision: "allow", why: "read_on_scope", phase: "post" };
+}
+// read-guard's whole run: exit 0 always (a PostToolUse hook's JSON is read only then); a
+// refusal prints readBlockJson, an allow prints nothing. An error, unreadable input, a
+// missing log or a log that fails is a refusal.
+export async function readGuardMain(env: Record<string, string | undefined>, read: () => Promise<string>, out: (s: string) => void): Promise<number> {
+  const ms = Math.min(Math.max(parseInt(env.PCW_HOOK_MS ?? "", 10) || HOOK_MS, 100), HOOK_MS);
+  let d: Decision;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const input = await Promise.race([read(), new Promise<never>((_, fail) => { timer = setTimeout(() => fail(new Error("timeout")), ms); })]);
+    d = readDecide(input, scopeFromEnv(env), readKey(env.PCW_HOOK_KEY_FILE));
+  } catch (e) {
+    d = { id: null, tool: "", url: null, decision: "deny", why: (e as Error)?.message === "timeout" ? "timeout" : "internal_error", phase: "post" };
+  } finally { clearTimeout(timer); }
+  try {
+    if (!env.PCW_NAV_LOG) throw new Error("no log");
+    appendFileSync(env.PCW_NAV_LOG, JSON.stringify(d) + "\n");
+  } catch { if (d.decision === "allow") d = { ...d, decision: "deny", why: "log_failed" }; }
+  if (d.decision === "deny") out(readBlockJson() + "\n");
+  return 0;
 }
 
 // The hook's self-test, at every preflight before a claim: the real nav-guard, started the
@@ -2209,8 +2378,11 @@ export const SELFTEST_SESSION = "pcw-selftest-session";
 function directEnv(o: Opts, name: string, allow: string[] = [SELFTEST_URL]): { env: Record<string, string>; log: string; marker: string } {
   const log = join(o.home, `${name}-decisions.jsonl`), marker = join(o.home, `${name}-inventory`);
   rmSync(log, { force: true });
-  writeFileSync(marker, `${SELFTEST_SESSION}\n`);
-  return { env: { ...sessionEnv(o, allow), PCW_NAV_LOG: fwd(log), PCW_INVENTORY_MARKER: fwd(marker), PCW_RESOLVE: "0" }, log, marker };
+  rmSync(marker, { recursive: true, force: true });
+  const env = sessionEnv(o, allow);
+  mkdirSync(marker, { recursive: true });
+  writeFileSync(markerPath(marker, SELFTEST_SESSION), `${SELFTEST_SESSION} ${env.PCW_RUN_NONCE}\n`);
+  return { env: { ...env, PCW_NAV_LOG: fwd(log), PCW_INVENTORY_DIR: fwd(marker), PCW_RESOLVE: "0" }, log, marker };
 }
 const navCall = (id: string, url: string, session = SELFTEST_SESSION) =>
   JSON.stringify({ hook_event_name: "PreToolUse", session_id: session, tool_use_id: id, tool_name: `${CHROME}navigate`, tool_input: { url } });
@@ -2228,8 +2400,9 @@ export function hookSelfTest(o: Opts, argv: string[] = [process.execPath, WORKER
     // The allow list over tool names: a tool on no list at all, refused by the hook itself.
     const u = call(JSON.stringify({ hook_event_name: "PreToolUse", session_id: SELFTEST_SESSION, tool_use_id: "toolu_selftest_unlisted", tool_name: UNLISTED_PROBE_TOOL, tool_input: {} }));
     // The inventory barrier: its own allowed address, from a session with no marker.
-    const b = call(navCall("toolu_selftest_barrier", SELFTEST_URL, "pcw-unconfirmed-session"));
-    const logged = readNavLog(log).map((x) => `${x.id}:${x.decision}${x.why === "worker_folder" ? ":wall" : x.why === "tool_not_allowed" ? ":unlisted" : x.why === "inventory_unconfirmed" ? ":barrier" : ""}`);
+    const b = call(navCall("toolu_selftest_barrier", SELFTEST_URL, "pcw-unconfirmed-session"), { PCW_INVENTORY_WAIT_MS: "200" });
+    const logged = readNavLog(log).map((x) => `${x.id}:${x.decision}${x.why === "worker_folder" ? ":wall" : x.why === "tool_not_allowed" ? ":unlisted"
+      : x.why === "inventory_unconfirmed" || x.why === "inventory_not_ready" ? ":barrier" : ""}`);
     const good = a.status === 0 && saidOf(a.stdout ?? "") === "allow" && d.status === 2 && saidOf(d.stdout ?? "") === "deny"
       && m.status === 2 && saidOf(m.stdout ?? "") === "deny" && w.status === 2 && saidOf(w.stdout ?? "") === "deny"
       && u.status === 2 && saidOf(u.stdout ?? "") === "deny" && b.status === 2 && saidOf(b.stdout ?? "") === "deny"
@@ -2237,7 +2410,7 @@ export function hookSelfTest(o: Opts, argv: string[] = [process.execPath, WORKER
         "toolu_selftest_unlisted:deny:unlisted", "toolu_selftest_barrier:deny:barrier"]);
     return Promise.resolve(good ? null : "hook_selftest_failed");
   } catch { return Promise.resolve("hook_selftest_failed"); }
-  finally { rmSync(log, { force: true }); rmSync(marker, { force: true }); }
+  finally { rmSync(log, { force: true }); rmSync(marker, { recursive: true, force: true }); }
 }
 
 // The probe's unlisted-tool step. A tool the session wasn't given can't be called through
@@ -2261,7 +2434,7 @@ export function hookUnlisted(o: Opts, argv: string[] = [process.execPath, WORKER
       if (r.status === 2 && saidOf(r.stdout ?? "") === "deny" && readNavLog(log).some((d) => d.id === id && d.decision === "deny" && d.why === "tool_not_allowed")) refused.push(name);
     });
   } catch { /* what was refused so far stands; the rest fails the step */ }
-  finally { rmSync(log, { force: true }); rmSync(marker, { force: true }); }
+  finally { rmSync(log, { force: true }); rmSync(marker, { recursive: true, force: true }); }
   return { tools: [...UNLISTED_TOOLS], refused, passed: refused.length === UNLISTED_TOOLS.length };
 }
 
@@ -2277,6 +2450,10 @@ export const ADDRESS_CASES: { kind: string; url: string; why: string }[] = [
   { kind: "localhost", url: "http://localhost:9/pcw", why: "private_address" },
   { kind: "loopback_other_port", url: "http://127.0.0.1:9/pcw", why: "private_address" },
   { kind: "private_network", url: "http://192.168.1.1/", why: "private_address" },
+  { kind: "decimal_ip", url: "http://2130706433/", why: "private_address" },
+  { kind: "hex_ip", url: "http://0x7f.1/", why: "private_address" },
+  { kind: "mapped_ipv6", url: "http://[::ffff:127.0.0.1]/", why: "private_address" },
+  { kind: "trailing_dot", url: "https://selftest.invalid./allowed", why: "trailing_dot" },
 ];
 export function hookAddresses(o: Opts, argv: string[] = [process.execPath, WORKER_FILE, "nav-guard"]): AddressLine {
   const { env, log, marker } = directEnv(o, "address", [SELFTEST_URL, ...ADDRESS_CASES.map((c) => c.url)]);
@@ -2290,7 +2467,7 @@ export function hookAddresses(o: Opts, argv: string[] = [process.execPath, WORKE
       cases.push({ kind: c.kind, why: d?.why ?? null, refused: r.status === 2 && saidOf(r.stdout ?? "") === "deny" && d?.decision === "deny" && d.why === c.why });
     });
   } catch { /* what ran stands; the rest fails the step */ }
-  finally { rmSync(log, { force: true }); rmSync(marker, { force: true }); }
+  finally { rmSync(log, { force: true }); rmSync(marker, { recursive: true, force: true }); }
   return { cases, passed: cases.length === ADDRESS_CASES.length && cases.every((c) => c.refused) };
 }
 
@@ -2320,22 +2497,38 @@ export function readNavLog(file: string): Decision[] {
 // as navigation_denied. Once one owed context has collected CONTEXT_REFUSALS_MAX of them in
 // a row (contextStreaks), the session didn't keep the order and the run fails as
 // tab_context_owed; refusals spread over separate owed contexts don't add up.
-export interface GuardCheck { code: Code | null; missing: string[]; unguarded: string[]; denied: string[]; walled: string[]; context_refusals: string[] }
-export function guardCheck(st: Stream, log: Decision[], paths: string[] = [], tokens?: string[]): GuardCheck {
-  const missing: string[] = [], unguarded: string[] = [], denied: string[] = [], walled: string[] = [], context_refusals: string[] = [];
+// A call the inventory barrier answered "not ready yet" (inventory_not_ready) was asked to
+// be made again: it is retried, not denied, and never counts toward any trip.
+// A page read read-guard refused (read_drift: the tab had left the job's sites when it was
+// read) fails the run as read_drift. With needPost (a run's own session), every page read
+// that returned an answer must have read-guard's decision too, or it went past the
+// read-time check: hook_missing_decision.
+export interface GuardCheck { code: Code | null; missing: string[]; unguarded: string[]; denied: string[]; walled: string[]; context_refusals: string[]; retried: string[]; drifted: string[] }
+export function guardCheck(st: Stream, log: Decision[], paths: string[] = [], tokens?: string[], needPost = false): GuardCheck {
+  const missing: string[] = [], unguarded: string[] = [], denied: string[] = [], walled: string[] = [], context_refusals: string[] = [], retried: string[] = [], drifted: string[] = [];
   for (const u of st.uses) {
     const mine = log.filter((d) => d.id === u.id);
     if (mine.some((d) => d.why === "worker_folder") || mentionsWorker(u.input, paths, tokens)) walled.push(u.id);
     if (!mine.length) { missing.push(u.id); continue; }
-    if (mine.some((d) => d.decision === "deny")) { (mine.every((d) => d.decision === "allow" || d.why === "context_owed") ? context_refusals : denied).push(u.id); continue; }
+    if (mine.some((d) => d.why === "read_drift")) { drifted.push(u.id); continue; }
+    if (mine.some((d) => d.decision === "deny")) {
+      if (mine.every((d) => d.decision === "allow" || d.why === "context_owed")) context_refusals.push(u.id);
+      else if (mine.every((d) => d.decision === "allow" || d.why === "inventory_not_ready")) retried.push(u.id);
+      else denied.push(u.id);
+      continue;
+    }
     const tool = u.name.startsWith(CHROME) ? u.name.slice(CHROME.length) : "";
-    if (READING.includes(tool) && mine.some((d) => d.tool === tool)) continue;
+    if (READING.includes(tool) && mine.some((d) => d.tool === tool && d.phase !== "post")) {
+      const r = st.results[u.id];
+      if (needPost && PAGE_READING.includes(tool) && r && !r.error && !mine.some((d) => d.phase === "post")) missing.push(u.id);
+      continue;
+    }
     const url = typeof u.input?.url === "string" ? u.input.url : null;
     if (!(NAVIGATING.includes(tool) && mine.some((d) => d.decision === "allow" && d.tool === tool && d.url === url))) unguarded.push(u.id);
   }
   const code: Code | null = walled.length ? "worker_folder_denied" : missing.length ? "hook_missing_decision" : unguarded.length ? "navigation_unguarded"
-    : denied.length ? "navigation_denied" : contextStreaks(log, false).longest >= CONTEXT_REFUSALS_MAX ? "tab_context_owed" : null;
-  return { code, missing, unguarded, denied, walled, context_refusals };
+    : drifted.length ? "read_drift" : denied.length ? "navigation_denied" : contextStreaks(log, false).longest >= CONTEXT_REFUSALS_MAX ? "tab_context_owed" : null;
+  return { code, missing, unguarded, denied, walled, context_refusals, retried, drifted };
 }
 
 // ---- Another Claude Code on this PC, and a stuck bridge ----------------------------------------
@@ -2476,41 +2669,83 @@ export function killTree(pid: number, plat = process.platform) {
 // kill-on-close and no breakaway. Ending the helper (timeout, STOP, the exit handler) or its
 // normal exit closes the job, and Windows ends every process still in it, a detached
 // grandchild whose parent already exited among them, which a tree kill (taskkill /T) can
-// miss. The worker builds the helper itself, once, with the .NET Framework's own compiler
-// (csc.exe, part of Windows), into the worker folder, and builds it again whenever
-// jobrun.cs changes (its hash is kept beside it). If it can't be built or doesn't answer,
-// Windows runs, the probe and bind-profile refuse (containment_unavailable) until it can.
-// Chrome and Claude in Chrome's native messaging host are outside the job by design: the
-// worker never starts Chrome (it must already be open), and Chrome starts the host.
+// miss. After it joins, the helper reads its own job back (QueryInformationJobObject) and
+// refuses to start anything unless it is in that job with kill-on-close set and neither
+// breakaway flag. The worker builds the helper itself with the .NET Framework's own compiler
+// (csc.exe, part of Windows), into the worker folder. The compiler's path is fixed under the
+// system root (%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe, then the 32-bit
+// Framework folder), never found on PATH. At every preflight the worker checks both the
+// source's hash and the built executable's own hash against what it recorded when it built
+// it (pcw-jobrun.sha256), and builds it again when either differs. Clear codes when it can't:
+// helper_compiler_missing (no csc.exe under the system root: the .NET Framework 4 feature is
+// off), helper_blocked (the compiler or the built helper was stopped from running, usually
+// by security software: allow pcw-jobrun.exe in the worker folder), and
+// containment_unavailable otherwise. Until it can, Windows runs, the probe and bind-profile
+// refuse. Chrome and Claude in Chrome's native messaging host are outside the job by design:
+// the worker never starts Chrome (it must already be open), and Chrome starts the host.
 export const JOB_HELPER_SOURCE = join(HERE, "jobrun.cs");
-export const JOB_HELPER_VERSION = "pcw-jobrun 1";
+export const JOB_HELPER_VERSION = "pcw-jobrun 2";
 export const JOB_HELPER_CODES = [121, 122];
-export function cscPath(env: Record<string, string | undefined> = process.env, has: (f: string) => boolean = existsSync): string | null {
-  const win = env.WINDIR ?? env.SystemRoot ?? env.SYSTEMROOT ?? "C:\\Windows";
-  return [join(win, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe"), join(win, "Microsoft.NET", "Framework", "v4.0.30319", "csc.exe")].find(has) ?? null;
+// The system root as Windows reports it (SystemRoot), when it is a plain local folder
+// (X:\...), else C:\Windows. WINDIR and PATH are never used to find the compiler.
+export function systemRoot(env: Record<string, string | undefined> = process.env): string {
+  const r = (env.SystemRoot ?? env.SYSTEMROOT ?? "").trim();
+  return /^[A-Za-z]:\\[^"<>|?*\r\n]{1,200}$/.test(r) && !/\.\./.test(r) ? r.replace(/\\+$/, "") : "C:\\Windows";
 }
-// The helper's path once it is built and answers its version, or null (built or not). Off
-// Windows there is none, and none is needed.
-export function ensureJobHelper(o: Opts): string | null {
-  if (o.jobHelper !== undefined) return o.jobHelper;
-  if (platform(o) !== "win32") return null;
+export const cscCandidates = (env: Record<string, string | undefined> = process.env) => {
+  const root = systemRoot(env);
+  return [`${root}\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe`, `${root}\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe`];
+};
+export function cscPath(env: Record<string, string | undefined> = process.env, has: (f: string) => boolean = existsSync): string | null {
+  return cscCandidates(env).find(has) ?? null;
+}
+export interface HelperState { exe: string | null; code: "helper_compiler_missing" | "helper_blocked" | "containment_unavailable" | null }
+// What the helper's build record holds: the source's hash and the built executable's own.
+export interface HelperStamp { source_sha256: string; exe_sha256: string }
+export function readStamp(file: string): HelperStamp | null {
+  try {
+    const j = JSON.parse(readFileSync(file, "utf8"));
+    return j && HEX64.test(j.source_sha256) && HEX64.test(j.exe_sha256) ? { source_sha256: j.source_sha256, exe_sha256: j.exe_sha256 } : null;
+  } catch { return null; }
+}
+// A process start the system refused outright (blocked, quarantined, access denied).
+const BLOCKED = new Set(["EPERM", "EACCES", "UNKNOWN", "EBUSY"]);
+export function jobHelperState(o: Opts): HelperState {
+  if (o.jobHelper !== undefined) return { exe: o.jobHelper, code: o.jobHelper ? null : "containment_unavailable" };
+  if (platform(o) !== "win32") return { exe: null, code: null };
   const exe = join(o.home, "pcw-jobrun.exe"), stamp = join(o.home, "pcw-jobrun.sha256");
   const want = fileSha(JOB_HELPER_SOURCE);
-  if (!want) return null;
-  const answers = () => { try { return execFileSync(exe, ["version"], { encoding: "utf8", timeout: 30_000, windowsHide: true }).trim() === JOB_HELPER_VERSION; } catch { return false; } };
-  let have: string | null = null;
-  try { have = readFileSync(stamp, "utf8").trim(); } catch { have = null; }
-  if (existsSync(exe) && have === want && answers()) return exe;
-  const csc = cscPath(o.env ?? process.env);
-  if (!csc) return null;
+  if (!want) return { exe: null, code: "containment_unavailable" };
+  let blocked = false;
+  const answers = () => {
+    try { return execFileSync(exe, ["version"], { encoding: "utf8", timeout: 30_000, windowsHide: true }).trim() === JOB_HELPER_VERSION; }
+    catch (e) { if (BLOCKED.has(String((e as any)?.code ?? ""))) blocked = true; return false; }
+  };
+  const have = readStamp(stamp);
+  if (existsSync(exe) && have?.source_sha256 === want && have.exe_sha256 === fileSha(exe) && answers()) return { exe, code: null };
+  const csc = (o.csc ?? cscPath)(o.env ?? process.env);
+  if (!csc) return { exe: null, code: "helper_compiler_missing" };
   try {
     rmSync(exe, { force: true });
+    rmSync(stamp, { force: true });
     execFileSync(csc, ["/nologo", "/optimize+", "/target:exe", `/out:${exe}`, JOB_HELPER_SOURCE], { stdio: "ignore", timeout: 120_000, windowsHide: true });
-    writeFileSync(stamp, `${want}\n`);
+  } catch (e) {
+    // Refused at start (access denied, blocked) or ended from outside without an exit code: blocked.
+    const err = e as any;
+    return { exe: null, code: BLOCKED.has(String(err?.code ?? "")) || (err?.status == null && !!err?.signal) ? "helper_blocked" : "containment_unavailable" };
+  }
+  const built = fileSha(exe);
+  if (!built) return { exe: null, code: "helper_blocked" };
+  if (!answers()) return { exe: null, code: blocked ? "helper_blocked" : "containment_unavailable" };
+  try {
+    writeFileSync(stamp, JSON.stringify({ source_sha256: want, exe_sha256: built }) + "\n");
     lockDown(o, exe); lockDown(o, stamp);
-  } catch { return null; }
-  return answers() ? exe : null;
+  } catch { return { exe: null, code: "containment_unavailable" }; }
+  return { exe, code: null };
 }
+// The helper's path once it is built, matches its record and answers its version, or null.
+// Off Windows there is none, and none is needed.
+export const ensureJobHelper = (o: Opts): string | null => jobHelperState(o).exe;
 // What holds files, as the helper's holders command reports it (Windows), with each
 // holder's parent's image name from the process list. [] when nothing can be read.
 export interface Holder { pid: number; ppid: number | null; image: string; parent_image: string | null }
@@ -2540,7 +2775,11 @@ export function parseHolders(out: string, ps: Proc[] = []): Holder[] {
   return out2;
 }
 // Windows runs refuse until the helper is there and answers.
-export const containmentProblem = (o: Opts): Code | null => platform(o) === "win32" && !ensureJobHelper(o) ? "containment_unavailable" : null;
+export const containmentProblem = (o: Opts): Code | null => {
+  if (platform(o) !== "win32") return null;
+  const st = jobHelperState(o);
+  return st.exe ? null : st.code ?? "containment_unavailable";
+};
 
 // The owner's STOP file, checked every second while the session runs: it ends the session
 // at once (stopped), and the run's end step deletes what the session left.
@@ -3157,8 +3396,9 @@ export interface RunOut { code: Heartbeat["code"] | Code; job: string | null; cl
 // and the run ends there on a mismatch. contextAfterRead: the hook's tab-context order
 // after every page read (the confirmation's read_context; on in the probe).
 export const inventoryGate = (tools: string[], denied: string[]): Gate => (init) => inventory({ init, uses: [], results: {}, denials: [], final: null }, tools, denied).ok;
-// pin: the job's allowlist entry, whose registrable domains (entryDomains) and query
-// setting bound every navigation of the session (none: nothing but the check page opens).
+// pin: the job's allowlist entry, whose domain patterns (entryDomains) and query parameter
+// patterns bound every navigation and every page read of the session (none: nothing but the
+// check page opens). The job's own fields never add to them.
 async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof sessionHashes>>, job: Job, limit: number, leftovers: number[], contextAfterRead = false,
   pin: Allow | null = null) {
   const markerSha = readMarker(o);
@@ -3170,7 +3410,7 @@ async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof 
   try {
     const prompt = `${h.prompt}\n\n## This run\n\n${JSON.stringify(instruction(job, canary, leftovers[0] ?? null, pin ? entryDomains(pin) : []), null, 2)}\n`;
     s = await runSession(o, sessionArgv(inst, o, h.settings, prompt), limit,
-      sessionEnv(o, [canary.url, job.start_url, END_URL], contextAfterRead, { domains: pin ? entryDomains(pin) : [], query: pin?.query === true }),
+      sessionEnv(o, [canary.url, job.start_url, END_URL], contextAfterRead, { domains: pin ? entryDomains(pin) : [], query: pin?.query_params ?? [] }),
       inventoryGate(allowedTools(h.settings) ?? [], h.settings.permissions.deny));
   } finally { await canary.close(); }
   const after = cliSha(o, inst);
@@ -3228,7 +3468,7 @@ export interface SessionChecks { cliChanged: boolean; diskExtension: string | nu
 export function verdict(s: Session, st: Stream, log: Decision[], tools: string[], denied: string[], canaryUrl: string,
   pin: Allow | null, leftovers: number[], checks: SessionChecks = { cliChanged: false, diskExtension: null }): Verdict {
   let given = reportFrom(s.out);
-  const guard = guardCheck(st, log, checks.workerPaths ?? [], checks.wallTokens);
+  const guard = guardCheck(st, log, checks.workerPaths ?? [], checks.wallTokens, true);
   let bad: Code | null = guard.walled.length ? guard.code : (checks.cliChanged ? "cli_changed" : null) ?? sessionCode(s, st, tools, denied, checks.diskExtension, !!checks.needLive, checks.confirmedExtension ?? null)
     ?? guard.code;
   let field: string | null = null;
@@ -3414,8 +3654,10 @@ export interface ConfigSweepLine { before: string[]; after: string[]; left: stri
 // covers a worker ended that way). confirm-profile refuses unless tree_kill passed.
 // job_object (Windows only): the containment helper's Job Object, given an intermediary
 // that starts short-lived children in a burst and one detached descendant, then exits at
-// once: passed when the descendant is gone once the helper has exited (jobObjectCheck).
-export interface JobObjectLine { helper: boolean; descendant_started: boolean; descendant_left: boolean; passed: boolean }
+// once: passed when the descendant is gone once the helper has exited (jobObjectCheck);
+// and then the helper itself is ended (as a timeout or STOP ends it) while its program and a
+// detached descendant still run: kill_tree_gone when both are gone after it.
+export interface JobObjectLine { helper: boolean; descendant_started: boolean; descendant_left: boolean; kill_tree_gone: boolean; passed: boolean }
 export interface ProcessLine { platform: string; tree_kill: { passed: boolean; left: number; polls: number }; signals: { signal: string; handler_ran: boolean; passed: boolean }[];
   job_object?: JobObjectLine }
 // The probe's step that counts how often an honest multi-read chore (the browser step, run
@@ -3438,7 +3680,8 @@ Keep this order the whole time: right after you open a new tab, and right after 
 2. For each of these pages in turn: open it in a new tab with tabs_create_mcp; call tabs_context_mcp; read it with get_page_text; call tabs_context_mcp; call find on it for the word chore; call tabs_context_mcp.
 ${chorePages(c).map((u, i) => `   Page ${i + 1}: ${u}`).join("\n")}
 Then end your reply with the word done.`;
-export function judgeChore(log: Decision[]): ChoreLine {
+export function judgeChore(all: Decision[]): ChoreLine {
+  const log = all.filter((d) => d.phase !== "post");
   const allowed = log.filter((d) => d.decision === "allow");
   const tabs = allowed.filter((d) => d.tool === "tabs_create_mcp").length;
   const reads = allowed.filter((d) => PAGE_READING.includes(d.tool)).length;
@@ -3510,19 +3753,36 @@ export const INTERMEDIARY = `const cp = require("node:child_process"), fs = requ
 for (let i = 0; i < 5; i++) cp.spawn(process.execPath, ["-e", "0"], { stdio: "ignore" });
 const c = cp.spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { detached: true, stdio: "ignore" });
 c.unref(); fs.writeFileSync(process.env.PCW_DESCENDANT, String(c.pid)); process.exit(0);`;
-export async function jobObjectCheck(o: Opts, helper: string | null, alive: (pid: number) => boolean = pidRunning): Promise<JobObjectLine> {
-  if (!helper) return { helper: false, descendant_started: false, descendant_left: false, passed: false };
+export const KILL_INTERMEDIARY = `const cp = require("node:child_process"), fs = require("node:fs");
+const c = cp.spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { detached: true, stdio: "ignore" });
+c.unref(); fs.writeFileSync(process.env.PCW_DESCENDANT, process.pid + " " + c.pid); setTimeout(() => {}, 60000);`;
+export async function jobObjectCheck(o: Opts, helper: string | null, alive: (pid: number) => boolean = pidRunning,
+  kill: (pid: number) => void = (pid) => { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }): Promise<JobObjectLine> {
+  const none = { helper: false, descendant_started: false, descendant_left: false, kill_tree_gone: false, passed: false };
+  if (!helper) return none;
   const file = join(o.home, "job-object-check.pid");
+  const gone = async (pids: number[]) => { let left = pids.some(alive); for (let i = 0; i < 25 && left; i++) { await new Promise((ok) => setTimeout(ok, 200)); left = pids.some(alive); } return !left; };
   rmSync(file, { force: true });
   const r = spawnSync(helper, ["run", process.execPath, "-e", INTERMEDIARY], { env: { ...process.env, PCW_DESCENDANT: file }, stdio: "ignore", timeout: 60_000, windowsHide: true });
   let pid = 0;
   try { pid = parseInt(readFileSync(file, "utf8"), 10) || 0; } catch { pid = 0; }
   rmSync(file, { force: true });
-  if (r.status !== 0 || !pid) return { helper: true, descendant_started: !!pid, descendant_left: false, passed: false };
-  let left = alive(pid);
-  for (let i = 0; i < 25 && left; i++) { await new Promise((ok) => setTimeout(ok, 200)); left = alive(pid); }
-  if (left) killTree(pid);
-  return { helper: true, descendant_started: true, descendant_left: left, passed: !left };
+  if (r.status !== 0 || !pid) return { ...none, helper: true, descendant_started: !!pid };
+  const ended = await gone([pid]);
+  if (!ended) killTree(pid);
+  // The helper itself ended from outside, its program and a detached descendant still running.
+  let kill_tree_gone = false;
+  const h = spawn(helper, ["run", process.execPath, "-e", KILL_INTERMEDIARY], { env: { ...process.env, PCW_DESCENDANT: file }, stdio: "ignore", windowsHide: true });
+  for (let i = 0; i < 100 && !exists(file); i++) await new Promise((ok) => setTimeout(ok, 100));
+  let pids: number[] = [];
+  try { pids = readFileSync(file, "utf8").trim().split(/\s+/).map(Number).filter((x) => x > 0); } catch { pids = []; }
+  rmSync(file, { force: true });
+  if (h.pid && pids.length === 2) {
+    kill(h.pid);
+    kill_tree_gone = await gone(pids);
+    if (!kill_tree_gone) for (const p of pids) killTree(p);
+  } else if (h.pid) killTree(h.pid);
+  return { helper: true, descendant_started: true, descendant_left: !ended, kill_tree_gone, passed: ended && kill_tree_gone };
 }
 export function pidRunning(pid: number): boolean { try { process.kill(pid, 0); return true; } catch (e) { return (e as any)?.code === "EPERM"; } }
 
@@ -3834,7 +4094,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const job: Job = { v: 1, id: PROBE_ID(now), from: "cain", created: now.toISOString(), expires: new Date(now.getTime() + 3_600_000).toISOString(),
       state: "claimed", lease_until: new Date(now.getTime() + LEASE_MS).toISOString(), attempt, site: pin.site,
       action: pin.action, step: "read", start_url: pin.url, done_looks_like: "The account settings page; report whether it is signed in and whether two-step sign-in is on",
-      follows: null, preview_seen: null, owner_go: null, go_token: null };
+      follows: null, preview_seen: null, owner_go: null, go_token: null, owner_reuse: null };
     const leftovers = readLeftovers(o);
     // With the hook's tab-context order after every read on, as on a PC whose reads don't
     // report their address: how often this honest chore trips it is counted (context_trips).
@@ -4023,11 +4283,14 @@ export const BROWSER_OK: readonly Code[] = ["ok", "needs_login", "already_gone"]
 // The stated boundary of this release, which the owner accepts once with
 // confirm-profile --accept-boundary (its version is recorded in the confirmation; a new
 // version of the text needs a new acceptance). Runs refuse until he has.
-export const BOUNDARY_VERSION = "1";
+export const BOUNDARY_VERSION = "2";
 export const BOUNDARY_TEXT = "This release is supervised browsing with checked tool calls and address checks at each observation. "
   + "It does not prevent requests the browser makes on its own: a redirect, the requests a page makes as it loads, or a popup outside Claude's tab group "
   + "reach their addresses before any check sees them. The worker fails a run that shows them afterwards; it can't stop them happening. "
-  + "The probe's redirect and popup cases show this on this PC.";
+  + "The probe's redirect and popup cases show this on this PC. "
+  + "The control on where a run goes is the domains your signed allowlist entry names: the worker takes them from the entry, never from the job, and refuses "
+  + "any other host before a navigation and when a page is read. Cain's keeper also refuses a new job that repeats a value a result reported; that is a "
+  + "mitigation, not a guarantee (a value reworded or carried by meaning gets past it), and a job may reuse a reported value only when you said yes to it.";
 
 // Which probe cases ran and passed on this PC, and which remain unverified here (failed,
 // not exercised, or not covered by any probe case at all: the boundary above).
@@ -4194,6 +4457,9 @@ export function signAllowlistFile(entriesFile: string, keyFile: string, passphra
   // is written anywhere (the signing tool writes nothing at all when it refuses).
   const risky = (Array.isArray(allow) ? allow : []).map((x: unknown, i: number) => ({ i, m: riskyMatch(x) })).filter((x) => x.m);
   if (risky.length) throw new WorkerError("allowlist_risky_url", risky.map((x) => `entry ${x.i + 1}: matched "${x.m!.word}" on host ${x.m!.host}`).join("; "));
+  // Every entry names its domains (the hosts its runs may open): refused before anything is signed.
+  const bare = (Array.isArray(allow) ? allow : []).map((x: any, i: number) => ({ i, x })).filter(({ x }) => !Array.isArray(x?.domains) || !x.domains.length);
+  if (bare.length) throw new WorkerError("allowlist_domains_missing", `${bare.map(({ i }) => `entry ${i + 1}`).join(", ")}: name "domains", the hosts its runs may open (exact, or *.host only where you mean every subdomain)`);
   const key: KeyObject = createPrivateKey({ key: readFileSync(keyFile, "utf8"), format: "pem", passphrase });
   const text = signAllowlist(kid, allow, signerOf(key));
   const check = parseAllowlist(text, new Map([[kid, createPublicKey(key)]]));
@@ -4220,7 +4486,7 @@ if (isMain && process.argv[2] === "nav-guard") {
   // what the permission layer does alone. It still refuses in the end.
   const stall = Math.min(parseInt(process.env.PCW_HOOK_STALL_MS ?? "", 10) || 0, 120_000);
   if (stall > 0) setTimeout(() => refuse("stalled"), stall);
-  const hard = stall > 0 ? undefined : setTimeout(() => refuse("timeout"), HOOK_MS + 1_000);
+  const hard = stall > 0 ? undefined : setTimeout(() => refuse("timeout"), HOOK_DEADLINE_MS + 1_000);
   const read = () => new Promise<string>((ok, fail) => {
     let text = "";
     process.stdin.setEncoding("utf8");
@@ -4231,6 +4497,19 @@ if (isMain && process.argv[2] === "nav-guard") {
   process.on("uncaughtException", () => refuse("internal_error"));
   if (!stall) hookMain(process.env, read, (x) => process.stdout.write(x), (x) => process.stderr.write(x))
     .then((code) => { clearTimeout(hard); process.exit(code); }, () => refuse("internal_error"));
+} else if (isMain && process.argv[2] === "read-guard") {
+  // The read-time drift check (PostToolUse). Every way out that isn't a logged allow replaces the answer.
+  const block = () => { try { process.stdout.write(readBlockJson() + "\n"); } finally { process.exit(0); } };
+  const hard = setTimeout(block, HOOK_MS + 1_000);
+  const read = () => new Promise<string>((ok, fail) => {
+    let text = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d) => { text += d; if (text.length > 4_000_000) fail(new Error("too_big")); });
+    process.stdin.on("end", () => ok(text));
+    process.stdin.on("error", fail);
+  });
+  process.on("uncaughtException", block);
+  readGuardMain(process.env, read, (x) => process.stdout.write(x)).then((code) => { clearTimeout(hard); process.exit(code); }, block);
 } else if (isMain) {
   const args = process.argv.slice(2);
   const o: Opts = { home: resolve(flag(args, "--home", process.env.PC_WORKER_HOME ?? process.cwd())!), attended: args.includes("--attended"),
@@ -4258,6 +4537,6 @@ if (isMain && process.argv[2] === "nav-guard") {
       const text = signAllowlistFile(a1, flag(args, "--key") ?? "", process.env.PC_OWNER_PASSPHRASE ?? "", flag(args, "--kid") ?? "");
       const out = flag(args, "--out");
       if (out) { writeFileSync(out, text); say({ written: out }); } else process.stdout.write(text);
-    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | check-cli | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard"); process.exit(2); }
+    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | check-cli | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
   } catch (e) { fail(e); }
 }

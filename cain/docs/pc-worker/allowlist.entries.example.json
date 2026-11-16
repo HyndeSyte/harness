@@ -1,6 +1,6 @@
 {
   "allow": [
     { "site": "example.com", "action": "read_account_settings", "url": "https://example.com/account/settings", "match": "exact",
-      "login_hosts": ["accounts.example.com"], "login_paths": ["/login", "/signin*"], "domains": ["example.com"] }
+      "login_hosts": ["accounts.example.com"], "login_paths": ["/login", "/signin*"], "domains": ["example.com", "accounts.example.com"] }
   ]
 }

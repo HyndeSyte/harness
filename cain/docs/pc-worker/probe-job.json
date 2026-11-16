@@ -15,5 +15,6 @@
   "follows": null,
   "preview_seen": null,
   "owner_go": null,
-  "go_token": null
+  "go_token": null,
+  "owner_reuse": null
 }

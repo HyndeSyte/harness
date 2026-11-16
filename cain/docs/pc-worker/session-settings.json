@@ -76,6 +76,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__claude-in-chrome__(read_page|get_page_text|find)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PCW_RUNTIME\" \"$PCW_WORKER\" read-guard",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }
