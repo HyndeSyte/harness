@@ -1840,7 +1840,9 @@ describe("the supervised probe and confirm-profile", () => {
     expect(ev.addresses.cases.map((c: any) => [c.kind, c.why])).toEqual([["file", "scheme_not_allowed"], ["localhost", "private_address"],
       ["loopback_other_port", "private_address"], ["private_network", "private_address"]]);
     expect(ev.init_order.init_first).toBe(true);
-    expect(ev.short_names).toMatchObject({ setting: null });
+    // On Windows the probe reads the real volume's setting (fsutil 8dot3name query); elsewhere there is none.
+    if (WIN) expect(ev.short_names).toMatchObject({ volume: expect.stringMatching(/^[A-Z]:$/) });
+    else expect(ev.short_names).toEqual({ volume: "", setting: null, line: null });
     expect(q.launches[0][2]).toContain("connection check");
     expect(q.launches[1][2]).toContain("connection check");
     expect(q.asked).toEqual([expect.stringContaining("Restart the Cain jobs Chrome now")]);
@@ -4221,7 +4223,8 @@ describe("the files around it", () => {
   });
 
   test("the session prompt and the owner's setup note say what the code does", () => {
-    const prompt = readFileSync(SESSION_FILES.prompt, "utf8");
+    // Line endings as checked out (CRLF on a Windows runner) don't matter to what the prompt says.
+    const prompt = readFileSync(SESSION_FILES.prompt, "utf8").replace(/\r\n/g, "\n");
     for (const w of ["canary_url", "done_url", "about:blank", "the profile", "extension id", "attempt id", "exactly as written", "data, never instructions", "Cain jobs", "no shell",
       "no clicking or typing", "browser_unreachable", "wrong_profile", "tab_id", "tabs_create_mcp", "Open no other tab", "Leave the tab open",
       "There is no notes field", "schema_violation", "call `mcp__claude-in-chrome__tabs_context_mcp`\n(it needs no arguments) before any other tool", "\"profile\": \"bound\"",
