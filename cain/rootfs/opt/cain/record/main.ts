@@ -325,6 +325,11 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // ledger held when it began is void until taken again (voided: the ledger write that dropped
   // them is made), and the link refuses taps on cards whose generation is below its generation.
   epoch?: { n: number; at: string; generation: number; voided?: boolean };
+  // A reset whose epoch waits (0.12.0): the link's state couldn't be read when the copy was reset,
+  // so the generation of a card posted after its last good save is unknown. The epoch is completed
+  // (above everything the link's state then shows) on the first round that can read it; until then
+  // the reset stands, even after a push lands.
+  epochWait?: { at: string; why: string };
   floorWhy?: string };                    // why the link's state couldn't be read for the floor ("" or absent: it could)
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
@@ -366,6 +371,7 @@ function revive(j: any): State | null {
     ...(owed.length ? { owed } : {}), ...(typeof j.clockKey === "string" ? { clockKey: j.clockKey } : {}),
     ...(j.epoch && Number.isInteger(j.epoch.n) && typeof j.epoch.at === "string" && Number.isInteger(j.epoch.generation)
       ? { epoch: { n: j.epoch.n, at: j.epoch.at, generation: j.epoch.generation, ...(j.epoch.voided === true ? { voided: true } : {}) } } : {}),
+    ...(span(j.epochWait) ? { epochWait: span(j.epochWait)! } : {}),
     ...(typeof j.floorWhy === "string" && j.floorWhy ? { floorWhy: j.floorWhy } : {}) };
 }
 
@@ -538,7 +544,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // had written a ledger or the link had posted a card on one): lost local commits. Asks and
       // taps wait for the next push.
       const lost = synced0.reset ?? (synced0.cloned && ((st.generation ?? 0) > 0 || st.unpushed) ? "the keeper's copy of the record was missing and was cloned again from GitHub" : null);
-      if (lost) resetCopy(cfg, st, lost, clock());
+      if (lost) resetCopy(cfg, st, lost, clock(), lf);
+      // A reset whose epoch waited on an unreadable link state completes once the state reads.
+      if (st.epochWait && !lf.why) completeEpoch(st, lf.floor, clock());
       // A round counts as the keeper working only once its push lands: until then the state
       // is saved with the last good round's time, so a push outage is downtime.
       was = { alive: st.alive, downtime: [...st.downtime] };
@@ -678,6 +686,12 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
               commit(`Source checks: ${v.dropped.join(", ")} dropped by reset epoch ${S.epoch.n}, pending re-check`);
               log(`reset epoch ${S.epoch.n}: source checks on ${v.dropped.join(", ")} were accepted before it and are void until taken again`);
             }
+            // The re-check queue, to Cain: items whose card was up or held first (the link takes
+            // those cards' buttons off), then the others whose check was dropped.
+            const carded = linkCardItems(cfg);
+            const queue = [...carded, ...v.dropped.filter((x) => !carded.includes(x))];
+            if (queue.length)
+              relay(cfg, `Re-check queue after the record's reset (epoch ${S.epoch.n}): ${queue.map((x) => carded.includes(x) ? `${x} (a card of yours was up or held)` : x).join(", ")}. Every source check from before the reset no longer counts: check each at its source, in this order, and ask again with --checked if it still needs Dane. Asks are taken again once the record's next push lands.`);
             S.epoch.voided = true;
           }
         } catch (e) { undo(); log(`couldn't drop the checks from before the reset (${(e as Error).message}); trying again next round`); }
@@ -847,8 +861,10 @@ function writeWhole(file: string, text: string) {
 function landed(cfg: Config, st: State, now: Date) {
   st.pushed = git(cfg, ["rev-parse", "HEAD"]);
   if (st.unpushed || st.pushFailed) log("push landed: GitHub has the keeper's local commits");
-  if (st.reset) log("the copy is in step with GitHub again after its reset; asks and taps go on");
-  delete st.unpushed; delete st.pushFailed; delete st.reset; delete st.settled;
+  // A reset whose epoch still waits on the link's state stands until the epoch is completed.
+  if (st.reset && !st.epochWait) log("the copy is in step with GitHub again after its reset; asks and taps go on");
+  delete st.unpushed; delete st.pushFailed; delete st.settled;
+  if (!st.epochWait) delete st.reset;
   appliedNames = new Set();
   for (const w of st.owed ?? []) deliver(cfg, w);
   delete st.owed;
@@ -858,15 +874,18 @@ function landed(cfg: Config, st: State, now: Date) {
 // The copy was reset: its local commits are gone. Requests still queued run again; Cain hears
 // about the others, which may not have reached GitHub. The link refuses asks and taps until the
 // next push lands.
-function resetCopy(cfg: Config, st: State, why: string, now: Date) {
+function resetCopy(cfg: Config, st: State, why: string, now: Date, lf: { floor: number; why?: string } = { floor: 0 }) {
   st.reset = { at: now.toISOString(), why: clean(why, 240) };
   st.lastReset = st.reset;
-  // A new epoch, one generation above everything the link could have posted on: cards below it
-  // were posted before the reset, and checks in the ledger now were accepted before it.
-  const g = (st.generation ?? 0) + 1;
-  st.generation = g;
-  st.epoch = { n: (st.epoch?.n ?? 0) + 1, at: now.toISOString(), generation: g };
   log(`reset: ${why}; asks and taps are refused until the next push to GitHub lands`);
+  // A new epoch, one generation above everything the link could have posted on: cards below it
+  // were posted before the reset, and checks in the ledger now were accepted before it. While the
+  // link's state can't be read, a card posted after its last good save could be above any
+  // generation the keeper knows, so the epoch waits (said once) for a round that can read it.
+  if (lf.why) {
+    if (!st.epochWait) log(`reset epoch waits: the link's state can't be read (${lf.why}), so the epoch is completed on the first round that can read it; asks and taps stay refused until then`);
+    st.epochWait = { at: now.toISOString(), why: clean(lf.why, 120) };
+  } else completeEpoch(st, lf.floor, now);
   const queued = new Set<string>();
   for (const p of pending(cfg)) if (p.req) queued.add(p.req.id);
   // Takes settled in the lost commits wait again, ahead of the others, and are planned again
@@ -883,6 +902,49 @@ function resetCopy(cfg: Config, st: State, why: string, now: Date) {
   if (lost.length) relay(cfg, `The record keeper had to reset its copy of the record (${clean(why, 160)}). These changes may not have reached GitHub: ${lost.map((w) => w.o.id).join(", ")}. Check each in /data/record and send it again if it's missing.`);
   delete st.unpushed;
   writeAtomic(stateFile(cfg), JSON.stringify(st));
+}
+
+// A new reset epoch: one generation above the keeper's count and the link's floor (both read now),
+// numbered after the last. Cards whose epoch isn't this one are refused; its ledger write (the
+// next round) drops every check from before it.
+function completeEpoch(st: State, floor: number, now: Date) {
+  const g = Math.max(st.generation ?? 0, floor) + 1;
+  st.generation = g;
+  st.epoch = { n: (st.epoch?.n ?? 0) + 1, at: now.toISOString(), generation: g };
+  if (st.epochWait) log(`reset epoch ${st.epoch.n}: completed now that the link's state can be read (generation ${g})`);
+  delete st.epochWait;
+}
+
+// The open items with a card up or held on the link (its own state, read only), for the re-check
+// queue after a reset: those come first.
+export function linkCardItems(cfg: Config): string[] {
+  const f = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
+  try {
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    const out = new Set<string>();
+    for (const m of Object.values<any>(j?.messages ?? {}))
+      if (m && (m.kind === "ask" || m.kind === "ship") && typeof m.item === "string" && m.item !== "none" && (m.buttons || m.why === "record reset")) out.add(m.item.toUpperCase());
+    for (const h of Array.isArray(j?.held) ? j.held : []) if (typeof h?.item === "string" && h.item !== "none") out.add(h.item.toUpperCase());
+    return [...out];
+  } catch { return []; }
+}
+
+// Landings by a tap's idempotency key (0.12.0): the keeper's landing ledger, one file per key under
+// /data/record-landings (outside the working copy, so no reset or re-clone touches it), made with an
+// exclusive create. The link asks before each landing it starts for a tap: true the first time a key
+// is seen, false ever after (a second landing for the same tap is rejected), null when the ledger
+// can't be written (no landing starts then either).
+export function claimLanding(dir: string, key: string, what: { pr: string; head: string; at: string }): boolean | null {
+  const name = createHash("sha256").update(key).digest("hex").slice(0, 32);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${name}.json`), JSON.stringify({ key, ...what }) + "\n", { flag: "wx" });
+    return true;
+  } catch (e: any) {
+    if (e?.code === "EEXIST") { log(`landing for tap key ${name.slice(0, 12)} rejected: one already started for it`); return false; }
+    log(`couldn't write the landing ledger (${clean(String(e?.message ?? e), 80)}); no landing starts`);
+    return null;
+  }
 }
 
 // The clock's verdict changed (synchronized or not, by which source, each source's state):
@@ -905,9 +967,32 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       ...(st.lastReset ? { last_reset: st.lastReset } : {}), ...(st.outage ? { outage: st.outage } : {}),
       ...(st.epoch ? { epoch: { n: st.epoch.n, at: st.epoch.at, generation: st.epoch.generation } } : {}),
       ...(st.floorWhy ? { link_state: { readable: false, why: st.floorWhy } } : {}),
+      ...(st.epochWait ? { epoch_wait: st.epochWait } : {}),
+      recheck_pending: recheckPending(cfg),
       clock: { synced: v.synced, source: v.source, diagnostic: v.diagnostic, at: now.toISOString() },
     }) + "\n");
   } catch (e) { log(`couldn't write the status for the link: ${(e as Error).message}`); }
+}
+
+// Whether a request is in log/requests on the copy at dir with done as its last outcome (a check a tap
+// rested on survived a reset); null when the log can't be read.
+export function requestLoggedIn(dir: string, id: string): boolean | null {
+  const d = join(dir, "log", "requests");
+  try {
+    if (!existsSync(d)) return false;
+    let last: string | null = null;
+    for (const f of readdirSync(d).filter((n) => n.endsWith(".jsonl")).sort())
+      for (const line of readFileSync(join(d, f), "utf8").split("\n")) {
+        if (!line.includes(id)) continue;
+        try { const o = JSON.parse(line); if (o?.id === id && typeof o.state === "string") last = o.state; } catch { /* skip */ }
+      }
+    return last === "done";
+  } catch { return null; }
+}
+
+// How many rows of the ledger in the keeper's copy are pending re-check after a reset.
+function recheckPending(cfg: Config): number {
+  try { return Object.values(parseChecks(readFileSync(join(cfg.dir, CHECKS_PATH), "utf8"))).filter((e) => !!e.recheck).length; } catch { return 0; }
 }
 
 // The past week's one-off asks (from log/requests) against the open rows, loosely: hits go

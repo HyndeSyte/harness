@@ -74,6 +74,13 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // tuning; and the checks the keeper didn't answer in time.
   const fails = { record: false, outcome: false };
   const tuned: any[] = [], waited: any[] = [];
+  // Round 7: whether a check's request survived a reset (default: yes), the keeper's landing ledger,
+  // the link's state file on disk (corrupt: what it holds instead of the saved state), hung reads
+  // killed at the ceiling, and what Discord answers to a webhook patch of @original (another id).
+  const survive = { fn: null as null | ((id: string) => boolean | null) };
+  const landLedger = { keys: new Set<string>(), broken: false };
+  const disk = { corrupt: null as string | null, writes: 0 };
+  const kills = { n: 0 };
   const autoKeep = (req: any) => {
     if (!keeper.auto) return;
     for (const o of req.ops ?? []) {
@@ -91,7 +98,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const calls: any[] = [], relayed: string[] = [], harness: any[] = [], logs: string[] = [];
   const reports: any[] = [], replays: any[] = [];          // the gate's report log, and the replay's reports
   const sent = { ids: new Set<string>(), texts: new Set<string>() };   // what Cain's transcripts say he sent
-  const discord = { marksButtonEdits: false };      // whether an edit of buttons alone marks a message edited
+  const discord = { marksButtonEdits: false, webhookId: null as string | null };      // whether an edit of buttons alone marks a message edited
   const posted: Record<string, any> = {};
   const nonces: Record<string, { id: string; at: number }> = {};
   const failing = new Set<string>();             // path prefixes that fail, like "/interactions/" or "PATCH" (a 5xx)
@@ -158,6 +165,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     // The tapped card, edited through the interaction's webhook after a deferred answer.
     if (method === "PATCH" && /^\/webhooks\/[^/]+\/[^/]+\/messages\/@original$/.test(path)) {
       if (hang.interactions || hang.edits) return new Promise(() => {});
+      if (discord.webhookId) return { id: discord.webhookId };          // Discord patched another message
       if (posted[tapped]) {
         if (body.content !== undefined) posted[tapped].content = body.content;
         if (body.components !== undefined) posted[tapped].components = body.components;
@@ -174,7 +182,11 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     return null;
   };
   const deps = {
-    rest, load: () => copy(state), save: (s: State) => { state = copy(s); }, now: () => t.now,
+    rest, load: () => (disk.corrupt !== null ? emptyState() : copy(state)), save: (s: State) => { state = copy(s); disk.corrupt = null; disk.writes++; }, now: () => t.now,
+    stateHealth: () => (disk.corrupt !== null ? { ok: false, why: "corrupt or mid-write" } : { ok: true }),
+    requestLogged: (id: string) => (survive.fn ? survive.fn(id) : true),
+    claimLanding: (key: string) => { if (landLedger.broken) return null; if (landLedger.keys.has(key)) return false; landLedger.keys.add(key); return true; },
+    killRead: () => { kills.n++; },
     relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
     record: () => { if (fails.record) throw new Error("EIO"); return { ...files }; },
@@ -233,7 +245,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return checking(link); },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited,
+    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited, survive, landLedger, disk, kills, deps,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

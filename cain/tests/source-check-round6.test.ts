@@ -9,7 +9,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CHECKS_PATH, checkedCell, parseChecks, voidChecks } from "../rootfs/opt/cain/record/core.ts";
-import { cycle, headDate, leakCheck, leakForms, readLinkFloor, redact } from "../rootfs/opt/cain/record/main.ts";
+import { cycle, headDate, leakCheck, leakForms, readLinkFloor, redact, requestLoggedIn } from "../rootfs/opt/cain/record/main.ts";
 import { MIN, PR, SHA1, pendingWith, rig as linkRig } from "./link-rig";
 import { A, PENDING, hrs, rig as keeperRig } from "./rig.ts";
 
@@ -46,6 +46,7 @@ function both() {
   };
   l.keeper.auto = false;
   l.keeper.onWait = () => { run(); };
+  l.survive.fn = (id: string) => requestLoggedIn(k.cfg.dir, id);    // log/requests on the keeper's copy
   const block = (on: boolean) => { const f = join(k.root, "pi/record-block-push"); if (on) writeFileSync(f, ""); else rmSync(f, { force: true }); };
   return { k, l, run, read, block };
 }
@@ -57,7 +58,7 @@ const posted = async () => {
   expect(out.status).toBe("posted");
   return { r, id: out.message as string, d: (r.link as any).d };
 };
-const relays = (r: ReturnType<typeof linkRig>) => r.relayed.filter((x) => x.startsWith("Dane tapped")).length;
+const relays = (r: ReturnType<typeof linkRig>) => r.relayed.filter((x) => x.includes("Dane tapped")).length;
 
 describe("1. exactly-once taps", () => {
   test("a read resolving 1 ms after the limit is busy: no action, the card only patched back as it was", async () => {
@@ -90,20 +91,18 @@ describe("1. exactly-once taps", () => {
     expect(r.msg(id)).toEqual(card);
   });
 
-  test("two concurrent taps on one card: the second answers busy at once without a read; exactly one acts", async () => {
+  test("two concurrent taps on one card: the second starts no read and waits for the first; exactly one acts", async () => {
+    // Round 7 (item 9): the second is answered with the first's recorded outcome, not busy.
     const { r, id, d } = await posted();
     let reads = 0;
     d.readFresh = () => { reads++; return new Promise((ok) => setTimeout(() => ok({ files: d.record(), outcome: { state: "done" } }), 40)); };
     const card = structuredClone(r.msg(id));
     const a = r.tap(card, r.ids(id)[0]);
-    const t0 = performance.now();
     const b = await r.tap(structuredClone(card), r.ids(id)[1]);
-    expect(performance.now() - t0).toBeLessThan(30);
-    expect(b).toBe("refused: busy");
+    expect(b).toBe("already: to Cain");
     expect(await a).toBe("to Cain");
     expect(reads).toBe(1);
     expect(relays(r)).toBe(1);
-    expect(r.logs.join("\n")).toContain("another fresh read is still in flight");
   });
 
   test("a retap or a Discord retry with the same key returns the recorded outcome and does nothing again", async () => {
@@ -344,7 +343,7 @@ describe("7. Ship taps wait for a landed push", () => {
     const now = new Date(r.t.now).toISOString();
     (r.files as any).status = JSON.stringify({ unpushed: true, push_failed: { at: now, why: "x", since: now }, clock: synced(r.t.now) });
     expect(await r.tap(structuredClone(r.msg(ship.message)), r.ids(ship.message)[1])).toBe("refused: ship unpushed");
-    expect(r.ephemerals().at(-1).content).toBe("Cain's record hasn't saved its latest changes yet, so Ship waits. Tap again once it has, in a minute or two.");
+    expect(r.ephemerals().at(-1).content).toBe("Cain's record has unsaved changes, so Ship waits. Tap again once they're saved, in a minute or two.");
     expect(r.buttons(ship.message)).toEqual(["Ship", "Not now"]);
     expect(r.github.landings).toEqual([]);
     (r.files as any).status = JSON.stringify({ unpushed: false, clock: synced(r.t.now) });

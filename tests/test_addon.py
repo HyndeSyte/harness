@@ -117,17 +117,18 @@ def test_cain_config_denies_every_api_and_mapping():
     # Keys (the record keeper's GitHub token, the review runner's three API keys) as
     # password fields, the review caps as bounded numbers, and the panel's owner (a
     # Home Assistant user id, not a key), and how many days a source check counts
-    # (source_check_max_days, 7 by default). Nothing else.
+    # (source_check_max_days, 7 by default), and how long a tap's fresh read may take
+    # (tap_read_ms, 1500 by default). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  source_check_max_days: 7\nschema:\n'
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  source_check_max_days: 7\n  tap_read_ms: 1500\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
         "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n"
-        "  source_check_max_days: int(0,90)\n")
+        "  source_check_max_days: int(0,90)\n  tap_read_ms: int(200,2500)\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():

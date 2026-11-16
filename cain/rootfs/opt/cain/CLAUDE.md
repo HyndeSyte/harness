@@ -140,20 +140,31 @@ specialist (the Harness add-on) does.
   told the status changed. Other taps that do nothing and keep the buttons: a slow read
   ("Busy, tap again"), the box's clock not synchronized just now, or the record being put
   back in step after a reset, or (once the keeper's pushes have failed for over half an hour)
-  the record not saving. A Ship tap also waits while any push hasn't landed ("Ship waits"),
-  since Ship can't be undone. A card posted before a reset of the record is refused ("Cain's
+  the record not saving. A Ship tap also waits while any push hasn't landed ("Cain's record has
+  unsaved changes, so Ship waits"), since Ship can't be undone, whatever the unsaved change is
+  about. A card posted before a reset of the record is refused ("Cain's
   record was reset after this was asked") and loses its buttons ("Record reset since, re-check
   needed"); every check from before the reset stops counting (its Checked cell says pending
-  re-check), so check it again and ask again with --checked if it still needs him. Each tap
+  re-check). After a reset the record keeper sends you a "Re-check queue" line: the items whose
+  card was up or held first. Check each at its source in that order, and once the keeper has
+  accepted the re-check, ask again with --checked if it still needs him. Each tap
   acts once: a repeat of the same tap shows what it did and does nothing again, and a tap the
   link was cut off in the middle of is finished from its record after a restart, never redone.
+  Each relayed tap line ends with its tap key ("Tap key tap-..."). A line that starts "Repeat of
+  tap key" may be one you already had: if you already had a line with that tap key, ignore it;
+  act on a tap key once. A Ship tap lands at most once.
   While the record keeper can't read the link's state, asks and Ship cards are refused saying
-  so: ask again in a few minutes. Nothing to do for any of them unless he asks. A tap honoured while
-  the keeper's push is failing is journaled; if the keeper then has to reset its copy, you get
-  a relayed line listing each such tap ("Acted on a check that may not have landed", with its
-  item, card generation, check and time) and he gets one short notice from the App: check each
-  item at its source, record what he tapped again if it's missing, and ask again with
-  --checked if it still needs him. A long push outage (over 30 minutes or three rounds) also
+  so: ask again in a few minutes. If the link's own state is damaged, it rebuilds it by itself
+  and tells him once; you get a line saying so: check the items still open and ask again what
+  still needs him. Nothing to do for any of them unless he asks. A tap honoured while
+  the keeper's push is failing is journaled. If the keeper then has to reset its copy, a tap
+  (journaled, or one the link was cut off in the middle of) whose check didn't survive the reset
+  is lost to the record's reset: he gets one line on its card's thread ("Lost to the record's
+  reset, please answer again.") and you a relayed line saying his tap was lost to the record's
+  reset, please answer again, with its item and tap key. Record nothing from that tap (if you
+  already acted on it, say so to him only if it changed something he can see), and once the
+  item's re-check is accepted, ask again with --checked if it still needs him. A tap whose check
+  survived the reset stands. A long push outage (over 30 minutes or three rounds) also
   gets him one notice from the App with the error in plain words: don't repeat it. A held ask
   whose row changes is dropped unasked, and you're told. Check again and ask again if it
   still needs him.
@@ -480,13 +491,16 @@ smoke test and any answer does. Command, then the expected line:
 10. `/opt/cain/record.sh leak-check /tmp/smoke-refusal.txt`: `"clean":true` (it reads every file
    under /data/work, the keeper's and the link's state, and your notices' rendered words); any
    true under token, userinfo or header fails. Never print or read the token yourself.
-11. `/opt/cain/keeper.sh reads 20` (about 80 seconds): `"pass":true`, p95_ms at most 1000,
-   keeper_rounds_seen at least 1.
+11. `/opt/cain/keeper.sh reads 20` (about 80 seconds): it prints p50_ms, p95_ms and max_ms;
+   `"pass":true`, p95_ms at most half of limit_ms (the tap_read_ms option), keeper_rounds_seen
+   at least 1. Past half the limit it fails loudly (a FAIL line, exit 2): report it as failed.
 12. `/opt/cain/keeper.sh slow-read` (`"status":"ok"`), a checked test ask he taps: he sees "Busy,
    tap again." with the buttons live, /data/work/link.log "tap refused: the ledger's read took".
    His next tap counts.
 13. `/opt/cain/keeper.sh stall-read 20`: `"second_tap":"busy at once"`, journal_write_ms under
-   1000, `"pass":true`.
+   1000, `"pass":true`. Then on real Discord: run it again and, while it holds, he taps a checked
+   test ask: "Busy, tap again." reaches him alone, its buttons are still there after the busy
+   reply, and once the 20 seconds are over his next tap on it counts once (relayed once).
 It passes only when you also see committed in the record: the `check` request done in
 log/requests/, state/checks.json with that row's entry and your check, and the open table's
 Checked column showing it. Tell him the result in one line with the commit hashes of those
@@ -503,7 +517,7 @@ minutes of deliberate failures on the box, ending with a restore from that backu
 On Run it, in this order:
 R1. `/opt/cain/record.sh block-push 3`, a checked test ask: for over two minutes keeper.sh clock
    shows unpushed, /data/work/link.log "left card <id>'s buttons on" once, the buttons stay, a
-   tap on a Ship card answers "Ship waits", and after three rounds he gets one notice ("the
+   tap on a Ship card answers "Cain's record has unsaved changes, so Ship waits", and after three rounds he gets one notice ("the
    smoke test is blocking it on purpose"). Then unpushed goes false.
 R2. With a checked test ask up, `pkill -f /opt/cain/link/main.ts`: keeper.sh clock answers again
    within about 5 seconds, and his tap comes back relayed once.
@@ -516,9 +530,11 @@ R4. `/opt/cain/record.sh block-push 2`, a checked test ask he taps, a queued row
    forced reset and "reset epoch N"; asks are refused with the reset reason until the push
    lands; a tap on a card posted before the reset answers "Cain's record was reset after this
    was asked" and the next sweep takes its buttons off; the Checked cells show pending
-   re-check; keeper.sh clock's generation never goes down; you get the "Acted on a check that
-   may not have landed" line and he one notice; once the push lands, the edit and take are done
-   once each.
+   re-check and keeper.sh clock shows recheck_pending; its generation never goes down; you get
+   the "Re-check queue" line; his journaled tap either stands (its check survived) or comes back
+   as "Lost to the record's reset, please answer again." on its card's thread, with your relayed
+   line; once the push lands, the edit and take are done once each, and asks resume within two
+   keeper rounds of the push landing (about two minutes): a new checked ask posts and counts.
 R5. Last, the rollback: ask him to restore this App from that backup (you can't change Home
    Assistant), and give him a message to send you once it's restored: "Rollback check: run
    /opt/cain/keeper.sh stopped and jq -r .alive /data/record-holds.json". keeper.sh answering

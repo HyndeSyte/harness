@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { BUILD, decide, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
 const RUN = { stop: { stopped: false, at: null } };   // the hook's view: nothing stopped
-import { closedItems, digest, EXPIRED_TAP, nextCheckin, parseHolds, RESUME, STOP } from "../rootfs/opt/cain/link/core";
+import { closedItems, digest, EXPIRED_TAP, nextCheckin, parseHolds, RESUME, STOP, tapKid } from "../rootfs/opt/cain/link/core";
 import { BOT, DAY, DM, HOUR, keeperHolds, MIN, NOV11_8AM, OWNER, PR, pendingWith, rig, SHA1, SHA2 } from "./link-rig";
 
 const undoRows = [{ type: 1, components: [{ type: 2, style: 2, label: "Undo", custom_id: "k:c:abc" },
@@ -558,10 +558,11 @@ describe("threading", () => {
     const r = rig();
     const id = await ask(r, "P08", "Q2");
     await r.tap(snap(r.msg(id)), r.ids(id)[1]);
-    expect(r.relayed[0]).toBe(`Dane tapped "Not filed" on your question P08 Q2: "Filed?" (Discord message ${id}; its card shows his answer. If it needs words from you, reply with reply_to ${id})`);
+    expect(r.relayed[0]).toBe(`Dane tapped "Not filed" on your question P08 Q2: "Filed?" (Discord message ${id}; its card shows his answer. If it needs words from you, reply with reply_to ${id}) Tap key ${tapKid([id, r.state().messages[id].checked?.gen ?? "none", r.state().messages[id].checked?.req ?? "none", "P08", "Not filed"].join("|"))}.`);
     const s = ((await r.link.ship({ text: "Cain 0.7.0 ready.", item: "P41", pr: PR, head: SHA1.toUpperCase() })) as any).message;
     await r.tap(snap(r.msg(s)), r.ids(s)[0]);
-    expect(r.relayed[1]).toStartWith(`Dane tapped "Ship" on your Ship card for P41: ${PR} at head ${SHA1} (Discord message ${s}; its card shows his answer. If it needs words from you, reply with reply_to ${s}) The link landed it: main has that commit now. Ship token: ship1.`);
+    expect(r.relayed[1]).toStartWith(`Dane tapped "Ship" on your Ship card for P41: ${PR} at head ${SHA1} (Discord message ${s}; its card shows his answer. If it needs words from you, reply with reply_to ${s}) Tap key tap-`);
+    expect(r.relayed[1]).toContain(". The link landed it: main has that commit now. Ship token: ship1.");
     expect(r.msg(s).content).toBe("Cain 0.7.0 ready.\n\nShipped: it's in main as of 8:00 AM. Installing it is next.");
   });
 

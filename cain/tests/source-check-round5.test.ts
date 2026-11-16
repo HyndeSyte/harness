@@ -10,7 +10,7 @@ import { join, relative } from "node:path";
 import { DATE_SKEW_MS } from "../rootfs/opt/cain/clock";
 import { plainPush, TAP_READ_MS, UNPUSHED_TAP_MS } from "../rootfs/opt/cain/link/core";
 import { CHECKS_PATH, generationOf, isFresh, openRow, parseChecks, plan, rowHash, upkeep, type Request, type Tree } from "../rootfs/opt/cain/record/core.ts";
-import { cycle, leakCheck, linkFloor, redact } from "../rootfs/opt/cain/record/main.ts";
+import { cycle, leakCheck, linkFloor, redact, requestLoggedIn } from "../rootfs/opt/cain/record/main.ts";
 import { MIN, pendingWith, rig as linkRig } from "./link-rig";
 import { A, PENDING, T0, hrs, rig as keeperRig } from "./rig.ts";
 
@@ -47,6 +47,7 @@ function both() {
   };
   l.keeper.auto = false;
   l.keeper.onWait = () => { run(); };
+  l.survive.fn = (id: string) => requestLoggedIn(k.cfg.dir, id);    // log/requests on the keeper's copy
   const block = (on: boolean) => { const f = join(k.root, "pi/record-block-push"); if (on) writeFileSync(f, ""); else rmSync(f, { force: true }); };
   return { k, l, run, read, block };
 }
@@ -206,8 +207,8 @@ describe("3. the generation floor: the keeper's state file is outside the workin
   }, 30_000);
 });
 
-describe("4. taps honoured while the ledger is unpushed: journaled, reported after a reset, refused after 30 minutes", () => {
-  test("a tap during a push failure, then a forced conflict reset: Cain and Dane hear of it; the journal clears once a push lands", async () => {
+describe("4. taps honoured while the ledger is unpushed: journaled, judged after a reset, refused after 30 minutes", () => {
+  test("a tap during a push failure, then a forced conflict reset: its check survived, so it stands; the journal clears once a push lands", async () => {
     const { k, l, run, read, block } = both();
     const q1 = await ask(l, "Q1", CHECKED);
     expect(q1.status).toBe("posted");
@@ -216,7 +217,7 @@ describe("4. taps honoured while the ledger is unpushed: journaled, reported aft
     k.cain({ id: "cain-next-1", ops: [{ op: "row", item: "P11", base: rowHash(openRow(read(P), "P11")!), set: { "Next step": "Mine" } }] });
     expect(run()).toMatchObject({ pushFailed: true });
     expect(await l.tap(structuredClone(l.msg(q1.message)), l.ids(q1.message)[0])).toBe("to Cain");
-    expect(l.state().uncertain).toEqual([{ gen, check: expect.stringMatching(/^link-check-p44-/), item: "P44", at: l.t.now, msg: q1.message, label: "Fixed" }]);
+    expect(l.state().uncertain).toEqual([{ gen, check: expect.stringMatching(/^link-check-p44-/), item: "P44", at: l.t.now, msg: q1.message, label: "Fixed", epoch: 0, key: expect.any(String) }]);
     await l.link.sweep();
     expect(l.relayed.join(" ")).not.toContain("may not have landed");   // no reset yet: nothing to say
     // A forced conflict resets the copy while pushes still fail.
@@ -225,16 +226,15 @@ describe("4. taps honoured while the ledger is unpushed: journaled, reported aft
     l.later(MIN); k.at(new Date(l.t.now));                              // the keeper's clock moves with the link's
     expect(run()).toMatchObject({ pushFailed: true });
     expect(JSON.parse(l.files.status!).reset.why).toContain("conflict forced by the smoke test");
+    // Round 7: the check this tap rested on was pushed before the reset, so it survived it (its
+    // request is in log/requests on the keeper's copy): the tap stands, and nobody is told otherwise.
     const before = l.posts();
     await l.link.sweep();
-    const line = l.relayed.find((x) => x.includes("Acted on a check that may not have landed"))!;
-    expect(line).toContain(`card generation ${gen}, check link-check-p44-`);
-    expect(line).toContain(`P44, at 8:00 AM (Discord message ${q1.message}, "Fixed")`);
-    expect(l.posts()).toBe(before + 1);
-    expect(l.last().content).toStartWith("Heads up: one of your taps (8:00 AM) acted on a check that may not have landed");
-    expect(l.last().content).not.toMatch(/P44|link-check/);
+    expect(l.logs.join("\n")).toContain("rests on a check that survived the reset: it stands");
+    expect(l.relayed.join(" ")).not.toContain("lost to the record's reset");
+    expect(l.posts()).toBe(before);
     await l.link.sweep();
-    expect(l.posts()).toBe(before + 1);                                 // once
+    expect(l.posts()).toBe(before);
     // The push lands: the journal is cleared.
     block(false);
     expect(run().ok).toBe(true);

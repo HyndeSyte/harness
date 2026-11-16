@@ -48,8 +48,9 @@
 #   keeper.sh morning "text"             post the one morning message (with Stop)
 #   keeper.sh stopped                    whether everything is stopped (Dane's Stop), and since when
 #   keeper.sh reads [n]                  n fresh reads of the record keeper's files (default 20), 4 seconds
-#                                        apart, the way a tap reads them: their times, the 95th percentile
-#                                        and whether it passes (at most one second); about 80 seconds
+#                                        apart, the way a tap reads them: p50, p95 and max (it fails loudly,
+#                                        exit 2, when p95 is over half the tap_read_ms limit) and whether it
+#                                        passes; about 80 seconds
 #   keeper.sh slow-read                  the smoke test: the next tap's fresh read is held past its limit,
 #                                        so that tap must answer "Busy, tap again." and keep its buttons
 #   keeper.sh stall-read [seconds]       the smoke test: a fresh read held that long (default 20), ignoring its
@@ -178,3 +179,9 @@ wait=45; [ "$cmd" = reads ] && wait=240; [ "$cmd" = stall-read ] && wait=150   #
 out=$(curl -sS -m "$wait" -H "@$hdr" -d "$body" "$url" 2>&1) \
   || { jq -nc --arg e "$out" '{status: "error", said: ("No answer: " + $e)}'; exit 1; }
 echo "$out"
+# The reads fail loudly: p95 over half the tap read limit (or a busy read) is a failure, said on its
+# own line and in the exit status.
+if [ "$cmd" = reads ] && [ "$(printf '%s' "$out" | jq -r '.pass // empty' 2>/dev/null)" = false ]; then
+  printf '%s' "$out" | jq -r '.fail // "FAIL: the reads did not pass"' >&2
+  exit 2
+fi

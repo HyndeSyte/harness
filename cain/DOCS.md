@@ -17,7 +17,8 @@ plugin (research preview) and your Claude plan; no API key.
 
 Options you may change, none needed: `source_check_max_days` (7 by default, 1 to 90) is
 how many days a source check counts before Cain's questions and Ship cards about that item
-need a new one.
+need a new one. `tap_read_ms` (1500 by default, 200 to 2500) is how long a tap may wait on
+reading the record before it answers "Busy, tap again".
 
 ## What Cain reads in Discord without asking
 
@@ -450,7 +451,9 @@ What Cain's link enforces:
     come off ("Status changed, re-check needed").
   - status unreadable: a read failed, or the ledger is behind the card's generation. The
     same status-changed words; the sweep judges the card later.
-  - busy: the read took longer than 1.5 seconds, or another tap's read is still in flight. The
+  - busy: the read took longer than the App's `tap_read_ms` option (1500 milliseconds unless
+    you change it; Discord wants an answer within 3 seconds), or another tap's read is still in
+    flight. The
     limit is enforced on the read itself: it is raced against a timer and cancelled through an
     abort signal when the timer wins, so a stalled read answers within the limit (tuned from the
     measured reads the smoke test prints). "Busy, tap again." Each is logged to `/data/record-waits.jsonl` and counted in
@@ -463,29 +466,51 @@ What Cain's link enforces:
     is being put back in step, so nothing was done. Tap again in a few minutes."
   - record unpushed: the keeper's pushes have been failing for over 30 minutes. "Cain's
     record hasn't saved for over half an hour, so nothing was done. Tap again once it has."
-  - record reset since: the card was posted before the keeper's latest reset epoch (below).
+  - record reset since: the card was stamped with an epoch other than the keeper's current one
+    (below): equality, not ordering, so a status that came back with an older epoch never
+    validates it.
     "Cain's record was reset after this was asked, so nothing was done. Cain will check it again
     and ask again if it still needs you." The sweep takes its buttons off on its next verified
-    read ("Record reset since, re-check needed") and tells Cain.
+    read ("Record reset since, re-check needed") and tells Cain to ask again once the keeper has
+    accepted the item's re-check.
   - ship unpushed: a tap on a Ship card while the keeper's status says unpushed at all, however
-    short the failure, since Ship can't be undone. "Cain's record hasn't saved its latest changes
-    yet, so Ship waits. Tap again once it has, in a minute or two." Taps on asks keep the
-    journal-and-notify path below.
+    short the failure, since Ship can't be undone. "Cain's record has unsaved changes, so Ship
+    waits. Tap again once they're saved, in a minute or two." Taps on asks keep the journal path
+    below. Known limitation: any unsaved change holds a Ship tap, not only one about the Ship
+    card's item, since the keeper's status has one unpushed flag for the whole record.
   Where the row sits in the table is never used.
 
   Each tap is decided exactly once. One settle guard per read decides between busy and honoured,
   once, before anything is done: a read that finishes after the limit, by a millisecond or because
   it ignored its cancellation, is busy for good, and that attempt is never honoured later. At most
   one fresh read is in flight: while one is pending, another tap answers busy at once without
-  starting a read. A busy answer (and every refusal that keeps the buttons) patches the card's
-  original message back as it was through the interaction's webhook, so its buttons are live
-  again, and the reason follows to you alone. Each honoured tap gets an idempotency key (the
-  card, its ledger generation, its check's request id, the item and the label), written to the
-  link's state in the same atomic save that marks the card answered, before Cain is told or a
-  landing starts. A retap or a Discord retry with the same key returns the recorded outcome and
-  does nothing again. If the link stops partway, its next sweep finishes the claim from that
-  record: a claim not yet acted on is acted on once, and one acted on but not yet shown gets only
-  its card edit; nothing is done twice.
+  starting a read. That guard can't wedge: a read still pending after 30 seconds is killed (its
+  file reads aborted, and anything it spawned killed as a process group; today's reads are file
+  reads in the link's own process, so there is nothing to spawn) and its slot is released by a
+  timer that doesn't wait for the read to settle, with one log line. Two taps on one card at once
+  (on different buttons, say) are handled one at a time: the second starts no read, waits for the
+  first, and is answered with the first one's recorded outcome, so exactly one is honoured. A busy
+  answer (and every refusal that keeps the buttons) patches the card's original message back as it
+  was through the interaction's webhook, so its buttons are live again, and the reason follows to
+  you alone; when that patch fails, or Discord answers with another message's id, the link edits
+  the card by its channel and message id with the bot's token instead. Each honoured tap gets an
+  idempotency key (the card, its ledger generation, its check's request id, the item and the
+  label), written to the link's state in the same atomic save that marks the card answered,
+  before Cain is told or a landing starts. A retap or a Discord retry with the same key returns
+  the recorded outcome and does nothing again. If the link stops partway, its next sweep finishes
+  the claim from that record: a claim not yet acted on is acted on once, and one acted on but not
+  yet shown gets only its card edit.
+
+  The key travels on. Cain's relayed line for the tap ends with its short form ("Tap key
+  tap-1a2b3c4d5e6f."). A line relayed again from a claim after a restart (the link may have been
+  cut off between telling Cain and recording that it did) starts "Repeat of tap key ...: if you
+  already had a line with this tap key, ignore this one.", so Cain acts on a tap key once. A Ship
+  tap's landing carries the key to the keeper's landing ledger (`/data/record-landings/`, outside
+  the record's working copy) before its first try; the ledger takes a key once and rejects a
+  second landing with the same key, so a landing a restart cut off is never started again: main
+  alone settles it (in main: landed, with its token; not in main: not landed, and a new Ship card
+  ships it). The guarantee as it holds: at most one landing and one assistant-visible action per
+  tap; a repeated line is marked as a repeat.
 - A one-off (`--item none`) is refused when its text holds an open row's item code or the
   row's whole Item phrase, quoting what matched. One whose words overlap an open row's Item
   more loosely (two of the row's distinctive words, or its only one) is held: nothing is
@@ -530,10 +555,21 @@ The reset epoch. Each reset starts a new epoch, recorded in the keeper's state f
 it began, and a generation one above everything the link could have posted on. Every source
 check the ledger holds when it begins was accepted before it, so each is dropped in the same
 round (its row keeps its id and version, and its Checked cell says `pending re-check: the record
-was reset, so its last check no longer counts`) until a new check is taken. Cards posted before
-it (their generation is below the epoch's) are refused with their own reason and lose their
-buttons on the sweep's next verified read, even when the ledger came back with the very check
-they rest on: a newer check of that row may have been in a commit the reset lost.
+was reset, so its last check no longer counts`) until a new check is taken. Each card is stamped
+with the epoch it was posted in, and a tap counts only while that equals the current epoch;
+cards from another epoch are refused with their own reason and lose their buttons on the sweep's
+next verified read, even when the ledger came back with the very check they rest on: a newer
+check of that row may have been in a commit the reset lost. A reset never completes its epoch
+while the keeper can't read the link's state (a card posted after the link's last good save
+could be above any generation the keeper knows): it waits, logs `reset epoch waits: the link's
+state can't be read (...)` once, keeps the reset standing (asks and taps refused) even if a push
+lands, and completes the epoch above everything the state then shows on the first round that
+can read it (`reset epoch N: completed now that the link's state can be read`).
+
+The re-check queue. Once the epoch's checks are dropped, the keeper relays Cain a "Re-check queue
+after the record's reset" line: the items whose card was up or held first, then the others whose
+check was dropped, to check at their source in that order and ask again with `--checked`. Its
+status counts the rows still pending re-check (`recheck_pending`, also in `keeper.sh clock`).
 
 The generation floor. Before posting an ask or Ship card, the link writes the generation it is
 about to post to its own state (`intendedGen` in `/data/link/state.json`), and saves the card's
@@ -544,10 +580,25 @@ and marks its status so the link posts no new ask or Ship card ("the record keep
 the link's state just now") until the file reads again (`floor: the link's state can be read
 again`). The link writes its state once at start when there is none.
 
+The link's state heals itself. At start and at each sweep the link reads its own state file as it
+is on disk. One failed read is looked at again next round, so a write caught mid-way never
+latches. After two failed reads in a row it rewrites the file whole (an atomic rename) with a
+generation of the larger of the keeper's floor and its own in-memory high-water mark, plus 10,
+posts you one notice ("Cain's link had to rebuild its saved state after the file was damaged.
+..."), tells Cain, and does nothing else from that state until a verified good read clears its
+unreadable flag. The keeper then reads the file again, and asks go on without you doing
+anything.
+
 A tap honoured while the ledger is unpushed is journaled by the link in its state file in
-`/data` (the card's generation, the check's request id, the item, the time and the label). If
-the keeper then resets its copy, the link lists those taps to Cain in a relayed line and tells
-you in one short notice that they acted on a check that may not have landed; the journal is
+`/data` (the card's generation and epoch, the check's request id, the item, the time, the label
+and the tap's key). Claims and journaled taps across a reset: one recorded before the reset is
+honoured only if the check it rests on survived it (its accepting request is in `log/requests/`
+on the keeper's current copy). One that didn't is lost to the reset: it is recorded so under its
+idempotency key, never acted on past the reset and never dropped silently, and you get one line
+on the card's thread ("Lost to the record's reset, please answer again.") while Cain gets a
+relayed line saying the tap was lost to the record's reset, please answer again (for a tap he
+had already heard, to disregard it), and to ask again with `--checked` once the item's re-check
+is accepted. The card's buttons come off ("Record reset since, re-check needed"). The journal is
 cleared once a push lands. Once a push failure is older than 30 minutes, taps are refused with
 their own reason (record unpushed) instead. And when the keeper's status has shown unpushed or
 reset for more than 30 minutes or three rounds, the link posts you one notice, once per outage,
@@ -609,15 +660,20 @@ The install smoke test (about twelve minutes):
    userinfo, and an Authorization header or a Basic or Bearer credential, and prints yes or no
    per file, never the match. Expect `{"clean":true,...}`; any `true` under token, userinfo or
    header fails the test.
-11. `/opt/cain/keeper.sh reads 20` (about 80 seconds). Expect `"pass":true`, `p95_ms` at most
-   1000 and `keeper_rounds_seen` at least 1.
+11. `/opt/cain/keeper.sh reads 20` (about 80 seconds). It prints `p50_ms`, `p95_ms` and `max_ms`.
+   Expect `"pass":true`, `p95_ms` at most half of `limit_ms` (the `tap_read_ms` option, 1500 by
+   default) and `keeper_rounds_seen` at least 1. Past half the limit it fails loudly: a `FAIL:`
+   line and exit status 2.
 12. `/opt/cain/keeper.sh slow-read` (expect `"status":"ok"`), then a checked test ask you tap.
    Expect "Busy, tap again." with the buttons live again, and `/data/work/link.log` showing `tap
    refused: the ledger's read took`. Your next tap counts.
 13. `/opt/cain/keeper.sh stall-read 20`: one fresh read is held for 20 seconds and ignores its
    cancellation. Expect `"second_tap":"busy at once"`, `journal_write_ms` under 1000 and
    `"pass":true`: while a read is stalled, another tap is answered busy without starting a read,
-   and a journal write to the link's state still completes.
+   and a journal write to the link's state still completes. Then the same on real Discord: run
+   `/opt/cain/keeper.sh stall-read 20` again and, while it holds, tap a checked test ask. Expect
+   "Busy, tap again." as a reply only you see, its buttons are still there after the busy reply, and, once the 20 seconds are over, your next tap on it honoured once (relayed once,
+   the card showing your answer).
 
 It passes only when he sees committed in the record the `check` request done in
 `log/requests/`, `state/checks.json` with that row's entry and his check, and the open
@@ -634,7 +690,7 @@ R1. `/opt/cain/record.sh block-push 3` (expect `the record keeper's rounds push 
    for the next 3 minutes`), then a checked test ask. For more than two minutes `keeper.sh clock`
    shows `"unpushed":true`; `/data/work/link.log` shows `left card <id>'s buttons on: no verified
    read of the ledger (unknown)` once, with the buttons still on; a tap on a Ship card meanwhile
-   answers "Cain's record hasn't saved its latest changes yet, so Ship waits."; after three
+   answers "Cain's record has unsaved changes, so Ship waits."; after three
    rounds you get one notice ("Cain's record hasn't saved to GitHub since ...: the smoke test is
    blocking it on purpose."). Then `"unpushed":false`.
 R2. With a checked test ask up, `pkill -f /opt/cain/link/main.ts`. Expect `keeper.sh clock` to
@@ -653,9 +709,12 @@ R4. `/opt/cain/record.sh block-push 2`, a checked test ask you tap (journaled), 
    keeper had to reset its copy of the record" until the push lands; a tap on a card posted
    before the reset answers "Cain's record was reset after this was asked, so nothing was done."
    and the next sweep takes its buttons off ("Record reset since, re-check needed"); the Checked
-   cells show `pending re-check`; `keeper.sh clock`'s generation never goes down; Cain gets the
-   relayed line "Acted on a check that may not have landed" and you one notice; once the push
-   lands, the row edit and the take are done, once each.
+   cells show `pending re-check` and `keeper.sh clock` shows `recheck_pending`; its generation
+   never goes down; Cain gets the "Re-check queue" line; your journaled tap either stands (its
+   check survived the reset) or comes back on its card's thread as "Lost to the record's reset,
+   please answer again." with Cain told the same; once the push lands, the row edit and the take
+   are done, once each, and asks resume within two keeper rounds of the push landing (about two
+   minutes): a new checked ask posts and its tap counts.
 R5. The rollback, last. Cain asks you to restore this App from the backup taken just before the
    install, and gives you a message to send him once it's restored ("Rollback check: run
    /opt/cain/keeper.sh stopped and jq -r .alive /data/record-holds.json"). Expect keeper.sh
@@ -665,10 +724,18 @@ R5. The rollback, last. Cain asks you to restore this App from the backup taken 
 
 Rollback. If the smoke test fails, the remedy is one step: in Home Assistant, restore this
 App from the backup taken just before the install (every install takes one first), which
-brings back its previous version. The rollback test runs this version's record against the
-previous keeper, copied into the tests as `cain/tests/fixtures/keeper-0.11.0`: that fixture is
-pinned to the version installed on the Pi (0.11.0 today), and moves when the Pi's does. After any
-rebase onto a version bump (another open pull request, pull request 21, also bumps this App's version),
+brings back its previous version. That backup must cover the keeper's state file outside the
+working copy (`/data/record-holds.json`, with the epoch and the reset that waits on it, and the
+landing ledger `/data/record-landings/`) and the link's state (`/data/link/state.json`, with the
+tap keys, the cards' epochs and the intended generation); a backup of the whole App, as Home
+Assistant takes before an install, covers all of `/data` but the two keys it leaves out. The
+rollback test runs this version's record against the previous keeper, copied into the tests as
+`cain/tests/fixtures/keeper-0.11.0`, and loads the state this version writes (epochs, tap keys,
+the intended generation, a waiting epoch, a landing ledger) into that keeper and into the
+previous link (`cain/tests/fixtures/link-0.11.0`): both start and ignore it. The fixtures are
+pinned to the version installed on the Pi (0.11.0 today), and move when the Pi's does. After any
+rebase onto a version bump (pull request 20, pull request 21 and pull request 23 also bump this
+App's version; pull request 20 lands first and this rebases onto it),
 both test suites and the rollback test run again on the new head before Ship. There is no switch that lets cards through without a
 check. The previous version's record keeper (as of 0.11.0) ignores state/checks.json, the
 `Checked` column and `state/one-off-audit.md` without error (tested): it reads and edits the

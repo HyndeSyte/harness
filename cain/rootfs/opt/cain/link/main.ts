@@ -57,6 +57,7 @@ import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { checkRuns, facts, inMain, land, type MergeDeps } from "./merge";
+import { claimLanding, requestLoggedIn } from "../record/main";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
@@ -80,6 +81,11 @@ const TUNING = process.env.SOURCE_CHECK_TUNING ?? "/data/work/source-check-refus
 const MAX_CHECK_DAYS = /^\d+$/.test(process.env.SOURCE_CHECK_MAX_DAYS ?? "") ? Number(process.env.SOURCE_CHECK_MAX_DAYS) : undefined;
 const NOTICES = process.env.LINK_NOTICES ?? "/data/work/link-notices.jsonl";   // the notices' rendered words (the leak check reads them)
 const RECORD_STATUS = process.env.RECORD_STATUS ?? "/data/record-ledger.json";   // the keeper's status: generation, push, reset, clock
+// The keeper's landing ledger (outside its working copy): one file per tap key that started a landing.
+const RECORD_LANDINGS = process.env.RECORD_LANDINGS ?? "/data/record-landings";
+// The App's tap_read_ms option: how long a tap's fresh read may take before it answers busy (the
+// link's own default when unset).
+const TAP_READ = /^\d+$/.test(process.env.TAP_READ_MS ?? "") ? Number(process.env.TAP_READ_MS) : undefined;
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
@@ -226,6 +232,18 @@ const link = new Link({
   },
   outcome: (id) => outcomeOf(readOr(outcomePath(id))),
   // A tap's fresh read: the four files at once, each read cancelled when the limit passes.
+  tapReadMs: TAP_READ,
+  // A fresh read past the 30-second ceiling: its file reads were aborted already; the reads run in
+  // this process and start no child processes, so there is no group to kill.
+  killRead: () => { console.log("[cain] link: a hung fresh read was released at its ceiling (its reads aborted; no child processes)"); },
+  // Whether a check request survived a reset: done in log/requests on the keeper's current copy.
+  requestLogged: (id) => requestLoggedIn(RECORD, id),
+  claimLanding: (key, what) => claimLanding(RECORD_LANDINGS, key, what),
+  // The state file as it is on disk (load() turns one that doesn't parse into an empty state).
+  stateHealth: () => {
+    try { const j = JSON.parse(readFileSync(STATE, "utf8")); return j && typeof j === "object" && !Array.isArray(j) && typeof j.messages === "object" ? { ok: true } : { ok: false, why: "not a state" }; }
+    catch (e: any) { return { ok: false, why: e?.code === "ENOENT" ? "missing" : "corrupt or mid-write" }; }
+  },
   readFresh: async (id, signal) => {
     const [pending, holds, checks, status, out] = await Promise.all([readOrAsync(`${RECORD}/state/PENDING.md`, signal), readOrAsync(HOLDS, signal),
       readOrAsync(`${RECORD}/state/checks.json`, signal), readOrAsync(RECORD_STATUS, signal), id ? readOrAsync(outcomePath(id), signal) : Promise.resolve(null)]);

@@ -127,7 +127,9 @@ describe("his Ship tap lands it in main", () => {
     expect(findToken(said)).toBeNull();
   });
 
-  test("a landing the link was cut off from is settled from main by the sweep", async () => {
+  test("a landing the link was cut off from is settled from main by the sweep, never landed a second time", async () => {
+    // Round 7: the tap's key is in the keeper's landing ledger from its first try, so after a restart
+    // main alone says whether it landed.
     const r = rig();
     const id = await ship(r);
     r.github.hold = true;
@@ -140,7 +142,25 @@ describe("his Ship tap lands it in main", () => {
     expect(r.github.landings).toHaveLength(1);
     r.later(2 * MIN);
     await sweep(r);
-    expect(r.github.landings).toHaveLength(2);
+    expect(r.github.landings).toHaveLength(1);
+    expect(r.msg(id).content).toBe(`${card}\n\nNot shipped: a landing for this tap was already started and was cut off by a restart, so it isn't started again. Nothing changed in main.`);
+    expect(findToken(r.relayed.at(-1)!)).toBeNull();
+  });
+
+  test("a landing cut off after its push: main has it, so it is settled as landed, with its token", async () => {
+    const r = rig();
+    const id = await ship(r);
+    r.github.hold = true;
+    void r.tap(snap(r.msg(id)), r.ids(id)[0]);
+    await tick();
+    r.github.main.push(SHA1);                                // the push went out just before the restart
+    r.restart();
+    r.github.hold = false;
+    r.later(4 * MIN);
+    await sweep(r);
+    r.later(2 * MIN);
+    await sweep(r);
+    expect(r.github.landings).toHaveLength(1);
     expect(r.msg(id).content).toBe(`${card}\n\nShipped: it's in main as of 8:06 AM. Installing it is next.`);
     expect(findToken(r.relayed.at(-1)!)).not.toBeNull();
   });

@@ -67,6 +67,11 @@ bashio::log.info "Cain is running"
 SOURCE_CHECK_MAX_DAYS="$(bashio::config 'source_check_max_days' 2>/dev/null || true)"
 case "$SOURCE_CHECK_MAX_DAYS" in ''|null|*[!0-9]*) SOURCE_CHECK_MAX_DAYS=7 ;; esac
 export SOURCE_CHECK_MAX_DAYS
+# tap_read_ms (1500 by default): how long a tap's fresh read of the record keeper's files may take
+# before the tap answers "Busy, tap again".
+TAP_READ_MS="$(bashio::config 'tap_read_ms' 2>/dev/null || true)"
+case "$TAP_READ_MS" in ''|null|*[!0-9]*) TAP_READ_MS=1500 ;; esac
+export TAP_READ_MS
 ( while true; do bun /opt/cain/link/main.ts 2>&1; sleep 5; done ) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Keeps a
 # copy in /data/record (so Home Assistant's backups carry it off the box),
