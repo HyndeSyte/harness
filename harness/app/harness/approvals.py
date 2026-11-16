@@ -130,7 +130,10 @@ def _verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
             return Verdict(False, "unknown approval")
         if a["consumed_at"] is not None:
             if a["outcome"] == "replaced":           # its card was replaced by a newer one
-                return Verdict(False, "replaced", proposal_id=a["proposal_id"])
+                return Verdict(False, _after_note(ledger, a["proposal_id"], "replaced"), proposal_id=a["proposal_id"])
+            if a["outcome"] == "expired":
+                return Verdict(False, _after_note(ledger, a["proposal_id"], "already used"),
+                               proposal_id=a["proposal_id"])
             if a["outcome"] == "updated":            # replaced when this version was installed
                 return Verdict(False, "replaced_by_update", proposal_id=a["proposal_id"])
             return Verdict(False, "already used", proposal_id=a["proposal_id"])
@@ -141,10 +144,12 @@ def _verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
             return Verdict(False, "approval belongs to another chat")
         if datetime.fromisoformat(a["expires_at"]) <= now:
             _expire(ledger, db, a, now)
-            return Verdict(False, "expired", proposal_id=a["proposal_id"])
+            return Verdict(False, _after_note(ledger, a["proposal_id"], "expired"), proposal_id=a["proposal_id"])
         p = db.execute("SELECT * FROM proposals WHERE id=?", (a["proposal_id"],)).fetchone()
         if p is not None and p["state"] == "superseded":
-            return Verdict(False, "replaced", proposal_id=p["id"])
+            return Verdict(False, _after_note(ledger, p["id"], "replaced"), proposal_id=p["id"])
+        if p is not None and p["state"] == "expired":
+            return Verdict(False, _after_note(ledger, p["id"], "proposal is no longer open"), proposal_id=p["id"])
         if p is None or p["state"] != "proposed":
             return Verdict(False, "proposal is no longer open", proposal_id=a["proposal_id"])
         params = json.loads(p["params_json"])
@@ -180,6 +185,19 @@ def _verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
         ledger.event("approval", {"proposal": p["id"], "action": action,
                                   "update": inc.update_id}, db=db)
     return Verdict(True, action, action=action, proposal_id=p["id"])
+
+
+def _after_note(ledger: Ledger, proposal_id: str, reason: str) -> str:
+    """His second tap of Approve as shown (after a newer note, runner._newer_note) on a card that ran
+    out or was replaced in between is answered as exactly that (0.24.0, fifth round)."""
+    if ledger.get_meta(f"calendar_change_note_check:{proposal_id}") != "confirmed":
+        return reason
+    p = ledger.db.execute("SELECT state FROM proposals WHERE id=?", (proposal_id,)).fetchone()
+    if p is not None and p["state"] == "superseded":
+        return "replaced_after_note"
+    if p is not None and p["state"] == "expired" or reason == "expired":
+        return "expired_after_note"
+    return reason
 
 
 def _expire(ledger: Ledger, db, a, now) -> None:

@@ -29,6 +29,8 @@ REFUSALS = {
     "replaced": "Replaced by a newer card.",
     "replaced_by_update": "Replaced when Harness updated. Nothing was done.",
     "confirm_after_note": "A newer note came in after this card and doesn't change it. Approve once more to go ahead as shown.",
+    "expired_after_note": "This card ran out after the newer note, before your second Approve, so nothing was done.",
+    "replaced_after_note": "A newer card replaced this one after the note, before your second Approve, so nothing was done.",
     "proposal changed after the card was shown": "That changed after you saw it; not done.",
     "policy changed since the card was shown": "The rules changed since; not done.",
 }

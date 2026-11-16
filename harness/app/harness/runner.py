@@ -46,6 +46,20 @@ def _addresses(old: dict, old_targets: set, new: dict, new_targets: set) -> bool
     return bool(a and b and (fit(a, b) or fit(b, a)))
 
 
+def _maybe_addresses(old: dict, new: dict) -> bool:
+    """Whether a rerun's change might speak to an open card's change, where plain code can't tell
+    (0.24.0, fifth round): one name holds the other's words but the kind of change differs, or the
+    same kind of change on the same calendar and day. Then the card asking which is used, never a
+    guess either way."""
+    from .calendar_change import fit
+    a, b = str(old.get("title", "")), str(new.get("title", ""))
+    if a and b and (fit(a, b) or fit(b, a)):
+        return True
+    day = lambda c: (c.get("dates") or "")[:10] or (c.get("start") or "")[:10]   # noqa: E731
+    return old.get("op") == new.get("op") and old.get("calendar") == new.get("calendar") \
+        and bool(day(old)) and day(old) == day(new)
+
+
 def _change_key(c: dict) -> tuple:
     """One change, however the model spaced or cased its title."""
     return (c.get("op"), c.get("calendar"), " ".join(str(c.get("title", "")).casefold().split()),
@@ -520,8 +534,10 @@ class Runner:
             # A later note or rerun replaces only the open cards whose change it addresses; the
             # others stay as they are, still offered on their own cards (0.24.0, third round).
             waiting_lines, params, replaced_keys, racing, asks, quiet = self._address_open(job, params)
-            if quiet:
-                self._newer_note(job, quiet)
+            # A note that speaks to none of the open cards is never dropped (0.24.0, fifth round): its
+            # change runs as a request of its own, and the line about the cards that stand, quoting
+            # the note, goes on that one response, so the note gets exactly one.
+            notice = self._newer_note(job, quiet) if quiet else ""
             for c, pids in asks:
                 self._ask_which(job, c, pids)
             if not params["changes"]:
@@ -532,12 +548,16 @@ class Runner:
                     return
                 self._all_done(job, receipt, done_lines, busy_lines, waiting_lines)
                 return
-            head = [f"Already done: {x}" for x in done_lines] + [f"In progress: {x}" for x in busy_lines] \
+            head = ([notice] if notice else []) \
+                + [f"Already done: {x}" for x in done_lines] + [f"In progress: {x}" for x in busy_lines] \
                 + [f"Still on its own card: {x}" for x in waiting_lines]
             # Each event he names, found before anything is offered or done (Nov 11): clear goes
             # straight through, unclear is asked once, by name.
             seen = self.calendar_change.preview(job, receipt, params)
             if seen is None:
+                if notice:                           # its question or refusal is out; the cards' line follows
+                    with self.ledger.tx() as db:
+                        self._reply(db, job, render.escape(notice), raw=True, kind="notice")
                 return
             lines = seen.lines
             warnings = self.calendar_change.warnings(
@@ -758,7 +778,7 @@ class Runner:
                 sent = datetime.fromisoformat(job["created_at"]).astimezone(ZoneInfo(self.config.timezone))
             except (ValueError, TypeError):
                 sent = None
-            return [], bool(provenance.open_day(his, sent))
+            return [], bool(provenance.open_day(his, sent, self.config.timezone))
         out = provenance.origin_lines(origin, self.ledger.now()) if origin else []
         cains = False
         try:                                   # his day, for "tomorrow" sent just before midnight
@@ -931,6 +951,11 @@ class Runner:
             if not hit and len(by_name) > 1:
                 asks.append((c, [k["row"]["id"] for k in by_name]))
                 unclear.add(i)
+            elif not hit:
+                maybe = [k for k in cards if any(_maybe_addresses(t, c) for t in k["theirs"])]
+                if maybe:                            # can't tell: ask (Card 1, ..., Neither), never guess
+                    asks.append((c, [k["row"]["id"] for k in maybe]))
+                    unclear.add(i)
         drop = set(unclear)
         for i, again in repeats.items():
             if any(k["row"]["id"] in replace for k in again):
@@ -1043,12 +1068,16 @@ class Runner:
                     seen.lines if seen else None, seen=seen, replaced=replaced)
         return new
 
-    def _newer_note(self, job, pids: list[str]) -> None:
-        """A note ran on this message and speaks to none of its open cards (0.24.0, fourth round):
-        each stands, its Approve relabeled "Approve as shown", and one notice beside them says a
-        newer note came in; Approve on each then asks once more before it does anything
-        (approvals: calendar_change_note_check)."""
+    def _newer_note(self, job, pids: list[str]) -> str:
+        """A note ran on this message and speaks to none of its open cards (0.24.0, fourth and fifth
+        rounds): each stands, its Approve relabeled "Approve as shown", and Approve on each then asks
+        once more before it does anything (approvals: calendar_change_note_check). The line saying so,
+        quoting the note, is returned for the note's own response (its card)."""
         said = []
+        text = self.ledger.job_text(job["id"])
+        seg = text.rsplit(NOTE_HEAD, 1)[1] if NOTE_HEAD in text else ""   # the newest note, as fenced
+        note = (seg.split(": ", 1)[1] if ": " in seg else "").rstrip().removesuffix("]")
+        quote = provenance.one_line(note, 100) if note.strip() else ""
         with self.ledger.tx() as db:
             for pid in pids:
                 self.ledger.set_meta(f"calendar_change_note_check:{pid}", "pending", db)
@@ -1064,12 +1093,11 @@ class Runner:
                     else:
                         db.execute("UPDATE outbox SET buttons_json=? WHERE state IN ('queued','held') AND binds_json LIKE ?",
                                    (json.dumps(buttons), f'%{a["nonce"]}%'))
-            self._reply(db, job, "A newer note about your message came in after "
-                        + ("this card" if len(pids) == 1 else "these cards") + ", and it doesn't speak to "
-                        + ("it" if len(pids) == 1 else "any of them") + (": " + "; ".join(said) if said else "")
-                        + ". " + ("It stays" if len(pids) == 1 else "They stay") + " as shown, and Approve now asks "
-                        "once more before it does anything.", kind="notice")
         log.info("job %s: a note that speaks to none of its %d open card(s): each asks once more", job["id"], len(pids))
+        return ("A newer note" + (f", \u201c{quote}\u201d," if quote else "") + " doesn't speak to "
+                + ("the earlier card" if len(pids) == 1 else "the earlier cards") + (" (" + "; ".join(said) + ")" if said else "")
+                + ", so " + ("it stays" if len(pids) == 1 else "they stay") + " as shown, Approve there asks once more, "
+                "and the note is this request of its own.")
 
     def _all_done(self, job, receipt, done_lines, busy_lines=(), waiting_lines=()) -> None:
         receipt["reason"] = "already_done"

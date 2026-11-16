@@ -536,8 +536,9 @@ def test_a_note_that_speaks_to_none_of_the_open_cards_makes_their_approve_ask_on
     m.claude.script = [ask(change("gmail", "remove", "PT"))]
     m.handover(paired=OWNER, message=mid, suggestion="Also, no PT today.")
     m.c.outbox.flush()
-    notice = [t for t in m.seen() if t.startswith("A newer note about your message came in")]
-    assert notice and "it doesn't speak to any of them" in notice[-1] and "Approve now asks once more" in notice[-1]
+    # Fifth round: the line about the cards that stand quotes the note, on the note's own card.
+    notice = [t for t in m.seen() if "A newer note, “Also, no PT today.”, doesn't speak to the earlier cards" in t]
+    assert notice and "Approve there asks once more" in notice[-1]
     labels = [c["label"] for r in m.link.cards[first]["rows"] for c in r["components"]]
     assert labels[0] == "Approve as shown"
     press(m, first, "Approve as shown")

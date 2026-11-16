@@ -647,3 +647,93 @@ def test_the_upgrade_after_pull_request_20s_migration_sweeps_once_and_leaves_its
     assert not any("An old reply from before" in t for t in m.seen())        # never sent as new
     assert len([t for t in m.seen() if t.startswith("Harness updated.")]) == 1
     assert migrate.run(old, m.cc, 1) == {}
+
+
+# -- 7. supersede edges --------------------------------------------------------------------------------
+
+from test_handover_round2 import press  # noqa: E402
+from test_handover_round4 import _two_cards  # noqa: E402
+
+
+def test_an_unmatched_note_gets_exactly_one_visible_response_that_quotes_it(m):
+    mid, (first, second) = _two_cards(m, second="Swim")
+    before = len(m.link.cards)
+    m.claude.script = [ask(change("gmail", "remove", "PT"))]
+    out = m.handover(paired=OWNER, message=mid, suggestion="Also, no PT today.")
+    m.c.outbox.flush()
+    new = [m.link.cards[c]["text"] for c in sorted(m.link.cards)[before:]]
+    assert len(new) == 1 and out["status"] == "waiting for his tap"        # one card: the note, as its own request
+    assert "Also, no PT today." in m.seen()[-1] and "Approve there asks once more" in m.seen()[-1]
+    assert m.link.cards[first]["rows"] and m.link.cards[second]["rows"]      # the stale cards stand
+
+
+def test_an_unmatched_note_that_needs_a_question_still_gets_one_response(m):
+    from fakes import result
+    mid, _ = _two_cards(m, second="Swim")
+    before = len(m.link.cards)
+    m.claude.script = [result({"type": "clarify", "question": "Which PT, the clinic or the pool?"})]
+    out = m.handover(paired=OWNER, message=mid, suggestion="Also, the PT.")
+    m.c.outbox.flush()
+    shown = len(m.link.cards) - before
+    assert out["said"] and shown <= 1          # the question, once: to Cain first, or on one card
+
+
+def test_when_a_note_may_speak_to_a_card_the_which_card_prompt_is_used(m):
+    mid, (first, second) = _two_cards(m, second="Swim")
+    m.claude.script = [ask(change("gmail", "remove", "Dentist", dates="2026-11-11"))]
+    m.handover(paired=OWNER, message=mid, suggestion="Actually no dentist.")
+    asked = m.seen()[-1]
+    assert asked.startswith("Which card does the newer note correct?")
+    assert "Card 1" in m.labels() and "Neither" in m.labels()
+    assert m.link.cards[first]["rows"]                                        # nothing replaced on a guess
+
+
+def _note_checked(m):
+    mid, (first, second) = _two_cards(m, second="Swim")
+    m.claude.script = [ask(change("gmail", "remove", "PT"))]
+    m.handover(paired=OWNER, message=mid, suggestion="Also, no PT today.")
+    press(m, first, "Approve as shown")                                       # the first tap confirms
+    assert any("A newer note came in after this card" in (t or "") for _, t in m.link.answers)
+    return mid, first, second
+
+
+def test_the_second_approve_as_shown_on_a_card_that_ran_out_says_so(m):
+    mid, first, _ = _note_checked(m)
+    m.clock.t += timedelta(days=2)
+    press(m, first, "Approve as shown")
+    assert "ran out after the newer note" in (m.link.answers[-1][1] or "") and not dentists(m)
+
+
+def test_the_second_approve_as_shown_on_a_card_replaced_in_between_says_so(m):
+    mid, first, _ = _note_checked(m)
+    custom = next(c["custom_id"] for r in m.link.cards[first]["rows"] for c in r["components"]
+                  if c["label"] == "Approve as shown")
+    m.claude.script = [ask(change("gmail", "add", "Dentist", dates="", start=at(16).isoformat(), end=at(17).isoformat()))]
+    m.handover(paired=OWNER, message=mid, suggestion="He means the dentist at 4.")
+    m.send(Handover(kind="press", press={"id": "98001", "token": "t", "app": "999", "custom_id": custom,
+                                         "message_id": str(first)}))
+    assert "replaced this one after the note" in (m.link.answers[-1][1] or "") and not dentists(m)
+
+
+# -- 8. the owner's time zone for open days, across a daylight saving change ------------------------
+
+from datetime import datetime as _dt, timezone as _utc  # noqa: E402
+
+from harness.provenance import open_day  # noqa: E402
+
+
+@pytest.mark.parametrize("sent_utc, words, left_open", [
+    # Nov 1, 2026: New York falls back at 6:00 UTC (2:00 EDT becomes 1:00 EST).
+    ("2026-11-01T05:30:00", "dentist tonight at 8", True),      # 1:30 AM EDT: the small hours
+    ("2026-11-01T06:30:00", "dentist tonight at 8", True),      # 1:30 AM EST, the hour again
+    ("2026-11-01T09:30:00", "dentist tonight at 8", False),     # 4:30 AM EST: past the small hours
+    ("2026-11-01T03:30:00", "dentist saturday at 3", True),     # 11:30 PM Sat EDT, though Sunday in UTC
+    ("2026-11-01T03:30:00", "dentist sunday at 3", False),
+    # Mar 14, 2027: it springs forward at 7:00 UTC (2:00 EST becomes 3:00 EDT).
+    ("2027-03-14T06:30:00", "dentist tonight at 8", True),      # 1:30 AM EST
+    ("2027-03-14T07:30:00", "dentist tonight at 8", True),      # 3:30 AM EDT
+    ("2027-03-14T08:30:00", "dentist tonight at 8", False),     # 4:30 AM EDT
+])
+def test_open_days_are_read_by_his_own_clock_across_daylight_saving(sent_utc, words, left_open):
+    sent = _dt.fromisoformat(sent_utc).replace(tzinfo=_utc.utc)
+    assert bool(open_day(words, sent, TZ)) is left_open

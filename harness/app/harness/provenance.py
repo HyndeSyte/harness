@@ -140,14 +140,19 @@ _MONTH_DAY = re.compile(r"\b(?:" + "|".join(f"{m}|{m[:3]}" for m in _MONTHS) + r
                         + r")\b")
 
 
-def open_day(words: str, sent: datetime | None) -> str:
-    """A day his words leave open, counted from when he sent them (`sent`, in his time zone), or "":
-    "next Friday"; a weekday that is the day he sent it ("Friday" on a Friday); an ordinal that is
-    that day's date with no month ("the 16th" on the 16th); "tonight" sent between midnight and
-    4 AM (0.24.0, fourth round). Any of them puts the change on a card, Cain or not."""
+def open_day(words: str, sent: datetime | None, tz: str | None = None) -> str:
+    """A day his words leave open, counted from when he sent them, or "": "next Friday"; a weekday
+    that is the day he sent it ("Friday" on a Friday); an ordinal that is that day's date with no
+    month ("the 16th" on the 16th); "tonight" sent between midnight and 4 AM (0.24.0, fourth round).
+    Any of them puts the change on a card, Cain or not. The sending day and the small hours are taken
+    in his configured time zone (`tz`, the add-on's timezone option; fifth round): `sent` is turned
+    into it here, whatever zone it came in, so a message sent across a daylight saving change reads
+    by his own clock, never by UTC or the Pi's."""
     hit = ambiguous(words)
     if hit or sent is None:
         return hit
+    if tz:
+        sent = sent.astimezone(ZoneInfo(tz))
     t = " " + words.casefold() + " "
     name = _DAYS[sent.weekday()]
     m = re.search(rf"\b(?:this\s+)?({name}|{name[:3]})s?\b", t)
@@ -244,7 +249,7 @@ def detail_line(c: dict, his: str, cain: str, tz: str, now: datetime,
         phrase = resolution(his, day, today, local.hour)
         shown = f" (your \u201c{render.escape(phrase)}\u201d)" if phrase and not re.search(r"\d", phrase) else ""
         fields.append(f"date {day:%a %b} {day.day}{shown}"
-                      + mark(bool(phrase), date_in(cain, day, today), True, forced=bool(open_day(his, local))))
+                      + mark(bool(phrase), date_in(cain, day, today), True, forced=bool(open_day(his, local, tz))))
     if at is not None:
         fields.append(f"time {render.clock_words(at, suffix=True)}"
                       + mark(time_in(his, at), time_in(cain, at), True))
