@@ -468,7 +468,7 @@ export function judgeShipGate(head: string, reports: GateReport[]): ShipGateLine
 // Its caps (twentieth round): one wait GitHub asks for longer than RATE_WAIT_CAP_MS (15 minutes) ends
 // the watch with rate_wait_cap; the whole watch never runs past WATCH_CAP_MS (2 hours, whatever
 // untilMs asks), and a watch that reaches it unsettled ends with watch_cap.
-export type WatchFailure = "no_head" | "other_head" | "head_moved" | "rate_wait_cap" | "watch_cap";
+export type WatchFailure = "no_head" | "other_head" | "head_moved" | "rate_wait_cap" | "watch_cap" | "live_acceptance";
 export interface WatchTarget { head?: string; pr?: number }
 export type WatchLine = ShipGateLine & { pr: number | null; bound_head: string | null; accepted_head: string | null; failure: WatchFailure | null; failure_why: string | null };
 export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, target: string | WatchTarget, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<WatchLine> {

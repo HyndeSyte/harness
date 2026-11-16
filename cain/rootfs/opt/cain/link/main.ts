@@ -34,7 +34,7 @@
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
 //                                       exactly those values when posted; a message he typed never counts
 //                                       (core.ts reuseProof); "ok", or refused with why
-//     POST /pc-notice {code}            one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
+//     POST /pc-notice {code, id?, job?}          one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
 //                                       condition and its fix; "posted" (a plain code it has no words for gets a generic line naming it), or refused
 // Nothing is published to the LAN: the App has no "ports:".
 //
@@ -309,7 +309,7 @@ Bun.serve({
         case "/replied": return json(await link.replied(b.m));
         case "/look": return json(await link.look(b.m));
         case "/reuse": return json(await link.reuseProof(b.m, b.values));
-        case "/pc-notice": return json(await link.pcNotice(b.code));
+        case "/pc-notice": return json(await link.pcNotice(b.code, b.job, b.id));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));

@@ -123,10 +123,15 @@ export const PC_NOTICES: Record<string, string> = {
   queue_empty_pending: "Your PC job keeper stopped: the PC job queue on GitHub is empty while a tap of yours approving a reused value waits to be settled. Fix: give the queue its first commit again, as in setup step 2 (pc-jobs.md, Troubleshooting); the tap then counts as used.",
   reuse_store_unreadable: "Your PC job keeper can't read its record of the taps you spent on reused values, so it takes no job that reuses a value until it can. Other PC jobs go on. Fix: see the store row in pc-jobs.md, Troubleshooting.",
   reuse_unsettled: "Your PC job keeper can't tell whether a job made from a tap of yours approving a reused value reached your PC: git gave no clear answer. The tap stays used, other PC jobs go on, and it tries again each round. If it lasts, see pc-jobs.md, Troubleshooting.",
-  reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next round, within a minute, once GitHub shows none of it arrived; then the job is queued again by itself. If it keeps being refused, check the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next round with a successful fetch from GitHub (within a minute while GitHub answers), once that fetch shows none of it arrived; then the job is queued again by itself. If it keeps being refused, check the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  reuse_record_unreadable: "Your PC job keeper has tried for three rounds to settle a tap of yours approving a reused value, written by an older version, but a file in its copy of the PC job queue can't be read. The tap stays used and other PC jobs go on. Fix: see the reuse_record_unreadable row in pc-jobs.md, Troubleshooting.",
+  reuse_fetch_failed: "Your PC job keeper has tried for three rounds to settle a tap of yours whose job GitHub refused three times, but it couldn't fetch the PC job queue from GitHub. The tap stays used until a round's fetch succeeds. Fix: see the reuse_fetch_failed row in pc-jobs.md, Troubleshooting (usually the network or the pc_jobs_token option).",
 };
 // A code the keeper sends that this link has no words for (a keeper ahead of the link).
 export const PC_NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
+export const PC_NOTICE_ID = /^[0-9a-f]{16,64}$/;
+export const PC_JOB_ID = /^j-\d{8}-[a-z0-9]{6}$/;
+const PC_NOTICE_KEEP = 200;              // the notice ids the link remembers having posted (the newest)
 export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
 export const CONNECTOR_LABEL = "Open connector settings";
@@ -230,6 +235,7 @@ export interface State {
   stopAt?: string;                   // the message holding the moving Stop
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
+  pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
 }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
@@ -1452,8 +1458,12 @@ export class Link {
     // A ship_gate watch of this pull request accepted another head (twentieth round: a watch binds to
     // the exact sha its pusher named, and its acceptance is kept by sha): a card for any other head is
     // refused while that acceptance stands, naming it and the command that records it replaced.
+    // One live acceptance per pull request (twenty-first round): the card reads that single one; more than
+    // one live (left from before the rule) is refused, naming each, until all but one are superseded.
     const watched = this.d.gateWatch?.(pr) ?? [];
-    if (watched.length && !watched.includes(head))
+    if (watched.length > 1)
+      throw new Refusal(`the Ship gate's watch of this pull request has more than one live acceptance (${watched.join(", ")}): supersede all but the one for this head (keeper.sh ship-gate --supersede <sha>) before showing its card`);
+    if (watched.length && watched[0] !== head)
       throw new Refusal(`the Ship gate's watch of this pull request accepted ${watched.join(" and ")}, not this head: if this head replaces it (a rebase), run keeper.sh ship-gate --supersede ${watched[0]}, then watch this head with keeper.sh ship-gate --pr <number> --head ${head} --watch before showing its card`);
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
@@ -1564,11 +1574,32 @@ export class Link {
   // it sent only on this answer ("posted"). A keeper newer than this link may send a code the link
   // has no words for (0.12.0, twentieth round): a plain code (lower-case letters, digits and "_",
   // at most 40) gets the generic line, naming the code; anything else is refused.
-  async pcNotice(code: unknown): Promise<{ status: "posted"; message: string }> {
+  //
+  // Twenty-first round: a notice may carry its id (the keeper's, kept before it posts) and the job it
+  // is about. The link deduplicates on the id: one it has already posted is answered "posted" with that
+  // message, and nothing is posted again, so a post whose acknowledgement was lost isn't repeated. The
+  // job, a PC job id of the queue's own shape only, is named on the line with the code.
+  async pcNotice(code: unknown, job?: unknown, id?: unknown): Promise<{ status: "posted"; message: string; duplicate?: true }> {
     const c = String(code ?? "");
-    const text = Object.hasOwn(PC_NOTICES, c) ? PC_NOTICES[c] : PC_NOTICE_CODE.test(c) ? pcNoticeUnknown(c) : "";
-    if (!text) throw new Refusal("not a PC job keeper notice");
-    return { status: "posted", message: await this.notice(text) };
+    const base = Object.hasOwn(PC_NOTICES, c) ? PC_NOTICES[c] : PC_NOTICE_CODE.test(c) ? pcNoticeUnknown(c) : "";
+    if (!base) throw new Refusal("not a PC job keeper notice");
+    const nid = id === undefined || id === null ? null : String(id);
+    if (nid !== null && !PC_NOTICE_ID.test(nid)) throw new Refusal("not a PC job keeper notice id");
+    const j = job === undefined || job === null ? null : String(job);
+    if (j !== null && !PC_JOB_ID.test(j)) throw new Refusal("not a PC job id");
+    if (nid !== null) {
+      const had = this.d.load().pcNotices?.[nid];
+      if (had) return { status: "posted", message: had.msg, duplicate: true };
+    }
+    const text = j ? `${base} (Job ${j}, code ${c}.)` : base;
+    const message = await this.notice(text);
+    if (nid !== null) {
+      const s = this.d.load();
+      const kept = Object.entries({ ...(s.pcNotices ?? {}), [nid]: { msg: message, at: this.d.now() } }).sort((a, b) => b[1].at - a[1].at).slice(0, PC_NOTICE_KEEP);
+      s.pcNotices = Object.fromEntries(kept);
+      this.d.save(s);
+    }
+    return { status: "posted", message };
   }
 
   // -- his yes to reusing a PC result's values (POST /reuse, the PC job keeper's ask) ----

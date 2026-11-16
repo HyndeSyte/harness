@@ -23,7 +23,7 @@
 //   bun main.ts worker          the PC worker's last heartbeat
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
   DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type OwnerReuse, type Result } from "./core.ts";
 
@@ -218,43 +218,87 @@ export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnsw
 //     settled), so the condition coming back is told again;
 //   - a notice file that can't be read counts as nothing told (a notice may then go out again,
 //     never be lost).
-export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused";
-export type Notify = (code: PcNotice) => boolean;
+//   - twenty-first round: a mark is removed only once its condition has been seen clear for
+//     CLEAR_ROUNDS (3) rounds in a row (a flapping condition is told once); every notice carries a
+//     notice id, kept with its key before the post, so a post whose acknowledgement was lost is sent
+//     again with the same id and the link, which deduplicates on it, doesn't post it twice;
+//   - twenty-first round: two waits are bounded with a notice: a legacy pending line whose record
+//     can't be read, and a third-refusal settle whose round couldn't fetch from GitHub. After
+//     WAIT_ROUNDS (3) such rounds for one tap, a once-only notice names the job and the code.
+export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused"
+  | "reuse_record_unreadable" | "reuse_fetch_failed";
+export interface NoticeSend { id: string; job?: string }
+export type Notify = (code: PcNotice, n?: NoticeSend) => boolean;
+export const CLEAR_ROUNDS = 3;
+export const WAIT_ROUNDS = 3;
+interface ToldMark { id: string; posted: boolean; clear: number }
+interface Told { told: Record<string, ToldMark>; waits: Record<string, number> }
 const toldFile = (cfg: Pick<Config, "used">) => `${cfg.used ?? USED_REUSE}.told.json`;
-function toldKeys(cfg: Pick<Config, "used">): Set<string> {
-  try { const a = JSON.parse(readFileSync(toldFile(cfg), "utf8")); return new Set(Array.isArray(a) ? a.filter((x) => typeof x === "string") : []); } catch { return new Set(); }
+const NOTICE_ID = /^[0-9a-f]{16,64}$/;
+// The notice file as read: version 2 ({v, told, waits}), or the twentieth round's list of keys (each
+// read as posted, with a fresh id). Unreadable: nothing told, no waits.
+function readTold(cfg: Pick<Config, "used">): Told {
+  let a: any;
+  try { a = JSON.parse(readFileSync(toldFile(cfg), "utf8")); } catch { return { told: {}, waits: {} }; }
+  if (Array.isArray(a)) return { told: Object.fromEntries(a.filter((x) => typeof x === "string").map((k) => [k, { id: newNoticeId(), posted: true, clear: 0 }])), waits: {} };
+  const told: Record<string, ToldMark> = {}, waits: Record<string, number> = {};
+  if (a && typeof a === "object" && a.told && typeof a.told === "object")
+    for (const [k, m] of Object.entries(a.told as Record<string, any>))
+      if (m && typeof m.id === "string" && NOTICE_ID.test(m.id)) told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0 };
+  if (a && typeof a === "object" && a.waits && typeof a.waits === "object")
+    for (const [k, n] of Object.entries(a.waits as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) waits[k] = n as number;
+  return { told, waits };
 }
-function saveTold(cfg: Pick<Config, "used">, keys: Set<string>): void {
+const newNoticeId = () => randomBytes(12).toString("hex");
+function saveTold(cfg: Pick<Config, "used">, t: Told): void {
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
-    writeFileSync(`${toldFile(cfg)}.tmp`, JSON.stringify([...keys]));
+    writeFileSync(`${toldFile(cfg)}.tmp`, JSON.stringify({ v: 2, ...t }));
     renameSync(`${toldFile(cfg)}.tmp`, toldFile(cfg));
   } catch (e) { log(`couldn't keep which notices went out: ${(e as Error).message}`); }
 }
-export function tell(cfg: Config, code: PcNotice, key: string = code): void {
-  const keys = toldKeys(cfg);
-  if (keys.has(key)) return;
+// The condition is here this round: told once (its id kept before the post), and its clear count reset.
+export function tell(cfg: Config, code: PcNotice, key: string = code, job?: string): void {
+  const t = readTold(cfg);
+  let m = t.told[key];
+  if (m?.posted) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
+  if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0 }; saveTold(cfg, t); }
+  m.clear = 0;
   let ok = false;
-  try { ok = (cfg.notify ?? linkNotify(cfg))(code); } catch { ok = false; }
-  if (!ok) { log(`couldn't tell the owner (${code}); trying again next round`); return; }
-  keys.add(key);
-  saveTold(cfg, keys);
+  try { ok = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(job && ID.test(job) ? { job } : {}) }); } catch { ok = false; }
+  if (!ok) { log(`couldn't tell the owner (${code}); trying again next round, with the same notice id`); return; }
+  m.posted = true;
+  saveTold(cfg, t);
 }
-// A condition that cleared: told again if it comes back.
+// A condition seen clear this round: its mark goes only after CLEAR_ROUNDS clear rounds in a row,
+// so a condition that comes back after that is told again, and one that flaps is told once.
 export function cleared(cfg: Config, key: string): void {
-  const keys = toldKeys(cfg);
-  if (keys.delete(key)) saveTold(cfg, keys);
+  const t = readTold(cfg);
+  let changed = false;
+  const m = t.told[key];
+  if (m) { m.clear += 1; if (m.clear >= CLEAR_ROUNDS) delete t.told[key]; changed = true; }
+  if (t.waits[key] !== undefined) { delete t.waits[key]; changed = true; }
+  if (changed) saveTold(cfg, t);
+}
+// One more round a bounded wait lasted (its key): at WAIT_ROUNDS, the once-only notice naming the job.
+export function waited(cfg: Config, code: PcNotice, key: string, job: string): number {
+  const t = readTold(cfg);
+  const n = (t.waits[key] ?? 0) + 1;
+  t.waits[key] = n;
+  saveTold(cfg, t);
+  if (n >= WAIT_ROUNDS) tell(cfg, code, key, job);
+  return n;
 }
 // The real send: one POST to the link's /pc-notice, keyed as linkReuse keys it.
 export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
-  return (code) => {
+  return (code, n) => {
     let tok = "";
     try { tok = readFileSync(cfg.discordEnv ?? DISCORD_ENV, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? ""; } catch { /* none */ }
     if (!tok) return false;
     const key = createHmac("sha256", tok).update("harness-relay-v1").digest("hex");
     const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     const conf = [`url = ${q(`${cfg.link ?? LINK}/pc-notice`)}`, `header = ${q(`X-Harness-Key: ${key}`)}`, `header = "Content-Type: application/json"`,
-      `data-binary = ${q(JSON.stringify({ code }))}`, `max-time = 40`, `noproxy = "*"`, `silent`].join("\n") + "\n";
+      `data-binary = ${q(JSON.stringify({ code, ...(n?.id ? { id: n.id } : {}), ...(n?.job ? { job: n.job } : {}) }))}`, `max-time = 40`, `noproxy = "*"`, `silent`].join("\n") + "\n";
     const p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore",
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
     if (p.exitCode !== 0) return false;
@@ -322,7 +366,7 @@ function named(dir: string, ids: string[], skip: string): boolean {
 export class ReuseUnsettled extends Error {}
 // The status a pending tap's replay is refused with, and the line the owner hears after a push
 // refused on every try: the same words.
-export const PENDING_STATUS = "pending: whether its job reached the PC's queue is settled at the keeper's next round, within a minute, once a fetch from GitHub shows where its pushes went, and until then the tap stays used";
+export const PENDING_STATUS = "pending: whether its job reached the PC's queue is settled at the keeper's next round with a successful fetch from GitHub (within a minute while GitHub answers), and until then the tap stays used";
 export const SPENT_WHY = "the keeper can't show whether the job made from that tap reached the PC's queue, so the tap counts as used for good; ask him again";
 // Step 0 of a round, after sync: every pending tap settled against the queue as GitHub has it.
 // fetched: the branch's commit this round's fetch brought (sync), or null when it brought none.
@@ -341,20 +385,20 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
       try { rec = jobs.some((j) => j.id === l.job) || named(cfg.dir, [l.job, ...(l.rid ? [l.rid] : [])], resolve(cfg.used ?? USED_REUSE)); } catch { rec = null; }
       if (rec === null) {
         unsettled.push(l.job);
-        tell(cfg, "reuse_unsettled", `unsettled:${l.m}`);
-        log(`the reuse tap for ${l.job} (written by an older keeper) can't be settled yet: a file in the queue copy can't be read`);
+        const n = waited(cfg, "reuse_record_unreadable", `record:${l.m}`, l.job);
+        log(`the reuse tap for ${l.job} (written by an older keeper) can't be settled yet: a file in the queue copy can't be read (round ${n}; the owner is told after ${WAIT_ROUNDS})`);
         continue;
       }
       if (rec) {
         recordReuse(cfg, l.m, l.job, "final", l.rid, undefined, { migrated: "round17_pending" });
         finalised.push(l.job);
         if (waiting(l)) { writeOutcome(cfg, { request: l.rid!, state: "queued", id: l.job }); rmSync(join(cfg.queue, `${l.rid}.json`), { force: true }); }
-        cleared(cfg, `unsettled:${l.m}`);
+        cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `record:${l.m}`);
         log(`migrated the reuse tap for ${l.job} (written by an older keeper, no commit): a record in the queue names it, so it landed`);
         continue;
       }
       recordReuse(cfg, l.m, l.job, "final", l.rid, undefined, { settled: "spent", migrated: "round17_pending" });
-      cleared(cfg, `unsettled:${l.m}`);
+      cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `record:${l.m}`);
       spent.push(l.job);
       if (waiting(l)) { writeOutcome(cfg, { request: l.rid!, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` }); rmSync(join(cfg.queue, `${l.rid}.json`), { force: true }); }
       tell(cfg, "reuse_migrated", `migrated:${l.m}`);
@@ -371,7 +415,7 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
         writeOutcome(cfg, { request: l.rid!, state: "queued", id: l.job });
         rmSync(join(cfg.queue, `${l.rid}.json`), { force: true });
       }
-      cleared(cfg, `shallow:${l.m}`); cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `refused:${l.m}`);
+      cleared(cfg, `shallow:${l.m}`); cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `refused:${l.m}`); cleared(cfg, `fetch:${l.m}`);
       log(`settled the reuse tap for ${l.job}: its push reached the queue`);
     } else if (seen === "absent") {
       const allRefused = l.attempts.length > 0 && l.attempts.every((a) => a.answer === "refused");
@@ -387,7 +431,7 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
         if (waiting(l)) { writeOutcome(cfg, { request: l.rid!, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` }); rmSync(join(cfg.queue, `${l.rid}.json`), { force: true }); }
         log(`the reuse tap for ${l.job} stays spent: no record shows every push of it refused, and the queue doesn't show it`);
       }
-      cleared(cfg, `shallow:${l.m}`); cleared(cfg, `unsettled:${l.m}`);
+      cleared(cfg, `shallow:${l.m}`); cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `fetch:${l.m}`);
     } else {
       unsettled.push(l.job);
       tell(cfg, seen === "shallow" ? "reuse_shallow" : "reuse_unsettled", `${seen === "shallow" ? "shallow" : "unsettled"}:${l.m}`);
@@ -545,7 +589,9 @@ export function readHeartbeat(dir: string): Heartbeat | null {
 export const REPROBE = "worker.ts probe --attended, then worker.ts confirm-profile --accept-boundary";
 export function heartbeatNotice(h: Heartbeat | null): string | null {
   if (h?.code === "update_pending")
-    return "The PC stopped taking jobs because Chrome has a Claude in Chrome update waiting. At the PC: restart the Cain jobs Chrome; the next run then asks for a new probe.";
+    return `The PC stopped taking jobs because Chrome has a Claude in Chrome update waiting, and an auto-update needs a new probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
+  if (h?.code === "extension_versions_ambiguous")
+    return `The PC stopped taking jobs because the Cain jobs profile holds more than one Claude in Chrome version, so the one Chrome runs can't be bound to the probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   if (h?.code === "worker_signin_missing")
     return "The PC isn't taking jobs because the worker's own Claude Code isn't signed in. At the PC: run the setup step that signs in claude-config, then start a run.";
   if (h?.code === "session_cleanup_failed")
@@ -667,7 +713,16 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
   let names = existsSync(cfg.queue) ? readdirSync(cfg.queue).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort() : [];
   try {
     const seen: { remoteHeads?: boolean } = {};
-    const fetched = sync(cfg, seen);
+    let fetched: string | null;
+    try { fetched = sync(cfg, seen); }
+    catch (e) {
+      // A round that couldn't fetch can't settle a tap whose pushes were all refused (the third-refusal
+      // settle): one more round of that wait for each, told once after WAIT_ROUNDS.
+      let taps: ReuseLine[] = [];
+      try { taps = [...reuseLedger(cfg).values()].filter((l) => l.state === "pending" && !l.legacy && l.attempts.length > 0 && l.attempts.every((a) => a.answer === "refused")); } catch { taps = []; }
+      for (const l of taps) waited(cfg, "reuse_fetch_failed", `fetch:${l.m}`, l.job);
+      throw e;
+    }
     const now = cfg.now?.() ?? new Date();
     const over = stale(readJobs(cfg.dir), now);
     if (over.length) {

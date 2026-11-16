@@ -305,12 +305,15 @@ in the harness repo; until then the keeper says it is waiting).
   otherwise the tap stays spent for good, even if the job later vanished from the queue):
   for another, ask again. A push counts as refused only on git's own refusal line for it;
   anything less clear never frees a tap. A refusal that says the tap "is pending" means the
-  keeper settles it at its next round, within a minute: wait, don't ask him again yet. No tap, no reuse.
+  keeper settles it at its next round with a successful fetch from GitHub (within a minute
+  while GitHub answers): wait, don't ask him again yet. No tap, no reuse.
 - The keeper sends him one Discord line itself (through the link, in its own fixed words)
   when the queue can't be read safely or a job from his tap was refused three times: a
   shallow copy, the queue's branch missing, an empty queue with a tap pending, an
-  unreadable tap record, a tap it can't settle. Each is told once while it lasts, and
-  again if it clears and comes back; a code your App has no words for comes as "a stop
+  unreadable tap record, a tap it can't settle, and a tap whose settling has waited three
+  rounds on an unreadable record or a failed fetch from GitHub (that line names the job and
+  its code). Each is told once while it lasts, and again only if it clears for three rounds
+  in a row and comes back; a code your App has no words for comes as "a stop
   condition the App does not know" with its code. Don't repeat it; if he asks, the fix is in
   that line and in the Troubleshooting table of cain/docs/pc-jobs.md.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
@@ -330,10 +333,13 @@ in the harness repo; until then the keeper says it is waiting).
   before the PC had checked its tools), `abort_kill_failed` (a session the PC ended wouldn't
   end in time; the PC stays unconfirmed until he probes again), `extension_slow_attach` (his
   probe saw Claude in Chrome too slow to attach: he restarts the Cain jobs Chrome and probes
-  again), `hook_margin_low` (a hook started so late in the run that the PC ended the session
-  at once: he closes heavy programs, restarts the PC and probes again first thing),
-  `probe_leftover` (a cut-off probe left files or a setting behind; the run didn't start: he
-  runs `bun worker.ts clean-probe`, opens a new terminal and runs again), `refusal_cap` (the session was refused twelve times
+  again), `hook_margin_low` (a hook started so late in the run, or never started within 36 seconds,
+  that the PC ended the session at once: he closes heavy programs, restarts the PC and probes
+  again within 5 minutes), `probe_leftover` (a cut-off probe left files or a setting behind;
+  the run didn't start: the refusal gives the command that removes each setting where it is
+  set; he runs it, opens a new terminal and runs again), `versions_changed` (Claude in Chrome
+  or Chrome updated during the run; its report was thrown away: he restarts the Cain jobs
+  Chrome and probes again), `refusal_cap` (the session was refused twelve times
   and ended), `domain_not_allowed` (the job named
   a host its allowlist entry doesn't allow; nothing ran), `containment_unavailable` (the
   PC couldn't build or start its Windows Job Object helper, so nothing runs uncontained),
@@ -341,7 +347,9 @@ in the harness repo; until then the keeper says it is waiting).
   `probe_stale` (a new Claude in Chrome, Chrome or Claude Code version, or a new Cain
   release with a new PC worker, or the Claude in Chrome or Chrome version installed isn't the
   one his probe saw: nothing runs until he probes and confirms again), `update_pending` (Chrome has a Claude in Chrome update waiting: he
-  restarts the Cain jobs Chrome), `boundary_not_accepted` (he hasn't accepted the stated
+  restarts the Cain jobs Chrome and probes again; an auto-update always needs a new probe),
+  `extension_versions_ambiguous` (the Cain jobs profile holds more than one Claude in Chrome
+  version: he restarts the Cain jobs Chrome and probes again), `boundary_not_accepted` (he hasn't accepted the stated
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
@@ -459,8 +467,10 @@ create, update or run any other routine.
      moves away it fails by name (`other_head`, `head_moved`) and accepts nothing. A Ship card
      for any other head of that pull request is refused while that acceptance stands, and the
      refusal names the accepted sha: after a rebase run
-     `/opt/cain/keeper.sh ship-gate --supersede <that sha>`, then watch the new head the same
-     way before its card. One wait for GitHub is at most 15 minutes and a watch at most 2
+     `/opt/cain/keeper.sh ship-gate --supersede <that sha>` (only once the new head is pushed:
+     it refuses while the pull request's head is still that sha), then watch the new head the
+     same way before its card. A pull request has one live acceptance at a time: a watch won't
+     accept while another stands (`live_acceptance`, naming it). One wait for GitHub is at most 15 minutes and a watch at most 2
      hours; past either it ends unsettled (`rate_wait_cap`, `watch_cap`). A reading GitHub refused (a 403 or 429 page) holds,
      never accepts: it says rate limit only when GitHub said so (a 429, or a 403 with its
      rate-limit signs) and otherwise names the endpoint as a permission failure, and the

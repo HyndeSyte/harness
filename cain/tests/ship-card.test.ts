@@ -10,7 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { CODES_WHY, SHIP_WORDS_WHY } from "../rootfs/opt/cain/gate/cain";
 import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, REVIEW_READ, unlabeled } from "../rootfs/opt/cain/link/core";
 import { watchFile } from "../rootfs/opt/cain/link/merge";
-import { acceptedFor, supersede } from "../rootfs/opt/cain/link/shipgate";
+import { acceptedFor, supersede, keepWatch, otherLive } from "../rootfs/opt/cain/link/shipgate";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -429,13 +429,51 @@ describe("twentieth review: the watch's acceptance is kept by sha, and supersede
     const refused = r.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 });
     await expect(refused).rejects.toThrow(`accepted ${SHA2}, not this head`);
     await expect(r.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 })).rejects.toThrow(`run keeper.sh ship-gate --supersede ${SHA2}`);
-    expect(supersede(dir, "5".repeat(40))).toMatchObject({ ok: false });       // nothing kept for that sha
-    expect(supersede(dir, "4".repeat(40))).toMatchObject({ ok: false });       // it accepted nothing
-    expect(supersede(dir, SHA2)).toEqual({ ok: true, pr: 5 });
+    const moved = async () => SHA1;                                 // the pull request's head is the rebased one
+    expect(await supersede(dir, "5".repeat(40), moved)).toMatchObject({ ok: false });       // nothing kept for that sha
+    expect(await supersede(dir, "4".repeat(40), moved)).toMatchObject({ ok: false });       // it accepted nothing
+    expect(await supersede(dir, SHA2, moved)).toEqual({ ok: true, pr: 5 });
     expect(JSON.parse(readFileSync(watchFile(dir, SHA2), "utf8")).superseded.at).toBeString();   // the record stays, marked
     expect(acceptedFor(dir, 5)).toEqual([]);
     kept(SHA1, SHA1);                                               // a new watch of the rebased head accepted it
     expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+    expect(r.msg(await ship(r)).content).toContain(LINE);
+  });
+});
+
+describe("twenty-first review: one live acceptance per pull request, and supersede only past the head", () => {
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  test("a watch refuses to accept while another live acceptance of that pull request stands, naming it; after a supersede it accepts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate21-"));
+    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2)).accepted_head).toBe(SHA2);
+    expect(otherLive(dir, 5, SHA1)).toEqual([SHA2]);
+    const refused = keepWatch(dir, line(SHA1), watchFile(dir, SHA1));
+    expect(refused).toMatchObject({ accepted_head: null, passed: false, failure: "live_acceptance" });
+    expect(refused.failure_why).toContain(SHA2);
+    expect(acceptedFor(dir, 5)).toEqual([SHA2]);                     // still the one live acceptance
+    expect(keepWatch(dir, line("6".repeat(40), 6), watchFile(dir, "6".repeat(40))).accepted_head).toBe("6".repeat(40));   // another pull request's: its own
+    expect(await supersede(dir, SHA2, async () => SHA1)).toEqual({ ok: true, pr: 5 });
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1)).accepted_head).toBe(SHA1);
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+  });
+  test("supersede refuses while the pull request's head is still the sha being replaced, naming the head, or when the head can't be read", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate21-"));
+    keepWatch(dir, line(SHA2), watchFile(dir, SHA2));
+    const same = await supersede(dir, SHA2, async () => SHA2);
+    expect(same).toMatchObject({ ok: false });
+    expect((same as any).why).toContain(`pull request 5's head is still ${SHA2}`);
+    expect(await supersede(dir, SHA2, async () => null)).toMatchObject({ ok: false });
+    expect(await supersede(dir, SHA2, async () => { throw new Error("down"); })).toMatchObject({ ok: false });
+    expect(acceptedFor(dir, 5)).toEqual([SHA2]);
+  });
+  test("the card reads the single live acceptance; more than one live is refused, naming each", async () => {
+    const r = shipRig();
+    const r2 = rig({ facts: true, gateWatch: () => [SHA1, SHA2] });
+    r2.github.facts = facts();
+    r2.reviews.list = [REVIEW];
+    await expect(r2.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 })).rejects.toThrow(`more than one live acceptance (${SHA1}, ${SHA2})`);
+    r.github.watched[PR] = SHA1;
     expect(r.msg(await ship(r)).content).toContain(LINE);
   });
 });

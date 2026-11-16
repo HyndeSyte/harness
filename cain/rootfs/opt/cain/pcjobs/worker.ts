@@ -121,6 +121,8 @@ export interface Opts {
   managedDirs?: string[];                           // the managed settings drop-in folders (managedDropins unless a test stands in)
   policyKeys?: () => string[];                      // Windows: the Claude Code policy registry keys that exist (policyKeys unless a test stands in)
   env?: Record<string, string | undefined>;         // the worker's own environment (process.env unless a test stands in)
+  envRegistry?: (name: string) => ("user" | "machine")[]; // Windows: the registry scopes that set a variable (registryEnvScopes unless a test stands in)
+  exeVersion?: (exe: string) => string | null;      // Windows: an executable's file version (exeFileVersion unless a test stands in)
   procs?: () => Proc[] | null;                      // the running processes (listProcs unless a test stands in)
   killPid?: (pid: number) => void;                  // ends one process (a stuck bridge's), killTree unless a test stands in
   platform?: string;
@@ -173,6 +175,7 @@ const P = {
   probeMarks: (o: Opts) => join(o.home, "probe-marks"),
   hookMargin: (o: Opts) => join(o.home, "hook-margin.json"),
   hookWorst: (o: Opts) => join(o.home, "hook-worst.json"),
+  versionHold: (o: Opts) => join(o.home, "version-hold.json"),
 };
 
 export const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -627,10 +630,11 @@ export function diskExtensionVersion(inst: Install): string | null {
 
 // The extension's active version: the one the dedicated profile's preferences say Chrome
 // runs. Chrome keeps each extension's entry under extensions.settings.<id>, in Secure
-// Preferences or Preferences (the entry can be split between them); the version is its
-// manifest's version where the entry carries one, else the version folder its path names
-// ("<id>/<version>_<n>"). That folder's manifest.json must exist and agree. null when the
-// entry, its version or its folder can't be read: the preflight fails closed on it.
+// Preferences or Preferences (the entry can be split between them); the version is the
+// entry's manifest version, the one Chrome loaded (0.12.0, twenty-first round: never a
+// folder's name; an entry without one is no version). The folder its path names
+// ("<id>/<version>_<n>") must hold a manifest.json that agrees. null when the entry, its
+// version or its folder can't be read: the preflight fails closed on it.
 export function activeExtensionVersion(inst: Install): string | null {
   const p = inst.profile;
   const dir = join(p.user_data_dir, p.profile_directory);
@@ -641,8 +645,10 @@ export function activeExtensionVersion(inst: Install): string | null {
     if (!e || typeof e !== "object") continue;
     const mv = e.manifest?.version;
     if (typeof mv === "string" && VER.test(mv)) version ??= mv;
+    // The path names the loaded folder, never the version (0.12.0, twenty-first round: the version is the
+    // entry's own, the one Chrome loaded, never read from a folder's name).
     const m = typeof e.path === "string" ? /^([a-p]{32})[\\/](\d+(?:\.\d+){0,3})(?:_\d+)?$/.exec(e.path) : null;
-    if (m && m[1] === p.extension_id) { folder ??= e.path.slice(33); version ??= m[2]; }
+    if (m && m[1] === p.extension_id) folder ??= e.path.slice(33);
   }
   if (!version) return null;
   const root = join(p.user_data_dir, p.profile_directory, "Extensions", p.extension_id);
@@ -734,6 +740,65 @@ export function updatePending(inst: Install): boolean {
   const active = activeExtensionVersion(inst), newest = diskExtensionVersion(inst);
   return !!active && !!newest && vcmp(active, newest) !== 0;
 }
+// Every version folder of the extension in the profile (0.12.0, twenty-first round). More than one (an
+// old folder left beside the loaded one, or an update unpacked) is extension_versions_ambiguous: which
+// one Chrome runs can't be bound to the probe, so runs refuse until a new probe (versionHold).
+export function extensionFolders(inst: Install): string[] {
+  const root = join(inst.profile.user_data_dir, inst.profile.profile_directory, "Extensions", inst.profile.extension_id);
+  try { return readdirSync(root).filter((v) => /^\d+(\.\d+){0,3}(_\d+)?$/.test(v)).sort(); } catch { return []; }
+}
+// Chrome's version (0.12.0, twenty-first round): the file version of the chrome.exe the dedicated Chrome
+// runs from (its process's command line names it), read on Windows; only when that can't be read, the
+// user data folder's Last Version file, named as the fallback it is (source).
+export type ChromeVersionSource = "chrome_exe" | "last_version_file";
+export const exeFileVersion = (exe: string): string | null => {
+  try {
+    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "(Get-Item -LiteralPath $env:PCW_EXE).VersionInfo.FileVersion"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 20_000, windowsHide: true, env: { ...process.env, PCW_EXE: exe } });
+    return out.trim() || null;
+  } catch { return null; }
+};
+export const exeOf = (cmd: string): string | null => { const m = /^\s*(?:"([^"]+)"|(\S+))/.exec(cmd); return m ? (m[1] ?? m[2]) : null; };
+export function chromeVersionRead(o: Opts, inst: Install): { version: string; source: ChromeVersionSource } | null {
+  const OK = /^\d+(\.\d+){1,3}$/;
+  if (platform(o) === "win32" || o.exeVersion) {
+    const ps = (o.procs ?? (() => listProcs(platform(o))))() ?? [];
+    const exe = exeOf(ps.find((p) => isDedicated(p, inst))?.cmd ?? "");
+    const v = exe ? (o.exeVersion ?? exeFileVersion)(exe)?.trim() ?? null : null;
+    if (v && OK.test(v)) return { version: v, source: "chrome_exe" };
+  }
+  let v = "";
+  try { v = readFileSync(join(inst.profile.user_data_dir, "Last Version"), "utf8").trim(); } catch { v = ""; }
+  return OK.test(v) ? { version: v, source: "last_version_file" } : null;
+}
+// The version hold (version-hold.json): an update pending or more than one version folder seen at a
+// run's preflight holds every run (its code) until a new probe has been confirmed (the confirmation
+// file differs from the one the hold saw: confirm-profile writes it only after a fresh probe), so an
+// auto-update always needs a new probe, even once Chrome has settled on one folder again. While the
+// installed versions differ from the confirmation's, probe_stale says so instead (it needs the same).
+export interface VersionHold { at: string; code: "update_pending" | "extension_versions_ambiguous"; folders: string[]; confirmed: string | null }
+const confirmedSha = (o: Opts): string | null => { try { return createHash("sha256").update(readFileSync(P.confirmed(o))).digest("hex"); } catch { return null; } };
+export function readVersionHold(o: Opts): VersionHold | null {
+  const x = readJson(P.versionHold(o)) as any;
+  return x && typeof x.at === "string" && (x.code === "update_pending" || x.code === "extension_versions_ambiguous")
+    ? { at: x.at, code: x.code, folders: Array.isArray(x.folders) ? x.folders.filter((f: unknown) => typeof f === "string").slice(0, 10) : [], confirmed: typeof x.confirmed === "string" ? x.confirmed : null } : null;
+}
+export function versionHold(o: Opts, inst: Install, now: Date): VersionHold["code"] | null {
+  const folders = extensionFolders(inst);
+  const code = updatePending(inst) ? "update_pending" : folders.length > 1 ? "extension_versions_ambiguous" : null;
+  if (code) {
+    const had = readVersionHold(o);
+    if (!had || had.code !== code) try { writeFileSync(P.versionHold(o), JSON.stringify({ at: now.toISOString(), code, folders, confirmed: had?.confirmed ?? confirmedSha(o) }) + "\n"); } catch { /* the refusal stands */ }
+    return code;
+  }
+  const had = readVersionHold(o);
+  if (!had) return null;
+  const sha = confirmedSha(o);
+  if (sha !== null && sha !== had.confirmed) { rmSync(P.versionHold(o), { force: true }); return null; }
+  if (versionMismatch(o, inst)) return null;           // probe_stale refuses next, naming what changed
+  return had.code;
+}
+export const VERSION_HOLD_HINT = "Claude in Chrome's version in the Cain jobs profile can't be bound to the probe (an update waiting, or more than one version folder): an auto-update needs a new probe. Restart the Cain jobs Chrome, then run the probe again and confirm-profile";
 
 // The claude executable's SHA-256, read in pieces (it is large), or null when it can't be read.
 export function fileSha(file: string): string | null {
@@ -759,8 +824,7 @@ export function fingerprint(o: Opts, inst: Install): Fingerprint | null {
   if (name !== p.profile_name) return null;
   const extension_version = activeExtensionVersion(inst);
   if (!extension_version) return null;
-  let chrome_version = "";
-  try { chrome_version = readFileSync(join(p.user_data_dir, "Last Version"), "utf8").trim(); } catch { chrome_version = ""; }
+  const chrome_version = chromeVersionRead(o, inst)?.version ?? "";
   const chrome_major = /^\d+(\.\d+){1,3}$/.test(chrome_version) ? parseInt(chrome_version.split(".")[0], 10) || 0 : 0;
   if (!chrome_major) return null;
   const cli_version = (o.cliVersion ?? (() => cliVersion(inst)))();
@@ -770,8 +834,9 @@ export function fingerprint(o: Opts, inst: Install): Fingerprint | null {
 // The versions a probe ran against and a confirmation holds (0.12.0, twentieth round): the extension's
 // id and version and Chrome's version, as they are in the fingerprint, named on their own in the probe's
 // result and in confirm-profile's answer so the owner sees exactly what was probed.
-export interface Versions { extension_id: string; extension_version: string; chrome_version: string }
-export const versionsOf = (fp: Fingerprint): Versions => ({ extension_id: fp.extension_id, extension_version: fp.extension_version, chrome_version: fp.chrome_version });
+export interface Versions { extension_id: string; extension_version: string; chrome_version: string; chrome_version_source?: ChromeVersionSource }
+export const versionsOf = (fp: Fingerprint, source?: ChromeVersionSource | null): Versions => ({ extension_id: fp.extension_id, extension_version: fp.extension_version, chrome_version: fp.chrome_version,
+  ...(source ? { chrome_version_source: source } : {}) });
 // A run against other installed versions than the confirmation's (the extension's manifest in the
 // profile, Chrome's Last Version, read now by fingerprint): a named message for the owner's line, or
 // null when they match. The run refuses (probe_stale) until a new probe and confirmation.
@@ -780,9 +845,10 @@ export function versionMismatch(o: Opts, inst: Install): string | null {
   if (!c || !fp) return null;
   const said: string[] = [];
   if (c.fingerprint.extension_id !== fp.extension_id) said.push(`the extension's id is ${fp.extension_id}, the probe saw ${c.fingerprint.extension_id}`);
-  if (c.fingerprint.extension_version !== fp.extension_version) said.push(`Claude in Chrome is ${fp.extension_version} in the profile's manifest, the probe saw ${c.fingerprint.extension_version}`);
-  if (c.fingerprint.chrome_version !== fp.chrome_version) said.push(`Chrome is ${fp.chrome_version}, the probe saw ${c.fingerprint.chrome_version}`);
-  return said.length ? `version_mismatch: ${said.join("; ")}: run the probe again, then confirm-profile` : null;
+  if (c.fingerprint.extension_version !== fp.extension_version) said.push(`Claude in Chrome is ${fp.extension_version} as the profile's preferences load it, the probe saw ${c.fingerprint.extension_version}`);
+  if (c.fingerprint.chrome_version !== fp.chrome_version)
+    said.push(`Chrome is ${fp.chrome_version}${chromeVersionRead(o, inst)?.source === "last_version_file" ? " (from the Last Version file, the fallback: chrome.exe's file version couldn't be read)" : ""}, the probe saw ${c.fingerprint.chrome_version}`);
+  return said.length ? `version_mismatch: ${said.join("; ")}: an auto-update needs a new probe: run the probe again, then confirm-profile` : null;
 }
 const sameParts = (a: Fingerprint, b: Fingerprint, keys: readonly string[]) => keys.every((k) => (a as any)[k] === (b as any)[k]);
 // Which version stopped runs (probe_stale): the extension's, Chrome's, or the CLI's.
@@ -1133,8 +1199,10 @@ export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false):
   if (!prefs.files.length) return "extension_entry_missing";
   if (prefs.disagree.length) return "prefs_disagree";
   if (prefs.others.length) return "extra_extension";
-  // An extension update unpacked but not yet running: restart the Cain jobs Chrome first.
-  if (updatePending(inst)) return "update_pending";
+  // An extension update unpacked but not yet running, or more than one version folder: held until a new
+  // probe (versionHold); the probe itself refuses while either is seen.
+  if (bypassConfirm) { if (updatePending(inst)) return "update_pending"; if (extensionFolders(inst).length > 1) return "extension_versions_ambiguous"; }
+  else { const held = versionHold(o, inst, clock(o)); if (held) return held; }
   const fp = fingerprint(o, inst);
   if (!fp) return "wrong_profile";
   if (!bypassConfirm && !readMarker(o)) return "wrong_profile";
@@ -1218,14 +1286,14 @@ export function sameStart(a: string, b: string): boolean {
   const x = isoMs(a), y = isoMs(b);
   return x !== null && y !== null && sameTick(x, y);
 }
-function lock(o: Opts, now: Date): { got: boolean; stale: boolean } {
+function lock(o: Opts, now: Date, kind: "run" | "probe" | "other" = "other"): { got: boolean; stale: boolean } {
   const f = P.lock(o);
   const started = o.procStart ?? procStart;
   let stale = false;
   for (let i = 0; i < 2; i++) {
     try {
       const fd = openSync(f, "wx");
-      writeSync(fd, JSON.stringify({ pid: process.pid, start: started(process.pid), at: now.toISOString() }));
+      writeSync(fd, JSON.stringify({ pid: process.pid, start: started(process.pid), at: now.toISOString(), kind }));
       closeSync(fd);
       return { got: true, stale };
     } catch {
@@ -1428,8 +1496,9 @@ export async function next(o: Opts): Promise<NextOut> {
   // any git operation, it reads and writes nothing (no heartbeat, no fetch, no closes).
   if (!o.attended) return { claim: null, closed: [], code: "attended_only" };
   if (existsSync(P.stop(o))) return quit("stopped");
-  const l = lock(o, now);
-  st.stale = l.stale;
+  const l = lock(o, now, "run");
+  st.stale = l.stale || staleSeen.has(o);
+  staleSeen.delete(o);
   if (!l.got) return quit("busy");
   let keep = false;
   try {
@@ -3295,13 +3364,16 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
   // Every session notes when each tool call was printed (0.12.0, nineteenth round: runs record their hooks' gaps).
   const timing = true;
   const useAt: Record<string, number> = {}, useCliAt: Record<string, number> = {};
-  const noteUses = (line: string, t: number) => {
+  // Each call's start on the worker's monotonic clock (callStart), for its hook-start deadline (marginAbort).
+  const callMono: Record<string, number> = {};
+  const noteUses = (line: string, t: number, mono: number) => {
     try {
       const ev = JSON.parse(line);
       const cliAt = typeof ev?.timestamp === "string" ? Date.parse(ev.timestamp) : typeof ev?.timestamp === "number" ? ev.timestamp : NaN;
       for (const c of ev?.message?.content ?? [])
         if (c?.type === "tool_use" && typeof c.id === "string" && useAt[c.id] === undefined && Object.keys(useAt).length < 200) {
           useAt[c.id] = t;
+          callMono[c.id] = callStart(mono, t, Number.isFinite(cliAt) ? cliAt : null);
           if (Number.isFinite(cliAt)) useCliAt[c.id] = cliAt;
         }
     } catch { /* not one event */ }
@@ -3319,13 +3391,16 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
     const why = readAbort(env.PCW_ABORT_FILE);
     if (why) { aborted = why; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
   }, ABORT_POLL_MS) : undefined;
-  // A run's hook that started too late (0.12.0, twentieth round): in a run session (PCW_SESSION_KIND run, so
-  // never in a session the probe bound to a timing step), each hook's logged start against its call's
-  // printing (useAt) is checked as its line lands; a gap that leaves under HOOK_GAP_MARGIN_MS of the
-  // timeout past the budget ends this session at once (hook_margin_low), not only the next renewal.
-  const marginWatch = env.PCW_SESSION_KIND === "run" && env.PCW_NAV_LOG ? setInterval(() => {
+  // A run's hook that started too late, or never (0.12.0, twentieth and twenty-first rounds): in a run session
+  // (PCW_SESSION_KIND run, so never in a session the probe bound to a timing step), every MARGIN_POLL_MS
+  // each call is checked against its hook's start line (marginAbort): a start gap that leaves under
+  // HOOK_GAP_MARGIN_MS of the timeout past the budget, or no start line by HOOK_START_DEADLINE_MS on the
+  // worker's own monotonic clock from the call's event, ends this session at once (hook_margin_low).
+  // With no log file to read, every call counts as never started.
+  const marginWatch = env.PCW_SESSION_KIND === "run" ? setInterval(() => {
     if (aborted) return;
-    if (lateHook(useAt, readHookTimes(env.PCW_NAV_LOG!))) { aborted = "hook_margin_low"; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
+    const starts = env.PCW_NAV_LOG ? readHookStarts(env.PCW_NAV_LOG) : [];
+    if (marginAbort(callMono, useAt, starts, performance.now())) { aborted = "hook_margin_low"; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
   }, MARGIN_POLL_MS) : undefined;
   const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); if (abortWatch) clearInterval(abortWatch); if (marginWatch) clearInterval(marginWatch); if (liveChild === child.pid) setLiveChild(null); };
   child.stdout?.on("data", (d) => {
@@ -3338,7 +3413,7 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
       buf = buf.slice(i + 1);
       const at = Date.now();
       if (firstTurnAt === undefined && /"type"\s*:\s*"assistant"/.test(line)) firstTurnAt = at;
-      if (timing && /"tool_use"/.test(line)) noteUses(line, at);
+      if (timing && /"tool_use"/.test(line)) noteUses(line, at, performance.now());
       if (gated) continue;
       const init = /"subtype"\s*:\s*"init"/.test(line) ? parseStream(line).init : null;
       if (!init) continue;
@@ -3995,6 +4070,55 @@ export function hookRunsOf(s: Pick<Session, "useAt">, log: Pick<Decision, "id" |
 }
 // Whether any hook of a session started too late: its gap leaves under lim.margin of the timeout past the budget.
 export const MARGIN_POLL_MS = 250;
+// The hook-start line (0.12.0, twenty-first round): nav-guard writes {start, id, t0} to the session's log the
+// moment it has read its input, so the worker knows a call's hook began before it has answered. Neither
+// readNavLog (no decision) nor readHookTimes (no done_at) takes it as a decision or a timing line.
+export function noteHookStart(file: string | undefined, id: string | null, t0: number): void {
+  if (!file || !id) return;
+  try { appendFileSync(file, JSON.stringify({ start: "nav-guard", id, t0 }) + "\n"); } catch { /* the worker's deadline decides */ }
+}
+export function readHookStarts(file: string): { id: string; t0: number }[] {
+  let text = "";
+  try { text = readFileSync(file, "utf8"); } catch { return []; }
+  const out: { id: string; t0: number }[] = [];
+  for (const l of text.split(/\r?\n/)) {
+    try {
+      const d = JSON.parse(l);
+      if (d && typeof d.id === "string" && typeof d.t0 === "number" && d.phase !== "post" && (d.start === "nav-guard" || typeof d.done_at === "number")) out.push({ id: d.id, t0: d.t0 });
+    } catch { /* a torn line */ }
+  }
+  return out;
+}
+// The worker's own deadline for each tool call of a run (0.12.0, twenty-first round). The twentieth round's
+// abort fired only on a gap it could see in the hook log, so a hook that never started, or started after
+// the CLI's own timeout (which is non-blocking for the CLI), left the call to the CLI. Now each call is
+// timed on the worker's monotonic clock from the moment its event is read from the stream (calls: that
+// start, in performance.now() milliseconds, moved back by the event's own timestamp where it carries a
+// usable one, never forward); with no hook-start line for it (readHookStarts: the start line or the
+// finished line) by the timeout less the margin (36 seconds), the session ends (hook_margin_low). A hook
+// whose start line shows a gap that leaves under the margin past the budget ends it too (the twentieth
+// round's rule, now on the start line, not only the finished one). Never skipped in a run session.
+export const HOOK_START_DEADLINE_MS = HOOK_TIMEOUT_S * 1000 - HOOK_GAP_MARGIN_MS;
+export function marginAbort(calls: Record<string, number>, useAt: Record<string, number>, starts: { id: string; t0: number }[], nowMono: number,
+  lim: TimingLimits = HOOK_LIMITS): "never_started" | "late_start" | null {
+  const began = new Map<string, number>();
+  for (const x of starts) if (!began.has(x.id) || x.t0 < began.get(x.id)!) began.set(x.id, x.t0);
+  for (const [id, t0] of began) {
+    const at = useAt[id];
+    if (at === undefined) continue;
+    const gap = Math.max(0, t0 - at);
+    if (lim.timeout - gap - lim.budget < lim.margin) return "late_start";
+  }
+  for (const [id, start] of Object.entries(calls))
+    if (!began.has(id) && nowMono - start >= lim.timeout - lim.margin) return "never_started";
+  return null;
+}
+// A call's start on the monotonic clock: its arrival, moved back by how far the event's own timestamp
+// (cliAt, wall clock) lies before the arrival's wall time, at most the timeout; no usable timestamp, the arrival.
+export function callStart(arrivalMono: number, arrivalWall: number, cliAt: number | null, lim: TimingLimits = HOOK_LIMITS): number {
+  const lag = cliAt !== null && Number.isFinite(cliAt) ? Math.min(Math.max(0, arrivalWall - cliAt), lim.timeout) : 0;
+  return arrivalMono - lag;
+}
 export function lateHook(useAt: Record<string, number>, times: Pick<Decision, "id" | "phase" | "t0" | "done_at">[], lim: TimingLimits = HOOK_LIMITS): boolean {
   const m = hookRunsOf({ useAt }, times, lim).margin_ms;
   return m !== null && m < lim.margin;
@@ -4050,7 +4174,8 @@ async function session(o: Opts, inst: Install, h: NonNullable<ReturnType<typeof 
   const stream = parseStream(s.out);
   const expected = expectedOf(canary, inst.profile.extension_id, job.attempt!);
   return { s, stream, expected, log: readNavLog(P.navLog(o)), canaryUrl: canary.url,
-    checks: { cliChanged: !before || before !== after, diskExtension: activeExtensionVersion(inst), workerPaths: wallOf(o).paths, wallTokens: wallOf(o).tokens } };
+    checks: { cliChanged: !before || before !== after, diskExtension: activeExtensionVersion(inst), workerPaths: wallOf(o).paths, wallTokens: wallOf(o).tokens,
+      versionsChanged: versionsAfter(o, inst) } };
 }
 
 // The extension's version as the session saw it (its init data), against the one on disk:
@@ -4097,13 +4222,24 @@ export interface Verdict { bad: Code | null; given: unknown; guard: GuardCheck; 
 // tab's address, so each read needs a tab context after it. needLive: an unattended run.
 // workerPaths: the worker folder and its config folder, for the second wall (guardCheck).
 export interface SessionChecks { cliChanged: boolean; diskExtension: string | null; contextAfterRead?: boolean; needLive?: boolean; confirmedExtension?: string | null;
-  workerPaths?: string[]; wallTokens?: string[] }
+  workerPaths?: string[]; wallTokens?: string[]; versionsChanged?: string | null }
+// Both versions rechecked once the session has ended (0.12.0, twenty-first round): the loaded extension
+// version and Chrome's, against the confirmation (versionMismatch), and the extension's version folders
+// (more than one, or an update unpacked meanwhile). Any: the run fails versions_changed, its report
+// discarded, naming what changed; the next run's preflight then holds until a new probe.
+export function versionsAfter(o: Opts, inst: Install): string | null {
+  const mm = versionMismatch(o, inst);
+  if (mm) return mm;
+  const folders = extensionFolders(inst);
+  if (updatePending(inst) || folders.length > 1) return `extension_versions_ambiguous: version folders ${folders.join(", ")}: an auto-update needs a new probe`;
+  return null;
+}
 export function verdict(s: Session, st: Stream, log: Decision[], tools: string[], denied: string[], canaryUrl: string,
   pin: Allow | null, leftovers: number[], checks: SessionChecks = { cliChanged: false, diskExtension: null }): Verdict {
   // A session a hook ended (or the inventory gate did) has its report discarded unread.
   let given = s.aborted ? null : reportFrom(s.out);
   const guard = guardCheck(st, log, checks.workerPaths ?? [], checks.wallTokens, true);
-  let bad: Code | null = guard.walled.length ? guard.code : (checks.cliChanged ? "cli_changed" : null) ?? sessionCode(s, st, tools, denied, checks.diskExtension, !!checks.needLive, checks.confirmedExtension ?? null)
+  let bad: Code | null = guard.walled.length ? guard.code : (checks.cliChanged ? "cli_changed" : null) ?? (checks.versionsChanged ? "versions_changed" : null) ?? sessionCode(s, st, tools, denied, checks.diskExtension, !!checks.needLive, checks.confirmedExtension ?? null)
     ?? guard.code;
   let field: string | null = null;
   if (!bad && given && typeof given === "object" && !Array.isArray(given)) {
@@ -4154,6 +4290,7 @@ export async function run(o: Opts): Promise<RunOut> {
     // A version the probe didn't see (the extension's id or version, Chrome's): named on the owner's line.
     let detail: string | null = null;
     if (n.code === "probe_stale") try { detail = versionMismatch(o, mustInstall(o)); } catch { detail = null; }
+    if (n.code === "update_pending" || n.code === "extension_versions_ambiguous") detail = VERSION_HOLD_HINT;
     return { code: n.code, job: null, closed: n.closed, ...(detail ? { detail } : {}) };
   }
   const c = n.claim;
@@ -4201,7 +4338,7 @@ export async function run(o: Opts): Promise<RunOut> {
     v.given = stripCanary(v.given);
     beat(o, final.code, mine.id, now, c.st, warnings);
     return { code: final.code, job: mine.id, closed: n.closed, state: stateAfter(mine, final), ...(warnings.length ? { warnings } : {}), ...(drift && drift !== "read_drift" ? { drift } : {}),
-      ...(unplaced.length ? { unplaced } : {}), ...(hook_denied.length ? { hook_denied } : {}) };
+      ...(unplaced.length ? { unplaced } : {}), ...(hook_denied.length ? { hook_denied } : {}), ...(final.code === "versions_changed" && checks.versionsChanged ? { detail: checks.versionsChanged } : {}) };
   } catch (e) {
     // The session's own folders failed it (its transcripts couldn't be deleted, or the
     // worker's sign-in went missing): the job fails with that code, loudly, and the
@@ -4582,13 +4719,31 @@ export function probeGate(ev: Evidence, plat: string): string | null {
   if (plat === "win32" && ev.helper_build?.passed !== true) return "helper_build";
   return null;
 }
+// The cold-sample refusal (0.12.0, twenty-first round): Windows Fast Startup keeps the kernel across Shut
+// down, so uptime isn't reset by powering off and on; only Restart (or Fast Startup off) gives a cold first
+// sample. The message names the uptime measured.
+export const coldSampleHint = (uptime_s: number | null | undefined) =>
+  `the probe's hook_timing step needs a cold first sample (cold_sample_missing): the PC had been up ${typeof uptime_s === "number" ? `${uptime_s} seconds` : "for an unknown time (its uptime couldn't be read)"}, more than the ${COLD_UPTIME_S} seconds allowed. Use Restart, not Shut down (with Windows Fast Startup on, Shut down then power on doesn't reset the uptime, so it never counts), or turn Fast Startup off, then run the probe within 5 minutes of the PC starting`;
+// The address paths the probe recorded beyond the one structured path (0.12.0, twenty-first round).
+export const STRUCTURED_PATH = `tool_response.${ADDRESS_BLOCK}.${ADDRESS_KEY}`;
+export const extraAddressPaths = (p: AddressPathsLine | undefined | null): string[] =>
+  p && typeof p === "object" ? [...new Set(Object.entries(p).flatMap(([tool, paths]) => (Array.isArray(paths) ? paths : []).filter((x) => x !== STRUCTURED_PATH).map((x) => `${tool}: ${x}`)))].sort() : [];
+// The refusal's words for a gate, with what the evidence names: the cold sample's uptime, and the extra
+// address-named key paths when structured_address failed on them (a schema mismatch, not a forged answer).
+export function probeGateHint(gate: string, ev: Partial<Evidence>): string {
+  if (gate === "hook_timing" && ev.hook_timing?.why === "cold_sample_missing") return coldSampleHint(ev.hook_timing.uptime_s);
+  const extra = extraAddressPaths(ev.address_paths);
+  if (gate === "structured_address" && extra.length)
+    return `the probe's structured_address step didn't pass: this PC's reading tools answer with address-named keys beyond ${STRUCTURED_PATH} (${extra.join("; ")}). That is a schema mismatch between Claude in Chrome's answers and the read guard's rule, not a forged answer: nothing runs until a policy change (report it with these paths: needs a code change)`;
+  return PROBE_GATE_HINT[gate];
+}
 export const PROBE_GATE_HINT: Record<string, string> = {
   redirect_read: "the probe's redirect_read step didn't pass its session_ended result: a page read after a redirect off the run's sites must end the session before the model's next tool call; nothing runs on this CLI and extension (report it: needs a code change)",
   structured_address: "the probe's structured_address step didn't pass: every reading tool's answer must carry its tab's address at tool_response.structuredContent.tabUrl and nowhere else, and on this PC one didn't; nothing runs (report it: needs a code change)",
   forged_address: "the probe's forged_address step didn't pass: a page writing a forged address field in its text, title and DOM must count as unplaced or drift, and on this PC it didn't; nothing runs (report it: needs a code change)",
   kill_latency: "the probe's kill_latency step didn't pass: a session a hook ended must be seen gone within the kill bound, below the read guard's hold; nothing runs (report it: needs a code change)",
   not_ready: "the probe's sessions hit the not-ready cap: the extension was slow to attach (extension_slow_attach). Restart the Cain jobs Chrome, wait a minute, then run the probe again",
-  hook_timing: "the probe's hook_timing step didn't pass: the hook's cold start on this PC plus its 26 second budget must stay 4 seconds under the hooks' 40 second timeout, a hook held to its budget must reach Claude Code as a refusal, and a hook that overruns must not let its navigation run, and its first session must be a cold one (cold_sample_missing: the PC had been up more than 5 minutes); see the hook_timing row in Troubleshooting, then run the probe again (first thing after a restart of the PC)",
+  hook_timing: "the probe's hook_timing step didn't pass: the hook's cold start on this PC plus its 26 second budget must stay 4 seconds under the hooks' 40 second timeout, a hook held to its budget must reach Claude Code as a refusal, and a hook that overruns must not let its navigation run, and its first session must be a cold one (cold_sample_missing: the PC had been up more than 5 minutes); see the hook_timing row in Troubleshooting, then run the probe again within 5 minutes of a Restart (not Shut down, which Fast Startup does not count)",
   payload_replay: "the probe's payload_replay step didn't pass: a hook input this PC's Claude Code really sent was refused by the read guard's strict parser (its reasons are in the probe's evidence), so every page read would count as unplaced; nothing runs (report it: needs a code change)",
   job_readback: "the probe's job_readback step didn't pass: the containment helper couldn't make, join and read back its Job Object inside the job the worker runs in; report it (needs a code change)",
   helper_build: "the probe's helper_build step didn't pass: the containment helper couldn't be built or checked (see helper_compiler_missing or helper_blocked in Troubleshooting), then run the probe again",
@@ -4836,7 +4991,7 @@ export const COLD_UPTIME_S = 300;
 export interface HookTimingLine {
   uptime_s: number | null; first_sample: "cold" | "warm"; first_gap_ms: number | null;
   cold_gap_ms: number | null; warm_gaps_ms: number[]; warm_spread_ms: number | null; cli_gaps_ms: number[]; max_gap_ms: number | null;
-  budget_ms: number; timeout_ms: number; margin_ms: number;
+  budget_ms: number; timeout_ms: number; margin_ms: number; hint?: string;
   full_budget: { tried: boolean; answered_ms: number | null; blocked: boolean };
   overrun: { tried: boolean; cli: "refused" | "error" | "ran" | "not_tried" };
   why: string | null; passed: boolean;
@@ -4903,7 +5058,8 @@ export function judgeHookTiming(m: TimingSessions, lim: TimingLimits = HOOK_LIMI
     : cli === "ran" || cli === "not_tried" ? "overrun_ran"
     : null;
   return { uptime_s, first_sample, first_gap_ms: cold.length ? cold[0] : null, cold_gap_ms: cold.length && first_sample === "cold" ? cold[0] : null, warm_gaps_ms: warm, warm_spread_ms: warm.length ? Math.max(...warm) - Math.min(...warm) : null,
-    cli_gaps_ms, max_gap_ms, budget_ms: lim.budget, timeout_ms: lim.timeout, margin_ms: lim.margin, full_budget, overrun, why, passed: why === null };
+    cli_gaps_ms, max_gap_ms, budget_ms: lim.budget, timeout_ms: lim.timeout, margin_ms: lim.margin, full_budget, overrun, why, passed: why === null,
+    ...(why === "cold_sample_missing" ? { hint: coldSampleHint(uptime_s) } : {}) };
 }
 // The step's sessions: run(prompt, extra environment) is one session as the probe runs them; each is
 // bound to its probe step through a marker in probeDir.
@@ -5055,7 +5211,7 @@ export async function probe(o: Opts): Promise<Evidence> {
   const denied: string[] = h.settings.permissions.deny;
   const launch = o.launch ?? launchSession;
   const limit = Math.min(inst.session_minutes * 60_000, MAX_SESSION_MS);
-  const l = lock(o, now);
+  const l = lock(o, now, "probe");
   if (!l.got) throw new WorkerError("busy");
   try {
     // Leftovers of a worker killed mid-session go first; then the worker's own sign-in.
@@ -5066,7 +5222,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     let stop_ok = false;
     try { stop_ok = (await next({ ...o, now: () => now })).code === "stopped"; } finally { rmSync(P.stop(o), { force: true }); }
     // 1b. The hook's timing on this PC (hook_timing), before any other session, so a probe run
-    // first thing after a reboot, or after the PC sat idle, measures a cold start. Its sessions
+    // within 5 minutes of a Restart (not a Fast Startup Shut down) measures a cold start. Its sessions
     // also capture the CLI's PreToolUse payloads for payload_replay (below).
     rmSync(P.hookCapture(o), { recursive: true, force: true });
     mkdirSync(P.hookCapture(o), { recursive: true });
@@ -5340,7 +5496,7 @@ export async function probe(o: Opts): Promise<Evidence> {
       fingerprint: fp, settings_sha256: h.settings_sha256, prompt_sha256: h.prompt_sha256, config_sha256: cfg.sha256, cli_sha256: cliSha(o, inst), tools,
       unlisted, process_end, context_trips, addresses, chore, init_order: initOrder, short_names,
       redirect_read, structured_address, session_ids, job_readback, helper_build, forged_address, fragment_strip, kill_latency, not_ready, hook_timing, payload_replay,
-      address_paths, versions: versionsOf(fp), candidate_patterns, worker: workerNow() };
+      address_paths, versions: versionsOf(fp, chromeVersionRead(o, inst)?.source), candidate_patterns, worker: workerNow() };
     writeFileSync(P.evidence(o), JSON.stringify(ev, null, 2) + "\n");
     return ev;
   } finally {
@@ -5517,7 +5673,8 @@ export function confirmProfile(o: Opts, opt: { acceptBoundary?: boolean } = {}):
   const gate = probeGate(ev, platform(o));
   if (gate) throw new WorkerError(gate === "helper_build" ? (ev.helper_build?.code as Code | null) ?? "containment_unavailable" : gate === "job_readback" ? "containment_unavailable"
     : gate === "not_ready" ? "extension_slow_attach" : "probe_required",
-    { step: gate, hint: PROBE_GATE_HINT[gate], ...(gate === "redirect_read" ? { session_ended: false, secret_withheld: ev.redirect_read?.secret_withheld === true } : {}) });
+    { step: gate, hint: probeGateHint(gate, ev), ...(gate === "structured_address" && extraAddressPaths(ev.address_paths).length ? { address_paths: extraAddressPaths(ev.address_paths) } : {}),
+      ...(gate === "hook_timing" && ev.hook_timing?.why === "cold_sample_missing" ? { uptime_s: ev.hook_timing.uptime_s ?? null } : {}), ...(gate === "redirect_read" ? { session_ended: false, secret_withheld: ev.redirect_read?.secret_withheld === true } : {}) });
   // The worker the probe ran is the worker confirming.
   const wn = workerNow();
   if (!ev.worker || ev.worker.worker_sha256 !== wn.worker_sha256 || ev.worker.cain_version !== wn.cain_version || ev.worker.policy_version !== wn.policy_version
@@ -5699,17 +5856,62 @@ export function cleanProbe(o: Opts): { swept: string[]; vars: string[] } {
   const after = probeLeftovers(o);
   return { swept: left.files.filter((f) => !after.files.includes(f)), vars: after.vars };
 }
+// Where a probe variable is set (0.12.0, twenty-first round), so the owner removes it where it lives: the
+// user's or the machine's environment in the registry (Windows: HKCU\Environment and the Session Manager's
+// Environment key), else this process alone (the terminal). Each with the exact command that removes it.
+export interface VarScope { name: string; scope: "process" | "user" | "machine"; remove: string }
+const USER_ENV_KEY = "HKCU\\Environment";
+const MACHINE_ENV_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+export const registryEnvScopes = (name: string): ("user" | "machine")[] => {
+  const has = (key: string) => { try { return spawnSync("reg", ["query", key, "/v", name], { stdio: "ignore", timeout: 10_000, windowsHide: true }).status === 0; } catch { return false; } };
+  return [...(has(USER_ENV_KEY) ? ["user" as const] : []), ...(has(MACHINE_ENV_KEY) ? ["machine" as const] : [])];
+};
+export function removeCommand(name: string, scope: VarScope["scope"], plat: string): string {
+  if (scope === "user") return `[Environment]::SetEnvironmentVariable('${name}', $null, 'User')`;
+  if (scope === "machine") return `[Environment]::SetEnvironmentVariable('${name}', $null, 'Machine') (in an administrator PowerShell)`;
+  return plat === "win32" ? `Remove-Item Env:${name}` : `unset ${name}`;
+}
+export function probeVarScopes(o: Opts, vars: string[]): VarScope[] {
+  const plat = platform(o);
+  const names = new Set(vars.map((v) => v.toUpperCase()));
+  const reg = plat === "win32" ? (o.envRegistry ?? registryEnvScopes) : null;
+  const out: VarScope[] = [];
+  for (const name of PROBE_ENV) {
+    const scopes: VarScope["scope"][] = reg ? reg(name) : [];
+    if (names.has(name) && !scopes.length) scopes.push("process");
+    for (const scope of scopes) out.push({ name, scope, remove: removeCommand(name, scope, plat) });
+  }
+  return out;
+}
+// The run preflight (twenty-first round): the worker's single-instance lock first. A probe (or another run)
+// holding it means a live probe's files and variables: nothing is swept, and the run refuses (busy), naming
+// the holder. With the lock held, leftovers are swept and the run refuses (probe_leftover), naming each
+// variable's scope and the command that removes it there; then the worker is started again (a new terminal).
+const staleSeen = new WeakSet<Opts>();     // a stale lock the preflight cleared, for next()'s heartbeat
 export function runPreflight(o: Opts): void {
   if (!o.attended) return;                 // next() refuses it first, reading nothing
-  const left = probeLeftovers(o);
-  if (!left.vars.length && !left.files.length) return;
-  let swept: string[] = [];
-  const l = lock(o, clock(o));
-  if (!l.got) throw new WorkerError("busy");
-  try { swept = cleanProbe(o).swept; } finally { unlock(o); }
-  try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe_leftover ${JSON.stringify({ vars: left.vars, files: left.files.length })}\n`); } catch { /* never stops it */ }
-  throw new WorkerError("probe_leftover", { vars: left.vars, files: left.files, swept,
-    hint: `the probe's leftovers were found before this run, so it didn't start: ${left.files.length ? `the files were swept (${PROBE_CLEANUP} does the same); ` : ""}${left.vars.length ? `unset ${left.vars.join(", ")} in this terminal; ` : ""}then run again` });
+  const now = clock(o);
+  const l = lock(o, now, "run");
+  if (!l.got) {
+    // A probe holds it: its files and variables are live, so nothing is checked or swept, and the run
+    // refuses by name. Another holder (a run): next() answers busy as before.
+    const h = readJson(P.lock(o)) as any;
+    if (h?.kind !== "probe") return;
+    throw new WorkerError("busy", { holder: "probe", pid: Number.isSafeInteger(h?.pid) ? h.pid : null,
+      hint: "a probe holds the worker's lock, so nothing was checked or swept: wait for the probe to end, then run again" });
+  }
+  if (l.stale) staleSeen.add(o);
+  let left: ProbeLeftovers, swept: string[] = [];
+  try {
+    left = probeLeftovers(o);
+    if (!left.vars.length && !left.files.length && !(platform(o) === "win32" && probeVarScopes(o, []).length)) return;
+    swept = cleanProbe(o).swept;
+  } finally { unlock(o); }
+  const scopes = probeVarScopes(o, left.vars);
+  const vars = [...new Set([...left.vars, ...scopes.map((v) => v.name)])].sort();
+  try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe_leftover ${JSON.stringify({ vars, scopes: scopes.map((v) => `${v.name}:${v.scope}`), files: left.files.length })}\n`); } catch { /* never stops it */ }
+  throw new WorkerError("probe_leftover", { vars, scopes, files: left.files, swept,
+    hint: `the probe's leftovers were found before this run, so it didn't start: ${left.files.length ? `the files were swept (${PROBE_CLEANUP} does the same); ` : ""}${scopes.length ? `remove ${scopes.map((v) => `${v.name} (${v.scope} scope) with: ${v.remove}`).join("; ")}; then close this terminal and start the worker again in a new one; ` : ""}then run again` });
 }
 export interface ProbeMode { deny: boolean; timing: string | null; capture: string | null; full: boolean; stall: number }
 const NO_PROBE: ProbeMode = { deny: false, timing: null, capture: null, full: false, stall: 0 };
@@ -5798,6 +6000,9 @@ if (isMain && process.argv[2] === "nav-guard") {
   const read = () => readRaw().then((t) => {
     readAt = Date.now();
     try { const x = JSON.parse(t)?.tool_use_id; callId = typeof x === "string" ? x.slice(0, 100) : null; } catch { callId = null; }
+    // The hook-start line (0.12.0, twenty-first round): the call's id and the process's start, logged
+    // the moment the input is read, so the worker's own deadline (marginAbort) sees this hook began.
+    noteHookStart(process.env.PCW_NAV_LOG, callId, t0);
     if (probe.capture) captureInput(probe.capture, "pre", t);
     return t;
   });
@@ -5852,7 +6057,7 @@ if (isMain && process.argv[2] === "nav-guard") {
     else if (cmd === "confirm-profile") {
       const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });
       const ev = readJson(P.evidence(o)) as Evidence;
-      say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, versions: versionsOf(c.fingerprint), hook_worst: readHookWorst(o), boundary_cases: ev.boundary ?? [], ...probeCases(ev),
+      say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, versions: versionsOf(c.fingerprint, (readJson(P.evidence(o)) as any)?.versions?.chrome_version_source ?? null), hook_worst: readHookWorst(o), boundary_cases: ev.boundary ?? [], ...probeCases(ev),
         extensions: extensionPrefs(mustInstall(o)).extensions });
     } else if (cmd === "check-host") say({ ...checkHost(o), cli: checkCli(o) });
     else if (cmd === "check-cli") say({ cli: checkCli(o) });

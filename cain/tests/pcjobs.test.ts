@@ -42,6 +42,7 @@ import {
   FORGED_PROMPT, FRAGMENT_PROMPT, FRAGMENT_MARK, READY_WAIT_MS, holdForEnd, FRAGMENT_PATH, RECORDED_ONLY, hookBudget, HOOK_BUDGET_MS, HOOK_MARGIN_MS, HOOK_REPLY_MS, awaitInventory,
   HOOK_GAP_MARGIN_MS, hookTimingStep, judgeHookTiming, timingGaps, payloadReplay, fragmentReport,
   foldKey, answerAddressKeys, addressPaths, probeLeftovers, cleanProbe, PROBE_CLEANUP, PROBE_ENV, hookDeniedOf, lateHook, noteHookWorst, readHookWorst, COLD_UPTIME_S, versionMismatch, versionsOf,
+  HOOK_START_DEADLINE_MS, marginAbort, callStart, noteHookStart, readHookStarts, coldSampleHint, extraAddressPaths, probeGateHint, STRUCTURED_PATH, removeCommand, probeVarScopes, VERSION_HOLD_HINT, chromeVersionRead, extensionFolders, readVersionHold, exeOf,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -474,7 +475,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   writeFileSync(join(udd, "Default", "Extensions", EXT, "1.2.3_0", "manifest.json"), JSON.stringify({ name: "Claude", version: "1.2.3" }));
   // Chrome's own record of the extension it runs: its entry under extensions.settings, whose path names the active version folder.
   writeFileSync(join(udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
-  writeFileSync(join(udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } }));
+  writeFileSync(join(udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } }));
   writeFileSync(join(udd, "Last Version"), "131.0.6778.86");
   writeFileSync(join(udd, "lockfile"), "");
   // The profile, bound as bind-profile leaves it: its marker's hash in the worker folder,
@@ -806,7 +807,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   };
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
     acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), managed: [], managedDirs: [],
-    policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
+    policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], exeVersion: () => null, envRegistry: () => [], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
     shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, hookTiming: async () => TIMING_OK, payloadReplay: () => REPLAY_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
     readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
@@ -1185,7 +1186,7 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
     expect((await run(q.opts(attended))).code).toBe("update_pending");
     // Restarted: the profile's preferences name the new folder, and the old one is gone.
     rmSync(join(q.udd, "Default", "Extensions", EXT, "1.2.3_0"), { recursive: true });
-    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.4_0`, state: 1 } } } }));
+    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.4_0`, state: 1, manifest: { version: "1.2.4" } } } } }));
     expect((await run(q.opts(attended))).code).toBe("probe_stale");
     expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
     expect(q.launches).toEqual([]);
@@ -3117,12 +3118,12 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" } }));
     expect(activeExtensionVersion(q.inst)).toBeNull();
     expect((await run(q.opts(attended))).code).toBe("extension_entry_missing");
-    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0` } } } }));
+    writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, manifest: { version: "1.2.3" } } } } }));
     // A newer folder Chrome hasn't switched to: update_pending, before any claim, attended ones too.
     mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0"));
     writeFileSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0", "manifest.json"), JSON.stringify({ version: "1.3.0" }));
     expect(updatePending(q.inst)).toBe(true);
-    expect(await run(q.opts(attended))).toEqual({ code: "update_pending", job: null, closed: [] });
+    expect(await run(q.opts(attended))).toEqual({ code: "update_pending", job: null, closed: [], detail: VERSION_HOLD_HINT });
     expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
     rmSync(join(q.udd, "Default", "Extensions", EXT, "1.3.0_0"), { recursive: true });
     // Chrome's own version, recorded at confirmation: a change stops runs as probe_stale, reason chrome_version_changed.
@@ -3367,7 +3368,7 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     expect(checkHost(q.opts())).toMatchObject({ extension_entry: { files: ["Secure Preferences"], key: `extensions.settings.${EXT}` } });
     // Only in Preferences: read there, and the run goes on.
     secure({});
-    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } });
+    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } });
     expect(checkHost(q.opts())).toMatchObject({ extension_entry: { files: ["Preferences"], key: `extensions.settings.${EXT}` } });
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
     // Split between both: both named.
@@ -3380,8 +3381,8 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     expect((await run(q.opts(attended))).code).toBe("extension_entry_missing");
     expect(() => checkHost(q.opts())).toThrow("extension_entry_missing");
     // A profile whose name isn't the confirmed one is still wrong_profile.
-    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } });
-    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Daily" }, extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0` } } } }));
+    prefs({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } });
+    writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Daily" }, extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, manifest: { version: "1.2.3" } } } } }));
     expect((await run(q.opts(attended))).code).toBe("wrong_profile");
   });
 
@@ -3389,7 +3390,7 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     const { q, id } = oneJob();
     const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", COMPONENT = "cccccccccccccccccccccccccccccccc";
     const secure = (others: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"),
-      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 }, ...others } } }));
+      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, ...others } } }));
     // Enabled, in Preferences only: read from the same source.
     writeFileSync(join(q.udd, "Default", "Preferences"), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [OTHER]: { state: 1, manifest: { name: "Helper" } } } } }));
     expect((await run(q.opts(attended))).code).toBe("extra_extension");
@@ -3603,7 +3604,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     const { q } = oneJob();
     const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const with_ = (e: object) => { writeFileSync(join(q.udd, "Default", "Secure Preferences"),
-      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 }, [OTHER]: e } } })); return extensionPrefs(q.inst).others; };
+      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, [OTHER]: e } } })); return extensionPrefs(q.inst).others; };
     expect(with_({ location: 5, state: 1 })).toEqual([]);                     // component
     for (const location of [1, 2, 3, 4, 6, 7, 8, 9, 10]) expect([location, with_({ location, state: 1 })]).toEqual([location, [OTHER]]);
     // Disable reasons: only the user's own (1) turns it off; others (a permissions increase, policy, corruption) leave it counted, as does state 0 alone.
@@ -3619,7 +3620,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     expect(err.detail.extensions).toContainEqual({ id: OTHER, name: "Policy helper", enabled: true, component: false, location: 7, state: 0, disable_reasons: [2] });
     with_({ location: 1, state: 1, disable_reasons: [1] });
     const p = queueRig({ confirmed: false });
-    writeFileSync(join(p.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 },
+    writeFileSync(join(p.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } },
       [OTHER]: { location: 5, state: 1 } } } }));
     const ev = await probe(p.opts(attended));
     expect(ev.extensions).toContainEqual({ id: OTHER, name: null, enabled: true, component: true, location: 5, state: 1, disable_reasons: null });
@@ -6235,7 +6236,7 @@ describe("twentieth review: the run preflight for probe leftovers, the address-f
     expect(err?.code).toBe("probe_leftover");
     expect(err.detail).toMatchObject({ vars: ["PCW_HOOK_STALL_MS"], swept: [`probe-marks/${"a".repeat(32)}.probe`, "hook-timing.jsonl", "hook-capture"] });
     expect(err.detail.hint).toContain(PROBE_CLEANUP);
-    expect(err.detail.hint).toContain("unset PCW_HOOK_STALL_MS");
+    expect(err.detail.hint).toContain(removeCommand("PCW_HOOK_STALL_MS", "process", WIN ? "win32" : "linux"));
     expect(q.launches.length).toBe(0);                                          // no session started
     expect(probeLeftovers(q.opts())).toEqual({ vars: [], files: [] });          // swept
     // The child's environment never takes a probe variable or a session kind from the worker's own.
@@ -6348,9 +6349,9 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 6000
   test("the probe and the confirmation name the extension's id and version and Chrome's version; a run on other installed versions is refused by name", async () => {
     const q = queueRig({ confirmed: false });
     const ev = await probe(q.opts(attended));
-    expect(ev.versions).toEqual({ extension_id: q.inst.profile.extension_id, extension_version: ev.fingerprint.extension_version, chrome_version: "131.0.6778.86" });
+    expect(ev.versions).toEqual({ extension_id: q.inst.profile.extension_id, extension_version: ev.fingerprint.extension_version, chrome_version: "131.0.6778.86", chrome_version_source: "last_version_file" });
     const c = confirmProfile(q.opts(), ACCEPT);
-    expect(versionsOf(c.fingerprint)).toEqual(ev.versions);
+    expect(versionsOf(c.fingerprint, "last_version_file")).toEqual(ev.versions);
     expect(versionMismatch(q.opts(), q.inst)).toBeNull();
     // Chrome updated under the confirmation: the run refuses, naming both versions, until a new probe.
     q.ask(READ);
@@ -6360,7 +6361,186 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 6000
     writeFileSync(join(q.udd, "Last Version"), "132.0.1.1");
     const out = await run(q.opts(attended));
     expect(out.code).toBe("probe_stale");
-    expect(out.detail).toBe("version_mismatch: Chrome is 132.0.1.1, the probe saw 131.0.6778.86: run the probe again, then confirm-profile");
+    expect(out.detail).toBe("version_mismatch: Chrome is 132.0.1.1 (from the Last Version file, the fallback: chrome.exe's file version couldn't be read), the probe saw 131.0.6778.86: an auto-update needs a new probe: run the probe again, then confirm-profile");
     expect(q.launches.length).toBe(before);
   }, 120_000);
+});
+
+describe("twenty-first review: the hook-start deadline, the Restart wording, the preflight's lock and scopes, the loaded versions, and the address-path schema refusal", () => {
+  test("each run call has its own hook-start deadline on the worker's clock: a hook that never starts, or starts at 30 seconds, is killed; one at 5 seconds runs", () => {
+    expect(HOOK_START_DEADLINE_MS).toBe(36_000);
+    // Pure: calls timed from their event on the monotonic clock; starts in wall-clock against useAt.
+    expect(marginAbort({ n1: 0 }, { n1: 1_000 }, [], 35_999)).toBeNull();
+    expect(marginAbort({ n1: 0 }, { n1: 1_000 }, [], 36_000)).toBe("never_started");
+    expect(marginAbort({ n1: 0 }, { n1: 1_000 }, [{ id: "n1", t0: 31_000 }], 31_000)).toBe("late_start");
+    expect(marginAbort({ n1: 0 }, { n1: 1_000 }, [{ id: "n1", t0: 6_000 }], 60_000)).toBeNull();
+    expect(marginAbort({ n1: 0, n2: 10_000 }, { n1: 1_000, n2: 11_000 }, [{ id: "n1", t0: 6_000 }], 45_000)).toBeNull();
+    expect(marginAbort({ n1: 0, n2: 10_000 }, { n1: 1_000, n2: 11_000 }, [{ id: "n1", t0: 6_000 }], 46_000)).toBe("never_started");
+    // The event's own timestamp only moves the start back; none usable, the arrival is the start.
+    expect(callStart(50_000, 1_000_000, null)).toBe(50_000);
+    expect(callStart(50_000, 1_000_000, 997_000)).toBe(47_000);
+    expect(callStart(50_000, 1_000_000, 1_005_000)).toBe(50_000);
+    expect(callStart(50_000, 1_000_000, 0)).toBe(10_000);
+    // The start line and the finished line both count as begun; a post hook never does; readNavLog ignores the start line.
+    const home = mkdtempSync(join(tmpdir(), "start21-"));
+    const log = join(home, "log.jsonl");
+    noteHookStart(log, "n1", 5_000);
+    appendFileSync(log, JSON.stringify({ id: "n2", tool: "navigate", url: null, decision: "allow", why: "run_address", t0: 7_000, done_at: 7_010 }) + "\n");
+    appendFileSync(log, JSON.stringify({ id: "r1", tool: "get_page_text", url: null, decision: "allow", why: "read", phase: "post", t0: 9_000, done_at: 9_010 }) + "\n");
+    expect(readHookStarts(log)).toEqual([{ id: "n1", t0: 5_000 }, { id: "n2", t0: 7_000 }]);
+    expect(readNavLog(log).map((d) => d.id)).toEqual(["n2", "r1"]);
+    expect(readHookTimes(log).map((d) => d.id)).toEqual(["n2", "r1"]);
+  });
+
+  const startWorld = async (hookAfterMs: number | null, endAfterMs: number, timeoutMs: number) => {
+    const home = mkdtempSync(join(tmpdir(), "deadline21-"));
+    const log = join(home, "log.jsonl");
+    const script = join(home, "session.js");
+    writeFileSync(script, `const fs = require("node:fs");
+const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+say({ type: "system", subtype: "init", session_id: "sess-dl-0021", tools: [], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
+const printed = Date.now();
+say({ type: "assistant", message: { content: [{ type: "tool_use", id: "n1", name: "${CH}navigate", input: { url: "about:blank" } }] } });
+${hookAfterMs === null ? "" : `setTimeout(() => fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ start: "nav-guard", id: "n1", t0: printed + ${hookAfterMs} }) + "\\n"), ${Math.min(hookAfterMs, 5_000)});`}
+setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), ${endAfterMs});`);
+    const env = cleanEnv({ PCW_NAV_LOG: log, PCW_ABORT_FILE: join(home, "abort"), PCW_SESSION_KIND: "run" });
+    const t0 = Date.now();
+    const s = await realLaunch([process.execPath, script], home, timeoutMs, env as Record<string, string>);
+    return { s, ms: Date.now() - t0 };
+  };
+  test("a run whose hook never writes its start line is killed before 40 seconds (hook_margin_low)", async () => {
+    const w = await startWorld(null, 55_000, 60_000);
+    expect(w.s.aborted).toBe("hook_margin_low");
+    expect(w.ms).toBeGreaterThanOrEqual(35_500);
+    expect(w.ms).toBeLessThan(40_000);
+    expect(sessionCode(w.s, parseStream(w.s.out), [], [])).toBe("hook_margin_low");
+  }, 90_000);
+  test("a run whose hook starts 30 seconds after its call is killed; one that starts at 5 seconds runs", async () => {
+    const late = await startWorld(30_000, 20_000, 30_000);
+    expect(late.s.aborted).toBe("hook_margin_low");
+    expect(late.ms).toBeLessThan(10_000);
+    const fine = await startWorld(5_000, 7_000, 30_000);
+    expect(fine.s.aborted).toBeUndefined();
+    expect(fine.s.timedOut).toBe(false);
+  }, 90_000);
+  test("the cold-sample refusal says Restart, not Shut down (Fast Startup), or Fast Startup off, within 5 minutes, and prints the uptime measured", async () => {
+    expect(coldSampleHint(1_234)).toContain("up 1234 seconds");
+    for (const w of ["Restart, not Shut down", "Fast Startup", "turn Fast Startup off", "within 5 minutes"]) expect(coldSampleHint(1_234)).toContain(w);
+    expect(coldSampleHint(null)).toContain("unknown time");
+    const session = (useAt: Record<string, number>): Session => ({ code: 0, out: "", timedOut: false, useAt });
+    const stamp = (id: string, t0: number) => ({ hook: "nav-guard", t0, id, read_at: t0 + 5, answered_at: t0 + 10, answer: "deny" });
+    const m = { full: { session: session({ a: 1_000 }), stamps: [stamp("a", 1_900)] }, warm: [1, 2, 3].map((i) => ({ session: session({ [`w${i}`]: 1_000 }), stamps: [stamp(`w${i}`, 1_300)] })), overrun: null };
+    expect(judgeHookTiming({ ...m, uptime_s: 901 }).hint).toBe(coldSampleHint(901));
+    expect(judgeHookTiming({ ...m, uptime_s: 100 }).hint).toBeUndefined();
+    // confirm-profile's refusal carries the same words and the uptime.
+    const q = queueRig({ confirmed: false });
+    await probe(q.opts(attended));
+    const file = join(q.home, "probe-evidence.json");
+    const ev = JSON.parse(readFileSync(file, "utf8"));
+    writeFileSync(file, JSON.stringify({ ...ev, hook_timing: { ...ev.hook_timing, uptime_s: 4_321, first_sample: "warm", cold_gap_ms: null, why: "cold_sample_missing", passed: false } }));
+    let err: any = null;
+    try { confirmProfile(q.opts(), ACCEPT); } catch (e) { err = e; }
+    expect(err?.code).toBe("probe_required");
+    expect(err?.detail).toMatchObject({ step: "hook_timing", uptime_s: 4_321, hint: coldSampleHint(4_321) });
+  }, 120_000);
+
+  test("a structured_address refusal on extra address-named key paths lists them and calls it a schema mismatch needing a policy change, not a forged answer", async () => {
+    const paths = { find: ["tool_response.structuredContent.tabUrl"], read_page: ["tool_response.structuredContent.tabUrl", "tool_response.content[].url"] };
+    expect(STRUCTURED_PATH).toBe("tool_response.structuredContent.tabUrl");
+    expect(extraAddressPaths(paths)).toEqual(["read_page: tool_response.content[].url"]);
+    expect(extraAddressPaths({ find: ["tool_response.structuredContent.tabUrl"] })).toEqual([]);
+    const q = queueRig({ confirmed: false });
+    await probe(q.opts(attended));
+    const file = join(q.home, "probe-evidence.json");
+    const ev = JSON.parse(readFileSync(file, "utf8"));
+    writeFileSync(file, JSON.stringify({ ...ev, address_paths: paths, structured_address: { ...ev.structured_address, unplaced: 1, passed: false } }));
+    let err: any = null;
+    try { confirmProfile(q.opts(), ACCEPT); } catch (e) { err = e; }
+    expect(err?.detail).toMatchObject({ step: "structured_address", address_paths: ["read_page: tool_response.content[].url"] });
+    expect(err.detail.hint).toContain("schema mismatch");
+    expect(err.detail.hint).toContain("not a forged answer");
+    expect(err.detail.hint).toContain("policy change");
+    expect(err.detail.hint).toContain("read_page: tool_response.content[].url");
+    // Without extra paths the old words stand.
+    writeFileSync(file, JSON.stringify({ ...ev, address_paths: { find: [STRUCTURED_PATH] }, structured_address: { ...ev.structured_address, passed: false } }));
+    err = null;
+    try { confirmProfile(q.opts(), ACCEPT); } catch (e) { err = e; }
+    expect(err?.detail?.hint).toBe(probeGateHint("structured_address", {}));
+    expect(err?.detail?.address_paths).toBeUndefined();
+  }, 120_000);
+  test("the run preflight takes the lock first: a probe holding it refuses the run with nothing swept; a probe variable is named with its scope and the command that removes it", async () => {
+    const { q } = oneJob();
+    writeFileSync(join(q.home, "hook-timing.jsonl"), "{}\n");
+    // A live probe holds the lock (this process, so it is alive): nothing is swept, the run refuses busy, naming it.
+    writeFileSync(join(q.home, "worker.lock"), JSON.stringify({ pid: process.pid, start: null, at: new Date().toISOString(), kind: "probe" }));
+    let err: any = null;
+    try { await run(q.opts({ ...attended, clock: () => new Date() })); } catch (e) { err = e; }
+    expect(err?.code).toBe("busy");
+    expect(err.detail).toMatchObject({ holder: "probe" });
+    expect(err.detail.hint).toContain("nothing was checked or swept");
+    expect(existsSync(join(q.home, "hook-timing.jsonl"))).toBe(true);
+    expect(q.launches.length).toBe(0);
+    rmSync(join(q.home, "worker.lock"));
+    // Scopes: the process alone (no registry off Windows); on Windows the registry's user and machine scopes.
+    expect(probeVarScopes(q.opts({ platform: "linux" }), ["PCW_HOOK_TIMING"])).toEqual([{ name: "PCW_HOOK_TIMING", scope: "process", remove: "unset PCW_HOOK_TIMING" }]);
+    const reg = (name: string): ("user" | "machine")[] => name === "PCW_HOOK_CAPTURE" ? ["user"] : name === "PCW_PROBE_STEP" ? ["machine"] : [];
+    expect(probeVarScopes(q.opts({ platform: "win32", envRegistry: reg }), ["PCW_HOOK_CAPTURE", "PCW_HOOK_TIMING"])).toEqual([
+      { name: "PCW_HOOK_TIMING", scope: "process", remove: "Remove-Item Env:PCW_HOOK_TIMING" },
+      { name: "PCW_HOOK_CAPTURE", scope: "user", remove: "[Environment]::SetEnvironmentVariable('PCW_HOOK_CAPTURE', $null, 'User')" },
+      { name: "PCW_PROBE_STEP", scope: "machine", remove: "[Environment]::SetEnvironmentVariable('PCW_PROBE_STEP', $null, 'Machine') (in an administrator PowerShell)" },
+    ]);
+    // The run's refusal names the scope and the command, then a restart of the worker.
+    const env = { ...q.opts().env, PCW_HOOK_TIMING: "/x" } as Record<string, string>;
+    err = null;
+    try { await run(q.opts({ ...attended, env, platform: "linux" })); } catch (e) { err = e; }
+    expect(err?.code).toBe("probe_leftover");
+    expect(err.detail.scopes).toEqual([{ name: "PCW_HOOK_TIMING", scope: "process", remove: "unset PCW_HOOK_TIMING" }]);
+    expect(err.detail.hint).toContain("PCW_HOOK_TIMING (process scope) with: unset PCW_HOOK_TIMING");
+    expect(err.detail.hint).toContain("start the worker again in a new one");
+    expect(existsSync(join(q.home, "worker.lock"))).toBe(false);
+  });
+  test("the extension's version is the loaded one in the profile's preferences, never a folder's name; more than one version folder holds runs until a new probe", async () => {
+    const { q, id } = oneJob();
+    const sp = join(q.udd, "Default", "Secure Preferences");
+    writeFileSync(sp, JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1 } } } }));
+    expect(activeExtensionVersion(q.inst)).toBeNull();                             // a folder's name is no version
+    writeFileSync(sp, JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } } } } }));
+    expect(activeExtensionVersion(q.inst)).toBe("1.2.3");
+    // An old folder left beside the loaded one: refused by name, and held until a new probe even once it is gone.
+    mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.2.2_0"));
+    writeFileSync(join(q.udd, "Default", "Extensions", EXT, "1.2.2_0", "manifest.json"), JSON.stringify({ version: "1.2.2" }));
+    expect(extensionFolders(q.inst)).toEqual(["1.2.2_0", "1.2.3_0"]);
+    expect(await run(q.opts(attended))).toEqual({ code: "extension_versions_ambiguous", job: null, closed: [], detail: VERSION_HOLD_HINT });
+    expect(VERSION_HOLD_HINT).toContain("an auto-update needs a new probe");
+    rmSync(join(q.udd, "Default", "Extensions", EXT, "1.2.2_0"), { recursive: true });
+    expect((await run(q.opts(attended))).code).toBe("extension_versions_ambiguous");
+    expect(readVersionHold(q.opts())).toMatchObject({ code: "extension_versions_ambiguous", folders: ["1.2.2_0", "1.2.3_0"] });
+    expect(q.launches).toEqual([]);
+    const cf = join(q.home, "confirmed.json");                                      // a new probe's confirmation (confirm-profile rewrites it)
+    writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), at: new Date(T0.getTime() + 60_000).toISOString() }, null, 2));
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    expect(readVersionHold(q.opts())).toBeNull();
+  });
+
+  test("Chrome's version is chrome.exe's file version; the Last Version file only as the named fallback", () => {
+    const q = queueRig();
+    expect(exeOf(`"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="x"`)).toBe("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
+    let asked: string | null = null;
+    const exe = (p: string) => { asked = p; return "131.0.6778.205"; };
+    expect(chromeVersionRead(q.opts({ exeVersion: exe }), q.inst)).toEqual({ version: "131.0.6778.205", source: "chrome_exe" });
+    expect(asked).toBe("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
+    expect(fingerprint(q.opts({ exeVersion: exe }), q.inst)?.chrome_version).toBe("131.0.6778.205");
+    expect(chromeVersionRead(q.opts({ exeVersion: () => null }), q.inst)).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
+    expect(chromeVersionRead(q.opts({ exeVersion: () => "not a version" }), q.inst)).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
+  });
+
+  test("both versions are rechecked after the session ends: an update during the run fails it (versions_changed), naming what changed", async () => {
+    const { q, id } = oneJob();
+    q.during(() => writeFileSync(join(q.udd, "Last Version"), "132.0.0.1"));
+    const out = await run(q.opts(attended));
+    expect(out).toMatchObject({ code: "versions_changed", job: id });
+    expect(out.detail).toContain("Chrome is 132.0.0.1");
+    expect(out.detail).toContain("an auto-update needs a new probe");
+    expect(JSON.parse(q.remoteFile(`results/${id}.json`))).toMatchObject({ code: "versions_changed" });
+  });
 });

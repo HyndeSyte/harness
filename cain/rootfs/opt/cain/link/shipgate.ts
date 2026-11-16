@@ -24,7 +24,7 @@
 // minutes (rate_wait_cap), or 2 hours in all (watch_cap).
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { gateReport, watchAccepted, watchFile, watchShipGate, type MergeDeps } from "./merge";
+import { gateReport, watchAccepted, watchFile, watchShipGate, type MergeDeps, type WatchLine } from "./merge";
 
 export const SHIP_REPO = "HyndeSyte/harness";
 export const WATCH_DIR = "/data/work";
@@ -52,15 +52,40 @@ export function acceptedFor(dir: string, pr: number): string[] {
   }
   return out.sort();
 }
+// One live acceptance per pull request (0.12.0, twenty-first round): the live (not superseded)
+// acceptances of a pull request other than this head. A watch refuses to accept while any stands
+// (live_acceptance, naming it), so the Ship card always reads exactly one.
+export const otherLive = (dir: string, pr: number, head: string): string[] => acceptedFor(dir, pr).filter((h) => h !== head);
+export const liveWhy = (other: string[]) =>
+  `another live acceptance of this pull request stands (${other.join(", ")}): supersede it first (keeper.sh ship-gate --supersede ${other[0]}, once the pull request's head has moved past it), then watch again`;
+// The watch's line as it is kept: an acceptance is kept only when no other live acceptance of its pull
+// request stands, read again as it is written; otherwise it is kept as a failure (live_acceptance).
+export function keepWatch(dir: string, line: WatchLine, out: string): WatchLine {
+  let kept = line;
+  if (line.pr !== null && line.accepted_head) {
+    const other = otherLive(dir, line.pr, line.accepted_head);
+    if (other.length) kept = { ...line, accepted_head: null, passed: false, failure: "live_acceptance", failure_why: liveWhy(other) };
+  }
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(`${out}.tmp`, JSON.stringify(kept, null, 2) + "\n");
+  renameSync(`${out}.tmp`, out);
+  return kept;
+}
 // keeper.sh ship-gate --supersede <sha>: the acceptance kept for that sha is marked replaced, with
 // when; the file stays, as the record of what was accepted. Written whole, then renamed into place.
-export function supersede(dir: string, sha: string, now = () => new Date()): { ok: true; pr: number | null } | { ok: false; why: string } {
+// Only once the pull request's head has moved past it (twenty-first round): headOf reads the pull
+// request's current head; the same sha, or a head that can't be read, refuses, naming it.
+export async function supersede(dir: string, sha: string, headOf: (pr: number) => Promise<string | null>, now = () => new Date()): Promise<{ ok: true; pr: number | null } | { ok: false; why: string }> {
   if (!SHA.test(sha)) return { ok: false, why: "that isn't a full commit sha" };
   const f = watchFile(dir, sha);
   let x: any;
   try { x = JSON.parse(readFileSync(f, "utf8")); } catch { return { ok: false, why: `no watch is kept for ${sha} (${f})` }; }
   if (x?.accepted_head !== sha) return { ok: false, why: `the watch kept for ${sha} accepted nothing: there is nothing to supersede` };
   if (x.superseded) return { ok: true, pr: typeof x.pr === "number" ? x.pr : null };
+  if (typeof x.pr !== "number") return { ok: false, why: `the watch kept for ${sha} names no pull request, so its head can't be checked: nothing is superseded` };
+  const now_head = await headOf(x.pr).catch(() => null);
+  if (!now_head || !SHA.test(now_head)) return { ok: false, why: `the head of pull request ${x.pr} couldn't be read from GitHub: nothing is superseded; try again` };
+  if (now_head.toLowerCase() === sha) return { ok: false, why: `pull request ${x.pr}'s head is still ${now_head.toLowerCase()}, the sha being replaced: supersede only once a new head has been pushed` };
   x.superseded = { at: now().toISOString() };
   writeFileSync(`${f}.tmp`, JSON.stringify(x, null, 2) + "\n");
   renameSync(`${f}.tmp`, f);
@@ -77,7 +102,8 @@ if (import.meta.main) {
   };
   const sup = flag("--supersede");
   if (sup !== undefined) {
-    const r = supersede(dir, sup.toLowerCase());
+    const headOf = async (n: number) => { const r = await api(`/repos/${flag("--repo") ?? SHIP_REPO}/pulls/${n}`); return r.status === 200 && typeof r.body?.head?.sha === "string" ? r.body.head.sha : null; };
+    const r = await supersede(dir, sup.toLowerCase(), headOf);
     if (!r.ok) { console.error(r.why); process.exit(1); }
     console.log(JSON.stringify({ superseded: sup.toLowerCase(), pr: r.pr }, null, 2));
     process.exit(0);
@@ -88,15 +114,19 @@ if (import.meta.main) {
   const repo = flag("--repo") ?? SHIP_REPO;
   const d: Pick<MergeDeps, "api"> = { api };
   if (!SHA.test(head) || (prArg !== undefined && (pr === null || !args.includes("--watch"))) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) usage();
+  // One live acceptance per pull request: a watch doesn't start while another stands.
+  if (pr !== null) { const other = otherLive(dir, pr, head); if (other.length) { console.error(liveWhy(other)); process.exit(1); } }
   if (!args.includes("--watch")) {
     console.log(JSON.stringify(await gateReport(d, repo, head), null, 2));
   } else {
     const every = Math.min(Math.max(Number(flag("--every") ?? 10), 2), 60) * 60_000;
     const hours = Math.min(Math.max(Number(flag("--hours") ?? 2), 0.1), 2) * 3_600_000;
     const out = flag("--out") ?? watchFile(dir, head);
-    const line = await watchShipGate(d, repo, pr !== null ? { pr, head } : head, { everyMs: every, untilMs: hours,
+    const watched = await watchShipGate(d, repo, pr !== null ? { pr, head } : head, { everyMs: every, untilMs: hours,
       each: (r) => console.log(JSON.stringify({ at: r.at, decision: r.decision, why: r.why, windows: r.windows, attempts: r.attempts.length })) });
-    try { mkdirSync(dirname(out), { recursive: true }); writeFileSync(out, JSON.stringify(line, null, 2) + "\n"); } catch { /* printed below anyway */ }
+    let line = watched;
+    try { line = keepWatch(dir, watched, out); } catch { line = watched.pr !== null && watched.accepted_head && otherLive(dir, watched.pr, watched.accepted_head).length
+      ? { ...watched, accepted_head: null, passed: false, failure: "live_acceptance", failure_why: liveWhy(otherLive(dir, watched.pr, watched.accepted_head)) } : watched; }
     console.log(JSON.stringify({ step: line.step, pr: line.pr, head: line.bound_head, accepted_head: line.accepted_head, passed: line.passed, failure: line.failure, failure_why: line.failure_why,
       refused_while_pending: line.refused_while_pending, accepted_early: line.accepted_early, accepted_after_pass: line.accepted_after_pass, attempts_seen: line.attempts_seen, kept: out }, null, 2));
     if (line.failure) process.exit(1);
