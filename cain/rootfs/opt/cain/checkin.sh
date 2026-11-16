@@ -56,7 +56,8 @@ last=$(printf '%s\n' "$screen" | tail -n 12)
 at=$(printf '%s\n' "$screen" | "$PS" 2>/dev/null)
 
 # A try of ours left in his input box (typed, and then the screen changed before its Enter): taken
-# back out with Ctrl+U once his input area is back, before anything new is typed. His box read
+# back out with Ctrl+U once his input area is back, before anything new is typed. Ctrl+U takes one
+# drawn line at a time (seen on a real Claude Code 2.1.317), so it goes in batches of 20. His box read
 # empty counts as the try gone only 30 seconds after it (one slow to draw turns up meanwhile). Given
 # up after 30 minutes, said, so a try that's gone some other way never blocks the rest.
 if [ -f "$state/typed" ]; then
@@ -73,7 +74,7 @@ if [ -f "$state/typed" ]; then
            rm -f "$state/typed" ;;
     draft)
       for _ in 1 2 3; do
-        timeout 10 $TM -u send-keys -t cain C-u 2>/dev/null
+        timeout 10 $TM -u send-keys -t cain $(printf 'C-u %.0s' $(seq 20)) 2>/dev/null
         sleep 1
         if [ "$(read_screen | "$PS" 2>/dev/null)" = ready ]; then
           rm -f "$state/typed"

@@ -7,7 +7,8 @@
 #           only the input box's borders and then its prompt line (">" or the arrow prompt, inside
 #           a box or not) holding nothing but that mark, and no dialog's key hints below the footer.
 #           Rows Claude Code draws under the footer, such as its panel of background tasks, don't
-#           change that. Any text in the prompt reads as a draft not sent, which typing would add
+#           change that, nor up to three rows it draws between the box's bottom border and the
+#           footer (a warning: seen on a real Claude Code 2.1.317, Nov 16). Any text in the prompt reads as a draft not sent, which typing would add
 #           to and send (round 11), so it's a draft. A plain capture can't tell gray text from
 #           typed text, so there's no exception for look-alikes (round 12): Claude Code's gray
 #           suggestions in an empty box, its start-up example among them, are off (session.sh).
@@ -48,12 +49,17 @@ awk '
     for (i = top; i <= n; i++) {
       if (line[i] ~ /esc to (cancel|exit|close|go back)|enter to (continue|confirm|select|apply|submit)/) hint = i
       if (!footer(line[i])) continue
-      for (j = i - 1; j >= 1 && border(line[j]); j--) { }
-      if (j < 1 || j < i - 3) continue
+      # Rows Claude Code may draw between its input box and the footer (a warning): up to three,
+      # passed over only when the bottom border of the box is right above them.
+      j = i - 1
+      for (m = 0; m < 3 && j >= 1 && !border(line[j]) && !prompt(line[j]); m++) j--
+      if (m > 0 && !(j >= 1 && border(line[j]))) j = i - 1
+      for (b = 0; j >= 1 && border(line[j]); j--) b++
+      if (j < 1 || b > 2) continue
       if ((p = prompt(line[j]))) { foot = i; empty = (p == 2); continue }
       # Text longer than a line: right above the bottom border its last line, and higher up, with
       # only more of it between, its prompt line holding text, under the top border.
-      if (j == i - 1) continue
+      if (b == 0) continue
       p = 0
       for (k = j - 1; k > 1 && k >= j - 40 && !border(line[k]) && !footer(line[k]); k--)
         if ((p = prompt(line[k]))) break

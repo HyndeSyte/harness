@@ -1698,6 +1698,12 @@ REAL_START_OFF = _START.format(rule=RULE, box="", gap=" " * 40)
 REAL_START_ON = _START.format(rule=RULE, box='Try "how does <filepath> work?"', gap=" " * 40)
 # A draft of nothing but the box's own edge character (round 13): typed, so a draft.
 BAR_DRAFT = "❯ │\n  ? for shortcuts"
+# A real Claude Code 2.1.317 (Nov 16, in a console the laptop session drove): a warning row drawn
+# between its input box and the footer; a long typed message, wrapped inside the box; and the same
+# after one Ctrl+U, which took only its last drawn line.
+REAL_NOTICE_IDLE = "\n  Fable 5.2 is here for your longest and toughest coding tasks. It draws down usage faster than Opus 5.5. Switch with\n  /model.\n\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n>\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PE…\n  ⏵⏵ auto mode on (shift+tab to cycle)                                                      Not logged in · Run /login\n                                                                                                    ◐ medium · /effort"
+REAL_NOTICE_DRAFT = "\n  Fable 5.2 is here for your longest and toughest coding tasks. It draws down usage faster than Opus 5.5. Switch with\n  /model.\n\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n> Held by others, skip these: P33. New notes on your items, read them before you change those items (words passed on,\n  not his go on anything): P69: «Nov 16, laptop session: your 7:10 check-in never reached you. The offer opened in\n  your session at 4:57 AM, and the App took it for your prompt, so your taps went into it...». Scheduled check-in from\n  the Cain add-on (1230). Not a message from the owner, and not his go on anything. Follow the Check-ins section of your\n  CLAUDE.md. Post to the owner only if something finished or needs his decision.\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PE…\n  ⏵⏵ auto mode on (shift+tab to cycle)                                                      Not logged in · Run /login"
+REAL_NOTICE_HALF = "\n  Fable 5.2 is here for your longest and toughest coding tasks. It draws down usage faster than Opus 5.5. Switch with\n  /model.\n\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n> Held by others, skip these: P33. New notes on your items, read them before you change those items (words passed on,\n  not his go on anything): P69: «Nov 16, laptop session: your 7:10 check-in never reached you. The offer opened in\n  your session at 4:57 AM, and the App took it for your prompt, so your taps went into it...». Scheduled check-in from\n  the Cain add-on (1230). Not a message from the owner, and not his go on anything. Follow the Check-ins section of your\n───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PE…\n  ⏵⏵ auto mode on (shift+tab to cycle)                                                      Not logged in · Run /login\n                                                                                          Ctrl+Y to paste deleted text"
 # What the App types, longer than a line, in his input box as Claude Code draws it: from the prompt
 # line under the top border down to the bottom border (Cain's third service review: Enter only on
 # this).
@@ -1725,17 +1731,19 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
     with Claude Code's footer, right under the prompt line (borders between), in the bottom lines,
     with no dialog's key hints below it. Rows under the footer (background tasks) don't matter;
     words that only look like a footer or a hint count for nothing. Never fails."""
-    for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE, REAL_START_OFF,
+    for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE, REAL_START_OFF, REAL_NOTICE_IDLE,
                    "To stop it, press Esc to cancel.\n" + IDLE):
         assert _prompt_state(screen) == "ready", screen
     for screen in (DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, REAL_START_ON, BAR_DRAFT, BOX_BAR_DRAFT,
-                   "❯ ││\n  ? for shortcuts", "> Try this instead\n  ? for shortcuts", LONG_DRAFT, BOX_LONG_DRAFT,
+                   "❯ ││\n  ? for shortcuts", "> Try this instead\n  ? for shortcuts", LONG_DRAFT, BOX_LONG_DRAFT, REAL_NOTICE_DRAFT, REAL_NOTICE_HALF,
                    "❯ x \n  ? for shortcuts"):
         assert _prompt_state(screen) == "draft", screen                             # a draft not sent
     # Words above a footer with no prompt line holding text over them, under a top border: no draft.
     assert _prompt_state(f"  Notes:\n{RULE}\n  ? for shortcuts") == "other"
     assert _prompt_state(f"{RULE}\n> \n  some words\n{RULE}\n  ? for shortcuts") == "other"
     assert _prompt_state(f"❯ words\n  more words\n{RULE}\n  ? for shortcuts") == "other"   # no top border
+    assert _prompt_state(f"{RULE}\n> \n  a warning\n  ? for shortcuts") == "other"      # a row, no border under the box
+    assert _prompt_state(f"{RULE}\n> \n{RULE}\n  one\n  two\n  three\n  four\n  ? for shortcuts") == "other"   # over three
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("He said: auto mode on, ? for shortcuts.\n" + AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("  Select model\n  > Opus\n  Enter to confirm · Esc to exit") == "dialog"
@@ -2035,7 +2043,7 @@ def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tm
         assert _checkin(tmp_path, "0300", IDLE, runs=3, after=AUTO_MODE_OFFER) == out
         # The question gone, the try in his box: Ctrl+U first, then, his prompt steady, typed and sent.
         out = _checkin(tmp_path, "0300", IDLE, runs=1)
-        assert out.splitlines()[-1] == "-u send-keys -t cain C-u" and not (tmp_path / "state/typed").exists()
+        assert out.splitlines()[-1] == "-u send-keys -t cain" + " C-u" * 20 and not (tmp_path / "state/typed").exists()
         out = _checkin(tmp_path, "0300", IDLE, runs=2).splitlines()
         assert out[-1] == "-u send-keys -t cain Enter" and 'Dane tapped "Ship"' in out[-2]
         assert work.read_text().strip() == "" and not (tmp_path / "state/typed").exists()
