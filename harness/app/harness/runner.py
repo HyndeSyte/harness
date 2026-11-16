@@ -590,7 +590,9 @@ class Runner:
                 self.calendar_change.note_lines(
                     pid, lines or [render.change_line(c, self.config.timezone, self.ledger.now())
                                    for c in params["changes"]], db, seen=seen)
-            if change and not warnings:
+            # The no-card paths only once the smoke test is recorded as passed (keeper.sh fastpath
+            # on, 0.24.0 fourth round); until then this is a normal card.
+            if change and not warnings and self.calendar_change.fast_path_ok():
                 self.calendar_change.auto_approve(pid, job["id"], db)
                 self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
                                                "receipt": receipt}, db=db)
@@ -702,7 +704,12 @@ class Runner:
         text = self.ledger.job_text(job["id"])
         his, _, note = text.partition(NOTE_HEAD)
         if not origin and not note:
-            return [], False
+            # No handover to quote, but a day his words leave open still needs his tap (0.24.0).
+            try:
+                sent = datetime.fromisoformat(job["created_at"]).astimezone(ZoneInfo(self.config.timezone))
+            except (ValueError, TypeError):
+                sent = None
+            return [], bool(provenance.open_day(his, sent))
         out = provenance.origin_lines(origin, self.ledger.now()) if origin else []
         cains = False
         try:                                   # his day, for "tomorrow" sent just before midnight

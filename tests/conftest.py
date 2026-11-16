@@ -17,6 +17,8 @@ OWNER = 424242
 def pytest_configure(config):
     config.addinivalue_line("markers", "raw_words: the test sends words the message rules refuse, on purpose "
                                        "(a test of escaping or of the rules themselves)")
+    config.addinivalue_line("markers", "card_only: the ledger as installed, with the no-card paths off "
+                                       "until the smoke test is recorded")
 
 
 # -- what he sees keeps to his standards (test_message_text.py has the static half) -------------
@@ -181,3 +183,16 @@ def no_read_back_pause(monkeypatch):
     """A read back read once more waits a few seconds on the Pi; not in tests."""
     from harness import calendar_change
     monkeypatch.setattr(calendar_change, "READ_BACK_PAUSE_S", 0)
+
+
+@pytest.fixture(autouse=True)
+def smoke_test_passed(request, monkeypatch):
+    """The no-card paths are off until Cain records the post-install smoke test (keeper.sh fastpath
+    on, 0.24.0 fourth round). Tests written before that run as on a Pi where it passed: nothing
+    recorded counts as on. A test marked card_only sees the ledger as installed, where nothing
+    recorded is card only; a recorded "off" is off everywhere."""
+    if request.node.get_closest_marker("card_only"):
+        return
+    from harness import calendar_change
+    monkeypatch.setattr(calendar_change, "fast_path_on",
+                        lambda ledger: calendar_change.fast_path(ledger).get("on", True) is True)

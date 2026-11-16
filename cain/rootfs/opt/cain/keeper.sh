@@ -5,6 +5,13 @@
 #                                        (it reads his message itself); answers with card ids.
 #                                        --message: the id in the tag of the message it rests on
 #                                        (its last 30 minutes); without it, his newest message
+#   keeper.sh fastpath on "<what the smoke test showed>"
+#                                        once the post-install smoke test on the real calendars
+#                                        has passed: records its result and lets his own fresh,
+#                                        clear words (and a mail date he tapped Add to Family on)
+#                                        go through without a card. Until then, every change
+#                                        comes on a card
+#   keeper.sh fastpath off               every calendar change on a card again
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
@@ -67,10 +74,18 @@ cmd="$1"; shift
 if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 case "$cmd" in
   handover|digest|meanings|places) url="$harness/$cmd"; ctx=harness-handover-v1 ;;
+  fastpath) url="$harness/fastpath"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
+if [ "$cmd" = fastpath ]; then
+  case "${1:-}" in
+    on) [ -n "${2:-}" ] || { echo '{"status":"error","said":"Say what the smoke test showed: fastpath on \"<result>\""}'; exit 2; } ;;
+    off) ;;
+    *) echo '{"status":"error","said":"fastpath takes on \"<smoke test result>\" or off"}'; exit 2 ;;
+  esac
+fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
@@ -126,6 +141,7 @@ case "$cmd" in
   handover) body=$(jq -nc --arg s "${1:-}" --arg p "$owner" --arg m "$message" \
               '{suggestion: $s, paired: $p} + (if $m == "" then {} else {message: $m} end)') ;;
   digest)   body='{}' ;;
+  fastpath) body=$(jq -nc --arg st "$1" --arg sm "${2:-}" '{state: $st, smoke: $sm}') ;;
   meanings)
     # The whole table each time: the specialist stores only what's new.
     if jq -e 'type == "array" or type == "object"' "$1" >/dev/null 2>&1; then

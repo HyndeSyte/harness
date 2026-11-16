@@ -115,6 +115,39 @@ WORDS = {"unknown": "I couldn't confirm it yet",
          "not_made": "that event was there before the add, so Undo leaves it",
          "read_back": "the calendar doesn't read back that way",
          "unverified": "the calendar doesn't read back that way"}
+# 0.24.0, fourth round: the two paths that apply with no card (his own fresh, clear words; a date
+# from his mail he tapped Add to Family on) are off until Cain records that the post-install smoke
+# test on the real calendars passed (keeper.sh fastpath on). Off when nothing is recorded, so every
+# install starts card-only, and every change comes on a card.
+FAST_PATH = "calendar_fast_path"
+SMOKE_MAX = 300
+
+
+def fast_path(ledger: Ledger) -> dict:
+    """What the ledger holds about the no-card paths: {"on": bool, "smoke": what the smoke test
+    showed, "at": when it was recorded}. {} when nothing is, which is card-only."""
+    try:
+        got = json.loads(ledger.get_meta(FAST_PATH) or "{}")
+    except ValueError:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def fast_path_on(ledger: Ledger) -> bool:
+    return fast_path(ledger).get("on") is True
+
+
+def set_fast_path(ledger: Ledger, on: bool, smoke: str = "") -> dict:
+    """Cain's command after the smoke test (controller._fastpath): on only with what the smoke test
+    showed, kept in the ledger with when; off at any time."""
+    record = {"on": bool(on), "smoke": " ".join(str(smoke or "").split())[:SMOKE_MAX],
+              "at": iso(ledger.now())}
+    with ledger.tx() as db:
+        ledger.set_meta(FAST_PATH, json.dumps(record), db)
+        ledger.event("calendar_fast_path", {"on": record["on"]}, db=db)
+    return record
+
+
 _MADE_GMAIL = re.compile(r"cm[0-9a-f]{32}")
 _MADE_FAMILY = re.compile(r"(?:^|/)hm-[0-9a-f]{32}\.ics$")
 STOPPED_UNDO = "I'm stopped, so I didn't undo that. It comes back as its own card after you turn me back on."
@@ -731,6 +764,13 @@ class CalendarChange:
                     return True
         return False
 
+    def fast_path_ok(self) -> bool:
+        """Whether a change may go through with no card at all (FAST_PATH)."""
+        on = fast_path_on(self.ledger)
+        if not on:
+            log.info("no-card path is off until the smoke test is recorded: a card instead")
+        return on
+
     def auto_approve(self, proposal_id: str, job_id: str, db) -> None:
         db.execute("UPDATE proposals SET state='auto_approved' WHERE id=? AND state='proposed'",
                    (proposal_id,))
@@ -933,7 +973,11 @@ class CalendarChange:
         """For a change going through with no tap: why it can't any more, or "". His message must
         still be his newest and under 2 minutes old (fast_check, a fresh read of the DM), and no
         card may be open or replaced for it (0.24.0, third round)."""
-        if p["state"] != "auto_approved" or self.fast_check is None:
+        if p["state"] != "auto_approved":
+            return ""
+        if not fast_path_on(self.ledger):
+            return "changes go through without a tap only once the check after installing has passed"
+        if self.fast_check is None:
             return ""
         try:
             return self.fast_check(p) or ""

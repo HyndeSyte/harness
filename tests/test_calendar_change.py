@@ -1713,7 +1713,7 @@ def test_a_family_move_is_read_back_by_the_day_it_moved_not_another_at_that_time
         return real(method, url, **kw)
     r.icloud.request = drops_it
     r.tell(change(op="move", dates="2026-11-23", start="2026-11-25T08:30:00-05:00",
-                  end="2026-11-25T15:00:00-05:00"), words="move monday's school to wednesday")
+                  end="2026-11-25T15:00:00-05:00"), words="move monday's school to nov 25")
     assert receipts(r) == []                   # Wednesday's own 8:30 isn't the day it moved
     r.advance(minutes=1)
     r.tick()

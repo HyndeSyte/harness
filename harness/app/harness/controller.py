@@ -461,7 +461,8 @@ class Controller:
         for h in (self.handovers.take() if self.handovers is not None else []):
             {"press": self._press, "digest": self._cain_digest,
              "morning-posted": self._morning_posted,
-             "meanings": self._meanings, "places": self._places}.get(h.kind, self._handover)(h)
+             "meanings": self._meanings, "places": self._places,
+             "fastpath": self._fastpath}.get(h.kind, self._handover)(h)
         self._beat()
         self._release_digest()
         self._link_health()
@@ -774,6 +775,30 @@ class Controller:
                              "or it isn't 7:00 AM yet.")
             return
         h.finish("ok", render.plain(self.ledger.get_meta("last_digest_text") or ""))
+
+    def _fastpath(self, h) -> None:
+        """Cain's keeper.sh fastpath (0.24.0, fourth round): once the post-install smoke test on the
+        real calendars has passed, "on" with what it showed turns on the two paths that apply with
+        no card, and the result is kept in the ledger; "off" turns them off again. Until "on",
+        every calendar change comes on a card."""
+        from .calendar_change import fast_path, set_fast_path
+        if h.state == "on":
+            if not h.smoke:
+                h.finish("refused", "Say what the smoke test showed: keeper.sh fastpath on \"<result>\". "
+                                    "Nothing changed; changes still come on a card.")
+                return
+            record = set_fast_path(self.ledger, True, h.smoke)
+            log.info("the no-card path is on: smoke test recorded")
+            h.finish("ok", "On: his own fresh, clear words and a mail date he tapped Add to Family on now "
+                           "go through without a card. Smoke test recorded: " + record["smoke"])
+            return
+        if h.state == "off":
+            set_fast_path(self.ledger, False, fast_path(self.ledger).get("smoke", ""))
+            log.info("the no-card path is off")
+            h.finish("ok", "Off: every calendar change comes on a card.")
+            return
+        now = fast_path(self.ledger)
+        h.finish("unknown", "Say on or off. It's " + ("on" if now.get("on") else "off (card only)") + " now.")
 
     def _meanings(self, h) -> None:
         """What he told Cain kinds of Family events mean, from his record, already checked

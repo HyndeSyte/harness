@@ -55,7 +55,7 @@ WAIT_S = 25
 MAX_BODY = 4096
 MAX_SUGGESTION = 1500
 MAX_MEANINGS_BODY = 16384             # up to 60 short rows, or the place book
-ROUTES = ("/handover", "/digest", "/press", "/morning-posted", "/meanings", "/places")
+ROUTES = ("/handover", "/digest", "/press", "/morning-posted", "/meanings", "/places", "/fastpath")
 BIG = ("/meanings", "/places")
 STUCK_S = 10 * 60
 
@@ -78,6 +78,8 @@ class Handover:
     press: dict = field(default_factory=dict)
     paired: str = ""                     # the Discord user Cain is paired with
     message: str = ""                    # the Discord message of his it rests on, when Cain names one
+    state: str = ""                      # /fastpath: "on" or "off"
+    smoke: str = ""                      # /fastpath: what the post-install smoke test showed
     done: threading.Event = field(default_factory=threading.Event)
     result: dict = field(default_factory=dict)
     arrived: float = field(default_factory=time.monotonic)
@@ -179,6 +181,8 @@ def _handler(inbox: Inbox, wait_s: float):
                          suggestion=str(body.get("suggestion") or "")[:MAX_SUGGESTION].strip(),
                          paired=str(body.get("paired") or "").strip(),
                          message=_message_id(body.get("message")),
+                         state=str(body.get("state") or "").strip().lower()[:8],
+                         smoke=str(body.get("smoke") or "")[:MAX_SUGGESTION].strip(),
                          press={k: str(body.get(k, "")) for k in
                                 ("id", "token", "app", "custom_id", "message_id")})
             inbox.submit(h)

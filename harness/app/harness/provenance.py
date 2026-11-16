@@ -23,6 +23,7 @@ _OPS = {"add": "Add", "add_series": "Add, repeating", "remove": "Take off", "mov
 _MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august", "september",
            "october", "november", "december")
 _DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+EARLY_HOURS = 4                        # "tonight" sent before 4 AM is left open
 _CLOCK = re.compile(r"(?i)\b(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?\s*m\b\.?|\b(\d{1,2}):([0-5]\d)\b|\bnoon\b")
 
 
@@ -79,19 +80,25 @@ def _day_of(c: dict, tz: ZoneInfo):
     return (_when(first) if first else None), None
 
 
-def resolution(words: str, day: date, today: date) -> str:
+def resolution(words: str, day: date, today: date, hour: int | None = None) -> str:
     """The words of his that name that day by a rule with one answer, counted from his own day
     (the day he sent it, in his time zone): "today", "tomorrow", a weekday ("Friday", "this
-    Friday": the soonest one, today included), the 13th (the soonest 13th), or the month and day
-    ("Nov 13", "11/13"). "" when none does. "next Friday" has no one answer (this coming one, or
-    the one after?), so it never counts (0.24.0, third round)."""
+    Friday": the soonest one), the 13th (the soonest 13th), or the month and day ("Nov 13",
+    "11/13"). "" when none does. "next Friday" has no one answer (this coming one, or the one
+    after?), so it never counts (0.24.0, third round). Nor, from the fourth round, does a weekday
+    that is the day he sent it ("Friday" sent on a Friday: today, or a week on?), an ordinal that
+    is today's date ("the 16th" sent on the 16th: today, or next month?), or "tonight" sent
+    between midnight and 4 AM (`hour`, his clock when he sent it: the night just ending, or the
+    one coming?). Each of those is left open (open_day) and comes on a card."""
     t = " " + words.casefold() + " "
-    if day == today and (m := re.search(r"\b(today|tonight|this (?:morning|afternoon|evening))\b", t)):
+    early = hour is not None and hour < EARLY_HOURS
+    if day == today and (m := re.search(r"\b(today|tonight|this (?:morning|afternoon|evening))\b", t)) \
+            and not (early and m.group(1) == "tonight"):
         return m.group(1)
     if day == today + timedelta(days=1) and re.search(r"\btomorrow\b", t):
         return "tomorrow"
     name = _DAYS[day.weekday()]
-    if (day - today).days == (day.weekday() - today.weekday()) % 7:
+    if day.weekday() != today.weekday() and (day - today).days == (day.weekday() - today.weekday()) % 7:
         for m in re.finditer(rf"\b(next\s+|this\s+)?({name}|{name[:3]})s?\b", t):
             if not (m.group(1) or "").startswith("next"):
                 return m.group(0).strip()
@@ -102,7 +109,7 @@ def resolution(words: str, day: date, today: date) -> str:
     if m:
         return m.group(0).strip()
     m = re.search(rf"\b(?:the\s+)?{day.day}(st|nd|rd|th)\b", t)
-    if m and _soonest_dom(today, day.day) == day:
+    if m and day.day != today.day and _soonest_dom(today, day.day) == day:
         return m.group(0).strip()
     return ""
 
@@ -128,6 +135,32 @@ def ambiguous(words: str) -> str:
     return m.group(0) if m else ""
 
 
+_MONTH_DAY = re.compile(r"\b(?:" + "|".join(f"{m}|{m[:3]}" for m in _MONTHS) + r")\.?\s+\d{1,2}(?:st|nd|rd|th)?\b|"
+                        r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:" + "|".join(f"{m}|{m[:3]}" for m in _MONTHS)
+                        + r")\b")
+
+
+def open_day(words: str, sent: datetime | None) -> str:
+    """A day his words leave open, counted from when he sent them (`sent`, in his time zone), or "":
+    "next Friday"; a weekday that is the day he sent it ("Friday" on a Friday); an ordinal that is
+    that day's date with no month ("the 16th" on the 16th); "tonight" sent between midnight and
+    4 AM (0.24.0, fourth round). Any of them puts the change on a card, Cain or not."""
+    hit = ambiguous(words)
+    if hit or sent is None:
+        return hit
+    t = " " + words.casefold() + " "
+    name = _DAYS[sent.weekday()]
+    m = re.search(rf"\b(?:this\s+)?({name}|{name[:3]})s?\b", t)
+    if m:
+        return m.group(0).strip()
+    m = re.search(rf"\b(?:the\s+)?{sent.day}(st|nd|rd|th)\b", _MONTH_DAY.sub(" ", t))
+    if m:
+        return m.group(0).strip()
+    if sent.hour < EARLY_HOURS and re.search(r"\btonight\b", t):
+        return "tonight"
+    return ""
+
+
 def date_in(words: str, day: date, today: date) -> bool:
     """He named that day himself, by a rule with one answer (resolution)."""
     return bool(resolution(words, day, today))
@@ -137,13 +170,14 @@ def resolutions(changes: list[dict], his: str, tz: str, sent: datetime) -> list[
     """For a receipt: each day his own words named by a relative word, and the date it was read
     as: “Friday” as Fri Nov 13 (his own day, "today", goes without saying). Plain text."""
     zone = ZoneInfo(tz)
-    today = sent.astimezone(zone).date()
+    local = sent.astimezone(zone)
+    today = local.date()
     out = []
     for c in changes:
         day, _ = _day_of(c, zone)
         if day is None:
             continue
-        phrase = resolution(his, day, today)
+        phrase = resolution(his, day, today, local.hour)
         if day != today and phrase and not re.search(r"\d", phrase):
             out.append(f"\u201c{phrase}\u201d as {day:%a %b} {day.day}")
     return list(dict.fromkeys(out))
@@ -184,7 +218,8 @@ def detail_line(c: dict, his: str, cain: str, tz: str, now: datetime,
     even when it's read after midnight; the day his words resolve to is shown with them, and a day
     his words leave open ("next Friday") is marked as not in his words, Cain or not (0.24.0)."""
     zone = ZoneInfo(tz)
-    today = (sent or now).astimezone(zone).date()
+    local = (sent or now).astimezone(zone)
+    today = local.date()
     marks = []
 
     def mark(in_his: bool, in_cain: bool, needed: bool = False, forced: bool = False) -> str:
@@ -206,10 +241,10 @@ def detail_line(c: dict, his: str, cain: str, tz: str, now: datetime,
               f"event {title}" + mark(_title_in(his, c.get("title", "")), _title_in(cain, c.get("title", "")))]
     day, at = _day_of(c, zone)
     if day is not None:
-        phrase = resolution(his, day, today)
+        phrase = resolution(his, day, today, local.hour)
         shown = f" (your \u201c{render.escape(phrase)}\u201d)" if phrase and not re.search(r"\d", phrase) else ""
         fields.append(f"date {day:%a %b} {day.day}{shown}"
-                      + mark(bool(phrase), date_in(cain, day, today), True, forced=bool(ambiguous(his))))
+                      + mark(bool(phrase), date_in(cain, day, today), True, forced=bool(open_day(his, local))))
     if at is not None:
         fields.append(f"time {render.clock_words(at, suffix=True)}"
                       + mark(time_in(his, at), time_in(cain, at), True))

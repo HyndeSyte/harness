@@ -207,7 +207,9 @@ def test_a_date_from_cains_suggestion_is_marked_from_cain_and_forces_a_tap(m):
 def test_which_fields_are_his_own():
     from datetime import date, datetime
     today = date(2026, 11, 11)
-    assert date_in("not doing the Wednesday drop-off", today, today)
+    assert date_in("not doing the drop-off today", today, today)
+    # Sent on a Wednesday, "Wednesday" could be today or a week on: left open (0.24.0, fourth round).
+    assert not date_in("not doing the Wednesday drop-off", today, today)
     assert date_in("dentist on Nov 13", date(2026, 11, 13), today) and date_in("the 13th", date(2026, 11, 13), today)
     assert not date_in("add the field trip", date(2026, 11, 13), today)
     assert time_in("at 9am", datetime(2026, 11, 13, 9, 0, tzinfo=NY)) and not time_in("at 10", datetime(2026, 11, 13, 9, 0, tzinfo=NY))
