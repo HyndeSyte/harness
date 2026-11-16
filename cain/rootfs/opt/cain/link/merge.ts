@@ -391,12 +391,20 @@ export interface GateReport { head: string; at: string; decision: GateDecision; 
 // a Retry-After header, or a body that says secondary rate limit; any other 403 is a permission
 // failure, named with the endpoint it refused. wait_ms: how long GitHub asks to wait (Retry-After,
 // or x-ratelimit-reset less now), which the watch honours before its next reading.
+//
+// Twentieth round: a Retry-After or x-ratelimit-reset that is there but can't be read (not whole
+// seconds, an HTTP date or an epoch second) counts as the cap, RATE_WAIT_CAP_MS, never as zero or
+// as no limit; the watch ends with a named failure when GitHub asks for longer than the cap.
 export const RATE_LIMITED = [403, 429];
+export const RATE_WAIT_CAP_MS = 15 * 60_000;
+export const WATCH_CAP_MS = 2 * 3_600_000;
 export function refusalOf(r: { status: number; body: any; headers?: Record<string, string> }, now: number): { kind: "rate_limit" | "permission"; wait_ms: number | null } | null {
   if (!RATE_LIMITED.includes(r.status)) return null;
   const h = r.headers ?? {};
-  const after = h["retry-after"] !== undefined && /^\d{1,6}$/.test(h["retry-after"].trim()) ? Number(h["retry-after"].trim()) * 1000 : null;
-  const reset = h["x-ratelimit-reset"] !== undefined && /^\d{9,11}$/.test(h["x-ratelimit-reset"].trim()) ? Math.max(0, Number(h["x-ratelimit-reset"].trim()) * 1000 - now) : null;
+  const ra = h["retry-after"]?.trim(), rs = h["x-ratelimit-reset"]?.trim();
+  const date = ra !== undefined && /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(ra) ? Date.parse(ra) : NaN;
+  const after = ra === undefined ? null : /^\d{1,6}$/.test(ra) ? Number(ra) * 1000 : Number.isFinite(date) ? Math.max(0, date - now) : RATE_WAIT_CAP_MS;
+  const reset = rs === undefined ? null : /^\d{9,11}$/.test(rs) ? Math.max(0, Number(rs) * 1000 - now) : RATE_WAIT_CAP_MS;
   const wait_ms = after ?? reset;
   let said = "";
   try { said = typeof r.body === "string" ? r.body : JSON.stringify(r.body ?? ""); } catch { said = ""; }
@@ -450,30 +458,45 @@ export function judgeShipGate(head: string, reports: GateReport[]): ShipGateLine
 // Retry-After or x-ratelimit-reset) until the gate accepts, refuses for good, or untilMs passes;
 // the line is judged on every report taken.
 //
-// Started before the candidate head is pushed (0.12.0, nineteenth round), it watches a pull request
-// instead (pr): it reads the pull request's head sha each time, and binds to the first head it sees
-// (one different from the head at its start, from); once bound, it reads and accepts only that sha,
-// whatever later pushes do to the branch. bound_head is kept with the line, and the Ship card is
-// refused for any other head of that pull request while the watch's acceptance stands (core.ts ship).
-export interface WatchTarget { head?: string; pr?: number; from?: string | null }
-export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, target: string | WatchTarget, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<ShipGateLine & { bound_head: string | null; accepted_head: string | null }> {
+// Started before the candidate head is pushed (0.12.0, twentieth round), it watches a pull request
+// for the exact sha the pusher supplies (pr and head: the local commit about to be pushed). It reads
+// the pull request's head each time and waits until it equals that sha; only then does it read the
+// gate, for that sha alone. The head the pull request showed at its first reading (the head before
+// the push) is waited past; any other head is a named failure, other_head, and so is the head moving
+// away from the sha once it was there, head_moved. Nothing is accepted on either.
+//
+// Its caps (twentieth round): one wait GitHub asks for longer than RATE_WAIT_CAP_MS (15 minutes) ends
+// the watch with rate_wait_cap; the whole watch never runs past WATCH_CAP_MS (2 hours, whatever
+// untilMs asks), and a watch that reaches it unsettled ends with watch_cap.
+export type WatchFailure = "no_head" | "other_head" | "head_moved" | "rate_wait_cap" | "watch_cap";
+export interface WatchTarget { head?: string; pr?: number }
+export type WatchLine = ShipGateLine & { pr: number | null; bound_head: string | null; accepted_head: string | null; failure: WatchFailure | null; failure_why: string | null };
+export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, target: string | WatchTarget, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<WatchLine> {
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((ok) => setTimeout(ok, ms)));
   const now = o.now ?? (() => new Date());
   const t = typeof target === "string" ? { head: target } : target;
+  const head = (t.head ?? "").toLowerCase();
+  const until = Math.min(o.untilMs, WATCH_CAP_MS);
   const t0 = now().getTime();
   const reports: GateReport[] = [];
-  let bound: string | null = t.head && SHA.test(t.head) ? t.head : null;
-  let from: string | null | undefined = t.from;
-  while (true) {
-    let wait = o.everyMs;
-    if (!bound && t.pr !== undefined) {
-      // The pull request's head now: the first one past its start binds the watch.
+  const byPr = t.pr !== undefined;
+  let bound: string | null = !byPr && SHA.test(head) ? head : null;
+  let from: string | undefined;
+  let failure: WatchFailure | null = null, failure_why: string | null = null;
+  const fail = (f: WatchFailure, why: string) => { failure = f; failure_why = why; };
+  if (byPr && !SHA.test(head)) fail("no_head", "the watch of a pull request needs the full sha about to be pushed (--head)");
+  while (!failure) {
+    let wait = o.everyMs, asked: number | null = null;
+    if (byPr) {
+      // The pull request's head now: the watch binds only when it equals the sha it was given.
       const r = await d.api(`/repos/${repo}/pulls/${t.pr}`).catch(() => null);
-      const sha = r && r.status === 200 && typeof r.body?.head?.sha === "string" && SHA.test(r.body.head.sha) ? r.body.head.sha : null;
-      if (from === undefined) from = sha;
-      else if (sha && sha !== from) bound = sha;
+      const sha = r && r.status === 200 && typeof r.body?.head?.sha === "string" && SHA.test(r.body.head.sha) ? r.body.head.sha.toLowerCase() : null;
       const k = r ? refusalOf(r, now().getTime()) : null;
-      if (k?.wait_ms) wait = Math.max(wait, k.wait_ms);
+      if (k?.wait_ms != null) asked = k.wait_ms;
+      if (sha === head) bound = head;
+      else if (sha && bound) { fail("head_moved", `the pull request's head moved away from ${head} to ${sha}: nothing is accepted; watch the new head with --head once it is pushed`); break; }
+      else if (sha && from === undefined) from = sha;                  // the head before the push: waited past
+      else if (sha && sha !== from) { fail("other_head", `a different head appeared on the pull request (${sha}, not ${head}): nothing is accepted; watch the head actually pushed with --head`); break; }
     }
     if (bound) {
       const r = await gateReport(d, repo, bound, now);
@@ -482,18 +505,30 @@ export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, tar
       // A run not listed yet (just after the push) is watched on; a failed attempt settles it.
       const settled = r.decision === "accept" || r.windows === "failed" || (r.decision === "refuse" && r.windows !== "missing");
       if (settled) break;
-      if (r.limited?.wait_ms) wait = Math.max(wait, r.limited.wait_ms);
+      if (r.limited?.wait_ms != null) asked = Math.max(asked ?? 0, r.limited.wait_ms);
     }
-    if (now().getTime() - t0 + wait > o.untilMs) break;
+    if (asked !== null && asked > RATE_WAIT_CAP_MS) { fail("rate_wait_cap", `GitHub asked to wait ${Math.ceil(asked / 60_000)} minutes, past the ${RATE_WAIT_CAP_MS / 60_000} minute cap on one wait: the watch ends unsettled`); break; }
+    if (asked !== null) wait = Math.max(wait, asked);
+    if (now().getTime() - t0 + wait > until) {
+      if (until >= WATCH_CAP_MS) fail("watch_cap", `the watch reached its ${WATCH_CAP_MS / 3_600_000} hour cap unsettled`);
+      break;
+    }
     await sleep(wait);
   }
-  const line = judgeShipGate(bound ?? t.head ?? "", reports);
+  const line = judgeShipGate(bound ?? head, reports);
   const last = reports.at(-1);
-  return { ...line, bound_head: bound, accepted_head: last && last.decision === "accept" ? last.head : null };
+  const accepted = !failure && last && last.decision === "accept" ? last.head : null;
+  return { ...line, passed: line.passed && !failure, pr: t.pr ?? null, bound_head: bound, accepted_head: accepted, failure, failure_why };
 }
-// The watch's record for one pull request (keeper.sh ship-gate --pr), as the Ship card reads it:
-// the head the watch accepted, or null.
-export const watchFile = (dir: string, pr: number) => `${dir}/ship-gate-pr-${pr}.json`;
-export function watchAccepted(text: string | null): string | null {
-  try { const x = JSON.parse(text ?? ""); return typeof x?.accepted_head === "string" && SHA.test(x.accepted_head) ? x.accepted_head : null; } catch { return null; }
+// The watch's record, kept by sha (twentieth round): /data/work/ship-gate-<sha>.json, with the pull
+// request it watched and the head it accepted, or null. keeper.sh ship-gate --supersede <sha> marks
+// an acceptance replaced (after a rebase); the Ship card reads every unsuperseded acceptance of its
+// pull request (shipgate.ts acceptedFor) and is refused for any other head while one stands.
+export const watchFile = (dir: string, sha: string) => `${dir}/ship-gate-${sha}.json`;
+export function watchAccepted(text: string | null): { pr: number | null; head: string } | null {
+  try {
+    const x = JSON.parse(text ?? "");
+    if (typeof x?.accepted_head !== "string" || !SHA.test(x.accepted_head) || x.superseded) return null;
+    return { pr: typeof x.pr === "number" ? x.pr : null, head: x.accepted_head };
+  } catch { return null; }
 }

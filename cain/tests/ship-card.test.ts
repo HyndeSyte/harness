@@ -9,7 +9,12 @@
 import { describe, expect, test } from "bun:test";
 import { CODES_WHY, SHIP_WORDS_WHY } from "../rootfs/opt/cain/gate/cain";
 import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, REVIEW_READ, unlabeled } from "../rootfs/opt/cain/link/core";
+import { watchFile } from "../rootfs/opt/cain/link/merge";
+import { acceptedFor, supersede } from "../rootfs/opt/cain/link/shipgate";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const DAY = 86_400_000;
 const FACTS = { head: SHA1, commits: 4, files: 12, areas: ["Cain's link", "Cain's rules"], title: "Cain 0.11.0: Ship cards from code",
@@ -402,10 +407,35 @@ describe("nineteenth review: the Ship card and the ship_gate watch's head", () =
   test("a card for another head than the one the watch accepted is refused; the accepted head's card goes", async () => {
     const r = shipRig();
     r.github.watched[PR] = SHA2;                                    // the watch bound to and accepted the first head pushed
-    await expect(r.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 })).rejects.toThrow("the Ship gate's watch of this pull request accepted another head");
+    await expect(r.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 })).rejects.toThrow(`the Ship gate's watch of this pull request accepted ${SHA2}, not this head`);
     r.github.watched[PR] = SHA1;
     expect(r.msg(await ship(r)).content).toContain(LINE);
     delete r.github.watched[PR];                                    // no watch: as before
+    expect(r.msg(await ship(r)).content).toContain(LINE);
+  });
+});
+
+describe("twentieth review: the watch's acceptance is kept by sha, and superseded by name", () => {
+  test("a card for a new head is refused naming the accepted sha and --supersede; after the supersede and a new watch, the new head's card goes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate-"));
+    const kept = (head: string, accepted: string | null, pr = 5) =>
+      writeFileSync(watchFile(dir, head), JSON.stringify({ step: "ship_gate", pr, bound_head: head, accepted_head: accepted, failure: null }) + "\n");
+    const r = rig({ facts: true, gateWatch: () => acceptedFor(dir, 5) });
+    r.github.facts = facts();
+    r.reviews.list = [REVIEW];
+    kept(SHA2, SHA2);                                               // the watch accepted the head before a rebase
+    kept("3".repeat(40), "3".repeat(40), 6);                        // another pull request's acceptance: not this card's
+    kept("4".repeat(40), null);                                     // a watch that accepted nothing: no acceptance
+    const refused = r.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 });
+    await expect(refused).rejects.toThrow(`accepted ${SHA2}, not this head`);
+    await expect(r.link.ship({ text: LINE, item: "P64", pr: PR, head: SHA1 })).rejects.toThrow(`run keeper.sh ship-gate --supersede ${SHA2}`);
+    expect(supersede(dir, "5".repeat(40))).toMatchObject({ ok: false });       // nothing kept for that sha
+    expect(supersede(dir, "4".repeat(40))).toMatchObject({ ok: false });       // it accepted nothing
+    expect(supersede(dir, SHA2)).toEqual({ ok: true, pr: 5 });
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA2), "utf8")).superseded.at).toBeString();   // the record stays, marked
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    kept(SHA1, SHA1);                                               // a new watch of the rebased head accepted it
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
     expect(r.msg(await ship(r)).content).toContain(LINE);
   });
 });

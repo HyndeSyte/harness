@@ -538,7 +538,7 @@ export interface Deps {
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
-  gateWatch?: (pr: string) => string | null;                       // the head a ship_gate watch of this pull request accepted (merge.ts watchAccepted), or null   // the head's check runs (merge.ts headChecks)
+  gateWatch?: (pr: string) => string[];                            // every unsuperseded head a ship_gate watch of this pull request accepted (shipgate.ts acceptedFor)
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1446,11 +1446,12 @@ export class Link {
       if (rev.head !== head || (rev.pr !== null && rev.pr.toLowerCase() !== pr.toLowerCase()))
         throw new Refusal(`review ${review} was of another head or pull request: get a review of this head as it is now`);
     }
-    // A ship_gate watch of this pull request accepted another head (it binds to the first head
-    // pushed after its start): a card for any other head is refused while that stands.
-    const watched = this.d.gateWatch?.(pr) ?? null;
-    if (watched && watched !== head)
-      throw new Refusal("the Ship gate's watch of this pull request accepted another head (the first one pushed after it started): watch this head with keeper.sh ship-gate --pr before showing its card");
+    // A ship_gate watch of this pull request accepted another head (twentieth round: a watch binds to
+    // the exact sha its pusher named, and its acceptance is kept by sha): a card for any other head is
+    // refused while that acceptance stands, naming it and the command that records it replaced.
+    const watched = this.d.gateWatch?.(pr) ?? [];
+    if (watched.length && !watched.includes(head))
+      throw new Refusal(`the Ship gate's watch of this pull request accepted ${watched.join(" and ")}, not this head: if this head replaces it (a rebase), run keeper.sh ship-gate --supersede ${watched[0]}, then watch this head with keeper.sh ship-gate --pr <number> --head ${head} --watch before showing its card`);
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));

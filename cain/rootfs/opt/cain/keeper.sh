@@ -41,9 +41,14 @@
 #                                        the Windows Ship gate read for that head without acting: what it
 #                                        would decide and why, the workflow file it read and every
 #                                        pcjobs-windows attempt it saw; --watch is the probe's ship_gate step
-#   keeper.sh ship-gate --pr <number> --watch
-#                                        the same watch, started before the push: it binds to the first head
-#                                        the pull request shows after it started and accepts only that sha
+#   keeper.sh ship-gate --pr <number> --head <full sha> --watch
+#                                        the same watch, started before the push, for the exact sha about to
+#                                        be pushed: it waits until the pull request's head equals that sha and
+#                                        accepts only it, and fails by name (other_head, head_moved) if another
+#                                        head appears or the head moves away; kept as ship-gate-<sha>.json
+#   keeper.sh ship-gate --supersede <full sha>
+#                                        records that the acceptance kept for that sha is replaced (a rebase),
+#                                        so a new watch can accept the pull request's new head for its card
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings

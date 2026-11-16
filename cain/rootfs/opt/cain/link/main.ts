@@ -60,7 +60,8 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { facts, headChecks, inMain, land, watchAccepted, watchFile, type MergeDeps } from "./merge";
+import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
+import { acceptedFor, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
@@ -209,7 +210,7 @@ const link = new Link({
   // included when the head's tests.yml names it), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.
   checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
-  gateWatch: (pr) => { const p = pullOf(pr); if (!p) return null; try { return watchAccepted(readFileSync(watchFile("/data/work", Number(p.pr)), "utf8")); } catch { return null; } },
+  gateWatch: (pr) => { const p = pullOf(pr); return p ? acceptedFor(WATCH_DIR, Number(p.pr)) : []; },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).

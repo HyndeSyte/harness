@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, refusalOf, watchAccepted, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, RATE_WAIT_CAP_MS, refusalOf, WATCH_CAP_MS, watchAccepted, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
@@ -721,27 +721,77 @@ describe("seventeenth review: the Windows gate reads every run and every attempt
     expect(line.reports.map((r) => r.decision)).toEqual(["hold", "hold", "accept"]);
   });
 
-  test("nineteenth review: a watch started before the push binds to the first head and accepts only for it; a later push doesn't move it", async () => {
-    const OLD = "f".repeat(40);
-    let prHead = OLD, i = 0;
-    const seen: string[] = [];
-    const green = () => fake({ checkPages: i < 2 ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] });
+  // Twentieth review: the watch takes the exact sha the pusher supplies (--pr and --head), waits for
+  // the pull request's head to equal it, and fails by name when another head shows or it moves away.
+  const OLD = "f".repeat(40);
+  const prWatch = (heads: (i: number) => string, greenFrom = 2) => {
+    let i = 0;
+    const read: string[] = [];
     const d = { api: async (p: string) => {
-      seen.push(p);
-      if (p === `/repos/${REPO}/pulls/21`) return { status: 200, body: { head: { sha: prHead } } };
-      if (p.includes(H2)) throw new Error(`read the second head: ${p}`);
-      return green().api(p);
+      read.push(p);
+      if (p === `/repos/${REPO}/pulls/21`) return { status: 200, body: { head: { sha: heads(i) } } };
+      return fake({ checkPages: i < greenFrom ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] }).api(p);
     } };
-    const line = await watchShipGate(d, REPO, { pr: 21 }, { everyMs: 1, untilMs: 10_000, sleep: async () => {
-      i++;
-      if (i === 1) prHead = H1;                                                // the candidate head is pushed
-      if (i === 2) prHead = H2;                                                // a later push moves the branch
-    } });
-    expect(line.bound_head).toBe(H1);
-    expect(line.accepted_head).toBe(H1);
+    return { d, read, tick: async () => { i++; } };
+  };
+  test("twentieth review: the pull request has an older head when the watch starts and the intended push comes after: it binds to the intended sha only", async () => {
+    const w = prWatch((i) => (i < 2 ? OLD : H1), 3);                       // two readings of the old head, then the push
+    const line = await watchShipGate(w.d, REPO, { pr: 21, head: H1 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(line).toMatchObject({ pr: 21, bound_head: H1, accepted_head: H1, failure: null, passed: true });
     expect(line.reports.every((r) => r.head === H1)).toBe(true);
-    expect(line.passed).toBe(true);
-    expect(watchAccepted(JSON.stringify(line))).toBe(H1);
+    expect(w.read.some((p) => p.includes(OLD))).toBe(false);                // the old head's gate was never read
+    expect(watchAccepted(JSON.stringify(line))).toEqual({ pr: 21, head: H1 });
+    expect(watchAccepted(JSON.stringify({ ...line, superseded: { at: "x" } }))).toBeNull();
     expect(watchAccepted("not json")).toBeNull();
+  });
+  test("twentieth review: a different head appearing is a named failure, and nothing is accepted", async () => {
+    const w = prWatch((i) => (i < 1 ? OLD : H2));
+    const line = await watchShipGate(w.d, REPO, { pr: 21, head: H1 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(line).toMatchObject({ failure: "other_head", bound_head: null, accepted_head: null, passed: false });
+    expect(line.failure_why).toContain(`a different head appeared on the pull request (${H2}, not ${H1})`);
+    expect(w.read.some((p) => p.includes(H2) && !p.endsWith("/pulls/21"))).toBe(false);
+  });
+  test("twentieth review: the head moving away from the sha after it was there is a named failure, and nothing is accepted", async () => {
+    const w = prWatch((i) => (i < 1 ? H1 : H2), 5);                        // bound at once, then a later push moves it
+    const line = await watchShipGate(w.d, REPO, { pr: 21, head: H1 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(line).toMatchObject({ failure: "head_moved", bound_head: H1, accepted_head: null, passed: false });
+    expect(line.failure_why).toContain(`moved away from ${H1} to ${H2}`);
+    const none = await watchShipGate(w.d, REPO, { pr: 21 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(none).toMatchObject({ failure: "no_head", accepted_head: null });     // a pull request watch needs --head
+  });
+  test("twentieth review: one wait over 15 minutes ends the watch by name; an unreadable Retry-After or reset counts as the cap", async () => {
+    const NOW = Date.parse("2026-11-16T10:00:00Z");
+    expect(RATE_WAIT_CAP_MS).toBe(15 * 60_000);
+    expect(WATCH_CAP_MS).toBe(2 * 3_600_000);
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "soon" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "-5" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 403, body: null, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1e10" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": new Date(NOW + 60_000).toUTCString() } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 60_000 });
+    // An unreadable header waits the cap (not past it), then reads again.
+    let t = NOW, i = 0;
+    const waits: number[] = [];
+    const d = (hdr: Record<string, string>) => ({ api: async (p: string) => (i === 0 && p.includes("check_name=pcjobs-windows")
+      ? { status: 429, body: null, headers: hdr } : fake({ checkPages: [[win(5, "success")]] }).api(p)) });
+    const clock = { sleep: async (ms: number) => { waits.push(ms); t += ms; i++; }, now: () => new Date(t) };
+    const capped = await watchShipGate(d({ "retry-after": "garbage" }), REPO, H1, { everyMs: 60_000, untilMs: WATCH_CAP_MS, ...clock });
+    expect(waits).toEqual([RATE_WAIT_CAP_MS]);
+    expect(capped).toMatchObject({ failure: null, accepted_head: H1 });
+    // Asked for longer than the cap: the watch ends at once, unsettled, named.
+    i = 0; waits.length = 0;
+    const long = await watchShipGate(d({ "retry-after": "1200" }), REPO, H1, { everyMs: 60_000, untilMs: WATCH_CAP_MS, ...clock });
+    expect(waits).toEqual([]);
+    expect(long).toMatchObject({ failure: "rate_wait_cap", accepted_head: null, passed: false });
+    expect(long.failure_why).toContain("past the 15 minute cap on one wait");
+  });
+  test("twentieth review: the whole watch is capped at 2 hours, whatever it is asked, and ends by name", async () => {
+    let t = Date.parse("2026-11-16T10:00:00Z");
+    const t0 = t;
+    const line = await watchShipGate(fake({ checkPages: [[win(5, null, "in_progress")]] }), REPO, H1,
+      { everyMs: 10 * 60_000, untilMs: 6 * 3_600_000, sleep: async (ms) => { t += ms; }, now: () => new Date(t) });
+    expect(t - t0).toBeLessThanOrEqual(WATCH_CAP_MS);
+    expect(line.reports.length).toBe(13);                                    // 0, 10, ... 120 minutes: the next would pass 2 hours
+    expect(line).toMatchObject({ failure: "watch_cap", accepted_head: null, passed: false });
+    expect(line.failure_why).toBe("the watch reached its 2 hour cap unsettled");
   });
 });
