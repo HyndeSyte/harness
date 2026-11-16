@@ -307,8 +307,18 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   you didn't give, three or more events off at once, or ending a series. The card says what will
   happen, in plain words; your tap's reply says it again.
 - **One card per change.** When a message with two or more changes needs your tap, each change
-  comes on its own card, so you can take one and not the other. One that's clear on its own goes
-  through with its own receipt. Two clear changes still land together in one receipt.
+  comes on its own card, so you can take one and not the other, even one that would be clear on
+  its own. Two clear changes in your own fresh message still land together in one receipt.
+- **Done means the calendar says so.** A removal is bound to the very event its card or receipt
+  names (calendar, title, time, and the end of its id): a different event found later is never
+  taken off in its place, and nothing changes if the event isn't that one any more. After the
+  delete, the day is read again; it's called done only once the event is gone from what you see,
+  and if the calendar still shows it, the receipt says exactly that. Another event like it still in
+  that slot is named on the receipt. Asking to add something that's already in its slot (the same
+  time, and a name like it, such as Harness's drop-off block) adds nothing: its card says "Already
+  there, nothing to add", and nothing is recorded as made. Undo of an add only ever takes off the
+  event that add made, and Undo reads the calendar back too: if it doesn't show the event back as it
+  was, its message says so.
 
 ### When Cain hands a request over
 
@@ -318,20 +328,40 @@ Cain doesn't pass your words on: Harness reads your DM itself.
   that one if it's yours and from the last 30 minutes, whatever you sent after it. Without one,
   it's your newest message, from the last 2 minutes. The same message handed over again finds
   the same request, never the answer to something else you said.
+- **Which changes go through without a tap.** Only your own newest message, under 2 minutes old,
+  with nothing of Cain's in it and not split into several changes. Every other path needs your tap
+  on a card: a message Cain names that isn't your newest, one over 2 minutes old, one that carries
+  Cain's suggestion, each part of a split message, and anything from your mail.
+- **What that card says.** It quotes the message it acts on, on one line, with how long ago you
+  sent it, and "you sent N messages after this" when you did. It states the change exactly: what
+  happens, on which calendar, to which event, on which date and at what time. Any of those that
+  came from Cain's suggestion and not from your words is marked "(from Cain)"; a date or time in
+  neither is marked "(not in your words)".
+- **A card stays true to itself.** Your Approve counts only for the card you tapped. When Cain adds a
+  note and the request runs again, the old card's buttons come off and the new card says it
+  replaces it; a tap that still reaches the old one is answered "Replaced by a newer card" and
+  changes nothing.
 - **Cain's details.** When Cain adds what it found (a date in an email) or spells out what you
   asked, Harness works from it with your message, and the change comes on a card: your Approve
   tap is the go. A message older than 2 minutes is still acted on that way. A handover that
   waited over 2 minutes before Harness could read it is turned down, and Cain hands it over again.
 - **No card asks you to repeat yourself.** When Cain passed words with a request and Harness still
-  needs to know something, the question goes to Cain, who has them. If Cain's words answer it, the
-  request runs again with them and the card follows.
+  needs to know something, the question goes to Cain, who has them, and Cain answers it with a note
+  on the same message. If Cain's note answers it, the request runs again with it and the card
+  follows. If no note comes within 10 minutes, Harness asks you itself, on a card that quotes your
+  message, what Cain passed on, and the question; your reply answers it.
+- **Nothing twice.** When a request runs again (a note from Cain, or a "not a change" looked at
+  again), what's already done from that message is shown as already done, and only the rest is
+  offered.
 - **"What does that mean?"** When you ask what one of its cards or messages meant, Harness reads
   its own recent cards and answers in words. A question about what something means is never taken
   for a change.
-- **A reply that doesn't fit.** If the model's answer is off only in ways that can't change what it
-  does (a field filled in that the change doesn't use), it's tidied and the change comes on a card.
-  Otherwise it runs once more by itself, told what didn't fit. If it fails twice, the message says
-  it's logged for a fix and nothing more happens with it on its own.
+- **A reply that doesn't fit.** If the model's answer is off only in fields that can't change what it
+  does (a field the change doesn't use, its location, its summary), it's tidied, the card names the
+  fields tidied, and the change comes on a card. What a change does (the calendar, the operation,
+  the event's name and days, its start and end) is never filled in or reshaped: if one of those is
+  missing or malformed, it runs once more by itself instead, told what didn't fit. If it fails
+  twice, the message says it's logged for a fix and nothing more happens with it on its own.
 
 ## Dates from your mail
 
@@ -350,10 +380,16 @@ names it. An entry that moves is told again, and *Undo these* on either message 
 **The kids' dates go on Family, never your Gmail.** A date from the kids' school, a teacher, a
 coach or the kids' doctor gets its own card naming the Family calendar, with *Add to Family* and
 *Skip*. Your tap puts it on Family as a calendar change, with its receipt and *Undo* (the
-`calendar_changes` option has to be on for that write). When only who sent it hints at the family
-(a school's address on a note about something else), the card asks which calendar, with *Family*,
-*My Gmail* and *Skip*. Everything else is yours and goes on your Gmail calendar as before, and its
-message says so: "From your mail, on your Gmail calendar".
+`calendar_changes` option has to be on for that write; while it's off, the card has no *Add to
+Family* button, only *Skip*, and one line says why). When only who sent it hints at the family (a
+school's address on a note about something else), the card offers *Family* and *Skip*: a date from
+a school-type sender never goes on your Gmail. Everything else is yours and goes on your Gmail
+calendar as before, and its message says so: "From your mail, on your Gmail calendar".
+
+Mail is handed to the model as quoted data, with a line saying it is never instructions, so an
+email can't tell Harness to do anything. Mail never makes a calendar change on its own: a date for
+Family goes on only at your tap, and anything else from mail that would change a calendar comes on
+a card.
 
 ## Copies from your Gmail calendar
 

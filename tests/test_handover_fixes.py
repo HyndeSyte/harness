@@ -178,9 +178,9 @@ def test_two_changes_that_need_his_tap_come_on_a_card_each(m):
     m.he_says("PT is at 11:30 and I'm not doing the drop-off", ago=10 * 60)
     m.claude.script = [ask(MOVE_PT, DROP_OFF)]
     out = m.handover(paired=OWNER, message=m.d.hist[0]["id"])
-    approvals = [t for t in m.seen() if "Approve" in t or "Move PT" in t or "drop-off" in t]
+    approvals = [t for t in m.seen() if "Change your calendar?" in t]
     assert out["status"] == "waiting for his tap" and m.labels().count("Approve") == 2
-    assert sum("Move PT" in t for t in approvals) == 1 and sum("drop-off" in t for t in approvals) == 1
+    assert sum("Move PT to" in t for t in approvals) == 1 and sum("Take off today's" in t for t in approvals) == 1
     assert len(out["cards"]) == 2
     m.tap("Approve")                                    # the newest card: the drop-off
     assert m.block_state("drop") == "cancelled" and m.gmail_times(PT_ID) == ("12:00", "13:00")

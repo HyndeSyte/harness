@@ -56,6 +56,8 @@ class Outbox:
         return sent
 
     def _send(self, row) -> bool:
+        if row["kind"] == "unbutton":
+            return self._unbutton(row)
         buttons = json.loads(row["buttons_json"]) if row["buttons_json"] else None
         if buttons:
             buttons = [[tuple(b) for b in r] for r in buttons]
@@ -93,6 +95,21 @@ class Outbox:
                     choices.bind(self.ledger, b["nonce"], mid)
             except (ValueError, LedgerError) as e:
                 self.ledger.event("bind_failed", {"outbox": row["id"], "error": str(e)[:100]})
+        return True
+
+    def _unbutton(self, row) -> bool:
+        """A card replaced by a newer one (approvals.supersede_open): its buttons come off. Its
+        approval is already used up, so a tap that beats this is refused anyway."""
+        try:
+            self.api.edit_reply_markup(row["chat_id"], int(row["text"]), None)
+        except ChatError as e:
+            self._failed(row, e)
+            return False
+        except ValueError:
+            pass
+        with self.ledger.tx() as db:
+            db.execute("UPDATE outbox SET state='sent', sent_at=?, attempts=attempts+1, last_error=NULL"
+                       " WHERE id=?", (iso(self.ledger.now()), row["id"]))
         return True
 
     def _expires(self, binds: list) -> str | None:

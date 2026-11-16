@@ -458,15 +458,21 @@ def test_off_says_so_and_changes_nothing(r):
 
 
 def test_several_changes_that_need_a_tap_come_one_card_each(r):
-    """0.24.0 (Nov 15): two changes in one message, one needing his tap. The clear one lands with
-    its receipt; the series ended comes on its own card, so he can take one and not the other."""
+    """0.24.0 (Nov 15): two changes in one message, one needing his tap. Each comes on its own card,
+    so he can take one and not the other; a part of a split is never done without his tap, even one
+    clear on its own (second review round)."""
     r.tell(change(dates="2026-11-23"), change(op="end_series", dates="2027-03-08"))
-    assert "2026-11-23" not in days_of(r.body()) and "2027-03-08" in days_of(r.body())
+    assert "2026-11-23" in days_of(r.body()) and "2027-03-08" in days_of(r.body())
     approvals = [s for s in r.bot.sent if s[2] and any(t == "Approve" for row in s[2] for t, _ in row)]
-    assert len(approvals) == 1 and "2026-11-23" not in approvals[0][1] and "Nov 23" not in approvals[0][1]
-    r.press(approvals[0], "Approve")                # ending a series is tapped
+    assert len(approvals) == 2
+    day_card = next(s for s in approvals if "Nov 23" in s[1])
+    end_card = next(s for s in approvals if s is not day_card)
+    assert "several changes in one message" in day_card[1]
+    r.press(end_card, "Approve")                    # ending a series is tapped
     days = days_of(r.body())
-    assert "2026-11-23" not in days and "2027-03-08" not in days and "2027-03-03" in days
+    assert "2026-11-23" in days and "2027-03-08" not in days and "2027-03-03" in days
+    r.press(day_card, "Approve")
+    assert "2026-11-23" not in days_of(r.body())
     assert len([s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)]) == 2
 
 
@@ -1095,11 +1101,17 @@ def test_a_gmail_series_and_one_of_its_days_are_each_checked(r):
     r.tell(change(calendar="gmail", op="move", title="harness test", dates="2026-12-08",
                   start="2026-12-08T21:00:00-05:00", end="2026-12-08T22:00:00-05:00"),
            change(calendar="gmail", op="end_series", title="harness test", dates="2026-12-15"))
-    r.approve()                                # ending a series is tapped
+    # A split message: each change on its own card (0.24.0), the move's tapped first.
+    cards = [s for s in r.bot.sent if s[2] and any(t == "Approve" for row in s[2] for t, _ in row)]
+    move = next(s for s in cards if "Move" in s[1])
+    r.press(move, "Approve")
+    r.press(next(s for s in cards if s is not move), "Approve")
     ended = list(r.gmail.events["cmS"]["recurrence"])
     day = r.gmail.events["cmS_20261209T000000Z"]
     day.update(etag='"his"', start={"dateTime": "2026-12-08T18:00:00-05:00"})    # he moved it again
-    r.press(r.with_button("Undo"), "Undo")
+    moved = next(s for s in reversed(r.bot.sent) if "Moved" in s[1] and s[2]
+                 and any(t == "Undo" for row in s[2] for t, _ in row))
+    r.press(moved, "Undo")
     assert "Not undone" in r.texts()[-1] and r.gmail.events["cmS"]["recurrence"] == ended
 
 

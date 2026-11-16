@@ -117,6 +117,8 @@ def verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
         if a is None:
             return Verdict(False, "unknown approval")
         if a["consumed_at"] is not None:
+            if a["outcome"] == "replaced":           # its card was replaced by a newer one
+                return Verdict(False, "replaced", proposal_id=a["proposal_id"])
             return Verdict(False, "already used", proposal_id=a["proposal_id"])
         if a["message_id"] is None or a["message_id"] != inc.message_id:
             return Verdict(False, "tap is not on the card it belongs to",
@@ -127,6 +129,8 @@ def verify_and_consume(ledger: Ledger, inc, *, owner_user_id: int,
             _expire(ledger, db, a, now)
             return Verdict(False, "expired", proposal_id=a["proposal_id"])
         p = db.execute("SELECT * FROM proposals WHERE id=?", (a["proposal_id"],)).fetchone()
+        if p is not None and p["state"] == "superseded":
+            return Verdict(False, "replaced", proposal_id=p["id"])
         if p is None or p["state"] != "proposed":
             return Verdict(False, "proposal is no longer open", proposal_id=a["proposal_id"])
         params = json.loads(p["params_json"])
@@ -163,3 +167,30 @@ def _expire(ledger: Ledger, db, a, now) -> None:
         db.execute("UPDATE proposals SET state='expired' WHERE id=?", (p["id"],))
         ledger.transition(p["job_id"], "expired",
                           receipt="expired before it was approved", db=db)
+
+
+def supersede_open(ledger: Ledger, job_ids: list[str], *, db) -> int:
+    """Each card still open for these requests is replaced (0.24.0): its proposal can't be
+    approved any more, its buttons are used up, and they come off the card (an "unbutton" in the
+    outbox; a card not sent yet goes without them). A tap on it is refused as "Replaced by a newer
+    card". Its request isn't moved: whoever replaces it does that. How many were replaced."""
+    if not job_ids:
+        return 0
+    now = iso(ledger.now())
+    marks = ",".join("?" * len(job_ids))
+    rows = db.execute(f"SELECT id FROM proposals WHERE state='proposed' AND job_id IN ({marks})",
+                      tuple(job_ids)).fetchall()
+    for p in rows:
+        db.execute("UPDATE proposals SET state='superseded' WHERE id=? AND state='proposed'", (p["id"],))
+        for a in db.execute("SELECT * FROM approvals WHERE proposal_id=? AND consumed_at IS NULL",
+                            (p["id"],)).fetchall():
+            db.execute("UPDATE approvals SET consumed_at=?, outcome='replaced' WHERE nonce=?",
+                       (now, a["nonce"]))
+            if a["message_id"]:
+                ledger.enqueue(chat_id=a["chat_id"], kind="unbutton", text=str(a["message_id"]), db=db)
+            else:
+                for o in db.execute("SELECT id, binds_json FROM outbox WHERE state IN ('queued','held')"
+                                    " AND binds_json LIKE ?", (f'%{a["nonce"]}%',)).fetchall():
+                    db.execute("UPDATE outbox SET buttons_json=NULL, binds_json=NULL WHERE id=?", (o["id"],))
+        ledger.event("proposal_replaced", {"proposal": p["id"]}, db=db)
+    return len(rows)

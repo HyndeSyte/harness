@@ -94,11 +94,12 @@ describe("keeper.sh against a fake link", () => {
       seen.push({ path: new URL(req.url).pathname, keyed: req.headers.get("x-harness-key") === key, body: JSON.parse(await req.text()) });
       return Response.json({ status: "card" });
     } });
-    const env = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_DISCORD_DIR: dir };
+    const env = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_KEEPER_TEST: "1", CAIN_DISCORD_DIR: dir };
     const keeper = async (...args: string[]) => {
       const p = Bun.spawn(["bash", KEEPER, ...args], { env, stdout: "pipe", stderr: "pipe" });
       const out = (await new Response(p.stdout).text()).trim();
-      return { code: await p.exited, out };
+      const err = (await new Response(p.stderr).text()).trim();
+      return { code: await p.exited, out, err };
     };
     try {
       await keeper("handover", "--message", "1439000000000000002", "Wednesday drop-off at 8:15 from now on");
@@ -115,6 +116,34 @@ describe("keeper.sh against a fake link", () => {
       expect(await keeper("handover", "--message")).toMatchObject({ code: 2 });          // a flag needs its value
       expect(await keeper("handover", "--message", "P31")).toMatchObject({ code: 2 });   // digits only
       expect(seen.length).toBe(3);                                                        // none of those handed over
+      // Cain's answer to a question the specialist sent him: a note on the same message.
+      await keeper("handover", "--message", "1439000000000000002", "It's the 8:00 drop-off, on his Gmail");
+      expect(seen[3]).toEqual({ path: "/handover", keyed: true,
+        body: { suggestion: "It's the 8:00 drop-off, on his Gmail", paired: "4242", message: "1439000000000000002" } });
+      // The override is in use only with the test flag, and says so.
+      expect((await keeper("handover", "--message", "1439000000000000002")).err).toContain("test override in use");
+      expect(seen.length).toBe(5);
+    } finally { server.stop(true); }
+  }, 30_000);
+
+  test.skipIf(!ready)("the specialist's address moves only with the test flag, and an ignored one is logged", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-"));
+    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["4242"], groups: {} }));
+    let hits = 0;
+    const server = Bun.serve({ port: 0, fetch() { hits++; return Response.json({ status: "card" }); } });
+    const base = { ...process.env, CAIN_HARNESS: `http://127.0.0.1:${server.port}`, CAIN_DISCORD_DIR: dir };
+    delete (base as any).CAIN_KEEPER_TEST;
+    try {
+      const p = Bun.spawn(["bash", KEEPER, "handover", "--message", "1439000000000000002"],
+        { env: base, stdout: "pipe", stderr: "pipe" });
+      const err = (await new Response(p.stderr).text()).trim();
+      await p.exited;
+      expect(hits).toBe(0);                          // not sent to the address in the environment
+      expect(err).toContain("CAIN_HARNESS ignored");
+      const text = (await Bun.file(KEEPER).text()).replace(/\r\n/g, "\n");
+      expect(text).toContain('harness="http://0fcc2575-harness:8098"');
+      expect(text).toContain('if [ "${CAIN_KEEPER_TEST:-}" = 1 ]; then');
     } finally { server.stop(true); }
   }, 30_000);
 });

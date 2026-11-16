@@ -26,12 +26,18 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import approvals, commands, effects, policy, prompts, render, rules, schema
+from . import approvals, commands, effects, policy, prompts, provenance, render, rules, schema
 from .config import Config
 from .engines import CallOutcome, Engine, EngineError, EngineResult, call_with_retries
 from .ledger import Ledger, iso
 
 NOTE_HEAD = "\n\n[A suggestion from Cain"     # controller._note's fence
+
+
+def _change_key(c: dict) -> tuple:
+    """One change, however the model spaced or cased its title."""
+    return (c.get("op"), c.get("calendar"), " ".join(str(c.get("title", "")).casefold().split()),
+            c.get("dates", ""), c.get("start", ""), c.get("end", ""), c.get("days", ""), c.get("until", ""))
 
 log = logging.getLogger("harness.runner")
 
@@ -71,6 +77,8 @@ PROVENANCE = {
     "cain_detail": "Cain spelled out the details for you.",
     "late": "it was handed over a while after you sent it.",
     "repaired": "my first reading of your message needed tidying before it fit.",
+    "not_newest": "it acts on an earlier message of yours, not your newest.",
+    "split": "it's one of several changes in one message, so each comes on its own card.",
 }
 
 # Flags that mean Cain's words came with the request: a question for him goes to Cain first, who
@@ -331,7 +339,7 @@ class Runner:
                 self.family_add.refuse_in_words(job, {"engine": engine, "model": res.model,
                                                       "usd": round(res.usd, 5)}, str(e))
                 return
-            repaired = effects.repair(res.output)
+            repaired, touched = effects.repair_fields(res.output)
             try:
                 out = schema.parse_output(repaired, stage_at_least=self.config.stage_at_least) \
                     if repaired is not None else None
@@ -342,7 +350,9 @@ class Runner:
                 return
             log.info("job %s: the reply's shape was repaired (%s)", job_id, str(e)[:80])
             # Whatever was set right, a change from it waits for his tap.
-            self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(self._flags(job) | {"repaired"})))
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(self._flags(job) | {"repaired"})), db)
+                self.ledger.set_meta(f"job_repaired:{job_id}", json.dumps(touched), db)
         receipt = {"engine": engine, "model": res.model, "usd": round(res.usd, 5),
                    "tokens": [res.input_tokens, res.output_tokens], "rules": fired,
                    "type": out.type}
@@ -375,16 +385,26 @@ class Runner:
         if self.answers_to_cain and (self._flags(job) & CAIN_NOTE or self._meaning_question(job)):
             # Cain passed words with it, or he asked what something means: the question goes to
             # Cain, who has them, never to a card asking him to repeat himself (Nov 15, P31).
+            receipt["question"] = body["question"][:500]
+            mid = self._message_id(job)
+            again = f"keeper.sh handover --message {mid} \"<the answer>\"" if mid else \
+                "keeper.sh handover \"<the answer>\""
             self._to_cain(job, "needs_clarification", receipt,
                           "No card went to him. The specialist still needs this: " + body["question"]
-                          + " If what you passed or found answers it, hand it over again with that"
-                          " as the suggestion; if not, ask him in your own words.")
+                          + f" Answer it now with a note: {again}. If only he can answer, ask him with"
+                          " one card; never ask him to repeat a change he already made in words. With"
+                          " no note in 10 minutes, the specialist asks him itself, on a card.")
             return
         text = render.answer(job["id"], body["question"], **self._footer_args(fired))
         with self.ledger.tx() as db:
             self.ledger.transition(job["id"], "needs_clarification",
                                    receipt=json.dumps(receipt), db=db)
             self._reply(db, job, text, kind="answer", raw=True)
+
+    def _message_id(self, job) -> str:
+        """The Discord message of his a request rests on, for Cain's note: its parts' too."""
+        root = self.ledger.job(self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]) or job
+        return str(root["message_id"]) if (root["message_id"] or 0) > 0 else ""
 
     def _on_no_action(self, job, body, receipt, fired):
         if self.answers_to_cain:
@@ -405,7 +425,12 @@ class Runner:
         """Discord's own signs that the words may not be his own, fresh ones
         (controller._handover). Any of them puts the change on a card to tap."""
         raw = self.ledger.get_meta(f"job_flags:{job['id']}")
-        return [PROVENANCE[f] for f in (json.loads(raw) if raw else []) if f in PROVENANCE]
+        out = [PROVENANCE[f] for f in (json.loads(raw) if raw else []) if f in PROVENANCE]
+        touched = json.loads(self.ledger.get_meta(f"job_repaired:{job['id']}") or "[]")
+        if touched and PROVENANCE["repaired"] in out:
+            out[out.index(PROVENANCE["repaired"])] = (
+                PROVENANCE["repaired"].rstrip(".") + f" (fields tidied: {', '.join(touched)}).")
+        return out
 
     def _on_rule(self, job, body, receipt, fired):
         with self.ledger.tx() as db:
@@ -442,12 +467,21 @@ class Runner:
         family = d.name == effects.FAMILY_ADD
         change = d.name == effects.CALENDAR_CHANGE
         lines = None
+        seen = None
+        head: list[str] = []
         if change:
             if self.calendar_change is None:
                 self._fail(job, "calendar_change_not_wired", job["engine"])
                 return
             if self.calendar_change.refuse(job, receipt, params):
                 return
+            # A request run again (a note from Cain) never does twice what's done or being done:
+            # those are said as done, and only the rest is offered.
+            done_lines, params = self._not_yet_done(job, params)
+            if done_lines and not params["changes"]:
+                self._all_done(job, receipt, done_lines)
+                return
+            head = [f"Already done: {x}" for x in done_lines]
             # Each event he names, found before anything is offered or done (Nov 11): clear goes
             # straight through, unclear is asked once, by name.
             seen = self.calendar_change.preview(job, receipt, params)
@@ -468,18 +502,33 @@ class Runner:
         else:
             warnings = []
         warnings = list(warnings) + self._provenance(job)
+        if change and head:
+            warnings.append("part of this message was already done, so only the rest is here.")
         if change and warnings and len(params["changes"]) > 1:
-            self._split(job, d, params, receipt)
+            self._split(job, d, params, receipt, head)
             return
-        self._offer(job, d, params, receipt, warnings, lines)
+        self._offer(job, d, params, receipt, warnings, lines, seen=seen, head=head)
 
-    def _offer(self, job, d, params, receipt, warnings, lines) -> None:
-        """The proposal, and the card that tells him about it, or its run with no tap."""
+    def _offer(self, job, d, params, receipt, warnings, lines, *, seen=None, head=()) -> None:
+        """The proposal, and the card that tells him about it, or its run with no tap. Only his
+        own newest message, under 2 minutes old, with nothing of Cain's and not split, runs with
+        no tap: anything else carries a flag (_provenance) and comes on a card."""
         family = d.name == effects.FAMILY_ADD
         change = d.name == effects.CALENDAR_CHANGE
+        top: list[str] = []
+        if receipt.get("source") == "mail" and not receipt.get("tapped") and not warnings:
+            warnings = ["it comes from your mail, and mail never changes a calendar without your tap."]
+        if change:
+            top, cains = self._origin(job, params)
+            if cains and not warnings:
+                warnings = ["a detail on this card is from Cain, not your words."]
         # One transaction: the proposal and the card that tells him about it
         # are written together, so a crash can't leave a job with no words.
         with self.ledger.tx() as db:
+            # A rerun's card replaces any card still open for this request: its buttons come off,
+            # so a tap binds only to the proposal it shows.
+            replaced = approvals.supersede_open(self.ledger, [job["id"]], db=db) or db.execute(
+                "SELECT 1 FROM proposals WHERE job_id=? AND state='superseded' LIMIT 1", (job["id"],)).fetchone()
             pid = approvals.create_proposal(self.ledger, job_id=job["id"],
                                             effect_type=d.name, params=params,
                                             policy_version=self.config.policy_version,
@@ -491,7 +540,7 @@ class Runner:
             if change:                      # what it says it will do, for his tap and the record
                 self.calendar_change.note_lines(
                     pid, lines or [render.change_line(c, self.config.timezone, self.ledger.now())
-                                   for c in params["changes"]], db)
+                                   for c in params["changes"]], db, seen=seen)
             if change and not warnings:
                 self.calendar_change.auto_approve(pid, job["id"], db)
                 self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
@@ -506,6 +555,11 @@ class Runner:
                                    ttl_s=self.config.approval_ttl_s, db=db)
             row = db.execute("SELECT expires_at FROM approvals WHERE nonce=?",
                              (nonce,)).fetchone()
+            if change:
+                body = lines or [render.change_line(c, self.config.timezone, self.ledger.now())
+                                 for c in params["changes"]]
+                lines = (["Replaces the earlier card."] if replaced else []) + top \
+                    + [render.escape(x) for x in head] + body
             card = render.proposal_card(d, params, tz=self.config.timezone,
                                         expires=datetime.fromisoformat(row["expires_at"]),
                                         job_id=job["id"], warnings=warnings, lines=lines or None,
@@ -516,11 +570,12 @@ class Runner:
                                 job_id=job["id"], buttons=render.proposal_buttons(nonce),
                                 binds=[{"type": "approval", "nonce": nonce}], db=db)
 
-    def _split(self, job, d, params, receipt) -> None:
+    def _split(self, job, d, params, receipt, head=()) -> None:
         """A message with several changes that needs his tap: each change on its own card, so he
-        can take one and not the other, and one that's clear on its own goes through with its
-        receipt (Nov 15: a drop-off removal and a term schedule change in one message). The first
-        stays with his message's request; each other one is a part of it (ledger.part_job)."""
+        can take one and not the other (Nov 15: a drop-off removal and a term schedule change in
+        one message). Every part of a split comes on a card, even one clear on its own: the
+        message as a whole wasn't. The first stays with his message's request; each other one is a
+        part of it (ledger.part_job). A rerun reuses the parts it already has."""
         cc = self.calendar_change
         pasted = self.family_add is not None and self.family_add._pasted_recently()
         parts = []
@@ -528,15 +583,120 @@ class Runner:
             sub = {"changes": [c]}
             seen = cc.preview_quiet(job, sub)
             warnings = list(cc.warnings(job, sub, pasted_recently=pasted)) + (seen.checks if seen else [])
-            parts.append((sub, warnings + self._provenance(job), seen.lines if seen else None))
-        log.info("job %s: %d changes, each on its own card or receipt", job["id"], len(parts))
+            flags = self._provenance(job)
+            if PROVENANCE["split"] not in flags:
+                flags.append(PROVENANCE["split"])
+            parts.append((sub, warnings + flags, seen.lines if seen else None, seen))
+        log.info("job %s: %d changes, each on its own card", job["id"], len(parts))
+        root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
+        known = json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
+        # Parts it already has and that are open again (a rerun) are used before new ones.
+        free = [j for j in known if j != job["id"] and (self.ledger.job(j) or {"state": ""})["state"]
+                in ("received", "running", "cancelled", "proposed")]
         others = []
         with self.ledger.tx() as db:
             for _ in parts[1:]:
-                others.append(self.ledger.part_job(job["id"], db=db))
-            self.ledger.set_meta(f"job_parts:{job['id']}", json.dumps(others), db)
-        for (sub, warnings, lines), jid in zip(parts, [job["id"]] + others):
-            self._offer(self.ledger.job(jid), d, sub, dict(receipt, part=True), warnings, lines)
+                if free:
+                    jid = free.pop(0)
+                    st = self.ledger.job(jid)["state"]
+                    if st == "proposed":
+                        approvals.supersede_open(self.ledger, [jid], db=db)
+                        self.ledger.transition(jid, "cancelled", db=db)
+                        st = "cancelled"
+                    for nxt in {"cancelled": ("received", "running"), "received": ("running",)}.get(st, ()):
+                        self.ledger.transition(jid, nxt, db=db)
+                    others.append(jid)
+                else:
+                    others.append(self.ledger.part_job(job["id"], db=db))
+            self.ledger.set_meta(f"job_parts:{root}", json.dumps(list(dict.fromkeys(known + others))), db)
+        for (sub, warnings, lines, seen), jid in zip(parts, [job["id"]] + others):
+            self._offer(self.ledger.job(jid), d, sub, dict(receipt, part=True), warnings, lines,
+                        seen=seen, head=head if jid == job["id"] else ())
+
+    # -- where it came from, and what's already done --------------------------------------------
+    def _origin(self, job, params) -> tuple[list[str], bool]:
+        """The card's first lines: the message of his it acts on, quoted, with its age and how many
+        he sent after it, and each change field by field, with what came from Cain marked so.
+        (lines, HTML-safe; whether any field is Cain's and not his)."""
+        root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
+        raw = self.ledger.get_meta(f"job_origin:{root}")
+        try:
+            origin = json.loads(raw) if raw else {}
+        except ValueError:
+            origin = {}
+        text = self.ledger.job_text(job["id"])
+        his, _, note = text.partition(NOTE_HEAD)
+        if not origin and not note:
+            return [], False
+        out = provenance.origin_lines(origin, self.ledger.now()) if origin else []
+        cains = False
+        for c in params.get("changes", []):
+            line, theirs = provenance.detail_line(c, his, note, self.config.timezone, self.ledger.now())
+            out.append(line)
+            cains = cains or theirs
+        return out, cains
+
+    def _family_of(self, job) -> list[str]:
+        root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
+        return [root] + json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
+
+    def _not_yet_done(self, job, params) -> tuple[list[str], dict]:
+        """Changes of this message already done or being done, under any of its requests (its
+        parts included), said in the words they were done in; and what's left to offer. The same
+        change is the same op on the same calendar, title, days and times, or a removal of an
+        event one already took off (by calendar and id)."""
+        ids = self._family_of(job)
+        marks = ",".join("?" * len(ids))
+        rows = self.ledger.db.execute(
+            f"SELECT p.id, p.params_json, p.state, x.undo_state FROM proposals p LEFT JOIN calendar_changes x"
+            f" ON x.proposal_id=p.id WHERE p.effect_type=? AND p.job_id IN ({marks})"
+            " AND p.state IN ('approved','auto_approved','executing','executed')",
+            (effects.CALENDAR_CHANGE, *ids)).fetchall()
+        rows = [r for r in rows if (r["undo_state"] or "none") != "undone"]
+        if not rows:
+            return [], params
+        done_keys, done_targets, words = {}, {}, {}
+        for r in rows:
+            try:
+                changes = json.loads(r["params_json"])["changes"]
+                raw = self.ledger.get_meta(f"calendar_change_lines:{r['id']}")
+                said = json.loads(raw) if raw else []
+            except (ValueError, KeyError, TypeError):
+                continue
+            for i, c in enumerate(changes):
+                said_i = said[i] if i < len(said) and len(said) == len(changes) else \
+                    render.change_line(c, self.config.timezone, self.ledger.now())
+                done_keys[_change_key(c)] = said_i
+            bound = (self.calendar_change.bound_of(r["id"]) or {}).get("bound", [])
+            for b in bound:
+                done_targets[(b["calendar"], b["series"], b["instance"])] = said[0] if said else "a removal"
+        left, done = [], []
+        for c in params["changes"]:
+            key = _change_key(c)
+            if key in done_keys:
+                done.append(done_keys[key])
+                continue
+            if c["op"] == "remove" and done_targets:
+                seen = self.calendar_change.preview_quiet(job, {"changes": [c]})
+                hit = [done_targets[k] for k in ((b["calendar"], b["series"], b["instance"])
+                                                 for b in (seen.bound if seen else [])) if k in done_targets]
+                if hit:
+                    done.append(hit[0])
+                    continue
+            left.append(c)
+        if done:
+            log.info("job %s: %d change(s) already done, %d left", job["id"], len(done), len(left))
+        return [render.plain(x) for x in dict.fromkeys(done)], {**params, "changes": left}
+
+    def _all_done(self, job, receipt, done_lines) -> None:
+        receipt["reason"] = "already_done"
+        words = "Already done, nothing new to change: " + "; ".join(done_lines) + "."
+        if self.answers_to_cain:
+            self._to_cain(job, "answered", receipt, words + " Nothing was offered again.")
+            return
+        with self.ledger.tx() as db:
+            self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
+            self._reply(db, job, words)
 
     # -- failure and time ------------------------------------------------------------
     def _fail(self, job, reason: str, engine: str | None, *, result: EngineResult | None = None,

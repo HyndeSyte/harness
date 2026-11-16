@@ -8,7 +8,12 @@
 - **Two changes in one message, a card each,** when they need your tap, so you can approve one and not the other.
 - **A reply that didn't fit is tidied or run once more by itself,** and if it fails twice the message says what happens next.
 - **"What does that card mean?" gets an answer.** Harness reads its own recent cards and explains, and never takes the question for a change.
-- **The kids' dates from your mail go on Family, never your Gmail.** School, teacher, coach and the kids' doctor mail get a card naming the Family calendar, with Add to Family and Skip. When it isn't clear whose it is, the card asks, with both calendars as buttons. Your own dates still go on Gmail, and the message now says "on your Gmail calendar".
+- **The kids' dates from your mail go on Family, never your Gmail.** School, teacher, coach and the kids' doctor mail get a card naming the Family calendar, with Add to Family and Skip. When only the sender looks like a school, the card offers Family and Skip, never your Gmail. With calendar changes off, there's no Add button, and a line says why. Your own dates still go on Gmail, and the message now says "on your Gmail calendar".
+- **Done means the calendar shows it.** A removal takes off exactly the event its card names (calendar, title, time and id), and is called done only once a fresh read shows it gone; if the calendar still shows it, the receipt says so. Asking to add what's already in that slot adds nothing and says "Already there, nothing to add". Undo of an add only takes off what that add made, and Undo reads the calendar back too.
+- **Only your own fresh words go through without a tap.** Your newest message, under 2 minutes old, with nothing from Cain and not split. Anything else comes on a card that quotes your message, says how old it is and how many you sent after it, spells out the change, and marks anything that came from Cain as "from Cain". A newer card replaces an older one, whose buttons come off.
+- **A question Cain doesn't answer in 10 minutes comes to you,** on a card that quotes what's already known.
+- **Nothing is done twice.** When a request runs again, what's already done is shown as done and only the rest is offered.
+- **Mail is read as data, never as instructions,** and never changes a calendar without your tap.
 
 ## 0.23.0
 

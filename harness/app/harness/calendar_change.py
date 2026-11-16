@@ -100,7 +100,11 @@ WORDS = {"unknown": "I couldn't confirm it yet",
          "no_credentials": "the calendar's sign-in isn't set on the Harness page",
          "no_key": "the Google key isn't set on the Harness page",
          "denied": "Google says this calendar isn't shared for changes",
-         "exists": "that one is already there"}
+         "exists": "that one is already there",
+         "not_made": "that event was there before the add, so Undo leaves it",
+         "read_back": "the calendar doesn't read back that way"}
+_MADE_GMAIL = re.compile(r"cm[0-9a-f]{32}")
+_MADE_FAMILY = re.compile(r"(?:^|/)hm-[0-9a-f]{32}\.ics$")
 STOPPED_UNDO = "I'm stopped, so I didn't undo that. It comes back as its own card after you turn me back on."
 RULE_WORDS = {"me": "are yours: Busy on Gmail and at work, unless you're already busy then",
               "kids": "mean you have the kids: Busy (watching kids) on Gmail and at work",
@@ -323,6 +327,10 @@ class Part:
     name: str = ""                     # the event as he'd name it, made safe: "PT"
     adds: bool = False                 # a new event, not one already there
     warns: list[str] = field(default_factory=list)       # facts for the card, from the read
+    # 0.24.0: a removal's events, as a read found them when it was offered (calendar, id, title,
+    # time), so the card names them and the run takes off only those (Nov 15).
+    bound: list[dict] = field(default_factory=list)
+    already: str = ""                  # an add whose slot already holds one like it: nothing to write
 
 
 @dataclass
@@ -330,6 +338,7 @@ class Preview:
     """What a change will do, found on a fresh read, and what to check before it does."""
     lines: list[str]
     checks: list[str] = field(default_factory=list)
+    bound: list[dict] = field(default_factory=list)      # each removal's events, as found (Part.bound)
 
 
 class CalendarChange:
@@ -419,7 +428,7 @@ class CalendarChange:
         checks = self._checks(job, parts)
         log.info("calendar change job %s: clear, %d part(s), %d check(s)", render.short(job["id"]),
                  len(parts), len(checks))
-        return Preview([p.will for p in parts], checks)
+        return self._preview_of(parts, checks)
 
     def preview_quiet(self, job, params: dict) -> Preview | None:
         """preview for one change of several already found clear together (runner._split): what it
@@ -428,7 +437,46 @@ class CalendarChange:
             parts, _ = self._plan_all(params, "preview")
         except (Refuse, ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
             return None
-        return Preview([p.will for p in parts], self._checks(job, parts))
+        return self._preview_of(parts, self._checks(job, parts))
+
+    def _preview_of(self, parts: list[Part], checks: list[str]) -> Preview:
+        """Each part's line, a removal's naming the very events it takes off (calendar, title,
+        time, id), so what he approves is those events and nothing a later read finds instead."""
+        lines = []
+        for p in parts:
+            if p.already:
+                lines.append(p.already)
+            elif p.bound:
+                lines.append(p.will + ": " + "; ".join(self._bound_words(b) for b in p.bound))
+            else:
+                lines.append(p.will)
+        return Preview(lines, checks, [b for p in parts for b in p.bound])
+
+    def _bound_words(self, b: dict) -> str:
+        """the Gmail event "Busy (school drop-off)", 8:00 AM Wed Nov 11, id ending 4f2a9c"""
+        when = _when(b["start"]) if b.get("start") else None
+        if isinstance(when, datetime):
+            local = when.astimezone(ZoneInfo(self.tz))
+            at = f"{render.clock_words(local, suffix=True)} {local:%a %b} {local.day}"
+        elif isinstance(when, date):
+            at = f"{when:%a %b} {when.day}, all day"
+        else:
+            at = ""
+        cal = "Gmail" if b["calendar"] == "gmail" else "Family"
+        tail = re.sub(r"[^0-9A-Za-z]", "", b.get("id") or "")[-6:]
+        return (f"the {cal} event \u201c{_safe(b['title'])}\u201d" + (f", {at}" if at else "")
+                + (f", id ending {tail}" if tail else ""))
+
+    @staticmethod
+    def _bound_of(f: "Found") -> list[dict]:
+        """An event and its copies, as a read found them now."""
+        out = []
+        for x in [f, *f.copies]:
+            ident = x.instance if x.calendar == "gmail" else (
+                caldav.href_path(getattr(x.raw, "href", "") or "").rsplit("/", 1)[-1] or x.series)
+            out.append({"calendar": x.calendar, "series": x.series, "instance": x.instance, "id": ident,
+                        "title": x.title, "start": _text(x.start) if x.start is not None else ""})
+        return out
 
     def _checks(self, job, parts: list[Part]) -> list[str]:
         """What a request found clear still can't do on its words alone. Not judging what he
@@ -453,6 +501,8 @@ class CalendarChange:
         out += [f"it ends {render.plain(part.ends)}, taking off every day of it from then on." for part in parts
                 if part.ends]
         out += [render.plain(w) for part in parts for w in part.warns]
+        out += [f"{render.plain(part.name)} is already there at that time, so there's nothing to add."
+                for part in parts if part.already]
         return out
 
     def _his_words(self, job) -> str:
@@ -515,10 +565,38 @@ class CalendarChange:
                        f"{'; '.join(render.plain(x) for x in lines)}. Outcome: {state}.{told}")
         return out[-RECENT_MAX:]
 
-    def note_lines(self, proposal_id: str, lines: list[str], db) -> None:
-        """What a card offered, so the tap's reply says what will happen."""
+    def note_lines(self, proposal_id: str, lines: list[str], db, seen: "Preview | None" = None) -> None:
+        """What a card offered, so the tap's reply says what will happen; and the events a removal
+        takes off and the adds already there, as the read for it found them, so the run does
+        exactly that (_drifted)."""
         if lines:
             self.ledger.set_meta(f"calendar_change_lines:{proposal_id}", json.dumps(lines), db)
+        if seen is not None:
+            self.ledger.set_meta(f"calendar_change_bound:{proposal_id}", json.dumps(
+                {"bound": seen.bound, "already": sum(1 for x in seen.lines if x.startswith("Already there"))}), db)
+
+    def bound_of(self, proposal_id: str) -> dict | None:
+        raw = self.ledger.get_meta(f"calendar_change_bound:{proposal_id}")
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
+
+    def _drifted(self, proposal_id: str, parts: list[Part]) -> str:
+        """What the run would do that isn't what was offered: another event to take off than the
+        one the card named (by calendar and id), or an add the card said was already there and
+        isn't now. "" when it's the same, or nothing was kept (a proposal from before 0.24.0)."""
+        kept = self.bound_of(proposal_id)
+        if kept is None:
+            return ""
+        key = lambda b: (b["calendar"], b["series"], b["instance"])   # noqa: E731
+        was = {key(b) for b in kept.get("bound", [])}
+        now = {key(b) for part in parts for b in part.bound}
+        if was != now:
+            return "the event to take off isn't the one that card named any more."
+        if kept.get("already", 0) != sum(1 for part in parts if part.already):
+            return "what's on the calendar in that slot changed since the card."
+        return ""
 
     def tap_words(self, proposal_id: str) -> str | None:
         """His Approve tap's reply: what will happen now. The receipt follows once it's done
@@ -764,6 +842,10 @@ class CalendarChange:
         except (ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
             self._refused(p, "unreadable", "Nothing changed: I couldn't read one of those events.")
             return
+        drift = self._drifted(p["id"], parts)
+        if drift:
+            self._refused(p, "changed", f"Nothing changed: {drift}")
+            return
         # Every write it will make, recorded before the first: a restart from here on is read, step
         # by step, never guessed at and never run twice (_fail_orphans, _settle).
         plan = {"notes": notes, "since": None, "read_at": None, "passes": 0, "told": False,
@@ -792,6 +874,7 @@ class CalendarChange:
     # -- each write, recorded so a read can settle it -----------------------------------------
     def _part_record(self, part: Part) -> dict:
         return {"will": part.will, "done": part.done, "name": part.name, "adds": part.adds,
+                "bound": part.bound, "already": part.already,
                 "steps": [{"spec": step.spec, "label": step.label, "what": step.what, "rows": step.rows,
                            "removed": [[c, u, i, t, d.isoformat()] for c, u, i, t, d in step.removed],
                            "status": "pending", "entry": None, "kind": "", "words": ""}
@@ -933,6 +1016,7 @@ class CalendarChange:
         """One receipt: what was done, and what wasn't, each by name with why. Never "Nothing
         changed" when something did (Nov 11). Only known outcomes come here: one a read hasn't
         settled waits for it (_settle)."""
+        results, notes = self._read_back_removals(results, list(notes))
         failed = [(part, landed, s, at) for part, landed, s, at in results if s is not None]
         done = [part for part, _, s, _ in results if s is None]
         ok = not failed
@@ -950,12 +1034,13 @@ class CalendarChange:
             if ok:
                 db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
                 self.ledger.event("calendar_change_done", {"steps": len(undo)}, db=db)
-                head = "<b>Done.</b>"
+                head = "<b>Nothing added.</b>" if done and all(part.already for part in done) else "<b>Done.</b>"
             else:
                 self.ledger.set_meta(PROBLEM, "Calendar change: the last one didn't finish", db)
                 head = ("<b>Only part of that went through.</b>" if done
                         else "<b>That stopped partway.</b>" if any(landed for _, landed, _, _ in failed)
-                        else "<b>Not confirmed.</b>" if any(s.kind == "unconfirmed" for _, _, s, _ in failed)
+                        else "<b>Not confirmed.</b>" if any(s.kind in ("unconfirmed", "read_back")
+                                                            for _, _, s, _ in failed)
                         else "<b>Nothing changed.</b>")
             lines = [head] + [part.done for part in done]
             for part, landed, s, at in failed:
@@ -963,7 +1048,9 @@ class CalendarChange:
                 went = " and ".join(dict.fromkeys(x.what for x in landed))
                 # Writes on one calendar (two series of one title, say) are part of it there,
                 # never "on Family, not on Family".
-                if s.kind == "unconfirmed":      # reads never could tell, and they've stopped
+                if s.kind == "read_back":        # written, and the calendar read back says otherwise
+                    lines.append(s.words)
+                elif s.kind == "unconfirmed":    # reads never could tell, and they've stopped
                     lines.append(f"Not confirmed: {part.will}. " + (
                         f"Part of it went through on {at.what}; reads couldn't tell whether the rest did"
                         if landed and went == at.what else
@@ -989,6 +1076,53 @@ class CalendarChange:
             self._say(db, self.chat_id, p["job_id"], "\n".join(lines), buttons=buttons, binds=binds)
         log.info("calendar change job %s: %s, %d of %d part(s) done, %d write(s)",
                  render.short(p["job_id"]), kind, len(done), len(results), len(undo))
+
+    def _read_back_removals(self, results: list, notes: list[str]) -> tuple[list, list[str]]:
+        """Before a removal is called done, the calendar is read again on its day: the very events
+        it took off (by calendar and id) must be gone from what he sees, or it isn't done and the
+        receipt says the calendar still shows it. Another event like it still in that slot is
+        named too, so "took off" never hides one that stayed (Nov 15)."""
+        out = []
+        for part, landed, s, at in results:
+            if s is not None or not part.bound:
+                out.append((part, landed, s, at))
+                continue
+            still, others, unread = [], [], []
+            for cal in sorted({b["calendar"] for b in part.bound}):
+                mine = [b for b in part.bound if b["calendar"] == cal]
+                days = sorted({self._day_of(b) for b in mine})
+                try:
+                    found, _ = self._read(cal, days)
+                except Refuse:
+                    unread.append("Family" if cal == "family" else "your Gmail calendar")
+                    continue
+                ids = {(b["series"], b["instance"]) for b in mine}
+                starts = [_when(b["start"]) for b in mine if b.get("start")]
+                for f in found:
+                    if (f.series, f.instance) in ids:
+                        still.append((cal, f))
+                    elif any(_same_start(f.start, t) for t in starts) and any(
+                            fit(part.name, n) or fit(n, part.name) for n in (f.title, block_name(f.title))):
+                        others.append((cal, f))
+            if still:
+                cals = " and ".join(dict.fromkeys("Family" if c == "family" else "Gmail" for c, _ in still))
+                out.append((part, landed, Stopped("read_back", words=(
+                    f"Not confirmed: {part.will}. I took it off, but a read of your {cals} calendar "
+                    "still shows it there.")), landed[-1] if landed else None))
+                continue
+            out.append((part, landed, s, at))
+            for cal, f in others:
+                where = "Family" if cal == "family" else "Gmail"
+                notes.append(f"Another {block_name(f.title) if f.block else f.title} at that time is still "
+                             f"on your {where} calendar; I didn't touch it.")
+            if unread:
+                notes.append(f"A read of {' or '.join(unread)} afterward didn't answer, so I can't say whether "
+                             "another one like it is still at that time.")
+        return out, notes
+
+    def _day_of(self, b: dict) -> date:
+        when = _when(b["start"])
+        return when.astimezone(ZoneInfo(self.tz)).date() if isinstance(when, datetime) else when
 
     # -- finding it --------------------------------------------------------------------------
     def _bounds(self, days: list[date], ahead: timedelta = timedelta(0)) -> tuple[datetime, datetime]:
@@ -1446,14 +1580,15 @@ class CalendarChange:
             will, done = self._remove_words(self._name(asked, f), [f], [f.first], self._where(f, bool(f.copies)))
             targets = frozenset((x.calendar, x.series, x.instance) for x in [f, *f.copies])
             parts.append((f.first, Part(will, done, steps, (targets, ("remove",)), removes=1,
-                                        name=self._name(asked, f))))
+                                        name=self._name(asked, f), bound=self._bound_of(f))))
         for group in series.values():
             will, done = self._remove_words(self._name(asked, group[0]), group, [g.first for g in group],
                                             " (Family)")
             targets = frozenset(("family", g.series, g.instance) for g in group)
             parts.append((min(g.first for g in group),
                           Part(will, done, [self._family_remove_days(group)], (targets, ("remove",)),
-                               removes=len(group), name=self._name(asked, group[0]))))
+                               removes=len(group), name=self._name(asked, group[0]),
+                               bound=[b for g in group for b in self._bound_of(g)])))
         return [part for _, part in sorted(parts, key=lambda x: x[0])], notes
 
     def _series_facts(self, calendar: str, f: Found) -> tuple[date, set[int]]:
@@ -1556,11 +1691,40 @@ class CalendarChange:
         return f"{render.day_words(s.date(), self._today()).removeprefix('on ')}, {render.span_words(s, e)}"
 
     def _add_part(self, c: dict, key: str) -> Part:
-        step = (self._family_add if c["calendar"] == "family" else self._gmail_add)(c, key)
         start, end, _ = self._new_times(c)
+        if c["op"] == "add":
+            there = self._already_there(c, start)
+            if there is not None:
+                # Nov 15: an add into a slot that held a drop-off block was recorded as done, and the
+                # removal after it reported the block gone while it stayed. Nothing is written, and
+                # nothing is recorded as made.
+                cal = "Family" if there.calendar == "family" else "Gmail"
+                name = _safe(block_name(there.title) if there.block else there.title)
+                words = (f"Already there, nothing to add: {name}, {self._when_words(start, end)}, "
+                         f"is on your {cal} calendar")
+                return Part(words, words, [], name=_safe(c["title"]), already=words)
+        step = (self._family_add if c["calendar"] == "family" else self._gmail_add)(c, key)
         text = f"{_safe(c['title'])}{self._new_words(c, start, end)}"
         where = " (Family)" if c["calendar"] == "family" else " (Gmail)"
         return Part(f"Add {text}{where}", f"Added {text}{where}", [step], name=_safe(c["title"]), adds=True)
+
+    def _already_there(self, c: dict, start) -> "Found | None":
+        """An event like the one asked for, already in its slot, on either calendar: the same
+        start, and either name holds the other's words ("School drop-off" and Harness's "Busy
+        (school drop-off)" block). A read that fails finds nothing, and the add goes as asked."""
+        day = start.astimezone(ZoneInfo(self.tz)).date() if isinstance(start, datetime) else start
+        try:
+            first, rest, _, _ = self._pool(c["calendar"], [day])
+        except Refuse:
+            return None
+        asked = c["title"]
+        for f in first + rest:
+            if isinstance(start, datetime) != isinstance(f.start, datetime) or not _same_start(f.start, start):
+                continue
+            names = {f.title, block_name(f.title)}
+            if any(fit(asked, n) or fit(n, asked) for n in names):
+                return f
+        return None
 
     def _new_words(self, c: dict, start, end) -> str:
         if c["op"] == "add_series":
@@ -2129,7 +2293,8 @@ class CalendarChange:
         for part in plan["parts"]:
             recs = part["steps"]
             steps = [Step(r["label"], lambda: {}, what=r["what"]) for r in recs]
-            whole = Part(part["will"], part["done"], steps)
+            whole = Part(part["will"], part["done"], steps, name=part.get("name", ""),
+                         bound=part.get("bound") or [], already=part.get("already", ""))
             landed = [s for s, r in zip(steps, recs) if r["status"] == "landed"]
             if len(landed) == len(recs):
                 results.append((whole, landed, None, None))
@@ -2456,12 +2621,26 @@ class CalendarChange:
         if problem is None:
             plan = _plan(row)
             plan.pop("undo", None)
+            first: dict[tuple, dict] = {}          # one event written twice: back as before the first
+            for step in steps:
+                first.setdefault((step["cal"], step.get("href") or step.get("id") or step.get("said")), step)
+            back = [self._undone_reads(step) for step in first.values()]
+            if "differs" in back:
+                words = (f"<b>Not confirmed:</b> I put {self._names(plan)} back, but a read of the calendar "
+                         "doesn't show it the way it was.")
+            elif "unread" in back:
+                words = (f"<b>Undone, not confirmed:</b> I put {self._names(plan)} back, but a read of "
+                         "the calendar afterward didn't answer.")
+            else:
+                words = "<b>Undone.</b> It's back the way it was."
             with self.ledger.tx() as db:
                 db.execute("UPDATE calendar_changes SET undo_state='undone', settle_json=?, updated_at=?"
                            " WHERE proposal_id=?", (json.dumps(plan) if plan else "", iso(self.ledger.now()),
                                                     row["proposal_id"]))
                 self._carry_versions(db, row, latest)
-                self._say(db, self.chat_id, row["job_id"], "<b>Undone.</b> It's back the way it was.")
+                if words != "<b>Undone.</b> It's back the way it was.":
+                    self.ledger.set_meta(PROBLEM, "Calendar change: an undo didn't read back", db)
+                self._say(db, self.chat_id, row["job_id"], words)
             return
         if problem == "unknown":
             self._undo_not_yet(row)
@@ -2470,6 +2649,46 @@ class CalendarChange:
             self.ledger.set_meta(PROBLEM, "Calendar change: an undo didn't finish", db)
         self._reopen(row, f"<b>Not fully undone:</b> {_safe(WORDS.get(problem, 'the calendar refused it'))}. "
                           "Undo tries what's left again.")
+
+    def _undone_reads(self, step: dict) -> str:
+        """An undone write, read again: "ok" when the calendar shows it as it was before the
+        change, "differs" when it doesn't, "unread" when the read can't tell."""
+        try:
+            if step["cal"] == "rule":
+                return "ok"
+            how = step["how"]
+            if step["cal"] == "gmail":
+                address = self.address()
+                if not address or self.google is None:
+                    return "unread"
+                kind, cur = self.google.look(address, step["id"])
+                if kind == "unknown":
+                    return "unread"
+                gone = kind == "gone" or (cur or {}).get("status") == "cancelled"
+                if how == "drop":
+                    return "ok" if gone else "differs"
+                if how == "restore":
+                    return "differs" if gone else "ok"
+                return "ok" if not gone and self._as_written(cur, step.get("fields") or {}) else "differs"
+            out, body = self.client.fetch(step["href"])
+            if out.kind not in ("ok", "gone"):
+                return "unread"
+            if how == "delete":
+                return "ok" if out.kind == "gone" else "differs"
+            if how == "restore":
+                return "ok" if out.kind == "ok" else "differs"
+            if out.kind != "ok":
+                return "differs"
+            if caldav._unchanged(body, step.get("before", "")):
+                return "ok"
+            # A server can store lines of its own: what counts is the days and times it holds.
+            today = self._today()
+            lo, hi = self._bounds([today - timedelta(days=1), today + timedelta(days=400)])
+            shape = lambda ics: sorted((o.instance, _moment(o.start), _moment(o.end), o.summary)   # noqa: E731
+                                       for o in self._occurrences(ics, lo, hi))
+            return "ok" if shape(body) == shape(step.get("before", "")) else "differs"
+        except (ValueError, KeyError, TypeError, AttributeError, ical.Unreadable):
+            return "unread"
 
     def _undo_not_yet(self, row) -> None:
         """An undo whose reads or answer couldn't say how far it got: run again on the schedule,
@@ -2637,7 +2856,18 @@ class CalendarChange:
             return "unknown"
         return "series_gone" if kind == "gone" or (cur or {}).get("status") == "cancelled" else "ok"
 
+    @staticmethod
+    def _made_here(step: dict) -> bool:
+        """An add's Undo takes off only the event that add made: its own fixed id ("cm" and 32 hex
+        on Gmail, "hm-" and 32 hex on Family, from _uid), never one that was there before."""
+        if step["cal"] == "gmail":
+            return bool(_MADE_GMAIL.fullmatch(step.get("id") or ""))
+        return bool(_MADE_FAMILY.search(caldav.href_path(step.get("href") or "")))
+
     def _undo_step(self, step: dict, latest: dict[str, str]) -> str:
+        if step["cal"] in ("gmail", "family") and step.get("how") in ("drop", "delete") \
+                and not self._made_here(step):
+            return "not_made"
         if step["cal"] == "rule":
             with self.ledger.tx() as db:     # put back what it said before, or nothing
                 family_rules.put(self.ledger, step["said"], None, db)

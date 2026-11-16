@@ -4,6 +4,8 @@
 
 - When you send a few messages in a row, Cain can tell the calendar specialist which one your calendar request is in, so it acts on that one and not on your newest.
 - A slip in Cain's tools can no longer pass a calendar request on by accident: run with nothing, the tool only lists what it does.
+- Cain names your message with every calendar request, answers the calendar specialist's questions himself on the same message, and never asks you to repeat a change you already made in words.
+- The specialist's address can only be moved by a test, and that is logged.
 
 ## 0.11.0
 

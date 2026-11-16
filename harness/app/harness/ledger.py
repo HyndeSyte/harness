@@ -638,6 +638,8 @@ class Ledger:
         flags = self.get_meta(f"job_flags:{job_id}")
         if flags:
             self.set_meta(f"job_flags:{new}", flags, db)
+        root = self.get_meta(f"job_parent:{job_id}") or job_id
+        self.set_meta(f"job_parent:{new}", root, db)     # its message: its card's quote, its reruns
         return new
 
     def job_text(self, job_id: str) -> str:

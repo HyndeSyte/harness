@@ -30,14 +30,14 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import (callbacks, choices, commands, daily, effects, ingress_filter, integrity,
-               policy, render, rules, watch)
+from . import (approvals, callbacks, choices, commands, daily, effects, ingress_filter, integrity,
+               policy, provenance, render, rules, watch)
 from .chat import Decision, Incoming
 from .config import Config
 from .discord_api import DiscordError, escape
 from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
 from .engines import Engine
-from .ledger import Ledger
+from .ledger import Ledger, iso
 from .outbox import Outbox
 from .runner import Runner
 from .vault import LABELS, Vault
@@ -47,6 +47,7 @@ log = logging.getLogger("harness.controller")
 SETTINGS_TTL_S = 15 * 60
 FRESH_S = 120              # a handed-over message must be this new, or the handover itself
 NAMED_FRESH_S = 30 * 60    # a message Cain names, or one his suggestion rests on, this new
+CLARIFY_WAIT_S = 10 * 60   # a question for Cain he hasn't answered by then goes to the owner, on a card
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
 PROBE_S = 5                # the watch's check of Cain and its message: short, never a stuck loop
 HEARD_FLOOR_S = 1_420_070_400   # 2015-01-01: an older "last heard from Discord" is nonsense
@@ -169,6 +170,8 @@ class Controller:
                              calendar_change=self.calendar_change)
         if self.mail_dates is not None:
             self.mail_dates.to_family = self._mail_to_family if self.calendar_change is not None else None
+            cc = self.calendar_change
+            self.mail_dates.family_on = (lambda: cc.on()) if cc is not None else (lambda: False)
         self.canary = daily.Canary(self.ledger, self.config, self.engines, self.executor,
                                    sleep=self.sleep, monotonic=self.monotonic,
                                    budget_ok=self._budget_ok)
@@ -205,6 +208,8 @@ class Controller:
         with self.ledger.tx() as db:
             job_id = self.ledger.made_job(owner, f"From his mail, for the Family calendar: {title}, "
                                                  f"{day:%a %b} {day.day}", kind="mail_family", db=db)
+        # His tap on the mail card is the go, so it runs with its receipt and Undo; mail never
+        # reaches a calendar any other way (runner._offer puts anything else from mail on a card).
         self.runner._offer(self.ledger.job(job_id), d, params, {"source": "mail", "tapped": True}, [], None)
         return True
 
@@ -316,10 +321,57 @@ class Controller:
         if self.mirror is not None and self.mirror.due():
             self.mirror.run()              # shadow only; its own failures are its record
             self._beat()
+        self._clarify_timeouts()
         self._watch_inputs()
         self._daily(paused)
         self.outbox.flush()
         self._publish()
+
+    def _clarify_timeouts(self) -> None:
+        """A question that went to Cain (runner._on_clarify) and that no note from him has answered
+        in 10 minutes goes to the owner after all, as the card it would have been: his message
+        quoted, what Cain passed, and the question, which his reply answers. Once a request."""
+        now = self.ledger.now()
+        for job in self.ledger.jobs_in("needs_clarification"):
+            if self.ledger.get_meta(f"clarify_card:{job['id']}"):
+                continue
+            receipts = self.ledger.receipts(job["id"])
+            try:
+                detail = json.loads(receipts[-1]["detail"] or "{}") if receipts else {}
+            except ValueError:
+                continue
+            if not isinstance(detail, dict) or not detail.get("said_to_cain"):
+                continue
+            try:
+                asked = datetime.fromisoformat(receipts[-1]["created_at"])
+            except (KeyError, ValueError, TypeError):
+                asked = datetime.fromisoformat(job["updated_at"])
+            if (now - asked).total_seconds() < CLARIFY_WAIT_S:
+                continue
+            text = self.ledger.job_text(job["id"])
+            his, _, note = text.partition(NOTE_HEAD)
+            root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
+            try:
+                origin = json.loads(self.ledger.get_meta(f"job_origin:{root}") or "{}")
+            except ValueError:
+                origin = {}
+            lines = ["<b>A question about your calendar request</b>"]
+            lines += provenance.origin_lines(origin or {"quote": his}, now)
+            said = note.split(": ", 1)[-1].rstrip("]").strip() if note else ""
+            if said:
+                lines.append(f"Cain passed on: \u201c{render.escape(provenance.one_line(said))}\u201d")
+            question = detail.get("question") or ""
+            lines.append(render.escape(question) if question else
+                         "I still need one detail to make this change.")
+            lines.append("Cain didn't answer this within 10 minutes, so I'm asking you. Nothing has changed.")
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(f"clarify_card:{job['id']}", iso(now), db)
+                self.ledger.enqueue(chat_id=job["chat_id"], kind="answer", job_id=job["id"],
+                                    text=render.fit("\n".join(lines)), db=db)
+                self.ledger.release_held(db=db)
+                self.ledger.event("clarify_to_owner", {"job": job["id"]}, db=db)
+            log.info("job %s: Cain didn't answer its question in 10 minutes; asked the owner",
+                     render.short(job["id"]))
 
     def _watch_inputs(self) -> None:
         """What the clients saw goes into the ledger, and an input that stopped is told, once an
@@ -529,8 +581,12 @@ class Controller:
                 + ("" if h.message else " Name the message it rests on with --message <its id>."))
             return
         text, flags, reply_to = self._discord_words(m, msgs, owner)
+        later = mine.index(m) if m in mine else 0            # his messages after it, newest first
         if age > FRESH_S:
             flags.append("late")                             # his tap is the go, not the handover
+        if later:
+            flags.append("not_newest")                       # never without his tap (0.24.0)
+        origin = {"quote": text, "sent_at": m.get("timestamp", ""), "after": later, "message": str(m["id"])}
         note = ""
         if h.suggestion:
             echoes = echoes_message(h.suggestion, text)
@@ -553,6 +609,7 @@ class Controller:
             job_id = jobs[0]
             if flags:
                 self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flags))))
+            self.ledger.set_meta(f"job_origin:{job_id}", json.dumps(origin))
         else:
             # The message acted on is the key: a later handover for the same message finds its
             # request, never the answer to whatever he said last.
@@ -563,37 +620,57 @@ class Controller:
                 h.finish("error", "That couldn't be recorded. Nothing changed.")
                 return
             job_id = row["id"]
+            self.ledger.set_meta(f"job_origin:{job_id}", json.dumps(origin))   # how many after it, now
             if note:
                 self._note_for_question(job_id, note, flags)
         h.job = render.short(job_id)                       # for the log only
         self._handover_jobs.setdefault(job_id, []).append(h)
 
     def _note_for_question(self, job_id: str, note: str, flags: list[str]) -> None:
-        """A note from Cain for a request of his that's waiting on its question, or that was
-        answered "not a change", reaches it: the request runs again with the note, fenced as
-        Cain's (Nov 11: a second handover with the missing fact got the same question back; Nov
-        15: a later handover got the same cached answer). A note it already has changes nothing,
-        and any change resting on it still gets his tap."""
+        """A note from Cain for a request of his reaches it: one waiting on its question, one
+        answered "not a change" to Cain alone, or one with a card still open (one of its parts,
+        when it was split). The request runs again with the note, fenced as Cain's (Nov 11: a
+        second handover with the missing fact got the same question back; Nov 15: a later handover
+        got the same cached answer). Every card still open for that message is replaced: its
+        buttons come off, so a tap binds only to what the newest card shows. What's already done
+        isn't done again: the rerun says it's done and offers only the rest (runner._not_yet_done).
+        A note it already has changes nothing, and any change resting on it still gets his tap."""
         job = self.ledger.job(job_id)
-        if job is None or job["state"] not in ("needs_clarification", "no_action", "answered"):
+        if job is None:
             return
-        if job["state"] != "needs_clarification" and not self._answered_to_cain(job_id):
+        parts = json.loads(self.ledger.get_meta(f"job_parts:{job_id}") or "[]")
+        family = [job_id] + parts
+        target = None
+        if job["state"] in ("needs_clarification", "proposed") or (
+                job["state"] in ("no_action", "answered") and self._answered_to_cain(job_id)):
+            target = job_id
+        else:
+            target = next((j for j in parts if (self.ledger.job(j) or {"state": ""})["state"] == "proposed"), None)
+        if target is None:
             return                       # a card he saw (a rule, a refusal) isn't sent again
-        text = self.ledger.job_text(job_id)
+        text = self.ledger.job_text(target)
         if note in text:
             return
-        flagged = json.loads(self.ledger.get_meta(f"job_flags:{job_id}") or "[]")
-        last = self.ledger.db.execute("SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id=?",
-                                      (job_id,)).fetchone()[0]
+        flagged = json.loads(self.ledger.get_meta(f"job_flags:{target}") or "[]")
+        marks = ",".join("?" * len(family))
+        last = self.ledger.db.execute(f"SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id IN ({marks})",
+                                      tuple(family)).fetchone()[0]
+        was = self.ledger.job(target)["state"]
         with self.ledger.tx() as db:
-            db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, job_id))
-            self.ledger.set_meta(f"job_flags:{job_id}", json.dumps(sorted(set(flagged + flags))), db)
-            self.ledger.transition(job_id, "received", db=db)
-            self.ledger.event("job_note", {"job": job_id}, db=db)
+            approvals.supersede_open(self.ledger, family, db=db)
+            for j in family:             # its other open cards are offered again by the rerun
+                if j != target and (self.ledger.job(j) or {"state": ""})["state"] == "proposed":
+                    self.ledger.transition(j, "cancelled", db=db, receipt=json.dumps({"reason": "replaced"}))
+            db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, target))
+            self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
+            if was == "proposed":
+                self.ledger.transition(target, "cancelled", db=db, receipt=json.dumps({"reason": "replaced"}))
+            self.ledger.transition(target, "received", db=db)
+            self.ledger.event("job_note", {"job": target}, db=db)
+            db.execute("DELETE FROM meta WHERE key=?", (f"clarify_card:{target}",))
             # Kept in the ledger, so every later answer about it, after a restart too, starts here.
             self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
-        log.info("handover: a note for job %s, which was %s: it runs again",
-                 render.short(job_id), job["state"])
+        log.info("handover: a note for job %s, which was %s: it runs again", render.short(target), was)
 
     def _answered_to_cain(self, job_id: str) -> bool:
         """Its last answer went to Cain alone, so running it again shows him nothing twice."""

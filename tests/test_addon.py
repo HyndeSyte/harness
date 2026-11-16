@@ -369,7 +369,9 @@ def test_cain_hands_calendar_changes_to_the_keeper_with_the_shared_key():
     assert code.index("unset key") < code.index("curl ")
     # To the specialist: requests and the digest. To Cain's own link, on this machine only:
     # showing a card, asking with buttons, the morning message.
-    assert f'harness="${{CAIN_HARNESS:-http://0fcc2575-harness:{handover.PORT}}}"' in code
+    assert f'harness="http://0fcc2575-harness:{handover.PORT}"' in code
+    # A test may move it only with the test flag too, and that's logged (0.24.0 review).
+    assert 'if [ "${CAIN_KEEPER_TEST:-}" = 1 ]; then' in code and "test override in use" in code
     assert 'url="$harness/$cmd"' in code
     assert 'link="${CAIN_LINK:-http://127.0.0.1:8097}"' in code and 'url="$link/$cmd"; ctx=harness-relay-v1' in code
     assert 'card) url="$link/look"; ctx=harness-relay-v1' in code

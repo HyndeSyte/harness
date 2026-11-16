@@ -47,7 +47,17 @@ set -u
 # Moved only for the tests.
 dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
 link="${CAIN_LINK:-http://127.0.0.1:8097}"
-harness="${CAIN_HARNESS:-http://0fcc2575-harness:8098}"
+# The specialist's address. A test may move it, only with CAIN_KEEPER_TEST=1 as well, and says so
+# on stderr (Cain's log): an address left in the environment can't send his requests elsewhere.
+harness="http://0fcc2575-harness:8098"
+if [ -n "${CAIN_HARNESS:-}" ]; then
+  if [ "${CAIN_KEEPER_TEST:-}" = 1 ]; then
+    harness="$CAIN_HARNESS"
+    echo "keeper.sh: test override in use, the specialist's address is $harness" >&2
+  else
+    echo "keeper.sh: CAIN_HARNESS ignored: it takes CAIN_KEEPER_TEST=1, for tests only" >&2
+  fi
+fi
 hooks="${CAIN_HOOKS:-/opt/cain/hooks}"
 usage() { sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
 # No command prints this usage: it never hands anything over.
