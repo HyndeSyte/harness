@@ -196,8 +196,14 @@ ending soon after it starts, the App keeps starting it again, and says so at the
 If a question waits on his screen, where no one answers it (one of Claude Code's own, or his
 own asked there by mistake), he can't take a message until it's answered: the App presses Esc
 after 5 minutes, and if that doesn't close it, starts his session fresh 5 minutes later (at
-most once an hour, and he's told to read your messages he may have missed). Only one that comes
-back within the hour reaches you, and it comes down once his prompt has been back 5 minutes.
+most once an hour, and he's told to read your messages he may have missed). You hear only when
+that can't clear it (a question back within the hour of a fresh start, or a step the App can't
+keep track of), and it comes down once his prompt has been back 5 minutes.
+The App types your taps and his check-ins into his session only after that session has passed
+its check of his own user (at every start, and every start is the App's: when Claude Code ends,
+his session ends and the App starts it again), only at his prompt, empty and steady, and it
+presses Enter only once what it typed sits in his input box. A tap that can't go in waits, never
+lost, and a check-in that misses its hour is named in the next one.
 If a try of the move fails, he keeps running the old way (after a restart of the App, when the
 try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
 session (`/opt/cain/notice.sh`), what happened and the way back:

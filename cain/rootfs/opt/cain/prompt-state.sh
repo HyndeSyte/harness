@@ -8,9 +8,13 @@
 #           a box or not) holding nothing but that mark, and no dialog's key hints below the footer.
 #           Rows Claude Code draws under the footer, such as its panel of background tasks, don't
 #           change that. Any text in the prompt reads as a draft not sent, which typing would add
-#           to and send (round 11), so it's "other". A plain capture can't tell gray text from
+#           to and send (round 11), so it's a draft. A plain capture can't tell gray text from
 #           typed text, so there's no exception for look-alikes (round 12): Claude Code's gray
 #           suggestions in an empty box, its start-up example among them, are off (session.sh).
+#   draft   his input area as for ready, holding text: on its prompt line, or, for text longer than
+#           a line, from its prompt line (under the box's top border) down to its bottom border.
+#           checkin.sh presses Enter on what it typed only while the screen reads so (Cain's third
+#           service review: a question can open between the read and the Enter).
 #   dialog  no input area, and a screen showing key hints ("Esc to cancel", "Enter to continue",
 #           "Enter to confirm" and the like) in those lines: a screen waiting for an answer, which
 #           typing would answer. Nov 16, Claude Code's offer to set up auto mode said "auto mode"
@@ -45,9 +49,17 @@ awk '
       if (line[i] ~ /esc to (cancel|exit|close|go back)|enter to (continue|confirm|select|apply|submit)/) hint = i
       if (!footer(line[i])) continue
       for (j = i - 1; j >= 1 && border(line[j]); j--) { }
-      if (j >= 1 && j >= i - 3 && (p = prompt(line[j]))) { foot = i; empty = (p == 2) }
+      if (j < 1 || j < i - 3) continue
+      if ((p = prompt(line[j]))) { foot = i; empty = (p == 2); continue }
+      # Text longer than a line: right above the bottom border its last line, and higher up, with
+      # only more of it between, its prompt line holding text, under the top border.
+      if (j == i - 1) continue
+      p = 0
+      for (k = j - 1; k > 1 && k >= j - 40 && !border(line[k]) && !footer(line[k]); k--)
+        if ((p = prompt(line[k]))) break
+      if (p == 1 && k > 1 && border(line[k - 1])) { foot = i; empty = 0 }
     }
-    if (foot && hint < foot) print (empty ? "ready" : "other")
+    if (foot && hint < foot) print (empty ? "ready" : "draft")
     else if (hint) print "dialog"
     else print "other"
   }'

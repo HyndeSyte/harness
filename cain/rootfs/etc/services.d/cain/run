@@ -24,6 +24,15 @@ cd /
 export TMPDIR=/run/cain/root-tmp CAIN_ROOT_TMP=/run/cain/root-tmp
 OPT=/opt/cain
 SOCK_TMUX=/run/cain/tmux/cain.sock
+# Whether his session as it runs now has passed its check of his own user (the old way: at once,
+# as 0.11.0 ran): checkin.sh types nothing into one that hasn't (Cain's third service review). Taken
+# away before every start of his session and at its every end; set only when the check passes.
+export SESSION_CHECKED=/run/cain/session-checked
+unchecked() { rm -f "$SESSION_CHECKED" 2>/dev/null || true; }
+checked_now() {
+  touch "$SESSION_CHECKED" 2>/dev/null \
+    || bashio::log.error "His session passed its check, but that couldn't be marked ($SESSION_CHECKED), so nothing is typed into it"
+}
 # Should this start ever end (a step it can't get past, or a fault in it), the finish script
 # halts the container: Dane hears it from root first (notice.sh; C1 second review). Not when a
 # signal ends it, as when the Supervisor stops or updates the App.
@@ -239,6 +248,7 @@ his_procs() {
 # shows none of his, three tries. The old way's root session: tmux, which must then answer that
 # there is no such session. 1 when it can't be shown ended.
 end_his_session() {
+  unchecked
   timeout 10 $TMUX_CMD -u kill-session -t cain 2>/dev/null || true
   if [ "$TMUX_CMD" != tmux ]; then
     local i
@@ -284,6 +294,7 @@ session_up() {
 # His session. A start that doesn't take returns 1, never ends this script: the foreground loop
 # below starts it again, later each time, and tells Dane if it keeps failing (session_ended).
 start_his_session() {
+  unchecked
   bashio::log.info "Starting Cain"
   if ! start_session; then bashio::log.error "tmux could not start"; return 1; fi
   sleep 3
@@ -377,10 +388,18 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     fi
     flag() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
     paired() { tr -d ' \n' < "$ACCESS_FILE" | grep -q '"allowFrom":\["'; }
-    # His screen in one word, as unstick.sh reads it (screen-state.sh: his prompt, as checkin.sh
-    # reads it, a screen waiting for an answer, or a sign-in's). It never fails; || for an
-    # unforeseen one, since this loop runs under errexit.
-    state=$(printf '%s\n' "$screen" | "$OPT/screen-state.sh" 2>/dev/null) || state=unknown
+    last=$(printf '%s\n' "$screen" | tail -n 30)
+    # His prompt or a screen waiting for an answer, read as checkin.sh reads it (prompt-state.sh,
+    # which never fails; || for an unforeseen one, since this loop runs under errexit).
+    at=$(printf '%s\n' "$screen" | "$OPT/prompt-state.sh" 2>/dev/null) || at=other
+    state=unknown
+    if printf '%s\n' "$last" | tail -n 12 | grep -Eqi 'run /login|token has expired|authentication_error|invalid api key|not logged in'; then state=login_needed
+    elif printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
+    elif printf '%s' "$last" | grep -Eqi 'do you trust|trust the files'; then state=trust_prompt
+    elif printf '%s' "$last" | grep -Eqi 'select login|login method|choose the text style|dark mode'; then state=first_run_menu
+    elif [ "$at" = ready ]; then state=ready
+    elif [ "$at" = dialog ]; then state=dialog
+    fi
     printf '{"signed_in": %s, "discord_token": %s, "paired": %s, "allowlist": %s, "screen": "%s", "mode": "%s"}\n' \
       "$(flag test -s "$CRED")" \
       "$(flag grep -q '^DISCORD_BOT_TOKEN=.' "$TOKEN_FILE")" \
@@ -530,12 +549,13 @@ if ! session_up; then
 fi
 up_since=$(date +%s); cleared=""; check_tries=0; check_due=$(( up_since + ${C1_CHECK_FIRST_S:-45} )); checked=""
 [ "$mode" = own ] || checked=1
+if [ -n "$checked" ]; then checked_now; else unchecked; fi
 while session_up; do
   if [ -z "$checked" ] && [ "$(date +%s)" -ge "$check_due" ]; then
     check_tries=$((check_tries + 1))
     if [ "$check_tries" -ge 5 ]; then run_check 1; else run_check 0; fi
     case "$crc" in
-      0) checked=1 ;;
+      0) checked=1; checked_now ;;
       3) "$OPT/notice.sh" tell breach || true                         # first: a stop that fails closed keeps it
          end_his_session || fail_closed; breach_stop; break ;;
       4) held_now ""; break ;;
@@ -578,7 +598,7 @@ while session_up; do
   # A question waiting on his screen, where no one answers it (unstick.sh): Esc after 5 minutes;
   # still there 5 minutes later, his session starts fresh, at most once an hour (Dane hears of one
   # that comes back sooner).
-  if [ "$("$OPT/unstick.sh" || true)" = restart ]; then
+  if [ "$(timeout -k 5 90 "$OPT/unstick.sh" || true)" = restart ]; then
     bashio::log.warning "Esc didn't close the question waiting on Cain's screen: starting his session fresh"
     end_his_session || fail_closed
     break

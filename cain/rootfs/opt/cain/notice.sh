@@ -83,7 +83,7 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
     switch-blocked) T="Cain is stopped"
       M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
     waiting) T="Cain isn't answering"
-      M="Cain isn't answering: a question keeps coming up on his screen, where no one answers it, and pressing Esc and a fresh start of his session didn't clear it. The App starts his session fresh once an hour by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+      M="Cain isn't answering: a question is waiting on his screen, where no one answers it, and the App couldn't clear it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
     *) return 1 ;;
   esac
 }

@@ -1113,10 +1113,9 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     # running again nor his move clears, only his prompt back (clear screen).
     call("tell", "waiting")
     assert field("screen", "kind") == "waiting" and (posted()["group"], posted()["alarm"]) == ("screen", "waiting")
-    assert read("discord")[-1].endswith("| Cain isn't answering: a question keeps coming up on his screen, where no one answers it, "
-                                        "and pressing Esc and a fresh start of his session didn't clear it. The App starts his session "
-                                        "fresh once an hour by itself. If he isn't back within an hour, restart the Cain App: Settings, "
-                                        "Apps, Cain, Restart. The Cain App's log has the details.")
+    assert read("discord")[-1].endswith("| Cain isn't answering: a question is waiting on his screen, where no one answers it, "
+                                        "and the App couldn't clear it by itself. If he isn't back within an hour, restart the Cain "
+                                        "App: Settings, Apps, Cain, Restart. The Cain App's log has the details.")
     call("clear", "running")
     call("clear", "switched")
     assert field("screen", "kind") == "waiting"
@@ -1487,7 +1486,13 @@ def test_cain_cannot_write_calendars_send_messages_or_change_home_assistant():
     assert not any("read-only" in d for d in deny)    # reading stays
 
 
-def _checkin(tmp_path, now, screen):
+def _checkin(tmp_path, now, screen, runs=None, checked=True, after=None, day="2026-11-08", **more):
+    """checkin.sh `runs` times, or by default until it sends something, at most twice (it types only
+    on a second read of his prompt, so one call is one step, as before the steadiness), with
+    a stand-in tmux whose screen is `screen` until something is typed. Then his input box holds it
+    (a draft on his prompt line), or the screen is `after` (a question that opened meanwhile);
+    Enter and Ctrl+U take it away. `checked`: the run script's mark that his session passed its
+    check of his own user. Returns all that was sent."""
     import os
     import shutil
     import subprocess
@@ -1495,26 +1500,49 @@ def _checkin(tmp_path, now, screen):
     if not bash:
         import pytest
         pytest.skip("no bash")
-    stub = tmp_path / "bin"
+    stub, box = tmp_path / "bin", tmp_path / "box"
     stub.mkdir(exist_ok=True)
+    box.mkdir(exist_ok=True)
     (stub / "tmux").write_text(
         "#!/bin/bash\n"
-        'if [ "$2" = capture-pane ]; then printf "%s\n" "$STUB_SCREEN"; exit 0; fi\n'
-        'printf "%s\n" "$*" >> "$STUB_SENT"\n', newline="\n")
+        'if [ "$2" = capture-pane ]; then\n'
+        '  if [ ! -f "$STUB_BOX/typed" ]; then printf "%s\\n" "$STUB_SCREEN"\n'
+        '  elif [ -n "${STUB_AFTER:-}" ]; then printf "%s\\n" "$STUB_AFTER"\n'
+        '  else printf "\\342\\235\\257 %s\\n  ? for shortcuts\\n" "$(cat "$STUB_BOX/typed")"; fi\n'
+        '  exit 0\n'
+        'fi\n'
+        'printf "%s\\n" "$*" >> "$STUB_SENT"\n'
+        'case "$*" in\n'
+        '  *" -l "*) printf "%s" "${@: -1}" > "$STUB_BOX/typed" ;;\n'
+        '  *" Enter"|*" C-u") rm -f "$STUB_BOX/typed" ;;\n'
+        'esac\n', encoding="utf-8", newline="\n")
     (stub / "tmux").chmod(0o755)
+    mark = tmp_path / "session-checked"
+    if checked:
+        mark.touch()
+    elif mark.exists():
+        mark.unlink()
     sent = tmp_path / "sent.txt"
     env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
-               CHECKIN_DIR=str(tmp_path / "done"), CHECKIN_NOW=now, CHECKIN_DAY="2026-11-08",
-               STUB_SCREEN=screen, STUB_SENT=str(sent),
-               PROMPT_STATE=(CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix())
+               CHECKIN_DIR=str(tmp_path / "done"), CHECKIN_NOW=now, CHECKIN_DAY=day,
+               STUB_SCREEN=screen, STUB_SENT=str(sent), STUB_BOX=box.as_posix(),
+               CHECKIN_STATE=str(tmp_path / "state"), SESSION_CHECKED=str(mark),
+               PROMPT_STATE=(CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix(), **more)
+    env.pop("STUB_AFTER", None)
+    if after is not None:
+        env["STUB_AFTER"] = after
     # Run from a file with plain line ends: a long script passed whole on Windows' command line can
     # lose a quote on its way to Git Bash (never on the Pi or the CI runner).
     script = tmp_path / "checkin.sh"
     script.write_text((CAIN / "rootfs/opt/cain/checkin.sh").read_text(encoding="utf-8").replace("\r\n", "\n"),
                       encoding="utf-8", newline="\n")
-    subprocess.run([bash, script.as_posix()], env=env, check=True, timeout=20)
-    return sent.read_text() if sent.exists() else ""
-
+    size = lambda: sent.stat().st_size if sent.exists() else 0
+    before = size()
+    for _ in range(runs or 2):
+        subprocess.run([bash, script.as_posix()], env=env, timeout=30)
+        if runs is None and size() > before:
+            break
+    return sent.read_text(encoding="utf-8") if sent.exists() else ""
 
 IDLE = "> \n  ? for shortcuts            auto mode on"
 
@@ -1670,6 +1698,13 @@ REAL_START_OFF = _START.format(rule=RULE, box="", gap=" " * 40)
 REAL_START_ON = _START.format(rule=RULE, box='Try "how does <filepath> work?"', gap=" " * 40)
 # A draft of nothing but the box's own edge character (round 13): typed, so a draft.
 BAR_DRAFT = "❯ │\n  ? for shortcuts"
+# What the App types, longer than a line, in his input box as Claude Code draws it: from the prompt
+# line under the top border down to the bottom border (Cain's third service review: Enter only on
+# this).
+LONG_DRAFT = (f"● Done.\n\n{RULE}\n❯ Relayed by the add-on: Dane tapped \"Ship\" on the card for\n"
+              f"  the update, a line long enough to go on\n{RULE}\n  ⏵⏵ auto mode on (shift+tab to cycle)")
+BOX_LONG_DRAFT = (f"╭{RULE}╮\n│ > Relayed by the add-on: Dane tapped \"Ship\" on the card {' ' * 3}│\n"
+                  f"│   for the update {' ' * 41}│\n╰{RULE}╯\n  ? for shortcuts")
 BOX_BAR_DRAFT = f"╭{RULE}╮\n│ > │ {' ' * 54}│\n╰{RULE}╯\n  ? for shortcuts"
 
 
@@ -1694,9 +1729,13 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
                    "To stop it, press Esc to cancel.\n" + IDLE):
         assert _prompt_state(screen) == "ready", screen
     for screen in (DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, REAL_START_ON, BAR_DRAFT, BOX_BAR_DRAFT,
-                   "❯ ││\n  ? for shortcuts", "> Try this instead\n  ? for shortcuts",
+                   "❯ ││\n  ? for shortcuts", "> Try this instead\n  ? for shortcuts", LONG_DRAFT, BOX_LONG_DRAFT,
                    "❯ x \n  ? for shortcuts"):
-        assert _prompt_state(screen) == "other", screen                             # a draft not sent
+        assert _prompt_state(screen) == "draft", screen                             # a draft not sent
+    # Words above a footer with no prompt line holding text over them, under a top border: no draft.
+    assert _prompt_state(f"  Notes:\n{RULE}\n  ? for shortcuts") == "other"
+    assert _prompt_state(f"{RULE}\n> \n  some words\n{RULE}\n  ? for shortcuts") == "other"
+    assert _prompt_state(f"❯ words\n  more words\n{RULE}\n  ? for shortcuts") == "other"   # no top border
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("He said: auto mode on, ? for shortcuts.\n" + AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("  Select model\n  > Opus\n  Enter to confirm · Esc to exit") == "dialog"
@@ -1740,22 +1779,19 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
 
 def test_the_status_page_tells_a_waiting_screen_from_his_prompt():
     """The panel's /status reads the screen as checkin.sh does (prompt-state.sh, Nov 16): ready only
-    at his prompt, a dialog for a screen waiting for an answer. It reads it through screen-state.sh,
-    which unstick.sh reads too, so the panel shows what the App acts on. Its loop runs under errexit
-    and pipefail, and an empty capture (no session, tmux down) leaves it running (round 9)."""
+    at his prompt, a dialog for a screen waiting for an answer. Its loop runs under errexit and
+    pipefail, and an empty capture (no session, tmux down) leaves it running (round 9)."""
     import shutil
     import subprocess
     bash = shutil.which("bash")
     if not bash:
         pytest.skip("no bash")
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
-    block = _run_fns(run, "    # His screen in one word, as unstick.sh reads it", "    printf '{\"signed_in\"")
-    assert '"$OPT/screen-state.sh"' in block and "prompt-state.sh\"" not in block
+    block = _run_fns(run, "    last=$(printf '%s\\n' \"$screen\" | tail -n 30)", "    printf '{\"signed_in\"")
     opt = (CAIN / "rootfs/opt/cain").as_posix()
 
     def state(screen):
-        script = (f'set -o errexit -o nounset -o pipefail\nOPT="{opt}"\nexport PROMPT_STATE="{opt}/prompt-state.sh"\n'
-                  'screen="$1"\n' + block + 'echo "$state"\n')
+        script = f'set -o errexit -o nounset -o pipefail\nOPT="{opt}"\nscreen="$1"\n' + block + 'echo "$state"\n'
         out = subprocess.run([bash, "-c", script, "state", screen],
                              capture_output=True, text=True, encoding="utf-8", timeout=20)
         assert out.returncode == 0, out.stderr
@@ -1764,9 +1800,6 @@ def test_the_status_page_tells_a_waiting_screen_from_his_prompt():
     assert state(IDLE) == "ready" and state(WORKING) == "ready" and state(IDLE_WITH_TASKS) == "ready"
     assert state("Earlier he said auto mode was on.\n\n  Choose an option\n  > Yes") == "unknown"
     assert state("Invalid API key · Please run /login") == "login_needed"
-    assert state("Paste code here if prompted >\n  Esc to cancel") == "waiting_for_code"
-    assert state("  Select login method:\n  ❯ 1. Claude account with subscription\n  Enter to confirm · Esc to cancel") == "first_run_menu"
-    assert state("  Do you trust the files in this folder?\n  ❯ 1. Yes, proceed\n  Enter to confirm · Esc to exit") == "trust_prompt"
     assert state("") == "unknown" and state("\n \n") == "unknown"      # and the loop goes on
 
 
@@ -1784,9 +1817,11 @@ def _unstick(tmp_path, now, screen, **more):
         stub.mkdir()
         opt.mkdir()
         (stub / "tmux").write_text('#!/bin/bash\nif [ "$2" = capture-pane ]; then [ -z "${STUB_DOWN:-}" ] || exit 1\n'
-                                   '  printf "%s\\n" "$STUB_SCREEN"; exit 0; fi\nprintf "%s\\n" "$*" >> "$STUB_SENT"\n', newline="\n")
+                                   '  [ -z "${STUB_HANG:-}" ] || exec sleep 20\n'
+                                   '  printf "%s\\n" "$STUB_SCREEN"; exit 0; fi\nprintf "%s\\n" "$*" >> "$STUB_SENT"\n'
+                                   '[ -z "${STUB_KEYS_FAIL:-}" ] || exit 1\n', newline="\n")
         (opt / "notice.sh").write_text('#!/bin/bash\necho "$NOTICE_LOCK_S $*" >> "$STUB_NOTICE"\nexit "${NOTICE_RC:-0}"\n', newline="\n")
-        for f in ("screen-state.sh", "prompt-state.sh", "unstick.sh"):
+        for f in ("prompt-state.sh", "unstick.sh"):
             (opt / f).write_text((CAIN / "rootfs/opt/cain" / f).read_text(encoding="utf-8").replace("\r\n", "\n"),
                                  encoding="utf-8", newline="\n")
         for f in (stub / "tmux", *opt.iterdir()):
@@ -1853,12 +1888,87 @@ def test_a_question_no_one_answers_is_closed_and_then_his_session_starts_fresh(t
     assert run(5000, DRAFT) == "" and run(5010, IDLE) == "" and run(5310, IDLE, NOTICE_RC="75") == ""
     assert run(5320, IDLE) == "" and run(5330, IDLE) == "" and read("notice")[-3:] == ["5 clear screen"] * 3
 
+    # A question that goes and another that comes: the new one gets its own 5 minutes and its own
+    # Esc, never the old one's count (outside review, round 1).
+    t += 10_000
+    assert [run(dt) for dt in (0, 50, 100, 150, 200, 250)] == [""] * 6
+    sent = len(read("sent"))
+    assert run(300) == "" and len(read("sent")) == sent + 1                      # Esc for the first
+    assert run(310, IDLE) == "" and run(320) == ""                                # gone; another
+    assert [run(dt) for dt in (370, 420, 470, 520, 570, 600)] == [""] * 6 and len(read("sent")) == sent + 1
+    assert run(620) == "" and len(read("sent")) == sent + 2                      # its own Esc
+    assert run(920, UNSTICK_GAP_S="5000") == "restart"
+
     # A gap of over a minute between waiting screens starts the count again: no Esc at 5 minutes.
     t += 10_000
     assert [run(dt) for dt in (0, 50, 100)] == ["", "", ""] and run(170, IDLE) == ""
     sent = len(read("sent"))
     assert [run(dt) for dt in (240, 290, 340, 390, 440, 490)] == [""] * 6 and len(read("sent")) == sent
     assert run(540) == "" and len(read("sent")) == sent + 1
+
+
+def test_the_way_out_of_a_question_holds_when_its_own_steps_fail(tmp_path):
+    """unstick.sh, outside review round 1: an Esc that can't be sent still leads on to a fresh start;
+    a hung tmux never holds it (or the run script's loop) past its bound; a step whose state can't
+    be kept isn't taken, and Dane hears instead, so no limit is skipped and no Esc repeats; a
+    sign-in on screen now is left alone, but old sign-in words above a question aren't."""
+    import json
+    import time
+    read = lambda f: (tmp_path / f).read_text(encoding="utf-8").splitlines() if (tmp_path / f).exists() else []
+    t = 2_000_000
+    run = lambda dt, screen=AUTO_MODE_OFFER, **more: _unstick(tmp_path, t + dt, screen, UNSTICK_GAP_S="5000", **more)
+
+    # Esc can't be sent: the try is kept all the same, and 5 minutes on, the fresh start.
+    assert run(0, STUB_KEYS_FAIL="1") == "" and run(300, STUB_KEYS_FAIL="1") == ""
+    assert read("sent") == ["-u send-keys -t cain Escape"] and read("queue") == []
+    assert run(599, STUB_KEYS_FAIL="1") == "" and run(600, STUB_KEYS_FAIL="1") == "restart"
+    # A hung tmux: bounded, nothing known, nothing done.
+    began = time.monotonic()
+    assert run(700, STUB_HANG="1", UNSTICK_TMUX_S="1") == "" and time.monotonic() - began < 15
+    # The hourly limit can't be read (its file is a directory): no fresh start; Dane hears, once.
+    state = tmp_path / "state"
+    (state / "restarted").unlink()
+    (state / "restarted").mkdir()
+    assert [run(dt) for dt in (1000, 1300, 1600)] == ["", "", ""] and read("notice") == ["5 tell waiting"]
+    assert run(1700) == "" and read("notice") == ["5 tell waiting"]
+    (state / "restarted").rmdir()
+    # The Esc's own mark can't be kept: no Esc goes (nothing could stop it repeating); Dane hears.
+    for f in ("since", "seen", "esc", "told"):
+        (state / f).unlink(missing_ok=True)
+    (state / "esc").mkdir()
+    sent = len(read("sent"))
+    assert [run(dt) for dt in (2000, 2300, 2310, 2320)] == ["", "", "", ""] and len(read("sent")) == sent
+    assert read("notice") == ["5 tell waiting"] * 2
+    (state / "esc").rmdir()
+
+    # A sign-in on screen now: never closed. Old sign-in words above a question: no matter.
+    signin = "  Browser didn't open? Use the url below to sign in:\n  Paste code here if prompted >\n  Esc to cancel"
+    t += 10_000
+    assert [run(dt, signin) for dt in (0, 300, 600, 900)] == ["", "", "", ""]
+    old = "Earlier: Paste code here if prompted >\n" + "\n".join(f"  his work, line {i}" for i in range(12)) + "\n"
+    sent = len(read("sent"))
+    assert run(1000, old + AUTO_MODE_OFFER) == "" and run(1300, old + AUTO_MODE_OFFER) == ""
+    assert len(read("sent")) == sent + 1
+
+
+def test_nothing_is_typed_into_a_session_before_its_check_passes():
+    """Cain's third service review (must-fix 4): every start of his session, the App's own restarts
+    included, is checked as his own user before anything is typed into it. session.sh starts Claude
+    Code once, so a new one is always the run script's start, with its check; the mark checkin.sh
+    reads is taken away before every start and at every end, and set only where the check passes
+    (at once the old way, which has none, as 0.11.0 ran)."""
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text(encoding="utf-8").replace("\r\n", "\n")
+    session = (CAIN / "rootfs/opt/cain/session.sh").read_text(encoding="utf-8")
+    assert "while true" not in session and session.count("claude --permission-mode") == 1
+    assert "export SESSION_CHECKED=/run/cain/session-checked" in run
+    for fn in ("start_his_session() {\n", "end_his_session() {\n"):
+        assert run.split(fn, 1)[1].lstrip().startswith("unchecked\n"), fn
+    marks = [l.strip() for l in run.splitlines() if "checked_now" in l and "checked_now()" not in l]
+    assert marks == ['if [ -n "$checked" ]; then checked_now; else unchecked; fi', "0) checked=1; checked_now ;;"]
+    assert run.index('[ "$mode" = own ] || checked=1\nif [ -n "$checked" ]; then checked_now; else unchecked; fi') > 0
+    checkin = (CAIN / "rootfs/opt/cain/checkin.sh").read_text(encoding="utf-8")
+    gate = checkin.index('[ -f "${SESSION_CHECKED:-/run/cain/session-checked}" ] || exit 0')
+    assert gate < checkin.index("screen=$(read_screen)") and gate < checkin.index("type_in() {")
 
 
 def test_cain_checks_in_on_his_own_record():
@@ -1896,6 +2006,71 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
     assert 'bun "$OPT/link/main.ts"' in run
     assert not re.search(r"^ports", (CAIN / "config.yaml").read_text(), re.M)
+
+
+def test_checkin_presses_enter_only_while_what_it_typed_sits_in_his_input_box(tmp_path):
+    """Cain's third service review: a question can open between the read and the Enter (the fault
+    that kept his prompts from him for three hours on Nov 16). checkin.sh types nothing into a
+    session that hasn't passed its check of his own user, nor on a single read of his prompt; it
+    types, reads the screen again, and presses Enter only while his input box holds what it typed.
+    Otherwise no Enter, the tap stays queued, and the try left in his box is taken back out
+    (Ctrl+U) once his input area is back, before anything is typed again."""
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        pytest.skip("no jq")
+    q, work = tmp_path / "relay.queue", tmp_path / "relay.queue.work"
+    q.write_text('{"text": "Dane tapped \\"Ship\\""}\n', newline="\n")
+    os.environ["RELAY_QUEUE"] = str(q)
+    try:
+        # No mark from the run script: nothing typed, the queue untouched.
+        assert _checkin(tmp_path, "0300", IDLE, checked=False) == "" and q.exists() and not work.exists()
+        # One read of his prompt: nothing yet.
+        assert _checkin(tmp_path, "0300", IDLE, runs=1) == "" and q.exists()
+        # A question opens as it types: no Enter, the tap kept, the try marked.
+        out = _checkin(tmp_path, "0300", IDLE, runs=1, after=AUTO_MODE_OFFER)
+        assert out.splitlines()[-1].startswith('-u send-keys -t cain -l Relayed by the add-on: Dane tapped "Ship"')
+        assert "Enter" not in out and 'Dane tapped' in work.read_text() and (tmp_path / "state/typed").exists()
+        # While the question stands: nothing more is typed.
+        assert _checkin(tmp_path, "0300", IDLE, runs=3, after=AUTO_MODE_OFFER) == out
+        # The question gone, the try in his box: Ctrl+U first, then, his prompt steady, typed and sent.
+        out = _checkin(tmp_path, "0300", IDLE, runs=1)
+        assert out.splitlines()[-1] == "-u send-keys -t cain C-u" and not (tmp_path / "state/typed").exists()
+        out = _checkin(tmp_path, "0300", IDLE, runs=2).splitlines()
+        assert out[-1] == "-u send-keys -t cain Enter" and 'Dane tapped "Ship"' in out[-2]
+        assert work.read_text().strip() == "" and not (tmp_path / "state/typed").exists()
+        # Nothing landed (his box still empty after typing): no Enter, the tap kept; the next read
+        # of an empty box clears the mark, and it's typed again.
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "Dane reacted"}\n', newline="\n")
+        out = _checkin(tmp_path, "0300", IDLE, runs=2, after=IDLE)
+        assert "Enter" not in out and "Dane reacted" in work.read_text()
+        out = _checkin(tmp_path, "0300", IDLE, runs=3)
+        assert out.splitlines()[-1] == "-u send-keys -t cain Enter" and work.read_text().strip() == ""
+        # A tap that can't be typed three times running goes after the newer ones, never lost.
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text": "first"}\n{"text": "second"}\n', newline="\n")
+        _checkin(tmp_path, "0300", IDLE, runs=6, after=IDLE, CHECKIN_TYPED_GRACE_S="0")
+        (tmp_path / "box/typed").unlink(missing_ok=True)               # it never landed
+        assert work.read_text() == '{"text": "second"}\n' and q.read_text() == '{"text": "first"}\n'
+        out = [l for l in _checkin(tmp_path, "0300", IDLE, runs=6).splitlines() if " -l " in l]
+        assert [l.split(": ", 1)[1] for l in out[-2:]] == ["second", "first"]
+    finally:
+        del os.environ["RELAY_QUEUE"]
+
+
+def test_a_checkin_that_missed_its_hour_is_named_in_the_next(tmp_path):
+    """Never silent (Cain's third service review): a check-in that couldn't go in within its hour (his
+    screen wasn't at his prompt) is named once in the next one, so Cain knows, say, that the morning
+    one never came. A first start, with no check-in yet, names none."""
+    first = _checkin(tmp_path, "1740", IDLE, day="2026-11-07")
+    assert "Scheduled check-in" in first and "didn't reach you" not in first        # the first ever
+    assert _checkin(tmp_path, "0712", AUTO_MODE_OFFER) == first                    # not at his prompt
+    out = _checkin(tmp_path, "1240", IDLE).splitlines()[-2]
+    assert "The 7:10 AM check-in didn't reach you: your screen wasn't at your prompt within its hour." in out
+    assert "(1230)" in out
+    assert "didn't reach you" not in _checkin(tmp_path, "1740", IDLE).splitlines()[-2]   # once
+    assert "didn't reach you" not in _checkin(tmp_path, "0712", IDLE, day="2026-11-09").splitlines()[-2]
 
 
 def test_a_relayed_tap_is_typed_in_before_any_checkin(tmp_path):
