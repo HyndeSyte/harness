@@ -287,6 +287,14 @@ class FamilyAdd:
         except ValueError:
             return False
 
+    def tapless(self) -> bool:
+        """Adds go without their tap only while both hold (0.24.0, fifth round): his tap on the
+        bake-in card (loosened) and the no-card flag, which is off after install until his Turn on
+        tap on the smoke test's card (calendar_change.FAST_PATH). Read at offer time and again at
+        write time (_blocked): with the flag off, an add is a normal card."""
+        from .calendar_change import fast_path_on      # imported here: calendar_change imports this
+        return self.loosened() and fast_path_on(self.ledger)
+
     def problem(self) -> str:
         return self.ledger.get_meta(PROBLEM) or ""
 
@@ -319,9 +327,12 @@ class FamilyAdd:
     def status_line(self) -> str:
         if not self.enabled():
             return "Family calendar adds: off"
-        if self.loosened():
+        if self.tapless():
             return ("Family calendar adds: on, skipping the Approve tap "
                     "(receipt, Undo and /stop stay; /checkadds brings the tap back)")
+        if self.loosened():
+            return ("Family calendar adds: on, each needs your tap until the check after installing "
+                    "has passed and you turned on changes without a card")
         b = self._bake()
         return f"Family calendar adds: on, each needs your tap ({b['n']} since the last problem)"
 
@@ -348,7 +359,7 @@ class FamilyAdd:
             waiting.append(what if r["state"] == "settling" else f"the undo of {what}")
         if waiting:
             parts.append(f"Not confirmed yet, still checking: {'; '.join(waiting)}.")
-        if self.enabled() and self.loosened():
+        if self.enabled() and self.tapless():
             n = self.ledger.db.execute(
                 "SELECT COUNT(*) FROM family_adds WHERE state='created' AND created_at>=?",
                 (iso(since) if since else "",)).fetchone()[0]
@@ -680,7 +691,7 @@ class FamilyAdd:
         """After his tap on the bake-in card, an add needs no tap of its own.
         Nothing else can come through here."""
         row = db.execute("SELECT effect_type FROM proposals WHERE id=?", (proposal_id,)).fetchone()
-        if not self.loosened() or row["effect_type"] != effects.FAMILY_ADD:
+        if not self.tapless() or row["effect_type"] != effects.FAMILY_ADD:
             return False
         # Its own state: checked again just before the write (_blocked).
         db.execute("UPDATE proposals SET state='auto_approved' WHERE id=? AND state='proposed'",
@@ -858,7 +869,7 @@ class FamilyAdd:
             return "stopped", "I'm stopped, so nothing was added."
         if not self.enabled():
             return "family_add_off", "Adding to the Family calendar is off, so nothing was added."
-        if p["state"] == "auto_approved" and not self.loosened():
+        if p["state"] == "auto_approved" and not self.tapless():
             return "tap_restored", ""          # it comes back as a card (_card_again)
         try:
             checked = effects.REGISTRY[effects.FAMILY_ADD].validate(params)
