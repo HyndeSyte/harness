@@ -37,8 +37,9 @@ relay() { printf '%s\n' "$(jq -cn --arg t "$1" '{text: $t}')" >> /data/relay.que
 # try whose alarm couldn't be (the lock busy, a write failed) is told again: by the old way's
 # loop every 10 minutes, and at the next start. 1 when it couldn't be told yet.
 tell_failed_switch() {
-  local now told why kind
-  now="$(wc -l < /data/c1/failed 2>/dev/null || echo 0)"
+  local now=0 told why kind
+  case "$mode" in old|own) ;; *) return 0 ;; esac            # stopped: his stop's own alarm says why
+  [ ! -f /data/c1/failed ] || now="$(wc -l < /data/c1/failed 2>/dev/null | tr -cd '0-9')"; [ -n "$now" ] || now=0
   told="$(head -c 20 /data/c1/failed-told 2>/dev/null | tr -cd '0-9' || true)"
   [ "$now" -gt "${told:-0}" ] || return 0
   why="$(tail -n 1 /data/c1/failed 2>/dev/null | cut -d' ' -f2- | tr -d '\r\n' | cut -c1-200 || true)"
@@ -102,9 +103,14 @@ else
             # was begun, so the old way is whole: he runs it, and the try is on record as failed,
             # so Dane hears it as any failed try, with its cause, and it isn't tried again here.
             *) if [ "$("$OPT/c1/state.sh")" = fresh ]; then
-                 printf '%s the switch ended with %s before it began\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" >> /data/c1/failed || true
-                 bashio::log.warning "The switch ended with $rc before it began: Cain runs the old way for now"
-                 break
+                 # Its record is what tells Dane: a try that can't be put on record stops him
+                 # instead, with its own alarm (C1 fifth outside round).
+                 if [ -f /data/c1/failed ] || [ ! -e /data/c1/failed ]; then
+                   { printf '%s the switch ended with %s before it began\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" >> /data/c1/failed; } 2>/dev/null \
+                     && { bashio::log.warning "The switch ended with $rc before it began: Cain runs the old way for now"; break; }
+                 fi
+                 mode=none; switch_stopped=1; stop_kind=switch-stopped
+                 stopped_why="the switch ended with $rc before it began, and that couldn't be put on record"; break
                fi ;;
           esac
           # Not switched: the old layout is whole again. Once more only while it may be tried.
@@ -112,10 +118,9 @@ else
           [ -f /data/link/specialist-signs ] && bun "$OPT/c1/tools.ts" may-retry /data/c1/failed || break
         done
         [ "$mode" != old ] || [ "$rc" != 1 ] || bashio::log.warning "Not switched (above): Cain runs the old way for now"
-        # A try that waits for a new container (exit 4) raises its own stop alarm, with the
-        # cause, at once (below); the start in the next container tells the failed try as he then
-        # runs. Any other: told now (tell_failed_switch).
-        if [ -z "$restart_first" ]; then tell_failed_switch || bashio::log.warning "A failed try of the switch couldn't be told yet: tried again in 10 minutes"; fi
+        # A failed try is told once the way he runs has passed its checks (below). A try that
+        # waits for a new container (exit 4) raises its own stop alarm, with the cause, at once;
+        # the start in the next container tells the failed try as he then runs.
       fi ;;
     *) mode=none; stop_kind=damaged; stopped_why="Cain's start state is damaged (/data/c1)" ;;
   esac
@@ -139,6 +144,11 @@ case "$mode" in
        fi
        [ "$mode" != old ] || [ -f /data/c1/a-since ] || date +%s > /data/c1/a-since ;;
 esac
+# A failed try of the switch is told only now the way he runs has passed its checks, the old way
+# or as his own user (C1 fifth outside round: never "he still answers" before that's so).
+if [ "$mode" = old ] || [ "$mode" = own ]; then
+  tell_failed_switch || bashio::log.warning "A failed try of the switch couldn't be told yet: tried again in 10 minutes"
+fi
 [ -z "$stopped_why" ] || bashio::log.error "Cain isn't started: $stopped_why (above)"
 # A stop is told at once, before any later step here can fail and end the start first (C1
 # second review), a stop that waits for the Supervisor's restart included.

@@ -39,6 +39,14 @@ once() {
   if ! printf '%s' "$raw" | jq -e 'type == "object" and (.ok | type == "boolean") and (.failed | type == "array") and (.unchecked | type == "array") and (.checks | type == "number")' >/dev/null 2>&1; then
     printf '%s' "$NOANSWER"; return
   fi
+  # A check it named as failed is a breach, whatever "ok" says; "not ok" that names none is no
+  # answer to trust (C1 fifth outside round).
+  if [ "$(printf '%s' "$raw" | jq '.failed | length')" != 0 ]; then
+    raw="$(printf '%s' "$raw" | jq -c '.ok = false')"
+  elif [ "$(printf '%s' "$raw" | jq -r .ok)" != true ]; then
+    jq -nc --arg u "the check said not all held but named no check" --arg c 0 '{ok: true, failed: [], unchecked: [$u], checks: ($c | tonumber)}'
+    return
+  fi
   # A breach it reported stands, however it ended; anything else counts only from a check that
   # ended well (one that printed a pass and then failed, or ran out of time, didn't pass: C1
   # fourth outside round).

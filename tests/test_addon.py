@@ -398,6 +398,11 @@ def test_the_check_stops_cain_on_a_breach_and_holds_him_when_it_cant_finish(tmp_
     vacuous = json.dumps({"ok": True, "failed": [], "unchecked": [], "checks": 0})
     rc, line, failed, held, calls, n = check(vacuous, C1_UNTRIED="retry")
     assert (rc, failed, held, calls) == (5, "", "", "") and "the check ran only 0 of its 45 checks" in line
+    # A check it names as failed is a breach whatever "ok" says; "not ok" naming none is no answer.
+    rc, line, failed, held, calls, n = check(json.dumps({"ok": True, "failed": ["uid1000 read a root secret"], "unchecked": [], "checks": 45}))
+    assert (rc, failed, calls) == (3, "0.12.0 uid1000 read a root secret\n", "killed\nnotice tell breach\n")
+    rc, line, failed, held, calls, n = check(json.dumps({"ok": False, "failed": [], "unchecked": [], "checks": 45}), C1_UNTRIED="retry")
+    assert (rc, failed, held) == (5, "", "") and "said not all held but named no check" in line
     # A check that answered and then failed, or ran out of time, didn't pass; a breach it reported stands.
     rc, line, failed, held, calls, n = check(good, C1_UNTRIED="retry", STUB_RC="37")
     assert (rc, failed, held, calls) == (5, "", "", "") and "the check ended with 37 after its answer" in line
@@ -883,7 +888,7 @@ def test_each_failed_switch_reaches_dane_once_as_he_really_runs(tmp_path):
         pytest.skip("no bash or jq")
     data, opt = _start_block(tmp_path, {
         "c1/state.sh": "echo fresh",
-        "c1/lock.sh": "exit 0",
+        "c1/lock.sh": '[ "$1" = old ] && [ -f "$STUB_DATA/old-fails" ] && exit 1; exit 0',
         # 0.12.0's switch, each call answering from a script: 4 (its validation failed, so it waits
         # for a new container), 1f (failed and undone here), 1 (waits, begins nothing), 0 (done). A
         # failure adds a line to the failed file; once three stand it waits and begins nothing.
@@ -942,6 +947,19 @@ def test_each_failed_switch_reaches_dane_once_as_he_really_runs(tmp_path):
     assert _run_start(tmp_path, **env) == "mode=old kind="
     assert read(calls) == ["notice tell switch-failed the switch ended with 127 before it began"]
     assert (data / "c1/failed").read_text().count("\n") == 1 and "the old way" in read(queue)[0]
+    # The same, and the try can't be put on record (its file isn't one): it stops him instead, with
+    # its own alarm, never the old way untold.
+    fresh(127)
+    (data / "c1/failed").mkdir()
+    assert _run_start(tmp_path, **env) == "mode=none kind=switch-stopped" and read(calls) == []
+    (data / "c1/failed").rmdir()
+    # A try fails and is undone, but the old way doesn't pass its own checks: he's stopped (its
+    # alarm says so), and the failed try isn't told as "he still answers", nor counted as told.
+    fresh("1f")
+    (data / "old-fails").write_text("1")
+    assert _run_start(tmp_path, **env) == "mode=none kind=setup" and read(calls) == [] and read(queue) == []
+    assert not (data / "c1/failed-told").exists()
+    (data / "old-fails").unlink()
     # A try fails and is undone, and the next in the same start goes through: he runs as his own
     # user, so only Cain hears.
     fresh("1f", 0)
