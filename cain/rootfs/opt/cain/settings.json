@@ -61,6 +61,7 @@
     "discord@claude-plugins-official": true
   },
   "syncClaudeAiPlugins": false,
+  "skillOverrides": { "auto-mode-setup": "off" },
   "hooks": {
     "PreToolUse": [
       {

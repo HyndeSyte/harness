@@ -38,7 +38,13 @@ send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
 
 screen=$($TM -u capture-pane -p -J -t cain 2>/dev/null) || exit 0
 last=$(printf '%s\n' "$screen" | tail -n 12)
-printf '%s' "$last" | grep -Eqi 'for shortcuts|auto mode' || exit 0     # at his prompt
+# At his prompt only when the bottom line on screen is the prompt's own footer ("? for
+# shortcuts", or "auto mode on"). Anything else there is a screen waiting for an answer, and
+# typing would answer it: Nov 16, Claude Code's "Teach auto mode about your environment?"
+# offer said "auto mode" higher up, so for three hours his taps, the cloud job checks and the
+# morning check-in went into the offer (each with an Enter) and not to him.
+foot=$(printf '%s\n' "$screen" | grep -v '^[[:space:]]*$' | tail -n 1)
+printf '%s' "$foot" | grep -Eqi 'for shortcuts|auto mode on' || exit 0  # at his prompt
 printf '%s' "$last" | grep -Eqi 'esc to interrupt' && exit 0           # working: later
 
 type_in() {

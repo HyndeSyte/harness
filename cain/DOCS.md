@@ -198,15 +198,17 @@ try ran as his user) and the App says so. Each time, the App tells you itself, f
 session (`/opt/cain/notice.sh`), what happened and the way back:
 
 - in Discord, from his bot, once;
-- in Home Assistant, as a notification and a push to your phone, again each day until it's
-  fixed, and taken down (with "Cain is back") once he has run two minutes and passed his check.
+- as a push to your phone, through Home Assistant, again each day until it's fixed, and
+  replaced (with "Cain is back") once he has run two minutes and passed his check. It goes to
+  your phone only: no Home Assistant notification, which everyone in the house would see.
 
 Alarms are kept apart by what they're about (whether he's running, whether his session keeps
 ending, whether his move went through), so one never takes down another.
 
 The Home Assistant side is one automation with a webhook trigger. The App has no Home
 Assistant API access, on purpose: the Supervisor's route to a notification would give every
-process of the App the run of all of Home Assistant, and this webhook can only show a notice.
+process of the App the run of all of Home Assistant, and this webhook can only pass an alarm on
+to your phone.
 Its id is a long random one (32 to 128 letters, digits, `-` or `_`) in this App's
 `notice_hook` option, which only the App's root and Home Assistant's admins can read, never
 Cain's own user: an id he could work out would let him send or take down an alarm. Until it's
@@ -218,6 +220,7 @@ Home Assistant's side that the channel works.
 ```yaml
 alias: Cain App alarms
 mode: queued
+max: 20
 triggers:
   - trigger: webhook
     webhook_id: <the notice_hook id>
@@ -230,23 +233,20 @@ actions:
           - action: input_datetime.set_datetime
             target: {entity_id: input_datetime.cain_alarms_checked}
             data: {timestamp: "{{ now().timestamp() }}"}
-      - conditions: "{{ trigger.json.state == 'clear' }}"
+      - conditions: "{{ trigger.json.state in ['on', 'clear'] }}"
         sequence:
-          - action: persistent_notification.dismiss
-            data: {notification_id: "cain_app_{{ trigger.json.group }}"}
           - action: notify.mobile_app_<your phone>
-            data: {title: "{{ trigger.json.title }}", message: "{{ trigger.json.message }}"}
-    default:
-      - action: persistent_notification.create
-        data:
-          notification_id: "cain_app_{{ trigger.json.group }}"
-          title: "{{ trigger.json.title }}"
-          message: "{{ trigger.json.message }}"
-      - action: notify.mobile_app_<your phone>
-        data: {title: "{{ trigger.json.title }}", message: "{{ trigger.json.message }}"}
+            data:
+              title: "{{ trigger.json.title }}"
+              message: "{{ trigger.json.message }}"
+              data:
+                tag: "cain_app_{{ trigger.json.group }}"
+                push:
+                  interruption-level: "{{ 'time-sensitive' if trigger.json.state == 'on' else 'active' }}"
 ```
 
-`input_datetime.cain_alarms_checked` is a date-and-time helper. An alarm raised while Home
+The tag is what lets "Cain is back", or a newer alarm about the same thing, replace the one on
+your phone. `input_datetime.cain_alarms_checked` is a date-and-time helper. An alarm raised while Home
 Assistant can't be reached is sent once it can; one that clears while it can't stays to be
 taken down. Home Assistant answers every webhook post alike, found or not, so the probe's time
 in the helper is the only proof the channel works end to end: after an update, set

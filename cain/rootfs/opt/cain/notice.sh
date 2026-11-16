@@ -5,8 +5,9 @@
 #     at each tick until it goes through.
 #   - Home Assistant: a local webhook whose id is the App's notice_hook option, a random id only
 #     root here and Home Assistant's admins know (never one Cain could work out). One automation
-#     there turns each post into a persistent notification and a push to his phone; that is all
-#     the webhook can reach (DOCS.md, "If Cain stops"). The App keeps homeassistant_api off on
+#     there turns each post into a push to his phone only, tagged by group so the next replaces
+#     it (no persistent notification: every Home Assistant user in the house sees those); that is
+#     all the webhook can reach (DOCS.md, "If Cain stops"). The App keeps homeassistant_api off on
 #     purpose: the Supervisor's own route to a notification needs it, and it would hand every
 #     root process here, and the old way's root session, the run of all of Home Assistant. Sent
 #     again daily while the alarm lasts, and at once when the hook is set or changed. A probe at
@@ -17,8 +18,8 @@
 # stopped, paused, or restarting), "session" (his session keeps ending), and "switch" (his move
 # to his own user failed; he runs the old way). Within a group a newer alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
-# clears, its Home Assistant notification comes down and both say so; until a hook takes it
-# down, the clearing is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
+# clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
+# is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
 # here runs without the lock: a writer that can't have it within 30 seconds exits 75, and the
 # alarm is raised again by its caller or the next tick.
 #   notice.sh tell <alarm> [cause]   raise it; raised already, only its repeats and retries run

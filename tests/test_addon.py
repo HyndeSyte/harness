@@ -1296,7 +1296,7 @@ def test_cain_status_gives_facts_not_the_screen():
     assert "$screen" not in status and "$last" not in status
     assert status.count("$(flag ") == 4 and '"$state"' in status
     states = {line.split("state=")[1].split(";")[0].strip() for line in run.splitlines() if "state=" in line and "then state=" in line}
-    assert states == {"login_needed", "waiting_for_code", "trust_prompt", "first_run_menu", "ready"}
+    assert states == {"login_needed", "waiting_for_code", "trust_prompt", "first_run_menu", "ready", "dialog"}
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     assert "location = /status {" in nginx and "alias /run/cain/www/status.json;" in nginx
 
@@ -1604,6 +1604,68 @@ def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
     assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed
     assert _checkin(tmp_path, "0300", IDLE) == ""
     assert _checkin(tmp_path, "0712", "Do you trust the files in this folder?") == ""
+
+
+# Claude Code's own offer, as it stood in his session on Nov 16 from 4:57 to 7:53 AM: "auto mode"
+# shows only above the offer's own bottom line, which is no prompt of his.
+AUTO_MODE_OFFER = (
+    "> /auto-mode-setup\n\n"
+    "  Teach auto mode about your environment?\n\n"
+    "  Claude Code reads this project, your recent Claude sessions, and optionally your shell history"
+    " and other repositories. Claude analyzes this data and customizes auto mode to make better decisions.\n\n"
+    "    How you use Claude here    Mixed\n"
+    "  > Also scan shell history    false\n"
+    "    Also scan your other repos false\n\n"
+    "    Continue\n\n"
+    "  ←/→ to change · Enter to continue · Esc to cancel\n\n\n")
+# His prompt at work, as Claude Code draws it: the footer is still the bottom line.
+WORKING = "> \n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt      ● high · /effort"
+
+
+def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
+    """Nov 16: Claude Code's auto mode offer said "auto mode" above its own bottom line, the check
+    took it for his prompt, and his taps, the cloud job checks and the morning check-in went into
+    the offer, each with an Enter, for three hours. Only his prompt's own footer, as the bottom line
+    on screen, lets anything be typed; words of his higher up don't count either way."""
+    import os
+    import shutil
+    assert _checkin(tmp_path, "0712", AUTO_MODE_OFFER) == ""
+    assert list((tmp_path / "done").glob("*")) == []                  # the morning one still to come
+    assert _checkin(tmp_path, "0712", WORKING) == ""                  # at work: later
+    out = _checkin(tmp_path, "0712", "To stop it, press Esc to cancel.\n" + IDLE)
+    assert "morning" in out and "Enter" in out                        # back at his prompt: it goes in
+    if shutil.which("jq"):
+        q = tmp_path / "relay.queue"
+        q.write_text('{"text": "Dane tapped \\"Ship\\""}\n', newline="\n")
+        os.environ["RELAY_QUEUE"] = str(q)
+        try:
+            (tmp_path / "sent.txt").unlink()
+            assert _checkin(tmp_path, "0712", AUTO_MODE_OFFER) == ""  # his tap waits for him,
+            assert q.exists() and not (tmp_path / "relay.queue.work").exists()   # untouched
+            assert 'Dane tapped "Ship"' in _checkin(tmp_path, "0712", IDLE)
+        finally:
+            del os.environ["RELAY_QUEUE"]
+
+
+def test_the_status_page_tells_a_waiting_screen_from_his_prompt():
+    """The panel's /status reads the screen the way checkin.sh does (Nov 16): ready only with his
+    prompt's footer as the bottom line; a screen waiting for an answer is a dialog."""
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("no bash")
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    block = _run_fns(run, "    last=$(printf '%s\\n' \"$screen\" | tail -n 30)", "    printf '{\"signed_in\"")
+
+    def state(screen):
+        out = subprocess.run([bash, "-c", 'screen="$1"\n' + block + 'echo "$state"\n', "state", screen],
+                             capture_output=True, text=True, encoding="utf-8", timeout=20)
+        return out.stdout.strip()
+    assert state(AUTO_MODE_OFFER) == "dialog"
+    assert state(IDLE) == "ready" and state(WORKING) == "ready"
+    assert state("Earlier he said auto mode was on.\n\n  Choose an option\n  > Yes") == "unknown"
+    assert state("Invalid API key · Please run /login") == "login_needed"
 
 
 def test_cain_checks_in_on_his_own_record():

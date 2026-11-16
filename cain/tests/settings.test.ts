@@ -88,9 +88,22 @@ describe("nothing of his own adds to his rules (C1)", () => {
   });
 });
 
-// The old way of starting (3.12 state A) uses 0.11.0's files unchanged, hooks and all.
+// Claude Code's own offers that stop a session at a question can't stop his: no one is at his
+// screen to answer. Nov 16, its offer to set up auto mode sat in his session for three hours.
+describe("Claude Code's auto mode setup offer is off (Nov 16)", () => {
+  test("the new way and the old", () => {
+    const legacy = JSON.parse(readFileSync(join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json"), "utf8"));
+    expect(settings.skillOverrides).toEqual({ "auto-mode-setup": "off" });
+    expect(legacy.skillOverrides).toEqual({ "auto-mode-setup": "off" });
+  });
+});
+
+// The old way of starting (3.12 state A) uses 0.11.0's files, hooks and all, with only that offer off.
 describe("the old way's files are 0.11.0's", () => {
   const legacy = JSON.parse(readFileSync(join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json"), "utf8"));
+  test("0.11.0's settings and the offer, nothing else", () => {
+    expect(Object.keys(legacy).sort()).toEqual(["hooks", "permissions", "skillOverrides"]);
+  });
   test("its reply and edit hooks are there", () => {
     const hooksOf = (event: string, tool: string) => (legacy.hooks[event] ?? []).filter((e: any) => e.matcher === tool).flatMap((e: any) => e.hooks);
     for (const t of ["mcp__plugin_discord_discord__reply", "mcp__plugin_discord_discord__edit_message"]) {
