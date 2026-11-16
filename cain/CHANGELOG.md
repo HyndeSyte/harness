@@ -10,7 +10,6 @@
 - Cain starts the build work on your list himself, as you said on Nov 15, so nothing waits on a Start card you never saw. Your Ship tap still approves every install.
 - Notes left for Cain are never lost: every check-in names each item with notes he hasn't read, until he reads them, and he reads them before deciding something still waits on someone.
 - When Cain's review sends a finished change back for fixes, the fixed version comes back to him at once, so it reaches your Ship card without waiting for a check-in.
-- When a question sits on Cain's screen, where no one answers it, he can't take your messages until it's answered. The App now closes it with Esc after 5 minutes, and if that doesn't work, starts his session fresh 5 minutes later, so he's back within about 10 minutes and reads what you sent meanwhile. You hear only if it keeps coming back.
 
 ## 0.12.0
 

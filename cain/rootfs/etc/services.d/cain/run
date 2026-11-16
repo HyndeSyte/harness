@@ -377,10 +377,18 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     fi
     flag() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
     paired() { tr -d ' \n' < "$ACCESS_FILE" | grep -q '"allowFrom":\["'; }
-    # His screen in one word, as unstick.sh reads it (screen-state.sh: his prompt, as checkin.sh
-    # reads it, a screen waiting for an answer, or a sign-in's). It never fails; || for an
-    # unforeseen one, since this loop runs under errexit.
-    state=$(printf '%s\n' "$screen" | "$OPT/screen-state.sh" 2>/dev/null) || state=unknown
+    last=$(printf '%s\n' "$screen" | tail -n 30)
+    # His prompt or a screen waiting for an answer, read as checkin.sh reads it (prompt-state.sh,
+    # which never fails; || for an unforeseen one, since this loop runs under errexit).
+    at=$(printf '%s\n' "$screen" | "$OPT/prompt-state.sh" 2>/dev/null) || at=other
+    state=unknown
+    if printf '%s\n' "$last" | tail -n 12 | grep -Eqi 'run /login|token has expired|authentication_error|invalid api key|not logged in'; then state=login_needed
+    elif printf '%s' "$last" | grep -Eqi 'paste.*code'; then state=waiting_for_code
+    elif printf '%s' "$last" | grep -Eqi 'do you trust|trust the files'; then state=trust_prompt
+    elif printf '%s' "$last" | grep -Eqi 'select login|login method|choose the text style|dark mode'; then state=first_run_menu
+    elif [ "$at" = ready ]; then state=ready
+    elif [ "$at" = dialog ]; then state=dialog
+    fi
     printf '{"signed_in": %s, "discord_token": %s, "paired": %s, "allowlist": %s, "screen": "%s", "mode": "%s"}\n' \
       "$(flag test -s "$CRED")" \
       "$(flag grep -q '^DISCORD_BOT_TOKEN=.' "$TOKEN_FILE")" \
@@ -574,14 +582,6 @@ while session_up; do
       end_his_session || fail_closed
       break
     fi
-  fi
-  # A question waiting on his screen, where no one answers it (unstick.sh): Esc after 5 minutes;
-  # still there 5 minutes later, his session starts fresh, at most once an hour (Dane hears of one
-  # that comes back sooner).
-  if [ "$("$OPT/unstick.sh" || true)" = restart ]; then
-    bashio::log.warning "Esc didn't close the question waiting on Cain's screen: starting his session fresh"
-    end_his_session || fail_closed
-    break
   fi
   if [ -z "$cleared" ] && [ -n "$checked" ] && [ $(( $(date +%s) - up_since )) -ge 120 ]; then
     cleared=1; quick=0
