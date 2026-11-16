@@ -18,6 +18,8 @@
 - Each step of the check on your real calendars now starts with your tap on a card that shows exactly what it will do; Cain can't make anything part of the check by himself, and your own requests during it stay yours.
 - Before a Ship card for the calendar specialist, Cain rehearses the incoming version's own update on a copy of its records. If an update starts without one, Cain runs it then; he moves its records without it only on your say.
 - Cain shows the specialist's messages about held requests, Test again when a calendar and the specialist don't agree on versions, and the daily reminder while requests wait.
+- After a calendar specialist update, its records move by themselves once its own rehearsal passes; only a failed one waits, with your Run check. Moving them without a rehearsal is only ever your tap on a card Cain can send you.
+- When the specialist can't change a calendar safely, Cain shows its message with your requests ready to copy and Open without protection, and leaves that choice to you; receipts there say Unprotected.
 
 ## 0.11.0
 

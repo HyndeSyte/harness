@@ -98,15 +98,20 @@ specialist (the Harness add-on) does.
   own test events the specialist sends an edit, a removal and an edit of one day of a series, each with
   a version it made out of date itself, and the calendar must refuse each with its documented stale
   answer, a read showing it wasn't applied. Any other answer is unknown: run the step again. If one
-  takes a stale edit, that calendar never opens and he gets a message saying it doesn't protect against
-  edits made at the same time, with Open cards without the check (whose words say edits there may
-  overwrite changes made elsewhere): show it and leave the choice to him. If it takes only the stale
-  removal, it stays closed with a message saying removals aren't protected, and removals there stay
-  held even after that override. If it turns down even the fresh edit, he gets a message saying the
-  specialist and that calendar don't agree on versions, with Test again: show it, leave the tap to
-  him, and don't run gate-open (it's refused there: an override would only bring refusals). The item
-  runs again after every update, and a calendar seen later taking a write without a new version closes
-  again with the same message. If a
+  takes a stale edit, or turns down even the fresh edit (the specialist and that calendar don't agree
+  on versions), he gets one message saying in plain words that the specialist can't change that
+  calendar safely and that he can edit it by hand, with each request held for it passed back as a line
+  ready to copy (and any held later, at once), and Open without protection (plus Test again when the
+  fresh edit was turned down): show it and leave the choice to him. Open without protection is his tap
+  alone: it lets changes there go as a read-compare-write with no version check, and every receipt for
+  that calendar then says Unprotected; show those receipts as they are. Your `gate-open` on such a
+  calendar only sends him that message again; it's never refused outright, and never opens it. If it
+  takes only the stale removal, it stays closed with a message saying removals aren't protected, and
+  removals there stay held even after Open cards without the check. The item
+  runs again after every update, and a calendar seen later taking a write that changed an event while
+  its version stayed the same closes again with that message, naming the write (a write that changed
+  nothing never does). A calendar that gives only weak versions is written as a read-compare-write,
+  compared weakly and sent without If-Match; that's expected, not a fault. If a
   calendar refuses the safety check on an unchanged event during the run, that calendar stays held
   and he gets a message saying edits there are blocked and why, with Open cards without the check:
   show it and leave the choice to him. Only on his say, `/opt/cain/keeper.sh fastpath gate-open gmail`
@@ -169,11 +174,16 @@ specialist (the Harness add-on) does.
   Show the card only if that marker exists, says ok and is under 24 hours old, and the answer showed
   the schema version, the no-card paths off, the gate set and no open Turn on cards; otherwise say what
   it found to him instead of the card. The link doesn't check the marker itself yet: this rule is the
-  check. An installed build with no dry run of its own build id moves nothing: calendar changes wait, he gets one message, and a
-  handover answers "Not taken" saying so. Then run `/opt/cain/keeper.sh fastpath migrate-check` (no
-  candidate): the running build rehearses itself and the records move right after. Only on his say,
-  `/opt/cain/keeper.sh fastpath migrate-override` moves them without one; it's logged as yours, and a
-  backup is taken first either way.
+  check. The install rehearsal is self-serve: a new build with no passing dry run of its own build id
+  (one that rehearsed the schema version the ledger is at now, under 24 hours old) runs it itself on a
+  copy of its ledger and, on a pass, takes a backup and moves the records at once, with nothing for you
+  to run. Only a failed dry run leaves it waiting: calendar changes wait, a handover answers "Not taken"
+  saying so, and he gets one message whose only button is Run check (the dry run again, in the
+  specialist): show it and leave the tap to him. `/opt/cain/keeper.sh fastpath migrate-check` (no
+  candidate) does the same as his Run check. `/opt/cain/keeper.sh fastpath migrate-override` only posts
+  him a card saying the move is unrehearsed, why the dry run failed and that a backup is taken first;
+  the records move only on his Move them anyway tap, once, for that build. Run it only on his say, and
+  never say the records moved until his tap's answer says so.
 - A note on a message with cards still open replaces only the card it corrects; the others
   stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's
   own rules decide which card a note speaks to. When it could correct more than one, or it can't

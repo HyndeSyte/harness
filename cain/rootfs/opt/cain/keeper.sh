@@ -53,7 +53,10 @@
 #                                        that was there and an edit of one day of a series. When the run
 #                                        can't complete on it, this opens that calendar without the check,
 #                                        logged as yours; its held changes come back on fresh cards. Dane's
-#                                        Open cards without the check tap does the same. Only on his say
+#                                        Open cards without the check tap does the same. Only on his say.
+#                                        On a calendar Harness can't protect (it takes stale writes, or
+#                                        turns down fresh ones), this only re-sends Dane his Open without
+#                                        protection card; opening it there is his tap alone
 #   keeper.sh fastpath migrate-check [path] [--candidate <path>]
 #                                        run a ledger migration on a copy of the ledger file at path
 #                                        (the specialist's own path; default its live ledger), never
@@ -67,10 +70,12 @@
 #                                        copy's checksum), and this writes it to the marker file
 #                                        /data/markers/harness-migrate-check.json, which a Ship card for
 #                                        the specialist needs (ok, under 24 hours old). An installed
-#                                        build with no dry run of its own build id recorded moves
-#                                        nothing until one is: this, run then, records it and moves them
-#   keeper.sh fastpath migrate-override  only on Dane's say: the installed build moves its records
-#                                        without a dry run, logged as yours, still with a backup first
+#                                        build rehearses itself on a copy and moves its records with
+#                                        no command; only a failed rehearsal waits (Dane has Run
+#                                        check). This, run then, rehearses again and moves them on a pass
+#   keeper.sh fastpath migrate-override  only on Dane's say: posts him a card to move the records
+#                                        without a rehearsal (why it failed, a backup first); they
+#                                        move only on his tap, once, for that build. Nothing more
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
