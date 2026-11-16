@@ -45,7 +45,7 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { teeConsole } from "../logfile";
 import { localReadings, verdict } from "../clock";
@@ -57,7 +57,8 @@ import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { checkRuns, facts, inMain, land, type MergeDeps } from "./merge";
-import { claimLanding, requestLoggedIn } from "../record/main";
+import { requestLoggedIn } from "../record/main";
+import { landingLedger } from "./landings";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
@@ -81,8 +82,11 @@ const TUNING = process.env.SOURCE_CHECK_TUNING ?? "/data/work/source-check-refus
 const MAX_CHECK_DAYS = /^\d+$/.test(process.env.SOURCE_CHECK_MAX_DAYS ?? "") ? Number(process.env.SOURCE_CHECK_MAX_DAYS) : undefined;
 const NOTICES = process.env.LINK_NOTICES ?? "/data/work/link-notices.jsonl";   // the notices' rendered words (the leak check reads them)
 const RECORD_STATUS = process.env.RECORD_STATUS ?? "/data/record-ledger.json";   // the keeper's status: generation, push, reset, clock
-// The keeper's landing ledger (outside its working copy): one file per tap key that started a landing.
+// The link's landing ledger (outside the record's working copy): one file per tap key that started a
+// landing. The link's alone: the record keeper never writes or cleans it. Its marker, outside it, is
+// in the link's own folder (a ledger behind the marker came back from a backup).
 const RECORD_LANDINGS = process.env.RECORD_LANDINGS ?? "/data/record-landings";
+const LANDINGS_MARKER = `${DIR}/landings-marker.json`;
 // The App's tap_read_ms option: how long a tap's fresh read may take before it answers busy (the
 // link's own default when unset).
 const TAP_READ = /^\d+$/.test(process.env.TAP_READ_MS ?? "") ? Number(process.env.TAP_READ_MS) : undefined;
@@ -122,7 +126,16 @@ function paired(): string {
 const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) => console.log(`[cain] link: ${line}`));
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
-function save(s: State): void { stateStore.save(s); }
+// Each save is stamped with when this version wrote it: a state file modified later than its stamp
+// was written by another version of the link (a rollback ran), the marker the versions share.
+function save(s: State): void { s.savedAt = Date.now(); stateStore.save(s); }
+function lastWriter(): { mtime: number; savedAt: number | null } | null {
+  try {
+    const mtime = statSync(STATE).mtimeMs;
+    const j = JSON.parse(readFileSync(STATE, "utf8"));
+    return { mtime, savedAt: Number.isFinite(j?.savedAt) ? j.savedAt : null };
+  } catch { return null; }
+}
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -238,7 +251,8 @@ const link = new Link({
   killRead: () => { console.log("[cain] link: a hung fresh read was released at its ceiling (its reads aborted; no child processes)"); },
   // Whether a check request survived a reset: done in log/requests on the keeper's current copy.
   requestLogged: (id) => requestLoggedIn(RECORD, id),
-  claimLanding: (key, what) => claimLanding(RECORD_LANDINGS, key, what),
+  landings: landingLedger(RECORD_LANDINGS, LANDINGS_MARKER, { log: (line) => console.log(`[cain] link: ${line}`) }),
+  lastWriter,
   // The state file as it is on disk (load() turns one that doesn't parse into an empty state).
   stateHealth: () => {
     try { const j = JSON.parse(readFileSync(STATE, "utf8")); return j && typeof j === "object" && !Array.isArray(j) && typeof j.messages === "object" ? { ok: true } : { ok: false, why: "not a state" }; }
@@ -332,7 +346,7 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -375,6 +389,7 @@ Bun.serve({
         case "/clock": return json(link.clockReport());
         case "/reads": return json(await link.probeReads(Number(b.n ?? 20)));
         case "/slowread": return json(link.slowRead());
+        case "/failwebhook": return json(link.failWebhook());
         case "/stallread": return json(await link.stallRead(Number(b.seconds ?? 20)));
         case "/stopped": {
           const st = link.stopped();

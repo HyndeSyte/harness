@@ -78,7 +78,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // the link's state file on disk (corrupt: what it holds instead of the saved state), hung reads
   // killed at the ceiling, and what Discord answers to a webhook patch of @original (another id).
   const survive = { fn: null as null | ((id: string) => boolean | null) };
-  const landLedger = { keys: new Set<string>(), broken: false };
+  const landLedger = { keys: new Set<string>(), broken: false, what: new Map<string, { pr: string; head: string; at: string }>(), settled: new Map<string, string>(),
+    untrusted: null as string | null, pruned: 0 };
+  // Round 8: the state file's modification time and the savedAt stamped in it (null: not wired).
+  const stamp = { value: null as null | { mtime: number; savedAt: number | null } };
   const disk = { corrupt: null as string | null, writes: 0 };
   const kills = { n: 0 };
   const autoKeep = (req: any) => {
@@ -185,7 +188,21 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     rest, load: () => (disk.corrupt !== null ? emptyState() : copy(state)), save: (s: State) => { state = copy(s); disk.corrupt = null; disk.writes++; }, now: () => t.now,
     stateHealth: () => (disk.corrupt !== null ? { ok: false, why: "corrupt or mid-write" } : { ok: true }),
     requestLogged: (id: string) => (survive.fn ? survive.fn(id) : true),
-    claimLanding: (key: string) => { if (landLedger.broken) return null; if (landLedger.keys.has(key)) return false; landLedger.keys.add(key); return true; },
+    landings: {
+      claim: (key: string, what: { pr: string; head: string; at: string }) => {
+        if (landLedger.broken || landLedger.untrusted) return null;
+        if (landLedger.keys.has(key)) return false;
+        landLedger.keys.add(key); landLedger.what.set(key, what); return true;
+      },
+      settle: (key: string, how: string) => { if (!landLedger.settled.has(key)) landLedger.settled.set(key, how); },
+      entries: () => [...landLedger.keys].map((key) => ({ key, ...(landLedger.what.get(key) ?? { pr: "", head: "", at: "" }),
+        ...(landLedger.settled.has(key) ? { settled: { how: landLedger.settled.get(key) as any, at: "" } } : {}) })),
+      prune: () => { landLedger.pruned++; return 0; },
+      untrusted: () => landLedger.untrusted,
+      trust: () => { landLedger.untrusted = null; },
+      count: () => landLedger.keys.size,
+    } as any,
+    lastWriter: () => stamp.value,
     killRead: () => { kills.n++; },
     relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
@@ -245,7 +262,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return checking(link); },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited, survive, landLedger, disk, kills, deps,
+    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited, survive, landLedger, stamp, disk, kills, deps,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

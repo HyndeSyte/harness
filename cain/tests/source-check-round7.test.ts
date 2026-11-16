@@ -9,13 +9,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LOST_TAP, Link, tapKid } from "../rootfs/opt/cain/link/core";
 import { CHECKS_PATH, parseChecks } from "../rootfs/opt/cain/record/core.ts";
-import { claimLanding, cycle, requestLoggedIn } from "../rootfs/opt/cain/record/main.ts";
+import { cycle, requestLoggedIn } from "../rootfs/opt/cain/record/main.ts";
+import { landingLedger } from "../rootfs/opt/cain/link/landings";
+const claimLanding = (dir: string, key: string, what: { pr: string; head: string; at: string }) => landingLedger(dir, join(dir, "..", "marker.json")).claim(key, what);
 import { Link as OldLink } from "./fixtures/link-0.11.0/core";
 import { cycle as oldCycle } from "./fixtures/keeper-0.11.0/main.ts";
 import { MIN, PR, SHA1, pendingWith, rig as linkRig } from "./link-rig";
 import { PENDING, rig as keeperRig } from "./rig.ts";
 
 const P = "state/PENDING.md";
+const CHECKED_PATH = CHECKS_PATH;
 const CHECKED = "the specialist's log, read at 8 this morning";
 const opts = ["Fixed", "Not fixed"];
 const logged: string[] = [];
@@ -128,24 +131,51 @@ describe("1. claims and journaled taps across a reset", () => {
     expect(threadLines(l, id)).toHaveLength(1);
   }, 30_000);
 
-  test("a crash after the claim, then a reset its check survived: acted on once, marked as a possible repeat", async () => {
+  test("a crash after the claim, then a reset that carried its check into the new epoch: acted on once, marked as a possible repeat", async () => {
+    // Round 8: survived means carried into the current epoch. The check was accepted only locally,
+    // the reset lost its commit, and the keeper ran it again after the epoch's ledger write: the
+    // ledger names that very request for the row's current version.
+    const b = await lostCheck();
+    const { l, id } = b;
+    const d = (l.link as any).d, relay = d.relay;
+    d.relay = () => { throw new Error("killed"); };
+    await expect(l.tap(structuredClone(l.msg(id)), l.ids(id)[0])).rejects.toThrow("killed");
+    d.relay = relay;
+    resetNow(b);
+    b.run();
+    const req = l.state().messages[id].checked!.req!;
+    expect(parseChecks(b.read(CHECKED_PATH)).P44.checked_req).toBe(req);
+    l.restart();
+    await l.link.sweep();
+    expect(tapped(l, id)).toHaveLength(1);
+    expect(tapped(l, id)[0]).toStartWith("Repeat of tap key tap-");
+    expect(lostLines(l)).toHaveLength(0);
+    expect(l.logs.join("\n")).toContain("predates the reset, but its check survived it: acted on");
+  }, 30_000);
+
+  test("round 8: a pre-reset claim whose check the epoch dropped is lost, never acted, though its request is still done in the log", async () => {
     const b = both();
-    const q1 = await ask(b.l, "Q1", CHECKED);                         // pushed: it survives the reset
+    const q1 = await ask(b.l, "Q1", CHECKED);                         // pushed before the reset
     const { l } = b;
     const d = (l.link as any).d, relay = d.relay;
     d.relay = () => { throw new Error("killed"); };
     await expect(l.tap(structuredClone(l.msg(q1.message)), l.ids(q1.message)[0])).rejects.toThrow("killed");
     d.relay = relay;
+    const key = Object.keys(l.state().taps!)[0];
     b.block(true);
     b.k.cain({ id: "cain-note-1", ops: [{ op: "note", item: "P11", text: "a note" }] });
     expect(b.run()).toMatchObject({ pushFailed: true });
     resetNow(b);
+    b.run();
+    expect(b.status().epoch.voided).toBe(true);
+    expect(requestLoggedIn(b.k.cfg.dir, l.state().taps![key].req!)).toBe(true);   // still done in the log
+    expect(parseChecks(b.read(CHECKED_PATH)).P44.recheck).toBeDefined();          // but dropped by the epoch
     l.restart();
     await l.link.sweep();
-    expect(tapped(l)).toHaveLength(1);
-    expect(tapped(l)[0]).toStartWith("Repeat of tap key tap-");
-    expect(lostLines(l)).toHaveLength(0);
-    expect(l.logs.join("\n")).toContain("predates the reset, but its check survived it: acted on");
+    await l.link.sweep();
+    expect(tapped(l)).toHaveLength(0);
+    expect(lostLines(l)).toHaveLength(1);
+    expect(l.state().taps![key]).toMatchObject({ outcome: "lost to reset" });
   }, 30_000);
 
   test("a journaled ask, then a reset that lost its check: Cain is told to disregard it, Dane one line on the card's thread", async () => {
@@ -287,7 +317,7 @@ describe("3. exactly once through the landing", () => {
     expect(claimLanding(join(dir, "l"), "k1", what)).toBe(true);
     expect(claimLanding(join(dir, "l"), "k1", what)).toBe(false);
     expect(claimLanding(join(dir, "l"), "k2", what)).toBe(true);
-    expect(readdirSync(join(dir, "l"))).toHaveLength(2);
+    expect(readdirSync(join(dir, "l")).filter((n) => !n.startsWith("."))).toHaveLength(2);
     writeFileSync(join(dir, "file"), "");
     expect(claimLanding(join(dir, "file", "x"), "k3", what)).toBeNull();
   });
@@ -462,7 +492,7 @@ describe("11. the docs", () => {
       expect(t).toContain("Repeat of tap key");
       expect(t).toContain("Re-check queue");
     }
-    expect(docs).toContain("at most one landing and one assistant-visible action per tap");
+    expect(docs).toContain("at most one unmarked line per tap key and at most one landing per tap");
     expect(docs).toContain("/data/record-holds.json");
     expect(docs).toContain("/data/link/state.json");
     expect(docs).toContain("tap_read_ms");

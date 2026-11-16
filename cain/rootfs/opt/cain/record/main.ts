@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
   maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, checksText, parseChecks, type OneOff, type WaitTimeout,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
-import { projectChecked, voidChecks } from "./core.ts";
+import { projectChecked, TAP_KEY, voidChecks } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
 
@@ -330,7 +330,12 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // (above everything the link's state then shows) on the first round that can read it; until then
   // the reset stands, even after a push lands.
   epochWait?: { at: string; why: string };
-  floorWhy?: string };                    // why the link's state couldn't be read for the floor ("" or absent: it could)
+  floorWhy?: string;                      // why the link's state couldn't be read for the floor ("" or absent: it could)
+  // Tap keys already acted on (0.12.0): a request carrying a tap key (its optional tap field) is
+  // taken once per key; a second request citing a consumed key is refused. Kept here, outside the
+  // working copy, so no reset or re-clone forgets one. The newest TAPS_KEPT.
+  taps?: Record<string, { id: string; at: string }> };
+const TAPS_KEPT = 1000;
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
 
@@ -372,7 +377,9 @@ function revive(j: any): State | null {
     ...(j.epoch && Number.isInteger(j.epoch.n) && typeof j.epoch.at === "string" && Number.isInteger(j.epoch.generation)
       ? { epoch: { n: j.epoch.n, at: j.epoch.at, generation: j.epoch.generation, ...(j.epoch.voided === true ? { voided: true } : {}) } } : {}),
     ...(span(j.epochWait) ? { epochWait: span(j.epochWait)! } : {}),
-    ...(typeof j.floorWhy === "string" && j.floorWhy ? { floorWhy: j.floorWhy } : {}) };
+    ...(typeof j.floorWhy === "string" && j.floorWhy ? { floorWhy: j.floorWhy } : {}),
+    ...(j.taps && typeof j.taps === "object" && !Array.isArray(j.taps)
+      ? { taps: Object.fromEntries(Object.entries<any>(j.taps).filter(([k, v]) => TAP_KEY.test(k) && v && typeof v.id === "string" && typeof v.at === "string").map(([k, v]) => [k, { id: v.id, at: v.at }])) } : {}) };
 }
 
 function publishedHolds(cfg: Config): string | null {
@@ -721,6 +728,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         let o: Outcome;
         if (it.error) o = { ...base, state: "rejected", reason: clean(it.error) };
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
+        else if (it.req!.tap && S.taps?.[it.req!.tap] && S.taps[it.req!.tap].id !== id)
+          o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps[it.req!.tap].id}; act on a tap key once` };
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
         else o = decide(it.req!, !!it.local, base);
         if (it.repoPath && existsSync(join(cfg.dir, it.repoPath))) rmSync(join(cfg.dir, it.repoPath), { force: true });
@@ -729,6 +738,11 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         o.commit = commit(message(o));
         outcomes.push(o);
         owed.push(owe(o, !!it.local, it.req, !!it.error));
+        if (o.state === "done" && it.req?.tap) {
+          S.taps = { ...(S.taps ?? {}), [it.req.tap]: { id, at: at.toISOString() } };
+          const keys = Object.keys(S.taps);
+          if (keys.length > TAPS_KEPT) for (const k of keys.slice(0, keys.length - TAPS_KEPT)) delete S.taps[k];
+        }
         // A hold that ended or moved may let a waiting take through, before anything newer.
         if (o.state === "done" && S.waiting.length) settle();
       }
@@ -929,23 +943,8 @@ export function linkCardItems(cfg: Config): string[] {
   } catch { return []; }
 }
 
-// Landings by a tap's idempotency key (0.12.0): the keeper's landing ledger, one file per key under
-// /data/record-landings (outside the working copy, so no reset or re-clone touches it), made with an
-// exclusive create. The link asks before each landing it starts for a tap: true the first time a key
-// is seen, false ever after (a second landing for the same tap is rejected), null when the ledger
-// can't be written (no landing starts then either).
-export function claimLanding(dir: string, key: string, what: { pr: string; head: string; at: string }): boolean | null {
-  const name = createHash("sha256").update(key).digest("hex").slice(0, 32);
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, `${name}.json`), JSON.stringify({ key, ...what }) + "\n", { flag: "wx" });
-    return true;
-  } catch (e: any) {
-    if (e?.code === "EEXIST") { log(`landing for tap key ${name.slice(0, 12)} rejected: one already started for it`); return false; }
-    log(`couldn't write the landing ledger (${clean(String(e?.message ?? e), 80)}); no landing starts`);
-    return null;
-  }
-}
+// The landing ledger (/data/record-landings) is the link's alone (link/landings.ts): the keeper never
+// writes, reads or cleans it.
 
 // The clock's verdict changed (synchronized or not, by which source, each source's state):
 // one log line naming what each source returned, instead of a refusal per check.
@@ -965,7 +964,7 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       at: now.toISOString(), generation: st.generation ?? 0, unpushed: st.unpushed === true,
       ...(st.pushFailed ? { push_failed: st.pushFailed } : {}), ...(st.reset ? { reset: st.reset } : {}),
       ...(st.lastReset ? { last_reset: st.lastReset } : {}), ...(st.outage ? { outage: st.outage } : {}),
-      ...(st.epoch ? { epoch: { n: st.epoch.n, at: st.epoch.at, generation: st.epoch.generation } } : {}),
+      ...(st.epoch ? { epoch: { n: st.epoch.n, at: st.epoch.at, generation: st.epoch.generation, voided: st.epoch.voided === true } } : {}),
       ...(st.floorWhy ? { link_state: { readable: false, why: st.floorWhy } } : {}),
       ...(st.epochWait ? { epoch_wait: st.epochWait } : {}),
       recheck_pending: recheckPending(cfg),

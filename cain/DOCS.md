@@ -18,7 +18,9 @@ plugin (research preview) and your Claude plan; no API key.
 Options you may change, none needed: `source_check_max_days` (7 by default, 1 to 90) is
 how many days a source check counts before Cain's questions and Ship cards about that item
 need a new one. `tap_read_ms` (1500 by default, 200 to 2500) is how long a tap may wait on
-reading the record before it answers "Busy, tap again".
+reading the record before it answers "Busy, tap again". If you change it, set tap_read_ms from the
+measured p95: the install smoke test's `keeper.sh reads` prints `p95_ms`, and the limit should be
+at least twice that (the reads fail loudly past half the limit).
 
 ## What Cain reads in Discord without asking
 
@@ -489,11 +491,16 @@ What Cain's link enforces:
   reads in the link's own process, so there is nothing to spawn) and its slot is released by a
   timer that doesn't wait for the read to settle, with one log line. Two taps on one card at once
   (on different buttons, say) are handled one at a time: the second starts no read, waits for the
-  first, and is answered with the first one's recorded outcome, so exactly one is honoured. A busy
+  first, and is answered with the first one's recorded outcome, so exactly one is honoured. If the
+  first hasn't settled by the read limit, the second answers "Busy, tap again." at once: it never
+  reads a claim the first is still writing and never starts a second action. A busy
   answer (and every refusal that keeps the buttons) patches the card's original message back as it
   was through the interaction's webhook, so its buttons are live again, and the reason follows to
   you alone; when that patch fails, or Discord answers with another message's id, the link edits
-  the card by its channel and message id with the bot's token instead. Each honoured tap gets an
+  the card by its channel and message id with the bot's token instead. The link posts cards as the
+  bot, so a bot-token edit of a card's components is allowed (Discord lets the author edit its own
+  message); the install smoke test forces the webhook patch to fail once on real Discord and checks
+  the buttons come back that way. Each honoured tap gets an
   idempotency key (the card, its ledger generation, its check's request id, the item and the
   label), written to the link's state in the same atomic save that marks the card answered,
   before Cain is told or a landing starts. A retap or a Discord retry with the same key returns
@@ -504,13 +511,37 @@ What Cain's link enforces:
   The key travels on. Cain's relayed line for the tap ends with its short form ("Tap key
   tap-1a2b3c4d5e6f."). A line relayed again from a claim after a restart (the link may have been
   cut off between telling Cain and recording that it did) starts "Repeat of tap key ...: if you
-  already had a line with this tap key, ignore this one.", so Cain acts on a tap key once. A Ship
-  tap's landing carries the key to the keeper's landing ledger (`/data/record-landings/`, outside
-  the record's working copy) before its first try; the ledger takes a key once and rejects a
-  second landing with the same key, so a landing a restart cut off is never started again: main
-  alone settles it (in main: landed, with its token; not in main: not landed, and a new Ship card
-  ships it). The guarantee as it holds: at most one landing and one assistant-visible action per
-  tap; a repeated line is marked as a repeat.
+  already had a line with this tap key, ignore this one.", so Cain acts on a tap key once. A record
+  request Cain sends because of a tap may carry its tap key (an optional `tap` field, "tap-" and 12
+  hex digits); the keeper takes one request per key and refuses a second request citing a key
+  already acted on ("tap key ... was already acted on by request ..."). It keeps the consumed keys
+  in its own state file (`/data/record-holds.json`, outside the working copy), so no reset or
+  re-clone forgets one; the request's own replay after a reset is not a second request.
+
+  The landing ledger. A Ship tap's landing carries the key to the link's landing ledger
+  (`/data/record-landings/`, outside the record's working copy, one file per key, made with an
+  exclusive create). The claim file and its directory are fsynced before the first push attempt.
+  The ledger takes a key once and rejects a second landing with the same key, so a landing a
+  restart cut off is never started again. Such an orphan is settled against the remote: the link
+  fetches main from GitHub and looks for the landing's token (its head commit) there, never in its
+  local copy. In main: landed, with its Ship token. Not in main: the landing is abandoned, and you
+  get one line on the card's thread ("The install was interrupted by a restart and did not land; a
+  new card follows.") while Cain gets a "Landing abandoned" line and shows a new Ship card for the
+  same pull request and head. While GitHub can't be reached, the key stays unresolved: the card
+  stays as it is and no new Ship card for that pull request and head goes out. Before any landing
+  starts, the link also looks for the token on the remote main, so a re-ship of content already
+  there pushes nothing and is reported as landed. A settled key is marked so in its file and pruned
+  by the link after 30 days; an unsettled one is never pruned. The ledger is the link's alone: The
+  record keeper never writes or cleans that directory. The link keeps a marker outside the ledger
+  (`/data/link/landings-marker.json`, and a count in its own state) of how many keys it has
+  claimed; a ledger behind that marker or that count, or with another id, came back from a backup,
+  and is trusted again only once each of its keys was looked for on the remote main by its token
+  (until then no landing starts).
+
+  The guarantee as it holds: at most one unmarked line per tap key and at most one landing per
+  tap. A line relayed again carries the "Repeat of tap key" marker. Attested, not enforced:
+  that Cain honours the repeat marker and acts on a tap key once (the keeper enforces it only for
+  requests that carry the key).
 - A one-off (`--item none`) is refused when its text holds an open row's item code or the
   row's whole Item phrase, quoting what matched. One whose words overlap an open row's Item
   more loosely (two of the row's distinctive words, or its only one) is held: nothing is
@@ -592,8 +623,15 @@ anything.
 A tap honoured while the ledger is unpushed is journaled by the link in its state file in
 `/data` (the card's generation and epoch, the check's request id, the item, the time, the label
 and the tap's key). Claims and journaled taps across a reset: one recorded before the reset is
-honoured only if the check it rests on survived it (its accepting request is in `log/requests/`
-on the keeper's current copy). One that didn't is lost to the reset: it is recorded so under its
+honoured only if the check it rests on survived it, judged after a restart by exactly the
+predicate a live tap uses. Survived means: the accepting request is done in `log/requests/` on
+the keeper's current copy, and the check was carried into the current epoch for the row's current
+version (the epoch's ledger write has dropped every older check, and the ledger's entry for the
+item names that very request, fresh, at the row's current version), with the ledger's generation
+no lower than the card's. A check the epoch dropped is not carried, so a claim resting on it comes
+out lost, never acted, even though its request is still done in the log; only a check accepted in
+a commit the reset lost, and run again by the keeper after the epoch began, survives. One that
+didn't survive is lost to the reset: it is recorded so under its
 idempotency key, never acted on past the reset and never dropped silently, and you get one line
 on the card's thread ("Lost to the record's reset, please answer again.") while Cain gets a
 relayed line saying the tap was lost to the record's reset, please answer again (for a tap he
@@ -602,8 +640,11 @@ is accepted. The card's buttons come off ("Record reset since, re-check needed")
 cleared once a push lands. Once a push failure is older than 30 minutes, taps are refused with
 their own reason (record unpushed) instead. And when the keeper's status has shown unpushed or
 reset for more than 30 minutes or three rounds, the link posts you one notice, once per outage,
-with the push error in plain words ("Cain's record hasn't saved to GitHub since 9:40 AM: GitHub
-didn't answer. Nothing is lost: the box keeps its copy and keeps trying.").
+with the push error in plain words and how long Ship taps have been held ("Cain's record hasn't
+saved to GitHub since 9:40 AM: GitHub didn't answer. Ship taps are held until it saves, for 35
+minutes so far. Nothing is lost: the box keeps its copy and keeps trying."). `keeper.sh clock`
+shows `recheck_pending` (also in the keeper's status) and whether Ship taps are held, and each
+check-in tells Cain how many items are pending re-check.
 
 What is mechanical and what rests on Cain's word. Mechanical, in code: no ask or Ship card
 about an item posts, and no tap on one counts, without a `check` the keeper accepted for
@@ -674,6 +715,10 @@ The install smoke test (about twelve minutes):
    `/opt/cain/keeper.sh stall-read 20` again and, while it holds, tap a checked test ask. Expect
    "Busy, tap again." as a reply only you see, its buttons are still there after the busy reply, and, once the 20 seconds are over, your next tap on it honoured once (relayed once,
    the card showing your answer).
+14. `/opt/cain/keeper.sh fail-webhook` (expect `"status":"ok"`), then `/opt/cain/keeper.sh
+   slow-read` and a checked test ask you tap. Expect "Busy, tap again.", the buttons back on the
+   card, and `/data/work/link.log` showing `forced by the smoke test (keeper.sh fail-webhook)` and
+   `editing it by channel and message id`: the buttons came back through the bot's own edit.
 
 It passes only when he sees committed in the record the `check` request done in
 `log/requests/`, `state/checks.json` with that row's entry and his check, and the open
@@ -725,14 +770,19 @@ R5. The rollback, last. Cain asks you to restore this App from the backup taken 
 Rollback. If the smoke test fails, the remedy is one step: in Home Assistant, restore this
 App from the backup taken just before the install (every install takes one first), which
 brings back its previous version. That backup must cover the keeper's state file outside the
-working copy (`/data/record-holds.json`, with the epoch and the reset that waits on it, and the
-landing ledger `/data/record-landings/`) and the link's state (`/data/link/state.json`, with the
-tap keys, the cards' epochs and the intended generation); a backup of the whole App, as Home
+working copy (`/data/record-holds.json`, with the epoch, the reset that waits on it and the
+consumed tap keys), the link's landing ledger (`/data/record-landings/`, checked against the remote
+main before it is trusted again after a restore) and the link's state (`/data/link/state.json`,
+with the tap keys, the cards' epochs and the intended generation); a backup of the whole App, as Home
 Assistant takes before an install, covers all of `/data` but the two keys it leaves out. The
 rollback test runs this version's record against the previous keeper, copied into the tests as
 `cain/tests/fixtures/keeper-0.11.0`, and loads the state this version writes (epochs, tap keys,
 the intended generation, a waiting epoch, a landing ledger) into that keeper and into the
-previous link (`cain/tests/fixtures/link-0.11.0`): both start and ignore it. The fixtures are
+previous link (`cain/tests/fixtures/link-0.11.0`): both start and ignore it. A roll-forward test
+runs this version, then the previous link answering taps and landing, then this version again: no
+stale claim acts and no ledger key gives a wrong result. On start the link discards claims older
+than the previous version's last run; the marker the versions share is the state file's
+modification time, against the time this version stamps in each save (`savedAt`). The fixtures are
 pinned to the version installed on the Pi (0.11.0 today), and move when the Pi's does. After any
 rebase onto a version bump (pull request 20, pull request 21 and pull request 23 also bump this
 App's version; pull request 20 lands first and this rebases onto it),

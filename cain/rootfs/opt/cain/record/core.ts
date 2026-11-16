@@ -40,7 +40,9 @@ export type Request = {
   summary: string;     // one line, becomes the commit message
   ops?: Op[];          // kind "change"
   note?: { text: string; about?: string };  // kind "note": Dane's words from his page, for Cain
+  tap?: string;        // optional (0.12.0): the tap key (tap-<12 hex>) of the relayed tap this request acts on; the keeper takes one request per key
 };
+export const TAP_KEY = /^tap-[0-9a-f]{12}$/;
 
 export type Outcome = {
   id: string; from: string; kind: string; summary: string;
@@ -153,6 +155,7 @@ export function parseRequest(raw: string): { req?: Request; error?: string } {
   // go into the log and the reply).
   const req = j as Request;
   if (!knownSender(j.from)) return { req, error: "from must be cain or laptop:<session id> (or page, for Dane's page)" };
+  if (j.tap !== undefined && (typeof j.tap !== "string" || !TAP_KEY.test(j.tap))) return { req, error: "tap, when given, is the tap key a relayed tap line ended with (tap- and 12 hex digits)" };
   if (j.kind === "note") {
     if (!j.note || typeof j.note.text !== "string" || !j.note.text.trim()) return { req, error: "note needs text" };
     return { req };

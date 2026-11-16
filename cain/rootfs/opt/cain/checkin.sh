@@ -133,6 +133,12 @@ if [ -s "$audit.work" ]; then
   [ "$total" -gt 3 ] && found=" ($((total - 3)) older not shown; state/one-off-audit.md lists them)$found"
   [ -n "$found" ] && lead="${lead}The record keeper's one-off audit since your last check-in (look at each; if a one-off was really about an open item, check that item at its source and ask under it):$found. "
 fi
+# Rows pending re-check after a reset of the record (the keeper's status): counted here, once per
+# check-in, until each is checked again.
+rp=$(jq -r '.recheck_pending // 0' "${RECORD_STATUS:-/data/record-ledger.json}" 2>/dev/null)
+if [ -n "$rp" ] && [ "$rp" -gt 0 ] 2>/dev/null; then
+  lead="${lead}Pending re-check after the record's reset: $rp item(s) (keeper.sh clock shows recheck_pending). Check each at its source and ask again with --checked if it still needs him. "
+fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
 else

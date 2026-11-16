@@ -22,6 +22,12 @@
 - If the App's own saved state is ever damaged, it rebuilds it by itself and tells you once; questions work again without you doing anything.
 - If the box ever has to start its copy of the record over, questions asked before that stop working (they say "Record reset since, re-check needed"), and every check from before it is marked pending re-check on your list until Cain checks again, the items with questions out first.
 - Right after this install Cain runs a quick test, about twelve minutes, that breaks nothing: a few test questions (tap any answer, or tap an old one when he says so), a harmless Ship card (tap Not now), and one notice that the record isn't saving, which he causes on purpose. For one step he asks you to set source_check_max_days to 0 and then back to 7, the only option you change. He tells you in a line whether it worked. If not, restore the App from the backup taken before the install; nothing else needs undoing.
+- If the box restarts in the middle of landing a Ship tap, the App asks GitHub itself whether it landed, never its own copy. If it didn't, you get one line under that card ("The install was interrupted by a restart and did not land; a new card follows.") and Cain shows you a new Ship card. If GitHub can't be reached, nothing new goes out until it can. Shipping something that is already in main pushes nothing and just says so.
+- A tap that waits on another tap on the same question for too long answers "Busy, tap again." straight away and does nothing else.
+- A tap from before the record had to start over counts afterwards only if the record really took its check again since; otherwise you get the "Lost to the record's reset" line.
+- The notice that the record isn't saving now says how long Ship taps have been held. Nothing to set up beyond the smoke test's one option change.
+- The smoke test gains one step: it makes Discord's usual way of putting a question's buttons back fail on purpose, and checks they come back anyway.
+- After a restore from a backup, the App checks with GitHub what has landed before it ships anything again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 
 ## 0.11.0

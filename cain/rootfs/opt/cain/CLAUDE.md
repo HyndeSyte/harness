@@ -152,7 +152,10 @@ specialist (the Harness add-on) does.
   link was cut off in the middle of is finished from its record after a restart, never redone.
   Each relayed tap line ends with its tap key ("Tap key tap-..."). A line that starts "Repeat of
   tap key" may be one you already had: if you already had a line with that tap key, ignore it;
-  act on a tap key once. A Ship tap lands at most once.
+  act on a tap key once. When you record what a tap said, put its tap key on the request:
+  `"tap": "tap-1a2b3c4d5e6f"` beside its id (optional, but use it): the record keeper takes one
+  request per tap key and refuses a second one citing a key already acted on. A Ship tap lands
+  at most once.
   While the record keeper can't read the link's state, asks and Ship cards are refused saying
   so: ask again in a few minutes. If the link's own state is damaged, it rebuilds it by itself
   and tells him once; you get a line saying so: check the items still open and ask again what
@@ -164,7 +167,8 @@ specialist (the Harness add-on) does.
   reset, please answer again, with its item and tap key. Record nothing from that tap (if you
   already acted on it, say so to him only if it changed something he can see), and once the
   item's re-check is accepted, ask again with --checked if it still needs him. A tap whose check
-  survived the reset stands. A long push outage (over 30 minutes or three rounds) also
+  survived the reset stands (survived: the keeper ran its check again after the reset, so it counts
+  now; a check the reset only dropped never survives). A long push outage (over 30 minutes or three rounds) also
   gets him one notice from the App with the error in plain words: don't repeat it. A held ask
   whose row changes is dropped unasked, and you're told. Check again and ask again if it
   still needs him.
@@ -430,6 +434,11 @@ create, update or run any other routine.
      settles.
    - Not landed: tell him in one line why, as a reply to the card, and what happens
      next (fixes through Build, then a new Ship card for the new head).
+   - Landing abandoned ("Landing abandoned: ..."): a restart cut the landing off and main
+     doesn't have it, so nothing landed. He was already told on the card that a new card
+     follows: check Home Assistant first, then show a new Ship card for the same pull request
+     and head, with `--checked`. If GitHub couldn't be read to settle it, you hear nothing
+     yet and a new Ship card for that pull request and head is refused until it settles.
    - In main but not installed (it landed just before a Stop, or the install's token ran
      out): once nothing is stopped, show a new Ship card for the same pull request and
      head. It stays up, and his tap on it gives a fresh token to install it.
@@ -501,6 +510,10 @@ smoke test and any answer does. Command, then the expected line:
    1000, `"pass":true`. Then on real Discord: run it again and, while it holds, he taps a checked
    test ask: "Busy, tap again." reaches him alone, its buttons are still there after the busy
    reply, and once the 20 seconds are over his next tap on it counts once (relayed once).
+14. `/opt/cain/keeper.sh fail-webhook` (`"status":"ok"`), then `/opt/cain/keeper.sh slow-read` and a
+   checked test ask he taps: "Busy, tap again.", the buttons back on the card, and
+   /data/work/link.log "forced by the smoke test (keeper.sh fail-webhook)" and "editing it by
+   channel and message id".
 It passes only when you also see committed in the record: the `check` request done in
 log/requests/, state/checks.json with that row's entry and your check, and the open table's
 Checked column showing it. Tell him the result in one line with the commit hashes of those

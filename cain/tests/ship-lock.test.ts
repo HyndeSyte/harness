@@ -128,8 +128,8 @@ describe("his Ship tap lands it in main", () => {
   });
 
   test("a landing the link was cut off from is settled from main by the sweep, never landed a second time", async () => {
-    // Round 7: the tap's key is in the keeper's landing ledger from its first try, so after a restart
-    // main alone says whether it landed.
+    // Round 7: the tap's key is in the link's landing ledger from its first try, so after a restart
+    // the remote main alone says whether it landed (round 8: not there, the landing is abandoned).
     const r = rig();
     const id = await ship(r);
     r.github.hold = true;
@@ -143,7 +143,8 @@ describe("his Ship tap lands it in main", () => {
     r.later(2 * MIN);
     await sweep(r);
     expect(r.github.landings).toHaveLength(1);
-    expect(r.msg(id).content).toBe(`${card}\n\nNot shipped: a landing for this tap was already started and was cut off by a restart, so it isn't started again. Nothing changed in main.`);
+    expect(r.msg(id).content).toBe(`${card}\n\nNot shipped: the install was interrupted by a restart and did not land. Nothing changed in main.`);
+    expect(r.relayed.at(-1)).toStartWith("Landing abandoned:");
     expect(findToken(r.relayed.at(-1)!)).toBeNull();
   });
 

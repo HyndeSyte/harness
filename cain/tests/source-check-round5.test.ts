@@ -208,7 +208,7 @@ describe("3. the generation floor: the keeper's state file is outside the workin
 });
 
 describe("4. taps honoured while the ledger is unpushed: journaled, judged after a reset, refused after 30 minutes", () => {
-  test("a tap during a push failure, then a forced conflict reset: its check survived, so it stands; the journal clears once a push lands", async () => {
+  test("a tap during a push failure, then a forced conflict reset: it waits while the reset stands, then (its check dropped by the epoch) is lost to the reset once; the journal clears", async () => {
     const { k, l, run, read, block } = both();
     const q1 = await ask(l, "Q1", CHECKED);
     expect(q1.status).toBe("posted");
@@ -217,7 +217,8 @@ describe("4. taps honoured while the ledger is unpushed: journaled, judged after
     k.cain({ id: "cain-next-1", ops: [{ op: "row", item: "P11", base: rowHash(openRow(read(P), "P11")!), set: { "Next step": "Mine" } }] });
     expect(run()).toMatchObject({ pushFailed: true });
     expect(await l.tap(structuredClone(l.msg(q1.message)), l.ids(q1.message)[0])).toBe("to Cain");
-    expect(l.state().uncertain).toEqual([{ gen, check: expect.stringMatching(/^link-check-p44-/), item: "P44", at: l.t.now, msg: q1.message, label: "Fixed", epoch: 0, key: expect.any(String) }]);
+    expect(l.state().uncertain).toEqual([{ gen, check: expect.stringMatching(/^link-check-p44-/), item: "P44", at: l.t.now, msg: q1.message, label: "Fixed", epoch: 0, key: expect.any(String),
+      ref: expect.objectContaining({ gen, epoch: 0 }), kind: "ask" }]);
     await l.link.sweep();
     expect(l.relayed.join(" ")).not.toContain("may not have landed");   // no reset yet: nothing to say
     // A forced conflict resets the copy while pushes still fail.
@@ -226,19 +227,22 @@ describe("4. taps honoured while the ledger is unpushed: journaled, judged after
     l.later(MIN); k.at(new Date(l.t.now));                              // the keeper's clock moves with the link's
     expect(run()).toMatchObject({ pushFailed: true });
     expect(JSON.parse(l.files.status!).reset.why).toContain("conflict forced by the smoke test");
-    // Round 7: the check this tap rested on was pushed before the reset, so it survived it (its
-    // request is in log/requests on the keeper's copy): the tap stands, and nobody is told otherwise.
+    // Round 8: while the reset stands nothing can be told, so the journaled tap waits.
     const before = l.posts();
     await l.link.sweep();
-    expect(l.logs.join("\n")).toContain("rests on a check that survived the reset: it stands");
     expect(l.relayed.join(" ")).not.toContain("lost to the record's reset");
     expect(l.posts()).toBe(before);
-    await l.link.sweep();
-    expect(l.posts()).toBe(before);
-    // The push lands: the journal is cleared.
+    // The push lands and the epoch's ledger write drops the check this tap rested on (it was pushed
+    // before the reset, so nothing carried it into the new epoch): its request is still done in the
+    // log, but the tap is lost to the reset, told once, never left standing.
     block(false);
     expect(run().ok).toBe(true);
+    expect(run().ok).toBe(true);
+    expect(JSON.parse(l.files.status!).epoch).toMatchObject({ n: 1, voided: true });
     await l.link.sweep();
+    expect(l.relayed.filter((x) => x.includes("was lost to the record's reset"))).toHaveLength(1);
+    await l.link.sweep();
+    expect(l.relayed.filter((x) => x.includes("was lost to the record's reset"))).toHaveLength(1);
     expect(l.state().uncertain).toBeUndefined();
   }, 30_000);
 
@@ -283,7 +287,7 @@ describe("5. a long outage: one notice to Dane with the push error in plain word
     r.files.status = down(r, 3 * MIN, 3);
     await r.link.sweep();
     expect(notices(r)).toHaveLength(1);
-    expect(notices(r)[0].content).toBe("Cain's record hasn't saved to GitHub since 7:57 AM: GitHub didn't answer. Nothing is lost: the box keeps its copy and keeps trying.");
+    expect(notices(r)[0].content).toBe("Cain's record hasn't saved to GitHub since 7:57 AM: GitHub didn't answer. Ship taps are held until it saves, for 3 minutes so far. Nothing is lost: the box keeps its copy and keeps trying.");
     expect(notices(r)[0].content).not.toContain("github.com");
     expect(r.state().messages[notices(r)[0].id]).toMatchObject({ kind: "notice" });
     r.later(40 * MIN);

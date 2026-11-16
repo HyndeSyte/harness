@@ -53,12 +53,16 @@
 #                                        passes; about 80 seconds
 #   keeper.sh slow-read                  the smoke test: the next tap's fresh read is held past its limit,
 #                                        so that tap must answer "Busy, tap again." and keep its buttons
+#   keeper.sh fail-webhook               the smoke test: the next time a busy tap puts a card's buttons back,
+#                                        the interaction's webhook patch is made to fail, so the buttons must
+#                                        come back through the fallback (an edit by channel and message id)
 #   keeper.sh stall-read [seconds]       the smoke test: a fresh read held that long (default 20), ignoring its
 #                                        cancellation; a second read meanwhile must answer busy at once, and a
 #                                        journal write to the link's state must still finish ("pass":true)
 #   keeper.sh clock                      the clock verdict (the record keeper's, with the source that
 #                                        satisfied it, and the box's own), the ledger's generation, whether
-#                                        a push or a reset is outstanding, and the last tap's read time
+#                                        a push or a reset is outstanding, how many rows are pending re-check
+#                                        (recheck_pending), whether Ship taps are held, and the last tap's read time
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
@@ -83,6 +87,7 @@ case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock|reads) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   slow-read) url="$link/slowread"; ctx=harness-relay-v1 ;;
+  fail-webhook) url="$link/failwebhook"; ctx=harness-relay-v1 ;;
   stall-read) url="$link/stallread"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
@@ -165,6 +170,7 @@ case "$cmd" in
   stopped)  body='{}' ;;
   clock)    body='{}' ;;
   slow-read) body='{}' ;;
+  fail-webhook) body='{}' ;;
   stall-read) body=$(jq -nc --arg n "${1:-20}" '{seconds: ($n | tonumber? // 20)}') ;;
   reads)    body=$(jq -nc --arg n "${1:-20}" '{n: ($n | tonumber? // 20)}') ;;
   card)     body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
