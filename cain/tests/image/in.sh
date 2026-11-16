@@ -173,7 +173,7 @@ final)
     || fail "prompt-state: the auto mode offer isn't read as a dialog"
   [ "$(seen 'Claude said:\n  For shortcuts, press ?\n')" = other ] && [ "$(seen '')" = other ] \
     || fail "prompt-state: words quoting a footer, or an empty screen, read as more than other"
-  [ "$(seen '❯ /permissions\n  ? for shortcuts\n')" = other ] \
+  [ "$(seen '❯ /permissions\n  ? for shortcuts\n')" = other ] && [ "$(seen '❯ │\n  ? for shortcuts\n')" = other ] \
     || fail "prompt-state: a draft in his input box read as ready"
   # Claude Code's own empty prompt line: the mark and a no-break space (U+00A0, octal 302 240).
   [ "$(seen '──────\n❯\302\240\n──────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n')" = ready ] \

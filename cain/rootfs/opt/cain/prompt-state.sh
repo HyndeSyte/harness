@@ -24,11 +24,17 @@
 # space here, or his empty prompt would read as a draft (seen on Claude Code 2.1.317, Nov 16).
 awk '
   function border(s) { gsub(/─|━|╭|╮|╰|╯|│|\302\240|[[:space:]]/, "", s); return s == "" }
-  # 2: his prompt line, empty; 1: his prompt line with anything in it; 0: not one.
-  function prompt(s) {
-    sub(/^([[:space:]]|\302\240|│)*/, "", s)
+  # 2: his prompt line, empty; 1: his prompt line with anything in it; 0: not one. Only the box
+  # itself is taken off: a left edge before the mark, and then its right edge at the end; a "│"
+  # typed in the box stays, as any other draft (round 13).
+  function prompt(s,   boxed) {
+    sub(/^([[:space:]]|\302\240)*/, "", s)
+    boxed = (s ~ /^│/)
+    if (boxed) sub(/^│([[:space:]]|\302\240)*/, "", s)
     if (s !~ /^(>|❯)/) return 0
-    sub(/^(>|❯)/, "", s); gsub(/[[:space:]]|\302\240|│/, "", s)
+    sub(/^(>|❯)/, "", s); sub(/([[:space:]]|\302\240)*$/, "", s)
+    if (boxed) { if (s !~ /│$/) return 1; sub(/│$/, "", s); sub(/([[:space:]]|\302\240)*$/, "", s) }
+    sub(/^([[:space:]]|\302\240)*/, "", s)
     return s == "" ? 2 : 1
   }
   function footer(s) { return s ~ /^([[:space:]]|\302\240)*([?] for shortcuts|(⏵)+([[:space:]]|\302\240)*auto mode on)/ }

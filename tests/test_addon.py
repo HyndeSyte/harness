@@ -1649,6 +1649,9 @@ _START = ("  Fable 5.2 is here for your longest and toughest coding tasks.\n\n{r
           "{gap}Update available! Run: winget upgrade Anthropic.ClaudeCode")
 REAL_START_OFF = _START.format(rule=RULE, box="", gap=" " * 40)
 REAL_START_ON = _START.format(rule=RULE, box='Try "how does <filepath> work?"', gap=" " * 40)
+# A draft of nothing but the box's own edge character (round 13): typed, so a draft.
+BAR_DRAFT = "❯ │\n  ? for shortcuts"
+BOX_BAR_DRAFT = f"╭{RULE}╮\n│ > │ {' ' * 54}│\n╰{RULE}╯\n  ? for shortcuts"
 
 
 def _prompt_state(screen):
@@ -1671,7 +1674,8 @@ def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
     for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE, REAL_START_OFF,
                    "To stop it, press Esc to cancel.\n" + IDLE):
         assert _prompt_state(screen) == "ready", screen
-    for screen in (DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, REAL_START_ON, "> Try this instead\n  ? for shortcuts",
+    for screen in (DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, REAL_START_ON, BAR_DRAFT, BOX_BAR_DRAFT,
+                   "❯ ││\n  ? for shortcuts", "> Try this instead\n  ? for shortcuts",
                    "❯ x \n  ? for shortcuts"):
         assert _prompt_state(screen) == "other", screen                             # a draft not sent
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
@@ -1695,7 +1699,8 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
     and his taps wait for it, as the check-in does within its hour."""
     import os
     import shutil
-    for screen in (AUTO_MODE_OFFER, QUOTED_FOOTER, OPTION_SCREEN, DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, WORKING):
+    for screen in (AUTO_MODE_OFFER, QUOTED_FOOTER, OPTION_SCREEN, DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT,
+                   BAR_DRAFT, BOX_BAR_DRAFT, WORKING):
         assert _checkin(tmp_path, "0712", screen) == "", screen       # (WORKING: at work, later)
     assert list((tmp_path / "done").glob("*")) == []                  # the morning one still to come
     out = _checkin(tmp_path, "0712", "To stop it, press Esc to cancel.\n" + IDLE_WITH_TASKS)
@@ -1706,7 +1711,7 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
         os.environ["RELAY_QUEUE"] = str(q)
         try:
             (tmp_path / "sent.txt").unlink()
-            for screen in (AUTO_MODE_OFFER, DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT):   # his tap waits for him,
+            for screen in (AUTO_MODE_OFFER, DRAFT, BOX_DRAFT, LOOKALIKE_DRAFT, BAR_DRAFT):   # his tap waits,
                 assert _checkin(tmp_path, "0712", screen) == "", screen
                 assert q.exists() and not (tmp_path / "relay.queue.work").exists()   # untouched
             assert 'Dane tapped "Ship"' in _checkin(tmp_path, "0712", IDLE)
