@@ -56,7 +56,7 @@
 import { existsSync, lstatSync, mkdirSync, openSync, closeSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, writeSync, appendFileSync } from "node:fs";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { homedir } from "node:os";
+import { homedir, uptime as osUptime } from "node:os";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { domainToASCII, fileURLToPath } from "node:url";
@@ -172,6 +172,7 @@ const P = {
   hookCapture: (o: Opts) => join(o.home, "hook-capture"),
   probeMarks: (o: Opts) => join(o.home, "probe-marks"),
   hookMargin: (o: Opts) => join(o.home, "hook-margin.json"),
+  hookWorst: (o: Opts) => join(o.home, "hook-worst.json"),
 };
 
 export const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -523,6 +524,9 @@ export function baseEnv(o: Opts): Record<string, string> {
   for (const [k, v] of Object.entries(envOf(o))) {
     if (typeof v !== "string") continue;
     const u = k.toUpperCase();
+    // Never a probe variable from the worker's own environment (0.12.0, twentieth round): only the
+    // probe sets them, for the one session it binds (bindProbe).
+    if (PROBE_ENV.includes(u)) continue;
     if (ENV_KEEP.has(u) || (CLAUDE_CODE_OK[u] && CLAUDE_CODE_OK[u](v, o.has ?? existsSync))) env[k] = v;
   }
   return { ...env, DISABLE_AUTOUPDATER: "1", PCW_RUNTIME: fwd(process.execPath), PCW_WORKER: fwd(WORKER_FILE) };
@@ -762,6 +766,23 @@ export function fingerprint(o: Opts, inst: Install): Fingerprint | null {
   const cli_version = (o.cliVersion ?? (() => cliVersion(inst)))();
   if (!cli_version) return null;
   return { user_data_dir: resolve(p.user_data_dir), profile_name: name, extension_id: p.extension_id, chrome_major, chrome_version, extension_version, cli_version };
+}
+// The versions a probe ran against and a confirmation holds (0.12.0, twentieth round): the extension's
+// id and version and Chrome's version, as they are in the fingerprint, named on their own in the probe's
+// result and in confirm-profile's answer so the owner sees exactly what was probed.
+export interface Versions { extension_id: string; extension_version: string; chrome_version: string }
+export const versionsOf = (fp: Fingerprint): Versions => ({ extension_id: fp.extension_id, extension_version: fp.extension_version, chrome_version: fp.chrome_version });
+// A run against other installed versions than the confirmation's (the extension's manifest in the
+// profile, Chrome's Last Version, read now by fingerprint): a named message for the owner's line, or
+// null when they match. The run refuses (probe_stale) until a new probe and confirmation.
+export function versionMismatch(o: Opts, inst: Install): string | null {
+  const c = readConfirmed(o), fp = fingerprint(o, inst);
+  if (!c || !fp) return null;
+  const said: string[] = [];
+  if (c.fingerprint.extension_id !== fp.extension_id) said.push(`the extension's id is ${fp.extension_id}, the probe saw ${c.fingerprint.extension_id}`);
+  if (c.fingerprint.extension_version !== fp.extension_version) said.push(`Claude in Chrome is ${fp.extension_version} in the profile's manifest, the probe saw ${c.fingerprint.extension_version}`);
+  if (c.fingerprint.chrome_version !== fp.chrome_version) said.push(`Chrome is ${fp.chrome_version}, the probe saw ${c.fingerprint.chrome_version}`);
+  return said.length ? `version_mismatch: ${said.join("; ")}: run the probe again, then confirm-profile` : null;
 }
 const sameParts = (a: Fingerprint, b: Fingerprint, keys: readonly string[]) => keys.every((k) => (a as any)[k] === (b as any)[k]);
 // Which version stopped runs (probe_stale): the extension's, Chrome's, or the CLI's.
@@ -1055,9 +1076,10 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // or the pinned settings do (18: read-guard's strict parser refuses a byte order mark, lone
 // surrogates and unsafe integers, and the hooks' timeout in the pinned settings is 40 seconds; 19:
 // both hooks refuse at once when probe mode shows outside a bound probe session, and read-guard names
-// why a read is unplaced). The pull request check (check_pr.py) wants it above main's whenever the
+// why a read is unplaced; 20: read-guard's address-field rule counts inside the placement-bearing answer
+// (tool_response) alone and folds keys by NFKC then ASCII lowercase). The pull request check (check_pr.py) wants it above main's whenever the
 // guard changed against main, so a rebase over another pull request that touched the guard bumps it again.
-export const POLICY_VERSION = "19";
+export const POLICY_VERSION = "20";
 // The hook bundle (the hook's own code: worker.ts, which holds nav-guard and read-guard, the format
 // it imports and the pinned Public Suffix List) plus the pinned session settings, hashed into every
 // confirmation (0.12.0, nineteenth round): the confirmation binds to what the hook is, not to the
@@ -2015,7 +2037,9 @@ export function markerSession(dir: string, token: string): string | null {
 // group), then kills the session's process itself, and if the session still isn't seen gone
 // it marks the PC unconfirmed with its own code (abort_kill_failed) until a new probe and
 // confirmation. The probe's kill_latency step measures that escalation on this PC.
-export const ABORT_CODES = ["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap"] as const;
+// hook_margin_low (0.12.0, twentieth round): the worker's own abort, never a hook's, for a real run whose
+// hook started so late that under HOOK_GAP_MARGIN_MS of the timeout was left past the budget (lateHook).
+export const ABORT_CODES = ["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low"] as const;
 export type AbortCode = typeof ABORT_CODES[number];
 export const ABORT_POLL_MS = 100;
 // read-guard's hold: with its input deadline (HOOK_MS), below the settings' hook timeout
@@ -2577,8 +2601,43 @@ export const ADDRESS_BLOCK = "structuredContent";
 export const ADDRESS_KEY = "tabUrl";
 export const ADDRESS_NAMES = ["url", "tabUrl", "tab_url", "taburl", "tabURL", "href", "location", "address", "pageUrl", "page_url"];
 const asciiLower = (k: string) => k.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
-const ADDRESS_FOLDED = ADDRESS_NAMES.map(asciiLower);
-const isAddressName = (k: string) => ADDRESS_NAMES.includes(k) || ADDRESS_FOLDED.includes(asciiLower(k));
+// A key's folded form (0.12.0, twentieth round): NFKC normalisation, then ASCII lowercase. So a
+// fullwidth "ｔａｂＵｒｌ" folds to "taburl" as "TABURL" does; a non-ASCII letter that only a
+// Unicode case mapping would lower (the dotted capital I) stays itself.
+export const foldKey = (k: string) => { let n = k; try { n = k.normalize("NFKC"); } catch { n = k; } return asciiLower(n); };
+const ADDRESS_FOLDED = ADDRESS_NAMES.map(foldKey);
+export const isAddressName = (k: string) => ADDRESS_NAMES.includes(k) || ADDRESS_FOLDED.includes(foldKey(k));
+// The placement-bearing answer (0.12.0, twentieth round): the hook input's tool_response, the parent
+// object of the structured path (ADDRESS_BLOCK.ADDRESS_KEY). The more-than-one rule counts the
+// address-named keys (isAddressName) at every depth inside it and nowhere else: the tool's own input
+// (a navigate's url) and the hook's own fields neither place a read nor unplace one. Inside the
+// answer the rule stays strict where placement is decided: exactly the one field at the path, nothing
+// else address-named at any depth, and a second key folding to the block's name counts as more.
+export function answerAddressKeys(resp: unknown, depth = 0): number {
+  if (depth > 40) return 2;
+  if (Array.isArray(resp)) return resp.reduce((n: number, y) => n + answerAddressKeys(y, depth + 1), 0);
+  if (!resp || typeof resp !== "object") return 0;
+  let n = 0;
+  for (const [k, y] of Object.entries(resp)) {
+    if (isAddressName(k)) n++;
+    if (depth === 0 && k !== ADDRESS_BLOCK && foldKey(k) === foldKey(ADDRESS_BLOCK)) n += 2;
+    n += answerAddressKeys(y, depth + 1);
+  }
+  return n;
+}
+// Every address-named key path an answer carries ("tool_response.structuredContent.tabUrl"), for the
+// probe's record of what this PC's real reading tools send (addressPaths). Key names only, never a value.
+export function answerAddressPaths(resp: unknown, at = "tool_response", out: Set<string> = new Set(), depth = 0): Set<string> {
+  if (depth > 40 || out.size >= 50) return out;
+  if (Array.isArray(resp)) { for (const y of resp) answerAddressPaths(y, `${at}[]`, out, depth + 1); return out; }
+  if (!resp || typeof resp !== "object") return out;
+  for (const [k, y] of Object.entries(resp)) {
+    const path = `${at}.${k.slice(0, 60)}`;
+    if (isAddressName(k)) out.add(path.slice(0, 200));
+    answerAddressPaths(y, path, out, depth + 1);
+  }
+  return out;
+}
 // The hook's input, parsed strictly (0.12.0, seventeenth round): RFC 8259 JSON and nothing else,
 // read by a parser that sees every object key as it decodes it, so a key written twice, or one
 // written another way (\u0074abUrl is tabUrl), is seen for what it is. JSON.parse keeps only the
@@ -2599,7 +2658,9 @@ const isAddressName = (k: string) => ADDRESS_NAMES.includes(k) || ADDRESS_FOLDED
 //   after the value but whitespace. Whitespace (space, tab, LF, CR, so CRLF line endings) is
 //   accepted before and after the value and between tokens.
 export const STRICT_DEPTH = 200;
-export interface Strict { value: unknown; dup: boolean; addressKeys: number }
+//   answerKeys: the same count inside the placement-bearing answer alone (answerAddressKeys over the
+//     input's tool_response), which is what the address-field rule judges.
+export interface Strict { value: unknown; dup: boolean; addressKeys: number; answerKeys?: number }
 export function parseStrict(text: string): Strict {
   let i = 0, dup = false, addressKeys = 0;
   const fail = (why = "not strict JSON"): never => { throw new Error(why); };
@@ -2697,27 +2758,20 @@ export function parseStrict(text: string): Strict {
   const value = val(0);
   ws();
   if (i !== text.length) fail();
-  return { value, dup, addressKeys };
+  const resp = value && typeof value === "object" && !Array.isArray(value) ? (value as any).tool_response : undefined;
+  return { value, dup, addressKeys, ...(resp !== undefined ? { answerKeys: answerAddressKeys(resp) } : {}) };
 }
-export function structuredUrl(r: unknown, seen: Pick<Strict, "dup" | "addressKeys"> | null = null): string | null {
+export function structuredUrl(r: unknown, seen: Pick<Strict, "dup" | "addressKeys" | "answerKeys"> | null = null): string | null {
   if (!r || typeof r !== "object" || Array.isArray(r)) return null;
   const block = (r as any)[ADDRESS_BLOCK];
   if (!block || typeof block !== "object" || Array.isArray(block)) return null;
   const v = block[ADDRESS_KEY];
   if (typeof v !== "string" || v.length === 0 || v.length > ADDRESS_MAX) return null;
-  // Exactly one address field in the whole answer: the one at the path.
-  let fields = 0;
-  const walk = (x: unknown, depth: number) => {
-    if (depth > 40) { fields += 2; return; }
-    if (Array.isArray(x)) { for (const y of x) walk(y, depth + 1); return; }
-    if (!x || typeof x !== "object") return;
-    for (const [k, y] of Object.entries(x)) { if (isAddressName(k)) fields++; walk(y, depth + 1); }
-  };
-  walk(r, 0);
-  if (fields !== 1) return null;
-  // The parser's own count over the whole input, every key as decoded and every repeat counted
-  // (parseStrict): a duplicate key anywhere, or any address-named key but the one, is unplaced.
-  if (seen !== null && (seen.dup || seen.addressKeys !== 1)) return null;
+  // Exactly one address field in the whole answer (the placement-bearing tool_response): the one at the path.
+  if (answerAddressKeys(r) !== 1) return null;
+  // The parser's own count over the answer, every key as decoded and every repeat counted
+  // (parseStrict), and a duplicate key anywhere in the input: unplaced.
+  if (seen !== null && (seen.dup || (seen.answerKeys ?? seen.addressKeys) !== 1)) return null;
   return v;
 }
 // Where a reported address may be: the end page, a check page, or a host the scope allows.
@@ -2740,10 +2794,12 @@ export const parserReason = (e: unknown): UnplacedReason => {
   const m = (e as Error)?.message;
   return (["bom", "lone_surrogate", "unsafe_integer", "number_range"] as const).find((x) => x === m) ?? "not_strict_json";
 };
-// The address-field rule on a strictly parsed input: every key whose ASCII-folded form is an
-// address name, at every depth, counted after decoding; more than one is address_fields.
-export const addressFieldsProblem = (st: Pick<Strict, "dup" | "addressKeys">): UnplacedReason | null =>
-  st.dup ? "duplicate_key" : st.addressKeys > 1 ? "address_fields" : null;
+// The address-field rule on a strictly parsed input (0.12.0, twentieth round: scoped to the answer):
+// every key whose folded form (foldKey: NFKC, then ASCII lowercase) is an address name, at every depth
+// of the placement-bearing answer (the input's tool_response), counted after decoding; more than one
+// is address_fields. A key written twice anywhere in the input is duplicate_key.
+export const addressFieldsProblem = (st: Pick<Strict, "dup" | "addressKeys" | "answerKeys">): UnplacedReason | null =>
+  st.dup ? "duplicate_key" : (st.answerKeys ?? st.addressKeys) > 1 ? "address_fields" : null;
 export function readDecide(input: string, scope: NavScope, key: Buffer | null = null): Decision {
   let call: any, parsed: Strict;
   try { parsed = parseStrict(input); call = parsed.value; } catch (e) { return { id: null, tool: "", url: null, decision: "deny", why: "read_unplaced", phase: "post", reason: parserReason(e) }; }
@@ -3263,7 +3319,15 @@ export const launchSession: Launch = (argv, cwd, timeoutMs, env, stopFile, gate,
     const why = readAbort(env.PCW_ABORT_FILE);
     if (why) { aborted = why; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
   }, ABORT_POLL_MS) : undefined;
-  const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); if (abortWatch) clearInterval(abortWatch); if (liveChild === child.pid) setLiveChild(null); };
+  // A run's hook that started too late (0.12.0, twentieth round): in a run session (PCW_SESSION_KIND run, so
+  // never in a session the probe bound to a timing step), each hook's logged start against its call's
+  // printing (useAt) is checked as its line lands; a gap that leaves under HOOK_GAP_MARGIN_MS of the
+  // timeout past the budget ends this session at once (hook_margin_low), not only the next renewal.
+  const marginWatch = env.PCW_SESSION_KIND === "run" && env.PCW_NAV_LOG ? setInterval(() => {
+    if (aborted) return;
+    if (lateHook(useAt, readHookTimes(env.PCW_NAV_LOG!))) { aborted = "hook_margin_low"; if (child.pid) killing = escalateAbort(child.pid, killSteps(child)); }
+  }, MARGIN_POLL_MS) : undefined;
+  const end = () => { clearTimeout(timer); if (watch) clearInterval(watch); if (abortWatch) clearInterval(abortWatch); if (marginWatch) clearInterval(marginWatch); if (liveChild === child.pid) setLiveChild(null); };
   child.stdout?.on("data", (d) => {
     const t = d.toString();
     if (out.length < 2_000_000) out += t;
@@ -3908,7 +3972,7 @@ function stillOurs(o: Opts, c: Claim, now: Date): Job | "cancelled" | null {
 }
 
 export interface RunOut { code: Heartbeat["code"] | Code; job: string | null; closed: string[]; state?: string; warnings?: string[]; drift?: string;
-  unplaced?: { tool: string; reason: string }[] }
+  unplaced?: { tool: string; reason: string }[]; detail?: string; hook_denied?: string[] }
 // Every unplaced read of a run, with its named reason (0.12.0, nineteenth round): the owner's run
 // report shows each, never only a count. No values: the tool's name and the reason.
 export function unplacedOf(log: Decision[]): { tool: string; reason: string }[] {
@@ -3928,6 +3992,29 @@ export function hookRunsOf(s: Pick<Session, "useAt">, log: Pick<Decision, "id" |
   const max_gap_ms = gaps.length ? Math.max(...gaps) : null;
   return { samples: timed.length, gaps_ms: gaps.slice(0, 50), max_gap_ms, max_ran_ms: ran.length ? Math.max(...ran) : null,
     finished_at: timed.length ? Math.max(...timed.map((d) => d.done_at!)) : null, margin_ms: max_gap_ms === null ? null : lim.timeout - max_gap_ms - lim.budget };
+}
+// Whether any hook of a session started too late: its gap leaves under lim.margin of the timeout past the budget.
+export const MARGIN_POLL_MS = 250;
+export function lateHook(useAt: Record<string, number>, times: Pick<Decision, "id" | "phase" | "t0" | "done_at">[], lim: TimingLimits = HOOK_LIMITS): boolean {
+  const m = hookRunsOf({ useAt }, times, lim).margin_ms;
+  return m !== null && m < lim.margin;
+}
+// The worst real-run hook start since the last probe (hook-worst.json), beside the probe's own figure
+// (0.12.0, twentieth round): probe holds the probe's longest gap and cold gap, run the longest gap a real
+// run saw since that probe, its margin and its job. A newer probe starts the run figure afresh.
+export interface HookWorst { probe: { at: string; max_gap_ms: number | null; cold_gap_ms: number | null } | null; run: { at: string; job: string; max_gap_ms: number; margin_ms: number | null } | null }
+export function readHookWorst(o: Opts): HookWorst | null {
+  const x = readJson(P.hookWorst(o)) as any;
+  return x && typeof x === "object" && "probe" in x && "run" in x ? x as HookWorst : null;
+}
+export function noteHookWorst(o: Opts, now: Date, job: string, hook: HookRuns): void {
+  if (hook.max_gap_ms === null) return;
+  const ev = readJson(P.evidence(o)) as Evidence | null;
+  const probe = ev && typeof ev.at === "string" ? { at: ev.at, max_gap_ms: ev.hook_timing?.max_gap_ms ?? null, cold_gap_ms: ev.hook_timing?.cold_gap_ms ?? null } : null;
+  const had = readHookWorst(o);
+  const same = had?.probe?.at === probe?.at;
+  const run = same && had?.run && had.run.max_gap_ms >= hook.max_gap_ms ? had.run : { at: now.toISOString(), job, max_gap_ms: hook.max_gap_ms, margin_ms: hook.margin_ms };
+  try { writeFileSync(P.hookWorst(o), JSON.stringify({ probe, run }, null, 2) + "\n"); } catch { /* never stops a run */ }
 }
 export interface LowMargin { at: string; margin_ms: number }
 export function readLowMargin(o: Opts): LowMargin | null {
@@ -4036,7 +4123,10 @@ export function verdict(s: Session, st: Stream, log: Decision[], tools: string[]
 // last-run.json: the run's job id, code and failing field's name, and for a read_drift the
 // registrable domain the page moved the tab to (domain), nothing else. It stays on the PC.
 // hook: the hooks' timing on that run (hookRunsOf: counts and milliseconds, no values).
-export const LAST_RUN_KEYS = ["at", "job", "code", "field", "domain", "hook"];
+// hook_denied: the hook's own deny reasons that aren't a page's doing (probe_marker), when one fired.
+export const LAST_RUN_KEYS = ["at", "job", "code", "field", "domain", "hook", "hook_denied"];
+// The probe-mode denies of a run (the backstop to runPreflight): named in the run's report.
+export const hookDeniedOf = (log: Decision[]): string[] => log.some((d) => d.why === "probe_marker" || d.reason === "probe_marker") ? ["probe_marker"] : [];
 // The field is written only when it is one of the worker's own field names or one of the
 // action's schema keys; anything else (a key the model made up, a lowercase word copied
 // from a page, a report key with _size after it) is written as unknown_field.
@@ -4058,8 +4148,14 @@ export function driftLine(code: Code, log: Decision[]): string | null {
 }
 
 export async function run(o: Opts): Promise<RunOut> {
+  runPreflight(o);
   const n = await next(o);
-  if (!n.claim) return { code: n.code, job: null, closed: n.closed };
+  if (!n.claim) {
+    // A version the probe didn't see (the extension's id or version, Chrome's): named on the owner's line.
+    let detail: string | null = null;
+    if (n.code === "probe_stale") try { detail = versionMismatch(o, mustInstall(o)); } catch { detail = null; }
+    return { code: n.code, job: null, closed: n.closed, ...(detail ? { detail } : {}) };
+  }
   const c = n.claim;
   try {
     const h = sessionHashes(o)!;
@@ -4094,7 +4190,9 @@ export async function run(o: Opts): Promise<RunOut> {
     const drift = driftLine(final.code, log);
     const hook = hookRunsOf(s, readHookTimes(P.navLog(o)));
     const unplaced = unplacedOf(log);
-    try { writeFileSync(P.lastRun(o), JSON.stringify({ ...lastRunOf(now, mine.id, final.code, failField, mine.action, drift?.split(":")[1] ?? null), hook }, null, 2) + "\n"); } catch { /* never stops a run */ }
+    const hook_denied = hookDeniedOf(log);
+    try { writeFileSync(P.lastRun(o), JSON.stringify({ ...lastRunOf(now, mine.id, final.code, failField, mine.action, drift?.split(":")[1] ?? null), hook, hook_denied }, null, 2) + "\n"); } catch { /* never stops a run */ }
+    noteHookWorst(o, now, mine.id, hook);
     if (hook.margin_ms !== null && hook.margin_ms < HOOK_GAP_MARGIN_MS)
       try { writeFileSync(P.hookMargin(o), JSON.stringify({ at: now.toISOString(), margin_ms: hook.margin_ms }) + "\n"); } catch { /* never stops a run */ }
     diagnose(o, c.inst, now, mine.id, final.code, final.final_url ?? sanitizeUrl(v.end?.final_url ?? (v.bad ? null : (v.given as any)?.final_url)), failField,
@@ -4103,7 +4201,7 @@ export async function run(o: Opts): Promise<RunOut> {
     v.given = stripCanary(v.given);
     beat(o, final.code, mine.id, now, c.st, warnings);
     return { code: final.code, job: mine.id, closed: n.closed, state: stateAfter(mine, final), ...(warnings.length ? { warnings } : {}), ...(drift && drift !== "read_drift" ? { drift } : {}),
-      ...(unplaced.length ? { unplaced } : {}) };
+      ...(unplaced.length ? { unplaced } : {}), ...(hook_denied.length ? { hook_denied } : {}) };
   } catch (e) {
     // The session's own folders failed it (its transcripts couldn't be deleted, or the
     // worker's sign-in went missing): the job fails with that code, loudly, and the
@@ -4272,7 +4370,7 @@ export interface Evidence {
   addresses: AddressLine; chore: ChoreLine; init_order: InitOrderLine; short_names: ShortNames;
   redirect_read: RedirectReadLine; structured_address: StructuredLine; session_ids: SessionIdLine; job_readback: ReadbackLine; helper_build: HelperBuildLine;
   forged_address: ForgedLine; fragment_strip: FragmentLine; kill_latency: KillLatencyLine; not_ready: NotReadyLine;
-  hook_timing: HookTimingLine; payload_replay: PayloadReplayLine;
+  hook_timing: HookTimingLine; payload_replay: PayloadReplayLine; address_paths?: AddressPathsLine; versions?: Versions;
   candidate_patterns: string[];
   worker: { worker_sha256: string | null; cain_version: string | null; policy_version: string | null };
 }
@@ -4490,7 +4588,7 @@ export const PROBE_GATE_HINT: Record<string, string> = {
   forged_address: "the probe's forged_address step didn't pass: a page writing a forged address field in its text, title and DOM must count as unplaced or drift, and on this PC it didn't; nothing runs (report it: needs a code change)",
   kill_latency: "the probe's kill_latency step didn't pass: a session a hook ended must be seen gone within the kill bound, below the read guard's hold; nothing runs (report it: needs a code change)",
   not_ready: "the probe's sessions hit the not-ready cap: the extension was slow to attach (extension_slow_attach). Restart the Cain jobs Chrome, wait a minute, then run the probe again",
-  hook_timing: "the probe's hook_timing step didn't pass: the hook's cold start on this PC plus its 26 second budget must stay 4 seconds under the hooks' 40 second timeout, a hook held to its budget must reach Claude Code as a refusal, and a hook that overruns must not let its navigation run; see the hook_timing row in Troubleshooting, then run the probe again (first thing after a restart of the PC)",
+  hook_timing: "the probe's hook_timing step didn't pass: the hook's cold start on this PC plus its 26 second budget must stay 4 seconds under the hooks' 40 second timeout, a hook held to its budget must reach Claude Code as a refusal, and a hook that overruns must not let its navigation run, and its first session must be a cold one (cold_sample_missing: the PC had been up more than 5 minutes); see the hook_timing row in Troubleshooting, then run the probe again (first thing after a restart of the PC)",
   payload_replay: "the probe's payload_replay step didn't pass: a hook input this PC's Claude Code really sent was refused by the read guard's strict parser (its reasons are in the probe's evidence), so every page read would count as unplaced; nothing runs (report it: needs a code change)",
   job_readback: "the probe's job_readback step didn't pass: the containment helper couldn't make, join and read back its Job Object inside the job the worker runs in; report it (needs a code change)",
   helper_build: "the probe's helper_build step didn't pass: the containment helper couldn't be built or checked (see helper_compiler_missing or helper_blocked in Troubleshooting), then run the probe again",
@@ -4730,7 +4828,13 @@ export function judgeSlowHook(st: Stream, c: Canary, log: Decision[], cliVersion
 // the held call was blocked, and the overrun call didn't run. It gates confirm-profile (PROBE_GATES).
 // The sessions also capture the PreToolUse payloads the CLI sends (PCW_HOOK_CAPTURE) for payload_replay.
 export interface TimingStamp { hook: string; t0: number; id: string | null; read_at: number | null; answered_at: number; answer: string }
+// The cold sample (0.12.0, twentieth round): the first session's gap counts as cold only when the
+// system had been up at most COLD_UPTIME_S when it started (uptime_s, os.uptime); otherwise it is marked
+// warm (first_sample), cold_gap_ms stays null and the step fails cold_sample_missing: restart the PC and
+// run the probe first thing.
+export const COLD_UPTIME_S = 300;
 export interface HookTimingLine {
+  uptime_s: number | null; first_sample: "cold" | "warm"; first_gap_ms: number | null;
   cold_gap_ms: number | null; warm_gaps_ms: number[]; warm_spread_ms: number | null; cli_gaps_ms: number[]; max_gap_ms: number | null;
   budget_ms: number; timeout_ms: number; margin_ms: number;
   full_budget: { tried: boolean; answered_ms: number | null; blocked: boolean };
@@ -4770,7 +4874,7 @@ export function timingGaps(s: Session, stamps: { id: string | null; t0: number }
   return stamps.filter((x) => x.id !== null && at[x.id] !== undefined && x.t0 >= at[x.id]).map((x) => x.t0 - at[x.id!]);
 }
 type Sample = { session: Session; stamps: TimingStamp[] };
-export interface TimingSessions { full: Sample | null; warm: Sample[]; overrun: { session: Session } | null }
+export interface TimingSessions { full: Sample | null; warm: Sample[]; overrun: { session: Session } | null; uptime_s?: number | null }
 export function judgeHookTiming(m: TimingSessions, lim: TimingLimits = HOOK_LIMITS): HookTimingLine {
   const cold = m.full ? timingGaps(m.full.session, m.full.stamps) : [];
   const warm = m.warm.flatMap((w) => timingGaps(w.session, w.stamps));
@@ -4790,18 +4894,21 @@ export function judgeHookTiming(m: TimingSessions, lim: TimingLimits = HOOK_LIMI
   const ores = nav ? ost!.results[nav.id] : undefined;
   const cli: HookTimingLine["overrun"]["cli"] = !nav ? "not_tried" : ost!.denials.some((d) => d.id === nav.id) ? "refused" : ores && !ores.error ? "ran" : "error";
   const overrun = { tried: !!nav, cli };
+  const uptime_s = typeof m.uptime_s === "number" && Number.isFinite(m.uptime_s) ? Math.floor(m.uptime_s) : null;
+  const first_sample: HookTimingLine["first_sample"] = uptime_s !== null && uptime_s >= 0 && uptime_s <= COLD_UPTIME_S ? "cold" : "warm";
   const why = !cold.length || warm.length < WARM_SAMPLES ? "gap_unmeasured"
     : max_gap_ms! + lim.budget + lim.margin > lim.timeout ? "gap_too_long"
+    : first_sample !== "cold" ? "cold_sample_missing"
     : !full_budget.tried || !blocked ? "full_budget_not_blocked"
     : cli === "ran" || cli === "not_tried" ? "overrun_ran"
     : null;
-  return { cold_gap_ms: cold.length ? cold[0] : null, warm_gaps_ms: warm, warm_spread_ms: warm.length ? Math.max(...warm) - Math.min(...warm) : null,
+  return { uptime_s, first_sample, first_gap_ms: cold.length ? cold[0] : null, cold_gap_ms: cold.length && first_sample === "cold" ? cold[0] : null, warm_gaps_ms: warm, warm_spread_ms: warm.length ? Math.max(...warm) - Math.min(...warm) : null,
     cli_gaps_ms, max_gap_ms, budget_ms: lim.budget, timeout_ms: lim.timeout, margin_ms: lim.margin, full_budget, overrun, why, passed: why === null };
 }
 // The step's sessions: run(prompt, extra environment) is one session as the probe runs them; each is
 // bound to its probe step through a marker in probeDir.
 export async function hookTimingStep(run: (prompt: string, env: Record<string, string>) => Promise<Session>, file: string, capture: string | null,
-  lim: TimingLimits = HOOK_LIMITS, probeDir: string = join(dirname(file), "probe-marks")): Promise<HookTimingLine> {
+  lim: TimingLimits = HOOK_LIMITS, probeDir: string = join(dirname(file), "probe-marks"), uptime: () => number | null = systemUptime): Promise<HookTimingLine> {
   const one = async (prompt: string, step: keyof typeof PROBE_STEPS, env: Record<string, string>) => {
     rmSync(file, { force: true });
     const b = bindProbe(probeDir, step, { PCW_HOOK_TIMING: file, ...env });
@@ -4812,12 +4919,14 @@ export async function hookTimingStep(run: (prompt: string, env: Record<string, s
     return { session, stamps };
   };
   const cap: Record<string, string> = capture ? { PCW_HOOK_CAPTURE: capture } : {};
+  const uptime_s = uptime();                     // read as the first, cold session starts
   const full = await one(HOOK_FULL_PROMPT, "hook_timing_held", { PCW_HOOK_FULL_BUDGET: "1", ...cap });
   const warm: Sample[] = [];
   for (let i = 0; i < WARM_SAMPLES; i++) warm.push(await one(HOOK_TIMING_PROMPT, "hook_timing_gap", cap));
   const overrun = await one(HOOK_OVERRUN_PROMPT, "hook_timing_overrun", { PCW_HOOK_STALL_MS: String(lim.stall) });
-  return judgeHookTiming({ full, warm, overrun }, lim);
+  return judgeHookTiming({ full, warm, overrun, uptime_s }, lim);
 }
+export const systemUptime = (): number | null => { try { const u = osUptime(); return Number.isFinite(u) ? u : null; } catch { return null; } };
 
 // ---- The probe's payload_replay step (0.12.0, eighteenth round) -------------------------------------
 // The PreToolUse payloads this PC's CLI really sent the hook (captured by the hook_timing step's
@@ -4830,6 +4939,27 @@ export async function hookTimingStep(run: (prompt: string, env: Record<string, s
 // strict parser refuses, so every page read would count as unplaced: nothing runs until a code
 // change (report it, with the reasons).
 export interface PayloadReplayLine { captured: number; parsed: number; agreed: number; failures: string[]; passed: boolean }
+// The reading tools' address key paths (0.12.0, twentieth round), from the same captured answers, read
+// before payload_replay deletes them: for each reading tool (read_page, get_page_text, find), the full
+// set of address-named key paths (answerAddressPaths, folded by foldKey) its real answers carried, so
+// the owner and the reviewers see where this CLI and extension put an address, not only that the one
+// structured path was there. Key paths only, never a value; recorded, not a gate (structured_address
+// and the read guard's rule decide placement).
+export type AddressPathsLine = Record<string, string[]>;
+export function addressPaths(dir: string): AddressPathsLine {
+  let names: string[] = [];
+  try { names = readdirSync(dir).filter((n) => n.startsWith("post-") && n.endsWith(".json")).sort(); } catch { names = []; }
+  const out: Record<string, Set<string>> = {};
+  for (const n of names) {
+    let v: any;
+    try { v = parseStrict(readFileSync(join(dir, n), "utf8")).value; } catch { continue; }
+    const name = typeof v?.tool_name === "string" ? v.tool_name : "";
+    const tool = name.startsWith(CHROME) ? name.slice(CHROME.length) : "";
+    if (!PAGE_READING.includes(tool) || v.tool_response === undefined) continue;
+    answerAddressPaths(v.tool_response, "tool_response", out[tool] ??= new Set());
+  }
+  return Object.fromEntries(Object.keys(out).sort().map((k) => [k, [...out[k]].sort()]));
+}
 export function payloadReplay(dir: string): PayloadReplayLine {
   let names: string[] = [];
   try { names = readdirSync(dir).filter((n) => n.endsWith(".json")).sort(); } catch { names = []; }
@@ -5184,6 +5314,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const structured_address = judgeStructured(as, alog);
     const session_ids = sessionIds(ast, alog);
     const not_ready = notReady([rlog, flog, glog, alog]);
+    const address_paths = addressPaths(P.hookCapture(o));
     const payload_replay = (o.payloadReplay ?? ((x: Opts) => payloadReplay(P.hookCapture(x))))(o);
     const job_readback = (o.readback ?? jobReadback)(o, platform(o) === "win32" ? ensureJobHelper(o) : null);
     const helper_build = helperBuild(o);
@@ -5209,10 +5340,12 @@ export async function probe(o: Opts): Promise<Evidence> {
       fingerprint: fp, settings_sha256: h.settings_sha256, prompt_sha256: h.prompt_sha256, config_sha256: cfg.sha256, cli_sha256: cliSha(o, inst), tools,
       unlisted, process_end, context_trips, addresses, chore, init_order: initOrder, short_names,
       redirect_read, structured_address, session_ids, job_readback, helper_build, forged_address, fragment_strip, kill_latency, not_ready, hook_timing, payload_replay,
-      candidate_patterns, worker: workerNow() };
+      address_paths, versions: versionsOf(fp), candidate_patterns, worker: workerNow() };
     writeFileSync(P.evidence(o), JSON.stringify(ev, null, 2) + "\n");
     return ev;
   } finally {
+    // The probe leaves nothing of probe mode behind for a run to find (runPreflight).
+    try { cleanProbe(o); } catch { /* the run preflight finds it */ }
     unlock(o);
   }
 }
@@ -5532,6 +5665,52 @@ export const PROBE_STEPS: Record<string, ("timing" | "capture" | "full" | "stall
   slow_hook: ["stall"], reading_tools: ["capture"],
 };
 const PROBE_VARS = ["PCW_HOOK_TIMING", "PCW_HOOK_CAPTURE", "PCW_HOOK_FULL_BUDGET", "PCW_HOOK_STALL_MS", "PCW_PROBE_STEP", "PCW_PROBE_TOKEN"];
+// What a run never inherits from the worker's own environment: the probe's variables and the session kind.
+export const PROBE_ENV = [...PROBE_VARS, "PCW_SESSION_KIND"];
+
+// ---- The run preflight: no probe leftovers (0.12.0, twentieth round) ---------------------------------
+// Before a run's session starts, the worker looks for anything of probe mode: a probe variable in its
+// own environment (PROBE_ENV; the child's environment never takes one: baseEnv scrubs them), a marker
+// left in probe-marks, a timing file (hook-timing.jsonl) or a capture folder (hook-capture) left by a
+// probe that was cut off. Finding any, it sweeps the files (under the lock, so never a live probe's)
+// and refuses the run (probe_leftover), naming what it found and the cleanup command
+// (PROBE_CLEANUP); the owner unsets any variable it names and runs again. The hook's own deny
+// (probe_marker, probeMode) stays as the backstop, and when it fires in a run its reason is in the run's
+// report (hook_denied) and in last-run.json. Nothing else changes in a run session: the read guard's
+// bounded hold and the worker's kill escalation are the production ones (only the probe's hold to the
+// whole budget, PCW_HOOK_FULL_BUDGET, is probe-only).
+export const PROBE_CLEANUP = "bun worker.ts clean-probe";
+export interface ProbeLeftovers { vars: string[]; files: string[] }
+export function probeLeftovers(o: Opts): ProbeLeftovers {
+  const env = envOf(o);
+  const vars = Object.keys(env).filter((k) => PROBE_ENV.includes(k.toUpperCase()) && typeof env[k] === "string" && env[k] !== "").sort();
+  const files: string[] = [];
+  try { for (const f of readdirSync(P.probeMarks(o)).sort()) files.push(`probe-marks/${f}`); } catch { /* none */ }
+  if (existsSync(P.hookTiming(o))) files.push("hook-timing.jsonl");
+  if (existsSync(P.hookCapture(o))) files.push("hook-capture");
+  return { vars, files };
+}
+// clean-probe: deletes the probe's leftover files and says which variables are still set.
+export function cleanProbe(o: Opts): { swept: string[]; vars: string[] } {
+  const left = probeLeftovers(o);
+  try { for (const f of readdirSync(P.probeMarks(o))) rmSync(join(P.probeMarks(o), f), { force: true, recursive: true }); } catch { /* none */ }
+  rmSync(P.hookTiming(o), { force: true });
+  rmSync(P.hookCapture(o), { force: true, recursive: true });
+  const after = probeLeftovers(o);
+  return { swept: left.files.filter((f) => !after.files.includes(f)), vars: after.vars };
+}
+export function runPreflight(o: Opts): void {
+  if (!o.attended) return;                 // next() refuses it first, reading nothing
+  const left = probeLeftovers(o);
+  if (!left.vars.length && !left.files.length) return;
+  let swept: string[] = [];
+  const l = lock(o, clock(o));
+  if (!l.got) throw new WorkerError("busy");
+  try { swept = cleanProbe(o).swept; } finally { unlock(o); }
+  try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe_leftover ${JSON.stringify({ vars: left.vars, files: left.files.length })}\n`); } catch { /* never stops it */ }
+  throw new WorkerError("probe_leftover", { vars: left.vars, files: left.files, swept,
+    hint: `the probe's leftovers were found before this run, so it didn't start: ${left.files.length ? `the files were swept (${PROBE_CLEANUP} does the same); ` : ""}${left.vars.length ? `unset ${left.vars.join(", ")} in this terminal; ` : ""}then run again` });
+}
 export interface ProbeMode { deny: boolean; timing: string | null; capture: string | null; full: boolean; stall: number }
 const NO_PROBE: ProbeMode = { deny: false, timing: null, capture: null, full: false, stall: 0 };
 export function probeMode(env: Record<string, string | undefined>): ProbeMode {
@@ -5673,16 +5852,17 @@ if (isMain && process.argv[2] === "nav-guard") {
     else if (cmd === "confirm-profile") {
       const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });
       const ev = readJson(P.evidence(o)) as Evidence;
-      say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, boundary_cases: ev.boundary ?? [], ...probeCases(ev),
+      say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, versions: versionsOf(c.fingerprint), hook_worst: readHookWorst(o), boundary_cases: ev.boundary ?? [], ...probeCases(ev),
         extensions: extensionPrefs(mustInstall(o)).extensions });
     } else if (cmd === "check-host") say({ ...checkHost(o), cli: checkCli(o) });
     else if (cmd === "check-cli") say({ cli: checkCli(o) });
+    else if (cmd === "clean-probe") say(cleanProbe(o));
     else if (cmd === "owner-keygen") say({ owner_pub: ownerKeygen(flag(args, "--kid") ?? "", flag(args, "--out") ?? o.home, process.env.PC_OWNER_PASSPHRASE ?? "") });
     else if (cmd === "owner-fpr" && a1) say({ owner_fpr: ownerFpr(a1) });
     else if (cmd === "sign-allowlist" && a1) {
       const text = signAllowlistFile(a1, flag(args, "--key") ?? "", process.env.PC_OWNER_PASSPHRASE ?? "", flag(args, "--kid") ?? "");
       const out = flag(args, "--out");
       if (out) { writeFileSync(out, text); say({ written: out }); } else process.stdout.write(text);
-    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | check-cli | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
+    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | check-cli | clean-probe | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
   } catch (e) { fail(e); }
 }

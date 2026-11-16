@@ -47,7 +47,7 @@ export const CODES = [
   "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
   "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab", "tab_context_owed",
   "containment_unavailable", "domain_not_allowed", "read_drift", "helper_compiler_missing", "helper_blocked",
-  "read_unplaced", "inventory_never_ready", "refusal_cap", "abort_kill_failed", "extension_slow_attach",
+  "read_unplaced", "inventory_never_ready", "refusal_cap", "abort_kill_failed", "extension_slow_attach", "hook_margin_low",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];

@@ -41,6 +41,7 @@ import {
   ABORT_HOLD_MS, ABORT_KILL_MS, HOOK_TIMEOUT_S, escalateAbort, markKillFailed, ADDRESS_BLOCK, ADDRESS_KEY, parseStrict, judgeForged, judgeFragmentStrip, killLatency, notReady,
   FORGED_PROMPT, FRAGMENT_PROMPT, FRAGMENT_MARK, READY_WAIT_MS, holdForEnd, FRAGMENT_PATH, RECORDED_ONLY, hookBudget, HOOK_BUDGET_MS, HOOK_MARGIN_MS, HOOK_REPLY_MS, awaitInventory,
   HOOK_GAP_MARGIN_MS, hookTimingStep, judgeHookTiming, timingGaps, payloadReplay, fragmentReport,
+  foldKey, answerAddressKeys, addressPaths, probeLeftovers, cleanProbe, PROBE_CLEANUP, PROBE_ENV, hookDeniedOf, lateHook, noteHookWorst, readHookWorst, COLD_UPTIME_S, versionMismatch, versionsOf,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -846,7 +847,7 @@ const configLeft = (dir: string) => (existsSync(dir) ? readdirSync(dir) : []).fi
 const ACCEPT = { acceptBoundary: true };
 // The probe's process-end check, as a healthy PC answers it.
 // The probe's hook_timing and payload_replay steps as a healthy PC records them (their own tests drive the real steps).
-const TIMING_OK = { cold_gap_ms: 900, warm_gaps_ms: [300, 320, 350], warm_spread_ms: 50, cli_gaps_ms: [], max_gap_ms: 900, budget_ms: 26_000, timeout_ms: 40_000, margin_ms: 4_000,
+const TIMING_OK = { uptime_s: 120, first_sample: "cold", first_gap_ms: 900, cold_gap_ms: 900, warm_gaps_ms: [300, 320, 350], warm_spread_ms: 50, cli_gaps_ms: [], max_gap_ms: 900, budget_ms: 26_000, timeout_ms: 40_000, margin_ms: 4_000,
   full_budget: { tried: true, answered_ms: 25_950, blocked: true }, overrun: { tried: true, cli: "refused" as const }, why: null, passed: true };
 const REPLAY_OK = { captured: 6, parsed: 6, agreed: 6, failures: [], passed: true };
 const PROCESS_OK = { platform: "win32", tree_kill: { passed: true, left: 0, polls: 1 }, signals: [{ signal: "SIGINT", handler_ran: false, passed: false }],
@@ -966,7 +967,7 @@ describe("the PC worker: one run", () => {
     const last = JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"));
     expect(last).toEqual({ at: T0.toISOString(), job: id, code: "ok", field: null, domain: null,
       // The hooks' timing (no values): how many ran, their start gaps, how long they ran and when the last finished.
-      hook: { samples: expect.any(Number), gaps_ms: expect.any(Array), max_gap_ms: null, max_ran_ms: expect.any(Number), finished_at: expect.any(Number), margin_ms: null } });
+      hook: { samples: expect.any(Number), gaps_ms: expect.any(Array), max_gap_ms: null, max_ran_ms: expect.any(Number), finished_at: expect.any(Number), margin_ms: null }, hook_denied: [] });
     expect(JSON.stringify(last)).not.toContain("example.com");
     const leftTab = JSON.parse(readFileSync(join(q.home, "leftover-tabs.json"), "utf8")).ids[0];
     // The navigation guard lets this run open its canary, its pinned start address and its end page, nothing else.
@@ -1146,7 +1147,9 @@ describe("the browser preflight: a fingerprint, not a latch", () => {
       const r = await run(q.opts(attended));
       if (code === "profile_changed" && r.code === "ok") continue;      // the same folder written another way is the same folder
       if (code === "profile_scan_failed" && r.code === "untrusted_config") throw new Error("install changed");
-      expect(r).toEqual({ code, job: null, closed: [] } as any);
+      const { detail, ...rest } = r as any;
+      expect(rest).toEqual({ code, job: null, closed: [] } as any);
+      if (detail !== undefined) expect([code, detail]).toEqual(["probe_stale", expect.stringMatching(/^version_mismatch: /)]);
       expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
       expect(q.launches).toEqual([]);
       round(q.cfg);
@@ -1534,7 +1537,7 @@ describe("the PC worker: what the model saw", () => {
       q.during(() => { if (++k === 2) q.hookRuns(false); });       // the bridge check's hook ran; the run's doesn't
       expect(await run(q.opts({ ...attended, diagnose: true }))).toMatchObject({ code: "hook_missing_decision", job: id, state: "failed" });
       expect(readFileSync(join(q.home, "diagnostics.log"), "utf8")).toContain(" missing=8");
-      expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toEqual({ at: T0.toISOString(), job: id, code: "hook_missing_decision", field: null, domain: null, hook: expect.objectContaining({ samples: expect.any(Number) }) });
+      expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toEqual({ at: T0.toISOString(), job: id, code: "hook_missing_decision", field: null, domain: null, hook: expect.objectContaining({ samples: expect.any(Number) }), hook_denied: [] });
       expect(result(q, id)).toMatchObject({ facts: {}, final_url: null });
       expect(q.history()).not.toContain('"signed_in": true');
     }
@@ -1882,7 +1885,7 @@ describe("hangs, locks and clocks", () => {
     for (const name of ["spendNonce", "nonces/", "confirmGate", "go_token)", "confirm.ts\""]) expect(src).not.toContain(name);
     // The command line's commands, every one of them.
     const cli = src.slice(src.indexOf("if (isMain"));
-    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "check-cli", "owner-keygen", "owner-fpr", "sign-allowlist"]);
+    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "check-cli", "clean-probe", "owner-keygen", "owner-fpr", "sign-allowlist"]);
     // Only confirm.ts holds the nonce spend, and it imports from the worker, not the other way round.
     expect(readFileSync(join(OPT, "pcjobs/confirm.ts"), "utf8")).toContain("export function spendNonce");
   });
@@ -2810,7 +2813,7 @@ describe("seventh review: the deny-alone check gates confirmation, address facts
     const r = result(q, id);
     expect(r).toMatchObject({ status: "failed", code: "schema_violation", facts: {}, final_url: null });
     expect(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8"))).toEqual({ at: T0.toISOString(), job: id, code: "schema_violation", field: "two_factor", domain: null,
-      hook: { samples: expect.any(Number), gaps_ms: expect.any(Array), max_gap_ms: null, max_ran_ms: expect.any(Number), finished_at: expect.any(Number), margin_ms: null } });
+      hook: { samples: expect.any(Number), gaps_ms: expect.any(Array), max_gap_ms: null, max_ran_ms: expect.any(Number), finished_at: expect.any(Number), margin_ms: null }, hook_denied: [] });
     expect(Object.keys(JSON.parse(readFileSync(join(q.home, "last-run.json"), "utf8")))).toEqual(LAST_RUN_KEYS);
     round(q.cfg);
     const reader = JSON.stringify([readResult(q.cfg.dir, id), heartbeatLine(readHeartbeat(q.cfg.dir)), readJobs(q.cfg.dir)]);
@@ -5201,7 +5204,7 @@ describe("fifteenth review: unplaced and drifted reads end the session, the work
     await readGuardMain(env, async () => readCall({ structuredContent: { tabUrl: "https://evil.example/x" } }, "r3"), (x) => { said += x; });
     expect(readAbort(abort)).toBe("read_drift");
     expect(JSON.parse(said).hookSpecificOutput.updatedMCPToolOutput).toBe(READ_DRIFT_MESSAGE);
-    expect(ABORT_CODES).toEqual(["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap"]);
+    expect(ABORT_CODES).toEqual(["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap", "hook_margin_low"]);
   });
 
   test("an unplaced read ends the run at once with no tab-context fallback, and the report is discarded", async () => {
@@ -5802,11 +5805,11 @@ describe("eighteenth review: the hook's margin measured on the PC, a strict pars
     expect(HOOK_STALL_MS).toBeGreaterThan(HOOK_TIMEOUT_S * 1000);
     expect(PROBE_GATES).toContain("hook_timing");
     expect(PROBE_GATES).toContain("payload_replay");
-    expect(POLICY_VERSION).toBe("19");
+    expect(POLICY_VERSION).toBe("20");
   });
 
   // The step's four sessions, each a real session process (the stand-in CLI) running the real nav-guard.
-  const timingWorld = (fake: Record<string, string>) => {
+  const timingWorld = (fake: Record<string, string>, uptime: () => number | null = () => 60) => {
     const dir = mkdtempSync(join(tmpdir(), "hook-timing-"));
     const capture = join(dir, "capture");
     mkdirSync(capture);
@@ -5815,7 +5818,7 @@ describe("eighteenth review: the hook's margin measured on the PC, a strict pars
       PATH: process.env.PATH ?? "", ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}), ...(process.env.TEMP ? { TEMP: process.env.TEMP } : {}),
       FAKE_WORKER: WORKER_FILE, FAKE_TIMEOUT_MS: String(LIM.timeout), PCW_HOOK_BUDGET_MS: String(LIM.budget), PCW_NAV_ALLOW: "[]",
       PCW_NAV_LOG: join(dir, `nav-${++k}.jsonl`), PCW_ABORT_FILE: join(dir, `abort-${k}`), ...fake, ...env });
-    return { dir, capture, step: () => hookTimingStep(run, join(dir, "timing.jsonl"), capture, LIM) };
+    return { dir, capture, step: () => hookTimingStep(run, join(dir, "timing.jsonl"), capture, LIM, undefined, uptime) };
   };
 
   test("hook_timing with a fake CLI: a small gap passes, the held hook's deny reaches the CLI, the overrun navigation is refused; the captured payloads replay clean", async () => {
@@ -6012,8 +6015,8 @@ describe("nineteenth review: the address-field rule, probe-only behaviours bound
     // The url and URL pair, beside the one field.
     expect(readDecide19(read({ structuredContent: { tabUrl: OK }, url: OK, URL: OK }), sc)).toMatchObject({ decision: "deny", why: "read_unplaced", reason: "address_fields" });
     expect(readDecide19(read({ structuredContent: { tabUrl: OK, URL: OK } }), sc)).toMatchObject({ why: "read_unplaced", reason: "address_fields" });
-    // Escaped so only decoding shows it: URL is URL.
-    expect(readDecide19(read({ structuredContent: { tabUrl: OK } }).replace('"tabId"', '"\\u0055RL":"x","tabId"'), sc)).toMatchObject({ why: "read_unplaced", reason: "address_fields" });
+    // Escaped so only decoding shows it: URL is URL. Inside the answer it counts (twentieth round: the rule is scoped to the answer).
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK } }).replace('"structuredContent"', '"\\u0055RL":"x","structuredContent"'), sc)).toMatchObject({ why: "read_unplaced", reason: "address_fields" });
     // Nested copies of the field.
     expect(readDecide19(read({ structuredContent: { tabUrl: OK, meta: { tabUrl: OK } } }), sc)).toMatchObject({ why: "read_unplaced", reason: "address_fields" });
     expect(readDecide19(read({ structuredContent: { tabUrl: OK }, content: [{ type: "text", text: "t", extra: [{ TABURL: OK }] }] }), sc)).toMatchObject({ reason: "address_fields" });
@@ -6166,5 +6169,198 @@ describe("nineteenth review: the address-field rule, probe-only behaviours bound
     const before = guardSha(files);
     appendFileSync(files[3], " ");
     expect(guardSha(files)).not.toBe(before);
+  }, 120_000);
+});
+
+describe("twentieth review: the run preflight for probe leftovers, the address-field rule scoped to the answer, a late hook ending a run, the cold sample, and the version binding", () => {
+  const sc = { domains: ["example.com"], canary: ["http://127.0.0.1:5000/pcw/tok"], query: [] as string[] };
+  const read = (resp: unknown, input: unknown = { tabId: 1 }, tool = "get_page_text") =>
+    JSON.stringify({ session_id: SID, tool_use_id: "r1", tool_name: `${CH}${tool}`, tool_input: input, tool_response: resp });
+  const OK = "https://example.com/account/settings";
+
+  test("keys fold by NFKC then ASCII lowercase: a fullwidth tabUrl beside the real one is address_fields; a non-ASCII letter still never folds", () => {
+    expect(foldKey("ｔａｂＵｒｌ")).toBe("taburl");
+    expect(foldKey("ＵＲＬ")).toBe("url");
+    expect(foldKey("locatİon")).not.toBe("location");                       // the dotted capital I stays itself
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK, "ｔａｂＵｒｌ": "https://evil.example/" } }), sc)).toMatchObject({ why: "read_unplaced", reason: "address_fields" });
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK }, "ｕｒｌ": OK }), sc)).toMatchObject({ why: "read_unplaced", reason: "address_fields" });
+    // Escaped so only decoding and folding show it: ｕｒｌ is ｕｒｌ.
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK } }).replace('"structuredContent"', '"\\uff55\\uff52\\uff4c":"x","structuredContent"'), sc)).toMatchObject({ reason: "address_fields" });
+    expect(parseStrict(read({ structuredContent: { tabUrl: OK, "ｔａｂＵｒｌ": OK } }))).toMatchObject({ answerKeys: 2 });
+  });
+
+  test("the more-than-one rule counts inside the placement-bearing answer alone; inside it the rule stays strict", () => {
+    // The tool's input carrying address-named keys (a url and a URL) neither places nor unplaces the read.
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK } }, { tabId: 1, url: OK, URL: OK }), sc)).toMatchObject({ decision: "allow", why: "read_on_scope" });
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK } }).replace('"tabId"', '"\\u0055RL":"x","tabId"'), sc)).toMatchObject({ decision: "allow" });
+    expect(answerAddressKeys({ structuredContent: { tabUrl: OK } })).toBe(1);
+    // Inside the answer: any second address-named key, at any depth, or a second block spelled another way.
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK }, content: [{ type: "text", text: "t", href: OK }] }), sc)).toMatchObject({ reason: "address_fields" });
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK }, StructuredContent: { other: 1 } }), sc)).toMatchObject({ reason: "address_fields" });
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK, meta: [{ Location: OK }] } }), sc)).toMatchObject({ reason: "address_fields" });
+    // A duplicate key anywhere in the input still unplaces it.
+    expect(readDecide19(read({ structuredContent: { tabUrl: OK } }).replace('"tabId":1', '"tabId":1,"tabId":2'), sc)).toMatchObject({ reason: "duplicate_key" });
+    // The replay runs the same rule: an input-side url is fine, an answer-side copy is not.
+    const dir = mkdtempSync(join(tmpdir(), "replay20-"));
+    writeFileSync(join(dir, "post-1.json"), read({ structuredContent: { tabUrl: OK } }, { tabId: 1, url: OK, URL: OK }));
+    writeFileSync(join(dir, "post-2.json"), read({ structuredContent: { tabUrl: OK, "ＵＲＬ": OK } }));
+    expect(payloadReplay(dir)).toMatchObject({ captured: 2, parsed: 1, failures: ["address_fields"], passed: false });
+  });
+
+  test("the probe records, per reading tool, every address-named key path its real answers carried", () => {
+    const dir = mkdtempSync(join(tmpdir(), "paths20-"));
+    writeFileSync(join(dir, "post-1.json"), read({ content: [{ type: "text", text: "x" }], structuredContent: { tabUrl: OK } }));
+    writeFileSync(join(dir, "post-2.json"), read({ structuredContent: { tabUrl: OK, frames: [{ URL: OK }] } }, { tabId: 1 }, "read_page"));
+    writeFileSync(join(dir, "post-3.json"), read({ structuredContent: { tabUrl: OK }, "ｈｒｅｆ": OK }, { tabId: 1, query: "q" }, "find"));
+    writeFileSync(join(dir, "pre-1.json"), JSON.stringify({ session_id: SID, tool_use_id: "n1", tool_name: `${CH}navigate`, tool_input: { url: OK } }));
+    writeFileSync(join(dir, "post-4.json"), read({ structuredContent: { tabUrl: OK } }, { tabId: 1 }, "tabs_context_mcp"));
+    expect(addressPaths(dir)).toEqual({
+      find: ["tool_response.structuredContent.tabUrl", "tool_response.ｈｒｅｆ"],
+      get_page_text: ["tool_response.structuredContent.tabUrl"],
+      read_page: ["tool_response.structuredContent.frames[].URL", "tool_response.structuredContent.tabUrl"],
+    });
+    expect(readdirSync(dir).length).toBe(5);                                     // read only: payload_replay deletes them after
+  });
+
+  test("a run preflight finds probe leftovers, sweeps the files, refuses with the cleanup command, and the child environment never takes a probe variable", async () => {
+    const { q, id } = oneJob();
+    mkdirSync(join(q.home, "probe-marks"), { recursive: true });
+    writeFileSync(join(q.home, "probe-marks", `${"a".repeat(32)}.probe`), `${"a".repeat(32)} slow_hook\n`);
+    writeFileSync(join(q.home, "hook-timing.jsonl"), "{}\n");
+    mkdirSync(join(q.home, "hook-capture"));
+    const env = { ...q.opts().env, PCW_HOOK_STALL_MS: "60000" } as Record<string, string>;
+    expect(probeLeftovers(q.opts({ env }))).toEqual({ vars: ["PCW_HOOK_STALL_MS"], files: [`probe-marks/${"a".repeat(32)}.probe`, "hook-timing.jsonl", "hook-capture"] });
+    let err: any;
+    try { await run(q.opts({ ...attended, env })); } catch (e) { err = e; }
+    expect(err?.code).toBe("probe_leftover");
+    expect(err.detail).toMatchObject({ vars: ["PCW_HOOK_STALL_MS"], swept: [`probe-marks/${"a".repeat(32)}.probe`, "hook-timing.jsonl", "hook-capture"] });
+    expect(err.detail.hint).toContain(PROBE_CLEANUP);
+    expect(err.detail.hint).toContain("unset PCW_HOOK_STALL_MS");
+    expect(q.launches.length).toBe(0);                                          // no session started
+    expect(probeLeftovers(q.opts())).toEqual({ vars: [], files: [] });          // swept
+    // The child's environment never takes a probe variable or a session kind from the worker's own.
+    const be = baseEnv(q.opts({ env: { ...env, PCW_HOOK_CAPTURE: "/x", PCW_SESSION_KIND: "probe", PCW_PROBE_TOKEN: "b".repeat(32) } }));
+    for (const k of PROBE_ENV) expect([k, be[k]]).toEqual([k, undefined]);
+    expect(sessionEnv(q.opts({ env }), [OK]).PCW_SESSION_KIND).toBe("run");
+    // A file left with no variable: refused once, then the run goes on.
+    writeFileSync(join(q.home, "hook-timing.jsonl"), "{}\n");
+    err = null;
+    try { await run(q.opts(attended)); } catch (e) { err = e; }
+    expect(err?.detail).toMatchObject({ vars: [], swept: ["hook-timing.jsonl"] });
+    q.say((_i, canary) => ({ canary, outcome: "seen", final_url: OK, facts: { signed_in: true } }));
+    const out = await run(q.opts(attended));
+    expect(out.job).toBe(id);
+    expect(out.hook_denied).toBeUndefined();
+    expect(cleanProbe(q.opts())).toEqual({ swept: [], vars: [] });
+  });
+
+  test("the hook's probe_marker deny, the backstop, is named in the run's report and last-run.json", () => {
+    const log = [{ id: null, tool: "", url: null, decision: "deny" as const, why: "probe_marker" }];
+    expect(hookDeniedOf(log)).toEqual(["probe_marker"]);
+    expect(hookDeniedOf([{ id: null, tool: "", url: null, decision: "deny" as const, why: "read_unplaced", phase: "post" as const, reason: "probe_marker" as const }])).toEqual(["probe_marker"]);
+    expect(hookDeniedOf([])).toEqual([]);
+    expect(LAST_RUN_KEYS).toContain("hook_denied");
+  });
+
+  test("an off-site read in a run session still ends the session: the production hold and kill escalation are unchanged there", async () => {
+    const home = mkdtempSync(join(tmpdir(), "runabort20-"));
+    mkdirSync(join(home, "probe-marks"));
+    const script = join(home, "session.js");
+    const input = read({ structuredContent: { tabUrl: "https://login.evil.example/phish" } });
+    writeFileSync(script, `const { spawnSync } = require("node:child_process");
+const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+say({ type: "system", subtype: "init", session_id: "sess-abort-0020", tools: [], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
+say({ type: "assistant", message: { content: [{ type: "tool_use", id: "r1", name: "${CH}get_page_text", input: { tabId: 1 } }] } });
+const r = spawnSync(process.execPath, [${JSON.stringify(WORKER_FILE)}, "read-guard"], { input: ${JSON.stringify(input)}, env: process.env, encoding: "utf8" });
+say({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "r1", content: r.stdout }] } });
+say({ type: "assistant", message: { content: [{ type: "tool_use", id: "next", name: "${CH}get_page_text", input: { tabId: 1 } }] } });
+say({ type: "result", subtype: "success", result: "{}" });`);
+    // A run's environment, with no hold override: read-guard holds for the production ABORT_HOLD_MS.
+    const env = cleanEnv({ PCW_NAV_ALLOW: "[]", PCW_NAV_DOMAINS: '["example.com"]', PCW_NAV_CANARY: "[]", PCW_NAV_LOG: join(home, "log.jsonl"),
+      PCW_ABORT_FILE: join(home, "inventory", "abort"), PCW_SESSION_KIND: "run", PCW_PROBE_DIR: join(home, "probe-marks") });
+    const t0 = Date.now();
+    const s = await realLaunch([process.execPath, script], home, 30_000, env as Record<string, string>);
+    expect(s.aborted).toBe("read_drift");
+    expect(Date.now() - t0).toBeLessThan(ABORT_HOLD_MS);                       // ended by the worker, well inside the hold
+    expect(s.abort_kill?.ended).toBe(true);
+    expect(parseStream(s.out).uses.map((u) => u.id)).toEqual(["r1"]);
+    expect(readNavLog(join(home, "log.jsonl"))).toMatchObject([{ id: "r1", phase: "post", why: "read_drift" }]);
+  }, 30_000);
+
+  test("a real run's hook that starts with under 4 seconds of margin ends that session at once (hook_margin_low); a probe-bound session isn't judged so", async () => {
+    // HOOK_LIMITS: a gap over 40 s - 26 s - 4 s = 10 s is late.
+    expect(lateHook({ n1: 1_000 }, [{ id: "n1", t0: 11_001, done_at: 11_010 }])).toBe(true);
+    expect(lateHook({ n1: 1_000 }, [{ id: "n1", t0: 10_999, done_at: 11_010 }])).toBe(false);
+    expect(lateHook({ n1: 1_000 }, [{ id: "n1", phase: "post", t0: 30_000, done_at: 30_010 }])).toBe(false);   // a read's post hook starts after the tool ran
+    const world = async (kind: string | null) => {
+      const home = mkdtempSync(join(tmpdir(), "late20-"));
+      const log = join(home, "log.jsonl");
+      const script = join(home, "session.js");
+      // The stand-in CLI prints a call, then its hook's log line lands with a start 11 seconds after the call was printed.
+      writeFileSync(script, `const fs = require("node:fs");
+const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+say({ type: "system", subtype: "init", session_id: "sess-late-0020", tools: [], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
+say({ type: "assistant", message: { content: [{ type: "tool_use", id: "n1", name: "${CH}navigate", input: { url: "${OK}" } }] } });
+setTimeout(() => { const t0 = Date.now() + 11000; fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ id: "n1", tool: "navigate", url: null, decision: "allow", why: "run_address", t0, done_at: t0 + 5 }) + "\\n"); }, 200);
+setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 6000);`);
+      const env = cleanEnv({ PCW_NAV_LOG: log, PCW_ABORT_FILE: join(home, "abort"), ...(kind ? { PCW_SESSION_KIND: kind } : {}) });
+      const t0 = Date.now();
+      const s = await realLaunch([process.execPath, script], home, 20_000, env as Record<string, string>);
+      return { s, ms: Date.now() - t0 };
+    };
+    const late = await world("run");
+    expect(late.s.aborted).toBe("hook_margin_low");
+    expect(late.ms).toBeLessThan(4_000);
+    expect(sessionCode(late.s, parseStream(late.s.out), [], [])).toBe("hook_margin_low");
+    const probed = await world("probe");
+    expect(probed.s.aborted).toBeUndefined();
+    expect(ABORT_CODES).toContain("hook_margin_low");
+  }, 60_000);
+
+  test("the observed real-run worst case is stored beside the probe's figure, and a newer probe starts it afresh", () => {
+    const home = mkdtempSync(join(tmpdir(), "worst20-"));
+    const o = { home } as Opts;
+    writeFileSync(join(home, "probe-evidence.json"), JSON.stringify({ at: "2026-11-16T08:00:00.000Z", hook_timing: { max_gap_ms: 900, cold_gap_ms: 900 } }));
+    const runs = (max: number | null) => ({ samples: 1, gaps_ms: max === null ? [] : [max], max_gap_ms: max, max_ran_ms: 10, finished_at: 1, margin_ms: max === null ? null : 14_000 - max });
+    noteHookWorst(o, new Date("2026-11-16T09:00:00Z"), "job-1", runs(1_200));
+    noteHookWorst(o, new Date("2026-11-16T10:00:00Z"), "job-2", runs(800));
+    noteHookWorst(o, new Date("2026-11-16T10:30:00Z"), "job-3", runs(null));
+    expect(readHookWorst(o)).toEqual({ probe: { at: "2026-11-16T08:00:00.000Z", max_gap_ms: 900, cold_gap_ms: 900 },
+      run: { at: "2026-11-16T09:00:00.000Z", job: "job-1", max_gap_ms: 1_200, margin_ms: 12_800 } });
+    writeFileSync(join(home, "probe-evidence.json"), JSON.stringify({ at: "2026-11-16T11:00:00.000Z", hook_timing: { max_gap_ms: 700, cold_gap_ms: 700 } }));
+    noteHookWorst(o, new Date("2026-11-16T12:00:00Z"), "job-4", runs(500));
+    expect(readHookWorst(o)?.run).toMatchObject({ job: "job-4", max_gap_ms: 500 });
+  });
+
+  test("the probe's first session is cold only within a few minutes of boot; otherwise it is marked warm and the step needs a cold one", () => {
+    const session = (useAt: Record<string, number>) => ({ code: 0, out: "", timedOut: false, useAt });
+    const stamp = (id: string, t0: number) => ({ hook: "nav-guard", t0, id, read_at: t0 + 5, answered_at: t0 + 10, answer: "deny" });
+    const m = { full: { session: session({ a: 1_000 }), stamps: [stamp("a", 1_900)] }, warm: [1, 2, 3].map((i) => ({ session: session({ [`w${i}`]: 1_000 }), stamps: [stamp(`w${i}`, 1_300)] })), overrun: null };
+    const cold = judgeHookTiming({ ...m, uptime_s: 120 });
+    expect(cold).toMatchObject({ uptime_s: 120, first_sample: "cold", first_gap_ms: 900, cold_gap_ms: 900 });
+    expect(cold.why).not.toBe("cold_sample_missing");
+    const warm = judgeHookTiming({ ...m, uptime_s: COLD_UPTIME_S + 1 });
+    expect(warm).toMatchObject({ first_sample: "warm", first_gap_ms: 900, cold_gap_ms: null, why: "cold_sample_missing", passed: false });
+    expect(judgeHookTiming({ ...m, uptime_s: null })).toMatchObject({ first_sample: "warm", why: "cold_sample_missing" });
+    expect(COLD_UPTIME_S).toBe(300);
+  });
+
+  test("the probe and the confirmation name the extension's id and version and Chrome's version; a run on other installed versions is refused by name", async () => {
+    const q = queueRig({ confirmed: false });
+    const ev = await probe(q.opts(attended));
+    expect(ev.versions).toEqual({ extension_id: q.inst.profile.extension_id, extension_version: ev.fingerprint.extension_version, chrome_version: "131.0.6778.86" });
+    const c = confirmProfile(q.opts(), ACCEPT);
+    expect(versionsOf(c.fingerprint)).toEqual(ev.versions);
+    expect(versionMismatch(q.opts(), q.inst)).toBeNull();
+    // Chrome updated under the confirmation: the run refuses, naming both versions, until a new probe.
+    q.ask(READ);
+    round(q.cfg);
+    q.clonePc();
+    const before = q.launches.length;
+    writeFileSync(join(q.udd, "Last Version"), "132.0.1.1");
+    const out = await run(q.opts(attended));
+    expect(out.code).toBe("probe_stale");
+    expect(out.detail).toBe("version_mismatch: Chrome is 132.0.1.1, the probe saw 131.0.6778.86: run the probe again, then confirm-profile");
+    expect(q.launches.length).toBe(before);
   }, 120_000);
 });
