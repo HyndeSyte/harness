@@ -886,7 +886,10 @@ class Controller:
                            "still come on a card until he taps Turn on.")
             return
         if h.state == "off":
-            set_fast_path(self.ledger, False, fast_path(self.ledger).get("smoke", ""), by="cain")
+            if cc is not None:
+                cc.turn_off("cain")              # its run is over and any Turn on card comes off
+            else:
+                set_fast_path(self.ledger, False, fast_path(self.ledger).get("smoke", ""), by="cain")
             log.info("the no-card path is off")
             h.finish("ok", "Off: every calendar change comes on a card.")
             return

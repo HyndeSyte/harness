@@ -186,7 +186,9 @@ def test_a_one_off_whose_version_moved_on_with_nothing_else_changed_is_still_ref
     pid = card_for(m, "haircut moved to 10:30 today", ask(MOVE_HAIRCUT))
     m.gmail._bump(HAIRCUT)
     m.tap("Approve")
-    assert haircut_at(m) == "10:00" and state(m, pid) == "stale"
+    # Seventh round: every field the card bound reads the same, so the event didn't change and the
+    # refusal is the calendar's own: not applied, one plain receipt, no fresh card.
+    assert haircut_at(m) == "10:00" and state(m, pid) == "fence_refused"
 
 
 # -- 2. a refused stale write is not unverified ---------------------------------------------------------
@@ -442,7 +444,7 @@ def test_a_late_landing_after_he_declined_the_offer_again_says_so_with_undo_firs
     m.cc.join_abandoned()
     m.c.tick()
     m.c.outbox.flush()
-    said = [t for t in m.seen() if t.startswith("It went through after all, though you declined it")]
+    said = [t for t in m.seen() if t.startswith("Applied despite your Decline")]
     assert said and "Undo comes first" in said[-1]
     card = max(m.link.cards)
     assert [c["label"] for r in m.link.cards[card]["rows"] for c in r["components"]][0] == "Undo"
@@ -562,7 +564,7 @@ def run_smoke(m):
     m.cc.join_abandoned()
     settle(m)
     m.c.outbox.flush()
-    assert m.seen()[-1].startswith("Done.") and "Add Dentist" in m.seen()[-1] or "Added Dentist" in m.seen()[-1]
+    assert m.seen()[-1].startswith("Done.") and "Added Smoke test: Dentist" in m.seen()[-1]   # a test event
     _approve(m, "haircut moved to 10:30 today", MOVE_HAIRCUT)
     m.tap("Undo")
     m.c.tick()
@@ -616,8 +618,7 @@ def test_the_card_shows_the_ledgers_evidence_and_every_no_card_path(m):
     run = run_smoke(m)
     out = m.send(Handover(kind="fastpath", state="on", run=run))
     assert out["status"] == "ok", out
-    card = m.seen()[-1]
-    assert card.startswith("The check after installing passed.")
+    card = next(t for t in reversed(m.seen()) if t.startswith("The check after installing passed."))
     for words in ("Gmail: An add, id ending", "Gmail: A move, id ending", "Gmail: A removal, id ending",
                   "Gmail: An Undo, id ending", "Family: An add, id ending", "Family: An Undo, id ending",
                   "Gmail: A write sent with an older version", "Family: A write sent with an older version",
@@ -644,7 +645,7 @@ def test_a_stored_bake_in_opt_in_is_named_by_calendar_and_date(m):
 def test_turn_on_then_a_turn_off_button_on_the_same_card(m):
     run = run_smoke(m)
     m.send(Handover(kind="fastpath", state="on", run=run))
-    card = max(m.link.cards)
+    card = card_with(m, "Turn on")
     m.tap("Turn on")
     m.c.outbox.flush()
     kept = calendar_change.fast_path(m.ledger)
@@ -683,7 +684,8 @@ def test_a_listing_lag_past_an_hour_is_refused(m):
     with m.ledger.tx() as db:
         db.execute("UPDATE calendar_changes SET settle_json=? WHERE proposal_id=?", (json.dumps(plan), row[0]))
     out = m.send(Handover(kind="fastpath", state="on", run=run))
-    assert out["status"] == "refused" and "listing_lag: 7200 seconds is outside 0 to 3600" in out["said"]
+    assert out["status"] == "refused" and "listing_lag: 7200 seconds on" in out["said"]
+    assert "is outside 0 to 300" in out["said"]                 # seventh round: bounded at 300 seconds
 
 
 # -- 7. etags byte for byte, a cancelled event is gone, and the If-Match is logged -------------------------

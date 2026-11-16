@@ -48,20 +48,63 @@ def schema(ledger: Ledger) -> int:
         return 1
 
 
-def run(ledger: Ledger, cc, chat_id: int) -> dict:
-    """Every step not done yet, in order. What it did, for the log and tests."""
+def run(ledger: Ledger, cc, chat_id: int, version: str | None = None) -> dict:
+    """Every step not done yet, in order, then the install step. What it did, for the log and tests."""
     if ledger.get_meta(DONE) is not None:
         if schema(ledger) < HANDOVER:
             with ledger.tx() as db:
                 ledger.set_meta(SCHEMA, str(HANDOVER), db)
+        out = {}
+    else:
+        reads = _read_in_flight(ledger, cc)
+        with ledger.tx() as db:
+            out = _sweep(ledger, cc, chat_id, reads, db)
+            ledger.set_meta(DONE, iso(ledger.now()), db)
+            ledger.set_meta(SCHEMA, str(max(schema(ledger), HANDOVER)), db)
+        log.info("ledger schema %d: %d card(s) replaced, %d change(s) read back done, %d unverified",
+                 HANDOVER, out["replaced"], out["done"], out["unverified"])
+    done = install(ledger, cc, version)
+    if done:
+        out = {**out, "install": done}
+    return out
+
+
+def install(ledger: Ledger, cc, version: str | None = None) -> dict:
+    """Once per App version the ledger starts under (0.24.0, seventh round), keyed to the version kept in
+    the ledger (calendar_change.INSTALLED), so every install gets it and a restart doesn't: the no-card
+    paths go off if they were on, a smoke run started before ends (its id gives no Turn on), every Turn
+    on card still open comes off, and the card path's gate is set: cards that aren't the smoke run's are
+    refused until the run has read back a change on each calendar (calendar_change.card_gate_open). {}
+    when this version was already installed here."""
+    from . import calendar_change as cal
+    version = version or cal.app_version()
+    kept = cal._meta_json(ledger, cal.INSTALLED)
+    if kept.get("version") == version:
         return {}
-    reads = _read_in_flight(ledger, cc)
+    now = iso(ledger.now())
+    out = {"version": version, "from": kept.get("version", ""), "fast_path_off": False, "run_closed": False,
+           "cards_retired": 0}
     with ledger.tx() as db:
-        out = _sweep(ledger, cc, chat_id, reads, db)
-        ledger.set_meta(DONE, iso(ledger.now()), db)
-        ledger.set_meta(SCHEMA, str(max(schema(ledger), HANDOVER)), db)
-    log.info("ledger schema %d: %d card(s) replaced, %d change(s) read back done, %d unverified",
-             HANDOVER, out["replaced"], out["done"], out["unverified"])
+        if cal.fast_path(ledger).get("on") is True:
+            cal.set_fast_path(ledger, False, cal.fast_path(ledger).get("smoke", ""), by="install", db=db)
+            out["fast_path_off"] = True
+        run = cal.smoke_run(ledger)
+        if run.get("id") and not run.get("closed"):
+            run.update(closed=now, closed_why="install")
+            if run.get("late_probe") == "pending":
+                run["late_probe"] = ""
+            ledger.set_meta(cal.SMOKE_RUN, json.dumps(run), db)
+            out["run_closed"] = True
+        if cc is not None:
+            out["cards_retired"] = cc.retire_turn_on(db)
+        else:
+            db.execute("DELETE FROM meta WHERE key=?", (cal.FAST_OFFER,))
+        ledger.set_meta(cal.CARD_GATE, json.dumps({"version": version, "at": now, "verified": {}}), db)
+        ledger.set_meta(cal.INSTALLED, json.dumps({"version": version, "schema": schema(ledger), "at": now}), db)
+        ledger.event("calendar_install", out, db=db)
+    log.info("installed %s: no-card paths %s, smoke run %s, %d Turn on button(s) off; cards wait for the smoke run",
+             version, "off" if out["fast_path_off"] else "unchanged", "ended" if out["run_closed"] else "none open",
+             out["cards_retired"])
     return out
 
 

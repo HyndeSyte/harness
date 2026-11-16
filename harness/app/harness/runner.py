@@ -815,14 +815,15 @@ class Runner:
 
     def _earlier_keys(self, job) -> dict:
         """Each change of this message offered before and not done (its lease ran out, it read back
-        as not confirmed, or its card was replaced), to the key its fixed id was made from, so the
+        as not confirmed, the calendar refused it as stale, or its card was replaced), to the key its
+        fixed id was made from, so the
         same change offered again writes to the same address (calendar_change.inherit_keys)."""
         ids = self._family_of(job)
         marks = ",".join("?" * len(ids))
         out: dict = {}
         for r in self.ledger.db.execute(
                 f"SELECT p.id FROM proposals p LEFT JOIN calendar_changes x ON x.proposal_id=p.id"
-                f" WHERE p.effect_type=? AND p.job_id IN ({marks}) AND (x.state IN ('lapsed','unverified','absent')"
+                f" WHERE p.effect_type=? AND p.job_id IN ({marks}) AND (x.state IN ('lapsed','unverified','absent','stale')"
                 " OR p.state='superseded') ORDER BY p.created_at", (effects.CALENDAR_CHANGE, *ids)).fetchall():
             for k, v in self.calendar_change.keys_by_change(r["id"]).items():
                 out.setdefault(k, v)

@@ -19,6 +19,8 @@ def pytest_configure(config):
                                        "(a test of escaping or of the rules themselves)")
     config.addinivalue_line("markers", "card_only: the ledger as installed, with the no-card paths off "
                                        "until the smoke test is recorded")
+    config.addinivalue_line("markers", "install_gate: the ledger as installed, with cards that aren't the smoke "
+                                       "run's refused until the run reads back a change on each calendar")
 
 
 # -- what he sees keeps to his standards (test_message_text.py has the static half) -------------
@@ -196,3 +198,14 @@ def smoke_test_passed(request, monkeypatch):
     from harness import calendar_change
     monkeypatch.setattr(calendar_change, "fast_path_on",
                         lambda ledger: calendar_change.fast_path(ledger).get("on", True) is True)
+
+
+@pytest.fixture(autouse=True)
+def card_path_verified(request, monkeypatch):
+    """After an install, cards that aren't the smoke run's wait until the run reads back a change on each
+    calendar (0.24.0, seventh round). Tests written before that run as on a Pi where it has: the gate is
+    open. A test marked install_gate sees the ledger as installed, gate and all."""
+    if request.node.get_closest_marker("install_gate"):
+        return
+    from harness import calendar_change
+    monkeypatch.setattr(calendar_change, "card_gate_open", lambda ledger: True)

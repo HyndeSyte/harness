@@ -384,8 +384,9 @@ def test_a_ledger_already_at_the_new_schema_version_still_gets_this_step_once(tm
 def test_a_ledger_whose_sweep_is_done_is_left_alone(tmp_path, clock, monkeypatch):
     old, ids = _old_ledger(tmp_path, clock, schema=2, done=True)
     from harness import migrate
-    assert migrate.run(old, None, 1) == {}
+    assert set(migrate.run(old, None, 1)) <= {"install"}     # seventh round: only the install step, once
     assert state_of(old, ids["card"]) == "proposed"
+    assert migrate.run(old, None, 1) == {}
 
 
 def test_a_crash_midway_leaves_the_ledger_as_it_was_and_reruns_cleanly(tmp_path, clock, monkeypatch):
