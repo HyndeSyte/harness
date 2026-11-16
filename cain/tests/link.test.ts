@@ -59,7 +59,7 @@ describe("taps", () => {
     await r.link.show(id, { item: "none" });
     expect(await r.tap(r.last(), "k:c:abc")).toBe("to specialist");
     expect(r.answers()).toEqual([6]);
-    expect(r.harness[0]).toEqual(["/press", { id: "11", token: "t", app: BOT, custom_id: "k:c:abc", message_id: id }]);
+    expect(r.harness[0]).toEqual(["/press", { id: expect.stringMatching(/^\d{15,22}$/), token: "t", app: BOT, custom_id: "k:c:abc", message_id: id }]);
   });
 
   test("on a card someone rewrote are refused", async () => {

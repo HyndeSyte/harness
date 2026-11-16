@@ -114,7 +114,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       const e = ledger[o.item];
       if ((e?.id ?? null) !== o.row || (e?.version ?? 0) !== o.version) { outcomes[req.id] = { state: "rejected", reason: `check ${o.item}: the row changed` }; return; }
       const entry = e ?? { id: `r${(++keeper.n).toString(16).padStart(12, "0")}`, version: 1, changed: new Date(t.now).toISOString() };
-      ledger[o.item] = { ...entry, checked: o.text, checked_at: new Date(t.now).toISOString(), checked_version: entry.version, checked_req: req.id, by: "cain" };
+      ledger[o.item] = { ...entry, checked: o.text, checked_at: new Date(t.now).toISOString(), checked_version: entry.version, checked_req: req.id, by: "cain",
+        ...(o.sf ? { checked_sf: o.sf } : {}) };
       files.checks = JSON.stringify(ledger);
     }
     outcomes[req.id] = { state: "done" };
@@ -139,6 +140,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const beyond = new Set<string>();              // on Discord, but further back than the look over his DM goes
   const spy = { onCall: null as null | ((method: string, path: string) => void) };   // runs as each call reaches Discord
   let seq = 0, lastId = "", tapped = "", taps = 0;
+  const seed = String(((BigInt(t.now - HOUR) - 1420070400000n) << 22n) + 1n);
   const snowflake = (at = t.now + t.discord) => String(((BigInt(at) - 1420070400000n) << 22n) + BigInt(++seq));
   const rest = async (method: string, path: string, body?: any, auth = true) => {
     calls.push({ method, path, body: copy(body), auth });
@@ -180,7 +182,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     // The DM channel itself: its last message id (round 16: the link's start mark).
     if (method === "GET" && path === `/channels/${DM}`) {
       const ids = Object.keys(posted).sort((a, b) => (BigInt(a) > BigInt(b) ? 1 : -1));
-      return { id: DM, type: 1, last_message_id: ids.at(-1) ?? null };
+      // Round 18: a DM is never empty on a real Pi (Cain's own talk is in it): with nothing posted yet, its last
+      // message is one from before the rig started.
+      return { id: DM, type: 1, last_message_id: ids.at(-1) ?? seed };
     }
     const one = new RegExp(`^/channels/${DM}/messages/(\\d+)$`).exec(path);
     if (one && method === "GET") return posted[one[1]] ? copy(posted[one[1]]) : { author: { id: OWNER } };
@@ -303,7 +307,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   } });
   const tap = (msg: any, custom_id: string, over: any = {}) => {
     tapped = String(msg.id);
-    return link.onInteraction({ type: 3, id: t.discord ? snowflake() : String(10 + ++taps), token: "t", application_id: BOT, channel_id: DM, user: { id: OWNER },
+    return link.onInteraction({ type: 3, id: snowflake(), token: "t", application_id: BOT, channel_id: DM, user: { id: OWNER },
       data: { custom_id }, message: copy(msg), ...over });
   };
   // Dane's own message in the DM, optionally a Discord reply to one of the bot's.

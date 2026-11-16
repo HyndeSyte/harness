@@ -147,13 +147,15 @@ describe("2. a backward clock step counts only past the Date header's skew margi
     expect(u!.stepped).toEqual(["P44"]);
   });
 
-  test("the link: a tap a few seconds behind the keeper's clock is honoured; one well behind is not", async () => {
+  // Round 18: a tap counts by Discord's times alone (the check's anchor against the tap's interaction), so a backward
+  // step of the Pi's clock no longer decides it either way (source-check-round18.test.ts, item 1).
+  test("the link: a tap a few seconds, or well, behind the keeper's clock is judged by Discord's times and honoured", async () => {
     const { r, id } = await posted();
     r.later(-5_000);
     expect(await r.tap(structuredClone(r.msg(id)), r.ids(id)[0])).toBe("to Cain");
     const b = await posted();
     b.r.later(-20_000);
-    expect(await b.r.tap(structuredClone(b.r.msg(b.id)), b.r.ids(b.id)[0])).toBe("dead: status changed");
+    expect(await b.r.tap(structuredClone(b.r.msg(b.id)), b.r.ids(b.id)[0])).toBe("to Cain");
   });
 
   test("the keeper logs its measured offset against GitHub's Date header each round it has one", () => {

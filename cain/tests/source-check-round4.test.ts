@@ -349,8 +349,9 @@ describe("3. the clock: four sources, one diagnostic, checked at tap time, a bac
     const r = linkRig({ unchecked: true, pending: pendingWith(["P08"], []) });
     const out = await r.link.ask({ text: "Is the packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q1", checked: CHECKED }) as any;
     r.later(-5 * MIN);
-    expect(await r.tap(structuredClone(r.msg(out.message)), r.ids(out.message)[0])).toBe("dead: status changed");
-    expect(r.relayed.join(" ")).not.toContain("Dane tapped");
+    // Round 18: the tap is judged by Discord's times (the check's anchor against the tap's interaction), not the
+    // Pi's clock, so a backward step alone no longer refuses it.
+    expect(await r.tap(structuredClone(r.msg(out.message)), r.ids(out.message)[0])).toBe("to Cain");
     // The keeper: its clock reads earlier than a check's time, so the check never counts again.
     const files: Record<string, string> = { [P]: PENDING };
     const p = plan({ id: "link-check-p44-1", from: "cain", kind: "change", summary: "s", ops: [{ op: "check", item: "P44", text: CHECKED, row: null, version: 0 }] } as Request,

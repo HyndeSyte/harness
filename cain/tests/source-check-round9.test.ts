@@ -212,17 +212,20 @@ describe("2. the roll-forward goes by run ids, never by file times", () => {
     expect(r.state().recheck).toBeUndefined();
   });
 
-  test("a forwards clock step past the check's age: the claim from the earlier run is discarded and told, never acted", async () => {
+  // Round 18: a claim is judged by Discord's time for its tap (the claim's interaction id), so a forwards step of
+  // the Pi's clock past the check's age alone no longer discards it (a tap Discord dates past the check's age is
+  // refused: source-check-round18.test.ts, item 1).
+  test("a forwards clock step past the check's age: the claim, judged by Discord's time for its tap, is finished once", async () => {
     const r = shipRig();
     const ask = await askCard(r);
     const key = await cutClaim(r, ask);
-    r.later(8 * DAY);                                                 // past source_check_max_days (7)
+    r.later(8 * DAY);                                                 // the Pi's clock past source_check_max_days (7)
+    r.t.discord = -8 * DAY;                                           // Discord's time hasn't moved
     r.restart();
     await r.link.sweep();
-    expect(r.relayed.filter((x) => x.includes("Dane tapped"))).toHaveLength(0);
-    expect(notActedLines(r)).toHaveLength(1);
-    expect(onThread(r, ask, NOT_ACTED_TAP)).toHaveLength(1);
-    expect(r.state().taps![key].outcome).toBe("not acted");
+    expect(notActedLines(r)).toHaveLength(0);
+    expect(r.state().taps![key].outcome).not.toBe("not acted");
+    expect(r.relayed.filter((x) => x.includes(`Tap key ${key.startsWith("tap-") ? key : ""}`) || x.includes("Dane tapped"))).toHaveLength(1);
   });
 
   test("a legitimate claim across a restart of the same version completes normally, once", async () => {

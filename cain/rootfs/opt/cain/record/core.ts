@@ -27,7 +27,10 @@ export type Op =
   | { op: "note"; item: string; text: string }                        // anyone, any item: kept for its holder
   // A source check on an open row (state/checks.json): row and version are the row's
   // ledger id and version as the link read them (null and 0: the ledger didn't know it).
-  | { op: "check"; item: string; text: string; row: string | null; version: number }
+  // Round 18: sf, the Discord snowflake the check is anchored to (the newest Discord-stamped id the link
+  // had when it handed the check over: a message or interaction id, never a clock reading), from which a
+  // tap's freshness is measured by Discord's times.
+  | { op: "check"; item: string; text: string; row: string | null; version: number; sf?: string }
   // A one-off ask to him, for the request log, with the link's declaration that it is about
   // no open item (not_about_item, always true). reason: Cain's one line on why, when its words
   // overlap an open row's Item (the link holds it until he gives one); logged with it.
@@ -292,6 +295,7 @@ function itemOpProblem(o: any): string | null {
       if (!(o.row === null || (typeof o.row === "string" && ROW_ID.test(o.row)))) return `check ${o.item}: needs row, the row's ledger id as read (null when it had none)`;
       if (!Number.isInteger(o.version) || o.version < 0 || (o.row === null) !== (o.version === 0))
         return `check ${o.item}: needs version, the row's version as read (0 when it had no ledger id)`;
+      if (o.sf !== undefined && !(typeof o.sf === "string" && /^\d{15,22}$/.test(o.sf))) return `check ${o.item}: sf must be a Discord snowflake`;
       return null;
     }
     case "note": {
@@ -561,6 +565,7 @@ export function itemKnown(text: string | null, id: string): boolean {
 export type CheckEntry = {
   id: string; version: number; changed: string; hash?: string;
   checked?: string; checked_at?: string; checked_version?: number; checked_req?: string; by?: string;
+  checked_sf?: string;   // round 18: the check's Discord anchor (a snowflake): a tap's freshness is its interaction's time less this
   stale_after?: string; aged?: string; pending_rewrite?: string; clock?: string; stepped_back?: string;
   recheck?: string;   // its check was dropped by a reset epoch (when it began): pending re-check until taken again
 };
@@ -592,6 +597,7 @@ export function parseChecks(text: string | null): Checks {
       e.checked = v.checked; e.checked_at = v.checked_at; e.checked_version = v.checked_version;
       if (typeof v.checked_req === "string") e.checked_req = v.checked_req;
       if (typeof v.by === "string") e.by = v.by;
+      if (typeof v.checked_sf === "string" && /^\d{15,22}$/.test(v.checked_sf)) e.checked_sf = v.checked_sf;
       if (typeof v.stale_after === "string" && !Number.isNaN(Date.parse(v.stale_after))) e.stale_after = v.stale_after;
       if (typeof v.aged === "string") e.aged = v.aged;
       if (typeof v.clock === "string") e.clock = v.clock;
@@ -611,7 +617,8 @@ export function checksText(c: Checks, generation?: number): string {
     out[k] = { id: e.id, version: e.version, changed: e.changed, ...(e.hash ? { hash: e.hash } : {}),
       ...(e.checked !== undefined ? { checked: e.checked, checked_at: e.checked_at, checked_version: e.checked_version,
         ...(e.stale_after ? { stale_after: e.stale_after } : {}), ...(e.aged ? { aged: e.aged } : {}),
-        ...(e.checked_req ? { checked_req: e.checked_req } : {}), ...(e.by ? { by: e.by } : {}), ...(e.clock ? { clock: e.clock } : {}) } : {}),
+        ...(e.checked_req ? { checked_req: e.checked_req } : {}), ...(e.by ? { by: e.by } : {}), ...(e.clock ? { clock: e.clock } : {}),
+        ...(e.checked_sf ? { checked_sf: e.checked_sf } : {}) } : {}),
       ...(e.pending_rewrite ? { pending_rewrite: e.pending_rewrite } : {}), ...(e.stepped_back ? { stepped_back: e.stepped_back } : {}),
       ...(e.recheck && e.checked === undefined ? { recheck: e.recheck } : {}) };
   }
@@ -652,6 +659,20 @@ export function isFresh(e: CheckEntry | undefined, now?: number, maxDays = DEFAU
   if (steppedBack(e, now)) return false;
   // A limit of 0 days (the smoke test's expired check): nothing counts, even in the same instant.
   return Number.isFinite(until) && now <= until && !(e.checked_at && until <= Date.parse(e.checked_at));
+}
+
+// Round 18: whether a tap counts against a check, by Discord's times alone. The check is of the row's version
+// and not pending a rewrite; its anchor (the snowflake time it was handed over at: its checked_sf, or the card's
+// own post when the check carried none) is no more than maxDays before `at`, Discord's time for the tap. The
+// keeper's aged and stepped_back marks and its stale_after are its own wall-clock readings: they decide the
+// Checked cell and retention, never whether a tap counts. A limit of 0 days: nothing counts.
+export const snowflakeTimeOf = (id: string | undefined | null): number => {
+  try { return id && /^\d{15,22}$/.test(id) ? Number(BigInt(id) >> 22n) + 1420070400000 : NaN; } catch { return NaN; }
+};
+export function freshByDiscord(e: CheckEntry | undefined, anchor: string | undefined | null, at: number, maxDays = DEFAULT_MAX_CHECK_DAYS): boolean {
+  if (!e || e.checked === undefined || e.checked_version !== e.version || e.pending_rewrite) return false;
+  const a = snowflakeTimeOf(anchor);
+  return maxDays > 0 && Number.isFinite(a) && Number.isFinite(at) && at - a <= maxDays * DAY_MS;
 }
 
 const norm = (s: string) => s.trim().replace(/\s+/g, " ");
@@ -747,7 +768,7 @@ export function voidChecks(ledger: Checks, at: string): { ledger: Checks; droppe
   const out: Checks = {}, dropped: string[] = [];
   for (const [code, e] of Object.entries(ledger)) {
     if (e.checked === undefined) { out[code] = e; continue; }
-    const { checked: _c, checked_at: _a, checked_version: _v, checked_req: _r, by: _b, stale_after: _s, aged: _g, clock: _k, stepped_back: _t, ...kept } = e;
+    const { checked: _c, checked_at: _a, checked_version: _v, checked_req: _r, by: _b, stale_after: _s, aged: _g, clock: _k, stepped_back: _t, checked_sf: _f, ...kept } = e;
     out[code] = { ...kept, recheck: at };
     dropped.push(code);
   }
@@ -1402,10 +1423,10 @@ export function plan(req: Request, tree: Tree, ctx: PlanContext): Plan {
       // A row the ledger didn't know yet gets its id from this request alone, so the same check
       // applied again after a lost push gives the row the same id.
       const entry: CheckEntry = e ?? { id: newRowId(`${req.id}\u0000${id}`), version: 1, changed: iso };
-      const { aged: _aged, stepped_back: _stepped, clock: _clock, recheck: _recheck, ...kept } = entry;
+      const { aged: _aged, stepped_back: _stepped, clock: _clock, recheck: _recheck, checked_sf: _sf, ...kept } = entry;
       const until = new Date(ctx.at.getTime() + maxCheckDays(ctx.maxCheckDays) * DAY_MS).toISOString();
       ledger = { ...ledger, [id]: { ...kept, checked: o.text.trim(), checked_at: iso, checked_version: entry.version, stale_after: until, checked_req: req.id, by: sender,
-        ...(ctx.clockSource ? { clock: ctx.clockSource } : {}) } };
+        ...(ctx.clockSource ? { clock: ctx.clockSource } : {}), ...(o.sf ? { checked_sf: o.sf } : {}) } };
       checked = true;
       if (h?.holder === sender) touched.add(id);
       continue;

@@ -489,8 +489,8 @@ describe("the link asks only on an accepted check of the row as it stands", () =
     expect(out.status).toBe("posted");
     const id = `link-check-p08-${NOV11_8AM}`;
     expect(r.submitted).toEqual([{ id, from: "cain", kind: "change",
-      summary: `Source check on P08 before asking him: ${CHECKED}`, ops: [{ op: "check", item: "P08", text: CHECKED, row: rowId("P08"), version: 4 }] }]);
-    expect(r.state().messages[(out as any).message].checked).toEqual({ row: rowId("P08"), version: 4, req: id, gen: 0, epoch: 0 });
+      summary: `Source check on P08 before asking him: ${CHECKED}`, ops: [{ op: "check", item: "P08", text: CHECKED, row: rowId("P08"), version: 4, sf: expect.stringMatching(/^\d{15,22}$/) }] }]);
+    expect(r.state().messages[(out as any).message].checked).toEqual({ row: rowId("P08"), version: 4, req: id, gen: 0, epoch: 0, sf: expect.stringMatching(/^\d{15,22}$/) });
     // The same check sent again while it still counts (say his line was refused): the accepted one stands.
     await r.link.answered({ item: "P08", question: "Q2" });
     expect((await r.link.ask({ text: "Is the packet filed yet?", options: opts, item: "P08", question: "Q3", checked: CHECKED })).status).toBe("posted");
@@ -627,7 +627,7 @@ describe("the link asks only on an accepted check of the row as it stands", () =
     expect(r.posts()).toBe(0);
     const out = await r.link.ship({ ...card, checked: "the pull request on GitHub, open at that head, read at 8 this morning" });
     expect(out.status).toBe("posted");
-    expect(r.submitted.map((q) => q.ops)).toEqual([[{ op: "check", item: "P41", text: "the pull request on GitHub, open at that head, read at 8 this morning", row: null, version: 0 }]]);
+    expect(r.submitted.map((q) => q.ops)).toEqual([[{ op: "check", item: "P41", text: "the pull request on GitHub, open at that head, read at 8 this morning", row: null, version: 0, sf: expect.stringMatching(/^\d{15,22}$/) }]]);
   });
 });
 

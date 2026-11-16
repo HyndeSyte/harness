@@ -375,7 +375,7 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // recover line accepted at the start check, waiting for its trailer.
   linesDone?: string[]; historyLines?: string[]; recoverLines?: { nonce: string; said: string }[];
   tapNotices?: TapNotice[] };
-type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold" | "superseded"; reason: string; msg?: string; at: string };
+type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold" | "superseded" | "unstamped"; reason: string; msg?: string; at: string };
 const TAPS_KEPT = 1000;
 // Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
 // Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
@@ -434,7 +434,7 @@ export const linkHeldFile = (cfg: Config) => cfg.linkHeld ?? join(dirname(cfg.qu
 // carries), floored by the hold start the durable held record carries (also as a snowflake time).
 export const HELD_CLOCK_TOLERANCE_MS = 2 * 60_000;
 export const snowflakeMs = (id: string) => { try { return /^\d{15,22}$/.test(id) ? Number(BigInt(id) >> 22n) + 1420070400000 : NaN; } catch { return NaN; } };
-function heldTap(cfg: Config, kid: string): { at: number; sf: number | null; holdSf: number | null } | null {
+function heldTap(cfg: Config, kid: string): { at: number; sf: number | null; holdSf: number | null; msg?: string } | null {
   try {
     const r = readLog<any>(linkHeldFile(cfg), { repair: false }).records.find((x) => x?.t === "held" && x.kid === kid);
     if (!r || !Number.isFinite(Number(r.at))) return null;
@@ -442,18 +442,22 @@ function heldTap(cfg: Config, kid: string): { at: number; sf: number | null; hol
     // Round 17: the hold's start is the snowflake of the Discord-stamped id the held record carries (the hold's
     // first held interaction), never a time the link computed from a clock: a record without one has no floor.
     const hs = typeof r.hold?.id === "string" ? snowflakeMs(r.hold.id) : NaN;
-    return { at: Number(r.at), sf: Number.isFinite(sf) ? sf : null, holdSf: Number.isFinite(hs) ? hs : null };
+    return { at: Number(r.at), sf: Number.isFinite(sf) ? sf : null, holdSf: Number.isFinite(hs) ? hs : null, ...(typeof r.msg === "string" ? { msg: r.msg } : {}) };
   } catch { return null; }
 }
 // Round 16: a key's expiry as a snowflake time: its card's post snowflake plus the lifetime its record
 // carries (expiry less the time it was logged, both by the link's one clock); without a card id, its expiry.
 // Round 17: with the explicit lifetime (life, a duration fixed at issuance) its key record carries, the expiry is
 // the post snowflake plus that duration; only a key logged before round 17 falls back to expiry less logged time.
-export function expirySf(k: { msg?: string; at?: number; exp?: number; life?: number }): number | null {
+// Round 18: no Pi clock fallback: a key record without a card snowflake takes it from the interaction (the message
+// id the held record or the link's tap record carries: msgFallback); without one, null (unplaced: refused).
+export function expirySf(k: { msg?: string; at?: number; exp?: number; life?: number }, msgFallback?: string): number | null {
   if (typeof k.exp !== "number" || !Number.isFinite(k.exp)) return null;
-  const m = snowflakeMs(String(k.msg ?? ""));
-  if (Number.isFinite(m) && typeof k.life === "number" && Number.isFinite(k.life)) return m + k.life;
-  return Number.isFinite(m) && typeof k.at === "number" && Number.isFinite(k.at) ? m + (k.exp - k.at) : k.exp;
+  let m = snowflakeMs(String(k.msg ?? ""));
+  if (!Number.isFinite(m)) m = snowflakeMs(String(msgFallback ?? ""));
+  if (!Number.isFinite(m)) return null;
+  if (typeof k.life === "number" && Number.isFinite(k.life)) return m + k.life;
+  return typeof k.at === "number" && Number.isFinite(k.at) ? m + (k.exp - k.at) : null;
 }
 function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }); }
 
@@ -1184,16 +1188,27 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // floored by the hold start its durable held record carries, against its card's expiry as a snowflake
       // time; the keeper's own clock and its restarts play no part. Without Discord's time, the link's logged
       // time against the key's expiry as before; without a held record, the link's issued time, else now.
-      const pastExpiry = (k: string, rec: { msg?: string; at?: number; exp?: number; life?: number }): null | "expired" | "floor" => {
+      // Round 18: no wall-clock fallback. A held tap is judged by its own interaction snowflake against its key's
+      // expiry; the hold's shared start (hold.id) is only the lateness floor, never the tap's time. A held record
+      // without an interaction id, or a key whose card can't be placed in Discord's time (no card snowflake on the
+      // key, the held record or the link's tap record), is refused without using the key ("unstamped"). A live tap
+      // is judged by the interaction id the link's tap record carries; without one, the link's own judgement by
+      // Discord's times (made at the tap) stands, and the keeper's clock plays no part.
+      const pastExpiry = (k: string, rec: { msg?: string; at?: number; exp?: number; life?: number }): null | "expired" | "floor" | "unstamped" => {
         const h = heldTap(cfg, k);
-        if (h && h.sf !== null) {
-          const e = expirySf(rec);
-          if (e === null) return null;
+        const own = linkTaps?.issued[k];
+        if (h) {
+          if (h.sf === null) return "unstamped";
+          const e = expirySf(rec, h.msg ?? own?.msg);
+          if (e === null) return "unstamped";
           if (h.sf > e) return "expired";
           return h.holdSf !== null && h.holdSf > e ? "floor" : null;
         }
-        const t = h ? h.at : (linkTaps?.issued[k]?.at ?? clock().getTime());
-        return typeof rec.exp === "number" && t > rec.exp ? "expired" : null;
+        const it = own?.it ? snowflakeMs(own.it) : NaN;
+        if (!Number.isFinite(it)) return null;
+        const e = expirySf(rec, own?.msg);
+        if (e === null) return "unstamped";
+        return it > e ? "expired" : null;
       };
       let past: ReturnType<typeof pastExpiry> = null;
       for (const it of items) {
@@ -1243,6 +1258,14 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           o = { ...base, state: "rejected", reason: `tap key ${tapK} was held across a restart, and its hold (by the link's durable held record) began after its card had expired, so nothing was recorded from it and the key isn't used up: record nothing from it, and ask again with --checked if it still needs him` };
           notice({ tap: tapK, why: "hold", reason: o.reason!, ...(r.msg ? { msg: r.msg } : {}) });
           log(`tap key ${tapK} refused: its hold began after its card's expiry`);
+        }
+        else if (tapK && past === "unstamped") {
+          // Round 18: a tap the keeper can't place in Discord's time (a held record without its interaction id, or a
+          // key whose card has no snowflake anywhere): refused without using the key, never judged by the Pi's clock.
+          const r = reg.keys.get(tapK)!;
+          o = { ...base, state: "rejected", reason: `tap key ${tapK} can't be placed in Discord's time (its held record has no interaction id, or its card no message id), so nothing was recorded from it and the key isn't used up: record nothing from it, and ask again with --checked if it still needs him` };
+          notice({ tap: tapK, why: "unstamped", reason: o.reason!, ...(r.msg ? { msg: r.msg } : {}) });
+          log(`tap key ${tapK} refused: it can't be placed in Discord's time`);
         }
         else if (tapK && past === "expired") {
           // Round 14: the keeper enforces expiry: a key tapped after the expiry its issued record carries is
@@ -1444,16 +1467,17 @@ export function linkFloor(cfg: Config): number { return readLinkFloor(cfg).floor
 // Round 10: the tap keys the link issued (its state's issued) and the short forms of the tap keys whose
 // landing it lists as unresolved (its state's unresolved, by full key: hashed here the way the link's
 // tapKid does). null: the link's state can't be read.
-export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap & { at?: number }>; unresolved: Set<string>; run: number | null; nonce: string | null } | null {
+export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap & { at?: number; it?: string }>; unresolved: Set<string>; run: number | null; nonce: string | null } | null {
   const f = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
   try {
     if (!existsSync(f) || lstatSync(f).size > 20_000_000) return null;
     const j = JSON.parse(readFileSync(f, "utf8"));
     if (!j || typeof j !== "object" || Array.isArray(j)) return null;
-    const issued: Record<string, IssuedTap & { at?: number }> = {};
+    const issued: Record<string, IssuedTap & { at?: number; it?: string }> = {};
     for (const [k, v] of Object.entries<any>(j.issued ?? {}))
       if (TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string")
         issued[k] = { item: v.item, kind: v.kind, ...(typeof v.at === "number" && Number.isFinite(v.at) ? { at: v.at } : {}), ...(typeof v.label === "string" ? { label: v.label } : {}), ...(typeof v.msg === "string" ? { msg: v.msg } : {}),
+          ...(typeof v.it === "string" && /^\d{15,22}$/.test(v.it) ? { it: v.it } : {}),
           ...(v.target && typeof v.target.item === "string" && Array.isArray(v.target.writes) ? { target: { item: v.target.item, writes: v.target.writes.filter((w: any) => typeof w === "string") } } : {}) };
     // Round 11: a tombstone keeps its consumed key too.
     const unresolved = new Set([...Object.keys(j.unresolved ?? {}), ...Object.keys(j.tombstones ?? {})].map((k) => `tap-${createHash("sha256").update(k).digest("hex").slice(0, 12)}`));

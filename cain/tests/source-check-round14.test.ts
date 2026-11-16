@@ -71,6 +71,8 @@ test("the keeper and the link name an ordinary start's unverified set the same w
   expect(KEEPER_SIDE_WHY).toBe(KEEPER_START_WHY);
 });
 
+const sfAt = (ms: number, n = 7) => String(((BigInt(ms) - 1420070400000n) << 22n) + BigInt(n));
+
 describe("1. the start-time re-arm re-runs every arming check", () => {
   test("a failed state save followed by a failed void write, then a restart: no buttons, and a tap is refused as withdrawn", async () => {
     const r = shipRig();
@@ -312,13 +314,15 @@ describe("3. the held queue is durable and judged by tap time", () => {
   test("the keeper judges a held tap by its tap time: before the expiry acts, after it is refused unused", () => {
     const k = keeperRig();
     const at = k.cfg.now!().getTime();
+    // Round 18: every tap carries its interaction id (Discord's time for it), the keeper's only measure of it.
+    const m311 = sfAt(at, 311), m312 = sfAt(at, 312);
     const ask = (kid: string, msg: string) => ({ t: "key", kid, item: "P11", kind: "ask", label: "Filed", msg, target: { item: "P11", writes: ["row-close", "decision"] }, at, exp: at + 10 * MIN });
-    appendLog(linkLog(k), ask("tap-00000000b311", "1570000000000000311"));
-    appendLog(linkLog(k), ask("tap-00000000b312", "1570000000000000312"));
+    appendLog(linkLog(k), ask("tap-00000000b311", m311));
+    appendLog(linkLog(k), ask("tap-00000000b312", m312));
     writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: {
-      "tap-00000000b311": { item: "P11", kind: "ask", label: "Filed", msg: "1570000000000000311", at: at + MIN },
-      "tap-00000000b312": { item: "P11", kind: "ask", label: "Filed", msg: "1570000000000000312", at: at + 20 * MIN } } }));
-    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000b311", msg: "1570000000000000311", at: at + MIN });
+      "tap-00000000b311": { item: "P11", kind: "ask", label: "Filed", msg: m311, at: at + MIN, it: sfAt(at + MIN, 1) },
+      "tap-00000000b312": { item: "P11", kind: "ask", label: "Filed", msg: m312, at: at + 20 * MIN, it: sfAt(at + 20 * MIN, 2) } } }));
+    appendLog(linkHeldFile(k.cfg), { t: "held", kid: "tap-00000000b311", msg: m311, at: at + MIN, it: sfAt(at + MIN, 1) });
     // Round 15: the keeper's own hold (a start with the remote down) begins before the taps.
     k.cain({ id: "cain-hold-0", ops: [{ op: "note", item: "P44", text: "a round" }] });
     expect(cycle(k.cfg).ok).toBe(true);
@@ -421,8 +425,11 @@ describe("5. expiry enforced by the keeper; removal edits retried; the post-rest
   test("the keeper refuses a key tapped past its card's expiry without using it up", () => {
     const k = keeperRig();
     const at = k.cfg.now!().getTime();
-    appendLog(linkLog(k), { t: "key", kid: "tap-00000000b501", item: "P11", kind: "ask", label: "Filed", msg: "1570000000000000501",
+    appendLog(linkLog(k), { t: "key", kid: "tap-00000000b501", item: "P11", kind: "ask", label: "Filed", msg: sfAt(at, 501),
       target: { item: "P11", writes: ["row-close", "decision"] }, at, exp: at + MIN });
+    // Round 18: judged by the interaction id on the link's tap record (Discord's time for the tap), not the keeper's clock.
+    writeFileSync(join(k.root, "pi/link/state.json"), JSON.stringify({ messages: {}, issued: {
+      "tap-00000000b501": { item: "P11", kind: "ask", label: "Filed", msg: sfAt(at, 501), at: at + 5 * MIN, it: sfAt(at + 5 * MIN, 5) } } }));
     k.at(new Date(at + 5 * MIN));
     k.cain({ id: "cain-late-5", tap: "tap-00000000b501", ops: [{ op: "row-close", item: "P11", evidence: "his tap" }] }, { issue: false });
     expect(cycle(k.cfg).ok).toBe(true);
