@@ -149,6 +149,7 @@ class Runner:
         self._budgets_ok = budgets_ok or self._budget_ok
         if calendar_change is not None:
             calendar_change.to_card = self.card_instead
+            calendar_change.reoffer = self.reoffer
 
     # -- budget -----------------------------------------------------------
     def _budget_ok(self, provider: str) -> bool:
@@ -625,6 +626,56 @@ class Runner:
                                 job_id=job["id"], buttons=render.proposal_buttons(
                                     nonce, **({"approve": "Add anyway", "decline": "Leave it"} if loose else {})),
                                 binds=[{"type": "approval", "nonce": nonce}], db=db)
+
+    def reoffer(self, kind: str, target: str) -> str:
+        """His tap on a card that offers requests again (0.24.0, fourth round): Propose again on the
+        message listing what the ledger migration replaced, or his pick of which card a note
+        corrects. Each comes back as a new card for his tap, quoting his message, never applied."""
+        if kind == "calendar_change_which":
+            return self._which_picked(target)
+        from . import migrate
+        n = 0
+        for pid in migrate.listed(self.ledger, target):
+            p = self.ledger.db.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+            if p is None or p["state"] not in ("superseded", "failed"):
+                continue
+            if self._again(p, "you tapped Propose again after Harness updated, so this is your request from "
+                              "before, on a new card."):
+                n += 1
+        if not n:
+            return "Nothing to bring back there."
+        return f"Back on {n} new card{'s' * (n != 1)}, each waiting for your tap."
+
+    def _again(self, p, why: str, extra: dict | None = None) -> str:
+        """One earlier request's change, as a new request of the same message (its quote, flags and
+        fixed ids kept), on a card. The new request's id, or "" if it couldn't be offered."""
+        old = self.ledger.job(p["job_id"])
+        if old is None:
+            return ""
+        root = self.ledger.get_meta(f"job_parent:{p['job_id']}") or p["job_id"]
+        try:
+            params = json.loads(p["params_json"])
+        except (ValueError, TypeError):
+            return ""
+        with self.ledger.tx() as db:
+            new = self.ledger.made_job(old["chat_id"], self.ledger.job_text(p["job_id"]), kind="message_again", db=db,
+                                       reply_to=old["reply_to_message_id"], created_at=old["created_at"])
+            self.ledger.set_meta(f"job_parent:{new}", root, db)
+            flags = self.ledger.get_meta(f"job_flags:{p['job_id']}") or self.ledger.get_meta(f"job_flags:{root}")
+            if flags:
+                self.ledger.set_meta(f"job_flags:{new}", flags, db)
+            parts = json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
+            if root != new:
+                self.ledger.set_meta(f"job_parts:{root}", json.dumps(parts + [new]), db)
+            for k, v in (extra or {}).items():
+                self.ledger.set_meta(f"{k}:{new}", v, db)
+        job = self.ledger.job(new)
+        d = effects.REGISTRY[effects.CALENDAR_CHANGE]
+        seen = self.calendar_change.preview_quiet(job, params)
+        warnings = [why] + (seen.checks if seen else [])
+        self._offer(job, d, params, {"reason": "offered_again"}, warnings, seen.lines if seen else None,
+                    seen=seen, replaced=False)
+        return new
 
     def card_instead(self, p, why: str) -> None:
         """A change that was going through with no tap, found at the moment of its write to need

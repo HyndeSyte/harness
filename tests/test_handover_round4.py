@@ -268,3 +268,149 @@ def test_his_wednesday_sent_on_a_wednesday_comes_on_a_card(m):
     out = m.tells("dentist wednesday at 3", ask(DENTIST))    # the rig's today is a Wednesday
     assert out["status"] == "waiting for his tap" and not dentists(m)
     assert "(not in your words)" in m.seen()[-1]
+
+
+# -- 2. the migration, keyed to the ledger's own schema version --------------------------------------
+
+def _old_ledger(tmp_path, clock, *, schema=None, done=False):
+    """A ledger as the current release (0.23.0) leaves it: an open card bound to a sent message, a
+    change approved and not started, and one mid-write whose add did land. No ledger_schema mark,
+    unless `schema` (another change installed first)."""
+    from harness import approvals as ap
+    from harness.ledger import Ledger, iso
+    from test_plain_commands import MOVE_PT
+    clock.t = datetime(2026, 11, 11, 12, 30, tzinfo=timezone.utc)
+    old = Ledger(str(tmp_path / "ledger.db"), clock=clock)
+    with old.tx() as db:
+        card_job = old.made_job(1, "PT moved to 11:30", kind="message", db=db, state="proposed")
+        swim_job = old.made_job(1, "swim lesson at 5 today", kind="message", db=db, state="approved")
+        mid_job = old.made_job(1, "add the dentist at 3 today", kind="message", db=db, state="approved")
+    card = ap.create_proposal(old, job_id=card_job, effect_type="calendar_change",
+                              params={"changes": [MOVE_PT]}, policy_version="p1", ttl_s=3600)
+    nonce = ap.mint(old, proposal_id=card, owner_user_id=1, ttl_s=3600)
+    ap.bind_message(old, nonce, 7777)
+    swim = ap.create_proposal(old, job_id=swim_job, effect_type="calendar_change", params={"changes": [change(
+        "gmail", "add", "Swim lesson", dates="", start=at(17).isoformat(), end=at(18).isoformat())]},
+        policy_version="p1", ttl_s=3600)
+    mid = ap.create_proposal(old, job_id=mid_job, effect_type="calendar_change",
+                             params={"changes": [DENTIST]}, policy_version="p1", ttl_s=3600)
+    entry = {"cal": "gmail", "how": "drop", "id": "cm" + "d" * 32, "check": {"kind": "there"},
+             "wrote": {"summary": "Dentist"}}
+    plan = {"parts": [{"will": "Add Dentist, today, 3:00 to 4:00 (Gmail)", "done": "Added Dentist (Gmail)",
+                       "name": "Dentist", "steps": [{"status": "unsure", "entry": entry, "label": "Gmail: Dentist added.",
+                                                     "what": "Gmail"}]}]}
+    with old.tx() as db:
+        db.execute("UPDATE proposals SET state='approved' WHERE id=?", (swim,))
+        db.execute("UPDATE proposals SET state='executing' WHERE id=?", (mid,))
+        db.execute("INSERT INTO calendar_changes(proposal_id, job_id, state, undo_state, undo_json, created_at,"
+                   " updated_at, settle_json) VALUES(?,?,?,?,?,?,?,?)",
+                   (mid, mid_job, "settling", "none", "[]", iso(clock()), iso(clock()), json.dumps(plan)))
+        if schema is not None:
+            old.set_meta("ledger_schema", str(schema), db)
+        if done:
+            old.set_meta("migration_done:handover_sweep", iso(clock()), db)
+    return old, {"card": card, "nonce": nonce, "swim": swim, "mid": mid, "entry": entry}
+
+
+def _landed_dentist(monkeypatch, entry):
+    """The mid-write add did land on his Gmail before the update; the card from before was sent
+    by the link before this test's fake link existed."""
+    import test_discord_keeper
+    real_buttons = test_discord_keeper.FakeLink.buttons
+    monkeypatch.setattr(test_discord_keeper.FakeLink, "buttons", lambda self, card, rows: None
+                        if card not in self.cards else real_buttons(self, card, rows))
+    real = Morning.seed
+
+    def seed(self):
+        real(self)
+        self.gmail.events[entry["id"]] = {"id": entry["id"], "summary": "Dentist", "status": "confirmed", "etag": '"9"',
+                                          "start": {"dateTime": at(15).isoformat(), "timeZone": TZ},
+                                          "end": {"dateTime": at(16).isoformat(), "timeZone": TZ}}
+    monkeypatch.setattr(Morning, "seed", seed)
+
+
+def state_of(ledger, pid):
+    return ledger.db.execute("SELECT state FROM proposals WHERE id=?", (pid,)).fetchone()[0]
+
+
+def test_an_upgrade_from_the_current_release_sweeps_once_and_lists_what_it_replaced(tmp_path, clock, monkeypatch):
+    from test_plain_commands import PT_ID
+    old, ids = _old_ledger(tmp_path, clock)
+    _landed_dentist(monkeypatch, ids["entry"])
+    m = Morning(old, tmp_path, clock)
+    assert old.get_meta("ledger_schema") == "2" and old.get_meta("migration_done:handover_sweep")
+    # The open card: replaced, its buttons off, its tap refused.
+    assert state_of(old, ids["card"]) == "superseded"
+    assert old.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='unbutton' AND text='7777'").fetchone()[0] == 1
+    m.send(Handover(kind="press", press={"id": "97001", "token": "t", "app": "999",
+                                         "custom_id": "k:" + approvals.callback_data("approve", ids["nonce"]),
+                                         "message_id": "7777"}))
+    assert any("Replaced when Harness updated. Nothing was done." in (t or "") for _, t in m.link.answers)
+    assert m.gmail_times(PT_ID) == ("12:00", "13:00")
+    # In flight: read back, recorded, never written again.
+    x = {r["proposal_id"]: r for r in rows(m)}
+    assert x[ids["mid"]]["state"] == "done" and state_of(old, ids["mid"]) == "executed"
+    assert x[ids["swim"]]["state"] == "unverified" and state_of(old, ids["swim"]) == "failed"
+    assert not [e for e in m.gmail.log if e[0] == "insert"]          # nothing re-applied
+    said = m.seen()
+    assert any(t.startswith("Done. Add Dentist") and "shows it done" in t for t in said)
+    assert any(t.startswith("Not confirmed: Add Swim lesson") and "nothing of it was written again" in t for t in said)
+    # One message listing each, with one Propose again button.
+    listing = [t for t in said if t.startswith("Harness updated.")]
+    assert len(listing) == 1
+    assert "1. Your message “PT moved to 11:30”: Move PT" in listing[0] and "(its card was replaced)" in listing[0]
+    assert "2. Your message “swim lesson at 5 today”: Add Swim lesson" in listing[0]
+    assert "Propose again puts each one back on a new card" in listing[0] and "Propose again" in m.labels()
+    m.tap("Propose again")
+    m.c.outbox.flush()
+    new_cards = [t for t in m.seen() if "you tapped Propose again after Harness updated" in t]
+    assert len(new_cards) == 2 and not [e for e in m.gmail.log if e[0] == "insert"]
+    m.tap("Approve")                                               # the newest: the swim lesson
+    assert [e["summary"] for e in m.gmail.events.values() if e.get("summary") == "Swim lesson"] == ["Swim lesson"]
+    # Once: a restart finds the marker and touches nothing.
+    from harness import migrate
+    assert migrate.run(old, m.cc, 1) == {}
+
+
+def test_a_ledger_already_at_the_new_schema_version_still_gets_this_step_once(tmp_path, clock, monkeypatch):
+    old, ids = _old_ledger(tmp_path, clock, schema=2)           # another change moved it to 2 first
+    _landed_dentist(monkeypatch, ids["entry"])
+    Morning(old, tmp_path, clock)
+    assert state_of(old, ids["card"]) == "superseded" and old.get_meta("ledger_schema") == "2"
+    assert old.get_meta("migration_done:handover_sweep")
+
+
+def test_a_ledger_whose_sweep_is_done_is_left_alone(tmp_path, clock, monkeypatch):
+    old, ids = _old_ledger(tmp_path, clock, schema=2, done=True)
+    from harness import migrate
+    assert migrate.run(old, None, 1) == {}
+    assert state_of(old, ids["card"]) == "proposed"
+
+
+def test_a_crash_midway_leaves_the_ledger_as_it_was_and_reruns_cleanly(tmp_path, clock, monkeypatch):
+    from harness import migrate
+    old, ids = _old_ledger(tmp_path, clock)
+    _landed_dentist(monkeypatch, ids["entry"])
+    real = migrate._listing
+    calls = []
+
+    def dies_once(*a):                                        # after the card is replaced, before the marker
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("power cut")
+        return real(*a)
+    monkeypatch.setattr(migrate, "_listing", dies_once)
+    real_run = migrate.run
+    monkeypatch.setattr(migrate, "run", lambda *a: {})        # the rig starts; the sweep runs below
+    m = Morning(old, tmp_path, clock)
+    monkeypatch.setattr(migrate, "run", real_run)
+    with pytest.raises(RuntimeError):
+        migrate.run(old, m.cc, 1)
+    assert state_of(old, ids["card"]) == "proposed" and old.get_meta("migration_done:handover_sweep") is None
+    assert old.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='unbutton'").fetchone()[0] == 0
+    assert migrate.run(old, m.cc, 1)["replaced"] == 1          # run again from the start, whole
+    m.c.outbox.flush()
+    assert state_of(old, ids["card"]) == "superseded" and old.get_meta("migration_done:handover_sweep")
+    assert old.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='unbutton'").fetchone()[0] == 1
+    assert len([t for t in m.seen() if t.startswith("Harness updated.")]) == 1
+    assert migrate.schema(old) == 2

@@ -999,6 +999,81 @@ class CalendarChange:
             unread_any = unread_any or bool(unread)
         return "unread" if unread_any else "done"
 
+    # -- the ledger migration (migrate.py): changes the version before left in flight ----------
+    def read_in_flight(self, p) -> tuple[str, list[dict]]:
+        """A change the version before left approved or mid-write, read back from the calendar and
+        never written: ("done", the writes a read found landed) when the calendar shows all of it,
+        else ("unverified", what landed). One never started is done only if the calendar already
+        shows it as asked (an add's very event there, a move already at its time)."""
+        try:
+            plan = json.loads(p["settle_json"] or "{}") if p["x_state"] else {}
+        except (ValueError, TypeError):
+            plan = {}
+        if not p["x_state"]:
+            try:
+                parts, _ = self._plan_all(json.loads(p["params_json"]), p["id"])
+            except (Refuse, ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
+                return "unverified", []
+            return ("done" if parts and all(part.already for part in parts) else "unverified"), []
+        landed, whole = [], bool(plan.get("parts"))
+        for part in plan.get("parts") or []:
+            for rec in part.get("steps", []):
+                entry = rec.get("entry")
+                if rec.get("status") in ("landed", "trying", "unsure") and entry:
+                    seen, _ = self._seen_as(entry)
+                    if seen == "landed" or (rec["status"] == "landed" and seen == "unread"):
+                        landed.append(entry)
+                        continue
+                whole = False
+        return ("done" if whole else "unverified"), landed
+
+    def record_in_flight(self, db, p, verdict: str, landed: list[dict]) -> None:
+        """migrate.py: a change in flight from the version before, recorded as the read found it,
+        with its receipt and Undo for what landed. Nothing of it is written again."""
+        now = iso(self.ledger.now())
+        row = db.execute("SELECT * FROM calendar_changes WHERE proposal_id=?", (p["id"],)).fetchone()
+        plan = _plan(row) if row is not None else {}
+        plan["migrated"] = verdict
+        undo = (json.loads(row["undo_json"] or "[]") if row is not None else [])
+        undo += [e for e in landed if e not in undo]
+        state = "done" if verdict == "done" else "unverified"
+        if row is None:
+            db.execute("INSERT INTO calendar_changes(proposal_id, job_id, state, undo_state, undo_json, created_at,"
+                       " updated_at, settle_json) VALUES(?,?,?,?,?,?,?,?)",
+                       (p["id"], p["job_id"], state, "open" if undo else "none", json.dumps(undo), now, now,
+                        json.dumps(plan)))
+        else:
+            db.execute("UPDATE calendar_changes SET state=?, undo_state=?, undo_json=?, settle_json=?, updated_at=?"
+                       " WHERE proposal_id=? AND state IN ('sending','settling')",
+                       (state, "open" if undo else "none", json.dumps(undo), json.dumps(plan), now, p["id"]))
+        db.execute("UPDATE proposals SET state=? WHERE id=? AND state IN ('approved','auto_approved','executing')",
+                   ("executed" if verdict == "done" else "failed", p["id"]))
+        job = db.execute("SELECT state FROM jobs WHERE id=?", (p["job_id"],)).fetchone()
+        if job is not None and job["state"] == "approved":
+            self.ledger.transition(p["job_id"], "executed" if verdict == "done" else "failed", db=db,
+                                   receipt=json.dumps({"reason": "migrated", "read": verdict}))
+        raw = self.ledger.get_meta(f"calendar_change_lines:{p['id']}")
+        try:
+            said = "; ".join(render.plain(x) for x in json.loads(raw)) if raw else ""
+        except ValueError:
+            said = ""
+        if not said:
+            try:
+                said = "; ".join(render.change_line(c, self.tz, self.ledger.now())
+                                 for c in json.loads(p["params_json"])["changes"])
+            except (ValueError, KeyError, TypeError):
+                said = ""
+        said = said or "; ".join(part.get("will", "") for part in plan.get("parts", [])) or "that calendar change"
+        if verdict == "done":
+            words = (f"<b>Done.</b> {_safe(said)}. It was being written when Harness updated, and a read of the "
+                     "calendar after the update shows it done.")
+        else:
+            words = (f"<b>Not confirmed:</b> {_safe(said)}. It was approved when Harness updated, and a read of "
+                     "the calendar after the update doesn't show it done, so nothing of it was written again."
+                     + (" Undo puts back the part that went through." if undo else ""))
+        buttons, binds = self._undo_button(db, p["id"]) if undo else (None, None)
+        self._say(db, self.chat_id, p["job_id"], words, buttons=buttons, binds=binds)
+
     def in_flight(self, proposal_id: str) -> bool:
         """Approved and not yet settled: being written, or waiting for a read."""
         p = self.ledger.db.execute("SELECT state FROM proposals WHERE id=?", (proposal_id,)).fetchone()

@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import (approvals, callbacks, choices, commands, daily, effects, ingress_filter, integrity,
+from . import (callbacks, choices, commands, daily, effects, ingress_filter, integrity, migrate,
                policy, provenance, render, rules, watch)
 from .chat import Decision, Incoming
 from .config import Config
@@ -291,16 +291,18 @@ class Controller:
         if self._reconciled:
             return
         self._reconciled = True
+        # 0.24.0, fourth round: the ledger's handover sweep, keyed to the ledger's own schema version
+        # (migrate.py), before anything else reads what the version before left: cards left open
+        # are replaced, changes left in flight are read back and recorded (never written again), and
+        # one message lists what was replaced, with Propose again.
+        swept = migrate.run(self.ledger, self.calendar_change, self.config.owner_user_id)
+        if swept:
+            log.info("ledger migrated: %s", swept)
         self.runner.reconcile_after_restart()
         if self.family_add is not None:
             self.family_add.reconcile_after_restart()
         if self.calendar_change is not None:
             self.calendar_change.reconcile_after_restart()
-        # 0.24.0, third round: cards left open by the version before are replaced, once, with their
-        # buttons taken off; a tap on one is answered that it was replaced when Harness updated.
-        replaced = approvals.replace_from_before(self.ledger)
-        if replaced:
-            log.info("replaced %d card(s) left open by the version before", replaced)
         self._clarify_timeouts(restart=True)
 
     # -- the loop --------------------------------------------------------------

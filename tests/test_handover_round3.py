@@ -7,15 +7,13 @@ cards left open by the version before, a second read past any cache, the scope o
 repeating event, relative days counted from his own day, and a clarify deadline that survives a
 stalled tick or a restart. All names and ids invented.
 """
-import json
 import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from harness import approvals, calendar_change, google_cal
+from harness import approvals, calendar_change
 from harness.handover import Handover
-from harness.ledger import Ledger, iso
 from harness.provenance import detail_line, resolution, resolutions
 from fakes import result
 from test_discord_keeper import OWNER
@@ -332,35 +330,7 @@ def test_a_correction_while_his_tap_is_being_done_waits_then_reads_the_result(m,
     assert "Already done" in h.result["said"] and "Approve" not in m.labels()
 
 
-# -- 6. cards left open by the version before ----------------------------------------------------
-
-def test_cards_left_open_by_the_previous_release_are_replaced_once(tmp_path, clock, monkeypatch):
-    import test_discord_keeper
-    gone = []
-    real = test_discord_keeper.FakeLink.buttons
-    monkeypatch.setattr(test_discord_keeper.FakeLink, "buttons", lambda self, card, rows: gone.append(card)
-                        if card not in self.cards else real(self, card, rows))
-    clock.t = datetime(2026, 11, 11, 12, 30, tzinfo=timezone.utc)
-    old = Ledger(str(tmp_path / "ledger.db"), clock=clock)
-    # A ledger as 0.23.0 left it: a card open, its approval bound to a sent message, no 0.24.0 marks.
-    with old.tx() as db:
-        job = old.made_job(1, "PT moved to 11:30", kind="message", db=db, state="proposed")
-    pid = approvals.create_proposal(old, job_id=job, effect_type="calendar_change",
-                                    params={"changes": [MOVE_PT]}, policy_version="p1", ttl_s=3600)
-    nonce = approvals.mint(old, proposal_id=pid, owner_user_id=1, ttl_s=3600)
-    approvals.bind_message(old, nonce, 7777)
-    assert old.get_meta(approvals.UPDATED) is None
-    m = Morning(old, tmp_path, clock)
-    assert old.db.execute("SELECT state FROM proposals WHERE id=?", (pid,)).fetchone()[0] == "superseded"
-    assert old.job(job)["state"] == "cancelled"
-    assert old.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='unbutton' AND text='7777'").fetchone()[0] == 1
-    assert gone                                              # its buttons came off through the link
-    m.send(Handover(kind="press", press={"id": "97001", "token": "t", "app": "999",
-                                         "custom_id": "k:" + approvals.callback_data("approve", nonce),
-                                         "message_id": "7777"}))
-    assert any("Replaced when Harness updated. Nothing was done." in (t or "") for _, t in m.link.answers)
-    assert m.gmail_times(PT_ID) == ("12:00", "13:00")
-    assert approvals.replace_from_before(old) == 0          # once
+# -- 6. cards left open by the version before: now tests/test_handover_round4.py (the migration) ------
 
 
 # -- 8. a repeating event: which day, or the whole series -------------------------------------------

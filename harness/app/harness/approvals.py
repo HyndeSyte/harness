@@ -219,26 +219,3 @@ def supersede_open(ledger: Ledger, job_ids: list[str], *, db) -> int:
     rows = db.execute(f"SELECT id FROM proposals WHERE state='proposed' AND job_id IN ({marks})",
                       tuple(job_ids)).fetchall()
     return sum(1 for p in rows if supersede(ledger, p["id"], db=db))
-
-
-UPDATED = "open_cards_replaced_0.24.0"
-
-
-def replace_from_before(ledger: Ledger) -> int:
-    """Once, the first time 0.24.0 runs: every card still open from the version before is replaced
-    (0.24.0, third round). Its proposal was made by older rules, so it can't be approved any more;
-    its buttons come off through the outbox, and a tap on it is answered "Replaced, please ask
-    again." Its request is closed. How many were replaced."""
-    if ledger.get_meta(UPDATED) is not None:
-        return 0
-    n = 0
-    with ledger.tx() as db:
-        for p in db.execute("SELECT id, job_id FROM proposals WHERE state='proposed'").fetchall():
-            if supersede(ledger, p["id"], db=db, outcome="updated"):
-                n += 1
-                job = db.execute("SELECT state FROM jobs WHERE id=?", (p["job_id"],)).fetchone()
-                if job is not None and job["state"] == "proposed":
-                    ledger.transition(p["job_id"], "cancelled", db=db,
-                                      receipt=json.dumps({"reason": "replaced_by_update"}))
-        ledger.set_meta(UPDATED, iso(ledger.now()), db)
-    return n
