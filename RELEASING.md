@@ -44,9 +44,12 @@ branch is up to date with `main` and these checks passed on it:
     down, which Windows Fast Startup doesn't count; `cold_sample_missing` otherwise, printing
     the uptime measured), its `structured_address` step records each reading tool's
     address-named key paths (extra paths refuse as a schema mismatch needing a policy
-    change), and its result names the Claude in Chrome id and loaded version and Chrome's
-    version (chrome.exe's file version, or the Last Version file as a named fallback) that
-    every run then checks before and after its session (an auto-update needs a new probe);
+    change; the refusal lists them grouped by tool, the failing tool marked, and the probe
+    prints the same hint at its end), and its result names the Claude in Chrome id and loaded
+    version and Chrome's version (chrome.exe's file version, or the Last Version file as a
+    named fallback, the source recorded) that every run then checks before and after its
+    session, like with like (an auto-update needs a new probe: a version hold clears only for
+    a confirmation of a probe run after the hold, of the versions loaded now);
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
     filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
     the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
@@ -79,7 +82,8 @@ unreadable header counts as the cap); every acceptance is kept by sha in
 refused while it stands, naming the accepted sha, and after a rebase
 `keeper.sh ship-gate --supersede <accepted sha>` records that the acceptance is replaced,
 only once the pull request's head differs from it; a pull request has one live acceptance at
-a time, and a watch refuses to accept while another stands, `live_acceptance`). Run it once on a head
+a time, and a watch refuses to accept while another stands, `live_acceptance`, checked and
+kept under the pull request's own lock file so two watches finishing together keep one). Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
   Run it before pushing (needs PyYAML):

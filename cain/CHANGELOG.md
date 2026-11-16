@@ -112,6 +112,12 @@
 - The Ship gate keeps one accepted change per pull request, and replacing it works only once a new change has been pushed.
 - A tap that can't be settled for three rounds, because a file can't be read or GitHub can't be reached, now gets one message naming the job. The queue's messages are no longer repeated when a problem flickers, or when Discord's answer was lost.
 - When the probe finds your reading tools send extra address fields, it lists them and says the page check needs a change, rather than calling it a forged answer.
+- Every page check of a run now has its own deadline, however long the run, and only the tool calls the page check covers are timed. A run started without its page-check log is refused at once by name instead of stopping after 36 seconds.
+- A held run after a Claude in Chrome update now clears only after a probe taken after the hold, of the versions loaded now; editing the confirmation file doesn't clear it. If the PC can't write that hold, it refuses every run by name until it can.
+- Chrome's version is read once per check, its source is recorded, and a different source after a run is named rather than failing the run. An update found after a run is called an update waiting.
+- Two Ship gate watches of one pull request finishing together now keep only one accepted change.
+- The queue's messages about a job now name it by what it does and on which site, never by its queue id. A message whose delivery wasn't confirmed keeps being retried with the same id until it is. The message about a tap written by the earlier test version that can't be settled now comes on the third round instead of at once. Rounds that can't reach GitHub and can't read the tap record now lead to one message after three.
+- When a leftover probe setting's location can't be read, the run says so and gives all three commands that remove it. The probe ends its output with the same hint confirm-profile would give, listing extra address fields by tool.
 
 ## 0.11.0
 
