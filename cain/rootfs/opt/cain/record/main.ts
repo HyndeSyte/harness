@@ -22,7 +22,7 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
-import { appendLog, readLog, syncDir } from "../applog.ts";
+import { appendLog, crashSpy, readLog, syncDir } from "../applog.ts";
 import { installState } from "../installflag.ts";
 
 export type Config = {
@@ -674,7 +674,7 @@ function writeAtomic(file: string, text: string) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   const fd = openSync(tmp, "w");
-  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  try { writeSync(fd, text); crashSpy.on?.(file); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, file);
   syncDir(dirname(file));
 }

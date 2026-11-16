@@ -95,7 +95,7 @@ import { judgeChecks, type Facts, type Landed } from "./merge";
 import { checkTextProblem, freshByDiscord, generationOf, inStep, isFresh, MAX_ONE_OFF_REASON, maxCheckDays, ONE_OFF_SUMMARY, oneOffHit, oneOffLoose, parseChecks,
   repeatsCheck, staleAfter, type Checks } from "../record/core";
 import type { Verdict } from "../clock";
-import { appendLog, readLog } from "../applog";
+import { appendLog, crashSpy, readLog } from "../applog";
 import { appendInstall, installResults, installState } from "../installflag";
 
 export const STOP = "k:stop";
@@ -207,6 +207,7 @@ export interface Shown {
   kind?: Kind;                       // absent on records from before 0.7.0 until the first sweep
   item?: string; question?: string;  // what the card is about: a PENDING id (or "none") and a question id
   posted?: number;
+  liveDigest?: string;               // round 18: its digest while live, kept when the sweep expired it
   expires?: number | null;           // when its buttons stop mattering; null: no time of its own
   ship?: { pr: string; head: string };
   checked?: Ref;                     // an ask or Ship card for an item: the accepted source check it rests on (0.12.0)
@@ -728,7 +729,7 @@ const shortDay = (ms: number, tz = "America/New_York") =>
 function writeDurable(f: string, text: string): void {
   const tmp = `${f}.tmp`;
   const fd = openSync(tmp, "w", 0o600);
-  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  try { writeSync(fd, text); crashSpy.on?.(f); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, f);
   try { const d = openSync(dirname(f), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* a folder that can't be synced */ }
 }
@@ -3057,8 +3058,9 @@ export class Link {
     if (rec.outcome === "expired" && rec.why === "expired" && rec.q && cid.startsWith("q:")) {
       const tapSf = /^\d{15,22}$/.test(String(it?.id ?? "")) ? snowflakeTime(String(it.id)) : null;
       const real = this.cardExpirySf(msgId, rec);
-      if (tapSf !== null && real !== null && tapSf <= real && !this.claimOn(msgId) && digest(it.message?.content ?? "", it.message?.components) === rec.digest) {
-        delete rec.outcome; delete rec.why; rec.q.used = false;
+      const shown = digest(it.message?.content ?? "", it.message?.components);
+      if (tapSf !== null && real !== null && tapSf <= real && !this.claimOn(msgId) && (shown === rec.liveDigest || shown === rec.digest)) {
+        delete rec.outcome; delete rec.why; rec.q.used = false; rec.digest = shown; delete rec.liveDigest;
         this.d.save(s);
         this.log(`tap on card ${msgId}: the sweep had expired it, but Discord stamps the tap before its real expiry; judged as live`);
       }
@@ -6008,7 +6010,8 @@ export class Link {
     const newest = new Map<string, string>();
     for (const [id, m] of Object.entries(s.messages)) {
       const k = rivalKey(m);
-      if (!k || !live(m, now)) continue;
+      // Round 18: live by the card's expiry as a Discord time (expiresBy), as the expiry below judges it.
+      if (!k || !m.buttons || m.outcome || (m.expires != null && this.expiresBy(id, m, now))) continue;
       const cur = newest.get(k);
       if (!cur || (m.posted ?? 0) > (s.messages[cur].posted ?? 0)
           || ((m.posted ?? 0) === (s.messages[cur].posted ?? 0) && newerId(id, cur))) newest.set(k, id);
@@ -6044,6 +6047,8 @@ export class Link {
       else { const k = rivalKey(m); if (k && newest.get(k) !== id) why = "replaced"; }
       if (!why) continue;
       m.outcome = why === "replaced" ? "replaced" : "expired"; m.why = why;
+      // Round 18: the card as it was live, so a tap Discord stamps before its real expiry can be matched to it.
+      if (why === "expired") m.liveDigest = m.digest;
       told.push([id, m, why]);
     }
     this.sweepHeld = heldNow;

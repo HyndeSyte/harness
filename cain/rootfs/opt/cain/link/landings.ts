@@ -15,7 +15,7 @@
 //   the marker's (or the link's state's), or that is missing while the marker isn't, came back
 //   from a backup: it isn't trusted (claims answer null) until each of its keys was looked for on
 //   the remote main by its head (the landing's token), and settled by what the remote said.
-import { appendLog, readLog } from "../applog";
+import { appendLog, crashSpy, readLog } from "../applog";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -73,7 +73,7 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
   const writeDurable = (file: string, text: string) => {
     const tmp = `${file}.${process.pid}.tmp`;
     const fd = openSync(tmp, "w");
-    try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+    try { writeSync(fd, text); crashSpy.on?.(file); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(tmp, file);
     fsyncPath(dirname(file), "dir");
   };
@@ -99,7 +99,7 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
           if (e?.code === "EEXIST") { log(`landing for tap key ${keyName(key).slice(0, 12)} rejected: one already started for it`); return false; }
           throw e;
         }
-        try { writeSync(fd, JSON.stringify({ key, ...what }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+        try { writeSync(fd, JSON.stringify({ key, ...what }) + "\n"); crashSpy.on?.(file); fsyncSync(fd); } finally { closeSync(fd); }
         o.sync?.("file");
         fsyncPath(dir, "dir");
         // The count, in the ledger and in the marker outside it, both durable.

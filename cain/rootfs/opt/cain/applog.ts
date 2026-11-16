@@ -71,6 +71,10 @@ export function readLog<T = any>(file: string, o: { repair?: boolean } = {}): Lo
 // the caller acts only once this returns.
 // Round 13: a test's view of each fsync, in order ("file <path>" or "dir <path>").
 export const syncSpy: { on: null | ((what: string) => void) } = { on: null };
+// Round 18: the tests' crash point for a durable write: called with the file after its bytes are written and before
+// they are fsynced (an append here, and the whole-file writers: the link's writeDurable, the landing ledger's, the
+// keeper's writeAtomic). A test throws from it to kill the write there and checks the dependent effect hadn't happened.
+export const crashSpy: { on: null | ((file: string) => void) } = { on: null };
 // Round 18: the interleaving rule for logs two processes append to (the install log: the link and the keeper): each
 // record is one framed write, opened for append, under MAX_RECORD_BYTES (below the 4096 bytes a single append is
 // written whole in), so two writers' records never interleave; a longer record is refused before anything is written.
@@ -84,6 +88,7 @@ export function appendLog(file: string, rec: unknown): void {
   try {
     const n = writeSync(fd, buf);
     if (n !== buf.length) throw new Error(`a log record was written short (${n} of ${buf.length} bytes)`);
+    crashSpy.on?.(file);
     fsyncSync(fd); syncSpy.on?.(`file ${file}`);
   } finally { closeSync(fd); }
   // A new log's directory entry is fsynced too, so a power cut can't lose the whole file.
