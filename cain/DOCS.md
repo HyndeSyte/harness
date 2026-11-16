@@ -741,8 +741,9 @@ What Cain's link enforces:
   (Cain hears "detected a restore"), and holds every request that carries a tap key until the rebuild
   completes. A partial restore in the other direction (the state older than the logs) loses nothing:
   the counts move up. The keeper refuses to start only for a case no rule explains (a log that can't be
-  read, or one with a damaged record before its end); then Cain tells you in one line, and if you agree
-  you send exactly `recover logs` in your DM. Cain runs `keeper.sh recover-logs --said <that message's
+  read, or one with a damaged record before its end); then Cain runs `keeper.sh recover-logs`, which
+  only proposes: the link sends you the exact line `recover logs <code>` (round 14, below), and if you
+  agree you send it in your DM. Cain runs `keeper.sh recover-logs --said <that message's
   id>`: the link checks it is your own message, under a day old, exactly that line, used once (written
   to the landing ledger like a settle), and leaves it for the keeper, which moves the damaged log aside
   and goes on only once its rebuild is verified against the record remote.
@@ -788,7 +789,7 @@ What Cain's link enforces:
   turn on only through your own line: `keeper.sh install-taps on` only proposes, and only once the
   post-install tests' result file (`/data/work/install-tests.json`, which Cain writes from the smoke
   test and the resilience run) names the full head they ran on and says both passed, each dated within
-  7 days. Then the link sends you the exact line `install taps on`; once you send it, Cain runs
+  7 days. Then the link sends you the exact line `install taps on <code>` (round 14, below); once you send it, Cain runs
   `keeper.sh install-taps on --said <that message's id>`, and it is on: your line is used once and
   written to the landing ledger like a settle, and the flag record names the tests' head.
   `keeper.sh install-taps once` (Cain's) lets exactly one Ship tap through, for the pull-the-plug case:
@@ -807,6 +808,77 @@ What Cain's link enforces:
   then the network comes back: the landing settles once, the held tap is decided once, and the clock
   shows `install_taps` off and no `consumed_unverified`. Cain records the result in the result file.
   The design is frozen for this scenario: nothing new is added before it runs.
+
+  The re-arm at start (round 14). A card whose buttons didn't go on at its post is armed at the next
+  start only after the link re-runs every arming check. First, every card in the issued-key log with no
+  durable state record (and no armed or void record) gets a void record and the Withdrawn line, before
+  anything else runs; a tap on such a card, even before that sweep, is refused as withdrawn and its
+  void record written then. Then, for each card left, its state record is saved again first (a save
+  that fails withdraws it instead: a void record and the Withdrawn line), and the card must not be
+  voided or expired (its keys' expiry, or its own), its source check must be accepted for its row's
+  current version (the same judgement a tap gets; a read that can't decide now leaves it for the next
+  sweep), and none of its keys may be consumed or tapped already. A card that fails gets the Expired
+  line (and goes into the expired-key index) or the Withdrawn line (with a void record, so the keeper
+  refuses its keys, and one line to Cain) instead of its buttons.
+
+  The consumed set at every start (round 14). The keeper rebuilds its consumed tap keys from the union
+  of the local copy's trailers on every ref (its branches, unpushed commits included), the record
+  remote's trailers (just fetched) and the link's landing ledger (`/data/record-landings`, read only):
+  any key whose ledger entry shows a started landing (a claim that wasn't voided) counts as consumed,
+  and the Ship take that follows that landing still goes once, as the landing's own write. Every start
+  of the keeper treats its consumed set as unverified until a fresh fetch has merged the remote's
+  trailers: until then `keeper.sh clock` shows `consumed_unverified` (an ordinary start's reason is
+  "a start", not a restore) and every request that carries a tap key is held under the remote-down rule
+  above. With GitHub answering, that is one round.
+
+  The durable held queue (round 14). While the keeper's consumed set is unverified, a tap on an ask is
+  held by the link: a framed, fsynced record in `/data/link-held.log`, stamped with its tap time and the
+  row and check version it was judged against, written before the card says it is held. The card shows
+  your answer with a line saying it is held and will act by itself or say why not; Cain hears it is held
+  and records nothing yet. A Ship tap isn't held: it waits, its buttons kept, and says so. Each sweep,
+  once the keeper is verified, each held tap is judged again: expiry by its tap time (a tap made before
+  its card expired still acts), and a row whose version changed since is told on the card as not acted
+  because the item changed (Cain gets "Tap not acted: ..."). One that passes is relayed to Cain with its
+  tap key, then marked released; a crash between the two relays it again, and the keeper's one request
+  per tap key keeps it to one effect. Held requests in the keeper's queue are Cain's own files, and stay
+  there across a kill of either process.
+
+  Every path says so on the card (round 14). Each tap is answered at once, and each hold or refusal puts
+  its own line on the card: held (Cain's record can't yet verify which taps were acted on; your answer
+  acts by itself or you're told why), withdrawn, expired, lost in a restore, and already acted on (the
+  keeper's consumed-key log, `/data/record-taps.jsonl`, read by the link). The owner's notice that taps
+  wait goes when the first tap is held, not only after a round has tried.
+
+  Expiry by the keeper, the removal queue and the post-restore sweep (round 14). The keeper refuses any
+  tap key whose tap came after the expiry its issued record carries, whatever the buttons showed, without
+  using the key up, and the link tells you on the card that it expired; the tap time is a held tap's from
+  `/data/link-held.log`, else the link's own record of the tap. The link indexes an expired card first,
+  then takes its buttons off through a durable removal queue (`/data/link-strip.log`, framed and
+  fsynced) that is retried each sweep until Discord takes the edit, so a tap while an edit is failing
+  is still told it expired. After a detected restore (an armed card in the issued-key log the state
+  doesn't know, a lost tap, or the keeper's own detected restore), the link looks over the bot's recent
+  messages in your DM once and takes the buttons off any card the rebuilt state and log don't know, with
+  a line saying it was lost in a restore of the App's state; a card past 100 days (one a `Tap-Card`
+  trailer names included) is told expired, not lost.
+
+  Your lines carry a code (round 14). `keeper.sh install-taps on` and `keeper.sh recover-logs` without
+  `--said` only propose: the link makes a fresh code, binds it to the keeper's current reset epoch and
+  to this start of the link, and sends you `install taps on <code>` or `recover logs <code>`, naming the
+  epoch. Your line counts only if its code belongs to a proposal made since the link's current start,
+  in the same epoch, not used before (the proposal is marked used in the link's state before any
+  effect), and only as a live message sent after the proposal: a line read back from older history never
+  counts. Each use goes into the record in its own commit with an `Owner-Line: <kind> <code>` trailer,
+  and the used codes are rebuilt from those trailers after any restore (`keeper.sh clock` shows
+  `used_lines`), so a restored ledger can't make an old line count again.
+
+  The combined fault scenario, round 14. On top of the steps above, it now includes: a real power cut
+  during issuance (pull the plug while Cain posts a checked test ask; after the restart the card either
+  has its buttons, re-armed after every check, or says it was withdrawn, and a tap on a withdrawn one
+  does nothing); a real power cut during a landing (as above, with install-taps once); and a rebuild
+  over SSH with the remote unreachable (with the Pi off its network, move the keeper's state and its
+  consumed log aside over SSH and restart the App: the keeper starts degraded, a tap on a test ask
+  comes back held on the card, and once the network is back the held tap acts exactly once and a
+  repeat of it is refused).
 
   The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
   issue 24. You have nothing to set up beyond the smoke test's one option change.
@@ -1091,7 +1163,8 @@ after any rebase, from the repository root, `bash cain/tests/fixtures/regenerate
 origin/main)" <the version on that main>` rewrites `link-<version>` and `keeper-<version>` from that
 commit (the header of each file names it), and a test checks the committed copies match. After any
 rebase onto a version bump (pull request 20, pull request 21 and pull request 23 also bump this
-App's version; pull request 20 lands first and this rebases onto it, regenerating the fixture),
+App's version; pull request 20 lands first and this rebases onto it, regenerating the fixtures, with full CI and the
+round files rerun on the new head and the result file regenerated only from runs on that head),
 both test suites and the rollback test run again on the new head before Ship. There is no switch that lets cards through without a
 check. The previous version's record keeper (as of 0.11.0) ignores state/checks.json, the
 `Checked` column and `state/one-off-audit.md` without error (tested): it reads and edits the

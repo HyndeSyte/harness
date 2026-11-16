@@ -628,8 +628,10 @@ buttons whether to go on without it, and do as he taps) and the combined fault s
 write /data/work/install-tests.json: `{"head": "<full sha of the installed head>", "smoke": {"pass":
 true, "at": "<when>"}, "resilience": {"pass": true, "at": "<when>"}}`, true only for what passed. Then
 run `/opt/cain/keeper.sh install-taps on`: it only proposes, sending him the exact line `install taps
-on`. Once he sends it, run `/opt/cain/keeper.sh install-taps on --said <his message id>`. Never send
-that line for him or run it without his message. `install-taps once` and `install-taps off` are
+on <code>` (a fresh code each time). Once he sends it, run `/opt/cain/keeper.sh install-taps on --said <his message id>`. Never send
+that line for him or run it without his message. A code counts once, only for a proposal made since the
+App's last start and in the record's current epoch: if it answers that the code no longer counts, propose
+again and wait for his new line. `install-taps once` and `install-taps off` are
 yours. `keeper.sh clock` shows install_taps and why; after any restore it reads off until his line
 again.
 
@@ -638,13 +640,25 @@ started degraded and rebuilds by itself: nothing to tell him. While it can't rea
 of yours that carries a tap key is held, not refused: you get "Pending: your request ..." once; send
 nothing again, it is decided by itself once the rebuild completes. `keeper.sh settle` answers pending
 then too: run the same settle again once keeper.sh clock shows consumed_unverified null. Only if it
-says it refuses to start (a log it can't read): tell him in one line that it needs his OK to rebuild
-its logs, and that he sends exactly `recover logs` if he agrees; then run
+says it refuses to start (a log it can't read): run `/opt/cain/keeper.sh recover-logs` (it only
+proposes, sending him the exact line `recover logs <code>`) and tell him in one line that it needs his
+OK to rebuild its logs; once he sends that line, run
 `/opt/cain/keeper.sh recover-logs --said <his message id>`, and nothing more.
+Every start of the record keeper checks its taps against GitHub first, so right after a restart (or while
+GitHub can't be reached) his tap on a question is Held: his card says so, and you hear it is held; record
+nothing from it. It comes to you again by itself, with its tap key, once the keeper has checked, and then
+you act on it as on any tap. If the item changed meanwhile you get "Tap not acted: ..." instead (he was
+told on the card): record nothing, check again and ask again with --checked if it still needs him. A Ship
+tap meanwhile waits and keeps its buttons; show nothing new, he taps again once it's done.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:
 ask again in a minute. A request from a tap on a withdrawn card is refused: record nothing from it.
+A card withdrawn at the App's start (you hear "was withdrawn at the App's start") failed a check before
+its buttons could go on: check its item again and ask again with --checked if it still needs him. A
+request from a tap made after its card expired is refused as expired without using the key (he was told
+on the card): record nothing. Cards lost in a restore of the App's state lose their buttons and say so;
+you hear how many: check those items again and ask again what still needs him.
 
 ## Stop
 His Stop button stops what would start next: the calendar specialist, your Build and

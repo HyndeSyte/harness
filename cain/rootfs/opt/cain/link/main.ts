@@ -137,6 +137,10 @@ const INSTALL_LOG = process.env.RECORD_INSTALL_LOG ?? "/data/record-install.log"
 const INSTALL_RESULTS = process.env.INSTALL_RESULTS ?? "/data/work/install-tests.json";
 const KEEPER_MIRROR = process.env.RECORD_ISSUED_LOG ?? "/data/record-issued.log";
 const RECOVER_FILE = process.env.RECORD_RECOVER ?? "/data/record-recover.json";
+// Round 14: the keeper's consumed-key log (read only), the link's held-tap log and its button-removal queue.
+const CONSUMED_LOG = process.env.RECORD_TAPS_LOG ?? "/data/record-taps.jsonl";
+const HELD_LOG = process.env.LINK_HELD_LOG ?? "/data/link-held.log";
+const STRIP_LOG = process.env.LINK_STRIP_LOG ?? "/data/link-strip.log";
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -231,7 +235,7 @@ const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${
 
 const link = new Link({
   rest, load, save, saveDurable, issuedLog: ISSUED_LOG, expiredLog: EXPIRED_LOG, installLog: INSTALL_LOG, installResults: INSTALL_RESULTS,
-  keeperMirror: KEEPER_MIRROR, recoverFile: RECOVER_FILE, now: Date.now, paired, toHarness,
+  keeperMirror: KEEPER_MIRROR, recoverFile: RECOVER_FILE, consumedLog: CONSUMED_LOG, heldLog: HELD_LOG, stripLog: STRIP_LOG, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`), status: readOr(RECORD_STATUS) }),

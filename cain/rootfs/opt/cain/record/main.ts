@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
   maxCheckDays, oneOffAudit, ONE_OFF_AUDIT_PATH, ONE_OFF_SUMMARY, PENDING_PATH, upkeep, generationOf, CHECKS_PATH, checksText, parseChecks, type OneOff, type WaitTimeout,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
-import { projectChecked, TAP_KEY, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
+import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
 import { appendLog, readLog, syncDir } from "../applog.ts";
@@ -57,7 +57,14 @@ export type Config = {
   installLog?: string;     // round 13: the install-taps log the keeper owns (default /data/record-install.log)
   recover?: string;        // round 13: the owner's accepted recover-logs line (default /data/record-recover.json)
   onItem?: (id: string) => void;   // round 13: the tests' hook, run as each request comes up for its decision
+  landings?: string;       // round 14: the link's landing ledger, read only (default /data/record-landings): a key it shows started counts as consumed
+  linkHeld?: string;       // round 14: the link's held-tap log, read only (default /data/link-held.log): a held tap's tap time
 };
+// Round 14: the reason an ordinary start's consumed set is unverified until a fresh fetch (the link reads it
+// as "not a restore"; the same words are in link/core.ts).
+export const KEEPER_START_WHY = "a start: the consumed tap keys are checked against the record remote before any tap counts";
+// Round 14: the consumer named for a key the landing ledger shows started.
+export const LEDGER_CONSUMER = "the link's landing ledger (its landing started)";
 
 // Whether the system clock is synchronized by the box's own sources (../clock.ts: the kernel's
 // flag first, then timedatectl, then timesyncd's flag file). The keeper's rounds add a fourth,
@@ -361,8 +368,12 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   rebuild?: { since: string; why: string; tries: number; next?: string; told?: string[] };
   recovered?: string[];                   // round 13: the owner's recover-logs message ids already used
   historyCards?: string[];                // round 13: card message ids named by Tap-Card trailers (newest last)
+  // Round 14: the owner-line nonces used (install taps on <nonce>, recover logs <nonce>): committed with an
+  // Owner-Line trailer (linesDone), and as the record's history has them (historyLines); recoverLines: a
+  // recover line accepted at the start check, waiting for its trailer.
+  linesDone?: string[]; historyLines?: string[]; recoverLines?: { nonce: string; said: string }[];
   tapNotices?: TapNotice[] };
-type TapNotice = { tap: string; why: "refused" | "lost"; reason: string; msg?: string; at: string };
+type TapNotice = { tap: string; why: "refused" | "lost" | "expired"; reason: string; msg?: string; at: string };
 const TAPS_KEPT = 1000;
 // Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
 // Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
@@ -393,16 +404,37 @@ export const recoverFile = (cfg: Config) => cfg.recover ?? join(dirname(cfg.queu
 export const ISSUED_KEEP_MS = 100 * 86_400_000;
 export function readConsumed(cfg: Config): Map<string, string> {
   const out = new Map<string, string>();
+  // Round 14: a request's id wins over the landing ledger's mark (the Ship take that follows a landing).
   for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records)
-    if (TAP_KEY.test(j?.tap) && typeof j.id === "string" && !out.has(j.tap)) out.set(j.tap, j.id);
+    if (TAP_KEY.test(j?.tap) && typeof j.id === "string" && (!out.has(j.tap) || out.get(j.tap) === LEDGER_CONSUMER)) out.set(j.tap, j.id);
   return out;
+}
+// Round 14: the tap keys the link's landing ledger shows a started landing for (a claim not voided).
+export const landingsDir = (cfg: Config) => cfg.landings ?? join(dirname(cfg.queue), "record-landings");
+export function ledgerStarted(cfg: Config): Set<string> {
+  const out = new Set<string>();
+  let names: string[] = [];
+  try { names = readdirSync(landingsDir(cfg)).filter((n) => /^[0-9a-f]{32}\.json$/.test(n)); } catch { return out; }
+  for (const n of names) {
+    try {
+      const j = JSON.parse(readFileSync(join(landingsDir(cfg), n), "utf8"));
+      if (typeof j?.key === "string" && !j.settled?.voided) out.add(`tap-${createHash("sha256").update(j.key).digest("hex").slice(0, 12)}`);
+    } catch { /* a file mid-write: the next round */ }
+  }
+  return out;
+}
+// Round 14: a held tap's tap time, from the link's held-tap log (null: not held there).
+export const linkHeldFile = (cfg: Config) => cfg.linkHeld ?? join(dirname(cfg.queue), "link-held.log");
+function heldTapTime(cfg: Config, kid: string): number | null {
+  try { const r = readLog<any>(linkHeldFile(cfg), { repair: false }).records.find((x) => x?.t === "held" && x.kid === kid); return r && Number.isFinite(Number(r.at)) ? Number(r.at) : null; }
+  catch { return null; }
 }
 function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }); }
 
 // Round 12: the issued keys the keeper knows, from the link's issued-key log and its own mirror of it,
 // each with its card's item, kind, label, message id and target; keys older than ISSUED_KEEP_MS are
 // stale. runs: the link's run records ({run, nonce}) in the order logged.
-export type IssuedRec = IssuedTap & { kid: string; at: number; run?: number; nonce?: string; voided?: boolean };
+export type IssuedRec = IssuedTap & { kid: string; at: number; run?: number; nonce?: string; voided?: boolean; exp?: number };
 export function readIssued(cfg: Config, now: number): { keys: Map<string, IssuedRec>; runs: { run: number; nonce: string }[] } {
   const keys = new Map<string, IssuedRec>(), runs: { run: number; nonce: string }[] = [];
   for (const f of [issuedMirrorFile(cfg), linkIssuedFile(cfg)]) {
@@ -415,7 +447,8 @@ export function readIssued(cfg: Config, now: number): { keys: Map<string, Issued
       if (Number.isFinite(at) && now - at > ISSUED_KEEP_MS) continue;
       if (!keys.has(r.kid)) keys.set(r.kid, { kid: r.kid, item: r.item, kind: r.kind, ...(typeof r.label === "string" ? { label: r.label } : {}),
         ...(typeof r.msg === "string" ? { msg: r.msg } : {}), ...(r.target && typeof r.target.item === "string" && Array.isArray(r.target.writes) ? { target: r.target } : {}),
-        at: Number.isFinite(at) ? at : now, ...(Number.isInteger(r.run) ? { run: r.run } : {}), ...(typeof r.nonce === "string" ? { nonce: r.nonce } : {}) });
+        at: Number.isFinite(at) ? at : now, ...(Number.isInteger(r.run) ? { run: r.run } : {}), ...(typeof r.nonce === "string" ? { nonce: r.nonce } : {}),
+        ...(typeof r.exp === "number" && Number.isFinite(r.exp) ? { exp: r.exp } : {}) });
     }
   }
   // Round 13: a card the link voided (its record never saved after its keys were logged): withdrawn.
@@ -443,16 +476,20 @@ function mirrorIssued(cfg: Config): number {
 // Round 12: the record remote's history of consumed tap keys: every tap-derived commit carries its key
 // as a "Tap-Key: tap-<12 hex>" trailer (and its request id as "Tap-Request"). Read from the remote's
 // branch and the local copy's head.
-export function historyTaps(cfg: Config, o: { cards?: string[]; once?: Set<string>; refs?: string[] } = {}): Map<string, string> {
+// Round 14: from every ref of the local copy (its branches, unpushed commits included, and the remote's
+// branch as last fetched), and with the Owner-Line trailers (lines).
+export function historyTaps(cfg: Config, o: { cards?: string[]; once?: Set<string>; refs?: string[]; lines?: Set<string> } = {}): Map<string, string> {
   const out = new Map<string, string>();
-  for (const ref of o.refs ?? [`origin/${cfg.branch}`, "HEAD"]) {
+  for (const ref of o.refs ?? ["--all"]) {
     let text = "";
-    try { text = git(cfg, ["log", "--reverse", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)%x1f%h%x1f%(trailers:key=Tap-Card,valueonly,separator=%x2C)%x1f%(trailers:key=Install-Once,valueonly,separator=%x2C)", ref]); } catch { continue; }
+    try { text = git(cfg, ["log", "--reverse", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)%x1f%h%x1f%(trailers:key=Tap-Card,valueonly,separator=%x2C)%x1f%(trailers:key=Install-Once,valueonly,separator=%x2C)%x1f%(trailers:key=Owner-Line,valueonly,separator=%x2C)", ref]); } catch { continue; }
     for (const rec of text.split("\x1e")) {
-      const [k, id, sha, card, once] = rec.split("\x1f").map((x) => (x ?? "").trim());
+      const [k, id, sha, card, once, line] = rec.split("\x1f").map((x) => (x ?? "").trim());
       if (k && TAP_KEY.test(k) && !out.has(k)) out.set(k, id || `the commit ${sha}`);
       if (card && /^\d{15,22}$/.test(card) && o.cards && !o.cards.includes(card)) o.cards.push(card);
       if (once && TAP_KEY.test(once)) o.once?.add(once);
+      const n = /^(?:install|recover) ([a-z][0-9a-f]{5})$/.exec(line ?? "");
+      if (n) o.lines?.add(n[1]);
     }
   }
   return out;
@@ -495,12 +532,12 @@ function logCounts(cfg: Config): NonNullable<State["logHigh"]> {
 }
 // Round 13: the owner's accepted recover-logs line (keeper.sh recover-logs, written by the link), under a
 // day old and not used before.
-function recoverAsked(cfg: Config, st: State, now: number): { said: string } | null {
+function recoverAsked(cfg: Config, st: State, now: number): { said: string; nonce?: string } | null {
   try {
     const j = JSON.parse(readFileSync(recoverFile(cfg), "utf8"));
     const at = Date.parse(String(j?.at ?? ""));
     if (typeof j?.said !== "string" || !/^\d{15,22}$/.test(j.said) || !Number.isFinite(at) || now - at > 86_400_000 || (st.recovered ?? []).includes(j.said)) return null;
-    return { said: j.said };
+    return { said: j.said, ...(typeof j.nonce === "string" && /^[a-z][0-9a-f]{5}$/.test(j.nonce) ? { nonce: j.nonce } : {}) };
   } catch { return null; }
 }
 let refusedWhy = "";
@@ -557,6 +594,9 @@ function revive(j: any): State | null {
       ...(Array.isArray(j.rebuild.told) ? { told: j.rebuild.told.filter((x: any) => typeof x === "string").slice(-200) } : {}) } } : {}),
     ...(Array.isArray(j.recovered) ? { recovered: j.recovered.filter((x: any) => typeof x === "string").slice(-50) } : {}),
     ...(Array.isArray(j.historyCards) ? { historyCards: j.historyCards.filter((x: any) => typeof x === "string" && /^\d{15,22}$/.test(x)).slice(-1000) } : {}),
+    ...(Array.isArray(j.linesDone) ? { linesDone: j.linesDone.filter((x: any) => typeof x === "string").slice(-200) } : {}),
+    ...(Array.isArray(j.historyLines) ? { historyLines: j.historyLines.filter((x: any) => typeof x === "string").slice(-200) } : {}),
+    ...(Array.isArray(j.recoverLines) ? { recoverLines: j.recoverLines.filter((x: any) => typeof x?.nonce === "string" && typeof x?.said === "string").slice(-50) } : {}),
     ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && (n.why === "refused" || n.why === "lost") && typeof n.at === "string")
       .map((n: any) => ({ tap: n.tap, why: n.why, reason: String(n.reason ?? ""), ...(typeof n.msg === "string" ? { msg: n.msg } : {}), at: n.at })) } : {}) };
 }
@@ -723,13 +763,14 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           const asked = recoverAsked(cfg, st0, clock().getTime());
           if (!asked) {
             const why = lc.fatal;
-            if (why !== refusedWhy) { refusedWhy = why; log(`REFUSED TO START: ${why}`); relay(cfg, `The record keeper refuses to start: ${why}. Nothing is applied until then. Only he can accept a rebuild: tell him in one line that the record keeper needs his OK to rebuild its logs, and that if he agrees he sends exactly "recover logs"; then run keeper.sh recover-logs --said <that message's id> (DOCS.md, Restores). Nothing more.`); }
+            if (why !== refusedWhy) { refusedWhy = why; log(`REFUSED TO START: ${why}`); relay(cfg, `The record keeper refuses to start: ${why}. Nothing is applied until then. Only he can accept a rebuild: tell him in one line that the record keeper needs his OK to rebuild its logs, and that if he agrees he sends exactly "recover logs" with the code the App sends him: first run keeper.sh recover-logs (it only proposes that line), then once he sends it keeper.sh recover-logs --said <that message's id> (DOCS.md, Restores). Nothing more.`); }
             return { applied: 0, ok: false, refused: why } as any;
           }
           const aside = `${lc.fatalFile}.damaged-${nowIso0.replace(/[^0-9]/g, "").slice(0, 14)}`;
           try { renameSync(lc.fatalFile!, aside); syncDir(dirname(aside)); }
           catch (e) { try { rmSync(lc.fatalFile!, { recursive: true, force: true }); } catch { /* it stays: the next round refuses again */ } log(`couldn't move ${lc.fatalFile} aside (${(e as Error).message}); removed it instead`); }
           st0.recovered = [...(st0.recovered ?? []), asked.said].slice(-50);
+          if (asked.nonce) st0.recoverLines = [...(st0.recoverLines ?? []), { nonce: asked.nonce, said: asked.said }].slice(-50);
           rmSync(recoverFile(cfg), { force: true });
           lc.lost.push(`${lc.fatal}; moved aside on his recover-logs line (message ${asked.said})`);
           log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted: ${lc.fatalFile} moved aside, rebuilding`);
@@ -983,6 +1024,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // Round 13: after a detected restore (S.rebuild) the rebuild counts only against a fresh fetch of the
       // record remote; until then the consumed set is unverified and tap-derived requests are held. A plain
       // restart rebuilds best effort from the local copy as before.
+      // Round 14: every start of the keeper treats its consumed set as unverified until a fresh fetch has
+      // merged the record remote's trailers: tap-derived requests are held meanwhile, as after a restore.
+      if (!rebuilt.has(cfg.dir) && !S.rebuild) S.rebuild = { since: nowIso, why: KEEPER_START_WHY, tries: 0 };
       if (S.rebuild || restored || synced0.reset || synced0.cloned || !rebuilt.has(cfg.dir)) {
         if (S.rebuild && !synced0.fetched) {
           const tries = S.rebuild.tries + 1;
@@ -991,10 +1035,14 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           if (due) log(`rebuild waits: GitHub didn't answer (try ${tries}); tap-derived requests stay held, and it tries again each round GitHub answers`);
         } else try {
           const have = readConsumed(cfg);
-          const cards = [...(S.historyCards ?? [])], once = new Set<string>();
+          const cards = [...(S.historyCards ?? [])], once = new Set<string>(), lines = new Set<string>(S.historyLines ?? []);
           let n = 0;
-          for (const [k, id] of historyTaps(cfg, { cards, once, ...(S.rebuild ? { refs: [`origin/${cfg.branch}`] } : {}) })) if (!have.has(k)) { appendConsumed(cfg, k, id, nowIso); n++; }
+          // Round 14: the union of the local copy's trailers on every ref (unpushed commits included), the
+          // remote's (just fetched) and the link's landing ledger (a started landing consumes its key).
+          for (const [k, id] of historyTaps(cfg, { cards, once, lines })) if (!have.has(k)) { appendConsumed(cfg, k, id, nowIso); have.set(k, id); n++; }
+          for (const k of ledgerStarted(cfg)) if (!have.has(k)) { appendConsumed(cfg, k, LEDGER_CONSUMER, nowIso); have.set(k, LEDGER_CONSUMER); n++; }
           S.historyCards = cards.slice(-1000);
+          S.historyLines = [...lines].slice(-200);
           // The one Ship tap an install-taps once let through, as the remote's Install-Once trailers have it.
           const used = new Set(installState(installLogFile(cfg)).onceUsed);
           for (const k of once) if (!used.has(k)) appendLog(installLogFile(cfg), { t: "once-used", kid: k, by: "keeper", why: "rebuilt from the record's history", at: nowIso });
@@ -1005,7 +1053,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
             delete S.rebuild;
             S.logHigh = logCounts(cfg);
             log(`REBUILD COMPLETE: the consumed set is verified against the record remote (${n} key(s) added, after ${was.tries} wait(s)); held tap-derived requests are decided now`);
-            if (was.tries || was.told?.length || n || was.why !== "the keeper's state was missing (a first start, or a wiped or restored image)")
+            if (was.tries || was.told?.length || n || (was.why !== "the keeper's state was missing (a first start, or a wiped or restored image)" && was.why !== KEEPER_START_WHY))
               relay(cfg, `The record keeper's rebuild is complete: its consumed tap keys are verified against the record's history on GitHub (${n} added), so requests that carry a tap key are decided again, the held ones first. Nothing to tell him.`);
           }
         } catch (e) {
@@ -1052,8 +1100,19 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         if (it.error) o = { ...base, state: "rejected", reason: clean(it.error) };
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
         else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && (S.taps?.[it.req!.tap] ?? consumed.get(it.req!.tap)) !== undefined
-          && (S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)) !== id)
+          && (S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)) !== id
+          // Round 14: a key the landing ledger consumed still takes its Ship take once: the landing's own write.
+          && !(!S.taps?.[it.req!.tap] && consumed.get(it.req!.tap) === LEDGER_CONSUMER && tapDerived({ ops: it.req!.ops as any[] }).ship))
           o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps?.[it.req!.tap]?.id ?? consumed.get(it.req!.tap)}; act on a tap key once` };
+        else if (tapK && typeof reg.keys.get(tapK)?.exp === "number" && (heldTapTime(cfg, tapK) ?? linkTaps?.issued[tapK]?.at ?? clock().getTime()) > reg.keys.get(tapK)!.exp!) {
+          // Round 14: the keeper enforces expiry: a key tapped after the expiry its issued record carries is
+          // refused without being used up, whatever the card's buttons showed; judged by its tap time (a held
+          // tap's, from the link's held-tap log), and he is told on the card that it expired.
+          const r = reg.keys.get(tapK)!;
+          o = { ...base, state: "rejected", reason: `tap key ${tapK} is from a card that had expired when he tapped it, so nothing was recorded from it and the key isn't used up: record nothing from it, and ask again with --checked if it still needs him` };
+          notice({ tap: tapK, why: "expired", reason: o.reason!, ...(r.msg ? { msg: r.msg } : {}) });
+          log(`tap key ${tapK} refused: tapped after its card's expiry`);
+        }
         else if (tapK && reg.keys.get(tapK)?.voided) {
           // Round 13: a key of a card the link withdrew (its record never saved): told, never used up.
           o = { ...base, state: "rejected", reason: `tap key ${tapK} is from a card the link withdrew (its record couldn't be saved after its keys were logged), so no tap on it counts: record nothing from it, and ask again with --checked if it still needs him` };
@@ -1097,6 +1156,27 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         // A hold that ended or moved may let a waiting take through, before anything newer.
         if (o.state === "done" && S.waiting.length) settle();
       }
+      // Round 14: each use of an owner line (install taps on <nonce> in the install log, recover logs <nonce>
+      // accepted at the start check) goes into the record in its own commit with an Owner-Line trailer, so the
+      // used lines are rebuilt from the history after any restore.
+      { const uses: { kind: string; nonce: string; said: string; at: string }[] = [];
+        try { for (const r of readLog<any>(installLogFile(cfg), { repair: false }).records)
+          if (r?.t === "flag" && r.how === "on" && r.by === "owner" && typeof r.nonce === "string" && /^[a-z][0-9a-f]{5}$/.test(r.nonce)) uses.push({ kind: "install", nonce: r.nonce, said: String(r.said ?? ""), at: String(r.at ?? nowIso) }); }
+        catch { /* none */ }
+        for (const r of S.recoverLines ?? []) uses.push({ kind: "recover", nonce: r.nonce, said: r.said, at: nowIso });
+        for (const u of uses) {
+          if ((S.linesDone ?? []).includes(u.nonce)) continue;
+          try {
+            const f = join(cfg.dir, "log/owner-lines.md");
+            mkdirSync(dirname(f), { recursive: true });
+            if (!existsSync(f)) writeFileSync(f, "# Owner lines\n\nEach line the owner sent to allow what only he may (install taps on, recover logs), once each.\n\n");
+            appendFileSync(f, `- ${u.at}: ${u.kind === "install" ? "install taps on" : "recover logs"}, code ${u.nonce}, his message ${clean(u.said, 30)}\n`);
+            commit(`Owner line: ${u.kind === "install" ? "install taps on" : "recover logs"} used once\n\nOwner-Line: ${u.kind} ${u.nonce}`);
+            S.linesDone = [...(S.linesDone ?? []), u.nonce].slice(-200);
+            log(`owner line ${u.kind} ${u.nonce} recorded with its Owner-Line trailer`);
+          } catch (e) { undo(); log(`couldn't record owner line ${u.kind} ${u.nonce} (${(e as Error).message}); trying again next round`); }
+        }
+        if (S.recoverLines?.length) S.recoverLines = S.recoverLines.filter((r) => !(S.linesDone ?? []).includes(r.nonce)); }
       // The one-off audit: the past week's one-offs matched loosely against the open rows, and
       // the link's wait and tap timeouts.
       if (items.length) audit(cfg, clock(), commit);
@@ -1216,16 +1296,16 @@ export function linkFloor(cfg: Config): number { return readLinkFloor(cfg).floor
 // Round 10: the tap keys the link issued (its state's issued) and the short forms of the tap keys whose
 // landing it lists as unresolved (its state's unresolved, by full key: hashed here the way the link's
 // tapKid does). null: the link's state can't be read.
-export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap>; unresolved: Set<string>; run: number | null; nonce: string | null } | null {
+export function readLinkTaps(cfg: Config): { issued: Record<string, IssuedTap & { at?: number }>; unresolved: Set<string>; run: number | null; nonce: string | null } | null {
   const f = cfg.linkState ?? join(dirname(cfg.queue), "link", "state.json");
   try {
     if (!existsSync(f) || lstatSync(f).size > 20_000_000) return null;
     const j = JSON.parse(readFileSync(f, "utf8"));
     if (!j || typeof j !== "object" || Array.isArray(j)) return null;
-    const issued: Record<string, IssuedTap> = {};
+    const issued: Record<string, IssuedTap & { at?: number }> = {};
     for (const [k, v] of Object.entries<any>(j.issued ?? {}))
       if (TAP_KEY.test(k) && v && typeof v.item === "string" && typeof v.kind === "string")
-        issued[k] = { item: v.item, kind: v.kind, ...(typeof v.label === "string" ? { label: v.label } : {}), ...(typeof v.msg === "string" ? { msg: v.msg } : {}),
+        issued[k] = { item: v.item, kind: v.kind, ...(typeof v.at === "number" && Number.isFinite(v.at) ? { at: v.at } : {}), ...(typeof v.label === "string" ? { label: v.label } : {}), ...(typeof v.msg === "string" ? { msg: v.msg } : {}),
           ...(v.target && typeof v.target.item === "string" && Array.isArray(v.target.writes) ? { target: { item: v.target.item, writes: v.target.writes.filter((w: any) => typeof w === "string") } } : {}) };
     // Round 11: a tombstone keeps its consumed key too.
     const unresolved = new Set([...Object.keys(j.unresolved ?? {}), ...Object.keys(j.tombstones ?? {})].map((k) => `tap-${createHash("sha256").update(k).digest("hex").slice(0, 12)}`));
@@ -1351,6 +1431,7 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       ...(st.linkRestore ? { link_restore: st.linkRestore } : {}),
       ...(st.rebuild ? { consumed_unverified: { since: st.rebuild.since, why: st.rebuild.why, tries: st.rebuild.tries } } : {}),
       ...(st.historyCards?.length ? { history_cards: st.historyCards.slice(-500) } : {}),
+      ...((st.linesDone?.length || st.historyLines?.length) ? { used_lines: [...new Set([...(st.linesDone ?? []), ...(st.historyLines ?? [])])].slice(-200) } : {}),
       recheck_pending: recheckPending(cfg),
       clock: { synced: v.synced, source: v.source, diagnostic: v.diagnostic, at: now.toISOString() },
     }) + "\n");

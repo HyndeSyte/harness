@@ -86,16 +86,22 @@
 #                                        install log (off when it is missing or damaged). on only proposes:
 #                                        once /data/work/install-tests.json says the smoke test and the
 #                                        resilience run passed (each dated, within 7 days) on a full head
-#                                        sha, the link sends him the exact line "install taps on"; once he
-#                                        sends it, on --said <that message's id> turns it on (his line is
-#                                        single use, written to the landing ledger first). once (Cain's)
+#                                        sha, the link sends him the exact line "install taps on <code>"
+#                                        (a fresh code, bound to the record's epoch and this start of the
+#                                        link); once he sends it, as a new message, on --said <that
+#                                        message's id> turns it on (his line is single use, written to the
+#                                        landing ledger first, then to the record with an Owner-Line
+#                                        trailer). once (Cain's)
 #                                        lets exactly one Ship tap land (the pull-the-plug case itself);
 #                                        off (Cain's) stops them. Until on, a Ship tap answers that installs
 #                                        wait for the post-install tests, and keeps its buttons
-#   keeper.sh recover-logs --said <his message id>
+#   keeper.sh recover-logs [--said <his message id>]
 #                                        the owner's alone, only when the record keeper says it refuses to
-#                                        start for a case no rule explains: his own message in his DM, under
-#                                        a day old, saying exactly "recover logs", single use; the keeper
+#                                        start for a case no rule explains. Without --said it only proposes,
+#                                        sending him the exact line "recover logs <code>" (bound like the
+#                                        install line). keeper.sh recover-logs --said <his message id>: his
+#                                        own message in his DM, under a day old, sent after the proposal,
+#                                        saying exactly that line, single use; the keeper
 #                                        moves the damaged log aside and goes on once its rebuild is
 #                                        verified against GitHub
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,

@@ -332,10 +332,11 @@ describe("4. install taps: a keeper-owned log, and his own line", () => {
     await expect(r.link.installTaps({ how: "on" })).rejects.toThrow("result file isn't there yet");
     passResults(r);
     expect(await r.link.installTaps({ how: "on" })).toMatchObject({ status: "proposed", install_taps: "off" });
-    expect(r.cards().some((m: any) => String(m.content).includes("```\ninstall taps on\n```"))).toBe(true);
+    // Round 14: the line carries the proposal's code.
+    const line = /```\n(install taps on [a-z][0-9a-f]{5})\n```/.exec(String(r.cards().find((m: any) => String(m.content).includes("install taps on"))!.content))![1];
     const wrong = r.his("install taps please");
-    await expect(r.link.installTaps({ how: "on", said: wrong.id })).rejects.toThrow(`doesn't say exactly "${INSTALL_LINE}"`);
-    const his = r.his("`Install taps on`");
+    await expect(r.link.installTaps({ how: "on", said: wrong.id })).rejects.toThrow(`doesn't say exactly "${INSTALL_LINE} <the code`);
+    const his = r.his("`" + line.replace("install", "Install") + "`");
     expect(await r.link.installTaps({ how: "on", said: his.id })).toMatchObject({ status: "ok", install_taps: "on" });
     expect(r.landLedger.owner).toEqual([expect.objectContaining({ kind: "install", said: his.id })]);
     expect(installState(r.installLog)).toMatchObject({ how: "on", head: "b".repeat(40) });
@@ -546,10 +547,12 @@ describe("6. a key that misses the mirror is looked up again before deciding", (
 describe("recover-logs on the link", () => {
   test("his exact line, single use, written to the ledger and the keeper's recover file", async () => {
     const r = shipRig();
-    await expect(r.link.recoverLogs({ said: r.his("recover the logs").id })).rejects.toThrow(`doesn't say exactly "${RECOVER_LINE}"`);
-    const his = r.his("Recover logs");
+    await expect(r.link.recoverLogs({ said: r.his("recover the logs").id })).rejects.toThrow(`doesn't say exactly "${RECOVER_LINE} <the code`);
+    expect(await r.link.recoverLogs({})).toMatchObject({ status: "proposed" });
+    const line = /```\n(recover logs [a-z][0-9a-f]{5})\n```/.exec(String(r.cards().find((m: any) => String(m.content).includes("recover logs"))!.content))![1];
+    const his = r.his(line.replace("recover", "Recover"));
     expect(await r.link.recoverLogs({ said: his.id })).toMatchObject({ status: "ok" });
-    expect(JSON.parse(readFileSync(r.recoverFile, "utf8"))).toMatchObject({ said: his.id });
+    expect(JSON.parse(readFileSync(r.recoverFile, "utf8"))).toMatchObject({ said: his.id, nonce: line.split(" ")[2] });
     expect(r.landLedger.owner).toEqual([expect.objectContaining({ kind: "recover", said: his.id })]);
     await expect(r.link.recoverLogs({ said: his.id })).rejects.toThrow("used already");
   });
