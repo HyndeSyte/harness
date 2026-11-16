@@ -5,12 +5,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, bumpsAt, checkRuns, facts, inMain, judgeChecks, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, bumpsAt, checkRuns, facts, headChecks, inMain, judgeChecks, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
 
-function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; main?: string; prHead?: string } = {}) {
+function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; main?: string; prHead?: string; yml?: string | null | 0 } = {}) {
   const parents: Record<string, string> = over.parents ?? { [M1]: M0, [H1]: M1, [H2]: H1, [X1]: M0 };
   const state = {
     main: over.main ?? M1,
@@ -40,6 +40,12 @@ function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; 
     api: async (path) => {
       if (state.apiDown) throw new Error("timeout");
       if (path === `/repos/${REPO}/pulls/13`) return { status: 200, body: pull };
+      // The head's tests.yml: its text, none (undefined or null: 404), or 0 (no answer).
+      if (path === `/repos/${REPO}/contents/.github/workflows/tests.yml?ref=${H1}`) {
+        if (over.yml === 0) return { status: 502, body: null };
+        if (over.yml == null) return { status: 404, body: null };
+        return { status: 200, body: { encoding: "base64", content: Buffer.from(over.yml).toString("base64") } };
+      }
       if (path.startsWith(`/repos/${REPO}/commits/${H1}/check-runs`)) {
         const name = new URL(`http://x${path}`).searchParams.get("check_name");
         const mine = name ? runs.filter((r: any) => r?.name === name) : runs;
@@ -134,6 +140,38 @@ describe("landing his Ship tap", () => {
     }
     const { d } = gh({ runs: [run("pytest", "failure", "completed", ACTIONS_APP, 1), run("pytest", "success", "completed", ACTIONS_APP, 2), run("bun", "success"), run("pr", "success")] });
     expect(await land(d, L)).toEqual({ ok: true, already: false });
+  });
+
+  test("pcjobs-windows, when the head's tests.yml names it or it ran there, must pass too; an older head without it lands as before", async () => {
+    const run = (name: string, conclusion: string | null, status = "completed", id = 1) => ({ id, name, status, conclusion, app: { id: ACTIONS_APP } });
+    const req = () => ["pytest", "bun", "pr"].map((n, i) => run(n, "success", "completed", 100 + i));
+    const YML = "jobs:\n  pytest: {}\n  bun: {}\n  pcjobs-windows:\n    runs-on: windows-latest\n";
+    const cases: [any[], string | null | 0, string | null, boolean][] = [
+      [[...req(), run("pcjobs-windows", "success")], YML, null, false],
+      [[...req(), run("pcjobs-windows", "failure")], YML, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      [[...req(), run("pcjobs-windows", "cancelled")], YML, "CI's pcjobs-windows check didn't pass on it (cancelled)", false],
+      [[...req(), run("pcjobs-windows", null, "in_progress")], YML, "CI is still running pcjobs-windows on it", true],
+      [req(), YML, "CI hasn't run pcjobs-windows on it", false],                       // named, never run: fail closed
+      [[...req(), run("pcjobs-windows", "failure")], null, "CI's pcjobs-windows check didn't pass on it (failure)", false],   // ran, not named
+      [req(), "jobs:\n  pytest: {}\n  bun: {}\n", null, false],                       // an older workflow
+      [req(), null, null, false],
+      [req(), 0, "GitHub didn't answer about its checks", true],                        // tests.yml unread: nothing judged
+    ];
+    for (const [runs, yml, why, again] of cases) {
+      const { d, state } = gh({ runs, yml });
+      expect(await land(d, L)).toEqual(why === null ? { ok: true, already: false } : { ok: false, why, again });
+      expect(state.pushes).toHaveLength(why === null ? 1 : 0);
+    }
+  });
+
+  test("headChecks: the runs, and whether pcjobs-windows must pass", async () => {
+    const run = (name: string, conclusion = "success") => ({ id: 1, name, status: "completed", conclusion, app: { id: ACTIONS_APP } });
+    const req = ["pytest", "bun", "pr"].map((n) => run(n));
+    expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pcjobs-windows: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: true });
+    expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pytest: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: false });
+    expect(await headChecks(gh({ runs: [...req, run("pcjobs-windows")] }).d, REPO, H1)).toEqual({ runs: [...req, run("pcjobs-windows")], windows: true });
+    expect(await headChecks(gh({ runs: req, yml: 0 }).d, REPO, H1)).toBeNull();
+    expect(await headChecks(gh({ runs: req }).d, REPO, H2)).toBe("missing");
   });
 
   test("when GitHub or the fetch doesn't answer, nothing is pushed, and a new card can follow", async () => {

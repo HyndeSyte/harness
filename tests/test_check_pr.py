@@ -275,6 +275,49 @@ def test_another_workflow_cant_borrow_a_required_name():
         "from another workflow."]
 
 
+def test_the_windows_job_the_ship_card_reads_keeps_its_name_and_always_runs():
+    tests = ".github/workflows/tests.yml"
+    w = _workflows()
+    assert "  pcjobs-windows:\n" in w[tests]                     # this branch's workflow has it
+    # Renamed, skipped or allowed to fail: each fails, as for a required check.
+    w[tests] = w[tests].replace("  pcjobs-windows:\n    runs-on", "  pcjobs-windows:\n    name: windows\n    runs-on")
+    assert check_pr.check_workflows(w) == [
+        f"{tests}: job pcjobs-windows is renamed to 'windows'; the Ship card reads it by its name, keep it."]
+    for key in ("if: false", "continue-on-error: true"):
+        w = _workflows()
+        w[tests] = w[tests].replace("  pcjobs-windows:\n    runs-on", f"  pcjobs-windows:\n    {key}\n    runs-on")
+        assert check_pr.check_workflows(w) == [
+            f"{tests}: job pcjobs-windows has `{key.split(':')[0]}`; the Ship card reads it, so it must always run and report."]
+    w = _workflows()
+    w[tests] = w[tests].replace("      - run: bun test cain/tests/pcjobs.test.ts",
+                                "      - run: bun test cain/tests/pcjobs.test.ts\n        continue-on-error: true")
+    assert check_pr.check_workflows(w) == [f"{tests}: job pcjobs-windows step 3 has `continue-on-error`."]
+
+
+def test_the_windows_job_may_go_but_nothing_else_may_report_under_its_name():
+    tests = ".github/workflows/tests.yml"
+    w = _workflows()
+    start = w[tests].index("  # The PC job worker runs")
+    w[tests] = w[tests][:start].rstrip() + "\n"
+    assert "pcjobs-windows" not in w[tests]
+    assert check_pr.check_workflows(w) == []                      # removed: the card no longer waits on it
+    # Another job of tests.yml, or another workflow, can't post a run under its name.
+    w = _workflows()
+    w[tests] = w[tests].replace("  pcjobs-windows:\n    runs-on", "  win:\n    name: pcjobs-windows\n    runs-on")
+    assert check_pr.check_workflows(w) == [
+        f"{tests}: job win reports as 'pcjobs-windows', the name of a check the Ship card reads; "
+        "only tests.yml's own job of that name may."]
+    w = dict(_workflows(), **{".github/workflows/x.yml": "on: push\njobs:\n  pcjobs-windows:\n"
+                                                           "    runs-on: windows-latest\n"})
+    assert check_pr.check_workflows(w) == [
+        ".github/workflows/x.yml: job pcjobs-windows reports as 'pcjobs-windows', the name of a check "
+        "the Ship card reads; only tests.yml's own job of that name may."]
+    # A trigger filter on tests.yml was already a failure (pytest and bun are there too).
+    w = _workflows()
+    w[tests] = w[tests].replace("  pull_request:\n", "  pull_request:\n    paths: ['cain/**']\n")
+    assert len(check_pr.check_workflows(w)) == 1
+
+
 def test_a_missing_required_workflow_fails():
     w = dict(_workflows(), **{".github/workflows/pr.yml": None})
     assert check_pr.check_workflows(w) == [".github/workflows/pr.yml is gone; it runs the "

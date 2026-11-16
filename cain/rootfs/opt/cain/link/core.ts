@@ -60,7 +60,9 @@
 // - Ship cards built from GitHub and the review service (0.11.0): the question names each
 //   App and version the tap installs, a line from GitHub has the pull request's title, how
 //   much it changes, the parts that matter most and its checks (read as the landing reads
-//   them: a failed check, or one not run yet, refuses the card; merged at that head, it's in
+//   them: a failed check, or one not run yet, refuses the card, and pcjobs-windows, whenever
+//   the head's tests.yml names it or it ran there, refuses it unless its newest run there
+//   passed; merged at that head, it's in
 //   main already), and the last line is the review service's own for the review Cain names,
 //   which must be a review of that very head. Cain's words say only what Dane will notice, on
 //   one line. Anything going wrong while the new lines are built gives the card as it was
@@ -87,7 +89,7 @@ import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
-import { judgeChecks, type Facts, type Landed } from "./merge";
+import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -514,7 +516,7 @@ export interface Deps {
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
-  checkRuns?: (pr: string, head: string) => Promise<any[] | "missing" | null>;   // the head's check runs (merge.ts checkRuns)
+  checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;   // the head's check runs (merge.ts headChecks)
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1404,7 +1406,8 @@ export class Link {
   // some time. Then GitHub is asked for the pull request and the head's check runs at once,
   // within FACTS_MS, and a part that doesn't come says so. Refused: no line for that review, a
   // review of another head or none named in it, its lines unreadable, a newer head on GitHub, a
-  // commit GitHub doesn't have, a check that failed or hasn't run. A pull request merged at
+  // commit GitHub doesn't have, a check that failed or hasn't run, pcjobs-windows (when the
+  // head's tests.yml names it or it ran there) not passed yet. A pull request merged at
   // this head is in main already: the landing asks nothing of its checks, so neither does the
   // card. Anything else going wrong while the new lines are built gives the card as it was
   // before: "Ship it?", his line and the line from GitHub as it was. Never no card.
@@ -1437,11 +1440,15 @@ export class Link {
       throw new Refusal("GitHub says it's merged, but main doesn't have that head (a squash or a rebase?), so a Ship tap can't install it");
     try {
       if (!merged && runs === "missing") throw new Refusal("GitHub doesn't have that commit: show the card for its head as it is now");
-      const checks = !merged && Array.isArray(runs) ? judgeChecks(runs) : null;
+      const checks = !merged && runs && runs !== "missing" && Array.isArray(runs.runs) ? judgeChecks(runs.runs, runs.windows === true) : null;
       const failed = checks?.find((c) => c.state === "failed");
       if (failed) throw new Refusal(`its ${failed.name} check didn't pass (${failed.conclusion}): fix it through Build first, then show a new Ship card`);
       const notRun = checks?.find((c) => c.state === "missing");
       if (notRun) throw new Refusal(`CI hasn't run ${notRun.name} on it yet: show the card once its checks have run`);
+      // Unlike a required check, a Windows run still going refuses the card: no ruleset holds
+      // main to it, so the card waits for it to pass (the landing checks it again).
+      if (checks?.some((c) => c.name === WINDOWS_CHECK && c.state === "running"))
+        throw new Refusal(`CI is still running ${WINDOWS_CHECK} on it: show the card once it has passed`);
       const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
         : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
       const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
@@ -1518,6 +1525,69 @@ export class Link {
     return { status: "ok", reply_to: rid, card: m?.card ?? null, item: m?.item ?? null, question: m?.question || null,
       asked: m?.q?.q ?? null, open: m ? live(m, now) : null,
       buttons: m?.buttons ? [...(m.labels ?? [])] : [], live: m ? live(m, now) : null };
+  }
+
+  // -- his yes to reusing a PC result's values (POST /reuse, the PC job keeper's ask) ----
+  // A follow-up PC job may carry a value an earlier result reported only on his yes
+  // (pcjobs/core.ts, owner_reuse). Cain writes the job, so his say-so proves nothing: the
+  // keeper sends the Discord message id the job names, and the link answers from what it
+  // recorded and what Discord has, never from Cain's words. The id is one of:
+  //   - tap: one of Cain's asks, which the link recorded he answered by tapping its first
+  //     option (the yes, "Use it"; a tap is recorded only from him, in his DM, with Cain
+  //     paired to him: who(), above), and whose words on Discord show every value exactly;
+  //   - reply: a message of his in the DM (by him, the bot's owner, Cain paired to him) that
+  //     shows every value exactly and is a Discord reply to such an ask, or, not a reply,
+  //     comes after one (the newest ask the link posted before it). An ask he answered by
+  //     tapping another option is a no, whatever he wrote after.
+  // Anything else is a Refusal: an id that isn't a Discord id, no such message in his DM,
+  // a message by anyone else, an ask not answered by his yes, a value missing. Discord
+  // down is an error. The keeper refuses the job on either (fail closed).
+  async reuseProof(messageId: unknown, values: unknown): Promise<{ status: "ok"; message: string; via: "tap" | "reply"; ask: string; values: string[] }> {
+    const id = String(messageId ?? "").trim();
+    if (!SNOWFLAKE.test(id)) throw new Refusal("needs a Discord message id: his reply in your DM, or the ask he tapped");
+    const vals = Array.isArray(values) ? values : [];
+    if (!vals.length || vals.length > 3 || !vals.every((v) => typeof v === "string" && v.length >= 4 && v.length <= 300 && !/[\u0000-\u001f\u007f]/.test(v)))
+      throw new Refusal("needs 1 to 3 values, each one line of 4 to 300 characters");
+    const want = vals as string[];
+    const { owner, dm, bot } = await this.identity();
+    if (this.d.paired() && this.d.paired() !== owner) throw new Refusal("Cain is paired with someone other than the bot's owner");
+    const get = async (mid: string) => {
+      try { return await this.rest("GET", `/channels/${dm}/messages/${mid}`); }
+      catch (e) { if (/discord 404/.test(String(e))) throw new Refusal("no message with that id in his DM"); throw e; }
+    };
+    const missing = (text: string) => want.filter((v) => !text.includes(v));
+    // One of Cain's asks, as Discord shows it now (his answer's line taken off), with every value.
+    const askShows = async (aid: string, rec: Shown) => {
+      const msg = await get(aid);
+      if (String(msg?.author?.id ?? "") !== bot) throw new Refusal("that ask isn't the bot's message");
+      if (rec.outcome === "answered" && !rec.words && rec.label !== undefined && rec.label !== rec.q?.options[0])
+        throw new Refusal(`he answered that ask by tapping "${rec.label}", not its first option`);
+      if (missing(withoutOutcome(String(msg?.content ?? ""))).length) throw new Refusal("that ask doesn't show every value exactly as written");
+    };
+    const s = this.d.load();
+    const rec = s.messages[id];
+    if (rec?.kind === "ask") {
+      if (!(rec.outcome === "answered" && !rec.words && rec.q && rec.label !== undefined))
+        throw new Refusal("no tap of his is recorded on that ask: it was answered in words, expired, replaced or is still open");
+      await askShows(id, rec);
+      return { status: "ok", message: id, via: "tap", ask: id, values: [...want] };
+    }
+    if (rec) throw new Refusal("that message is a card of the link's, not one of Cain's asks");
+    const msg = await get(id);
+    if (String(msg?.author?.id ?? "") !== owner) throw new Refusal("that isn't one of his messages in your DM");
+    if (missing(String(msg?.content ?? "")).length) throw new Refusal("his message doesn't show every value exactly as written");
+    const ref = msg?.message_reference;
+    let aid = "";
+    if (ref?.message_id && Number(ref.type ?? 0) === 0) aid = String(ref.message_id);
+    else {
+      // Not a reply: the newest ask the link posted before his message.
+      for (const [k, m] of Object.entries(s.messages))
+        if (m.kind === "ask" && SNOWFLAKE.test(k) && BigInt(k) < BigInt(id) && (!aid || BigInt(k) > BigInt(aid))) aid = k;
+    }
+    const ask = aid ? s.messages[aid] : undefined;
+    if (!ask || ask.kind !== "ask") throw new Refusal(ref?.message_id ? "his message replies to something other than one of your asks" : "no ask of yours came before his message");
+    await askShows(aid, ask);
+    return { status: "ok", message: id, via: "reply", ask: aid, values: [...want] };
   }
 
   // -- taps -------------------------------------------------------------------

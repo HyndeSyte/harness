@@ -4,7 +4,8 @@
 // fast-forward of main, after checking:
 //   - on GitHub's API: the pull request is open, into main, from a branch of this
 //     repository, still at that head, and its pytest, bun and pr checks passed there
-//     (GitHub Actions);
+//     (GitHub Actions), and pcjobs-windows too whenever the head's tests.yml names it
+//     or it ran there (headChecks);
 //   - over SSH with the deploy key: the pull request's head is that commit, and main
 //     is an ancestor of it (so nothing on main is lost, and nothing is merged in);
 //   - right before the push: nothing is stopped.
@@ -13,6 +14,11 @@
 // again. Nothing here retries a push.
 export const ACTIONS_APP = 15368;               // GitHub Actions, the source of the required checks
 export const CHECKS = ["pytest", "bun", "pr"] as const;
+// The Windows run of the PC worker's tests (tests.yml). No ruleset requires it (that takes
+// admin rights), so the link does: whenever the head's tests.yml names it, or it ran on the
+// head, a Ship card waits for its newest run there to pass, and so does the landing.
+export const WINDOWS_CHECK = "pcjobs-windows";
+const TESTS_YML = ".github/workflows/tests.yml";
 
 export interface Git { code: number; out: string; err: string }
 export interface MergeDeps {
@@ -155,12 +161,34 @@ export async function checkRuns(d: Pick<MergeDeps, "api">, repo: string, head: s
   return (each as any[][]).flat();
 }
 
+// The head's checks as a Ship card and the landing judge them: the required checks' runs
+// (checkRuns), pcjobs-windows's runs read the same way, and whether the head's tests.yml names
+// pcjobs-windows at all. Any mention of it there counts (fail closed: a renamed or commented
+// job still makes the card wait for a run under that name). windows: it must pass, since
+// tests.yml names it or it ran on the head. "missing" or null as for checkRuns; null too
+// when tests.yml can't be read, so nothing is judged without knowing whether it's defined.
+export interface HeadChecks { runs: any[]; windows: boolean }
+export async function headChecks(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<HeadChecks | "missing" | null> {
+  const [req, win, yml] = await Promise.all([checkRuns(d, repo, head), runsOf(d, repo, head, WINDOWS_CHECK), read(d, `/repos/${repo}/contents/${TESTS_YML}?ref=${head}`)]);
+  if (req === "missing" || win === "missing") return "missing";
+  if (req === null || win === null || yml === null) return null;
+  let named = false;
+  if (yml !== "missing") {
+    if (typeof yml.content !== "string" || yml.encoding !== "base64") return null;
+    named = Buffer.from(yml.content, "base64").toString("utf8").includes(WINDOWS_CHECK);
+  }
+  const ran = win.some((r) => r?.name === WINDOWS_CHECK && r?.app?.id === ACTIONS_APP);
+  return { runs: [...req, ...win], windows: named || ran };
+}
+
 // Each required check's newest run from GitHub Actions: passed (success only), still
-// running, failed (any other conclusion, skipped and neutral too), or not run yet. The one
-// judgment for the landing (failedChecks) and the Ship card.
+// running, failed (any other conclusion, skipped, neutral and cancelled too), or not run
+// yet; with windows, pcjobs-windows judged the same way after them. The one judgment for
+// the landing (failedChecks) and the Ship card.
 export interface CheckState { name: string; state: "passed" | "running" | "failed" | "missing"; conclusion?: string }
-export function judgeChecks(runs: any[]): CheckState[] {
-  return CHECKS.map((name): CheckState => {
+export function judgeChecks(runs: any[], windows = false): CheckState[] {
+  const names: string[] = windows ? [...CHECKS, WINDOWS_CHECK] : [...CHECKS];
+  return names.map((name): CheckState => {
     const mine = runs.filter((r) => r?.name === name && r?.app?.id === ACTIONS_APP).sort((a, b) => Number(b.id) - Number(a.id));
     const r = mine[0];
     if (!r) return { name, state: "missing" };
@@ -223,8 +251,8 @@ export async function inMain(d: MergeDeps, repo: string, head: string): Promise<
 }
 
 // The first check, in order, that keeps it from landing.
-function failedChecks(runs: any[]): Landed | null {
-  for (const c of judgeChecks(runs)) {
+function failedChecks(h: HeadChecks): Landed | null {
+  for (const c of judgeChecks(h.runs, h.windows)) {
     if (c.state === "missing") return no(`CI hasn't run ${c.name} on it`);
     if (c.state === "running") return no(`CI is still running ${c.name} on it`, true);
     if (c.state === "failed") return no(`CI's ${c.name} check didn't pass on it (${c.conclusion})`);
@@ -243,7 +271,7 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
     if (String(pull.base?.ref ?? "") !== "main") return no("it isn't a pull request into main");
     if (String(pull.head?.repo?.full_name ?? "").toLowerCase() !== repo) return no("its branch isn't in this repository");
     if (String(pull.head?.sha ?? "").toLowerCase() !== l.head) return no("its branch moved on since the card: it has newer commits");
-    const runs = await checkRuns(d, l.repo, l.head);
+    const runs = await headChecks(d, l.repo, l.head);
     if (runs === "missing") return no("GitHub doesn't have that commit");
     if (!runs) return no("GitHub didn't answer about its checks", true);
     const bad = failedChecks(runs);

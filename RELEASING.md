@@ -33,7 +33,16 @@ branch is up to date with `main` and these checks passed on it:
     one App bumped. A `config.yaml` whose `version` is missing, duplicated, unparseable
     or not a quoted `X.Y.Z` fails, on `main` or the branch;
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
-    filters and no `if` or `continue-on-error`, and no other workflow reuses the names.
+    filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
+    the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
+    `tests.yml` defines it.
+
+`pcjobs-windows` is not a required check in the rulesets (making it one needs the
+repository's rulesets, which take admin rights no session has). The link enforces it
+instead: when the head's `tests.yml` names it, or a run of it exists on the head, a Ship
+card is refused, and a landing refused or held, unless its newest run on that exact head
+passed ("CI is still running pcjobs-windows on it" waits; a failed, cancelled or skipped
+run, or none at all, refuses).
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.

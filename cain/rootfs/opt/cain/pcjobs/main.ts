@@ -23,13 +23,56 @@
 //   bun main.ts worker          the PC worker's last heartbeat
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
-  DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type Result } from "./core.ts";
+import { createHmac } from "node:crypto";
+import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
+  DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type OwnerReuse, type Result } from "./core.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; branch: string;
   token?: string; pub: string; now?: () => Date; rand?: () => number;
+  link?: string;                 // Cain's link, for owner_reuse proofs (default http://127.0.0.1:8097)
+  discordEnv?: string;           // the bot token's file, for the link's key (the token itself is never kept or printed)
+  verifyReuse?: ReuseCheck;      // the tests' stand-in for the link
 };
+
+// ---- His yes to reusing a reported value, checked by the link ----------------------
+// A job's owner_reuse names the Discord message of his yes (core.ts OwnerReuse). Cain
+// wrote the job, so the keeper asks the link, which alone hears his taps and reads his DM
+// as the bot (link/core.ts reuseProof): his recorded tap on the first option ("Use it")
+// of one of Cain's asks that shows every value, or his own message in the DM showing every
+// value, in answer to such an ask. Fail closed: no key, the link down or slow, a refusal,
+// or an answer that isn't a plain yes for this message and these values, refuses the job.
+export type ReuseCheck = (r: OwnerReuse) => { ok: true; via: string } | { ok: false; why: string };
+export const LINK = "http://127.0.0.1:8097";
+export const DISCORD_ENV = "/data/.claude/channels/discord/.env";
+// The link's answer, read strictly: status ok, this very message, these very values.
+export function reuseAnswer(r: OwnerReuse, text: string): { ok: true; via: string } | { ok: false; why: string } {
+  let a: any;
+  try { a = JSON.parse(text); } catch { return { ok: false, why: "the link didn't answer" }; }
+  if (a?.status === "refused" && typeof a.said === "string") return { ok: false, why: `the link says ${a.said.replace(/[\u0000-\u001f]+/g, " ").slice(0, 200)}` };
+  if (a?.status !== "ok" || a.message !== r.message_id || (a.via !== "tap" && a.via !== "reply")
+    || !Array.isArray(a.values) || a.values.length !== r.values.length || a.values.some((v: unknown, i: number) => v !== r.values[i]))
+    return { ok: false, why: "the link couldn't check it" };
+  return { ok: true, via: a.via };
+}
+// The real check: one POST to the link's /reuse, keyed as keeper.sh keys it, through curl
+// (the keeper's round is synchronous). The key and body go in on curl's standard input
+// (its config), never on a command line another process could read.
+export function linkReuse(cfg: Pick<Config, "link" | "discordEnv">): ReuseCheck {
+  return (r) => {
+    let tok = "";
+    try { tok = readFileSync(cfg.discordEnv ?? DISCORD_ENV, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? ""; } catch { /* none */ }
+    if (!tok) return { ok: false, why: "no bot token here, so the link can't be asked" };
+    const key = createHmac("sha256", tok).update("harness-relay-v1").digest("hex");
+    const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    const conf = [`url = ${q(`${cfg.link ?? LINK}/reuse`)}`, `header = ${q(`X-Harness-Key: ${key}`)}`, `header = "Content-Type: application/json"`,
+      `data-binary = ${q(JSON.stringify({ m: r.message_id, values: r.values }))}`, `max-time = 40`, `noproxy = "*"`, `silent`].join("\n") + "\n";
+    const p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+    if (p.exitCode !== 0) return { ok: false, why: "the link didn't answer" };
+    return reuseAnswer(r, p.stdout.toString());
+  };
+}
 
 const KEEPER = "Cain's PC job keeper";
 const log = (m: string) => console.log(`[pc-jobs] ${m}`);
@@ -188,8 +231,19 @@ export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: 
   const values = jobs.flatMap((j) => { const r = readResult(cfg.dir, j.id); return r && r !== "bad" ? reportValues(r, j) : []; })
     .filter((v) => !(/^https?:/i.test(v) && own.has(normalUrl(v, true))));
   // A mitigation, not a guarantee (core.ts): the pinned domains are the control. A value
-  // the owner said yes to reusing, recorded on the job as owner_reuse, goes through.
-  if (unapprovedValues(req.job, values).length) return { why: "a job can't carry a value from a PC result (an address or account a page showed): write it from the owner's words or the allowlist instead, or ask the owner and record his answer as owner_reuse" };
+  // the owner said yes to reusing goes through only with owner_reuse naming the Discord
+  // message of his yes, which the link checks (linkReuse, above); Cain's words alone never
+  // count, and one message answers for one job.
+  const reuse = req.job && typeof req.job === "object" ? req.job.owner_reuse : undefined;
+  if (reuse !== undefined && reuse !== null) {
+    if (!reuseOk(reuse)) return { why: `${REUSE_SHAPE}; without his message's id it is refused` };
+    const used = jobs.find((j) => j.owner_reuse?.message_id === reuse.message_id);
+    if (used) return { why: `owner_reuse refused: that message of his already answered for ${used.id}; ask him again for this job` };
+    let v: ReturnType<ReuseCheck>;
+    try { v = (cfg.verifyReuse ?? linkReuse(cfg))(reuse); } catch { v = { ok: false, why: "the link couldn't check it" }; }
+    if (!v.ok) return { why: `owner_reuse refused: ${v.why}. Reuse needs his "Use it" tap on your ask that quotes each value, or his own reply in the DM that does` };
+  }
+  if (unapprovedValues(req.job, values).length) return { why: "a job can't carry a value from a PC result (an address or account a page showed): write it from the owner's words or the allowlist instead, or ask the owner and record his yes as owner_reuse with its Discord message id" };
   let id = newId(now, cfg.rand);
   while (jobs.some((j) => j.id === id)) id = newId(now, cfg.rand);
   const made = jobFromAsk(req.job, now, id);
@@ -298,6 +352,8 @@ export function configFromEnv(env = process.env): Config {
     branch: env.PC_JOBS_BRANCH ?? "main",
     token: env.PC_JOBS_TOKEN || undefined,
     pub: env.CAIN_SHIP_PUB ?? "/data/trust/ship.pub",
+    link: env.CAIN_LINK ?? LINK,
+    discordEnv: env.LINK_ENV ?? DISCORD_ENV,
   };
 }
 

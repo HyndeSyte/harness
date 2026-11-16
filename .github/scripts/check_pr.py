@@ -20,7 +20,11 @@
    it is refreshed; the failure prints the line to add.
 5. The required checks keep reporting: the pytest and bun jobs in tests.yml and
    the pr job in pr.yml keep their names, with no path or branch filters and no
-   `if` or `continue-on-error`, and no other workflow reuses those names.
+   `if` or `continue-on-error`, and no other workflow reuses those names. The
+   pcjobs-windows job in tests.yml isn't required by GitHub, but the link reads it
+   before a Ship card whenever tests.yml names it: while it is there, the same rules
+   hold for it (its name stays, no `if` or `continue-on-error`, no other job or
+   workflow reports under its name). It may be removed.
 
 It reads the pull request only through git (diff, show, ls-tree) and never runs
 or imports its files. In CI, pr.yml runs main's copy of this script:
@@ -54,6 +58,9 @@ SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 # The required checks (RELEASING.md): workflow file -> job ids that must stay as they are.
 REQUIRED_JOBS = {".github/workflows/tests.yml": ("pytest", "bun"),
                  ".github/workflows/pr.yml": ("pr",)}
+# Jobs no ruleset requires, but that the link reads before a Ship card whenever the
+# head's workflow names them (RELEASING.md): while one is there, the rules above hold for it.
+GATED_JOBS = {".github/workflows/tests.yml": ("pcjobs-windows",)}
 FILTER_KEYS = ("branches", "branches-ignore", "paths", "paths-ignore", "tags", "tags-ignore")
 STALE = "The branch is not up to date with main, update it."
 
@@ -260,6 +267,7 @@ def check_workflows(workflows: dict[str, str | None]) -> list[str]:
     required ones present as None when they're missing."""
     problems = []
     names = {j for jobs in REQUIRED_JOBS.values() for j in jobs}
+    gated_names = {j for jobs in GATED_JOBS.values() for j in jobs}
     for path in sorted(workflows):
         text = workflows[path]
         required = REQUIRED_JOBS.get(path, ())
@@ -275,20 +283,23 @@ def check_workflows(workflows: dict[str, str | None]) -> list[str]:
             problems.append(f"{path} isn't a workflow mapping.")
             continue
         jobs = doc.get("jobs") if isinstance(doc.get("jobs"), dict) else {}
-        if required:
+        gated = tuple(j for j in GATED_JOBS.get(path, ()) if j in jobs)
+        if required or gated:
             for f in _filters(_on(doc)):
                 problems.append(f"{path} filters its trigger ({f}); the required checks must "
                                 "run on every pull request.")
         for job_id, job in jobs.items():
             job = job if isinstance(job, dict) else {}
             shown = job.get("name", job_id)
-            if job_id in required:
+            if job_id in required or job_id in gated:
+                what = "a required check" if job_id in required else "the Ship card reads it, so it"
                 if "name" in job and job["name"] != job_id:
                     problems.append(f"{path}: job {job_id} is renamed to {job['name']!r}; "
-                                    "the required check names stay fixed.")
+                                    + ("the required check names stay fixed." if job_id in required
+                                       else "the Ship card reads it by its name, keep it."))
                 for key in ("if", "continue-on-error"):
                     if key in job:
-                        problems.append(f"{path}: job {job_id} has `{key}`; a required check "
+                        problems.append(f"{path}: job {job_id} has `{key}`; {what} "
                                         "must always run and report.")
                 for i, step in enumerate(job.get("steps") or []):
                     if isinstance(step, dict):
@@ -298,6 +309,10 @@ def check_workflows(workflows: dict[str, str | None]) -> list[str]:
             elif job_id in names or shown in names:
                 problems.append(f"{path}: job {job_id} reports as {shown!r}, the name of a "
                                 "required check from another workflow.")
+            elif job_id in gated_names or shown in gated_names:
+                problems.append(f"{path}: job {job_id} reports as {shown!r}, the name of a "
+                                "check the Ship card reads; only tests.yml's own job of that "
+                                "name may.")
         for job_id in required:
             if job_id not in jobs:
                 problems.append(f"{path} has no {job_id} job; it's a required check, keep its name.")

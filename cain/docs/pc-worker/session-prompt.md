@@ -9,12 +9,14 @@ know. Only http and https addresses open (never file, data, javascript, chrome, 
 other than about:blank, or any other kind), never an address on this computer or its
 network other than the run's own check page, only on the hosts the run's
 `allowed_domains` names (exactly, or every subdomain where it says `*.`), and with no
-query and no fragment unless the run's own address has one.
+query unless the run's own address has one. A fragment (`#` and what follows) is dropped
+before an address opens.
 
-If the worker answers "Not ready yet", make the same call again: that is not a refusal.
-If a page read comes back saying the tab is no longer on the job's own sites, the page
-moved your tab elsewhere: don't read it again, report `uncertain`, and end the run as
-step 3 says.
+If the worker answers "Not ready yet", make the same call again; after three of those
+the worker ends the session. Every refusal counts: a session refused twelve times is
+ended. If a page read is refused (the tab left the job's own sites, or the read didn't
+say which address it was on), the worker ends the session there and throws the report
+away: there is nothing more to do.
 
 The required order, every time: right after `tabs_create_mcp`, and right after every
 `read_page`, `get_page_text` or `find` call, call `mcp__claude-in-chrome__tabs_context_mcp`

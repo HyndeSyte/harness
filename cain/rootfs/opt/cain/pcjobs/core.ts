@@ -47,6 +47,7 @@ export const CODES = [
   "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
   "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab", "tab_context_owed",
   "containment_unavailable", "domain_not_allowed", "read_drift", "helper_compiler_missing", "helper_blocked",
+  "read_unplaced", "inventory_never_ready", "refusal_cap",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -145,12 +146,17 @@ export interface Job {
   preview_seen: Seen | null;   // confirm: what that preview saw
   owner_go: string | null;     // confirm: Dane's exact words, quoted
   go_token: string | null;     // confirm: job2.<claim>.<signature>
-  owner_reuse: OwnerReuse | null;   // a read that reuses values a PC result reported, on the owner's tap (reportValues, below)
+  owner_reuse: OwnerReuse | null;   // a read that reuses values a PC result reported, on the owner's yes, which the link proves (reportValues, below)
 }
 // The owner's go to reuse values a PC result reported in a new job: the values, exactly,
-// and his answer as Cain recorded it from his tap, in quotes. Recorded on the job, so the
-// queue keeps who said yes; it is Cain's record, not a signature.
-export interface OwnerReuse { values: string[]; go: string }
+// his answer as Cain wrote it down, in quotes, and the Discord message that proves it
+// (message_id): the ask of Cain's he tapped "Use it" on, or his own reply in the DM. Cain
+// writes the job, so go is only Cain's record; message_id is what counts. The keeper
+// hands it to the link, which checks it against its own record of his taps and against
+// Discord (link/core.ts reuseProof), and refuses the job unless it holds (main.ts check).
+// The job file keeps it, so the queue shows which message said yes, and one message
+// answers for one job only.
+export interface OwnerReuse { values: string[]; go: string; message_id: string }
 
 export interface Result {
   v: 1;
@@ -305,8 +311,14 @@ function seenOk(s: unknown): s is Seen {
   return isObj(s) && exact(s, SEEN_KEYS) && checkFacts("delete_account", s).ok;
 }
 
-const reuseOk = (r: unknown): r is OwnerReuse => isObj(r) && exact(r, ["values", "go"]) && Array.isArray(r.values) && r.values.length >= 1 && r.values.length <= 3
-  && r.values.every((v: unknown) => line(v, 300) && (v as string).length >= 4) && typeof r.go === "string" && QUOTED.test(r.go);
+// A Discord message id (a snowflake), as the link takes it.
+export const SNOWFLAKE = /^\d{15,22}$/;
+export const REUSE_KEYS = ["values", "go", "message_id"];
+export const REUSE_SHAPE = "owner_reuse is null, or {values: 1 to 3 reported values, go: the owner's answer to Cain's ask, in quotes, "
+  + "message_id: the Discord message id of his yes (the ask he tapped \"Use it\" on, or his reply in the DM)}";
+export const reuseOk = (r: unknown): r is OwnerReuse => isObj(r) && exact(r, REUSE_KEYS) && Array.isArray(r.values) && r.values.length >= 1 && r.values.length <= 3
+  && r.values.every((v: unknown) => line(v, 300) && (v as string).length >= 4) && typeof r.go === "string" && QUOTED.test(r.go)
+  && typeof r.message_id === "string" && SNOWFLAKE.test(r.message_id);
 
 // ---- Jobs and results ---------------------------------------------------------------
 // A job file's text, checked for shape alone (what a job token says is checked apart).
@@ -342,7 +354,7 @@ export function parseJob(text: string): Checked<Job> {
   } else if (j.follows !== null || j.preview_seen !== null || j.owner_go !== null || j.go_token !== null) {
     return no("only a confirm job has follows, preview_seen, owner_go and go_token");
   }
-  if (!(j.owner_reuse === null || reuseOk(j.owner_reuse))) return no("owner_reuse is null, or {values: 1 to 3 reported values, go: the owner's answer to Cain's ask, in quotes}");
+  if (!(j.owner_reuse === null || reuseOk(j.owner_reuse))) return no(REUSE_SHAPE);
   return { ok: true, value: j as Job };
 }
 
@@ -618,9 +630,11 @@ function punycodeLabel(label: string): string {
 // and "host"). An internationalized host (punycode, xn--) is allowed only where an exact
 // entry names it. The worker takes a run's domains from this signed entry alone, never
 // from the job. `query_params` (optional, off by default) lets the run's navigations carry
-// a query whose every parameter name matches one of its patterns (a name, or a prefix
-// ending in "*"), within QUERY_MAX characters; without it any query is refused, and a
-// fragment always is. The signature is his Ed25519 key's, over the
+// a query whose every parameter matches one of its patterns (a name or a prefix ending in
+// "*", each with its value's character class and maximum length: queryPattern), within
+// QUERY_MAX characters; without it any query is refused. A fragment is stripped by the
+// worker's hook before it goes. An allowed query on a signed-in site can still leave state
+// behind there (a saved search, a remembered view). The signature is his Ed25519 key's, over the
 // canonical bytes of {v, kid, allow}; the worker checks it against owner.pub on the PC,
 // and owner.pub against the fingerprint pinned in his install config.
 export interface Allow {
@@ -639,7 +653,21 @@ const LOGIN_PATH = /^\/[A-Za-z0-9._~%\/-]{0,100}\*?$/;
 const listOf = (x: unknown, re: RegExp) => x === undefined || (Array.isArray(x) && x.length <= 8 && x.every((v) => typeof v === "string" && re.test(v)));
 const REDIRECT_PATH = /^\/(?:[A-Za-z0-9._~%-]+\/)*[A-Za-z0-9._~%-]*$/;
 const ENTRY_KEYS = ["site", "action", "url", "match", "login_hosts", "login_paths", "alternatives", "redirects", "reviewed", "domains", "query_params"];
-const QUERY_PARAM = /^[A-Za-z0-9_.-]{1,40}\*?$/;
+// One query parameter pattern: a name (or a name prefix ending in "*"), "=", and the value's
+// constraint, a character class of a-z, A-Z, 0-9 and the literals _ . ~ - (no other
+// characters, so nothing percent-encoded or "+"-joined passes) with a length range of at
+// most 100: "page=[0-9]{1,4}", "tab=[a-z_]{1,20}". A pattern without a value constraint, or a
+// bare wildcard name, is refused at signing (queryPattern).
+export const QUERY_PARAM = /^([A-Za-z0-9_.-]{1,40})(\*?)=\[((?:a-z|A-Z|0-9|[_.~-])+)\]\{(\d{1,3}),(\d{1,3})\}$/;
+export const QUERY_VALUE_MAX = 100;
+export function queryPattern(p: unknown): { name: string; prefix: boolean; value: RegExp } | null {
+  if (typeof p !== "string") return null;
+  const m = QUERY_PARAM.exec(p);
+  if (!m) return null;
+  const lo = Number(m[4]), hi = Number(m[5]);
+  if (hi < 1 || lo > hi || hi > QUERY_VALUE_MAX) return null;
+  return { name: m[1], prefix: m[2] === "*", value: new RegExp(`^[${m[3]}]{${lo},${hi}}$`) };
+}
 // The longest query a navigation may carry on an entry that allows one (query_params).
 export const QUERY_MAX = 200;
 // One domain pattern: an exact host, or "*." and a host, either with a registrable domain
@@ -691,12 +719,19 @@ export function jobScopeProblem(job: { site: string; start_url: string }, pin: A
   return d.length && hostAllowed(host, d) && hostAllowed(job.site, d) ? null : "domain_not_allowed";
 }
 // Whether an address's query may be sent under an entry's query_params: none at all, or
-// every parameter name matching one of the patterns, the whole within QUERY_MAX.
+// every parameter matching one of the patterns (queryPattern), by its name and by its value
+// as written (never decoded: the class has no "%" or "+"), the whole within QUERY_MAX.
 export function queryAllowed(search: string, params: readonly string[] | undefined): boolean {
   if (!search || search === "?") return search === "";
   if (!params?.length || search.length > QUERY_MAX + 1) return false;
-  const names = search.slice(1).split("&").map((kv) => { try { return decodeURIComponent(kv.split("=")[0].replace(/\+/g, " ")); } catch { return "\u0000"; } });
-  return names.every((n) => n.length > 0 && params.some((p) => p.endsWith("*") ? n.startsWith(p.slice(0, -1)) : n === p));
+  const pats = params.map(queryPattern);
+  if (pats.some((p) => !p)) return false;
+  return search.slice(1).split("&").every((kv) => {
+    const i = kv.indexOf("=");
+    const name = i < 0 ? kv : kv.slice(0, i), value = i < 0 ? "" : kv.slice(i + 1);
+    if (!name || i < 0) return false;
+    return pats.some((p) => (p!.prefix ? name.startsWith(p!.name) : name === p!.name) && p!.value.test(value));
+  });
 }
 
 function entriesOk(list: unknown): Checked<Allow[]> {
@@ -714,8 +749,9 @@ function entriesOk(list: unknown): Checked<Allow[]> {
       || (e.alternatives !== undefined && e.alternatives !== true) || (e.reviewed !== undefined && e.reviewed !== true)
       || !(e.redirects === undefined || (listOf(e.redirects, REDIRECT_PATH) && e.redirects.every((r: string) => r !== "/" && r.length <= 100)))
       || !(Array.isArray(e.domains) && e.domains.length > 0 && e.domains.length <= 8 && e.domains.every(domainPattern))
-      || !(e.query_params === undefined || (listOf(e.query_params, QUERY_PARAM) && e.query_params.length > 0)) || !domainsCover(e))
-      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), domains (the hosts its runs may open: exact, or *.host where you mean every subdomain; covering the pin's host, the site and each sign-in host), and optionally login_hosts, login_paths, alternatives (true), redirects (path prefixes on its host) and query_params (the query parameter names its runs may send)}");
+      || !(e.query_params === undefined || (Array.isArray(e.query_params) && e.query_params.length > 0 && e.query_params.length <= 8 && e.query_params.every((q: unknown) => !!queryPattern(q))))
+      || !domainsCover(e))
+      return no("each allowlist entry is {site, action (a read-only one), url (https, on the site, no query), match (exact or prefix), domains (the hosts its runs may open: exact, or *.host where you mean every subdomain; covering the pin's host, the site and each sign-in host), and optionally login_hosts, login_paths, alternatives (true), redirects (path prefixes on its host) and query_params (the query parameters its runs may send, each a name and its value's constraint, like page=[0-9]{1,4})}");
     const a: Allow = { site: e.site, action: e.action, url: e.url, match: e.match, domains: [...e.domains] };
     if (e.login_hosts !== undefined) a.login_hosts = e.login_hosts;
     if (e.login_paths !== undefined) a.login_paths = e.login_paths;
@@ -885,9 +921,14 @@ export function jobFromAsk(ask: any, now: Date, id: string): Checked<Job> {
 // The control that holds is the pinned domains: whatever a job says, its run can open only
 // the hosts its signed allowlist entry names (hostAllowed, and the hook in worker.ts).
 // When a follow-up job really needs a reported value (an address the owner wants checked
-// next), Cain asks the owner first and records his answer on the job as owner_reuse: the
-// values, exactly, and his answer in quotes. The keeper then lets exactly those values
-// through, and nothing else carried from a result.
+// next), Cain asks the owner first (keeper.sh ask, the value quoted, "Use it" first) and
+// records his answer on the job as owner_reuse: the values, exactly, his answer in quotes,
+// and the Discord message id of his yes (that ask, once he tapped "Use it", or his own
+// reply). Cain's words alone prove nothing: the keeper has the link check the message
+// (main.ts check, link/core.ts reuseProof) and refuses the job unless the link answers
+// that it is his yes and shows every value. Only then do exactly those values go
+// through, and nothing else carried from a result. unapprovedValues below reads the
+// shape alone; the proof is check's.
 const quoted = (v: string | number | boolean) => typeof v === "string" ? JSON.stringify(v) : String(v);
 export function resultLines(r: Result): string[] {
   return [

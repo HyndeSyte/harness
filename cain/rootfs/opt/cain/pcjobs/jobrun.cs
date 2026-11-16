@@ -19,6 +19,10 @@
 //     Asks the Restart Manager which processes hold any of the files, and prints one line
 //     per process: "<pid> <parent pid> <image name>". Nothing else. Exit 0 when it could ask
 //     (no lines: none found), 1 when it couldn't.
+//   pcw-jobrun.exe inspect
+//     The probe's read-back check (job_readback): prints "outer=<0|1> readback=<ok|failed>",
+//     whether it already ran inside an outer job and whether its own job, made, joined and
+//     read back as a run's is, held there. Starts nothing. Exit 0 when it held, 121 when not.
 //   pcw-jobrun.exe version
 //     Prints the helper's protocol version.
 //
@@ -33,7 +37,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class PcwJobRun {
-  const string VERSION = "pcw-jobrun 2";
+  const string VERSION = "pcw-jobrun 3";
 
   [StructLayout(LayoutKind.Sequential)]
   struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
@@ -99,9 +103,10 @@ public static class PcwJobRun {
     return sb.Append('"').ToString();
   }
 
-  static int Run(string[] args) {
-    if (args.Length < 2) return 120;
-    IntPtr job = CreateJobObject(IntPtr.Zero, null);
+  // Makes the job, joins it and reads it back (in this job, kill on close, no breakaway of
+  // either kind): 0 with the job, or 121.
+  static int MakeJob(out IntPtr job) {
+    job = CreateJobObject(IntPtr.Zero, null);
     if (job == IntPtr.Zero) { Console.Error.WriteLine("pcw-jobrun: no job object"); return 121; }
     var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
     // Kill on close, and nothing else: no BREAKAWAY_OK, no SILENT_BREAKAWAY_OK.
@@ -121,6 +126,28 @@ public static class PcwJobRun {
     if ((flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) == 0 || (flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)) != 0) {
       Console.Error.WriteLine("pcw-jobrun: job allows breakaway"); return 121;
     }
+    return 0;
+  }
+
+  // The probe's read-back check: whether this process already ran inside a job (an outer
+  // one: a terminal, a scheduler or a CI runner can put it there), then the same job, join
+  // and read-back a run does. Prints one line, "outer=<0|1> readback=<ok|failed>"; exit 0
+  // when the read-back held, 121 when it didn't. Starts nothing.
+  static int Inspect() {
+    bool outer;
+    if (!IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out outer)) outer = false;
+    IntPtr job;
+    int r = MakeJob(out job);
+    Console.WriteLine("outer=" + (outer ? "1" : "0") + " readback=" + (r == 0 ? "ok" : "failed"));
+    GC.KeepAlive(job);
+    return r;
+  }
+
+  static int Run(string[] args) {
+    if (args.Length < 2) return 120;
+    IntPtr job;
+    int made = MakeJob(out job);
+    if (made != 0) return made;
     var rest = new List<string>();
     for (int i = 2; i < args.Length; i++) rest.Add(Quote(args[i]));
     var psi = new ProcessStartInfo(args[1], string.Join(" ", rest.ToArray())) { UseShellExecute = false };
@@ -181,6 +208,7 @@ public static class PcwJobRun {
     switch (args[0]) {
       case "run": return Run(args);
       case "holders": return Holders(args);
+      case "inspect": return Inspect();
       case "version": Console.WriteLine(VERSION); return 0;
       default: return 120;
     }

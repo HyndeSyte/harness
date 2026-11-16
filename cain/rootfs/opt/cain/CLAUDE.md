@@ -257,7 +257,10 @@ in the harness repo; until then the keeper says it is waiting).
   run that shows them afterwards, it can't stop them. The browser session may open only
   http and https addresses on the hosts his signed allowlist entry names for that job
   (never his computer or home network), a page read on any other host is refused, and
-  nothing runs until the session's tools were checked. Those pinned hosts are the control
+  nothing runs until the session's tools were checked. A page read off those hosts, or one
+  that doesn't say in a structured field which address it was on, ends the session at once
+  and its report is thrown away; whether the page's text was also kept from the browser
+  session is shown only by his probe, so never say it was. Those pinned hosts are the control
   on where a run goes; the keeper's refusal of reported values (below) is a mitigation,
   not a guarantee. Never describe it as more than that. He accepted that boundary once at
   his PC; until he has, nothing runs.
@@ -286,10 +289,15 @@ in the harness repo; until then the keeper says it is waiting).
 - When a follow-up read really needs a value a result reported (an address he wants
   checked next), ask him first, with the value quoted:
   `/opt/cain/keeper.sh ask --item <id> --question <Q id> "Check the address the PC reported, \"<value>\", in a new job?" "Use it" "Don't"`.
-  Only on his "Use it" tap, add to the job request `"owner_reuse": {"values": ["<the
-  value, exactly>"], "go": "\u201cUse it: check the address the PC reported\u201d"}` (his
-  tapped label and the question, in quotes). The keeper lets exactly those values through.
-  No tap, no reuse.
+  The value goes in the ask exactly as it will go in the job, and "Use it" stays the first
+  option. Only on his yes, add to the job request `"owner_reuse": {"values": ["<the value,
+  exactly>"], "go": "\u201cUse it: check the address the PC reported\u201d", "message_id":
+  "<id>"}`: the id is the ask's Discord message id when he tapped "Use it" (the relayed tap
+  line names it), or his own message's id when he said yes in words and his message shows
+  every value exactly (a reply to the ask, or the next thing after it). The keeper has the
+  link read that message from his DM, with the same check as his taps, and refuses the job
+  unless it is his tap on your ask's first option or his own message showing the values.
+  One yes covers one job: for another, ask again. No proof, no reuse.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
@@ -302,7 +310,10 @@ in the harness repo; until then the keeper says it is waiting).
   typed fields; nothing of it was kept), `canary_cookie_missing`, `result_rejected`,
   `tab_context_owed` (the browser session skipped the tab check the PC asked for three
   times in a row), `read_drift` (a page moved the tab off the job's hosts and the PC
-  refused the read before the browser session saw it), `domain_not_allowed` (the job named
+  ended the session at the read), `read_unplaced` (a page read didn't say which address it
+  was on; the session was ended), `inventory_never_ready` (the session asked four times
+  before the PC had checked its tools), `refusal_cap` (the session was refused twelve times
+  and ended), `domain_not_allowed` (the job named
   a host its allowlist entry doesn't allow; nothing ran), `containment_unavailable` (the
   PC couldn't build or start its Windows Job Object helper, so nothing runs uncontained),
   `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
@@ -413,7 +424,8 @@ create, update or run any other routine.
      reviewers read your summary, not the code. Your line holds no check, test, build or
      CI words, no GitHub, job, status or result words (passed, green, success), and no
      review, verdict or AI names: the link refuses them. It also
-     refuses the card while a check failed or hasn't run yet, and for a review of another
+     refuses the card while a check failed or hasn't run yet (the PC worker's Windows
+     check too, while it is still running), and for a review of another
      head (or one that names none). If the review found something worth fixing, run
      Build again on the same branch with the fixes first. A new head needs a new review
      of it and a new Ship card; the old card's buttons come off by themselves when the

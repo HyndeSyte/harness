@@ -29,6 +29,11 @@
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+//   from the PC job keeper (pcjobs/main.ts), on this machine only:
+//     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
+//                                       result: his recorded tap on the first option of one of Cain's asks that
+//                                       shows them, or his own DM message showing them in answer to such an ask
+//                                       (core.ts reuseProof); "ok", or refused with why
 // Nothing is published to the LAN: the App has no "ports:".
 //
 // The gate (piece D), enforcing since 0.10.0: the link's send points fix and refuse
@@ -53,7 +58,7 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { checkRuns, facts, inMain, land, type MergeDeps } from "./merge";
+import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
@@ -198,9 +203,10 @@ const link = new Link({
   } : undefined,
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
-  // A Ship card reads the head's checks as the landing does (merge.ts), and the review
+  // A Ship card reads the head's checks as the landing does (merge.ts headChecks, pcjobs-windows
+  // included when the head's tests.yml names it), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.
-  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? checkRuns(github, p.repo, head) : null; },
+  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
@@ -262,7 +268,7 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse"]);
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 
@@ -298,6 +304,7 @@ Bun.serve({
         case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
         case "/replied": return json(await link.replied(b.m));
         case "/look": return json(await link.look(b.m));
+        case "/reuse": return json(await link.reuseProof(b.m, b.values));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));

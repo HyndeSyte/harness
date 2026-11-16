@@ -73,6 +73,14 @@
 - The PC's first tool call no longer fails if it comes a moment before the PC has checked the session's tools: it waits up to five seconds, then asks to try again. Only skipped tab checks count toward the three-in-a-row limit.
 - Plain words on reported values: Cain refusing a job that repeats one is a safety net, not a guarantee; your signed sites are the real limit. A follow-up job can reuse a reported value only after you say yes to Cain's question. You accept this new wording once when you confirm the probe.
 - On Windows the PC finds its compiler only in the Windows folder, rebuilds its helper whenever it changed, checks the helper really sits in its locked job, and says plainly when the compiler is missing or security software blocks it. The probe also ends the helper on purpose and checks nothing it started is left.
+- A page read off the job's sites, or one whose answer doesn't say in a structured field which address it was on, now ends the whole browser session at once and the run's report is thrown away. The PC no longer falls back on the tab check for a read it can't place, and never takes the address from page text.
+- The PC tells you which site a page moved the tab to when that happens (for example "read_drift:example.org"), on your PC only.
+- The check that a session's tools were looked at now uses a token the PC makes for each session, not Claude Code's own session id. A session that asks four times before that check is done is ended, and so is one refused twelve times in all.
+- A follow-up job can reuse a value a result reported only with proof of your yes that Cain can't write himself: your tap on "Use it", or your own reply in your DM showing the value, which Cain's bot reads and checks. One yes covers one job.
+- Allowed address parameters now each need a value pattern and a maximum length (like page=[0-9]{1,4}); a name alone is refused when you sign, so sign your allowlist again if it has any. A "#" part of an address is dropped instead of refused. Allowed parameters on a site you are signed in to can still leave something behind there.
+- Signing writes site names in plain ASCII, the way a browser reads them.
+- The probe has five new steps, and confirming needs each one: a page that redirects off the job's sites is read and the session must end showing only the refusal, every reading tool must say which address it read, the session ids must agree, and on Windows the helper must build and its Job Object must hold inside any outer job. It also lists the sites a sign-in went through, for your allowlist. You accept new boundary words once more, since what is promised when a page is read off-site changed.
+- A Ship card now waits until the PC worker's Windows tests have passed for that exact change.
 
 ## 0.11.0
 

@@ -83,6 +83,64 @@ describe("the Ship card the link builds", () => {
     expect(r.github.asked).toContain(`runs ${SHA1}`);                            // the head the card names
   });
 
+  test("pcjobs-windows, when the head's tests.yml names it or it ran there: its newest run must have passed, or no card", async () => {
+    const r = shipRig();
+    const win = (conclusion: string | null, status = "completed", id = 1) => [...passing(), checkRun("pcjobs-windows", conclusion, status, id)];
+    const github = async () => lines(r, await ship(r))[2];
+    // Defined and green: the card, with the usual line.
+    r.github.windows = true;
+    r.github.runs = win("success");
+    expect(await github()).toBe(`${GITHUB} ${CHECKS_PASSED}`);
+    // Green, while a required check still runs: the card says so, as before.
+    r.github.runs = [checkRun("pytest"), checkRun("bun", null, "in_progress"), checkRun("pr"), checkRun("pcjobs-windows")];
+    expect(await github()).toBe(`${GITHUB} ${CHECKS_RUNNING}`);
+    let posts = r.posts();
+    const refused = (why: string) => expect(ship(r, { text: "Other words." })).rejects.toThrow(why);
+    for (const c of ["failure", "cancelled", "skipped", "timed_out"]) {
+      r.github.runs = win(c);
+      await refused(`its pcjobs-windows check didn't pass (${c}): fix it through Build first, then show a new Ship card`);
+    }
+    r.github.runs = win(null, "in_progress");
+    await refused("CI is still running pcjobs-windows on it: show the card once it has passed");
+    r.github.runs = win(null, "queued");
+    await refused("CI is still running pcjobs-windows on it");
+    // The newest run counts: a re-run that's going, after a green one, refuses; a green re-run after a failed one passes.
+    r.github.runs = [...passing(), checkRun("pcjobs-windows", "success", "completed", 1), checkRun("pcjobs-windows", null, "in_progress", 2)];
+    await refused("CI is still running pcjobs-windows on it");
+    expect(r.posts()).toBe(posts);                                               // nothing posted for a refused card
+    r.github.runs = [...passing(), checkRun("pcjobs-windows", "failure", "completed", 1), checkRun("pcjobs-windows", "success", "completed", 2)];
+    expect(await github()).toBe(`${GITHUB} ${CHECKS_PASSED}`);
+    posts = r.posts();
+    // Named in the head's tests.yml but no run seen yet: fail closed.
+    r.github.runs = passing();
+    await refused("CI hasn't run pcjobs-windows on it yet: show the card once its checks have run");
+    // Not named there (an older workflow), yet it ran on the head: it still counts.
+    r.github.windows = false;
+    r.github.runs = win("failure");
+    await refused("its pcjobs-windows check didn't pass (failure)");
+    // A run from another app under its name doesn't count, but tests.yml still names it.
+    r.github.windows = true;
+    r.github.runs = [...passing(), { ...checkRun("pcjobs-windows"), app: { id: 1236702 } }];
+    await refused("CI hasn't run pcjobs-windows on it yet");
+    // A required check that failed is named first.
+    r.github.runs = [checkRun("pytest", "failure"), checkRun("bun"), checkRun("pr"), checkRun("pcjobs-windows", null, "in_progress")];
+    await refused("its pytest check didn't pass (failure)");
+    expect(r.posts()).toBe(posts);                                               // nothing posted for a refused card
+  });
+
+  test("a head whose tests.yml has no pcjobs-windows job, and no run of it: the card as before", async () => {
+    const r = shipRig();
+    r.github.windows = false;
+    r.github.runs = passing();
+    expect(lines(r, await ship(r))[2]).toBe(`${GITHUB} ${CHECKS_PASSED}`);
+    r.github.runs = [checkRun("pytest"), checkRun("bun", null, "in_progress"), checkRun("pr")];
+    expect(lines(r, await ship(r))[2]).toBe(`${GITHUB} ${CHECKS_RUNNING}`);
+    // Unreadable (no whole answer, or tests.yml couldn't be read): the card says so, and the landing checks again.
+    r.github.windows = true;
+    r.github.runs = null;
+    expect(lines(r, await ship(r))[2]).toBe(`${GITHUB} ${CHECKS_UNREAD}`);
+  });
+
   test("a pull request merged at this head, and main has it: its checks don't refuse it (a new card after a token ran out)", async () => {
     const r = shipRig({ facts: facts({ merged: true }) });
     r.github.main.push(SHA1);
