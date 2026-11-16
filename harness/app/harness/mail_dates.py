@@ -123,9 +123,16 @@ _QUOTED = re.compile(r"(?im)^\s*(>|on .{1,80} wrote:|-{2,}\s*original message|-{
 # Seventeenth round: promotion is told by its structure, not by one common word ("deals", "discover"): an explicit
 # offer (a discount), or a block of calls to action and links (two or more between them).
 _OFFER = re.compile(r"(?i)(\bsave up to \$?\d|\bsave \$?\d+(\.\d+)?\s*%|\d+\s*%\s*off\b|\bsave \$\d)")
+# Eighteenth round: "unsubscribe" isn't a call to action (every mail has one), and a link that's boilerplate (its
+# address, or the words just before it on its line: unsubscribe, manage your account, privacy, help, preferences,
+# view in browser, opt out) doesn't count either.
 _CTA = re.compile(r"(?i)\b(learn more|shop now|sign up|join now|start saving|try it|recommended for you|"
-                  r"you might also like|unsubscribe|advertisement|sponsored|limited[- ]time)\b")
+                  r"you might also like|advertisement|sponsored|limited[- ]time)\b")
 _LINK = re.compile(r"(?i)\bhttps?://\S+")
+_BOILERPLATE_URL = re.compile(r"(?i)(unsubscribe|privacy|help|preferences|account|manage|opt-?out)")
+_BOILERPLATE_WORDS = re.compile(r"(?i)\b(unsubscribe|manage (your )?account|privacy( policy| notice)?|"
+                                r"help( center)?|preferences|view (it )?in (your )?browser|opt[- ]?out)\b")
+_BOILERPLATE_BEFORE = 40              # characters before a link, on its line, read for boilerplate words
 # A salutation on its own line: a greeting and up to three words ("Hello Alex", "Hi there!"), or a short line ending
 # in a comma of at most four words ("Alex,", "Dear Alex Doe,"), so a sentence cut by a comma isn't one.
 _SALUTATION = re.compile(r"(?i)^\s*((hi|hello|hey|dear|greetings|good (morning|afternoon|evening))\b(\s+[\w'.-]+){0,3}"
@@ -133,11 +140,26 @@ _SALUTATION = re.compile(r"(?i)^\s*((hi|hello|hey|dear|greetings|good (morning|a
 
 
 def _promotional(lead: str) -> bool:
-    """Whether a block reads as promotion by its structure (seventeenth round): an explicit offer, or two or more
-    calls to action and links between them."""
+    """Whether a block reads as promotion by its structure (seventeenth round): an explicit offer, or calls to
+    action and links between them. Eighteenth round: more than two of them (two is an ordinary notice's "learn
+    more" and a link), and boilerplate links don't count (_real_links)."""
     if _OFFER.search(lead):
         return True
-    return len(_CTA.findall(lead)) + len(_LINK.findall(lead)) >= 2
+    return len(_CTA.findall(lead)) + _real_links(lead) > 2
+
+
+def _real_links(lead: str) -> int:
+    """Eighteenth round: the links in a block that aren't boilerplate: neither the address nor the words just before
+    it on its line (up to _BOILERPLATE_BEFORE characters) are an unsubscribe, account, privacy, help, preferences,
+    view in browser or opt out link."""
+    n = 0
+    for m in _LINK.finditer(lead):
+        line_start = lead.rfind("\n", 0, m.start()) + 1
+        before = lead[max(line_start, m.start() - _BOILERPLATE_BEFORE):m.start()]
+        if _BOILERPLATE_URL.search(m.group(0)) or _BOILERPLATE_WORDS.search(before):
+            continue
+        n += 1
+    return n
 
 
 # What may carry a date he has to act on. Anything else never leaves the Pi.
@@ -358,7 +380,8 @@ def marker_placed(text: str, marks) -> bool:
     promotional or quoted section further down doesn't count, and a first block that reads as promotion is
     ambiguous: then it doesn't count either, and the mail is kept. Seventeenth round: leading salutation-only lines
     ("Hello Alex," on its own) are passed over before the first block is chosen, and promotion is told by its
-    structure (_promotional), never by one common word."""
+    structure (_promotional), never by one common word. Eighteenth round: a salutation-shaped line that holds a
+    marker ("Subscribe and Save," on its own) isn't passed over; it starts the first block."""
     lines = (text or "").replace("\r\n", "\n").casefold().split("\n")
     i = 0
     while i < len(lines) and not lines[i].strip():
@@ -369,8 +392,9 @@ def marker_placed(text: str, marks) -> bool:
         i += 1
     if any(w in line for line in header for w in marks):
         return True
-    while i < len(lines) and (not lines[i].strip() or _SALUTATION.match(lines[i])):
-        i += 1                                 # blank lines and a salutation on its own line
+    while i < len(lines) and (not lines[i].strip() or
+                              (_SALUTATION.match(lines[i]) and not any(w in lines[i] for w in marks))):
+        i += 1                                 # blank lines and a salutation on its own line, never one with a marker
     block = []
     while i < len(lines) and lines[i].strip():
         block.append(lines[i])
@@ -1367,7 +1391,7 @@ class MailDates:
         else:
             text = ("<b>From your mail, written to your Gmail calendar but not confirmed:</b>\n" + "\n".join(lines)
                     + more + "\nReads of your calendar haven't found these as written. Nothing to do if "
-                    "that's fine; tap Undo these if they shouldn't be there.")
+                    "that's fine; the button below takes them off if they shouldn't be there.")
         told = "told" if confirmed else "unconfirmed"
         with self.ledger.tx() as db:
             for row, _ in items:
@@ -1418,7 +1442,7 @@ class MailDates:
             if row["cal"] == FAMILY_CAL:
                 text = (f"<b>From your mail, for the Family calendar:</b>\n{named}\nIt's from the kids' "
                         "school, a teacher, a coach or their doctor, so it goes on Family, not your "
-                        "Gmail. Tap Add to Family to put it there, or Skip.")
+                        "Gmail. The buttons below put it there or skip it.")
                 options = (("Add to Family", "mail_dates_family"), ("Skip", "mail_dates_skip"))
             else:
                 # A school-type sender that doesn't say whose it is: Family or nothing, never his

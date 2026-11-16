@@ -487,30 +487,39 @@ class FamilyAdd:
 
     def tap_effect(self, op: dict) -> str:
         """Sixteenth round: whether the Family add an Approve led to is on the calendar, read by the event's own id
-        (it comes from the proposal): "done", "not_done" (gone) or "unread"."""
+        (it comes from the proposal): "done", "unread", or eighteenth round "absent" (nothing at its address: Harness
+        can't tell whether it was added and taken off since, so it's never added again from here)."""
         pid = str((op or {}).get("proposal") or "")
         if not pid:
             return "unread"
         out, _ = self.client.fetch(self.client.href_for(caldav.uid_for(pid)))
-        return {"ok": "done", "gone": "not_done"}.get(out.kind, "unread")
+        return {"ok": "done", "gone": "absent"}.get(out.kind, "unread")
 
     def undo_op(self, target: str) -> dict | None:
         """Seventeenth round: his Undo on a Family add, named before it's acted on by the event it takes off (its
         address, from the proposal) and the state it must read in afterwards: gone. None when nothing is open."""
-        row = self.ledger.db.execute("SELECT undo_state FROM family_adds WHERE proposal_id=?",
+        row = self.ledger.db.execute("SELECT undo_state, etag FROM family_adds WHERE proposal_id=?",
                                      (str(target or ""),)).fetchone()
         if row is None or row["undo_state"] != "open":
             return None
         return {"effect": "undo", "kind": "family_add_undo",
-                "steps": [{"cal": "family", "how": "delete", "href": self.client.href_for(caldav.uid_for(target))}]}
+                "steps": [{"cal": "family", "how": "delete", "href": self.client.href_for(caldav.uid_for(target)),
+                           "etag": row["etag"] or ""}]}
 
     def undo_parts(self, op: dict) -> list[str]:
-        """The read of a Family Undo's identity: "done" when the event is gone, "not_done" when it's there,
-        "unread" when the calendar couldn't tell."""
+        """The read of a Family Undo's identity: "done" when the event is gone, "unread" when the calendar couldn't
+        tell. Eighteenth round: "not_done" only when it's there in the very version the add left (journaled with
+        the step); any other version is "changed": changed since, Harness can't tell, no Go ahead."""
         got = []
         for st in (op or {}).get("steps") or []:
             out, _ = self.client.fetch(str(st.get("href") or ""))
-            got.append({"gone": "done", "ok": "not_done"}.get(out.kind, "unread"))
+            after = str(st.get("etag") or "")
+            if out.kind == "gone":
+                got.append("done")
+            elif out.kind == "ok":
+                got.append("not_done" if after and out.etag == after else "changed")
+            else:
+                got.append("unread")
         return got
 
     def _counted_uids(self, b: dict) -> list[str]:
@@ -1053,7 +1062,7 @@ class FamilyAdd:
             if row["etag"]:
                 buttons, binds = self._undo_button(db, row["proposal_id"])
                 self._say(db, self.chat_id, row["job_id"],
-                          text + "\nNothing to do if that's right; tap Undo if it's wrong.",
+                          text + "\nNothing to do if that's right; the button below takes it off if it's wrong.",
                           buttons=buttons, binds=binds)
             else:
                 self._say(db, self.chat_id, row["job_id"], text + "\niCloud gave no version tag for "

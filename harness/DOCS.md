@@ -646,6 +646,13 @@ On Gmail, and then the same on Family:
 2. A move: "move Smoke test: Pool test to 4 PM". Done, and it shows at 4 only. Then *Undo* on it:
    "Undone".
 3. A removal: "take off Smoke test: Pool test tomorrow". Done, and it's gone.
+3a. Delete and read (done by hand, and its answer noted with the run): add a throwaway event, delete
+    it in Google Calendar on the web, and read it by its id (the events API's get, from the API explorer):
+    write down whether Google answers it as `"status": "cancelled"` or with 404 or 410. Harness treats a
+    cancelled event as taken off since, and 404 or 410 at a fixed id it wrote as "can't tell whether it was
+    added and taken off"; either way it's never added again from a tap's card. This step confirms what
+    Google answers on the real calendar. On Family, the same: delete a throwaway event in the Calendar app
+    and note that a read of its address answers 404.
 4. A card for an event that changed since it. To produce the Gmail stale card: add a throwaway
    one-off event in Google Calendar on the web (not a series), ask Cain to move it, and when its card
    comes, open the event in Google Calendar and change its end time by 15 minutes, save, then tap
@@ -853,15 +860,29 @@ bound to); one whose intent can't be written isn't acted on and you're told noth
 did is in the ledger its outcome is recorded; every journal write is checked, and one that fails is
 logged and told (a tap that went through but whose outcome couldn't be written says so). A tap with an
 intent and no outcome is "outcome unknown", never "not carried out". An error after the intent is
-written keeps that: the tap isn't refused or struck off, its intent stays, you're told on the tap that
-Harness can't tell yet whether it went through, and at the next start the calendar is read for it by its
-identity before anything is done with it (a tap the records in use already took is left to their own
-reads, with no *Go ahead*). Only an error before the intent, or a calendar's own answer turning it down,
+written keeps that: the tap isn't refused or struck off, its intent stays, and you're told on the tap that
+Harness can't tell yet whether it went through and reads your calendar for it in about a minute. That read
+runs in the running loop (and at a start, through the same code), judged by what the records in use hold of
+the tap's decision as well as by the calendar: a tap whose approval or choice was never used up (the error
+came between the tap being taken in and its decision being recorded) didn't run, so its card says so and
+has *Go ahead*; a change whose approval was used up and which Harness's own executor is still carrying out
+stays unknown in the journal, never struck, until that ends; one whose decision the records took and
+finished is said truthfully, with no *Go ahead* (its button is used up and its receipt says what
+happened). A read that can't answer, or a change still being carried out, is read again after 1, 2, 5,
+15, 30 and 60 minutes, and you're told once when the next read is; once that runs out, the tap gets its
+card for good. Only an error before the intent, or a calendar's own answer turning it down,
 is a refusal. A tap on a choice that writes a calendar names its identity too: *Add anyway* the fixed ids
 its adds are written under (made from the receipt it came from, so the same tap taken again writes to
-the same ids, and the writer reads that id before writing), *Undo* and the Family *Undo* each event and
-the state it must read in afterwards. Any other choice that writes a calendar has no identity to read,
-so once it may have run its card offers no *Go ahead* and says so. A refusal's outcome and its note
+the same ids, and the writer reads that id before writing: a read that can't answer means nothing is
+added, and a duplicate id from Google (409) or from iCloud's `If-None-Match: *` means it's already there
+and nothing was written), *Undo* and the Family *Undo* each event, the version the change left it in
+(Google's etag, iCloud's ETag) and the state it must read in afterwards. A read finding any other version
+says it changed since and Harness can't tell, with no *Go ahead*, and the Undo writer itself sends
+If-Match on that version, so an edit of yours since is refused by the calendar, never overwritten (a day
+of a series whose content still reads exactly as written is the one exception: another day's change
+gives it a new version). *Go ahead* is offered on an allow list: only for a kind that carries a readable
+identity, or one declared as changing only Harness's own records; any other kind, a new one included,
+gets none, and its card says so. A refusal's outcome and its note
 are written before the note is posted, and the note's delivery after it, so after a restart a refused
 tap is never taken again and its note goes again only if its delivery wasn't recorded; a tap is struck
 off only once its outcome is recorded and its note delivered. A tap's age is read from Discord's own
@@ -870,9 +891,15 @@ journal's is used. While the clock is flagged as behind the records the age is u
 reported, not taken; if that tap was on the clock card, the card is posted again. Across a restore (the
 swap applied at that start) nothing written in the journal is taken by itself. For each tap that may
 have reached a calendar, the calendar is read first for its effect by that identity; one it shows is
-marked done, with no button. A Google event read as cancelled at its fixed id was added and deleted
-since: its card says so and has no *Go ahead*, and nothing is put back. A change of several parts is
-read part by part: its card names which are there, and its *Go ahead* does only the others. Then one
+marked done, with no button (an Undo already done is said by what it leaves: the event gone, back, or
+as it was). A Google event read as cancelled at its fixed id was added and deleted since: its card says so
+and has no *Go ahead*, and nothing is put back. An add with nothing at its fixed id (Google answering 404
+or 410 there, or an empty Family address) can't be told from one added and deleted since: its card says
+Harness can't tell whether it was added and taken off, with no *Go ahead*, and it's never added again
+from there. A change of several parts is read part by part, each Gmail removal by its own bound event
+only: its card names which are settled, and its *Go ahead* does only the others. Which parts to leave out
+is read again just before that one run and then forgotten, so a later run of the same change leaves
+nothing out on an old read. Then one
 message counts the rest by what's recorded (carried out before the records were put back, can't tell,
 not carried out) and points at the cards below it; the newest ten each get a card that says which (a
 tap whose time can't be read always gets one, marked "time unknown"), and any older ones are listed in a
@@ -881,7 +908,10 @@ does nothing more; otherwise the tap
 goes through the usual checks on the records in use, and the write itself reads the event's fixed id
 or version first, so nothing is made twice. While Harness runs degraded without its records a tap is
 refused at once and you hear it through Cain's link. The tap journal is a required part of the
-handover service: the App doesn't start without it. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
+handover service: the App doesn't start without it. No card of Harness's names a button in its prose: where a card has one,
+it says what "the button below" does. If Cain's link refuses a card all the same for telling him to use
+a button it doesn't carry, the card isn't dropped: it goes once more with those sentences taken out (its
+own buttons kept), the refusal is recorded in Harness's log, and the link writes its own gate-report entry. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
 the App such a writer waits in bounded slices, logging each and trying again, and gives up after five
 minutes with an error rather than hang. The hold is always released, even when what it holds fails. The
 checkpoint and the online backup run under the hold strictly before the migration's transaction begins,

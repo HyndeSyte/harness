@@ -757,7 +757,8 @@ class FamilyCalDav:
         if sending is not None:
             sending()
         try:
-            r = self._call(auth, "DELETE", href, {"If-Match": current or etag})
+            # Eighteenth round: If-Match the version the harness journaled when it wrote it, when it has one.
+            r = self._call(auth, "DELETE", href, {"If-Match": etag or current})
         except TransportError as e:
             return Outcome("failed" if e.kind == "blocked" else "unknown")
         if r.status in (200, 204):

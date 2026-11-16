@@ -80,6 +80,17 @@
 - **Subscribe & Save mail that opens with a greeting is still skipped,** and a word like "deals" in it no longer counts as an advert; an ordinary order mail with a real offer in it still comes through.
 - **Setting stray files aside from the command line takes back a copy that fails,** a full disk included, says why and leaves everything as it was.
 - **A message held through a restore makes no promise it can't keep,** and one whose time had already passed says so.
+- **A tap cut off by an error is read again within minutes, not only at the next start.** Harness looks at your calendar for it about a minute later, tells you once when it will look again if it can't tell yet, and gives it its card once it can.
+- **A tap cut off before Harness took it gets its button back.** If the error came before your approval was recorded, nothing ran, and its card says so with Go ahead. One Harness was still carrying out is followed to the end before its card comes, never dropped.
+- **Undo never overwrites an edit of yours.** It only acts on an event still in the version your change left it in; one you edited since is left alone, and its card says it changed. An Undo already done is said as what it leaves: the event gone, back, or as it was.
+- **An event gone from where Harness added it is never added again from a tap's card.** On Google (deleted, or not found) and on Family alike, the card says Harness can't tell whether it was added and taken off since, with no Go ahead. The "since taken off" rule now covers Family as well as Gmail.
+- **Go ahead only for taps Harness knows how to look for.** Any other kind of tap, including one a later version adds, gets no Go ahead once it may have run.
+- **Two removals on one card are each checked on their own,** so one being gone never makes the other look done.
+- **Go ahead on a change that's partly there re-reads your calendar just before it runs,** and only for that one run.
+- **Add anyway never adds blind.** If your calendar can't be read to check first, nothing is added; if the second event turns out to be there already, the receipt says nothing was written.
+- **No card of Harness's points you at a button that isn't on it,** and if Cain's link turns one down for that, it still reaches you without that sentence.
+- **Setting stray files aside picks up where it stopped** if a removal fails partway, without copying anything twice.
+- **Subscribe & Save mail is still skipped when its first line reads like a greeting,** and an unsubscribe or privacy link no longer makes an ordinary mail look like an advert.
 
 ## 0.23.0
 

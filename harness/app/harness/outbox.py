@@ -37,6 +37,31 @@ def _plain(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+# Eighteenth round: Cain's link refuses a card that tells him to use a button it doesn't carry, with this reason
+# (cain/rootfs/opt/cain/link/core.ts): `the card names "Go ahead", which it doesn't carry`.
+_LINK_REFUSED = re.compile(r"the card names (.+), which it doesn't carry")
+
+
+def refused_labels(e: ChatError) -> list[str]:
+    """The button labels a link refusal names, or [] when the error isn't that refusal."""
+    if getattr(e, "code", 0) != 400:
+        return []
+    m = _LINK_REFUSED.search(e.description or "")
+    return re.findall(r'"([^"]{1,60})"', m.group(1)) if m else []
+
+
+def strip_button_words(text: str, labels: list[str]) -> str:
+    """The card's text with every sentence that names one of `labels` taken out, line by line, so what's left
+    says what happened without pointing at a button that isn't there."""
+    out = []
+    for line in text.split("\n"):
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        keep = [x for x in parts if not any(label.casefold() in _plain(x).casefold() for label in labels)]
+        if keep or not line.strip():
+            out.append(" ".join(keep))
+    return "\n".join(out).strip()
+
+
 class Outbox:
     def __init__(self, ledger: Ledger, api, *, sleep: Callable[[float], None] = time.sleep,
                  tz: str = "America/New_York"):
@@ -77,8 +102,23 @@ class Outbox:
         try:
             mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
         except ChatError as e:
-            self._failed(row, e)
-            return False
+            labels = refused_labels(e)
+            if not labels:
+                self._failed(row, e)
+                return False
+            # Eighteenth round: the link refused it for naming a button it doesn't carry. Not dead: it goes once
+            # more as plain words with those sentences taken out, its own buttons kept, and the refusal is
+            # recorded here (the link writes its gate-report entry), so the relay's "logged for a fix" holds.
+            text = render.fit(strip_button_words(text, labels))
+            log.error("Cain's link refused a card for naming %s; it goes without those words", ", ".join(labels))
+            if not self.ledger.fenced:
+                self.ledger.event("link_refused_card", {"outbox": row["id"], "labels": labels[:5],
+                                                        "said": e.description[:200]})
+            try:
+                mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
+            except ChatError as e2:
+                self._failed(row, e2)
+                return False
         now = self.ledger.now()
         # Fourteenth round: the delivery marks are exempt from a staged restore's fence (the restart card goes
         # out and isn't sent twice). Fifteenth round: through the ledger's outbox-only method.

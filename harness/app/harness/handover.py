@@ -179,7 +179,7 @@ def _row_key(r: dict, key: Callable[[dict], str]) -> str:
     """The tap a journal line belongs to."""
     if isinstance(r.get("press"), dict):
         return key(r["press"])
-    for field_ in ("intent", "committed", "outcome", "delivered"):
+    for field_ in ("intent", "committed", "outcome", "delivered", "check"):
         if field_ in r:
             return str(r.get(field_) or "")
     return str(r.get("key") or "")
@@ -362,6 +362,15 @@ class Inbox:
             return False
         return self._append({"outcome": self.key(press), "kind": kind, "note": note, "at": time.time()})
 
+    def journal_check(self, press: dict, n: int, next_at: float, told: bool) -> bool:
+        """Eighteenth round: an unknown tap read on the calendar by its identity that couldn't settle yet (the read
+        couldn't answer, or Harness's own records are still carrying it out): how many reads it has had, when the
+        next one is (seconds since the epoch, on the records' clock), and whether he's been told it waits."""
+        if not self.journal or not press:
+            return False
+        return self._append({"check": self.key(press), "n": int(n), "next": float(next_at), "told": bool(told),
+                             "at": time.time()})
+
     def journal_delivered(self, press: dict) -> bool:
         """Sixteenth round: the note on that tap reached him; at the next start it isn't posted again."""
         if not self.journal or not press:
@@ -410,7 +419,7 @@ class Inbox:
                 k = self.key(r["press"])
                 taps.setdefault(k, {"press": {a: str(b) for a, b in r["press"].items()}, "at": r.get("at"),
                                     "intent": False, "op": {}, "committed": False, "outcome": "", "note": "",
-                                    "delivered": False})
+                                    "delivered": False, "checks": 0, "next_check": None, "told_check": False})
                 continue
             k = _row_key(r, self.key)
             t = taps.get(k)
@@ -428,6 +437,12 @@ class Inbox:
                 t["outcome"], t["note"] = "refused", str(r.get("notice") or "")
             elif "delivered" in r:
                 t["delivered"] = True
+            elif "check" in r:
+                try:
+                    t["checks"], t["next_check"] = int(r.get("n") or 0), float(r.get("next"))
+                except (TypeError, ValueError):
+                    t["checks"], t["next_check"] = t["checks"] + 1, 0.0
+                t["told_check"] = t["told_check"] or bool(r.get("told"))
         for t in taps.values():
             t["state"] = ("committed" if t["committed"] else t["outcome"] if t["outcome"]
                           else "unknown" if t["intent"] else "not_started")

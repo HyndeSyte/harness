@@ -171,7 +171,7 @@ def test_a_place_nothing_can_place_goes_to_the_map_once_and_is_asked_once(drives
     assert geocoded(drives) == [RINK]                             # not found is kept too
     (card,) = place_cards(drives)
     _, text, buttons, _ = card
-    assert text == f"Where is HMLC? (for Skating HMLC, {day(start)}) Reply with an address, or tap Skip."
+    assert text == f"Where is HMLC? (for Skating HMLC, {day(start)}) Reply with an address, or skip it with the button below."
     assert labels(buttons) == ["Skip"]
     assert [tuple(r) for r in drives.ledger.db.execute("SELECT key, state FROM place_asks")] == [("hmlc", "asked")]
 
@@ -423,5 +423,5 @@ def test_cains_rules_keep_the_place_book_and_answer_the_card():
     assert "handover|digest|meanings|places)" in code
     rules = (ROOT / "cain/rootfs/opt/cain/CLAUDE.md").read_text(encoding="utf-8")
     assert "areas/home/places.md" in rules and "/opt/cain/keeper.sh places" in rules
-    assert "`| Place | Address | Said on |`" in rules and "Reply with an address, or tap Skip." in rules
+    assert "`| Place | Address | Said on |`" in rules and "Reply with an address, or skip it with the button below." in rules
     assert "/places" in handover.ROUTES

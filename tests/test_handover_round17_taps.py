@@ -252,7 +252,9 @@ def test_undo_carries_its_events_and_their_state_after_and_is_read_after_a_resto
     before = len(m.link.cards)
     restart_after_restore(m, backup)
     said = [c["text"] for c in new_cards(m, before)]
-    assert any("already on your calendar" in t for t in said), said         # the calendar shows it undone
+    # Eighteenth round: said by what the Undo leaves (the event gone), never "already on your calendar".
+    assert any("already undone on your calendar: the event is gone" in t for t in said), said
+    assert not any("already on your calendar" in t for t in said), said
     assert "Go ahead" not in card_labels(new_cards(m, before))
 
 
@@ -311,7 +313,7 @@ def test_a_family_add_is_read_by_its_fixed_address(m, monkeypatch):
     assert m.cc.tap_parts(op) == ["done"]
     href = m.client.href_for(m.cc._uid(op["keys"][0] if op.get("keys") else f"{op['proposal']}:0", "hm-"))
     del m.icloud.events[next(k for k in m.icloud.events if k.endswith(pathlib.PurePosixPath(href).name))]
-    assert m.cc.tap_parts(op) == ["not_done"]                                 # read, and answered: not there
+    assert m.cc.tap_parts(op) == ["absent"]       # eighteenth round: not there, and can't tell if made and taken off
 
 
 @pytest.mark.card_only
@@ -340,29 +342,32 @@ def test_a_google_event_deleted_since_is_never_put_back(m, monkeypatch):
 
 @pytest.mark.card_only
 def test_a_mixed_change_is_said_per_part_and_go_ahead_does_only_whats_missing(m, monkeypatch):
-    out = m.tells("add the dentist 3 to 4 and lunch 5 to 6 today", ask(DENTIST, LUNCH))
+    # Eighteenth round: an add read absent at its fixed id (Google's 404) can't be told from one added and taken
+    # off since, so the part that's missing here is a removal that never landed (its event still there).
+    out = m.tells("add the dentist 3 to 4 and take PT off today", ask(DENTIST, REMOVE_PT))
     assert out["status"] == "waiting for his tap", out
     m.c.outbox.flush()
+    was, copy = dict(m.gmail.events[PT_ID]), dict(m.icloud.events)
     backup, press = landed_then_crashed(m, monkeypatch)
-    (lunch,) = named(m, "Lunch")
-    del m.gmail.events[lunch["id"]]                                           # that write never landed
+    m.gmail.events[PT_ID] = was                                               # that removal never landed
+    m.icloud.events.update(copy)
     before = len(m.link.cards)
     restart_after_restore(m, backup)
     cards = new_cards(m, before)
-    card = next(c["text"] for c in cards if "Part of it is on your calendar" in c["text"])
-    assert "Dentist: on your calendar" in card and "Lunch: not on your calendar" in card
-    assert "Go ahead does only the parts that aren't there" in card
+    card = next(c["text"] for c in cards if "Part of it is settled on your calendar" in c["text"])
+    assert "Dentist: on your calendar" in card and "PT: not done on your calendar" in card
+    assert "The button below does only the parts that aren't" in card
     seen = len(m.link.cards)
     out = m.tap("Go ahead")
     assert out["status"] == "ok"
     for _ in range(4):
         m.c.tick()
     m.c.outbox.flush()
-    assert len(named(m, "Dentist")) == 1 and len(named(m, "Lunch")) == 1
+    assert len(named(m, "Dentist")) == 1 and m.gmail.events[PT_ID]["status"] == "cancelled"
     dentist_inserts = [e for e in m.gmail.log if e[0] == "insert" and e[1]["summary"] == "Dentist"]
     assert len(dentist_inserts) == 1                                          # the part that was there: not run
     after = new_said(m, seen)
-    assert any("Lunch" in t for t in after) and not any("Dentist" in t and "Already there" in t for t in after)
+    assert any("PT" in t for t in after) and not any("Dentist" in t and "Already there" in t for t in after)
 
 
 # -- 4. the tap's age: the journal's time wins on a large disagreement -----------------------------------------------

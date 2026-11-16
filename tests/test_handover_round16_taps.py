@@ -170,7 +170,7 @@ def test_a_crash_between_the_write_and_the_journal_commit_then_a_restore_never_w
 
 
 @pytest.mark.card_only
-def test_an_unknown_tap_whose_write_never_landed_says_so_and_go_ahead_does_it_once(m, monkeypatch):
+def test_an_unknown_tap_whose_write_never_landed_across_a_restore_is_said_and_not_added_blind(m, monkeypatch):
     dentist_card(m)
     backup = sqlite3.connect(":memory:")
     m.ledger.db.backup(backup)
@@ -183,12 +183,13 @@ def test_an_unknown_tap_whose_write_never_landed_says_so_and_go_ahead_does_it_on
     restart_after_restore(m, backup)
     card = [t for t in m.seen() if t.startswith("A tap of yours from")]
     assert len(card) == 1 and "can't tell whether it was carried out" in card[-1]
-    assert "your calendar doesn't show it now" in card[-1]
-    out = m.tap("Go ahead")
-    assert out["status"] == "ok"
+    # Eighteenth round: Google answers 404 at its fixed id, and across a restore Harness can't tell whether it was
+    # added and taken off since, so it's said so and not added again from here (no Go ahead).
+    assert "can't tell whether it was added and taken off since" in card[-1]
+    assert "Go ahead" not in m.labels()
     for _ in range(3):
         m.c.tick()
-    assert len(dentists(m)) == 1                                              # done now, once
+    assert dentists(m) == []                                                  # nothing written
 
 
 class Crash(BaseException):

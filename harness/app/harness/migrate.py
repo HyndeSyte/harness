@@ -1793,6 +1793,45 @@ def _protected_why(base: str, name: str) -> str:
     return "the swap's state doesn't name it"
 
 
+SET_ASIDE_PROGRESS = ".set-aside"      # beside the swap marker while --set-aside is part way (eighteenth round)
+
+
+def _sha256(path: str) -> str:
+    """The file's SHA-256, read in chunks (eighteenth round: shared by --set-aside's checks and its progress key)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _set_aside_progress(folder: str, swap: str, path: str) -> dict:
+    """Eighteenth round: the progress an earlier --set-aside left for this same swap, or {} when there's none to
+    use. It counts only while the swap marker is byte for byte the one it was made against (the marker is updated
+    only once every removal is done), and only when the folder it names is a plain set-aside folder beside the
+    records; anything else is ignored and a fresh folder is chosen."""
+    try:
+        rec = _read_json(path)
+        if not isinstance(rec, dict) or rec.get("marker") != _sha256(swap):
+            return {}
+    except (OSError, ValueError):
+        return {}
+    dest, files = rec.get("dest"), rec.get("files")
+    if not (isinstance(dest, str) and _plain_name(dest) and dest.startswith("harness-set-aside-")
+            and isinstance(files, dict)):
+        return {}
+    if os.path.lexists(os.path.join(folder, dest)) and not os.path.isdir(os.path.join(folder, dest)):
+        return {}
+    clean = {}
+    for name, r in files.items():
+        if not (isinstance(name, str) and _plain_name(name) and isinstance(r, dict)):
+            return {}
+        d = r.get("digest")
+        clean[name] = {"digest": d if isinstance(d, str) else None, "removed": bool(r.get("removed"))}
+    return {"marker": rec["marker"], "dest": dest, "files": clean}
+
+
 def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> dict:
     """Fifteenth round, from the command line (python3 -m harness.migrate <records> --set-aside): a swap refused for
     files it doesn't own is sorted by moving them into a folder beside the records (harness-set-aside-<time>-<n>/),
@@ -1804,9 +1843,14 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
     else (the live ledger, its own log, the staged restore, a kept set, anything outside the folder) is refused
     explicitly, and so is a conflict that's a protected file; the whole set is checked before anything moves; each
     file is copied, the copy checked byte for byte and fsynced, and only then is the original removed. The folder's
-    name is unique (time plus a counter)."""
+    name is unique (time plus a counter).
+
+    Eighteenth round: resumable. Progress is kept beside the swap marker (<records>.swap.json.set-aside, written
+    whole and fsynced): the folder chosen and, per file, the copy's digest once checked and whether the original
+    was removed. A run after one cut short (a removal that failed, a kill) uses the same folder, accepts a checked
+    copy whose original is gone, and finishes the rest; the marker is updated only once every removal is done, and
+    the progress record is then removed. A copy never checked whose original is gone is a hard stop."""
     from datetime import timezone as _tz
-    import hashlib
     import shutil
     base = os.path.abspath(ledger_path)
     folder = os.path.dirname(base)
@@ -1823,8 +1867,28 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
             return {"ok": False, "said": "there's no readable restore swap beside the records to sort",
                     "files": swap_files(base)}
         movable, protected = swap_conflicts(base, plan)
+        # Eighteenth round: an earlier run for this same swap (the marker byte for byte as it was) left its progress
+        # beside the marker: the folder it chose and, per file, the copy's digest once checked and whether the
+        # original was removed. A checked copy whose original is gone is taken as moved; one never checked (or no
+        # longer matching) whose original is gone is a hard stop.
+        progress_path = swap + SET_ASIDE_PROGRESS
+        progress = _set_aside_progress(folder, swap, progress_path)
+        settled: list[str] = []
+        if progress:
+            dest = os.path.join(folder, progress["dest"])
+            for name, rec in progress["files"].items():
+                if name in movable or os.path.lexists(os.path.join(folder, name)):
+                    continue
+                d = rec.get("digest")
+                copy = os.path.join(dest, name)
+                if not d or not os.path.isfile(copy) or _sha256(copy) != d:
+                    return {"ok": False, "said": f"{name} is gone from beside the records but its copy in "
+                                                 f"{progress['dest']}/ was never checked (or no longer matches), so "
+                                                 "nothing more was removed and the swap marker is as it was; sort it "
+                                                 "by hand", "files": swap_files(base)}
+                settled.append(name)
         named = [str(n) for n in plan.get("conflict") or []]
-        refusals = [f"{n}: {_protected_why(base, n)}" for n in named if n not in movable and
+        refusals = [f"{n}: {_protected_why(base, n)}" for n in named if n not in movable and n not in settled and
                     (not _plain_name(n) or os.path.lexists(os.path.join(folder, n)) or _protected_why(base, n)
                      != "the swap's state doesn't name it")]
         refusals += [f"{n}: {why}" for n, why in protected]
@@ -1832,32 +1896,33 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
             return {"ok": False, "said": "nothing was moved: these can't be set aside by this command and need "
                                          "sorting by hand: " + "; ".join(refusals),
                     "refused": refusals, "files": swap_files(base)}
-        if not movable and not plan.get("refused"):
+        if not movable and not settled and not plan.get("refused"):
             return {"ok": False, "said": "there's no refused restore swap beside the records to sort",
                     "files": swap_files(base)}
-        stamp = (now or datetime.now(_tz.utc)).strftime("%Y%m%dT%H%M%SZ")
-        n = 1
-        dest = os.path.join(folder, f"harness-set-aside-{stamp}-{n}")
-        while os.path.lexists(dest):
-            n += 1
+        if not progress:
+            stamp = (now or datetime.now(_tz.utc)).strftime("%Y%m%dT%H%M%SZ")
+            n = 1
             dest = os.path.join(folder, f"harness-set-aside-{stamp}-{n}")
+            while os.path.lexists(dest):
+                n += 1
+                dest = os.path.join(folder, f"harness-set-aside-{stamp}-{n}")
         why = plan.get("refused") or "files at the records' name it doesn't own (the refusal wasn't recorded)"
+        already = f" ({', '.join(settled)} already moved there)" if settled else ""
         ask = (f"The restore swap was refused: {why}. Move {', '.join(movable) or 'nothing'} into "
-               f"{os.path.basename(dest)}/ and let the next start finish the swap? Type yes to go ahead: ")
+               f"{os.path.basename(dest)}/{already} and let the next start finish the swap? Type yes to go ahead: ")
         answer = (confirm or input)(ask)
         if str(answer or "").strip().lower() != "yes":
             return {"ok": False, "said": "not confirmed, so nothing was moved", "files": swap_files(base)}
-
-        def digest(path: str) -> str:
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    h.update(chunk)
-            return h.hexdigest()
+        digest = _sha256
         if movable:
+            files = dict(progress["files"]) if progress else {}
+            for name in movable:
+                files[name] = {"digest": None, "removed": False}
+            record = {"marker": _sha256(swap), "dest": os.path.basename(dest), "files": files}
             # Seventeenth round: a copy or fsync that fails (a full disk, most likely) or a copy that doesn't match
             # takes back what it made (the partial copies, then the folder while empty) and leaves the originals
-            # and the marker as they were, with a plain reason; the command line then exits non-zero.
+            # and the marker as they were, with a plain reason; the command line then exits non-zero. Eighteenth
+            # round: copies an earlier run already accounted for (originals gone) are never taken back.
             copied: list[str] = []
 
             def take_back() -> None:
@@ -1870,20 +1935,33 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
                     os.rmdir(dest)
                 except OSError:
                     pass
+                try:
+                    if not os.path.isdir(dest):
+                        os.remove(progress_path)
+                    else:
+                        for name in movable:
+                            record["files"][name] = {"digest": None, "removed": False}
+                        _write_json(progress_path, record)
+                except OSError:
+                    pass
             try:
-                os.makedirs(dest, exist_ok=False)
+                _write_json(progress_path, record)              # before the folder: a run cut off here is found again
+                os.makedirs(dest, exist_ok=True)
                 for name in movable:
                     src, dst = os.path.join(folder, name), os.path.join(dest, name)
                     copied.append(dst)
                     shutil.copy2(src, dst)
                     with open(dst, "rb") as f:
                         os.fsync(f.fileno())
-                    if digest(src) != digest(dst):
+                    d = digest(src)
+                    if d != digest(dst):
                         take_back()
                         return {"ok": False, "said": f"the copy of {name} didn't match it, so nothing was moved and "
                                                      "the swap marker is as it was", "files": swap_files(base)}
+                    record["files"][name] = {"digest": d, "removed": False}
                 _fsync_dir(dest)
                 _fsync_dir(folder)
+                _write_json(progress_path, record)              # every copy checked, recorded before any removal
             except OSError as e:
                 take_back()
                 reason = ("the disk is full" if getattr(e, "errno", None) in (errno.ENOSPC, errno.EDQUOT)
@@ -1893,17 +1971,29 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
                         "files": swap_files(base)}
             try:
                 for name in movable:
-                    os.remove(os.path.join(folder, name))
+                    try:
+                        os.remove(os.path.join(folder, name))
+                    except FileNotFoundError:
+                        pass                                    # gone already: its copy is checked
+                    record["files"][name]["removed"] = True
+                    _write_json(progress_path, record)          # each removal recorded as it's done
                 _fsync_dir(folder)
             except OSError as e:
                 # The copies are whole and checked, so they stay (the folder holds what was taken off); the marker
-                # is left as it was, so the swap isn't finished on a half-moved set.
+                # is left as it was, so the swap isn't finished on a half-moved set. Eighteenth round: the next run
+                # finds this folder through the progress record and finishes the removals.
                 log.error("an original couldn't be removed after its copy was made (%s)", type(e).__name__)
                 return {"ok": False, "said": f"the copies are in {os.path.basename(dest)}/, but an original couldn't be "
-                                             f"removed ({type(e).__name__}), so the swap marker is as it was",
+                                             f"removed ({type(e).__name__}), so the swap marker is as it was; run "
+                                             "--set-aside again to finish",
                         "files": swap_files(base)}
+        movable = list(settled) + [m for m in movable if m not in settled]
         plan = {k: v for k, v in plan.items() if k not in ("refused", "conflict")}
         _write_json(swap, plan)
+        try:
+            os.remove(progress_path)                            # eighteenth round: the set is done with
+        except OSError:
+            pass
         log.warning("files the restore swap refused were set aside in %s", os.path.basename(dest))
         return {"ok": True, "moved": movable, "into": os.path.basename(dest) if movable else "",
                 "said": "Set aside. The next start of Harness finishes the restore swap."}
