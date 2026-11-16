@@ -8,10 +8,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ABANDONED_TAP, Link, tapKid } from "../rootfs/opt/cain/link/core";
+import { ABANDONED_TAP, tapKid } from "../rootfs/opt/cain/link/core";
 import { LANDING_KEEP_MS, keyName, landingLedger } from "../rootfs/opt/cain/link/landings";
 import { cycle } from "../rootfs/opt/cain/record/main.ts";
-import { Link as OldLink } from "./fixtures/link-0.11.0/core";
 import { DAY, MIN, PR, SHA1, SHA2, pendingWith, rig as linkRig } from "./link-rig";
 import { rig as keeperRig } from "./rig.ts";
 
@@ -190,6 +189,7 @@ describe("3. the landing ledger: durable, bounded, and checked after a restore",
     expect(L.untrusted()).not.toBeNull();                            // GitHub can't be read: still untrusted
     expect(r.logs.join("\n")).toContain("it stays untrusted, and no landing starts");
     r.github.readable = true;
+    r.later(2 * MIN);                                                // round 9: looked for again on the backoff
     await r.link.sweep();
     expect(L.untrusted()).toBeNull();
     expect(L.entries()!.find((e) => e.key === "k1")!.settled!.how).toBe("landed");
@@ -295,58 +295,7 @@ describe("8. the outage notice, the re-check count, and tap_read_ms from the mea
   });
 });
 
-describe("9. roll-forward: this version, the previous one, then this version again", () => {
-  test("no stale claim acts, and no ledger key gives a wrong result", async () => {
-    const r = linkRig({ unchecked: true, pending: pendingWith(["P41", "P08"], []) });
-    // This version: an ask whose tap is claimed and then cut off, and a Ship tap whose landing is cut off.
-    const ask = await r.link.ask({ text: "Is the packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q1", checked: "the county portal, read at 8" }) as any;
-    const d = (r.link as any).d, relay = d.relay;
-    d.relay = () => { throw new Error("killed"); };
-    await expect(r.tap(structuredClone(r.msg(ask.message)), r.ids(ask.message)[0])).rejects.toThrow("killed");
-    d.relay = relay;
-    expect(Object.values(r.state().taps!)[0].stage).toBe("claimed");
-    const ship = await shipCard(r);
-    r.github.hold = true;
-    void r.tap(structuredClone(r.msg(ship)), r.ids(ship)[0]);
-    await wait(10);
-    expect(r.landLedger.keys.size).toBe(1);
-    const savedAt = r.t.now;
-    // The previous version starts on that state, answers a tap and lands the Ship tap itself.
-    r.github.hold = false;
-    r.later(10 * MIN);
-    const old = new OldLink(r.deps as any);
-    await old.sweep();
-    await old.whenLanded();
-    expect(r.github.main).toEqual([SHA1]);
-    expect(r.state().messages[ship].shipping!.state).toBe("landed");
-    const oldShip = await old.ship({ item: "P41", pr: PR, head: SHA2, text: WORDS }) as any;
-    expect(await old.onInteraction({ type: 3, id: "992", token: "t", application_id: "999", channel_id: "5151", user: { id: "4242" },
-      data: { custom_id: r.ids(oldShip.message)[0] }, message: structuredClone(r.msg(oldShip.message)) })).toBe("to Cain");
-    await old.whenLanded();
-    expect(r.github.main).toEqual([SHA1, SHA2]);
-    const before = r.relayed.filter((x) => x.includes("Dane tapped")).length;
-    // This version again: the state file was written after this version's last stamp (the marker the
-    // versions share), so the claim from before the previous version's run is discarded, never acted.
-    r.later(MIN);
-    r.stamp.value = { mtime: r.t.now - 30_000, savedAt };
-    r.restart();
-    await r.link.sweep();
-    await r.link.whenLanded();
-    expect(r.logs.join("\n")).toContain("claim(s) older than its last run discarded, never acted");
-    expect(Object.values(r.state().taps ?? {}).filter((t) => t.stage !== "edited")).toEqual([]);
-    expect(Object.values(r.state().taps ?? {}).some((t) => t.msg === ask.message)).toBe(false);
-    expect(r.relayed.filter((x) => x.includes("Dane tapped")).length).toBe(before);
-    expect(r.github.landings.filter((l) => l.head === SHA1)).toHaveLength(2);   // this version's cut-off try and the previous version's landing
-    // The ledger's key for the cut-off landing gives no wrong result: a new card for that head, tapped,
-    // finds it in the remote main and pushes nothing.
-    const again = await shipCard(r);
-    expect(await r.tap(structuredClone(r.msg(again)), r.ids(again)[0])).toBe("to Cain");
-    await r.link.whenLanded();
-    expect(r.github.landings.filter((l) => l.head === SHA1)).toHaveLength(2);
-    expect(r.relayed.at(-1)).toContain("(it was there already)");
-    void Link;
-  });
-});
+// 9. The roll-forward moved to round 9 (source-check-round9.test.ts): run ids, not file times.
 
 describe("10. the docs", () => {
   test("DOCS.md and the rules state the guarantee, the ledger, and the notes on the other pull requests", () => {

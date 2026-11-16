@@ -1,5 +1,6 @@
-// The record keeper as of main at Cain 0.11.0 (unchanged copy), for the rollback test in
-// source-check-round3.test.ts: the previous version must tolerate the ledger's files.
+// The record keeper as of main at Cain 0.11.0 (commit 4746b670b38b91ff6cb6a8530da9763b1e5562c8; unchanged copy), for the
+// roll-forward tests: the previous version must tolerate the ledger's files. Rebuilt by
+// cain/tests/fixtures/regenerate.sh; never edited by hand.
 // The record keeper's rules, with no I/O, so they can be tested on their own.
 // Every change to Cain's record (the private org repo) arrives as a small JSON
 // "request". The keeper is the record's one writer: it applies requests one at a

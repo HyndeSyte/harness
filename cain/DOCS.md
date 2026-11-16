@@ -508,27 +508,77 @@ What Cain's link enforces:
   the claim from that record: a claim not yet acted on is acted on once, and one acted on but not
   yet shown gets only its card edit.
 
+  Claims across a restart, by run (since round 9). Each start of the link raises a run counter in
+  its state file by one, durably, before it acts on anything, and each claim records the run it was
+  made in. A claim from an earlier run (this version before a restart, or with the previous version
+  having run on the state in between) is either completed through the live-tap predicate or
+  discarded, judged never by file times or save stamps, so a clock step either way changes
+  nothing. The predicate: the card is still as the claim left it (answered with that label), and the
+  check it rests on gets exactly the verdict a live tap would get now. A claim that passes is acted
+  on once, its line marked as a possible repeat. One that fails (its status changed, the record was
+  reset, its card was changed or is gone) is discarded, never acted: you get one line on the card's
+  thread ("Your tap was not acted on after a restart; a new card follows."), Cain gets one "Tap not
+  acted" line with its tap key, each once, the card shows "Not acted after a restart, re-check
+  needed", and the item goes on the link's re-check queue. One that can't be judged now (a read that
+  failed, a reset standing, the clock, a push hold) waits for the next sweep. The re-check queue is
+  the link's own list of items whose tap was lost or not acted on; an item leaves it once a new
+  check of it is accepted, and `keeper.sh clock` lists it (`recheck_queue`).
+
   The key travels on. Cain's relayed line for the tap ends with its short form ("Tap key
   tap-1a2b3c4d5e6f."). A line relayed again from a claim after a restart (the link may have been
   cut off between telling Cain and recording that it did) starts "Repeat of tap key ...: if you
   already had a line with this tap key, ignore this one.", so Cain acts on a tap key once. A record
-  request Cain sends because of a tap may carry its tap key (an optional `tap` field, "tap-" and 12
-  hex digits); the keeper takes one request per key and refuses a second request citing a key
-  already acted on ("tap key ... was already acted on by request ..."). It keeps the consumed keys
-  in its own state file (`/data/record-holds.json`, outside the working copy), so no reset or
-  re-clone forgets one; the request's own replay after a reset is not a second request.
+  request Cain sends because of a tap carries its tap key (a `tap` field, "tap-" and 12 hex
+  digits); the keeper takes one request per key and refuses a second request citing a key already
+  acted on ("tap key ... was already acted on by request ..."). Since round 9 the key is required
+  on Cain's requests of the kinds that can come from a tap: a `row-close`, a `take` for a Ship job
+  (its job starts "ship"), and a `put` or `append` to a `decisions.md` (where Cain's rules record
+  his tapped answer). One of those without `tap` is rejected ("tap key required: ..."); one that
+  didn't come from a tap says `"tap": "none"` (never for a Ship take, which always follows his Ship
+  tap). Laptop sessions get no taps and aren't asked for one. The keeper keeps the consumed keys in
+  its own state file (`/data/record-holds.json`, outside the working copy), so no reset or re-clone
+  forgets one; the request's own replay after a reset is not a second request. A consumed key is
+  pruned once it is older than `TAP_KEEP_MS` (3 days: the longest card lifetime, until the morning
+  check-in after next, under two days, plus a margin).
 
   The landing ledger. A Ship tap's landing carries the key to the link's landing ledger
   (`/data/record-landings/`, outside the record's working copy, one file per key, made with an
   exclusive create). The claim file and its directory are fsynced before the first push attempt.
   The ledger takes a key once and rejects a second landing with the same key, so a landing a
-  restart cut off is never started again. Such an orphan is settled against the remote: the link
-  fetches main from GitHub and looks for the landing's token (its head commit) there, never in its
-  local copy. In main: landed, with its Ship token. Not in main: the landing is abandoned, and you
-  get one line on the card's thread ("The install was interrupted by a restart and did not land; a
-  new card follows.") while Cain gets a "Landing abandoned" line and shows a new Ship card for the
-  same pull request and head. While GitHub can't be reached, the key stays unresolved: the card
-  stays as it is and no new Ship card for that pull request and head goes out. Before any landing
+  restart cut off is never started again. Such an orphan is settled against the remote, never the
+  link's local copy. Where the token lives: the landing's token is the pull request's head commit
+  itself. The link pushes exactly that commit to main as a fast-forward, so it writes no trailer or
+  commit of its own (one would change the commit the checks passed on); its claim records main's
+  tip as GitHub had it just before the push (the base commit). How settlement looks for it
+  (`merge.ts` `settledFrom`): a fetch of main deep enough to search from the landing's recorded base
+  commit to the remote tip (the whole of main, no depth, and a shallow copy deepened to full
+  history), then: the base and the head both ancestors of the tip, landed; the base there and the
+  head not, did not land. If that range is unavailable (the fetch fails, a shallow copy that can't
+  be deepened, a rewritten main where the base is gone or is no longer an ancestor of the tip), the
+  key stays unresolved, treated as below, never as did not land. In main: landed, with its Ship
+  token. Not in main: the landing is abandoned, and you get one line on the card's thread ("The
+  install was interrupted by a restart and did not land; a new card follows.") while Cain gets a
+  "Landing abandoned" line and shows a new Ship card for the same pull request and head.
+
+  An unreachable remote never wedges a landing silently (round 9). While the remote can't settle a
+  key, the card stays as it is and no new Ship card for that pull request and head goes out, and
+  the sweep looks again by itself on a bounded backoff (1, 2, 4, then every 5 minutes), needing no
+  tap or restart; the remote check of a restored or untrusted ledger backs off the same way. After
+  `UNRESOLVED_TELL_FAILS` failures (5) or `UNRESOLVED_TELL_MS` since the first (15 minutes),
+  whichever comes first, you get one line on the card's thread ("Landing unconfirmed: main's remote
+  has been unreachable since 9:05 AM, retrying.", or "main's history couldn't be searched" when the
+  range is the trouble) and Cain one "Landing unconfirmed" line, each once. `keeper.sh clock` lists
+  each unresolved key (`unresolved_landings`: its tap key, age in minutes, failures and last error).
+  When the remote comes back the key settles and the usual outcome follows: landed, or abandoned
+  with its told-once lines and a new card.
+
+  The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
+  ledger claim, made right before the first push attempt and only after the tap passed the live-tap
+  predicate. A reset of the record that wins before that point (checked right before the claim)
+  prevents the push, and the tap is lost as any tap whose check didn't survive a reset: one line on
+  the card's thread, one to Cain, the item on the re-check queue. Once the claim is made, a reset
+  does not revoke it: the landing settles truthfully, as landed with its ledger mark when GitHub took
+  the push, even if the check would now fail. Before any landing
   starts, the link also looks for the token on the remote main, so a re-ship of content already
   there pushes nothing and is reported as landed. A settled key is marked so in its file and pruned
   by the link after 30 days; an unsettled one is never pruned. The ledger is the link's alone: The
@@ -760,6 +810,12 @@ R4. `/opt/cain/record.sh block-push 2`, a checked test ask you tap (journaled), 
    please answer again." with Cain told the same; once the push lands, the row edit and the take
    are done, once each, and asks resume within two keeper rounds of the push landing (about two
    minutes): a new checked ask posts and its tap counts.
+R4b. Pull the plug on a landing. Only with a real Ship you mean to make (a card for a head already
+   in main pushes nothing, so it can't test this), and only if you choose to: tap Ship, then power
+   off between the push and the ledger mark (pull the Pi's power right after the tap, before the
+   card shows how it went). Expect, on the next start, the result to settle to landed exactly once:
+   one "The link landed it" line to Cain, the card showing it shipped, no second push, and
+   `keeper.sh clock` with no `unresolved_landings` once GitHub answers.
 R5. The rollback, last. Cain asks you to restore this App from the backup taken just before the
    install, and gives you a message to send him once it's restored ("Rollback check: run
    /opt/cain/keeper.sh stopped and jq -r .alive /data/record-holds.json"). Expect keeper.sh
@@ -780,10 +836,14 @@ rollback test runs this version's record against the previous keeper, copied int
 the intended generation, a waiting epoch, a landing ledger) into that keeper and into the
 previous link (`cain/tests/fixtures/link-0.11.0`): both start and ignore it. A roll-forward test
 runs this version, then the previous link answering taps and landing, then this version again: no
-stale claim acts and no ledger key gives a wrong result. On start the link discards claims older
-than the previous version's last run; the marker the versions share is the state file's
-modification time, against the time this version stamps in each save (`savedAt`). The fixtures are
-pinned to the version installed on the Pi (0.11.0 today), and move when the Pi's does. After any
+stale claim acts and no ledger key gives a wrong result. On start the link raises its run counter,
+and a claim from an earlier run is completed through the live-tap predicate or discarded and told
+(Claims across a restart, by run, above), never by file times or save stamps; the tests step the
+clock back and forward across it. The fixtures are pinned to the version installed on the Pi (0.11.0
+today), and move when the Pi's does. They are rebuilt from main as it stands, never edited by hand:
+after any rebase, from the repository root, `bash cain/tests/fixtures/regenerate.sh "$(git rev-parse
+origin/main)" <the version on that main>` rewrites `link-<version>` and `keeper-<version>` from that
+commit (the header of each file names it), and a test checks the committed copies match. After any
 rebase onto a version bump (pull request 20, pull request 21 and pull request 23 also bump this
 App's version; pull request 20 lands first and this rebases onto it),
 both test suites and the rollback test run again on the new head before Ship. There is no switch that lets cards through without a

@@ -1,5 +1,6 @@
-// The record keeper as of main at Cain 0.11.0 (unchanged copy), for the rollback test in
-// source-check-round3.test.ts: the previous version must tolerate the ledger's files.
+// The record keeper as of main at Cain 0.11.0 (commit 4746b670b38b91ff6cb6a8530da9763b1e5562c8; unchanged copy), for the
+// roll-forward tests: the previous version must tolerate the ledger's files. Rebuilt by
+// cain/tests/fixtures/regenerate.sh; never edited by hand.
 // Cain's record keeper: the one writer of the record (the private org repo).
 // Keeps a copy of the record on the Pi (/data/record, so Home Assistant's
 // backups carry it off the box), applies requests one at a time, commits each,

@@ -170,7 +170,7 @@ describe("record keeper, end to end", () => {
     cycle(cfg);   // makes the Pi's copy
     writeFileSync(join(seed, "areas/farm/decisions.md"), "- 2026-11-08 keep the ram\n");
     g(seed, "add", "-A"); g(seed, "commit", "--quiet", "-m", "laptop"); g(seed, "push", "--quiet", "origin", "HEAD:main");
-    queue("1.json", { id: "req-010", from: "cain", kind: "change", summary: "Decision", ops: [
+    queue("1.json", { id: "req-010", from: "cain", kind: "change", summary: "Decision", tap: "none", ops: [
       { op: "append", path: "areas/farm/decisions.md", text: "- 2026-11-08 order hay" }] });
     expect(cycle(cfg).ok).toBe(true);
     expect(upstream("areas/farm/decisions.md")).toBe("- 2026-11-08 keep the ram\n- 2026-11-08 order hay\n");

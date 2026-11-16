@@ -7,6 +7,8 @@ import {
 } from "../rootfs/opt/cain/record/core.ts";
 import { blobSha } from "../rootfs/opt/cain/record/main.ts";
 import { A, B, PENDING, T0, hrs } from "./rig.ts";
+import { tapDerived } from "../rootfs/opt/cain/record/core.ts";
+const tapAuto = (from: string, ops: any[]) => from === "cain" && tapDerived({ ops }).names.length ? { tap: tapDerived({ ops }).ship ? "tap-00000000beef" : "none" } : {};
 
 const P = "state/PENDING.md";
 
@@ -29,7 +31,9 @@ function world(files: Record<string, string> = { [P]: PENDING }) {
     // Plans a request at a time; when it's ok, its files and holds become the record.
     // Read as the keeper reads it first (parseRequest), then planned.
     run(from: string, ops: any[], at: Date = T0): Plan {
-      const parsed = parseRequest(JSON.stringify({ id: `req-${++n}-abcd`, from, kind: "change", summary: "s", ops }));
+      // Cain's requests that can act on a tap carry a tap key (round 9): these tests are about other
+      // things, so a stand-in key goes with each (tapAuto).
+      const parsed = parseRequest(JSON.stringify({ id: `req-${++n}-abcd`, from, kind: "change", summary: "s", ops, ...tapAuto(from, ops) }));
       if (parsed.error) return { state: "rejected", reason: parsed.error };
       const p = plan(parsed.req as Request, t, { at, holds, tz: "America/New_York" });
       if (p.state === "ok") {

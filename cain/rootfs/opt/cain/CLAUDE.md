@@ -153,9 +153,16 @@ specialist (the Harness add-on) does.
   Each relayed tap line ends with its tap key ("Tap key tap-..."). A line that starts "Repeat of
   tap key" may be one you already had: if you already had a line with that tap key, ignore it;
   act on a tap key once. When you record what a tap said, put its tap key on the request:
-  `"tap": "tap-1a2b3c4d5e6f"` beside its id (optional, but use it): the record keeper takes one
-  request per tap key and refuses a second one citing a key already acted on. A Ship tap lands
-  at most once.
+  `"tap": "tap-1a2b3c4d5e6f"` beside its id: the record keeper takes one request per tap key and
+  refuses a second one citing a key already acted on. On a `row-close`, a `take` for a Ship job and
+  a write to a decisions.md the tap key is required: the keeper rejects one without `tap`. When one
+  of those didn't come from a tap (a row closed on its source's evidence, a decision in his words),
+  say `"tap": "none"`; a Ship take always carries its Ship tap's key. A Ship tap lands at most once.
+  A tap claimed just before a restart is finished after it only if its card still passes the same
+  check a live tap gets; otherwise you get "Tap not acted: ..." with its tap key, he gets one line on
+  the card, nothing was done for it: record nothing from it, and once the item's re-check is accepted
+  (it is on the link's re-check queue, which `/opt/cain/keeper.sh clock` lists), ask again with
+  --checked if it still needs him.
   While the record keeper can't read the link's state, asks and Ship cards are refused saying
   so: ask again in a few minutes. If the link's own state is damaged, it rebuilds it by itself
   and tells him once; you get a line saying so: check the items still open and ask again what
@@ -164,7 +171,8 @@ specialist (the Harness add-on) does.
   (journaled, or one the link was cut off in the middle of) whose check didn't survive the reset
   is lost to the record's reset: he gets one line on its card's thread ("Lost to the record's
   reset, please answer again.") and you a relayed line saying his tap was lost to the record's
-  reset, please answer again, with its item and tap key. Record nothing from that tap (if you
+  reset, please answer again, with its item and tap key (the item goes on the link's re-check
+  queue). Record nothing from that tap (if you
   already acted on it, say so to him only if it changed something he can see), and once the
   item's re-check is accepted, ask again with --checked if it still needs him. A tap whose check
   survived the reset stands (survived: the keeper ran its check again after the reset, so it counts
@@ -422,7 +430,7 @@ create, update or run any other routine.
    once it's settled:
    - Landed ("The link landed it ... Ship token: ..."): check Home Assistant first
      (below), then `take` its item with
-     `"job": "ship <title>"`, and once that's done, RemoteTrigger `run` on Ship with
+     `"job": "ship <title>"` and his Ship tap's key as the request's `"tap"`, and once that's done, RemoteTrigger `run` on Ship with
      body `{"text": "Install pull request <url>, landed in main at <full head sha>. Ship token: <the token, exactly as relayed>. Dane tapped Ship at <time>."}`;
      a hook refuses a Ship run without his token for that pull request and head, or
      once it has run out (2 hours). Write /data/jobs/<cse_X> as `ship | <title>`. When
@@ -437,8 +445,13 @@ create, update or run any other routine.
    - Landing abandoned ("Landing abandoned: ..."): a restart cut the landing off and main
      doesn't have it, so nothing landed. He was already told on the card that a new card
      follows: check Home Assistant first, then show a new Ship card for the same pull request
-     and head, with `--checked`. If GitHub couldn't be read to settle it, you hear nothing
-     yet and a new Ship card for that pull request and head is refused until it settles.
+     and head, with `--checked`. While GitHub can't settle it, a new Ship card for that pull
+     request and head is refused, and the link keeps looking by itself; if that lasts (5 tries
+     or 15 minutes) you get one "Landing unconfirmed: ..." line and he gets one on the card.
+     Nothing to do or tell him: you hear how it settles.
+   - A reset of the record that comes before the landing starts stops the push, and the tap is
+     lost to the reset (the usual lost line). Once the landing has started, a reset no longer
+     revokes it: it settles as it really went.
    - In main but not installed (it landed just before a Stop, or the install's token ran
      out): once nothing is stopped, show a new Ship card for the same pull request and
      head. It stays up, and his tap on it gives a fresh token to install it.
@@ -548,6 +561,11 @@ R4. `/opt/cain/record.sh block-push 2`, a checked test ask he taps, a queued row
    as "Lost to the record's reset, please answer again." on its card's thread, with your relayed
    line; once the push lands, the edit and take are done once each, and asks resume within two
    keeper rounds of the push landing (about two minutes): a new checked ask posts and counts.
+R4b. Only on a real Ship he means to make, and only if he wants to: he taps Ship, then pulls the
+   Pi's power right after, before the card shows how it went. On the next start the landing
+   settles to landed exactly once: one "The link landed it" line, no second push, keeper.sh clock
+   without unresolved_landings. Never offer it with a test card (one already in main pushes
+   nothing).
 R5. Last, the rollback: ask him to restore this App from that backup (you can't change Home
    Assistant), and give him a message to send you once it's restored: "Rollback check: run
    /opt/cain/keeper.sh stopped and jq -r .alive /data/record-holds.json". keeper.sh answering
@@ -670,7 +688,8 @@ writers clash. Your GitHub write tools are switched off on purpose. To change fi
      is `/opt/cain/record.sh rowsha P08`, the row as you read it.
    - `{"op": "row-add", "item": "P45", "cells": {"Item": "...", "Who": "Cain", "Next step": "..."}}`
    - `{"op": "row-close", "item": "P08", "evidence": "<what shows it's done>"}`: moves
-     it to Done, dated.
+     it to Done, dated. Its request carries `"tap"`: the tap key when his tap closed it, or
+     `"none"`.
    One row holds one fact: a row-add or row op whose Item claims two statuses about two
    things ("license filed Nov 3; permit not filed") is rejected, naming both; give each
    its own row. A put of the whole open list lands whole or not at all: any new or changed

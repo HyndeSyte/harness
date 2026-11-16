@@ -1,6 +1,6 @@
-// Cain's link as of main at Cain 0.11.0 (its core, imports pointed at this tree's unchanged modules),
-// for the rollback test in source-check-round7.test.ts: the previous link must start on, and ignore,
-// the state this version writes.
+// Cain's link as of main at Cain 0.11.0 (commit 4746b670b38b91ff6cb6a8530da9763b1e5562c8; its core, imports pointed at this tree's unchanged modules),
+// for the roll-forward tests: the previous link must start on, and ignore, the state this version
+// writes. Rebuilt by cain/tests/fixtures/regenerate.sh; never edited by hand.
 // Cain's link to Dane on Discord, for everything his plugin can't do: taps,
 // reactions, and cards. Plain code, no model.
 //

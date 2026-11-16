@@ -45,7 +45,7 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { teeConsole } from "../logfile";
 import { localReadings, verdict } from "../clock";
@@ -56,7 +56,7 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { checkRuns, facts, inMain, land, type MergeDeps } from "./merge";
+import { checkRuns, facts, land, mainTip, settledFrom, type MergeDeps } from "./merge";
 import { requestLoggedIn } from "../record/main";
 import { landingLedger } from "./landings";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
@@ -126,16 +126,7 @@ function paired(): string {
 const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) => console.log(`[cain] link: ${line}`));
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
-// Each save is stamped with when this version wrote it: a state file modified later than its stamp
-// was written by another version of the link (a rollback ran), the marker the versions share.
-function save(s: State): void { s.savedAt = Date.now(); stateStore.save(s); }
-function lastWriter(): { mtime: number; savedAt: number | null } | null {
-  try {
-    const mtime = statSync(STATE).mtimeMs;
-    const j = JSON.parse(readFileSync(STATE, "utf8"));
-    return { mtime, savedAt: Number.isFinite(j?.savedAt) ? j.savedAt : null };
-  } catch { return null; }
-}
+function save(s: State): void { stateStore.save(s); }
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -252,7 +243,6 @@ const link = new Link({
   // Whether a check request survived a reset: done in log/requests on the keeper's current copy.
   requestLogged: (id) => requestLoggedIn(RECORD, id),
   landings: landingLedger(RECORD_LANDINGS, LANDINGS_MARKER, { log: (line) => console.log(`[cain] link: ${line}`) }),
-  lastWriter,
   // The state file as it is on disk (load() turns one that doesn't parse into an empty state).
   stateHealth: () => {
     try { const j = JSON.parse(readFileSync(STATE, "utf8")); return j && typeof j === "object" && !Array.isArray(j) && typeof j.messages === "object" ? { ok: true } : { ok: false, why: "not a state" }; }
@@ -277,7 +267,14 @@ const link = new Link({
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
     return land({ ...github, stopped }, { repo: p.repo, pr: p.pr, head });
   } : undefined,
-  landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
+  // Settled against the remote: from the landing's recorded base to main's tip (merge.ts settledFrom).
+  landed: deployKey ? async ({ pr, head }, base) => {
+    const p = pullOf(pr);
+    if (!p) return null;
+    const r = await settledFrom(github, p.repo, head, base);
+    return "inMain" in r ? r.inMain : { unresolved: r.unresolved };
+  } : undefined,
+  mainTip: deployKey ? async (pr) => { const p = pullOf(pr); return p ? mainTip(github, p.repo) : null; } : undefined,
   facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
   // A Ship card reads the head's checks as the landing does (merge.ts), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.

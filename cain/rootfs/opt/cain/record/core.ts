@@ -40,9 +40,26 @@ export type Request = {
   summary: string;     // one line, becomes the commit message
   ops?: Op[];          // kind "change"
   note?: { text: string; about?: string };  // kind "note": Dane's words from his page, for Cain
-  tap?: string;        // optional (0.12.0): the tap key (tap-<12 hex>) of the relayed tap this request acts on; the keeper takes one request per key
+  // The tap key (tap-<12 hex>) of the relayed tap this request acts on; the keeper takes one request
+  // per key (0.12.0). Required on Cain's requests that can act on a tap (round 9, tapDerived): there
+  // it is the key, or "none" for one that didn't come from a tap (a Ship take never says none).
+  tap?: string;
 };
 export const TAP_KEY = /^tap-[0-9a-f]{12}$/;
+export const NO_TAP = "none";
+// The ops of Cain's that can come from a tap, by name (round 9): a row-close, a take for a Ship job
+// (its job starts "ship"), and a write to a decisions.md (Cain's rules record his tapped answer
+// there). A request holding any of them must carry its tap key.
+export function tapDerived(req: { ops?: any[] }): { names: string[]; ship: boolean } {
+  const names: string[] = [];
+  let ship = false;
+  for (const o of req.ops ?? []) {
+    if (o?.op === "row-close") names.push(`row-close ${o.item}`);
+    else if (o?.op === "take" && typeof o.job === "string" && /^ship\b/i.test(o.job.trim())) { names.push(`take ${o.item} for a Ship`); ship = true; }
+    else if ((o?.op === "put" || o?.op === "append") && typeof o.path === "string" && /(^|\/)decisions\.md$/.test(o.path)) names.push(`${o.op} ${o.path}`);
+  }
+  return { names, ship };
+}
 
 export type Outcome = {
   id: string; from: string; kind: string; summary: string;
@@ -155,7 +172,7 @@ export function parseRequest(raw: string): { req?: Request; error?: string } {
   // go into the log and the reply).
   const req = j as Request;
   if (!knownSender(j.from)) return { req, error: "from must be cain or laptop:<session id> (or page, for Dane's page)" };
-  if (j.tap !== undefined && (typeof j.tap !== "string" || !TAP_KEY.test(j.tap))) return { req, error: "tap, when given, is the tap key a relayed tap line ended with (tap- and 12 hex digits)" };
+  if (j.tap !== undefined && (typeof j.tap !== "string" || !(TAP_KEY.test(j.tap) || j.tap === NO_TAP))) return { req, error: "tap, when given, is the tap key a relayed tap line ended with (tap- and 12 hex digits), or none" };
   if (j.kind === "note") {
     if (!j.note || typeof j.note.text !== "string" || !j.note.text.trim()) return { req, error: "note needs text" };
     return { req };
@@ -191,6 +208,13 @@ export function parseRequest(raw: string): { req?: Request; error?: string } {
     if (o.op === "put" && o.content.trim() === "") return { req, error: `put ${o.path}: empty content; removing a file is only done as part of a merge` };
     if (o.op === "append" && (typeof o.text !== "string" || !o.text.trim())) return { req, error: `append ${o.path}: needs text` };
     if (o.op === "remove" && (typeof o.base !== "string" || typeof o.merged_into !== "string" || !okPath(o.merged_into))) return { req, error: `remove ${o.path}: needs base and an allowed merged_into` };
+  }
+  // Round 9: Cain's request that can act on a tap carries its tap key.
+  if (j.from === "cain") {
+    const t = tapDerived(j);
+    if (t.names.length && j.tap === undefined)
+      return { req, error: `tap key required: ${t.names.join(", ")} can act on his tap, so the request carries "tap": the tap key the relayed tap line ended with (or "none" when it didn't come from a tap)` };
+    if (t.ship && j.tap === NO_TAP) return { req, error: "tap key required: a take for a Ship job always follows his Ship tap, so tap is that tap's key, never none" };
   }
   return { req };
 }

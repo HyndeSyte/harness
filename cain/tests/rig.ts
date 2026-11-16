@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseHolds, type Holds, type Outcome } from "../rootfs/opt/cain/record/core.ts";
+import { parseHolds, tapDerived, type Holds, type Outcome } from "../rootfs/opt/cain/record/core.ts";
 import type { Config } from "../rootfs/opt/cain/record/main.ts";
 
 export const T0 = new Date("2026-11-11T13:00:00Z");
@@ -56,7 +56,7 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
   const put = (path: string, text: string) => { mkdirSync(join(seed, path, ".."), { recursive: true }); writeFileSync(join(seed, path), text); };
   for (const [p, t] of Object.entries(files)) put(p, t);
   g("add", "-A"); g("commit", "--quiet", "-m", "seed"); g("push", "--quiet", "origin", "HEAD:main");
-  let now = T0, n = 0;
+  let now = T0, n = 0, taps = 0;
   const synced = { ok: true };
   const cfg: Config = {
     remote, dir: join(root, "pi/record"), queue: join(root, "pi/queue"), outcomes: join(root, "pi/outcomes"),
@@ -83,7 +83,12 @@ export function rig(files: Record<string, string> = { "state/PENDING.md": PENDIN
       }
     },
     // Cain's request, through his local queue.
-    cain(req: Record<string, unknown>) { writeFileSync(join(cfg.queue, `${String(++n).padStart(4, "0")}.json`), JSON.stringify({ from: "cain", kind: "change", summary: "s", ...req })); },
+    // Round 9: one that can act on a tap gets a stand-in tap key unless the test gives "tap" itself.
+    cain(req: Record<string, unknown>) {
+      const t = tapDerived({ ops: req.ops as any[] });
+      const auto = !("tap" in req) && t.names.length ? { tap: t.ship ? `tap-${(++taps).toString(16).padStart(12, "0")}` : "none" } : {};
+      writeFileSync(join(cfg.queue, `${String(++n).padStart(4, "0")}.json`), JSON.stringify({ from: "cain", kind: "change", summary: "s", ...auto, ...req }));
+    },
     // Requests from laptop sessions, pushed to the record's inbox together in one commit.
     inbox(...reqs: [string, Record<string, unknown>][]) {
       pull();

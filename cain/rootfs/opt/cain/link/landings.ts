@@ -20,9 +20,10 @@ import { dirname, join } from "node:path";
 export const LANDING_KEEP_MS = 30 * 86_400_000;
 const META = ".ledger.json";
 
-export interface LandingEntry { key: string; pr: string; head: string; at: string; settled?: { how: "landed" | "not landed"; at: string } }
+// base: main's tip when the key was claimed (round 9): settlement searches from it to the remote tip.
+export interface LandingEntry { key: string; pr: string; head: string; at: string; base?: string; settled?: { how: "landed" | "not landed"; at: string } }
 export interface Landings {
-  claim(key: string, what: { pr: string; head: string; at: string }): boolean | null;
+  claim(key: string, what: { pr: string; head: string; at: string; base?: string }): boolean | null;
   settle(key: string, how: "landed" | "not landed", at: string): void;
   entries(): LandingEntry[] | null;
   prune(now: number, keepMs?: number): number;

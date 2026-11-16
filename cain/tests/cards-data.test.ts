@@ -197,7 +197,7 @@ describe("the cards, published for the reply hook", () => {
   test("the link asks for a write after each save and each sweep, and answers /cards itself", () => {
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
     expect(main).toContain("const stateStore = stateFile(STATE, () => cards.soon());");
-    expect(main).toContain("function save(s: State): void { s.savedAt = Date.now(); stateStore.save(s); }");
+    expect(main).toContain("function save(s: State): void { stateStore.save(s); }");
     expect(main).toContain("finally { cards.soon(); setTimeout(sweepLoop, SWEEP_MS); }");
     expect(main).toContain('url.pathname === "/cards") return json(await link.cardsFor())');
     expect(main).not.toContain("publishCards(");                          // only through the writer

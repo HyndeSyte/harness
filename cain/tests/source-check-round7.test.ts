@@ -176,6 +176,21 @@ describe("1. claims and journaled taps across a reset", () => {
     expect(tapped(l)).toHaveLength(0);
     expect(lostLines(l)).toHaveLength(1);
     expect(l.state().taps![key]).toMatchObject({ outcome: "lost to reset" });
+    // Round 9: told once each, one line on its card's thread and one to Cain, and the item on the
+    // re-check queue until a fresh card's re-check is accepted.
+    expect(threadLines(l, q1.message)).toHaveLength(1);
+    expect(lostLines(l)[0]).toContain(`tap key ${tapKid(key)}`);
+    expect(lostLines(l)[0]).toContain("P44 is on the link's re-check queue until then");
+    expect(l.state().recheck?.P44).toBeDefined();
+    expect((l.link.clockReport() as any).recheck_queue.map((x: any) => x.item)).toEqual(["P44"]);
+    await l.link.sweep();
+    expect(lostLines(l)).toHaveLength(1);
+    expect(threadLines(l, q1.message)).toHaveLength(1);
+    const fresh = await ask(l, "Q2", "the specialist's log again, read at 8:30");
+    expect(fresh.status).toBe("posted");
+    expect(l.msg(fresh.message).components.length).toBeGreaterThan(0);
+    expect(l.state().recheck?.P44).toBeUndefined();
+    expect(l.logs.join("\n")).toContain("P44 left the link's re-check queue: its re-check was accepted");
   }, 30_000);
 
   test("a journaled ask, then a reset that lost its check: Cain is told to disregard it, Dane one line on the card's thread", async () => {

@@ -50,6 +50,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     factsHang: false,                              // GitHub never answers about a pull request's facts
     hold: false,                                   // a landing waits until go()
     readable: true,                                // main can be read (for landings over 2 hours old)
+    unreadableWhy: null as string | null,          // round 9: what the remote says when it can't be read (null: no answer)
+    reads: 0,                                      // how often the remote main was read for a landing
+    bases: [] as (string | null | undefined)[],    // the base each remote read searched from
     // A Ship card's other read (with facts): the head's check runs ("missing": GitHub has no such
     // commit; null: no answer), which can hang; and what was asked, in order.
     runs: passing() as any[] | "missing" | null,
@@ -78,10 +81,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   // the link's state file on disk (corrupt: what it holds instead of the saved state), hung reads
   // killed at the ceiling, and what Discord answers to a webhook patch of @original (another id).
   const survive = { fn: null as null | ((id: string) => boolean | null) };
-  const landLedger = { keys: new Set<string>(), broken: false, what: new Map<string, { pr: string; head: string; at: string }>(), settled: new Map<string, string>(),
+  const landLedger = { keys: new Set<string>(), broken: false, what: new Map<string, { pr: string; head: string; at: string; base?: string }>(), settled: new Map<string, string>(),
     untrusted: null as string | null, pruned: 0 };
-  // Round 8: the state file's modification time and the savedAt stamped in it (null: not wired).
-  const stamp = { value: null as null | { mtime: number; savedAt: number | null } };
   const disk = { corrupt: null as string | null, writes: 0 };
   const kills = { n: 0 };
   const autoKeep = (req: any) => {
@@ -189,7 +190,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     stateHealth: () => (disk.corrupt !== null ? { ok: false, why: "corrupt or mid-write" } : { ok: true }),
     requestLogged: (id: string) => (survive.fn ? survive.fn(id) : true),
     landings: {
-      claim: (key: string, what: { pr: string; head: string; at: string }) => {
+      claim: (key: string, what: { pr: string; head: string; at: string; base?: string }) => {
         if (landLedger.broken || landLedger.untrusted) return null;
         if (landLedger.keys.has(key)) return false;
         landLedger.keys.add(key); landLedger.what.set(key, what); return true;
@@ -202,7 +203,6 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       trust: () => { landLedger.untrusted = null; },
       count: () => landLedger.keys.size,
     } as any,
-    lastWriter: () => stamp.value,
     killRead: () => { kills.n++; },
     relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
@@ -225,7 +225,13 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       github.main.push(l.head);
       return { ok: true, already: false };
     },
-    landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }) => github.readable ? github.main.includes(ship.head) : null,
+    landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }, base?: string | null) => {
+      github.reads++; github.bases.push(base);
+      if (!github.readable) return github.unreadableWhy ? { unresolved: github.unreadableWhy } : null;
+      return github.main.includes(ship.head);
+    },
+    // main's tip as the landing's base (a stand-in commit before anything landed).
+    mainTip: opts.noDeployKey ? undefined : async () => (github.readable ? (github.main.at(-1) ?? "0".repeat(40)) : null),
     facts: opts.facts ? (pr: string) => { github.asked.push(`facts ${pr}`); return github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts); } : undefined,
     checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(copy(github.runs)); } : undefined,
     factsMs: opts.factsMs ?? 50,
@@ -262,7 +268,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return checking(link); },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited, survive, landLedger, stamp, disk, kills, deps,
+    reports, replays, sent, discord, limitN, spy, reviews, submitted, outcomes, keeper, fails, tuned, waited, survive, landLedger, disk, kills, deps,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

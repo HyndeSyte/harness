@@ -336,6 +336,17 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // working copy, so no reset or re-clone forgets one. The newest TAPS_KEPT.
   taps?: Record<string, { id: string; at: string }> };
 const TAPS_KEPT = 1000;
+// Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
+// Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
+export const TAP_KEEP_MS = 3 * 86_400_000;
+export function pruneTaps(taps: Record<string, { id: string; at: string }> | undefined, now: number): number {
+  let n = 0;
+  for (const [k, v] of Object.entries(taps ?? {})) {
+    const at = Date.parse(v.at);
+    if (Number.isFinite(at) && now - at > TAP_KEEP_MS) { delete taps![k]; n++; }
+  }
+  return n;
+}
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
 
@@ -717,6 +728,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       if (published === null ? Object.keys(S.holds).length > 0 : published !== holdsText(S.holds))
         republish(`Holds: ${HOLDS_PATH} put back to the keeper's copy`);
 
+      // Consumed tap keys older than TAP_KEEP_MS go (round 9).
+      { const pruned = pruneTaps(S.taps, clock().getTime()); if (pruned) log(`pruned ${pruned} consumed tap key(s) older than ${TAP_KEEP_MS / 86_400_000} days`); }
       for (const it of items) {
         const at = clock();
         const id = it.req?.id ?? `unreadable-${it.name}`;
@@ -728,7 +741,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         let o: Outcome;
         if (it.error) o = { ...base, state: "rejected", reason: clean(it.error) };
         else if (seen.has(id)) o = { ...base, state: "rejected", reason: "an id that was already used" };
-        else if (it.req!.tap && S.taps?.[it.req!.tap] && S.taps[it.req!.tap].id !== id)
+        else if (it.req!.tap && TAP_KEY.test(it.req!.tap) && S.taps?.[it.req!.tap] && S.taps[it.req!.tap].id !== id)
           o = { ...base, state: "rejected", reason: `tap key ${it.req!.tap} was already acted on by request ${S.taps[it.req!.tap].id}; act on a tap key once` };
         else if (it.req!.kind === "note") o = { ...base, state: "relayed" };
         else o = decide(it.req!, !!it.local, base);
@@ -738,7 +751,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         o.commit = commit(message(o));
         outcomes.push(o);
         owed.push(owe(o, !!it.local, it.req, !!it.error));
-        if (o.state === "done" && it.req?.tap) {
+        if (o.state === "done" && it.req?.tap && TAP_KEY.test(it.req.tap)) {
           S.taps = { ...(S.taps ?? {}), [it.req.tap]: { id, at: at.toISOString() } };
           const keys = Object.keys(S.taps);
           if (keys.length > TAPS_KEPT) for (const k of keys.slice(0, keys.length - TAPS_KEPT)) delete S.taps[k];

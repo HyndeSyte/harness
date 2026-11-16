@@ -28,6 +28,9 @@
 - The notice that the record isn't saving now says how long Ship taps have been held. Nothing to set up beyond the smoke test's one option change.
 - The smoke test gains one step: it makes Discord's usual way of putting a question's buttons back fail on purpose, and checks they come back anyway.
 - After a restore from a backup, the App checks with GitHub what has landed before it ships anything again.
+- If GitHub can't be reached to confirm a Ship that a restart cut off, the App keeps asking by itself, a little less often each time. If that lasts (five tries or a quarter of an hour), you get one line under that card ("Landing unconfirmed: main's remote has been unreachable since 9:05 AM, retrying."), and the usual line follows once GitHub answers.
+- A tap the box was in the middle of when it restarted is finished afterwards only if the question still holds up the way a fresh tap would. Otherwise you get one line under it ("Your tap was not acted on after a restart; a new card follows.") and Cain asks again once he has checked again. Clock jumps don't change this.
+- A Ship tap that the record's restart beats to the push ships nothing, and you get the "Lost to the record's reset" line. Once the push has started, it settles as it really went.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 
 ## 0.11.0
