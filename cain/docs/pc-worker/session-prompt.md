@@ -9,8 +9,8 @@ know. Only http and https addresses open (never file, data, javascript, chrome, 
 other than about:blank, or any other kind), never an address on this computer or its
 network other than the run's own check page, only on the hosts the run's
 `allowed_domains` names (exactly, or every subdomain where it says `*.`), and with no
-query unless the run's own address has one. A fragment (`#` and what follows) is dropped
-before an address opens.
+query unless the run's own address has one. Never add a fragment (`#` and what follows)
+to an address: one with a fragment is refused.
 
 If the worker answers "Not ready yet", make the same call again; after three of those
 the worker ends the session. Every refusal counts: a session refused twelve times is

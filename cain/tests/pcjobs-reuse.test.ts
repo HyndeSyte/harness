@@ -1,16 +1,18 @@
 // Owner reuse with provenance Cain can't forge: a PC job may carry a value an earlier
 // result reported only when its owner_reuse names the Discord message of his yes, and the
 // link (link/core.ts reuseProof) finds that message is his recorded "Use it" tap on an ask
-// that shows each value, or his own reply in the DM that does. The keeper (pcjobs/main.ts
-// check) refuses the job otherwise, fail closed.
+// that quoted exactly those values when posted. A reply he typed never counts. The keeper
+// (pcjobs/main.ts check) refuses the job otherwise, fail closed, and one tap answers for one
+// job across restarts (main.ts usedReuse).
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { check, readJobs, reuseAnswer, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { check, readJobs, recordReuse, reuseAnswer, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
+import { askValues } from "../rootfs/opt/cain/link/core";
 
 const VALUE = "****plnt";
 const ASKED = `Check the account the PC reported, "${VALUE}", in a new job?`;
@@ -23,88 +25,83 @@ async function asked(r: ReturnType<typeof rig>, text = ASKED, options = ["Use it
 }
 const tapOn = (r: ReturnType<typeof rig>, id: string, i: number, over: any = {}) => r.tap(r.msg(id), r.ids(id)[i], over);
 
-describe("the link: whether a message is his yes to reusing values (reuseProof)", () => {
-  test("his tap on the first option of an ask that shows the value is his yes", async () => {
+describe("the link: only his \"Use it\" tap on an ask that quoted exactly the values is a yes (reuseProof)", () => {
+  test("his tap on Use it, the first option of an ask that quoted the value, is his yes, for exactly the values asked", async () => {
     const r = rig();
     const id = await asked(r);
+    expect(r.state().messages[id].values).toEqual([VALUE]);                    // the link recorded the values asked
     expect(await tapOn(r, id, 0)).toBe("to Cain");
     expect(await r.link.reuseProof(id, [VALUE])).toEqual({ status: "ok", message: id, via: "tap", ask: id, values: [VALUE] });
-    // Each value must be on it, exactly as written.
-    await expect(r.link.reuseProof(id, [VALUE, "https://example.com/account/security"])).rejects.toThrow("doesn't show every value");
-    await expect(r.link.reuseProof(id, ["****PLNT"])).rejects.toThrow("doesn't show every value");
-    // His answer's own line on the card ("You answered: Use it") is no place for a value.
-    await expect(r.link.reuseProof(id, ["Use it"])).rejects.toThrow("doesn't show every value");
+    // Exactly the values the ask quoted: no more, no fewer, no other spelling.
+    await expect(r.link.reuseProof(id, [VALUE, "https://example.com/account/security"])).rejects.toThrow("aren't exactly the ones that ask quoted");
+    await expect(r.link.reuseProof(id, ["****PLNT"])).rejects.toThrow("aren't exactly the ones that ask quoted");
+    await expect(r.link.reuseProof(id, ["Use it"])).rejects.toThrow("aren't exactly the ones that ask quoted");
+    // Two values asked: both, in either order, but never one alone.
+    const two = await asked(r, `Check "${VALUE}" and "https://example.com/account/security" in a new job?`);
+    await tapOn(r, two, 0);
+    expect(await r.link.reuseProof(two, ["https://example.com/account/security", VALUE])).toMatchObject({ status: "ok", via: "tap" });
+    await expect(r.link.reuseProof(two, [VALUE])).rejects.toThrow("aren't exactly the ones that ask quoted");
+    await expect(r.link.reuseProof(two, [VALUE, VALUE])).rejects.toThrow("aren't exactly the ones that ask quoted");
   });
 
-  test("a tap on another option, no tap yet, or a tap by anyone else is not", async () => {
+  test("a tap on another option, no tap yet, a tap by anyone else, or a first option that isn't Use it is not", async () => {
     const r = rig();
     const no = await asked(r);
     await tapOn(r, no, 1);
-    await expect(r.link.reuseProof(no, [VALUE])).rejects.toThrow('tapping "Don\'t", not its first option');
+    await expect(r.link.reuseProof(no, [VALUE])).rejects.toThrow('tapping "Don\'t", not its first option "Use it"');
     const open = await asked(r, `Check "${VALUE}" now?`);
     await expect(r.link.reuseProof(open, [VALUE])).rejects.toThrow("no tap of his is recorded");
     expect(await tapOn(r, open, 0, { user: { id: "333" } })).toBe("refused: not the owner");
     await expect(r.link.reuseProof(open, [VALUE])).rejects.toThrow("no tap of his is recorded");
-    // Answered in words (keeper.sh answered): the tap path doesn't hold; his reply's own id does.
+    // Answered in words (keeper.sh answered): no tap, so no yes.
     await r.link.answered({ item: "P08", question: "Q2" });
     await expect(r.link.reuseProof(open, [VALUE])).rejects.toThrow("no tap of his is recorded");
+    // A first option other than "Use it" doesn't approve a reuse, even tapped.
+    const sure = await asked(r, `Check "${VALUE}" in a new job?`, ["Sure", "Don't"]);
+    await tapOn(r, sure, 0);
+    await expect(r.link.reuseProof(sure, [VALUE])).rejects.toThrow('not its first option "Use it"');
   });
 
-  test("an ask that doesn't show the value proves nothing, even on his yes", async () => {
+  test("an ask that quoted no value proves nothing, even on his tap", async () => {
     const r = rig();
-    const id = await asked(r, "Check the account the PC reported in a new job?");
+    const id = await asked(r, `Check the account the PC reported, ${VALUE}, in a new job?`);   // shown, but not quoted
     await tapOn(r, id, 0);
-    await expect(r.link.reuseProof(id, [VALUE])).rejects.toThrow("that ask doesn't show every value");
+    await expect(r.link.reuseProof(id, [VALUE])).rejects.toThrow("quoted no value when it was posted");
   });
 
-  test("his own message showing the value, replying to such an ask or coming after it, is his yes", async () => {
+  test("a reply he typed never authorises, even one that quotes the value, replies to the ask or follows it", async () => {
     const r = rig();
     const id = await asked(r);
-    const reply = r.his(`Yes, check ${VALUE}`, id);
-    expect(await r.link.reuseProof(reply.id, [VALUE])).toEqual({ status: "ok", message: reply.id, via: "reply", ask: id, values: [VALUE] });
+    const reply = r.his(`Yes, check "${VALUE}"`, id);
+    await expect(r.link.reuseProof(reply.id, [VALUE])).rejects.toThrow("only his \"Use it\" tap on your ask approves a reuse, never a message he typed");
     const after = r.his(`go ahead with ${VALUE}`);
-    expect(await r.link.reuseProof(after.id, [VALUE])).toMatchObject({ status: "ok", via: "reply", ask: id });
-    // His message must show each value itself.
-    const vague = r.his("yes", id);
-    await expect(r.link.reuseProof(vague.id, [VALUE])).rejects.toThrow("his message doesn't show every value");
-  });
-
-  test("a message by anyone else, or replying to something that isn't an ask that shows the value, is not", async () => {
-    const r = rig();
-    const id = await asked(r);
+    await expect(r.link.reuseProof(after.id, [VALUE])).rejects.toThrow("never a message he typed");
+    // Even after his tap on that very ask, his reply's own id isn't the yes: the ask's is.
+    await tapOn(r, id, 0);
+    await expect(r.link.reuseProof(reply.id, [VALUE])).rejects.toThrow("never a message he typed");
+    expect(await r.link.reuseProof(id, [VALUE])).toMatchObject({ status: "ok", via: "tap", ask: id });
+    // A message by anyone else, or the bot's own reply, likewise.
     const theirs = r.his(`Yes, check ${VALUE}`, id);
     r.posted[theirs.id].author = { id: "333" };
-    await expect(r.link.reuseProof(theirs.id, [VALUE])).rejects.toThrow("isn't one of his messages");
-    // Cain's own reply (the bot's, not a card the link recorded) can't stand in for his.
-    const bots = r.his(`Yes, check ${VALUE}`, id);
-    r.posted[bots.id].author = { id: "999" };
-    await expect(r.link.reuseProof(bots.id, [VALUE])).rejects.toThrow("isn't one of his messages");
-    // A reply to a message that isn't one of Cain's asks.
-    const other = r.his(`about ${VALUE}`);
-    const toHis = r.his(`Yes, ${VALUE}`, other.id);
-    await expect(r.link.reuseProof(toHis.id, [VALUE])).rejects.toThrow("replies to something other than one of your asks");
-    // A reply to an ask that doesn't show the value.
-    const plain = await asked(r, "Check it in a new job?");
-    const toPlain = r.his(`Yes, ${VALUE}`, plain);
-    await expect(r.link.reuseProof(toPlain.id, [VALUE])).rejects.toThrow("that ask doesn't show every value");
+    await expect(r.link.reuseProof(theirs.id, [VALUE])).rejects.toThrow("never a message he typed");
   });
 
   test("words after he tapped no are still a no", async () => {
     const r = rig();
     const id = await asked(r);
     await tapOn(r, id, 1);
-    const reply = r.his(`fine, ${VALUE}`, id);
-    await expect(r.link.reuseProof(reply.id, [VALUE])).rejects.toThrow("not its first option");
+    const reply = r.his(`fine, "${VALUE}"`, id);
+    await expect(r.link.reuseProof(reply.id, [VALUE])).rejects.toThrow("never a message he typed");
+    await expect(r.link.reuseProof(id, [VALUE])).rejects.toThrow("not its first option");
   });
 
-  test("no ask before his message, a card of the link's, bad ids or values, a pairing with someone else and Discord down all refuse", async () => {
+  test("a card of the link's, bad ids or values, a pairing with someone else and Discord down all refuse", async () => {
     const r = rig();
-    const early = r.his(`check ${VALUE}`);
-    await expect(r.link.reuseProof(early.id, [VALUE])).rejects.toThrow("no ask of yours came before his message");
-    const card = await r.link.addCard({ text: `Moved ${VALUE}.`, rows: [], kind: "reply" });
+    const card = await r.link.addCard({ text: `Moved "${VALUE}".`, rows: [], kind: "reply" });
     const shown = await r.link.show(card, { item: "none" });
     await expect(r.link.reuseProof(shown, [VALUE])).rejects.toThrow("a card of the link's");
     await expect(r.link.reuseProof("12", [VALUE])).rejects.toThrow("needs a Discord message id");
+    const early = r.his(`check ${VALUE}`);
     await expect(r.link.reuseProof(early.id, [])).rejects.toThrow("1 to 3 values");
     await expect(r.link.reuseProof(early.id, ["abc"])).rejects.toThrow("1 to 3 values");
     await expect(r.link.reuseProof(early.id, [VALUE, "bbbb", "cccc", "dddd"])).rejects.toThrow("1 to 3 values");
@@ -118,6 +115,13 @@ describe("the link: whether a message is his yes to reusing values (reuseProof)"
     r.failing.clear();
     r.refusing.add(`/channels/${DM}/messages/`);
     await expect(r.link.reuseProof(id, [VALUE])).rejects.toThrow();
+  });
+
+  test("askValues: the straight-quoted values of an ask, at most three", () => {
+    expect(askValues(ASKED)).toEqual([VALUE]);
+    expect(askValues(`a "abc" b`)).toEqual([]);
+    expect(askValues(`"aaaa" "bbbb" "cccc" "dddd"`)).toEqual([]);
+    expect(askValues(`\u201c${VALUE}\u201d`)).toEqual([]);
   });
 });
 
@@ -139,7 +143,7 @@ function queue(extra: Job[] = []): { cfg: Config; jobs: Job[] } {
     final_url: null, facts: { signed_in: true, account: VALUE }, tools: [], attended: true };
   for (const j of [done, ...extra]) writeFileSync(join(dir, "jobs", `${j.id}.json`), jobText(j));
   writeFileSync(join(dir, "results", `${done.id}.json`), resultText(r));
-  const cfg: Config = { remote: "", dir, queue: join(dir, "q"), outcomes: join(dir, "o"), branch: "main", pub: "", rand: () => 0.5 };
+  const cfg: Config = { remote: "", dir, queue: join(dir, "q"), outcomes: join(dir, "o"), branch: "main", pub: "", rand: () => 0.5, used: join(dir, "state", "reuse-used.jsonl") };
   return { cfg, jobs: readJobs(dir) };
 }
 const ask = (job: any) => JSON.stringify({ from: "cain", job });
@@ -164,7 +168,7 @@ describe("the keeper: owner_reuse is taken only with the link's proof", () => {
     // The link refuses: so does the keeper, with the link's reason and what reuse needs.
     const refused = check({ ...cfg, verifyReuse: stub({ ok: false, why: "the link says his message doesn't show every value exactly as written" }) },
       ask({ ...carry, owner_reuse: reuse() }), jobs, T0);
-    expect(refused).toEqual({ why: "owner_reuse refused: the link says his message doesn't show every value exactly as written. Reuse needs his \"Use it\" tap on your ask that quotes each value, or his own reply in the DM that does" });
+    expect(refused).toEqual({ why: "owner_reuse refused: the link says his message doesn't show every value exactly as written. Reuse needs his \"Use it\" tap on your ask that quotes each value; a reply he types never counts" });
     expect(seen).toEqual([reuse()]);
     // A verifier that throws counts as a refusal.
     expect(check({ ...cfg, verifyReuse: () => { throw new Error("boom"); } }, ask({ ...carry, owner_reuse: reuse() }), jobs, T0))
@@ -181,8 +185,50 @@ describe("the keeper: owner_reuse is taken only with the link's proof", () => {
     const first = check({ ...cfg, verifyReuse: yes }, ask({ ...carry, owner_reuse: reuse() }), jobs, T0) as { job: Job };
     let asked = 0;
     const again = check({ ...cfg, verifyReuse: () => { asked++; return { ok: true, via: "tap" }; } }, ask({ ...carry, owner_reuse: reuse() }), [...jobs, first.job], T0);
-    expect(again).toEqual({ why: `owner_reuse refused: that message of his already answered for ${first.job.id}; ask him again for this job` });
+    expect(again).toEqual({ why: `owner_reuse refused: that tap of his already answered for ${first.job.id}; ask him again for this job` });
     expect(asked).toBe(0);
+  });
+
+  test("a reply quoting the value is refused; the tap is accepted once; a second job citing the same tap is refused, across a keeper restart", async () => {
+    const r = rig();
+    const id = await asked(r);
+    const reply = r.his(`Yes, check "${VALUE}"`, id);
+    await tapOn(r, id, 0);
+    // The keeper's check against the link itself (the rig's), as linkReuse asks it.
+    const viaLink = (seen: string[]): ReuseCheck => (x) => { seen.push(x.message_id); return reuseCalls.get(x.message_id) ?? { ok: false, why: "the link couldn't check it" }; };
+    const reuseCalls = new Map<string, ReturnType<ReuseCheck>>();
+    for (const m of [id, reply.id]) {
+      try { reuseCalls.set(m, reuseAnswer(reuse({ message_id: m }), JSON.stringify(await r.link.reuseProof(m, [VALUE])))); }
+      catch (e) { reuseCalls.set(m, { ok: false, why: `the link says ${(e as Error).message}` }); }
+    }
+    const { cfg, jobs } = queue();
+    const carry = { ...READ, done_looks_like: `The settings page for ${VALUE}` };
+    const seen: string[] = [];
+    // His typed reply, even quoting the value: refused.
+    expect(check({ ...cfg, verifyReuse: viaLink(seen) }, ask({ ...carry, owner_reuse: reuse({ message_id: reply.id }) }), jobs, T0))
+      .toEqual({ why: expect.stringContaining("never a message he typed") });
+    // The tap: accepted once.
+    const first = check({ ...cfg, verifyReuse: viaLink(seen) }, ask({ ...carry, owner_reuse: reuse({ message_id: id }) }), jobs, T0) as { job: Job };
+    expect(first.job.owner_reuse?.message_id).toBe(id);
+    recordReuse(cfg, id, first.job.id);                                          // round() records it once the job is pushed
+    // A keeper restart: a fresh copy of the queue without that job file, the same used-tap file. The tap stays spent.
+    const fresh = queue();
+    const restarted: Config = { ...fresh.cfg, used: cfg.used };
+    expect(usedReuse(restarted).get(id)).toBe(first.job.id);
+    const n = seen.length;
+    expect(check({ ...restarted, verifyReuse: viaLink(seen) }, ask({ ...carry, owner_reuse: reuse({ message_id: id }) }), fresh.jobs, T0))
+      .toEqual({ why: `owner_reuse refused: that tap of his already answered for ${first.job.id}; ask him again for this job` });
+    expect(seen.length).toBe(n);                                                 // refused before the link is asked
+    // The file is only appended to: a torn last line doesn't lose the taps before it.
+    appendFileSync(cfg.used!, "{\"m\": \"13");
+    expect(usedReuse(restarted).get(id)).toBe(first.job.id);
+  });
+
+  test("a link answer that says reply, or any way but tap, is refused by the keeper", () => {
+    const { cfg, jobs } = queue();
+    const carry = { ...READ, done_looks_like: `The settings page for ${VALUE}` };
+    expect(check({ ...cfg, verifyReuse: () => ({ ok: true, via: "reply" }) }, ask({ ...carry, owner_reuse: reuse() }), jobs, T0))
+      .toEqual({ why: expect.stringContaining("only his \"Use it\" tap counts, never a message he typed") });
   });
 
   test("owner_reuse on a job that carries nothing reported is checked all the same", () => {
@@ -194,10 +240,10 @@ describe("the keeper: owner_reuse is taken only with the link's proof", () => {
 
   test("the link's answer is read strictly: this message, these values, a known way", () => {
     const r = reuse({ values: [VALUE, "https://example.com/account/security"] });
-    const good = { status: "ok", message: MSG, via: "reply", ask: "1300000000000000000", values: r.values };
-    expect(reuseAnswer(r, JSON.stringify(good))).toEqual({ ok: true, via: "reply" });
+    const good = { status: "ok", message: MSG, via: "tap", ask: MSG, values: r.values };
+    expect(reuseAnswer(r, JSON.stringify(good))).toEqual({ ok: true, via: "tap" });
     for (const bad of [{ ...good, message: "1300000000000000002" }, { ...good, values: [VALUE] }, { ...good, values: [...r.values].reverse() },
-      { ...good, via: "said so" }, { ...good, status: "posted" }, { status: "refused" }, "not json"])
+      { ...good, via: "said so" }, { ...good, via: "reply" }, { ...good, ask: "1300000000000000000" }, { ...good, status: "posted" }, { status: "refused" }, "not json"])
       expect([bad, reuseAnswer(r, typeof bad === "string" ? bad : JSON.stringify(bad)).ok]).toEqual([bad, false]);
     expect(reuseAnswer(r, JSON.stringify({ status: "refused", said: "that isn't one of his messages in your DM" })))
       .toEqual({ ok: false, why: "the link says that isn't one of his messages in your DM" });
@@ -238,7 +284,7 @@ describe("the keeper asks the link over its local API", () => {
     const url = `http://127.0.0.1:${server.port}`;
     try {
       expect(await run(join(dir, ".env"), url, id, [VALUE])).toEqual({ ok: true, via: "tap" });
-      expect(await run(join(dir, ".env"), url, id, [`${VALUE}"x\\y`])).toEqual({ ok: false, why: "the link says that ask doesn't show every value exactly as written" });
+      expect(await run(join(dir, ".env"), url, id, [`${VALUE}"x\\y`])).toEqual({ ok: false, why: "the link says the values aren't exactly the ones that ask quoted when it was posted" });
       expect(await run(join(dir, "wrong.env"), url, id, [VALUE])).toEqual({ ok: false, why: "the link couldn't check it" });
       expect(await run(join(dir, "none.env"), url, id, [VALUE])).toEqual({ ok: false, why: "no bot token here, so the link can't be asked" });
       expect(hits).toEqual(["/reuse", "/reuse", "/reuse"]);

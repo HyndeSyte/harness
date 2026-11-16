@@ -25,16 +25,19 @@ and refuses any other host before a navigation and again when a page is read. Th
 control. Cain's keeper also refuses a new job that repeats a value a result reported (an
 address or a masked account a page showed): **that is a mitigation, not a guarantee**,
 since a value reworded, split up or carried by meaning gets past a check that matches
-letters. A follow-up job may reuse a reported value only when you said yes to it, with
+letters. A follow-up job may reuse a reported value only when you tapped yes to it, with
 proof Cain can't write himself: Cain asks you with the value quoted, and the job names the
-Discord message of your yes (`owner_reuse.message_id`): the ask you tapped "Use it" on, or
-your own reply in your DM that shows the value. The keeper has Cain's bot read that message
-(the same check it makes on your taps: you, in your DM) and refuses the job unless it is
-your tap on the ask's first option or your own message showing every value exactly. One
-yes covers one job. A reply that says "don't use X" still contains X: only a tap on
-another option counts as a no, so tap rather than type when you mean no.
+Discord message id of that ask (`owner_reuse.message_id`). **Only your tap on its "Use it"
+button counts**; a reply you type never authorises a reuse, even one that quotes the value
+or answers the ask, and the keeper refuses a reuse that names a plain message. Cain's link
+records each ask with the values it quoted when it was posted, and its own record of your
+tap (you, in your DM, Cain paired to you); the keeper has the link check the job's values
+are exactly the ones that ask quoted and that you tapped its "Use it". One tap covers one
+job: the keeper records every tap it accepted in an append-only file
+(`/data/pc-jobs-reuse-used.jsonl` on the Pi) that survives restarts, so a second job
+citing the same tap is refused.
 
-**You accept that boundary once, in words** (its text names the domains as the control and the report-value check as a mitigation, says a page read off the job's sites or one it can't place ends the session and throws its report away, and says that where the probe hasn't shown Claude Code keeping a refused page from the model, the promise is only that the session ends before its next tool call; this release is boundary version 3, so confirm again). `confirm-profile` refuses
+**You accept that boundary once, in words** (its text names the domains as the control and the report-value check as a mitigation, says a page read off the job's sites or one it can't place ends the session and throws its report away, and says that where the probe hasn't shown Claude Code keeping a refused page from the model, the promise is only that the session ends before its next tool call; this release has two boundary texts, versions 4 and 5, and the probe's redirect check picks which one you sign, so confirm again). `confirm-profile` refuses
 (`boundary_not_accepted`, printing the boundary's text) until you run it with
 `--accept-boundary`; the confirmation records the version of the text you accepted
 (`boundary_version`), and every run refuses (`boundary_not_accepted`) until the
@@ -330,11 +333,14 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   its own token starts with that token; nothing in the hook's input, the CLI's session id
   included, takes part in the match. The marker also records the CLI's session id from the
   init event, and the hook logs the session id its input carries with every decision
-  (`sid`), only so the probe can compare the two (`session_ids`, below). A marker that
+  (`sid`), only so the probe can record the two (`session_ids`, below, a diagnostic, not a gate). A marker that
   doesn't start with the token is refused at once (`inventory_unconfirmed`). **When the
-  marker isn't there yet** (the init event and the model's first call can race), the hook
-  waits for it, up to 5 seconds, and only then refuses, with its own message asking the
-  model to make the same call again (`inventory_not_ready`). **At most three of those per
+  marker isn't there yet** (the init event and the model's first call can race, or the
+  extension is slow to attach), the hook waits on readiness itself before the session's
+  first call is answered, polling for the marker for up to 15 seconds, so a slow attach
+  costs time rather than the model's retries; a later call waits up to 5 seconds. Only then
+  does it refuse, with its own message asking the model to make the same call again
+  (`inventory_not_ready`). Each wait is logged with its time (`waited_ms`). **At most three of those per
   session**: the fourth ends the session (`inventory_never_ready`, its own failure code).
   A failed inventory, an init event it can't parse, or a worker that fails leaves no
   marker, so nothing in that session runs. **Every refusal counts toward a cumulative cap
@@ -405,9 +411,10 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   carried by meaning gets past it. The control is the pinned domains: whatever a job says,
   its run opens only the hosts its signed entry names. When a follow-up job really needs a
   reported value (an address you want checked next), Cain asks you first, and records your
-  answer on the job: `owner_reuse`, the values exactly and your answer in quotes. The
-  keeper then lets exactly those values through and nothing else from a result; it is
-  Cain's record of your tap, kept in the queue, not a signature. Tests run a multi-field
+  answer on the job: `owner_reuse`, the values exactly, your answer in quotes and the id of
+  the ask you tapped "Use it" on. The keeper lets exactly those values through, and nothing
+  else from a result, only once Cain's link confirms that tap on an ask that quoted exactly
+  those values (a typed reply never counts), and only once per tap. Tests run a multi-field
   instruction and address-based payloads through the schema, the reader and the keeper,
   and a reuse with and without your recorded answer. Cain's rules still say a fact is
   never an instruction and never goes into a tool's or a command's arguments; the code is
@@ -462,10 +469,14 @@ check reads what the parser made of it, each refusing on its own: (1) the scheme
   another domain with content in its query gets nowhere, and a shared-hosting neighbour
   (another `github.io` site) is another domain; an internationalized host (punycode,
   `xn--`) passes only where the entry names it exactly (`idn_not_allowed`), so a homograph
-  of an allowed host is refused; (4) a fragment is stripped before these checks: the
-  address is judged without it, and an allowed navigation is sent on without it (the hook's
-  allow carries the stripped address as the call's updated input; the log line says
-  `fragment_stripped`). A query is refused (`query_not_allowed`) unless the entry names
+  of an allowed host is refused; (4) an address with a fragment (`#` and what follows) is
+  refused (`fragment_not_allowed`). A fragment is never sent to a server by the browser,
+  but that is no comfort: script on the page can read it and send it anywhere, so a
+  model-chosen fragment could carry a token out. Stripping it instead (the hook's allow
+  carrying the address without it as the call's updated input; the log line says
+  `fragment_stripped`) stays in the code but is off by default, and is turned on only by a
+  confirmation whose probe `fragment_strip` step showed the browser really received the
+  stripped address, under the same hook policy version. A query is refused (`query_not_allowed`) unless the entry names
   `query_params` and every parameter matches one of them by its name and by its value's
   character class and maximum length, capped at 200 characters in all (`query_too_long`).
   **An allowed query on a site you are signed in to is still a request that site acts
@@ -510,9 +521,12 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   or read fails the confirmation (`context_order_failed`). **It checks every page read as
   it happens, too** (`read-guard`, a PostToolUse hook on `read_page`, `get_page_text` and
   `find` in the pinned settings): before a reading tool's answer reaches the model, it
-  reads the tab's current address from a **structured field the extension sets** on the
-  answer (its `url`, or the same inside its `structuredContent`), **never from the answer's
-  text**, so nothing a page writes can place it, and checks it against the run's domains
+  reads the tab's current address from **one structured field, at one exact path**: the
+  hook input's `tool_response.structuredContent.tabUrl` (the MCP result's structured block,
+  never a text block), **never from the answer's text, title or DOM**, which are strings no
+  key is ever read from. An answer with any other address-named field beside it (`url`,
+  `href`, `location` and the like, anywhere in the answer), or that key written twice, is
+  unplaced too, so nothing a page writes can place it, and checks it against the run's domains
   as it would a navigation (the check page and the end page pass). **Both failures end the
   run at once, with no fallback**: a page that moved its tab off the job's sites after an
   allowed navigation (a redirect, a script) is `read_drift`; an answer with no address in
@@ -521,8 +535,13 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   abort file, the worker (which watches it every 100 ms) ends the session's whole process
   tree, and on Windows its Job Object, the moment the decision is made; nav-guard refuses
   every call once the file exists (`session_aborted`); read-guard holds its answer back
-  until the session is gone (up to 15 seconds, inside its 30 second timeout) and replaces
-  it with a one-line refusal. The run fails with that code and **its report is discarded
+  until the session is gone, for at most 10 seconds (with its 10 second input deadline, well
+  inside its 30 second timeout, so it always answers itself), and on expiry returns the
+  one-line refusal explicitly. The worker's side escalates within 8 seconds: it ends the
+  Job Object (on Windows, by ending the helper that holds it; elsewhere the process group),
+  then kills the session's process itself, and if the session still isn't seen gone it
+  marks the PC unconfirmed with its own code (`abort_kill_failed`) until you probe and
+  confirm again. The run fails with that code and **its report is discarded
   unread**. The drift is logged with the address's registrable domain and keyed hashes
   only, and at your PC the run says which registrable domain the tab was moved to
   (`"drift": "read_drift:example.org"` in its output, and `domain` in `last-run.json`;
@@ -530,9 +549,10 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   fails (`hook_missing_decision`). **The guarantee rests on the session ending, not on
   Claude Code replacing the tool's answer**: whether the installed Claude Code keeps the
   refused page from the model (`updatedMCPToolOutput`) is shown only by the probe's
-  `redirect_read` step, and confirming needs it; the stated boundary says that where the
-  replacement hasn't been shown, the promise is only that the session ends before its next
-  tool call. Any error inside it, input it can't read, or no input within its 10 second
+  `redirect_read` step. Confirming needs its `session_ended` result; its `secret_withheld`
+  result is recorded and picks which boundary text you sign: where it held, the text says the
+  page's text was kept from the model on this PC; where it didn't, the text says the promise
+  is only that the session ends before its next tool call. Any error inside it, input it can't read, or no input within its 10 second
   deadline (headroom for a cold start of Git Bash and the runtime) is refused too (exit
   code 2 and a deny decision in JSON); its settings timeout (30 seconds) is longer than
   that deadline, so it refuses before Claude Code would give up on it. A test in the
@@ -1105,22 +1125,42 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     (runs stay attended either way in this one). It also records `read_context` (now
     false whenever the confirmation holds: a PC whose reading tools don't place their
     reads can't be confirmed at all) and `live_extension_version`.
-    **Round 15's probe steps, each named, each failing closed** (`confirm-profile` refuses
-    with the step's name and what to do while any of them didn't pass; they are in
-    `probe-evidence.json` and in `worker.log`'s `probe round15` line):
+    **The probe's named steps for what only the real CLI and extension can show** (the gating
+    ones refuse `confirm-profile` with the step's name and what to do; all are in
+    `probe-evidence.json` and in `worker.log`'s `probe round15` and `probe round16` lines):
     - `redirect_read`: a session opens a check page that redirects off the run's sites (to
-      `localhost`, which the scope refuses) and reads it. It passes only when read-guard
-      refused that read as `read_drift`, the worker ended the session for it, the model
-      made no tool call after the read, the transcript shows only the one-line refusal for
-      the read (or no answer at all, when the session ended first), and the off-site page's
-      secret appears nowhere in the session's output. This is the step that shows whether
-      your Claude Code really keeps a refused page from the model.
+      `localhost`, which the scope refuses) and reads it. Two named results.
+      `session_ended` (gates confirmation): read-guard refused that read as `read_drift`,
+      the worker ended the session for it, and the model made no tool call after the read.
+      `secret_withheld` (recorded, not a gate): the transcript shows only the one-line
+      refusal for the read (or no answer at all, when the session ended first) and the
+      off-site page's secret appears nowhere in the session's output; it picks which of the
+      two boundary texts you sign (version 4 when it held, version 5 when it didn't). A
+      refusal says which result failed.
     - `structured_address`: a session reads the check page once with each of `read_page`,
-      `get_page_text` and `find`; every one of the three must carry its tab's address in a
-      structured field (none unplaced).
-    - `session_ids`: the init event's session id equals the one the hook's input carries,
-      in every decision of that session (recorded as evidence only: the barrier uses the
-      worker's own token).
+      `get_page_text` and `find`; every one of the three must carry its tab's address at
+      `tool_response.structuredContent.tabUrl` and nowhere else (none unplaced).
+    - `forged_address` (gates): a session opens a check page that redirects to an off-site
+      page writing a forged address field, naming the run's own check page, in its text, its
+      title and its DOM, and reads it. It passes only when that read counts as `read_drift`
+      or `read_unplaced` and the session was ended for it.
+    - `kill_latency` (gates): how long the worker's escalation took to end the sessions the
+      redirect and forged reads aborted, against its 8 second bound (below the read guard's
+      10 second hold).
+    - not-ready counts (`not_ready`, gates): how often the inventory barrier answered "not
+      ready yet" across the probe's sessions, and how long each wait took. A session that hit
+      the not-ready cap is named for what it means, the extension slow to attach
+      (`extension_slow_attach`), and the confirmation refuses: restart the Cain jobs Chrome,
+      wait a minute, probe again.
+    - `fragment_strip` (recorded, not a gate): with stripping on for that session alone, a
+      navigation to the check page with a fragment, then the tab list. It passes only when
+      the hook stripped the fragment and the tab shows the check page without it: the browser
+      received the stripped address. Only then does the confirmation turn stripping on
+      (`fragment_strip` in `confirmed.json`); otherwise every address with a fragment stays
+      refused.
+    - `session_ids` (recorded, a diagnostic, not a gate): whether the init event's session
+      id equals the one the hook's input carries, in every decision of that session. The
+      barrier uses the worker's own token, never either id.
     - `job_readback` (Windows): the helper's `inspect` run makes, joins and reads back its
       Job Object from inside whatever job the worker itself runs in (`outer_job` says
       whether there was one), as every run does.
@@ -1165,7 +1205,12 @@ install file with `"unattended": true` is refused (`unattended_unsupported`).
 
 The Windows CI job (`pcjobs-windows`) runs these tests on Windows and is green, but it
 is not a required check: only the repository's rulesets can make it one, and changing
-them takes admin rights a build session doesn't have.
+them takes admin rights a build session doesn't have. Cain's link holds Ship to it
+instead: a Ship card and the landing count only `pcjobs-windows` runs for that very head
+commit, every attempt GitHub lists, in whatever order: one still going holds, one that
+didn't pass refuses even beside a green re-run (a flaky Windows run needs a new commit),
+no run or a run for another commit refuses, and GitHub not answering holds. Tests run that
+gate against a fake GitHub for each case.
 
 **What the tests show, and what they don't.** The worker's tests (`cain/tests/pcjobs.test.ts`)
 run against a stand-in browser and a stand-in `claude` command that emulate the
@@ -1266,10 +1311,13 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `hook_missing_decision` from the probe's smoke step (the Windows hook quoting case) | `nav-decisions.jsonl` is missing or empty | The hook command didn't start. Claude Code runs it through Git Bash: `"$PCW_RUNTIME" "$PCW_WORKER" nav-guard`, both paths with forward slashes, set by the worker. Check `bun` (or `node`) runs from that path in Git Bash (`"C:/Users/you/.bun/bin/bun.exe" --version`) and that the worker's folder path has no `"` in it. |
 | `navigation_denied` | `nav-decisions.jsonl`: the `deny` lines and their `why` | The session tried an address or tool it may not (`address_not_allowed`, whose line has only the address's registrable `domain` and the keyed hashes `host_hmac` and `url_hmac`, never the address; `no_address`, a new tab without one; `tool_not_allowed`, a tool name not on the hook's list; `scheme_not_allowed`, an address that isn't http or https; `private_address`, this computer or its network, or a name that resolves to one; `ip_address`, any other IP-literal host; `trailing_dot`; `domain_not_allowed`, a host the job's entry doesn't allow, the usual sign of a page planting an address; `idn_not_allowed`, an internationalized host the entry doesn't name exactly; `query_not_allowed`, `query_too_long` or `fragment_not_allowed`; `inventory_unconfirmed`, a call whose session marker isn't this session's), or nav-guard couldn't decide (`timeout`, `internal_error`, `unreadable_input`, `log_failed`). A page talking the model into a detour shows up here: look at the job's site. A `tool_not_allowed` after an extension update means the extension added or renamed a tool. `context_owed` lines aren't counted here (see `tab_context_owed`), nor `inventory_not_ready` lines (the model was asked to make the same call again). |
 | `read_drift` | the run's output (`"drift": "read_drift:<registrable domain>"`), `last-run.json`'s `domain`, and `nav-decisions.jsonl`: the line with `why` `read_drift` and `phase` `post` (its registrable `domain` and keyed hashes, never the address) | A page read happened on a tab that had left the job's sites (a redirect after an allowed navigation, or a script moving the tab): read-guard refused it, the session was ended at once and the report thrown away. The output names the registrable domain the tab went to. If the site really sends you on there to show that page, add that host to the entry's `domains` (the probe's `candidate_patterns` lists the hosts a sign-in went through) and sign again. Needs a code change: no. |
-| `read_unplaced` | `nav-decisions.jsonl`: the line with `why` `read_unplaced` and `phase` `post` | A reading tool's answer carried no tab address in a structured field (or read-guard couldn't read or log it): the session was ended at once and the report thrown away. If it happens on every run, your Claude in Chrome's answers don't carry the field; the probe's `structured_address` step would have refused to confirm. Report it: needs a code change. |
+| `read_unplaced` | `nav-decisions.jsonl`: the line with `why` `read_unplaced` and `phase` `post` | A reading tool's answer carried no tab address at `tool_response.structuredContent.tabUrl`, or carried another address field beside it or that key twice (or read-guard couldn't read or log it): the session was ended at once and the report thrown away. If it happens on every run, your Claude in Chrome's answers don't carry the field; the probe's `structured_address` step would have refused to confirm. Report it: needs a code change. |
 | `inventory_never_ready` | `nav-decisions.jsonl`: three `inventory_not_ready` lines, then one `inventory_never_ready` | The session asked four times before the worker had checked its tools: the worker never wrote the session's marker (its inventory check never passed, or the marker couldn't be written). Run again; if it repeats, look for `tool_inventory` lines in `worker.log`. |
 | `refusal_cap` | `nav-decisions.jsonl`: the session's `deny` lines, the last with `cap` `refusal_cap` | The session collected twelve refusals of any kind and was ended. A page talking the model into one detour after another looks like this: look at the `why` of each line and at the job's site. Needs a code change: no. |
-| `redirect_read`, `structured_address`, `session_ids` (`confirm-profile`) | `probe-evidence.json`: that step's line; `worker.log`: `probe round15` | That probe step didn't pass (above, under the probe). Nothing runs on this Claude Code and extension: rerun the probe once; if it repeats, report it (needs a code change). |
+| `redirect_read`, `structured_address`, `forged_address`, `kill_latency` (`confirm-profile`) | `probe-evidence.json`: that step's line (for `redirect_read`, its `session_ended` and `secret_withheld`; the refusal says which failed); `worker.log`: `probe round15` and `probe round16` | That probe step didn't pass (above, under the probe). Nothing runs on this Claude Code and extension: rerun the probe once; if it repeats, report it (needs a code change). `session_ids` and `fragment_strip` never refuse: the first is a diagnostic, the second only turns fragment stripping on. |
+| `extension_slow_attach` (`confirm-profile`) | `probe-evidence.json`: `not_ready` (counts, `waits_ms`, `first_wait_ms`) | A probe session hit the not-ready cap: Claude in Chrome took too long to attach. Restart the Cain jobs Chrome, wait a minute, then run the probe again. Needs a code change: only if it repeats on a healthy Chrome. |
+| `abort_kill_failed` | `abort-kill-failed.json` in the worker folder; `worker.log`: `abort_kill_failed` | A hook ended a session, and the worker couldn't see it gone within 8 seconds after ending its Job Object and then its process. The PC is unconfirmed until a new probe: check Task Manager for a leftover `claude` or `pcw-jobrun`, end it, then run the probe and `confirm-profile` again (which clears the file). Report it if it repeats. |
+| `navigation_denied` with `fragment_not_allowed` | `nav-decisions.jsonl`: the deny line | The session tried an address with a `#` part. Fragments are refused unless your probe's `fragment_strip` step passed. Nothing to fix unless the job's own address has one: pin it without the `#` part. |
 | `containment_unavailable` with step `job_readback` (`confirm-profile`) | `probe-evidence.json`: `job_readback` (`outer_job`, `readback`) | The helper couldn't make, join or read back its Job Object inside the job the worker runs in. Start the worker from a plain terminal (not from another tool that puts it in a job of its own) and probe again; if it repeats, report it. |
 | `domain_not_allowed` (a job's result) | the job and your allowlist entry | The job names a host (its site or its start address's host) that its entry's `domains` don't allow, so no session ran. Write the job on the entry's own hosts, or add the host to the entry and sign again. Needs a code change: no. |
 | `allowlist_domains_missing` (`sign-allowlist`), or `allowlist_unverified` on every job | its detail: `entry <n>: name "domains" ...`; `worker.ts sign-allowlist` | An entry has no `domains` (every entry needs them from this version). Add the hosts its runs may open (setup step 5) and sign again. Needs a code change: no. |

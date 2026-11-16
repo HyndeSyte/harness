@@ -31,8 +31,8 @@
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
 //     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
-//                                       result: his recorded tap on the first option of one of Cain's asks that
-//                                       shows them, or his own DM message showing them in answer to such an ask
+//                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
+//                                       exactly those values when posted; a message he typed never counts
 //                                       (core.ts reuseProof); "ok", or refused with why
 // Nothing is published to the LAN: the App has no "ports:".
 //

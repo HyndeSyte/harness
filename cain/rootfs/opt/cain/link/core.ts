@@ -61,8 +61,8 @@
 //   App and version the tap installs, a line from GitHub has the pull request's title, how
 //   much it changes, the parts that matter most and its checks (read as the landing reads
 //   them: a failed check, or one not run yet, refuses the card, and pcjobs-windows, whenever
-//   the head's tests.yml names it or it ran there, refuses it unless its newest run there
-//   passed; merged at that head, it's in
+//   the head's tests.yml names it or it ran there, refuses it unless every run of it GitHub
+//   lists for that very head passed (merge.ts judgeChecks); merged at that head, it's in
 //   main already), and the last line is the review service's own for the review Cain names,
 //   which must be a review of that very head. Cain's words say only what Dane will notice, on
 //   one line. Anything going wrong while the new lines are built gives the card as it was
@@ -139,6 +139,8 @@ const DIRECT_KINDS = new Set(["stopped", "resumed", "alert"]);
 const ITEM = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
 const QUESTION = /^[A-Za-z0-9][A-Za-z0-9._:#-]{0,39}$/;
 const SNOWFLAKE = /^\d{15,22}$/;
+// The one answer of an owner-reuse ask that approves it (reuseProof): its first option.
+export const REUSE_YES = "Use it";
 const SHA = /^[0-9a-f]{40}$/;
 export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
 
@@ -182,6 +184,14 @@ export interface Shown {
     tries?: number; next?: number;    // it can't land yet: how often it was tried, and when it's tried next
     line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
+  values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
+}
+// The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
+// tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
+// characters; at most 3 (more, and none count).
+export function askValues(text: string): string[] {
+  const out = [...String(text ?? "").matchAll(/"([^"\r\n]{4,300})"/g)].map((m) => m[1]);
+  return out.length <= 3 ? out : [];
 }
 export interface Ask {               // Cain's question waiting behind the open one
   text: string; options: string[]; item: string; question: string; replyTo?: string; at: number; expires: number;
@@ -1346,7 +1356,7 @@ export class Link {
       { replyTo: e.replyTo, nonce });
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
-      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
+      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false }, values: askValues(text) });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -1531,63 +1541,46 @@ export class Link {
   // A follow-up PC job may carry a value an earlier result reported only on his yes
   // (pcjobs/core.ts, owner_reuse). Cain writes the job, so his say-so proves nothing: the
   // keeper sends the Discord message id the job names, and the link answers from what it
-  // recorded and what Discord has, never from Cain's words. The id is one of:
-  //   - tap: one of Cain's asks, which the link recorded he answered by tapping its first
-  //     option (the yes, "Use it"; a tap is recorded only from him, in his DM, with Cain
-  //     paired to him: who(), above), and whose words on Discord show every value exactly;
-  //   - reply: a message of his in the DM (by him, the bot's owner, Cain paired to him) that
-  //     shows every value exactly and is a Discord reply to such an ask, or, not a reply,
-  //     comes after one (the newest ask the link posted before it). An ask he answered by
-  //     tapping another option is a no, whatever he wrote after.
-  // Anything else is a Refusal: an id that isn't a Discord id, no such message in his DM,
-  // a message by anyone else, an ask not answered by his yes, a value missing. Discord
-  // down is an error. The keeper refuses the job on either (fail closed).
-  async reuseProof(messageId: unknown, values: unknown): Promise<{ status: "ok"; message: string; via: "tap" | "reply"; ask: string; values: string[] }> {
+  // recorded and what Discord has, never from Cain's words. Only one thing is a yes (0.12.0):
+  // his tap on the "Use it" button, the first option, of one of Cain's asks (a tap is
+  // recorded only from him, in his DM, with Cain paired to him: who(), below), where the
+  // values the job names are exactly the values that ask quoted when the link posted it
+  // (askValues, recorded with the ask as values) and Discord still shows each of them on it.
+  // The id is the ask's own message id. A message he typed never authorises, even one that
+  // replies to the ask or quotes the value: free text can be misread, and the keeper refuses
+  // a reuse that names a plain message. One tap answers for one job: the keeper records each
+  // id it accepted in an append-only file that survives restarts (pcjobs/main.ts usedReuse).
+  // Anything else is a Refusal: an id that isn't a Discord id, a message that isn't one of
+  // Cain's asks, an ask not answered by his "Use it" tap, other values than it quoted.
+  // Discord down is an error. The keeper refuses the job on either (fail closed).
+  async reuseProof(messageId: unknown, values: unknown): Promise<{ status: "ok"; message: string; via: "tap"; ask: string; values: string[] }> {
     const id = String(messageId ?? "").trim();
-    if (!SNOWFLAKE.test(id)) throw new Refusal("needs a Discord message id: his reply in your DM, or the ask he tapped");
+    if (!SNOWFLAKE.test(id)) throw new Refusal("needs a Discord message id: the ask he tapped \"Use it\" on");
     const vals = Array.isArray(values) ? values : [];
     if (!vals.length || vals.length > 3 || !vals.every((v) => typeof v === "string" && v.length >= 4 && v.length <= 300 && !/[\u0000-\u001f\u007f]/.test(v)))
       throw new Refusal("needs 1 to 3 values, each one line of 4 to 300 characters");
     const want = vals as string[];
     const { owner, dm, bot } = await this.identity();
     if (this.d.paired() && this.d.paired() !== owner) throw new Refusal("Cain is paired with someone other than the bot's owner");
-    const get = async (mid: string) => {
-      try { return await this.rest("GET", `/channels/${dm}/messages/${mid}`); }
-      catch (e) { if (/discord 404/.test(String(e))) throw new Refusal("no message with that id in his DM"); throw e; }
-    };
-    const missing = (text: string) => want.filter((v) => !text.includes(v));
-    // One of Cain's asks, as Discord shows it now (his answer's line taken off), with every value.
-    const askShows = async (aid: string, rec: Shown) => {
-      const msg = await get(aid);
-      if (String(msg?.author?.id ?? "") !== bot) throw new Refusal("that ask isn't the bot's message");
-      if (rec.outcome === "answered" && !rec.words && rec.label !== undefined && rec.label !== rec.q?.options[0])
-        throw new Refusal(`he answered that ask by tapping "${rec.label}", not its first option`);
-      if (missing(withoutOutcome(String(msg?.content ?? ""))).length) throw new Refusal("that ask doesn't show every value exactly as written");
-    };
     const s = this.d.load();
     const rec = s.messages[id];
-    if (rec?.kind === "ask") {
-      if (!(rec.outcome === "answered" && !rec.words && rec.q && rec.label !== undefined))
-        throw new Refusal("no tap of his is recorded on that ask: it was answered in words, expired, replaced or is still open");
-      await askShows(id, rec);
-      return { status: "ok", message: id, via: "tap", ask: id, values: [...want] };
-    }
-    if (rec) throw new Refusal("that message is a card of the link's, not one of Cain's asks");
-    const msg = await get(id);
-    if (String(msg?.author?.id ?? "") !== owner) throw new Refusal("that isn't one of his messages in your DM");
-    if (missing(String(msg?.content ?? "")).length) throw new Refusal("his message doesn't show every value exactly as written");
-    const ref = msg?.message_reference;
-    let aid = "";
-    if (ref?.message_id && Number(ref.type ?? 0) === 0) aid = String(ref.message_id);
-    else {
-      // Not a reply: the newest ask the link posted before his message.
-      for (const [k, m] of Object.entries(s.messages))
-        if (m.kind === "ask" && SNOWFLAKE.test(k) && BigInt(k) < BigInt(id) && (!aid || BigInt(k) > BigInt(aid))) aid = k;
-    }
-    const ask = aid ? s.messages[aid] : undefined;
-    if (!ask || ask.kind !== "ask") throw new Refusal(ref?.message_id ? "his message replies to something other than one of your asks" : "no ask of yours came before his message");
-    await askShows(aid, ask);
-    return { status: "ok", message: id, via: "reply", ask: aid, values: [...want] };
+    if (!rec) throw new Refusal("that isn't one of your asks: only his \"Use it\" tap on your ask approves a reuse, never a message he typed");
+    if (rec.kind !== "ask") throw new Refusal("that message is a card of the link's, not one of Cain's asks");
+    if (!(rec.outcome === "answered" && !rec.words && rec.q && rec.label !== undefined))
+      throw new Refusal("no tap of his is recorded on that ask: it was answered in words, expired, replaced or is still open");
+    if (rec.label !== rec.q.options[0] || rec.label !== REUSE_YES)
+      throw new Refusal(`he answered that ask by tapping "${rec.label}", not its first option "${REUSE_YES}"`);
+    const asked = rec.values ?? [];
+    if (!asked.length) throw new Refusal("that ask quoted no value when it was posted, so his tap approved none");
+    if (asked.length !== want.length || want.some((v) => !asked.includes(v)) || new Set(want).size !== want.length)
+      throw new Refusal("the values aren't exactly the ones that ask quoted when it was posted");
+    let msg: any;
+    try { msg = await this.rest("GET", `/channels/${dm}/messages/${id}`); }
+    catch (e) { if (/discord 404/.test(String(e))) throw new Refusal("no message with that id in his DM"); throw e; }
+    if (String(msg?.author?.id ?? "") !== bot) throw new Refusal("that ask isn't the bot's message");
+    const text = withoutOutcome(String(msg?.content ?? ""));
+    if (want.some((v) => !text.includes(v))) throw new Refusal("that ask doesn't show every value exactly as written");
+    return { status: "ok", message: id, via: "tap", ask: id, values: [...want] };
   }
 
   // -- taps -------------------------------------------------------------------

@@ -104,13 +104,15 @@ describe("the Ship card the link builds", () => {
     await refused("CI is still running pcjobs-windows on it: show the card once it has passed");
     r.github.runs = win(null, "queued");
     await refused("CI is still running pcjobs-windows on it");
-    // The newest run counts: a re-run that's going, after a green one, refuses; a green re-run after a failed one passes.
+    // Every attempt counts, in either order: a re-run that's going, after a green one, refuses; so does a green re-run beside a failed one.
     r.github.runs = [...passing(), checkRun("pcjobs-windows", "success", "completed", 1), checkRun("pcjobs-windows", null, "in_progress", 2)];
     await refused("CI is still running pcjobs-windows on it");
     expect(r.posts()).toBe(posts);                                               // nothing posted for a refused card
     r.github.runs = [...passing(), checkRun("pcjobs-windows", "failure", "completed", 1), checkRun("pcjobs-windows", "success", "completed", 2)];
-    expect(await github()).toBe(`${GITHUB} ${CHECKS_PASSED}`);
-    posts = r.posts();
+    await refused("its pcjobs-windows check didn't pass (failure)");
+    r.github.runs = [...passing(), checkRun("pcjobs-windows", "success", "completed", 2), checkRun("pcjobs-windows", "failure", "completed", 1)];
+    await refused("its pcjobs-windows check didn't pass (failure)");
+    expect(r.posts()).toBe(posts);
     // Named in the head's tests.yml but no run seen yet: fail closed.
     r.github.runs = passing();
     await refused("CI hasn't run pcjobs-windows on it yet: show the card once its checks have run");

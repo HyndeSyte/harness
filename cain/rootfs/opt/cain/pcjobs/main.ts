@@ -21,7 +21,7 @@
 //   bun main.ts list            the PC worker's last heartbeat, then one line per job, newest first
 //   bun main.ts result <id>     a job's result, checked, as fixed lines (each fact a quoted string, labelled untrusted)
 //   bun main.ts worker          the PC worker's last heartbeat
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHmac } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
@@ -33,15 +33,17 @@ export type Config = {
   link?: string;                 // Cain's link, for owner_reuse proofs (default http://127.0.0.1:8097)
   discordEnv?: string;           // the bot token's file, for the link's key (the token itself is never kept or printed)
   verifyReuse?: ReuseCheck;      // the tests' stand-in for the link
+  used?: string;                 // the append-only file of the owner-reuse taps already spent (default /data/pc-jobs-reuse-used.jsonl)
 };
 
 // ---- His yes to reusing a reported value, checked by the link ----------------------
-// A job's owner_reuse names the Discord message of his yes (core.ts OwnerReuse). Cain
-// wrote the job, so the keeper asks the link, which alone hears his taps and reads his DM
-// as the bot (link/core.ts reuseProof): his recorded tap on the first option ("Use it")
-// of one of Cain's asks that shows every value, or his own message in the DM showing every
-// value, in answer to such an ask. Fail closed: no key, the link down or slow, a refusal,
-// or an answer that isn't a plain yes for this message and these values, refuses the job.
+// A job's owner_reuse names the Discord message of his yes (core.ts OwnerReuse): the ask he
+// tapped "Use it" on. Cain wrote the job, so the keeper asks the link, which alone hears his
+// taps (link/core.ts reuseProof): his recorded tap on the "Use it" button of one of Cain's
+// asks that quoted exactly these values when it was posted. A message he typed never counts,
+// even one quoting the value: the link refuses it, and so does the keeper, which takes only
+// an answer that says "tap". Fail closed: no key, the link down or slow, a refusal, or an
+// answer that isn't a plain tap for this message and these values, refuses the job.
 export type ReuseCheck = (r: OwnerReuse) => { ok: true; via: string } | { ok: false; why: string };
 export const LINK = "http://127.0.0.1:8097";
 export const DISCORD_ENV = "/data/.claude/channels/discord/.env";
@@ -50,7 +52,7 @@ export function reuseAnswer(r: OwnerReuse, text: string): { ok: true; via: strin
   let a: any;
   try { a = JSON.parse(text); } catch { return { ok: false, why: "the link didn't answer" }; }
   if (a?.status === "refused" && typeof a.said === "string") return { ok: false, why: `the link says ${a.said.replace(/[\u0000-\u001f]+/g, " ").slice(0, 200)}` };
-  if (a?.status !== "ok" || a.message !== r.message_id || (a.via !== "tap" && a.via !== "reply")
+  if (a?.status !== "ok" || a.message !== r.message_id || a.via !== "tap" || a.ask !== r.message_id
     || !Array.isArray(a.values) || a.values.length !== r.values.length || a.values.some((v: unknown, i: number) => v !== r.values[i]))
     return { ok: false, why: "the link couldn't check it" };
   return { ok: true, via: a.via };
@@ -72,6 +74,28 @@ export function linkReuse(cfg: Pick<Config, "link" | "discordEnv">): ReuseCheck 
     if (p.exitCode !== 0) return { ok: false, why: "the link didn't answer" };
     return reuseAnswer(r, p.stdout.toString());
   };
+}
+
+// ---- The taps already spent on a reuse: an append-only file -------------------------------
+// One "Use it" tap answers for one job. The keeper records each tap it accepted, with its job,
+// one JSON line each, in a file of its own outside the queue copy (which is rebuilt from
+// GitHub), only ever appended to, so a keeper restart, a queue copy made afresh or a job file
+// gone from the queue doesn't free a tap for a second job. The queue's own job files are read
+// too (check, below), which covers a crash between the push and the line.
+export const USED_REUSE = "/data/pc-jobs-reuse-used.jsonl";
+export function usedReuse(cfg: Pick<Config, "used">): Map<string, string> {
+  const out = new Map<string, string>();
+  let text = "";
+  try { text = readFileSync(cfg.used ?? USED_REUSE, "utf8"); } catch { return out; }
+  for (const l of text.split("\n")) {
+    try { const o = JSON.parse(l); if (typeof o?.m === "string" && typeof o?.job === "string" && !out.has(o.m)) out.set(o.m, o.job); } catch { /* a torn line */ }
+  }
+  return out;
+}
+export function recordReuse(cfg: Pick<Config, "used">, m: string, job: string): void {
+  const f = cfg.used ?? USED_REUSE;
+  mkdirSync(dirname(f), { recursive: true });
+  appendFileSync(f, JSON.stringify({ m, job }) + "\n");
 }
 
 const KEEPER = "Cain's PC job keeper";
@@ -232,16 +256,18 @@ export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: 
     .filter((v) => !(/^https?:/i.test(v) && own.has(normalUrl(v, true))));
   // A mitigation, not a guarantee (core.ts): the pinned domains are the control. A value
   // the owner said yes to reusing goes through only with owner_reuse naming the Discord
-  // message of his yes, which the link checks (linkReuse, above); Cain's words alone never
-  // count, and one message answers for one job.
+  // message of his "Use it" tap, which the link checks (linkReuse, above); Cain's words and
+  // the owner's typed replies never count, and one tap answers for one job, across restarts
+  // (usedReuse, above, and the queue's own job files).
   const reuse = req.job && typeof req.job === "object" ? req.job.owner_reuse : undefined;
   if (reuse !== undefined && reuse !== null) {
     if (!reuseOk(reuse)) return { why: `${REUSE_SHAPE}; without his message's id it is refused` };
-    const used = jobs.find((j) => j.owner_reuse?.message_id === reuse.message_id);
-    if (used) return { why: `owner_reuse refused: that message of his already answered for ${used.id}; ask him again for this job` };
+    const used = jobs.find((j) => j.owner_reuse?.message_id === reuse.message_id)?.id ?? usedReuse(cfg).get(reuse.message_id);
+    if (used) return { why: `owner_reuse refused: that tap of his already answered for ${used}; ask him again for this job` };
     let v: ReturnType<ReuseCheck>;
     try { v = (cfg.verifyReuse ?? linkReuse(cfg))(reuse); } catch { v = { ok: false, why: "the link couldn't check it" }; }
-    if (!v.ok) return { why: `owner_reuse refused: ${v.why}. Reuse needs his "Use it" tap on your ask that quotes each value, or his own reply in the DM that does` };
+    if (v.ok && v.via !== "tap") v = { ok: false, why: "only his \"Use it\" tap counts, never a message he typed" };
+    if (!v.ok) return { why: `owner_reuse refused: ${v.why}. Reuse needs his "Use it" tap on your ask that quotes each value; a reply he types never counts` };
   }
   if (unapprovedValues(req.job, values).length) return { why: "a job can't carry a value from a PC result (an address or account a page showed): write it from the owner's words or the allowlist instead, or ask the owner and record his yes as owner_reuse with its Discord message id" };
   let id = newId(now, cfg.rand);
@@ -315,6 +341,10 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
     for (const m of made) {
       if (m.job) {
+        if (m.job.owner_reuse) {
+          try { recordReuse(cfg, m.job.owner_reuse.message_id, m.job.id); }
+          catch (e) { log(`couldn't record the reuse tap for ${m.job.id} (the queue's job file still holds it): ${(e as Error).message}`); }
+        }
         writeOutcome(cfg, { request: m.rid, state: "queued", id: m.job.id });
         log(`queued ${m.job.id} (${m.job.step} ${m.job.action} on ${m.job.site})`);
       } else {
@@ -354,6 +384,7 @@ export function configFromEnv(env = process.env): Config {
     pub: env.CAIN_SHIP_PUB ?? "/data/trust/ship.pub",
     link: env.CAIN_LINK ?? LINK,
     discordEnv: env.LINK_ENV ?? DISCORD_ENV,
+    used: env.PC_JOBS_REUSE_USED ?? USED_REUSE,
   };
 }
 

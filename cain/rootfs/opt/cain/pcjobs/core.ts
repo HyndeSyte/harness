@@ -47,7 +47,7 @@ export const CODES = [
   "worker_signin_missing", "session_cleanup_failed", "session_stopped", "extension_entry_missing", "extra_extension", "host_parent_gone",
   "unattended_unsupported", "worker_folder_denied", "prefs_disagree", "canary_first", "other_tab", "tab_context_owed",
   "containment_unavailable", "domain_not_allowed", "read_drift", "helper_compiler_missing", "helper_blocked",
-  "read_unplaced", "inventory_never_ready", "refusal_cap",
+  "read_unplaced", "inventory_never_ready", "refusal_cap", "abort_kill_failed", "extension_slow_attach",
 ] as const;
 export type State = typeof STATES[number];
 export type Step = typeof STEPS[number];
@@ -150,12 +150,13 @@ export interface Job {
 }
 // The owner's go to reuse values a PC result reported in a new job: the values, exactly,
 // his answer as Cain wrote it down, in quotes, and the Discord message that proves it
-// (message_id): the ask of Cain's he tapped "Use it" on, or his own reply in the DM. Cain
-// writes the job, so go is only Cain's record; message_id is what counts. The keeper
-// hands it to the link, which checks it against its own record of his taps and against
-// Discord (link/core.ts reuseProof), and refuses the job unless it holds (main.ts check).
-// The job file keeps it, so the queue shows which message said yes, and one message
-// answers for one job only.
+// (message_id): the ask of Cain's he tapped "Use it" on, and nothing else (0.12.0: a reply he
+// typed never counts, even one quoting the value). Cain writes the job, so go is only Cain's
+// record; message_id is what counts. The keeper hands it to the link, which checks it
+// against its own record of his taps and of the values that ask quoted when posted
+// (link/core.ts reuseProof), and refuses the job unless it holds (main.ts check). The job
+// file keeps it, so the queue shows which tap said yes, and one tap answers for one job
+// only, across keeper restarts (main.ts usedReuse).
 export interface OwnerReuse { values: string[]; go: string; message_id: string }
 
 export interface Result {
@@ -315,7 +316,7 @@ function seenOk(s: unknown): s is Seen {
 export const SNOWFLAKE = /^\d{15,22}$/;
 export const REUSE_KEYS = ["values", "go", "message_id"];
 export const REUSE_SHAPE = "owner_reuse is null, or {values: 1 to 3 reported values, go: the owner's answer to Cain's ask, in quotes, "
-  + "message_id: the Discord message id of his yes (the ask he tapped \"Use it\" on, or his reply in the DM)}";
+  + "message_id: the Discord message id of the ask he tapped \"Use it\" on (a reply he typed never counts)}";
 export const reuseOk = (r: unknown): r is OwnerReuse => isObj(r) && exact(r, REUSE_KEYS) && Array.isArray(r.values) && r.values.length >= 1 && r.values.length <= 3
   && r.values.every((v: unknown) => line(v, 300) && (v as string).length >= 4) && typeof r.go === "string" && QUOTED.test(r.go)
   && typeof r.message_id === "string" && SNOWFLAKE.test(r.message_id);
@@ -923,10 +924,10 @@ export function jobFromAsk(ask: any, now: Date, id: string): Checked<Job> {
 // When a follow-up job really needs a reported value (an address the owner wants checked
 // next), Cain asks the owner first (keeper.sh ask, the value quoted, "Use it" first) and
 // records his answer on the job as owner_reuse: the values, exactly, his answer in quotes,
-// and the Discord message id of his yes (that ask, once he tapped "Use it", or his own
-// reply). Cain's words alone prove nothing: the keeper has the link check the message
+// and the Discord message id of that ask, once he tapped "Use it" on it (a reply he typed
+// never counts). Cain's words alone prove nothing: the keeper has the link check the tap
 // (main.ts check, link/core.ts reuseProof) and refuses the job unless the link answers
-// that it is his yes and shows every value. Only then do exactly those values go
+// that it is his "Use it" tap on an ask that quoted exactly those values. Only then do exactly those values go
 // through, and nothing else carried from a result. unapprovedValues below reads the
 // shape alone; the proof is check's.
 const quoted = (v: string | number | boolean) => typeof v === "string" ? JSON.stringify(v) : String(v);

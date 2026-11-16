@@ -10,7 +10,7 @@ import { ACTIONS_APP, bumpsAt, checkRuns, facts, headChecks, inMain, judgeChecks
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
 
-function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; main?: string; prHead?: string; yml?: string | null | 0 } = {}) {
+function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; main?: string; prHead?: string; yml?: string | null | 0; winStatus?: number } = {}) {
   const parents: Record<string, string> = over.parents ?? { [M1]: M0, [H1]: M1, [H2]: H1, [X1]: M0 };
   const state = {
     main: over.main ?? M1,
@@ -48,6 +48,7 @@ function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; 
       }
       if (path.startsWith(`/repos/${REPO}/commits/${H1}/check-runs`)) {
         const name = new URL(`http://x${path}`).searchParams.get("check_name");
+        if (name === "pcjobs-windows" && over.winStatus) return { status: over.winStatus, body: { message: "Server Error" } };
         const mine = name ? runs.filter((r: any) => r?.name === name) : runs;
         return { status: 200, body: { total_count: mine.length, check_runs: mine } };
       }
@@ -143,7 +144,7 @@ describe("landing his Ship tap", () => {
   });
 
   test("pcjobs-windows, when the head's tests.yml names it or it ran there, must pass too; an older head without it lands as before", async () => {
-    const run = (name: string, conclusion: string | null, status = "completed", id = 1) => ({ id, name, status, conclusion, app: { id: ACTIONS_APP } });
+    const run = (name: string, conclusion: string | null, status = "completed", id = 1) => ({ id, name, status, conclusion, head_sha: H1, app: { id: ACTIONS_APP } });
     const req = () => ["pytest", "bun", "pr"].map((n, i) => run(n, "success", "completed", 100 + i));
     const YML = "jobs:\n  pytest: {}\n  bun: {}\n  pcjobs-windows:\n    runs-on: windows-latest\n";
     const cases: [any[], string | null | 0, string | null, boolean][] = [
@@ -165,13 +166,47 @@ describe("landing his Ship tap", () => {
   });
 
   test("headChecks: the runs, and whether pcjobs-windows must pass", async () => {
-    const run = (name: string, conclusion = "success") => ({ id: 1, name, status: "completed", conclusion, app: { id: ACTIONS_APP } });
+    const run = (name: string, conclusion = "success") => ({ id: 1, name, status: "completed", conclusion, head_sha: H1, app: { id: ACTIONS_APP } });
     const req = ["pytest", "bun", "pr"].map((n) => run(n));
     expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pcjobs-windows: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: true });
     expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pytest: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: false });
     expect(await headChecks(gh({ runs: [...req, run("pcjobs-windows")] }).d, REPO, H1)).toEqual({ runs: [...req, run("pcjobs-windows")], windows: true });
     expect(await headChecks(gh({ runs: req, yml: 0 }).d, REPO, H1)).toBeNull();
     expect(await headChecks(gh({ runs: req }).d, REPO, H2)).toBe("missing");
+  });
+
+  test("the Windows-job gate against a fake GitHub: an API error, no run, a cancelled run, a stale-head run and re-run attempts in both orders all refuse or hold; none passes", async () => {
+    const YML = "jobs:\n  pytest: {}\n  bun: {}\n  pcjobs-windows:\n    runs-on: windows-latest\n";
+    const run = (conclusion: string | null, status = "completed", id = 1, head = H1) => ({ id, name: "pcjobs-windows", status, conclusion, head_sha: head, app: { id: ACTIONS_APP } });
+    const req = () => ["pytest", "bun", "pr"].map((n, i) => ({ id: 100 + i, name: n, status: "completed", conclusion: "success", head_sha: H1, app: { id: ACTIONS_APP } }));
+    const cases: [string, { runs: any[]; winStatus?: number }, string, boolean][] = [
+      ["API error", { runs: [...req(), run("success")], winStatus: 502 }, "GitHub didn't answer about its checks", true],
+      ["API refusal", { runs: [...req(), run("success")], winStatus: 403 }, "GitHub didn't answer about its checks", true],
+      ["no run", { runs: req() }, "CI hasn't run pcjobs-windows on it", false],
+      ["cancelled", { runs: [...req(), run("cancelled")] }, "CI's pcjobs-windows check didn't pass on it (cancelled)", false],
+      ["stale head", { runs: [...req(), run("success", "completed", 1, H2)] }, "CI hasn't run pcjobs-windows on it", false],
+      ["no head named", { runs: [...req(), { ...run("success"), head_sha: undefined }] }, "CI hasn't run pcjobs-windows on it", false],
+      ["green, then a failed re-run", { runs: [...req(), run("success", "completed", 1), run("failure", "completed", 2)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      ["failed, then a green re-run", { runs: [...req(), run("failure", "completed", 1), run("success", "completed", 2)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      ["green re-run listed first", { runs: [...req(), run("success", "completed", 2), run("failure", "completed", 1)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      ["green, then a re-run going", { runs: [...req(), run("success", "completed", 1), run(null, "in_progress", 2)] }, "CI is still running pcjobs-windows on it", true],
+      ["a re-run going, listed first", { runs: [...req(), run(null, "queued", 2), run("success", "completed", 1)] }, "CI is still running pcjobs-windows on it", true],
+      ["a stale green beside this head's failure", { runs: [...req(), run("success", "completed", 2, H2), run("failure", "completed", 1)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+    ];
+    for (const [, c, why, again] of cases) {
+      const { d, state } = gh({ ...c, yml: YML });
+      expect(await land(d, L)).toEqual({ ok: false, why, again });
+      expect(state.pushes).toEqual([]);
+      // The Ship card reads the same: headChecks, then judgeChecks.
+      const h = await headChecks(d, REPO, H1);
+      if (c.winStatus) { expect(h).toBeNull(); continue; }
+      expect(h).not.toBeNull();
+      const w = judgeChecks((h as any).runs, (h as any).windows).find((x) => x.name === "pcjobs-windows")!;
+      expect(w.state).not.toBe("passed");
+    }
+    // A stale-head run that didn't pass isn't this head's either, and doesn't make an older workflow wait.
+    const old = gh({ runs: [...req(), run("failure", "completed", 1, H2)], yml: "jobs:\n  pytest: {}\n" });
+    expect(await land(old.d, L)).toEqual({ ok: true, already: false });
   });
 
   test("when GitHub or the fetch doesn't answer, nothing is pushed, and a new card can follow", async () => {

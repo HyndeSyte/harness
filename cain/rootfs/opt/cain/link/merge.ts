@@ -16,7 +16,8 @@ export const ACTIONS_APP = 15368;               // GitHub Actions, the source of
 export const CHECKS = ["pytest", "bun", "pr"] as const;
 // The Windows run of the PC worker's tests (tests.yml). No ruleset requires it (that takes
 // admin rights), so the link does: whenever the head's tests.yml names it, or it ran on the
-// head, a Ship card waits for its newest run there to pass, and so does the landing.
+// head, a Ship card waits for every run of it on that very head to pass (judgeChecks), and
+// so does the landing.
 export const WINDOWS_CHECK = "pcjobs-windows";
 const TESTS_YML = ".github/workflows/tests.yml";
 
@@ -177,14 +178,20 @@ export async function headChecks(d: Pick<MergeDeps, "api">, repo: string, head: 
     if (typeof yml.content !== "string" || yml.encoding !== "base64") return null;
     named = Buffer.from(yml.content, "base64").toString("utf8").includes(WINDOWS_CHECK);
   }
-  const ran = win.some((r) => r?.name === WINDOWS_CHECK && r?.app?.id === ACTIONS_APP);
-  return { runs: [...req, ...win], windows: named || ran };
+  // A Windows run for another commit (a stale head) isn't this head's run: it is left out, so
+  // it can neither pass the head nor count as having run there (0.12.0). Only a run whose
+  // head_sha is this very head counts.
+  const mine = win.filter((r) => r?.head_sha === head);
+  const ran = mine.some((r) => r?.name === WINDOWS_CHECK && r?.app?.id === ACTIONS_APP);
+  return { runs: [...req, ...mine], windows: named || ran };
 }
 
 // Each required check's newest run from GitHub Actions: passed (success only), still
 // running, failed (any other conclusion, skipped, neutral and cancelled too), or not run
-// yet; with windows, pcjobs-windows judged the same way after them. The one judgment for
-// the landing (failedChecks) and the Ship card.
+// yet; with windows, pcjobs-windows after them, judged stricter (0.12.0): every attempt of it
+// GitHub lists on the head counts, in whatever order they come, so one still going holds it
+// and one that didn't pass refuses it even beside a green re-run. A flaky Windows run needs a
+// new commit. The one judgment for the landing (failedChecks) and the Ship card.
 export interface CheckState { name: string; state: "passed" | "running" | "failed" | "missing"; conclusion?: string }
 export function judgeChecks(runs: any[], windows = false): CheckState[] {
   const names: string[] = windows ? [...CHECKS, WINDOWS_CHECK] : [...CHECKS];
@@ -192,6 +199,12 @@ export function judgeChecks(runs: any[], windows = false): CheckState[] {
     const mine = runs.filter((r) => r?.name === name && r?.app?.id === ACTIONS_APP).sort((a, b) => Number(b.id) - Number(a.id));
     const r = mine[0];
     if (!r) return { name, state: "missing" };
+    if (name === WINDOWS_CHECK) {
+      const bad = mine.find((x) => x.status === "completed" && x.conclusion !== "success");
+      if (bad) return { name, state: "failed", conclusion: String(bad.conclusion ?? "no result") };
+      if (mine.some((x) => x.status !== "completed")) return { name, state: "running" };
+      return { name, state: "passed" };
+    }
     if (r.status !== "completed") return { name, state: "running" };
     if (r.conclusion !== "success") return { name, state: "failed", conclusion: String(r.conclusion ?? "no result") };
     return { name, state: "passed" };

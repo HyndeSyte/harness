@@ -24,7 +24,7 @@ import {
   judgeInjection, judgeSlowHook, HOOK_STALL_MS, CANARY_PATH, MARKER_MAX_AGE_S,
   manifestCheck, normalPath, checkHost, signAllowlistFile, ownerKeygen, PROFILE_BOUND, LAST_RUN_KEYS, readsAsRecorded,
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
-  BOUNDARY_VERSION, BOUNDARY_TEXT, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
+  BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
@@ -38,8 +38,11 @@ import {
   stripFragment, judgeRedirectRead, judgeStructured, sessionIds, jobReadback, helperBuild, candidatePatterns, probeGate, PROBE_GATES, asciiPattern, asciiEntry, driftLine,
   READ_UNPLACED_MESSAGE, REDIRECT_READ_PROMPT, READS_PROMPT, verdict, hostScope, onCanary,
   jobHelperState, cscCandidates, systemRoot, readStamp, JOB_HELPER_SOURCE, KILL_INTERMEDIARY, blocker, hostAllowed, jobScopeProblem, queryAllowed, entryRegistrable,
-  type Install, type Instruction, type Opts, type Session, type Gate,
+  ABORT_HOLD_MS, ABORT_KILL_MS, HOOK_TIMEOUT_S, escalateAbort, markKillFailed, ADDRESS_BLOCK, ADDRESS_KEY, rawKeys, judgeForged, judgeFragmentStrip, killLatency, notReady,
+  FORGED_PROMPT, FRAGMENT_PROMPT, FRAGMENT_MARK, READY_WAIT_MS, holdForEnd,
+  type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
+import { get as httpGet } from "node:http";
 import { spendNonce } from "../rootfs/opt/cain/pcjobs/confirm.ts";
 import { makeToken, publicKey as shipPublicKey, readToken } from "../rootfs/opt/cain/ship-token.ts";
 import { publicOf } from "../rootfs/opt/cain/link/shipkey.ts";
@@ -528,6 +531,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   let choreSlip = (_page: number, _step: number) => false;   // the probe's chore: which tab-context calls the model skips
   // The bridge check's read: get_page_text on the tab, as a reading tool answers.
   let bridgeRead = async (b: Browser, tabId: number | undefined) => { await b.use("get_page_text", { tabId }); };
+  let killEnd: KillEnd = { ended: true, step: "job_object", ms: 120 };
   const group: { id: number; url: string }[] = [];
   let tabSeq = 100;
   const launches: string[][] = [];
@@ -584,6 +588,8 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
           const code = await hookMain(env, async () => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: name, tool_input: input }), (x) => { said += x; }, () => {});
           if (code !== 0) { events.push(ev.res(id, true, "PreToolUse:mcp hook error: Blocked by the PC worker: this run may open only its own addresses.")); return { id, ok: false, text: "" }; }
           explicit = /"permissionDecision":"allow"/.test(said);
+          // Claude Code sends the call on with the hook's updatedInput (a stripped fragment).
+          try { const up = JSON.parse(said)?.hookSpecificOutput?.updatedInput; if (up && typeof up.url === "string") input = { ...input, url: up.url }; } catch { /* no JSON */ }
         }
         if (!explicit && !cliAllowed.includes(name) && mode === "dontAsk") {
           denials.push({ tool: name, id });
@@ -612,7 +618,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
           // The read-time drift check (PostToolUse), as Claude Code runs it: its block replaces the answer.
           if (hookRuns && !env.PCW_HOOK_STALL_MS && env.PCW_TEST_OPEN !== "1") {
             let said = "";
-            const response = readsUrl ? { content: [{ type: "text", text }], structuredContent: { url: t?.url ?? "" } } : [{ type: "text", text }];
+            const response = readsUrl ? { content: [{ type: "text", text }], structuredContent: { tabUrl: t?.url ?? "" } } : [{ type: "text", text }];
             await readGuardMain({ ...env, PCW_ABORT_HOLD_MS: "0" }, async () => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: name, tool_input: input, tool_response: response }), (x) => { said += x; });
             if (said) { try { text = JSON.parse(said).hookSpecificOutput.updatedMCPToolOutput; } catch { /* left as is */ } }
           }
@@ -719,14 +725,24 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
       events.push(fin("done"));
       return { code: 0, out: stream(events), timedOut: false };
     }
-    if (prompt.includes("redirect check")) {
+    if (prompt.includes("redirect check") || prompt.includes("forged-address check")) {
       // As the prompt says: open the page that redirects off the run's sites, then read it. The
-      // read is refused and the session ended (the abort file); the stand-in stops there.
+      // read is refused and the session ended (the abort file); the stand-in stops there, and
+      // says how the worker's escalation ended it (killEnd).
       const url = /Open (\S+) with navigate/.exec(prompt)![1];
       const tab = await first();
       await b.use("navigate", { tabId: tab.id, url });
       await b.use("get_page_text", { tabId: tab.id });
-      if (!existsSync(env.PCW_ABORT_FILE ?? "")) events.push(fin("done"));
+      const ended = existsSync(env.PCW_ABORT_FILE ?? "");
+      if (!ended) events.push(fin("done"));
+      return { code: 0, out: stream(events), timedOut: false, ...(ended ? { abort_kill: killEnd } : {}) };
+    }
+    if (prompt.includes("fragment check")) {
+      const url = /Open (\S+) with navigate/.exec(prompt)![1];
+      const tab = await first();
+      await b.use("navigate", { tabId: tab.id, url });
+      await b.use("tabs_context_mcp");
+      events.push(fin("done"));
       return { code: 0, out: stream(events), timedOut: false };
     }
     if (prompt.includes("reading-tools check")) {
@@ -777,13 +793,13 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
     readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
-  const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string } = {}) => {
+  const confirmNow = (over: { deny_check?: boolean; cli?: string; o?: Partial<Opts>; read_context?: boolean; live?: boolean; cliSha?: string; fragment?: boolean } = {}) => {
     const o = opts({ ...(over.cli ? { cliVersion: () => over.cli! } : {}), ...over.o });
     const h = sessionHashes(o)!;
     fileOk(join(home, "confirmed.json"), JSON.stringify({ v: 1, at: T0.toISOString(), fingerprint: fingerprint(o, inst), settings_sha256: h.settings_sha256,
       prompt_sha256: h.prompt_sha256, config_sha256: outsideConfig(o).sha256, deny_check: over.deny_check ?? true, read_context: over.read_context ?? false,
-      live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_VERSION,
-      ...workerNow() }, null, 2));
+      live_extension_version: over.live ?? true, deny_cli_version: over.cli ?? "2.1.0", cli_sha256: over.cliSha ?? "c".repeat(64), boundary_version: BOUNDARY_ENDED.version,
+      ...workerNow(), fragment_strip: over.fragment ?? false }, null, 2));
   };
   if (o.confirmed !== false) confirmNow();
   const remoteFile = (path: string) => sh(["git", "show", `main:${path}`], remote);
@@ -796,7 +812,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     tools: (f: (prompt: string) => string[]) => { tools = f; }, status: (x: string) => { status = x; }, extVersion: (x: string | null) => { extVersion = x; },
     runExtra: (f: typeof runExtra) => { runExtra = f; }, credExtra: (f: typeof credExtra) => { credExtra = f; }, inject: (f: typeof inject) => { inject = f; }, asked, dedicated, manifest, hookRuns: (x: boolean) => { hookRuns = x; }, bridgeFails: (x: number) => { bridgeFails = x; }, group,
     bridgeRead: (f: typeof bridgeRead) => { bridgeRead = f; }, readsUrl: (x: boolean) => { readsUrl = x; }, choreSlip: (f: typeof choreSlip) => { choreSlip = f; },
-    at: (d: Date) => { now = d; }, tick: (ms: number) => { monoNow += ms; } };
+    at: (d: Date) => { now = d; }, tick: (ms: number) => { monoNow += ms; }, killEnd: (k: KillEnd) => { killEnd = k; } };
 }
 
 // A read job queued by Cain, and the PC's clone ready.
@@ -1872,8 +1888,8 @@ describe("the supervised probe and confirm-profile", () => {
     expect(ev.inventory).toContain(`${CH}read_page`);
     // Smoke twice back to back (the worker's own sign-in holds), the owner's Chrome restart and smoke again, then the browser step,
     // the five destination checks, the schema check, the slowed-hook check, the deny check, the credential check, the multi-tab chore,
-    // the redirect read and the reading-tools check.
-    expect(q.launches.length).toBe(17);
+    // the redirect read, the forged-address read, the fragment check and the reading-tools check.
+    expect(q.launches.length).toBe(19);
     // The chore's trip rate per read, the real hook's address step, the init event first, and the volume's 8.3 setting (none off Windows).
     expect(ev.chore).toEqual({ tabs: 3, reads: 6, refusals: 0, longest: 0, rate_per_read: 0, passed: true });
     expect(ev.addresses.passed).toBe(true);
@@ -2930,13 +2946,18 @@ describe("eighth review: the stated boundary, the canary from the server's recor
     let err: any = null;
     try { confirmProfile(q.opts()); } catch (e) { err = e; }
     expect(err?.code).toBe("boundary_not_accepted");
-    expect(String(err?.detail)).toContain(BOUNDARY_TEXT);
+    // The stand-in's redirect read shows only the refusal: the withheld text is the one he signs.
+    expect(ev1.redirect_read.secret_withheld).toBe(true);
+    expect(String(err?.detail)).toContain(BOUNDARY_WITHHELD.text);
+    expect(String(err?.detail)).toContain(`version ${BOUNDARY_WITHHELD.version}`);
     expect(String(err?.detail)).toContain("--accept-boundary");
-    expect(BOUNDARY_TEXT).toContain("supervised browsing with checked tool calls and address checks at each observation");
-    expect(BOUNDARY_TEXT).toContain("does not prevent");
+    for (const b of [BOUNDARY_WITHHELD, BOUNDARY_ENDED]) {
+      expect(b.text).toContain("supervised browsing with checked tool calls and address checks at each observation");
+      expect(b.text).toContain("does not prevent");
+    }
     expect(readConfirmed(q.opts())).toBeNull();
     const c = confirmProfile(q.opts(), ACCEPT);
-    expect(c.boundary_version).toBe(BOUNDARY_VERSION);
+    expect(c.boundary_version).toBe(BOUNDARY_WITHHELD.version);
     q.ask(READ); round(q.cfg); q.clonePc();
     expect((await run(q.opts(attended))).code).toBe("ok");
     // A confirmation without the acceptance (from before it, or of another text version): every run refuses, before any claim.
@@ -4932,7 +4953,7 @@ describe("fourteenth review: the read-time drift check, what counts as a trip, t
   const CANARY_URL = "http://127.0.0.1:5000/pcw/tok";
   const sc = { domains: ["example.com"], canary: [CANARY_URL], query: [] as string[] };
   const readCall = (url: string | null, id = "r1", tool = "get_page_text") => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: `${CH}${tool}`, tool_input: { tabId: 1 },
-    tool_response: url === null ? [{ type: "text", text: "Title: t\n\nPage text." }] : { content: [{ type: "text", text: `Title: t\nURL: ${url}\n\nPage text.` }], structuredContent: { url } } });
+    tool_response: url === null ? [{ type: "text", text: "Title: t\n\nPage text." }] : { content: [{ type: "text", text: `Title: t\nURL: ${url}\n\nPage text.` }], structuredContent: { tabUrl: url } } });
 
   test("read-guard: a page read whose tab has left the job's sites is replaced before the model sees it, and logged with its domain and a keyed hash only", async () => {
     const key = Buffer.alloc(32, 7);
@@ -5030,9 +5051,12 @@ describe("fourteenth review: the read-time drift check, what counts as a trip, t
 
   test("report values: the refusal is a mitigation, the pinned domains are the control, and a follow-up job reuses a reported value only on the owner's recorded yes", () => {
     // The boundary says so, under a new version the owner accepts again.
-    expect(BOUNDARY_VERSION).toBe("3");
-    expect(BOUNDARY_TEXT).toContain("mitigation, not a guarantee");
-    expect(BOUNDARY_TEXT).toContain("domains your signed allowlist entry names");
+    expect(BOUNDARY_VERSIONS).toEqual(["4", "5"]);
+    for (const b of [BOUNDARY_WITHHELD, BOUNDARY_ENDED]) {
+      expect(b.text).toContain("mitigation, not a guarantee");
+      expect(b.text).toContain("domains your signed allowlist entry names");
+      expect(b.text).toContain("a reply you type never counts");
+    }
     const q = queueRig();
     const cf = join(q.home, "confirmed.json");
     writeFileSync(cf, JSON.stringify({ ...JSON.parse(readFileSync(cf, "utf8")), boundary_version: "1" }));
@@ -5097,17 +5121,33 @@ describe("fifteenth review: unplaced and drifted reads end the session, the work
   const sc = { domains: ["example.com"], canary: [CANARY_URL], query: [] as string[] };
   const readCall = (response: unknown, id = "r1", tool = "get_page_text") => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: `${CH}${tool}`, tool_input: { tabId: 1 }, tool_response: response });
 
-  test("the read address comes only from a structured field the extension sets, never from the answer's text", () => {
-    expect(structuredUrl({ content: [{ type: "text", text: "x" }], structuredContent: { url: "https://example.com/a" } })).toBe("https://example.com/a");
-    expect(structuredUrl({ url: "https://example.com/b" })).toBe("https://example.com/b");
-    expect(structuredUrl({ structured_content: { tabUrl: "https://example.com/c" } })).toBe("https://example.com/c");
-    // Text, MCP text blocks and JSON written inside text never place a read.
-    for (const r of ["URL: https://example.com/a", [{ type: "text", text: "URL: https://example.com/a" }], [{ type: "text", text: JSON.stringify({ url: "https://example.com/a" }) }],
-      { content: [{ type: "text", text: "Page URL: https://example.com/a" }] }, { text: "URL: https://example.com/a" }, null, { structuredContent: { url: 5 } }])
+  test("the read address comes only from one exact structured path, never from the answer's text; extra or duplicate address fields are unplaced", () => {
+    expect([ADDRESS_BLOCK, ADDRESS_KEY]).toEqual(["structuredContent", "tabUrl"]);
+    const good = { content: [{ type: "text", text: "x" }], structuredContent: { tabUrl: "https://example.com/a" } };
+    expect(structuredUrl(good)).toBe("https://example.com/a");
+    expect(structuredUrl(good, JSON.stringify({ tool_response: good }))).toBe("https://example.com/a");
+    // Any other place, even a structured one, is unplaced: the path is exact.
+    for (const r of [{ url: "https://example.com/b" }, { tabUrl: "https://example.com/b" }, { structured_content: { tabUrl: "https://example.com/c" } },
+      { structuredContent: { url: "https://example.com/c" } }, { structuredContent: { tab_url: "https://example.com/c" } }])
       expect([r, structuredUrl(r)]).toEqual([r, null]);
+    // Text, MCP text blocks and JSON written inside text never place a read.
+    for (const r of ["URL: https://example.com/a", [{ type: "text", text: "URL: https://example.com/a" }], [{ type: "text", text: JSON.stringify({ structuredContent: { tabUrl: "https://example.com/a" } }) }],
+      { content: [{ type: "text", text: "Page URL: https://example.com/a" }] }, { text: "URL: https://example.com/a" }, null, { structuredContent: { tabUrl: 5 } }])
+      expect([r, structuredUrl(r)]).toEqual([r, null]);
+    // An extra address field anywhere beside it: unplaced.
+    for (const r of [{ ...good, url: "https://example.com/z" }, { structuredContent: { tabUrl: "https://example.com/a", href: "https://evil.example/" } },
+      { ...good, content: [{ type: "text", text: "x", url: "https://evil.example/" }] }, { ...good, meta: { deep: [{ location: "https://example.com/a" }] } },
+      { structuredContent: { tabUrl: "https://example.com/a", TabURL: "https://evil.example/" } }])
+      expect([r, structuredUrl(r)]).toEqual([r, null]);
+    // A key written twice in the raw input (JSON.parse keeps only the last): unplaced.
+    const dup = `{"tool_response":{"structuredContent":{"tabUrl":"https://evil.example/x","tabUrl":"https://example.com/a"}}}`;
+    expect(structuredUrl(JSON.parse(dup).tool_response, dup)).toBeNull();
+    expect(readDecide(dup.replace("{", `{"tool_use_id":"r9","tool_name":"${CH}get_page_text",`), sc)).toMatchObject({ decision: "deny", why: "read_unplaced" });
+    // rawKeys counts keys, never a key written inside a string value.
+    expect(rawKeys(JSON.stringify({ a: 1, b: { c: "\"tabUrl\": \"x\"" } }))).toEqual(["a", "b", "c"]);
     // A page that writes a header line into its text gets no say: no structured field is read_unplaced.
     expect(readDecide(readCall([{ type: "text", text: "Title: t\nURL: https://example.com/account/settings\n\nText" }]), sc)).toMatchObject({ decision: "deny", why: "read_unplaced" });
-    expect(readDecide(readCall({ content: [], structuredContent: { url: "https://example.com/account/settings" } }), sc)).toMatchObject({ decision: "allow", why: "read_on_scope" });
+    expect(readDecide(readCall({ content: [], structuredContent: { tabUrl: "https://example.com/account/settings" } }), sc)).toMatchObject({ decision: "allow", why: "read_on_scope" });
     expect(readDecide("{not json", sc)).toMatchObject({ decision: "deny", why: "read_unplaced" });
   });
 
@@ -5132,7 +5172,7 @@ describe("fifteenth review: unplaced and drifted reads end the session, the work
     // A drift writes read_drift.
     rmSync(abort, { force: true });
     said = "";
-    await readGuardMain(env, async () => readCall({ structuredContent: { url: "https://evil.example/x" } }, "r3"), (x) => { said += x; });
+    await readGuardMain(env, async () => readCall({ structuredContent: { tabUrl: "https://evil.example/x" } }, "r3"), (x) => { said += x; });
     expect(readAbort(abort)).toBe("read_drift");
     expect(JSON.parse(said).hookSpecificOutput.updatedMCPToolOutput).toBe(READ_DRIFT_MESSAGE);
     expect(ABORT_CODES).toEqual(["tool_inventory", "read_drift", "read_unplaced", "inventory_never_ready", "refusal_cap"]);
@@ -5160,7 +5200,7 @@ describe("fifteenth review: unplaced and drifted reads end the session, the work
 const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
 say({ type: "system", subtype: "init", session_id: "sess-abort-0001", tools: [], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
 say({ type: "assistant", message: { content: [{ type: "tool_use", id: "r1", name: "${CH}get_page_text", input: { tabId: 1 } }] } });
-const r = spawnSync(process.execPath, [${JSON.stringify(join(OPT, "pcjobs/worker.ts"))}, "read-guard"], { input: ${JSON.stringify(readCall({ structuredContent: { url: "https://login.evil.example/phish" } }))}, env: process.env, encoding: "utf8" });
+const r = spawnSync(process.execPath, [${JSON.stringify(join(OPT, "pcjobs/worker.ts"))}, "read-guard"], { input: ${JSON.stringify(readCall({ structuredContent: { tabUrl: "https://login.evil.example/phish" } }))}, env: process.env, encoding: "utf8" });
 say({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "r1", content: r.stdout }] } });
 say({ type: "assistant", message: { content: [{ type: "tool_use", id: "next", name: "${CH}get_page_text", input: { tabId: 1 } }] } });
 say({ type: "result", subtype: "success", result: "{}" });`);
@@ -5179,7 +5219,7 @@ say({ type: "result", subtype: "success", result: "{}" });`);
     const dir = mkdtempSync(join(tmpdir(), "caps-"));
     const abort = join(dir, "abort");
     const base = { PCW_NAV_ALLOW: JSON.stringify(["https://example.com/a"]), PCW_NAV_DOMAINS: '["example.com"]', PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_RESOLVE: "0",
-      PCW_INVENTORY_DIR: join(dir, "inventory"), PCW_SESSION_TOKEN: TNONCE, PCW_INVENTORY_WAIT_MS: "1", PCW_ABORT_FILE: abort };
+      PCW_INVENTORY_DIR: join(dir, "inventory"), PCW_SESSION_TOKEN: TNONCE, PCW_INVENTORY_WAIT_MS: "1", PCW_READY_WAIT_MS: "1", PCW_ABORT_FILE: abort };
     const call = (env: Record<string, string>, id: string, tool = `${CH}find`, input: any = {}) => hookMain(env, async () => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: tool, tool_input: input }), () => {}, () => {});
     // No marker: three not-ready answers, then the fourth ends the session.
     for (const id of ["a1", "a2", "a3"]) expect(await call(base, id)).toBe(2);
@@ -5209,21 +5249,44 @@ say({ type: "result", subtype: "success", result: "{}" });`);
     expect(REFUSALS_MAX).toBe(12);
   });
 
-  test("fragments on allowed addresses are stripped, not refused, and the browser is sent the stripped address", async () => {
+  test("fragments are refused by default; stripping runs only behind the probe's fragment_strip result and this policy version", async () => {
     expect(stripFragment("https://example.com/a#section")).toBe("https://example.com/a");
     expect(stripFragment("about:blank")).toBe("about:blank");
-    const d = navDecide(JSON.stringify({ tool_use_id: "f1", tool_name: `${CH}navigate`, tool_input: { url: "https://example.com/a#token-here" } }), JSON.stringify(["https://example.com/a"]), undefined,
-      { scope: { domains: ["example.com"], canary: [], query: [] } });
+    const call = (id: string, url: string) => JSON.stringify({ tool_use_id: id, tool_name: `${CH}navigate`, tool_input: { url } });
+    const scope = { domains: ["example.com"], canary: [], query: [] };
+    const allow = JSON.stringify(["https://example.com/a"]);
+    // Default: an address with a fragment is a navigation refusal, never stripped, logged without the address.
+    const key = Buffer.alloc(32, 3);
+    const refused = navDecide(call("f0", "https://example.com/a#token-here"), allow, undefined, { scope, key });
+    expect(refused).toMatchObject({ decision: "deny", why: "fragment_not_allowed", url: null, domain: "example.com" });
+    expect(JSON.stringify(refused)).not.toContain("token-here");
+    expect(navDecide(call("f0", "https://example.com/a#"), allow, undefined, { scope })).toMatchObject({ decision: "deny", why: "fragment_not_allowed" });
+    // Behind the probe result: stripped, and the browser sent the stripped address.
+    const d = navDecide(call("f1", "https://example.com/a#token-here"), allow, undefined, { scope, fragmentStrip: true });
     expect(d).toMatchObject({ decision: "allow", url: "https://example.com/a", fragment_stripped: true });
     expect(JSON.parse(allowJson("https://example.com/a")).hookSpecificOutput.updatedInput).toEqual({ url: "https://example.com/a" });
     expect(JSON.parse(allowJson()).hookSpecificOutput.updatedInput).toBeUndefined();
     // Off the allowed sites, a fragment changes nothing: refused, logged without the address.
-    const off = navDecide(JSON.stringify({ tool_use_id: "f2", tool_name: `${CH}navigate`, tool_input: { url: "https://evil.example/#x" } }), JSON.stringify(["https://example.com/a"]), undefined,
-      { scope: { domains: ["example.com"], canary: [], query: [] } });
+    const off = navDecide(call("f2", "https://evil.example/#x"), allow, undefined, { scope, fragmentStrip: true });
     expect(off).toMatchObject({ decision: "deny", why: "domain_not_allowed", url: null });
     // The guard matches the model's call (with its fragment) to the stripped allow.
     const st = parseStream(stream([ev.init(GIVEN), ev.use("f1", `${CH}navigate`, { url: "https://example.com/a#token-here" })]));
     expect(guardCheck(st, [{ ...d, sid: SID }]).code).toBeNull();
+    // The hook reads the switch from its environment: only PCW_FRAGMENT_STRIP equal to this policy version turns it on.
+    const dir = mkdtempSync(join(tmpdir(), "frag-"));
+    const env = { PCW_NAV_ALLOW: allow, PCW_NAV_DOMAINS: '["example.com"]', PCW_NAV_CANARY: "[]", PCW_NAV_QUERY: "[]", PCW_NAV_LOG: join(dir, "log.jsonl"),
+      PCW_RESOLVE: "0", ...markerEnv(dir) };
+    const hook = async (extra: Record<string, string>, id: string) => { let said = ""; const code = await hookMain({ ...env, ...extra }, async () => call(id, "https://example.com/a#t"), (x) => { said += x; }, () => {}); return { code, said }; };
+    expect((await hook({}, "h1")).code).toBe(2);
+    expect((await hook({ PCW_FRAGMENT_STRIP: "15" }, "h2")).code).toBe(2);
+    expect((await hook({ PCW_FRAGMENT_STRIP: "1" }, "h3")).code).toBe(2);
+    const on = await hook({ PCW_FRAGMENT_STRIP: POLICY_VERSION }, "h4");
+    expect(on.code).toBe(0);
+    expect(JSON.parse(on.said).hookSpecificOutput.updatedInput).toEqual({ url: "https://example.com/a" });
+    // The worker sets it only from a confirmation whose fragment_strip holds; off by default.
+    const o = { home: dir } as Opts;
+    expect(sessionEnv(o, ["https://example.com/a"]).PCW_FRAGMENT_STRIP).toBeUndefined();
+    expect(sessionEnv(o, ["https://example.com/a"], false, { fragmentStrip: true }).PCW_FRAGMENT_STRIP).toBe(POLICY_VERSION);
   });
 
   test("query patterns need a value class and a maximum length; a bare or unconstrained pattern is refused at signing; patterns go to ASCII", () => {
@@ -5255,17 +5318,22 @@ say({ type: "result", subtype: "success", result: "{}" });`);
     // Passes: the session was ended for read_drift, the transcript shows only the refusal (or nothing), no next call, no secret.
     expect(judgeRedirectRead(sess("", "read_drift"), reads({ r1: READ_DRIFT_MESSAGE }), c, drift).passed).toBe(true);
     expect(judgeRedirectRead(sess("", "read_drift"), reads({}), c, drift).passed).toBe(true);
-    // Fails: page text in the answer, the secret anywhere, a next call, no abort.
-    expect(judgeRedirectRead(sess("", "read_drift"), reads({ r1: "Off-site secret: o-secret" }), c, drift)).toMatchObject({ refusal_only: false, passed: false });
-    expect(judgeRedirectRead(sess("... o-secret ...", "read_drift"), reads({ r1: READ_DRIFT_MESSAGE }), c, drift)).toMatchObject({ secret_seen: true, passed: false });
-    expect(judgeRedirectRead(sess("", "read_drift"), reads({ r1: READ_DRIFT_MESSAGE }, [ev.use("r2", `${CH}find`, {})]), c, drift)).toMatchObject({ next_call: true, passed: false });
+    expect(judgeRedirectRead(sess("", "read_drift"), reads({ r1: READ_DRIFT_MESSAGE }), c, drift)).toMatchObject({ session_ended: true, secret_withheld: true });
+    // Two results: page text in the answer, or the secret anywhere, fails secret_withheld only (recorded, it picks the boundary text); the session still ended.
+    expect(judgeRedirectRead(sess("", "read_drift"), reads({ r1: "Off-site secret: o-secret" }), c, drift)).toMatchObject({ refusal_only: false, session_ended: true, secret_withheld: false, passed: true });
+    expect(judgeRedirectRead(sess("... o-secret ...", "read_drift"), reads({ r1: READ_DRIFT_MESSAGE }), c, drift)).toMatchObject({ secret_seen: true, secret_withheld: false, passed: true });
+    expect(boundaryFor({ redirect_read: judgeRedirectRead(sess("... o-secret ...", "read_drift"), reads({ r1: READ_DRIFT_MESSAGE }), c, drift) })).toBe(BOUNDARY_ENDED);
+    expect(boundaryFor({ redirect_read: judgeRedirectRead(sess("", "read_drift"), reads({}), c, drift) })).toBe(BOUNDARY_WITHHELD);
+    expect(boundaryFor(null)).toBe(BOUNDARY_ENDED);
+    // A next call, or no abort, fails session_ended, which gates.
+    expect(judgeRedirectRead(sess("", "read_drift"), reads({ r1: READ_DRIFT_MESSAGE }, [ev.use("r2", `${CH}find`, {})]), c, drift)).toMatchObject({ next_call: true, session_ended: false, passed: false });
     expect(judgeRedirectRead(sess(""), reads({ r1: READ_DRIFT_MESSAGE }), c, drift).passed).toBe(false);
     // The structured address: each of the three reading tools placed, none unplaced.
     const post = (tool: string, why = "read_on_scope") => ({ id: tool, tool, url: null, decision: why === "read_on_scope" ? "allow" as const : "deny" as const, why, phase: "post" as const });
     expect(judgeStructured(sess(""), ["read_page", "get_page_text", "find"].map((t) => post(t))).passed).toBe(true);
     expect(judgeStructured(sess(""), ["read_page", "get_page_text"].map((t) => post(t))).passed).toBe(false);
     expect(judgeStructured(sess("", "read_unplaced"), [post("read_page"), post("get_page_text"), post("find"), post("find", "read_unplaced")]).passed).toBe(false);
-    // The session ids: the init event's against every hook decision's.
+    // The session ids: the init event's against every hook decision's (a diagnostic, not a gate).
     const st = parseStream(stream([ev.init(GIVEN)]));
     const pre = (sid: string | null) => ({ id: "x", tool: "find", url: null, decision: "allow" as const, why: "reads", sid });
     expect(sessionIds(st, [pre(SID), pre(SID)])).toEqual({ init: true, hook: 2, match: true, passed: true });
@@ -5279,10 +5347,14 @@ say({ type: "result", subtype: "success", result: "{}" });`);
     expect(jobReadback(win, null)).toMatchObject({ applies: true, passed: false });
     expect(jobReadback(q.opts({ platform: "linux" }), null)).toMatchObject({ applies: false });
     expect(helperBuild(q.opts({ platform: "win32", jobHelper: undefined, csc: () => null }))).toEqual({ applies: true, code: "helper_compiler_missing", passed: false });
-    // The gates, in order, by name.
-    const good = { redirect_read: { passed: true }, structured_address: { passed: true }, session_ids: { passed: true }, job_readback: { passed: true }, helper_build: { passed: true } } as any;
+    // The gates, in order, by name. session_ids and fragment_strip never gate.
+    const good = { redirect_read: { session_ended: true, passed: true }, structured_address: { passed: true }, forged_address: { passed: true }, kill_latency: { passed: true },
+      not_ready: { passed: true }, job_readback: { passed: true }, helper_build: { passed: true }, session_ids: { passed: false }, fragment_strip: { passed: false } } as any;
+    expect(PROBE_GATES).not.toContain("session_ids");
     expect(probeGate(good, "win32")).toBeNull();
-    for (const k of PROBE_GATES) expect([k, probeGate({ ...good, [k]: { passed: false } }, "win32")]).toEqual([k, k]);
+    for (const k of PROBE_GATES) expect([k, probeGate({ ...good, [k]: { passed: false, session_ended: false } }, "win32")]).toEqual([k, k]);
+    // The redirect step gates on session_ended alone.
+    expect(probeGate({ ...good, redirect_read: { session_ended: true, secret_withheld: false, passed: true } }, "win32")).toBeNull();
     expect(probeGate({ ...good, job_readback: { applies: false, passed: false }, helper_build: { applies: false, passed: false } }, "linux")).toBeNull();
     // The prompts name what the steps need.
     expect(REDIRECT_READ_PROMPT({ url: CANARY_URL } as any)).toContain(`${CANARY_URL}/redirect-away`);
@@ -5299,7 +5371,214 @@ say({ type: "result", subtype: "success", result: "{}" });`);
     expect(driftLine("ok", [])).toBeNull();
     expect(lastRunOf(new Date(0), "j-1", "read_drift", null, "", "evil.example")).toMatchObject({ domain: "evil.example" });
     expect(lastRunOf(new Date(0), "j-1", "ok", null, "", "evil.example")).toMatchObject({ domain: null });
-    expect(BOUNDARY_TEXT).toContain("ends the session at once");
-    expect(BOUNDARY_TEXT).toContain("only that the session ends before its next tool call");
+    for (const b of [BOUNDARY_WITHHELD, BOUNDARY_ENDED]) expect(b.text).toContain("ends the session at once");
+    expect(BOUNDARY_ENDED.text).toContain("only that the session ends before its next tool call");
+    expect(BOUNDARY_WITHHELD.text).toContain("kept that page's text from the model as well");
+    expect(BOUNDARY_WITHHELD.version).not.toBe(BOUNDARY_ENDED.version);
   });
+});
+
+describe("sixteenth review: the read guard's bounded hold and the kill escalation, the exact address path, fragments refused, the readiness wait, and the probe's new steps", () => {
+  const CANARY_URL = "http://127.0.0.1:5000/pcw/tok";
+
+  test("the hold is bounded below the hook timeout, and returns the blocking result explicitly on expiry", async () => {
+    expect(ABORT_HOLD_MS).toBe(10_000);
+    expect(HOOK_MS + ABORT_HOLD_MS).toBeLessThan(HOOK_TIMEOUT_S * 1000);
+    expect(ABORT_KILL_MS).toBeLessThan(ABORT_HOLD_MS);
+    expect(READY_WAIT_MS + HOOK_MS).toBeLessThan(HOOK_TIMEOUT_S * 1000);
+    const t0 = Date.now();
+    expect(await holdForEnd({ PCW_ABORT_HOLD_MS: "50" })).toBe("expired");
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(40);
+    // An environment can shorten the hold, never lengthen it past the bound.
+    const t1 = Date.now();
+    const long = holdForEnd({ PCW_ABORT_HOLD_MS: "999999" });
+    expect(await Promise.race([long, new Promise((ok) => setTimeout(() => ok("bounded"), 50))])).toBe("bounded");
+    expect(Date.now() - t1).toBeLessThan(ABORT_HOLD_MS);
+    // read-guard prints the block once the hold expires, after writing the abort file.
+    const dir = mkdtempSync(join(tmpdir(), "hold-"));
+    const env = { PCW_NAV_ALLOW: "[]", PCW_NAV_DOMAINS: '["example.com"]', PCW_NAV_CANARY: "[]", PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_ABORT_FILE: join(dir, "abort"), PCW_ABORT_HOLD_MS: "60" };
+    let said = "";
+    await readGuardMain(env, async () => JSON.stringify({ tool_use_id: "r1", tool_name: `${CH}find`, tool_input: {}, tool_response: { structuredContent: { tabUrl: "https://evil.example/" } } }), (x) => { said += x; });
+    expect(readAbort(env.PCW_ABORT_FILE)).toBe("read_drift");
+    expect(JSON.parse(said)).toMatchObject({ decision: "block", hookSpecificOutput: { updatedMCPToolOutput: READ_DRIFT_MESSAGE } });
+  });
+
+  test("the kill escalation: the Job Object first, then the process, then the PC marked unconfirmed; a kill that hangs can't hold it past its bound", async () => {
+    let alive = true;
+    const calls: string[] = [];
+    // The Job Object ends it.
+    expect(await escalateAbort(7, { job: () => { calls.push("job"); alive = false; }, each: () => { calls.push("each"); }, alive: () => alive }, 400))
+      .toMatchObject({ ended: true, step: "job_object" });
+    expect(calls).toEqual(["job"]);
+    // The Job Object's kill hangs; the per-process kill ends it.
+    alive = true; calls.length = 0;
+    const r2 = await escalateAbort(7, { job: () => { calls.push("job"); return new Promise(() => {}); }, each: () => { calls.push("each"); alive = false; }, alive: () => alive }, 400);
+    expect(r2).toMatchObject({ ended: true, step: "per_process" });
+    expect(calls).toEqual(["job", "each"]);
+    // Both kills hang and the session never goes: ended false within the bound, so the caller marks the PC unconfirmed.
+    const t0 = Date.now();
+    const r3 = await escalateAbort(7, { job: () => new Promise(() => {}), each: () => new Promise(() => {}), alive: () => true }, 400);
+    expect(r3).toMatchObject({ ended: false, step: "unconfirmed" });
+    expect(Date.now() - t0).toBeLessThan(1_500);
+    expect(r3.ms).toBeGreaterThanOrEqual(390);
+    // A kill that throws, or an alive check that throws, is no way out either.
+    expect(await escalateAbort(7, { job: () => { throw new Error("x"); }, each: () => { throw new Error("y"); }, alive: () => { throw new Error("z"); } }, 200))
+      .toMatchObject({ ended: false, step: "unconfirmed" });
+    // The PC is marked: the preflight says abort_kill_failed until a new probe and confirmation clear it.
+    const q = queueRig();
+    expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+    markKillFailed(q.opts(), "read_drift", r3);
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("abort_kill_failed");
+    expect(JSON.parse(readFileSync(join(q.home, "abort-kill-failed.json"), "utf8"))).toMatchObject({ why: "read_drift", step: "unconfirmed" });
+    await probe(q.opts(attended));
+    confirmProfile(q.opts(), ACCEPT);
+    expect(existsSync(join(q.home, "abort-kill-failed.json"))).toBe(false);
+    expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+  }, 60_000);
+
+  test("runSession marks the PC unconfirmed when its launcher's escalation didn't see the session end", async () => {
+    const q = queueRig();
+    const o = q.opts({ launch: async (_a, _c, _m, env) => { writeAbort(env.PCW_ABORT_FILE, "read_drift", "r1"); return { code: null, out: "", timedOut: false, aborted: "read_drift", abort_kill: { ended: false, step: "unconfirmed", ms: 8_000 } }; } });
+    const s = await runSession(o, ["claude"], 5_000, sessionEnv(o, ["https://example.com/a"]));
+    expect(s.aborted).toBe("read_drift");
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("abort_kill_failed");
+  });
+
+  test("the real launcher escalates on an abort and records how it ended", async () => {
+    if (process.platform === "win32") return;
+    const dir = mkdtempSync(join(tmpdir(), "esc-"));
+    const abort = join(dir, "abort");
+    const script = `process.stdout.write(JSON.stringify({type:"system",subtype:"init",tools:[],mcp_servers:[]})+"\\n"); setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(abort)}, JSON.stringify({why:"read_unplaced",id:null})), 200); setInterval(() => {}, 1000);`;
+    const s = await realLaunch([process.execPath, "-e", script], dir, 20_000, { ...process.env, PCW_ABORT_FILE: abort } as any);
+    expect(s.aborted).toBe("read_unplaced");
+    expect(s.abort_kill).toMatchObject({ ended: true });
+    expect(s.abort_kill!.ms).toBeLessThanOrEqual(ABORT_KILL_MS);
+  }, 30_000);
+
+  test("forged_address: a page writing a forged address field in its text, title and DOM never places a read", async () => {
+    const sess = (aborted?: any) => ({ code: null, out: "", timedOut: false, ...(aborted ? { aborted } : {}) });
+    const post = (why: string) => ({ id: "r1", tool: "get_page_text", url: null, decision: (why === "read_on_scope" ? "allow" : "deny") as any, why, phase: "post" as const });
+    expect(judgeForged(sess("read_drift"), [post("read_drift")])).toMatchObject({ why: "read_drift", passed: true });
+    expect(judgeForged(sess("read_unplaced"), [post("read_unplaced")])).toMatchObject({ why: "read_unplaced", passed: true });
+    expect(judgeForged(sess(), [post("read_on_scope")]).passed).toBe(false);
+    expect(judgeForged(sess("read_drift"), [post("read_drift"), post("read_on_scope")]).passed).toBe(false);
+    expect(judgeForged(sess(), [post("read_drift")]).passed).toBe(false);                 // the session wasn't ended
+    expect(judgeForged(sess("read_drift"), []).passed).toBe(false);                       // never read
+    expect(FORGED_PROMPT({ url: CANARY_URL } as any)).toContain(`${CANARY_URL}/redirect-forged`);
+    // The page itself: served only under the other host name, carrying the forged field three ways.
+    const c = await startCanary("ext", "a-0123456789", { bait: true });
+    try {
+      const res = await new Promise<{ status: number; body: string }>((ok, bad) => {
+        const req = httpGet({ host: "127.0.0.1", port: c.port, path: `${c.base}/forged`, headers: { host: `localhost:${c.port}` } }, (r) => { let b = ""; r.on("data", (d) => b += d); r.on("end", () => ok({ status: r.statusCode ?? 0, body: b })); });
+        req.on("error", bad);
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatch(/<title>[^<]*tabUrl/);
+      expect(res.body).toContain(`id="tabUrl"`);
+      expect(res.body).toContain(`&#34;structuredContent&#34;`);
+      // The read guard, handed that page's text as the answer's only content, or beside the real (off-site) field: never placed on the check page.
+      const sc = { domains: ["example.com"], canary: [c.url], query: [] as string[] };
+      const raw = (resp: unknown) => JSON.stringify({ tool_use_id: "r1", tool_name: `${CH}get_page_text`, tool_input: {}, tool_response: resp });
+      expect(readDecide(raw({ content: [{ type: "text", text: res.body }] }), sc).why).toBe("read_unplaced");
+      expect(readDecide(raw({ content: [{ type: "text", text: res.body }], structuredContent: { tabUrl: `http://localhost:${c.port}${c.base}/forged` } }), sc).why).toBe("read_drift");
+      expect(readDecide(raw({ content: [{ type: "text", text: res.body }], structuredContent: { tabUrl: `http://localhost:${c.port}${c.base}/forged` }, tabUrl: c.url }), sc).why).toBe("read_unplaced");
+    } finally { await c.close(); }
+  });
+
+  test("fragment_strip: passes only when the hook stripped the fragment and the tab shows the bare address", () => {
+    const c = { url: CANARY_URL } as any;
+    const nav = (over: any = {}) => ({ id: "n1", tool: "navigate", url: CANARY_URL, decision: "allow" as const, why: "run_address", fragment_stripped: true as const, ...over });
+    const st = (tabUrl: string) => parseStream(stream([ev.init(GIVEN), ev.use("n1", `${CH}navigate`, { url: `${CANARY_URL}#${FRAGMENT_MARK}` }), ev.res("n1", false, "navigated"),
+      ev.use("t1", `${CH}tabs_context_mcp`, {}), ev.res("t1", false, JSON.stringify({ availableTabs: [{ tabId: 1, url: tabUrl }] }))]));
+    expect(judgeFragmentStrip(st(CANARY_URL), c, [nav()])).toEqual({ tried: true, stripped: true, tab_bare: true, passed: true });
+    expect(judgeFragmentStrip(st(`${CANARY_URL}#${FRAGMENT_MARK}`), c, [nav()]).passed).toBe(false);   // the browser got the fragment
+    expect(judgeFragmentStrip(st(CANARY_URL), c, [nav({ fragment_stripped: undefined })]).passed).toBe(false);
+    expect(judgeFragmentStrip(st(CANARY_URL), c, [nav({ decision: "deny", why: "fragment_not_allowed" })]).passed).toBe(false);
+    expect(FRAGMENT_PROMPT(c)).toContain(`${CANARY_URL}#${FRAGMENT_MARK}`);
+  });
+
+  test("kill_latency and the not-ready counts: measured against their bounds, a cap trip named extension_slow_attach", () => {
+    const s = (k?: KillEnd) => ({ code: null, out: "", timedOut: false, ...(k ? { abort_kill: k } : {}) });
+    expect(killLatency([s({ ended: true, step: "job_object", ms: 120 }), s({ ended: true, step: "per_process", ms: 4_000 })])).toEqual({ sessions: 2, max_ms: 4_000, bound_ms: ABORT_KILL_MS, steps: ["job_object", "per_process"], passed: true });
+    expect(killLatency([s({ ended: true, step: "job_object", ms: ABORT_KILL_MS + 1 })]).passed).toBe(false);
+    expect(killLatency([s({ ended: false, step: "unconfirmed", ms: 100 })]).passed).toBe(false);
+    expect(killLatency([s({ ended: true, step: "job_object", ms: 1 }), s()]).passed).toBe(false);      // a session with no measurement
+    expect(killLatency([]).passed).toBe(false);
+    const pre = (why: string, waited_ms?: number, cap?: any) => ({ id: "x", tool: "find", url: null, decision: (why === "reads" ? "allow" : "deny") as any, why, ...(waited_ms ? { waited_ms } : {}), ...(cap ? { cap } : {}) });
+    expect(notReady([[pre("reads", 2_400)], [pre("inventory_not_ready", 5_000), pre("reads")]])).toEqual({ count: 1, waits_ms: [5_000], first_wait_ms: 5_000, cap_tripped: false, reason: null, passed: true });
+    expect(notReady([[pre("inventory_not_ready", 15_000), pre("inventory_not_ready", 5_000), pre("inventory_not_ready", 5_000), pre("inventory_never_ready", 5_000, "inventory_never_ready")]]))
+      .toMatchObject({ count: 4, cap_tripped: true, reason: "extension_slow_attach", passed: false });
+  });
+
+  test("the hook waits on readiness itself before the session's first call, longer than later calls, and logs each wait", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ready-"));
+    const env = { PCW_NAV_ALLOW: "[]", PCW_NAV_DOMAINS: "[]", PCW_NAV_LOG: join(dir, "log.jsonl"), PCW_RESOLVE: "0", PCW_INVENTORY_DIR: join(dir, "inventory"),
+      PCW_SESSION_TOKEN: TNONCE, PCW_INVENTORY_WAIT_MS: "100", PCW_READY_WAIT_MS: "2000" };
+    const call = (id: string) => hookMain(env, async () => JSON.stringify({ session_id: SID, tool_use_id: id, tool_name: `${CH}find`, tool_input: {} }), () => {}, () => {});
+    // The marker arrives 400 ms in: the first call waits for it and runs, without a not-ready answer.
+    setTimeout(() => { mkdirSync(env.PCW_INVENTORY_DIR, { recursive: true }); writeFileSync(markerPath(env.PCW_INVENTORY_DIR, TNONCE), `${TNONCE} ${SID}\n`); }, 400);
+    expect(await call("c1")).toBe(0);
+    const first = readNavLog(env.PCW_NAV_LOG)[0];
+    expect(first).toMatchObject({ decision: "allow", why: "reads" });
+    expect(first.waited_ms!).toBeGreaterThanOrEqual(300);
+    // A later call, the marker gone: only the shorter wait, then not ready, with its time logged.
+    rmSync(env.PCW_INVENTORY_DIR, { recursive: true, force: true });
+    const t0 = Date.now();
+    expect(await call("c2")).toBe(2);
+    expect(Date.now() - t0).toBeLessThan(1_500);
+    expect(readNavLog(env.PCW_NAV_LOG)[1]).toMatchObject({ why: "inventory_not_ready" });
+    expect(readNavLog(env.PCW_NAV_LOG)[1].waited_ms!).toBeGreaterThanOrEqual(90);
+  });
+
+  test("the probe runs the forged, fragment and kill steps; confirming records fragment_strip, refuses a slow kill and a slow attach by name, and runs strip only then", async () => {
+    const q = queueRig({ confirmed: false });
+    const ev1 = await probe(q.opts(attended));
+    expect(ev1.forged_address).toMatchObject({ tried: true, passed: true });
+    expect(["read_drift", "read_unplaced"]).toContain(ev1.forged_address.why);
+    expect(ev1.fragment_strip).toEqual({ tried: true, stripped: true, tab_bare: true, passed: true });
+    expect(ev1.kill_latency).toMatchObject({ sessions: 2, passed: true });
+    expect(ev1.not_ready).toMatchObject({ cap_tripped: false, passed: true });
+    expect(ev1.redirect_read).toMatchObject({ session_ended: true, secret_withheld: true });
+    expect(q.envs.some((e) => e.PCW_FRAGMENT_STRIP === POLICY_VERSION)).toBe(true);    // the fragment session alone
+    const c = confirmProfile(q.opts(), ACCEPT);
+    expect(c.fragment_strip).toBe(true);
+    expect(readConfirmed(q.opts())!.fragment_strip).toBe(true);
+    // A run then strips; a confirmation without it refuses fragments (the default).
+    const n = q.envs.length;
+    q.ask(READ); round(q.cfg); q.clonePc();
+    expect((await run(q.opts(attended))).code).toBe("ok");
+    expect(q.envs.slice(n).at(-1)!.PCW_FRAGMENT_STRIP).toBe(POLICY_VERSION);
+    q.confirmNow();
+    expect(readConfirmed(q.opts())!.fragment_strip).toBe(false);
+    // A confirmation from before the field holds false.
+    const cf = join(q.home, "confirmed.json");
+    const { fragment_strip: _f, ...old } = JSON.parse(readFileSync(cf, "utf8"));
+    writeFileSync(cf, JSON.stringify(old));
+    expect(readConfirmed(q.opts())!.fragment_strip).toBe(false);
+    // A slow kill refuses the confirmation by name.
+    const slow = queueRig({ confirmed: false });
+    slow.killEnd({ ended: true, step: "per_process", ms: ABORT_KILL_MS + 500 });
+    await probe(slow.opts(attended));
+    let err: any = null;
+    try { confirmProfile(slow.opts(), ACCEPT); } catch (e) { err = e; }
+    expect(err?.code).toBe("probe_required");
+    expect(err?.detail).toMatchObject({ step: "kill_latency" });
+    // A redirect read the session didn't end for refuses, saying which result failed.
+    const ev = JSON.parse(readFileSync(join(q.home, "probe-evidence.json"), "utf8"));
+    writeFileSync(join(q.home, "probe-evidence.json"), JSON.stringify({ ...ev, redirect_read: { ...ev.redirect_read, session_ended: false, passed: false, secret_withheld: true } }));
+    err = null;
+    try { confirmProfile(q.opts(), ACCEPT); } catch (e) { err = e; }
+    expect(err?.detail).toMatchObject({ step: "redirect_read", session_ended: false, secret_withheld: true });
+    // A not-ready cap trip refuses as extension_slow_attach.
+    writeFileSync(join(q.home, "probe-evidence.json"), JSON.stringify({ ...ev, not_ready: { count: 4, waits_ms: [], first_wait_ms: 15_000, cap_tripped: true, reason: "extension_slow_attach", passed: false } }));
+    err = null;
+    try { confirmProfile(q.opts(), ACCEPT); } catch (e) { err = e; }
+    expect(err?.code).toBe("extension_slow_attach");
+    // Without the secret withheld, the other boundary text is the one he signs.
+    writeFileSync(join(q.home, "probe-evidence.json"), JSON.stringify({ ...ev, redirect_read: { ...ev.redirect_read, secret_withheld: false } }));
+    err = null;
+    try { confirmProfile(q.opts()); } catch (e) { err = e; }
+    expect(String(err?.detail)).toContain(BOUNDARY_ENDED.text);
+    expect(confirmProfile(q.opts(), ACCEPT).boundary_version).toBe(BOUNDARY_ENDED.version);
+  }, 120_000);
 });

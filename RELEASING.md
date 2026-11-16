@@ -40,9 +40,11 @@ branch is up to date with `main` and these checks passed on it:
 `pcjobs-windows` is not a required check in the rulesets (making it one needs the
 repository's rulesets, which take admin rights no session has). The link enforces it
 instead: when the head's `tests.yml` names it, or a run of it exists on the head, a Ship
-card is refused, and a landing refused or held, unless its newest run on that exact head
-passed ("CI is still running pcjobs-windows on it" waits; a failed, cancelled or skipped
-run, or none at all, refuses).
+card is refused, and a landing refused or held, unless every run of it GitHub lists for
+that exact head commit passed, in whatever order ("CI is still running pcjobs-windows on
+it" waits; a failed, cancelled or skipped attempt refuses even beside a green re-run, so a
+flaky Windows run needs a new commit; a run for another commit doesn't count, and none at
+all refuses; GitHub not answering holds).
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.

@@ -257,8 +257,9 @@ in the harness repo; until then the keeper says it is waiting).
   run that shows them afterwards, it can't stop them. The browser session may open only
   http and https addresses on the hosts his signed allowlist entry names for that job
   (never his computer or home network), a page read on any other host is refused, and
-  nothing runs until the session's tools were checked. A page read off those hosts, or one
-  that doesn't say in a structured field which address it was on, ends the session at once
+  nothing runs until the session's tools were checked. An address with a "#" part is refused
+  unless his probe showed it is stripped first. A page read off those hosts, or one
+  that doesn't say in its one structured field which address it was on, ends the session at once
   and its report is thrown away; whether the page's text was also kept from the browser
   session is shown only by his probe, so never say it was. Those pinned hosts are the control
   on where a run goes; the keeper's refusal of reported values (below) is a mitigation,
@@ -289,15 +290,17 @@ in the harness repo; until then the keeper says it is waiting).
 - When a follow-up read really needs a value a result reported (an address he wants
   checked next), ask him first, with the value quoted:
   `/opt/cain/keeper.sh ask --item <id> --question <Q id> "Check the address the PC reported, \"<value>\", in a new job?" "Use it" "Don't"`.
-  The value goes in the ask exactly as it will go in the job, and "Use it" stays the first
-  option. Only on his yes, add to the job request `"owner_reuse": {"values": ["<the value,
-  exactly>"], "go": "\u201cUse it: check the address the PC reported\u201d", "message_id":
-  "<id>"}`: the id is the ask's Discord message id when he tapped "Use it" (the relayed tap
-  line names it), or his own message's id when he said yes in words and his message shows
-  every value exactly (a reply to the ask, or the next thing after it). The keeper has the
-  link read that message from his DM, with the same check as his taps, and refuses the job
-  unless it is his tap on your ask's first option or his own message showing the values.
-  One yes covers one job: for another, ask again. No proof, no reuse.
+  The value goes in the ask exactly as it will go in the job, in straight double quotes, and
+  "Use it" stays the first option. Only on his tap on "Use it", add to the job request
+  `"owner_reuse": {"values": ["<the value, exactly>"], "go": "\u201cUse it: check the address
+  the PC reported\u201d", "message_id": "<id>"}`: the id is that ask's Discord message id (the
+  relayed tap line names it), and the values are exactly the ones the ask quoted, no more
+  and no fewer. Only the tap counts: a reply he types never authorises a reuse, even one
+  that quotes the value or answers the ask. If he answers in words, ask again and let him
+  tap. The keeper has the link check its own record of that tap and of the values the ask
+  quoted when it was posted, and refuses the job otherwise. One tap covers one job, for
+  good (the keeper keeps every tap it used, across restarts): for another, ask again. No
+  tap, no reuse.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
@@ -312,7 +315,10 @@ in the harness repo; until then the keeper says it is waiting).
   times in a row), `read_drift` (a page moved the tab off the job's hosts and the PC
   ended the session at the read), `read_unplaced` (a page read didn't say which address it
   was on; the session was ended), `inventory_never_ready` (the session asked four times
-  before the PC had checked its tools), `refusal_cap` (the session was refused twelve times
+  before the PC had checked its tools), `abort_kill_failed` (a session the PC ended wouldn't
+  end in time; the PC stays unconfirmed until he probes again), `extension_slow_attach` (his
+  probe saw Claude in Chrome too slow to attach: he restarts the Cain jobs Chrome and probes
+  again), `refusal_cap` (the session was refused twelve times
   and ended), `domain_not_allowed` (the job named
   a host its allowlist entry doesn't allow; nothing ran), `containment_unavailable` (the
   PC couldn't build or start its Windows Job Object helper, so nothing runs uncontained),
