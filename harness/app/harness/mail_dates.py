@@ -107,6 +107,22 @@ SKIP_FIELDS = ("from", "subject", "unless")
 SKIPPED_META = "mail_skipped"         # {"count", "recent": [{"sender", "subject", "rule"}]}: the status page's
 SKIP_MIN = 3                          # a word in mail_skip.json shorter than this would match far too much
 SKIP_RECENT = 20                      # skipped mail shown on the status page, newest last
+# Sixteenth round: caps on mail_skip.json (over any of them, the whole file is ignored and the page says why).
+SKIP_MAX_ENTRIES = 50                 # kinds in the file
+SKIP_MAX_WORDS = 20                   # words in each of "from", "subject" and "unless"
+SKIP_MAX_WORD = 80                    # characters in a word
+SKIP_MAX_NAME = 80                    # characters in a name
+# Sixteenth round: where a marker in the mail's text counts. Only in a header line at the top, or in the first
+# block of text before the order's items; never in a promotional or quoted section further down. A first block that
+# reads as promotion is ambiguous, and the mail is kept.
+LEAD_MAX = 600
+_HEADER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{1,40}:\s*\S")
+_ORDER_ITEMS = re.compile(r"(?i)\b(order\s*#|order number|order summary|items? in (this|your) (order|delivery)|"
+                          r"qty\b|quantity\b|item subtotal|shipment details|ship to\b)")
+_QUOTED = re.compile(r"(?im)^\s*(>|on .{1,80} wrote:|-{2,}\s*original message|-{2,}\s*forwarded message)")
+_PROMO = re.compile(r"(?i)\b(learn more|sign up|join now|try it|start saving|save up to|discover|explore|"
+                    r"recommended for you|you might also like|deals?\b|\d+\s*% off|limited time|"
+                    r"unsubscribe|advertisement|sponsored)")
 
 # What may carry a date he has to act on. Anything else never leaves the Pi.
 _PICK = re.compile(
@@ -266,6 +282,10 @@ def skip_file_check(data_dir: str | None) -> tuple[list[dict], str]:
     entries = got.get("skip") if isinstance(got, dict) and set(got) == {"skip"} else got
     if not isinstance(entries, list):
         return kinds, 'it isn\'t a list of kinds (or {"skip": [...]})'
+    if len(entries) > SKIP_MAX_ENTRIES:
+        log.warning("%s is ignored: more than %d kinds; only the built-in kinds are skipped", SKIP_FILE,
+                    SKIP_MAX_ENTRIES)
+        return kinds, f"it has more than {SKIP_MAX_ENTRIES} kinds"
     extra = []
     for n, k in enumerate(entries, 1):
         why = _skip_entry_problem(k)
@@ -285,6 +305,8 @@ def _skip_entry_problem(k) -> str:
         return f"has a field it doesn't know ({unknown[0]})"
     if not isinstance(k.get("name"), str) or not k["name"].strip():
         return "has no name"
+    if len(k["name"]) > SKIP_MAX_NAME:
+        return f"has a name longer than {SKIP_MAX_NAME} characters"
     for f in SKIP_FIELDS:
         if f not in k:
             if f == "unless":
@@ -293,11 +315,15 @@ def _skip_entry_problem(k) -> str:
         words = k[f]
         if not isinstance(words, list) or (not words and f != "unless"):
             return f'has "{f}" that isn\'t a list of words'
+        if len(words) > SKIP_MAX_WORDS:
+            return f'has more than {SKIP_MAX_WORDS} words in "{f}"'
         for w in words:
             if not isinstance(w, str):
                 return f'has a word in "{f}" that isn\'t text'
             if len(w.strip()) < SKIP_MIN:
                 return f'has a word in "{f}" shorter than {SKIP_MIN} characters'
+            if len(w) > SKIP_MAX_WORD:
+                return f'has a word in "{f}" longer than {SKIP_MAX_WORD} characters'
     return ""
 
 
@@ -310,11 +336,44 @@ def _has_word(text: str, word: str) -> bool:
     return re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", text) is not None
 
 
+def marker_placed(text: str, marks) -> bool:
+    """Sixteenth round: whether a marker sits where it says what the mail is: in a header line at the top of the
+    text, or in its first block of text before the order's items (cut at a quoted section too). A marker only in a
+    promotional or quoted section further down doesn't count, and a first block that reads as promotion is
+    ambiguous: then it doesn't count either, and the mail is kept."""
+    lines = (text or "").replace("\r\n", "\n").casefold().split("\n")
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    header = []
+    while i < len(lines) and _HEADER_LINE.match(lines[i].strip()) and not _ORDER_ITEMS.search(lines[i]):
+        header.append(lines[i])
+        i += 1
+    if any(w in line for line in header for w in marks):
+        return True
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    block = []
+    while i < len(lines) and lines[i].strip():
+        block.append(lines[i])
+        i += 1
+    lead = "\n".join(block)
+    for rx in (_ORDER_ITEMS, _QUOTED):
+        m = rx.search(lead)
+        if m:
+            lead = lead[:m.start()]
+    lead = lead[:LEAD_MAX]
+    if not any(w in lead for w in marks):
+        return False
+    return not _PROMO.search(lead)
+
+
 def skipped_kind(sender: str, subject: str, kinds, body=None) -> str:
     """The name of the kind he said no to that this mail is, or "": its sender holds one of the kind's
     "from" words, its subject one of its "subject" words and none of its "unless" words as a whole word
-    ("returning" isn't "return"); and for a kind with markers, a marker is in the subject or else in the
-    mail's text (`body`: a callable read only then)."""
+    ("returning" isn't "return"); and for a kind with markers, a marker is in the subject or else placed in the
+    mail's text where it says what the mail is (marker_placed: a header, or the first block before the order's
+    items; never a promotional or quoted section) (`body`: a callable read only then)."""
     who, what = (sender or "").casefold(), (subject or "").casefold()
     for k in kinds:
         if not any(w in who for w in k.get("from") or ()):
@@ -328,10 +387,10 @@ def skipped_kind(sender: str, subject: str, kinds, body=None) -> str:
             text = ""
             if body is not None:
                 try:
-                    text = (body() or "").casefold()
+                    text = body() or ""
                 except Exception:              # noqa: BLE001: unread text can't show the marker
                     text = ""
-            if not any(w in text for w in marks):
+            if not marker_placed(text, marks):
                 continue
         return str(k.get("name") or "")
     return ""

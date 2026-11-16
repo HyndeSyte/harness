@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import (callbacks, choices, commands, daily, effects, ingress_filter, integrity, migrate,
+from . import (approvals, callbacks, choices, commands, daily, effects, ingress_filter, integrity, migrate,
                handover, policy, provenance, render, rules, watch)
 from .chat import Decision, Incoming
 from .config import Config
@@ -624,30 +624,39 @@ class Controller:
                 self._fence()                  # fenced once the tap that staged it has its reply recorded
 
     def _refuse_tap(self, h, text: str, *, status: str = "refused", **extra) -> None:
-        """Fifteenth round: a queued tap's one terminal refusal. He's told once (Inbox.notify), then it's struck
-        off the journal; a note that couldn't be posted now is kept in the journal and posted at the next start,
-        so it's never lost to a restart."""
+        """Fifteenth round: a queued tap's one terminal refusal. Sixteenth round: durable. Its outcome and note are
+        appended (fsynced) to the journal before the note is posted (Inbox.notify), and its delivery after; it's
+        struck off only once he's been told. A note that can't be posted now stays in the journal and goes at the
+        next start, once; a tap with a terminal outcome is never taken again."""
         h.finish(status, text, **extra)
         if self.handovers is None:
             return
+        if not h.journaled:
+            self.handovers.tell(h, text)
+            return
         if self.handovers.notify(h, text):
             self.handovers.journal_done(h.press)
-        elif h.journaled and self.handovers.journal_notice(h.press, text):
+            return
+        row = self.handovers.row_for(h.press)
+        if row is not None and row["outcome"]:
             log.warning("a note on a refused tap couldn't be posted now; it goes at the next start")
         else:
+            # Neither the outcome nor the note could be kept: struck off, so it can never be taken again.
+            log.error("a refused tap's outcome couldn't be written down and its note didn't go")
             self.handovers.journal_done(h.press)
 
     def _replay_taps(self) -> None:
-        """Fourteenth round, once per start: taps written to the journal that the last run never committed (it
-        stopped first). One from the last TAP_REPLAY_S is taken now (a tap already in the ledger isn't taken
-        twice); an older one is struck off and he's told it wasn't taken, so a tap is never silently lost.
+        """Fourteenth round, once per start: taps written to the journal that the last run never finished (it
+        stopped first).
 
-        Fifteenth round: a tap whose commit is in the journal is never taken again, whatever the ledger says. Across
-        a restore (a swap applied at this start, or a restore staged at it) nothing is taken by itself: every tap
-        written down is listed for him, each with a fresh button of its own (_relist_taps). A note to him the last
-        run couldn't post is posted now. A tap's age is from Discord's own stamp in its id where that reads as a
-        real time, else from when it was written down, and unknown while the clock is flagged as behind the
-        records (then it's reported, not taken). The queue is read under its own mutex."""
+        Sixteenth round, by the journal's own records: a tap with its outcome recorded is never taken again (done:
+        struck off; refused: its note posted if it wasn't delivered, then struck off). Across a restore (a swap
+        applied at this start, or a restore staged at it) nothing is taken by itself: every tap left is listed for
+        him (_relist_taps), by what's recorded, after a read of the calendar for its effect. Otherwise a tap acted on
+        (an intent, no outcome) is finished through the records' own checks (they say whether it went, so nothing
+        is done twice); a tap never acted on is taken now if it's from the last TAP_REPLAY_S, else struck off and
+        he's told nothing changed. A tap's age is unknown while the clock is flagged (then it's reported, not
+        taken, and the clock card goes out again if that tap was on it). The queue is read under its own mutex."""
         if getattr(self, "_taps_replayed", False) or self.handovers is None:
             return
         self._taps_replayed = True
@@ -657,19 +666,24 @@ class Controller:
             stalled = bool(migrate.clock_stall(self.ledger))
         except Exception:                       # noqa: BLE001: an unreadable clock check counts as a stall
             stalled = True
-        late, relist = [], []
+        late, relist, clock_tap = [], [], False
         for row in self.handovers.journaled():
             p = row["press"]
             if self.handovers.key(p) in queued:
                 continue
-            if row.get("notice"):
-                self._post_pending_notice(p, row["notice"], row.get("at"))
+            if row["state"] in ("refused", "found"):
+                self._post_pending_notice(row)
                 continue
             if boundary:
                 relist.append(row)
                 continue
-            if row.get("committed"):
+            if row["state"] == "committed":
                 self.handovers.journal_done(p)  # done before the stop; only its strike was left
+                continue
+            if row["state"] == "unknown":
+                log.warning("a tap the last run acted on without recording its outcome is finished through the "
+                            "records' own checks")
+                self.handovers.give_back([handover.Handover(kind="press", press=p, journaled=True)])
                 continue
             age = None if stalled else self._tap_age(row)
             if age is not None and age <= self.TAP_REPLAY_S:
@@ -677,6 +691,7 @@ class Controller:
                 self.handovers.give_back([handover.Handover(kind="press", press=p, journaled=True)])
             else:
                 late.append(p)
+                clock_tap = clock_tap or (stalled and self._choice_kind(p) == "migration_clock")
         if relist and self.config is not None:
             self._relist_taps(relist)
         if late and self.config is not None:
@@ -684,93 +699,235 @@ class Controller:
                 self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=(
                     f"Harness stopped before it took {'a tap' if len(late) == 1 else f'{len(late)} taps'} of yours, "
                     "so nothing changed from "
-                    f"{'it' if len(late) == 1 else 'them'}. A card still works until it runs out."))
+                    f"{'it' if len(late) == 1 else 'them'}."
+                    + (" The clock card follows again." if clock_tap else " A card still works until it runs out.")))
                 self.ledger.event("taps_not_taken", {"count": len(late), "clock_stalled": stalled}, db=db)
             for p in late:
                 self.handovers.journal_done(p)
+            if clock_tap:
+                # Sixteenth round: the clock card's own tap can't be aged while the clock is flagged, so the card
+                # is issued again rather than left dead.
+                migrate.post_clock_card(self.ledger, self.config.owner_user_id, force=True)
 
-    @staticmethod
-    def _tap_age(row: dict) -> float | None:
-        """Seconds since the tap: Discord's stamp in the interaction's id when it reads as a real time (after
-        2020, not ahead of now by more than a day), else when it was written down. None when neither reads."""
+    def _choice_kind(self, p: dict) -> str:
+        cid = str((p or {}).get("custom_id") or "")
+        nonce = choices.parse(cid[len(DISCORD_PREFIX):]) if cid.startswith(DISCORD_PREFIX) else None
+        return (choices.kind_of(self.ledger, nonce) or "") if nonce else ""
+
+    TAP_STAMP_TOLERANCE_S = 120   # Discord's stamp and the journal's time agree within this, or the journal's wins
+
+    @classmethod
+    def _tap_age(cls, row: dict) -> float | None:
+        """Seconds since the tap. Sixteenth round: the tap is written down within seconds of Discord's stamp in its
+        interaction id, so where both read and they disagree by more than TAP_STAMP_TOLERANCE_S, the journal's own
+        time bounds it and is used. Discord's stamp is used where the journal's time doesn't read; the journal's
+        where the stamp doesn't read as a real time (after 2020, not ahead of now by more than a day). None when
+        neither reads."""
         now = time.time()
+        stamp = None
         when = snowflake_time((row.get("press") or {}).get("id"))
         if when is not None:
             t = when.timestamp()
             if datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() <= t <= now + 86400:
-                return now - t
+                stamp = t
         try:
-            return now - float(row.get("at"))
+            at = float(row.get("at"))
         except (TypeError, ValueError):
-            return None
+            at = None
+        if at is not None and (stamp is None or abs(stamp - at) > cls.TAP_STAMP_TOLERANCE_S):
+            return now - at
+        return None if stamp is None else now - stamp
 
-    def _post_pending_notice(self, p: dict, text: str, at) -> None:
-        """Fifteenth round: a note the last run owed him on a tap, posted now (on the tap while Discord still
-        takes it, else as a message), then struck off."""
+    def _post_pending_notice(self, row: dict) -> None:
+        """A tap with a terminal outcome recorded: never taken again. Its note is posted only if its delivery
+        isn't recorded (on the tap while Discord still takes it, else as a message), then it's struck off."""
+        p = row["press"]
+        if row.get("delivered") or not row.get("note"):
+            self.handovers.journal_done(p)
+            return
         h = handover.Handover(kind="press", press=p, journaled=True)
-        fresh = self._tap_age({"press": p, "at": at})
-        if fresh is not None and fresh <= self.TAP_REPLAY_S and self.handovers.notify(h, text):
+        fresh = self._tap_age(row)
+        if fresh is not None and fresh <= self.TAP_REPLAY_S and self.handovers.notify(h, row["note"]):
             self.handovers.journal_done(p)
             return
         if self.config is None:
             return
         with self.ledger.tx() as db:
             self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
-                                text=render.fit("About a tap of yours: " + render.escape(text)))
+                                text=render.fit("About a tap of yours: " + render.escape(row["note"])))
             self.ledger.event("tap_notice_posted", {}, db=db)
+        if not self.handovers.journal_delivered(p):
+            log.error("a note's delivery couldn't be written to the tap journal")
         self.handovers.journal_done(p)
 
+    # -- a tap's calendar effect, by a stable identity (sixteenth round) -------------------------------------------
+
+    def _tap_op(self, p: dict) -> dict:
+        """What the tap leads to on a calendar, named by a stable identity read from the records before it's acted
+        on: an Approve on a calendar change (its proposal, its changes and the key each add's fixed event id is
+        made from) or on a Family add (its proposal: the event's id comes from it). {"effect": "records"} for a tap
+        that changes only Harness's own records; {"effect": "calendar", "kind": ...} for one that may reach a
+        calendar but carries no identity to check."""
+        cid = str((p or {}).get("custom_id") or "")
+        data = cid[len(DISCORD_PREFIX):] if cid.startswith(DISCORD_PREFIX) else ""
+        try:
+            if choices.parse(data) is not None:
+                kind = choices.kind_of(self.ledger, choices.parse(data)) or ""
+                if kind.startswith(("calendar_change_", "family_add_", "mail_dates_")):
+                    return {"effect": "calendar", "kind": kind}
+                return {"effect": "records", "kind": kind}
+            parsed = approvals.parse_callback_data(data)
+            if parsed is None:
+                return {"effect": "records"}
+            action, nonce = parsed
+            row = self.ledger.db.execute(
+                "SELECT p.id, p.effect_type, p.params_json FROM approvals a JOIN proposals p ON p.id=a.proposal_id"
+                " WHERE a.nonce=?", (nonce,)).fetchone()
+            if row is None or action != "approve":
+                return {"effect": "records"}
+            if row["effect_type"] == effects.CALENDAR_CHANGE and self.calendar_change is not None:
+                params = json.loads(row["params_json"])
+                return {"effect": effects.CALENDAR_CHANGE, "proposal": row["id"],
+                        "changes": list(params.get("changes") or []),
+                        "keys": self.calendar_change.keys_of(row["id"]),
+                        "bound": (self.calendar_change.bound_of(row["id"]) or {}).get("bound", [])}
+            if row["effect_type"] == effects.FAMILY_ADD:
+                return {"effect": effects.FAMILY_ADD, "proposal": row["id"]}
+            return {"effect": "calendar", "kind": row["effect_type"]}
+        except (ValueError, TypeError, KeyError, AttributeError) as e:
+            log.warning("a tap's calendar effect couldn't be read (%s)", type(e).__name__)
+            return {"effect": "calendar", "kind": "unread"}
+
+    def _tap_effect(self, op: dict) -> str:
+        """A read of the calendar for the tap's effect, by its stable identity: "done" (the calendar shows it),
+        "not_done" (a read answered and it isn't there), "unread" (a read couldn't tell), "unchecked" (it carries no
+        identity to read by) or "records" (it changes only Harness's own records)."""
+        effect = (op or {}).get("effect") or "records"
+        try:
+            if effect == effects.CALENDAR_CHANGE and self.calendar_change is not None:
+                return self.calendar_change.tap_effect(op)
+            if effect == effects.FAMILY_ADD and self.family_add is not None:
+                return self.family_add.tap_effect(op)
+        except Exception as e:                  # noqa: BLE001: a read that fails says nothing about the calendar
+            log.warning("a tap's effect couldn't be read on the calendar (%s)", type(e).__name__)
+            return "unread"
+        return "records" if effect == "records" else "unchecked"
+
     RELIST_MAX = 10
+    TAP_STATE_WORDS = {"committed": "carried out before the records were put back",
+                       "unknown": "Harness can't tell whether it was carried out",
+                       "not_started": "not carried out",
+                       "found": "already on your calendar"}
 
     def _relist_taps(self, rows: list[dict]) -> None:
         """Fifteenth round: the records were put back from a backup at this start, so no tap written down before it
-        is taken by itself (the backup may predate it, or have it). He gets a message listing them, then one card
-        per tap with a fresh button that does that tap now, on the records in use, if he still wants it."""
+        is taken by itself. Sixteenth round, truthfully: each tap's recorded state (carried out before the records
+        were put back; outcome unknown; not carried out) and, for one that reaches a calendar, a read of the
+        calendar by the effect's own identity first: one the calendar already shows is marked done and gets no
+        button. The rest are sorted by tap time; the newest RELIST_MAX get a card with a fresh Go ahead, and every
+        older one is listed in a second message by its time and state (counts by state in the first), so none is
+        out of reach."""
         owner, tz = self.config.owner_user_id, ZoneInfo(self.config.timezone)
-        shown = rows[:self.RELIST_MAX]
+
+        def stamp(row):
+            try:
+                return float(row.get("at"))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def when(row):
+            try:
+                t = datetime.fromtimestamp(float(row.get("at")), timezone.utc).astimezone(tz)
+                return f"{t:%a %-I:%M %p}"
+            except (TypeError, ValueError, OverflowError, OSError):
+                return "before the restart"
+        checked = []
+        for row in sorted(rows, key=stamp, reverse=True):
+            seen = "unchecked"
+            if row["state"] in ("committed", "unknown"):
+                seen = self._tap_effect(row.get("op") or {})
+            if seen == "done":
+                if not self.handovers.journal_outcome(row["press"], "found"):
+                    log.error("a tap's outcome couldn't be written to the tap journal")
+                row = dict(row, state="found")
+            checked.append((row, seen))
+        found = [r for r, _ in checked if r["state"] == "found"]
+        open_ = [(r, seen) for r, seen in checked if r["state"] != "found"]
+        shown, rest = open_[:self.RELIST_MAX], open_[self.RELIST_MAX:]
+        counts = {k: sum(1 for r, _ in open_ if r["state"] == k) for k in ("committed", "unknown", "not_started")}
+        n = len(rows)
+        parts = [f"<b>Harness's records were put back from a backup</b>, so "
+                 f"{'a tap of yours from before it was' if n == 1 else f'{n} taps of yours from before it were'} "
+                 "not taken by itself."]
+        said = [f"{c} {self.TAP_STATE_WORDS[k]}" for k, c in counts.items() if c]
+        if found:
+            said.append(f"{len(found)} {self.TAP_STATE_WORDS['found']}, so nothing is left to do for "
+                        f"{'it' if len(found) == 1 else 'them'}")
+        if said:
+            parts.append("Of " + ("it" if n == 1 else "them") + ": " + "; ".join(said) + ".")
+        if shown:
+            parts.append(("The newest one follows" if len(shown) == 1 else f"The newest {len(shown)} follow")
+                         + " with a Go ahead of its own, if you still want it."
+                         + (f" The other {len(rest)} are listed after them by time and state." if rest else ""))
         with self.ledger.tx() as db:
-            n = len(rows)
-            self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
-                "<b>Harness's records were put back from a backup</b>, so "
-                f"{'a tap of yours from before it was' if n == 1 else f'{n} taps of yours from before it were'} "
-                "not carried out on them. "
-                + ("It follows with its own button, if you still want it."
-                   if n == 1 else "Each follows with its own button, if you still want it.")
-                + ("" if n <= len(shown) else f" The newest {len(shown)} are shown; the rest were not carried out.")))
-            for row in shown:
+            self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(" ".join(parts)))
+            for row, seen in shown:
                 p = row["press"]
-                t = None
-                try:
-                    t = datetime.fromtimestamp(float(row.get("at")), timezone.utc).astimezone(tz)
-                except (TypeError, ValueError, OverflowError, OSError):
-                    pass
-                when = f"{t:%a %-I:%M %p}" if t else "before the restart"
-                before = ("It was carried out on the records before they were put back; the records in use now "
-                          "don't have it." if row.get("committed") else "It wasn't carried out.")
+                text = self._relist_words(row["state"], seen)
                 nonce = choices.mint(self.ledger, kind="tap_reconfirm", chat_id=owner, ttl_s=self.TAP_RELIST_TTL_S,
                                      target=json.dumps({"custom_id": p.get("custom_id", ""),
-                                                        "message_id": p.get("message_id", "")}), db=db)
+                                                        "message_id": p.get("message_id", ""),
+                                                        "op": row.get("op") or {}}), db=db)
                 self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
-                    f"A tap of yours from {render.escape(when)}. {before} Go ahead does it now."),
+                    f"A tap of yours from {render.escape(when(row))}. {text}"),
                     buttons=[[("Go ahead", choices.callback_data(nonce))]],
                     binds=[{"type": "choice", "nonce": nonce}])
-            self.ledger.event("taps_relisted", {"count": n, "shown": len(shown)}, db=db)
+            if rest:
+                lines = [f"• {render.escape(when(r))}: {self.TAP_STATE_WORDS[r['state']]}" for r, _ in reversed(rest)]
+                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
+                    "<b>Older taps from before the records were put back</b>, not taken by themselves:\n"
+                    + "\n".join(lines)))
+            self.ledger.event("taps_relisted", {"count": n, "shown": len(shown), "listed": len(rest),
+                                                "found": len(found), **counts}, db=db)
         for row in rows:
             self.handovers.journal_done(row["press"])
+
+    @staticmethod
+    def _relist_words(state: str, seen: str) -> str:
+        if state == "not_started":
+            return "It wasn't carried out. Go ahead does it now."
+        first = ("It was carried out on the records before they were put back" if state == "committed"
+                 else "Harness can't tell whether it was carried out before the records were put back")
+        if seen == "not_done":
+            return f"{first}, and your calendar doesn't show it now. Go ahead does it now."
+        if seen == "unread":
+            return (f"{first}, and your calendar couldn't be read just now. Go ahead reads it again and does it "
+                    "only if it isn't there.")
+        if seen == "unchecked":
+            return f"{first}, and this kind of tap leaves nothing Harness can read on your calendar. Go ahead does it now."
+        return f"{first}; the records in use now don't have it. Go ahead does it now."
 
     TAP_RELIST_TTL_S = 24 * 3600
 
     def _reconfirm_tap(self, target: str) -> str:
         """His Go ahead on a relisted tap (fifteenth round): the tap he made before the restore, taken now on the
-        records in use, through the same checks as any tap (that card, once, before it expires)."""
+        records in use, through the same checks as any tap (that card, once, before it expires). Sixteenth round:
+        never blindly. A tap that reaches a calendar is read there first by its effect's identity: one the calendar
+        shows is done, nothing written; otherwise it goes through the normal checks, and the write itself reads
+        its fixed event id or its version before it writes, so nothing is made twice."""
         try:
             t = json.loads(target or "{}")
             cid = str(t.get("custom_id") or "")
             mid = int(t.get("message_id") or 0)
+            op = t.get("op") if isinstance(t.get("op"), dict) else {}
         except (ValueError, TypeError, AttributeError):
             return "That can't be read, so nothing changed."
         if not cid.startswith(DISCORD_PREFIX):
             return "That can't be read, so nothing changed."
+        if self._tap_effect(op) == "done":
+            with self.ledger.tx() as db:
+                self.ledger.event("tap_reconfirm_found", {}, db=db)
+            return "That's on your calendar already, so nothing was done again."
         if cid in (STOP, RESUME):
             return render.escape(self.commands._stop("") if cid == STOP else self.commands._resume(""))
         inc = Incoming(update_id=-int(time.time() * 1000), kind="callback", user_id=self.config.owner_user_id,
@@ -911,15 +1068,28 @@ class Controller:
         """A tap on one of our cards, checked by Cain's link and passed back here. The
         card's own checks (that card, once, before it expires) are the ledger's."""
         p = h.press
+        journaled = self.handovers is not None and h.journaled and bool(self.handovers.journal)
+        if journaled and not self.handovers.journal_intent(p, self._tap_op(p)):
+            # Sixteenth round: the intent is written before anything is acted on; one that can't be is a refusal.
+            log.error("a tap's intent couldn't be written to the tap journal: not taken")
+            self._refuse_tap(h, handover.UNRECORDED_TAP, journaled=False)
+            return
         self._press_inner(h, p)
         # Fourteenth round: answered (and struck off the tap journal) only once what it did is committed.
         # Fifteenth round: the commit is written in the journal itself first, so a replay never acts twice, even
-        # after the ledger is put back from a backup that predates it.
-        if self.handovers is not None and h.journaled:
-            self.handovers.journal_commit(p)
+        # after the ledger is put back from a backup that predates it. Sixteenth round: its result is checked.
+        if journaled and not self.handovers.journal_commit(p):
+            log.error("a tap was carried out but its outcome couldn't be written to the tap journal")
+            told = self.handovers.tell(h, self.COMMIT_UNRECORDED)
+            h.finish("ok", self.COMMIT_UNRECORDED, journal_commit=False, told=told)
+            return                             # kept: the next start settles it by the records and the calendar
         h.finish("ok")
         if self.handovers is not None:
             self.handovers.journal_done(p)
+
+    COMMIT_UNRECORDED = ("Your tap went through, but Harness couldn't note that in its tap list (logged). If its "
+                         "records are ever put back from a backup, it reads your calendar before doing anything with "
+                         "this tap again.")
 
     def _press_inner(self, h, p) -> None:
         owner = self.config.owner_user_id

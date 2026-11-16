@@ -160,6 +160,13 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
                      f'{_e(mig.get("lock_retry_s", ""))} s and Harness starts normally once it is free.</div>')
     for f in mig.get("files") or []:
         parts.append(f'<div class="muted">Beside the records: {_e(f)}</div>')
+    if mig.get("marker_unwritten"):
+        # Sixteenth round: the swap's refusal couldn't be written into its marker.
+        parts.append(f'<div class="no">⚠ The restore swap\'s refusal couldn\'t be written into its marker '
+                     f'({_e(mig["marker_unwritten"])}); the files in the way are listed above.</div>')
+    if mig.get("degraded") and mig.get("note") == "not delivered":
+        parts.append(f'<div class="no">⚠ Note not delivered: the message telling you Harness started degraded '
+                     f'didn\'t reach Cain\'s link after {_e(mig.get("note_tries", 0))} tries.</div>')
     if st.get("mail_skip_problem"):
         parts.append(f'<div class="no">⚠ mail_skip.json is ignored: {_e(st["mail_skip_problem"])}. Only the built-in '
                      'kinds are skipped.</div>')

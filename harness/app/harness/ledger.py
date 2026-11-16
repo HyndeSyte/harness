@@ -415,6 +415,9 @@ class LedgerBusy(TimeoutError):
     """A write waited WRITER_WAIT_MAX_S for another thread's hold on the ledger and gave up; nothing was written."""
 
 
+_OUTBOX_PASS = object()     # sixteenth round: the one key to the fence exemption, handed only by Ledger.outbox_tx
+
+
 class LedgerFenced(RuntimeError):
     """Fourteenth round: a restore is staged, so the ledger takes no write (Ledger.fence): it fails at once with
     the plain reason, never waits. Only the outbox's delivery bookkeeping is exempt (Ledger.outbox_tx)."""
@@ -532,21 +535,26 @@ class Ledger:
 
     def tx(self):
         """One write transaction (_tx). Fails at once with LedgerFenced while a staged restore fences the ledger."""
-        return self._tx(False)
+        return self._tx(None)
 
     def outbox_tx(self):
         """Fifteenth round: the one write a staged restore's fence lets through, the outbox's own delivery
         bookkeeping (sent marks, retries, a card's button binds), so the restart card goes out and nothing is
-        posted twice. Nothing else may use it: the exemption is this method, not an argument any caller can pass."""
-        return self._tx(True)
+        posted twice. Nothing else may use it: the exemption is this method, not an argument any caller can pass.
+        Sixteenth round: asserted at run time. _tx takes the exemption only as this module's private pass, which only
+        this method hands it; anything else (True included) is refused with a TypeError."""
+        return self._tx(_OUTBOX_PASS)
 
     @contextmanager
-    def _tx(self, fence_exempt: bool):
+    def _tx(self, exempt_pass):
         """One write transaction. BEGIN IMMEDIATE so two writers can never
         interleave a read-check-write. Twelfth round: while another thread holds this ledger's
         writers off (hold_writers, the migration), it waits until that's over. Fourteenth round: while a
         restore is staged (fence) it fails at once with LedgerFenced, unless fence_exempt (the outbox's own
         delivery bookkeeping, so the restart card and replies still go out)."""
+        if exempt_pass is not None and exempt_pass is not _OUTBOX_PASS:
+            raise TypeError("the fence exemption is the outbox's own (Ledger.outbox_tx)")
+        fence_exempt = exempt_pass is _OUTBOX_PASS
         key, me = self._key(), threading.get_ident()
         with _GATE:
             if key in _FENCED and not fence_exempt:

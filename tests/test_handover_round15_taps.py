@@ -173,9 +173,7 @@ def test_an_uncommitted_tap_across_a_restore_is_listed_not_taken(m, clock, tmp_p
     assert any(t.startswith("A tap of yours from") and "It wasn't carried out." in t for t in m.seen())
 
 
-def test_build_marks_a_start_that_swapped_a_restore_in():
-    src = (pathlib.Path(controller_mod.__file__).parent / "__main__.py").read_text()
-    assert "controller.restored_at_start = bool(swapped.get(\"ok\")) or migrate.restore_staged(path)" in src
+# Sixteenth round: the restore flag at start is tested through the real build (test_handover_round16_taps.py).
 
 
 # -- 3. one terminal outcome, one note, owned by the loop -------------------------------------------------------------
@@ -246,9 +244,9 @@ def test_a_note_that_cant_go_now_is_kept_and_posted_at_the_next_start(m, clock, 
     finally:
         m.ledger.unfence()
     rows = m.c.handovers.journaled()
-    assert len(rows) == 1 and rows[0]["notice"] == m.c.FENCED                # durable, not lost
+    assert len(rows) == 1 and rows[0]["note"] == m.c.FENCED and not rows[0]["delivered"]   # durable, not lost
     rows_on_disk = [json.loads(x) for x in open(m.c.handovers.journal)]
-    assert any(r.get("notice") == m.c.FENCED for r in rows_on_disk)
+    assert any(r.get("note") == m.c.FENCED and r.get("kind") == "refused" for r in rows_on_disk)
     told = []
     m.c.handovers.answer = lambda callback, text: told.append(text)          # the next start, link back
     m.c._taps_replayed = False
@@ -263,7 +261,7 @@ def test_a_stale_pending_note_goes_as_a_message(m, clock, tmp_path):
     m.c.handovers.journal = str(tmp_path / "taps.jsonl")
     h = Handover(kind="press", press=dict(PRESS, custom_id="hx:zz"))
     assert m.c.handovers.journal_add(h)
-    assert m.c.handovers.journal_notice(h.press, "Not taken: a test reason. Nothing changed.")
+    assert m.c.handovers.journal_outcome(h.press, "refused", "Not taken: a test reason. Nothing changed.")
     rows = [json.loads(x) for x in open(m.c.handovers.journal)]
     for r in rows:
         r["at"] -= 3600
@@ -277,7 +275,7 @@ def test_a_stale_pending_note_goes_as_a_message(m, clock, tmp_path):
 
 def test_the_degraded_start_refuses_a_tap_through_the_links_answer_route(loopback, tmp_path):
     told = []
-    inbox = handover.Inbox(lambda: TOKEN, refusing="the records couldn't be opened (DatabaseError)",
+    inbox = handover.Inbox(lambda: TOKEN, journal="", refusing="the records couldn't be opened (DatabaseError)",
                            answer=lambda callback, text: told.append((callback, text)))
     srv = handover.serve(inbox, port=0, host="127.0.0.1", wait_s=30)
     try:
@@ -288,44 +286,13 @@ def test_the_degraded_start_refuses_a_tap_through_the_links_answer_route(loopbac
     assert told == [("9:t", handover.DEGRADED_TAP)] and inbox.pending() == 0
 
 
-def test_the_degraded_start_wires_the_links_answer_route():
-    from harness import __main__ as main_mod
-    src = inspect.getsource(main_mod.degraded)
-    assert "handover.Inbox(token, refusing=why, answer=chat.answer_callback)" in src
+# Sixteenth round: the degraded start's answer route is tested through degraded() itself (test_handover_round16_taps.py).
 
 
 # -- 8. no dead buttons from cards held while fenced ----------------------------------------------------------------
 
-def test_a_card_due_while_fenced_is_held_then_sent_and_bound_and_its_tap_is_answered(m, clock):
-    """On the real dispatch path: the card isn't sent while fenced (a tap then gets the staged-restore line from the
-    service), and once unfenced it's sent with its buttons bound, and a tap on it is taken."""
-    from harness import choices
-    owner = m.c.config.owner_user_id
-    with m.ledger.tx() as db:
-        nonce = choices.mint(m.ledger, kind="migration_clock", target="0", chat_id=owner, ttl_s=3600, db=db)
-        m.ledger.enqueue(chat_id=owner, kind="notice", text="A card made just before the fence.",
-                         buttons=[[("Card button", choices.callback_data(nonce))]],
-                         binds=[{"type": "choice", "nonce": nonce}], db=db)
-        m.ledger.enqueue(chat_id=owner, kind="notice", text="Restart Harness now to put its records back.", db=db)
-    m.ledger.fence(m.c.FENCED)
-    try:
-        m.c._fence()
-        m.c.outbox.flush()
-        assert any("Restart Harness now" in t for t in m.seen())             # the restart card still goes
-        assert "Card button" not in m.labels()                              # the card with buttons waits
-        out = m.send(Handover(kind="press", press={"id": "77", "token": "t", "app": "9",
-                                                   "custom_id": "hx:c:whatever", "message_id": "1"}))
-        assert out["status"] == "refused" and out["said"] == m.c.FENCED     # a definite answer
-    finally:
-        m.ledger.unfence()
-        m.c.handovers.fenced = ""
-    m.c.outbox.flush()
-    assert "Card button" in m.labels()
-    before = len(m.link.answers)
-    out = m.tap("Card button")
-    assert out["status"] == "ok", m.link.answers[before:]
-    assert not [a for _, a in m.link.answers if a in ("That button isn't valid here.", "That button isn't valid "
-                                                                                       "any more.")]
+# Sixteenth round: a card held while fenced is tested through a real restart with a swap
+# (test_handover_round16_restore.py).
 
 
 # -- 10. heartbeat and clock check while fenced ---------------------------------------------------------------------
@@ -375,8 +342,8 @@ def snowflake(when: float) -> str:
 
 
 def test_a_taps_age_comes_from_discords_own_stamp(m):
-    old = {"press": {"id": snowflake(time.time() - 3600)}, "at": time.time()}   # written down just now
-    assert 3500 < m.c._tap_age(old) < 3700                                    # but Discord says an hour ago
+    near = {"press": {"id": snowflake(time.time() - 600)}, "at": time.time() - 560}   # they agree within tolerance
+    assert 590 < m.c._tap_age(near) < 610                                     # Discord's own stamp
     plain = {"press": {"id": "91001"}, "at": time.time() - 60}               # not a real stamp: when written
     assert 50 < m.c._tap_age(plain) < 70
 

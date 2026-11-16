@@ -485,6 +485,15 @@ class FamilyAdd:
             lines.append(f"Before this count: {counts(earlier)}.")
         return "\n".join(lines)
 
+    def tap_effect(self, op: dict) -> str:
+        """Sixteenth round: whether the Family add an Approve led to is on the calendar, read by the event's own id
+        (it comes from the proposal): "done", "not_done" (gone) or "unread"."""
+        pid = str((op or {}).get("proposal") or "")
+        if not pid:
+            return "unread"
+        out, _ = self.client.fetch(self.client.href_for(caldav.uid_for(pid)))
+        return {"ok": "done", "gone": "not_done"}.get(out.kind, "unread")
+
     def _counted_uids(self, b: dict) -> list[str]:
         return [r["uid"] for r in self.ledger.db.execute(
             "SELECT uid FROM family_adds WHERE state IN ('created','written','unconfirmed') AND rowid>?",

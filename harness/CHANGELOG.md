@@ -64,10 +64,15 @@
 - **Two restores in a row bring back every held request, once each.** A set of records put aside is cleared only after its own requests came back.
 - **Amazon's skipped mail is only Subscribe & Save delivery management.** Prime, Audible and Kindle renewals, an order's new delivery date and its return window all come through. Harness's page counts the mail it skipped, with sender, subject and the rule, and if mail_skip.json has a mistake it's ignored whole and the page says why.
 - **A restore whose own note can't be read moves nothing.** Harness starts degraded and its page lists the files beside your records. A restore refused for a file that isn't its own can be sorted from the App's command line, which moves just those files aside after you type yes.
-- **No button is dead after a restore is staged.** A card with buttons waits and goes out after the restart, and a tap meanwhile is answered that Harness is waiting to restart.
+- **No button is dead after a restore is staged.** A card with buttons waits, and after the restart its words come back once, without the buttons that belonged to the records set aside. A tap meanwhile is answered that Harness is waiting to restart.
 - **A start that waited for a restore being staged goes on by itself** once the staging is done; its page shows the wait.
 - **While a restore is staged, Harness's page still shows its loop and its clock check,** so a stuck Harness never looks like one waiting to restart.
 - **Possibly overwritten is told for a removed repeat exception in another time zone,** and time zones some calendars write by other names (Windows or older names) are no longer told as someone else's edit.
+- **After a restore, Harness looks at your calendar before offering a tap again.** A tap whose change is already on your calendar is marked done with no button, so nothing is added twice. Each tap from before the restore says plainly whether it was carried out, not carried out, or Harness can't tell, and Go ahead reads your calendar again before it does anything.
+- **Every tap from before a restore is listed,** the newest ten with a Go ahead each and any older ones in a second message by time, with how many were in each state.
+- **A tap that went through but couldn't be noted down says so,** instead of being ignored.
+- **A restore held up by a stray file goes on by itself once the file is gone,** and the command line that moves stray files aside only ever moves the restore's own stray log files, checking each copy first. If Harness can't tell you it started without its records, its page says the note wasn't delivered.
+- **A Subscribe & Save advert at the bottom of an ordinary Amazon delivery mail no longer hides it.** Only a mail that says Subscribe & Save at the top or in its subject is skipped, and mail_skip.json has size limits (50 kinds, 20 words a list).
 
 ## 0.23.0
 

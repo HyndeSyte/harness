@@ -298,11 +298,19 @@ def _write_json(path: str, data: dict) -> None:
     if not path:
         return
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # Sixteenth round: a write, fsync or rename that fails leaves the file it would replace as it was.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     _fsync_dir(os.path.dirname(os.path.abspath(path)))     # fourteenth round: the rename itself survives power loss
 
 
@@ -1492,10 +1500,12 @@ class SwapRefused(RuntimeError):
     Fifteenth round: `files` lists what's at the live and kept names (for the status page and the command line),
     and `conflict` the files that stopped it, which `--set-aside` moves into a dated folder."""
 
-    def __init__(self, why: str, *, files: list | None = None, conflict: list | None = None):
+    def __init__(self, why: str, *, files: list | None = None, conflict: list | None = None,
+                 marker_unwritten: str = ""):
         super().__init__(why)
         self.files = list(files or [])
         self.conflict = list(conflict or [])
+        self.marker_unwritten = marker_unwritten   # sixteenth round: why the refusal isn't in the marker, or ""
 
 
 class LockBusy(SwapRefused):
@@ -1525,15 +1535,21 @@ def swap_files(ledger_path: str) -> list[str]:
 
 def _refused(base: str, plan: dict | None, why: str, conflict: list[str]) -> SwapRefused:
     """A SwapRefused with the listing; the reason and the conflicting files are recorded in a readable marker
-    (atomically), so the command line's --set-aside knows what to move. An unreadable marker is never touched."""
+    (atomically), so the command line's --set-aside knows what was refused. An unreadable marker is never touched.
+    Sixteenth round: a refusal that couldn't be written into the marker is said (marker_unwritten), on the degraded
+    page and in the command line's listing, which derives the conflict from the swap's state either way."""
     swap = base + SWAP_MARKER
+    unwritten = ""
     if plan is not None and plan.get("kept"):
         plan = dict(plan, refused=why, conflict=[os.path.basename(c) for c in conflict])
         try:
             _write_json(swap, plan)
-        except OSError:
-            pass
-    return SwapRefused(why, files=swap_files(base), conflict=[os.path.basename(c) for c in conflict])
+        except OSError as e:
+            unwritten = type(e).__name__
+            log.error("the swap's refusal couldn't be written into its marker (%s); the old marker stays as it was",
+                      unwritten)
+    return SwapRefused(why, files=swap_files(base), conflict=[os.path.basename(c) for c in conflict],
+                       marker_unwritten=unwritten)
 
 
 def _swap_step(phase: str) -> None:
@@ -1566,8 +1582,21 @@ def apply_staged_restore(ledger_path: str, now: datetime | None = None) -> dict:
             raise SwapRefused("a restore swap was under way but its marker can't be read, so nothing was moved",
                               files=swap_files(base))
         if plan.get("refused"):
-            raise SwapRefused(f"a restore swap was refused earlier: {plan['refused']}", files=swap_files(base),
-                              conflict=list(plan.get("conflict") or []))
+            # Sixteenth round: re-evaluated at each start. Once the files that stopped it are gone (sorted by hand,
+            # or by --set-aside), the refusal clears and the swap goes on from where it stopped.
+            movable, protected = swap_conflicts(base, plan)
+            named = [str(n) for n in plan.get("conflict") or []]
+            if movable or protected or any(os.path.lexists(os.path.join(os.path.dirname(base), n))
+                                           for n in named if _plain_name(n)):
+                raise SwapRefused(f"a restore swap was refused earlier: {plan['refused']}", files=swap_files(base),
+                                  conflict=named)
+            log.warning("the files that stopped the restore swap are gone: the refusal is cleared and the swap goes on")
+            plan = {k: v for k, v in plan.items() if k not in ("refused", "conflict")}
+            try:
+                _write_json(swap, plan)
+            except OSError as e:
+                log.error("the cleared refusal couldn't be written into the swap marker (%s); the swap goes on",
+                          type(e).__name__)
         log.warning("a restore swap was under way when the App stopped: finishing it")
         return _finish_swap(base, plan)
     if not os.path.isfile(staged):
@@ -1716,13 +1745,68 @@ def _roll_back(base: str, plan: dict, why: str) -> dict:
     return {"ok": False, "said": why, "rolled_back": True}
 
 
+def _plain_name(n: str) -> bool:
+    return bool(n) and "/" not in n and "\\" not in n and n not in (".", "..")
+
+
+def swap_conflicts(base: str, plan: dict) -> tuple[list[str], list[tuple[str, str]]]:
+    """Sixteenth round: what stops a swap now, derived from its validated state (the marker's recorded steps and
+    what's on disk), never from names read out of the marker. (movable, protected): movable are the swap's own
+    conflicting sidecars at the records' live name (a -wal or -shm there after its own move was recorded, or beside
+    the restored records); protected are files in the way that are never moved by --set-aside (the records' own
+    file at the live name, a kept set's file at the kept name), each with why."""
+    done = set(plan.get("done") or [])
+    kept = str(plan.get("kept") or "")
+    movable: list[str] = []
+    protected: list[tuple[str, str]] = []
+    staged = os.path.isfile(base + RESTORE_SUFFIX)
+    for x in ("-wal", "-shm"):
+        if not os.path.lexists(base + x):
+            continue
+        if "renamed" in done or ("moved" + x in done and staged):
+            movable.append(os.path.basename(base + x))
+    if "renamed" not in done:
+        if "moved" in done and staged and os.path.lexists(base):
+            protected.append((os.path.basename(base), "the records' own file at the live name"))
+        for x in SIDECARS:
+            if "moved" + x not in done and os.path.lexists(base + x) and kept and os.path.lexists(kept + x):
+                protected.append((os.path.basename(kept + x), "a kept set's file"))
+    return movable, protected
+
+
+def _protected_why(base: str, name: str) -> str:
+    """Why a name the marker gives isn't one --set-aside moves (sixteenth round), or "" when it's an ordinary name."""
+    b = os.path.basename(base)
+    if not _plain_name(name):
+        return "it isn't a plain name in the records' folder"
+    if name == b:
+        return "it's the records' own file"
+    if name in (b + "-wal", b + "-shm"):
+        return "it's the records' own log, and the swap's state doesn't say it's foreign"
+    if name.startswith(b + RESTORE_SUFFIX) or name in (b + STAGE_MARKER, b + SWAP_MARKER, b + RESTORED):
+        return "it's the staged restore or one of the swap's markers"
+    if name.startswith("harness-replaced-"):
+        return "it's part of a kept set"
+    if name.startswith("harness-set-aside-") or name.startswith("harness-before-"):
+        return "it's a set-aside folder or a backup"
+    return "the swap's state doesn't name it"
+
+
 def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> dict:
     """Fifteenth round, from the command line (python3 -m harness.migrate <records> --set-aside): a swap refused for
-    files it doesn't own (a foreign log at the live name, or a kept name already taken) is sorted by moving exactly
-    those files into a dated folder beside the records (harness-set-aside-<time>/), after the listing is shown and
-    `confirm` (a typed yes) agrees; then the refusal is cleared from the swap marker, so the next start finishes the
-    swap. Under harness.lock: refused while Harness runs normally (the degraded start lets the lock go)."""
+    files it doesn't own is sorted by moving them into a folder beside the records (harness-set-aside-<time>-<n>/),
+    after the listing is shown and `confirm` (a typed yes) agrees; then the refusal is cleared from the swap marker,
+    so the next start finishes the swap. Under harness.lock: refused while Harness runs normally.
+
+    Sixteenth round: the move set is derived from the swap's validated state (swap_conflicts), never from names
+    read out of the marker: only the swap's own conflicting sidecars at the live name. A marker naming anything
+    else (the live ledger, its own log, the staged restore, a kept set, anything outside the folder) is refused
+    explicitly, and so is a conflict that's a protected file; the whole set is checked before anything moves; each
+    file is copied, the copy checked byte for byte and fsynced, and only then is the original removed. The folder's
+    name is unique (time plus a counter)."""
     from datetime import timezone as _tz
+    import hashlib
+    import shutil
     base = os.path.abspath(ledger_path)
     folder = os.path.dirname(base)
     swap = base + SWAP_MARKER
@@ -1734,31 +1818,64 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
                                          "was moved; stop the App first"}
     try:
         plan = _read_json(swap)
-        if not _plan_ok(base, plan) or not plan.get("refused"):
+        if not _plan_ok(base, plan):
+            return {"ok": False, "said": "there's no readable restore swap beside the records to sort",
+                    "files": swap_files(base)}
+        movable, protected = swap_conflicts(base, plan)
+        named = [str(n) for n in plan.get("conflict") or []]
+        refusals = [f"{n}: {_protected_why(base, n)}" for n in named if n not in movable and
+                    (not _plain_name(n) or os.path.lexists(os.path.join(folder, n)) or _protected_why(base, n)
+                     != "the swap's state doesn't name it")]
+        refusals += [f"{n}: {why}" for n, why in protected]
+        if refusals:
+            return {"ok": False, "said": "nothing was moved: these can't be set aside by this command and need "
+                                         "sorting by hand: " + "; ".join(refusals),
+                    "refused": refusals, "files": swap_files(base)}
+        if not movable and not plan.get("refused"):
             return {"ok": False, "said": "there's no refused restore swap beside the records to sort",
                     "files": swap_files(base)}
-        names = [str(n) for n in plan.get("conflict") or []]
-        if not names or any("/" in n or n in ("", ".", "..") or not n.startswith("harness") for n in names):
-            return {"ok": False, "said": "the swap marker doesn't name files this can move", "files": swap_files(base)}
-        present = [n for n in names if os.path.lexists(os.path.join(folder, n))]
         stamp = (now or datetime.now(_tz.utc)).strftime("%Y%m%dT%H%M%SZ")
-        dest = os.path.join(folder, f"harness-set-aside-{stamp}")
-        ask = (f"The restore swap was refused: {plan['refused']}. Move {', '.join(present) or 'nothing'} into "
+        n = 1
+        dest = os.path.join(folder, f"harness-set-aside-{stamp}-{n}")
+        while os.path.lexists(dest):
+            n += 1
+            dest = os.path.join(folder, f"harness-set-aside-{stamp}-{n}")
+        why = plan.get("refused") or "files at the records' name it doesn't own (the refusal wasn't recorded)"
+        ask = (f"The restore swap was refused: {why}. Move {', '.join(movable) or 'nothing'} into "
                f"{os.path.basename(dest)}/ and let the next start finish the swap? Type yes to go ahead: ")
         answer = (confirm or input)(ask)
         if str(answer or "").strip().lower() != "yes":
             return {"ok": False, "said": "not confirmed, so nothing was moved", "files": swap_files(base)}
-        if present:
+
+        def digest(path: str) -> str:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        if movable:
             os.makedirs(dest, exist_ok=False)
-            for n in present:
-                os.replace(os.path.join(folder, n), os.path.join(dest, n))
+            copied = []
+            for name in movable:
+                src, dst = os.path.join(folder, name), os.path.join(dest, name)
+                shutil.copy2(src, dst)
+                with open(dst, "rb") as f:
+                    os.fsync(f.fileno())
+                if digest(src) != digest(dst):
+                    for c in copied + [dst]:
+                        _remove(c)
+                    return {"ok": False, "said": f"the copy of {name} didn't match it, so nothing was moved",
+                            "files": swap_files(base)}
+                copied.append(dst)
             _fsync_dir(dest)
             _fsync_dir(folder)
-        plan.pop("refused", None)
-        plan.pop("conflict", None)
+            for name in movable:
+                os.remove(os.path.join(folder, name))
+            _fsync_dir(folder)
+        plan = {k: v for k, v in plan.items() if k not in ("refused", "conflict")}
         _write_json(swap, plan)
         log.warning("files the restore swap refused were set aside in %s", os.path.basename(dest))
-        return {"ok": True, "moved": present, "into": os.path.basename(dest) if present else "",
+        return {"ok": True, "moved": movable, "into": os.path.basename(dest) if movable else "",
                 "said": "Set aside. The next start of Harness finishes the restore swap."}
     finally:
         if lock is not None:
@@ -1969,11 +2086,15 @@ def after_restore(ledger: Ledger, chat_id: int, tz: str) -> dict:
     return {"held": held, **info}
 
 
-def _went_in_kept(kept: str, flag: str) -> bool:
+def _went_in_kept(kept: str, flag: str, text: str = "") -> bool:
     """Fifteenth round: a post-back cut short and then set aside by another restore: whether the records set aside
     after this kept set recorded that item's post and delivered it (its outbox row sent). Delivered there: not
     posted again; recorded but never delivered (it was set aside queued): posted again, so it's neither lost nor
-    doubled. Each later kept set is only read."""
+    doubled. Each later kept set is only read.
+
+    Sixteenth round: a flag in the older format (no outbox row) counts as done only when that later set's outbox
+    shows a delivered row for this very post (its text, `text`); otherwise the item is posted again under the
+    once-each guard and the set is kept until it's done."""
     import sqlite3
     folder = os.path.dirname(os.path.abspath(kept))
     for later in kept_sets(folder):
@@ -1990,7 +2111,10 @@ def _went_in_kept(kept: str, flag: str) -> bool:
             try:
                 row = int(json.loads(got[0]).get("outbox"))
             except (ValueError, TypeError, AttributeError):
-                return True                    # recorded the older way: taken as sent
+                if not text:
+                    return False
+                sent = conn.execute("SELECT 1 FROM outbox WHERE state='sent' AND text=?", (text,)).fetchone()
+                return sent is not None        # recorded the older way: done only if delivered there
             state = conn.execute("SELECT state FROM outbox WHERE id=?", (row,)).fetchone()
             return bool(state) and state[0] == "sent"
         except sqlite3.Error:
@@ -2000,36 +2124,84 @@ def _went_in_kept(kept: str, flag: str) -> bool:
     return False
 
 
+def held_messages(kept_path: str) -> list[tuple[str, str, bool]]:
+    """Sixteenth round: the messages a kept set still had queued when the records were put back (cards held by the
+    fence among them, the restart card's own turn included), not its own post-backs: (key, text, had buttons)."""
+    import sqlite3
+    out: list[tuple[str, str, bool]] = []
+    if not os.path.isfile(kept_path):
+        return out
+    try:
+        conn = sqlite3.connect(f"file:{kept_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return out
+    try:
+        ours = set()
+        for (value,) in conn.execute("SELECT value FROM meta WHERE key LIKE ?", (POSTED + "%",)).fetchall():
+            try:
+                ours.add(int(json.loads(value).get("outbox")))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        for rid, text, buttons in conn.execute("SELECT id, text, buttons_json FROM outbox WHERE state='queued' "
+                                               "ORDER BY id").fetchall():
+            post_back = str(text).startswith(("<b>Harness's records are back from the backup</b>",
+                                              "A request that was waiting in the records set aside",
+                                              "<i>A message that was waiting to go out"))
+            if rid not in ours and text and not post_back:
+                out.append((f"outbox:{rid}", str(text), bool(buttons)))
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return out
+
+
+def _held_message_text(text: str, buttons: bool) -> str:
+    return render.fit("<i>A message that was waiting to go out when the records were put back"
+                      + (" (its buttons belonged to the records set aside, so they're left off; Harness asks again "
+                         "where it still needs your answer)" if buttons else "") + ":</i>\n" + text)
+
+
 def _post_back(ledger: Ledger, chat_id: int, tz: str, kept: str, frm: str) -> int:
-    """One kept set's post-back (after_restore): its summary and each held request, once. How many it holds."""
+    """One kept set's post-back (after_restore): its summary, each held request and (sixteenth round) each message it
+    still had queued, once. How many requests it holds."""
     name = os.path.basename(kept)
     items = held_items(kept, tz)
+    messages = held_messages(kept)
     mark_path = kept + POSTBACK
     mark = _read_json(mark_path)
     posted = list(mark.get("posted") or [])
     sent = 0
-    for key, lines in [("summary", [])] + items:
+
+    def text_for(key: str, lines) -> str:
+        if key == "summary":
+            return render.fit(
+                f"<b>Harness's records are back from the backup</b> "
+                f"({render.escape(frm or 'a backup')}). The records they replaced are "
+                f"kept as {render.escape(name)}. "
+                + (f"{len(items)} request{'s were' if len(items) != 1 else ' was'} waiting there; each "
+                   "follows, ready to copy into the calendar app." if items
+                   else "No requests were waiting there."))
+        if key.startswith("outbox:"):
+            return _held_message_text(lines[0], lines[1])
+        return render.fit("A request that was waiting in the records set aside; ready to copy into the calendar "
+                          "app:\n" + "\n".join(lines))
+    todo = [("summary", [])] + items + [(k, (t, b)) for k, t, b in messages]
+    for key, lines in todo:
         if key in posted:
             continue
         flag = f"{POSTED}{name}:{key}"
-        if mark.get("pending") == key and (ledger.get_meta(flag) is not None or _went_in_kept(kept, flag)):
+        text = text_for(key, lines)
+        if mark.get("pending") == key and (ledger.get_meta(flag) is not None or _went_in_kept(kept, flag, text)):
             posted.append(key)                 # it went; the stop came before the marker said so
             continue
         mark = {"posted": posted, "pending": key, "done": False, "from": frm}
         _write_json(mark_path, mark)
         with ledger.tx() as db:
-            if ledger.get_meta(flag) is None:
-                if key == "summary":
-                    text = (f"<b>Harness's records are back from the backup</b> "
-                            f"({render.escape(frm or 'a backup')}). The records they replaced are "
-                            f"kept as {render.escape(name)}. "
-                            + (f"{len(items)} request{'s were' if len(items) != 1 else ' was'} waiting there; each "
-                               "follows, ready to copy into the calendar app." if items
-                               else "No requests were waiting there."))
-                else:
-                    text = "A request that was waiting in the records set aside; ready to copy into the calendar " \
-                           "app:\n" + "\n".join(lines)
-                row = ledger.enqueue(chat_id=chat_id, kind="notice", text=render.fit(text), db=db)
+            dup = key.startswith("outbox:") and db.execute(
+                "SELECT 1 FROM outbox WHERE text IN (?, ?)", (text, lines[0])).fetchone() is not None
+            if ledger.get_meta(flag) is None and not dup:
+                row = ledger.enqueue(chat_id=chat_id, kind="notice", text=text, db=db)
                 ledger.set_meta(flag, json.dumps({"at": iso(ledger.now()), "outbox": row}), db)
                 sent += key != "summary"
         _swap_step("posted:" + key)
@@ -2037,7 +2209,7 @@ def _post_back(ledger: Ledger, chat_id: int, tz: str, kept: str, frm: str) -> in
         _write_json(mark_path, {"posted": posted, "pending": None, "done": False, "from": frm})
     with ledger.tx() as db:
         ledger.event("migration_restored", {"from": frm, "kept": name, "held_passed_back": len(items),
-                                            "sent_now": sent}, db=db)
+                                            "messages_passed_back": len(messages), "sent_now": sent}, db=db)
     _write_json(mark_path, {"posted": posted, "pending": None, "done": True, "from": frm})
     return len(items)
 
@@ -2053,10 +2225,16 @@ if __name__ == "__main__":
     # Fifteenth round: --swap lists what's at the records' live and kept names (nothing is moved); --set-aside moves
     # the files a refused swap named into a dated folder, after a typed yes, and clears the refusal.
     if len(args) == 2 and args[1] == "--swap":
-        plan = _read_json(os.path.abspath(args[0]) + SWAP_MARKER)
-        print(json.dumps({"ok": True, "swap_marker": os.path.lexists(os.path.abspath(args[0]) + SWAP_MARKER),
-                          "marker_readable": _plan_ok(os.path.abspath(args[0]), plan),
+        base_ = os.path.abspath(args[0])
+        plan = _read_json(base_ + SWAP_MARKER)
+        readable = _plan_ok(base_, plan)
+        movable, protected = swap_conflicts(base_, plan) if readable else ([], [])
+        # Sixteenth round: the conflict as the swap's state shows it now, and whether the refusal reached the marker.
+        print(json.dumps({"ok": True, "swap_marker": os.path.lexists(base_ + SWAP_MARKER),
+                          "marker_readable": readable,
                           "refused": plan.get("refused", ""), "conflict": plan.get("conflict", []),
+                          "conflict_now": movable, "protected_now": [f"{n}: {w}" for n, w in protected],
+                          "refusal_not_recorded": bool(readable and (movable or protected) and not plan.get("refused")),
                           "files": swap_files(args[0])}, indent=1, sort_keys=True))
         sys.exit(0)
     if len(args) == 2 and args[1] == "--set-aside":

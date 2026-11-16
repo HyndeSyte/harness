@@ -5914,6 +5914,53 @@ class CalendarChange:
                      ends=name, name=name, warns=[fact] if fact else [], bound=bound, expect=expect)], \
             [fact[0].upper() + fact[1:]] if fact else []
 
+    # -- a tap's effect, read by its own identity (sixteenth round) -----------------------------------------------
+    def tap_effect(self, op: dict) -> str:
+        """For a tap whose outcome isn't known (the records put back from a backup): whether the calendar shows what
+        the Approve led to, read by the effect's own stable identity and never by a search of the slot. An add (or
+        a repeating add) by the fixed id it's written under (from the key in `op`); a Gmail removal by the event id
+        the card was bound to. "done" when every part reads as done, "not_done" when a read answered that one
+        isn't, "unread" when a read couldn't tell, "unchecked" when a part carries no identity to read by."""
+        changes = list((op or {}).get("changes") or [])
+        if not changes:
+            return "unchecked"
+        pid = str(op.get("proposal") or "")
+        keys = [str(k) for k in op.get("keys") or []]
+        bound = [b for b in op.get("bound") or [] if isinstance(b, dict)]
+        got = []
+        for i, c in enumerate(changes):
+            kind, calendar = c.get("op"), c.get("calendar")
+            if kind in ("add", "add_series"):
+                key = keys[i] if i < len(keys) else f"{pid}:{i}"
+                got.append(self._there_by_id(calendar, self._uid(key, "hm-" if calendar == "family" else "cm")))
+            elif kind == "remove" and calendar == "gmail":
+                mine = [b for b in bound if b.get("op") == "remove" and b.get("calendar") == "gmail"]
+                if not mine:
+                    got.append("unchecked")
+                for b in mine:
+                    there = self._there_by_id("gmail", str(b.get("instance") or b.get("id") or ""))
+                    got.append({"done": "not_done", "not_done": "done"}.get(there, there))
+            else:
+                got.append("unchecked")
+        for verdict in ("not_done", "unread", "unchecked"):
+            if verdict in got:
+                return verdict
+        return "done"
+
+    def _there_by_id(self, calendar: str, ident: str) -> str:
+        """One event read by its id: "done" (there, not cancelled), "not_done" (gone), "unread"."""
+        if not ident:
+            return "unread"
+        if calendar == "gmail":
+            if self.google is None or not self.address():
+                return "unread"
+            kind, ev = self.google.look(self._gmail_address(), ident)
+            if kind == "gone" or (kind == "ok" and (ev or {}).get("status") == "cancelled"):
+                return "not_done"
+            return "done" if kind == "ok" and ev else "unread"
+        out, _ = self.client.fetch(self.client.href_for(ident))
+        return {"ok": "done", "gone": "not_done"}.get(out.kind, "unread")
+
     def _uid(self, key: str, prefix: str) -> str:
         return prefix + hashlib.sha256(f"calendar_change:{key}".encode()).hexdigest()[:32]
 

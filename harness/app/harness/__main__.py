@@ -209,12 +209,13 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
 
 
 LOCK_RETRY_S = 5            # fifteenth round: how often a start waiting on a restore being staged tries the lock again
-NOTE_RETRY_S = 60           # fifteenth round: how often the degraded note to him is tried again until it goes
-NOTE_TRIES = 10
+NOTE_RETRY_S = 60           # fifteenth round: the degraded note's first wait before it's tried again
+NOTE_RETRY_MAX_S = 30 * 60  # sixteenth round: the wait doubles after each failed try, up to this
+NOTE_TRIES = 10             # sixteenth round: then the page says "note not delivered" and it stops trying
 
 
 def degraded(data_dir: str, port: int, why: str, *, lock_wait: bool = False, files: list | None = None,
-             handover_port: int | None = None):
+             handover_port: int | None = None, marker_unwritten: str = ""):
     """Thirteenth round: when the records can't be opened at all, the specialist still serves its status page and
     Cain's health check (status "degraded", with why), so it's seen and said, and waits to be stopped. A restore
     staged by the command line (with the App stopped) or from a Home Assistant backup is the way back.
@@ -240,11 +241,15 @@ def degraded(data_dir: str, port: int, why: str, *, lock_wait: bool = False, fil
                     "lock_retry_s": LOCK_RETRY_S})
     if files:
         mig["files"] = list(files)
+    if marker_unwritten:
+        # Sixteenth round: the swap's refusal couldn't be written into its marker; the page says so.
+        mig["marker_unwritten"] = marker_unwritten
+    mig["note"] = "trying"
     status: dict = {"notes": [f"Harness started degraded: {why}. Calendar work is off until it starts normally."],
                     "migration": mig}
     web = serve(SetupApp(vault, status, queue.Queue()), port=port)
     chat = LinkChat(CainLink(token))
-    inbox = handover.Inbox(token, refusing=why, answer=chat.answer_callback)
+    inbox = handover.Inbox(token, journal="", refusing=why, answer=chat.answer_callback)   # refuses every tap: none is written down
     inbox.migration = dict(mig)
     inbox.degraded = why
     srv = None
@@ -262,17 +267,27 @@ def degraded(data_dir: str, port: int, why: str, *, lock_wait: bool = False, fil
     if lock_wait:
         note = ("Harness is waiting for a restore being staged beside its records before it starts; calendar work "
                 "is off until then and it starts by itself once the staging is done.")
-    note_tries, note_at, lock_at = 0, -1e9, time.monotonic()
+    note_tries, note_due, lock_at = 0, time.monotonic(), time.monotonic()
     out: int | str = 1
     while not stop_now:
         now = time.monotonic()
-        if note_tries < NOTE_TRIES and now - note_at >= NOTE_RETRY_S:
-            note_at, note_tries = now, note_tries + 1
+        if mig["note"] == "trying" and now >= note_due:
+            note_tries += 1
             try:
                 chat.send_message(0, note, kind="notice")       # best effort: Cain's link may be down too
-                note_tries = NOTE_TRIES
+                mig["note"] = "delivered"
             except Exception as e:                              # noqa: BLE001
-                log.info("the degraded note couldn't be posted (%s); tried again later", type(e).__name__)
+                if note_tries >= NOTE_TRIES:
+                    mig["note"] = "not delivered"
+                    log.error("the degraded note couldn't be posted after %d tries (%s)", note_tries,
+                              type(e).__name__)
+                else:
+                    wait = min(NOTE_RETRY_MAX_S, NOTE_RETRY_S * 2 ** (note_tries - 1))
+                    note_due = now + wait
+                    log.info("the degraded note couldn't be posted (%s); tried again in %.0fs", type(e).__name__, wait)
+            mig["note_tries"] = note_tries
+            status["migration"] = mig
+            inbox.migration = dict(mig)
         if lock_wait and now - lock_at >= LOCK_RETRY_S:
             lock_at = now
             if migrate.hold_process_lock(path, wait_s=0):
@@ -314,7 +329,7 @@ def main() -> int:
             why = (f"the records weren't opened: {e}" if isinstance(e, migrate.SwapRefused)
                    else f"the records couldn't be opened ({type(e).__name__})")
             got = degraded(data_dir, port, why, lock_wait=isinstance(e, migrate.LockBusy),
-                           files=getattr(e, "files", None))
+                           files=getattr(e, "files", None), marker_unwritten=getattr(e, "marker_unwritten", ""))
             if got != "retry":                 # fifteenth round: the lock came free, so the start goes on
                 return got
 

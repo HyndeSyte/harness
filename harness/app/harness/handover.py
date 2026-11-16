@@ -162,9 +162,6 @@ class Handover:
     job: str = ""                        # the job's short id: for the log, never for him
     journaled: bool = False              # /press: written to the tap journal (fourteenth round)
     told: bool = False                   # /press: he was told once that it waits (fourteenth round)
-    # Fifteenth round: the tap's one terminal note to him, sent once (Inbox.notify), whoever settles it.
-    notified: str = ""
-    _note_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def finish(self, status: str, said: str = "", **extra) -> None:
         if not self.done.is_set():
@@ -177,10 +174,25 @@ class Handover:
             self.done.set()
 
 
+def _row_key(r: dict, key: Callable[[dict], str]) -> str:
+    """The tap a journal line belongs to."""
+    if isinstance(r.get("press"), dict):
+        return key(r["press"])
+    for field_ in ("intent", "committed", "outcome", "delivered"):
+        if field_ in r:
+            return str(r.get(field_) or "")
+    return str(r.get("key") or "")
+
+
 class Inbox:
-    def __init__(self, token_fn: Callable[[], str], wake: threading.Event | None = None, *, journal: str = "",
+    def __init__(self, token_fn: Callable[[], str], wake: threading.Event | None = None, *, journal: str,
                  staged: Callable[[], bool] | None = None,
-                 answer: Callable[[str, str], None] | None = None, refusing: str = ""):
+                 answer: Callable[[str, str], None] | None = None, refusing: str = "",
+                 _journal_less: bool = False):
+        # Sixteenth round: the tap journal is a required argument. Only the no-ledger degraded start (which refuses
+        # every tap at once and queues nothing) and tests (Inbox.for_tests) may go without one.
+        if not journal and not refusing and not _journal_less:
+            raise ValueError("the tap journal's path is required")
         self._token_fn = token_fn
         self.queue: "queue.Queue[Handover]" = queue.Queue()
         self._front: list[Handover] = []     # fourteenth round: items given back by the controller, taken first
@@ -199,6 +211,12 @@ class Inbox:
         self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
         self.migration: dict = {}            # twelfth round: the ledger waiting for its move (migrate.waiting_summary)
         self.degraded = ""                   # thirteenth round: why it started without its records, or ""
+
+    @classmethod
+    def for_tests(cls, token_fn: Callable[[], str], wake: threading.Event | None = None, **kw) -> "Inbox":
+        """Sixteenth round: tests only. An inbox with no tap journal (taps are queued, never written down)."""
+        kw.setdefault("journal", "")
+        return cls(token_fn, wake, _journal_less=True, **kw)
 
     def beat(self) -> None:
         self.beat_at = time.monotonic()
@@ -238,12 +256,21 @@ class Inbox:
         with self._lock:
             self._front[:0] = list(items)
 
-    # -- the tap journal (fourteenth round; fifteenth: commits and pending notes in the journal itself) --------
+    # -- the tap journal (fourteenth round; fifteenth: commits in the journal itself; sixteenth: intents, outcomes)
     #
-    # One JSON line per record, appended and fsynced: {"press", "at"} when a tap is taken; {"committed": key} once
-    # what it did is committed in the ledger; {"notice": text, "key": key} for a note to him that couldn't be
-    # posted yet. A tap's lines are struck off (the file rewritten without them) only after its commit, or once
-    # he has been told it wasn't taken. A line that can't be read (a torn tail) is skipped, never the whole file.
+    # One JSON line per record, appended and fsynced, each write's result checked:
+    #   {"press", "at"}                     the tap, written down before Cain's link hears it was taken;
+    #   {"intent": key, "op", "at"}         sixteenth round: about to act on it (before the records change and before
+    #                                       any calendar write it leads to); "op" names its calendar effect by a
+    #                                       stable identity (the proposal and its fixed event ids), or none;
+    #   {"committed": key, "at"}            what it did is committed in the records: its outcome, done;
+    #   {"outcome": key, "kind", "note"}    sixteenth round: a terminal outcome other than done ("refused", or
+    #                                       "found": the calendar already shows it), written before the note;
+    #   {"delivered": key, "at"}            sixteenth round: that note reached him.
+    # A tap with an intent and no outcome is "outcome unknown", never "not carried out". A tap's lines are struck
+    # off (the file rewritten without them) only once its outcome is recorded and, for a note, delivered. A line
+    # that can't be read (a torn tail) is skipped, never the whole file. {"notice", "key"} lines from the fifteenth
+    # round read as a refusal whose note wasn't delivered.
 
     @staticmethod
     def key(press: dict) -> str:
@@ -312,19 +339,33 @@ class Inbox:
         h.journaled = True
         return True
 
+    def journal_intent(self, press: dict, op: dict | None = None) -> bool:
+        """Sixteenth round: about to act on the tap, written (fsynced) before the records change and before any
+        calendar write it leads to. Whether it was written: a tap whose intent can't be written isn't acted on."""
+        if not self.journal or not press:
+            return False
+        return self._append({"intent": self.key(press), "op": dict(op or {}), "at": time.time()})
+
     def journal_commit(self, press: dict) -> bool:
         """Fifteenth round: what the tap did is committed in the ledger. Recorded in the journal itself, before
         the tap is struck off, so a replay never acts twice even when the ledger is later put back from a backup
-        that predates it."""
+        that predates it. Sixteenth round: the caller checks the result; a failure is logged and told."""
         if not self.journal or not press:
             return False
         return self._append({"committed": self.key(press), "at": time.time()})
 
-    def journal_notice(self, press: dict, text: str) -> bool:
-        """Fifteenth round: a note to him on that tap that couldn't be posted now; posted at the next start."""
+    def journal_outcome(self, press: dict, kind: str, note: str = "") -> bool:
+        """Sixteenth round: the tap's terminal outcome ("refused", or "found": the calendar already shows it) and the
+        note owed to him, written (fsynced) before the note is posted, so a tap with one is never taken again."""
         if not self.journal or not press:
             return False
-        return self._append({"notice": text, "key": self.key(press), "at": time.time()})
+        return self._append({"outcome": self.key(press), "kind": kind, "note": note, "at": time.time()})
+
+    def journal_delivered(self, press: dict) -> bool:
+        """Sixteenth round: the note on that tap reached him; at the next start it isn't posted again."""
+        if not self.journal or not press:
+            return False
+        return self._append({"delivered": self.key(press), "at": time.time()})
 
     def journal_done(self, press: dict) -> None:
         """Strikes a tap off (all its lines) once what it did is committed, or he has been told it wasn't taken."""
@@ -333,8 +374,7 @@ class Inbox:
         key = self.key(press)
 
         def mine(r: dict) -> bool:
-            return (self.key(r["press"]) if isinstance(r.get("press"), dict)
-                    else str(r.get("committed") or r.get("key") or "")) == key
+            return _row_key(r, self.key) == key
         with self._lock:
             rows = self._journal_lines()
             keep = [r for r in rows if not mine(r)]
@@ -355,8 +395,10 @@ class Inbox:
                 log.error("the tap journal couldn't be updated: %s", type(e).__name__)
 
     def journaled(self) -> list[dict]:
-        """The taps written down and not yet struck off, oldest first: {"press", "at", "committed", "notice"}
-        each (committed: what it did is in the ledger; notice: a note to him still to post, or "")."""
+        """The taps written down and not yet struck off, oldest first, each {"press", "at", "intent", "op",
+        "committed", "outcome", "note", "delivered", "state"}. state: "committed" (its outcome, done, is recorded),
+        "refused" or "found" (a terminal outcome other than done), "unknown" (an intent and no outcome: it may or may
+        not have been carried out), or "not_started" (written down, never acted on)."""
         if not self.journal:
             return []
         with self._lock:
@@ -366,12 +408,34 @@ class Inbox:
             if isinstance(r.get("press"), dict):
                 k = self.key(r["press"])
                 taps.setdefault(k, {"press": {a: str(b) for a, b in r["press"].items()}, "at": r.get("at"),
-                                    "committed": False, "notice": ""})
-            elif r.get("committed") and str(r["committed"]) in taps:
-                taps[str(r["committed"])]["committed"] = True
-            elif r.get("notice") and str(r.get("key") or "") in taps:
-                taps[str(r["key"])]["notice"] = str(r["notice"])
+                                    "intent": False, "op": {}, "committed": False, "outcome": "", "note": "",
+                                    "delivered": False})
+                continue
+            k = _row_key(r, self.key)
+            t = taps.get(k)
+            if t is None:
+                continue
+            if "intent" in r:
+                t["intent"] = True
+                t["op"] = r.get("op") if isinstance(r.get("op"), dict) else {}
+            elif "committed" in r:
+                t["committed"] = True
+            elif "outcome" in r and not t["outcome"]:
+                t["outcome"] = str(r.get("kind") or "refused")
+                t["note"] = str(r.get("note") or "")
+            elif "notice" in r and not t["outcome"]:      # the fifteenth round's pending note
+                t["outcome"], t["note"] = "refused", str(r.get("notice") or "")
+            elif "delivered" in r:
+                t["delivered"] = True
+        for t in taps.values():
+            t["state"] = ("committed" if t["committed"] else t["outcome"] if t["outcome"]
+                          else "unknown" if t["intent"] else "not_started")
         return list(taps.values())
+
+    def row_for(self, press: dict) -> dict | None:
+        """One tap's journal entry (journaled), or None."""
+        key = self.key(press)
+        return next((t for t in self.journaled() if self.key(t["press"]) == key), None)
 
     def queued_keys(self) -> set[str]:
         """Fifteenth round: the taps queued for the controller now, read under the queue's own mutex."""
@@ -379,16 +443,25 @@ class Inbox:
             items = list(self._front) + list(self.queue.queue)
         return {self.key(h.press) for h in items if h.kind == "press"}
 
-    def notify(self, h: Handover, text: str) -> bool:
-        """Fifteenth round: the one terminal note to him on an accepted tap, behind a once-flag, so whichever of
-        the controller's paths settles it (or both, in a race) he hears it once. Whether he has been told."""
-        with h._note_lock:
-            if h.notified:
+    def notify(self, h: Handover, text: str, kind: str = "refused") -> bool:
+        """The one terminal note to him on a tap. Sixteenth round: durable, not an in-memory flag. For a tap written
+        down, its outcome and note are appended (fsynced) to the journal first; a note already recorded there is
+        the one posted, and one already delivered isn't posted again; once it goes, its delivery is recorded.
+        Whether he has been told."""
+        if not (h.journaled and self.journal):
+            return self.tell(h, text)
+        row = self.row_for(h.press)
+        if row is not None and row["outcome"]:
+            if row["delivered"]:
                 return True
-            if not self.tell(h, text):
-                return False
-            h.notified = text
-            return True
+            text = row["note"] or text
+        elif not self.journal_outcome(h.press, kind, text):
+            log.error("a tap's outcome couldn't be written to the tap journal; he's told all the same")
+        if not self.tell(h, text):
+            return False
+        if not self.journal_delivered(h.press):
+            log.error("a note's delivery couldn't be written to the tap journal")
+        return True
 
     def tell(self, h: Handover, text: str) -> bool:
         """A short note to him on that tap (the link's follow-up to its deferred answer). Whether it went."""

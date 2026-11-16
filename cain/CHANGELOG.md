@@ -28,6 +28,7 @@
 - The receipt button that takes one Gmail block off without remembering anything is now "Not this time", and Cain's message checks know it by that name.
 - After a restore, Cain shows each held request the specialist passes back once, one message each.
 - After a restore, Cain shows the specialist's list of your taps from before it, each with Go ahead, and leaves those taps to you.
+- Those taps now say whether each was carried out, not carried out, or the specialist can't tell, and one already on your calendar comes with no button.
 
 ## 0.11.0
 

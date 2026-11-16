@@ -416,7 +416,7 @@ def test_a_failed_migration_starts_degraded_says_so_once_and_offers_run_check_an
     assert len(notices(ledger)) == 1                                                 # posted once
     summary = migrate.migration_summary(ledger)
     assert summary["degraded"] is True and summary["waiting"] is True
-    inbox = handover.Inbox(lambda: "x")
+    inbox = handover.Inbox.for_tests(lambda: "x")
     inbox.migration = summary
     inbox.beat()
     assert inbox.health()["migration"]["degraded"] is True

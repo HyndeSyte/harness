@@ -114,7 +114,7 @@ class Morning:
                             requests=queue.Queue(), poll_timeout=0, family_add=self.fa, calendar_change=self.cc)
         self.c.discord = DiscordKeeper(self.d, store.get, store.set)
         self.c.discord_chat = LinkChat(self.link, paused=lambda: commands.is_paused(ledger))
-        self.c.handovers = Inbox(lambda: TOKEN)
+        self.c.handovers = Inbox.for_tests(lambda: TOKEN)
         self.seed()
         self.days_done()
         self.c.startup()

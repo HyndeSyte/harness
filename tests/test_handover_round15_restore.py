@@ -89,10 +89,7 @@ def test_the_start_is_degraded_with_the_listing_on_the_status_page(tmp_path, clo
     assert 'files=getattr(e, "files", None)' in src
 
 
-def test_the_swap_marker_is_written_atomically():
-    import inspect
-    src = inspect.getsource(migrate._write_json)
-    assert "os.fsync" in src and "os.replace(tmp, path)" in src and "_fsync_dir" in src
+# Sixteenth round: the atomic marker write is tested by failing its write, fsync and rename (test_handover_round16_restore.py).
 
 
 # -- 9. a staging slower than the lock wait ---------------------------------------------------------------------------
@@ -336,8 +333,6 @@ def test_a_kept_set_not_posted_back_is_never_pruned(tmp_path):
         mm._free_bytes = real
 
 
-def test_every_kept_set_not_done_is_posted_back_and_pruning_reads_each_marker():
-    import inspect
-    assert "kept_sets(folder)" in inspect.getsource(migrate.after_restore)
-    assert 'if not _read_json(p + POSTBACK).get("done")' in inspect.getsource(migrate.prune_kept)
+# Sixteenth round: the post-back pruning is tested through after_restore (test_handover_round16_restore.py).
+
 
