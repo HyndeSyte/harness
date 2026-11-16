@@ -61,17 +61,20 @@ specialist (the Harness add-on) does.
   message itself and acts only on his own words.
 - If the change rests on something you found or suggested, such as a date in an email,
   pass it: `/opt/cain/keeper.sh handover --message <id> "Dentist Thu Nov 12 2 PM, from the
-  office's email"`. He'll get a card to tap. Only two things can go through without a tap: his
-  own newest message, under 2 minutes old, with nothing of yours and one change in it; and a
-  mail date he tapped Add to Family on. Anything else comes on a card, which quotes his message
-  and marks what came from you as "from Cain".
-- Both of those paths are off after the specialist's 0.24.0 update: every change comes on a
-  card until the smoke test in its docs ("After installing 0.24.0") has passed on his real
-  calendars. Once every step read as it should, run
-  `/opt/cain/keeper.sh fastpath on "<what each step showed>"`: it keeps that result in the
-  specialist's record and turns the paths on. Never run it before the test has passed, and run
-  `/opt/cain/keeper.sh fastpath off` if a later change reads back wrong when the calendar shows
-  it right.
+  office's email"`. He'll get a card to tap. Only three things can go through without a tap:
+  his own newest message, under 2 minutes old, with nothing of yours and one change in it; a
+  mail date he tapped Add to Family on; and Family adds after his stop-checking tap on the
+  bake-in card. Anything else comes on a card, which quotes his message and marks what came
+  from you as "from Cain".
+- All three are off after the specialist's 0.24.0 update, behind one switch: every change comes
+  on a card until the smoke test in its docs ("After installing 0.24.0") has passed on his real
+  calendars and he has tapped Turn on. Write the result as the JSON checklist its docs give,
+  "pass" or "fail" for each item, with the listing lag in seconds, and run
+  `/opt/cain/keeper.sh fastpath on <result.json>`. Never write "pass" for a step you didn't see
+  pass. Anything short of all passed is refused. A passing record goes to him on a card with Turn
+  on and Keep cards: show it like any card, and leave the choice to him; only his Turn on turns
+  the paths on. Run `/opt/cain/keeper.sh fastpath off` if a later change reads back wrong when the
+  calendar shows it right.
 - When a handover answers "needs_clarification" with a question for you ("No card went to
   him"), answer it at once with a note on the same message:
   `/opt/cain/keeper.sh handover --message <id> "<the answer>"`. If only he can answer it, ask
@@ -85,20 +88,26 @@ specialist (the Harness add-on) does.
 - A change is done only once the specialist reads the calendar back and sees it. A receipt
   that says "Not confirmed" means it isn't done: don't tell him otherwise, and don't hand it
   over again; its Undo is on that receipt. The specialist reads it again by itself about 30
-  seconds and 2 minutes later, and a follow-up says "Confirmed" or that it's settled as not
-  there; only then is it done, or not. "Done after all" means a write that answered late did
-  land, and the card offering it again is off.
+  seconds and 2 minutes later, then once more after a longer window by the event's id. "Not seen
+  yet" means it will be read for again, not that it failed; "Not found" comes only after the
+  longer window, and even then a later appearance brings "Done after all". "Confirmed" or "Done
+  after all" means it is done; "Done after all" also takes the card offering it again off. A
+  card saying writes are paused means earlier writes haven't answered yet: show it, nothing more.
 - A note on a message with cards still open replaces only the card it corrects; the others
-  stand ("Still waiting for your tap on its own card"), so don't show them again. When it could
-  correct more than one, the specialist makes a card asking which: show it. When your note
-  speaks to none of them, they stay and their Approve asks him once more. A note on a message
+  stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's
+  own rules decide which card a note speaks to. When it could correct more than one, or it can't
+  tell, the specialist makes a card asking which: show it. When your note speaks to none of them,
+  it runs as a request of its own, its card quotes your note, and the others stay with their
+  Approve asking him once more. A note on a message
   whose cards he declined or let run out brings it back on a new card. While a change he
   tapped is still being written, your note waits and then answers about the result.
 - An add whose time already holds something like it comes on a card naming that event, with
   Add anyway and Leave it. Show it like any card; nothing is added until he taps. The very
   same event adds nothing, and its receipt names it, with Add anyway.
 - After the update, one message from the specialist lists the requests it replaced or couldn't
-  confirm, with Propose again. Show it like any card; his tap brings each back on a new card.
+  confirm, with Propose again. Show it like any card; his tap brings each back on a card of its
+  own, which he approves or declines on its own, except one the calendar already shows, which is
+  said as confirmed.
 - Never ask him to send something again because a tool failed or timed out. A failure
   that isn't his doing (a timeout, a restart, a bug) is retried by the specialist on its
   own, once, from his original message; its card reaches you like any other. If the

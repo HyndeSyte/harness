@@ -250,8 +250,11 @@ an open card the same way *keep checking* does, and the count starts over.
 
 It won't offer this while any standing rule is still waiting for your tap, and says so.
 
-If you tap the button to stop checking, adds go straight in without the Approve tap, up to
-5 a day. Anything with a warning still gets a card, and so does any add at a start time
+If you tap the button to stop checking, and the switch for changes without a card is on (it's off
+after installing 0.24.0 until you tap *Turn on* on the smoke test's card; see "When Cain hands a
+request over"), adds go straight in without the Approve tap, up to 5 a day. With that switch off,
+each add is a normal card, even after this tap, and the switch is checked again at the moment of
+the write. Anything with a warning still gets a card, and so does any add at a start time
 another add already has, or from a message that looks pasted (a quoted line, an email's header
 lines, a forward, a link), any message in the 30 minutes after one, or a message sent as a reply.
 A long or several-line message is no sign of a paste: you dictate. You still get the receipt and the Undo,
@@ -306,7 +309,7 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   written to you), a reply to one, an edited or forwarded message, a note from Cain; a new length
   you didn't give, three or more events off at once, or ending a series. The card says what will
   happen, in plain words; your tap's reply says it again. Until the smoke test after installing
-  0.24.0 has passed and Cain has turned the no-tap paths on (below), every change comes on a card.
+  0.24.0 has passed and you've tapped *Turn on* on its card (below), every change comes on a card.
 - **One card per change.** When a message with two or more changes needs your tap, each change
   comes on its own card, so you can take one and not the other, even one that would be clear on
   its own. Two clear changes in your own fresh message still land together in one receipt.
@@ -322,22 +325,51 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   Gmail but not on the Family copy says exactly that, with *Undo*. A read that disagrees is read
   once more a few seconds later, asking past any cache, and both reads go in the log. Undo is read
   back the same way, event by event, and says so if the calendar doesn't show it back as it was.
-- **Not confirmed is read again.** A change the read back doesn't show is read again by itself about
-  30 seconds and 2 minutes later. If a later read shows it as asked, a follow-up says "Confirmed";
-  if the read at 2 minutes still doesn't, a follow-up says it's settled as not on the calendar.
-  Neither writes anything. Asking for the same add again later first looks for that change's own
-  event (by its id) and the slot, so it finds the first write if it did land, and adds nothing.
-- **Writes can't hang, or land twice.** Each write to Google or iCloud gets 30 seconds; one with no
-  answer by then is abandoned and treated as a write whose answer was lost, so it's settled by
-  reading, never sent again blind. Each write carries a token recorded before it goes out. A change
-  being written counts as in progress for 2 minutes; after that it's offered again on a card only
-  once two reads a few seconds apart both answer and both find it not done (a read that can't tell
-  leaves it in progress). An add offered again keeps the event id of its first offer, so it can
+- **Not seen isn't the same as not done.** A change the read back doesn't show is read again by
+  itself about 30 seconds and 2 minutes later, then once more after a longer window (10 minutes, or
+  longer when the smoke test saw the calendar's listing lag: five times the lag it saw, up to an
+  hour). If a read shows it as asked, a follow-up says "Confirmed". If the read at 2 minutes still
+  doesn't, a follow-up says "Not seen yet", and when it will be read for again. The last read asks
+  for the event by its own id where the calendar can (an add's fixed id, a moved or removed event's
+  id), not a day's list. Only if that doesn't show it either does a follow-up say "Not found", and
+  even then its event ids are kept and read every 30 minutes for a week: if it shows up after all,
+  you get "Done after all" with *Undo*. All of this is kept in the record, so a restart carries on
+  where it was. None of it writes anything. Asking for the same add again later first looks for that
+  change's own event (by its id) and the slot, so it finds the first write if it did land, and adds
+  nothing.
+- **Writes can't hang, or land twice.** Each write to Google or iCloud has one total deadline of 45
+  seconds, kept by the write itself: connecting, the request, every request it makes (a sign-in,
+  the calendar's name check, the write) and the whole answer, with no retries; a watchdog shuts its
+  connection at the deadline, so a server that answers a byte at a time can't keep it going.
+  Harness waits 30 seconds for it; one with no answer by then is abandoned and treated as a write
+  whose answer was lost, so it's settled by reading, never sent again blind, and its own thread
+  ends by the deadline. If three abandoned writes are still running at once, new writes wait: the
+  change comes on a card saying writes are paused, and your tap writes it once they've finished.
+  Each write carries a token recorded before it goes out. A change being written counts as in
+  progress for 2 minutes, and never less than 45 seconds after its last write went out; after that
+  it's offered again on a card only once two reads a few seconds apart both answer and both find it
+  not done (a read that can't tell leaves it in progress). A change offered again that way is read
+  for again too, like one not confirmed (30 seconds, 2 minutes, the longer window by id, then every
+  30 minutes for a week): if it shows up, "Done after all" with *Undo*, and the newer card comes
+  off. An add offered again keeps the event id of its first offer, so it can
   never become a second event, and the calendar is searched by that id first. If the first write
   answers after all, its token is no longer current: it's recorded as done ("Done after all"), with
   *Undo*, and the card that offered it again comes off; if you'd already tapped that card, it found
   the first write there and added nothing. A move offered again checks the event's current time
   first, and one already at its new time moves nothing.
+- **A stale move or removal is turned down by the calendar itself.** The card keeps each event's
+  version as its read found it (Google's etag, or the iCloud resource's), and the move or removal is
+  sent with that version (If-Match), so if a correction, an *Undo* or anyone's edit changed the event
+  since, Google or iCloud refuses the write rather than applying it. One exception, so a second card
+  on the same event isn't refused because of the first one's write elsewhere in it (two days of one
+  Family series are one iCloud resource): when a read just before the write shows that very event,
+  by id, with the title and start the card showed, the version from that read is sent instead, so
+  anything newer than it is still refused. A write refused for its version is read by the event's
+  id and compared with the change (title, start, end, all day or not, repeating or not): Done only
+  when it already shows the change as asked (with nothing of Harness's there to undo); otherwise
+  "Not confirmed", with what that read shows, and it joins the reads again. A late add whose fixed
+  address turns out to be taken (Google's 409, iCloud's 412) is never assumed to be Harness's own
+  write: the event there is read and compared the same way, and only a match counts as there.
 - **Bound to the event the card names.** A removal or a move is bound to the very event its card or
   receipt names (calendar, id, and for a repeating event which day of it): a different event found
   later is never changed in its place, and nothing changes if the event isn't that one any more.
@@ -365,13 +397,18 @@ Cain doesn't pass your words on: Harness reads your DM itself.
   that one if it's yours and from the last 30 minutes, whatever you sent after it. Without one,
   it's your newest message, from the last 2 minutes. The same message handed over again finds
   the same request, never the answer to something else you said.
-- **Which changes go through without a tap.** Only two paths: your own newest message, under 2
+- **Which changes go through without a tap.** Only three paths: your own newest message, under 2
   minutes old, with nothing of Cain's in it, not split into several changes and with no day your
-  words leave open; and a date from your mail you tapped *Add to Family* on (your tap on the mail
-  card is the go). Both are **off after installing**, so every change comes on a normal card, until
-  the smoke test below has passed on the real calendars and Cain records it (`keeper.sh fastpath on
-  "<what the smoke test showed>"`); the result is kept in the record, and `keeper.sh fastpath off`
-  turns them off again. Once on, each is checked again at the moment of the write: for your message,
+  words leave open; a date from your mail you tapped *Add to Family* on (your tap on the mail card
+  is the go); and Family adds once you've tapped "stop checking" on the bake-in card (Family
+  calendar adds, above). All three sit behind one switch, and it's **off after installing**, so
+  every change comes on a normal card, until the smoke test below has passed on the real calendars,
+  Cain sends its record (`keeper.sh fastpath on <result.json>`), and you tap *Turn on* on the card
+  that shows it. A record with anything short of every item passed is refused and nothing changes;
+  *Keep cards* leaves it off; the record, who tapped and when are kept in the record, and
+  `keeper.sh fastpath off` turns it off again at any time. Even with the bake-in tap already given,
+  a Family add is a normal card while the switch is off. Each path is checked against the switch
+  again at the moment of the write. Once on, each is also checked again then: for your message,
   a fresh read of the DM must still show it as your newest, still under 2 minutes old, with no card
   open or replaced for it, in the same step that takes the change, and that step records your
   newest message; if any of that fails, it comes on a card saying why, and nothing is written. Right
@@ -390,8 +427,10 @@ Cain doesn't pass your words on: Harness reads your DM itself.
   neither is marked "(not in your words)".
 - **Days in your words.** "Today", "tonight", "tomorrow", a weekday ("Friday", "this Friday": the
   soonest one, today included), "the 13th" (the soonest 13th) and a month and day count as your
-  words, counted from the day you sent the message in your time zone, so "tomorrow" sent at 11:58
-  PM is the next day even if it's read after midnight. The card shows the date with your word
+  words, counted from the day you sent the message in your time zone (the add-on's `timezone`
+  option, never UTC or the Pi's own clock, and right across a daylight saving change), so "tomorrow"
+  sent at 11:58 PM is the next day even if it's read after midnight. The rules below that leave a
+  day open (the day you sent it, and the small hours from midnight to 4 AM) use that same zone. The card shows the date with your word
   ("date Fri Nov 13 (your "Friday")") and the receipt says how it was read ("Read from your words:
   "Friday" as Fri Nov 13."). Some days have no one answer, so their date is marked "(not in your
   words)" and the change comes on a card: "next Friday"; a weekday that is the day you sent it
@@ -405,10 +444,17 @@ Cain doesn't pass your words on: Harness reads your DM itself.
   reaches an old one is answered "Replaced by a newer card" and changes nothing. When the name
   matches more than one card, none is replaced: a card asks which one it corrects (*Card 1*,
   *Card 2*, and so on, or *Neither*, which puts the correction on a card of its own). The other
-  cards from that message stand, still waiting for your tap, and aren't offered twice. A note that
-  speaks to none of the open cards leaves them as shown, says so in one message beside them, and
-  relabels their button *Approve as shown*: the first tap on it only confirms you've seen there's a
-  newer note, and the next one approves. A note on a message whose cards you all declined, or that
+  cards from that message stand, still waiting for your tap, and aren't offered twice. Whether a note
+  speaks to a card is decided by Harness's own rules in code (the same event by id, or the same kind
+  of change to an event whose name holds the other's words), not by the model. When those rules
+  can't tell (the name matches but the kind of change differs, or the same kind of change on the same
+  calendar and day), the card asking which is used (*Card 1*, and so on, or *Neither*), never a
+  guess, so a stale card isn't left standing unasked. A note that speaks to none of the open cards
+  is never dropped: it runs as a request of its own, and its one response (its card, or its
+  question) carries a line quoting the note and saying the earlier cards stay as shown. Those cards'
+  button becomes *Approve as shown*: the first tap on it only confirms you've seen there's a newer
+  note, and the next one approves; if the card ran out or was replaced in between, that second tap
+  says exactly that, and nothing is done. A note on a message whose cards you all declined, or that
   ran out, runs it again as a new request of that same message, quoting it, on a new card. If your
   tap on a card is still being carried out when a correction comes, the correction waits for it to
   finish, then works from what it did.
@@ -418,9 +464,17 @@ Cain doesn't pass your words on: Harness reads your DM itself.
   version before is replaced: its buttons come off, and a tap on it is answered "Replaced when
   Harness updated. Nothing was done." Any change the version before had approved or was writing is
   read back from the calendar and recorded as done, with its receipt and *Undo*, or as not
-  confirmed, with a receipt saying so; none is written again. Then one message lists each request
-  that was replaced or not confirmed, a sentence each with your message quoted, with one *Propose
-  again* button that puts each back on a new card for your tap.
+  confirmed, with a receipt saying so; none is written again. One the version before approved but
+  never started kept no event id of its own, so it counts as done only when each part is an add whose
+  event is there and the calendar made that event after your approval (its own "created" time); a
+  move found at its time, or an event made before, could be anyone's, so it's not confirmed. A change
+  recorded as not confirmed joins the same reads as any other (30 seconds, 2 minutes, the longer
+  window by id, then every 30 minutes for a week). Then one message lists each request that was
+  replaced or not confirmed, a sentence each with your message quoted, with one *Propose again*
+  button: a tap uses up every button on its message, so it puts each request back on a card of its
+  own, and each card is approved or declined on its own, as the message says. Just before that, each
+  request's slot is read: one the calendar now shows is said as "Confirmed" instead of offered
+  again.
 - **Cain's details.** When Cain adds what it found (a date in an email) or spells out what you
   asked, Harness works from it with your message, and the change comes on a card: your Approve
   tap is the go. A message older than 2 minutes is still acted on that way. A handover that
@@ -451,7 +505,7 @@ Cain doesn't pass your words on: Harness reads your DM itself.
 ### After installing 0.24.0: a smoke test on the real calendars
 
 The read back is tested against fake calendars; Google and iCloud can list a change a little
-late. So the two paths without a tap stay off after installing, and every change comes on a card,
+late. So the three paths without a tap stay off after installing, and every change comes on a card,
 until this has been run once with throwaway events on a day with nothing else on it (each name
 below is an example; use anything unmistakable), looking at both calendars after each step. Each
 step comes on a card for now; tap *Approve*:
@@ -467,10 +521,27 @@ step comes on a card for now; tap *Approve*:
 6. Undo of each: tap *Undo* on each of those receipts. Each says "Undone", and both calendars are
    back as they were.
 
+7. A late write: a change whose write is held past its wait (or one whose card was offered again
+   after its lease ran out) is read back and said as done once, never twice.
+8. The listing lag: how many seconds after an add's receipt it first showed in each calendar's
+   list.
+
 If a step says "Not confirmed" while the calendar does show the change, the log has both reads
 ("read back of gmail (first)" and "(fresh)"): that's the case to report, and the paths without a
-tap stay off. When every step reads as above, Cain runs `keeper.sh fastpath on "<what each step
-showed>"`, which keeps that result in the record and turns them on. Nothing else to set up.
+tap stay off. Cain writes the result as a JSON file with this fixed checklist, `"pass"` or
+`"fail"` for each item:
+
+```json
+{"gmail":  {"add": "pass", "move": "pass", "remove": "pass", "undo": "pass"},
+ "family": {"add": "pass", "move": "pass", "remove": "pass", "undo": "pass"},
+ "late_landing": "pass", "listing_lag_seconds": 12}
+```
+
+and runs `keeper.sh fastpath on <result.json>`. Anything short of every item passed (a fail, a
+missing item, a lag that isn't a number of seconds from 0 to 3600) is refused and nothing changes.
+A passing record sizes the longer read window from the lag, and comes to you on a card that says
+in plain words what passed, with *Turn on* and *Keep cards*. Only your *Turn on* turns the paths
+without a tap on; the record, who tapped and when are kept. Nothing else to set up.
 
 ## Dates from your mail
 
