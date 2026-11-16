@@ -233,83 +233,173 @@ export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnsw
 //     acknowledged is never cleared: it is sent again with its saved id until the link answers posted;
 //     a round that can't fetch and can't read the tap store counts toward the store's own notice
 //     (reuse_store_unreadable, after three such rounds).
+//   - twenty-third round: a one-time migration (notice file version 3) gives every mark of an earlier keeper
+//     its code: the per-record marks (record:<tap>, fetch:<tap>, ...) by their key's prefix, with the job read
+//     back from the tap ledger; a mark never posted whose code can't be told goes out as notice_undelivered
+//     ("an earlier notice could not be delivered") and is logged, never a silent orphan. Each round first sends
+//     every mark still owed (resendOwed), whatever its key. A permanent refusal by the link (its answer
+//     "refused", a client error other than already posted) is capped: the mark is kept as refused, never
+//     sent again, logged loudly, and shown on the keeper's status (pcjobs.sh worker and list, noticeTrouble);
+//   - twenty-third round: every caller names the job by its site and action, or, when the keeper can't say
+//     them, by when it was queued ({queued}: the job's created time, else the day in its id); the link words
+//     that "a PC browser job queued at ...". A job given any other way (a string, a queue id) is a bug: logged
+//     as an error, and the notice still goes, named by when it was queued where the id says so.
 export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused"
-  | "reuse_record_unreadable" | "reuse_fetch_failed";
-// The job a notice is about, by what it does (twenty-second round): its site and action, never its id.
-export interface JobWhat { site: string; action: string }
+  | "reuse_record_unreadable" | "reuse_fetch_failed" | "notice_undelivered";
+const PC_NOTICE_CODES: readonly PcNotice[] = ["reuse_migrated", "reuse_shallow", "queue_branch_missing", "queue_empty_pending", "reuse_store_unreadable", "reuse_unsettled",
+  "reuse_push_refused", "reuse_record_unreadable", "reuse_fetch_failed", "notice_undelivered"];
+// The job a notice is about, by what it does (twenty-second round): its site and action, never its id; or,
+// when those can't be told (twenty-third round), when it was queued.
+export type JobWhat = { site: string; action: string } | { queued: string };
 export interface NoticeSend { id: string; job?: JobWhat }
-export type Notify = (code: PcNotice, n?: NoticeSend) => boolean;
+// What the link answered: true (posted, or already posted), false (no answer or a passing error: try again),
+// or "refused" (a permanent refusal: never sent again).
+export type Notify = (code: PcNotice, n?: NoticeSend) => boolean | "refused";
 export const CLEAR_ROUNDS = 3;
 export const WAIT_ROUNDS = 3;
 // A mark keeps its code and job (twenty-second round), so a post whose acknowledgement was lost is sent
 // again with its saved id until the link confirms it, whether or not its condition is still here.
-interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat }
+interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat; refused?: boolean }
 interface Told { told: Record<string, ToldMark>; waits: Record<string, number> }
 const toldFile = (cfg: Pick<Config, "used">) => `${cfg.used ?? USED_REUSE}.told.json`;
 const NOTICE_ID = /^[0-9a-f]{16,64}$/;
 const SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
 const ACTION = /^[a-z][a-z0-9_]{2,39}$/;
+const QUEUED = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z)?$/;
 const jobWhat = (x: any): JobWhat | undefined =>
-  x && typeof x === "object" && typeof x.site === "string" && typeof x.action === "string" && SITE.test(x.site) && ACTION.test(x.action) ? { site: x.site, action: x.action } : undefined;
-const NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
-// The notice file as read: version 2 ({v, told, waits}), or the twentieth round's list of keys (each
-// read as posted, with a fresh id). Unreadable: nothing told, no waits.
-function readTold(cfg: Pick<Config, "used">): Told {
+  !x || typeof x !== "object" || Array.isArray(x) ? undefined
+    : typeof x.site === "string" && typeof x.action === "string" && SITE.test(x.site) && ACTION.test(x.action) ? { site: x.site, action: x.action }
+    : typeof x.queued === "string" && QUEUED.test(x.queued) && Number.isFinite(Date.parse(x.queued.length === 10 ? `${x.queued}T00:00:00Z` : x.queued)) ? { queued: x.queued }
+    : undefined;
+const isCode = (x: unknown): x is PcNotice => typeof x === "string" && (PC_NOTICE_CODES as readonly string[]).includes(x);
+// An earlier keeper's mark key, by its prefix (or the whole key), to its code.
+const KEY_CODES: Record<string, PcNotice> = { record: "reuse_record_unreadable", fetch: "reuse_fetch_failed", migrated: "reuse_migrated", shallow: "reuse_shallow",
+  unsettled: "reuse_unsettled", refused: "reuse_push_refused", store: "reuse_store_unreadable", empty: "queue_empty_pending", branch: "queue_branch_missing" };
+const codeOfKey = (k: string): PcNotice | undefined => isCode(k) ? k : KEY_CODES[k.split(":")[0]];
+// The notice file as read: version 3; version 2 ({v, told, waits}) or the twentieth round's list of keys (each
+// read as posted, with a fresh id) are migrated once (migrateTold) and written back as version 3.
+// Unreadable: nothing told, no waits.
+function readTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "dir">>): Told {
   let a: any;
   try { a = JSON.parse(readFileSync(toldFile(cfg), "utf8")); } catch { return { told: {}, waits: {} }; }
-  if (Array.isArray(a)) return { told: Object.fromEntries(a.filter((x) => typeof x === "string").map((k) => [k, { id: newNoticeId(), posted: true, clear: 0 }])), waits: {} };
+  if (Array.isArray(a)) {
+    const t: Told = { told: Object.fromEntries(a.filter((x) => typeof x === "string").map((k) => [k, { id: newNoticeId(), posted: true, clear: 0, ...(codeOfKey(k) ? { code: codeOfKey(k)! } : {}) }])), waits: {} };
+    saveTold(cfg, t);
+    return t;
+  }
   const told: Record<string, ToldMark> = {}, waits: Record<string, number> = {};
   if (a && typeof a === "object" && a.told && typeof a.told === "object")
     for (const [k, m] of Object.entries(a.told as Record<string, any>))
       if (m && typeof m.id === "string" && NOTICE_ID.test(m.id)) {
-        const code = typeof m.code === "string" && NOTICE_CODE.test(m.code) ? m.code as PcNotice : NOTICE_CODE.test(k) ? k as PcNotice : undefined;
+        const code = isCode(m.code) ? m.code : undefined;
         const job = jobWhat(m.job);
-        told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0, ...(code ? { code } : {}), ...(job ? { job } : {}) };
+        told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0, ...(code ? { code } : {}), ...(job ? { job } : {}),
+          ...(m.refused === true ? { refused: true } : {}) };
       }
   if (a && typeof a === "object" && a.waits && typeof a.waits === "object")
     for (const [k, n] of Object.entries(a.waits as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) waits[k] = n as number;
-  return { told, waits };
+  const t = { told, waits };
+  if (a?.v !== 3) { migrateTold(cfg, t); saveTold(cfg, t); }
+  return t;
+}
+// The one-time migration of an earlier keeper's marks (twenty-third round): each gets its code from its key;
+// a tap's mark gets its job from the tap ledger (what it does, else when it was queued). A mark never posted
+// whose code can't be told becomes notice_undelivered, logged, so it is still sent (resendOwed).
+function migrateTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "dir">>, t: Told): void {
+  let ledger: Map<string, ReuseLine> | null = null;
+  try { ledger = reuseLedger(cfg); } catch { ledger = null; }
+  for (const [k, m] of Object.entries(t.told)) {
+    if (!m.code) {
+      const c = codeOfKey(k);
+      if (c) m.code = c;
+      else if (!m.posted) { m.code = "notice_undelivered"; log(`error: an earlier keeper's notice (${k.replace(/[^\w:.-]/g, "?").slice(0, 60)}) was never delivered and its code can't be told: sending the generic line that an earlier notice could not be delivered`); }
+    }
+    const tap = k.includes(":") ? ledger?.get(k.slice(k.indexOf(":") + 1)) : undefined;
+    if (!m.job && tap && m.code !== "notice_undelivered") { const w = cfg.queue !== undefined && cfg.dir !== undefined ? whatOf(cfg as Config, tap) : jobWhat(tap) ?? queuedOf(cfg, tap.job); if (w) m.job = w; }
+  }
 }
 const newNoticeId = () => randomBytes(12).toString("hex");
 function saveTold(cfg: Pick<Config, "used">, t: Told): void {
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
-    writeFileSync(`${toldFile(cfg)}.tmp`, JSON.stringify({ v: 2, ...t }));
+    writeFileSync(`${toldFile(cfg)}.tmp`, JSON.stringify({ v: 3, ...t }));
     renameSync(`${toldFile(cfg)}.tmp`, toldFile(cfg));
   } catch (e) { log(`couldn't keep which notices went out: ${(e as Error).message}`); }
 }
-// One send of a mark, with its saved id: true once the link confirms it posted (or had already posted it).
-function send(cfg: Config, m: ToldMark, code: PcNotice): boolean {
-  let ok = false;
-  try { ok = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(m.job ? { job: m.job } : {}) }); } catch { ok = false; }
-  if (!ok) log(`couldn't tell the owner (${code}); trying again next round, with the same notice id`);
-  return ok;
+// One send of a mark, with its saved id: "posted" once the link confirms it posted (or had already posted it),
+// "refused" on a permanent refusal (logged loudly, never sent again), "retry" otherwise.
+function send(cfg: Config, m: ToldMark, code: PcNotice): "posted" | "retry" | "refused" {
+  let a: boolean | "refused" = false;
+  const job = m.job === undefined ? undefined : jobWhat(m.job);
+  if (m.job !== undefined && !job) { log(`error: notice ${code} carries a job that isn't a site and action or a queued time: sent without it`); delete m.job; }
+  try { a = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(job ? { job } : {}) }); } catch { a = false; }
+  if (a === "refused") {
+    log(`ERROR: the link refused notice ${code} for good (not a passing error): it won't be sent again; the keeper's status shows it until its condition clears`);
+    return "refused";
+  }
+  if (!a) log(`couldn't tell the owner (${code}); trying again next round, with the same notice id`);
+  return a ? "posted" : "retry";
+}
+// The job a caller passed, checked (twenty-third round): a site and action, or a queued time. A string (a queue
+// id, or anything else) is a bug: logged as an error, named by when it was queued where the id says so.
+function checkedJob(cfg: Pick<Config, "used"> & Partial<Pick<Config, "dir">>, code: PcNotice, job: unknown): JobWhat | undefined {
+  if (job === undefined || job === null) return undefined;
+  const w = jobWhat(job);
+  if (w) return w;
+  log(`error: notice ${code} was given its job ${typeof job === "string" ? "as a string" : "in a shape that isn't a site and action"}: a bug in the keeper; the notice goes, named by when its job was queued where that can be told`);
+  return typeof job === "string" && ID.test(job) ? queuedOf(cfg, job) : undefined;
 }
 // The condition is here this round: told once (its id kept before the post), and its clear count reset.
 export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobWhat): void {
   const t = readTold(cfg);
   let m = t.told[key];
-  if (m?.posted) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
-  const what = jobWhat(job);
+  if (m?.posted || m?.refused) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
+  const what = checkedJob(cfg, code, job);
   if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0, code, ...(what ? { job: what } : {}) }; saveTold(cfg, t); }
   m.clear = 0;
   m.code ??= code;
-  if (!send(cfg, m, code)) { saveTold(cfg, t); return; }
-  m.posted = true;
+  if (!m.job && what) m.job = what;
+  const a = send(cfg, m, m.code);
+  if (a === "posted") m.posted = true;
+  if (a === "refused") m.refused = true;
   saveTold(cfg, t);
+}
+// Every mark still owed (never acknowledged, never refused), whatever its key: sent again with its saved id,
+// once per round, so no mark is left unsent because no round looks at its key any more.
+// A mark acknowledged by this round's resend starts its clear count only at the next round, as when cleared sends it.
+const ackedThisRound = new Set<string>();
+export function resendOwed(cfg: Config): void {
+  ackedThisRound.clear();
+  const t = readTold(cfg);
+  let changed = false;
+  for (const [k, m] of Object.entries(t.told)) {
+    if (m.posted || m.refused || !m.code) continue;
+    const a = send(cfg, m, m.code);
+    if (a === "posted") { m.posted = true; m.clear = 0; changed = true; ackedThisRound.add(`${toldFile(cfg)}\0${k}`); }
+    if (a === "refused") { m.refused = true; changed = true; }
+  }
+  if (changed) saveTold(cfg, t);
+}
+// The keeper's status lines about its notices (pcjobs.sh worker and list): each notice the link refused for good.
+export function noticeTrouble(cfg: Pick<Config, "used">): string[] {
+  const t = readTold(cfg);
+  return Object.values(t.told).filter((m) => m.refused && m.code).map((m) =>
+    `Keeper: the link refused a notice for Dane for good (${m.code}); it isn't sent again. The keeper's log says why; tell him in your own words if it matters.`);
 }
 // A condition seen clear this round. A mark whose post was never acknowledged (posted false) is never
 // counted down or deleted (twenty-second round): it is sent again with its saved id until the link answers
-// posted or already posted, and only then does its clear count start. A posted mark goes after
-// CLEAR_ROUNDS clear rounds in a row, so a condition that comes back after that is told again, and one that
-// flaps is told once.
+// posted or already posted, and only then does its clear count start. A posted mark, or one the link refused
+// for good, goes after CLEAR_ROUNDS clear rounds in a row, so a condition that comes back after that is told
+// again, and one that flaps is told once.
 export function cleared(cfg: Config, key: string): void {
   const t = readTold(cfg);
   let changed = false;
   const m = t.told[key];
-  if (m && !m.posted) {
-    if (m.code && send(cfg, m, m.code)) { m.posted = true; m.clear = 0; changed = true; }
-  } else if (m) { m.clear += 1; if (m.clear >= CLEAR_ROUNDS) delete t.told[key]; changed = true; }
+  if (m && !m.posted && !m.refused) {
+    const a = m.code ? send(cfg, m, m.code) : "retry";
+    if (a === "posted") { m.posted = true; m.clear = 0; changed = true; }
+    if (a === "refused") { m.refused = true; changed = true; }
+  } else if (m && !ackedThisRound.delete(`${toldFile(cfg)}\0${key}`)) { m.clear += 1; if (m.clear >= CLEAR_ROUNDS) delete t.told[key]; changed = true; }
   if (t.waits[key] !== undefined) { delete t.waits[key]; changed = true; }
   if (changed) saveTold(cfg, t);
 }
@@ -323,15 +413,29 @@ export function waited(cfg: Config, code: PcNotice, key: string, job?: JobWhat):
   if (n >= WAIT_ROUNDS) tell(cfg, code, key, job);
   return n;
 }
+// When a job was queued, for the owner's line when its site and action can't be told (twenty-third round):
+// the job file's created time in the queue copy, else the day its id names. Never the id itself.
+export function queuedOf(cfg: Partial<Pick<Config, "dir">>, job: string): JobWhat | undefined {
+  if (!ID.test(job)) return undefined;
+  if (cfg.dir) {
+    try {
+      const c = JSON.parse(readFileSync(join(cfg.dir, "jobs", `${job}.json`), "utf8"))?.created;
+      if (typeof c === "string" && Number.isFinite(Date.parse(c))) return { queued: new Date(Date.parse(c)).toISOString().replace(/\.\d{3}Z$/, "Z") };
+    } catch { /* the day in its id */ }
+  }
+  const d = /^j-(\d{4})(\d{2})(\d{2})-/.exec(job);
+  return d ? jobWhat({ queued: `${d[1]}-${d[2]}-${d[3]}` }) : undefined;
+}
 // What a tap's job does, for the owner's line: the ledger's own record of it, else the request still
-// waiting in the queue folder, else the job file in the queue copy. Never its id.
+// waiting in the queue folder, else the job file in the queue copy; failing all of those, when it was queued
+// (twenty-third round). Never its id.
 export function whatOf(cfg: Config, l: Pick<ReuseLine, "job" | "rid" | "site" | "action">): JobWhat | undefined {
   const own = jobWhat(l);
   if (own) return own;
   const read = (f: string) => { try { return JSON.parse(readFileSync(f, "utf8")); } catch { return null; } };
-  if (l.rid && RID.test(l.rid)) { const r = jobWhat(read(join(cfg.queue, `${l.rid}.json`))?.job); if (r) return r; }
-  if (ID.test(l.job)) return jobWhat(read(join(cfg.dir, "jobs", `${l.job}.json`)));
-  return undefined;
+  if (l.rid && RID.test(l.rid)) { const r = jobWhat(read(join(cfg.queue, `${l.rid}.json`))?.job); if (r && "site" in r) return r; }
+  if (ID.test(l.job)) { const r = jobWhat(read(join(cfg.dir, "jobs", `${l.job}.json`))); if (r && "site" in r) return r; }
+  return queuedOf(cfg, l.job);
 }
 // The real send: one POST to the link's /pc-notice, keyed as linkReuse keys it.
 export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
@@ -342,11 +446,18 @@ export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
     const key = createHmac("sha256", tok).update("harness-relay-v1").digest("hex");
     const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     const conf = [`url = ${q(`${cfg.link ?? LINK}/pc-notice`)}`, `header = ${q(`X-Harness-Key: ${key}`)}`, `header = "Content-Type: application/json"`,
-      `data-binary = ${q(JSON.stringify({ code, ...(n?.id ? { id: n.id } : {}), ...(n?.job ? { job: { site: n.job.site, action: n.job.action } } : {}) }))}`, `max-time = 40`, `noproxy = "*"`, `silent`].join("\n") + "\n";
+      `data-binary = ${q(JSON.stringify({ code, ...(n?.id ? { id: n.id } : {}), ...(n?.job ? { job: "site" in n.job ? { site: n.job.site, action: n.job.action } : { queued: n.job.queued } } : {}) }))}`,
+      `max-time = 40`, `noproxy = "*"`, `silent`, `write-out = "\\n%{http_code}"`].join("\n") + "\n";
     const p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore",
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
     if (p.exitCode !== 0) return false;
-    try { return JSON.parse(p.stdout.toString())?.status === "posted"; } catch { return false; }
+    // "posted" (with duplicate when it was already posted) is the acknowledgement; "refused" is the link's own
+    // permanent answer to a request it won't post (a client error); anything else is passing.
+    const out = p.stdout.toString(), cut = out.lastIndexOf("\n");
+    const http = Number(out.slice(cut + 1).trim());
+    let st: unknown;
+    try { st = JSON.parse(out.slice(0, cut))?.status; } catch { return false; }
+    return http === 200 && st === "posted" ? true : http === 400 && st === "refused" ? "refused" : false;
   };
 }
 
@@ -445,7 +556,7 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
       cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `record:${l.m}`);
       spent.push(l.job);
       if (waiting(l)) { writeOutcome(cfg, { request: l.rid!, state: "refused", reason: `owner_reuse refused: ${SPENT_WHY}` }); rmSync(join(cfg.queue, `${l.rid}.json`), { force: true }); }
-      tell(cfg, "reuse_migrated", `migrated:${l.m}`);
+      tell(cfg, "reuse_migrated", `migrated:${l.m}`, whatOf(cfg, l));
       log(`migrated the reuse tap for ${l.job} (written by an older keeper, no commit): spent`);
       continue;
     }
@@ -478,7 +589,7 @@ export function reconcileReuse(cfg: Config, jobs: Job[], fetched: string | null 
       cleared(cfg, `shallow:${l.m}`); cleared(cfg, `unsettled:${l.m}`); cleared(cfg, `fetch:${l.m}`);
     } else {
       unsettled.push(l.job);
-      tell(cfg, seen === "shallow" ? "reuse_shallow" : "reuse_unsettled", `${seen === "shallow" ? "shallow" : "unsettled"}:${l.m}`);
+      tell(cfg, seen === "shallow" ? "reuse_shallow" : "reuse_unsettled", `${seen === "shallow" ? "shallow" : "unsettled"}:${l.m}`, whatOf(cfg, l));
       log(`the reuse tap for ${l.job} can't be settled yet (${seen === "shallow" ? "the queue copy is shallow" : "git gave no clear answer"}); it stays pending, so spent, and the round goes on`);
     }
   }
@@ -585,7 +696,7 @@ export function push(cfg: Config, taps: Tap[] = []): void {
     if (a.answer === "ok") return;
     if (i >= PUSH_TRIES) {
       // Told once per tap (not per job made from it), so a tap rolled back and refused again isn't told twice.
-      if (taps.length && answers.every((x) => x === "refused")) for (const t of taps) tell(cfg, "reuse_push_refused", `refused:${t.m}`);
+      if (taps.length && answers.every((x) => x === "refused")) for (const t of taps) tell(cfg, "reuse_push_refused", `refused:${t.m}`, whatOf(cfg, t));
       throw new PushRefused(`git push: ${a.answer}${a.said ? ` (${a.said})` : ""}`, answers);
     }
     log(`push ${i} of ${PUSH_TRIES} didn't go through (${a.answer}), trying again: ${a.said}`);
@@ -759,6 +870,8 @@ export function check(cfg: Config, raw: string, jobs: Job[], now: Date): { job: 
 // refusal at once, a job once GitHub has its commit.
 export function round(cfg: Config): { ok: boolean; queued: number; refused: number } {
   let names = existsSync(cfg.queue) ? readdirSync(cfg.queue).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort() : [];
+  // Every notice still owed goes again first (twenty-third round), whatever its key.
+  try { resendOwed(cfg); } catch (e) { log(`couldn't send the notices still owed: ${(e as Error).message}`); }
   try {
     const seen: { remoteHeads?: boolean } = {};
     let fetched: string | null;
@@ -913,8 +1026,10 @@ if (import.meta.main) {
   const [cmd, arg] = process.argv.slice(2);
   if (cmd === "worker") {
     console.log(heartbeatLine(readHeartbeat(cfg.dir)));
+    for (const l of noticeTrouble(cfg)) console.log(l);
   } else if (cmd === "list") {
     console.log(heartbeatLine(readHeartbeat(cfg.dir)));
+    for (const l of noticeTrouble(cfg)) console.log(l);
     const jobs = readJobs(cfg.dir);
     if (!jobs.length) console.log("no jobs");
     for (const j of jobs) { const r = readResult(cfg.dir, j.id); console.log(listLine(j, r === "bad" ? null : r)); }

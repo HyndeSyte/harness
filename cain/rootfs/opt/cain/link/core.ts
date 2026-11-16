@@ -126,6 +126,7 @@ export const PC_NOTICES: Record<string, string> = {
   reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next round with a successful fetch from GitHub (within a minute while GitHub answers), once that fetch shows none of it arrived; then the job is queued again by itself. If it keeps being refused, check the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
   reuse_record_unreadable: "Your PC job keeper has tried for three rounds to settle a tap of yours approving a reused value, written by an older version, but a file in its copy of the PC job queue can't be read. The tap stays used and other PC jobs go on. Fix: see the reuse_record_unreadable row in pc-jobs.md, Troubleshooting.",
   reuse_fetch_failed: "Your PC job keeper has tried for three rounds to settle a tap of yours whose job GitHub refused three times, but it couldn't fetch the PC job queue from GitHub. The tap stays used until a round's fetch succeeds. Fix: see the reuse_fetch_failed row in pc-jobs.md, Troubleshooting (usually the network or the pc_jobs_token option).",
+  notice_undelivered: "Your PC job keeper had an earlier notice for you that could not be delivered, and after its update it can no longer say which one. If something about PC jobs seems stuck, see pc-jobs.md, Troubleshooting; Cain can read the keeper's log.",
 };
 // A code the keeper sends that this link has no words for (a keeper ahead of the link).
 export const PC_NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
@@ -136,6 +137,17 @@ export const PC_JOB_ID = /^j-\d{8}-[a-z0-9]{6}$/;
 const PC_SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
 const PC_ACTION = /^[a-z][a-z0-9_]{2,39}$/;
 export const pcJobWords = (j: { site: string; action: string }) => `the job to ${j.action.replace(/_/g, " ")} on ${j.site}`;
+// A job the keeper can't name by its site and action (twenty-third round): by when it was queued, in words
+// ("a PC browser job queued at Nov 15, 2:05 PM", or "queued on Nov 15" when only the day is known), never an id.
+export const PC_QUEUED = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z)?$/;
+export function pcQueuedWords(queued: string, tz = "America/New_York"): string | null {
+  if (!PC_QUEUED.test(queued)) return null;
+  const day = queued.length === 10;
+  const t = Date.parse(day ? `${queued}T12:00:00Z` : queued);
+  if (!Number.isFinite(t)) return null;
+  const f = (o: Intl.DateTimeFormatOptions) => { try { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: day ? "UTC" : tz }).format(t); } catch { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: "UTC" }).format(t); } };
+  return day ? `a PC browser job queued on ${f({ month: "short", day: "numeric" })}` : `a PC browser job queued at ${f({ month: "short", day: "numeric" })}, ${f({ hour: "numeric", minute: "2-digit" })}`;
+}
 const PC_NOTICE_KEEP = 200;              // the notice ids the link remembers having posted (the newest)
 export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
@@ -1592,19 +1604,24 @@ export class Link {
     if (!base) throw new Refusal("not a PC job keeper notice");
     const nid = id === undefined || id === null ? null : String(id);
     if (nid !== null && !PC_NOTICE_ID.test(nid)) throw new Refusal("not a PC job keeper notice id");
-    let what: { site: string; action: string } | null = null;
+    let named: string | null = null;
     if (job !== undefined && job !== null) {
       const j = job as any;
-      if (typeof j !== "object" || Array.isArray(j) || typeof j.site !== "string" || typeof j.action !== "string" || !PC_SITE.test(j.site) || !PC_ACTION.test(j.action)
-        || Object.keys(j).some((k) => k !== "site" && k !== "action"))
-        throw new Refusal("not a PC job: a job is named by its site and action, never by its queue id");
-      what = { site: j.site, action: j.action };
+      // Twenty-third round: or, when the keeper can't say its site and action, by when it was queued ({queued}).
+      const queued = j && typeof j === "object" && !Array.isArray(j) && Object.keys(j).length === 1 && typeof j.queued === "string" ? pcQueuedWords(j.queued, this.d.tz) : null;
+      if (queued) named = queued;
+      else {
+        if (typeof j !== "object" || Array.isArray(j) || typeof j.site !== "string" || typeof j.action !== "string" || !PC_SITE.test(j.site) || !PC_ACTION.test(j.action)
+          || Object.keys(j).some((k) => k !== "site" && k !== "action"))
+          throw new Refusal("not a PC job: a job is named by its site and action, never by its queue id");
+        named = pcJobWords({ site: j.site, action: j.action });
+      }
     }
     if (nid !== null) {
       const had = this.d.load().pcNotices?.[nid];
       if (had) return { status: "posted", message: had.msg, duplicate: true };
     }
-    const text = what ? `${base} (It is ${pcJobWords(what)}, code ${c}.)` : base;
+    const text = named ? `${base} (It is ${named}, code ${c}.)` : base;
     noMachineText(text);
     const message = await this.notice(text);
     if (nid !== null) {

@@ -11,9 +11,10 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFile
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { cleared, linkNotify, noticeTrouble, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
-import { askValues, PC_NOTICES } from "../rootfs/opt/cain/link/core";
+import { askValues, PC_NOTICES, pcQueuedWords } from "../rootfs/opt/cain/link/core";
+import { linkFetch } from "../rootfs/opt/cain/link/http";
 
 const VALUE = "****plnt";
 const ASKED = `Check the account the PC reported, "${VALUE}", in a new job?`;
@@ -849,7 +850,7 @@ describe("twenty-first review: bounded waits with a notice, three clear rounds, 
     expect(round(cfg()).ok).toBe(false);                                            // three refused pushes
     const job = { site: "example.com", action: "read_account_settings" };
     expect(reuseLedger({ used: w.used }).get(MSG)).toMatchObject(job);               // the ledger keeps what the job does
-    expect(sent).toEqual([{ code: "reuse_push_refused", job: undefined }]);
+    expect(sent).toEqual([{ code: "reuse_push_refused", job }]);                     // twenty-third round: named too
     const away = `${w.remote}.away`;
     renameSync(w.remote, away);
     for (let i = 0; i < 2; i++) expect(round(cfg()).ok).toBe(false);
@@ -920,14 +921,9 @@ describe("twenty-second review: the job named by what it does, a lost acknowledg
     const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
     const r = rig();
     const bodies: any[] = [];
-    // The link's route (link/main.ts: the relay key, then link.pcNotice with the body's code, job and id).
-    const server = Bun.serve({ port: 0, async fetch(req) {
-      if (req.headers.get("x-harness-key") !== key) return Response.json({ status: "refused" }, { status: 403 });
-      const b: any = await req.json();
-      bodies.push(b);
-      try { return Response.json(await r.link.pcNotice(b.code, b.job, b.id)); }
-      catch (e) { return Response.json({ status: "refused", said: (e as Error).message }, { status: 400 }); }
-    } });
+    // The link's own HTTP handler (link/http.ts linkFetch, what link/main.ts serves), on a port of its own.
+    const handler = linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true });
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", async fetch(req, srv) { bodies.push(await req.clone().json()); return handler(req, srv); } });
     const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
     const used = join(dir, "state", "used.jsonl");
     try {
@@ -990,5 +986,143 @@ describe("twenty-second review: the job named by what it does, a lost acknowledg
     renameSync(away, w.remote);
     expect(round(w.cfg("pi-1")).ok).toBe(true);                                    // fetches again: the store's own path takes over, still once
     expect(w.told).toEqual(["reuse_store_unreadable"]);
+  });
+});
+
+describe("twenty-third review: notice marks never leave the owner untold, permanent refusals capped, every job named, through the link's real handler", () => {
+  const TOKEN = "not-a-real-token.for-the-notice-test-23";
+  const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
+  const serve = (r: ReturnType<typeof rig>) => {
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true }) });
+    return server;
+  };
+  const envFile = () => { const d = mkdtempSync(join(tmpdir(), "pcjobs-env23-")); writeFileSync(join(d, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`); return join(d, ".env"); };
+
+  test.skipIf(!Bun.which("curl"))("end to end through the link's real HTTP handler: posted, already posted, and refused, as the keeper reads them", async () => {
+    const r = rig();
+    const server = serve(r);
+    try {
+      const url = `http://127.0.0.1:${server.port}/pc-notice`;
+      const post = (b: unknown, k = key) => fetch(url, { method: "POST", body: JSON.stringify(b), headers: { "content-type": "application/json", "x-harness-key": k } });
+      const id = "a".repeat(24);
+      const first = await post({ code: "reuse_fetch_failed", id, job: { site: "example.com", action: "read_account_settings" } });
+      expect(first.status).toBe(200);
+      const one = await first.json();
+      expect(one).toEqual({ status: "posted", message: expect.any(String) });
+      const again = await post({ code: "reuse_fetch_failed", id, job: { site: "example.com", action: "read_account_settings" } });
+      expect(again.status).toBe(200);
+      expect(await again.json()).toEqual({ status: "posted", message: one.message, duplicate: true });     // already posted: the same message
+      const bad = await post({ code: "reuse_fetch_failed", id: "b".repeat(24), job: "j-20261115-abcdef" });
+      expect(bad.status).toBe(400);
+      expect((await bad.json()).status).toBe("refused");
+      expect((await post({ code: "reuse_fetch_failed" }, "0".repeat(64))).status).toBe(403);
+      // The keeper's own send, over curl, in its own process (its curl call is synchronous), reads each answer as it must.
+      const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
+      const src = `const { linkNotify } = await import(${JSON.stringify(main)});
+        const n = linkNotify({ link: "http://127.0.0.1:${server.port}", discordEnv: ${JSON.stringify(envFile())} });
+        const job = { site: "example.com", action: "read_account_settings" };
+        console.log(JSON.stringify([n("reuse_fetch_failed", { id: "c".repeat(24), job }), n("reuse_fetch_failed", { id: "c".repeat(24), job }),
+          n("reuse_fetch_failed", { id: "d".repeat(24), job: { site: "Example Com", action: "x" } }), n("reuse_fetch_failed", { id: "e".repeat(24), job: { queued: "2026-11-15T14:05:00Z" } })]));`;
+      const child = Bun.spawn(["bun", "-e", src], { stdout: "pipe", stderr: "pipe" });
+      await child.exited;
+      expect(JSON.parse((await new Response(child.stdout).text()).trim())).toEqual([true, true, "refused", true]);   // posted, already posted, refused, posted
+      const lines = Object.values(r.posted).map((m: any) => m.content as string);
+      expect(lines).toContain(`${PC_NOTICES.reuse_fetch_failed} (It is a PC browser job queued at Nov 15, 9:05 AM, code reuse_fetch_failed.)`);
+      expect(r.reports).toEqual([]);                                                // the gate's rules: nothing to fix or hold
+      expect(linkNotify({ link: "http://127.0.0.1:1", discordEnv: envFile() })("reuse_fetch_failed", { id: "f".repeat(24) })).toBe(false);   // no answer: passing
+    } finally { server.stop(true); }
+  }, 30_000);
+
+  test("upgrading a notice file from the previous keeper: each per-record mark gets its code and job, an unknown one goes as the generic line, logged", () => {
+    const w = world();
+    w.first();
+    const used = w.used;
+    mkdirSync(dirname(used), { recursive: true });
+    const M2 = "1300000000000000099";
+    writeFileSync(used, [JSON.stringify({ m: MSG, job: "j-20261115-legacy", state: "pending", rid: "pc-0009", site: "example.com", action: "read_account_settings" }),
+      JSON.stringify({ m: M2, job: "j-20261114-other1", state: "pending", rid: "pc-0010" })].join("\n") + "\n");
+    const id = (c: string) => c.repeat(24);
+    writeFileSync(`${used}.told.json`, JSON.stringify({ v: 2, told: {
+      [`record:${MSG}`]: { id: id("1"), posted: false, clear: 0 },
+      [`fetch:${M2}`]: { id: id("2"), posted: false, clear: 0 },
+      "weird:x": { id: id("3"), posted: false, clear: 0 },
+      store: { id: id("4"), posted: true, clear: 0 },
+    }, waits: {} }));
+    const sent: { code: string; id: string; job?: any }[] = [];
+    const logs: string[] = [];
+    const was = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(" ")); };
+    try { resendOwed(w.cfg("pi-1", { notify: ((code: string, n?: any) => { sent.push({ code, id: n.id, job: n.job }); return true; }) as any })); }
+    finally { console.log = was; }
+    expect(sent).toEqual([
+      { code: "reuse_record_unreadable", id: id("1"), job: { site: "example.com", action: "read_account_settings" } },
+      { code: "reuse_fetch_failed", id: id("2"), job: { queued: "2026-11-14" } },        // no site and action anywhere: when it was queued
+      { code: "notice_undelivered", id: id("3"), job: undefined },
+    ]);
+    expect(logs.join("\n")).toContain("was never delivered and its code can't be told");
+    const file = JSON.parse(readFileSync(`${used}.told.json`, "utf8"));
+    expect(file.v).toBe(3);
+    expect(file.told.store).toMatchObject({ code: "reuse_store_unreadable", posted: true });
+    for (const k of [`record:${MSG}`, `fetch:${M2}`, "weird:x"]) expect(file.told[k].posted).toBe(true);
+    expect(PC_NOTICES.notice_undelivered).toContain("could not be delivered");
+    // Once migrated, nothing is sent again.
+    const more: string[] = [];
+    resendOwed(w.cfg("pi-1", { notify: ((c: string) => { more.push(c); return true; }) as any }));
+    expect(more).toEqual([]);
+  });
+
+  test("a permanent refusal by the link is capped: never sent again, logged loudly, shown on the keeper's status until it clears", () => {
+    const w = world();
+    w.first();
+    const calls: string[] = [];
+    const notify = ((c: string) => { calls.push(c); return "refused"; }) as any;
+    mkdirSync(w.used, { recursive: true });                                         // the store can't be read
+    const logs: string[] = [];
+    const was = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(" ")); };
+    try {
+      expect(round(w.cfg("pi-1", { notify })).ok).toBe(true);
+      expect(round(w.cfg("pi-1", { notify })).ok).toBe(true);
+    } finally { console.log = was; }
+    expect(calls).toEqual(["reuse_store_unreadable"]);                              // once, never again
+    expect(logs.join("\n")).toContain("ERROR: the link refused notice reuse_store_unreadable for good");
+    expect(noticeTrouble({ used: w.used })).toEqual([expect.stringContaining("the link refused a notice for Dane for good (reuse_store_unreadable)")]);
+    for (const l of noticeTrouble({ used: w.used })) { expect(l).not.toMatch(/j-\d{8}-[a-z0-9]{6}/); expect(l).not.toMatch(/[0-9a-f]{24}/); }
+    rmSync(w.used, { recursive: true, force: true });
+    for (let i = 0; i < 3; i++) expect(round(w.cfg("pi-1", { notify })).ok).toBe(true);
+    expect(noticeTrouble({ used: w.used })).toEqual([]);                            // cleared after three clear rounds
+    expect(calls).toEqual(["reuse_store_unreadable"]);
+  });
+
+  test("every caller names the job by its site and action, or when it was queued; a string is a logged error, never a refusal or an unnamed line", () => {
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
+    const calls = [...main.matchAll(/\b(tell|waited)\(cfg, ([^;]*?)\);/g)].map((m) => m[2]).filter((a) => !a.startsWith("code, key"));
+    expect(calls.length).toBeGreaterThanOrEqual(8);
+    for (const a of calls) {
+      const tapNotice = !/^"reuse_store_unreadable"|^empty \?/.test(a);                  // the store and the queue's branch aren't about a job
+      if (tapNotice) expect(a).toMatch(/, whatOf\(cfg, (l|t)\)$/);
+    }
+    const w = world();
+    w.first();
+    const sent: any[] = [];
+    const logs: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((code: string, n?: any) => { sent.push({ code, job: n?.job }); return true; }) as any });
+    const was = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(" ")); };
+    try {
+      tell(cfg, "reuse_fetch_failed", "fetch:s1", "j-20261115-abcdef" as any);
+      tell(cfg, "reuse_fetch_failed", "fetch:s2", { site: "Bad Site", action: "x" } as any);
+    } finally { console.log = was; }
+    expect(sent).toEqual([{ code: "reuse_fetch_failed", job: { queued: "2026-11-15" } }, { code: "reuse_fetch_failed", job: undefined }]);
+    expect(logs.filter((l) => l.includes("error: notice reuse_fetch_failed was given its job")).length).toBe(2);
+    // No site and action anywhere: the job file's created time, else the day in its id.
+    expect(whatOf(cfg, { job: "j-20261113-zzzzzz" })).toEqual({ queued: "2026-11-13" });
+    mkdirSync(join(cfg.dir, "jobs"), { recursive: true });
+    writeFileSync(join(cfg.dir, "jobs", "j-20261113-yyyyyy.json"), JSON.stringify({ created: "2026-11-13T19:05:07.123Z" }));
+    expect(queuedOf(cfg, "j-20261113-yyyyyy")).toEqual({ queued: "2026-11-13T19:05:07Z" });
+    expect(pcQueuedWords("2026-11-13T19:05:07Z")).toBe("a PC browser job queued at Nov 13, 2:05 PM");
+    expect(pcQueuedWords("2026-11-13")).toBe("a PC browser job queued on Nov 13");
+    expect(pcQueuedWords("j-20261113-yyyyyy")).toBeNull();
+    void cleared;
   });
 });
