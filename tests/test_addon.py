@@ -2255,6 +2255,18 @@ def test_a_relayed_record_is_typed_as_written_or_set_aside(tmp_path):
         line = _typed(_checkin(tmp_path, "1240", IDLE).splitlines()[-2])
         assert "Relayed records the App couldn't read: 1, set aside unread" in line
         assert "couldn't read" not in _checkin(tmp_path, "1740", IDLE).splitlines()[-2]
+        # Two records on one line are no record: set aside whole, nothing of them typed (round 21).
+        (tmp_path / "sent.txt").unlink()
+        q.write_text('{"text":"Approve"}{"text":"NOT approve"}\n', newline="\n")
+        assert _checkin(tmp_path, "0300", IDLE, runs=3) == "" and work.read_text().strip() == ""
+        assert bad.read_text().splitlines()[-1] == '{"text":"Approve"}{"text":"NOT approve"}'
+        # Its naming survives the App's restart (this container's state gone): the next check-in names
+        # it, once (round 21).
+        import shutil as _sh
+        _sh.rmtree(tmp_path / "state")
+        line = _typed(_checkin(tmp_path, "0712", IDLE, day="2026-11-09").splitlines()[-2])
+        assert "Relayed records the App couldn't read: 1, set aside unread" in line
+        assert "couldn't read" not in _checkin(tmp_path, "1240", IDLE, day="2026-11-09").splitlines()[-2]
     finally:
         del os.environ["RELAY_QUEUE"], os.environ["RELAY_BAD"]
 
