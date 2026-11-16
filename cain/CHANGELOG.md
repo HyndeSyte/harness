@@ -22,6 +22,9 @@
 - When the specialist can't change a calendar safely, Cain shows its message with your requests ready to copy and Open without protection, and leaves that choice to you; receipts there say Unprotected.
 - Cain shows the specialist's Possibly overwritten messages and cards that say Unprotected as they are, and tells you why a calendar request waits when the specialist's records haven't moved yet, pointing to its Run check message.
 - On your say, Cain can send you a card to restore the specialist's records from a backup by its version; only your Put them back tap does it, and it takes effect the next time the specialist starts.
+- After your Put them back tap, Cain shows the specialist's card asking you to restart it now, and the requests that come back to you ready to copy after the restart.
+- When the specialist starts degraded after a move that failed, Cain shows its message with Run check and Put them back and leaves the tap to you.
+- On your say, Cain can send you the card that takes the specialist's clock as right when it's behind its records and old backups aren't pruned; only your tap does it.
 
 ## 0.11.0
 

@@ -189,12 +189,23 @@ specialist (the Harness add-on) does.
   `/opt/cain/keeper.sh fastpath migrate-restore <schema> <build>` posts him a card to put the records
   back from the backup taken at that schema version before that build's move; his Put them back tap
   stages it, and it takes effect the next time the specialist starts, after which its records move to
-  the running build again. Its backups are counted in its own run time, never the wall clock; a Home
-  Assistant backup is the copy off the Pi.
+  the running build again. Once staged, the specialist takes nothing new until it restarts (a handover
+  answers "Not taken" asking for the restart) and one card asks him to restart the App now, saying the
+  backup's age and what is set aside: show it, and say the restart in one line if he asks; the records
+  set aside are kept beside the restored ones, and the requests held there come back to him ready to
+  copy after the restart. A move that failed or was interrupted isn't tried again by itself: the
+  specialist runs degraded (its status page and /health say so) and he gets one message with Run check
+  and Put them back: show it and leave the tap to him. A full disk is said plainly, and nothing is
+  copied. Its backups are counted in its own run time, never the wall clock; a Home Assistant backup is
+  the copy off the Pi. When its clock is behind its own records, old backups aren't pruned: /health
+  names the record that holds it up, and he gets one card with Use the clock as it is now; only on his
+  say, `/opt/cain/keeper.sh fastpath migrate-clock` posts that card again. The clock is taken as right
+  only on his tap.
 - Every change sent without a calendar's version check (opened without protection, or a calendar that
   gives only weak versions) says Unprotected on its card and receipt: edits made at the same time by
   someone else can be overwritten or deleted. Show those as they are. A "Possibly overwritten" message
-  names fields that changed around such a write, before and after: show it, nothing more. A calendar
+  names fields that changed around such a write, before and after: show it, nothing more. Fields a
+  calendar rewrites by itself (its baseline, read by the check after installing) never bring one. A calendar
   opened without protection never closes again on its own for that.
 - A note on a message with cards still open replaces only the card it corrects; the others
   stand ("Still waiting for your tap on its own card"), so don't show them again. The specialist's

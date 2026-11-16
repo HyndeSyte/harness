@@ -83,7 +83,12 @@
 #                                        his Put them back tap stages it, checked, and it replaces the
 #                                        records the next time Harness starts (the ones replaced are
 #                                        kept beside them), then they move to the running build again.
-#                                        A Home Assistant backup is the copy off the Pi
+#                                        Once staged, Harness takes nothing new and his card asks him
+#                                        to restart the App now. A Home Assistant backup is the copy
+#                                        off the Pi
+#   keeper.sh fastpath migrate-clock     only posts him the card with Use the clock as it is now, when
+#                                        Harness's clock is behind its own records and holds backup
+#                                        pruning up; the clock is taken as right only on his tap
 #   keeper.sh digest                     take today's calendar digest for the morning message
 #   keeper.sh meanings <file>            send what Dane said kinds of Family events mean: the
 #                                        table in areas/family/calendar-meanings.md (rows of
@@ -177,9 +182,10 @@ if [ "$cmd" = fastpath ]; then
         { [ -z "$mc_candidate" ] && { [ "${2:-}" != --candidate ] && [ "${3:-}" != --candidate ]; } || [[ "$mc_candidate" =~ ^/[A-Za-z0-9/._-]{1,255}$ ]]; } \
           || { echo '{"status":"error","said":"--candidate takes the absolute path of the incoming build: its source tree (the harness App folder) or its image path (/opt/harness)"}'; exit 2; } ;;
     migrate-override) [ $# -eq 1 ] || { echo '{"status":"error","said":"fastpath migrate-override takes nothing more"}'; exit 2; } ;;
+    migrate-clock) [ $# -eq 1 ] || { echo '{"status":"error","said":"fastpath migrate-clock takes nothing more"}'; exit 2; } ;;
     migrate-restore) { [ $# -eq 3 ] && [[ "${2:-}" =~ ^[0-9]{1,4}$ ]] && [[ "${3:-}" =~ ^[0-9A-Za-z._-]{4,64}$ ]]; } \
           || { echo '{"status":"error","said":"fastpath migrate-restore takes the backup'"'"'s schema version and build: fastpath migrate-restore <schema> <build>"}'; exit 2; } ;;
-    *) echo '{"status":"error","said":"fastpath takes smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open <gmail|family>, migrate-check [path] [--candidate <path>], migrate-override or migrate-restore <schema> <build>"}'; exit 2 ;;
+    *) echo '{"status":"error","said":"fastpath takes smoke-start, smoke-step <run id> <step> [script], on <run id>, off, gate-open <gmail|family>, migrate-check [path] [--candidate <path>], migrate-override, migrate-restore <schema> <build> or migrate-clock"}'; exit 2 ;;
   esac
 fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
