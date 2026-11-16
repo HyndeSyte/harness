@@ -4,7 +4,7 @@
 
 - Cain checks a thing where it lives (your mail, a portal, GitHub) before he asks you about it, and the App now holds him to it: a question or Ship card about one of your open items goes out only once the record has accepted his check of that item as it stands now.
 - A check must name a real source (a mail with its sender and date, a page, a file, a command or a message), never "from memory". The App proves a check was recorded, not that the source was read: that part is on Cain's word.
-- A check counts for 7 days, by the record's own clock, and only once the box's clock is set right. New option, source_check_max_days, if you want a different limit; nothing to set up.
+- A check counts for 7 days by Discord's own times (from when it was handed over to when you tap), and is only taken once the box's clock is set right. New option, source_check_max_days, if you want a different limit; nothing to set up.
 - If the item changes after the card went up, its buttons come off and it says "Status changed, re-check needed". Your tap counts only after the App looks at the record again and finds the check still good; if it can't look, the tap does nothing and says so.
 - What he checked shows on the item's row in your record, with the date it goes stale.
 - A one-off question that names one of your open items is held back; one that only sounds like one waits until Cain names the item or says why it isn't, and that reason is kept.
@@ -68,6 +68,10 @@
 - A question's or Ship card's time limit is fixed when it goes out, so a jump of the Pi's clock no longer moves it, and a tap is timed by Discord.
 - After a restore from a backup, a Ship card from before the restore loses its buttons and says Cain sends a new one; the look back over your messages picks up where it stopped after a restart, and old messages it reads never get a reply.
 - A held tap that a restart cut off in the middle of being passed to Cain reaches him once more only marked as a repeat, or not at all if it was already acted on. After a restore, the App looks back over the last 100 days of your DM for cards it no longer knows.
+- A jump of the Pi's clock no longer makes a fresh check look stale or a stale one look fresh, and a card whose buttons came off early because of one still takes a tap you made before its real time limit.
+- If Cain's re-ask after a lost tap and your old answer cross, only one of them counts, and the card says which.
+- A tap the App can't place in Discord's own time does nothing and says so on the card, instead of being judged by the Pi's clock.
+- The App's saved state is written safely on every save, so a power cut can't undo a tap it already took.
 - One known gap, said plainly: if a tap was used while GitHub was down, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 

@@ -120,7 +120,8 @@ specialist (the Harness add-on) does.
 - The link refuses an ask or Ship card for an item without a check of its row as it
   stands now: any change to the row's cells but Since and Checked (its Item and Done when
   too) makes a new version that needs a new check, and a check older than the App's
-  `source_check_max_days` (7 days unless he changed it, by the record keeper's clock) no
+  `source_check_max_days` (7 days unless he changed it, by Discord's own times: from when the
+  link hands your check over to when he taps) no
   longer counts. Since means nothing about status. The link hands your check to the record
   keeper and waits up to 30 seconds for its local work (not the push to GitHub): only once
   the keeper has accepted it, for the row as it stands, does the card go out. If the keeper
@@ -673,11 +674,13 @@ log/requests/) and in state/decisions.md, and act on it only if the key is in no
 memory (the keeper refuses a second request for a key anyway). If no request of yours for that key reaches
 the keeper within 10 minutes, the link asks him on the card to answer again on the fresh card you send, and
 that tap key is superseded: the keeper refuses a request for it from then on (he is told on the card), so send
-none; check the item again and ask again with --checked if it still needs him. Held taps are judged by Discord's
+none; check the item again and ask again with --checked if it still needs him. That line waits until the keeper has
+taken the supersede; if the keeper acted on the key meanwhile, his card says his answer was acted on after all, you
+hear "Replayed held tap key ... was acted on", and nothing more is asked or needed. Held taps are judged by Discord's
 own times, never the Pi's clock; if the Pi's clock is off, his card says "The Pi's clock is off by about N
 minutes, waiting for time sync." Nothing to do or tell him about it. A held tap refused because its hold
-began after its card expired comes back as "Tap not acted: ..." too: record nothing, and ask again with
---checked if it still needs him.
+began after its card expired, or because Discord's time for it can't be read, comes back as "Tap not acted: ..."
+too: record nothing, and ask again with --checked if it still needs him.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:

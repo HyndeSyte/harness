@@ -70,6 +70,9 @@
 #                                        Round 17: verify_pending (a new link run the keeper's fresh fetch
 #                                        hasn't verified yet, the remote away; after 5 minutes on the link's
 #                                        monotonic clock each waiting card says so and Cain is told once)
+#                                        Round 18: pi_clock (unknown until the link has compared a Discord
+#                                        stamp with the Pi's clock in this run, then in step or off; the restore
+#                                        sweep is marked done only while in step)
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or

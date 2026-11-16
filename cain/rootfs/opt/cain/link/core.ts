@@ -4998,7 +4998,7 @@ export class Link {
     const life = typeof meta.expires === "number" ? Math.max(0, meta.expires - this.d.now()) : undefined;
     const msg = await this.postCard(text, [], opts);
     const id = String(msg.id);
-    // Round 18: a check that carried no anchor of its own is measured from this card's post snowflake.
+    // Round 18: a check with no anchor of its own (one taken before round 18) is measured from this card's post snowflake.
     if (meta.checked && !meta.checked.sf && /^\d{15,22}$/.test(id)) meta.checked.sf = id;
     this.d.crashPoint?.("issue:after-post");
     const cids: string[] = comps.flatMap((r: any) => (r.components ?? []).map((b: any) => String(b.custom_id)));

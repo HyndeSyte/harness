@@ -1058,6 +1058,70 @@ What Cain's link enforces:
   minutes the card gets the waiting line and Cain hears verification is pending; once the network is back
   the keeper's next round verifies for the new link run without a keeper restart, and the card arms.
 
+  Round 18 (the eighteenth review's fixes: rows of the invariant table that broke its own clock rule, a
+  race the ordering sentence didn't cover, and a durability hole; the design stays frozen for the combined
+  fault scenario, which is unchanged, and no new durable store). The table in
+  `cain/docs/source-check-invariants.md` is updated for every row this round touches.
+
+  A source check's freshness is measured by Discord's times. When the link hands a check to the keeper it
+  anchors it to a Discord stamp: the newest of your DM's last message id (read from Discord just then), the
+  message the ask replies to, and the newest stamp the link has seen in this run, each no later than the
+  hand-over. The keeper keeps it with the check (`checked_sf`). A tap counts only while its interaction
+  snowflake less that anchor is within `source_check_max_days`; a check taken before this round, with no anchor, is measured from the post snowflake of the card
+  resting on it (the link sends no check without one: with no Discord stamp to give, nothing is posted). The keeper's own clock still dates the check, ages it
+  in the Checked cell and decides whether a card is posted, but never whether a tap counts, so a step of the
+  Pi's clock hours either way, with its clock verdict still synchronized, changes nothing.
+
+  The expired-key index keeps each card's expiry as a Discord time (its post snowflake plus its lifetime) and
+  is a cleanup marker only: a tap is refused as expired only when its interaction is stamped after that
+  expiry. A card the sweep took off early (after a forward step of the Pi's clock it hadn't measured yet) is
+  judged again by the tap's own stamp: one stamped before the card's real expiry acts, as long as the card
+  shows what was posted and nothing else used it.
+
+  A supersede is ordered against consumption. After the link appends the supersede of a replayed tap key,
+  the line asking you to answer again waits until the keeper's status shows that supersede mirrored and the
+  key still absent from the consumed-key log; if the keeper consumed the key meanwhile, the card says your
+  answer was acted on after all instead. The keeper reads the link's issued-key log for a supersede of a key
+  just before consuming it, so exactly one of the two happens.
+
+  A released held tap is judged by its own interaction snowflake against its key's expiry; the hold's shared
+  start only floors the keeper's lateness check, never stands for the tap's time.
+
+  Every save of the link's state is fsynced: the temp file before the rename, the folder after it. No save
+  that isn't durable can replace one that is.
+
+  No Pi clock fallback decides whether a tap counts. A key record without a card snowflake takes it from the
+  interaction (the message id it carries), and a tap that can't be placed in Discord's time at all (a held
+  record without its interaction id, or a key whose card has no snowflake anywhere) is refused, with one line
+  on the card ("Not acted: Discord's time for this answer couldn't be read ..."). A card posted and then cut
+  off by a crash before its keys were logged can't be tapped into acting.
+
+  A link run is one above both the state's count and the highest run in the issued-key log, with a fresh
+  random nonce fsynced before use: a link state restored from a backup can't reuse a run the keeper's verified
+  status names, so waiting cards stay unarmed until a new verification.
+
+  The Pi's clock verdict is unknown until the link has compared a Discord stamp with it in this run (a post
+  or a tap); unknown is never taken as in step. The restore sweep's done mark waits for in step, and the
+  "clock is off" line for a comparison that says off. `keeper.sh clock` shows it as `pi_clock`.
+
+  An item hold lapses after a day on the keeper's monotonic clock within its run (from when it saw that
+  renewal), or by the wall clock's idle day, whichever comes first: a lapse only frees an item. A key record
+  without a card snowflake is pruned by a snowflake comparison (the keeper's mirror: once a key logged after
+  it is 100 days behind the newest card) or, on the link, on the monotonic clock of its run; never by a
+  wall-clock duration.
+
+  The consumed-key rebuild after a restore uses only landing claims the link settled against the remote main
+  (with the record's Tap-Key trailers); an open claim is settled from the remote main first. Each record of
+  an append-only log is one write under 4000 bytes, so the link's and the keeper's appends to the install
+  log never interleave. The keeper renames the recover file to record-recover.json.taken before acting on it,
+  and deletes only that; a line the link writes meanwhile is taken next.
+
+  A card's buttons come off at its post snowflake plus its lifetime, through the offset the link measured
+  against Discord's stamps; the Pi's clock is kept for how long records are kept. The keeper's reset epoch
+  never decreases: a state or status restored from an older snapshot takes the higher epoch. Each row of the
+  table whose fsync point matters has a crash-injection test (a kill after the write and before its fsync),
+  and the table lists them.
+
   The live CLI test's edit-after-reply case is a known skip in CI and in cloud sessions, tracked in
   issue 24. You have nothing to set up beyond the smoke test's one option change.
 
