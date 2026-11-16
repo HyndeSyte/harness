@@ -159,6 +159,10 @@ final)
   holder discord; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
   [ "$(printf '%s' "$out" | jq -r .ok)" = true ] || fail "the check of his own user failed: $out"
+  # Its inventory: 35 checks need nothing running, and the 10 of the Supervisor, the sockets and
+  # the link make the 45 check.sh requires of a pass (C1_CHECK_MIN). A change here changes both.
+  [ "$(printf '%s' "$out" | jq -r .checks)" = 35 ] || fail "the check's inventory isn't 35 without the link: $out"
+  grep -q 'MIN="${C1_CHECK_MIN:-45}"' "$OPT/c1/check.sh" || fail "check.sh doesn't require the 45 checks of a pass"
   holder cain; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
   printf '%s' "$out" | jq -e '.ok == false and (.failed | any(test("carries the bot token")))' >/dev/null \

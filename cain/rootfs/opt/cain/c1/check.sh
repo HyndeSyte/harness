@@ -27,13 +27,24 @@ RUNMARKS="${C1_RUN_MARKS:-/run/cain}"
 VERSION="${C1_VERSION:-unknown}"
 SOCK_TMUX="${SOCK_TMUX:-/run/cain/tmux/cain.sock}"
 TRIES="${C1_CHECK_TRIES:-1}"
+# How many checks c1/check.ts makes when it can try everything (45: 35 that need nothing running,
+# and 10 of the Supervisor, the panel's sockets and the link). An answer that says all held with
+# fewer isn't a check that passed: it's taken as one that couldn't try everything (C1 third outside
+# round). The image test pins the 35 (tests/image/in.sh final).
+MIN="${C1_CHECK_MIN:-45}"
 NOANSWER='{"ok": true, "failed": [], "unchecked": ["the check gave no answer"], "checks": 0}'
 once() {
-  local raw
+  local raw n
   raw="$(timeout 60 "$OPT/as-cain" bun "$OPT/c1/check.ts" 2>/dev/null | tail -n 1)"
-  if printf '%s' "$raw" | jq -e 'type == "object" and (.ok | type == "boolean") and (.failed | type == "array") and (.unchecked | type == "array") and (.checks | type == "number")' >/dev/null 2>&1; then
-    printf '%s' "$raw"
-  else printf '%s' "$NOANSWER"; fi
+  if ! printf '%s' "$raw" | jq -e 'type == "object" and (.ok | type == "boolean") and (.failed | type == "array") and (.unchecked | type == "array") and (.checks | type == "number")' >/dev/null 2>&1; then
+    printf '%s' "$NOANSWER"; return
+  fi
+  n="$(printf '%s' "$raw" | jq -r .checks)"; n="${n%%.*}"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  if [ "$(printf '%s' "$raw" | jq -r .ok)" = true ] && [ "$(printf '%s' "$raw" | jq '.unchecked | length')" = 0 ] && [ "$n" -lt "$MIN" ]; then
+    jq -nc --arg u "the check ran only $n of its $MIN checks" --arg c "$n" '{ok: true, failed: [], unchecked: [$u], checks: ($c | tonumber)}'
+    return
+  fi
+  printf '%s' "$raw"
 }
 mark() {   # mark <file> <what>: in /data/c1, else in /run/cain for this container; 1 if neither
   if { printf '%s %s\n' "$VERSION" "$2" > "$1.tmp" && chmod 0600 "$1.tmp" && mv "$1.tmp" "$1"; } 2>/dev/null; then return 0; fi

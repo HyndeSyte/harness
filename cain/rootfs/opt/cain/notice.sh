@@ -87,22 +87,25 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
 plain() { printf '%s' "$1" | tr '\r\n' '  ' | sed 's/ *\xe2\x80\x94 */, /g; s/add-on/App/g; s/  */ /g; s/ $//' | cut -c1-160; }
 
 # A group's state: the alarm raised and its cause, when Home Assistant last had it and from which
-# hook (its hash), whether Discord has it, and whether it has cleared (its notification still to
-# come down).
+# hook (its hash), whether Discord has it, whether Home Assistant shows a notification for the
+# group (any alarm of it, a replaced one included: it stays to be taken down), and whether it has
+# cleared (its notification still to come down).
 load() {   # load <group>
-  kind=""; cause=""; sent=0; fp=""; discord=0; clear=0; G="$1"
+  kind=""; cause=""; sent=0; fp=""; discord=0; clear=0; shown=0; G="$1"
   [ -f "$DIR/$G" ] || return 1
   local k v
   while IFS=' ' read -r k v; do
-    case "$k" in kind) kind="$v" ;; cause) cause="$v" ;; sent) sent="$v" ;; fp) fp="$v" ;; discord) discord="$v" ;; clear) clear="$v" ;; esac
+    case "$k" in kind) kind="$v" ;; cause) cause="$v" ;; sent) sent="$v" ;; fp) fp="$v" ;; discord) discord="$v" ;;
+      clear) clear="$v" ;; shown) shown="$v" ;; esac
   done < "$DIR/$G"
   case "$sent" in ''|*[!0-9]*) sent=0 ;; esac
   [[ "$fp" =~ ^[0-9a-f]{16}$ ]] || fp=""
+  [ "$shown" = 1 ] || shown=0
   [ "$(group_of "$kind" 2>/dev/null)" = "$G" ] && alarm "$kind" "$cause"
 }
 save() {
   if mkdir -p "$DIR" 2>/dev/null \
-     && printf 'kind %s\ncause %s\nsent %s\nfp %s\ndiscord %s\nclear %s\n' "$kind" "$cause" "$sent" "$fp" "$discord" "$clear" > "$DIR/.$G.tmp" 2>/dev/null \
+     && printf 'kind %s\ncause %s\nsent %s\nfp %s\ndiscord %s\nclear %s\nshown %s\n' "$kind" "$cause" "$sent" "$fp" "$discord" "$clear" "$shown" > "$DIR/.$G.tmp" 2>/dev/null \
      && mv -fT "$DIR/.$G.tmp" "$DIR/$G" 2>/dev/null; then return 0; fi
   rm -f "$DIR/.$G.tmp" 2>/dev/null
   echo "[cain] alarm '$kind': its state couldn't be kept ($DIR/$G), so its caller raises it again" >&2
@@ -144,7 +147,7 @@ deliver() {   # a group's raised alarm: Discord once, Home Assistant daily or wh
   now="$(date +%s)"
   if h="$(hook)"; then
     if [ "$fp" != "$(hash16 "$h")" ] || [ $((now - sent)) -ge "$DAY" ]; then
-      if ha_send on "$T" "$M"; then sent="$now"; fp="$(hash16 "$h")"; said="${said:+$said and }Home Assistant"
+      if ha_send on "$T" "$M"; then sent="$now"; fp="$(hash16 "$h")"; shown=1; said="${said:+$said and }Home Assistant"
       else missed="${missed:+$missed and }Home Assistant"; fi
     fi
   else missed="${missed:+$missed and }Home Assistant (no notice_hook set)"; fi
@@ -155,7 +158,7 @@ deliver() {   # a group's raised alarm: Discord once, Home Assistant daily or wh
 }
 finish_clear() {   # a group's cleared alarm: its notification comes down, then its state goes
   cleared_text "$G"
-  if [ -z "$fp" ]; then rm -f "$DIR/$G"; echo "[cain] alarm '$kind' cleared"; return 0; fi
+  if [ "$shown" != 1 ]; then rm -f "$DIR/$G"; echo "[cain] alarm '$kind' cleared"; return 0; fi
   if ha_send clear "$CT" "$CM"; then rm -f "$DIR/$G"; echo "[cain] alarm '$kind' cleared, and Home Assistant's notification came down"; return 0; fi
   echo "[cain] alarm '$kind' cleared, but Home Assistant's notification is still up: taking it down is tried again in 10 minutes" >&2
   return 1
@@ -166,6 +169,8 @@ tell() {   # tell <kind> [cause]
   g="$(group_of "$1")" || { echo "notice: no alarm called '$1'" >&2; return 2; }
   c="$(plain "${2:-}")"
   if load "$g" && [ "$kind" = "$1" ] && [ "$cause" = "$c" ] && [ "$clear" != 1 ]; then deliver; return; fi
+  # A new alarm for the group: delivered afresh, but what Home Assistant shows for the group is
+  # kept (shown), so a notification of the alarm it replaces still comes down when it clears.
   G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0
   deliver
 }

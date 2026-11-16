@@ -390,10 +390,16 @@ def test_the_check_stops_cain_on_a_breach_and_holds_him_when_it_cant_finish(tmp_
         line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
         return out.returncode, line, read(marks / "failed"), read(marks / "held"), read(stub / "calls"), int(read(stub / "n") or 0)
 
-    good = json.dumps({"ok": True, "failed": [], "unchecked": [], "checks": 30})
+    good = json.dumps({"ok": True, "failed": [], "unchecked": [], "checks": 45})
     later = json.dumps({"ok": True, "failed": [], "unchecked": ["his key on /card: the link didn't answer"], "checks": 29})
     breach = json.dumps({"ok": False, "failed": ["can't read /data/link/discord.env"], "unchecked": [], "checks": 30})
-    assert check(good) == (0, "[c1] check: all 30 held", "", "", "", 1)
+    assert check(good) == (0, "[c1] check: all 45 held", "", "", "", 1)
+    # An answer that says all held with fewer checks than it makes is no pass (C1 third outside round).
+    vacuous = json.dumps({"ok": True, "failed": [], "unchecked": [], "checks": 0})
+    rc, line, failed, held, calls, n = check(vacuous, C1_UNTRIED="retry")
+    assert (rc, failed, held, calls) == (5, "", "", "") and "the check ran only 0 of its 45 checks" in line
+    rc, line, failed, held, calls, n = check(json.dumps({"ok": True, "failed": [], "unchecked": [], "checks": 44}))
+    assert (rc, held, calls) == (4, "0.12.0 the check ran only 44 of its 45 checks\n", "killed\nnotice tell held\n")
     rc, line, failed, held, calls, n = check(breach)
     assert (rc, failed, held, calls, n) == (3, "0.12.0 can't read /data/link/discord.env\n", "", "killed\nnotice tell breach\n", 1)
     assert "FAILED" in line
@@ -405,11 +411,11 @@ def test_the_check_stops_cain_on_a_breach_and_holds_him_when_it_cant_finish(tmp_
     assert (rc, failed, held, calls, n) == (4, "", "0.12.0 the check gave no answer\n", "killed\nnotice tell held\n", 1)
     assert "held (not a breach)" in line
     # On its own, five tries a minute apart before deciding.
-    assert check(later, later, good, C1_CHECK_TRIES="5") == (0, "[c1] check: all 30 held", "", "", "", 3)
+    assert check(later, later, good, C1_CHECK_TRIES="5") == (0, "[c1] check: all 45 held", "", "", "", 3)
     rc, line, failed, held, calls, n = check(*[later] * 5, C1_CHECK_TRIES="5")
     assert (rc, held, calls, n) == (4, "0.12.0 his key on /card: the link didn't answer\n", "killed\nnotice tell held\n", 5)
     # Held: no session to end.
-    assert check(good, held=True) == (0, "[c1] check: all 30 held", "", "", "", 1)
+    assert check(good, held=True) == (0, "[c1] check: all 45 held", "", "", "", 1)
     rc, line, failed, held, calls, n = check(later, held=True)
     assert (rc, failed, calls, n) == (4, "", "notice tell held\n", 1) and held.startswith("0.12.0 his key on /card")
     rc, line, failed, held, calls, n = check(breach, held=True)
@@ -534,58 +540,79 @@ def test_the_held_start_tries_the_check_until_it_finishes(tmp_path):
         return out.stdout.strip().splitlines(), calls.read_text().splitlines()
 
     tried = "check held=1 tries=1 version=0.12.0"
-    out, calls = hold(4, 4, 0)
+    out, all_calls = hold(4, 4, 0)
+    # No session of his while he's held: ended and shown ended first, and again before each try.
+    assert all_calls[:2] == ["ended", "notice tell held"]
+    assert all(all_calls[i - 1] == "ended" for i, c in enumerate(all_calls) if c == tried)
+    calls = [c for c in all_calls if c != "ended"]
     assert calls[:6] == ["notice tell held", tried, "notice tell held", tried, "notice tell held", tried]
     assert calls[6].startswith("relay Your session was held because the check of your own user couldn't finish "
                                "(his key on /card: the link didn't answer)") and "P33" in calls[6] and len(calls) == 7
     assert out[-1].startswith("mode=own held= kind= ")
     out, calls = hold(4, 3)
-    assert calls == ["notice tell held", tried, "notice tell held", tried]
+    assert [c for c in calls if c != "ended"] == ["notice tell held", tried, "notice tell held", tried]
     assert out[-1] == "mode=none held= kind=breach why=a check of his own user found a breach: cant read x"
     (data / "c1/check-failed").unlink()
     out, calls = hold(3, failed_at=runc / "check-failed")             # kept only in /run/cain
     assert out[-1] == "mode=none held= kind=breach why=a check of his own user found a breach: cant read x"
-    out, calls = hold(0, session=True)                                 # a session of his survived: ended first
-    assert calls[0] == "ended" and calls[1] == "notice tell held"
 
 
 def test_his_session_is_ended_even_when_tmux_wont_end_it(tmp_path):
-    """end_his_session (services.d/cain/run): tmux first, bounded; a session that still runs is
-    ended with every process of his user; it answers 1 only if one still runs after both."""
+    """end_his_session (services.d/cain/run). His own user's session: tmux first, then every
+    process of his user, until /proc shows none of his (three tries); tmux's answers prove nothing
+    either way. The old way's root session: ended only when tmux answers there's no such session;
+    a timeout or any other answer is no proof, so it answers 1 (C1 third outside round)."""
     import shutil
     import subprocess
     if not shutil.which("bash"):
         pytest.skip("no bash")
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
-    fn = _run_fns(run, "end_his_session() {", "\n}\n") + "\n}\n"
-    bindir = tmp_path / "bin"
+    fns = _run_fns(run, "his_procs() {", "# When his session can't be shown ended")
+    procs, bindir = tmp_path / "proc", tmp_path / "bin"
     bindir.mkdir()
     (bindir / "fake-tmux").write_text('#!/bin/bash\necho "tmux $*" >> "$CALLS"\ncase "$*" in *kill-session*) exit 1;; '
-                                      '*has-session*) [ -f "$UP" ];; esac\n')
-    (bindir / "setpriv").write_text('#!/bin/bash\necho "setpriv $*" >> "$CALLS"\n[ -n "$STUCK" ] || rm -f "$UP"\n')
-    for f in ("fake-tmux", "setpriv"):
+                                      '*has-session*) exit "$HAS";; esac\n')
+    (bindir / "tmux").write_text('#!/bin/bash\necho "tmux $*" >> "$CALLS"\ncase "$*" in *has-session*) exit "$HAS";; esac; exit 1\n')
+    (bindir / "setpriv").write_text('#!/bin/bash\necho "setpriv $*" >> "$CALLS"\n[ -n "$STUCK" ] || rm -rf "$PROCS"/*\n')
+    for f in ("fake-tmux", "tmux", "setpriv"):
         (bindir / f).chmod(0o755)
-    script = ("set -o errexit -o nounset -o pipefail\n"
-              "bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
-              f'TMUX_CMD="{(bindir / "fake-tmux").as_posix()}"; mode=own\n'
-              "has_session() { timeout 10 $TMUX_CMD -u has-session -t cain 2>/dev/null; }\n"
-              + fn + 'if end_his_session; then echo ended; else echo runs; fi\n')
-    (tmp_path / "end.sh").write_text(script)
 
-    def end(stuck=""):
-        calls, up = tmp_path / f"calls{stuck}", tmp_path / "up"
-        up.write_text("x")
-        env = {**os.environ, "CALLS": calls.as_posix(), "UP": up.as_posix(), "STUCK": stuck,
-               "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+    def end(tmux, has, procs_of_his=True, stuck=""):
+        calls = tmp_path / f"calls-{len(list(tmp_path.glob('calls-*')))}"
+        shutil.rmtree(procs, ignore_errors=True)
+        procs.mkdir()
+        if procs_of_his:
+            (procs / "4242").mkdir()
+            (procs / "4242/status").write_text("Name:\tclaude\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\n")
+        (procs / "1").mkdir()
+        (procs / "1/status").write_text("Name:\tinit\nState:\tS (sleeping)\nUid:\t0\t0\t0\t0\n")
+        script = ("set -o errexit -o nounset -o pipefail\n"
+                  "bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
+                  f'TMUX_CMD="{tmux}"; mode=own\n' + fns + 'if end_his_session; then echo ended; else echo runs; fi\n')
+        (tmp_path / "end.sh").write_text(script)
+        env = {**os.environ, "CALLS": calls.as_posix(), "HAS": str(has), "STUCK": stuck, "PROCS": procs.as_posix(),
+               "C1_PROC_ROOT": procs.as_posix(), "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
         out = subprocess.run(["bash", (tmp_path / "end.sh").as_posix()], capture_output=True, text=True, env=env, timeout=60)
         assert out.returncode == 0, out.stderr[-400:]
-        return out.stdout.strip(), calls.read_text().splitlines()
+        return out.stdout.strip(), (calls.read_text().splitlines() if calls.exists() else [])
 
-    said, calls = end()
-    assert said == "ended" and calls[0].endswith("kill-session -t cain")
-    assert any(c.startswith("setpriv --reuid=1000 --regid=1000 --clear-groups bash -c kill -9 -1") for c in calls)
-    said, calls = end("1")
-    assert said == "runs"
+    own = (bindir / "fake-tmux").as_posix()
+    # His own user: tmux won't end it and even says it's gone (or times out); /proc decides.
+    for has in (1, 124, 0):
+        said, calls = end(own, has)
+        assert said == "ended" and calls[0].endswith("kill-session -t cain"), has
+        assert any(c.startswith("setpriv --reuid=1000 --regid=1000 --clear-groups bash -c kill -9 -1") for c in calls), has
+    said, calls = end(own, 1, stuck="1")
+    assert said == "runs" and sum(c.startswith("setpriv") for c in calls) == 3
+    said, calls = end(own, 124, procs_of_his=False)
+    assert said == "ended" and not any(c.startswith("setpriv") for c in calls)
+    # The old way's root session: only tmux's "no such session" is proof.
+    assert end("tmux", 1, procs_of_his=False)[0] == "ended"
+    assert end("tmux", 124, procs_of_his=False)[0] == "runs"
+    assert end("tmux", 0, procs_of_his=False)[0] == "runs"
+    # A session that can't be shown ended stops the App: the one exit of the start, told by its trap.
+    fail = _run_fns(run, "fail_closed() {", "\n")
+    assert fail.strip().endswith("exit 1; }") and "no_session() { end_his_session || fail_closed; }" in run
 
 
 def test_no_stop_is_silent(tmp_path):
@@ -606,7 +633,7 @@ def test_no_stop_is_silent(tmp_path):
         assert re.search(r"\bstop_kind=[a-z-]+", line), line
     kinds = set(re.findall(r"\bstop_kind=([a-z-]+)", run))
     assert kinds == {"setup", "breach", "switch-stopped", "switch-restart", "restart", "damaged"}
-    told = set(re.findall(r'notice\.sh" tell ([a-z-]+)', run))
+    told = set(re.findall(r'notice\.sh" tell ([a-z-]+)', run)) | set(re.findall(r"\bkind=(switch-[a-z]+)", run))
     assert told == {"exited", "switch-failed", "switch-waits", "held", "session"}
     for kind in kinds | told:
         out = subprocess.run(["bash", (CAIN / "rootfs/opt/cain/notice.sh").as_posix(), "text", kind], capture_output=True, text=True)
@@ -617,7 +644,8 @@ def test_no_stop_is_silent(tmp_path):
     fn = _run_fns(run, "stopped() {", "# His session held")
     assert fn.count('"$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_cause" || true') == 3 and fn.count("no_session") == 3
     assert 'if [ "$mode" = none ]; then stopped; fi' in run
-    assert not re.search(r"^\s*exit\b", "\n".join(code), re.M)          # nothing ends the start on purpose
+    exits = [l for l in code if re.search(r"\bexit \d", l)]
+    assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }']
     assert "check-told" not in run and "stopped-told" not in run and '"$OPT/alert.sh" "Cain is stopped' not in run
     # The check runs in the foreground only, one try at a time: never in the background.
     assert run.count('"$OPT/c1/check.sh"') == 2 and "C1_UNTRIED" in run
@@ -635,12 +663,14 @@ def test_no_stop_is_silent(tmp_path):
 
 
 def _whole_start(tmp_path, **stubs):
-    """The whole start (services.d/cain/run) as bashio runs it, on a fake /data, /run/cain and
-    /opt/cain, with every command it runs stubbed: each stub and notice.sh call is noted in calls,
-    and sleep is short. A stop file makes every sleep end its caller, so it all winds down."""
+    """The whole start (services.d/cain/run) as bashio runs it, on a fake /data, /run/cain, /opt/cain
+    and /proc, with every command it runs stubbed: each stub and notice.sh call is noted in calls,
+    and sleep is short. A stop file makes every sleep end its caller, so it all winds down. The
+    stubbed setpriv (ending every process of his user) empties the fake /proc of his processes."""
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
     data, runc, opt, bindir = tmp_path / "data", tmp_path / "run" / "cain", tmp_path / "opt", tmp_path / "bin"
-    for d in (data / "c1", data / "link", opt / "c1", opt / "discord", bindir):
+    procs = tmp_path / "proc"
+    for d in (data / "c1", data / "link", opt / "c1", opt / "discord", bindir, procs):
         d.mkdir(parents=True, exist_ok=True)
     calls, stop = tmp_path / "calls", tmp_path / "stop"
     note = f'echo "$(basename "$0") $*" >> {calls.as_posix()}'
@@ -652,7 +682,7 @@ def _whole_start(tmp_path, **stubs):
         (opt / name).write_text(f"#!/bin/bash\n{note}\n{body}\n")
         (opt / name).chmod(0o755)
     for name, body in {"bun": 'case "$2" in container-id) echo boot:1;; esac; exit 0', "tmux": "exit 1", "claude": "exit 0",
-                       "setpriv": f'{note}\nrm -f {(tmp_path / "session").as_posix()}',
+                       "setpriv": f'{note}\nrm -f {(tmp_path / "session").as_posix()}; rm -rf {procs.as_posix()}/4242',
                        "sleep": (f'[ -f {stop.as_posix()} ] && kill -TERM "$PPID" 2>/dev/null\n'
                                  'case "$1" in 3600|600) echo "sleep $1" >> ' + calls.as_posix() + ';; esac\n'
                                  'exec /bin/sleep 0.05')}.items():
@@ -664,7 +694,8 @@ def _whole_start(tmp_path, **stubs):
     prelude = ("set -o errexit -o nounset -o pipefail\n"
                "bashio::log.info() { :; }; bashio::log.warning() { :; }; bashio::log.error() { :; }\n"
                "bashio::addon.version() { echo 0.12.0; }; bashio::addon.restart() { echo restart >> " + calls.as_posix() + "; }\n"
-               "bashio::config() { echo ''; }\n")
+               "bashio::config() { echo ''; }\n"
+               f"export C1_PROC_ROOT={procs.as_posix()}\n")
     (tmp_path / "whole.sh").write_text(prelude + body)
     return calls, stop, bindir, runc
 
@@ -724,17 +755,19 @@ def test_the_whole_start_keeps_starting_a_session_that_wont_start_and_says_so(tm
 
 
 def _session_up(tmp_path):
-    """as-cain for a session that starts and runs until something ends every process of his user
-    (the stubbed setpriv removes the session file); tmux's own kill-session fails."""
-    up = (tmp_path / "session").as_posix()
-    return (f'case "$*" in *new-session*) touch {up};; *has-session*) [ -f {up} ] || exit 1;; '
-            '*kill-session*) exit 1;; esac; exit 0')
+    """as-cain for a session that starts (a process of his in the fake /proc) and runs until every
+    process of his user is ended (the stubbed setpriv); tmux's own kill-session fails."""
+    up, proc = (tmp_path / "session").as_posix(), (tmp_path / "proc" / "4242").as_posix()
+    return (f'case "$*" in *new-session*) touch {up}; mkdir -p {proc}; '
+            f'printf "State:\\tS (sleeping)\\nUid:\\t1000\\t1000\\t1000\\t1000\\n" > {proc}/status;; '
+            f'*has-session*) [ -f {up} ] || exit 1;; *kill-session*) exit 1;; esac; exit 0')
 
 
 def test_the_whole_start_acts_on_a_breach_at_once_even_when_tmux_wont_end_him(tmp_path):
     """The check of his own user runs in the start's own loop, for the session it started with, and
     its answer is the authority: a breach ends his session even when tmux won't (every process of
-    his user), and he's stopped there, alive and told, without waiting on any record or restart."""
+    his user, till /proc shows none), and he's stopped there, alive and told, without waiting on
+    any record or restart."""
     import shutil
     if not shutil.which("bash") or not shutil.which("jq") or os.name == "nt":
         pytest.skip("needs bash, jq and a POSIX process model")
@@ -745,7 +778,7 @@ def test_the_whole_start_acts_on_a_breach_at_once_even_when_tmux_wont_end_him(tm
     assert len(checks) == 1, lines[:30]
     ended = next(i for i, l in enumerate(lines) if l.startswith("setpriv --reuid=1000"))
     assert checks[0] < ended < lines.index("notice.sh tell breach"), lines[:40]
-    assert "sleep 3600" in lines and not (tmp_path / "session").exists()
+    assert "sleep 3600" in lines and not (tmp_path / "session").exists() and not (tmp_path / "proc/4242").exists()
 
 
 def test_the_whole_start_holds_him_after_five_tries_that_cant_finish(tmp_path):
@@ -760,7 +793,23 @@ def test_the_whole_start_holds_him_after_five_tries_that_cant_finish(tmp_path):
                                    C1_CHECK_FIRST_S="0", C1_CHECK_EVERY_S="0", C1_HELD_FIRST_S="3600")
     assert alive, err
     assert [l for l in lines if l.startswith("untried=")][:5] == ["untried=retry"] * 4 + ["untried=hold"], lines[:40]
-    assert "notice.sh tell held" in lines and not (tmp_path / "session").exists()
+    assert "notice.sh tell held" in lines and not (tmp_path / "proc/4242").exists()
+
+
+def test_the_whole_start_holds_him_when_the_check_ends_unexpectedly(tmp_path):
+    """A check that ends with anything but its four answers (here it isn't there to run: 127) holds
+    him at once, never tried again forever: his session ended, the hold recorded with why, and
+    Dane told it's a pause."""
+    import shutil
+    if not shutil.which("bash") or not shutil.which("jq") or os.name == "nt":
+        pytest.skip("needs bash, jq and a POSIX process model")
+    calls, stop, bindir, _ = _whole_start(tmp_path, **{"as-cain": _session_up(tmp_path), "c1/check.sh": "exit 127"})
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell held" in l,
+                                   C1_CHECK_FIRST_S="0", C1_HELD_FIRST_S="3600")
+    assert alive, err
+    assert sum(l.startswith("check.sh") for l in lines) == 1 and "notice.sh tell held" in lines, lines[:40]
+    held = (tmp_path / "data/c1/check-held").read_text()
+    assert held.startswith("0.12.0 the check ended with 127") and not (tmp_path / "proc/4242").exists()
 
 
 def test_an_end_of_the_start_is_told_but_not_a_stop_by_signal(tmp_path):
@@ -841,6 +890,15 @@ def test_each_failed_switch_reaches_dane_once_as_he_really_runs(tmp_path):
     assert _run_start(tmp_path, **env) == "mode=none kind=switch-restart" and read(calls) == []
     assert _run_start(tmp_path, **env) == "mode=old kind="
     assert read(calls) == ["notice tell switch-failed the smoke test failed"] and "the old way" in read(queue)[0]
+    # The alarm couldn't be kept (the lock busy): not counted as told, so the next start tells it.
+    fresh("1f")
+    (opt / "notice.sh").write_text('#!/bin/bash\necho "notice $*" >> "$STUB_DATA/calls"\n'
+                                   '[ -f "$STUB_DATA/lock-busy" ] && exit 75; exit 0\n')
+    (data / "lock-busy").write_text("1")
+    assert _run_start(tmp_path, **env) == "mode=old kind=" and not (data / "c1/failed-told").exists() and read(queue) == []
+    (data / "lock-busy").unlink()
+    assert _run_start(tmp_path, **env) == "mode=old kind=" and (data / "c1/failed-told").read_text().strip() == "1"
+    assert read(calls) == ["notice tell switch-failed the smoke test failed"] * 2 and len(read(queue)) == 1
     # A try fails and is undone, and the next in the same start goes through: he runs as his own
     # user, so only Cain hears.
     fresh("1f", 0)
@@ -959,6 +1017,16 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     cleared = [json.loads(l.split('" ', 1)[1]) for l in read("ha") if '"state":"clear"' in l]
     assert {(c["group"], c["title"]) for c in cleared} == {("stop", "Cain is back"), ("session", "Cain is back")}
     assert read("discord")[-1].endswith("| Cain is running again.")
+    # The same group's alarm replaced while Home Assistant is away: what it showed still comes down.
+    call("tell", "held")
+    os.remove(stub / "ha-up")
+    call("tell", "breach")
+    assert field("stop", "kind") == "breach" and field("stop", "shown") == "1" and field("stop", "fp") == ""
+    call("clear", "running", want=1)
+    assert field("stop", "clear") == "1"                                  # still to come down
+    (stub / "ha-up").touch()
+    call("tick")
+    assert not (groups / "stop").exists() and (posted()["state"], posted()["group"]) == ("clear", "stop")
     # The same alarm with another cause is a new alarm.
     n = len(read("discord"))
     call("tell", "switch-failed", "his connectors wouldn't all load")
