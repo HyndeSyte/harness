@@ -310,7 +310,13 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   earlier versions), and Cain's
   reader turns it into one line for you naming what to run at the PC. Chrome's own full
   version (from the user data folder's `Last Version`) is recorded at confirmation, and
-  any change of it is `probe_stale` with reason `chrome_version_changed`.
+  any change of it is `probe_stale` with reason `chrome_version_changed`. **The versions
+  are named (twentieth round):** the probe's result and `confirm-profile` record the
+  extension's id and version and Chrome's version (`versions`), and every run reads the
+  installed ones (the extension's active manifest in the profile and Chrome's `Last
+  Version`) and refuses on a mismatch with `probe_stale` and a detail line such as
+  `version_mismatch: Chrome is <now>, the probe saw <then>: run the probe again, then
+  confirm-profile`, until a new probe.
 - **Settings from anywhere else, checked every run.** Claude Code still reads managed
   settings whatever the flags say, so before every run the worker also reads your user
   settings as the session sees them (`claude-config/settings.json` and
@@ -566,9 +572,18 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   strict JSON; an integer past the safe range (more than 9007199254740991 either way) is
   **rejected** (never rounded, never kept as a string), and a number that overflows to
   infinity too. Each rejection makes the read unplaced. **More than one address field is
-  unplaced too** (0.12.0, nineteenth round): after decoding, every key whose ASCII-folded
-  form is an address name is counted at every depth the gate reads, so `url` beside `URL`,
-  or a nested copy of `tabUrl`, makes the read unplaced with the reason `address_fields`.
+  unplaced too** (0.12.0, nineteenth round; scoped and folded in the twentieth): after
+  decoding, every key whose folded form is an address name is counted at every depth of the
+  placement-bearing answer, the hook input's `tool_response` (the object that holds the
+  structured path `structuredContent.tabUrl`), so `url` beside `URL`, or a nested copy of
+  `tabUrl`, makes the read unplaced with the reason `address_fields`. A key is folded by
+  **NFKC normalisation, then ASCII lowercase**, so a fullwidth `ｔａｂＵｒｌ` counts as
+  `tabUrl`; a letter only a Unicode case mapping would lower stays itself. The tool's own
+  input (a navigate's `url`) and the hook's own fields are outside the answer and neither
+  place a read nor unplace one. Inside the answer the rule stays strict where placement is
+  decided: exactly the one field at the path, nothing else address-named at any depth, and a
+  second key folding to `structuredContent` counts as more than one. A key written twice
+  anywhere in the input is still `duplicate_key`.
   Every unplaced read carries its named reason (`bom`, `lone_surrogate`, `unsafe_integer`,
   `number_range`, `not_strict_json`, `duplicate_key`, `address_fields`, `no_address`,
   `unreadable`, `probe_marker`) in `nav-decisions.jsonl`, and **the run's report that
@@ -1197,7 +1212,10 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       refusal says which result failed.
     - `structured_address`: a session reads the check page once with each of `read_page`,
       `get_page_text` and `find`; every one of the three must carry its tab's address at
-      `tool_response.structuredContent.tabUrl` and nowhere else (none unplaced).
+      `tool_response.structuredContent.tabUrl` and nowhere else (none unplaced). The probe
+      also records, for each reading tool, the full set of address-named key paths its real
+      answers carried (`address_paths` in `probe-evidence.json`, key paths only, never a
+      value; twentieth round), so what this PC's tools send is on record.
     - `forged_address` (gates): a session opens a check page that redirects to an off-site
       page writing a forged address field, naming the run's own check page, in its text, its
       title and its DOM, and reads it. It passes only when that read counts as `read_drift`
@@ -1236,7 +1254,12 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       the hook to its whole 26 second budget**: it must reach Claude Code as a refusal of an
       allowed call (`full_budget`: `blocked`, with when it answered), and its gap between
       Claude Code printing the call and the hook process's own start is the cold sample
-      (`cold_gap_ms`). Then **three warm sessions**, one call each, give the warm samples
+      (`cold_gap_ms`). **It counts as cold only when the PC started within the last 5
+      minutes** (twentieth round): the step records the system's uptime as the first session
+      starts (`uptime_s`), and marks the first sample `cold` at 300 seconds or less, else
+      `warm` (`first_sample`, `first_gap_ms`); a warm first sample leaves `cold_gap_ms` empty
+      and the step fails with `cold_sample_missing`: restart the PC and probe within five
+      minutes. Then **three warm sessions**, one call each, give the warm samples
       (`warm_gaps_ms`) and their spread (`warm_spread_ms`, longest less shortest). Where Claude
       Code's event carries its own timestamp, the gap from it is recorded too (`cli_gaps_ms`).
       Last, the hook is stalled past the 40 second timeout, and what Claude Code did with that
@@ -1258,7 +1281,27 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       longest, how long the hooks ran and when the last finished. When the longest gap leaves
       less than 4 seconds of the timeout past the budget, it is written to `hook-margin.json`,
       and `confirm-profile` refuses to renew (`hook_margin_low`) until a newer probe has
-      measured the margin again.
+      measured the margin again. **A real run does not wait for that** (twentieth round):
+      the worker watches the hook log while the session runs, and the moment a hook's start
+      gap leaves under 4 seconds of margin (a gap over 10 seconds), it ends that session at
+      once and the run fails with `hook_margin_low`. The worst real-run gap since the last
+      probe is kept beside the probe's own figure in `hook-worst.json` (`probe`: `max_gap_ms`,
+      `cold_gap_ms`; `run`: `job`, `max_gap_ms`, `margin_ms`), and `confirm-profile` prints it
+      (`hook_worst`); a newer probe starts the run figure afresh.
+      **Before a run's session starts, a preflight** (twentieth round) looks for anything of
+      probe mode: a probe variable in the worker's own environment (`PCW_HOOK_TIMING`,
+      `PCW_HOOK_CAPTURE`, `PCW_HOOK_FULL_BUDGET`, `PCW_HOOK_STALL_MS`, `PCW_PROBE_STEP`,
+      `PCW_PROBE_TOKEN`, `PCW_SESSION_KIND`), a marker left in `probe-marks`, a
+      `hook-timing.jsonl` or a `hook-capture` folder. Finding any, it sweeps the files and
+      refuses the run (`probe_leftover`), naming what it found and the cleanup command
+      (`bun worker.ts clean-probe`, which deletes them and says which variables are still set);
+      unset any variable it names and run again. The session's own environment never takes a
+      probe variable, and the probe cleans up after itself. The hook's own refusal
+      (`probe_marker`) stays as the backstop, and when it fires in a run its reason is in the
+      run's report and `last-run.json` (`hook_denied`). Nothing else differs in a run session:
+      the read guard's bounded hold (10 seconds) and the worker's kill escalation (8 seconds)
+      are the production ones, and an off-site read in a run still ends the session; only the
+      probe's hold to the whole budget is probe-only.
     - `payload_replay` (gates): the hook inputs your Claude Code really sent during
       `hook_timing` and the reading-tools session, both the PreToolUse calls and **the
       reading tools' answers that read-guard reads** (kept for the probe alone, at most 50 in
@@ -1576,6 +1619,10 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `hook_timing` (`confirm-profile`) | `probe-evidence.json`: `hook_timing` (`cold_gap_ms`, `warm_gaps_ms`, `max_gap_ms`, `full_budget`, `overrun`, `why`); `worker.log`: `probe hook_timing` | `gap_too_long`: on this PC the hook's start (Git Bash and the runtime) takes so long that it plus the hook's 26 second budget comes within 4 seconds of the 40 second timeout. Close other heavy programs, check whether your security software scans Git Bash or the runtime on every start, restart the PC and run the probe again first thing. `gap_unmeasured`: Claude Code didn't print a tool call before starting its hook, so the gap couldn't be measured: report it (needs a code change). `full_budget_not_blocked`: a hook held to its budget didn't reach Claude Code as a refusal (the CLI gave up on it first, or ran the call anyway): report it with your `claude` version (needs a code change). `overrun_ran`: a navigation whose hook never answered ran anyway: the permission layer isn't refusing on its own; check `session-settings.json` is the pinned one and report it. |
 | `payload_replay` (`confirm-profile`) | `probe-evidence.json`: `payload_replay` (`captured`, `parsed`, `agreed`, `failures`); `worker.log`: `probe round18` | The hook input your Claude Code sent was refused by the read guard's strict parser (`bom`: it starts with a byte order mark; `lone_surrogate`; `unsafe_integer`: a number past the safe range; `duplicate_key`; `disagrees`), or nothing was captured (`captured` 0: the probe's sessions made no tool call). Every page read would count as unplaced, so nothing runs. Run the probe once more; if it repeats, report the reasons (needs a code change). |
 | `hook_margin_low` (`confirm-profile`) | `hook-margin.json` in the worker folder; `last-run.json`: `hook` | A real run's hooks started so late that less than 4 seconds of the 40 second timeout was left past the 26 second budget. Close heavy programs (a scan, a backup), restart the PC, then run the probe again first thing (its `hook_timing` measures the margin anew) and `confirm-profile`. Needs a code change: only if it repeats on an idle PC. |
+| `probe_leftover` (`worker.ts run`) | its detail: `vars`, `files`, `swept`, `hint`; `worker.log`: `probe_leftover` | A probe was cut off and left its marker, timing or capture files, or a probe variable is set in the terminal you ran from. The files were swept already (`bun worker.ts clean-probe` does the same); unset each variable it names (or open a new terminal) and run again. Needs a code change: no. |
+| `hook_margin_low` (a run's result) | `last-run.json`: `hook`; `hook-worst.json` | During this run a hook started more than 10 seconds after Claude Code asked for it, leaving under 4 seconds before the 40 second timeout, so the worker ended the session at once. Close heavy programs, restart the PC, probe again first thing and confirm. Needs a code change: only if it repeats on an idle PC. |
+| `hook_timing` with `cold_sample_missing` (`confirm-profile`) | `probe-evidence.json`: `hook_timing` (`uptime_s`, `first_sample`) | The probe's first session wasn't within 5 minutes of the PC starting, so it isn't a cold sample. Restart the PC and run the probe within five minutes. Needs a code change: no. |
+| `probe_stale` with `version_mismatch` (a run's refusal) | its detail; `confirm-profile`'s `versions` | The Claude in Chrome id or version, or Chrome's version, installed now isn't the one the probe saw. Restart the Cain jobs Chrome if an update is waiting, then run the probe and `confirm-profile` again. Needs a code change: no. |
 | `probe_marker` (a run's `navigation_denied`, `hook_missing_decision` or `read_unplaced` with reason `probe_marker`) | `nav-decisions.jsonl`: a line with `why` or `reason` `probe_marker`; the `probe-marks` folder in the worker folder | The hook saw a sign of probe mode in a run: a file left in `probe-marks`, or a probe setting in the environment. Delete everything in `probe-marks`, close the terminal you started the run from and open a new one, then run again. Needs a code change: no, unless it repeats with `probe-marks` empty. |
 | `fragment_strip` with `no_page_report` | `probe-evidence.json`: `fragment_strip` (`why`, `received`) | The fragment check page sent no report for its step's nonce in time (the page didn't load, its script was blocked, or the extension took long). Fragments stay refused; that's safe. Run the probe again; if it repeats, check the Cain jobs Chrome allows scripts on `http://127.0.0.1`. |
 | `reuse_migrated` (a Discord line from Cain's App) | `/data/pc-jobs-reuse-used.jsonl` on the Pi: a line with `migrated` | A tap written by an older keeper was counted as used. Nothing to fix: if you still want that check, let Cain ask again and tap. |

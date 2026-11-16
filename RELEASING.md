@@ -38,7 +38,12 @@ branch is up to date with `main` and these checks passed on it:
     again), every hook timeout in the pinned settings equals the hook's `HOOK_TIMEOUT_S`,
     and the description carries `Hook policy version: <N>` and the guard-surface hash line
     of each of those three files at the head (`cain/tools/guard-surface.sh` prints them). A
-    new policy version needs a new probe and confirmation on the PC;
+    new policy version needs a new probe and confirmation on the PC. The probe steps that
+    gate it are listed in `cain/docs/pc-jobs.md`; since the twentieth round its `hook_timing`
+    step needs a cold first sample (taken within 5 minutes of the PC starting,
+    `cold_sample_missing` otherwise), its `structured_address` step records each reading
+    tool's address-named key paths, and its result names the Claude in Chrome id and version
+    and Chrome's version that every run then checks;
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
     filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
     the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while

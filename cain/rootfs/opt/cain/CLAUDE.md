@@ -330,13 +330,17 @@ in the harness repo; until then the keeper says it is waiting).
   before the PC had checked its tools), `abort_kill_failed` (a session the PC ended wouldn't
   end in time; the PC stays unconfirmed until he probes again), `extension_slow_attach` (his
   probe saw Claude in Chrome too slow to attach: he restarts the Cain jobs Chrome and probes
-  again), `refusal_cap` (the session was refused twelve times
+  again), `hook_margin_low` (a hook started so late in the run that the PC ended the session
+  at once: he closes heavy programs, restarts the PC and probes again first thing),
+  `probe_leftover` (a cut-off probe left files or a setting behind; the run didn't start: he
+  runs `bun worker.ts clean-probe`, opens a new terminal and runs again), `refusal_cap` (the session was refused twelve times
   and ended), `domain_not_allowed` (the job named
   a host its allowlist entry doesn't allow; nothing ran), `containment_unavailable` (the
   PC couldn't build or start its Windows Job Object helper, so nothing runs uncontained),
   `browser_timeout` and more); a heartbeat code such as `profile_unconfirmed`, `profile_changed`,
   `probe_stale` (a new Claude in Chrome, Chrome or Claude Code version, or a new Cain
-  release with a new PC worker: nothing runs until he probes and confirms again), `update_pending` (Chrome has a Claude in Chrome update waiting: he
+  release with a new PC worker, or the Claude in Chrome or Chrome version installed isn't the
+  one his probe saw: nothing runs until he probes and confirms again), `update_pending` (Chrome has a Claude in Chrome update waiting: he
   restarts the Cain jobs Chrome), `boundary_not_accepted` (he hasn't accepted the stated
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
