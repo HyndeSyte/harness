@@ -1459,10 +1459,14 @@ export function wallOf(o: Opts): Wall {
   const longs = workerPaths(o);
   const targets = [...longs, join(P.cliConfig(o), CREDENTIAL)];
   let unreadable = false;
-  const shorts = targets.map((t) => { const s = sp(t); if (s === null) unreadable = true; return s; }).filter((s): s is string => !!s);
-  const leaf = (p: string) => canonPath(p).split("/").filter(Boolean).at(-1) ?? "";
-  const tokens = [...new Set([basename(resolve(o.home)).toLowerCase(), ...shorts.map(leaf).filter((n) => n.includes("~"))])].filter((t) => t.length > 0);
-  const paths = [...new Set([...longs, ...shorts.slice(0, 2).concat(shorts.slice(2).filter((s) => s.includes("~")))].map((p) => canonPath(fwd(p)).replace(/\/+$/, "")))];
+  // Each target's short form, kept only where it differs from the long one (a temp folder
+  // whose own ancestor is a short name, like RUNNER~1, isn't a short form of the target).
+  const pairs = targets.map((t) => { const s = sp(t); if (s === null) unreadable = true; return { long: t, short: s }; })
+    .filter((x): x is { long: string; short: string } => !!x.short && canonPath(fwd(x.short)) !== canonPath(fwd(x.long)));
+  const leaf = (p: string) => canonPath(fwd(p)).split("/").filter(Boolean).at(-1) ?? "";
+  const tokens = [...new Set([basename(resolve(o.home)).toLowerCase(),
+    ...pairs.filter((x) => leaf(x.short) !== leaf(x.long)).map((x) => leaf(x.short))])].filter((t) => t.length > 0);
+  const paths = [...new Set([...longs, ...pairs.map((x) => x.short)].map((p) => canonPath(fwd(p)).replace(/\/+$/, "")))];
   return { paths, tokens, names: [...WORKER_NAMES], unreadable };
 }
 // Which strings in a tool call's input can name a filesystem target or a command argument:

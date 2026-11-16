@@ -3837,6 +3837,13 @@ describe("twelfth review: the hook's allow list, process trees, path forms, real
       expect([x, decide({ tabId: 1, query: x }).why]).toEqual([x, "worker_folder"]);
     for (const x of ["PROGRA~1", "C:/PROGRA~1/thing", "DOCUME~1", "CLAUDE~2", "MICROS~1.NET", "claude", "credentials", "programs", "pcw", "two-step pc settings", "~1", "PC-WOR~2", "pc-worker"])
       expect([x, decide({ tabId: 1, query: x }).decision]).toEqual([x, "allow"]);
+    // A folder whose own ancestor has a short name (a temp folder under RUNNER~1) adds nothing: a short form counts only where it differs.
+    const plain = wallOf(q.opts({ shortPath: (p: string) => p }));
+    expect(plain.paths).toEqual(workerPaths(q.opts()).map((p) => canonPath(p)));
+    expect(plain.tokens).toEqual(["pc-worker-t3st"]);
+    const underShort = q.opts({ home: join(q.root, "RUNNER~1", "pc-worker-t3st"), shortPath: (p: string) => p });
+    expect(wallOf(underShort).paths).toHaveLength(2);
+    expect(wallOf(underShort).tokens).toEqual(["pc-worker-t3st"]);
     // A short name that can't be read on Windows: the preflight refuses (untrusted_config).
     expect(browserPreflight(q.opts({ ...attended, shortPath: () => null }), q.inst)).toBe("untrusted_config");
   });
