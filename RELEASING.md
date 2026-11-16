@@ -61,10 +61,15 @@ and otherwise a permission failure naming the endpoint. `/opt/cain/keeper.sh shi
 sha>` on the Pi reads that gate for a head without acting and prints what it would decide and
 why, the workflow file it read and every attempt it saw (`--watch` keeps watching a fresh
 head until its Windows run is done: the PC probe's `ship_gate` step, started before that head
-is pushed so it sees the Windows run pending; `--pr <number> --watch` instead binds to the
-first head the pull request shows after the watch started, accepts only that sha, honours
-GitHub's Retry-After and rate-limit reset before its next reading, and a Ship card for any
-other head of that pull request is refused while that acceptance stands). Run it once on a head
+is pushed so it sees the Windows run pending; `--pr <number> --head <full sha> --watch`
+instead takes the exact commit about to be pushed, waits until the pull request's head equals
+it, accepts only that sha and fails by name (`other_head`, `head_moved`) if a different head
+appears or the head moves away; it honours GitHub's Retry-After and rate-limit reset before
+its next reading, each wait capped at 15 minutes and the whole watch at 2 hours (an
+unreadable header counts as the cap); every acceptance is kept by sha in
+`/data/work/ship-gate-<sha>.json`, a Ship card for any other head of that pull request is
+refused while it stands, naming the accepted sha, and after a rebase
+`keeper.sh ship-gate --supersede <accepted sha>` records that the acceptance is replaced). Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
   Run it before pushing (needs PyYAML):

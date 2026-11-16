@@ -303,12 +303,15 @@ in the harness repo; until then the keeper says it is waiting).
   and GitHub's answer to it, and keeps them across restarts, crashes and power cuts; it
   frees a tap only when its record shows GitHub refused every push of that job, and
   otherwise the tap stays spent for good, even if the job later vanished from the queue):
-  for another, ask again. A refusal that says the tap "is pending" means the keeper settles
-  it at its next start: wait, don't ask him again yet. No tap, no reuse.
+  for another, ask again. A push counts as refused only on git's own refusal line for it;
+  anything less clear never frees a tap. A refusal that says the tap "is pending" means the
+  keeper settles it at its next round, within a minute: wait, don't ask him again yet. No tap, no reuse.
 - The keeper sends him one Discord line itself (through the link, in its own fixed words)
   when the queue can't be read safely or a job from his tap was refused three times: a
   shallow copy, the queue's branch missing, an empty queue with a tap pending, an
-  unreadable tap record, a tap it can't settle. Don't repeat it; if he asks, the fix is in
+  unreadable tap record, a tap it can't settle. Each is told once while it lasts, and
+  again if it clears and comes back; a code your App has no words for comes as "a stop
+  condition the App does not know" with its code. Don't repeat it; if he asks, the fix is in
   that line and in the Troubleshooting table of cain/docs/pc-jobs.md.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
@@ -446,10 +449,15 @@ create, update or run any other routine.
      that Windows gate for a head without acting and says what it would decide and why;
      with `--watch` it is his probe's `ship_gate` step, kept in /data/work: start it before
      the candidate head is pushed (it must see the Windows run pending), then push. Better,
-     `/opt/cain/keeper.sh ship-gate --pr <number> --watch` started before the push binds to
-     the first head the pull request shows after it started and accepts only that sha; a
-     Ship card for any other head of that pull request is refused while that acceptance
-     stands (watch the new head first). A reading GitHub refused (a 403 or 429 page) holds,
+     `/opt/cain/keeper.sh ship-gate --pr <number> --head <full sha> --watch`, started before
+     the push with the full sha of the commit the build is about to push, waits until the
+     pull request's head is that sha and accepts only it; if another head appears or the head
+     moves away it fails by name (`other_head`, `head_moved`) and accepts nothing. A Ship card
+     for any other head of that pull request is refused while that acceptance stands, and the
+     refusal names the accepted sha: after a rebase run
+     `/opt/cain/keeper.sh ship-gate --supersede <that sha>`, then watch the new head the same
+     way before its card. One wait for GitHub is at most 15 minutes and a watch at most 2
+     hours; past either it ends unsettled (`rate_wait_cap`, `watch_cap`). A reading GitHub refused (a 403 or 429 page) holds,
      never accepts: it says rate limit only when GitHub said so (a 429, or a 403 with its
      rate-limit signs) and otherwise names the endpoint as a permission failure, and the
      watch waits as long as GitHub asks. Run either only when he asks, or once on a head whose Windows run failed

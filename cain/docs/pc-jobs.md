@@ -1337,7 +1337,12 @@ carries `x-ratelimit-remaining: 0`, a `Retry-After` header, or a body that says 
 rate limit (the dry run says `hold`, naming the rate limit and how long GitHub asked to
 wait); **any other 403 is a permission failure**, and the dry run says `hold` naming the
 endpoint GitHub refused. The watch waits as long as `Retry-After` or `x-ratelimit-reset`
-asks before its next reading. Tests run that gate against a fake GitHub for each case, a failed attempt
+asks before its next reading, **within caps (twentieth round)**: one wait is at most 15
+minutes (GitHub asking for longer ends the watch at once with `rate_wait_cap`), the whole
+watch is at most 2 hours (`--hours` can't go past it; an unsettled watch that reaches it ends
+with `watch_cap`), and a `Retry-After` or reset header that is there but can't be read (not
+whole seconds, an HTTP date or an epoch second) counts as the 15 minute cap, never as zero or
+as no limit. Tests run that gate against a fake GitHub for each case, a failed attempt
 on a second page and a page error among them.
 
 **Read the gate without acting, once, before relying on it** (Cain, or you through him):
@@ -1355,13 +1360,23 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     yet pushed), start `/opt/cain/keeper.sh ship-gate <full head sha> --watch` on the Pi (or
     have Cain run it and show you its lines), then push. A watch started after the Windows run
     finished never sees it pending and doesn't pass. Better still, **watch the pull request
-    instead of a sha**: `/opt/cain/keeper.sh ship-gate --pr <number> --watch`, started before
-    the push, binds to the first head the pull request shows after it started and reads and
-    accepts only that sha, whatever a later push does to the branch; it is kept in
-    `/data/work/ship-gate-pr-<number>.json`, and **a Ship card for any other head of that pull
-    request is refused** while that acceptance stands (watch the new head to move it). It reads the gate now and then every 10
-    minutes (`--every`) for up to 2 hours (`--hours`), printing one line per reading, and
-    keeps the step in `/data/work/ship-gate-<head>.json`: the workflow file read, the head
+    for the exact commit about to be pushed (twentieth round)**:
+    `/opt/cain/keeper.sh ship-gate --pr <number> --head <full sha> --watch`, started before
+    the push, with `--head` the local commit the push will send (`git rev-parse HEAD`). It
+    waits until the pull request's head equals that sha (the head it shows before the push is
+    waited past), then reads and accepts only that sha. If a different head appears on the
+    pull request it fails with `other_head`, and if the head moves away from that sha it fails
+    with `head_moved`; either way nothing is accepted (the command exits 1). `--pr` without
+    `--head` is refused. Every watch is kept by its sha in `/data/work/ship-gate-<sha>.json`
+    (with the pull request, the head it bound, the head it accepted and any failure), and
+    **a Ship card for any other head of that pull request is refused** while that acceptance
+    stands, naming the accepted sha and the command to replace it. After a rebase, record that
+    the new head replaces the old acceptance with
+    `/opt/cain/keeper.sh ship-gate --supersede <accepted sha>` (it marks that file superseded,
+    with the time, and keeps it), then watch the new head the same way before its card. A watch
+    of a single sha with no `--pr` never blocks a card. It reads the gate now and then every 10
+    minutes (`--every`) for up to 2 hours (`--hours`, at most 2), printing one line per reading, and
+    keeps the step in `/data/work/ship-gate-<sha>.json`: the workflow file read, the head
     judged, every reading with its decision and every attempt seen. It passes only when the
     gate was seen refusing (`hold` or `refuse`) while the Windows run was still going, never
     accepted while an attempt was going or had failed, and accepted at the end, once every
@@ -1386,7 +1401,15 @@ push of its job ever succeeded.** Before each push attempt the keeper appends to
 pending line the commit that attempt will push (so a commit rebased after GitHub refused a
 push that wasn't a fast-forward is recorded too), and after each attempt the remote's answer:
 `ok`, `refused` (with GitHub's words) or `unknown` (a timeout, a broken connection, an answer
-it can't read). At the next start the tap counts as landed (final) if any recorded commit is
+it can't read). **What counts as refused (twentieth round):** the keeper pushes with
+`git push --porcelain`, and an attempt is recorded `refused` only when git's own line for
+that exact ref is a `!` line (`[rejected]` or `[remote rejected]`; a non-fast-forward when it
+says `non-fast-forward` or `fetch first`). A non-zero exit whose line shows the ref updated
+(a tracking-ref failure or a hook error printed after the update), no line for the ref, a
+`!` line for another ref, and an authentication or 403 message are all `unknown`, never
+`refused`. Before any rollback decision the landed checks run, in this order in code: any
+recorded commit in the fetched branch, then any job, report or worker record naming the job
+or request, then any attempt answered `ok`. At the next round the tap counts as landed (final) if any recorded commit is
 in the fetched branch, an attempt was answered `ok`, or any job, report or worker record in
 the queue names its job or request. It **rolls back only when every recorded attempt was
 refused and none is unknown or unanswered**. The absence of the commit and of every record
@@ -1405,18 +1428,34 @@ its request, if still waiting, is refused with that reason.
 - **GitHub can't be reached when the keeper restarts**: the round stops, the tap stays
   pending (spent), and a replay is refused; once GitHub answers, the next round settles it.
 - **Three pushes, each refused**: you get one Discord line saying the job didn't reach your
-  PC's queue and the tap is settled at the keeper's next start; a replay meanwhile is refused
-  with that same pending status. At the next start the tap is rolled back, once, and the
-  request checked afresh.
+  PC's queue and the tap is settled at the keeper's next round, within a minute (twentieth
+  round: not at the next process start); a replay meanwhile is refused with that same
+  pending status. That next round settles it once its fetch from GitHub shows none of the
+  recorded commits in the branch and no record names the job: the tap is rolled back, once,
+  and the request checked afresh.
+- **A push that landed and then failed** (git exits non-zero after the ref was updated, for
+  example a tracking-ref or hook error): its answer is `unknown`, the next round finds the
+  commit in the branch, and the tap is final; it is never rolled back.
 - **One push timed out among the three**: its answer is `unknown`, so the tap stays spent.
 - **An older store** (a pending line written by the seventeenth round's keeper, with no
-  commit): it is treated as spent and finalised with one migration line, and you get one
-  Discord line about it.
+  commit): it gets the same record check first (twentieth round). A job, report or worker
+  record in the queue naming its job or request makes it landed (final, `migrated:
+  round17_pending`, nobody told); only with no record is it treated as spent and finalised
+  with one migration line, and you get one Discord line about it. A record that can't be read
+  keeps it pending (`reuse_unsettled`).
 - **A stop condition** (a shallow copy of the queue, the queue's branch missing, an empty
   queue on GitHub with a tap pending, a store that can't be read, a tap that can't be
   settled): you get one Discord line naming it and the fix (the Troubleshooting rows
   `reuse_shallow`, `queue_branch_missing`, `queue_empty_pending`, `reuse_store_unreadable`,
-  `reuse_unsettled`). A shallow copy and a tap that can't be settled hold that tap alone
+  `reuse_unsettled`). **How a notice is told once (twentieth round):** which notices were
+  told is kept in its own small file beside the tap store,
+  `/data/pc-jobs-reuse-used.jsonl.told.json` (never inside the store). A notice is marked
+  told only once the link answers that it posted it; a failed post is tried again the next
+  round. The mark is removed when the condition is seen clear (the store read, the branch
+  back, the tap settled), so a recurrence is told again. A notice file that can't be read
+  counts as nothing told: a notice can repeat, never be lost. A code the link has no words for
+  (a keeper newer than the link) still reaches you, as "a stop condition the App does not
+  know, code <code>, see troubleshooting". A shallow copy and a tap that can't be settled hold that tap alone
   (its request waits); other jobs go on. An unreadable store holds every reuse request and
   lets other jobs go on. A missing branch or an empty queue stops the round.
 - **The Pi loses power right after a tap is written.** Run this on the Pi (in Cain's
@@ -1545,7 +1584,11 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `queue_empty_pending` (a Discord line) | the `pc-jobs` repository on GitHub | The queue on GitHub has no branch at all while a tap waits to be settled; the round stops. Fix: give it its first commit again (setup step 2); the tap then counts as used. |
 | `reuse_store_unreadable` (a Discord line) | `/data/pc-jobs-reuse-used.jsonl` on the Pi | The keeper can't read its record of used taps (it isn't a readable file), so it takes no reuse job until it can; other jobs go on. Fix: make it a readable file again (if something replaced it with a folder, move that aside); never delete a readable one: it is what keeps a tap from answering twice. |
 | `reuse_unsettled` (a Discord line) | the keeper's log in the Cain App's log | Git gave no clear answer about a tap's job (a file in the queue copy it couldn't read, or git neither yes nor no). That tap waits; other jobs go on; it tries each round. If it lasts a day, delete `/data/pc-jobs` and restart the Cain App. |
-| `reuse_push_refused` (a Discord line) | the keeper's log: `push 3 of 3` | GitHub refused the push of a job made from your tap three times. The tap is settled at the keeper's next start (rolled back only because every try was refused), and the job is queued again by itself. If it repeats, check the `pc_jobs_token` option (Contents read and write on `pc-jobs`). |
+| `reuse_push_refused` (a Discord line) | the keeper's log: `push 3 of 3` | GitHub refused the push of a job made from your tap three times. The tap is settled at the keeper's next round, within a minute, once a fetch shows none of its commits landed (rolled back only because every try was refused), and the job is queued again by itself. If it repeats, check the `pc_jobs_token` option (Contents read and write on `pc-jobs`). |
+| a stop condition the App does not know, code `<code>` (a Discord line) | the keeper's log in the Cain App's log | The keeper is newer than the link that posts its notices (an update half applied). Find the code in this table; restart the Cain App so both run the same version. Needs a code change: no. |
+| `other_head` or `head_moved` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`) | its last line and `/data/work/ship-gate-<sha>.json`: `failure`, `failure_why` | The pull request's head was not the sha the watch was told (another commit was pushed), or it moved away from it. Nothing was accepted. Start a new watch with `--head` set to the commit actually pushed, before pushing it. Needs a code change: no. |
+| a Ship card refused: "the Ship gate's watch of this pull request accepted `<sha>`, not this head" | `/data/work/ship-gate-<sha>.json` | An earlier watch accepted another head of this pull request (often before a rebase). If this head replaces it, run `keeper.sh ship-gate --supersede <sha>`, then watch this head with `--pr <number> --head <head> --watch`. |
+| `rate_wait_cap` or `watch_cap` (the gate watch) | the watch's lines: the last reading's `why` | GitHub asked for a wait past 15 minutes (or sent a wait it couldn't read), or the watch reached its 2 hour cap unsettled. Nothing was accepted. Wait for GitHub's limit to reset, then watch again. |
 | `extension_slow_attach` (`confirm-profile`) | `probe-evidence.json`: `not_ready` (counts, `waits_ms`, `first_wait_ms`) | A probe session hit the not-ready cap: Claude in Chrome took too long to attach. Restart the Cain jobs Chrome, wait a minute, then run the probe again. Needs a code change: only if it repeats on a healthy Chrome. |
 | `abort_kill_failed` | `abort-kill-failed.json` in the worker folder; `worker.log`: `abort_kill_failed` | A hook ended a session, and the worker couldn't see it gone within 8 seconds after ending its Job Object and then its process. The PC is unconfirmed until a new probe: check Task Manager for a leftover `claude` or `pcw-jobrun`, end it, then run the probe and `confirm-profile` again (which clears the file). Report it if it repeats. |
 | `navigation_denied` with `fragment_not_allowed` | `nav-decisions.jsonl`: the deny line | The session tried an address with a `#` part. Fragments are refused unless your probe's `fragment_strip` step passed. Nothing to fix unless the job's own address has one: pin it without the `#` part. |
