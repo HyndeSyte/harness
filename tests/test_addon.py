@@ -1624,6 +1624,17 @@ WORKING = "> \n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt   
 # His prompt up, with Claude Code's panel of background tasks drawn under its footer (round 9).
 IDLE_WITH_TASKS = ("❯ \n  ? for shortcuts            auto mode on\n"
                    "  ● Explore Reading repository files 40s · ↓ to manage")
+# His input area as Claude Code drew it on Nov 16 (rules around the prompt line), and in the older
+# rounded box.
+RULE = "─" * 60
+REAL_IDLE = (f"● Here's where things stand.\n\n{RULE}\n> \n{RULE}\n"
+             "  ⏵⏵ auto mode on (shift+tab to cycle)                    ● high · /effort")
+BOX_IDLE = f"╭{RULE}╮\n│ >  {' ' * 56}│\n╰{RULE}╯\n  ? for shortcuts"
+# Words that only look like a footer (outside review, round 10): his own quoting one, with no
+# prompt; and a menu with an "auto mode on" option and key hints of its own.
+QUOTED_FOOTER = "Claude said:\n  “For shortcuts, press ?”\n  Last message delivered."
+OPTION_SCREEN = ("  Permission mode\n  ❯ 1. auto mode on\n    2. default\n"
+                 "  Enter to apply · Esc to exit")
 
 
 def _prompt_state(screen):
@@ -1639,16 +1650,22 @@ def _prompt_state(screen):
 
 
 def test_prompt_state_reads_his_prompt_and_a_screen_waiting_for_an_answer():
-    """prompt-state.sh: ready only with his prompt's footer in the bottom lines and no dialog's key
-    hints below it; rows under the footer (background tasks) don't matter, and words higher up,
-    a footer's or a hint's, count for nothing either way. Never fails."""
-    assert _prompt_state(IDLE) == "ready" and _prompt_state(WORKING) == "ready"
-    assert _prompt_state(IDLE_WITH_TASKS) == "ready"
-    assert _prompt_state("To stop it, press Esc to cancel.\n" + IDLE) == "ready"
+    """prompt-state.sh: ready only when his input area is on screen by its shape: a line starting
+    with Claude Code's footer, right under the prompt line (borders between), in the bottom lines,
+    with no dialog's key hints below it. Rows under the footer (background tasks) don't matter;
+    words that only look like a footer or a hint count for nothing. Never fails."""
+    for screen in (IDLE, WORKING, IDLE_WITH_TASKS, REAL_IDLE, BOX_IDLE,
+                   "To stop it, press Esc to cancel.\n" + IDLE):
+        assert _prompt_state(screen) == "ready", screen
     assert _prompt_state(AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("He said: auto mode on, ? for shortcuts.\n" + AUTO_MODE_OFFER) == "dialog"
     assert _prompt_state("  Select model\n  > Opus\n  Enter to confirm · Esc to exit") == "dialog"
-    assert _prompt_state("  ? for shortcuts  Esc to cancel") == "dialog"           # both on one line: no
+    assert _prompt_state(OPTION_SCREEN) == "dialog"
+    assert _prompt_state("> \n  ? for shortcuts  Esc to cancel") == "dialog"      # both on one line: no
+    assert _prompt_state(QUOTED_FOOTER) == "other"                                  # no input area
+    assert _prompt_state("  Notes:\n  ? for shortcuts, see the docs") == "other"   # no prompt above it
+    assert _prompt_state("> \n  some words\n  ? for shortcuts") == "other"         # not right under it
+    assert _prompt_state("  ⏵⏵ auto mode on (shift+tab to cycle)") == "other"
     assert _prompt_state(IDLE + "\n" + "\n".join(f"line {i}" for i in range(12))) == "other"   # footer gone by
     assert _prompt_state("") == "other" and _prompt_state("\n  \n") == "other"
     assert _prompt_state("Welcome to Claude Code\n Select login method:") == "other"
@@ -1661,9 +1678,9 @@ def test_checkin_never_types_into_a_screen_waiting_for_an_answer(tmp_path):
     and his taps wait for it, as the check-in does within its hour."""
     import os
     import shutil
-    assert _checkin(tmp_path, "0712", AUTO_MODE_OFFER) == ""
+    for screen in (AUTO_MODE_OFFER, QUOTED_FOOTER, OPTION_SCREEN, WORKING):   # at work: later
+        assert _checkin(tmp_path, "0712", screen) == "", screen
     assert list((tmp_path / "done").glob("*")) == []                  # the morning one still to come
-    assert _checkin(tmp_path, "0712", WORKING) == ""                  # at work: later
     out = _checkin(tmp_path, "0712", "To stop it, press Esc to cancel.\n" + IDLE_WITH_TASKS)
     assert "morning" in out and "Enter" in out                        # back at his prompt: it goes in
     if shutil.which("jq"):

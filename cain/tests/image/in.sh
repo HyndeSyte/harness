@@ -163,6 +163,16 @@ final)
   # the link make the 45 check.sh requires of a pass (C1_CHECK_MIN). A change here changes both.
   [ "$(printf '%s' "$out" | jq -r .checks)" = 35 ] || fail "the check's inventory isn't 35 without the link: $out"
   grep -q 'MIN="${C1_CHECK_MIN:-45}"' "$OPT/c1/check.sh" || fail "check.sh doesn't require the 45 checks of a pass"
+  # His screen, read with the image's own awk (prompt-state.sh, outside review round 10): his input
+  # area, with a background task row under it, is ready; the auto mode offer is a dialog; words
+  # that only quote a footer, and an empty screen, are neither.
+  seen() { printf "$1" | "$OPT/prompt-state.sh"; }
+  [ "$(seen '──────\n> \n──────\n  ⏵⏵ auto mode on (shift+tab to cycle)   ● high\n  ● Explore 40s · ↓ to manage\n')" = ready ] \
+    || fail "prompt-state: his input area isn't read as ready"
+  [ "$(seen '> /auto-mode-setup\n  Teach auto mode about your environment?\n    Continue\n  ←/→ to change · Enter to continue · Esc to cancel\n')" = dialog ] \
+    || fail "prompt-state: the auto mode offer isn't read as a dialog"
+  [ "$(seen 'Claude said:\n  For shortcuts, press ?\n')" = other ] && [ "$(seen '')" = other ] \
+    || fail "prompt-state: words quoting a footer, or an empty screen, read as more than other"
   holder cain; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null
   printf '%s' "$out" | jq -e '.ok == false and (.failed | any(test("carries the bot token")))' >/dev/null \
