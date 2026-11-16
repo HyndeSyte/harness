@@ -414,3 +414,59 @@ def test_a_crash_midway_leaves_the_ledger_as_it_was_and_reruns_cleanly(tmp_path,
     assert old.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='unbutton'").fetchone()[0] == 1
     assert len([t for t in m.seen() if t.startswith("Harness updated.")]) == 1
     assert migrate.schema(old) == 2
+
+
+# -- 5. not confirmed is not the end ----------------------------------------------------------------
+
+def _hide_dentist_from_day_reads(m, monkeypatch, until=None):
+    real = m.gmail.events_between
+
+    def hides(address, start, end, fresh=False):
+        if until is not None and m.clock() >= until:
+            return real(address, start, end)
+        return [e for e in real(address, start, end) if e.get("summary") != "Dentist"]
+    monkeypatch.setattr(m.gmail, "events_between", hides)
+
+
+def test_not_confirmed_is_read_again_and_confirmed_with_a_follow_up(m, monkeypatch):
+    from test_plain_commands import NOW
+    _hide_dentist_from_day_reads(m, monkeypatch, until=NOW + timedelta(seconds=20))
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert m.seen()[-1].startswith("Not confirmed.") and rows(m)[-1]["state"] == "unverified"
+    plan = json.loads(rows(m)[-1]["settle_json"])
+    assert len(plan["recheck"]) == 2
+    m.clock.t += timedelta(seconds=10)
+    m.c.tick()
+    assert rows(m)[-1]["state"] == "unverified"              # not due yet
+    m.clock.t += timedelta(seconds=25)
+    m.c.tick()
+    assert rows(m)[-1]["state"] == "done"
+    assert m.seen()[-1].startswith("Confirmed. A later read of the calendar shows it as asked: Add Dentist")
+    assert len([x for x in m.gmail.log if x[0] == "insert"]) == 1
+
+
+def test_not_confirmed_twice_more_is_settled_as_absent_and_never_written_again(m, monkeypatch):
+    _hide_dentist_from_day_reads(m, monkeypatch)
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert rows(m)[-1]["state"] == "unverified"
+    m.gmail.events.pop(next(k for k, e in m.gmail.events.items() if e.get("summary") == "Dentist"))
+    seen = len(m.seen())
+    m.clock.t += timedelta(seconds=35)
+    m.c.tick()
+    assert rows(m)[-1]["state"] == "unverified" and len(m.seen()) == seen     # said nothing yet
+    m.clock.t += timedelta(minutes=2)
+    m.c.tick()
+    assert rows(m)[-1]["state"] == "absent"
+    assert m.seen()[-1].startswith("Not done: Add Dentist") and "nothing is written again" in m.seen()[-1]
+    m.clock.t += timedelta(minutes=5)
+    m.c.tick()
+    assert len([x for x in m.gmail.log if x[0] == "insert"]) == 1
+
+
+def test_a_retry_of_a_not_confirmed_add_finds_its_first_write_and_adds_nothing(m, monkeypatch):
+    _hide_dentist_from_day_reads(m, monkeypatch)                # day reads lag; by id it's there
+    m.tells("add the dentist at 3 today", ask(DENTIST))
+    assert rows(m)[-1]["state"] == "unverified"
+    m.tells("add the dentist at 3 today", ask(DENTIST))        # he says it again
+    assert "Already there, nothing added: “Dentist”" in m.seen()[-1] and "Add anyway" in m.labels()
+    assert len([x for x in m.gmail.log if x[0] == "insert"]) == 1

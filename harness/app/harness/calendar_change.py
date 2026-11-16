@@ -100,6 +100,9 @@ LEASE_S = 120
 # abandoned after it (_bounded): it's then a write whose answer was lost, settled by reading. A
 # write that answers after its change lapsed is fenced out by its token (_drain_late).
 WRITE_TIMEOUT_S = 30
+# A change the read back doesn't show is read again, in the background, this long after its
+# receipt: confirmed then, with a follow-up receipt, or settled as absent after the last.
+RECHECK_S = (30, 120)
 # A read back that disagrees is read once more, this long after, asking past any cache (_read_back).
 READ_BACK_PAUSE_S = 3
 READ_BACK_DAYS = 60                    # how far on a series's end is read back
@@ -808,6 +811,7 @@ class CalendarChange:
             self._execute(p, paused)
         if not paused:
             self._settle_pending()
+            self._recheck_unverified()
         now = self.ledger.now()
         for (pid,) in self.ledger.db.execute(           # newest first, read fresh: an undo before
                 "SELECT proposal_id FROM calendar_changes WHERE undo_state IN ('requested','settling')"
@@ -1513,6 +1517,17 @@ class CalendarChange:
                                    receipt=json.dumps({"effect": effects.CALENDAR_CHANGE,
                                                        "steps": len(undo), "outcome": kind,
                                                        "parts": len(results), "parts_done": len(done)}))
+            if kind == "unverified":
+                # Not confirmed isn't the end (0.24.0, fourth round): read again in the background
+                # about 30 seconds and 2 minutes on (_recheck_unverified).
+                row = db.execute("SELECT settle_json FROM calendar_changes WHERE proposal_id=?", (p["id"],)).fetchone()
+                plan = json.loads(row[0]) if row and row[0] else {}
+                if plan.get("parts") and len(plan["parts"]) == len(results):
+                    base = self.ledger.now()
+                    plan["recheck"] = [iso(base + timedelta(seconds=x)) for x in RECHECK_S]
+                    plan["unverified"] = [i for i, (_, _, st, _) in enumerate(results)
+                                          if st is not None and st.kind == "read_back"]
+                    self._save_plan(p["id"], plan, db)
             if ok:
                 db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
                 self.ledger.event("calendar_change_done", {"steps": len(undo)}, db=db)
@@ -1569,6 +1584,46 @@ class CalendarChange:
             self._say(db, self.chat_id, p["job_id"], "\n".join(lines), buttons=buttons, binds=binds)
         log.info("calendar change job %s: %s, %d of %d part(s) done, %d write(s)",
                  render.short(p["job_id"]), kind, len(done), len(results), len(undo))
+
+    def _recheck_unverified(self) -> None:
+        """Changes kept as not confirmed, read again about 30 seconds and 2 minutes after their
+        receipt (0.24.0, fourth round): a read that now shows each part as asked confirms it, with a
+        follow-up receipt; after the last read, one that still doesn't is settled as absent, said
+        once. A read that can't tell waits for the next. Nothing is written either way."""
+        now = self.ledger.now()
+        for row in self.ledger.db.execute("SELECT * FROM calendar_changes WHERE state='unverified'").fetchall():
+            plan = _plan(row)
+            due = plan.get("recheck") or []
+            if not due or datetime.fromisoformat(due[0]) > now:
+                continue
+            parts = [plan["parts"][i] for i in plan.get("unverified", []) if i < len(plan.get("parts", []))]
+            verdict = self._reads_done(parts) if parts else "unread"
+            rest = due[1:]
+            log.info("calendar change %s: not confirmed, read again: %s", render.short(row["proposal_id"]), verdict)
+            plan["recheck"] = rest
+            with self.ledger.tx() as db:
+                if verdict == "done":
+                    plan.pop("recheck", None)
+                    db.execute("UPDATE calendar_changes SET state='done', settle_json=?, updated_at=? WHERE"
+                               " proposal_id=? AND state='unverified'", (json.dumps(plan), iso(now), row["proposal_id"]))
+                    db.execute("UPDATE proposals SET state='executed' WHERE id=? AND state='failed'",
+                               (row["proposal_id"],))
+                    db.execute("DELETE FROM meta WHERE key=?", (PROBLEM,))
+                    self.ledger.event("calendar_change_confirmed_later", {"proposal": row["proposal_id"]}, db=db)
+                    self._say(db, self.chat_id, row["job_id"], "<b>Confirmed.</b> A later read of the calendar "
+                              "shows it as asked: " + "; ".join(part["will"] for part in parts) + ".")
+                elif not rest and verdict == "not_done":
+                    db.execute("UPDATE calendar_changes SET state='absent', settle_json=?, updated_at=? WHERE"
+                               " proposal_id=? AND state='unverified'", (json.dumps(plan), iso(now), row["proposal_id"]))
+                    self.ledger.event("calendar_change_absent", {"proposal": row["proposal_id"]}, db=db)
+                    undo = row["undo_state"] == "open"
+                    buttons, binds = self._undo_button(db, row["proposal_id"]) if undo else (None, None)
+                    self._say(db, self.chat_id, row["job_id"], "<b>Not done:</b> " + "; ".join(
+                        part["will"] for part in parts) + ". A read two minutes on still doesn't show it, so it's "
+                        "settled as not on the calendar, and nothing is written again."
+                        + (" Undo puts back what did go through." if undo else ""), buttons=buttons, binds=binds)
+                else:
+                    self._save_plan(row["proposal_id"], plan, db)
 
     def _read_as(self, p) -> list[str]:
         """Each day his own words named by a relative word, as it was read (provenance.resolutions),
@@ -2341,6 +2396,12 @@ class CalendarChange:
             # ran out keeps the id of the first offer, so an earlier write that landed late is found
             # here, by that id, and isn't written a second time.
             same, like = self._made_already(c, uid, start, end), None
+            for twin in ([] if same is not None else self._unsettled_ids(c, start, end)):
+                # A retry of a change kept as not confirmed (or lapsed) passes the same decision
+                # first, against that change's own id: its write may be there after all.
+                same = self._made_already(c, twin, start, end)
+                if same is not None:
+                    break
             if same is None:
                 same, like = self._already_there(c, start, end, rule)
             if same is not None:
@@ -2371,6 +2432,26 @@ class CalendarChange:
                    "start": _text(start), "end": _text(end), "repeats": bool(rule)}]
         return Part(f"Add {text}{where}", f"Added {text}{where}", [step], name=_safe(c["title"]), adds=True,
                     expect=expect, loose=loose, change=dict(c))
+
+    def _unsettled_ids(self, c: dict, start, end) -> list[str]:
+        """The fixed ids of earlier adds of this very event (calendar, title, start, end) that were
+        never confirmed: not confirmed, settled as absent, or lapsed, in the last week."""
+        out = []
+        since = iso(self.ledger.now() - timedelta(days=7))
+        for row in self.ledger.db.execute(
+                "SELECT settle_json FROM calendar_changes WHERE state IN ('unverified','absent','lapsed')"
+                " AND updated_at>=? ORDER BY rowid DESC LIMIT 20", (since,)).fetchall():
+            try:
+                parts = json.loads(row[0] or "{}").get("parts") or []
+            except ValueError:
+                continue
+            for part in parts:
+                for e in part.get("expect") or []:
+                    if e.get("kind") == "there" and e.get("calendar") == c["calendar"] \
+                            and exact_title(e.get("title", "")) == exact_title(c["title"]) \
+                            and e.get("start") == _text(start) and e.get("end") == _text(end):
+                        out.append(e["id"])
+        return list(dict.fromkeys(out))
 
     def _made_already(self, c: dict, uid: str, start, end) -> "Found | None":
         """The event this very add writes, found by its own fixed id, already there as asked: an

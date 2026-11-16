@@ -809,7 +809,7 @@ class Runner:
         rows = self.ledger.db.execute(
             f"SELECT p.id, p.params_json, p.state, x.undo_state, x.state AS done_state FROM proposals p"
             f" LEFT JOIN calendar_changes x ON x.proposal_id=p.id WHERE p.effect_type=? AND p.job_id IN ({marks})"
-            " AND p.state IN ('approved','auto_approved','executing','executed','declined')",
+            " AND p.state IN ('approved','auto_approved','executing','executed','failed','declined')",
             (effects.CALENDAR_CHANGE, *ids)).fetchall()
         rows = [r for r in rows if (r["undo_state"] or "none") != "undone"]
         if not rows:
@@ -820,8 +820,10 @@ class Runner:
                 if not self.ledger.get_meta(f"calendar_change_left:{r['id']}"):
                     continue
                 into = done_keys
-            elif r["state"] == "executed":
-                if (r["done_state"] or "done") != "done":
+            elif r["state"] in ("executed", "failed"):
+                # Done is what the calendar was read showing: a change confirmed by a later read, or a
+                # write that landed after its lease ran out, counts; not confirmed or lapsed doesn't.
+                if (r["done_state"] or ("done" if r["state"] == "executed" else "")) not in ("done", "landed_late"):
                     continue
                 into = done_keys
             else:
