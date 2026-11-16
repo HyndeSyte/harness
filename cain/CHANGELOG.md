@@ -101,10 +101,17 @@
 - Your probe's "#" check page now has a one-time code of its own, and says plainly when the page never reported.
 - Your confirmation is now tied to the exact page-check code and pinned settings, not just a version number. This update needs a new probe and confirmation.
 - Watching the Ship gate now takes the exact change about to be sent and waits for it; if a different change shows up, or it moves away, the watch says so and accepts nothing. A Ship card refused because an earlier change was accepted names it and the one command that replaces it after a rebase. Each wait for GitHub is at most 15 minutes, and a watch at most 2 hours.
-- A send of a job from your tap counts as refused only when GitHub's own answer says so; anything less clear keeps the tap used. A job refused three times is settled within a minute, not at the next restart.
+- A send of a job from your tap counts as refused only when GitHub's own answer says so; anything less clear keeps the tap used. A job refused three times is settled at the keeper's next round that reaches GitHub, not at the next restart.
 - The once-only messages about the job queue are now only marked sent once Discord has them, and you hear again if the problem clears and comes back. A tap written by the earlier test version whose job is on record now counts as done.
 - A run first checks no probe leftovers are lying around and says how to clear them. A run whose page checks start too late now stops at once, and the probe's first timing sample must be taken within five minutes of starting the PC.
 - The page check's address rule now looks only at what the reading tool answered, with wide letters folded, and the probe records which address fields your reading tools send. Runs now check Claude in Chrome's and Chrome's versions against the ones your probe saw. This update needs a new probe and confirmation.
+- A run now also stops when a page check never starts at all, timed by the PC itself, not only when one starts late.
+- The probe's cold timing sample says to use Restart, not Shut down (Windows Fast Startup keeps the PC from counting as freshly started), or to turn Fast Startup off, and shows how long the PC had been up.
+- A run no longer touches anything while a probe is running, and a leftover probe setting is named with where it is set and the exact command that removes it.
+- Claude in Chrome's version is read from what Chrome actually loaded, and Chrome's from the running program itself. More than one Claude in Chrome version in the profile, an update waiting, or a version that changes during a run stops runs until a new probe.
+- The Ship gate keeps one accepted change per pull request, and replacing it works only once a new change has been pushed.
+- A tap that can't be settled for three rounds, because a file can't be read or GitHub can't be reached, now gets one message naming the job. The queue's messages are no longer repeated when a problem flickers, or when Discord's answer was lost.
+- When the probe finds your reading tools send extra address fields, it lists them and says the page check needs a change, rather than calling it a forged answer.
 
 ## 0.11.0
 

@@ -315,8 +315,21 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   extension's id and version and Chrome's version (`versions`), and every run reads the
   installed ones (the extension's active manifest in the profile and Chrome's `Last
   Version`) and refuses on a mismatch with `probe_stale` and a detail line such as
-  `version_mismatch: Chrome is <now>, the probe saw <then>: run the probe again, then
-  confirm-profile`, until a new probe.
+  `version_mismatch: Chrome is <now>, the probe saw <then>: an auto-update needs a new
+  probe: run the probe again, then confirm-profile`, until a new probe. **Where each
+  version comes from (twenty-first round):** the extension's version is the one the
+  profile's `Preferences` or `Secure Preferences` entry for its id says Chrome loaded (the
+  entry's manifest version), never a folder's name; an entry without one is no version
+  (`wrong_profile`). More than one version folder for the extension, or an update unpacked
+  and waiting, refuses every run (`extension_versions_ambiguous`, `update_pending`) and is
+  kept in `version-hold.json`, so runs stay held **until a new probe and confirmation**,
+  even once Chrome has settled on one folder again. Chrome's version is the file version of
+  the `chrome.exe` the Cain jobs Chrome runs from (its process's command line names it);
+  only when that can't be read is the `Last Version` file used, and the result says so
+  (`chrome_version_source`: `chrome_exe` or `last_version_file`; a mismatch line says
+  "from the Last Version file, the fallback"). Both are read again once each session has
+  ended: a version that changed during a run fails it (`versions_changed`, its report
+  discarded, the detail naming what changed), and the next run then needs a new probe.
 - **Settings from anywhere else, checked every run.** Claude Code still reads managed
   settings whatever the flags say, so before every run the worker also reads your user
   settings as the session sees them (`claude-config/settings.json` and
@@ -1029,9 +1042,11 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     after you cleared browsing data, run `bind-profile` again. It prints `{"bound": ...}`,
     or the code that stopped it.
 11. **The supervised probe: the only way to the first confirmation.** Not a queued job:
-    nothing in the queue runs, and nothing is pushed. **Run it first thing after restarting
-    the PC** (or after it sat idle for half an hour or more): its first step measures the
-    hook's cold start (`hook_timing`, below). With the Cain jobs Chrome open and
+    nothing in the queue runs, and nothing is pushed. **Run it within 5 minutes of a
+    Restart of the PC** (Start, Power, Restart; **not Shut down**, which Windows Fast Startup
+    doesn't count as a fresh start, so the uptime isn't reset; or turn Fast Startup off first):
+    its first step measures the hook's cold start (`hook_timing`, below) and refuses
+    (`cold_sample_missing`, printing the uptime it measured) when the PC has been up longer. With the Cain jobs Chrome open and
     you watching, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
     probe --attended --home C:/pc-worker-k7q2xz` (add `--diagnose` for the diagnostic capture,
     below). In order, it:
@@ -1215,7 +1230,12 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       `tool_response.structuredContent.tabUrl` and nowhere else (none unplaced). The probe
       also records, for each reading tool, the full set of address-named key paths its real
       answers carried (`address_paths` in `probe-evidence.json`, key paths only, never a
-      value; twentieth round), so what this PC's tools send is on record.
+      value; twentieth round), so what this PC's tools send is on record. **When the step
+      refuses because a tool's answers carry address-named keys beyond that path**
+      (twenty-first round), the refusal lists the recorded paths (`address_paths` in its
+      detail, as `tool: path`) and calls it what it is: a schema mismatch between Claude in
+      Chrome's answers and the read guard's rule, needing a policy change (a code change),
+      not a forged answer.
     - `forged_address` (gates): a session opens a check page that redirects to an off-site
       page writing a forged address field, naming the run's own check page, in its text, its
       title and its DOM, and reads it. It passes only when that read counts as `read_drift`
@@ -1248,8 +1268,8 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     - `session_ids` (recorded, a diagnostic, not a gate): whether the init event's session
       id equals the one the hook's input carries, in every decision of that session. The
       barrier uses the worker's own token, never either id.
-    - `hook_timing` (gates; it runs first, before the smoke step, so **run the probe first
-      thing after restarting the PC, or after it sat idle**, to measure a cold start): five
+    - `hook_timing` (gates; it runs first, before the smoke step, so **run the probe within
+      5 minutes of a Restart of the PC, not a Shut down**, to measure a cold start): five
       short sessions, in this order (nineteenth round). **The very first, cold session holds
       the hook to its whole 26 second budget**: it must reach Claude Code as a refusal of an
       allowed call (`full_budget`: `blocked`, with when it answered), and its gap between
@@ -1258,8 +1278,12 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       minutes** (twentieth round): the step records the system's uptime as the first session
       starts (`uptime_s`), and marks the first sample `cold` at 300 seconds or less, else
       `warm` (`first_sample`, `first_gap_ms`); a warm first sample leaves `cold_gap_ms` empty
-      and the step fails with `cold_sample_missing`: restart the PC and probe within five
-      minutes. Then **three warm sessions**, one call each, give the warm samples
+      and the step fails with `cold_sample_missing`. **Use Restart, not Shut down**: with
+      Windows Fast Startup on (the default), Shut down then power on keeps the kernel and does
+      not reset the uptime, so it never gives a cold sample. Restart (or turn Fast Startup off
+      in Control Panel, Power Options, "Choose what the power buttons do"), then run the probe
+      within 5 minutes of the PC starting. The refusal prints the uptime it measured
+      (`uptime_s`) with these words. Then **three warm sessions**, one call each, give the warm samples
       (`warm_gaps_ms`) and their spread (`warm_spread_ms`, longest less shortest). Where Claude
       Code's event carries its own timestamp, the gap from it is recorded too (`cli_gaps_ms`).
       Last, the hook is stalled past the 40 second timeout, and what Claude Code did with that
@@ -1284,7 +1308,15 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       measured the margin again. **A real run does not wait for that** (twentieth round):
       the worker watches the hook log while the session runs, and the moment a hook's start
       gap leaves under 4 seconds of margin (a gap over 10 seconds), it ends that session at
-      once and the run fails with `hook_margin_low`. The worst real-run gap since the last
+      once and the run fails with `hook_margin_low`. **A hook that never starts is caught too**
+      (twenty-first round): the worker times each tool call on its own monotonic clock from the
+      moment the call's event is read from the stream (moved earlier by the event's own
+      timestamp where it carries a usable one, never later). The hook writes a start line the
+      moment it has read its input; with no start line for a call 36 seconds in (the 40 second
+      timeout less the 4 second margin), the worker ends the session (`hook_margin_low`) and the
+      run fails, so the CLI's own timeout (which lets the call through) never decides it. A
+      start line showing a gap over 10 seconds ends it as before, as soon as it lands. The
+      check is never skipped in a run. The worst real-run gap since the last
       probe is kept beside the probe's own figure in `hook-worst.json` (`probe`: `max_gap_ms`,
       `cold_gap_ms`; `run`: `job`, `max_gap_ms`, `margin_ms`), and `confirm-profile` prints it
       (`hook_worst`); a newer probe starts the run figure afresh.
@@ -1295,7 +1327,16 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       `hook-timing.jsonl` or a `hook-capture` folder. Finding any, it sweeps the files and
       refuses the run (`probe_leftover`), naming what it found and the cleanup command
       (`bun worker.ts clean-probe`, which deletes them and says which variables are still set);
-      unset any variable it names and run again. The session's own environment never takes a
+      unset any variable it names and run again. **It takes the worker's single-instance lock
+      first** (twenty-first round): while a probe holds the lock, its files and variables are
+      live, so the run refuses (`busy`, naming the probe) and sweeps nothing. Each probe
+      variable it finds is named with where it is set (`scopes`: `process` for this terminal
+      alone, or `user` or `machine`, read from the registry on Windows: `HKCU\Environment`
+      and the Session Manager's `Environment` key) and the exact command that removes it
+      there (`Remove-Item Env:<name>` in this terminal, or
+      `[Environment]::SetEnvironmentVariable('<name>', $null, 'User')`, or the same with
+      `'Machine'` in an administrator PowerShell); then close the terminal and start the
+      worker again in a new one. The session's own environment never takes a
       probe variable, and the probe cleans up after itself. The hook's own refusal
       (`probe_marker`) stays as the backstop, and when it fires in a run its reason is in the
       run's report and `last-run.json` (`hook_denied`). Nothing else differs in a run session:
@@ -1416,7 +1457,13 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     stands, naming the accepted sha and the command to replace it. After a rebase, record that
     the new head replaces the old acceptance with
     `/opt/cain/keeper.sh ship-gate --supersede <accepted sha>` (it marks that file superseded,
-    with the time, and keeps it), then watch the new head the same way before its card. A watch
+    with the time, and keeps it), then watch the new head the same way before its card. **One
+    live acceptance per pull request (twenty-first round):** a watch with `--pr` doesn't start,
+    and never accepts, while another live (not superseded) acceptance of that pull request
+    stands; it fails with `live_acceptance`, naming it. `--supersede` refuses unless the pull
+    request's current head (read from GitHub) differs from the sha being replaced, naming the
+    head it saw (and refuses when that head can't be read). The Ship card reads the single live
+    acceptance; more than one (left from before this rule) refuses the card, naming each. A watch
     of a single sha with no `--pr` never blocks a card. It reads the gate now and then every 10
     minutes (`--every`) for up to 2 hours (`--hours`, at most 2), printing one line per reading, and
     keeps the step in `/data/work/ship-gate-<sha>.json`: the workflow file read, the head
@@ -1471,11 +1518,13 @@ its request, if still waiting, is refused with that reason.
 - **GitHub can't be reached when the keeper restarts**: the round stops, the tap stays
   pending (spent), and a replay is refused; once GitHub answers, the next round settles it.
 - **Three pushes, each refused**: you get one Discord line saying the job didn't reach your
-  PC's queue and the tap is settled at the keeper's next round, within a minute (twentieth
-  round: not at the next process start); a replay meanwhile is refused with that same
-  pending status. That next round settles it once its fetch from GitHub shows none of the
-  recorded commits in the branch and no record names the job: the tap is rolled back, once,
-  and the request checked afresh.
+  PC's queue and the tap is settled at the keeper's next round with a successful fetch from
+  GitHub (within a minute while GitHub answers; twenty-first round wording); a replay
+  meanwhile is refused with that same pending status. That round settles it once its fetch
+  shows none of the recorded commits in the branch and no record names the job: the tap is
+  rolled back, once, and the request checked afresh. **The wait is bounded with a notice**
+  (twenty-first round): after three rounds whose fetch failed, you get one Discord line
+  naming the job and the code (`reuse_fetch_failed`).
 - **A push that landed and then failed** (git exits non-zero after the ref was updated, for
   example a tracking-ref or hook error): its answer is `unknown`, the next round finds the
   commit in the branch, and the tap is final; it is never rolled back.
@@ -1485,7 +1534,8 @@ its request, if still waiting, is refused with that reason.
   record in the queue naming its job or request makes it landed (final, `migrated:
   round17_pending`, nobody told); only with no record is it treated as spent and finalised
   with one migration line, and you get one Discord line about it. A record that can't be read
-  keeps it pending (`reuse_unsettled`).
+  keeps it pending; after three such rounds you get one Discord line naming the job and the
+  code (`reuse_record_unreadable`; twenty-first round).
 - **A stop condition** (a shallow copy of the queue, the queue's branch missing, an empty
   queue on GitHub with a tap pending, a store that can't be read, a tap that can't be
   settled): you get one Discord line naming it and the fix (the Troubleshooting rows
@@ -1494,8 +1544,13 @@ its request, if still waiting, is refused with that reason.
   told is kept in its own small file beside the tap store,
   `/data/pc-jobs-reuse-used.jsonl.told.json` (never inside the store). A notice is marked
   told only once the link answers that it posted it; a failed post is tried again the next
-  round. The mark is removed when the condition is seen clear (the store read, the branch
-  back, the tap settled), so a recurrence is told again. A notice file that can't be read
+  round. **The mark is removed only once the condition has been seen clear for three rounds
+  in a row** (twenty-first round; the store read, the branch back, the tap settled), so a
+  condition that flaps is told once, and one that comes back after three clear rounds is told
+  again. **Each notice carries a notice id**, kept in the file before the post; a post whose
+  acknowledgement was lost is sent again with the same id, and the link, which keeps the ids
+  it posted, answers it as posted without posting it twice. A notice about one tap names its
+  job and code on the line (the job's id only, in the queue's own shape). A notice file that can't be read
   counts as nothing told: a notice can repeat, never be lost. A code the link has no words for
   (a keeper newer than the link) still reaches you, as "a stop condition the App does not
   know, code <code>, see troubleshooting". A shallow copy and a tap that can't be settled hold that tap alone
@@ -1593,7 +1648,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | Probe: `config_sweep_required` at `confirm-profile` | its `left` names; `probe-evidence.json`'s `config_sweep`; `C:/pc-worker-k7q2xz/claude-config` | After the probe's two smoke sessions something was in `claude-config` that is neither kept (`.credentials.json`, `settings.json`, `CLAUDE.md`) nor swept: usually a process still writing there after the session ended (an editor, a sync client, a second `claude` with `CLAUDE_CONFIG_DIR` set to it). Close it, delete the named entries, and run the probe again. Needs a code change: no. |
 | `popups_allowed` in `worker.log` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `popups`; chrome://settings/content/popups in the Cain jobs profile | Pop-ups and redirects are allowed in the dedicated profile, as its default or for a site. A warning only: runs go on, and the stated boundary covers a popup. Choose **Don't allow sites to send pop-ups or use redirects** and remove any site from the allowed list (setup step 7). Needs a code change: no. |
 | `unattended_unsupported` | `install.json`: `unattended` | This version has no unattended runs; an install file that asks for them is refused by every command that reads it (`run --attended`, `probe`, `bind-profile`, `confirm-profile`, `check-host`, `check-cli`; the key and allowlist tools don't read it). Set `"unattended": false` (and run `worker.ts run --attended` yourself). Needs a code change: no; unattended runs come with a later version that adds request-level blocking. |
-| `busy` | `worker.lock` | Another run holds the lock. Wait; a lock from a dead run clears itself (`stale_lock` in the heartbeat). |
+| `busy` | `worker.lock` (its `kind`); a run's refusal detail `holder` | Another run holds the lock. Wait; a lock from a dead run clears itself (`stale_lock` in the heartbeat). When the refusal names `holder` `probe` (twenty-first round), a probe is running: the run checked and swept nothing; wait for the probe to finish, then run again. |
 | `chrome_busy` (the competing-session case) | Task Manager, Details: any `claude.exe`, or `node` running `claude-code` | Close the other Claude Code session (or end a leftover one) and run again. Any other Claude Code process blocks a run, attached to Chrome or not: the worker can't tell, and the extension would serve it instead. |
 | `extension_unreachable` | `probe`'s detail, or the bridge check in `worker.log` | Open the Cain jobs Chrome on its folder, check Claude in Chrome is on and paired with the `claude` command. The worker already ended a leftover native messaging host and checked again; if it persists, restart that Chrome. |
 | `extension_unreachable` with "Claude in Chrome: not listed" (the strict-MCP-config case) | `probe`'s detail; the `tools` in `probe-evidence.json` hold no `mcp__claude-in-chrome__` names | `--strict-mcp-config` may be keeping the built-in Chrome integration out on your `claude` version. Don't edit the session's flags by hand (the settings hash fails closed): ask for a build without that flag. The inventory check already fails any MCP server but Claude in Chrome's, so dropping the flag keeps that guarantee. Untested assumption: that `--strict-mcp-config` leaves the built-in Chrome integration in. Needs a code change: yes. |
@@ -1616,13 +1671,14 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `inventory_never_ready` | `nav-decisions.jsonl`: three `inventory_not_ready` lines, then one `inventory_never_ready` | The session asked four times before the worker had checked its tools: the worker never wrote the session's marker (its inventory check never passed, or the marker couldn't be written). Run again; if it repeats, look for `tool_inventory` lines in `worker.log`. |
 | `refusal_cap` | `nav-decisions.jsonl`: the session's `deny` lines, the last with `cap` `refusal_cap` | The session collected twelve refusals of any kind and was ended. A page talking the model into one detour after another looks like this: look at the `why` of each line and at the job's site. Needs a code change: no. |
 | `redirect_read`, `structured_address`, `forged_address`, `kill_latency` (`confirm-profile`) | `probe-evidence.json`: that step's line (for `redirect_read`, its `session_ended` and `secret_withheld`; the refusal says which failed); `worker.log`: `probe round15` and `probe round16` | That probe step didn't pass (above, under the probe). Nothing runs on this Claude Code and extension: rerun the probe once; if it repeats, report it (needs a code change). `session_ids` and `fragment_strip` never refuse: the first is a diagnostic, the second only turns fragment stripping on. |
+| `structured_address` with `address_paths` in its detail (`confirm-profile`) | its detail: `address_paths` (`tool: path`) and `hint`; `probe-evidence.json`: `address_paths` | A reading tool's real answers carry address-named keys beyond `tool_response.structuredContent.tabUrl`. That is a schema mismatch between Claude in Chrome's answers and the read guard's rule, not a forged answer: every read would count as unplaced. Nothing runs until a policy change: report it with those paths (needs a code change). |
 | `hook_timing` (`confirm-profile`) | `probe-evidence.json`: `hook_timing` (`cold_gap_ms`, `warm_gaps_ms`, `max_gap_ms`, `full_budget`, `overrun`, `why`); `worker.log`: `probe hook_timing` | `gap_too_long`: on this PC the hook's start (Git Bash and the runtime) takes so long that it plus the hook's 26 second budget comes within 4 seconds of the 40 second timeout. Close other heavy programs, check whether your security software scans Git Bash or the runtime on every start, restart the PC and run the probe again first thing. `gap_unmeasured`: Claude Code didn't print a tool call before starting its hook, so the gap couldn't be measured: report it (needs a code change). `full_budget_not_blocked`: a hook held to its budget didn't reach Claude Code as a refusal (the CLI gave up on it first, or ran the call anyway): report it with your `claude` version (needs a code change). `overrun_ran`: a navigation whose hook never answered ran anyway: the permission layer isn't refusing on its own; check `session-settings.json` is the pinned one and report it. |
 | `payload_replay` (`confirm-profile`) | `probe-evidence.json`: `payload_replay` (`captured`, `parsed`, `agreed`, `failures`); `worker.log`: `probe round18` | The hook input your Claude Code sent was refused by the read guard's strict parser (`bom`: it starts with a byte order mark; `lone_surrogate`; `unsafe_integer`: a number past the safe range; `duplicate_key`; `disagrees`), or nothing was captured (`captured` 0: the probe's sessions made no tool call). Every page read would count as unplaced, so nothing runs. Run the probe once more; if it repeats, report the reasons (needs a code change). |
 | `hook_margin_low` (`confirm-profile`) | `hook-margin.json` in the worker folder; `last-run.json`: `hook` | A real run's hooks started so late that less than 4 seconds of the 40 second timeout was left past the 26 second budget. Close heavy programs (a scan, a backup), restart the PC, then run the probe again first thing (its `hook_timing` measures the margin anew) and `confirm-profile`. Needs a code change: only if it repeats on an idle PC. |
-| `probe_leftover` (`worker.ts run`) | its detail: `vars`, `files`, `swept`, `hint`; `worker.log`: `probe_leftover` | A probe was cut off and left its marker, timing or capture files, or a probe variable is set in the terminal you ran from. The files were swept already (`bun worker.ts clean-probe` does the same); unset each variable it names (or open a new terminal) and run again. Needs a code change: no. |
-| `hook_margin_low` (a run's result) | `last-run.json`: `hook`; `hook-worst.json` | During this run a hook started more than 10 seconds after Claude Code asked for it, leaving under 4 seconds before the 40 second timeout, so the worker ended the session at once. Close heavy programs, restart the PC, probe again first thing and confirm. Needs a code change: only if it repeats on an idle PC. |
-| `hook_timing` with `cold_sample_missing` (`confirm-profile`) | `probe-evidence.json`: `hook_timing` (`uptime_s`, `first_sample`) | The probe's first session wasn't within 5 minutes of the PC starting, so it isn't a cold sample. Restart the PC and run the probe within five minutes. Needs a code change: no. |
-| `probe_stale` with `version_mismatch` (a run's refusal) | its detail; `confirm-profile`'s `versions` | The Claude in Chrome id or version, or Chrome's version, installed now isn't the one the probe saw. Restart the Cain jobs Chrome if an update is waiting, then run the probe and `confirm-profile` again. Needs a code change: no. |
+| `probe_leftover` (`worker.ts run`) | its detail: `vars`, `scopes` (each variable's `scope` and `remove` command), `files`, `swept`, `hint`; `worker.log`: `probe_leftover` | A probe was cut off and left its marker, timing or capture files, or a probe variable is set. The files were swept already (`bun worker.ts clean-probe` does the same). For each variable, run the command the refusal gives for its scope: `Remove-Item Env:<name>` for this terminal (`process`), `[Environment]::SetEnvironmentVariable('<name>', $null, 'User')` for `user`, the same with `'Machine'` in an administrator PowerShell for `machine`. Then close the terminal, start the worker in a new one and run again. |
+| `hook_margin_low` (a run's result) | `last-run.json`: `hook`; `hook-worst.json` | During this run a hook started more than 10 seconds after Claude Code asked for it, leaving under 4 seconds before the 40 second timeout, so the worker ended the session at once. Close heavy programs, restart the PC, probe again first thing and confirm. Needs a code change: only if it repeats on an idle PC. Also when a call's hook never wrote its start line within 36 seconds of the call (twenty-first round): the hook didn't start, or started past Claude Code's own timeout. Close heavy programs, check Git Bash and Bun start quickly, restart the PC and probe again first thing. |
+| `hook_timing` with `cold_sample_missing` (`confirm-profile`) | its detail: `uptime_s` and `hint`; `probe-evidence.json`: `hook_timing` (`uptime_s`, `first_sample`, `hint`) | The probe's first session wasn't within 5 minutes of the PC starting (the refusal prints the uptime it measured), so it isn't a cold sample. **Use Restart, not Shut down**: with Windows Fast Startup on, Shut down then power on doesn't reset the uptime, so it never counts. Restart the PC (or turn Fast Startup off: Control Panel, Power Options, "Choose what the power buttons do", untick "Turn on fast startup", then shut down and start), and run the probe within 5 minutes of it starting. |
+| `probe_stale` with `version_mismatch` (a run's refusal) | its detail; `confirm-profile`'s `versions` | The Claude in Chrome id or version, or Chrome's version, installed now isn't the one the probe saw. Restart the Cain jobs Chrome if an update is waiting, then run the probe and `confirm-profile` again. Needs a code change: no. An auto-update needs a new probe. When the line says Chrome's version came "from the Last Version file, the fallback", the worker couldn't read the running `chrome.exe`'s file version (Task Manager, Details: is the Cain jobs Chrome running?). |
 | `probe_marker` (a run's `navigation_denied`, `hook_missing_decision` or `read_unplaced` with reason `probe_marker`) | `nav-decisions.jsonl`: a line with `why` or `reason` `probe_marker`; the `probe-marks` folder in the worker folder | The hook saw a sign of probe mode in a run: a file left in `probe-marks`, or a probe setting in the environment. Delete everything in `probe-marks`, close the terminal you started the run from and open a new one, then run again. Needs a code change: no, unless it repeats with `probe-marks` empty. |
 | `fragment_strip` with `no_page_report` | `probe-evidence.json`: `fragment_strip` (`why`, `received`) | The fragment check page sent no report for its step's nonce in time (the page didn't load, its script was blocked, or the extension took long). Fragments stay refused; that's safe. Run the probe again; if it repeats, check the Cain jobs Chrome allows scripts on `http://127.0.0.1`. |
 | `reuse_migrated` (a Discord line from Cain's App) | `/data/pc-jobs-reuse-used.jsonl` on the Pi: a line with `migrated` | A tap written by an older keeper was counted as used. Nothing to fix: if you still want that check, let Cain ask again and tap. |
@@ -1631,9 +1687,12 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `queue_empty_pending` (a Discord line) | the `pc-jobs` repository on GitHub | The queue on GitHub has no branch at all while a tap waits to be settled; the round stops. Fix: give it its first commit again (setup step 2); the tap then counts as used. |
 | `reuse_store_unreadable` (a Discord line) | `/data/pc-jobs-reuse-used.jsonl` on the Pi | The keeper can't read its record of used taps (it isn't a readable file), so it takes no reuse job until it can; other jobs go on. Fix: make it a readable file again (if something replaced it with a folder, move that aside); never delete a readable one: it is what keeps a tap from answering twice. |
 | `reuse_unsettled` (a Discord line) | the keeper's log in the Cain App's log | Git gave no clear answer about a tap's job (a file in the queue copy it couldn't read, or git neither yes nor no). That tap waits; other jobs go on; it tries each round. If it lasts a day, delete `/data/pc-jobs` and restart the Cain App. |
-| `reuse_push_refused` (a Discord line) | the keeper's log: `push 3 of 3` | GitHub refused the push of a job made from your tap three times. The tap is settled at the keeper's next round, within a minute, once a fetch shows none of its commits landed (rolled back only because every try was refused), and the job is queued again by itself. If it repeats, check the `pc_jobs_token` option (Contents read and write on `pc-jobs`). |
+| `reuse_record_unreadable` (a Discord line, naming the job) | the keeper's log in the Cain App's log; the files in `/data/pc-jobs` on the Pi | For three rounds the keeper couldn't read a file in its queue copy while settling a tap written by an older version. The tap stays used; other jobs go on. Fix: delete `/data/pc-jobs` on the Pi (Cain's App data) and restart the App, so the copy is fetched afresh. |
+| `reuse_fetch_failed` (a Discord line, naming the job) | the keeper's log: `round didn't finish` | For three rounds the keeper couldn't fetch the queue from GitHub while a tap whose job GitHub refused three times waits to be settled. It settles at the next round with a successful fetch. Fix: check the Pi's network and the `pc_jobs_token` option. |
+| `reuse_push_refused` (a Discord line) | the keeper's log: `push 3 of 3` | GitHub refused the push of a job made from your tap three times. The tap is settled at the keeper's next round with a successful fetch from GitHub (within a minute while GitHub answers), once that fetch shows none of its commits landed (rolled back only because every try was refused), and the job is queued again by itself. If it repeats, check the `pc_jobs_token` option (Contents read and write on `pc-jobs`). |
 | a stop condition the App does not know, code `<code>` (a Discord line) | the keeper's log in the Cain App's log | The keeper is newer than the link that posts its notices (an update half applied). Find the code in this table; restart the Cain App so both run the same version. Needs a code change: no. |
 | `other_head` or `head_moved` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`) | its last line and `/data/work/ship-gate-<sha>.json`: `failure`, `failure_why` | The pull request's head was not the sha the watch was told (another commit was pushed), or it moved away from it. Nothing was accepted. Start a new watch with `--head` set to the commit actually pushed, before pushing it. Needs a code change: no. |
+| `live_acceptance` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`), or a Ship card refused for "more than one live acceptance" | the refusal's words; `/data/work/ship-gate-*.json` | Another live acceptance of that pull request stands. Once the pull request's head has moved past it, run `keeper.sh ship-gate --supersede <that sha>`, then watch again. A supersede refused with "head is still" means nothing new was pushed yet: push the new head first. |
 | a Ship card refused: "the Ship gate's watch of this pull request accepted `<sha>`, not this head" | `/data/work/ship-gate-<sha>.json` | An earlier watch accepted another head of this pull request (often before a rebase). If this head replaces it, run `keeper.sh ship-gate --supersede <sha>`, then watch this head with `--pr <number> --head <head> --watch`. |
 | `rate_wait_cap` or `watch_cap` (the gate watch) | the watch's lines: the last reading's `why` | GitHub asked for a wait past 15 minutes (or sent a wait it couldn't read), or the watch reached its 2 hour cap unsettled. Nothing was accepted. Wait for GitHub's limit to reset, then watch again. |
 | `extension_slow_attach` (`confirm-profile`) | `probe-evidence.json`: `not_ready` (counts, `waits_ms`, `first_wait_ms`) | A probe session hit the not-ready cap: Claude in Chrome took too long to attach. Restart the Cain jobs Chrome, wait a minute, then run the probe again. Needs a code change: only if it repeats on a healthy Chrome. |
@@ -1656,7 +1715,9 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `browser_unreachable` | is the Cain jobs Chrome open? | Start it with `--user-data-dir=C:/pc-worker-k7q2xz/chrome` before the run. |
 | `probe_stale` | `confirmed.json`'s `fingerprint`, `worker_sha256`, `cain_version` and `policy_version` against what is installed now; `heartbeat.json`'s `reason` | Claude in Chrome (`extension_version_changed`), Chrome (`chrome_version_changed`) or `claude` (`cli_version_changed`) updated, or the worker itself did (`worker_changed`: a new Cain release, its version step included, or a confirmation from before these were recorded). For the extension or Chrome, restart the Cain jobs Chrome first. Then run `probe --attended`, then `confirm-profile --accept-boundary`. Nothing else runs until then. |
 | `probe_stale` with reason `cli_version_changed` | `worker.ts check-cli`: the pinned against the current version and hash | Usually the autoupdater: the session runs with `DISABLE_AUTOUPDATER=1`, but a `claude` you run yourself in a terminal (or an installer) updates the same executable. Set `DISABLE_AUTOUPDATER=1` in your own Windows user environment too, then run the probe and `confirm-profile --accept-boundary` again. Needs a code change: no. |
-| `update_pending` | chrome://extensions in the Cain jobs Chrome; the version folders under the profile's `Extensions\<id>` | Chrome has unpacked a Claude in Chrome update into a newer version folder but still runs the old one. Restart the Cain jobs Chrome (close every window, open it again); the next run is `probe_stale` until you probe and confirm the new version. Needs a code change: no. |
+| `update_pending` | chrome://extensions in the Cain jobs Chrome; the version folders under the profile's `Extensions\<id>` | Chrome has unpacked a Claude in Chrome update into a newer version folder but still runs the old one. Restart the Cain jobs Chrome (close every window, open it again); the next run is `probe_stale` until you probe and confirm the new version. Needs a code change: no. Runs stay held after the restart until a new probe and confirmation (`version-hold.json` in the worker folder; twenty-first round): an auto-update needs a new probe. |
+| `extension_versions_ambiguous` | the version folders under the Cain jobs profile's `Extensions\<id>`; `version-hold.json` in the worker folder (`folders`) | The profile holds more than one Claude in Chrome version folder, so which one Chrome runs can't be bound to the probe. Restart the Cain jobs Chrome (it removes the old folder), then run the probe again and `confirm-profile`; runs stay held until then. |
+| `versions_changed` (a run's result) | the run's `detail` | Claude in Chrome's loaded version or Chrome's version changed during the run (an auto-update), checked once the session ended; the run's report was discarded. Restart the Cain jobs Chrome, then run the probe again and `confirm-profile`. |
 | `boundary_not_accepted` | `confirmed.json`: `boundary_version`; `confirm-profile`'s output | The confirmation doesn't hold your acceptance of the current boundary text (you ran `confirm-profile` without `--accept-boundary`, the confirmation is from before this release, or the text changed). Read the boundary (top of this note), then run `confirm-profile --accept-boundary` after a passing probe. Needs a code change: no. |
 | `injection_required` (`confirm-profile`) | `probe-evidence.json`: `injection`, `injection_plan` | A planted-instruction case didn't pass: the page was never read, or the token came out in an accepted value. Run the probe again; if it repeats, the schema or the session prompt needs a change. |
 | `profile_changed`, `profile_unconfirmed` | `confirmed.json` | Run the probe and `confirm-profile`. |

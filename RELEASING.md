@@ -40,10 +40,13 @@ branch is up to date with `main` and these checks passed on it:
     of each of those three files at the head (`cain/tools/guard-surface.sh` prints them). A
     new policy version needs a new probe and confirmation on the PC. The probe steps that
     gate it are listed in `cain/docs/pc-jobs.md`; since the twentieth round its `hook_timing`
-    step needs a cold first sample (taken within 5 minutes of the PC starting,
-    `cold_sample_missing` otherwise), its `structured_address` step records each reading
-    tool's address-named key paths, and its result names the Claude in Chrome id and version
-    and Chrome's version that every run then checks;
+    step needs a cold first sample (taken within 5 minutes of a Restart of the PC, not a Shut
+    down, which Windows Fast Startup doesn't count; `cold_sample_missing` otherwise, printing
+    the uptime measured), its `structured_address` step records each reading tool's
+    address-named key paths (extra paths refuse as a schema mismatch needing a policy
+    change), and its result names the Claude in Chrome id and loaded version and Chrome's
+    version (chrome.exe's file version, or the Last Version file as a named fallback) that
+    every run then checks before and after its session (an auto-update needs a new probe);
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
     filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
     the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
@@ -74,7 +77,9 @@ its next reading, each wait capped at 15 minutes and the whole watch at 2 hours 
 unreadable header counts as the cap); every acceptance is kept by sha in
 `/data/work/ship-gate-<sha>.json`, a Ship card for any other head of that pull request is
 refused while it stands, naming the accepted sha, and after a rebase
-`keeper.sh ship-gate --supersede <accepted sha>` records that the acceptance is replaced). Run it once on a head
+`keeper.sh ship-gate --supersede <accepted sha>` records that the acceptance is replaced,
+only once the pull request's head differs from it; a pull request has one live acceptance at
+a time, and a watch refuses to accept while another stands, `live_acceptance`). Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
   Run it before pushing (needs PyYAML):
